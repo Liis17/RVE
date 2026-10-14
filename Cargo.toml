@@ -1,0 +1,14 @@
+[workspace]
+members = ["engine/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+ash = "=0.38.0"
+ash-window = "=0.13.0"
+raw-window-handle = "=0.6.2"
+winit = "=0.30.13"

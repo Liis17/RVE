@@ -1,0 +1,350 @@
+use engine_core::Time;
+use engine_render::{FrameStatus, Renderer, RendererConfig};
+use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
+use std::env;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test]";
+const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
+const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
+
+struct Options {
+    frames: Option<u64>,
+    render_scale: f32,
+    resize_test: bool,
+}
+
+fn parse_args<I, S>(args: I) -> Result<Options, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into);
+    let mut frames = None;
+    let mut render_scale = None;
+    let mut resize_test = false;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--frames" => {
+                if frames.is_some() {
+                    return Err("флаг --frames указан повторно".to_owned());
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| "после --frames требуется N".to_owned())?;
+                let value = value.parse::<u64>().map_err(|_| {
+                    "значение --frames должно быть положительным целым u64".to_owned()
+                })?;
+                if value == 0 {
+                    return Err("значение --frames должно быть больше нуля".to_owned());
+                }
+                frames = Some(value);
+            }
+            "--render-scale" => {
+                if render_scale.is_some() {
+                    return Err("флаг --render-scale указан повторно".to_owned());
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| "после --render-scale требуется S".to_owned())?;
+                let value = value
+                    .parse::<f32>()
+                    .map_err(|_| "значение --render-scale должно быть числом".to_owned())?;
+                if !value.is_finite() || value <= 0.0 || value > 1.0 {
+                    return Err("--render-scale должен быть конечным числом в (0, 1]".to_owned());
+                }
+                render_scale = Some(value);
+            }
+            "--resize-test" => {
+                if resize_test {
+                    return Err("флаг --resize-test указан повторно".to_owned());
+                }
+                resize_test = true;
+            }
+            _ => return Err(format!("неизвестный аргумент: {argument}")),
+        }
+    }
+    if resize_test && frames.is_some_and(|count| count < 120) {
+        return Err("с --resize-test значение --frames должно быть не меньше 120".to_owned());
+    }
+    Ok(Options {
+        frames,
+        render_scale: render_scale.unwrap_or(1.0),
+        resize_test,
+    })
+}
+
+#[derive(Default)]
+struct ResizeTest {
+    initial_requested: bool,
+    initial_resized: bool,
+    minimize_deadline: Option<Instant>,
+    restore_requested: bool,
+    restore_size: bool,
+    complete: bool,
+}
+
+struct Sandbox {
+    renderer: Option<Renderer>,
+    time: Time,
+    options: Options,
+    presented_frames: u64,
+    resize_test: ResizeTest,
+    failure: Option<String>,
+}
+
+impl Sandbox {
+    fn new(options: Options) -> Self {
+        Self {
+            renderer: None,
+            time: Time::new(),
+            options,
+            presented_frames: 0,
+            resize_test: ResizeTest::default(),
+            failure: None,
+        }
+    }
+
+    fn report_resize(&mut self, width: u32, height: u32) {
+        println!("Resized: {width}x{height} (physical pixels)");
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.resize(width, height);
+        }
+        if self.options.resize_test {
+            if self.resize_test.initial_requested
+                && width == RESIZE_SIZE.width
+                && height == RESIZE_SIZE.height
+            {
+                self.resize_test.initial_resized = true;
+            }
+            if self.resize_test.restore_requested
+                && width == RESTORE_SIZE.width
+                && height == RESTORE_SIZE.height
+            {
+                self.resize_test.restore_size = true;
+            }
+        }
+    }
+
+    fn request_inner_size(&mut self, window: &Window, target: PhysicalSize<u32>) {
+        if let Some(actual_size) = window.request_inner_size(target) {
+            println!(
+                "request_inner_size actual: {}x{} (physical pixels)",
+                actual_size.width, actual_size.height
+            );
+            self.report_resize(actual_size.width, actual_size.height);
+            if actual_size != target {
+                self.failure = Some(format!(
+                    "resize-test: requested {}x{}, actual {}x{}",
+                    target.width, target.height, actual_size.width, actual_size.height
+                ));
+            }
+        }
+    }
+
+    fn advance_resize_test(&mut self, window: &Window) {
+        if !self.options.resize_test || self.failure.is_some() || self.resize_test.complete {
+            return;
+        }
+        if !self.resize_test.initial_requested && self.presented_frames >= 30 {
+            self.resize_test.initial_requested = true;
+            println!("resize-test: requesting 960x540 after 30 presentations");
+            self.request_inner_size(window, RESIZE_SIZE);
+        }
+        if self.resize_test.initial_resized
+            && self.presented_frames >= 60
+            && self.resize_test.minimize_deadline.is_none()
+        {
+            println!("resize-test: minimizing after 60 presentations");
+            window.set_minimized(true);
+            self.resize_test.minimize_deadline = Some(Instant::now() + Duration::from_millis(250));
+        }
+        if !self.resize_test.restore_requested
+            && self
+                .resize_test
+                .minimize_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            println!("resize-test: restoring after 250ms");
+            window.set_minimized(false);
+            self.resize_test.restore_requested = true;
+            self.request_inner_size(window, RESTORE_SIZE);
+        }
+        if self.resize_test.restore_requested
+            && self.resize_test.restore_size
+            && window.is_minimized() != Some(true)
+        {
+            self.resize_test.complete = true;
+            println!("resize-test: restore complete; actual 1280x720");
+        }
+    }
+
+    fn take_failure(&mut self) -> Option<String> {
+        self.failure.take()
+    }
+}
+
+impl WindowHandler for Sandbox {
+    fn init(&mut self, window: Arc<Window>) -> bool {
+        let size = window.inner_size();
+        let config = RendererConfig {
+            render_scale: self.options.render_scale,
+            ..RendererConfig::default()
+        };
+        match Renderer::new(Arc::clone(&window), size.width, size.height, config) {
+            Ok(renderer) => {
+                let capabilities = renderer.capabilities();
+                let api_major = (capabilities.api_version >> 22) & 0x7f;
+                let api_minor = (capabilities.api_version >> 12) & 0x3ff;
+                println!(
+                    "GPU: {} (vendor 0x{:04x}), Vulkan {}.{}, discrete: {}, tessellation: {}",
+                    capabilities.device_name,
+                    capabilities.vendor_id,
+                    api_major,
+                    api_minor,
+                    capabilities.discrete,
+                    capabilities.tessellation_shader
+                );
+                self.renderer = Some(renderer);
+                true
+            }
+            Err(error) => {
+                self.failure = Some(format!("ошибка рендерера: {error}"));
+                false
+            }
+        }
+    }
+
+    fn frame(&mut self, window: &Window) -> bool {
+        let _ = self.time.tick();
+        if window.is_minimized() == Some(true) {
+            return true;
+        }
+        let elapsed = self.time.elapsed().as_secs_f32();
+        let color = [
+            0.5 + 0.5 * elapsed.sin(),
+            0.5 + 0.5 * (elapsed * 0.73).sin(),
+            0.5 + 0.5 * (elapsed * 0.41).sin(),
+            1.0,
+        ];
+        let Some(renderer) = self.renderer.as_mut() else {
+            self.failure = Some("рендерер отсутствует".to_owned());
+            return false;
+        };
+        match renderer.render_frame(color) {
+            Ok(FrameStatus::Presented) => {
+                self.presented_frames += 1;
+                self.advance_resize_test(window);
+                if self
+                    .options
+                    .frames
+                    .is_some_and(|limit| self.presented_frames >= limit)
+                {
+                    if self.options.resize_test && !self.resize_test.complete {
+                        self.failure = Some(format!(
+                            "resize-test не завершился за {} успешных презентаций",
+                            self.presented_frames
+                        ));
+                        return false;
+                    }
+                    return false;
+                }
+                true
+            }
+            Ok(FrameStatus::Skipped) => true,
+            Err(error) => {
+                self.failure = Some(format!("ошибка Vulkan render_frame: {error}"));
+                false
+            }
+        }
+    }
+
+    fn resized(&mut self, width: u32, height: u32) {
+        self.report_resize(width, height);
+    }
+
+    fn update(&mut self, window: &Window) -> bool {
+        self.advance_resize_test(window);
+        if self.failure.is_some() {
+            return false;
+        }
+        true
+    }
+
+    fn exiting(&mut self) {
+        self.renderer.take();
+    }
+}
+
+fn main() -> ExitCode {
+    let options = match parse_args(env::args().skip(1)) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("Ошибка аргументов: {error}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let config = WindowConfig::default();
+    let mut app = Sandbox::new(options);
+    let run_result = run(config, &mut app);
+    let failure = app.take_failure();
+    let exit_code = match (run_result, failure) {
+        (Err(error), _) => {
+            eprintln!("ошибка окна: {error}");
+            1
+        }
+        (Ok(()), Some(error)) => {
+            eprintln!("{error}");
+            1
+        }
+        (Ok(()), None) => 0,
+    };
+    drop(app);
+    ExitCode::from(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    #[test]
+    fn parses_all_supported_flags() {
+        let options = parse_args(["--frames", "120", "--render-scale", "0.5", "--resize-test"])
+            .expect("valid arguments should parse");
+        assert_eq!(options.frames, Some(120));
+        assert_eq!(options.render_scale, 0.5);
+        assert!(options.resize_test);
+    }
+
+    #[test]
+    fn rejects_invalid_or_repeated_flags() {
+        for arguments in [
+            vec!["--unknown"],
+            vec!["--frames"],
+            vec!["--frames", "abc"],
+            vec!["--frames", "0"],
+            vec!["--frames", "2", "--frames", "3"],
+            vec!["--render-scale"],
+            vec!["--render-scale", "NaN"],
+            vec!["--render-scale", "inf"],
+            vec!["--render-scale", "0"],
+            vec!["--render-scale", "2"],
+            vec!["--render-scale", "0.5", "--render-scale", "0.25"],
+            vec!["--resize-test", "--resize-test"],
+            vec!["--frames", "119", "--resize-test"],
+        ] {
+            assert!(parse_args(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn defaults_to_unbounded_run_at_native_scale() {
+        let options = parse_args(Vec::<String>::new()).expect("empty args are valid");
+        assert_eq!(options.frames, None);
+        assert_eq!(options.render_scale, 1.0);
+        assert!(!options.resize_test);
+    }
+}
