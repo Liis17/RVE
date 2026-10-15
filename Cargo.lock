@@ -1395,6 +1395,7 @@ dependencies = [
  "engine-assets",
  "engine-core",
  "engine-render",
+ "engine-scene",
  "engine-window",
  "font8x8",
  "glam",

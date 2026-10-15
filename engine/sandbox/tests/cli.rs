@@ -57,3 +57,15 @@ fn missing_or_invalid_assets_exit_with_code_two_before_opening_a_window() {
     }
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+#[test]
+fn triangle_scene_rejects_model_before_loading_assets() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sandbox"))
+        .args(["--scene", "triangle", "--model", "/model/cube.fbx"])
+        .output()
+        .expect("sandbox binary should start");
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("Ошибка аргументов:"), "{stderr}");
+}

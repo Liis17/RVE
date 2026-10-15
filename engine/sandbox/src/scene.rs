@@ -2,6 +2,8 @@
 
 use engine_assets::TextureData;
 use engine_render::Vertex;
+use engine_scene::camera::OrbitCamera;
+use engine_scene::light::{OrbitingSun, shadow_view_projection};
 use glam::camera::rh::proj::directx;
 use glam::{Mat4, Vec3};
 
@@ -9,15 +11,33 @@ use glam::{Mat4, Vec3};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scene {
     Triangle,
-    #[default]
     Cube,
+    #[default]
+    Shadows,
 }
+
+const SHADOWS_CAMERA: OrbitCamera = OrbitCamera {
+    target: Vec3::ZERO,
+    radius: 4.2,
+    height: 1.5,
+    angular_speed: std::f32::consts::TAU / 20.0,
+    fov_narrow: std::f32::consts::FRAC_PI_4,
+    near: 0.1,
+    far: 100.0,
+};
+
+const SHADOWS_SUN: OrbitingSun = OrbitingSun {
+    elevation: std::f32::consts::PI * 55.0 / 180.0,
+    start_azimuth: 0.0,
+    angular_speed: -std::f32::consts::TAU / 12.0,
+};
 
 impl Scene {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "triangle" => Some(Self::Triangle),
             "cube" => Some(Self::Cube),
+            "shadows" => Some(Self::Shadows),
             _ => None,
         }
     }
@@ -25,7 +45,7 @@ impl Scene {
     pub fn mesh(self) -> (Vec<Vertex>, Vec<u32>) {
         match self {
             Self::Triangle => (TRIANGLE_VERTICES.to_vec(), TRIANGLE_INDICES.to_vec()),
-            Self::Cube => cube_mesh(),
+            Self::Cube | Self::Shadows => cube_mesh(),
         }
     }
 
@@ -33,14 +53,17 @@ impl Scene {
     pub fn texture(self) -> Option<TextureData> {
         match self {
             Self::Triangle => None,
-            Self::Cube => Some(checker_texture()),
+            Self::Cube | Self::Shadows => Some(checker_texture()),
         }
     }
 
-    pub fn view_projection(self, width: u32, height: u32) -> Mat4 {
+    pub fn view_projection(self, elapsed: f32, width: u32, height: u32) -> Mat4 {
         match self {
             Self::Triangle => triangle_view_projection(width, height),
             Self::Cube => cube_view_projection(width, height),
+            Self::Shadows => SHADOWS_CAMERA
+                .camera_at(elapsed)
+                .view_projection(width, height),
         }
     }
 
@@ -48,8 +71,38 @@ impl Scene {
         match self {
             Self::Triangle => Mat4::from_rotation_z(elapsed),
             Self::Cube => cube_model(elapsed),
+            Self::Shadows => Mat4::from_rotation_z(elapsed),
         }
     }
+}
+
+pub fn shadows_light_direction(elapsed: f32) -> Vec3 {
+    SHADOWS_SUN.direction_at(elapsed)
+}
+
+pub fn shadows_light_view_projection(elapsed: f32) -> Mat4 {
+    shadow_view_projection(shadows_light_direction(elapsed), Vec3::ZERO, 1.8)
+}
+
+/// Квадратная плоскость 2×2 на высоте −1, с обходом CCW со стороны +Y.
+pub fn plane_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let positions = [
+        [-1.0, -1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, -1.0, -1.0],
+    ];
+    let vertices = positions
+        .into_iter()
+        .zip([[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]])
+        .map(|(position, uv)| Vertex {
+            position,
+            normal: [0.0, 1.0, 0.0],
+            uv,
+            color: [0.78, 0.78, 0.78],
+        })
+        .collect();
+    (vertices, vec![0, 1, 2, 0, 2, 3])
 }
 
 const TRIANGLE_NORMAL: [f32; 3] = [0.0, 0.0, 1.0];
@@ -169,7 +222,8 @@ fn aspect_ratio(width: u32, height: u32) -> f32 {
 mod tests {
     use super::{
         Scene, TRIANGLE_INDICES, TRIANGLE_VERTICES, checker_texture, cube_mesh, cube_model,
-        cube_view_projection, triangle_view_projection,
+        cube_view_projection, plane_mesh, shadows_light_direction, shadows_light_view_projection,
+        triangle_view_projection,
     };
     use glam::{Mat4, Vec3, Vec4};
 
@@ -222,16 +276,19 @@ mod tests {
     }
 
     #[test]
-    fn scenes_parse_by_name_and_default_to_textured_cube() {
+    fn scenes_parse_by_name_and_default_to_shadows() {
         assert_eq!(Scene::parse("triangle"), Some(Scene::Triangle));
         assert_eq!(Scene::parse("cube"), Some(Scene::Cube));
+        assert_eq!(Scene::parse("shadows"), Some(Scene::Shadows));
         assert_eq!(Scene::parse("Cube"), None);
         assert_eq!(Scene::parse(""), None);
-        assert_eq!(Scene::default(), Scene::Cube);
+        assert_eq!(Scene::default(), Scene::Shadows);
         assert_eq!(Scene::Triangle.mesh().0, TRIANGLE_VERTICES);
         assert_eq!(Scene::Cube.mesh(), cube_mesh());
+        assert_eq!(Scene::Shadows.mesh(), cube_mesh());
         assert!(Scene::Triangle.texture().is_none());
         assert!(Scene::Cube.texture().is_some());
+        assert!(Scene::Shadows.texture().is_some());
     }
 
     #[test]
@@ -312,5 +369,111 @@ mod tests {
         let front = clip(transform, [0.0, 0.0, 0.5]);
         let back = clip(transform, [0.0, 0.0, -0.5]);
         assert!(front.z / front.w < back.z / back.w);
+    }
+
+    #[test]
+    fn plane_is_two_meters_square_at_y_minus_one_with_upward_winding() {
+        let (vertices, indices) = plane_mesh();
+        assert_eq!(vertices.len(), 4);
+        assert_eq!(indices, [0, 1, 2, 0, 2, 3]);
+        assert!(vertices.iter().all(|vertex| {
+            vertex.position[1] == -1.0
+                && (-1.0..=1.0).contains(&vertex.position[0])
+                && (-1.0..=1.0).contains(&vertex.position[2])
+                && vertex.normal == [0.0, 1.0, 0.0]
+        }));
+        for triangle in indices.as_chunks::<3>().0 {
+            let points = triangle.map(|index| Vec3::from(vertices[index as usize].position));
+            let winding = (points[1] - points[0]).cross(points[2] - points[0]);
+            assert!(winding.dot(Vec3::Y) > 0.0);
+        }
+        assert_eq!(
+            vertices.iter().map(|vertex| vertex.uv).collect::<Vec<_>>(),
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]]
+        );
+    }
+
+    #[test]
+    fn shadow_cube_rotates_around_z_and_stays_above_the_plane() {
+        let (vertices, _) = cube_mesh();
+        assert!(
+            Scene::Shadows
+                .model(1.73)
+                .transform_point3(Vec3::Z)
+                .abs_diff_eq(Vec3::Z, 1e-6)
+        );
+        for step in 0..64 {
+            let model = Scene::Shadows.model(step as f32 * 0.13);
+            for vertex in &vertices {
+                assert!(model.transform_point3(Vec3::from(vertex.position)).y > -1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_scene_projects_cube_and_plane_inside_all_window_shapes() {
+        let (cube_vertices, _) = cube_mesh();
+        let (plane_vertices, _) = plane_mesh();
+        for (width, height) in [(1280, 720), (720, 1280), (1000, 1000), (0, 0)] {
+            for step in 0..64 {
+                // Равномерные моменты проходят также через диагональные азимуты камеры.
+                let elapsed = step as f32 * 20.0 / 64.0;
+                let transform = Scene::Shadows.view_projection(elapsed, width, height);
+                let model = Scene::Shadows.model(elapsed);
+                for position in cube_vertices
+                    .iter()
+                    .map(|vertex| model.transform_point3(Vec3::from(vertex.position)))
+                    .chain(
+                        plane_vertices
+                            .iter()
+                            .map(|vertex| Vec3::from(vertex.position)),
+                    )
+                {
+                    let point = transform * position.extend(1.0);
+                    let ndc = point.truncate() / point.w;
+                    assert!(point.w > 0.0, "{width}x{height} t={elapsed}: {point:?}");
+                    assert!(
+                        ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0,
+                        "{width}x{height} t={elapsed}: {ndc:?}"
+                    );
+                    assert!(
+                        ndc.z > 0.0 && ndc.z < 1.0,
+                        "{width}x{height} t={elapsed}: {ndc:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn camera_and_sun_move_in_opposite_azimuth_directions() {
+        let start = super::SHADOWS_CAMERA.camera_at(0.0);
+        let next = super::SHADOWS_CAMERA.camera_at(0.001);
+        let right = start
+            .view()
+            .inverse()
+            .transform_vector3(Vec3::X)
+            .normalize();
+        assert!((next.position - start.position).dot(right) > 0.0);
+        assert!(shadows_light_direction(0.25).x < 0.0);
+    }
+
+    #[test]
+    fn sun_projection_of_cube_center_hits_the_plane_square_at_every_azimuth() {
+        for step in 0..64 {
+            let elapsed = step as f32 * 12.0 / 64.0;
+            let direction = shadows_light_direction(elapsed);
+            assert!(direction.y < 0.0);
+            let distance = -1.0 / direction.y;
+            let projected = direction * distance;
+            assert!((projected.y + 1.0).abs() < 1e-6);
+            assert!(
+                projected.x.abs() <= 1.0 && projected.z.abs() <= 1.0,
+                "{projected:?}"
+            );
+
+            let clip = shadows_light_view_projection(elapsed) * Vec3::ZERO.extend(1.0);
+            assert!(clip.w.is_finite());
+        }
     }
 }
