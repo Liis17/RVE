@@ -434,7 +434,9 @@ mod tests {
     /// Прямоугольники `[x, y, width, height]` из вершин, записанных push_quad.
     fn quads(vertices: &[OverlayVertex]) -> Vec<[f32; 4]> {
         vertices
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|quad| {
                 let [left, top] = quad[0].position;
                 let [right, bottom] = quad[5].position;

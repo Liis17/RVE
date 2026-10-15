@@ -3289,8 +3289,10 @@ mod tests {
         let bytes = overlay_vertex_bytes(&vertices);
         assert_eq!(bytes.len(), 6 * size_of::<f32>());
         let floats = bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_ne_bytes(*chunk))
             .collect::<Vec<_>>();
         assert_eq!(floats, [1.0, 2.0, 0.25, 0.5, 0.75, 1.0]);
     }
