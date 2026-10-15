@@ -69,6 +69,8 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ## Ограничения и инварианты
 
+- `.github/workflows/ci.yml` проверяет весь workspace на Windows и macOS при push в любую ветку и для PR: форматирование, Clippy, сборку и unit-/integration-/doc-тесты. Workflow создаёт `build/` и выполняет проверки из него. Общая проверка `CI` требует успеха обеих платформ; для запрета слияния при ошибках она используется как required status check в защите `main` на GitHub. Тесты не создают окно и не загружают Vulkan; фактический графический путь проверяется отдельно через sandbox. Правило сопровождать новые фичи тестами закреплено в `AGENTS.md`.
+
 - Целевые runtime — настольные Windows с Vulkan-драйвером GPU и macOS с Vulkan loader и MoltenVK. Остальные ОС не имеют платформенных адаптеров; мобильный lifecycle не реализован.
 - Требуется Vulkan 1.3 и фактическая поддержка требуемых features, очереди, surface usage и форматов; наличие самого Vulkan loader недостаточно.
 - Сейчас выполняется только clear-and-blit путь. Геометрия, шейдеры, HDR/тонмаппинг, DLSS/FSR и tessellation pipeline отсутствуют.

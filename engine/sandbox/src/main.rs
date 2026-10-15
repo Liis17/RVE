@@ -317,7 +317,103 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args;
+    use super::{Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, parse_args};
+
+    #[test]
+    fn frame_limit_accepts_u64_boundaries() {
+        for limit in [1, u64::MAX] {
+            let options = parse_args(["--frames".to_owned(), limit.to_string()]).unwrap();
+            assert_eq!(options.frames, Some(limit));
+        }
+    }
+
+    #[test]
+    fn scale_accepts_small_positive_values_and_native_resolution() {
+        for scale in [f32::MIN_POSITIVE, 1.0] {
+            let options = parse_args(["--render-scale".to_owned(), scale.to_string()]).unwrap();
+            assert_eq!(options.render_scale, scale);
+        }
+    }
+
+    #[test]
+    fn resize_test_accepts_unbounded_run_and_flags_in_any_order() {
+        let options = parse_args(["--resize-test"]).unwrap();
+        assert!(options.resize_test);
+        assert_eq!(options.frames, None);
+
+        let options =
+            parse_args(["--resize-test", "--render-scale", "1", "--frames", "120"]).unwrap();
+        assert!(options.resize_test);
+        assert_eq!(options.frames, Some(120));
+        assert_eq!(options.render_scale, 1.0);
+    }
+
+    #[test]
+    fn rejects_negative_overflowing_and_malformed_values() {
+        for arguments in [
+            vec!["--frames", "-1"],
+            vec!["--frames", "18446744073709551616"],
+            vec!["--frames", "1.5"],
+            vec!["--frames", "--resize-test"],
+            vec!["--render-scale", "abc"],
+            vec!["--render-scale", "-0.5"],
+            vec!["--render-scale", "-inf"],
+            vec!["--render-scale", "--frames", "120"],
+            vec!["--resize-test", "--frames", "119"],
+            vec!["120"],
+        ] {
+            assert!(parse_args(arguments.clone()).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn resize_progress_requires_requested_and_matching_physical_sizes() {
+        let mut sandbox = Sandbox::new(Options {
+            frames: None,
+            render_scale: 1.0,
+            resize_test: true,
+        });
+        sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
+        sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
+        assert!(!sandbox.resize_test.initial_resized);
+        assert!(!sandbox.resize_test.restore_size);
+
+        sandbox.resize_test.initial_requested = true;
+        sandbox.resize_test.restore_requested = true;
+        sandbox.report_resize(0, 0);
+        sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height + 1);
+        sandbox.report_resize(RESTORE_SIZE.width + 1, RESTORE_SIZE.height);
+        assert!(!sandbox.resize_test.initial_resized);
+        assert!(!sandbox.resize_test.restore_size);
+
+        sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
+        assert!(sandbox.resize_test.initial_resized);
+        assert!(!sandbox.resize_test.restore_size);
+        sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
+        assert!(sandbox.resize_test.restore_size);
+        assert!(!sandbox.resize_test.complete);
+    }
+
+    #[test]
+    fn normal_resize_does_not_advance_disabled_resize_test() {
+        let mut sandbox = Sandbox::new(parse_args(Vec::<String>::new()).unwrap());
+        sandbox.resize_test.initial_requested = true;
+        sandbox.resize_test.restore_requested = true;
+
+        sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
+        sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
+        assert!(!sandbox.resize_test.initial_resized);
+        assert!(!sandbox.resize_test.restore_size);
+    }
+
+    #[test]
+    fn failure_can_be_taken_only_once_after_the_event_loop() {
+        let mut sandbox = Sandbox::new(parse_args(Vec::<String>::new()).unwrap());
+        assert_eq!(sandbox.take_failure(), None);
+        sandbox.failure = Some("render failed".to_owned());
+        assert_eq!(sandbox.take_failure().as_deref(), Some("render failed"));
+        assert_eq!(sandbox.take_failure(), None);
+    }
 
     #[test]
     fn parses_all_supported_flags() {
