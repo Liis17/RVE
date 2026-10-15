@@ -75,16 +75,22 @@ cargo build -p sandbox
 
 Тесты проверяют время игрового цикла, завершение оконного приложения и ошибки, настройки renderer, расширения Vulkan и параметры swapchain, требования платформенных адаптеров, CLI и обработку resize в sandbox. Интеграционный тест `engine/sandbox/tests/cli.rs` запускает бинарник с неверными аргументами и проверяет код выхода 2 и диагностику. Автотестам не нужны окно, GPU или Vulkan runtime; они не проверяют фактическую отрисовку и обработку событий ОС.
 
-Workflow [Rust CI](.github/workflows/ci.yml) запускается при push в любую ветку, для PR и вручную. На `windows-latest` и `macos-latest` создаётся `build/`, затем из него выполняются:
+Workflow [Rust CI](.github/workflows/ci.yml) запускается при push в любую ветку, для PR и вручную. Скрипт `.github/scripts/affected_packages.py` читает граф workspace из `cargo metadata --no-deps` и выбирает изменённые крейты вместе со всеми транзитивно зависящими от них крейтами. Например, изменение `engine-core` проверяет `engine-core` и `sandbox`, а изменение независимого `engine-audio` — только `engine-audio`. Зависимости для компиляции выбранных крейтов Cargo собирает автоматически.
+
+Для PR сравниваются merge-base базовой ветки и head PR; для push — весь диапазон `before..after`. Общие настройки, `Cargo.lock`, CI и неизвестные пути запускают проверку всех крейтов. Ручной запуск, первый push новой ветки и недоступный `before` также проверяют весь workspace. Изменения только Markdown-документации вне крейтов, vault Obsidian и `LICENSE` пропускают проверки Rust.
+
+На `windows-latest` и `macos-latest` создаётся `build/`, затем из него выполняются проверки с `-p` для каждого выбранного крейта (пример для `engine-core`):
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo build --workspace --locked
-cargo test --workspace --locked
+cargo fmt -p engine-core -p sandbox --check
+cargo clippy -p engine-core -p sandbox --all-targets --locked -- -D warnings
+cargo build -p engine-core -p sandbox --locked
+cargo test -p engine-core -p sandbox --locked
 ```
 
-Общая проверка `CI` проходит только при успехе обеих платформ. Для `main` она должна быть обязательной в GitHub branch protection с требованием актуальности ветки относительно `main`; один workflow без защиты ветки не запрещает слияние. Порядок работы: коммит с кодом и тестами в рабочей ветке → push → PR → успешная `CI` → слияние.
+Тесты выбора крейтов выполняются в CI на Ubuntu; локальная команда: `python3 -B -m unittest discover -s .github/scripts -v` из корня репозитория.
+
+Общая проверка `CI` требует успешного выбора крейтов и успеха обеих платформ, если выбраны крейты. При отсутствии затронутых крейтов она допускает пропуск платформенных заданий. Ошибка выбора крейтов, ошибка или отмена нужных проверок блокирует `CI`. Для `main` она должна быть обязательной в GitHub branch protection с требованием актуальности ветки относительно `main`; один workflow без защиты ветки не запрещает слияние. Порядок работы: коммит с кодом и тестами в рабочей ветке → push → PR → успешная `CI` → слияние.
 
 Запуск sandbox из `build/`:
 
