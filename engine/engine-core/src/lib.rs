@@ -49,6 +49,47 @@ impl Default for Time {
 #[cfg(test)]
 mod tests {
     use super::Time;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn default_starts_without_frames() {
+        assert_eq!(Time::default().frame(), 0);
+    }
+
+    #[test]
+    fn first_tick_measures_time_since_creation() {
+        let start = Instant::now() - Duration::from_secs(60);
+        let mut time = Time {
+            start,
+            previous_tick: start,
+            frame: 0,
+        };
+        let before = start.elapsed();
+        let delta = time.tick();
+        let after = start.elapsed();
+
+        assert!(delta >= before && delta <= after);
+        assert!(time.elapsed() >= delta);
+        assert_eq!(time.frame(), 1);
+    }
+
+    #[test]
+    fn tick_measures_from_previous_tick_instead_of_start() {
+        let start = Instant::now() - Duration::from_secs(120);
+        let previous_tick = start + Duration::from_secs(60);
+        let mut time = Time {
+            start,
+            previous_tick,
+            frame: 4,
+        };
+        let before = previous_tick.elapsed();
+        let delta = time.tick();
+        let after = previous_tick.elapsed();
+
+        assert!(delta >= before && delta <= after);
+        assert_eq!(time.previous_tick.duration_since(previous_tick), delta);
+        assert_eq!(time.frame(), 5);
+    }
 
     #[test]
     fn tick_advances_frame_counter() {
