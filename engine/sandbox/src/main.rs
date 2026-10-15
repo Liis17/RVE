@@ -8,6 +8,7 @@ use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
 use engine_render::{DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId};
+use engine_resources::{ResourceConfig, ResourceSystem};
 use engine_window::{PhysicalSize, Window, WindowHandler, run};
 use scene::Scene;
 use std::env;
@@ -447,7 +448,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let assets = Assets::new(ASSETS_DIR);
+    let mut resources = match ResourceSystem::start(ResourceConfig {
+        root: ASSETS_DIR.into(),
+        ..ResourceConfig::default()
+    }) {
+        Ok(resources) => resources,
+        Err(error) => {
+            eprintln!("Ошибка ресурса: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let assets = Assets::with_resources(resources.handle());
     let content = match load_content(&options, &assets) {
         Ok(content) => content,
         Err(error) => {
@@ -458,7 +469,7 @@ fn main() -> ExitCode {
     let mut app = Sandbox::new(options, content);
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
-    let exit_code = match (run_result, failure) {
+    let mut exit_code = match (run_result, failure) {
         (Err(error), _) => {
             eprintln!("ошибка окна: {error}");
             1
@@ -470,16 +481,46 @@ fn main() -> ExitCode {
         (Ok(()), None) => 0,
     };
     drop(app);
+    if let Err(error) = resources.shutdown() {
+        eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+        if exit_code == 0 {
+            exit_code = 1;
+        }
+    }
     ExitCode::from(exit_code)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Content, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args};
+    use engine_assets::Assets;
+    use engine_resources::{ResourceConfig, ResourceSystem};
 
     fn sandbox(options: Options) -> Sandbox {
         let content = Content::from_scene(options.scene);
         Sandbox::new(options, content)
+    }
+
+    #[test]
+    fn procedural_content_loads_when_the_assets_root_is_missing() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rve-sandbox-missing-assets-{}-{nonce}",
+            std::process::id()
+        ));
+        let mut resources = ResourceSystem::start(ResourceConfig {
+            root,
+            ..ResourceConfig::default()
+        })
+        .unwrap();
+        let assets = Assets::with_resources(resources.handle());
+        let options = parse_args(["--scene", "triangle"]).unwrap();
+        let content = super::load_content(&options, &assets).unwrap();
+        assert!(!content.meshes.is_empty());
+        resources.shutdown().unwrap();
     }
 
     #[test]

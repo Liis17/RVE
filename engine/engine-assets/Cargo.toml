@@ -8,5 +8,10 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+engine-resources = { path = "../engine-resources" }
 png.workspace = true
 ufbx.workspace = true
+
+[dev-dependencies]
+engine-files = { path = "../engine-files" }
+engine-pak = { path = "../engine-pak" }

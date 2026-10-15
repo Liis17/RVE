@@ -1,0 +1,13 @@
+[package]
+name = "engine-pak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+engine-files = { path = "../engine-files" }
+lz4_flex.workspace = true
+serde.workspace = true
+toml.workspace = true
+zstd.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "rvepak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-pak = { path = "../../engine/engine-pak" }
+
+[dev-dependencies]
+engine-files = { path = "../../engine/engine-files" }
+engine-pak = { path = "../../engine/engine-pak" }
