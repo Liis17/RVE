@@ -10,8 +10,10 @@ license = "MIT"
 [workspace.dependencies]
 ash = "=0.38.0"
 ash-window = "=0.13.0"
+blake3 = "=1.8.7"
 font8x8 = { version = "=0.3.1", default-features = false }
 glam = "=0.34.1"
+lz4_flex = "=0.14.0"
 # naga 30.0.1 не собирает glsl-in без wgsl-in или spv-in: модуль interpolator скрыт за ними.
 naga = { version = "=30.0.1", features = ["glsl-in", "spv-out", "wgsl-in"] }
 png = "=0.18.1"
@@ -19,3 +21,4 @@ raw-window-handle = "=0.6.2"
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 ufbx = "=0.11.5"
 winit = "=0.30.13"
+zstd = "=0.14.2"
