@@ -11,6 +11,7 @@ engine-render = { path = "../engine-render" }
 engine-assets = { path = "../engine-assets" }
 engine-resources = { path = "../engine-resources" }
 engine-scene = { path = "../engine-scene" }
+engine-project = { path = "../engine-project" }
 font8x8.workspace = true
 glam.workspace = true
 sysinfo.workspace = true

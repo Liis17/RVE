@@ -1,4 +1,3 @@
-mod bootstrap;
 mod content;
 mod debug_overlay;
 mod scene;
@@ -7,9 +6,10 @@ use content::Content;
 use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
+use engine_project::BootstrapConfig;
 use engine_render::{DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId};
 use engine_resources::{ResourceConfig, ResourceSystem};
-use engine_window::{PhysicalSize, Window, WindowHandler, run};
+use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use scene::Scene;
 use std::env;
 use std::process::ExitCode;
@@ -441,12 +441,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config = match bootstrap::load() {
+    let bootstrap = match BootstrapConfig::load("bootstrap.rves") {
         Ok(config) => config,
         Err(error) => {
             eprintln!("Ошибка настроек: {error}");
             return ExitCode::from(2);
         }
+    };
+    let default_window = WindowConfig::default();
+    let config = WindowConfig {
+        title: bootstrap.window_title.unwrap_or(default_window.title),
+        width: bootstrap.window_size_x.unwrap_or(default_window.width),
+        height: bootstrap.window_size_y.unwrap_or(default_window.height),
     };
     let mut resources = match ResourceSystem::start(ResourceConfig {
         root: ASSETS_DIR.into(),

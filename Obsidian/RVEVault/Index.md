@@ -21,7 +21,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EngineScene]] | Камеры, трансформации и направленный свет |
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |
 
-Три крейта-скелета (`engine-physics`, `engine-audio`, `engine-editor`) описаны в [[Architecture]]; отдельных заметок для них нет.
+Пустые модули `engine-audio`, `engine-physics`, `engine-network` и `engine-neural`, а также скелет `engine-editor` описаны в [[Architecture]]; отдельных заметок для них нет.
 
 ## Обновление памяти
 

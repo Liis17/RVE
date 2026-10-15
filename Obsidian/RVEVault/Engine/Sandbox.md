@@ -14,9 +14,9 @@ Parent: [[Index]]
 | `engine/sandbox/src/content.rs` | `Content`, `Mesh` | Меши и текстуры кадра из демонстрационной сцены или модели; вписывание модели в единичный куб, окружение и замена текстур |
 | `engine/sandbox/src/scene.rs` | `Scene`, `plane_mesh`, `cube_mesh`, `checker_texture`, `triangle_view_projection`, `cube_view_projection`, `shadows_light_view_projection` | Геометрия и параметры демонстрационных сцен; камеры и свет используют [[Engine/EngineScene]] |
 | `engine/sandbox/src/debug_overlay.rs` | `DebugOverlay` | Метрики `--debug-overlay`, их история и геометрия панели со шрифтом font8x8 |
-| `engine/sandbox/src/bootstrap.rs` | `load` | Чтение и проверка начального размера окна из рабочего каталога |
-| `bootstrap.rves.example` | `WindowSizeX`, `WindowSizeY` | Шаблон локального файла настроек |
-| `engine/sandbox/Cargo.toml` | зависимости `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `glam`, `sysinfo`, `font8x8` | Сборка приложения из рабочих крейтов, сцена, загрузка ресурсов, статистика и bitmap-шрифт оверлея |
+| `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Общий разбор и загрузка начальных настроек `bootstrap.rves` |
+| `bootstrap.rves.example` | `WindowSizeX`, `WindowSizeY`, `WindowTitle`, `AllowMultipleInstances` | Шаблон локального файла настроек |
+| `engine/sandbox/Cargo.toml` | зависимости `engine-core`, `engine-project`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `glam`, `sysinfo`, `font8x8` | Сборка приложения из рабочих крейтов, сцена, загрузка ресурсов, статистика и bitmap-шрифт оверлея |
 
 ## Публичные контракты
 
@@ -34,10 +34,15 @@ Parent: [[Index]]
 
 Повторные или неизвестные флаги, отсутствие значения, некорректное значение и сочетание `--scene triangle --model …` дают код 2. Ошибка запуска `ResourceSystem` или загрузки содержимого (`AssetError`) выводится как `Ошибка ресурса: …` и даёт код 2 до создания окна. Это относится и к повреждённым архивам, отсутствующим владельцам и дублирующим virtual paths при процедурной сцене. При сочетании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка окна или renderer даёт код 1; успешное закрытие или завершение лимита — код 0.
 
-Перед созданием окна `bootstrap::load` читает `bootstrap.rves` из текущего рабочего
+Перед созданием окна `engine_project::BootstrapConfig::load` из
+`engine/engine-project/src/bootstrap.rs` читает `bootstrap.rves` из текущего рабочего
 каталога (обычно `build/`). `WindowSizeX` и `WindowSizeY` задают начальные ширину и
-высоту клиентской области в физических пикселях. Формат — `Имя=Значение`, один
-параметр на строку, значения — положительные `u32`. Пустые строки и пробелы вокруг
+высоту клиентской области в физических пикселях. Дополнительные поля — непустой
+`WindowTitle`, `AllowMultipleInstances=true|false` (по умолчанию `true`) и `AppIcon`
+(virtual path внутри `Assets`). Sandbox применяет размер и заголовок окна; из новых
+полей он применяет только `WindowTitle`, а `AllowMultipleInstances` и `AppIcon`
+принимает и игнорирует. Формат — `Имя=Значение`, один
+параметр на строку; значения размеров — положительные `u32`. Пустые строки и пробелы вокруг
 имени/значения допускаются, регистр имён учитывается. Если файла или параметра нет,
 сохраняется соответствующее значение `WindowConfig::default()` (1280×720).
 Ошибки чтения, неверный синтаксис, значения, неизвестные и повторные параметры

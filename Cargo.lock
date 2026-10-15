@@ -430,6 +430,14 @@ name = "engine-files"
 version = "0.1.0"
 
 [[package]]
+name = "engine-network"
+version = "0.1.0"
+
+[[package]]
+name = "engine-neural"
+version = "0.1.0"
+
+[[package]]
 name = "engine-pak"
 version = "0.1.0"
 dependencies = [
@@ -467,6 +475,15 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+]
+
+[[package]]
+name = "engine-project"
+version = "0.1.0"
+dependencies = [
+ "engine-files",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -1495,6 +1512,7 @@ dependencies = [
  "engine-core",
  "engine-files",
  "engine-pak",
+ "engine-project",
  "engine-render",
  "engine-resources",
  "engine-scene",
