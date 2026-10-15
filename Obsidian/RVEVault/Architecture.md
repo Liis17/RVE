@@ -13,7 +13,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 | Rust 2024, Cargo workspace с resolver 3 | Сборка библиотечных крейтов и приложения | `Cargo.toml` |
 | winit 0.30.13 | Окно и цикл событий | `engine/engine-window/Cargo.toml` |
 | ash 0.38.0 | Vulkan bindings и runtime-загрузка loader | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
-| ash-window 0.13.0 | Surface и обязательные instance extensions | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
+| ash-window 0.13.0 | Surface и обязательные instance extensions через платформенный адаптер | `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml` |
 | raw-window-handle 0.6.2 | Передача display/window handles в renderer | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
 | Vulkan 1.3 | Dynamic rendering, synchronization2 и графический вывод | `engine/engine-render/src/lib.rs` |
 
@@ -23,6 +23,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 - [[Engine/EngineCore]] — `Time`, независимый от остальных крейтов.
 - [[Engine/EngineWindow]] — цикл окна на winit.
+- [[Engine/EnginePlatform]] — общий интерфейс и отдельные адаптеры Windows/macOS.
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
 - [[Engine/Sandbox]] — приложение, соединяющее core, window и render.
 
@@ -32,7 +33,8 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 - `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`.
 - `engine-window` зависит от winit.
-- `engine-render` зависит от ash, ash-window и raw-window-handle, но не от winit.
+- `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit.
+- `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
 - `engine-core` и пять крейтов-скелетов не имеют внешних зависимостей.
 
 Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-assets/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
@@ -49,7 +51,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ### Vulkan-кадр
 
-`Renderer::new` загружает Vulkan loader, создаёт instance и surface, проверяет расширения и выбирает физическое устройство с API не ниже 1.3, поддержкой dynamic rendering и synchronization2, общей graphics/present queue family и подходящими форматами. Дискретное устройство получает приоритет. При нулевом начальном размере создание swapchain и offscreen-изображений откладывается.
+`Renderer::new` загружает Vulkan loader и создаёт surface через `engine-platform`; объединяет требования платформы с расширениями surface/swapchain и конфигурации. Общий renderer создаёт instance с флагами адаптера и выбирает физическое устройство с API не ниже 1.3, поддержкой dynamic rendering и synchronization2, общей graphics/present queue family и подходящими форматами. Дискретное устройство получает приоритет. При нулевом начальном размере создание swapchain и offscreen-изображений откладывается.
 
 `Sandbox::frame` тикает `Time` и передаёт меняющийся clear color в `Renderer::render_frame`. Renderer очищает offscreen-target через dynamic rendering, затем линейно blit-ит изображение в приобретённый swapchain image и вызывает present. При resize swapchain и per-frame targets пересоздаются; нулевой размер пропускает кадр. `render_scale` задаёт отдельное render resolution; размеры рассчитываются через floor и ограничиваются минимумом 1×1.
 

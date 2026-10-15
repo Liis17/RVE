@@ -8,6 +8,9 @@ RVE — начальный каркас игрового движка на Rust 
 |---|---|---|
 | `engine-core` | Время игрового цикла (`Time`) | Работает |
 | `engine-window` | Окно и цикл событий на winit | Работает |
+| `engine-platform` | Выбор платформенного адаптера по целевой ОС | Работает |
+| `engine-platform-windows` | Windows: загрузка Vulkan и оконная поверхность | Работает |
+| `engine-platform-macos` | macOS: загрузка Vulkan и Metal surface | Интеграция без настроек MoltenVK portability |
 | `engine-render` | Vulkan renderer: clear offscreen-кадра и blit в swapchain | Работает |
 | `engine-scene` | Игровые объекты, компоненты и сцены | Скелет |
 | `engine-assets` | Загрузка и хранение текстур, моделей и ресурсов | Скелет |

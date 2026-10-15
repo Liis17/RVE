@@ -6,5 +6,5 @@ license.workspace = true
 
 [dependencies]
 ash.workspace = true
-ash-window.workspace = true
 raw-window-handle.workspace = true
+engine-platform = { path = "../engine-platform" }

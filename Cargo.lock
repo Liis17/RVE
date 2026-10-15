@@ -344,11 +344,35 @@ name = "engine-physics"
 version = "0.1.0"
 
 [[package]]
-name = "engine-render"
+name = "engine-platform"
+version = "0.1.0"
+dependencies = [
+ "engine-platform-macos",
+ "engine-platform-windows",
+]
+
+[[package]]
+name = "engine-platform-macos"
 version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+]
+
+[[package]]
+name = "engine-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "ash-window",
+]
+
+[[package]]
+name = "engine-render"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "engine-platform",
  "raw-window-handle",
 ]
 
