@@ -1270,8 +1270,153 @@ fn select_composite_alpha(
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderError, scaled_extent, select_surface_extent, validate_render_scale};
+    use super::{
+        RenderError, RendererConfig, check_extensions, deduplicate_names, missing_extensions,
+        scaled_extent, select_composite_alpha, select_surface_extent, validate_render_scale,
+    };
     use ash::vk;
+    use std::ffi::{CStr, CString};
+
+    fn extension(name: &CStr) -> vk::ExtensionProperties {
+        let mut property = vk::ExtensionProperties::default();
+        for (destination, source) in property
+            .extension_name
+            .iter_mut()
+            .zip(name.to_bytes_with_nul())
+        {
+            *destination = *source as _;
+        }
+        property
+    }
+
+    #[test]
+    fn default_config_uses_native_resolution_without_extra_extensions() {
+        let config = RendererConfig::default();
+        assert_eq!(config.render_scale, 1.0);
+        assert!(validate_render_scale(config.render_scale).is_ok());
+        assert!(config.extra_instance_extensions.is_empty());
+        assert!(config.extra_device_extensions.is_empty());
+    }
+
+    #[test]
+    fn extension_names_are_deduplicated_preserving_request_order() {
+        let first = CString::new("VK_KHR_surface").unwrap();
+        let second = CString::new("VK_KHR_swapchain").unwrap();
+        assert_eq!(
+            deduplicate_names(vec![
+                first.clone(),
+                second.clone(),
+                first.clone(),
+                second.clone(),
+            ]),
+            vec![first, second]
+        );
+        assert!(deduplicate_names(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn extension_checks_accept_supported_and_empty_requests() {
+        let available = [extension(c"VK_KHR_surface"), extension(c"VK_KHR_swapchain")];
+        let requested = [c"VK_KHR_swapchain".to_owned()];
+
+        assert!(check_extensions(&requested, &available, "device").is_ok());
+        assert!(check_extensions(&[], &available, "instance").is_ok());
+        assert!(check_extensions(&[], &[], "device").is_ok());
+    }
+
+    #[test]
+    fn missing_extensions_report_all_missing_names_and_their_kind() {
+        let available = [extension(c"VK_KHR_surface")];
+        let requested = [
+            c"VK_KHR_surface".to_owned(),
+            c"VK_KHR_swapchain".to_owned(),
+            c"VK_KHR_portability_subset".to_owned(),
+        ];
+        let missing = missing_extensions(&requested, &available, "device");
+
+        assert_eq!(missing.len(), 2);
+        assert!(missing[0].contains("device"));
+        assert!(missing[0].contains("VK_KHR_swapchain"));
+        assert!(missing[1].contains("VK_KHR_portability_subset"));
+        match check_extensions(&requested, &available, "device") {
+            Err(RenderError::Unsupported(message)) => {
+                for diagnostic in missing {
+                    assert!(message.contains(&diagnostic));
+                }
+            }
+            result => panic!("expected unsupported extensions, got {result:?}"),
+        }
+        assert_eq!(missing_extensions(&requested, &[], "device").len(), 3);
+    }
+
+    #[test]
+    fn extension_names_require_an_exact_match() {
+        let available = [extension(c"VK_KHR_surface_extra")];
+        let requested = [c"VK_KHR_surface".to_owned()];
+        assert!(matches!(
+            check_extensions(&requested, &available, "instance"),
+            Err(RenderError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn composite_alpha_prefers_opaque_then_supported_fallbacks() {
+        let modes = [
+            vk::CompositeAlphaFlagsKHR::OPAQUE,
+            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+            vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+            vk::CompositeAlphaFlagsKHR::INHERIT,
+        ];
+        for index in 0..modes.len() {
+            let supported = modes[index..]
+                .iter()
+                .copied()
+                .fold(vk::CompositeAlphaFlagsKHR::empty(), |all, mode| all | mode);
+            assert_eq!(select_composite_alpha(supported), Some(modes[index]));
+        }
+        assert_eq!(
+            select_composite_alpha(vk::CompositeAlphaFlagsKHR::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn native_scale_preserves_large_output_dimensions() {
+        let output = vk::Extent2D {
+            width: u32::MAX,
+            height: u32::MAX - 1,
+        };
+        assert_eq!(scaled_extent(output, 1.0), output);
+    }
+
+    #[test]
+    fn variable_surface_extent_preserves_sizes_inside_limits() {
+        let capabilities = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+            min_image_extent: vk::Extent2D {
+                width: 100,
+                height: 100,
+            },
+            max_image_extent: vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            ..Default::default()
+        };
+        for size in [
+            capabilities.min_image_extent,
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            capabilities.max_image_extent,
+        ] {
+            assert_eq!(select_surface_extent(capabilities, size), size);
+        }
+    }
 
     #[test]
     fn render_scale_accepts_finite_values_in_range() {

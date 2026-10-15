@@ -183,3 +183,81 @@ impl<H: WindowHandler> ApplicationHandler for WindowApplication<'_, H> {
         self.finish();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Handler {
+        exit_calls: usize,
+    }
+
+    impl WindowHandler for Handler {
+        fn init(&mut self, _window: Arc<Window>) -> bool {
+            panic!("headless tests must not create a window");
+        }
+
+        fn frame(&mut self, _window: &Window) -> bool {
+            panic!("headless tests must not render a frame");
+        }
+
+        fn exiting(&mut self) {
+            self.exit_calls += 1;
+        }
+    }
+
+    #[test]
+    fn default_window_has_sandbox_title_and_hd_size() {
+        let config = WindowConfig::default();
+        assert_eq!(config.title, "RVE Sandbox");
+        assert_eq!((config.width, config.height), (1280, 720));
+    }
+
+    #[test]
+    fn finish_notifies_handler_once_even_without_a_window() {
+        let mut handler = Handler::default();
+        let mut app = WindowApplication {
+            config: WindowConfig::default(),
+            handler: &mut handler,
+            window: None,
+            error: None,
+            exited: false,
+        };
+
+        app.finish();
+        assert_eq!(app.handler.exit_calls, 1);
+        assert!(app.exited);
+        app.finish();
+        assert_eq!(app.handler.exit_calls, 1);
+    }
+
+    #[test]
+    fn finish_preserves_failure_for_the_caller() {
+        let mut handler = Handler::default();
+        let mut app = WindowApplication {
+            config: WindowConfig::default(),
+            handler: &mut handler,
+            window: None,
+            error: Some(WindowError::EventLoop(EventLoopError::RecreationAttempt)),
+            exited: false,
+        };
+
+        app.finish();
+        assert!(matches!(
+            app.error,
+            Some(WindowError::EventLoop(EventLoopError::RecreationAttempt))
+        ));
+        assert_eq!(app.handler.exit_calls, 1);
+    }
+
+    #[test]
+    fn event_loop_error_retains_context_and_source() {
+        let error = WindowError::EventLoop(EventLoopError::ExitFailure(7));
+        assert!(error.to_string().contains("ошибка цикла событий"));
+        assert!(matches!(
+            error.source().unwrap().downcast_ref::<EventLoopError>(),
+            Some(EventLoopError::ExitFailure(7))
+        ));
+    }
+}

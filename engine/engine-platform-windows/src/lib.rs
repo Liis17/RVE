@@ -18,3 +18,15 @@ pub fn load_vulkan() -> Result<Entry, LoadingError> {
     // SAFETY: загружается системный Vulkan loader; Entry удерживает библиотеку живой.
     unsafe { Entry::load() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_vulkan_requires_no_additional_platform_extensions() {
+        assert!(INSTANCE_EXTENSIONS.is_empty());
+        assert!(INSTANCE_FLAGS.is_empty());
+        assert!(DEVICE_EXTENSIONS.is_empty());
+    }
+}
