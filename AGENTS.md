@@ -38,9 +38,14 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 
 ## Быстрые команды
 
-Запускай из корня workspace:
+Артефакты Cargo хранятся только в `build/` в корне репозитория (настроено в
+`.cargo/config.toml`). Каталог исключён из Git. Сборку, проверки и запуск движка
+выполняй с рабочим каталогом `build/`; Cargo найдёт workspace в родительской папке.
+При первом запуске создай `build/` из корня репозитория, затем перейди в него:
 
 ~~~powershell
+mkdir build
+cd build
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace
@@ -52,6 +57,13 @@ cargo run -p sandbox -- --frames 300 --resize-test
 ~~~
 
 Для CLI и границ текущего Vulkan пути смотри `README.md`; для контрактов — соответствующие заметки в `Obsidian/RVEVault/`.
+
+Начальные параметры окна читаются из `bootstrap.rves` в текущем рабочем каталоге,
+при обычном запуске — `build/bootstrap.rves`. Формат: `WindowSizeX=1280` и
+`WindowSizeY=720`, каждый параметр на отдельной строке. При первой подготовке
+можно скопировать `bootstrap.rves.example` в `build/bootstrap.rves`; существующий
+файл настроек не перезаписывай. Отсутствующий файл или параметр сохраняет
+соответствующий размер по умолчанию; некорректные настройки дают код выхода 2.
 
 ## Тесты и CI
 

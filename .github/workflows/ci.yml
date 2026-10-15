@@ -21,17 +21,24 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Create build directory
+        shell: bash
+        run: mkdir -p build
       - name: Install Rust stable
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Select Rust stable
         run: rustup default stable
       - name: Check formatting
+        working-directory: build
         run: cargo fmt --all --check
       - name: Clippy
+        working-directory: build
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build workspace
+        working-directory: build
         run: cargo build --workspace --locked
       - name: Test workspace
+        working-directory: build
         run: cargo test --workspace --locked
 
   ci:

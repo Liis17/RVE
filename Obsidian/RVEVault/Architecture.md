@@ -20,6 +20,10 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 Версии внешних крейтов закреплены в `Cargo.toml`. `engine-render` не зависит от winit: он принимает обобщённое окно через `raw-window-handle`.
 
+`.cargo/config.toml` задаёт `build/` в корне репозитория как каталог артефактов Cargo.
+Он исключён из Git через `.gitignore`. Сборка, проверки и запуск выполняются с рабочим
+каталогом `build/`; debug-бинарник sandbox находится в `build/debug/`.
+
 ## Компоненты
 
 - [[Engine/EngineCore]] — `Time`, независимый от остальных крейтов.
@@ -44,11 +48,16 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ### Запуск и цикл окна
 
-`engine/sandbox/src/main.rs` разбирает аргументы, создаёт `Sandbox` и вызывает `engine_window::run` с `WindowConfig::default()`. `engine-window` создаёт event loop и окно в `resumed`, после чего вызывает `WindowHandler::init`. В каждом `about_to_wait` вызывается `update`, а затем запрашивается перерисовка; `frame` вызывается при `RedrawRequested`. Изменения размеров передаются в физических пикселях через `resized`.
+`engine/sandbox/src/main.rs` разбирает аргументы, загружает начальный размер окна
+через `bootstrap::load` из `bootstrap.rves` в рабочем каталоге, создаёт `Sandbox` и
+вызывает `engine_window::run` с полученным `WindowConfig`. Параметры `WindowSizeX`
+и `WindowSizeY` задают физический размер; отсутствующие параметры или файл
+сохраняют defaults 1280×720, ошибочные настройки завершают запуск с кодом 2.
+`engine-window` создаёт event loop и окно в `resumed`, после чего вызывает `WindowHandler::init`. В каждом `about_to_wait` вызывается `update`, а затем запрашивается перерисовка; `frame` вызывается при `RedrawRequested`. Изменения размеров передаются в физических пикселях через `resized`.
 
 При выходе `WindowHandler::exiting` вызывается до освобождения окна. Sandbox удаляет renderer в этом callback; renderer удерживает `Arc` окна до уничтожения Vulkan surface.
 
-Источники: `engine/engine-window/src/lib.rs`, `engine/sandbox/src/main.rs`.
+Источники: `engine/engine-window/src/lib.rs`, `engine/sandbox/src/main.rs`, `engine/sandbox/src/bootstrap.rs`.
 
 ### Vulkan-кадр
 
@@ -60,7 +69,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ## Ограничения и инварианты
 
-- `.github/workflows/ci.yml` проверяет весь workspace на Windows и macOS при push в любую ветку и для PR: форматирование, Clippy, сборку и unit-/integration-/doc-тесты. Общая проверка `CI` требует успеха обеих платформ; для запрета слияния при ошибках она используется как required status check в защите `main` на GitHub. Тесты не создают окно и не загружают Vulkan; фактический графический путь проверяется отдельно через sandbox. Правило сопровождать новые фичи тестами закреплено в `AGENTS.md`.
+- `.github/workflows/ci.yml` проверяет весь workspace на Windows и macOS при push в любую ветку и для PR: форматирование, Clippy, сборку и unit-/integration-/doc-тесты. Workflow создаёт `build/` и выполняет проверки из него. Общая проверка `CI` требует успеха обеих платформ; для запрета слияния при ошибках она используется как required status check в защите `main` на GitHub. Тесты не создают окно и не загружают Vulkan; фактический графический путь проверяется отдельно через sandbox. Правило сопровождать новые фичи тестами закреплено в `AGENTS.md`.
 
 - Целевые runtime — настольные Windows с Vulkan-драйвером GPU и macOS с Vulkan loader и MoltenVK. Остальные ОС не имеют платформенных адаптеров; мобильный lifecycle не реализован.
 - Требуется Vulkan 1.3 и фактическая поддержка требуемых features, очереди, surface usage и форматов; наличие самого Vulkan loader недостаточно.
