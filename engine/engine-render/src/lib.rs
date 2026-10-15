@@ -14,6 +14,10 @@ const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const SHADOW_MAP_SIZE: u32 = 2048;
+/// Максимальное ожидание swapchain image перед пропуском кадра.
+const ACQUIRE_TIMEOUT_NS: u64 = 100_000_000;
+const NO_GRAPHICS_QUEUE_FAMILY_REASON: &str = "нет graphics queue family";
+const NO_GRAPHICS_PRESENT_QUEUE_FAMILY_REASON: &str = "нет общей graphics + present queue family";
 const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const MESH_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
 const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
@@ -150,6 +154,17 @@ pub struct Capabilities {
     pub tessellation_shader: bool,
 }
 
+/// Результат проверки базовых Vulkan-требований для физического устройства.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceReport {
+    pub name: String,
+    pub vendor_id: u32,
+    pub api_version: u32,
+    pub discrete: bool,
+    pub suitable: bool,
+    pub reasons: Vec<String>,
+}
+
 /// Ошибка загрузки Vulkan или создания рендерера.
 #[derive(Debug)]
 pub enum RenderError {
@@ -208,6 +223,106 @@ impl From<vk::Result> for RenderError {
 pub enum FrameStatus {
     Presented,
     Skipped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcquireAction {
+    Acquired { image_index: u32, suboptimal: bool },
+    OutOfDate,
+    Skipped,
+    Failed(vk::Result),
+}
+
+fn classify_acquire_result(result: Result<(u32, bool), vk::Result>) -> AcquireAction {
+    match result {
+        Ok((image_index, suboptimal)) => AcquireAction::Acquired {
+            image_index,
+            suboptimal,
+        },
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => AcquireAction::OutOfDate,
+        Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => AcquireAction::Skipped,
+        Err(error) => AcquireAction::Failed(error),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeInstanceFailure {
+    NoDriver,
+    Vulkan(vk::Result),
+}
+
+fn classify_probe_instance_failure(error: vk::Result) -> ProbeInstanceFailure {
+    match error {
+        vk::Result::ERROR_INCOMPATIBLE_DRIVER | vk::Result::ERROR_INITIALIZATION_FAILED => {
+            ProbeInstanceFailure::NoDriver
+        }
+        error => ProbeInstanceFailure::Vulkan(error),
+    }
+}
+
+/// Проверяет доступные Vulkan-устройства без создания окна или surface.
+///
+/// `suitable` учитывает Vulkan 1.3, dynamic rendering, synchronization2,
+/// graphics queue и обязательные расширения устройства, включая swapchain.
+/// Возможность present и совместимость с конкретным surface проверяются
+/// отдельно в [`Renderer::new`]. Если loader недоступен, возвращается
+/// `RenderError::Loader`; если instance не создаётся из-за отсутствующего
+/// драйвера (`ERROR_INCOMPATIBLE_DRIVER` или `ERROR_INITIALIZATION_FAILED`),
+/// либо физических устройств нет, возвращается `Ok(Vec::new())`. Прочие
+/// ошибки probe возвращаются как `RenderError`, а устройства, которые не
+/// проходят требования, представлены отчётами с `suitable == false`.
+pub fn probe_devices() -> Result<Vec<DeviceReport>, RenderError> {
+    let entry =
+        engine_platform::load_vulkan().map_err(|error| RenderError::Loader(error.to_string()))?;
+    let requested_extensions = deduplicate_names(
+        engine_platform::INSTANCE_EXTENSIONS
+            .iter()
+            .map(|name| CString::from(*name))
+            .collect(),
+    );
+    // SAFETY: extension enumeration only queries the loaded Vulkan loader.
+    let available_extensions = unsafe { entry.enumerate_instance_extension_properties(None) }?;
+    check_extensions(&requested_extensions, &available_extensions, "instance")?;
+
+    let extension_pointers = requested_extensions
+        .iter()
+        .map(|name| name.as_ptr())
+        .collect::<Vec<_>>();
+    let application_info = vk::ApplicationInfo::default()
+        .application_name(c"RVE")
+        .application_version(vk::make_api_version(0, 0, 1, 0))
+        .engine_name(c"RVE")
+        .engine_version(vk::make_api_version(0, 0, 1, 0))
+        .api_version(vk::make_api_version(0, 1, 3, 0));
+    let instance_info = vk::InstanceCreateInfo::default()
+        .flags(engine_platform::INSTANCE_FLAGS)
+        .application_info(&application_info)
+        .enabled_extension_names(&extension_pointers);
+    // SAFETY: extension pointers and application info remain alive through instance creation.
+    let instance = match unsafe { entry.create_instance(&instance_info, None) } {
+        Ok(instance) => instance,
+        Err(error) => match classify_probe_instance_failure(error) {
+            ProbeInstanceFailure::NoDriver => return Ok(Vec::new()),
+            ProbeInstanceFailure::Vulkan(error) => return Err(RenderError::Vulkan(error)),
+        },
+    };
+
+    let result = (|| {
+        let required_device_extensions = required_device_extensions(&[]);
+        // SAFETY: the instance is live and no surface is needed to enumerate physical devices.
+        let physical_devices = unsafe { instance.enumerate_physical_devices() }?;
+        physical_devices
+            .into_iter()
+            .map(|physical_device| {
+                inspect_device(&instance, physical_device, &required_device_extensions)
+                    .map(|inspection| inspection.report)
+            })
+            .collect()
+    })();
+
+    // SAFETY: no device or other child objects were created from this probe instance.
+    unsafe { instance.destroy_instance(None) };
+    result
 }
 
 trait WindowHandleOwner: HasDisplayHandle + HasWindowHandle + Send + Sync {}
@@ -435,20 +550,29 @@ impl Renderer {
         frame_uniforms.buffer.write(&uniforms)?;
         let frame_set = frame_uniforms.set;
         // SAFETY: swapchain живёт в self до окончания acquire и получает валидный semaphore.
-        let (image_index, acquire_suboptimal) = match unsafe {
+        let acquire_result = unsafe {
             swapchain_loader.acquire_next_image(
                 swapchain_handle,
-                u64::MAX,
+                ACQUIRE_TIMEOUT_NS,
                 image_available,
                 vk::Fence::null(),
             )
-        } {
-            Ok(result) => result,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+        };
+        let (image_index, acquire_suboptimal) = match classify_acquire_result(acquire_result) {
+            AcquireAction::Acquired {
+                image_index,
+                suboptimal,
+            } => (image_index, suboptimal),
+            AcquireAction::OutOfDate => {
                 self.swapchain_dirty = true;
                 return Ok(FrameStatus::Skipped);
             }
-            Err(error) => return Err(RenderError::Vulkan(error)),
+            AcquireAction::Skipped => {
+                // TIMEOUT/NOT_READY do not signal image_available; the fence is still signaled,
+                // frame_slot is unchanged, and reset_fences runs only after a successful acquire.
+                return Ok(FrameStatus::Skipped);
+            }
+            AcquireAction::Failed(error) => return Err(RenderError::Vulkan(error)),
         };
         let image_index = image_index as usize;
         if image_index >= image_count {
@@ -665,19 +789,8 @@ impl Renderer {
         ));
         self.surface = Some(surface);
 
-        let mut required_device_extensions = self
-            .config
-            .extra_device_extensions
-            .iter()
-            .map(|name| CString::from(*name))
-            .collect::<Vec<_>>();
-        required_device_extensions.push(ash::khr::swapchain::NAME.to_owned());
-        required_device_extensions.extend(
-            engine_platform::DEVICE_EXTENSIONS
-                .iter()
-                .map(|name| CString::from(*name)),
-        );
-        let required_device_extensions = deduplicate_names(required_device_extensions);
+        let required_device_extensions =
+            required_device_extensions(&self.config.extra_device_extensions);
         let choice = choose_device(
             self.instance()?,
             self.surface_loader()?,
@@ -1535,6 +1648,155 @@ struct DeviceChoice {
     timestamp_period: f32,
 }
 
+struct DeviceFacts {
+    api_version: u32,
+    dynamic_rendering: bool,
+    synchronization2: bool,
+    supported_extensions: HashSet<String>,
+    graphics_queue_families: Vec<bool>,
+}
+
+struct DeviceEvaluation {
+    reasons: Vec<String>,
+    graphics_queue_family_indices: Vec<u32>,
+}
+
+struct DeviceInspection {
+    report: DeviceReport,
+    tessellation_shader: bool,
+    timestamp_period: f32,
+    queue_families: Vec<vk::QueueFamilyProperties>,
+    graphics_queue_family_indices: Vec<u32>,
+}
+
+fn required_device_extensions(extra: &[&CStr]) -> Vec<CString> {
+    let mut required = extra
+        .iter()
+        .map(|name| CString::from(*name))
+        .collect::<Vec<_>>();
+    required.push(ash::khr::swapchain::NAME.to_owned());
+    required.extend(
+        engine_platform::DEVICE_EXTENSIONS
+            .iter()
+            .map(|name| CString::from(*name)),
+    );
+    deduplicate_names(required)
+}
+
+fn evaluate_device(facts: &DeviceFacts, required_extensions: &[CString]) -> DeviceEvaluation {
+    let mut reasons = Vec::new();
+    if vk::api_version_major(facts.api_version) < 1
+        || (vk::api_version_major(facts.api_version) == 1
+            && vk::api_version_minor(facts.api_version) < 3)
+    {
+        reasons.push("Vulkan API ниже 1.3".to_owned());
+    }
+    if !facts.dynamic_rendering {
+        reasons.push("не поддерживается dynamicRendering".to_owned());
+    }
+    if !facts.synchronization2 {
+        reasons.push("не поддерживается synchronization2".to_owned());
+    }
+    for extension in required_extensions {
+        let name = extension.to_string_lossy();
+        if !facts.supported_extensions.contains(name.as_ref()) {
+            reasons.push(format!("device extension недоступен: {name}"));
+        }
+    }
+    let graphics_queue_family_indices = facts
+        .graphics_queue_families
+        .iter()
+        .enumerate()
+        .filter_map(|(index, supports_graphics)| supports_graphics.then_some(index as u32))
+        .collect::<Vec<_>>();
+    if graphics_queue_family_indices.is_empty() {
+        reasons.push(NO_GRAPHICS_QUEUE_FAMILY_REASON.to_owned());
+    }
+    DeviceEvaluation {
+        reasons,
+        graphics_queue_family_indices,
+    }
+}
+
+fn inspect_device(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    required_extensions: &[CString],
+) -> Result<DeviceInspection, RenderError> {
+    // SAFETY: physical_device was returned by the live instance.
+    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+
+    // SAFETY: device feature query uses a valid physical device and a properly initialized pNext chain.
+    let mut features_13 = vk::PhysicalDeviceVulkan13Features::default();
+    let mut features_2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features_13);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features_2) };
+    let tessellation_shader = features_2.features.tessellation_shader != vk::FALSE;
+
+    // SAFETY: extension enumeration is read-only for the live physical device.
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
+    let supported_extensions = extensions
+        .iter()
+        .map(|extension| {
+            // SAFETY: Vulkan extension property names are fixed-size null-terminated strings.
+            unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let queue_families =
+        // SAFETY: queue-family properties are read from the live physical device.
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    let facts = DeviceFacts {
+        api_version: properties.api_version,
+        dynamic_rendering: features_13.dynamic_rendering != vk::FALSE,
+        synchronization2: features_13.synchronization2 != vk::FALSE,
+        supported_extensions,
+        graphics_queue_families: queue_families
+            .iter()
+            .map(|family| {
+                family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            })
+            .collect(),
+    };
+    let evaluation = evaluate_device(&facts, required_extensions);
+    let report = DeviceReport {
+        name,
+        vendor_id: properties.vendor_id,
+        api_version: properties.api_version,
+        discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
+        suitable: evaluation.reasons.is_empty(),
+        reasons: evaluation.reasons,
+    };
+
+    Ok(DeviceInspection {
+        report,
+        tessellation_shader,
+        timestamp_period: properties.limits.timestamp_period,
+        queue_families,
+        graphics_queue_family_indices: evaluation.graphics_queue_family_indices,
+    })
+}
+
+fn best_device_index<T>(
+    devices: &[T],
+    is_suitable: impl Fn(&T) -> bool,
+    is_discrete: impl Fn(&T) -> bool,
+) -> Option<usize> {
+    let mut best = None;
+    for (index, device) in devices.iter().enumerate() {
+        if !is_suitable(device) {
+            continue;
+        }
+        if best.is_none_or(|best_index| is_discrete(device) && !is_discrete(&devices[best_index])) {
+            best = Some(index);
+        }
+    }
+    best
+}
+
 fn choose_device(
     instance: &ash::Instance,
     surface_loader: &ash::khr::surface::Instance,
@@ -1543,42 +1805,22 @@ fn choose_device(
 ) -> Result<DeviceChoice, RenderError> {
     // SAFETY: physical-device enumeration is read-only and the instance is alive.
     let physical_devices = unsafe { instance.enumerate_physical_devices() }?;
-    let mut best: Option<(i32, DeviceChoice)> = None;
+    let mut candidates = Vec::new();
     let mut rejected = Vec::new();
     for physical_device in physical_devices {
-        // SAFETY: physical_device was returned by the live instance.
-        let properties = unsafe { instance.get_physical_device_properties(physical_device) };
-        let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        let mut reasons = Vec::new();
-        if vk::api_version_major(properties.api_version) < 1
-            || (vk::api_version_major(properties.api_version) == 1
-                && vk::api_version_minor(properties.api_version) < 3)
-        {
-            reasons.push("Vulkan API ниже 1.3".to_owned());
+        let inspection = inspect_device(instance, physical_device, required_extensions)?;
+        let name = inspection.report.name.clone();
+        let mut reasons = inspection.report.reasons.clone();
+        if !inspection.report.suitable {
+            if let Some(reason) = reasons
+                .iter_mut()
+                .find(|reason| reason.as_str() == NO_GRAPHICS_QUEUE_FAMILY_REASON)
+            {
+                *reason = NO_GRAPHICS_PRESENT_QUEUE_FAMILY_REASON.to_owned();
+            }
+            rejected.push(format!("{name}: {}", reasons.join(", ")));
+            continue;
         }
-
-        // SAFETY: device feature query uses a valid physical device and a properly initialized pNext chain.
-        let mut features_13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut features_2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features_13);
-        unsafe { instance.get_physical_device_features2(physical_device, &mut features_2) };
-        let tessellation_shader = features_2.features.tessellation_shader != vk::FALSE;
-        if features_13.dynamic_rendering == vk::FALSE {
-            reasons.push("не поддерживается dynamicRendering".to_owned());
-        }
-        if features_13.synchronization2 == vk::FALSE {
-            reasons.push("не поддерживается synchronization2".to_owned());
-        }
-
-        // SAFETY: extension enumeration is read-only for the live physical device.
-        let device_extensions =
-            unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
-        reasons.extend(missing_extensions(
-            required_extensions,
-            &device_extensions,
-            "device",
-        ));
 
         // SAFETY: properties and format support are queried for this physical device.
         let offscreen_properties = unsafe {
@@ -1647,25 +1889,16 @@ fn choose_device(
             reasons.push("нет surface-формата с BLIT_DST и COLOR_ATTACHMENT_BLEND".to_owned());
         }
 
-        let queue_families =
-            // SAFETY: queue-family properties are read from the live physical device.
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let mut queue_family_index = None;
         let mut timestamp_valid_bits = 0;
-        for (index, family) in queue_families.iter().enumerate() {
-            if !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                continue;
-            }
+        for &index in &inspection.graphics_queue_family_indices {
             // SAFETY: family index is from this device's enumerated queue-family properties.
             if unsafe {
-                surface_loader.get_physical_device_surface_support(
-                    physical_device,
-                    index as u32,
-                    surface,
-                )
+                surface_loader.get_physical_device_surface_support(physical_device, index, surface)
             }? {
-                queue_family_index = Some(index as u32);
-                timestamp_valid_bits = family.timestamp_valid_bits;
+                queue_family_index = Some(index);
+                timestamp_valid_bits =
+                    inspection.queue_families[index as usize].timestamp_valid_bits;
                 break;
             }
         }
@@ -1677,31 +1910,24 @@ fn choose_device(
             rejected.push(format!("{name}: {}", reasons.join(", ")));
             continue;
         }
-        let device_name = name;
-        let choice = DeviceChoice {
+        candidates.push(DeviceChoice {
             physical_device,
             queue_family_index: queue_family_index.ok_or(RenderError::InvalidState(
                 "не найдена очередь после проверки",
             ))?,
             surface_format: surface_format
                 .ok_or(RenderError::InvalidState("не найден формат после проверки"))?,
-            device_name,
-            vendor_id: properties.vendor_id,
-            api_version: properties.api_version,
-            discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
-            tessellation_shader,
+            device_name: inspection.report.name,
+            vendor_id: inspection.report.vendor_id,
+            api_version: inspection.report.api_version,
+            discrete: inspection.report.discrete,
+            tessellation_shader: inspection.tessellation_shader,
             timestamp_valid_bits,
-            timestamp_period: properties.limits.timestamp_period,
-        };
-        let score = i32::from(choice.discrete);
-        if best
-            .as_ref()
-            .is_none_or(|(best_score, _)| score > *best_score)
-        {
-            best = Some((score, choice));
-        }
+            timestamp_period: inspection.timestamp_period,
+        });
     }
-    best.map(|(_, choice)| choice)
+    best_device_index(&candidates, |_| true, |candidate| candidate.discrete)
+        .map(|index| candidates.remove(index))
         .ok_or(RenderError::NoSuitableDevice(rejected))
 }
 
@@ -3119,17 +3345,218 @@ fn select_composite_alpha(
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectionalLight, DrawCommand, FRAME_UNIFORMS_SIZE, Frame, MESH_FRAGMENT_SHADER,
-        MESH_VERTEX_SHADER, MeshId, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex,
-        RenderError, RendererConfig, SHADOW_VERTEX_SHADER, TextureId, Vertex, check_extensions,
-        deduplicate_names, frame_uniform_bytes, index_bytes, missing_extensions, normal_matrix,
-        overlay_vertex_bytes, push_constant_bytes, scaled_extent, scene_viewport,
-        select_composite_alpha, select_surface_extent, timestamp_duration, validate_draws,
-        validate_mesh, validate_overlay, validate_render_scale, validate_texture, vertex_bytes,
+        AcquireAction, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
+        FRAME_UNIFORMS_SIZE, Frame, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, MeshId,
+        OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure,
+        RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER, TextureId, Vertex,
+        best_device_index, check_extensions, classify_acquire_result,
+        classify_probe_instance_failure, deduplicate_names, evaluate_device, frame_uniform_bytes,
+        index_bytes, missing_extensions, normal_matrix, overlay_vertex_bytes, push_constant_bytes,
+        scaled_extent, scene_viewport, select_composite_alpha, select_surface_extent,
+        timestamp_duration, validate_draws, validate_mesh, validate_overlay, validate_render_scale,
+        validate_texture, vertex_bytes,
     };
     use ash::vk;
-    use std::ffi::{CStr, CString};
     use std::time::Duration;
+    use std::{
+        collections::HashSet,
+        ffi::{CStr, CString},
+    };
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn renderer_is_send() {
+        assert_send::<Renderer>();
+    }
+
+    #[test]
+    fn device_evaluation_accepts_all_shared_requirements() {
+        let facts = DeviceFacts {
+            api_version: vk::make_api_version(0, 1, 3, 0),
+            dynamic_rendering: true,
+            synchronization2: true,
+            supported_extensions: HashSet::from([
+                "VK_KHR_swapchain".to_owned(),
+                "VK_KHR_portability_subset".to_owned(),
+            ]),
+            graphics_queue_families: vec![false, true],
+        };
+        let required = [
+            CString::new("VK_KHR_swapchain").unwrap(),
+            CString::new("VK_KHR_portability_subset").unwrap(),
+        ];
+
+        let evaluation = evaluate_device(&facts, &required);
+
+        assert!(evaluation.reasons.is_empty());
+        assert_eq!(evaluation.graphics_queue_family_indices, [1]);
+    }
+
+    #[test]
+    fn device_evaluation_accepts_api_major_version_two() {
+        let facts = DeviceFacts {
+            api_version: vk::make_api_version(0, 2, 0, 0),
+            dynamic_rendering: true,
+            synchronization2: true,
+            supported_extensions: HashSet::new(),
+            graphics_queue_families: vec![true],
+        };
+
+        let evaluation = evaluate_device(&facts, &[]);
+
+        assert!(evaluation.reasons.is_empty());
+        assert_eq!(evaluation.graphics_queue_family_indices, [0]);
+    }
+
+    #[test]
+    fn probe_instance_failure_distinguishes_missing_driver_from_other_errors() {
+        assert_eq!(
+            classify_probe_instance_failure(vk::Result::ERROR_INCOMPATIBLE_DRIVER),
+            ProbeInstanceFailure::NoDriver
+        );
+        assert_eq!(
+            classify_probe_instance_failure(vk::Result::ERROR_INITIALIZATION_FAILED),
+            ProbeInstanceFailure::NoDriver
+        );
+        assert_eq!(
+            classify_probe_instance_failure(vk::Result::ERROR_UNKNOWN),
+            ProbeInstanceFailure::Vulkan(vk::Result::ERROR_UNKNOWN)
+        );
+    }
+
+    #[test]
+    fn device_evaluation_reports_each_missing_shared_requirement() {
+        let facts = DeviceFacts {
+            api_version: vk::make_api_version(0, 1, 2, 0),
+            dynamic_rendering: false,
+            synchronization2: false,
+            supported_extensions: HashSet::new(),
+            graphics_queue_families: vec![false, false],
+        };
+        let required = [
+            CString::new("VK_KHR_swapchain").unwrap(),
+            CString::new("VK_KHR_portability_subset").unwrap(),
+        ];
+
+        let evaluation = evaluate_device(&facts, &required);
+
+        assert_eq!(
+            evaluation.reasons,
+            [
+                "Vulkan API ниже 1.3",
+                "не поддерживается dynamicRendering",
+                "не поддерживается synchronization2",
+                "device extension недоступен: VK_KHR_swapchain",
+                "device extension недоступен: VK_KHR_portability_subset",
+                "нет graphics queue family",
+            ]
+        );
+        assert!(evaluation.graphics_queue_family_indices.is_empty());
+    }
+
+    #[test]
+    fn best_device_index_prefers_discrete_suitable_devices_and_keeps_first_tie() {
+        let reports = [
+            DeviceReport {
+                name: "integrated".to_owned(),
+                vendor_id: 1,
+                api_version: 0,
+                discrete: false,
+                suitable: true,
+                reasons: Vec::new(),
+            },
+            DeviceReport {
+                name: "integrated tie".to_owned(),
+                vendor_id: 2,
+                api_version: 0,
+                discrete: false,
+                suitable: true,
+                reasons: Vec::new(),
+            },
+            DeviceReport {
+                name: "discrete".to_owned(),
+                vendor_id: 3,
+                api_version: 0,
+                discrete: true,
+                suitable: true,
+                reasons: Vec::new(),
+            },
+            DeviceReport {
+                name: "discrete tie".to_owned(),
+                vendor_id: 4,
+                api_version: 0,
+                discrete: true,
+                suitable: true,
+                reasons: Vec::new(),
+            },
+            DeviceReport {
+                name: "unsupported discrete".to_owned(),
+                vendor_id: 5,
+                api_version: 0,
+                discrete: true,
+                suitable: false,
+                reasons: vec!["unsupported".to_owned()],
+            },
+        ];
+        assert_eq!(
+            best_device_index(&reports, |report| report.suitable, |report| report.discrete),
+            Some(2)
+        );
+        assert_eq!(
+            best_device_index(
+                &reports[..2],
+                |report| report.suitable,
+                |report| report.discrete
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            best_device_index(
+                &reports[2..4],
+                |report| report.suitable,
+                |report| report.discrete
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            best_device_index(
+                &reports[4..],
+                |report| report.suitable,
+                |report| report.discrete
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn acquire_result_classification_preserves_success_suboptimal_and_skip_actions() {
+        assert_eq!(
+            classify_acquire_result(Ok((3, false))),
+            AcquireAction::Acquired {
+                image_index: 3,
+                suboptimal: false,
+            }
+        );
+        assert_eq!(
+            classify_acquire_result(Ok((2, true))),
+            AcquireAction::Acquired {
+                image_index: 2,
+                suboptimal: true,
+            }
+        );
+        assert_eq!(
+            classify_acquire_result(Err(vk::Result::ERROR_OUT_OF_DATE_KHR)),
+            AcquireAction::OutOfDate
+        );
+        for result in [vk::Result::TIMEOUT, vk::Result::NOT_READY] {
+            assert_eq!(classify_acquire_result(Err(result)), AcquireAction::Skipped);
+        }
+        assert_eq!(
+            classify_acquire_result(Err(vk::Result::ERROR_DEVICE_LOST)),
+            AcquireAction::Failed(vk::Result::ERROR_DEVICE_LOST)
+        );
+    }
 
     #[test]
     fn embedded_shaders_are_spirv_words() {
