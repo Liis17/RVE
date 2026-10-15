@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const MESH_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
 
@@ -611,12 +612,17 @@ impl Renderer {
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let color_formats = [OFFSCREEN_FORMAT];
-        let mut rendering_info =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
         let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
@@ -624,6 +630,7 @@ impl Renderer {
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterization)
             .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
             .color_blend_state(&color_blend)
             .dynamic_state(&dynamic_state)
             .layout(
@@ -823,6 +830,16 @@ fn choose_device(
             .contains(offscreen_features)
         {
             reasons.push("R16G16B16A16_SFLOAT не поддерживает нужные offscreen usage".to_owned());
+        }
+        // SAFETY: format support is queried for this physical device.
+        let depth_properties = unsafe {
+            instance.get_physical_device_format_properties(physical_device, DEPTH_FORMAT)
+        };
+        if !depth_properties
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        {
+            reasons.push("D32_SFLOAT не поддерживается как depth attachment".to_owned());
         }
 
         // SAFETY: the surface and physical device belong to the same live instance.
@@ -1085,10 +1102,8 @@ impl Drop for FrameResources {
 }
 
 struct OffscreenTarget {
-    device: ash::Device,
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
+    color: DeviceImage,
+    depth: DeviceImage,
     layout: vk::ImageLayout,
 }
 
@@ -1099,9 +1114,51 @@ impl OffscreenTarget {
         physical_device: vk::PhysicalDevice,
         extent: vk::Extent2D,
     ) -> Result<Self, RenderError> {
+        Ok(Self {
+            color: DeviceImage::new(
+                instance,
+                device,
+                physical_device,
+                extent,
+                OFFSCREEN_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                color_subresource_range(),
+            )?,
+            depth: DeviceImage::new(
+                instance,
+                device,
+                physical_device,
+                extent,
+                DEPTH_FORMAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                depth_subresource_range(),
+            )?,
+            layout: vk::ImageLayout::UNDEFINED,
+        })
+    }
+}
+
+struct DeviceImage {
+    device: ash::Device,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+}
+
+impl DeviceImage {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        subresource_range: vk::ImageSubresourceRange,
+    ) -> Result<Self, RenderError> {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(OFFSCREEN_FORMAT)
+            .format(format)
             .extent(vk::Extent3D {
                 width: extent.width,
                 height: extent.height,
@@ -1111,7 +1168,7 @@ impl OffscreenTarget {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         // SAFETY: image parameters use a supported optimal format and non-zero extent.
@@ -1121,7 +1178,6 @@ impl OffscreenTarget {
             image,
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
-            layout: vk::ImageLayout::UNDEFINED,
         };
         // SAFETY: image was created by this device and remains alive.
         let requirements = unsafe { device.get_image_memory_requirements(target.image) };
@@ -1144,16 +1200,16 @@ impl OffscreenTarget {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(target.image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(OFFSCREEN_FORMAT)
+            .format(format)
             .components(vk::ComponentMapping::default())
-            .subresource_range(color_subresource_range());
-        // SAFETY: image view matches the bound image format and its single color subresource.
+            .subresource_range(subresource_range);
+        // SAFETY: image view matches the bound image format and its single subresource.
         target.view = unsafe { device.create_image_view(&view_info, None) }?;
         Ok(target)
     }
 }
 
-impl Drop for OffscreenTarget {
+impl Drop for DeviceImage {
     fn drop(&mut self) {
         if self.view != vk::ImageView::null() {
             // SAFETY: view is an owned child of image and is destroyed before its image.
@@ -1203,12 +1259,31 @@ fn record_frame(
         .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(target.image)
+        .image(target.color.image)
         .subresource_range(color_subresource_range());
     pipeline_barrier(device, command_buffer, scene_barrier);
+    // Глубина не сохраняется между кадрами, поэтому прошлое содержимое отбрасывается.
+    let depth_barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+        .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+        .dst_stage_mask(
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(target.depth.image)
+        .subresource_range(depth_subresource_range());
+    pipeline_barrier(device, command_buffer, depth_barrier);
 
     let color_attachment = [vk::RenderingAttachmentInfo::default()
-        .image_view(target.view)
+        .image_view(target.color.view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
@@ -1217,13 +1292,25 @@ fn record_frame(
                 float32: scene.clear_color,
             },
         })];
+    let depth_attachment = vk::RenderingAttachmentInfo::default()
+        .image_view(target.depth.view)
+        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .clear_value(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        });
     let rendering_info = vk::RenderingInfo::default()
         .render_area(vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: render_extent,
         })
         .layer_count(1)
-        .color_attachments(&color_attachment);
+        .color_attachments(&color_attachment)
+        .depth_attachment(&depth_attachment);
     // SAFETY: the dynamic-rendering attachment view covers the configured render extent.
     unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
     record_draws(device, command_buffer, render_extent, scene);
@@ -1239,13 +1326,13 @@ fn record_frame(
         .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(target.image)
+        .image(target.color.image)
         .subresource_range(color_subresource_range());
     pipeline_barrier(device, command_buffer, source_barrier);
     record_output_pass(
         device,
         command_buffer,
-        target.image,
+        target.color.image,
         output_image,
         render_extent,
         output_extent,
@@ -1403,6 +1490,15 @@ fn pipeline_barrier(
 fn color_subresource_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1)
+}
+
+fn depth_subresource_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::DEPTH)
         .base_mip_level(0)
         .level_count(1)
         .base_array_layer(0)

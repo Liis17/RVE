@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, очищает offscreen-изображение и переносит его в swapchain. Полноценные сцены, ресурсы, физика, звук и редактор пока не реализованы.
+RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует цветные треугольные меши с depth buffer в offscreen-изображение и переносит его в swapchain. Полноценные сцены, ресурсы, физика, звук и редактор пока не реализованы.
 
 ## Стек
 
@@ -13,6 +13,8 @@ RVE — workspace игрового движка на Rust. Его рабочий
 | Rust 2024, Cargo workspace с resolver 3 | Сборка библиотечных крейтов и приложения | `Cargo.toml` |
 | winit 0.30.13 | Окно и цикл событий | `engine/engine-window/Cargo.toml` |
 | ash 0.38.0 | Vulkan bindings и runtime-загрузка loader | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
+| naga 30.0.1 | Компиляция GLSL-шейдеров в SPIR-V при сборке, без Vulkan SDK | `engine/engine-render/build.rs` |
+| glam 0.34.1 | Матрицы трансформации и перспективы в sandbox | `engine/sandbox/src/scene.rs` |
 | ash-window 0.13.0 | Surface и обязательные instance extensions через платформенный адаптер | `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml` |
 | raw-window-handle 0.6.2 | Передача display/window handles в renderer | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
 | Vulkan 1.3 | Dynamic rendering, synchronization2 и графический вывод | `engine/engine-render/src/lib.rs` |
@@ -36,9 +38,9 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ## Направления зависимостей
 
-- `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`.
+- `sandbox` зависит от `engine-core`, `engine-window`, `engine-render` и glam.
 - `engine-window` зависит от winit.
-- `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit.
+- `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit и glam; naga — его build-зависимость.
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
 - `engine-core` и пять крейтов-скелетов не имеют внешних зависимостей.
 
@@ -63,7 +65,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 `Renderer::new` загружает Vulkan loader и создаёт surface через `engine-platform`; объединяет требования платформы с расширениями surface/swapchain и конфигурации. Общий renderer создаёт instance с флагами адаптера и выбирает физическое устройство с API не ниже 1.3, поддержкой dynamic rendering и synchronization2, общей graphics/present queue family и подходящими форматами. Дискретное устройство получает приоритет. При нулевом начальном размере создание swapchain и offscreen-изображений откладывается.
 
-`Sandbox::frame` тикает `Time` и передаёт меняющийся clear color в `Renderer::render_frame`. Renderer очищает offscreen-target через dynamic rendering, затем линейно blit-ит изображение в приобретённый swapchain image и вызывает present. При resize swapchain и per-frame targets пересоздаются; нулевой размер пропускает кадр. `render_scale` задаёт отдельное render resolution; размеры рассчитываются через floor и ограничиваются минимумом 1×1.
+При инициализации sandbox загружает меш выбранной сцены через `Renderer::create_mesh`. `Sandbox::frame` тикает `Time` и передаёт в `Renderer::render_frame` меняющийся clear color и `DrawCommand` с матрицей, рассчитанной glam. Renderer очищает цвет и глубину offscreen-target через dynamic rendering, рисует меши единственным graphics pipeline, затем линейно blit-ит изображение в приобретённый swapchain image и вызывает present. При resize swapchain и per-frame targets пересоздаются; нулевой размер пропускает кадр. `render_scale` задаёт отдельное render resolution; размеры рассчитываются через floor и ограничиваются минимумом 1×1.
 
 Источники: `engine/engine-render/src/lib.rs`, `engine/engine-platform-windows/src/lib.rs`, `engine/engine-platform-macos/src/lib.rs`, `engine/sandbox/src/main.rs`.
 
@@ -73,7 +75,8 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 - Целевые runtime — настольные Windows с Vulkan-драйвером GPU и macOS с Vulkan loader и MoltenVK. Остальные ОС не имеют платформенных адаптеров; мобильный lifecycle не реализован.
 - Требуется Vulkan 1.3 и фактическая поддержка требуемых features, очереди, surface usage и форматов; наличие самого Vulkan loader недостаточно.
-- Сейчас выполняется только clear-and-blit путь. Геометрия, шейдеры, HDR/тонмаппинг, DLSS/FSR и tessellation pipeline отсутствуют.
+- Renderer рисует только треугольные меши с вершинным цветом одним pipeline; текстур, освещения, материалов, staging-загрузки и удаления мешей нет. HDR/тонмаппинг, DLSS/FSR и tessellation pipeline отсутствуют.
+- Контракт `DrawCommand::transform`: clip space с осью Y вверх и глубиной `[0, 1]`; Y переворачивается отрицательной высотой viewport.
 - При отсутствии `VK_LAYER_KHRONOS_validation` debug renderer сообщает об этом и продолжает без слоя. Vulkan SDK для текущего пути не нужен; macOS требует отдельно установленного Vulkan loader и MoltenVK либо окружения SDK.
 - Базовый teardown renderer вызывает `device_wait_idle`, но это не доказывает завершение всех операций presentation engine. Maintenance extensions для этого сейчас не включены.
 
@@ -85,3 +88,5 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - Renderer принимает display/window handles через `raw-window-handle` и удерживает `Arc` окна, не вводя прямую зависимость от winit; такой контракт закреплён в утверждённых решениях.
 - Расширения instance/device передаются через `RendererConfig` до создания соответствующих объектов; неподдерживаемые запросы приводят к ошибке. Эта возможность включена по утверждённому требованию о будущих интеграциях.
 - Тесселяция включается как Vulkan feature только при поддержке выбранного устройства. Самих шейдеров и pipeline для тесселяции нет.
+- Шейдеры пишутся на GLSL и компилируются в SPIR-V крейтом naga в `build.rs`; так выбрал пользователь, чтобы сборка локально и в CI Windows/macOS не требовала Vulkan SDK и `glslc`.
+- Матрицы считаются крейтом glam по выбору пользователя. Публичный API renderer принимает матрицу как `[[f32; 4]; 4]` и не зависит от glam.
