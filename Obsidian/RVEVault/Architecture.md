@@ -19,6 +19,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 | serde 1.0.229, toml 0.8.23 | Строгая типизированная конфигурация manifest для builder | `engine/engine-pak/src/builder.rs` |
 | zstd 0.14.2 | Независимые Zstandard frames в RVEPAK | `engine/engine-pak/src` |
 | lz4_flex 0.14.0 | Независимые LZ4 blocks в RVEPAK | `engine/engine-pak/src` |
+| flume 0.11.1 | Bounded request queues и runtime-agnostic async receive в ресурсном сервисе | `engine/engine-resources/Cargo.toml` |
 | sysinfo 0.39.6 (только фича `system`) | Память и загрузка CPU процесса для `--debug-overlay` | `engine/sandbox/src/debug_overlay.rs` |
 | font8x8 0.3.1 | Bitmap-шрифт 8×8 оверлея | `engine/sandbox/src/debug_overlay.rs` |
 | ufbx 0.11.5 | Загрузка FBX; C-библиотека собирается через `cc` | `engine/engine-assets/src/lib.rs` |
@@ -42,6 +43,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
 - [[Engine/EngineFiles]] — канонические virtual paths и `ReadAt` для позиционного чтения.
 - [[Engine/EnginePak]] — версия 1 архива, потоковый writer, reader и каталог архивов.
+- [[Engine/EngineResources]] — фоновый доступ к loose files и RVEPAK через ограниченный worker pool.
 - `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG в память CPU, без зависимости от renderer.
 - [[Engine/EngineScene]] — камеры, трансформации и свет на glam, независимо от renderer.
@@ -52,7 +54,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 ## Направления зависимостей
 
 - `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `engine-scene`, glam, sysinfo и font8x8.
-- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; инструмент `rvepak` зависит от него. `engine-files` не имеет внешних зависимостей. Архивная runtime-загрузка пока не подключена к `engine-assets` или sandbox.
+- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; сервис пока не подключён к `engine-assets` или sandbox. `engine-files` не имеет внешних зависимостей.
 - `engine-scene` зависит от glam и не зависит от renderer; sandbox передаёт его вычисленные матрицы через API renderer.
 - `engine-assets` зависит от ufbx и png; от renderer и окна не зависит.
 - `engine-window` зависит от winit.
@@ -60,7 +62,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
 - `engine-core` и три крейта-скелета не имеют внешних зависимостей.
 
-Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-assets/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
+Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-assets/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
 
 ## Файловые источники и RVEPAK
 
@@ -70,7 +72,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 Чтение ограничивается configurable index, result, chunk и memory budgets. `ReadControl` резервирует footprint результата, stored/decoded чанка и codec workspace до аллокаций и позволяет отменить чтение между чанками. На Windows `seek_read` меняет file cursor, поэтому file-backed payload reads и worker reopenings используют независимые handles с проверкой ArchiveId; на Unix исходный positional handle остаётся закреплён за Archive.
 
-Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; загрузка из архива пока не включена в `engine-assets`, sandbox или графический путь.
+Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. `engine-resources` выбирает packed-only режим при наличии архивов и loose режим без них, ограничивает очередь и memory footprint и выполняет чтение в background workers. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; сервис пока не включён в `engine-assets`, sandbox или графический путь.
 
 ## Основные потоки
 

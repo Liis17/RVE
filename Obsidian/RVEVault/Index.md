@@ -16,6 +16,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EngineRender]] | Vulkan renderer и вывод кадра |
 | [[Engine/EngineFiles]] | Канонические пути и позиционное чтение файлов |
 | [[Engine/EnginePak]] | Формат RVEPAK, builder manifest, CLI и межархивный каталог |
+| [[Engine/EngineResources]] | Фоновое чтение loose и packed бинарных ресурсов |
 | [[Engine/EngineAssets]] | Пути ресурсов, загрузка моделей FBX и текстур PNG |
 | [[Engine/EngineScene]] | Камеры, трансформации и направленный свет |
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |

@@ -88,4 +88,4 @@ The `engine-pak` crate exposes `Archive` for immutable metadata, `stat`, sorted 
 
 `engine-files::ReadAt` supplies checked `u64` positional reads and is injectable for recording and sparse test readers. A caller-provided source must keep its bytes stable for the lifetime of an opened `Archive`. Unix `FileSource` uses positional `read_at`. Windows `seek_read` moves the file cursor, so one source serializes its own cursor access; file-backed archive payload reads and worker reopenings use independent file handles and verify ArchiveId before reading payload bytes. No archive-wide mutex serializes worker reads.
 
-The `engine-pak` library includes a reusable TOML manifest builder, and the `rvepak` tool builds, lists, and verifies top-level archive sets. Runtime loading is not yet connected to `engine-assets`, sandbox, or a resource service.
+The `engine-pak` library includes a reusable TOML manifest builder, and the `rvepak` tool builds, lists, and verifies top-level archive sets. The `engine-resources` crate provides background reads over loose files and validated archive catalogs; it is not yet connected to `engine-assets` or sandbox.

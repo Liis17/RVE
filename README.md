@@ -14,6 +14,7 @@ RVE — игровой движок на Rust с выводом через Vulka
 | `engine-render` | Vulkan renderer: меши в offscreen-кадре и blit в swapchain | Работает |
 | `engine-files` | Канонические virtual paths и позиционное чтение файлов | Работает |
 | `engine-pak` | Чтение, запись и проверка каталогов RVEPAK v1 | Работает |
+| `engine-resources` | Фоновое чтение loose и packed бинарных ресурсов | Работает |
 | `rvepak` | Сборка, просмотр и проверка наборов RVEPAK из TOML manifest | Работает |
 | `engine-scene` | Игровые объекты, компоненты и сцены | Скелет |
 | `engine-assets` | Загрузка моделей FBX и текстур PNG из каталога `assets` | Работает |
@@ -22,11 +23,12 @@ RVE — игровой движок на Rust с выводом через Vulka
 | `engine-editor` | Графический редактор сцен и ресурсов | Скелет |
 | `sandbox` | Оконное приложение для проверки движка | Работает |
 
-`engine-files` и `engine-pak` предоставляют самостоятельную библиотеку виртуальных
-путей и архивов с positional reads, потоковой записью, диапазонными чтениями,
-межархивными ссылками и reusable manifest builder. Инструмент `rvepak` собирает
-opaque файлы любого типа, но runtime-загрузка архивов пока не подключена к
-`engine-assets` или sandbox. Wire contract описан в [RVEPAK v1 format](docs/rvepak-format.md).
+`engine-files` и `engine-pak` предоставляют виртуальные пути и архивы с positional
+reads, потоковой записью, диапазонными чтениями, межархивными ссылками и reusable
+manifest builder. `engine-resources` запускает bounded worker pool для чтения
+loose files или RVEPAK, а инструмент `rvepak` собирает opaque файлы любого типа.
+Resource service пока не подключён к `engine-assets` или sandbox. Wire contract
+описан в [RVEPAK v1 format](docs/rvepak-format.md).
 
 ### Сборка архивов ресурсов
 
@@ -60,6 +62,20 @@ overrides. `--no-dedup` сохраняет каждый input самостоят
 межархивную зависимость; `verify` потоково проверяет каждый уникальный local blob.
 Успех возвращает код 0, ошибки аргументов, manifest или входных данных — 2,
 операционные ошибки ввода-вывода и повреждённого архива — 1.
+
+### Фоновое чтение ресурсов
+
+`ResourceSystem::start(ResourceConfig::default())` закрепляет `assets` относительно
+текущего каталога, запускает coordinator и bounded worker pool. Если там есть
+верхнеуровневый `.rvepak`, сервис валидирует каталог и работает только с архивами;
+иначе читает loose files. Отсутствующий ресурс возвращается как typed
+ошибка, а ошибка архива не включает loose fallback. `ResourceHandle` отправляет
+stat, read-all и half-open range requests; `receive` работает с любым executor,
+`try_receive` не блокирует, `wait` предназначен для startup и legacy code.
+Настройки по умолчанию: до 4 workers, очередь 128 запросов, индекс 256 MiB,
+результат одного чтения 256 MiB и общий transient/pending-result memory budget
+512 MiB. Полный контракт и ограничения описаны в
+[`EngineResources`](Obsidian/RVEVault/Engine/EngineResources.md).
 
 ## Требования
 

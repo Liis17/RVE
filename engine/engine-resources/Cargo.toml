@@ -1,0 +1,10 @@
+[package]
+name = "engine-resources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-files = { path = "../engine-files" }
+engine-pak = { path = "../engine-pak" }
+flume.workspace = true

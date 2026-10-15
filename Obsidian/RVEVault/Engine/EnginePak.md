@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение
 
-`engine-pak` читает, записывает, строит и проверяет неизменяемые RVEPAK v1 archives. `Archive` владеет проверенными metadata и backing source, `ArchiveWriter` добавляет локальные blobs потоково, `ArchiveCatalog` объединяет namespace и разрешает cross-archive references, а builder превращает строгий TOML manifest в полный набор архивов. CLI `tools/rvepak` использует этот библиотечный API для build/list/verify. Runtime-ресурсы пока не подключены к [[Engine/EngineAssets]] или sandbox.
+`engine-pak` читает, записывает, строит и проверяет неизменяемые RVEPAK v1 archives. `Archive` владеет проверенными metadata и backing source, `ArchiveWriter` добавляет локальные blobs потоково, `ArchiveCatalog` объединяет namespace и разрешает cross-archive references, а builder превращает строгий TOML manifest в полный набор архивов. CLI `tools/rvepak` использует этот библиотечный API для build/list/verify. Фоновое чтение предоставляет [[Engine/EngineResources]], пока не подключённый к [[Engine/EngineAssets]] или sandbox.
 
 Полная wire-раскладка — заголовок, индекс, ссылки и chunk descriptors — нормативно описана в [`docs/rvepak-format.md`](../../../docs/rvepak-format.md). Архив хранит opaque bytes без ограничений расширений. Chunk codec независим для каждой локальной blob; доступны None, Zstandard и LZ4 block.
 
@@ -37,4 +37,4 @@ Parent: [[Index]]
 
 Крейт зависит от `engine-files`, `blake3`, `zstd`, `lz4_flex`, `serde` и `toml`; внешние версии закреплены в workspace `Cargo.toml`. `rvepak` зависит от `engine-pak` и не содержит отдельного archive parser или owner resolver. На Windows `seek_read` меняет cursor, поэтому `Archive` использует отдельный file handle для payload read и сверяет ArchiveId до чтения; Unix сохраняет первоначальный positional handle. `Archive::reopen_for_worker` открывает новый handle и заново проверяет identity. Код не сериализует параллельные archive reads глобальным mutex.
 
-`engine-pak` и `rvepak` не выполняют worker scheduling, async coordination или интеграцию с FBX/PNG. Каталог и reader APIs остаются базой для runtime resource service и будущего подключения к sandbox.
+`engine-pak` и `rvepak` не выполняют worker scheduling, async coordination или интеграцию с FBX/PNG. Эти обязанности принадлежат `engine-resources`; см. [[Engine/EngineResources]].
