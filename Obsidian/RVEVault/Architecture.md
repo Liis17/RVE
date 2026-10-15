@@ -48,11 +48,16 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ### Запуск и цикл окна
 
-`engine/sandbox/src/main.rs` разбирает аргументы, создаёт `Sandbox` и вызывает `engine_window::run` с `WindowConfig::default()`. `engine-window` создаёт event loop и окно в `resumed`, после чего вызывает `WindowHandler::init`. В каждом `about_to_wait` вызывается `update`, а затем запрашивается перерисовка; `frame` вызывается при `RedrawRequested`. Изменения размеров передаются в физических пикселях через `resized`.
+`engine/sandbox/src/main.rs` разбирает аргументы, загружает начальный размер окна
+через `bootstrap::load` из `bootstrap.rves` в рабочем каталоге, создаёт `Sandbox` и
+вызывает `engine_window::run` с полученным `WindowConfig`. Параметры `WindowSizeX`
+и `WindowSizeY` задают физический размер; отсутствующие параметры или файл
+сохраняют defaults 1280×720, ошибочные настройки завершают запуск с кодом 2.
+`engine-window` создаёт event loop и окно в `resumed`, после чего вызывает `WindowHandler::init`. В каждом `about_to_wait` вызывается `update`, а затем запрашивается перерисовка; `frame` вызывается при `RedrawRequested`. Изменения размеров передаются в физических пикселях через `resized`.
 
 При выходе `WindowHandler::exiting` вызывается до освобождения окна. Sandbox удаляет renderer в этом callback; renderer удерживает `Arc` окна до уничтожения Vulkan surface.
 
-Источники: `engine/engine-window/src/lib.rs`, `engine/sandbox/src/main.rs`.
+Источники: `engine/engine-window/src/lib.rs`, `engine/sandbox/src/main.rs`, `engine/sandbox/src/bootstrap.rs`.
 
 ### Vulkan-кадр
 
