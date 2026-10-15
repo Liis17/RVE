@@ -14,6 +14,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 | `Obsidian/RVEVault/Architecture.md` | Архитектура, основные потоки и ограничения |
 | `Obsidian/RVEVault/Engine/EngineCore.md` | Время игрового цикла |
 | `Obsidian/RVEVault/Engine/EngineWindow.md` | Окно и цикл событий |
+| `Obsidian/RVEVault/Engine/EnginePlatform.md` | Платформенные адаптеры Windows/macOS |
 | `Obsidian/RVEVault/Engine/EngineRender.md` | Vulkan renderer |
 | `Obsidian/RVEVault/Engine/Sandbox.md` | Пример приложения и CLI |
 

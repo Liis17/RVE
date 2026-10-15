@@ -132,9 +132,8 @@ impl Renderer {
         W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
     {
         validate_render_scale(config.render_scale)?;
-        // SAFETY: ash загружает Vulkan loader из системных библиотек и проверяет доступность символов.
-        let entry =
-            unsafe { Entry::load() }.map_err(|error| RenderError::Loader(error.to_string()))?;
+        let entry = engine_platform::load_vulkan()
+            .map_err(|error| RenderError::Loader(error.to_string()))?;
         let window: Arc<dyn WindowHandleOwner> = window;
         let mut renderer = Self {
             entry,
@@ -295,15 +294,20 @@ impl Renderer {
 
     fn initialize(&mut self) -> Result<(), RenderError> {
         let display_handle = self.window.display_handle().map_err(RenderError::Handle)?;
-        let required = ash_window::enumerate_required_extensions(display_handle.as_raw())
+        let required = engine_platform::enumerate_required_extensions(display_handle.as_raw())
             .map_err(RenderError::Vulkan)?;
         let mut requested_instance_extensions = required
             .iter()
             .map(|pointer| {
-                // SAFETY: ash-window returns static, null-terminated Vulkan extension names.
+                // SAFETY: the platform adapter returns static, null-terminated extension names.
                 unsafe { CStr::from_ptr(*pointer) }.to_owned()
             })
             .collect::<Vec<_>>();
+        requested_instance_extensions.extend(
+            engine_platform::INSTANCE_EXTENSIONS
+                .iter()
+                .map(|name| CString::from(*name)),
+        );
         requested_instance_extensions.extend(
             self.config
                 .extra_instance_extensions
@@ -354,6 +358,7 @@ impl Renderer {
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::make_api_version(0, 1, 3, 0));
         let instance_info = vk::InstanceCreateInfo::default()
+            .flags(engine_platform::INSTANCE_FLAGS)
             .application_info(&application_info)
             .enabled_extension_names(&instance_extension_pointers)
             .enabled_layer_names(&layer_pointers);
@@ -365,7 +370,7 @@ impl Renderer {
         let window_handle = self.window.window_handle().map_err(RenderError::Handle)?;
         // SAFETY: handles refer to the live Arc-owned window and the instance enabled required surface extensions.
         let surface = unsafe {
-            ash_window::create_surface(
+            engine_platform::create_surface(
                 &self.entry,
                 self.instance()?,
                 display_handle.as_raw(),
@@ -386,6 +391,11 @@ impl Renderer {
             .map(|name| CString::from(*name))
             .collect::<Vec<_>>();
         required_device_extensions.push(ash::khr::swapchain::NAME.to_owned());
+        required_device_extensions.extend(
+            engine_platform::DEVICE_EXTENSIONS
+                .iter()
+                .map(|name| CString::from(*name)),
+        );
         let required_device_extensions = deduplicate_names(required_device_extensions);
         let choice = choose_device(
             self.instance()?,

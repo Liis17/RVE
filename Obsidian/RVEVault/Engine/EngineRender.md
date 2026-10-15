@@ -11,7 +11,7 @@ Parent: [[Index]]
 | Файл | Значимый символ | Роль |
 |---|---|---|
 | `engine/engine-render/src/lib.rs` | `RendererConfig`, `Capabilities`, `RenderError`, `FrameStatus`, `Renderer` | Публичный контракт renderer и реализация Vulkan-пути |
-| `engine/engine-render/Cargo.toml` | `ash`, `ash-window`, `raw-window-handle` | Vulkan bindings и оконные handles без зависимости от winit |
+| `engine/engine-render/Cargo.toml` | `ash`, `engine-platform`, `raw-window-handle` | Vulkan bindings, платформенная интеграция и оконные handles без зависимости от winit |
 
 ## Публичные контракты
 
@@ -29,14 +29,15 @@ Parent: [[Index]]
 
 ## Зависимости и взаимодействия
 
-- Использует ash 0.38.0, ash-window 0.13.0 и raw-window-handle 0.6.2.
+- Использует ash 0.38.0 и raw-window-handle 0.6.2. [[Engine/EnginePlatform]] предоставляет загрузку Vulkan, требования платформы и surface через ash-window 0.13.0.
 - Используется в [[Engine/Sandbox]], который передаёт `Arc<Window>` из [[Engine/EngineWindow]].
 - `engine-render` намеренно не зависит от winit; это проверяется командой `cargo tree -p engine-render`.
 
 ## Ограничения и важные детали
 
 - Требуется Vulkan API не ниже 1.3, `dynamicRendering`, `synchronization2`, `VK_KHR_swapchain`, graphics+present queue family, surface с `TRANSFER_DST` и FIFO, surface-формат с `BLIT_DST`, а также поддержка optimal tiling offscreen-формата `R16G16B16A16_SFLOAT` с `COLOR_ATTACHMENT`, `BLIT_SRC` и `SAMPLED_IMAGE_FILTER_LINEAR`.
-- Проверки расширений instance/device выполняются до их создания; дополнительные расширения из конфигурации дедуплицируются. Отсутствующее расширение приводит к `RenderError::Unsupported`.
+- Проверки расширений instance/device выполняются до их создания; требования платформы и дополнительные расширения из конфигурации дедуплицируются. Отсутствующее расширение приводит к `RenderError::Unsupported`.
+- Renderer одинаков для Windows и macOS. На macOS адаптер добавляет portability extensions и флаг instance для MoltenVK; отдельного Metal renderer нет. Loader и surface предоставляются платформой, владение Vulkan-объектами остаётся у renderer.
 - Discrete GPU получает приоритет. Выбор устройства также проверяет API, features, очередь, surface и форматы; причины отказа включаются в `NoSuitableDevice`.
 - Swapchain использует FIFO и exclusive sharing. Размер ограничивается возможностями surface. При начальном размере 0×0 renderer создаёт instance, устройство и capabilities, но откладывает swapchain и offscreen-изображения до ненулевого размера.
 - Существует два frame slot с отдельными command buffer, fence, acquire semaphore и offscreen-target. Render-finished semaphore привязан к swapchain image. Fence сбрасывается после acquire и записи command buffer, перед submit.

@@ -8,6 +8,9 @@ RVE — начальный каркас игрового движка на Rust 
 |---|---|---|
 | `engine-core` | Время игрового цикла (`Time`) | Работает |
 | `engine-window` | Окно и цикл событий на winit | Работает |
+| `engine-platform` | Выбор платформенного адаптера по целевой ОС | Работает |
+| `engine-platform-windows` | Windows: загрузка Vulkan и оконная поверхность | Работает |
+| `engine-platform-macos` | macOS: загрузка Vulkan, MoltenVK portability и Metal surface | Работает |
 | `engine-render` | Vulkan renderer: clear offscreen-кадра и blit в swapchain | Работает |
 | `engine-scene` | Игровые объекты, компоненты и сцены | Скелет |
 | `engine-assets` | Загрузка и хранение текстур, моделей и ресурсов | Скелет |
@@ -19,9 +22,30 @@ RVE — начальный каркас игрового движка на Rust 
 ## Требования
 
 - Rust stable с поддержкой edition 2024.
-- На текущем этапе целевая среда — настольная Windows.
+- Целевые среды — настольные Windows и macOS. На Windows используется Vulkan-драйвер GPU, на macOS — MoltenVK поверх Metal.
 - Драйвер и Vulkan runtime должны предоставлять Vulkan 1.3, `dynamicRendering`, `synchronization2`, `VK_KHR_swapchain`, graphics- и present-очередь, а также требуемые surface-форматы и операции blit. Renderer проверяет эти условия при выборе устройства.
 - Vulkan SDK для сборки и текущего пути запуска не требуется: Vulkan loader загружается во время выполнения, а шейдеры пока не используются. SDK может предоставить validation layer для debug-сборок; в среде выполненных проверок `VK_LAYER_KHRONOS_validation` отсутствовал, поэтому runtime validation не запускалась.
+
+### Windows
+
+Установите Rust и актуальный драйвер GPU с поддержкой Vulkan 1.3. Платформенный адаптер загружает системный `vulkan-1.dll`.
+
+### macOS
+
+Установите Rust и Vulkan runtime с актуальным MoltenVK. Для Homebrew:
+
+```sh
+brew install molten-vk vulkan-loader
+cargo run -p sandbox -- --frames 120
+```
+
+Адаптер сначала ищет `libvulkan.dylib` через системный загрузчик, затем пробует `/opt/homebrew/lib/libvulkan.dylib` для Homebrew на Apple Silicon. Альтернатива — Vulkan SDK с настроенным окружением по [инструкции MoltenVK](https://github.com/KhronosGroup/MoltenVK/blob/main/README.md). Установка одной библиотеки MoltenVK без Vulkan loader для этого пути недостаточна.
+
+Адаптер macOS включает `VK_KHR_portability_enumeration`, флаг `ENUMERATE_PORTABILITY_KHR` и `VK_KHR_portability_subset`. Требования общего renderer к Vulkan 1.3, features и форматам сохраняются; старый MoltenVK или неподходящий GPU могут не пройти проверку устройства.
+
+## Платформенная структура
+
+`engine-render` использует общий интерфейс `engine-platform`; Cargo выбирает адаптер по целевой ОС. Загрузка Vulkan, интеграция поверхности окна и требования платформы находятся в `engine-platform-windows` и `engine-platform-macos`. Общая отрисовка остаётся в `engine-render`, оконный цикл на winit — в `engine-window`, приложение — в `sandbox`. Адаптеры не зависят от renderer. Остальные ОС пока не имеют адаптеров.
 
 ## Сборка и проверки
 
@@ -47,6 +71,15 @@ cargo run -p sandbox -- --frames 300 --resize-test
 `--frames N` завершает приложение после N успешных вызовов презентации; N — положительный `u64`. `--render-scale S` задаёт масштаб offscreen-разрешения и принимает конечное число из `(0, 1]`. `--resize-test` после 30 презентаций запрашивает 960×540, после 60 сворачивает окно на 250 мс и затем запрашивает восстановление 1280×720. При совместном использовании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка аргументов возвращает код 2, ошибка окна или рендерера — код 1, успешное завершение — код 0. Без `--frames` приложение работает до закрытия окна.
 
 Команда `cargo tree -p engine-render` позволяет проверить, что `engine-render` не зависит от winit.
+
+Проверка Windows-кода с macOS без линковки Windows-бинарника:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+```
+
+Эта проверка не заменяет сборку и запуск на Windows.
 
 ## Границы текущего renderer
 
