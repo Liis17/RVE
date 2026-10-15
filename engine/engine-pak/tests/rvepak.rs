@@ -3,7 +3,7 @@ use engine_pak::{
     Archive, ArchiveCatalog, ArchiveLimits, ArchiveWriter, BlobOptions, CatalogLimits, Codec,
     ContentHash, MemoryFootprint, PakError, ReadControl, ReadReservation, WriterOptions,
 };
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
@@ -148,6 +148,31 @@ fn archive_bytes(codec: Codec, chunk_size: u64, path_text: &str, content: &[u8])
         .add_local(path(path_text), content, Some(hash(content)))
         .unwrap();
     finish(writer).0
+}
+
+fn zstd_frame(content: &[u8], checksum: bool) -> Vec<u8> {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.include_checksum(checksum).unwrap();
+    encoder.write_all(content).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn archive_bytes_with_zstd_frame(content: &[u8], frame: &[u8]) -> Vec<u8> {
+    let archive = archive_bytes(Codec::Zstd, content.len() as u64, "asset", content);
+    let old_index_offset = index_offset(&archive);
+    let mut index = archive[old_index_offset..].to_vec();
+    let blob_entry = 8 + 4 + "asset".len() + 1 + 8;
+    let chunk_descriptor = blob_entry + 8 + 1 + 8 + 8 + 32 + 4;
+    put_u64(&mut index, chunk_descriptor, 64);
+    put_u64(&mut index, chunk_descriptor + 8, frame.len() as u64);
+
+    let mut bytes = archive[..64].to_vec();
+    bytes.extend_from_slice(frame);
+    let new_index_offset = bytes.len() as u64;
+    put_u64(&mut bytes, 16, new_index_offset);
+    bytes.extend_from_slice(&index);
+    refresh_index_hash(&mut bytes);
+    bytes
 }
 
 fn hash(content: &[u8]) -> ContentHash {
@@ -386,6 +411,57 @@ fn chunk_and_full_blob_checksums_detect_payload_corruption() {
     let archive = Archive::open(MemorySource::new(broken_blob_hash)).unwrap();
     assert_eq!(archive.read_all(&path("a")).unwrap(), b"data");
     assert!(matches!(archive.verify(), Err(PakError::Corrupt(_))));
+}
+
+#[test]
+fn zstd_content_checksum_frames_are_accepted_and_unused_bit_is_ignored() {
+    let content = b"checksum protected payload";
+    let mut frame = zstd_frame(content, true);
+    assert_ne!(frame[4] & 0x04, 0, "frame has the content checksum flag");
+    frame[4] |= 0x10;
+    let archive = Archive::open(MemorySource::new(archive_bytes_with_zstd_frame(
+        content, &frame,
+    )))
+    .unwrap();
+
+    assert_eq!(archive.read_all(&path("asset")).unwrap(), content);
+    assert_eq!(
+        archive.read_range(&path("asset"), 3..10).unwrap(),
+        &content[3..10]
+    );
+    assert_eq!(archive.verify().unwrap().local_blobs_verified, 1);
+}
+
+#[test]
+fn zstd_reserved_frame_bit_is_rejected() {
+    let content = b"reserved bit";
+    let mut frame = zstd_frame(content, false);
+    frame[4] |= 0x08;
+    let archive = Archive::open(MemorySource::new(archive_bytes_with_zstd_frame(
+        content, &frame,
+    )))
+    .unwrap();
+
+    assert!(matches!(
+        archive.read_all(&path("asset")),
+        Err(PakError::Corrupt(message)) if message == "reserved Zstandard frame bit is set"
+    ));
+}
+
+#[test]
+fn zstd_content_checksum_corruption_is_rejected_by_the_decoder() {
+    let content = b"checksum corruption";
+    let mut frame = zstd_frame(content, true);
+    *frame.last_mut().unwrap() ^= 1;
+    let archive = Archive::open(MemorySource::new(archive_bytes_with_zstd_frame(
+        content, &frame,
+    )))
+    .unwrap();
+
+    assert!(matches!(
+        archive.read_all(&path("asset")),
+        Err(PakError::Corrupt(message)) if message == "invalid Zstandard chunk"
+    ));
 }
 
 #[test]
@@ -708,7 +784,7 @@ fn zstd_window_limit_rejects_oversized_window_before_decoder_work() {
     ));
 
     let mut reserved_bit = bytes.clone();
-    reserved_bit[68] |= 0x04;
+    reserved_bit[68] |= 0x08;
     let archive = Archive::open(MemorySource::new(reserved_bit)).unwrap();
     assert!(matches!(
         archive.read_all(&path("a")),

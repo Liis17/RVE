@@ -79,9 +79,11 @@ overrides. Чтобы сохранить каждый input самостояте
 ошибка, а ошибка архива не включает loose fallback. `ResourceHandle` отправляет
 stat, read-all и half-open range requests; `receive` работает с любым executor,
 `try_receive` не блокирует, `wait` предназначен для startup и legacy code.
-Настройки по умолчанию: до 4 workers, очередь 128 запросов, индекс 256 MiB,
-результат одного чтения 256 MiB и общий transient/pending-result memory budget
-512 MiB. Полный контракт и ограничения описаны в
+Настройки по умолчанию: до 4 workers, очередь 128 запросов, сериализованные
+несжатые индексы 256 MiB суммарно, результат одного чтения 256 MiB и общий
+transient/pending-result memory budget 512 MiB. Лимит индекса измеряет байты
+формата, а не память распарсенных метаданных; она может быть больше и не входит
+в бюджет чтений. Полный контракт и ограничения описаны в
 [`EngineResources`](Obsidian/RVEVault/Engine/EngineResources.md).
 При запуске sandbox сначала проверяет аргументы и `bootstrap.rves`, затем открывает
 каталог ресурсов до подготовки содержимого — даже для процедурной сцены. Верхнеуровневый

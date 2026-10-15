@@ -64,16 +64,10 @@ impl ResourceError {
         match self {
             Self::InvalidPath(_) => ResourceErrorKind::InvalidPath,
             Self::NotFound(_) => ResourceErrorKind::NotFound,
-            Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
-                ResourceErrorKind::NotFound
-            }
             Self::Io { .. } => ResourceErrorKind::Io,
             Self::Archive(error) => match error {
                 PakError::Path(_) => ResourceErrorKind::InvalidPath,
                 PakError::NotFound(_) => ResourceErrorKind::NotFound,
-                PakError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
-                    ResourceErrorKind::NotFound
-                }
                 PakError::Io { .. } => ResourceErrorKind::Io,
                 PakError::Corrupt(_) => ResourceErrorKind::Corrupt,
                 PakError::InvalidRange { .. } => ResourceErrorKind::InvalidRange,

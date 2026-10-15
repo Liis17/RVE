@@ -296,6 +296,19 @@ fn map_resource_error(path: &Path, error: ResourceError) -> AssetError {
     }
 }
 
+fn is_missing_texture_candidate(error: &AssetError) -> bool {
+    let AssetError::Io { error, .. } = error else {
+        return false;
+    };
+    match error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ResourceError>())
+    {
+        Some(resource_error) => resource_error.kind() == ResourceErrorKind::NotFound,
+        None => error.kind() == io::ErrorKind::NotFound,
+    }
+}
+
 fn legacy_path(root: &Path, path: &Path) -> Result<PathBuf, AssetError> {
     let canonical_root = fs::canonicalize(root).map_err(|error| AssetError::Io {
         path: root.to_owned(),
@@ -526,17 +539,13 @@ fn load_fbx_texture(
         let asset_path = format!("/{candidate}");
         let path = assets.root.join(candidate);
         match assets.stat_asset(&asset_path, &path) {
-            Err(AssetError::Io { error, .. }) if error.kind() == io::ErrorKind::NotFound => {
-                continue;
-            }
+            Err(error) if is_missing_texture_candidate(&error) => continue,
             Err(error) => return Err(error),
             Ok(_) => {}
         }
         require_extension(&path, "png")?;
         let bytes = match assets.read_asset(&asset_path, &path) {
-            Err(AssetError::Io { error, .. }) if error.kind() == io::ErrorKind::NotFound => {
-                continue;
-            }
+            Err(error) if is_missing_texture_candidate(&error) => continue,
             Err(error) => return Err(error),
             Ok(bytes) => bytes,
         };
@@ -647,13 +656,14 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetError, Assets, Model, ModelMesh, ModelVertex, decode_png, texture_candidates,
+        AssetError, Assets, Model, ModelMesh, ModelVertex, decode_png,
+        is_missing_texture_candidate, map_resource_error, texture_candidates,
     };
     use engine_files::VirtualPath;
     use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
     use engine_resources::{ResourceConfig, ResourceError, ResourceErrorKind, ResourceSystem};
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
     use std::path::{Path, PathBuf};
 
     /// Временный каталог ресурсов, удаляемый в конце теста.
@@ -1177,6 +1187,51 @@ mod tests {
                 assert_eq!(path, temp.root.join("texture/paint.png"));
             }
             other => panic!("expected first candidate decode failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fbx_texture_search_skips_only_typed_missing_resources() {
+        let path = PathBuf::from("texture/paint.png");
+        let missing_virtual_path = map_resource_error(
+            &path,
+            ResourceError::NotFound("texture/paint.png".to_owned()),
+        );
+        let missing_backing_file = map_resource_error(
+            &path,
+            ResourceError::Io {
+                path: Some(path.clone()),
+                source: io::Error::new(io::ErrorKind::NotFound, "archive backing file vanished"),
+            },
+        );
+
+        assert!(is_missing_texture_candidate(&missing_virtual_path));
+        assert!(!is_missing_texture_candidate(&missing_backing_file));
+        assert_eq!(
+            resource_error(&missing_backing_file).unwrap().kind(),
+            ResourceErrorKind::Io
+        );
+    }
+
+    #[test]
+    fn texture_directory_candidate_stops_search_for_legacy_and_service_assets() {
+        let temp = TempAssets::new("texture-directory-candidate");
+        temp.write(
+            "model/quad.fbx",
+            quad_fbx(Some("../texture/paint.png")).as_bytes(),
+        );
+        fs::create_dir_all(temp.root.join("texture/paint.png")).unwrap();
+        temp.write("model/paint.png", &rgba_png());
+        let legacy_assets = temp.assets();
+        let (_system, service_assets) = temp.resource_assets();
+
+        for assets in [&legacy_assets, &service_assets] {
+            match assets.load_model("/model/quad.fbx") {
+                Err(AssetError::Io { error, .. }) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                }
+                other => panic!("expected the directory candidate to stop search, got {other:?}"),
+            }
         }
     }
 

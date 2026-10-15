@@ -14,6 +14,7 @@ const NONE_CODEC_SCRATCH_SIZE: u64 = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ArchiveLimits {
+    /// Maximum serialized, uncompressed index length. This limits format bytes, not parsed metadata memory.
     pub max_index_bytes: u64,
     pub max_path_bytes: u32,
     pub max_files: u32,
@@ -752,10 +753,8 @@ fn zstd_frame_window_size(frame: &[u8], expected_size: u64) -> Result<u64> {
         return Err(PakError::corrupt("invalid Zstandard frame header"));
     }
     let descriptor = frame[4];
-    if descriptor & 0x0c != 0 {
-        return Err(PakError::corrupt(
-            "reserved or unused Zstandard frame bit is set",
-        ));
+    if descriptor & 0x08 != 0 {
+        return Err(PakError::corrupt("reserved Zstandard frame bit is set"));
     }
     let content_size_flag = descriptor >> 6;
     let single_segment = descriptor & 0x20 != 0;

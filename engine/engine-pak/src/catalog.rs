@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct CatalogLimits {
+    /// Maximum aggregate serialized, uncompressed index length. This does not bound catalog metadata memory.
     pub max_total_index_bytes: u64,
     pub max_archives: u32,
 }

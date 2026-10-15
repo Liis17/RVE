@@ -1,6 +1,9 @@
 use super::*;
 use engine_files::ReadAt;
-use engine_pak::{Archive, ArchiveId, ArchiveWriter, BlobId, BlobOptions, Codec, WriterOptions};
+use engine_pak::{
+    Archive, ArchiveCatalog, ArchiveId, ArchiveWriter, BlobId, BlobOptions, CatalogLimits, Codec,
+    HEADER_SIZE, WriterOptions,
+};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -514,6 +517,34 @@ impl ReadAt for RecordingReader {
     }
 }
 
+struct MissingPayloadReader {
+    bytes: Vec<u8>,
+    index_start: u64,
+}
+
+impl ReadAt for MissingPayloadReader {
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.bytes.len() as u64)
+    }
+
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        if (HEADER_SIZE..self.index_start).contains(&offset) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "injected missing archive backing payload",
+            ));
+        }
+        let start = usize::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset too large"))?;
+        if start >= self.bytes.len() {
+            return Ok(0);
+        }
+        let count = buffer.len().min(self.bytes.len() - start);
+        buffer[..count].copy_from_slice(&self.bytes[start..start + count]);
+        Ok(count)
+    }
+}
+
 fn catalog_with_reader(
     bytes: Vec<u8>,
     gate: Arc<ReadGate>,
@@ -531,6 +562,36 @@ fn catalog_with_reader(
     catalog.insert(archive).unwrap();
     catalog.validate().unwrap();
     (Arc::new(catalog), reader)
+}
+
+#[test]
+fn backing_io_not_found_is_distinct_from_a_missing_virtual_resource() {
+    let root = TempDirectory::new();
+    let bytes = archive_bytes(Codec::None, 4, &[("exists.bin", b"data")]);
+    let index_start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let reader = Arc::new(MissingPayloadReader { bytes, index_start });
+    let archive = Archive::open_shared(reader).unwrap();
+    let mut catalog = ArchiveCatalog::new(CatalogLimits::default());
+    catalog.insert(archive).unwrap();
+    catalog.validate().unwrap();
+    let system = injected_system(root.path(), Backend::Packed(Arc::new(catalog)), 1, 2, 1024);
+    let handle = system.handle();
+
+    assert_eq!(
+        handle
+            .stat("missing.bin")
+            .unwrap()
+            .wait()
+            .unwrap_err()
+            .kind(),
+        crate::ResourceErrorKind::NotFound
+    );
+    let error = handle.read_all("exists.bin").unwrap().wait().unwrap_err();
+    assert_eq!(error.kind(), crate::ResourceErrorKind::Io);
+    match error {
+        ResourceError::Io { source, .. } => assert_eq!(source.kind(), io::ErrorKind::NotFound),
+        other => panic!("expected the original backing I/O error, got {other:?}"),
+    }
 }
 
 fn injected_system(

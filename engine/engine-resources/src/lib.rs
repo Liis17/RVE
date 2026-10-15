@@ -26,7 +26,9 @@ pub struct ResourceConfig {
     /// Maximum number of queued jobs. Outstanding requests, including results
     /// not yet received, are separately bounded to this value plus worker count.
     pub queue_capacity: usize,
-    /// Aggregate uncompressed archive index bytes loaded at startup.
+    /// Aggregate serialized, uncompressed archive index bytes loaded at startup.
+    /// This limits archive format bytes, not parsed metadata memory; the parser
+    /// and catalog can use more memory, which is not included in `max_memory_bytes`.
     pub max_total_index_bytes: u64,
     /// Maximum byte count for one `read_all` or `read_range` result.
     pub max_result_bytes: u64,
