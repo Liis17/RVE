@@ -1,14 +1,16 @@
 mod bootstrap;
+mod scene;
 
 use engine_core::Time;
-use engine_render::{FrameStatus, Renderer, RendererConfig};
+use engine_render::{DrawCommand, FrameStatus, MeshId, Renderer, RendererConfig};
 use engine_window::{PhysicalSize, Window, WindowHandler, run};
+use scene::Scene;
 use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test] [--scene triangle|cube]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -16,6 +18,7 @@ struct Options {
     frames: Option<u64>,
     render_scale: f32,
     resize_test: bool,
+    scene: Scene,
 }
 
 fn parse_args<I, S>(args: I) -> Result<Options, String>
@@ -27,6 +30,7 @@ where
     let mut frames = None;
     let mut render_scale = None;
     let mut resize_test = false;
+    let mut scene = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--frames" => {
@@ -65,6 +69,17 @@ where
                 }
                 resize_test = true;
             }
+            "--scene" => {
+                if scene.is_some() {
+                    return Err("флаг --scene указан повторно".to_owned());
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| "после --scene требуется triangle или cube".to_owned())?;
+                scene = Some(Scene::parse(&value).ok_or_else(|| {
+                    format!("неизвестная сцена: {value}; доступны triangle и cube")
+                })?);
+            }
             _ => return Err(format!("неизвестный аргумент: {argument}")),
         }
     }
@@ -75,6 +90,7 @@ where
         frames,
         render_scale: render_scale.unwrap_or(1.0),
         resize_test,
+        scene: scene.unwrap_or_default(),
     })
 }
 
@@ -90,6 +106,8 @@ struct ResizeTest {
 
 struct Sandbox {
     renderer: Option<Renderer>,
+    mesh: Option<MeshId>,
+    size: PhysicalSize<u32>,
     time: Time,
     options: Options,
     presented_frames: u64,
@@ -101,6 +119,8 @@ impl Sandbox {
     fn new(options: Options) -> Self {
         Self {
             renderer: None,
+            mesh: None,
+            size: PhysicalSize::new(0, 0),
             time: Time::new(),
             options,
             presented_frames: 0,
@@ -111,6 +131,7 @@ impl Sandbox {
 
     fn report_resize(&mut self, width: u32, height: u32) {
         println!("Resized: {width}x{height} (physical pixels)");
+        self.size = PhysicalSize::new(width, height);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.resize(width, height);
         }
@@ -192,12 +213,13 @@ impl WindowHandler for Sandbox {
     fn init(&mut self, window: Arc<Window>) -> bool {
         let size = window.inner_size();
         println!("Window: {}x{} (physical pixels)", size.width, size.height);
+        self.size = size;
         let config = RendererConfig {
             render_scale: self.options.render_scale,
             ..RendererConfig::default()
         };
         match Renderer::new(Arc::clone(&window), size.width, size.height, config) {
-            Ok(renderer) => {
+            Ok(mut renderer) => {
                 let capabilities = renderer.capabilities();
                 let api_major = (capabilities.api_version >> 22) & 0x7f;
                 let api_minor = (capabilities.api_version >> 12) & 0x3ff;
@@ -210,6 +232,14 @@ impl WindowHandler for Sandbox {
                     capabilities.discrete,
                     capabilities.tessellation_shader
                 );
+                let (vertices, indices) = self.options.scene.mesh();
+                match renderer.create_mesh(vertices, indices) {
+                    Ok(mesh) => self.mesh = Some(mesh),
+                    Err(error) => {
+                        self.failure = Some(format!("ошибка создания меша: {error}"));
+                        return false;
+                    }
+                }
                 self.renderer = Some(renderer);
                 true
             }
@@ -232,11 +262,19 @@ impl WindowHandler for Sandbox {
             0.5 + 0.5 * (elapsed * 0.41).sin(),
             1.0,
         ];
-        let Some(renderer) = self.renderer.as_mut() else {
+        let (Some(renderer), Some(mesh)) = (self.renderer.as_mut(), self.mesh) else {
             self.failure = Some("рендерер отсутствует".to_owned());
             return false;
         };
-        match renderer.render_frame(color) {
+        let draws = [DrawCommand {
+            mesh,
+            transform: self
+                .options
+                .scene
+                .transform(elapsed, self.size.width, self.size.height)
+                .to_cols_array_2d(),
+        }];
+        match renderer.render_frame(color, &draws) {
             Ok(FrameStatus::Presented) => {
                 self.presented_frames += 1;
                 self.advance_resize_test(window);
@@ -317,7 +355,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, parse_args};
+    use super::{Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args};
 
     #[test]
     fn frame_limit_accepts_u64_boundaries() {
@@ -372,6 +410,7 @@ mod tests {
             frames: None,
             render_scale: 1.0,
             resize_test: true,
+            scene: Scene::Cube,
         });
         sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
         sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
@@ -417,11 +456,20 @@ mod tests {
 
     #[test]
     fn parses_all_supported_flags() {
-        let options = parse_args(["--frames", "120", "--render-scale", "0.5", "--resize-test"])
-            .expect("valid arguments should parse");
+        let options = parse_args([
+            "--frames",
+            "120",
+            "--render-scale",
+            "0.5",
+            "--resize-test",
+            "--scene",
+            "triangle",
+        ])
+        .expect("valid arguments should parse");
         assert_eq!(options.frames, Some(120));
         assert_eq!(options.render_scale, 0.5);
         assert!(options.resize_test);
+        assert_eq!(options.scene, Scene::Triangle);
     }
 
     #[test]
@@ -440,6 +488,9 @@ mod tests {
             vec!["--render-scale", "0.5", "--render-scale", "0.25"],
             vec!["--resize-test", "--resize-test"],
             vec!["--frames", "119", "--resize-test"],
+            vec!["--scene"],
+            vec!["--scene", "sphere"],
+            vec!["--scene", "cube", "--scene", "triangle"],
         ] {
             assert!(parse_args(arguments).is_err());
         }
@@ -451,5 +502,6 @@ mod tests {
         assert_eq!(options.frames, None);
         assert_eq!(options.render_scale, 1.0);
         assert!(!options.resize_test);
+        assert_eq!(options.scene, Scene::Cube);
     }
 }

@@ -1,6 +1,6 @@
 # RVE
 
-RVE — начальный каркас игрового движка на Rust с выводом через Vulkan. Сейчас рабочий путь включает счётчик времени, окно на winit, очистку offscreen-изображения и его вывод в swapchain. `engine/sandbox` служит примером запуска и проверки этого пути.
+RVE — начальный каркас игрового движка на Rust с выводом через Vulkan. Сейчас рабочий путь включает счётчик времени, окно на winit, рисование цветных треугольных мешей с depth buffer в offscreen-изображение и его вывод в swapchain. `engine/sandbox` служит примером запуска и проверки этого пути: показывает вращающийся куб или треугольник.
 
 ## Крейт-пакеты
 
@@ -11,7 +11,7 @@ RVE — начальный каркас игрового движка на Rust 
 | `engine-platform` | Выбор платформенного адаптера по целевой ОС | Работает |
 | `engine-platform-windows` | Windows: загрузка Vulkan и оконная поверхность | Работает |
 | `engine-platform-macos` | macOS: загрузка Vulkan, MoltenVK portability и Metal surface | Работает |
-| `engine-render` | Vulkan renderer: clear offscreen-кадра и blit в swapchain | Работает |
+| `engine-render` | Vulkan renderer: меши в offscreen-кадре и blit в swapchain | Работает |
 | `engine-scene` | Игровые объекты, компоненты и сцены | Скелет |
 | `engine-assets` | Загрузка и хранение текстур, моделей и ресурсов | Скелет |
 | `engine-physics` | Столкновения и физическая симуляция | Скелет |
@@ -23,8 +23,8 @@ RVE — начальный каркас игрового движка на Rust 
 
 - Rust stable с поддержкой edition 2024.
 - Целевые среды — настольные Windows и macOS. На Windows используется Vulkan-драйвер GPU, на macOS — MoltenVK поверх Metal.
-- Драйвер и Vulkan runtime должны предоставлять Vulkan 1.3, `dynamicRendering`, `synchronization2`, `VK_KHR_swapchain`, graphics- и present-очередь, а также требуемые surface-форматы и операции blit. Renderer проверяет эти условия при выборе устройства.
-- Vulkan SDK для сборки и текущего пути запуска не требуется: Vulkan loader загружается во время выполнения, а шейдеры пока не используются. SDK может предоставить validation layer для debug-сборок; в среде выполненных проверок `VK_LAYER_KHRONOS_validation` отсутствовал, поэтому runtime validation не запускалась.
+- Драйвер и Vulkan runtime должны предоставлять Vulkan 1.3, `dynamicRendering`, `synchronization2`, `VK_KHR_swapchain`, graphics- и present-очередь, а также требуемые surface-форматы, depth-формат `D32_SFLOAT` и операции blit. Renderer проверяет эти условия при выборе устройства.
+- Vulkan SDK для сборки и текущего пути запуска не требуется: Vulkan loader загружается во время выполнения, а GLSL-шейдеры из `engine/engine-render/shaders/` компилируются в SPIR-V крейтом naga в `build.rs` при сборке. SDK может предоставить validation layer для debug-сборок; в среде выполненных проверок `VK_LAYER_KHRONOS_validation` отсутствовал, поэтому runtime validation не запускалась.
 
 ### Windows
 
@@ -73,7 +73,7 @@ cargo build -p sandbox
 
 Каждая новая фича сопровождается тестами в том же коммите; исправление бага — регрессионным тестом. Общая команда `cargo test --workspace --locked` запускает unit-, integration- и doc-тесты всех крейтов. В крейтах-скелетах пока нет поведения для тестирования.
 
-Тесты проверяют время игрового цикла, завершение оконного приложения и ошибки, настройки renderer, расширения Vulkan и параметры swapchain, требования платформенных адаптеров, CLI и обработку resize в sandbox. Интеграционный тест `engine/sandbox/tests/cli.rs` запускает бинарник с неверными аргументами и проверяет код выхода 2 и диагностику. Автотестам не нужны окно, GPU или Vulkan runtime; они не проверяют фактическую отрисовку и обработку событий ОС.
+Тесты проверяют время игрового цикла, завершение оконного приложения и ошибки, настройки renderer, расширения Vulkan и параметры swapchain, проверку мешей, раскладку вершин и встроенный SPIR-V, геометрию и проекции сцен sandbox, требования платформенных адаптеров, CLI и обработку resize в sandbox. Интеграционный тест `engine/sandbox/tests/cli.rs` запускает бинарник с неверными аргументами и проверяет код выхода 2 и диагностику. Автотестам не нужны окно, GPU или Vulkan runtime; они не проверяют фактическую отрисовку и обработку событий ОС.
 
 Workflow [Rust CI](.github/workflows/ci.yml) запускается при push в любую ветку, для PR и вручную. Скрипт `.github/scripts/affected_packages.py` читает граф workspace из `cargo metadata --no-deps` и выбирает изменённые крейты вместе со всеми транзитивно зависящими от них крейтами. Например, изменение `engine-core` проверяет `engine-core` и `sandbox`, а изменение независимого `engine-audio` — только `engine-audio`. Зависимости для компиляции выбранных крейтов Cargo собирает автоматически.
 
@@ -99,6 +99,7 @@ cargo run -p sandbox
 cargo run -p sandbox -- --frames 120
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
 cargo run -p sandbox -- --frames 300 --resize-test
+cargo run -p sandbox -- --scene triangle
 ```
 
 Для запуска собранного бинарника из того же рабочего каталога используй
@@ -136,7 +137,7 @@ WindowSizeY=720
 Размер читается при старте; изменение файла применяется при следующем запуске.
 Файл в `build/` не попадает в Git; шаблон `bootstrap.rves.example` хранится в репозитории.
 
-`--frames N` завершает приложение после N успешных вызовов презентации; N — положительный `u64`. `--render-scale S` задаёт масштаб offscreen-разрешения и принимает конечное число из `(0, 1]`. `--resize-test` после 30 презентаций запрашивает 960×540, после 60 сворачивает окно на 250 мс и затем запрашивает восстановление 1280×720. При совместном использовании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка аргументов возвращает код 2, ошибка окна или рендерера — код 1, успешное завершение — код 0. Без `--frames` приложение работает до закрытия окна.
+`--frames N` завершает приложение после N успешных вызовов презентации; N — положительный `u64`. `--render-scale S` задаёт масштаб offscreen-разрешения и принимает конечное число из `(0, 1]`. `--resize-test` после 30 презентаций запрашивает 960×540, после 60 сворачивает окно на 250 мс и затем запрашивает восстановление 1280×720. `--scene triangle|cube` выбирает демонстрационную сцену; по умолчанию — `cube`. При совместном использовании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка аргументов возвращает код 2, ошибка окна или рендерера — код 1, успешное завершение — код 0. Без `--frames` приложение работает до закрытия окна.
 
 Команда `cargo tree -p engine-render` позволяет проверить, что `engine-render` не зависит от winit.
 
@@ -151,7 +152,7 @@ cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
 
 ## Границы текущего renderer
 
-Рендерер выбирает устройство с Vulkan 1.3, dynamic rendering и synchronization2, создаёт offscreen-таргет в `R16G16B16A16_SFLOAT`, очищает его и линейно масштабирует в поддерживаемый surface-формат. `RendererConfig::render_scale` разделяет render resolution и output resolution. В коде пока нет геометрии, шейдеров, HDR-тонмаппинга, интеграции DLSS/FSR или tessellation pipeline. Поддержка tessellationShader сообщается через capabilities и включается при наличии у устройства; это не реализует тесселяцию.
+Рендерер выбирает устройство с Vulkan 1.3, dynamic rendering и synchronization2, создаёт offscreen-таргет в `R16G16B16A16_SFLOAT` с depth buffer `D32_SFLOAT`, очищает его, рисует меши и линейно масштабирует результат в поддерживаемый surface-формат. `RendererConfig::render_scale` разделяет render resolution и output resolution. Меши создаются через `Renderer::create_mesh` из вершин с позицией и цветом и индексов треугольников; `render_frame` принимает список `DrawCommand` с матрицей в clip space (Y вверх, глубина `[0, 1]`). Есть один pipeline с вершинными цветами, без текстур, освещения и отсечения граней. Буферы мешей лежат в host-visible памяти без staging-загрузки, удаления мешей нет. В коде пока нет HDR-тонмаппинга, интеграции DLSS/FSR или tessellation pipeline. Поддержка tessellationShader сообщается через capabilities и включается при наличии у устройства; это не реализует тесселяцию.
 
 Renderer проверяет наличие validation layer только в debug-сборке и продолжает работу без него, если слой не найден. Smoke-проверки не заменяют validation layers. При teardown вызывается `device_wait_idle`, но это ожидание само по себе не доказывает завершение всех операций presentation engine. Maintenance extensions для дополнительной синхронизации presentation resources сейчас не включены.
 

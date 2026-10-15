@@ -8,3 +8,4 @@ license.workspace = true
 engine-core = { path = "../engine-core" }
 engine-window = { path = "../engine-window" }
 engine-render = { path = "../engine-render" }
+glam.workspace = true
