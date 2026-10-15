@@ -1925,15 +1925,7 @@ fn record_frame(
 
     if let Some(pool) = scene.timestamps {
         // SAFETY: the slot fence was waited, so these queries are not in use; reset happens outside rendering.
-        unsafe {
-            device.cmd_reset_query_pool(command_buffer, pool, 0, TIMESTAMP_QUERY_COUNT);
-            device.cmd_write_timestamp2(
-                command_buffer,
-                vk::PipelineStageFlags2::TOP_OF_PIPE,
-                pool,
-                0,
-            );
-        }
+        unsafe { device.cmd_reset_query_pool(command_buffer, pool, 0, TIMESTAMP_QUERY_COUNT) };
     }
     let scene_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(if target.layout == vk::ImageLayout::UNDEFINED {
@@ -1974,6 +1966,19 @@ fn record_frame(
         .image(target.depth.image)
         .subresource_range(depth_subresource_range());
     pipeline_barrier(device, command_buffer, depth_barrier);
+    if let Some(pool) = scene.timestamps {
+        // Начало пишется на той же стадии, что и конец: ожидание предыдущей работы очереди
+        // (blit и оверлей прошлого кадра стоят за acquire и vsync) остаётся до замера.
+        // SAFETY: the query was reset above, outside rendering.
+        unsafe {
+            device.cmd_write_timestamp2(
+                command_buffer,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                pool,
+                0,
+            );
+        }
+    }
 
     let color_attachment = [vk::RenderingAttachmentInfo::default()
         .image_view(target.color.view)
