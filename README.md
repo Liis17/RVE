@@ -36,7 +36,6 @@ RVE — начальный каркас игрового движка на Rust 
 
 ```sh
 brew install molten-vk vulkan-loader
-cargo run -p sandbox -- --frames 120
 ```
 
 Адаптер сначала ищет `libvulkan.dylib` через системный загрузчик, затем пробует `/opt/homebrew/lib/libvulkan.dylib` для Homebrew на Apple Silicon. Альтернатива — Vulkan SDK с настроенным окружением по [инструкции MoltenVK](https://github.com/KhronosGroup/MoltenVK/blob/main/README.md). Установка одной библиотеки MoltenVK без Vulkan loader для этого пути недостаточна.
@@ -49,7 +48,18 @@ cargo run -p sandbox -- --frames 120
 
 ## Сборка и проверки
 
-Из корня репозитория:
+Артефакты Cargo сохраняются в `build/` в корне репозитория согласно
+`.cargo/config.toml`. Каталог исключён из Git. Сборка, проверки и запуск выполняются
+из `build/`. При первой подготовке создай каталог и перейди в него:
+
+```sh
+mkdir -p build
+cd build
+```
+
+В PowerShell для первого создания каталога используй `New-Item -ItemType Directory -Force build`, затем `Set-Location build`.
+
+Из `build/`:
 
 ```powershell
 cargo fmt --all --check
@@ -65,18 +75,24 @@ cargo build -p sandbox
 
 Тесты проверяют время игрового цикла, завершение оконного приложения и ошибки, настройки renderer, расширения Vulkan и параметры swapchain, требования платформенных адаптеров, CLI и обработку resize в sandbox. Интеграционный тест `engine/sandbox/tests/cli.rs` запускает бинарник с неверными аргументами и проверяет код выхода 2 и диагностику. Автотестам не нужны окно, GPU или Vulkan runtime; они не проверяют фактическую отрисовку и обработку событий ОС.
 
-Workflow [Rust CI](.github/workflows/ci.yml) запускается при push в любую ветку, для PR и вручную. На `windows-latest` и `macos-latest` выполняются:
+Workflow [Rust CI](.github/workflows/ci.yml) запускается при push в любую ветку, для PR и вручную. Скрипт `.github/scripts/affected_packages.py` читает граф workspace из `cargo metadata --no-deps` и выбирает изменённые крейты вместе со всеми транзитивно зависящими от них крейтами. Например, изменение `engine-core` проверяет `engine-core` и `sandbox`, а изменение независимого `engine-audio` — только `engine-audio`. Зависимости для компиляции выбранных крейтов Cargo собирает автоматически.
+
+Для PR сравниваются merge-base базовой ветки и head PR; для push — весь диапазон `before..after`. Общие настройки, `Cargo.lock`, CI и неизвестные пути запускают проверку всех крейтов. Ручной запуск, первый push новой ветки и недоступный `before` также проверяют весь workspace. Изменения только Markdown-документации вне крейтов, vault Obsidian и `LICENSE` пропускают проверки Rust.
+
+На `windows-latest` и `macos-latest` создаётся `build/`, затем из него выполняются проверки с `-p` для каждого выбранного крейта (пример для `engine-core`):
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo build --workspace --locked
-cargo test --workspace --locked
+cargo fmt -p engine-core -p sandbox --check
+cargo clippy -p engine-core -p sandbox --all-targets --locked -- -D warnings
+cargo build -p engine-core -p sandbox --locked
+cargo test -p engine-core -p sandbox --locked
 ```
 
-Общая проверка `CI` проходит только при успехе обеих платформ. Для `main` она должна быть обязательной в GitHub branch protection с требованием актуальности ветки относительно `main`; один workflow без защиты ветки не запрещает слияние. Порядок работы: коммит с кодом и тестами в рабочей ветке → push → PR → успешная `CI` → слияние.
+Тесты выбора крейтов выполняются в CI на Ubuntu; локальная команда: `python3 -B -m unittest discover -s .github/scripts -v` из корня репозитория.
 
-Запуск sandbox:
+Общая проверка `CI` требует успешного выбора крейтов и успеха обеих платформ, если выбраны крейты. При отсутствии затронутых крейтов она допускает пропуск платформенных заданий. Ошибка выбора крейтов, ошибка или отмена нужных проверок блокирует `CI`. Для `main` она должна быть обязательной в GitHub branch protection с требованием актуальности ветки относительно `main`; один workflow без защиты ветки не запрещает слияние. Порядок работы: коммит с кодом и тестами в рабочей ветке → push → PR → успешная `CI` → слияние.
+
+Запуск sandbox из `build/`:
 
 ```powershell
 cargo run -p sandbox
@@ -84,6 +100,41 @@ cargo run -p sandbox -- --frames 120
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
 cargo run -p sandbox -- --frames 300 --resize-test
 ```
+
+Для запуска собранного бинарника из того же рабочего каталога используй
+`./debug/sandbox` на macOS или `.\debug\sandbox.exe` на Windows.
+
+### Начальные настройки
+
+Перед созданием окна sandbox читает `bootstrap.rves` из текущего рабочего
+каталога. При принятом способе запуска это `build/bootstrap.rves`, независимо
+от расположения бинарника в `build/debug/` или `build/release/`.
+
+Для первой настройки скопируй шаблон из корня репозитория. Из `build/` на macOS:
+
+```sh
+cp ../bootstrap.rves.example bootstrap.rves
+```
+
+В PowerShell: `Copy-Item ../bootstrap.rves.example bootstrap.rves`.
+Повторное копирование заменяет локальные настройки; для дальнейших изменений
+редактируй сам `build/bootstrap.rves`:
+
+```text
+WindowSizeX=1280
+WindowSizeY=720
+```
+
+Одна строка задаёт один параметр; имена чувствительны к регистру. Размеры
+клиентской области окна задаются в физических пикселях положительными целыми
+числами `u32`. Пробелы вокруг имени и значения и пустые строки допускаются.
+Если файла или отдельного параметра нет, используется соответствующий размер
+по умолчанию: 1280 по X, 720 по Y. Некорректные значения, неизвестные или повторные
+параметры, строки без `=` и ошибки чтения файла останавливают запуск с кодом 2;
+ошибка разбора содержит имя файла и номер строки.
+
+Размер читается при старте; изменение файла применяется при следующем запуске.
+Файл в `build/` не попадает в Git; шаблон `bootstrap.rves.example` хранится в репозитории.
 
 `--frames N` завершает приложение после N успешных вызовов презентации; N — положительный `u64`. `--render-scale S` задаёт масштаб offscreen-разрешения и принимает конечное число из `(0, 1]`. `--resize-test` после 30 презентаций запрашивает 960×540, после 60 сворачивает окно на 250 мс и затем запрашивает восстановление 1280×720. При совместном использовании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка аргументов возвращает код 2, ошибка окна или рендерера — код 1, успешное завершение — код 0. Без `--frames` приложение работает до закрытия окна.
 

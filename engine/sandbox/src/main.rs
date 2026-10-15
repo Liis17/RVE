@@ -1,6 +1,8 @@
+mod bootstrap;
+
 use engine_core::Time;
 use engine_render::{FrameStatus, Renderer, RendererConfig};
-use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
+use engine_window::{PhysicalSize, Window, WindowHandler, run};
 use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -189,6 +191,7 @@ impl Sandbox {
 impl WindowHandler for Sandbox {
     fn init(&mut self, window: Arc<Window>) -> bool {
         let size = window.inner_size();
+        println!("Window: {}x{} (physical pixels)", size.width, size.height);
         let config = RendererConfig {
             render_scale: self.options.render_scale,
             ..RendererConfig::default()
@@ -287,7 +290,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config = WindowConfig::default();
+    let config = match bootstrap::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Ошибка настроек: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let mut app = Sandbox::new(options);
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
