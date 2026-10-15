@@ -453,6 +453,7 @@ fn main() -> ExitCode {
         title: bootstrap.window_title.unwrap_or(default_window.title),
         width: bootstrap.window_size_x.unwrap_or(default_window.width),
         height: bootstrap.window_size_y.unwrap_or(default_window.height),
+        ..WindowConfig::default()
     };
     let mut resources = match ResourceSystem::start(ResourceConfig {
         root: ASSETS_DIR.into(),
