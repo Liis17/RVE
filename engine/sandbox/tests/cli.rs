@@ -10,6 +10,7 @@ fn invalid_arguments_exit_with_code_two_and_usage_before_opening_a_window() {
         vec!["--render-scale", "NaN"],
         vec!["--render-scale", "0.5", "--render-scale", "1"],
         vec!["--resize-test", "--frames", "119"],
+        vec!["--debug-overlay", "--debug-overlay"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_sandbox"))
             .args(&arguments)

@@ -1,8 +1,10 @@
 mod bootstrap;
 mod content;
+mod debug_overlay;
 mod scene;
 
 use content::Content;
+use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
 use engine_render::{
@@ -15,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test] [--scene triangle|cube | --model /путь.fbx] [--texture /путь.png]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test] [--scene triangle|cube | --model /путь.fbx] [--texture /путь.png] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -28,6 +30,8 @@ struct Options {
     model: Option<String>,
     /// Путь PNG внутри `assets`, заменяющий текстуры сцены или модели.
     texture: Option<String>,
+    /// Показывать панель FPS, памяти и загрузки CPU/GPU.
+    debug_overlay: bool,
 }
 
 fn parse_args<I, S>(args: I) -> Result<Options, String>
@@ -42,6 +46,7 @@ where
     let mut scene = None;
     let mut model = None;
     let mut texture = None;
+    let mut debug_overlay = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--frames" => {
@@ -79,6 +84,12 @@ where
                     return Err("флаг --resize-test указан повторно".to_owned());
                 }
                 resize_test = true;
+            }
+            "--debug-overlay" => {
+                if debug_overlay {
+                    return Err("флаг --debug-overlay указан повторно".to_owned());
+                }
+                debug_overlay = true;
             }
             "--scene" => {
                 if scene.is_some() {
@@ -125,6 +136,7 @@ where
         scene: scene.unwrap_or_default(),
         model,
         texture,
+        debug_overlay,
     })
 }
 
@@ -159,6 +171,7 @@ struct Sandbox {
     options: Options,
     presented_frames: u64,
     resize_test: ResizeTest,
+    debug_overlay: Option<DebugOverlay>,
     failure: Option<String>,
 }
 
@@ -173,6 +186,7 @@ impl Sandbox {
             options,
             presented_frames: 0,
             resize_test: ResizeTest::default(),
+            debug_overlay: None,
             failure: None,
         }
     }
@@ -303,6 +317,12 @@ impl WindowHandler for Sandbox {
                     self.failure = Some(error);
                     return false;
                 }
+                if self.options.debug_overlay {
+                    self.debug_overlay = Some(DebugOverlay::new(
+                        &renderer.capabilities().device_name,
+                        Instant::now(),
+                    ));
+                }
                 self.renderer = Some(renderer);
                 true
             }
@@ -339,6 +359,11 @@ impl WindowHandler for Sandbox {
                 model,
             })
             .collect::<Vec<_>>();
+        let gpu_time = renderer.take_gpu_frame_time();
+        let overlay = match self.debug_overlay.as_mut() {
+            Some(overlay) => overlay.update(Instant::now(), gpu_time),
+            None => &[],
+        };
         let frame = Frame {
             clear_color: color,
             view_projection: self
@@ -347,11 +372,14 @@ impl WindowHandler for Sandbox {
                 .to_cols_array_2d(),
             light: DirectionalLight::default(),
             draws: &draws,
-            overlay: &[],
+            overlay,
         };
         match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {
                 self.presented_frames += 1;
+                if let Some(overlay) = self.debug_overlay.as_mut() {
+                    overlay.frame_presented();
+                }
                 self.advance_resize_test(window);
                 if self
                     .options
@@ -501,6 +529,7 @@ mod tests {
             scene: Scene::Cube,
             model: None,
             texture: None,
+            debug_overlay: false,
         });
         sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
         sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
@@ -556,6 +585,7 @@ mod tests {
             "triangle",
             "--texture",
             "/texture/paint.png",
+            "--debug-overlay",
         ])
         .expect("valid arguments should parse");
         assert_eq!(options.frames, Some(120));
@@ -564,6 +594,7 @@ mod tests {
         assert_eq!(options.scene, Scene::Triangle);
         assert_eq!(options.model, None);
         assert_eq!(options.texture.as_deref(), Some("/texture/paint.png"));
+        assert!(options.debug_overlay);
 
         let options = parse_args(["--model", "/model/cube.fbx"]).unwrap();
         assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
@@ -593,6 +624,8 @@ mod tests {
             vec!["--model", "/a.fbx", "--model", "/b.fbx"],
             vec!["--texture"],
             vec!["--texture", "/a.png", "--texture", "/b.png"],
+            vec!["--debug-overlay", "--debug-overlay"],
+            vec!["--debug-overlay", "1"],
             vec!["--scene", "cube", "--model", "/model/cube.fbx"],
             vec!["--model", "/model/cube.fbx", "--scene", "triangle"],
         ] {
@@ -609,5 +642,6 @@ mod tests {
         assert_eq!(options.scene, Scene::Cube);
         assert_eq!(options.model, None);
         assert_eq!(options.texture, None);
+        assert!(!options.debug_overlay);
     }
 }
