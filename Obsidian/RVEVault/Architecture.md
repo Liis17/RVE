@@ -16,6 +16,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 | naga 30.0.1 | Компиляция GLSL-шейдеров в SPIR-V при сборке, без Vulkan SDK | `engine/engine-render/build.rs` |
 | glam 0.34.1 | Камеры, трансформации, свет и матрицы сцены | `engine/engine-scene/src`, `engine/sandbox/src/scene.rs`, `engine/sandbox/src/content.rs` |
 | blake3 1.8.7 | ArchiveId, hashes chunks и полных decoded blobs | `engine/engine-pak/src` |
+| serde 1.0.229, toml 0.8.23 | Строгая типизированная конфигурация manifest для builder | `engine/engine-pak/src/builder.rs` |
 | zstd 0.14.2 | Независимые Zstandard frames в RVEPAK | `engine/engine-pak/src` |
 | lz4_flex 0.14.0 | Независимые LZ4 blocks в RVEPAK | `engine/engine-pak/src` |
 | sysinfo 0.39.6 (только фича `system`) | Память и загрузка CPU процесса для `--debug-overlay` | `engine/sandbox/src/debug_overlay.rs` |
@@ -41,6 +42,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
 - [[Engine/EngineFiles]] — канонические virtual paths и `ReadAt` для позиционного чтения.
 - [[Engine/EnginePak]] — версия 1 архива, потоковый writer, reader и каталог архивов.
+- `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG в память CPU, без зависимости от renderer.
 - [[Engine/EngineScene]] — камеры, трансформации и свет на glam, независимо от renderer.
 - [[Engine/Sandbox]] — приложение, соединяющее core, window, render, assets и scene.
@@ -50,7 +52,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 ## Направления зависимостей
 
 - `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `engine-scene`, glam, sysinfo и font8x8.
-- `engine-pak` зависит от `engine-files`, blake3, zstd и lz4_flex; `engine-files` не имеет внешних зависимостей. Эти два крейта пока не подключены к `engine-assets` или sandbox.
+- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; инструмент `rvepak` зависит от него. `engine-files` не имеет внешних зависимостей. Архивная runtime-загрузка пока не подключена к `engine-assets` или sandbox.
 - `engine-scene` зависит от glam и не зависит от renderer; sandbox передаёт его вычисленные матрицы через API renderer.
 - `engine-assets` зависит от ufbx и png; от renderer и окна не зависит.
 - `engine-window` зависит от winit.
@@ -64,9 +66,11 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 `engine-files::VirtualPath` задаёт case-sensitive UTF-8 namespace ресурсов, а `ReadAt` и `FileSource` читают абсолютные `u64`-диапазоны без общего archive lock. `engine-pak::Archive` проверяет header/index, открывает range reads по пересекающимся чанкам и проверяет chunk/full-blob BLAKE3. `ArchiveCatalog` проверяет уникальность полного virtual path и связывает external references только с local blob указанного владельца. `ArchiveWriter` записывает каждый локальный blob потоково и возвращает ArchiveId и BlobId/hash map для следующих архивов. Точная публичная раскладка v1 описана в [`docs/rvepak-format.md`](../../docs/rvepak-format.md).
 
+`engine-pak::preflight` раскрывает и проверяет все inputs manifest до BLAKE3 prepass и записи, а `execute` строит весь набор в staging directory, проверяет его через `ArchiveCatalog` и публикует с атомарным запретом замены существующего output. `tools/rvepak` предоставляет команды `build`, `list` и `verify`; только `verify` повторно декодирует все unique local blobs. Manifest и политика dedup описаны в [[Engine/EnginePak]].
+
 Чтение ограничивается configurable index, result, chunk и memory budgets. `ReadControl` резервирует footprint результата, stored/decoded чанка и codec workspace до аллокаций и позволяет отменить чтение между чанками. На Windows `seek_read` меняет file cursor, поэтому file-backed payload reads и worker reopenings используют независимые handles с проверкой ArchiveId; на Unix исходный positional handle остаётся закреплён за Archive.
 
-Каталог может обнаруживать верхнеуровневые `.rvepak` файлы без loose-file fallback. Загрузка из архива пока не включена в `engine-assets`, sandbox или графический путь.
+Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; загрузка из архива пока не включена в `engine-assets`, sandbox или графический путь.
 
 ## Основные потоки
 

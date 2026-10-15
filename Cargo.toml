@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine/*"]
+members = ["engine/*", "tools/*"]
 resolver = "3"
 
 [workspace.package]
@@ -18,7 +18,9 @@ lz4_flex = "=0.14.0"
 naga = { version = "=30.0.1", features = ["glsl-in", "spv-out", "wgsl-in"] }
 png = "=0.18.1"
 raw-window-handle = "=0.6.2"
+serde = { version = "=1.0.229", features = ["derive"] }
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
+toml = "=0.8.23"
 ufbx = "=0.11.5"
 winit = "=0.30.13"
 zstd = "=0.14.2"

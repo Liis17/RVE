@@ -1,4 +1,4 @@
-use crate::format::{ArchiveId, BlobId, FileReference};
+use crate::format::{ArchiveId, BlobId, Codec, ContentHash, FileReference};
 use crate::reader::{Archive, AssetStat, ReadControl, VerifyReport};
 use crate::{NoopReadControl, PakError, Result};
 use engine_files::VirtualPath;
@@ -26,6 +26,21 @@ impl Default for CatalogLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredArchive {
     pub path: PathBuf,
+}
+
+/// One catalog path and the local archive/blob that ultimately owns its bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogAsset {
+    pub path: VirtualPath,
+    /// Archive whose file table contains this path.
+    pub archive_id: ArchiveId,
+    /// Archive containing the local blob, which may differ for an external reference.
+    pub owner_archive_id: ArchiveId,
+    pub blob_id: BlobId,
+    pub size: u64,
+    pub content_hash: ContentHash,
+    pub codec: Codec,
+    pub chunk_count: u32,
 }
 
 /// Returns top-level regular files whose extension is `.rvepak`, sorted by filename.
@@ -180,6 +195,26 @@ impl ArchiveCatalog {
 
     pub fn list(&self) -> impl Iterator<Item = &VirtualPath> {
         self.paths.keys()
+    }
+
+    /// Returns every path with its declaration archive and resolved local blob owner.
+    pub fn entries(&self) -> Result<Vec<CatalogAsset>> {
+        self.paths
+            .iter()
+            .map(|(path, (archive_id, _))| {
+                let stat = self.stat(path)?;
+                Ok(CatalogAsset {
+                    path: path.clone(),
+                    archive_id: *archive_id,
+                    owner_archive_id: stat.owner_archive_id,
+                    blob_id: stat.blob_id,
+                    size: stat.size,
+                    content_hash: stat.content_hash,
+                    codec: stat.codec,
+                    chunk_count: stat.chunk_count,
+                })
+            })
+            .collect()
     }
 
     pub fn stat(&self, path: &VirtualPath) -> Result<AssetStat> {

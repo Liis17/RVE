@@ -14,6 +14,7 @@ RVE — игровой движок на Rust с выводом через Vulka
 | `engine-render` | Vulkan renderer: меши в offscreen-кадре и blit в swapchain | Работает |
 | `engine-files` | Канонические virtual paths и позиционное чтение файлов | Работает |
 | `engine-pak` | Чтение, запись и проверка каталогов RVEPAK v1 | Работает |
+| `rvepak` | Сборка, просмотр и проверка наборов RVEPAK из TOML manifest | Работает |
 | `engine-scene` | Игровые объекты, компоненты и сцены | Скелет |
 | `engine-assets` | Загрузка моделей FBX и текстур PNG из каталога `assets` | Работает |
 | `engine-physics` | Столкновения и физическая симуляция | Скелет |
@@ -22,9 +23,43 @@ RVE — игровой движок на Rust с выводом через Vulka
 | `sandbox` | Оконное приложение для проверки движка | Работает |
 
 `engine-files` и `engine-pak` предоставляют самостоятельную библиотеку виртуальных
-путей и архивов с positional reads, потоковой записью, диапазонными чтениями и
-межархивными ссылками. Эта библиотека пока не подключена к `engine-assets` или
-sandbox. Wire contract описан в [RVEPAK v1 format](docs/rvepak-format.md).
+путей и архивов с positional reads, потоковой записью, диапазонными чтениями,
+межархивными ссылками и reusable manifest builder. Инструмент `rvepak` собирает
+opaque файлы любого типа, но runtime-загрузка архивов пока не подключена к
+`engine-assets` или sandbox. Wire contract описан в [RVEPAK v1 format](docs/rvepak-format.md).
+
+### Сборка архивов ресурсов
+
+`rvepak` принимает один TOML manifest: `root` и `output` задаются относительно
+manifest-файла, `[[archives]]` задают упорядоченные `.rvepak` файлы, а
+`[[archives.inputs]]` выбирают файлы или каталоги относительно `root`. Каталоги
+обходятся рекурсивно; виртуальные пути остаются относительно `root`. Все форматы
+и расширения являются opaque bytes. Поля compression — `codec` (`none`, `zstd`,
+`lz4`), `chunk_size` и `zstd_level`; значения из `[defaults]` можно переопределить
+для каждого input. Неизвестные поля, повторные virtual paths, symlinks, пустые
+группы и небезопасные имена архивов отклоняются до записи.
+
+Пример полной схемы: [`rvepak.example.toml`](rvepak.example.toml). Запускай команды
+из `build/`; output directory должна ещё не существовать. Builder пишет все архивы
+во временный соседний каталог, проверяет общий `ArchiveCatalog`, затем публикует
+набор атомарно без замены существующего output.
+
+```sh
+cargo run -p rvepak -- build ../rvepak.example.toml
+cargo run -p rvepak -- build ../rvepak.example.toml --no-dedup
+cargo run -p rvepak -- list game-assets
+cargo run -p rvepak -- verify game-assets
+```
+
+Deduplication включена по умолчанию и использует BLAKE3 плюс размер до сжатия:
+первое в manifest вхождение владеет blob, повтор в том же архиве становится
+alias, а в следующем архиве — прямой ссылкой на архив-владелец. Компрессионные
+настройки повторов наследуются от владельца; builder сообщает об отличающихся
+overrides. `--no-dedup` сохраняет каждый input самостоятельным локальным blob.
+`list` показывает полный virtual path, размер, effective codec, владельца и
+межархивную зависимость; `verify` потоково проверяет каждый уникальный local blob.
+Успех возвращает код 0, ошибки аргументов, manifest или входных данных — 2,
+операционные ошибки ввода-вывода и повреждённого архива — 1.
 
 ## Требования
 
@@ -80,7 +115,7 @@ cargo build -p sandbox
 
 Каждая новая фича сопровождается тестами в том же коммите; исправление бага — регрессионным тестом. Общая команда `cargo test --workspace --locked` запускает unit-, integration- и doc-тесты всех крейтов. В крейтах-скелетах пока нет поведения для тестирования.
 
-Тесты проверяют время игрового цикла, завершение оконного приложения и ошибки, настройки renderer, расширения Vulkan и параметры swapchain, virtual paths, RVEPAK golden wire fixture, codecs и диапазонные чтения, повреждённые индексы, external references, память и cancellation, sparse offsets выше 4 GiB, декодирование PNG, загрузку FBX (триангуляция, нормали, UV, перевод осей и единиц, внешние и встроенные текстуры, ошибки), вписывание модели в кадр, проверку мешей и текстур, раскладку вершин, push constants и uniform-блока света, матрицу нормалей, встроенный SPIR-V, геометрию и проекции сцен sandbox, требования платформенных адаптеров, CLI и обработку resize в sandbox. Интеграционный тест `engine/sandbox/tests/cli.rs` запускает бинарник с неверными аргументами и отсутствующими или некорректными ресурсами и проверяет код выхода 2 и диагностику до открытия окна. Автотестам не нужны окно, GPU или Vulkan runtime; они не проверяют фактическую отрисовку и обработку событий ОС.
+Тесты проверяют время игрового цикла, завершение оконного приложения и ошибки, настройки renderer, расширения Vulkan и параметры swapchain, virtual paths, RVEPAK golden wire fixture, manifest preflight, opaque asset build, deduplication, aliases и external references, безопасную публикацию, CLI list/verify и коды выхода, codecs и диапазонные чтения, повреждённые индексы, память и cancellation, sparse offsets выше 4 GiB, декодирование PNG, загрузку FBX (триангуляция, нормали, UV, перевод осей и единиц, внешние и встроенные текстуры, ошибки), вписывание модели в кадр, проверку мешей и текстур, раскладку вершин, push constants и uniform-блока света, матрицу нормалей, встроенный SPIR-V, геометрию и проекции сцен sandbox, требования платформенных адаптеров и обработку resize в sandbox. Интеграционные тесты CLI запускают бинарники без окна или GPU. Автотестам не нужны окно, GPU или Vulkan runtime; они не проверяют фактическую отрисовку и обработку событий ОС.
 
 Workflow [Rust CI](.github/workflows/ci.yml) запускается при push в любую ветку, для PR и вручную. Скрипт `.github/scripts/affected_packages.py` читает граф workspace из `cargo metadata --no-deps` и выбирает изменённые крейты вместе со всеми транзитивно зависящими от них крейтами. Например, изменение `engine-core` проверяет `engine-core` и `sandbox`, а изменение независимого `engine-audio` — только `engine-audio`. Зависимости для компиляции выбранных крейтов Cargo собирает автоматически.
 

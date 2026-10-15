@@ -1,0 +1,16 @@
+# Paths in this manifest are relative to the directory containing this file.
+root = "build/assets"
+output = "build/game-assets"
+
+[defaults]
+codec = "zstd"
+chunk_size = 262144
+zstd_level = 3
+
+[[archives]]
+name = "game.rvepak"
+
+# A directory selector includes every regular file below it. Virtual paths stay
+# relative to `root`; files with the same basename in different folders are distinct.
+[[archives.inputs]]
+path = "."

@@ -10,13 +10,20 @@ from affected_packages import affected_packages, changed_paths
 ROOT = Path("/workspace")
 
 
-def package(name, dependencies=()):
+def package(name, dependencies=(), directory=None, dependency_directories=None):
+    package_directory = Path(directory) if directory else Path("engine") / name
+    dependency_directories = dependency_directories or {}
     return {
         "id": name,
         "name": name,
-        "manifest_path": str(ROOT / "engine" / name / "Cargo.toml"),
+        "manifest_path": str(ROOT / package_directory / "Cargo.toml"),
         "dependencies": [
-            {"name": dependency, "path": str(ROOT / "engine" / dependency)}
+            {
+                "name": dependency,
+                "path": str(ROOT / dependency_directories.get(
+                    dependency, Path("engine") / dependency
+                )),
+            }
             for dependency in dependencies
         ],
     }
@@ -99,6 +106,22 @@ class PackageSelectionTests(unittest.TestCase):
         self.metadata["packages"].append(nested)
         self.metadata["workspace_members"].append("nested")
         self.assertEqual(self.select(["engine/audio/nested/src/lib.rs"]), ["nested"])
+
+    def test_tool_ownership_and_engine_pak_dependents_are_selected(self):
+        pak_directory = "engine/engine-pak"
+        self.metadata["packages"] = [
+            package("engine-pak", directory=pak_directory),
+            package("engine-resources", ["engine-pak"],
+                    directory="engine/engine-resources",
+                    dependency_directories={"engine-pak": pak_directory}),
+            package("rvepak", ["engine-pak"], directory="tools/rvepak",
+                    dependency_directories={"engine-pak": pak_directory}),
+        ]
+        self.metadata["workspace_members"] = ["engine-pak", "engine-resources", "rvepak"]
+
+        self.assertEqual(self.select(["tools/rvepak/src/main.rs"]), ["rvepak"])
+        self.assertEqual(self.select(["engine/engine-pak/src/builder.rs"]),
+                         ["engine-pak", "engine-resources", "rvepak"])
 
 
 class ChangeRangeTests(unittest.TestCase):
