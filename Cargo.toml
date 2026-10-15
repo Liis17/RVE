@@ -13,5 +13,7 @@ ash-window = "=0.13.0"
 glam = "=0.34.1"
 # naga 30.0.1 не собирает glsl-in без wgsl-in или spv-in: модуль interpolator скрыт за ними.
 naga = { version = "=30.0.1", features = ["glsl-in", "spv-out", "wgsl-in"] }
+png = "=0.18.1"
 raw-window-handle = "=0.6.2"
+ufbx = "=0.11.5"
 winit = "=0.30.13"

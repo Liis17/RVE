@@ -16,6 +16,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 | `Obsidian/RVEVault/Engine/EngineWindow.md` | Окно и цикл событий |
 | `Obsidian/RVEVault/Engine/EnginePlatform.md` | Платформенные адаптеры Windows/macOS |
 | `Obsidian/RVEVault/Engine/EngineRender.md` | Vulkan renderer |
+| `Obsidian/RVEVault/Engine/EngineAssets.md` | Ресурсы: FBX и PNG из `assets` |
 | `Obsidian/RVEVault/Engine/Sandbox.md` | Пример приложения и CLI |
 
 ### Чтение памяти
