@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует треугольные меши с текстурой, направленным светом и depth buffer в offscreen-изображение и переносит его в swapchain. Модели FBX и текстуры PNG загружаются из каталога `assets`. Полноценные сцены, физика, звук и редактор пока не реализованы.
+RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. Математические компоненты камер, трансформаций и света предоставляет `engine-scene`; демонстрационная сцена с вращающимся кубом и плоскостью показывает отбрасываемые тени. Модели FBX и текстуры PNG загружаются из каталога `assets`. Физика, звук и редактор пока не реализованы.
 
 ## Стек
 
@@ -14,7 +14,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 | winit 0.30.13 | Окно и цикл событий | `engine/engine-window/Cargo.toml` |
 | ash 0.38.0 | Vulkan bindings и runtime-загрузка loader | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
 | naga 30.0.1 | Компиляция GLSL-шейдеров в SPIR-V при сборке, без Vulkan SDK | `engine/engine-render/build.rs` |
-| glam 0.34.1 | Матрицы трансформации и перспективы в sandbox | `engine/sandbox/src/scene.rs`, `engine/sandbox/src/content.rs` |
+| glam 0.34.1 | Камеры, трансформации, свет и матрицы сцены | `engine/engine-scene/src`, `engine/sandbox/src/scene.rs`, `engine/sandbox/src/content.rs` |
 | sysinfo 0.39.6 (только фича `system`) | Память и загрузка CPU процесса для `--debug-overlay` | `engine/sandbox/src/debug_overlay.rs` |
 | font8x8 0.3.1 | Bitmap-шрифт 8×8 оверлея | `engine/sandbox/src/debug_overlay.rs` |
 | ufbx 0.11.5 | Загрузка FBX; C-библиотека собирается через `cc` | `engine/engine-assets/src/lib.rs` |
@@ -37,18 +37,20 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - [[Engine/EnginePlatform]] — общий интерфейс и отдельные адаптеры Windows/macOS.
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG в память CPU, без зависимости от renderer.
-- [[Engine/Sandbox]] — приложение, соединяющее core, window, render и assets.
+- [[Engine/EngineScene]] — камеры, трансформации и свет на glam, независимо от renderer.
+- [[Engine/Sandbox]] — приложение, соединяющее core, window, render, assets и scene.
 
-Четыре остальных крейта — документированные скелеты: `engine-scene`, `engine-physics`, `engine-audio`, `engine-editor`. В `engine/engine-scene/src/lib.rs`, `engine/engine-physics/src/lib.rs`, `engine/engine-audio/src/lib.rs` и `engine/engine-editor/src/lib.rs` находятся только комментарии назначения; типов, модулей и зависимостей пока нет.
+Три оставшихся крейта — скелеты: `engine-physics`, `engine-audio`, `engine-editor`. Их `src/lib.rs` содержат только комментарии назначения; типов, модулей и зависимостей пока нет.
 
 ## Направления зависимостей
 
-- `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`, `engine-assets`, glam, sysinfo и font8x8.
+- `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `engine-scene`, glam, sysinfo и font8x8.
+- `engine-scene` зависит от glam и не зависит от renderer; sandbox передаёт его вычисленные матрицы через API renderer.
 - `engine-assets` зависит от ufbx и png; от renderer и окна не зависит.
 - `engine-window` зависит от winit.
 - `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit и glam; naga — его build-зависимость.
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
-- `engine-core` и четыре крейта-скелета не имеют внешних зависимостей.
+- `engine-core` и три крейта-скелета не имеют внешних зависимостей.
 
 Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-assets/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
 
@@ -72,9 +74,9 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ### Vulkan-кадр
 
-`Renderer::new` загружает Vulkan loader и создаёт surface через `engine-platform`; объединяет требования платформы с расширениями surface/swapchain и конфигурации. Общий renderer создаёт instance с флагами адаптера и выбирает физическое устройство с API не ниже 1.3, поддержкой dynamic rendering и synchronization2, общей graphics/present queue family и подходящими форматами. Дискретное устройство получает приоритет. При нулевом начальном размере создание swapchain и offscreen-изображений откладывается.
+`Renderer::new` загружает Vulkan loader и создаёт surface через `engine-platform`; объединяет требования платформы с расширениями surface/swapchain и конфигурации. Общий renderer создаёт instance с флагами адаптера и выбирает физическое устройство с API не ниже 1.3, поддержкой dynamic rendering и synchronization2, общей graphics/present queue family и подходящими форматами. Дискретное устройство получает приоритет. При нулевом начальном размере создание swapchain и per-frame offscreen-targets откладывается; общая shadow map создаётся при инициализации renderer.
 
-При инициализации sandbox загружает текстуры содержимого через `Renderer::create_texture` (staging-копия с ожиданием fence) и его меши через `Renderer::create_mesh`; у модели FBX по мешу на каждый материал. `Sandbox::frame` тикает `Time` и передаёт в `Renderer::render_frame` `Frame` с меняющимся clear color, матрицей камеры, направленным светом и `DrawCommand` с матрицей модели; матрицы рассчитывает glam. Renderer записывает параметры света в uniform buffer текущего слота кадра, а `clip_from_model` и матрицу нормалей — в push constants. Renderer очищает цвет и глубину offscreen-target через dynamic rendering, рисует меши единственным graphics pipeline, затем линейно blit-ит изображение в приобретённый swapchain image, при непустом `Frame::overlay` рисует поверх него 2D-треугольники оверлея в разрешении окна и вызывает present. Время scene pass измеряется timestamp queries и доступно через `Renderer::take_gpu_frame_time`. При resize swapchain и per-frame targets пересоздаются; нулевой размер пропускает кадр. `render_scale` задаёт отдельное render resolution; размеры рассчитываются через floor и ограничиваются минимумом 1×1.
+При инициализации sandbox загружает текстуры содержимого через `Renderer::create_texture` (staging-копия с ожиданием fence) и его меши через `Renderer::create_mesh`; у модели FBX по мешу на каждый материал. `Sandbox::frame` использует одно значение elapsed для движения объекта, камеры и солнца и передаёт в `Frame` матрицы камеры и света, освещение, меняющийся clear color и `DrawCommand` для объекта и окружения. Матрицы рассчитывают `engine-scene` и glam, renderer получает их в виде массивов `f32`. Renderer сначала записывает depth-only shadow pass в общую карту глубины, затем очищает цвет и глубину offscreen-target и рисует сцену, где mesh shader читает тень. После scene pass renderer линейно blit-ит изображение в приобретённый swapchain image, при непустом `Frame::overlay` рисует поверх него 2D-треугольники оверлея в разрешении окна и вызывает present. Время shadow и scene pass измеряется timestamp queries и доступно через `Renderer::take_gpu_frame_time`; замер может немного занижать время, если начало shadow pass перекрывается с хвостом предыдущего кадра. При resize swapchain и per-frame targets пересоздаются; нулевой размер пропускает кадр. `render_scale` задаёт отдельное render resolution; размеры рассчитываются через floor и ограничиваются минимумом 1×1.
 
 Источники: `engine/engine-render/src/lib.rs`, `engine/engine-platform-windows/src/lib.rs`, `engine/engine-platform-macos/src/lib.rs`, `engine/sandbox/src/main.rs`.
 
@@ -85,7 +87,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - `engine-assets` собирает C-исходник ufbx через `cc`, поэтому сборке нужен C-компилятор целевой платформы: MSVC на Windows, clang на macOS. Кросс-проверка Windows с macOS (`--target x86_64-pc-windows-gnu`) требует MinGW или исключения `engine-assets` и `sandbox`.
 - Целевые runtime — настольные Windows с Vulkan-драйвером GPU и macOS с Vulkan loader и MoltenVK. Остальные ОС не имеют платформенных адаптеров; мобильный lifecycle не реализован.
 - Требуется Vulkan 1.3 и фактическая поддержка требуемых features, очереди, surface usage и форматов; наличие самого Vulkan loader недостаточно.
-- Renderer рисует треугольные меши одним mesh pipeline (отдельный overlay pipeline рисует только нетекстурированные 2D-треугольники оверлея): одна текстура на draw, умноженная на цвет вершины, и один направленный свет с ambient. Mipmaps, specular, теней, PBR-материалов, staging-загрузки мешей и удаления мешей и текстур нет. HDR/тонмаппинг, DLSS/FSR и tessellation pipeline отсутствуют.
+- Renderer рисует меши одним scene pipeline после depth-only shadow pass (отдельный overlay pipeline рисует 2D-треугольники оверлея): одна текстура на draw, умноженная на цвет вершины, направленный свет с ambient и PCF 3×3 для теней. Текущая реализация использует одну общую карту `D32_SFLOAT` размером 2048×2048, без specular, PBR, каскадов, mipmaps, staging-загрузки мешей и удаления мешей и текстур. HDR/тонмаппинг, DLSS/FSR и tessellation pipeline отсутствуют.
 - Контракт `Frame::view_projection`: мировое пространство → clip space с осью Y вверх и глубиной `[0, 1]`; Y переворачивается отрицательной высотой viewport. `DrawCommand::model` переводит модель в мировое пространство.
 - При отсутствии `VK_LAYER_KHRONOS_validation` debug renderer сообщает об этом и продолжает без слоя. Vulkan SDK для текущего пути не нужен; macOS требует отдельно установленного Vulkan loader и MoltenVK либо окружения SDK.
 - Базовый teardown renderer вызывает `device_wait_idle`, но это не доказывает завершение всех операций presentation engine. Maintenance extensions для этого сейчас не включены.
