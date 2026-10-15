@@ -326,7 +326,7 @@ impl Renderer {
         &self.capabilities
     }
 
-    /// Забирает GPU-время scene pass последнего завершённого кадра.
+    /// Забирает GPU-время shadow и scene pass последнего завершённого кадра.
     ///
     /// Каждое измерение возвращается один раз; `None` — нового измерения нет
     /// или очередь не поддерживает timestamp queries. Вывод в окно и оверлей
@@ -1865,7 +1865,7 @@ struct FrameResources {
     /// Вершины оверлея этого слота и ёмкость буфера в байтах.
     overlay_buffer: Option<HostBuffer>,
     overlay_capacity: usize,
-    /// Пул из двух timestamp вокруг scene pass; `None`, если очередь их не поддерживает.
+    /// Пул из двух timestamp: перед shadow pass и после scene pass; `None`, если очередь их не поддерживает.
     timestamps: Option<vk::QueryPool>,
     /// Timestamp записаны и отправлены, но ещё не прочитаны.
     timestamps_pending: bool,
@@ -1904,7 +1904,7 @@ impl FrameResources {
         Ok(frame)
     }
 
-    /// Читает GPU-время scene pass, записанное прошлой отправкой этого слота.
+    /// Читает GPU-время shadow и scene pass, записанное прошлой отправкой этого слота.
     ///
     /// Вызывается после ожидания fence слота.
     fn read_gpu_time(

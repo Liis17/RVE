@@ -1,6 +1,9 @@
 //! Содержимое кадра sandbox: демонстрационная сцена или модель из assets.
 
-use crate::scene::{Scene, plane_mesh, shadows_light_direction, shadows_light_view_projection};
+use crate::scene::{
+    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, plane_mesh, shadows_light_direction,
+    shadows_light_view_projection,
+};
 use engine_assets::{Model, TextureData};
 use engine_render::{DirectionalLight, Vertex};
 use glam::{Mat4, Vec3};
@@ -117,8 +120,8 @@ impl Content {
         }
         DirectionalLight {
             direction: shadows_light_direction(elapsed).to_array(),
-            color: [1.0; 3],
-            ambient: [0.15; 3],
+            color: SHADOWS_LIGHT_COLOR,
+            ambient: SHADOWS_AMBIENT,
         }
     }
 

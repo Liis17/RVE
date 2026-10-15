@@ -32,6 +32,13 @@ const SHADOWS_SUN: OrbitingSun = OrbitingSun {
     angular_speed: -std::f32::consts::TAU / 12.0,
 };
 
+pub(super) const SHADOWS_LIGHT_CENTER: Vec3 = Vec3::ZERO;
+/// Сфера охватывает углы плоскости (радиус √3 ≈ 1.73) и вращающийся куб.
+/// Для `--model` этого достаточно: `fit` вписывает модель в единичный куб.
+pub(super) const SHADOWS_LIGHT_RADIUS: f32 = 1.8;
+pub(super) const SHADOWS_LIGHT_COLOR: [f32; 3] = [1.0; 3];
+pub(super) const SHADOWS_AMBIENT: [f32; 3] = [0.15; 3];
+
 impl Scene {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
@@ -81,7 +88,11 @@ pub fn shadows_light_direction(elapsed: f32) -> Vec3 {
 }
 
 pub fn shadows_light_view_projection(elapsed: f32) -> Mat4 {
-    shadow_view_projection(shadows_light_direction(elapsed), Vec3::ZERO, 1.8)
+    shadow_view_projection(
+        shadows_light_direction(elapsed),
+        SHADOWS_LIGHT_CENTER,
+        SHADOWS_LIGHT_RADIUS,
+    )
 }
 
 /// Квадратная плоскость 2×2 на высоте −1, с обходом CCW со стороны +Y.
@@ -471,9 +482,34 @@ mod tests {
                 projected.x.abs() <= 1.0 && projected.z.abs() <= 1.0,
                 "{projected:?}"
             );
+        }
+    }
 
-            let clip = shadows_light_view_projection(elapsed) * Vec3::ZERO.extend(1.0);
-            assert!(clip.w.is_finite());
+    #[test]
+    fn shadow_map_covers_rotating_cube_and_plane_for_full_sun_orbit() {
+        let (cube_vertices, _) = cube_mesh();
+        let (plane_vertices, _) = plane_mesh();
+        for step in 0..=64 {
+            let elapsed = step as f32 * 12.0 / 64.0;
+            let light_view_projection = shadows_light_view_projection(elapsed);
+            let model = Scene::Shadows.model(elapsed);
+
+            for (name, position) in cube_vertices
+                .iter()
+                .map(|vertex| ("cube", model.transform_point3(Vec3::from(vertex.position))))
+                .chain(
+                    plane_vertices
+                        .iter()
+                        .map(|vertex| ("plane", Vec3::from(vertex.position))),
+                )
+            {
+                let clip = light_view_projection * position.extend(1.0);
+                let ndc = clip.truncate() / clip.w;
+                assert!(
+                    ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z),
+                    "{name} t={elapsed}: {ndc:?}"
+                );
+            }
         }
     }
 }
