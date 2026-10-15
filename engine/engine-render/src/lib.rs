@@ -7,6 +7,7 @@ use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
@@ -14,6 +15,20 @@ const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const MESH_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
+const OVERLAY_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.vert.spv"));
+const OVERLAY_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/overlay.frag.spv"));
+/// Swapchain принимает blit кадра и затем рисование оверлея.
+const SWAPCHAIN_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::TRANSFER_DST.as_raw() | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
+);
+const SURFACE_FORMAT_FEATURES: vk::FormatFeatureFlags = vk::FormatFeatureFlags::from_raw(
+    vk::FormatFeatureFlags::BLIT_DST.as_raw()
+        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND.as_raw(),
+);
+const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
+/// Два timestamp на слот кадра: начало и конец scene pass.
+const TIMESTAMP_QUERY_COUNT: u32 = 2;
 /// Белая текстура 1x1 создаётся при инициализации и используется для `texture: None`.
 const WHITE_TEXTURE: usize = 0;
 const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
@@ -30,6 +45,17 @@ pub struct Vertex {
     pub normal: [f32; 3],
     pub uv: [f32; 2],
     pub color: [f32; 3],
+}
+
+/// Вершина 2D-оверлея, рисуемого поверх кадра в разрешении окна.
+///
+/// `position` задаётся в физических пикселях от левого верхнего угла окна,
+/// `color` — линейный RGB с непредумноженной альфой.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OverlayVertex {
+    pub position: [f32; 2],
+    pub color: [f32; 4],
 }
 
 /// Идентификатор меша, созданного [`Renderer::create_mesh`].
@@ -75,12 +101,16 @@ impl Default for DirectionalLight {
 ///
 /// `view_projection` переводит мировое пространство в clip space и задаётся по столбцам.
 /// Ось Y clip space направлена вверх, глубина после деления на `w` лежит в `[0, 1]`.
+/// `overlay` — треугольники (по три вершины), которые рисуются с альфа-смешиванием
+/// поверх итогового изображения без масштабирования `render_scale`; пустой срез
+/// отключает оверлей.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
     pub clear_color: [f32; 4],
     pub view_projection: [[f32; 4]; 4],
     pub light: DirectionalLight,
     pub draws: &'a [DrawCommand],
+    pub overlay: &'a [OverlayVertex],
 }
 
 /// Настройки Vulkan-рендерера.
@@ -187,6 +217,13 @@ pub struct Renderer {
     command_pool: Option<vk::CommandPool>,
     pipeline_layout: Option<vk::PipelineLayout>,
     pipeline: Option<vk::Pipeline>,
+    overlay_pipeline_layout: Option<vk::PipelineLayout>,
+    overlay_pipeline: Option<vk::Pipeline>,
+    /// Значащие биты timestamp очереди; ноль — измерение времени GPU недоступно.
+    timestamp_valid_bits: u32,
+    /// Наносекунд на один тик timestamp.
+    timestamp_period: f32,
+    pending_gpu_time: Option<Duration>,
     frame_set_layout: Option<vk::DescriptorSetLayout>,
     texture_set_layout: Option<vk::DescriptorSetLayout>,
     frame_descriptor_pool: Option<vk::DescriptorPool>,
@@ -234,6 +271,11 @@ impl Renderer {
             command_pool: None,
             pipeline_layout: None,
             pipeline: None,
+            overlay_pipeline_layout: None,
+            overlay_pipeline: None,
+            timestamp_valid_bits: 0,
+            timestamp_period: 0.0,
+            pending_gpu_time: None,
             frame_set_layout: None,
             texture_set_layout: None,
             frame_descriptor_pool: None,
@@ -265,6 +307,15 @@ impl Renderer {
     /// Возвращает характеристики выбранного GPU.
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    /// Забирает GPU-время scene pass последнего завершённого кадра.
+    ///
+    /// Каждое измерение возвращается один раз; `None` — нового измерения нет
+    /// или очередь не поддерживает timestamp queries. Вывод в окно и оверлей
+    /// не учитываются: они ждут готовности swapchain image.
+    pub fn take_gpu_frame_time(&mut self) -> Option<Duration> {
+        self.pending_gpu_time.take()
     }
 
     /// Отмечает физический размер клиентской области как изменённый.
@@ -318,6 +369,7 @@ impl Renderer {
     /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
         validate_draws(frame.draws, self.meshes.len(), self.textures.len())?;
+        validate_overlay(frame.overlay)?;
         let uniforms = frame_uniform_bytes(&frame.light)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(FrameStatus::Skipped);
@@ -327,6 +379,7 @@ impl Renderer {
             return Ok(FrameStatus::Skipped);
         }
 
+        let instance = self.instance()?.clone();
         let device = self.device()?.clone();
         let swapchain_loader = self.swapchain_loader()?.clone();
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
@@ -335,7 +388,7 @@ impl Renderer {
         let frame_slot = self.frame_slot;
         let frame_resources = self
             .frames
-            .get(frame_slot)
+            .get_mut(frame_slot)
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
         let fence = frame_resources.fence;
         let image_available = frame_resources.image_available;
@@ -345,6 +398,16 @@ impl Renderer {
 
         // SAFETY: fence принадлежит текущему слоту и предыдущая работа этого слота завершается перед повторным использованием.
         unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        if let Some(gpu_time) = frame_resources.read_gpu_time(
+            &device,
+            self.timestamp_valid_bits,
+            self.timestamp_period,
+        )? {
+            self.pending_gpu_time = Some(gpu_time);
+        }
+        // Fence слота дождались, поэтому GPU больше не читает вершины оверлея этого слота.
+        frame_resources.write_overlay(&instance, &device, self.physical_device, frame.overlay)?;
+        let timestamps = frame_resources.timestamps;
         let frame_uniforms =
             self.frame_uniforms
                 .get(frame_slot)
@@ -392,8 +455,26 @@ impl Renderer {
             view_projection: frame.view_projection,
             draws: frame.draws,
             clear_color: frame.clear_color,
+            timestamps,
         };
-        let target = self.frames[frame_slot]
+        let frame_resources = &mut self.frames[frame_slot];
+        let overlay =
+            match &frame_resources.overlay_buffer {
+                Some(buffer) if !frame.overlay.is_empty() => Some(OverlayPass {
+                    pipeline: self
+                        .overlay_pipeline
+                        .ok_or(RenderError::InvalidState("overlay pipeline отсутствует"))?,
+                    pipeline_layout: self.overlay_pipeline_layout.ok_or(
+                        RenderError::InvalidState("overlay pipeline layout отсутствует"),
+                    )?,
+                    vertex_buffer: buffer.buffer,
+                    // validate_overlay проверил, что число вершин помещается в u32.
+                    vertex_count: frame.overlay.len() as u32,
+                    view: swapchain.views[image_index],
+                }),
+                _ => None,
+            };
+        let target = frame_resources
             .target
             .as_mut()
             .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
@@ -405,6 +486,7 @@ impl Renderer {
             swapchain.extent,
             offscreen_extent,
             &scene,
+            overlay.as_ref(),
         )?;
 
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
@@ -429,6 +511,8 @@ impl Renderer {
             .signal_semaphore_infos(&signal_infos)];
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
         unsafe { device.queue_submit2(self.queue, &submit_info, fence) }?;
+        // Результаты timestamp читаются после следующего ожидания fence этого слота.
+        self.frames[frame_slot].timestamps_pending = timestamps.is_some();
 
         let wait_semaphores = [render_finished];
         let swapchains = [swapchain_handle];
@@ -569,6 +653,8 @@ impl Renderer {
         self.physical_device = choice.physical_device;
         self.queue_family_index = choice.queue_family_index;
         self.surface_format = choice.surface_format;
+        self.timestamp_valid_bits = choice.timestamp_valid_bits;
+        self.timestamp_period = choice.timestamp_period;
         self.capabilities = Capabilities {
             device_name: choice.device_name,
             vendor_id: choice.vendor_id,
@@ -625,6 +711,7 @@ impl Renderer {
         self.create_frame_resources()?;
         self.create_descriptor_resources()?;
         self.create_mesh_pipeline()?;
+        self.create_overlay_pipeline()?;
         let white = self.upload_texture(1, 1, &[255; 4])?;
         self.textures.push(white);
 
@@ -641,9 +728,13 @@ impl Renderer {
             .command_buffer_count(FRAMES_IN_FLIGHT as u32);
         // SAFETY: command pool was created for the selected graphics queue family.
         let command_buffers = unsafe { self.device()?.allocate_command_buffers(&allocate_info) }?;
+        let timestamps = self.timestamp_valid_bits != 0;
         for command_buffer in command_buffers {
-            self.frames
-                .push(FrameResources::new(self.device()?, command_buffer)?);
+            self.frames.push(FrameResources::new(
+                self.device()?,
+                command_buffer,
+                timestamps,
+            )?);
         }
         Ok(())
     }
@@ -989,6 +1080,99 @@ impl Renderer {
         Ok(())
     }
 
+    /// Pipeline оверлея: 2D-треугольники с альфа-смешиванием прямо в swapchain image.
+    fn create_overlay_pipeline(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let push_constant_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(OVERLAY_PUSH_CONSTANTS_SIZE as u32)];
+        let layout_info =
+            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constant_ranges);
+        // SAFETY: the layout has a single small vertex push-constant range and no descriptor sets.
+        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
+        self.overlay_pipeline_layout = Some(layout);
+
+        let vertex_module = ShaderModule::new(&device, OVERLAY_VERTEX_SHADER)?;
+        let fragment_module = ShaderModule::new(&device, OVERLAY_FRAGMENT_SHADER)?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_module.handle)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_module.handle)
+                .name(c"main"),
+        ];
+        let vertex_bindings = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<OverlayVertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let vertex_attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(std::mem::offset_of!(OverlayVertex, position) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(std::mem::offset_of!(OverlayVertex, color) as u32),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let color_formats = [self.surface_format.format];
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering_info)];
+        // SAFETY: shader modules, layout and the surface color format are valid for this device.
+        let pipelines = unsafe {
+            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+        }
+        .map_err(|(_, error)| RenderError::Vulkan(error))?;
+        self.overlay_pipeline = pipelines.into_iter().next();
+        Ok(())
+    }
+
     fn recreate_swapchain(&mut self) -> Result<(), RenderError> {
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(());
@@ -1103,6 +1287,14 @@ impl Drop for Renderer {
                 // SAFETY: the only pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
+            if let Some(pipeline) = self.overlay_pipeline.take() {
+                // SAFETY: the device is idle, so no command buffer uses this pipeline.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            if let Some(layout) = self.overlay_pipeline_layout.take() {
+                // SAFETY: the only pipeline created with this layout was destroyed above.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
             for layout in [self.frame_set_layout.take(), self.texture_set_layout.take()]
                 .into_iter()
                 .flatten()
@@ -1142,6 +1334,8 @@ struct DeviceChoice {
     api_version: u32,
     discrete: bool,
     tessellation_shader: bool,
+    timestamp_valid_bits: u32,
+    timestamp_period: f32,
 }
 
 fn choose_device(
@@ -1232,9 +1426,9 @@ fn choose_device(
         }?;
         if !surface_capabilities
             .supported_usage_flags
-            .contains(vk::ImageUsageFlags::TRANSFER_DST)
+            .contains(SWAPCHAIN_USAGE)
         {
-            reasons.push("surface не поддерживает TRANSFER_DST".to_owned());
+            reasons.push("surface не поддерживает TRANSFER_DST и COLOR_ATTACHMENT".to_owned());
         }
         // SAFETY: surface query only reads capabilities for the live device and surface.
         let surface_formats = unsafe {
@@ -1249,13 +1443,14 @@ fn choose_device(
         }
         let surface_format = choose_surface_format(instance, physical_device, &surface_formats);
         if surface_format.is_none() {
-            reasons.push("нет surface-формата с BLIT_DST".to_owned());
+            reasons.push("нет surface-формата с BLIT_DST и COLOR_ATTACHMENT_BLEND".to_owned());
         }
 
         let queue_families =
             // SAFETY: queue-family properties are read from the live physical device.
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let mut queue_family_index = None;
+        let mut timestamp_valid_bits = 0;
         for (index, family) in queue_families.iter().enumerate() {
             if !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
                 continue;
@@ -1269,6 +1464,7 @@ fn choose_device(
                 )
             }? {
                 queue_family_index = Some(index as u32);
+                timestamp_valid_bits = family.timestamp_valid_bits;
                 break;
             }
         }
@@ -1293,6 +1489,8 @@ fn choose_device(
             api_version: properties.api_version,
             discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             tessellation_shader,
+            timestamp_valid_bits,
+            timestamp_period: properties.limits.timestamp_period,
         };
         let score = i32::from(choice.discrete);
         if best
@@ -1319,7 +1517,7 @@ fn choose_surface_format(
         };
         return properties
             .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::BLIT_DST)
+            .contains(SURFACE_FORMAT_FEATURES)
             .then_some(vk::SurfaceFormatKHR {
                 format: vk::Format::B8G8R8A8_SRGB,
                 color_space: formats[0].color_space,
@@ -1333,7 +1531,7 @@ fn choose_surface_format(
         };
         if properties
             .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::BLIT_DST)
+            .contains(SURFACE_FORMAT_FEATURES)
         {
             supported.push(*format);
         }
@@ -1353,6 +1551,7 @@ struct SwapchainBundle {
     device: ash::Device,
     handle: vk::SwapchainKHR,
     images: Vec<vk::Image>,
+    views: Vec<vk::ImageView>,
     render_finished: Vec<vk::Semaphore>,
     extent: vk::Extent2D,
 }
@@ -1374,12 +1573,9 @@ impl SwapchainBundle {
         let capabilities = unsafe {
             surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
         }?;
-        if !capabilities
-            .supported_usage_flags
-            .contains(vk::ImageUsageFlags::TRANSFER_DST)
-        {
+        if !capabilities.supported_usage_flags.contains(SWAPCHAIN_USAGE) {
             return Err(RenderError::Unsupported(
-                "surface больше не поддерживает TRANSFER_DST".to_owned(),
+                "surface больше не поддерживает TRANSFER_DST и COLOR_ATTACHMENT".to_owned(),
             ));
         }
         let extent = select_surface_extent(capabilities, requested_extent);
@@ -1401,7 +1597,7 @@ impl SwapchainBundle {
             .image_color_space(surface_format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
+            .image_usage(SWAPCHAIN_USAGE)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(composite_alpha)
@@ -1415,12 +1611,22 @@ impl SwapchainBundle {
             device: device.clone(),
             handle,
             images: Vec::new(),
+            views: Vec::new(),
             render_finished: Vec::new(),
             extent,
         };
         // SAFETY: the swapchain was just created by this loader and is still alive.
         bundle.images = unsafe { loader.get_swapchain_images(bundle.handle) }?;
-        for _ in &bundle.images {
+        for &image in &bundle.images {
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(surface_format.format)
+                .components(vk::ComponentMapping::default())
+                .subresource_range(color_subresource_range());
+            // SAFETY: the view matches the swapchain image format and its single color subresource.
+            let view = unsafe { device.create_image_view(&view_info, None) }?;
+            bundle.views.push(view);
             // SAFETY: a default semaphore create info is valid for a binary semaphore.
             let semaphore =
                 unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
@@ -1435,6 +1641,10 @@ impl Drop for SwapchainBundle {
         for semaphore in self.render_finished.drain(..) {
             // SAFETY: the swapchain is idle before bundle replacement/destruction.
             unsafe { self.device.destroy_semaphore(semaphore, None) };
+        }
+        for view in self.views.drain(..) {
+            // SAFETY: views of swapchain images are destroyed before the swapchain that owns the images.
+            unsafe { self.device.destroy_image_view(view, None) };
         }
         if self.handle != vk::SwapchainKHR::null() {
             let loader = ash::khr::swapchain::Device::new(&self.instance, &self.device);
@@ -1451,16 +1661,31 @@ struct FrameResources {
     fence: vk::Fence,
     image_available: vk::Semaphore,
     target: Option<OffscreenTarget>,
+    /// Вершины оверлея этого слота и ёмкость буфера в байтах.
+    overlay_buffer: Option<HostBuffer>,
+    overlay_capacity: usize,
+    /// Пул из двух timestamp вокруг scene pass; `None`, если очередь их не поддерживает.
+    timestamps: Option<vk::QueryPool>,
+    /// Timestamp записаны и отправлены, но ещё не прочитаны.
+    timestamps_pending: bool,
 }
 
 impl FrameResources {
-    fn new(device: &ash::Device, command_buffer: vk::CommandBuffer) -> Result<Self, RenderError> {
+    fn new(
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+        timestamps: bool,
+    ) -> Result<Self, RenderError> {
         let mut frame = Self {
             device: device.clone(),
             command_buffer,
             fence: vk::Fence::null(),
             image_available: vk::Semaphore::null(),
             target: None,
+            overlay_buffer: None,
+            overlay_capacity: 0,
+            timestamps: None,
+            timestamps_pending: false,
         };
         // SAFETY: creating an unsignaled binary semaphore uses a valid default create info.
         frame.image_available =
@@ -1468,12 +1693,82 @@ impl FrameResources {
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         // SAFETY: the fence starts signaled so the first frame can wait before using the slot.
         frame.fence = unsafe { device.create_fence(&fence_info, None) }?;
+        if timestamps {
+            let pool_info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(TIMESTAMP_QUERY_COUNT);
+            // SAFETY: the queue family reported non-zero timestampValidBits.
+            frame.timestamps = Some(unsafe { device.create_query_pool(&pool_info, None) }?);
+        }
         Ok(frame)
+    }
+
+    /// Читает GPU-время scene pass, записанное прошлой отправкой этого слота.
+    ///
+    /// Вызывается после ожидания fence слота.
+    fn read_gpu_time(
+        &mut self,
+        device: &ash::Device,
+        valid_bits: u32,
+        period: f32,
+    ) -> Result<Option<Duration>, RenderError> {
+        let Some(pool) = self.timestamps.filter(|_| self.timestamps_pending) else {
+            return Ok(None);
+        };
+        self.timestamps_pending = false;
+        let mut ticks = [0_u64; TIMESTAMP_QUERY_COUNT as usize];
+        // SAFETY: both queries were reset and written by a submission whose fence was waited.
+        match unsafe {
+            device.get_query_pool_results(pool, 0, &mut ticks, vk::QueryResultFlags::TYPE_64)
+        } {
+            Ok(()) => Ok(Some(timestamp_duration(
+                ticks[0], ticks[1], valid_bits, period,
+            ))),
+            Err(vk::Result::NOT_READY) => Ok(None),
+            Err(error) => Err(RenderError::Vulkan(error)),
+        }
+    }
+
+    /// Копирует вершины оверлея в буфер слота, увеличивая его при нехватке места.
+    ///
+    /// Вызывается после ожидания fence слота, когда GPU уже не читает прежний буфер.
+    fn write_overlay(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        vertices: &[OverlayVertex],
+    ) -> Result<(), RenderError> {
+        if vertices.is_empty() {
+            return Ok(());
+        }
+        let bytes = overlay_vertex_bytes(vertices);
+        if self.overlay_buffer.is_none() || self.overlay_capacity < bytes.len() {
+            let capacity = bytes.len().next_power_of_two();
+            self.overlay_buffer = None;
+            self.overlay_capacity = 0;
+            self.overlay_buffer = Some(HostBuffer::new(
+                instance,
+                device,
+                physical_device,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                &vec![0; capacity],
+            )?);
+            self.overlay_capacity = capacity;
+        }
+        self.overlay_buffer
+            .as_ref()
+            .ok_or(RenderError::InvalidState("буфер оверлея отсутствует"))?
+            .write(bytes)
     }
 }
 
 impl Drop for FrameResources {
     fn drop(&mut self) {
+        if let Some(pool) = self.timestamps.take() {
+            // SAFETY: the renderer waits for device idle before dropping frame resources.
+            unsafe { self.device.destroy_query_pool(pool, None) };
+        }
         if self.fence != vk::Fence::null() {
             // SAFETY: the renderer waits for device idle before dropping frame resources.
             unsafe { self.device.destroy_fence(self.fence, None) };
@@ -1610,6 +1905,7 @@ impl Drop for DeviceImage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_frame(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -1618,6 +1914,7 @@ fn record_frame(
     output_extent: vk::Extent2D,
     render_extent: vk::Extent2D,
     scene: &ScenePass<'_>,
+    overlay: Option<&OverlayPass>,
 ) -> Result<(), RenderError> {
     // SAFETY: this frame's command buffer is no longer in flight because its fence was waited.
     unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty()) }?;
@@ -1626,6 +1923,10 @@ fn record_frame(
     // SAFETY: the command buffer was reset and belongs to the renderer's graphics command pool.
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
 
+    if let Some(pool) = scene.timestamps {
+        // SAFETY: the slot fence was waited, so these queries are not in use; reset happens outside rendering.
+        unsafe { device.cmd_reset_query_pool(command_buffer, pool, 0, TIMESTAMP_QUERY_COUNT) };
+    }
     let scene_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(if target.layout == vk::ImageLayout::UNDEFINED {
             vk::PipelineStageFlags2::NONE
@@ -1665,6 +1966,19 @@ fn record_frame(
         .image(target.depth.image)
         .subresource_range(depth_subresource_range());
     pipeline_barrier(device, command_buffer, depth_barrier);
+    if let Some(pool) = scene.timestamps {
+        // Начало пишется на той же стадии, что и конец: ожидание предыдущей работы очереди
+        // (blit и оверлей прошлого кадра стоят за acquire и vsync) остаётся до замера.
+        // SAFETY: the query was reset above, outside rendering.
+        unsafe {
+            device.cmd_write_timestamp2(
+                command_buffer,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                pool,
+                0,
+            );
+        }
+    }
 
     let color_attachment = [vk::RenderingAttachmentInfo::default()
         .image_view(target.color.view)
@@ -1700,6 +2014,18 @@ fn record_frame(
     record_draws(device, command_buffer, render_extent, scene);
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
+    if let Some(pool) = scene.timestamps {
+        // Конец scene pass: blit и оверлей ждут swapchain image и в замер не входят.
+        // SAFETY: the query was reset at the start of this command buffer.
+        unsafe {
+            device.cmd_write_timestamp2(
+                command_buffer,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                pool,
+                1,
+            );
+        }
+    }
 
     let source_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -1720,6 +2046,7 @@ fn record_frame(
         output_image,
         render_extent,
         output_extent,
+        overlay,
     );
     // SAFETY: command recording is complete before the command buffer is submitted.
     unsafe { device.end_command_buffer(command_buffer) }?;
@@ -1736,6 +2063,16 @@ struct ScenePass<'a> {
     view_projection: [[f32; 4]; 4],
     draws: &'a [DrawCommand],
     clear_color: [f32; 4],
+    timestamps: Option<vk::QueryPool>,
+}
+
+/// Рисование вершин оверлея поверх swapchain image после blit.
+struct OverlayPass {
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    vertex_buffer: vk::Buffer,
+    vertex_count: u32,
+    view: vk::ImageView,
 }
 
 fn record_draws(
@@ -1823,6 +2160,7 @@ fn record_output_pass(
     output_image: vk::Image,
     render_extent: vk::Extent2D,
     output_extent: vk::Extent2D,
+    overlay: Option<&OverlayPass>,
 ) {
     // TRANSFER связывает переход layout с ожиданием acquire на этой стадии.
     let output_barrier = vk::ImageMemoryBarrier2::default()
@@ -1867,18 +2205,104 @@ fn record_output_pass(
     // SAFETY: source/destination images support the requested blit formats and layouts.
     unsafe { device.cmd_blit_image2(command_buffer, &blit_info) };
 
+    let (last_stage, last_access, last_layout) = match overlay {
+        Some(overlay) => {
+            record_overlay(device, command_buffer, output_image, output_extent, overlay);
+            (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            )
+        }
+        None => (
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        ),
+    };
     let present_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .src_stage_mask(last_stage)
+        .src_access_mask(last_access)
         .dst_stage_mask(vk::PipelineStageFlags2::NONE)
         .dst_access_mask(vk::AccessFlags2::NONE)
-        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .old_layout(last_layout)
         .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(output_image)
         .subresource_range(color_subresource_range());
     pipeline_barrier(device, command_buffer, present_barrier);
+}
+
+/// Рисует оверлей поверх результата blit; image остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
+fn record_overlay(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    output_image: vk::Image,
+    output_extent: vk::Extent2D,
+    overlay: &OverlayPass,
+) {
+    let to_attachment = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(
+            vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        )
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(output_image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, to_attachment);
+
+    let area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: output_extent,
+    };
+    // Результат blit сохраняется: оверлей смешивается поверх него.
+    let color_attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(overlay.view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(area)
+        .layer_count(1)
+        .color_attachments(&color_attachment);
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: output_extent.width as f32,
+        height: output_extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let push_constants =
+        float_bytes::<OVERLAY_PUSH_CONSTANTS_SIZE>(&[viewport[0].width, viewport[0].height]);
+    // SAFETY: the view belongs to the output image, the pipeline matches the swapchain format,
+    // and the vertex buffer holds vertex_count overlay vertices written after the slot fence.
+    unsafe {
+        device.cmd_begin_rendering(command_buffer, &rendering_info);
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            overlay.pipeline,
+        );
+        device.cmd_set_viewport(command_buffer, 0, &viewport);
+        device.cmd_set_scissor(command_buffer, 0, &[area]);
+        device.cmd_bind_vertex_buffers(command_buffer, 0, &[overlay.vertex_buffer], &[0]);
+        device.cmd_push_constants(
+            command_buffer,
+            overlay.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            &push_constants,
+        );
+        device.cmd_draw(command_buffer, overlay.vertex_count, 1, 0, 0);
+        device.cmd_end_rendering(command_buffer);
+    }
 }
 
 fn pipeline_barrier(
@@ -2142,6 +2566,34 @@ fn validate_texture(
     Ok(())
 }
 
+fn validate_overlay(vertices: &[OverlayVertex]) -> Result<(), RenderError> {
+    if !vertices.len().is_multiple_of(3) {
+        return Err(RenderError::InvalidMesh(
+            "число вершин оверлея должно быть кратным трём",
+        ));
+    }
+    if u32::try_from(vertices.len()).is_err() {
+        return Err(RenderError::InvalidMesh("слишком много вершин оверлея"));
+    }
+    Ok(())
+}
+
+/// Длительность между timestamp с учётом значащих бит и переполнения счётчика.
+fn timestamp_duration(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> Duration {
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1_u64 << valid_bits) - 1
+    };
+    let ticks = end.wrapping_sub(start) & mask;
+    Duration::from_nanos((ticks as f64 * f64::from(period_ns)) as u64)
+}
+
+fn overlay_vertex_bytes(vertices: &[OverlayVertex]) -> &[u8] {
+    // SAFETY: OverlayVertex is repr(C) and consists only of f32 fields without padding.
+    unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast(), size_of_val(vertices)) }
+}
+
 fn vertex_bytes(vertices: &[Vertex]) -> &[u8] {
     // SAFETY: Vertex is repr(C) and consists only of f32 fields without padding.
     unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast(), size_of_val(vertices)) }
@@ -2313,18 +2765,25 @@ fn select_composite_alpha(
 mod tests {
     use super::{
         DirectionalLight, DrawCommand, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, MeshId,
-        RenderError, RendererConfig, TextureId, Vertex, check_extensions, deduplicate_names,
-        frame_uniform_bytes, index_bytes, missing_extensions, multiply, normal_matrix,
-        push_constant_bytes, scaled_extent, scene_viewport, select_composite_alpha,
-        select_surface_extent, validate_draws, validate_mesh, validate_render_scale,
+        OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex, RenderError, RendererConfig,
+        TextureId, Vertex, check_extensions, deduplicate_names, frame_uniform_bytes, index_bytes,
+        missing_extensions, multiply, normal_matrix, overlay_vertex_bytes, push_constant_bytes,
+        scaled_extent, scene_viewport, select_composite_alpha, select_surface_extent,
+        timestamp_duration, validate_draws, validate_mesh, validate_overlay, validate_render_scale,
         validate_texture, vertex_bytes,
     };
     use ash::vk;
     use std::ffi::{CStr, CString};
+    use std::time::Duration;
 
     #[test]
     fn embedded_shaders_are_spirv_words() {
-        for shader in [MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER] {
+        for shader in [
+            MESH_VERTEX_SHADER,
+            MESH_FRAGMENT_SHADER,
+            OVERLAY_VERTEX_SHADER,
+            OVERLAY_FRAGMENT_SHADER,
+        ] {
             let words = ash::util::read_spv(&mut std::io::Cursor::new(shader)).unwrap();
             assert_eq!(words[0], 0x0723_0203);
         }
@@ -2804,6 +3263,68 @@ mod tests {
                 width: 1920,
                 height: 1080,
             }
+        );
+    }
+
+    #[test]
+    fn overlay_validation_requires_whole_triangles() {
+        let vertex = OverlayVertex::default();
+        assert!(validate_overlay(&[]).is_ok());
+        assert!(validate_overlay(&[vertex; 3]).is_ok());
+        assert!(validate_overlay(&[vertex; 6]).is_ok());
+        for count in [1, 2, 4] {
+            assert!(matches!(
+                validate_overlay(&vec![vertex; count]),
+                Err(RenderError::InvalidMesh(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn overlay_vertices_are_tightly_packed_floats() {
+        let vertices = [OverlayVertex {
+            position: [1.0, 2.0],
+            color: [0.25, 0.5, 0.75, 1.0],
+        }];
+        let bytes = overlay_vertex_bytes(&vertices);
+        assert_eq!(bytes.len(), 6 * size_of::<f32>());
+        let floats = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_ne_bytes(*chunk))
+            .collect::<Vec<_>>();
+        assert_eq!(floats, [1.0, 2.0, 0.25, 0.5, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn timestamp_duration_scales_ticks_by_period() {
+        assert_eq!(
+            timestamp_duration(100, 1_100, 64, 1.0),
+            Duration::from_nanos(1_000)
+        );
+        assert_eq!(
+            timestamp_duration(0, 1_000, 64, 2.5),
+            Duration::from_nanos(2_500)
+        );
+        assert_eq!(timestamp_duration(5, 5, 64, 1.0), Duration::ZERO);
+    }
+
+    #[test]
+    fn timestamp_duration_handles_counter_wrap_within_valid_bits() {
+        let max = (1_u64 << 36) - 1;
+        assert_eq!(
+            timestamp_duration(max - 9, 10, 36, 1.0),
+            Duration::from_nanos(20)
+        );
+        // Биты выше timestampValidBits не определены и отбрасываются.
+        assert_eq!(
+            timestamp_duration(1 << 40, (1 << 40) + 7 + (1 << 37), 36, 1.0),
+            Duration::from_nanos(7)
+        );
+        assert_eq!(
+            timestamp_duration(u64::MAX, 4, 64, 1.0),
+            Duration::from_nanos(5)
         );
     }
 }
