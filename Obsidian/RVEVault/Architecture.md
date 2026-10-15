@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует цветные треугольные меши с depth buffer в offscreen-изображение и переносит его в swapchain. Полноценные сцены, ресурсы, физика, звук и редактор пока не реализованы.
+RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует треугольные меши с текстурой, направленным светом и depth buffer в offscreen-изображение и переносит его в swapchain. Полноценные сцены, ресурсы, физика, звук и редактор пока не реализованы.
 
 ## Стек
 
@@ -65,7 +65,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 `Renderer::new` загружает Vulkan loader и создаёт surface через `engine-platform`; объединяет требования платформы с расширениями surface/swapchain и конфигурации. Общий renderer создаёт instance с флагами адаптера и выбирает физическое устройство с API не ниже 1.3, поддержкой dynamic rendering и synchronization2, общей graphics/present queue family и подходящими форматами. Дискретное устройство получает приоритет. При нулевом начальном размере создание swapchain и offscreen-изображений откладывается.
 
-При инициализации sandbox загружает меш выбранной сцены через `Renderer::create_mesh`. `Sandbox::frame` тикает `Time` и передаёт в `Renderer::render_frame` меняющийся clear color и `DrawCommand` с матрицей, рассчитанной glam. Renderer очищает цвет и глубину offscreen-target через dynamic rendering, рисует меши единственным graphics pipeline, затем линейно blit-ит изображение в приобретённый swapchain image и вызывает present. При resize swapchain и per-frame targets пересоздаются; нулевой размер пропускает кадр. `render_scale` задаёт отдельное render resolution; размеры рассчитываются через floor и ограничиваются минимумом 1×1.
+При инициализации sandbox загружает меш выбранной сцены через `Renderer::create_mesh` и её текстуру через `Renderer::create_texture` (staging-копия с ожиданием fence). `Sandbox::frame` тикает `Time` и передаёт в `Renderer::render_frame` `Frame` с меняющимся clear color, матрицей камеры, направленным светом и `DrawCommand` с матрицей модели; матрицы рассчитывает glam. Renderer записывает параметры света в uniform buffer текущего слота кадра, а `clip_from_model` и матрицу нормалей — в push constants. Renderer очищает цвет и глубину offscreen-target через dynamic rendering, рисует меши единственным graphics pipeline, затем линейно blit-ит изображение в приобретённый swapchain image и вызывает present. При resize swapchain и per-frame targets пересоздаются; нулевой размер пропускает кадр. `render_scale` задаёт отдельное render resolution; размеры рассчитываются через floor и ограничиваются минимумом 1×1.
 
 Источники: `engine/engine-render/src/lib.rs`, `engine/engine-platform-windows/src/lib.rs`, `engine/engine-platform-macos/src/lib.rs`, `engine/sandbox/src/main.rs`.
 
@@ -75,8 +75,8 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 - Целевые runtime — настольные Windows с Vulkan-драйвером GPU и macOS с Vulkan loader и MoltenVK. Остальные ОС не имеют платформенных адаптеров; мобильный lifecycle не реализован.
 - Требуется Vulkan 1.3 и фактическая поддержка требуемых features, очереди, surface usage и форматов; наличие самого Vulkan loader недостаточно.
-- Renderer рисует только треугольные меши с вершинным цветом одним pipeline; текстур, освещения, материалов, staging-загрузки и удаления мешей нет. HDR/тонмаппинг, DLSS/FSR и tessellation pipeline отсутствуют.
-- Контракт `DrawCommand::transform`: clip space с осью Y вверх и глубиной `[0, 1]`; Y переворачивается отрицательной высотой viewport.
+- Renderer рисует треугольные меши одним pipeline: одна текстура на draw, умноженная на цвет вершины, и один направленный свет с ambient. Mipmaps, specular, теней, PBR-материалов, staging-загрузки мешей и удаления мешей и текстур нет. HDR/тонмаппинг, DLSS/FSR и tessellation pipeline отсутствуют.
+- Контракт `Frame::view_projection`: мировое пространство → clip space с осью Y вверх и глубиной `[0, 1]`; Y переворачивается отрицательной высотой viewport. `DrawCommand::model` переводит модель в мировое пространство.
 - При отсутствии `VK_LAYER_KHRONOS_validation` debug renderer сообщает об этом и продолжает без слоя. Vulkan SDK для текущего пути не нужен; macOS требует отдельно установленного Vulkan loader и MoltenVK либо окружения SDK.
 - Базовый teardown renderer вызывает `device_wait_idle`, но это не доказывает завершение всех операций presentation engine. Maintenance extensions для этого сейчас не включены.
 

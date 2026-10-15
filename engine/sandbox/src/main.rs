@@ -2,7 +2,9 @@ mod bootstrap;
 mod scene;
 
 use engine_core::Time;
-use engine_render::{DrawCommand, FrameStatus, MeshId, Renderer, RendererConfig};
+use engine_render::{
+    DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId,
+};
 use engine_window::{PhysicalSize, Window, WindowHandler, run};
 use scene::Scene;
 use std::env;
@@ -107,6 +109,7 @@ struct ResizeTest {
 struct Sandbox {
     renderer: Option<Renderer>,
     mesh: Option<MeshId>,
+    texture: Option<TextureId>,
     size: PhysicalSize<u32>,
     time: Time,
     options: Options,
@@ -120,6 +123,7 @@ impl Sandbox {
         Self {
             renderer: None,
             mesh: None,
+            texture: None,
             size: PhysicalSize::new(0, 0),
             time: Time::new(),
             options,
@@ -233,11 +237,20 @@ impl WindowHandler for Sandbox {
                     capabilities.tessellation_shader
                 );
                 let (vertices, indices) = self.options.scene.mesh();
-                match renderer.create_mesh(vertices, indices) {
+                match renderer.create_mesh(&vertices, &indices) {
                     Ok(mesh) => self.mesh = Some(mesh),
                     Err(error) => {
                         self.failure = Some(format!("ошибка создания меша: {error}"));
                         return false;
+                    }
+                }
+                if let Some(texture) = self.options.scene.texture() {
+                    match renderer.create_texture(texture.width, texture.height, &texture.rgba) {
+                        Ok(texture) => self.texture = Some(texture),
+                        Err(error) => {
+                            self.failure = Some(format!("ошибка создания текстуры: {error}"));
+                            return false;
+                        }
                     }
                 }
                 self.renderer = Some(renderer);
@@ -266,15 +279,21 @@ impl WindowHandler for Sandbox {
             self.failure = Some("рендерер отсутствует".to_owned());
             return false;
         };
+        let scene = self.options.scene;
         let draws = [DrawCommand {
             mesh,
-            transform: self
-                .options
-                .scene
-                .transform(elapsed, self.size.width, self.size.height)
-                .to_cols_array_2d(),
+            texture: self.texture,
+            model: scene.model(elapsed).to_cols_array_2d(),
         }];
-        match renderer.render_frame(color, &draws) {
+        let frame = Frame {
+            clear_color: color,
+            view_projection: scene
+                .view_projection(self.size.width, self.size.height)
+                .to_cols_array_2d(),
+            light: DirectionalLight::default(),
+            draws: &draws,
+        };
+        match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {
                 self.presented_frames += 1;
                 self.advance_resize_test(window);

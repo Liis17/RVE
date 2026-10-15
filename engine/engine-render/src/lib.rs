@@ -11,14 +11,24 @@ use std::sync::Arc;
 const FRAMES_IN_FLIGHT: usize = 2;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+const TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const MESH_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
+/// Белая текстура 1x1 создаётся при инициализации и используется для `texture: None`.
+const WHITE_TEXTURE: usize = 0;
+const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
+const FRAME_UNIFORMS_SIZE: usize = 3 * size_of::<[f32; 4]>();
 
-/// Вершина меша: позиция в пространстве модели и линейный RGB-цвет.
+/// Вершина меша в пространстве модели.
+///
+/// `uv` отсчитывается от левого верхнего угла текстуры, `color` умножается
+/// на цвет текстуры в линейном RGB.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vertex {
     pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
     pub color: [f32; 3],
 }
 
@@ -26,14 +36,51 @@ pub struct Vertex {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MeshId(usize);
 
-/// Команда рисования меша с матрицей в clip space.
+/// Идентификатор текстуры, созданной [`Renderer::create_texture`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TextureId(usize);
+
+/// Команда рисования меша.
 ///
-/// `transform` задаётся по столбцам. Ось Y clip space направлена вверх,
-/// глубина после деления на `w` лежит в `[0, 1]`.
+/// `model` переводит пространство модели в мировое и задаётся по столбцам.
+/// Без текстуры меш рисуется белой текстурой, то есть цветом вершин.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawCommand {
     pub mesh: MeshId,
-    pub transform: [[f32; 4]; 4],
+    pub texture: Option<TextureId>,
+    pub model: [[f32; 4]; 4],
+}
+
+/// Направленный свет и фоновое освещение сцены в линейном RGB.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirectionalLight {
+    /// Направление лучей в мировом пространстве; длина не важна, но не может быть нулевой.
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub ambient: [f32; 3],
+}
+
+impl Default for DirectionalLight {
+    /// Свет сверху слева со стороны камеры, смотрящей вдоль -Z.
+    fn default() -> Self {
+        Self {
+            direction: [0.4, -0.7, -0.6],
+            color: [1.0, 1.0, 1.0],
+            ambient: [0.15, 0.15, 0.15],
+        }
+    }
+}
+
+/// Описание кадра для [`Renderer::render_frame`].
+///
+/// `view_projection` переводит мировое пространство в clip space и задаётся по столбцам.
+/// Ось Y clip space направлена вверх, глубина после деления на `w` лежит в `[0, 1]`.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame<'a> {
+    pub clear_color: [f32; 4],
+    pub view_projection: [[f32; 4]; 4],
+    pub light: DirectionalLight,
+    pub draws: &'a [DrawCommand],
 }
 
 /// Настройки Vulkan-рендерера.
@@ -73,6 +120,7 @@ pub enum RenderError {
     NoSuitableDevice(Vec<String>),
     InvalidState(&'static str),
     InvalidMesh(&'static str),
+    InvalidTexture(String),
 }
 
 impl fmt::Display for RenderError {
@@ -94,6 +142,7 @@ impl fmt::Display for RenderError {
             }
             Self::InvalidState(message) => write!(f, "некорректное состояние рендерера: {message}"),
             Self::InvalidMesh(message) => write!(f, "некорректный меш: {message}"),
+            Self::InvalidTexture(message) => write!(f, "некорректная текстура: {message}"),
         }
     }
 }
@@ -138,7 +187,14 @@ pub struct Renderer {
     command_pool: Option<vk::CommandPool>,
     pipeline_layout: Option<vk::PipelineLayout>,
     pipeline: Option<vk::Pipeline>,
+    frame_set_layout: Option<vk::DescriptorSetLayout>,
+    texture_set_layout: Option<vk::DescriptorSetLayout>,
+    frame_descriptor_pool: Option<vk::DescriptorPool>,
+    frame_uniforms: Vec<FrameUniforms>,
+    sampler: Option<vk::Sampler>,
+    max_texture_size: u32,
     meshes: Vec<MeshBuffers>,
+    textures: Vec<Texture>,
     frames: Vec<FrameResources>,
     frame_slot: usize,
     swapchain: Option<SwapchainBundle>,
@@ -178,7 +234,14 @@ impl Renderer {
             command_pool: None,
             pipeline_layout: None,
             pipeline: None,
+            frame_set_layout: None,
+            texture_set_layout: None,
+            frame_descriptor_pool: None,
+            frame_uniforms: Vec::new(),
+            sampler: None,
+            max_texture_size: 0,
             meshes: Vec::new(),
+            textures: Vec::new(),
             frames: Vec::new(),
             frame_slot: 0,
             swapchain: None,
@@ -239,13 +302,23 @@ impl Renderer {
         Ok(MeshId(self.meshes.len() - 1))
     }
 
-    /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
-    pub fn render_frame(
+    /// Загружает sRGB-текстуру RGBA8 со строками сверху вниз и ждёт завершения копирования.
+    pub fn create_texture(
         &mut self,
-        clear_color: [f32; 4],
-        draws: &[DrawCommand],
-    ) -> Result<FrameStatus, RenderError> {
-        validate_draws(draws, self.meshes.len())?;
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<TextureId, RenderError> {
+        validate_texture(width, height, rgba.len(), self.max_texture_size)?;
+        let texture = self.upload_texture(width, height, rgba)?;
+        self.textures.push(texture);
+        Ok(TextureId(self.textures.len() - 1))
+    }
+
+    /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
+    pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
+        validate_draws(frame.draws, self.meshes.len(), self.textures.len())?;
+        let uniforms = frame_uniform_bytes(&frame.light)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(FrameStatus::Skipped);
         }
@@ -260,18 +333,27 @@ impl Renderer {
             "swapchain отсутствует после создания",
         ))?;
         let frame_slot = self.frame_slot;
-        let frame = self
+        let frame_resources = self
             .frames
             .get(frame_slot)
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
-        let fence = frame.fence;
-        let image_available = frame.image_available;
-        let command_buffer = frame.command_buffer;
+        let fence = frame_resources.fence;
+        let image_available = frame_resources.image_available;
+        let command_buffer = frame_resources.command_buffer;
         let swapchain_handle = swapchain.handle;
         let image_count = swapchain.images.len();
 
         // SAFETY: fence принадлежит текущему слоту и предыдущая работа этого слота завершается перед повторным использованием.
         unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        let frame_uniforms =
+            self.frame_uniforms
+                .get(frame_slot)
+                .ok_or(RenderError::InvalidState(
+                    "нет uniform-буфера текущего кадра",
+                ))?;
+        // Fence слота дождались, поэтому GPU больше не читает этот буфер.
+        frame_uniforms.buffer.write(&uniforms)?;
+        let frame_set = frame_uniforms.set;
         // SAFETY: swapchain живёт в self до окончания acquire и получает валидный semaphore.
         let (image_index, acquire_suboptimal) = match unsafe {
             swapchain_loader.acquire_next_image(
@@ -304,9 +386,12 @@ impl Renderer {
             pipeline_layout: self
                 .pipeline_layout
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
+            frame_set,
             meshes: &self.meshes,
-            draws,
-            clear_color,
+            textures: &self.textures,
+            view_projection: frame.view_projection,
+            draws: frame.draws,
+            clear_color: frame.clear_color,
         };
         let target = self.frames[frame_slot]
             .target
@@ -530,8 +615,18 @@ impl Renderer {
         // SAFETY: device and queue-family index are valid for this renderer.
         self.command_pool =
             Some(unsafe { self.device()?.create_command_pool(&command_pool_info, None) }?);
+        // SAFETY: physical_device was selected from this live instance.
+        let limits = unsafe {
+            self.instance()?
+                .get_physical_device_properties(self.physical_device)
+        }
+        .limits;
+        self.max_texture_size = limits.max_image_dimension2_d;
         self.create_frame_resources()?;
+        self.create_descriptor_resources()?;
         self.create_mesh_pipeline()?;
+        let white = self.upload_texture(1, 1, &[255; 4])?;
+        self.textures.push(white);
 
         if self.output_extent.width != 0 && self.output_extent.height != 0 {
             self.recreate_swapchain()?;
@@ -553,15 +648,252 @@ impl Renderer {
         Ok(())
     }
 
+    /// Создаёт layout дескрипторов, sampler и uniform-буферы освещения для каждого кадра.
+    fn create_descriptor_resources(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let frame_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let frame_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&frame_bindings);
+        // SAFETY: the binding describes one fragment-stage uniform buffer.
+        self.frame_set_layout =
+            Some(unsafe { device.create_descriptor_set_layout(&frame_layout_info, None) }?);
+        let texture_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let texture_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&texture_bindings);
+        // SAFETY: the bindings describe a fragment-stage sampled image and sampler.
+        self.texture_set_layout =
+            Some(unsafe { device.create_descriptor_set_layout(&texture_layout_info, None) }?);
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .max_lod(0.0);
+        // SAFETY: the sampler uses core filtering and addressing modes without anisotropy.
+        self.sampler = Some(unsafe { device.create_sampler(&sampler_info, None) }?);
+
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(self.frames.len() as u32)];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(self.frames.len() as u32)
+            .pool_sizes(&pool_sizes);
+        // SAFETY: the pool holds exactly one uniform-buffer set per frame slot.
+        let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+        self.frame_descriptor_pool = Some(pool);
+        let layouts = vec![self.frame_set_layout()?; self.frames.len()];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&layouts);
+        // SAFETY: the pool was sized for these sets and the layout is alive.
+        let sets = unsafe { device.allocate_descriptor_sets(&allocate_info) }?;
+        for set in sets {
+            let buffer = HostBuffer::new(
+                self.instance()?,
+                &device,
+                self.physical_device,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                &[0; FRAME_UNIFORMS_SIZE],
+            )?;
+            let buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(buffer.buffer)
+                .offset(0)
+                .range(FRAME_UNIFORMS_SIZE as vk::DeviceSize)];
+            let write = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&buffer_info)];
+            // SAFETY: the set and buffer are alive and no command buffer uses the set yet.
+            unsafe { device.update_descriptor_sets(&write, &[]) };
+            self.frame_uniforms.push(FrameUniforms { buffer, set });
+        }
+        Ok(())
+    }
+
+    /// Копирует пиксели через staging-буфер в device-local image и создаёт её дескрипторы.
+    fn upload_texture(&self, width: u32, height: u32, rgba: &[u8]) -> Result<Texture, RenderError> {
+        let device = self.device()?;
+        let extent = vk::Extent2D { width, height };
+        let image = DeviceImage::new(
+            self.instance()?,
+            device,
+            self.physical_device,
+            extent,
+            TEXTURE_FORMAT,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            color_subresource_range(),
+        )?;
+        let staging = HostBuffer::new(
+            self.instance()?,
+            device,
+            self.physical_device,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            rgba,
+        )?;
+        self.submit_once(|command_buffer| {
+            let to_transfer = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image.image)
+                .subresource_range(color_subresource_range());
+            pipeline_barrier(device, command_buffer, to_transfer);
+            let region = [vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(color_subresource_layers())
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })];
+            // SAFETY: the staging buffer holds width * height RGBA8 texels for this image.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    staging.buffer,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                )
+            };
+            let to_shader = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image.image)
+                .subresource_range(color_subresource_range());
+            pipeline_barrier(device, command_buffer, to_shader);
+        })?;
+        drop(staging);
+
+        let mut texture = Texture {
+            device: device.clone(),
+            pool: vk::DescriptorPool::null(),
+            set: vk::DescriptorSet::null(),
+            image,
+        };
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        // SAFETY: the pool holds the single descriptor set of this texture.
+        texture.pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+        let layouts = [self.texture_set_layout()?];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(texture.pool)
+            .set_layouts(&layouts);
+        // SAFETY: the pool was sized for one set of this layout.
+        texture.set = unsafe { device.allocate_descriptor_sets(&allocate_info) }?[0];
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(texture.image.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let sampler_info = [vk::DescriptorImageInfo::default().sampler(
+            self.sampler
+                .ok_or(RenderError::InvalidState("sampler отсутствует"))?,
+        )];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(texture.set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(texture.set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&sampler_info),
+        ];
+        // SAFETY: the set, image view and sampler are alive and the set is not in use.
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        Ok(texture)
+    }
+
+    /// Записывает одноразовый command buffer, отправляет его и ждёт завершения.
+    fn submit_once(&self, record: impl FnOnce(vk::CommandBuffer)) -> Result<(), RenderError> {
+        let device = self.device()?;
+        let command_pool = self.command_pool()?;
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: the command pool belongs to this device and is used from this thread only.
+        let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info) }?[0];
+        let result = (|| {
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: the command buffer was just allocated and is in the initial state.
+            unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
+            record(command_buffer);
+            // SAFETY: recording started above and all commands have been recorded.
+            unsafe { device.end_command_buffer(command_buffer) }?;
+            // SAFETY: a default fence create info produces an unsignaled fence.
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+            let command_infos = [vk::CommandBufferSubmitInfo::default()
+                .command_buffer(command_buffer)
+                .device_mask(0)];
+            let submit_info = [vk::SubmitInfo2::default().command_buffer_infos(&command_infos)];
+            // SAFETY: the queue is used only by this renderer thread and the fence is unsignaled.
+            let submitted = unsafe { device.queue_submit2(self.queue, &submit_info, fence) }
+                // SAFETY: waiting on a fence passed to a successful submit.
+                .and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
+            // SAFETY: the fence is either unsubmitted or already signaled.
+            unsafe { device.destroy_fence(fence, None) };
+            submitted.map_err(RenderError::from)
+        })();
+        if result.is_ok() {
+            // SAFETY: the submission has completed, so the command buffer is no longer in use.
+            unsafe { device.free_command_buffers(command_pool, &[command_buffer]) };
+        }
+        result
+    }
+
     fn create_mesh_pipeline(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
         let push_constant_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
-            .size(size_of::<[[f32; 4]; 4]>() as u32)];
-        let layout_info =
-            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constant_ranges);
-        // SAFETY: the layout only describes a vertex push-constant range within the guaranteed 128 bytes.
+            .size(PUSH_CONSTANTS_SIZE as u32)];
+        let set_layouts = [self.frame_set_layout()?, self.texture_set_layout()?];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant_ranges);
+        // SAFETY: the vertex push-constant range fits in the guaranteed 128 bytes.
         self.pipeline_layout = Some(unsafe { device.create_pipeline_layout(&layout_info, None) }?);
 
         let vertex_module = ShaderModule::new(&device, MESH_VERTEX_SHADER)?;
@@ -588,6 +920,16 @@ impl Renderer {
                 .offset(std::mem::offset_of!(Vertex, position) as u32),
             vk::VertexInputAttributeDescription::default()
                 .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, normal) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(2)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, uv) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(3)
                 .binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(std::mem::offset_of!(Vertex, color) as u32),
@@ -719,6 +1061,18 @@ impl Renderer {
         self.command_pool
             .ok_or(RenderError::InvalidState("command pool отсутствует"))
     }
+
+    fn frame_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
+        self.frame_set_layout.ok_or(RenderError::InvalidState(
+            "layout дескрипторов кадра отсутствует",
+        ))
+    }
+
+    fn texture_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
+        self.texture_set_layout.ok_or(RenderError::InvalidState(
+            "layout дескрипторов текстуры отсутствует",
+        ))
+    }
 }
 
 impl Drop for Renderer {
@@ -730,7 +1084,17 @@ impl Drop for Renderer {
         self.swapchain.take();
         self.frames.clear();
         self.meshes.clear();
+        self.textures.clear();
+        self.frame_uniforms.clear();
         if let Some(device) = self.device.as_ref() {
+            if let Some(pool) = self.frame_descriptor_pool.take() {
+                // SAFETY: the device is idle; destroying the pool frees its frame sets.
+                unsafe { device.destroy_descriptor_pool(pool, None) };
+            }
+            if let Some(sampler) = self.sampler.take() {
+                // SAFETY: every texture descriptor referencing the sampler was destroyed above.
+                unsafe { device.destroy_sampler(sampler, None) };
+            }
             if let Some(pipeline) = self.pipeline.take() {
                 // SAFETY: the device is idle, so no command buffer uses this pipeline.
                 unsafe { device.destroy_pipeline(pipeline, None) };
@@ -738,6 +1102,13 @@ impl Drop for Renderer {
             if let Some(layout) = self.pipeline_layout.take() {
                 // SAFETY: the only pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+            for layout in [self.frame_set_layout.take(), self.texture_set_layout.take()]
+                .into_iter()
+                .flatten()
+            {
+                // SAFETY: the pipeline layout and all descriptor pools using it are gone.
+                unsafe { device.destroy_descriptor_set_layout(layout, None) };
             }
         }
         if let (Some(device), Some(command_pool)) = (self.device.as_ref(), self.command_pool.take())
@@ -840,6 +1211,19 @@ fn choose_device(
             .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
         {
             reasons.push("D32_SFLOAT не поддерживается как depth attachment".to_owned());
+        }
+        // SAFETY: format support is queried for this physical device.
+        let texture_properties = unsafe {
+            instance.get_physical_device_format_properties(physical_device, TEXTURE_FORMAT)
+        };
+        let texture_features = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::TRANSFER_DST;
+        if !texture_properties
+            .optimal_tiling_features
+            .contains(texture_features)
+        {
+            reasons.push("R8G8B8A8_SRGB не поддерживает выборку текстур".to_owned());
         }
 
         // SAFETY: the surface and physical device belong to the same live instance.
@@ -1346,7 +1730,10 @@ fn record_frame(
 struct ScenePass<'a> {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
+    frame_set: vk::DescriptorSet,
     meshes: &'a [MeshBuffers],
+    textures: &'a [Texture],
+    view_projection: [[f32; 4]; 4],
     draws: &'a [DrawCommand],
     clear_color: [f32; 4],
 }
@@ -1374,12 +1761,30 @@ fn record_draws(
         );
         device.cmd_set_viewport(command_buffer, 0, &viewport);
         device.cmd_set_scissor(command_buffer, 0, &scissor);
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            scene.pipeline_layout,
+            0,
+            &[scene.frame_set],
+            &[],
+        );
     }
     for draw in scene.draws {
-        // Индекс проверен validate_draws до начала кадра.
+        // Индексы проверены validate_draws до начала кадра.
         let mesh = &scene.meshes[draw.mesh.0];
-        // SAFETY: mesh buffers stay alive until the device is idle and match the pipeline layout.
+        let texture = &scene.textures[draw.texture.map_or(WHITE_TEXTURE, |texture| texture.0)];
+        let push_constants = push_constant_bytes(&scene.view_projection, &draw.model);
+        // SAFETY: mesh buffers and textures stay alive until the device is idle and match the pipeline layout.
         unsafe {
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                scene.pipeline_layout,
+                1,
+                &[texture.set],
+                &[],
+            );
             device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer.buffer], &[0]);
             device.cmd_bind_index_buffer(
                 command_buffer,
@@ -1392,7 +1797,7 @@ fn record_draws(
                 scene.pipeline_layout,
                 vk::ShaderStageFlags::VERTEX,
                 0,
-                &transform_bytes(&draw.transform),
+                &push_constants,
             );
             device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
         }
@@ -1539,6 +1944,29 @@ impl Drop for ShaderModule {
     }
 }
 
+/// Uniform-буфер освещения и его набор дескрипторов для одного слота кадра.
+struct FrameUniforms {
+    buffer: HostBuffer,
+    set: vk::DescriptorSet,
+}
+
+/// Текстура в device-local памяти с собственным пулом на один набор дескрипторов.
+struct Texture {
+    device: ash::Device,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    image: DeviceImage,
+}
+
+impl Drop for Texture {
+    fn drop(&mut self) {
+        if self.pool != vk::DescriptorPool::null() {
+            // SAFETY: the renderer waits for device idle before dropping textures; this frees the set.
+            unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
+        }
+    }
+}
+
 struct MeshBuffers {
     vertex_buffer: HostBuffer,
     index_buffer: HostBuffer,
@@ -1604,6 +2032,24 @@ impl HostBuffer {
     }
 }
 
+impl HostBuffer {
+    /// Перезаписывает начало буфера; GPU не должен читать буфер во время записи.
+    fn write(&self, data: &[u8]) -> Result<(), RenderError> {
+        // SAFETY: callers write at most the buffer size into coherent memory that is not in use by the GPU.
+        unsafe {
+            let mapped = self.device.map_memory(
+                self.memory,
+                0,
+                data.len() as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
+            self.device.unmap_memory(self.memory);
+        }
+        Ok(())
+    }
+}
+
 impl Drop for HostBuffer {
     fn drop(&mut self) {
         // SAFETY: the renderer waits for device idle before dropping meshes.
@@ -1649,9 +2095,49 @@ fn validate_mesh(vertex_count: usize, indices: &[u32]) -> Result<(), RenderError
     Ok(())
 }
 
-fn validate_draws(draws: &[DrawCommand], mesh_count: usize) -> Result<(), RenderError> {
+fn validate_draws(
+    draws: &[DrawCommand],
+    mesh_count: usize,
+    texture_count: usize,
+) -> Result<(), RenderError> {
     if draws.iter().any(|draw| draw.mesh.0 >= mesh_count) {
         return Err(RenderError::InvalidMesh("MeshId не принадлежит renderer"));
+    }
+    if draws.iter().any(|draw| {
+        draw.texture
+            .is_some_and(|texture| texture.0 >= texture_count)
+    }) {
+        return Err(RenderError::InvalidTexture(
+            "TextureId не принадлежит renderer".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_texture(
+    width: u32,
+    height: u32,
+    byte_count: usize,
+    max_size: u32,
+) -> Result<(), RenderError> {
+    if width == 0 || height == 0 {
+        return Err(RenderError::InvalidTexture(
+            "размеры должны быть больше нуля".to_owned(),
+        ));
+    }
+    if width > max_size || height > max_size {
+        return Err(RenderError::InvalidTexture(format!(
+            "{width}x{height} больше предела GPU {max_size}x{max_size}"
+        )));
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|texels| texels.checked_mul(4));
+    if expected != Some(byte_count) {
+        return Err(RenderError::InvalidTexture(format!(
+            "для RGBA8 {width}x{height} нужно {} байт, передано {byte_count}",
+            expected.map_or_else(|| "больше usize::MAX".to_owned(), |bytes| bytes.to_string())
+        )));
     }
     Ok(())
 }
@@ -1666,17 +2152,68 @@ fn index_bytes(indices: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
 }
 
-fn transform_bytes(transform: &[[f32; 4]; 4]) -> [u8; 64] {
-    let mut bytes = [0; 64];
-    for (chunk, value) in bytes
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(transform.as_flattened())
-    {
+/// Байты uniform-блока `FrameUniforms` фрагментного шейдера: три `vec4` по std140.
+fn frame_uniform_bytes(light: &DirectionalLight) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
+    let [x, y, z] = light.direction;
+    let length_squared = x * x + y * y + z * z;
+    if !length_squared.is_finite() || length_squared == 0.0 {
+        return Err(RenderError::InvalidConfig(
+            "направление света должно быть конечным и ненулевым",
+        ));
+    }
+    let values = [light.direction, light.color, light.ambient].map(|[r, g, b]| [r, g, b, 0.0]);
+    Ok(float_bytes(values.as_flattened()))
+}
+
+/// Байты push constants: `clip_from_model`, затем матрица нормалей; обе по столбцам.
+fn push_constant_bytes(
+    view_projection: &[[f32; 4]; 4],
+    model: &[[f32; 4]; 4],
+) -> [u8; PUSH_CONSTANTS_SIZE] {
+    let clip_from_model = multiply(view_projection, model);
+    let normal_from_model = normal_matrix(model);
+    float_bytes(&[clip_from_model, normal_from_model].as_flattened().concat())
+}
+
+fn float_bytes<const N: usize>(values: &[f32]) -> [u8; N] {
+    let mut bytes = [0; N];
+    for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(values) {
         chunk.copy_from_slice(&value.to_ne_bytes());
     }
     bytes
+}
+
+/// Произведение матриц `a * b`, хранящихся по столбцам.
+fn multiply(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    b.map(|column| std::array::from_fn(|row| (0..4).map(|k| a[k][row] * column[k]).sum()))
+}
+
+/// Матрица нормалей: присоединённая к блоку 3x3 модели со знаком определителя.
+///
+/// Она пропорциональна обратной транспонированной матрице, а длину нормали
+/// восстанавливает нормализация в шейдере. Знак сохраняет внешние нормали
+/// у зеркальных моделей.
+fn normal_matrix(model: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let [a, b, c] = [0, 1, 2].map(|column| {
+        let [x, y, z, _] = model[column];
+        [x, y, z]
+    });
+    let cross = |u: [f32; 3], v: [f32; 3]| {
+        [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ]
+    };
+    let columns = [cross(b, c), cross(c, a), cross(a, b)];
+    let determinant: f32 = (0..3).map(|i| a[i] * columns[0][i]).sum();
+    let sign = if determinant < 0.0 { -1.0 } else { 1.0 };
+    let mut result = [[0.0; 4]; 4];
+    for (target, column) in result.iter_mut().zip(columns) {
+        *target = [column[0] * sign, column[1] * sign, column[2] * sign, 0.0];
+    }
+    result[3][3] = 1.0;
+    result
 }
 
 fn deduplicate_names(names: Vec<CString>) -> Vec<CString> {
@@ -1775,10 +2312,12 @@ fn select_composite_alpha(
 #[cfg(test)]
 mod tests {
     use super::{
-        DrawCommand, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, MeshId, RenderError, RendererConfig,
-        Vertex, check_extensions, deduplicate_names, index_bytes, missing_extensions,
-        scaled_extent, scene_viewport, select_composite_alpha, select_surface_extent,
-        transform_bytes, validate_draws, validate_mesh, validate_render_scale, vertex_bytes,
+        DirectionalLight, DrawCommand, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, MeshId,
+        RenderError, RendererConfig, TextureId, Vertex, check_extensions, deduplicate_names,
+        frame_uniform_bytes, index_bytes, missing_extensions, multiply, normal_matrix,
+        push_constant_bytes, scaled_extent, scene_viewport, select_composite_alpha,
+        select_surface_extent, validate_draws, validate_mesh, validate_render_scale,
+        validate_texture, vertex_bytes,
     };
     use ash::vk;
     use std::ffi::{CStr, CString};
@@ -1817,32 +2356,102 @@ mod tests {
         }
     }
 
+    const IDENTITY: [[f32; 4]; 4] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+
+    fn floats(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_ne_bytes(*chunk))
+            .collect()
+    }
+
+    fn transform_normal(matrix: &[[f32; 4]; 4], normal: [f32; 3]) -> [f32; 3] {
+        let [x, y, z] = std::array::from_fn(|row| {
+            (0..3)
+                .map(|column| matrix[column][row] * normal[column])
+                .sum::<f32>()
+        });
+        let length = (x * x + y * y + z * z).sqrt();
+        [x / length, y / length, z / length]
+    }
+
+    fn assert_close(actual: [f32; 3], expected: [f32; 3]) {
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, e)| (a - e).abs() < 1e-5),
+            "{actual:?} != {expected:?}"
+        );
+    }
+
     #[test]
-    fn draw_validation_rejects_unknown_meshes() {
-        let draw = |index| DrawCommand {
-            mesh: MeshId(index),
-            transform: [[0.0; 4]; 4],
+    fn draw_validation_rejects_unknown_meshes_and_textures() {
+        let draw = |mesh, texture: Option<usize>| DrawCommand {
+            mesh: MeshId(mesh),
+            texture: texture.map(TextureId),
+            model: IDENTITY,
         };
-        assert!(validate_draws(&[], 0).is_ok());
-        assert!(validate_draws(&[draw(0), draw(1)], 2).is_ok());
+        assert!(validate_draws(&[], 0, 1).is_ok());
+        assert!(validate_draws(&[draw(0, None), draw(1, Some(1))], 2, 2).is_ok());
         assert!(matches!(
-            validate_draws(&[draw(0), draw(2)], 2),
+            validate_draws(&[draw(0, None), draw(2, None)], 2, 2),
             Err(RenderError::InvalidMesh(_))
+        ));
+        assert!(matches!(
+            validate_draws(&[draw(0, Some(2))], 1, 2),
+            Err(RenderError::InvalidTexture(_))
         ));
     }
 
     #[test]
+    fn texture_validation_requires_rgba8_bytes_within_gpu_limits() {
+        assert!(validate_texture(1, 1, 4, 16).is_ok());
+        assert!(validate_texture(16, 2, 128, 16).is_ok());
+        for (width, height, bytes) in [
+            (0, 1, 0),
+            (1, 0, 0),
+            (17, 1, 68),
+            (1, 17, 68),
+            (2, 2, 15),
+            (2, 2, 17),
+            (2, 2, 12),
+        ] {
+            assert!(
+                matches!(
+                    validate_texture(width, height, bytes, 16),
+                    Err(RenderError::InvalidTexture(_))
+                ),
+                "{width}x{height} {bytes}"
+            );
+        }
+        assert!(validate_texture(u32::MAX, u32::MAX, 0, u32::MAX).is_err());
+    }
+
+    #[test]
     fn vertex_layout_matches_shader_inputs() {
-        assert_eq!(size_of::<Vertex>(), 24);
+        assert_eq!(size_of::<Vertex>(), 44);
         assert_eq!(std::mem::offset_of!(Vertex, position), 0);
-        assert_eq!(std::mem::offset_of!(Vertex, color), 12);
+        assert_eq!(std::mem::offset_of!(Vertex, normal), 12);
+        assert_eq!(std::mem::offset_of!(Vertex, uv), 24);
+        assert_eq!(std::mem::offset_of!(Vertex, color), 32);
         let vertices = [Vertex {
             position: [1.0, 2.0, 3.0],
-            color: [4.0, 5.0, 6.0],
+            normal: [4.0, 5.0, 6.0],
+            uv: [7.0, 8.0],
+            color: [9.0, 10.0, 11.0],
         }];
-        let bytes = vertex_bytes(&vertices);
-        assert_eq!(bytes.len(), 24);
-        assert_eq!(&bytes[20..24], &6.0_f32.to_ne_bytes());
+        assert_eq!(
+            floats(vertex_bytes(&vertices)),
+            (1..=11).map(|value| value as f32).collect::<Vec<_>>()
+        );
         assert_eq!(
             index_bytes(&[1, 2]),
             [1_u32.to_ne_bytes(), 2_u32.to_ne_bytes()].concat()
@@ -1850,13 +2459,101 @@ mod tests {
     }
 
     #[test]
-    fn transform_is_pushed_column_by_column() {
-        let mut transform = [[0.0; 4]; 4];
-        transform[1][0] = 7.0;
-        transform[3][2] = 9.0;
-        let bytes = transform_bytes(&transform);
-        assert_eq!(&bytes[16..20], &7.0_f32.to_ne_bytes());
-        assert_eq!(&bytes[56..60], &9.0_f32.to_ne_bytes());
+    fn matrices_multiply_column_major() {
+        let mut translate = IDENTITY;
+        translate[3] = [1.0, 2.0, 3.0, 1.0];
+        let mut scale = IDENTITY;
+        scale[0][0] = 2.0;
+        // Сначала масштаб, затем перенос: точка (1, 0, 0) переходит в (3, 2, 3).
+        let combined = multiply(&translate, &scale);
+        assert_eq!(combined[0], [2.0, 0.0, 0.0, 0.0]);
+        assert_eq!(combined[3], [1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(multiply(&IDENTITY, &scale), scale);
+    }
+
+    #[test]
+    fn push_constants_hold_clip_and_normal_matrices_column_by_column() {
+        let mut view_projection = IDENTITY;
+        view_projection[3] = [0.0, 0.0, 5.0, 1.0];
+        let mut model = IDENTITY;
+        model[0][0] = 2.0;
+        let values = floats(&push_constant_bytes(&view_projection, &model));
+        assert_eq!(values.len(), 32);
+        assert_eq!(&values[..4], &[2.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&values[12..16], &[0.0, 0.0, 5.0, 1.0]);
+        // Матрица нормалей пропорциональна обратной транспонированной: масштаб X делит нормаль X.
+        assert_eq!(&values[16..20], &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&values[20..24], &[0.0, 2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn normal_matrix_keeps_normals_perpendicular_under_non_uniform_scale() {
+        // Плоскость x + y = 0 после растяжения по X вдвое имеет нормаль, пропорциональную (1, 2, 0).
+        let mut model = IDENTITY;
+        model[0][0] = 2.0;
+        model[3] = [5.0, 6.0, 7.0, 1.0];
+        let inv_sqrt5 = 1.0 / 5.0_f32.sqrt();
+        assert_close(
+            transform_normal(&normal_matrix(&model), [1.0, 1.0, 0.0]),
+            [inv_sqrt5, 2.0 * inv_sqrt5, 0.0],
+        );
+        // Поворот на 90° вокруг Z переводит нормаль +X в +Y.
+        let rotation = [
+            [0.0, 1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        assert_close(
+            transform_normal(&normal_matrix(&rotation), [1.0, 0.0, 0.0]),
+            [0.0, 1.0, 0.0],
+        );
+    }
+
+    #[test]
+    fn normal_matrix_keeps_outward_normals_for_mirrored_models() {
+        let mut mirror = IDENTITY;
+        mirror[0][0] = -1.0;
+        // Зеркальная по X грань +X становится гранью -X, и нормаль должна смотреть в -X.
+        assert_close(
+            transform_normal(&normal_matrix(&mirror), [1.0, 0.0, 0.0]),
+            [-1.0, 0.0, 0.0],
+        );
+        assert_close(
+            transform_normal(&normal_matrix(&mirror), [0.0, 1.0, 0.0]),
+            [0.0, 1.0, 0.0],
+        );
+    }
+
+    #[test]
+    fn frame_uniforms_pack_light_as_three_vec4() {
+        let light = DirectionalLight {
+            direction: [1.0, 2.0, 3.0],
+            color: [4.0, 5.0, 6.0],
+            ambient: [7.0, 8.0, 9.0],
+        };
+        assert_eq!(
+            floats(&frame_uniform_bytes(&light).unwrap()),
+            [1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0, 7.0, 8.0, 9.0, 0.0]
+        );
+        assert!(frame_uniform_bytes(&DirectionalLight::default()).is_ok());
+    }
+
+    #[test]
+    fn frame_uniforms_reject_zero_or_non_finite_light_direction() {
+        for direction in [[0.0; 3], [f32::NAN, 0.0, 0.0], [f32::INFINITY, 0.0, 0.0]] {
+            let light = DirectionalLight {
+                direction,
+                ..DirectionalLight::default()
+            };
+            assert!(
+                matches!(
+                    frame_uniform_bytes(&light),
+                    Err(RenderError::InvalidConfig(_))
+                ),
+                "{direction:?}"
+            );
+        }
     }
 
     #[test]
