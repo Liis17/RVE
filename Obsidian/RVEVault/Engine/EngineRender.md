@@ -37,6 +37,7 @@ Parent: [[Index]]
 
 - Требуется Vulkan API не ниже 1.3, `dynamicRendering`, `synchronization2`, `VK_KHR_swapchain`, graphics+present queue family, surface с `TRANSFER_DST` и FIFO, surface-формат с `BLIT_DST`, а также поддержка optimal tiling offscreen-формата `R16G16B16A16_SFLOAT` с `COLOR_ATTACHMENT`, `BLIT_SRC` и `SAMPLED_IMAGE_FILTER_LINEAR`.
 - Проверки расширений instance/device выполняются до их создания; требования платформы и дополнительные расширения из конфигурации дедуплицируются. Отсутствующее расширение приводит к `RenderError::Unsupported`.
+- Renderer одинаков для Windows и macOS. На macOS адаптер добавляет portability extensions и флаг instance для MoltenVK; отдельного Metal renderer нет. Loader и surface предоставляются платформой, владение Vulkan-объектами остаётся у renderer.
 - Discrete GPU получает приоритет. Выбор устройства также проверяет API, features, очередь, surface и форматы; причины отказа включаются в `NoSuitableDevice`.
 - Swapchain использует FIFO и exclusive sharing. Размер ограничивается возможностями surface. При начальном размере 0×0 renderer создаёт instance, устройство и capabilities, но откладывает swapchain и offscreen-изображения до ненулевого размера.
 - Существует два frame slot с отдельными command buffer, fence, acquire semaphore и offscreen-target. Render-finished semaphore привязан к swapchain image. Fence сбрасывается после acquire и записи command buffer, перед submit.

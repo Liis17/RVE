@@ -31,6 +31,7 @@ Parent: [[Index]]
 ## Зависимости и взаимодействия
 
 - Использует winit 0.30.13 для event loop, окна и событий.
+- Оконный цикл общий для Windows и macOS; реализации ОС предоставляет winit. Vulkan loader и surface находятся в [[Engine/EnginePlatform]].
 - Используется в [[Engine/Sandbox]]; renderer создаётся приложением отдельно.
 
 ## Ограничения и важные детали
