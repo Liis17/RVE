@@ -36,7 +36,6 @@ RVE — начальный каркас игрового движка на Rust 
 
 ```sh
 brew install molten-vk vulkan-loader
-cargo run -p sandbox -- --frames 120
 ```
 
 Адаптер сначала ищет `libvulkan.dylib` через системный загрузчик, затем пробует `/opt/homebrew/lib/libvulkan.dylib` для Homebrew на Apple Silicon. Альтернатива — Vulkan SDK с настроенным окружением по [инструкции MoltenVK](https://github.com/KhronosGroup/MoltenVK/blob/main/README.md). Установка одной библиотеки MoltenVK без Vulkan loader для этого пути недостаточна.
@@ -49,7 +48,18 @@ cargo run -p sandbox -- --frames 120
 
 ## Сборка и проверки
 
-Из корня репозитория:
+Артефакты Cargo сохраняются в `build/` в корне репозитория согласно
+`.cargo/config.toml`. Каталог исключён из Git. Сборка, проверки и запуск выполняются
+из `build/`. При первой подготовке создай каталог и перейди в него:
+
+```sh
+mkdir -p build
+cd build
+```
+
+В PowerShell для первого создания каталога используй `New-Item -ItemType Directory -Force build`, затем `Set-Location build`.
+
+Из `build/`:
 
 ```powershell
 cargo fmt --all --check
@@ -59,7 +69,7 @@ cargo test --workspace
 cargo build -p sandbox
 ```
 
-Запуск sandbox:
+Запуск sandbox из `build/`:
 
 ```powershell
 cargo run -p sandbox
@@ -67,6 +77,9 @@ cargo run -p sandbox -- --frames 120
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
 cargo run -p sandbox -- --frames 300 --resize-test
 ```
+
+Для запуска собранного бинарника из того же рабочего каталога используй
+`./debug/sandbox` на macOS или `.\debug\sandbox.exe` на Windows.
 
 `--frames N` завершает приложение после N успешных вызовов презентации; N — положительный `u64`. `--render-scale S` задаёт масштаб offscreen-разрешения и принимает конечное число из `(0, 1]`. `--resize-test` после 30 презентаций запрашивает 960×540, после 60 сворачивает окно на 250 мс и затем запрашивает восстановление 1280×720. При совместном использовании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка аргументов возвращает код 2, ошибка окна или рендерера — код 1, успешное завершение — код 0. Без `--frames` приложение работает до закрытия окна.
 

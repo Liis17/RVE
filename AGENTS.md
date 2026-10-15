@@ -38,9 +38,14 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 
 ## Быстрые команды
 
-Запускай из корня workspace:
+Артефакты Cargo хранятся только в `build/` в корне репозитория (настроено в
+`.cargo/config.toml`). Каталог исключён из Git. Сборку, проверки и запуск движка
+выполняй с рабочим каталогом `build/`; Cargo найдёт workspace в родительской папке.
+При первом запуске создай `build/` из корня репозитория, затем перейди в него:
 
 ~~~powershell
+mkdir build
+cd build
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace
