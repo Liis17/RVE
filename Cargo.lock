@@ -467,6 +467,10 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "libc",
+ "objc2-app-kit",
+ "objc2-core-graphics",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -475,6 +479,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1104,6 +1109,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "objc2-core-graphics"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
+dependencies = [
+ "objc2-core-foundation",
 ]
 
 [[package]]

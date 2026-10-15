@@ -7,3 +7,7 @@ license.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 ash.workspace = true
 ash-window.workspace = true
+libc.workspace = true
+objc2-app-kit.workspace = true
+objc2-core-graphics.workspace = true
+objc2-foundation.workspace = true
