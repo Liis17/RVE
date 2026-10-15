@@ -1,8 +1,11 @@
 //! Содержимое кадра sandbox: демонстрационная сцена или модель из assets.
 
-use crate::scene::Scene;
+use crate::scene::{
+    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, plane_mesh, shadows_light_direction,
+    shadows_light_view_projection,
+};
 use engine_assets::{Model, TextureData};
-use engine_render::Vertex;
+use engine_render::{DirectionalLight, Vertex};
 use glam::{Mat4, Vec3};
 
 /// Меш с индексом текстуры в [`Content::textures`].
@@ -11,6 +14,8 @@ pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub texture: Option<usize>,
+    /// Окружение остаётся неподвижным и не наследует fit или движение объекта.
+    pub environment: bool,
 }
 
 /// Меши и текстуры для загрузки в renderer и анимация, которой они следуют.
@@ -28,12 +33,23 @@ impl Content {
     pub fn from_scene(scene: Scene) -> Self {
         let (vertices, indices) = scene.mesh();
         let textures = scene.texture().into_iter().collect::<Vec<_>>();
-        Self {
-            meshes: vec![Mesh {
+        let mut meshes = vec![Mesh {
+            vertices,
+            indices,
+            texture: (!textures.is_empty()).then_some(0),
+            environment: false,
+        }];
+        if scene == Scene::Shadows {
+            let (vertices, indices) = plane_mesh();
+            meshes.push(Mesh {
                 vertices,
                 indices,
-                texture: (!textures.is_empty()).then_some(0),
-            }],
+                texture: None,
+                environment: true,
+            });
+        }
+        Self {
+            meshes,
             textures,
             motion: scene,
             fit: Mat4::IDENTITY,
@@ -42,11 +58,11 @@ impl Content {
 
     /// Модель вращается как куб и масштабируется так, чтобы её bounding box
     /// по наибольшей стороне совпал с кубом демонстрационной сцены.
-    pub fn from_model(model: Model) -> Self {
+    pub fn from_model(model: Model, scene: Scene) -> Self {
         let fit = model.bounds().map_or(Mat4::IDENTITY, |(min, max)| {
             fit_to_unit_cube(Vec3::from(min), Vec3::from(max))
         });
-        let meshes = model
+        let mut meshes = model
             .meshes
             .into_iter()
             .map(|mesh| Mesh {
@@ -62,12 +78,22 @@ impl Content {
                     .collect(),
                 indices: mesh.indices,
                 texture: mesh.texture,
+                environment: false,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if scene == Scene::Shadows {
+            let (vertices, indices) = plane_mesh();
+            meshes.push(Mesh {
+                vertices,
+                indices,
+                texture: None,
+                environment: true,
+            });
+        }
         Self {
             meshes,
             textures: model.textures,
-            motion: Scene::Cube,
+            motion: scene,
             fit,
         }
     }
@@ -84,8 +110,23 @@ impl Content {
         self.motion.model(elapsed) * self.fit
     }
 
-    pub fn view_projection(&self, width: u32, height: u32) -> Mat4 {
-        self.motion.view_projection(width, height)
+    pub fn view_projection(&self, elapsed: f32, width: u32, height: u32) -> Mat4 {
+        self.motion.view_projection(elapsed, width, height)
+    }
+
+    pub fn light(&self, elapsed: f32) -> DirectionalLight {
+        if self.motion != Scene::Shadows {
+            return DirectionalLight::default();
+        }
+        DirectionalLight {
+            direction: shadows_light_direction(elapsed).to_array(),
+            color: SHADOWS_LIGHT_COLOR,
+            ambient: SHADOWS_AMBIENT,
+        }
+    }
+
+    pub fn shadow_view_projection(&self, elapsed: f32) -> Option<Mat4> {
+        (self.motion == Scene::Shadows).then(|| shadows_light_view_projection(elapsed))
     }
 }
 
@@ -164,7 +205,7 @@ mod tests {
 
     #[test]
     fn models_keep_meshes_textures_and_attributes_with_white_vertex_color() {
-        let content = Content::from_model(model());
+        let content = Content::from_model(model(), Scene::Cube);
         assert_eq!(content.meshes.len(), 2);
         assert_eq!(content.meshes[0].texture, Some(0));
         assert_eq!(content.meshes[1].texture, None);
@@ -179,7 +220,7 @@ mod tests {
 
     #[test]
     fn model_bounds_are_fitted_into_a_centered_unit_cube() {
-        let content = Content::from_model(model());
+        let content = Content::from_model(model(), Scene::Cube);
         // Bounding box (10..14, 0..2, 0..1): центр (12, 1, 0.5), наибольшая сторона 4.
         let fitted = |point: [f32; 3]| content.fit.transform_point3(Vec3::from(point));
         assert!(fitted([12.0, 1.0, 0.5]).length() < 1e-6);
@@ -196,7 +237,7 @@ mod tests {
 
     #[test]
     fn texture_override_applies_to_every_mesh() {
-        let mut content = Content::from_model(model());
+        let mut content = Content::from_model(model(), Scene::Cube);
         content.override_texture(texture(9));
         assert_eq!(content.textures, [texture(9)]);
         assert!(content.meshes.iter().all(|mesh| mesh.texture == Some(0)));
@@ -208,11 +249,66 @@ mod tests {
 
     #[test]
     fn scene_content_matrices_match_the_scene() {
-        let cube = Content::from_scene(Scene::Cube);
-        assert_eq!(cube.model(1.5), Scene::Cube.model(1.5));
+        for scene in [Scene::Triangle, Scene::Cube] {
+            let content = Content::from_scene(scene);
+            assert_eq!(content.model(1.5), scene.model(1.5));
+            assert_eq!(
+                content.view_projection(1.5, 800, 600),
+                scene.view_projection(1.5, 800, 600)
+            );
+            assert_eq!(
+                content.light(1.5),
+                engine_render::DirectionalLight::default()
+            );
+            assert!(content.shadow_view_projection(1.5).is_none());
+        }
+    }
+
+    #[test]
+    fn shadow_scene_adds_untextured_environment_mesh_and_scene_lighting() {
+        let content = Content::from_scene(Scene::Shadows);
+        assert_eq!(content.meshes.len(), 2);
+        assert!(!content.meshes[0].environment);
+        assert!(content.meshes[1].environment);
+        assert_eq!(content.meshes[1].texture, None);
+        assert_eq!(content.light(0.0).color, [1.0; 3]);
+        assert_eq!(content.light(0.0).ambient, [0.15; 3]);
+        assert!(content.shadow_view_projection(0.0).is_some());
         assert_eq!(
-            cube.view_projection(800, 600),
-            Scene::Cube.view_projection(800, 600)
+            Content::from_scene(Scene::Cube).light(0.0),
+            engine_render::DirectionalLight::default()
         );
+        assert!(
+            Content::from_scene(Scene::Cube)
+                .shadow_view_projection(0.0)
+                .is_none()
+        );
+        assert!(
+            Content::from_scene(Scene::Triangle)
+                .shadow_view_projection(0.0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn model_uses_selected_scene_motion_and_shadows_add_unfitted_plane() {
+        let cube = Content::from_model(model(), Scene::Cube);
+        let shadows = Content::from_model(model(), Scene::Shadows);
+        assert_eq!(cube.meshes.len(), 2);
+        assert_eq!(shadows.meshes.len(), 3);
+        assert!(shadows.meshes[..2].iter().all(|mesh| !mesh.environment));
+        assert!(shadows.meshes[2].environment);
+        assert!(shadows.meshes[2].texture.is_none());
+        assert_eq!(shadows.motion, Scene::Shadows);
+        assert_eq!(shadows.model(0.0), Scene::Shadows.model(0.0) * shadows.fit);
+        assert_eq!(cube.model(1.0), Scene::Cube.model(1.0) * cube.fit);
+    }
+
+    #[test]
+    fn texture_override_also_covers_shadow_environment() {
+        let mut content = Content::from_scene(Scene::Shadows);
+        content.override_texture(texture(11));
+        assert_eq!(content.textures, [texture(11)]);
+        assert!(content.meshes.iter().all(|mesh| mesh.texture == Some(0)));
     }
 }

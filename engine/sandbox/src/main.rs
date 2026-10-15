@@ -7,9 +7,7 @@ use content::Content;
 use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
-use engine_render::{
-    DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId,
-};
+use engine_render::{DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId};
 use engine_window::{PhysicalSize, Window, WindowHandler, run};
 use scene::Scene;
 use std::env;
@@ -17,7 +15,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test] [--scene triangle|cube | --model /путь.fbx] [--texture /путь.png] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test] [--scene triangle|cube|shadows] [--model /путь.fbx] [--texture /путь.png] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -95,11 +93,11 @@ where
                 if scene.is_some() {
                     return Err("флаг --scene указан повторно".to_owned());
                 }
-                let value = args
-                    .next()
-                    .ok_or_else(|| "после --scene требуется triangle или cube".to_owned())?;
+                let value = args.next().ok_or_else(|| {
+                    "после --scene требуется triangle, cube или shadows".to_owned()
+                })?;
                 scene = Some(Scene::parse(&value).ok_or_else(|| {
-                    format!("неизвестная сцена: {value}; доступны triangle и cube")
+                    format!("неизвестная сцена: {value}; доступны triangle, cube и shadows")
                 })?);
             }
             "--model" => {
@@ -123,8 +121,8 @@ where
             _ => return Err(format!("неизвестный аргумент: {argument}")),
         }
     }
-    if scene.is_some() && model.is_some() {
-        return Err("--scene и --model нельзя указывать вместе".to_owned());
+    if scene == Some(Scene::Triangle) && model.is_some() {
+        return Err("--scene triangle нельзя сочетать с --model".to_owned());
     }
     if resize_test && frames.is_some_and(|count| count < 120) {
         return Err("с --resize-test значение --frames должно быть не меньше 120".to_owned());
@@ -143,7 +141,7 @@ where
 /// Загружает модель или демонстрационную сцену и заменяет текстуры, если задан `--texture`.
 fn load_content(options: &Options, assets: &Assets) -> Result<Content, AssetError> {
     let mut content = match &options.model {
-        Some(path) => Content::from_model(assets.load_model(path)?),
+        Some(path) => Content::from_model(assets.load_model(path)?, options.scene),
         None => Content::from_scene(options.scene),
     };
     if let Some(path) = &options.texture {
@@ -165,7 +163,7 @@ struct ResizeTest {
 struct Sandbox {
     renderer: Option<Renderer>,
     content: Content,
-    meshes: Vec<(MeshId, Option<TextureId>)>,
+    meshes: Vec<(MeshId, Option<TextureId>, bool)>,
     size: PhysicalSize<u32>,
     time: Time,
     options: Options,
@@ -279,8 +277,11 @@ impl Sandbox {
             let id = renderer
                 .create_mesh(&mesh.vertices, &mesh.indices)
                 .map_err(|error| format!("ошибка создания меша: {error}"))?;
-            self.meshes
-                .push((id, mesh.texture.map(|index| textures[index])));
+            self.meshes.push((
+                id,
+                mesh.texture.map(|index| textures[index]),
+                mesh.environment,
+            ));
         }
         Ok(())
     }
@@ -353,10 +354,14 @@ impl WindowHandler for Sandbox {
         let draws = self
             .meshes
             .iter()
-            .map(|&(mesh, texture)| DrawCommand {
+            .map(|&(mesh, texture, environment)| DrawCommand {
                 mesh,
                 texture,
-                model,
+                model: if environment {
+                    glam::Mat4::IDENTITY.to_cols_array_2d()
+                } else {
+                    model
+                },
             })
             .collect::<Vec<_>>();
         let gpu_time = renderer.take_gpu_frame_time();
@@ -368,9 +373,13 @@ impl WindowHandler for Sandbox {
             clear_color: color,
             view_projection: self
                 .content
-                .view_projection(self.size.width, self.size.height)
+                .view_projection(elapsed, self.size.width, self.size.height)
                 .to_cols_array_2d(),
-            light: DirectionalLight::default(),
+            shadow_view_projection: self
+                .content
+                .shadow_view_projection(elapsed)
+                .map(|matrix| matrix.to_cols_array_2d()),
+            light: self.content.light(elapsed),
             draws: &draws,
             overlay,
         };
@@ -599,6 +608,17 @@ mod tests {
         let options = parse_args(["--model", "/model/cube.fbx"]).unwrap();
         assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
         assert_eq!(options.texture, None);
+        for scene in ["shadows", "cube"] {
+            let options = parse_args(["--scene", scene, "--model", "/model/cube.fbx"])
+                .expect("cube and shadow scenes may load a model");
+            assert_eq!(options.scene, Scene::parse(scene).unwrap());
+            assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
+        }
+        assert!(parse_args(["--scene", "triangle", "--model", "/model/cube.fbx"]).is_err());
+        assert_eq!(
+            parse_args(Vec::<String>::new()).unwrap().scene,
+            Scene::Shadows
+        );
     }
 
     #[test]
@@ -626,7 +646,6 @@ mod tests {
             vec!["--texture", "/a.png", "--texture", "/b.png"],
             vec!["--debug-overlay", "--debug-overlay"],
             vec!["--debug-overlay", "1"],
-            vec!["--scene", "cube", "--model", "/model/cube.fbx"],
             vec!["--model", "/model/cube.fbx", "--scene", "triangle"],
         ] {
             assert!(parse_args(arguments).is_err());
@@ -639,7 +658,7 @@ mod tests {
         assert_eq!(options.frames, None);
         assert_eq!(options.render_scale, 1.0);
         assert!(!options.resize_test);
-        assert_eq!(options.scene, Scene::Cube);
+        assert_eq!(options.scene, Scene::Shadows);
         assert_eq!(options.model, None);
         assert_eq!(options.texture, None);
         assert!(!options.debug_overlay);
