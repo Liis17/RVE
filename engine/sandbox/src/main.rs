@@ -1,7 +1,8 @@
 mod bootstrap;
+mod scene;
 
 use engine_core::Time;
-use engine_render::{FrameStatus, Renderer, RendererConfig};
+use engine_render::{DrawCommand, FrameStatus, MeshId, Renderer, RendererConfig};
 use engine_window::{PhysicalSize, Window, WindowHandler, run};
 use std::env;
 use std::process::ExitCode;
@@ -90,6 +91,8 @@ struct ResizeTest {
 
 struct Sandbox {
     renderer: Option<Renderer>,
+    triangle: Option<MeshId>,
+    size: PhysicalSize<u32>,
     time: Time,
     options: Options,
     presented_frames: u64,
@@ -101,6 +104,8 @@ impl Sandbox {
     fn new(options: Options) -> Self {
         Self {
             renderer: None,
+            triangle: None,
+            size: PhysicalSize::new(0, 0),
             time: Time::new(),
             options,
             presented_frames: 0,
@@ -111,6 +116,7 @@ impl Sandbox {
 
     fn report_resize(&mut self, width: u32, height: u32) {
         println!("Resized: {width}x{height} (physical pixels)");
+        self.size = PhysicalSize::new(width, height);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.resize(width, height);
         }
@@ -192,12 +198,13 @@ impl WindowHandler for Sandbox {
     fn init(&mut self, window: Arc<Window>) -> bool {
         let size = window.inner_size();
         println!("Window: {}x{} (physical pixels)", size.width, size.height);
+        self.size = size;
         let config = RendererConfig {
             render_scale: self.options.render_scale,
             ..RendererConfig::default()
         };
         match Renderer::new(Arc::clone(&window), size.width, size.height, config) {
-            Ok(renderer) => {
+            Ok(mut renderer) => {
                 let capabilities = renderer.capabilities();
                 let api_major = (capabilities.api_version >> 22) & 0x7f;
                 let api_minor = (capabilities.api_version >> 12) & 0x3ff;
@@ -210,6 +217,13 @@ impl WindowHandler for Sandbox {
                     capabilities.discrete,
                     capabilities.tessellation_shader
                 );
+                match renderer.create_mesh(&scene::TRIANGLE_VERTICES, &scene::TRIANGLE_INDICES) {
+                    Ok(mesh) => self.triangle = Some(mesh),
+                    Err(error) => {
+                        self.failure = Some(format!("ошибка создания меша: {error}"));
+                        return false;
+                    }
+                }
                 self.renderer = Some(renderer);
                 true
             }
@@ -232,11 +246,16 @@ impl WindowHandler for Sandbox {
             0.5 + 0.5 * (elapsed * 0.41).sin(),
             1.0,
         ];
-        let Some(renderer) = self.renderer.as_mut() else {
+        let (Some(renderer), Some(triangle)) = (self.renderer.as_mut(), self.triangle) else {
             self.failure = Some("рендерер отсутствует".to_owned());
             return false;
         };
-        match renderer.render_frame(color) {
+        let draws = [DrawCommand {
+            mesh: triangle,
+            transform: scene::triangle_transform(elapsed, self.size.width, self.size.height)
+                .to_cols_array_2d(),
+        }];
+        match renderer.render_frame(color, &draws) {
             Ok(FrameStatus::Presented) => {
                 self.presented_frames += 1;
                 self.advance_resize_test(window);

@@ -10,6 +10,30 @@ use std::sync::Arc;
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
+const MESH_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
+
+/// Вершина меша: позиция в пространстве модели и линейный RGB-цвет.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Vertex {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+}
+
+/// Идентификатор меша, созданного [`Renderer::create_mesh`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MeshId(usize);
+
+/// Команда рисования меша с матрицей в clip space.
+///
+/// `transform` задаётся по столбцам. Ось Y clip space направлена вверх,
+/// глубина после деления на `w` лежит в `[0, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawCommand {
+    pub mesh: MeshId,
+    pub transform: [[f32; 4]; 4],
+}
 
 /// Настройки Vulkan-рендерера.
 pub struct RendererConfig {
@@ -47,6 +71,7 @@ pub enum RenderError {
     Unsupported(String),
     NoSuitableDevice(Vec<String>),
     InvalidState(&'static str),
+    InvalidMesh(&'static str),
 }
 
 impl fmt::Display for RenderError {
@@ -67,6 +92,7 @@ impl fmt::Display for RenderError {
                 Ok(())
             }
             Self::InvalidState(message) => write!(f, "некорректное состояние рендерера: {message}"),
+            Self::InvalidMesh(message) => write!(f, "некорректный меш: {message}"),
         }
     }
 }
@@ -109,6 +135,9 @@ pub struct Renderer {
     queue: vk::Queue,
     queue_family_index: u32,
     command_pool: Option<vk::CommandPool>,
+    pipeline_layout: Option<vk::PipelineLayout>,
+    pipeline: Option<vk::Pipeline>,
+    meshes: Vec<MeshBuffers>,
     frames: Vec<FrameResources>,
     frame_slot: usize,
     swapchain: Option<SwapchainBundle>,
@@ -146,6 +175,9 @@ impl Renderer {
             queue: vk::Queue::null(),
             queue_family_index: 0,
             command_pool: None,
+            pipeline_layout: None,
+            pipeline: None,
+            meshes: Vec::new(),
             frames: Vec::new(),
             frame_slot: 0,
             swapchain: None,
@@ -177,8 +209,42 @@ impl Renderer {
         self.swapchain_dirty = true;
     }
 
-    /// Очищает offscreen-таргет и масштабирует его содержимое в swapchain.
-    pub fn render_frame(&mut self, clear_color: [f32; 4]) -> Result<FrameStatus, RenderError> {
+    /// Загружает треугольный меш в память GPU. Каждые три индекса образуют треугольник.
+    pub fn create_mesh(
+        &mut self,
+        vertices: &[Vertex],
+        indices: &[u32],
+    ) -> Result<MeshId, RenderError> {
+        validate_mesh(vertices.len(), indices)?;
+        let vertex_buffer = HostBuffer::new(
+            self.instance()?,
+            self.device()?,
+            self.physical_device,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            vertex_bytes(vertices),
+        )?;
+        let index_buffer = HostBuffer::new(
+            self.instance()?,
+            self.device()?,
+            self.physical_device,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            index_bytes(indices),
+        )?;
+        self.meshes.push(MeshBuffers {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+        });
+        Ok(MeshId(self.meshes.len() - 1))
+    }
+
+    /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
+    pub fn render_frame(
+        &mut self,
+        clear_color: [f32; 4],
+        draws: &[DrawCommand],
+    ) -> Result<FrameStatus, RenderError> {
+        validate_draws(draws, self.meshes.len())?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(FrameStatus::Skipped);
         }
@@ -230,6 +296,17 @@ impl Renderer {
         }
 
         let offscreen_extent = scaled_extent(swapchain.extent, self.config.render_scale);
+        let scene = ScenePass {
+            pipeline: self
+                .pipeline
+                .ok_or(RenderError::InvalidState("pipeline отсутствует"))?,
+            pipeline_layout: self
+                .pipeline_layout
+                .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
+            meshes: &self.meshes,
+            draws,
+            clear_color,
+        };
         let target = self.frames[frame_slot]
             .target
             .as_mut()
@@ -241,7 +318,7 @@ impl Renderer {
             swapchain.images[image_index],
             swapchain.extent,
             offscreen_extent,
-            clear_color,
+            &scene,
         )?;
 
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
@@ -453,6 +530,7 @@ impl Renderer {
         self.command_pool =
             Some(unsafe { self.device()?.create_command_pool(&command_pool_info, None) }?);
         self.create_frame_resources()?;
+        self.create_mesh_pipeline()?;
 
         if self.output_extent.width != 0 && self.output_extent.height != 0 {
             self.recreate_swapchain()?;
@@ -471,6 +549,94 @@ impl Renderer {
             self.frames
                 .push(FrameResources::new(self.device()?, command_buffer)?);
         }
+        Ok(())
+    }
+
+    fn create_mesh_pipeline(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let push_constant_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(size_of::<[[f32; 4]; 4]>() as u32)];
+        let layout_info =
+            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constant_ranges);
+        // SAFETY: the layout only describes a vertex push-constant range within the guaranteed 128 bytes.
+        self.pipeline_layout = Some(unsafe { device.create_pipeline_layout(&layout_info, None) }?);
+
+        let vertex_module = ShaderModule::new(&device, MESH_VERTEX_SHADER)?;
+        let fragment_module = ShaderModule::new(&device, MESH_FRAGMENT_SHADER)?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_module.handle)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_module.handle)
+                .name(c"main"),
+        ];
+        let vertex_bindings = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<Vertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let vertex_attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, position) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, color) as u32),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        // Отсечение граней выключено: видимость не зависит от порядка обхода вершин.
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let color_formats = [OFFSCREEN_FORMAT];
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(
+                self.pipeline_layout
+                    .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
+            )
+            .push_next(&mut rendering_info)];
+        // SAFETY: shader modules, layout and dynamic-rendering formats are valid for this device.
+        let pipelines = unsafe {
+            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+        }
+        .map_err(|(_, error)| RenderError::Vulkan(error))?;
+        self.pipeline = pipelines.into_iter().next();
         Ok(())
     }
 
@@ -556,6 +722,17 @@ impl Drop for Renderer {
         }
         self.swapchain.take();
         self.frames.clear();
+        self.meshes.clear();
+        if let Some(device) = self.device.as_ref() {
+            if let Some(pipeline) = self.pipeline.take() {
+                // SAFETY: the device is idle, so no command buffer uses this pipeline.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            if let Some(layout) = self.pipeline_layout.take() {
+                // SAFETY: the only pipeline created with this layout was destroyed above.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+        }
         if let (Some(device), Some(command_pool)) = (self.device.as_ref(), self.command_pool.take())
         {
             // SAFETY: all command buffers and per-frame objects are no longer in use.
@@ -948,19 +1125,15 @@ impl OffscreenTarget {
         };
         // SAFETY: image was created by this device and remains alive.
         let requirements = unsafe { device.get_image_memory_requirements(target.image) };
-        // SAFETY: memory properties are queried from the live physical device.
-        let memory_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let memory_type = (0..memory_properties.memory_type_count)
-            .find(|index| {
-                requirements.memory_type_bits & (1 << index) != 0
-                    && memory_properties.memory_types[*index as usize]
-                        .property_flags
-                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            })
-            .ok_or_else(|| {
-                RenderError::Unsupported("нет DEVICE_LOCAL memory для offscreen image".to_owned())
-            })?;
+        let memory_type = find_memory_type(
+            instance,
+            physical_device,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| {
+            RenderError::Unsupported("нет DEVICE_LOCAL memory для offscreen image".to_owned())
+        })?;
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type);
@@ -1004,7 +1177,7 @@ fn record_frame(
     output_image: vk::Image,
     output_extent: vk::Extent2D,
     render_extent: vk::Extent2D,
-    clear_color: [f32; 4],
+    scene: &ScenePass<'_>,
 ) -> Result<(), RenderError> {
     // SAFETY: this frame's command buffer is no longer in flight because its fence was waited.
     unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty()) }?;
@@ -1041,7 +1214,7 @@ fn record_frame(
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: clear_color,
+                float32: scene.clear_color,
             },
         })];
     let rendering_info = vk::RenderingInfo::default()
@@ -1053,6 +1226,7 @@ fn record_frame(
         .color_attachments(&color_attachment);
     // SAFETY: the dynamic-rendering attachment view covers the configured render extent.
     unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
+    record_draws(device, command_buffer, render_extent, scene);
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
 
@@ -1080,6 +1254,74 @@ fn record_frame(
     unsafe { device.end_command_buffer(command_buffer) }?;
     target.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
     Ok(())
+}
+
+struct ScenePass<'a> {
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    meshes: &'a [MeshBuffers],
+    draws: &'a [DrawCommand],
+    clear_color: [f32; 4],
+}
+
+fn record_draws(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    render_extent: vk::Extent2D,
+    scene: &ScenePass<'_>,
+) {
+    if scene.draws.is_empty() {
+        return;
+    }
+    let viewport = [scene_viewport(render_extent)];
+    let scissor = [vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: render_extent,
+    }];
+    // SAFETY: recording happens inside dynamic rendering with a pipeline built for its formats.
+    unsafe {
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            scene.pipeline,
+        );
+        device.cmd_set_viewport(command_buffer, 0, &viewport);
+        device.cmd_set_scissor(command_buffer, 0, &scissor);
+    }
+    for draw in scene.draws {
+        // Индекс проверен validate_draws до начала кадра.
+        let mesh = &scene.meshes[draw.mesh.0];
+        // SAFETY: mesh buffers stay alive until the device is idle and match the pipeline layout.
+        unsafe {
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer.buffer], &[0]);
+            device.cmd_bind_index_buffer(
+                command_buffer,
+                mesh.index_buffer.buffer,
+                0,
+                vk::IndexType::UINT32,
+            );
+            device.cmd_push_constants(
+                command_buffer,
+                scene.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &transform_bytes(&draw.transform),
+            );
+            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+        }
+    }
+}
+
+/// Viewport с отрицательной высотой направляет ось Y clip space вверх.
+fn scene_viewport(extent: vk::Extent2D) -> vk::Viewport {
+    vk::Viewport {
+        x: 0.0,
+        y: extent.height as f32,
+        width: extent.width as f32,
+        height: -(extent.height as f32),
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }
 }
 
 fn record_output_pass(
@@ -1173,6 +1415,172 @@ fn color_subresource_layers() -> vk::ImageSubresourceLayers {
         .mip_level(0)
         .base_array_layer(0)
         .layer_count(1)
+}
+
+struct ShaderModule {
+    device: ash::Device,
+    handle: vk::ShaderModule,
+}
+
+impl ShaderModule {
+    fn new(device: &ash::Device, spirv: &[u8]) -> Result<Self, RenderError> {
+        let code = ash::util::read_spv(&mut std::io::Cursor::new(spirv))
+            .map_err(|_| RenderError::InvalidState("встроенный SPIR-V повреждён"))?;
+        let info = vk::ShaderModuleCreateInfo::default().code(&code);
+        // SAFETY: the SPIR-V was produced and validated by naga at build time.
+        let handle = unsafe { device.create_shader_module(&info, None) }?;
+        Ok(Self {
+            device: device.clone(),
+            handle,
+        })
+    }
+}
+
+impl Drop for ShaderModule {
+    fn drop(&mut self) {
+        // SAFETY: shader modules may be destroyed once pipeline creation has returned.
+        unsafe { self.device.destroy_shader_module(self.handle, None) };
+    }
+}
+
+struct MeshBuffers {
+    vertex_buffer: HostBuffer,
+    index_buffer: HostBuffer,
+    index_count: u32,
+}
+
+/// Буфер в host-visible памяти; данные копируются один раз при создании.
+struct HostBuffer {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl HostBuffer {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        usage: vk::BufferUsageFlags,
+        data: &[u8],
+    ) -> Result<Self, RenderError> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(data.len() as vk::DeviceSize)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: the buffer has a non-zero size guaranteed by mesh validation.
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
+        let mut host_buffer = Self {
+            device: device.clone(),
+            buffer,
+            memory: vk::DeviceMemory::null(),
+        };
+        // SAFETY: buffer was created by this device and remains alive.
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let memory_type = find_memory_type(
+            instance,
+            physical_device,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or_else(|| {
+            RenderError::Unsupported("нет HOST_VISIBLE | HOST_COHERENT memory для меша".to_owned())
+        })?;
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        // SAFETY: allocation requirements and memory type were reported for this buffer.
+        host_buffer.memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
+        // SAFETY: memory allocation satisfies the buffer's reported requirements.
+        unsafe { device.bind_buffer_memory(buffer, host_buffer.memory, 0) }?;
+        // SAFETY: the coherent allocation is at least data.len() bytes and is not mapped elsewhere.
+        unsafe {
+            let mapped = device.map_memory(
+                host_buffer.memory,
+                0,
+                data.len() as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
+            device.unmap_memory(host_buffer.memory);
+        }
+        Ok(host_buffer)
+    }
+}
+
+impl Drop for HostBuffer {
+    fn drop(&mut self) {
+        // SAFETY: the renderer waits for device idle before dropping meshes.
+        unsafe { self.device.destroy_buffer(self.buffer, None) };
+        if self.memory != vk::DeviceMemory::null() {
+            // SAFETY: the buffer bound to this memory was destroyed first.
+            unsafe { self.device.free_memory(self.memory, None) };
+        }
+    }
+}
+
+fn find_memory_type(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    type_bits: u32,
+    flags: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    // SAFETY: memory properties are queried from the live physical device.
+    let properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    (0..properties.memory_type_count).find(|index| {
+        type_bits & (1 << index) != 0
+            && properties.memory_types[*index as usize]
+                .property_flags
+                .contains(flags)
+    })
+}
+
+fn validate_mesh(vertex_count: usize, indices: &[u32]) -> Result<(), RenderError> {
+    if vertex_count == 0 {
+        return Err(RenderError::InvalidMesh("нет вершин"));
+    }
+    if indices.is_empty() || !indices.len().is_multiple_of(3) {
+        return Err(RenderError::InvalidMesh(
+            "число индексов должно быть положительным и кратным трём",
+        ));
+    }
+    if u32::try_from(indices.len()).is_err() {
+        return Err(RenderError::InvalidMesh("слишком много индексов"));
+    }
+    if indices.iter().any(|&index| index as usize >= vertex_count) {
+        return Err(RenderError::InvalidMesh("индекс выходит за пределы вершин"));
+    }
+    Ok(())
+}
+
+fn validate_draws(draws: &[DrawCommand], mesh_count: usize) -> Result<(), RenderError> {
+    if draws.iter().any(|draw| draw.mesh.0 >= mesh_count) {
+        return Err(RenderError::InvalidMesh("MeshId не принадлежит renderer"));
+    }
+    Ok(())
+}
+
+fn vertex_bytes(vertices: &[Vertex]) -> &[u8] {
+    // SAFETY: Vertex is repr(C) and consists only of f32 fields without padding.
+    unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast(), size_of_val(vertices)) }
+}
+
+fn index_bytes(indices: &[u32]) -> &[u8] {
+    // SAFETY: u32 has no padding and any initialized u32 slice is readable as bytes.
+    unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
+}
+
+fn transform_bytes(transform: &[[f32; 4]; 4]) -> [u8; 64] {
+    let mut bytes = [0; 64];
+    for (chunk, value) in bytes
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(transform.as_flattened())
+    {
+        chunk.copy_from_slice(&value.to_ne_bytes());
+    }
+    bytes
 }
 
 fn deduplicate_names(names: Vec<CString>) -> Vec<CString> {
@@ -1271,11 +1679,100 @@ fn select_composite_alpha(
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderError, RendererConfig, check_extensions, deduplicate_names, missing_extensions,
-        scaled_extent, select_composite_alpha, select_surface_extent, validate_render_scale,
+        DrawCommand, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, MeshId, RenderError, RendererConfig,
+        Vertex, check_extensions, deduplicate_names, index_bytes, missing_extensions,
+        scaled_extent, scene_viewport, select_composite_alpha, select_surface_extent,
+        transform_bytes, validate_draws, validate_mesh, validate_render_scale, vertex_bytes,
     };
     use ash::vk;
     use std::ffi::{CStr, CString};
+
+    #[test]
+    fn embedded_shaders_are_spirv_words() {
+        for shader in [MESH_VERTEX_SHADER, MESH_FRAGMENT_SHADER] {
+            let words = ash::util::read_spv(&mut std::io::Cursor::new(shader)).unwrap();
+            assert_eq!(words[0], 0x0723_0203);
+        }
+    }
+
+    #[test]
+    fn mesh_validation_accepts_triangle_lists_inside_vertex_range() {
+        assert!(validate_mesh(3, &[0, 1, 2]).is_ok());
+        assert!(validate_mesh(4, &[0, 1, 2, 2, 3, 0]).is_ok());
+    }
+
+    #[test]
+    fn mesh_validation_rejects_empty_partial_and_out_of_range_input() {
+        for (vertex_count, indices) in [
+            (0, vec![0, 0, 0]),
+            (3, vec![]),
+            (3, vec![0, 1]),
+            (3, vec![0, 1, 2, 0]),
+            (3, vec![0, 1, 3]),
+            (3, vec![0, 1, u32::MAX]),
+        ] {
+            assert!(
+                matches!(
+                    validate_mesh(vertex_count, &indices),
+                    Err(RenderError::InvalidMesh(_))
+                ),
+                "{vertex_count} {indices:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_validation_rejects_unknown_meshes() {
+        let draw = |index| DrawCommand {
+            mesh: MeshId(index),
+            transform: [[0.0; 4]; 4],
+        };
+        assert!(validate_draws(&[], 0).is_ok());
+        assert!(validate_draws(&[draw(0), draw(1)], 2).is_ok());
+        assert!(matches!(
+            validate_draws(&[draw(0), draw(2)], 2),
+            Err(RenderError::InvalidMesh(_))
+        ));
+    }
+
+    #[test]
+    fn vertex_layout_matches_shader_inputs() {
+        assert_eq!(size_of::<Vertex>(), 24);
+        assert_eq!(std::mem::offset_of!(Vertex, position), 0);
+        assert_eq!(std::mem::offset_of!(Vertex, color), 12);
+        let vertices = [Vertex {
+            position: [1.0, 2.0, 3.0],
+            color: [4.0, 5.0, 6.0],
+        }];
+        let bytes = vertex_bytes(&vertices);
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[20..24], &6.0_f32.to_ne_bytes());
+        assert_eq!(
+            index_bytes(&[1, 2]),
+            [1_u32.to_ne_bytes(), 2_u32.to_ne_bytes()].concat()
+        );
+    }
+
+    #[test]
+    fn transform_is_pushed_column_by_column() {
+        let mut transform = [[0.0; 4]; 4];
+        transform[1][0] = 7.0;
+        transform[3][2] = 9.0;
+        let bytes = transform_bytes(&transform);
+        assert_eq!(&bytes[16..20], &7.0_f32.to_ne_bytes());
+        assert_eq!(&bytes[56..60], &9.0_f32.to_ne_bytes());
+    }
+
+    #[test]
+    fn scene_viewport_points_clip_space_y_up() {
+        let viewport = scene_viewport(vk::Extent2D {
+            width: 640,
+            height: 360,
+        });
+        assert_eq!((viewport.x, viewport.y), (0.0, 360.0));
+        assert_eq!((viewport.width, viewport.height), (640.0, -360.0));
+        assert_eq!((viewport.min_depth, viewport.max_depth), (0.0, 1.0));
+    }
 
     fn extension(name: &CStr) -> vk::ExtensionProperties {
         let mut property = vk::ExtensionProperties::default();
