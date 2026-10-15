@@ -13,9 +13,10 @@ Parent: [[Index]]
 | `engine/sandbox/src/main.rs` | `parse_args`, `load_content`, `Sandbox`, `WindowHandler`, `main` | Разбор CLI, загрузка ресурсов, инициализация renderer, кадры и коды завершения |
 | `engine/sandbox/src/content.rs` | `Content`, `Mesh` | Меши и текстуры кадра из демонстрационной сцены или модели; вписывание модели в единичный куб и замена текстур |
 | `engine/sandbox/src/scene.rs` | `Scene`, `TRIANGLE_VERTICES`, `cube_mesh`, `checker_texture`, `triangle_view_projection`, `cube_view_projection`, `cube_model` | Геометрия и текстура демонстрационных сцен, матрицы камеры и модели через glam |
+| `engine/sandbox/src/debug_overlay.rs` | `DebugOverlay` | Метрики `--debug-overlay`, их история и геометрия панели со шрифтом font8x8 |
 | `engine/sandbox/src/bootstrap.rs` | `load` | Чтение и проверка начального размера окна из рабочего каталога |
 | `bootstrap.rves.example` | `WindowSizeX`, `WindowSizeY` | Шаблон локального файла настроек |
-| `engine/sandbox/Cargo.toml` | зависимости `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `glam` | Сборка приложения из рабочих крейтов и математика матриц |
+| `engine/sandbox/Cargo.toml` | зависимости `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `glam`, `sysinfo`, `font8x8` | Сборка приложения из рабочих крейтов, математика матриц, статистика процесса и bitmap-шрифт оверлея |
 
 ## Публичные контракты
 
@@ -29,6 +30,7 @@ Parent: [[Index]]
 | `--scene triangle\|cube` | Демонстрационная сцена; по умолчанию `cube` |
 | `--model /путь.fbx` | Модель FBX из `assets` вместо сцены; нельзя сочетать с `--scene` |
 | `--texture /путь.png` | PNG из `assets`, заменяющий текстуры всех мешей сцены или модели |
+| `--debug-overlay` | Панель метрик в левом верхнем углу окна |
 
 Повторные или неизвестные флаги, отсутствие значения, некорректное значение и сочетание `--scene` с `--model` дают код 2. Ошибка ресурса (`AssetError`) выводится как `Ошибка ресурса: …` и тоже даёт код 2 до создания окна. При сочетании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка окна или renderer даёт код 1; успешное закрытие или завершение лимита — код 0.
 
@@ -48,10 +50,11 @@ Parent: [[Index]]
 - Использует [[Engine/EngineCore]] для `Time`.
 - Через [[Engine/EngineWindow]] реализует `WindowHandler`.
 - Через [[Engine/EngineAssets]] с корнем `ASSETS_DIR` (`assets` в рабочем каталоге) загружает модель и заменяющую текстуру до запуска цикла окна.
-- Через [[Engine/EngineRender]] создаёт Vulkan renderer, загружает текстуры содержимого через `create_texture` и меши через `create_mesh`, затем вызывает `render_frame` с `Frame`: матрица камеры, `DirectionalLight::default()` и по `DrawCommand` на меш с общей матрицей модели.
+- Через [[Engine/EngineRender]] создаёт Vulkan renderer, загружает текстуры содержимого через `create_texture` и меши через `create_mesh`, затем вызывает `render_frame` с `Frame`: матрица камеры, `DirectionalLight::default()` и по `DrawCommand` на меш с общей матрицей модели; с `--debug-overlay` также вершины панели в `Frame::overlay`, иначе пустой срез.
 
 ## Ограничения и важные детали
 
+- `--debug-overlay`: полупрозрачная чёрная панель в физических пикселях (без учёта DPI). Сверху вниз: FPS крупным шрифтом и график за 30 с; память процесса (RSS / working set) и график за 2 мин; загрузка CPU процессом, название CPU и график за 30 с; доля GPU-времени scene pass ([[Engine/EngineRender]] `take_gpu_frame_time`), название GPU из `Capabilities` и график за 30 с. Выборка и перестройка геометрии — раз в 0,5 с на главном потоке; sysinfo обновляет только текущий процесс. FPS считает только `FrameStatus::Presented`. `Process::cpu_usage` sysinfo суммирует ядра, поэтому делится на число логических CPU. Подписи латиницей шрифтом 8×8 (font8x8); символы вне ASCII заменяются на `?`, имена устройств обрезаются до 36 символов. Источники метрик (память и CPU процесса, GPU по timestamps) и латиница выбраны пользователем.
 - По умолчанию создаётся окно `RVE Sandbox` размером 1280×720 и используется `render_scale = 1.0`.
 - Сборка и запуск выполняются из `build/`; debug-бинарник находится в `build/debug/`. При инициализации sandbox сообщает фактический физический размер окна.
 - Clear color и угол поворота меняются на основе `Time::elapsed()`.
