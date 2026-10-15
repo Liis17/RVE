@@ -14,9 +14,10 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EngineWindow]] | Окно и цикл событий |
 | [[Engine/EnginePlatform]] | Выбор и реализация платформенной интеграции Windows/macOS |
 | [[Engine/EngineRender]] | Vulkan renderer и вывод кадра |
+| [[Engine/EngineAssets]] | Пути ресурсов, загрузка моделей FBX и текстур PNG |
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |
 
-Пять крейтов-скелетов (`engine-scene`, `engine-assets`, `engine-physics`, `engine-audio`, `engine-editor`) описаны в [[Architecture]]; отдельных заметок для них нет.
+Четыре крейта-скелета (`engine-scene`, `engine-physics`, `engine-audio`, `engine-editor`) описаны в [[Architecture]]; отдельных заметок для них нет.
 
 ## Обновление памяти
 

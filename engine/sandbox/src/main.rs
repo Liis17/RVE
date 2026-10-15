@@ -1,6 +1,9 @@
 mod bootstrap;
+mod content;
 mod scene;
 
+use content::Content;
+use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
 use engine_render::{
     DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId,
@@ -12,7 +15,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test] [--scene triangle|cube]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test] [--scene triangle|cube | --model /путь.fbx] [--texture /путь.png]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -21,6 +24,10 @@ struct Options {
     render_scale: f32,
     resize_test: bool,
     scene: Scene,
+    /// Путь модели внутри `assets`, например `/model/cube.fbx`.
+    model: Option<String>,
+    /// Путь PNG внутри `assets`, заменяющий текстуры сцены или модели.
+    texture: Option<String>,
 }
 
 fn parse_args<I, S>(args: I) -> Result<Options, String>
@@ -33,6 +40,8 @@ where
     let mut render_scale = None;
     let mut resize_test = false;
     let mut scene = None;
+    let mut model = None;
+    let mut texture = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--frames" => {
@@ -82,8 +91,29 @@ where
                     format!("неизвестная сцена: {value}; доступны triangle и cube")
                 })?);
             }
+            "--model" => {
+                if model.is_some() {
+                    return Err("флаг --model указан повторно".to_owned());
+                }
+                model = Some(
+                    args.next()
+                        .ok_or_else(|| "после --model требуется путь в assets".to_owned())?,
+                );
+            }
+            "--texture" => {
+                if texture.is_some() {
+                    return Err("флаг --texture указан повторно".to_owned());
+                }
+                texture = Some(
+                    args.next()
+                        .ok_or_else(|| "после --texture требуется путь в assets".to_owned())?,
+                );
+            }
             _ => return Err(format!("неизвестный аргумент: {argument}")),
         }
+    }
+    if scene.is_some() && model.is_some() {
+        return Err("--scene и --model нельзя указывать вместе".to_owned());
     }
     if resize_test && frames.is_some_and(|count| count < 120) {
         return Err("с --resize-test значение --frames должно быть не меньше 120".to_owned());
@@ -93,7 +123,21 @@ where
         render_scale: render_scale.unwrap_or(1.0),
         resize_test,
         scene: scene.unwrap_or_default(),
+        model,
+        texture,
     })
+}
+
+/// Загружает модель или демонстрационную сцену и заменяет текстуры, если задан `--texture`.
+fn load_content(options: &Options, assets: &Assets) -> Result<Content, AssetError> {
+    let mut content = match &options.model {
+        Some(path) => Content::from_model(assets.load_model(path)?),
+        None => Content::from_scene(options.scene),
+    };
+    if let Some(path) = &options.texture {
+        content.override_texture(assets.load_texture(path)?);
+    }
+    Ok(content)
 }
 
 #[derive(Default)]
@@ -108,8 +152,8 @@ struct ResizeTest {
 
 struct Sandbox {
     renderer: Option<Renderer>,
-    mesh: Option<MeshId>,
-    texture: Option<TextureId>,
+    content: Content,
+    meshes: Vec<(MeshId, Option<TextureId>)>,
     size: PhysicalSize<u32>,
     time: Time,
     options: Options,
@@ -119,11 +163,11 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    fn new(options: Options) -> Self {
+    fn new(options: Options, content: Content) -> Self {
         Self {
             renderer: None,
-            mesh: None,
-            texture: None,
+            content,
+            meshes: Vec::new(),
             size: PhysicalSize::new(0, 0),
             time: Time::new(),
             options,
@@ -208,6 +252,25 @@ impl Sandbox {
         }
     }
 
+    fn upload_content(&mut self, renderer: &mut Renderer) -> Result<(), String> {
+        let mut textures = Vec::with_capacity(self.content.textures.len());
+        for texture in &self.content.textures {
+            textures.push(
+                renderer
+                    .create_texture(texture.width, texture.height, &texture.rgba)
+                    .map_err(|error| format!("ошибка создания текстуры: {error}"))?,
+            );
+        }
+        for mesh in &self.content.meshes {
+            let id = renderer
+                .create_mesh(&mesh.vertices, &mesh.indices)
+                .map_err(|error| format!("ошибка создания меша: {error}"))?;
+            self.meshes
+                .push((id, mesh.texture.map(|index| textures[index])));
+        }
+        Ok(())
+    }
+
     fn take_failure(&mut self) -> Option<String> {
         self.failure.take()
     }
@@ -236,22 +299,9 @@ impl WindowHandler for Sandbox {
                     capabilities.discrete,
                     capabilities.tessellation_shader
                 );
-                let (vertices, indices) = self.options.scene.mesh();
-                match renderer.create_mesh(&vertices, &indices) {
-                    Ok(mesh) => self.mesh = Some(mesh),
-                    Err(error) => {
-                        self.failure = Some(format!("ошибка создания меша: {error}"));
-                        return false;
-                    }
-                }
-                if let Some(texture) = self.options.scene.texture() {
-                    match renderer.create_texture(texture.width, texture.height, &texture.rgba) {
-                        Ok(texture) => self.texture = Some(texture),
-                        Err(error) => {
-                            self.failure = Some(format!("ошибка создания текстуры: {error}"));
-                            return false;
-                        }
-                    }
+                if let Err(error) = self.upload_content(&mut renderer) {
+                    self.failure = Some(error);
+                    return false;
                 }
                 self.renderer = Some(renderer);
                 true
@@ -275,19 +325,24 @@ impl WindowHandler for Sandbox {
             0.5 + 0.5 * (elapsed * 0.41).sin(),
             1.0,
         ];
-        let (Some(renderer), Some(mesh)) = (self.renderer.as_mut(), self.mesh) else {
+        let Some(renderer) = self.renderer.as_mut() else {
             self.failure = Some("рендерер отсутствует".to_owned());
             return false;
         };
-        let scene = self.options.scene;
-        let draws = [DrawCommand {
-            mesh,
-            texture: self.texture,
-            model: scene.model(elapsed).to_cols_array_2d(),
-        }];
+        let model = self.content.model(elapsed).to_cols_array_2d();
+        let draws = self
+            .meshes
+            .iter()
+            .map(|&(mesh, texture)| DrawCommand {
+                mesh,
+                texture,
+                model,
+            })
+            .collect::<Vec<_>>();
         let frame = Frame {
             clear_color: color,
-            view_projection: scene
+            view_projection: self
+                .content
                 .view_projection(self.size.width, self.size.height)
                 .to_cols_array_2d(),
             light: DirectionalLight::default(),
@@ -354,7 +409,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut app = Sandbox::new(options);
+    let assets = Assets::new(ASSETS_DIR);
+    let content = match load_content(&options, &assets) {
+        Ok(content) => content,
+        Err(error) => {
+            eprintln!("Ошибка ресурса: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut app = Sandbox::new(options, content);
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
     let exit_code = match (run_result, failure) {
@@ -374,7 +437,12 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args};
+    use super::{Content, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args};
+
+    fn sandbox(options: Options) -> Sandbox {
+        let content = Content::from_scene(options.scene);
+        Sandbox::new(options, content)
+    }
 
     #[test]
     fn frame_limit_accepts_u64_boundaries() {
@@ -425,11 +493,13 @@ mod tests {
 
     #[test]
     fn resize_progress_requires_requested_and_matching_physical_sizes() {
-        let mut sandbox = Sandbox::new(Options {
+        let mut sandbox = sandbox(Options {
             frames: None,
             render_scale: 1.0,
             resize_test: true,
             scene: Scene::Cube,
+            model: None,
+            texture: None,
         });
         sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
         sandbox.report_resize(RESTORE_SIZE.width, RESTORE_SIZE.height);
@@ -454,7 +524,7 @@ mod tests {
 
     #[test]
     fn normal_resize_does_not_advance_disabled_resize_test() {
-        let mut sandbox = Sandbox::new(parse_args(Vec::<String>::new()).unwrap());
+        let mut sandbox = sandbox(parse_args(Vec::<String>::new()).unwrap());
         sandbox.resize_test.initial_requested = true;
         sandbox.resize_test.restore_requested = true;
 
@@ -466,7 +536,7 @@ mod tests {
 
     #[test]
     fn failure_can_be_taken_only_once_after_the_event_loop() {
-        let mut sandbox = Sandbox::new(parse_args(Vec::<String>::new()).unwrap());
+        let mut sandbox = sandbox(parse_args(Vec::<String>::new()).unwrap());
         assert_eq!(sandbox.take_failure(), None);
         sandbox.failure = Some("render failed".to_owned());
         assert_eq!(sandbox.take_failure().as_deref(), Some("render failed"));
@@ -483,12 +553,20 @@ mod tests {
             "--resize-test",
             "--scene",
             "triangle",
+            "--texture",
+            "/texture/paint.png",
         ])
         .expect("valid arguments should parse");
         assert_eq!(options.frames, Some(120));
         assert_eq!(options.render_scale, 0.5);
         assert!(options.resize_test);
         assert_eq!(options.scene, Scene::Triangle);
+        assert_eq!(options.model, None);
+        assert_eq!(options.texture.as_deref(), Some("/texture/paint.png"));
+
+        let options = parse_args(["--model", "/model/cube.fbx"]).unwrap();
+        assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
+        assert_eq!(options.texture, None);
     }
 
     #[test]
@@ -510,6 +588,12 @@ mod tests {
             vec!["--scene"],
             vec!["--scene", "sphere"],
             vec!["--scene", "cube", "--scene", "triangle"],
+            vec!["--model"],
+            vec!["--model", "/a.fbx", "--model", "/b.fbx"],
+            vec!["--texture"],
+            vec!["--texture", "/a.png", "--texture", "/b.png"],
+            vec!["--scene", "cube", "--model", "/model/cube.fbx"],
+            vec!["--model", "/model/cube.fbx", "--scene", "triangle"],
         ] {
             assert!(parse_args(arguments).is_err());
         }
@@ -522,5 +606,7 @@ mod tests {
         assert_eq!(options.render_scale, 1.0);
         assert!(!options.resize_test);
         assert_eq!(options.scene, Scene::Cube);
+        assert_eq!(options.model, None);
+        assert_eq!(options.texture, None);
     }
 }

@@ -1,5 +1,6 @@
 //! Геометрия и трансформации демонстрационной сцены sandbox.
 
+use engine_assets::TextureData;
 use engine_render::Vertex;
 use glam::camera::rh::proj::directx;
 use glam::{Mat4, Vec3};
@@ -29,7 +30,7 @@ impl Scene {
     }
 
     /// Текстура сцены; треугольник рисуется цветом вершин без текстуры.
-    pub fn texture(self) -> Option<Texture> {
+    pub fn texture(self) -> Option<TextureData> {
         match self {
             Self::Triangle => None,
             Self::Cube => Some(checker_texture()),
@@ -49,13 +50,6 @@ impl Scene {
             Self::Cube => cube_model(elapsed),
         }
     }
-}
-
-/// Пиксели RGBA8 по строкам сверху вниз.
-pub struct Texture {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
 }
 
 const TRIANGLE_NORMAL: [f32; 3] = [0.0, 0.0, 1.0];
@@ -116,7 +110,7 @@ pub fn cube_mesh() -> (Vec<Vertex>, Vec<u32>) {
 }
 
 /// Шахматная текстура 256x256 из клеток 32x32.
-pub fn checker_texture() -> Texture {
+pub fn checker_texture() -> TextureData {
     const SIZE: u32 = 256;
     const CELL: u32 = 32;
     let rgba = (0..SIZE * SIZE)
@@ -129,7 +123,7 @@ pub fn checker_texture() -> Texture {
             }
         })
         .collect();
-    Texture {
+    TextureData {
         width: SIZE,
         height: SIZE,
         rgba,
