@@ -1,0 +1,29 @@
+use std::process::Command;
+
+#[test]
+fn invalid_arguments_exit_with_code_two_and_usage_before_opening_a_window() {
+    for arguments in [
+        vec!["--unknown"],
+        vec!["--frames"],
+        vec!["--frames", "0"],
+        vec!["--frames", "18446744073709551616"],
+        vec!["--render-scale", "NaN"],
+        vec!["--render-scale", "0.5", "--render-scale", "1"],
+        vec!["--resize-test", "--frames", "119"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sandbox"))
+            .args(&arguments)
+            .output()
+            .expect("sandbox binary should start");
+        let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {stderr}");
+        assert!(stderr.contains("Ошибка аргументов:"), "{stderr}");
+        assert!(
+            stderr
+                .contains("Использование: sandbox [--frames N] [--render-scale S] [--resize-test]"),
+            "{stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+    }
+}

@@ -19,3 +19,15 @@ pub fn load_vulkan() -> Result<Entry, LoadingError> {
     // SAFETY: оба пути указывают на Vulkan loader; Entry удерживает библиотеку живой.
     unsafe { Entry::load().or_else(|_| Entry::load_from("/opt/homebrew/lib/libvulkan.dylib")) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moltenvk_requires_portability_enumeration_and_subset() {
+        assert!(INSTANCE_EXTENSIONS.contains(&c"VK_KHR_portability_enumeration"));
+        assert!(INSTANCE_FLAGS.contains(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR));
+        assert!(DEVICE_EXTENSIONS.contains(&c"VK_KHR_portability_subset"));
+    }
+}

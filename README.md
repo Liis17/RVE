@@ -59,6 +59,23 @@ cargo test --workspace
 cargo build -p sandbox
 ```
 
+### Автоматические тесты и PR
+
+Каждая новая фича сопровождается тестами в том же коммите; исправление бага — регрессионным тестом. Общая команда `cargo test --workspace --locked` запускает unit-, integration- и doc-тесты всех крейтов. В крейтах-скелетах пока нет поведения для тестирования.
+
+Тесты проверяют время игрового цикла, завершение оконного приложения и ошибки, настройки renderer, расширения Vulkan и параметры swapchain, требования платформенных адаптеров, CLI и обработку resize в sandbox. Интеграционный тест `engine/sandbox/tests/cli.rs` запускает бинарник с неверными аргументами и проверяет код выхода 2 и диагностику. Автотестам не нужны окно, GPU или Vulkan runtime; они не проверяют фактическую отрисовку и обработку событий ОС.
+
+Workflow [Rust CI](.github/workflows/ci.yml) запускается при push в любую ветку, для PR и вручную. На `windows-latest` и `macos-latest` выполняются:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --locked
+cargo test --workspace --locked
+```
+
+Общая проверка `CI` проходит только при успехе обеих платформ. Для `main` она должна быть обязательной в GitHub branch protection с требованием актуальности ветки относительно `main`; один workflow без защиты ветки не запрещает слияние. Порядок работы: коммит с кодом и тестами в рабочей ветке → push → PR → успешная `CI` → слияние.
+
 Запуск sandbox:
 
 ```powershell
