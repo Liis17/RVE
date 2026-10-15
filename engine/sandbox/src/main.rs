@@ -347,6 +347,7 @@ impl WindowHandler for Sandbox {
                 .to_cols_array_2d(),
             light: DirectionalLight::default(),
             draws: &draws,
+            overlay: &[],
         };
         match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {
