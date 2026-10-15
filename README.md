@@ -17,7 +17,7 @@ RVE — игровой движок на Rust с выводом через Vulka
 | `engine-resources` | Фоновое чтение loose и packed бинарных ресурсов | Работает |
 | `rvepak` | Сборка, просмотр и проверка наборов RVEPAK из TOML manifest | Работает |
 | `engine-scene` | Игровые объекты, компоненты и сцены | Скелет |
-| `engine-assets` | Загрузка моделей FBX и текстур PNG из каталога `assets` | Работает |
+| `engine-assets` | Загрузка FBX и PNG через фоновый сервис ресурсов | Работает |
 | `engine-physics` | Столкновения и физическая симуляция | Скелет |
 | `engine-audio` | Воспроизведение и управление игровым звуком | Скелет |
 | `engine-editor` | Графический редактор сцен и ресурсов | Скелет |
@@ -25,10 +25,11 @@ RVE — игровой движок на Rust с выводом через Vulka
 
 `engine-files` и `engine-pak` предоставляют виртуальные пути и архивы с positional
 reads, потоковой записью, диапазонными чтениями, межархивными ссылками и reusable
-manifest builder. `engine-resources` запускает bounded worker pool для чтения
-loose files или RVEPAK, а инструмент `rvepak` собирает opaque файлы любого типа.
-Resource service пока не подключён к `engine-assets` или sandbox. Wire contract
-описан в [RVEPAK v1 format](docs/rvepak-format.md).
+manifest builder. `engine-resources` запускает bounded worker pool для чтения loose
+files или RVEPAK, а инструмент `rvepak` собирает opaque файлы любого типа.
+`engine-assets` получает через сервис байты FBX и PNG и декодирует их в CPU-данные;
+sandbox загружает их до создания окна, а GPU upload остаётся на потоке renderer.
+Wire contract описан в [RVEPAK v1 format](docs/rvepak-format.md).
 
 ### Сборка архивов ресурсов
 
@@ -42,22 +43,28 @@ manifest-файла, `[[archives]]` задают упорядоченные `.rv
 группы и небезопасные имена архивов отклоняются до записи.
 
 Пример полной схемы: [`rvepak.example.toml`](rvepak.example.toml). Запускай команды
-из `build/`; output directory должна ещё не существовать. Builder пишет все архивы
-во временный соседний каталог, проверяет общий `ArchiveCatalog`, затем публикует
-набор атомарно без замены существующего output.
+из `build/`; output directory должна ещё не существовать. Пример создаёт
+`game/assets`, который sandbox обнаружит при запуске из `build/game/`. Builder пишет
+все архивы во временный соседний каталог, проверяет общий `ArchiveCatalog`, затем
+публикует набор атомарно без замены существующего output.
 
 ```sh
 cargo run -p rvepak -- build ../rvepak.example.toml
-cargo run -p rvepak -- build ../rvepak.example.toml --no-dedup
-cargo run -p rvepak -- list game-assets
-cargo run -p rvepak -- verify game-assets
+cargo run -p rvepak -- list game/assets
+cargo run -p rvepak -- verify game/assets
+cargo build -p sandbox
+cd game
+../debug/sandbox --frames 120
+# Windows: ../debug/sandbox.exe --frames 120
 ```
 
 Deduplication включена по умолчанию и использует BLAKE3 плюс размер до сжатия:
 первое в manifest вхождение владеет blob, повтор в том же архиве становится
 alias, а в следующем архиве — прямой ссылкой на архив-владелец. Компрессионные
 настройки повторов наследуются от владельца; builder сообщает об отличающихся
-overrides. `--no-dedup` сохраняет каждый input самостоятельным локальным blob.
+overrides. Чтобы сохранить каждый input самостоятельным локальным blob, передай
+`--no-dedup` команде `build` вместо запуска по умолчанию; output directory при этом
+также должна быть новой.
 `list` показывает полный virtual path, размер, effective codec, владельца и
 межархивную зависимость; `verify` потоково проверяет каждый уникальный local blob.
 Успех возвращает код 0, ошибки аргументов, manifest или входных данных — 2,
@@ -76,6 +83,10 @@ stat, read-all и half-open range requests; `receive` работает с люб
 результат одного чтения 256 MiB и общий transient/pending-result memory budget
 512 MiB. Полный контракт и ограничения описаны в
 [`EngineResources`](Obsidian/RVEVault/Engine/EngineResources.md).
+При запуске sandbox сначала проверяет аргументы и `bootstrap.rves`, затем открывает
+каталог ресурсов до подготовки содержимого — даже для процедурной сцены. Верхнеуровневый
+`.rvepak` переключает `assets` в packed-only режим; повреждённый архив, неверный владелец
+или дублирующий virtual path завершает запуск с кодом 2 до окна.
 
 ## Требования
 
@@ -201,8 +212,10 @@ WindowSizeY=720
 ### Ресурсы: модели и текстуры
 
 Ресурсы лежат в каталоге `assets` текущего рабочего каталога, при обычном запуске —
-`build/assets`, и вместе с `build/` не попадают в Git. Путь ресурса записывается от
-корня этого каталога через `/`: `/model/cube.fbx` означает `build/assets/model/cube.fbx`.
+`build/assets`, и вместе с `build/` не попадают в Git. Каталог может содержать loose
+файлы или верхнеуровневые `.rvepak`; при наличии архивов включается только packed mode.
+Путь ресурса записывается от корня этого каталога через `/`: `/model/cube.fbx` означает
+`build/assets/model/cube.fbx`.
 Компоненты `.` и `..`, пустые компоненты, `\` и `:` запрещены.
 
 ```text
@@ -218,9 +231,11 @@ build/assets/
 неподвижная плоскость. Сочетание с `--scene triangle` недопустимо. Оси и единицы файла
 приводятся к Y вверх и метрам, поэтому экспорт Blender по умолчанию подходит без настройки.
 Текстура материала (Base Color
-или Diffuse) должна быть PNG: встроенная в FBX либо файлом. Файл ищется по пути из FBX
-относительно модели, затем по имени файла рядом с моделью. Например, при экспорте из
-Blender с `Path Mode: Relative` в `assets/model/` подойдёт путь `../texture/cube.png`.
+или Diffuse) должна быть PNG: встроенная в FBX либо ресурсом в том же namespace.
+Относительные пути нормализуются внутри `assets`, включая `..`; Windows-пути художника
+также пробуют basename рядом с моделью. Абсолютный host path не читается напрямую.
+Например, при экспорте из Blender с `Path Mode: Relative` в `assets/model/` подойдёт
+путь `../texture/cube.png`.
 
 `--texture /путь.png` заменяет текстуры модели или демонстрационной сцены одной
 PNG-текстурой. Ошибки ресурсов (нет файла, не тот формат, повреждённые данные,

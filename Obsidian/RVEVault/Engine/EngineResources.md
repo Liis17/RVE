@@ -6,7 +6,7 @@ Parent: [[Index]]
 
 `engine-resources` предоставляет общий фоновый доступ к готовым бинарным ресурсам. Он читает loose files и RVEPAK, но не декодирует FBX/PNG и не зависит от окон, renderer, сценариев или async runtime. Потребители получают cloneable `ResourceHandle` и отправляют запросы на metadata, полный файл или диапазон байтов.
 
-Крейт пока не подключён к `engine-assets` и sandbox: текущая загрузка FBX/PNG продолжает пользоваться собственным `Assets` API.
+`engine-assets::Assets::with_resources` использует handle для загрузки FBX/PNG и внешних текстур. Sandbox запускает сервис после проверки аргументов и `bootstrap.rves`, затем синхронно подготавливает CPU-содержимое до создания окна. Renderer загружает уже готовые геометрию и пиксели на своём потоке; оконные callbacks не ждут запросы ресурсов. Порядок запуска sandbox описан в [[Engine/Sandbox]].
 
 ## Источники и namespace
 
@@ -33,4 +33,4 @@ Virtual paths используют UTF-8, чувствительный к рег
 
 ## Зависимости и интеграция
 
-Крейт зависит от `engine-files` для virtual paths и positional reads, `engine-pak` для discovery, каталога и декодирования архивов, а также bounded async-capable channel `flume`. Он не добавляет глобальный runtime, scheduler, asset cache или decoder. `ResourceHandle::root` возвращает закреплённый корень, чтобы следующий потребитель мог сохранить совместимый root API.
+Крейт зависит от `engine-files` для virtual paths и positional reads, `engine-pak` для discovery, каталога и декодирования архивов, а также bounded async-capable channel `flume`. Он не добавляет глобальный runtime, scheduler, asset cache или format decoder. `ResourceHandle::root` возвращает закреплённый корень для совместимого `Assets::root()` API.

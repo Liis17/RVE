@@ -1,6 +1,6 @@
 # Paths in this manifest are relative to the directory containing this file.
 root = "build/assets"
-output = "build/game-assets"
+output = "build/game/assets"
 
 [defaults]
 codec = "zstd"

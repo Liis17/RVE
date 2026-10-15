@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. Математические компоненты камер, трансформаций и света предоставляет `engine-scene`; демонстрационная сцена с вращающимся кубом и плоскостью показывает отбрасываемые тени. Модели FBX и текстуры PNG загружаются из каталога `assets`. Физика, звук и редактор пока не реализованы.
+RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. Математические компоненты камер, трансформаций и света предоставляет `engine-scene`; демонстрационная сцена с вращающимся кубом и плоскостью показывает отбрасываемые тени. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Физика, звук и редактор пока не реализованы.
 
 ## Стек
 
@@ -53,10 +53,10 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ## Направления зависимостей
 
-- `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `engine-scene`, glam, sysinfo и font8x8.
-- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; сервис пока не подключён к `engine-assets` или sandbox. `engine-files` не имеет внешних зависимостей.
+- `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
+- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets` и sandbox читают через его handle. `engine-files` не имеет внешних зависимостей.
 - `engine-scene` зависит от glam и не зависит от renderer; sandbox передаёт его вычисленные матрицы через API renderer.
-- `engine-assets` зависит от ufbx и png; от renderer и окна не зависит.
+- `engine-assets` зависит от `engine-resources`, ufbx и png; от renderer и окна не зависит.
 - `engine-window` зависит от winit.
 - `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit и glam; naga — его build-зависимость.
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
@@ -72,23 +72,24 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 Чтение ограничивается configurable index, result, chunk и memory budgets. `ReadControl` резервирует footprint результата, stored/decoded чанка и codec workspace до аллокаций и позволяет отменить чтение между чанками. На Windows `seek_read` меняет file cursor, поэтому file-backed payload reads и worker reopenings используют независимые handles с проверкой ArchiveId; на Unix исходный positional handle остаётся закреплён за Archive.
 
-Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. `engine-resources` выбирает packed-only режим при наличии архивов и loose режим без них, ограничивает очередь и memory footprint и выполняет чтение в background workers. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; сервис пока не включён в `engine-assets`, sandbox или графический путь.
+Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. `engine-resources` выбирает packed-only режим при наличии архивов и loose режим без них, ограничивает очередь и memory footprint и выполняет чтение в background workers. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; sandbox использует `assets` как root по умолчанию.
 
 ## Основные потоки
 
 ### Запуск и цикл окна
 
-`engine/sandbox/src/main.rs` разбирает аргументы, загружает начальный размер окна
-через `bootstrap::load` из `bootstrap.rves` в рабочем каталоге, создаёт `Sandbox` и
-вызывает `engine_window::run` с полученным `WindowConfig`. Параметры `WindowSizeX`
-и `WindowSizeY` задают физический размер; отсутствующие параметры или файл
-сохраняют defaults 1280×720, ошибочные настройки завершают запуск с кодом 2.
-Затем до создания окна загружается содержимое кадра (`load_content`): демонстрационная
-сцена либо модель `--model` через `Assets::load_model` и, при `--texture`, заменяющая
-текстура через `Assets::load_texture`. Ошибка ресурса также даёт код 2.
+`engine/sandbox/src/main.rs` разбирает аргументы и загружает начальный размер окна
+через `bootstrap::load` из `bootstrap.rves` в рабочем каталоге. После этих проверок
+`ResourceSystem::start` открывает `assets` (или проверяет его архивный каталог), затем
+`Assets::with_resources` загружает CPU-содержимое кадра до создания окна. Это происходит
+и для процедурных сцен; отсутствующий loose root допустим, а ошибка архива или ресурса
+завершает запуск с кодом 2. FBX разбирается через `ufbx::load_memory` на вызывающем
+startup-потоке, внешние текстуры читаются через тот же handle, GPU upload выполняется
+позже при renderer initialization. Параметры `WindowSizeX` и `WindowSizeY` задают
+физический размер; отсутствующие параметры или файл сохраняют defaults 1280×720.
 `engine-window` создаёт event loop и окно в `resumed`, после чего вызывает `WindowHandler::init`. В каждом `about_to_wait` вызывается `update`, а затем запрашивается перерисовка; `frame` вызывается при `RedrawRequested`. Изменения размеров передаются в физических пикселях через `resized`.
 
-При выходе `WindowHandler::exiting` вызывается до освобождения окна. Sandbox удаляет renderer в этом callback; renderer удерживает `Arc` окна до уничтожения Vulkan surface.
+При выходе `WindowHandler::exiting` вызывается до освобождения окна. Sandbox удаляет renderer в этом callback; после возврата из event loop сначала уничтожается `Sandbox`, затем `ResourceSystem` joins coordinator и workers.
 
 Источники: `engine/engine-window/src/lib.rs`, `engine/sandbox/src/main.rs`, `engine/sandbox/src/bootstrap.rs`.
 

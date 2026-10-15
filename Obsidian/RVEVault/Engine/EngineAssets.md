@@ -4,24 +4,24 @@ Parent: [[Index]]
 
 ## Назначение
 
-`engine-assets` находит ресурсы в каталоге `assets` и загружает их в память CPU: модели FBX и текстуры PNG. Крейт не зависит от renderer; [[Engine/Sandbox]] переводит загруженные данные в вершины и текстуры [[Engine/EngineRender]].
+`engine-assets` загружает модели FBX и текстуры PNG в память CPU. `Assets::with_resources` читает байты через [[Engine/EngineResources]] из loose files или RVEPAK; `Assets::new(root)` сохраняет совместимый файловый API. Крейт не зависит от renderer; [[Engine/Sandbox]] переводит CPU-данные в ресурсы [[Engine/EngineRender]].
 
 ## Источники
 
 | Файл | Значимый символ | Роль |
 |---|---|---|
 | `engine/engine-assets/src/lib.rs` | `ASSETS_DIR`, `Assets`, `Model`, `ModelMesh`, `ModelVertex`, `TextureData`, `AssetError`, `decode_png` | Пути ресурсов, загрузка FBX через ufbx и PNG через png |
-| `engine/engine-assets/Cargo.toml` | `ufbx`, `png` | Разбор FBX и декодирование PNG |
+| `engine/engine-assets/Cargo.toml` | `engine-resources`, `ufbx`, `png` | Чтение resource bytes, разбор FBX и декодирование PNG |
 
 ## Публичные контракты
 
 | Контракт | Поведение и условия |
 |---|---|
 | `ASSETS_DIR` | `"assets"` — каталог ресурсов относительно рабочего каталога; при обычном запуске это `build/assets` |
-| `Assets::new(root)`, `Assets::root()` | Каталог, в котором ищутся ресурсы |
+| `Assets::new(root)`, `Assets::with_resources(handle)`, `Assets::root()` | Каталог, в котором ищутся ресурсы; сервисный вариант сохраняет root из handle |
 | `Assets::resolve(&self, asset_path: &str) -> Result<PathBuf, AssetError>` | `/model/cube.fbx` → `<root>/model/cube.fbx`; ведущий `/` необязателен. Разделитель — `/`. Пустой путь, пустые компоненты, `.`, `..`, `\` и `:` дают `InvalidPath`, поэтому путь не выходит за пределы каталога ресурсов |
-| `Assets::load_texture(&self, asset_path) -> Result<TextureData, AssetError>` | Требует расширение `.png` (регистр не важен), читает файл и декодирует его |
-| `Assets::load_model(&self, asset_path) -> Result<Model, AssetError>` | Требует расширение `.fbx`, загружает все меши и их PNG-текстуры |
+| `Assets::load_texture(&self, asset_path) -> Result<TextureData, AssetError>` | Требует расширение `.png` (регистр не важен), читает resource bytes и декодирует их |
+| `Assets::load_model(&self, asset_path) -> Result<Model, AssetError>` | Требует расширение `.fbx`, читает FBX в память и загружает все меши и их PNG-текстуры |
 | `decode_png(bytes) -> Result<TextureData, String>` | Любой цветовой тип и глубина PNG → RGBA8: палитра раскрывается, 16 бит усекаются до старшего байта, серый и RGB получают непрозрачную альфу. Предел памяти декодера — 512 МиБ |
 | `TextureData` | `width`, `height`, `rgba: Vec<u8>` — sRGB RGBA8 по строкам сверху вниз; совпадает с входом `Renderer::create_texture` |
 | `Model` | `meshes: Vec<ModelMesh>` и `textures: Vec<TextureData>`; `bounds()` возвращает минимальный и максимальный углы всех вершин или `None` без вершин |
@@ -31,18 +31,18 @@ Parent: [[Index]]
 
 ## Загрузка FBX
 
-- ufbx загружает файл по пути и приводит сцену к осям +X вправо, +Y вверх, +Z вперёд и к метрам (`target_axes`, `target_unit_meters = 1`, `SpaceConversion::ModifyGeometry`). Отсутствующие нормали ufbx генерирует сам.
+- ufbx разбирает FBX через `load_memory` с virtual filename модели и приводит сцену к осям +X вправо, +Y вверх, +Z вперёд и к метрам (`target_axes`, `target_unit_meters = 1`, `SpaceConversion::ModifyGeometry`). Внешнее чтение ufbx отключено; все файлы запрашиваются через `ResourceHandle`, а CPU-разбор выполняется вызывающим потоком до окна. Отсутствующие нормали ufbx генерирует сам.
 - Обходятся все узлы с мешем. Позиции переводятся матрицей `geometry_to_world` узла, нормали — `matrix_for_normals` от неё, а затем нормализуются; у вырожденных нормалей результат `[0, 1, 0]`.
 - Меш делится на части по материалам (`material_parts`). Материалы экземпляра в узле имеют приоритет над материалами геометрии. Многоугольники триангулируются ufbx. Каждый угол треугольника становится отдельной вершиной: индексы последовательные, дедупликации вершин нет.
 - В FBX ось `v` текстуры направлена вверх, поэтому загрузчик пишет `1 - v`. Без UV-слоя `uv = [0, 0]`.
 - Текстура части — файловая текстура `DiffuseColor` материала FBX либо `base_color` PBR-материала. Одна текстура FBX загружается один раз и разделяется частями.
-- Встроенный в FBX PNG декодируется из содержимого файла. Внешняя текстура ищется по пути, который ufbx разрешил относительно файла модели, затем по имени файла из относительного и абсолютного путей в каталоге модели. Имя выделяется и по `/`, и по `\`, чтобы работали пути из Windows. Первый существующий файл должен быть PNG, иначе ошибка `UnsupportedFormat`; если ничего не найдено — `MissingTexture`.
+- Встроенный в FBX PNG декодируется из содержимого файла. Внешняя текстура ищется по нормализованному virtual path из FBX и относительным путям внутри resource root; разделители `/` и `\` поддерживаются, а `..` разрешён только пока нормализация остаётся внутри root. Для host paths используется только basename рядом с моделью, файловая система за root недоступна. Первый найденный кандидат проверяется на PNG и читается; только `NotFound` допускает следующий кандидат. Ошибка чтения, бюджета или декодирования останавливает поиск.
 
 ## Зависимости и взаимодействия
 
 - ufbx 0.11.5 — Rust-обёртка C-библиотеки ufbx; её исходник собирается крейтом `cc` при `cargo build`, поэтому нужен C-компилятор (MSVC на Windows, clang на macOS). Поддерживает двоичный и ASCII FBX.
 - png 0.18.1 — чистый Rust-декодер PNG.
-- Используется только в [[Engine/Sandbox]].
+- Используется в [[Engine/Sandbox]]; service-backed чтение и startup порядок описаны в [[Engine/EngineResources]] и [[Engine/Sandbox]].
 
 ## Ограничения
 

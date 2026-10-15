@@ -123,6 +123,33 @@ class PackageSelectionTests(unittest.TestCase):
         self.assertEqual(self.select(["engine/engine-pak/src/builder.rs"]),
                          ["engine-pak", "engine-resources", "rvepak"])
 
+    def test_resource_asset_sandbox_consumers_are_selected_transitively(self):
+        resources = "engine/engine-resources"
+        assets = "engine/engine-assets"
+        sandbox = "engine/sandbox"
+        self.metadata["packages"] = [
+            package("engine-resources", directory=resources),
+            package("engine-assets", ["engine-resources"], directory=assets,
+                    dependency_directories={"engine-resources": resources}),
+            package("sandbox", ["engine-assets", "engine-resources"], directory=sandbox,
+                    dependency_directories={
+                        "engine-assets": assets,
+                        "engine-resources": resources,
+                    }),
+        ]
+        self.metadata["workspace_members"] = [
+            "engine-resources", "engine-assets", "sandbox"
+        ]
+
+        self.assertEqual(
+            self.select(["engine/engine-resources/src/service.rs"]),
+            ["engine-assets", "engine-resources", "sandbox"],
+        )
+        self.assertEqual(
+            self.select(["engine/engine-assets/src/lib.rs"]),
+            ["engine-assets", "sandbox"],
+        )
+
 
 class ChangeRangeTests(unittest.TestCase):
     def setUp(self):

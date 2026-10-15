@@ -3,6 +3,7 @@
 //! Ресурсы лежат в каталоге [`ASSETS_DIR`] рабочего каталога и адресуются путями
 //! вида `/model/cube.fbx`: такой путь указывает на файл `assets/model/cube.fbx`.
 
+use engine_resources::{ResourceError, ResourceErrorKind, ResourceHandle, ResourceStat};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -139,11 +140,23 @@ impl Error for AssetError {
 #[derive(Clone, Debug)]
 pub struct Assets {
     root: PathBuf,
+    resources: Option<ResourceHandle>,
 }
 
 impl Assets {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            resources: None,
+        }
+    }
+
+    /// Uses a background resource handle for every loose or packed byte read.
+    pub fn with_resources(resources: ResourceHandle) -> Self {
+        Self {
+            root: resources.root().to_owned(),
+            resources: Some(resources),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -181,7 +194,7 @@ impl Assets {
     pub fn load_texture(&self, asset_path: &str) -> Result<TextureData, AssetError> {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "png")?;
-        let bytes = read(&path)?;
+        let bytes = self.read_asset(asset_path, &path)?;
         decode_png(&bytes).map_err(|message| AssetError::Decode { path, message })
     }
 
@@ -192,7 +205,45 @@ impl Assets {
     pub fn load_model(&self, asset_path: &str) -> Result<Model, AssetError> {
         let path = self.resolve(asset_path)?;
         require_extension(&path, "fbx")?;
-        load_fbx(&path)
+        let bytes = self.read_asset(asset_path, &path)?;
+        load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self)
+    }
+
+    fn read_asset(&self, asset_path: &str, path: &Path) -> Result<Vec<u8>, AssetError> {
+        let Some(resources) = &self.resources else {
+            return read_legacy(&self.root, path);
+        };
+        let request = resources
+            .read_all(asset_path)
+            .map_err(|error| map_resource_error(path, error))?;
+        request
+            .wait()
+            .map_err(|error| map_resource_error(path, error))
+    }
+
+    fn stat_asset(&self, asset_path: &str, path: &Path) -> Result<ResourceStat, AssetError> {
+        let Some(resources) = &self.resources else {
+            let path = legacy_path(&self.root, path)?;
+            let metadata = fs::metadata(&path).map_err(|error| AssetError::Io {
+                path: path.clone(),
+                error,
+            })?;
+            if !metadata.is_file() {
+                return Err(AssetError::Io {
+                    path,
+                    error: io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
+                });
+            }
+            return Ok(ResourceStat {
+                size: metadata.len(),
+            });
+        };
+        let request = resources
+            .stat(asset_path)
+            .map_err(|error| map_resource_error(path, error))?;
+        request
+            .wait()
+            .map_err(|error| map_resource_error(path, error))
     }
 }
 
@@ -211,11 +262,74 @@ fn require_extension(path: &Path, expected: &'static str) -> Result<(), AssetErr
     }
 }
 
-fn read(path: &Path) -> Result<Vec<u8>, AssetError> {
-    fs::read(path).map_err(|error| AssetError::Io {
+fn virtual_asset_path(asset_path: &str) -> String {
+    format!("/{}", asset_path.strip_prefix('/').unwrap_or(asset_path))
+}
+
+fn map_resource_error(path: &Path, error: ResourceError) -> AssetError {
+    if matches!(
+        error.kind(),
+        ResourceErrorKind::InvalidPath | ResourceErrorKind::PathOutsideRoot
+    ) {
+        return AssetError::InvalidPath {
+            path: path.display().to_string(),
+            reason: "путь ресурса не прошёл проверку ресурсного корня",
+        };
+    }
+    let kind = match error.kind() {
+        ResourceErrorKind::NotFound => io::ErrorKind::NotFound,
+        ResourceErrorKind::NonRegularFile => io::ErrorKind::InvalidInput,
+        ResourceErrorKind::Io => match &error {
+            ResourceError::Io { source, .. } => source.kind(),
+            _ => io::ErrorKind::Other,
+        },
+        ResourceErrorKind::Unsupported => io::ErrorKind::Unsupported,
+        ResourceErrorKind::BudgetExceeded => io::ErrorKind::OutOfMemory,
+        ResourceErrorKind::Stopped | ResourceErrorKind::Cancelled => io::ErrorKind::Interrupted,
+        ResourceErrorKind::QueueFull => io::ErrorKind::WouldBlock,
+        _ => io::ErrorKind::Other,
+    };
+    // Keeping ResourceError as the inner error preserves its typed kind for callers.
+    AssetError::Io {
+        path: path.to_owned(),
+        error: io::Error::new(kind, error),
+    }
+}
+
+fn legacy_path(root: &Path, path: &Path) -> Result<PathBuf, AssetError> {
+    let canonical_root = fs::canonicalize(root).map_err(|error| AssetError::Io {
+        path: root.to_owned(),
+        error,
+    })?;
+    let canonical_path = fs::canonicalize(path).map_err(|error| AssetError::Io {
         path: path.to_owned(),
         error,
-    })
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(AssetError::Io {
+            path: path.to_owned(),
+            error: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "resource path resolves outside its root",
+            ),
+        });
+    }
+    Ok(canonical_path)
+}
+
+fn read_legacy(root: &Path, path: &Path) -> Result<Vec<u8>, AssetError> {
+    let path = legacy_path(root, path)?;
+    let metadata = fs::metadata(&path).map_err(|error| AssetError::Io {
+        path: path.clone(),
+        error,
+    })?;
+    if !metadata.is_file() {
+        return Err(AssetError::Io {
+            path,
+            error: io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
+        });
+    }
+    fs::read(&path).map_err(|error| AssetError::Io { path, error })
 }
 
 /// Декодирует PNG любого цветового типа и глубины в RGBA8.
@@ -266,20 +380,22 @@ pub fn decode_png(bytes: &[u8]) -> Result<TextureData, String> {
     })
 }
 
-fn load_fbx(path: &Path) -> Result<Model, AssetError> {
+fn load_fbx(
+    bytes: &[u8],
+    virtual_path: &str,
+    path: &Path,
+    assets: &Assets,
+) -> Result<Model, AssetError> {
     let decode_error = |message: String| AssetError::Decode {
         path: path.to_owned(),
         message,
     };
-    // Существование файла проверяется заранее, чтобы ошибка была такой же, как у текстур.
-    fs::metadata(path).map_err(|error| AssetError::Io {
-        path: path.to_owned(),
-        error,
-    })?;
-    let filename = path
-        .to_str()
-        .ok_or_else(|| decode_error("путь модели не в UTF-8".to_owned()))?;
     let options = ufbx::LoadOpts {
+        filename: virtual_path.into(),
+        path_separator: b'/',
+        load_external_files: false,
+        open_main_file_with_default: false,
+        open_file_cb: Default::default(),
         target_axes: ufbx::CoordinateAxes {
             right: ufbx::CoordinateAxis::PositiveX,
             up: ufbx::CoordinateAxis::PositiveY,
@@ -290,7 +406,7 @@ fn load_fbx(path: &Path) -> Result<Model, AssetError> {
         generate_missing_normals: true,
         ..Default::default()
     };
-    let scene = ufbx::load_file(filename, options)
+    let scene = ufbx::load_memory(bytes, options)
         .map_err(|error| decode_error(format!("ошибка FBX: {error:?}")))?;
 
     let mut model = Model {
@@ -348,7 +464,9 @@ fn load_fbx(path: &Path) -> Result<Model, AssetError> {
                 Some(texture) => Some(match loaded_textures.get(&texture.element.element_id) {
                     Some(&index) => index,
                     None => {
-                        model.textures.push(load_fbx_texture(path, texture)?);
+                        model
+                            .textures
+                            .push(load_fbx_texture(virtual_path, path, texture, assets)?);
                         let index = model.textures.len() - 1;
                         loaded_textures.insert(texture.element.element_id, index);
                         index
@@ -379,7 +497,12 @@ fn diffuse_texture(material: &ufbx::Material) -> Option<&ufbx::Texture> {
         .find(|texture| texture.type_ == ufbx::TextureType::File)
 }
 
-fn load_fbx_texture(model: &Path, texture: &ufbx::Texture) -> Result<TextureData, AssetError> {
+fn load_fbx_texture(
+    model_virtual_path: &str,
+    model: &Path,
+    texture: &ufbx::Texture,
+    assets: &Assets,
+) -> Result<TextureData, AssetError> {
     if !texture.content.is_empty() {
         return decode_png(&texture.content).map_err(|message| AssetError::Decode {
             path: model.to_owned(),
@@ -390,57 +513,86 @@ fn load_fbx_texture(model: &Path, texture: &ufbx::Texture) -> Result<TextureData
         });
     }
     let tried = texture_candidates(
-        model,
+        model_virtual_path,
         &texture.filename,
         &texture.relative_filename,
         &texture.absolute_filename,
     );
-    let Some(path) = tried.iter().find(|path| path.is_file()) else {
-        let name = [
-            &texture.relative_filename,
-            &texture.absolute_filename,
-            &texture.filename,
-        ]
-        .into_iter()
-        .map(|name| name.as_ref() as &str)
-        .find(|name| !name.is_empty())
-        .unwrap_or_default()
-        .to_owned();
-        return Err(AssetError::MissingTexture {
-            model: model.to_owned(),
-            texture: name,
-            tried,
-        });
-    };
-    require_extension(path, "png")?;
-    let bytes = read(path)?;
-    decode_png(&bytes).map_err(|message| AssetError::Decode {
-        path: path.clone(),
-        message,
+    let tried_paths = tried
+        .iter()
+        .map(|candidate| assets.root.join(candidate))
+        .collect::<Vec<_>>();
+    for candidate in &tried {
+        let asset_path = format!("/{candidate}");
+        let path = assets.root.join(candidate);
+        match assets.stat_asset(&asset_path, &path) {
+            Err(AssetError::Io { error, .. }) if error.kind() == io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        require_extension(&path, "png")?;
+        let bytes = match assets.read_asset(&asset_path, &path) {
+            Err(AssetError::Io { error, .. }) if error.kind() == io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => return Err(error),
+            Ok(bytes) => bytes,
+        };
+        return decode_png(&bytes).map_err(|message| AssetError::Decode { path, message });
+    }
+    let name = [
+        &texture.relative_filename,
+        &texture.absolute_filename,
+        &texture.filename,
+    ]
+    .into_iter()
+    .map(|name| name.as_ref() as &str)
+    .find(|name| !name.is_empty())
+    .unwrap_or_default()
+    .to_owned();
+    Err(AssetError::MissingTexture {
+        model: model.to_owned(),
+        texture: name,
+        tried: tried_paths,
     })
 }
 
 /// Пути поиска внешней текстуры без повторов: путь, который ufbx разрешил
 /// относительно модели, затем файлы с тем же именем рядом с моделью.
-fn texture_candidates(
-    model: &Path,
-    resolved: &str,
-    relative: &str,
-    absolute: &str,
-) -> Vec<PathBuf> {
-    let directory = model.parent().unwrap_or(Path::new(""));
+fn texture_candidates(model: &str, resolved: &str, relative: &str, absolute: &str) -> Vec<String> {
+    let model = model.trim_start_matches('/').replace('\\', "/");
+    let model_directory = model
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
     let mut candidates = Vec::new();
     if !resolved.is_empty() {
-        candidates.push(PathBuf::from(resolved));
+        let resolved_path = resolved.replace('\\', "/");
+        let rooted = resolved_path.starts_with('/')
+            || (!model_directory.is_empty()
+                && resolved_path
+                    .strip_prefix(model_directory)
+                    .is_some_and(|rest| rest.starts_with('/')));
+        if let Some(candidate) = normalize_texture_reference(&model, resolved, rooted) {
+            candidates.push(candidate);
+        }
     }
     for name in [relative, absolute] {
         // В FBX из Windows разделителем может быть `\`, поэтому имя выделяется вручную.
-        if let Some(file_name) = name
-            .rsplit(['/', '\\'])
-            .next()
-            .filter(|name| !name.is_empty())
+        let normalized = name.replace('\\', "/");
+        if !is_host_absolute(&normalized)
+            && let Some(candidate) = normalize_texture_reference(&model, &normalized, false)
         {
-            candidates.push(directory.join(file_name));
+            candidates.push(candidate);
+        }
+        if let Some(file_name) = normalized
+            .rsplit('/')
+            .next()
+            .filter(|file_name| !file_name.is_empty())
+            && let Some(candidate) = normalize_texture_reference(&model, file_name, false)
+        {
+            candidates.push(candidate);
         }
     }
     let mut unique = Vec::with_capacity(candidates.len());
@@ -450,6 +602,36 @@ fn texture_candidates(
         }
     }
     unique
+}
+
+fn is_host_absolute(path: &str) -> bool {
+    path.starts_with('/')
+        || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic())
+}
+
+fn normalize_texture_reference(model: &str, reference: &str, rooted: bool) -> Option<String> {
+    let reference = reference.replace('\\', "/");
+    let rooted = rooted || reference.starts_with('/');
+    let reference = reference.trim_start_matches('/');
+    let mut components = Vec::new();
+    if !rooted && let Some((directory, _)) = model.rsplit_once('/') {
+        components.extend(directory.split('/'));
+    }
+    for component in reference.split('/') {
+        match component {
+            "" => return None,
+            "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            _ if component.contains([':', '\0']) => return None,
+            _ => components.push(component),
+        }
+    }
+    if components.is_empty() {
+        return None;
+    }
+    Some(components.join("/"))
 }
 
 fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
@@ -467,7 +649,11 @@ mod tests {
     use super::{
         AssetError, Assets, Model, ModelMesh, ModelVertex, decode_png, texture_candidates,
     };
+    use engine_files::VirtualPath;
+    use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
+    use engine_resources::{ResourceConfig, ResourceError, ResourceErrorKind, ResourceSystem};
     use std::fs;
+    use std::io::Cursor;
     use std::path::{Path, PathBuf};
 
     /// Временный каталог ресурсов, удаляемый в конце теста.
@@ -477,9 +663,12 @@ mod tests {
 
     impl TempAssets {
         fn new(name: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("rve-assets-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("rve-assets-{name}-{}-{nonce}", std::process::id()));
             fs::create_dir_all(&root).unwrap();
             Self { root }
         }
@@ -493,11 +682,54 @@ mod tests {
         fn assets(&self) -> Assets {
             Assets::new(&self.root)
         }
+
+        fn resource_assets(&self) -> (ResourceSystem, Assets) {
+            let system = ResourceSystem::start(ResourceConfig {
+                root: self.root.clone(),
+                ..ResourceConfig::default()
+            })
+            .unwrap();
+            let assets = Assets::with_resources(system.handle());
+            (system, assets)
+        }
     }
 
     impl Drop for TempAssets {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn write_archive(
+        root: &Path,
+        name: &str,
+        entries: &[(&str, &[u8])],
+    ) -> (ArchiveId, Vec<BlobId>) {
+        let mut writer = ArchiveWriter::new(
+            fs::File::create(root.join(name)).unwrap(),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        let mut blobs = Vec::with_capacity(entries.len());
+        for (path, bytes) in entries {
+            blobs.push(
+                writer
+                    .add_local(VirtualPath::parse(path).unwrap(), Cursor::new(*bytes), None)
+                    .unwrap(),
+            );
+        }
+        let finished = writer.finish().unwrap();
+        let id = finished.archive_id;
+        drop(finished.into_inner());
+        (id, blobs)
+    }
+
+    fn resource_error(error: &AssetError) -> Option<&ResourceError> {
+        match error {
+            AssetError::Io { error, .. } => error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<ResourceError>()),
+            _ => None,
         }
     }
 
@@ -736,6 +968,44 @@ mod tests {
     }
 
     #[test]
+    fn resource_budget_and_stopped_errors_keep_their_typed_source() {
+        let temp = TempAssets::new("resource-errors");
+        temp.write("texture/paint.png", &rgba_png());
+        let budget_system = ResourceSystem::start(ResourceConfig {
+            root: temp.root.clone(),
+            max_result_bytes: 1,
+            ..ResourceConfig::default()
+        })
+        .unwrap();
+        let budget_assets = Assets::with_resources(budget_system.handle());
+        let budget_error = budget_assets
+            .load_texture("/texture/paint.png")
+            .unwrap_err();
+        assert_eq!(
+            resource_error(&budget_error).map(ResourceError::kind),
+            Some(ResourceErrorKind::BudgetExceeded)
+        );
+        drop(budget_assets);
+        drop(budget_system);
+
+        let mut stopped_system = ResourceSystem::start(ResourceConfig {
+            root: temp.root.clone(),
+            ..ResourceConfig::default()
+        })
+        .unwrap();
+        let stopped_handle = stopped_system.handle();
+        stopped_system.shutdown().unwrap();
+        let stopped_assets = Assets::with_resources(stopped_handle);
+        let stopped_error = stopped_assets
+            .load_texture("/texture/paint.png")
+            .unwrap_err();
+        assert_eq!(
+            resource_error(&stopped_error).map(ResourceError::kind),
+            Some(ResourceErrorKind::Stopped)
+        );
+    }
+
+    #[test]
     fn fbx_quad_is_triangulated_with_normals_flipped_uv_and_meters() {
         let temp = TempAssets::new("quad");
         temp.write("model/quad.fbx", quad_fbx(None).as_bytes());
@@ -780,12 +1050,133 @@ mod tests {
         temp.write("texture/paint.png", &rgba_png());
         temp.write("model/paint.png", &rgba_png());
         let assets = temp.assets();
+        let (_system, resource_assets) = temp.resource_assets();
 
         for model in ["/model/relative.fbx", "/model/absolute.fbx"] {
-            let model = assets.load_model(model).unwrap();
-            assert_eq!(model.meshes[0].texture, Some(0), "{model:?}");
-            assert_eq!(model.textures.len(), 1);
-            assert_eq!(model.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
+            let expected = assets.load_model(model).unwrap();
+            let actual = resource_assets.load_model(model).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.meshes[0].texture, Some(0), "{actual:?}");
+            assert_eq!(actual.textures.len(), 1);
+            assert_eq!(actual.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
+        }
+    }
+
+    #[test]
+    fn legacy_loose_resource_loose_and_packed_paths_return_same_cpu_assets() {
+        let model_bytes = quad_fbx(Some("../texture/paint.png")).into_bytes();
+        let texture_bytes = rgba_png();
+        let loose = TempAssets::new("resource-equivalence-loose");
+        loose.write("model/relative.fbx", &model_bytes);
+        loose.write("texture/paint.png", &texture_bytes);
+
+        let legacy = loose.assets();
+        let expected_model = legacy.load_model("/model/relative.fbx").unwrap();
+        let expected_texture = legacy.load_texture("/texture/paint.png").unwrap();
+        let (_loose_system, loose_assets) = loose.resource_assets();
+        assert_eq!(
+            loose_assets.load_model("/model/relative.fbx").unwrap(),
+            expected_model
+        );
+        assert_eq!(
+            loose_assets.load_texture("/texture/paint.png").unwrap(),
+            expected_texture
+        );
+
+        let packed = TempAssets::new("resource-equivalence-packed");
+        write_archive(
+            &packed.root,
+            "assets.rvepak",
+            &[
+                ("model/relative.fbx", &model_bytes),
+                ("texture/paint.png", &texture_bytes),
+            ],
+        );
+        let (_packed_system, packed_assets) = packed.resource_assets();
+        assert_eq!(
+            packed_assets.load_model("/model/relative.fbx").unwrap(),
+            expected_model
+        );
+        assert_eq!(
+            packed_assets.load_texture("/texture/paint.png").unwrap(),
+            expected_texture
+        );
+    }
+
+    #[test]
+    fn packed_external_texture_reference_reads_its_owner_archive() {
+        let model_bytes = quad_fbx(Some("paint.png")).into_bytes();
+        let texture_bytes = rgba_png();
+        let packed = TempAssets::new("packed-external-owner");
+        let (owner_id, owner_blobs) = write_archive(
+            &packed.root,
+            "a-owner.rvepak",
+            &[("texture/paint.png", &texture_bytes)],
+        );
+        let mut model_writer = ArchiveWriter::new(
+            fs::File::create(packed.root.join("b-model.rvepak")).unwrap(),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        model_writer
+            .add_local(
+                VirtualPath::parse("model/quad.fbx").unwrap(),
+                Cursor::new(&model_bytes),
+                None,
+            )
+            .unwrap();
+        model_writer
+            .add_external(
+                VirtualPath::parse("model/paint.png").unwrap(),
+                owner_id,
+                owner_blobs[0],
+            )
+            .unwrap();
+        drop(model_writer.finish().unwrap().into_inner());
+
+        let (_system, assets) = packed.resource_assets();
+        let model = assets.load_model("/model/quad.fbx").unwrap();
+        assert_eq!(model.meshes[0].texture, Some(0));
+        assert_eq!(model.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn external_host_texture_path_never_reads_outside_the_assets_root() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let external = std::env::temp_dir().join(format!(
+            "rve-assets-host-texture-{}-{nonce}.png",
+            std::process::id(),
+        ));
+        fs::write(&external, rgba_png()).unwrap();
+        let temp = TempAssets::new("host-texture-path");
+        temp.write(
+            "model/quad.fbx",
+            quad_fbx(Some(external.to_str().unwrap())).as_bytes(),
+        );
+        let (_system, assets) = temp.resource_assets();
+        let result = assets.load_model("/model/quad.fbx");
+        fs::remove_file(external).unwrap();
+        assert!(matches!(result, Err(AssetError::MissingTexture { .. })));
+    }
+
+    #[test]
+    fn external_texture_decode_error_does_not_fall_back_to_the_basename() {
+        let temp = TempAssets::new("external-texture-error");
+        temp.write(
+            "model/quad.fbx",
+            quad_fbx(Some("../texture/paint.png")).as_bytes(),
+        );
+        temp.write("texture/paint.png", b"corrupt png");
+        temp.write("model/paint.png", &rgba_png());
+        let (_system, assets) = temp.resource_assets();
+        match assets.load_model("/model/quad.fbx") {
+            Err(AssetError::Decode { path, .. }) => {
+                assert_eq!(path, temp.root.join("texture/paint.png"));
+            }
+            other => panic!("expected first candidate decode failure, got {other:?}"),
         }
     }
 
@@ -832,7 +1223,10 @@ mod tests {
                 "Connections:  {\n\tC: \"OO\",5000,4000\n",
             );
         temp.write("model/embedded.fbx", fbx.as_bytes());
-        let model = temp.assets().load_model("/model/embedded.fbx").unwrap();
+        let expected = temp.assets().load_model("/model/embedded.fbx").unwrap();
+        let (_system, assets) = temp.resource_assets();
+        let model = assets.load_model("/model/embedded.fbx").unwrap();
+        assert_eq!(model, expected);
         assert_eq!(model.meshes[0].texture, Some(0));
         assert_eq!(model.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
@@ -898,19 +1292,14 @@ mod tests {
 
     #[test]
     fn texture_candidates_deduplicate_and_accept_windows_separators() {
-        let model = Path::new("assets/model/cube.fbx");
+        let model = "/model/cube.fbx";
         assert_eq!(
-            texture_candidates(
-                model,
-                "assets/model/paint.png",
-                "paint.png",
-                "C:\\art\\paint.png"
-            ),
-            [PathBuf::from("assets/model/paint.png")]
+            texture_candidates(model, "model/paint.png", "paint.png", "C:\\art\\paint.png"),
+            ["model/paint.png"]
         );
         assert_eq!(
             texture_candidates(model, "", "../texture/paint.png", ""),
-            [PathBuf::from("assets/model/paint.png")]
+            ["texture/paint.png", "model/paint.png"]
         );
         assert!(texture_candidates(model, "", "", "").is_empty());
     }
