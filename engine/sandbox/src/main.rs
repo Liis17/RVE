@@ -370,6 +370,7 @@ impl WindowHandler for Sandbox {
                 .content
                 .view_projection(self.size.width, self.size.height)
                 .to_cols_array_2d(),
+            shadow_view_projection: None,
             light: DirectionalLight::default(),
             draws: &draws,
             overlay,

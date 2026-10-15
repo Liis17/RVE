@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 ash.workspace = true
-raw-window-handle.workspace = true
+raw-window-handle = { workspace = true, features = ["std"] }
 engine-platform = { path = "../engine-platform" }
 
 [build-dependencies]
