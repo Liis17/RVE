@@ -514,7 +514,10 @@ dependencies = [
 name = "engine-scene"
 version = "0.1.0"
 dependencies = [
+ "engine-files",
  "glam",
+ "serde",
+ "toml",
 ]
 
 [[package]]

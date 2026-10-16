@@ -9,3 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 glam.workspace = true
+engine-files = { path = "../engine-files" }
+serde.workspace = true
+toml.workspace = true
