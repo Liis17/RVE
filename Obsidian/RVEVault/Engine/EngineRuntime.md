@@ -6,6 +6,9 @@ Parent: [[Index]]
 
 `engine-runtime` связывает настройки проекта, ресурсы, сцену, скрипты, окно и renderer в игровое приложение. Публичный вход — `engine_runtime::run_player(register_heavy: fn(&mut HeavyRegistry)) -> ExitCode`; бинарник `engine/rve-player` передаёт пустой callback регистрации heavy-скриптов. Runtime не переносит оконную или Vulkan-логику в `engine-project`, `engine-window` либо `engine-platform`.
 
+Схема `bootstrap.rves` и `project.rveproject`, defaults и их проверка описаны в
+[[Engine/EngineProject]]. Здесь зафиксированы только runtime-пути и использование.
+
 ## Layout проекта
 
 Все базовые пути вычисляются от каталога текущего исполняемого файла или `--project`, а не от cwd. На Windows `Layout` получает абсолютный путь и удаляет verbatim-префикс через `engine_files::strip_windows_verbatim_prefix`; ограничения Windows-форм описаны в [[Engine/EngineFiles]]. На Unix существующие пути канонизируются; каталог `--project` проверяется до создания `Layout`.
@@ -15,13 +18,21 @@ Parent: [[Index]]
 | Release | `exe_dir/Engine/bootstrap.rves` | `exe_dir/Assets`, `SourceMode::Registry` | `/rve/project.toml` через `ResourceHandle` |
 | Dev (`--project <dir>`) | `<project>/bootstrap.rves` | `<project>/Assets`, `SourceMode::Loose` | `<project>/project.rveproject` |
 
-Заголовок окна берётся из `WindowTitle`, затем из `ProjectSettings.name`. `AppIcon` загружается через `Assets::load_texture` до создания окна; ошибка загрузки относится к коду 2. Начальный размер окна берётся из bootstrap с defaults `WindowConfig`.
+Заголовок окна берётся из bootstrap, затем из `ProjectSettings.name`. `AppIcon`
+загружается через `Assets::load_texture` до создания окна; ошибка загрузки относится
+к коду 2. Начальный размер окна берётся из bootstrap с defaults `WindowConfig`.
 
 ## Потоки и протокол запуска
 
 Первой runtime-операцией после получения пути executable вызывается `unsafe engine_platform::prepare_vulkan_environment(exe_dir)`. Она выполняется до создания потоков. Затем создаётся `PendingActivation`, которая сохраняет ранний сигнал singleton activation до `WindowProxy`.
 
-После разбора CLI, bootstrap и загрузки настроек runtime пытается захватить `InstanceLock` по `ProjectSettings.id`, если `AllowMultipleInstances=false`. `AlreadyRunning` запускает `activate_running_instance` с дедлайном 5 секунд: подтверждение завершает второй процесс с кодом 0; timeout выполняет один повторный `acquire`, чтобы принять блокировку, если прежний владелец завершился. Если lock остался занят или повторная попытка завершилась ошибкой, код выхода 4.
+После разбора CLI, bootstrap и загрузки настроек runtime пытается захватить
+`InstanceLock` по `ProjectSettings.id`, если bootstrap запрещает несколько
+экземпляров. Значение ключа и другие поля настроек описаны в [[Engine/EngineProject]].
+`AlreadyRunning` запускает `activate_running_instance` с дедлайном 5 секунд:
+подтверждение завершает второй процесс с кодом 0; timeout выполняет один повторный
+`acquire`, чтобы принять блокировку, если прежний владелец завершился. Если lock
+остался занят или повторная попытка завершилась ошибкой, код выхода 4.
 
 Затем выполняется проверка hardware requirements: подходящее устройство Vulkan, RAM и число логических CPU. Ошибка `probe_devices`, отсутствие подходящего устройства или недостаток ресурсов выводятся в stderr и системный диалог; код выхода 3. CPU-загрузка сцены идёт до окна: `SceneDocument` строит `World`, FBX кэшируется по пути модели, override PNG заменяет текстуры всех мешей соответствующего объекта, а lite-файлы читаются как UTF-8 через `ResourceHandle`.
 
@@ -33,7 +44,7 @@ Parent: [[Index]]
 
 Scripts thread выполняет `start`, затем цикл `update(dt)` → `World::build_frame` → `FrameSnapshot`. Время приходит из монотонного `Clock`; `dt` отражает фактически прошедшее время. Снимки передаются через `flume::bounded(1)`, а отправитель выбирает между готовностью очереди и control-каналом через `Selector`, поэтому заполненная очередь не блокирует Shutdown.
 
-Render thread выбирает между snapshots и resize/occlusion/shutdown control-каналом. `view_projection` пересчитывается по последнему размеру окна. Нулевой размер или occlusion приостанавливает отрисовку; render отбрасывает уже поставленный снимок, а scripts получают Background и продолжают вызывать `update` с частотой `ProjectSettings.runtime.background_tick_hz`, не собирая и не отправляя новые snapshots. Если `Background(true)` пришёл до `Go` (например, при нулевом начальном размере окна), scripts запоминают последнее значение до handshake и начинают сразу в соответствующем режиме. Ожидание следующего фонового тика выполняется через `recv_timeout` и injected clock, без `sleep`. Восстановление окна возвращает scripts в обычный цикл и публикацию snapshots.
+Render thread выбирает между snapshots и resize/occlusion/shutdown control-каналом. `view_projection` пересчитывается по последнему размеру окна. Нулевой размер или occlusion приостанавливает отрисовку; render отбрасывает уже поставленный снимок, а scripts получают Background и продолжают вызывать `update` с частотой `ProjectSettings.runtime.background_tick_hz` ([[Engine/EngineProject]]), не собирая и не отправляя новые snapshots. Если `Background(true)` пришёл до `Go` (например, при нулевом начальном размере окна), scripts запоминают последнее значение до handshake и начинают сразу в соответствующем режиме. Ожидание следующего фонового тика выполняется через `recv_timeout` и injected clock, без `sleep`. Восстановление окна возвращает scripts в обычный цикл и публикацию snapshots.
 
 `drain_events` выводится runtime: Info в stdout, Error в stderr с префиксом `[script]`. При штатном shutdown scripts thread сначала вызывает `destroy` (`on_destroy`), а runtime ждёт его завершения до 2 секунд. При timeout `ScriptInterruptHandle` прерывает зависший lite Lua-код; затем runtime ждёт ещё до 2 секунд через stopped-канал. Если scripts всё ещё не остановились (например, heavy-скрипт блокирует поток), runtime отсоединяет handle без `join`, пишет ошибку и возвращает код 1. Interrupted lite callbacks не получают `on_destroy` согласно контракту [[Engine/EngineScript]]. При ошибке или панике renderer interrupt подаётся сразу.
 

@@ -13,12 +13,18 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 | `Obsidian/RVEVault/Index.md` | Навигация по базе знаний |
 | `Obsidian/RVEVault/Architecture.md` | Архитектура, основные потоки и ограничения |
 | `Obsidian/RVEVault/Engine/EngineCore.md` | Время игрового цикла |
+| `Obsidian/RVEVault/Engine/EngineProject.md` | Форматы `bootstrap.rves` и `project.rveproject` |
 | `Obsidian/RVEVault/Engine/EngineWindow.md` | Окно и цикл событий |
 | `Obsidian/RVEVault/Engine/EnginePlatform.md` | Платформенные адаптеры Windows/macOS |
 | `Obsidian/RVEVault/Engine/EngineRender.md` | Vulkan renderer |
-| `Obsidian/RVEVault/Engine/EngineScene.md` | Камеры, трансформации и направленный свет |
+| `Obsidian/RVEVault/Engine/EngineScene.md` | Формат `.rvescene`, runtime-мир, камеры, трансформации и свет |
+| `Obsidian/RVEVault/Engine/EngineFiles.md` | Канонические пути и позиционное чтение |
+| `Obsidian/RVEVault/Engine/EnginePak.md` | RVEPAK, builder и реестр архивов |
 | `Obsidian/RVEVault/Engine/EngineResources.md` | Фоновое чтение loose и packed бинарных ресурсов |
 | `Obsidian/RVEVault/Engine/EngineAssets.md` | Ресурсы: FBX и PNG из `assets` |
+| `Obsidian/RVEVault/Engine/EngineScript.md` | Lua и Rust-скрипты сцен |
+| `Obsidian/RVEVault/Engine/EngineRuntime.md` | Игровой runtime и player |
+| `Obsidian/RVEVault/Engine/RveBuild.md` | Сборка проекта в release player |
 | `Obsidian/RVEVault/Engine/Sandbox.md` | Пример приложения и CLI |
 
 ### Чтение памяти
@@ -47,6 +53,17 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 Перед завершением задачи определяй компоненты, которые могут зависеть от изменений.
 
 - В `engine-core`, `engine-window` и `engine-render` проверяй публичный API и его использование в `engine/sandbox`.
+- Изменения `engine-window`, `engine-render`, `engine-platform`, `engine-scene`,
+  `engine-script`, `engine-resources` и `engine-project` проверяй также на
+  потребителях `engine-runtime`/`rve-player` и `rve-build`, если они используют
+  изменённый крейт. Прямые workspace-зависимости:
+  - `engine-runtime`: `engine-assets`, `engine-files`, `engine-audio`,
+    `engine-neural`, `engine-network`, `engine-physics`, `engine-platform`,
+    `engine-project`, `engine-render`, `engine-resources`, `engine-scene`,
+    `engine-script`, `engine-window`.
+  - `rve-build`: `engine-assets`, `engine-files`, `engine-pak`, `engine-project`,
+    `engine-resources`, `engine-scene`.
+  - `rve-player`: `engine-runtime`.
 - При изменении `engine-platform` проверяй общий интерфейс, адаптеры `engine-platform-windows` и `engine-platform-macos` и вызовы из renderer.
 - Контракты: учитывай `WindowHandler`, `WindowConfig`, `RendererConfig`, `FrameStatus`, ошибки библиотек, CLI sandbox и коды завершения. При их изменении проверяй производителей и потребителей.
 - Платформы: учитывай Windows с Vulkan-драйвером и macOS с Vulkan loader и MoltenVK. Меняй только затронутые платформы и явно указывай непроверенные.
@@ -83,11 +100,16 @@ cargo run -p sandbox -- --frames 300 --resize-test
 Для CLI и границ текущего Vulkan пути смотри `README.md`; для контрактов — соответствующие заметки в `Obsidian/RVEVault/`.
 
 Начальные параметры окна читаются из `bootstrap.rves` в текущем рабочем каталоге,
-при обычном запуске — `build/bootstrap.rves`. Формат: `WindowSizeX=1280` и
-`WindowSizeY=720`, каждый параметр на отдельной строке. При первой подготовке
-можно скопировать `bootstrap.rves.example` в `build/bootstrap.rves`; существующий
-файл настроек не перезаписывай. Отсутствующий файл или параметр сохраняет
-соответствующий размер по умолчанию; некорректные настройки дают код выхода 2.
+при обычном запуске sandbox — `build/bootstrap.rves`. Формат: один параметр
+`Имя=Значение` на строку: `WindowSizeX`, `WindowSizeY`, `WindowTitle`,
+`AllowMultipleInstances` (`true`/`false`) и необязательный `AppIcon` (virtual path в
+`Assets`). Sandbox читает файл из cwd; `rve-player` использует `Engine/bootstrap.rves`
+рядом с exe в release layout или файл в каталоге проекта при `--project`.
+При первой подготовке файл можно создать копированием `bootstrap.rves.example` в
+`build/bootstrap.rves`; существующий файл настроек не перезаписывай. Отсутствующий
+файл или параметр сохраняет соответствующее значение по умолчанию (размер окна —
+1280×720); некорректные настройки дают код выхода 2. Подробности: [README.md](README.md)
+и `Obsidian/RVEVault/Engine/EngineProject.md`.
 
 ## Тесты и CI
 

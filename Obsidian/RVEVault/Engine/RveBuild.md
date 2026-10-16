@@ -3,7 +3,8 @@
 `tools/rve-build` собирает игровой релиз из каталога проекта или запускает его в
 dev-режиме. Инструмент является внешним crate workspace и зависит от
 `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak`
-и `engine-files`. Подробности runtime layout проекта и релиза находятся в
+и `engine-files`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
+Подробности runtime layout проекта и релиза находятся в
 [[Engine/EngineRuntime]], формат сцены — в [[Engine/EngineScene]], а формат архива и
 реестр — в [[Engine/EnginePak]].
 
@@ -14,8 +15,9 @@ dev-режиме. Инструмент является внешним crate wor
 `ResourceSystem` в `SourceMode::Loose`, затем проверяет каждую включённую сцену с
 помощью `SceneDocument`. Выключенные сцены не открываются. В сборку попадают файлы
 включённых сцен, их `[[assets]]`, внешние PNG-зависимости FBX через
-`Assets::model_dependencies` и заданный `BootstrapConfig.app_icon`. Неиспользуемые
-файлы каталога Assets не копируются.
+`Assets::model_dependencies` и заданный `BootstrapConfig.app_icon`. Иконка должна
+иметь расширение `.png` и успешно загружаться через `Assets::load_texture`.
+Неиспользуемые файлы каталога Assets не копируются.
 
 `build_project_archives` сериализует `ProjectSettings::to_toml` и
 `ArchiveSetRegistry::to_toml` во временный каталог, передаёт generated files вместе

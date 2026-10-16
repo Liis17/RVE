@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение
 
-`engine-pak` читает legacy RVEPAK v1 и текущий v2, записывает v2, строит и проверяет наборы архивов. `Archive` владеет проверенными metadata и backing source, `ArchiveWriter` добавляет локальные blobs через временный spool, `ArchiveCatalog` объединяет namespace v1/v2 и разрешает cross-archive references, а builder превращает строгий TOML manifest в полный набор архивов. CLI `tools/rvepak` использует этот библиотечный API для build/list/verify. Фоновое чтение и выбор packed-only режима предоставляет [[Engine/EngineResources]], который используется [[Engine/EngineAssets]] и sandbox.
+`engine-pak` читает legacy RVEPAK v1 и текущий v2, записывает v2, строит и проверяет наборы архивов. `Archive` владеет проверенными metadata и backing source, `ArchiveWriter` добавляет локальные blobs через временный spool, `ArchiveCatalog` объединяет namespace v1/v2 и разрешает cross-archive references, а builder превращает строгий TOML manifest в полный набор архивов. CLI `tools/rvepak` использует этот библиотечный API для build/list/verify. Фоновое чтение и выбор packed-only режима предоставляет [[Engine/EngineResources]], который используют [[Engine/EngineAssets]], runtime игры и sandbox.
 
 Полная wire-раскладка — заголовок, индекс, ссылки и chunk descriptors — нормативно описана в [`docs/rvepak-format.md`](../../../docs/rvepak-format.md). Архив хранит opaque bytes без ограничений расширений. Chunk codec независим для каждой локальной blob; доступны None, Zstandard и LZ4 block.
 

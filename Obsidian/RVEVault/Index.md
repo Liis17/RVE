@@ -11,6 +11,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | Заметка | Назначение |
 |---|---|
 | [[Engine/EngineCore]] | Счётчик времени игрового цикла |
+| [[Engine/EngineProject]] | Форматы bootstrap и настроек проекта игры |
 | [[Engine/EngineWindow]] | Окно и цикл событий |
 | [[Engine/EnginePlatform]] | Выбор и реализация платформенной интеграции Windows/macOS |
 | [[Engine/EngineRender]] | Vulkan renderer и вывод кадра |

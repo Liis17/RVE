@@ -6,7 +6,7 @@ Parent: [[Index]]
 
 `engine-resources` предоставляет общий фоновый доступ к готовым бинарным ресурсам. Он читает loose files и RVEPAK, но не декодирует FBX/PNG и не зависит от окон, renderer, сценариев или async runtime. Потребители получают cloneable `ResourceHandle` и отправляют запросы на metadata, полный файл или диапазон байтов.
 
-`engine-assets::Assets::with_resources` использует handle для загрузки FBX/PNG и внешних текстур. Sandbox запускает сервис после проверки аргументов и `bootstrap.rves`, затем синхронно подготавливает CPU-содержимое до создания окна. Renderer загружает уже готовые геометрию и пиксели на своём потоке; оконные callbacks не ждут запросы ресурсов. Порядок запуска sandbox описан в [[Engine/Sandbox]].
+`engine-assets::Assets::with_resources` использует handle для загрузки FBX/PNG и внешних текстур; его потребляют `engine-runtime` и [[Engine/Sandbox]]. Sandbox запускает сервис после проверки аргументов и `bootstrap.rves`, затем синхронно подготавливает CPU-содержимое до создания окна. Renderer загружает уже готовые геометрию и пиксели на своём потоке; оконные callbacks не ждут запросы ресурсов. Порядок запуска описан в [[Engine/EngineRuntime]] и [[Engine/Sandbox]].
 
 ## Источники и namespace
 

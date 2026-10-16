@@ -291,6 +291,95 @@ cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
 
 Эта проверка не заменяет сборку и запуск на Windows.
 
+## Проект игры
+
+Каталог проекта содержит `project.rveproject`, `bootstrap.rves`, `Assets/` и,
+необязательно, `HeavyScripts/` — crate с Rust-скриптами. Пример целиком находится
+в [examples/demo-game](examples/demo-game/).
+
+`project.rveproject` — TOML. `id` — ключ singleton lock, когда в bootstrap задано
+`AllowMultipleInstances=false`; `name` — имя игры и запасной заголовок окна;
+`version` — непустая строка. Стартует первая включённая сцена в списке, и хотя бы
+одна сцена должна быть включена. `heavy_scripts` задаёт необязательный относительный
+путь к crate. `requirements.min_ram_mb` и `min_cpu_threads` — минимальные требования
+(0 означает отсутствие минимума); `runtime.background_tick_hz` задаёт частоту
+обновления скриптов при свёрнутом или скрытом окне (по умолчанию 30 Гц).
+
+```toml
+id = "demo-game"
+name = "RVE Demo"
+version = "1.0.0"
+heavy_scripts = "HeavyScripts"
+[[scenes]]
+path = "/scenes/main.rvescene"
+enabled = true
+```
+
+`.rvescene` — TOML: `[[assets]]` объявляет virtual paths и необязательное имя
+`archive`; `[[objects]]` задаёт `id`, необязательные `name` и `parent`, `transform`
+и компоненты `camera`, `mesh_renderer`, `directional_light`, `lite_scripts`,
+`heavy_scripts`. Поворот задаётся в градусах с порядком Эйлера Unity YXZ; камера
+смотрит вдоль локальной оси −Z. В сцене требуется ровно одна камера и допускается
+не более одного направленного света.
+
+Минимальная валидная сцена на основе `Assets/scenes/main.rvescene`:
+
+```toml
+[[assets]]
+path = "/models/shared-cube.fbx"
+
+[[assets]]
+path = "/scripts/rotate.lua"
+
+[[objects]]
+id = "camera"
+name = "Camera"
+[objects.transform]
+position = [0.0, 0.0, 6.0]
+[objects.camera]
+fov_deg = 55.0
+near = 0.1
+far = 100.0
+
+[[objects]]
+id = "shared-cube"
+name = "Shared Cube"
+[objects.transform]
+position = [0.0, 0.0, 0.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[[objects.lite_scripts]]
+path = "/scripts/rotate.lua"
+params = { speed = 30.0 }
+```
+
+Lite-скрипт возвращает таблицу с необязательными `on_start(self)`,
+`on_update(self, dt)` и `on_destroy(self)`. Он получает `self.transform` с векторами
+`position`, `rotation`, `scale` (каждый с `x/y/z`), `self.params`, `self.object.id`,
+`self.object.name`, `rve.log`, `rve.time.elapsed` и `rve.time.frame`:
+
+```lua
+local Rotate = {}
+function Rotate:on_update(dt)
+  local rotation = self.transform.rotation
+  self.transform.rotation = {
+    x = rotation.x,
+    y = rotation.y + (self.params.speed or 30.0) * dt,
+    z = rotation.z
+  }
+end
+return Rotate
+```
+
+Lua-песочница открывает базовую библиотеку и `table`, `string`, `math`, `utf8`;
+`dofile`, `loadfile`, `require` и библиотеки `coroutine`, `io`, `os`, `package` и
+`debug` недоступны. Ошибка callback или неконечная трансформация отключает
+экземпляр. Crate `HeavyScripts/` реализует
+`engine_script::HeavyScript` и экспортирует `pub fn register(registry: &mut engine_script::HeavyRegistry)`;
+паника callback отключает экземпляр. Полная схема
+описана в [EngineScene](Obsidian/RVEVault/Engine/EngineScene.md), настройки проекта —
+в [EngineProject](Obsidian/RVEVault/Engine/EngineProject.md).
+
 ## rve-player
 
 `rve-player` запускает сцену из проекта. Из `build/` dev-режим задаётся каталогом проекта:
@@ -300,7 +389,9 @@ cargo run -p rve-player -- --project /path/to/project
 cargo run -p rve-player -- --project /path/to/project --frames 300
 ```
 
-Без `--project` используется release layout рядом с исполняемым файлом. Все пути вычисляются от `exe_dir` или каталога проекта, а не от текущего рабочего каталога.
+Без `--project` используется release layout рядом с исполняемым файлом. После выбора
+режима пути bootstrap, ресурсов и настроек привязаны к `exe_dir` или каталогу проекта,
+а не к текущему рабочему каталогу.
 
 | Режим | Bootstrap | Ресурсы | Настройки проекта |
 |---|---|---|---|

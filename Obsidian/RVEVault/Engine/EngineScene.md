@@ -42,4 +42,4 @@ Parent: [[Index]]
 
 ## Зависимости и размещение
 
-`engine-scene` зависит от glam, engine-files, serde и toml. `engine-render` не зависит от него и не принимает типы glam; runtime и скрипты также не являются зависимостями сцены. Sandbox пока сам собирает процедурную демонстрационную сцену из прежних математических компонентов; документы `.rvescene` пока не загружаются ни одним приложением.
+`engine-scene` зависит от glam, engine-files, serde и toml. `engine-render` не зависит от него и не принимает типы glam; runtime и скрипты также не являются зависимостями сцены. `engine-runtime` загружает `.rvescene` в `World` для `rve-player`; sandbox сохраняет собственную процедурную демонстрационную сцену. Поток загрузки игры описан в [[Engine/EngineRuntime]].

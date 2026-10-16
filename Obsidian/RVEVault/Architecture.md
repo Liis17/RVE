@@ -43,8 +43,8 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EnginePlatform]] — общий интерфейс и отдельные адаптеры Windows/macOS.
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
 - [[Engine/EngineFiles]] — канонические virtual paths, Windows filesystem path normalization и `ReadAt` для позиционного чтения.
-- `engine-project` — настройки проекта и bootstrap-конфигурация для приложений и инструментов.
-- [[Engine/EnginePak]] — версия 1 архива, потоковый writer, reader и каталог архивов.
+- [[Engine/EngineProject]] — общие форматы настроек проекта и bootstrap для приложений и инструментов.
+- [[Engine/EnginePak]] — чтение RVEPAK v1/v2, запись v2, потоковый writer и каталог архивов.
 - [[Engine/EngineResources]] — фоновый доступ к loose files и RVEPAK через ограниченный worker pool.
 - `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG в память CPU, без зависимости от renderer.
@@ -61,9 +61,9 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - `sandbox` зависит от `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
 - `rve-player` зависит от `engine-runtime`; runtime соединяет `engine-project`, `engine-files`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `engine-script` и пустые доменные модули. `engine-files` снимает Windows verbatim-префикс в `Layout`; flume обслуживает управляющие каналы и ограниченную очередь снимков, sysinfo сверяет RAM и CPU с требованиями проекта.
 - `rve-build` использует `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak` и `engine-files`: проверяет включённые сцены и ресурсы, назначает архивы и генерирует player crate с абсолютной зависимостью от `engine-runtime` текущего checkout. Платформенный конвейер macOS дополнительно собирает Vulkan loader и MoltenVK в релиз; подробности — в [[Engine/RveBuild]].
-- `engine-project` зависит от `engine-files`, serde и toml. `BootstrapConfig` читает `bootstrap.rves`, а `ProjectSettings` разбирает `project.rveproject`; общая валидация virtual paths использует `engine-files::VirtualPath`.
-- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; он содержит и wire-формат архивов, и отдельный TOML-контракт `ArchiveSetRegistry`. Инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets` и sandbox читают через его handle. `engine-files` не имеет внешних зависимостей.
-- `engine-scene` зависит от glam, `engine-files`, serde и toml: документы `.rvescene` используют `VirtualPath`, а `World` рассчитывает сцены независимо от renderer и script runtime. Sandbox передаёт вычисленные матрицы через API renderer.
+- `engine-project` зависит от `engine-files`, serde и toml; контракты файлов и их потребители описаны в [[Engine/EngineProject]].
+- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; он содержит и wire-формат архивов, и отдельный TOML-контракт `ArchiveSetRegistry`. Инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets`, sandbox и runtime получают данные через его handle. `engine-files` не имеет внешних зависимостей.
+- `engine-scene` зависит от glam, `engine-files`, serde и toml: документы `.rvescene` используют `VirtualPath`, а `World` рассчитывает сцены независимо от renderer и script runtime. Runtime игры использует документы и `World`; sandbox продолжает строить процедурную демонстрационную сцену на математических компонентах.
 - `engine-script` зависит от `engine-scene` и `mlua` с Lua 5.4 и vendored исходниками. Он связывает `World` с Lua и heavy-скриптами, не зависит от runtime, renderer или window; Lua state остаётся на scripts thread, а отдельный interrupt handle можно передать другому потоку.
 - `engine-assets` зависит от `engine-resources`, ufbx и png; от renderer и окна не зависит. `Assets::model_dependencies` использует тот же поиск внешних текстур и stat-источник, что и `load_model`, чтобы builder мог собрать зависимости без декодирования PNG.
 - `engine-window` зависит от winit.
@@ -92,11 +92,9 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 ### Запуск и цикл окна
 
 `engine/sandbox/src/main.rs` разбирает аргументы и загружает `BootstrapConfig` через
-`engine_project::BootstrapConfig::load` из `engine/engine-project/src/bootstrap.rs`.
-Конфигурация принимает `WindowSizeX`, `WindowSizeY`, `WindowTitle`,
-`AllowMultipleInstances` и `AppIcon`. Sandbox применяет размеры и заголовок; из новых
-полей он применяет только `WindowTitle`, а `AllowMultipleInstances` и `AppIcon`
-разбирает и игнорирует. Размеры окна по умолчанию — 1280×720. После этих проверок
+`engine_project::BootstrapConfig::load`. Sandbox применяет размер и заголовок окна;
+прочие bootstrap-поля разбираются, но не меняют его поведение. Поля, defaults и
+расположение файлов для приложений описаны в [[Engine/EngineProject]]. После этих проверок
 `ResourceSystem::start` открывает `assets` в `SourceMode::Auto` (или проверяет его архивный каталог), затем
 `Assets::with_resources` загружает CPU-содержимое кадра до создания окна. Это происходит
 и для процедурных сцен; отсутствующий loose root допустим, а ошибка архива или ресурса

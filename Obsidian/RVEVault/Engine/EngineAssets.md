@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение
 
-`engine-assets` загружает модели FBX и текстуры PNG в память CPU. `Assets::with_resources` читает байты через [[Engine/EngineResources]] из loose files или RVEPAK; `Assets::new(root)` сохраняет совместимый файловый API. Крейт не зависит от renderer; [[Engine/Sandbox]] переводит CPU-данные в ресурсы [[Engine/EngineRender]].
+`engine-assets` загружает модели FBX и текстуры PNG в память CPU. `Assets::with_resources` читает байты через [[Engine/EngineResources]] из loose files или RVEPAK; `Assets::new(root)` сохраняет совместимый файловый API. Крейт не зависит от renderer; `engine-runtime` и [[Engine/Sandbox]] переводят CPU-данные в ресурсы [[Engine/EngineRender]].
 
 ## Источники
 
@@ -44,7 +44,7 @@ Parent: [[Index]]
 
 - ufbx 0.11.5 — Rust-обёртка C-библиотеки ufbx; её исходник собирается крейтом `cc` при `cargo build`, поэтому нужен C-компилятор (MSVC на Windows, clang на macOS). Поддерживает двоичный и ASCII FBX.
 - png 0.18.1 — чистый Rust-декодер PNG.
-- Используется в [[Engine/Sandbox]]; service-backed чтение и startup порядок описаны в [[Engine/EngineResources]] и [[Engine/Sandbox]].
+- Используется в `engine-runtime` и [[Engine/Sandbox]]; service-backed чтение и startup порядок описаны в [[Engine/EngineResources]], [[Engine/EngineRuntime]] и [[Engine/Sandbox]].
 
 ## Ограничения
 
