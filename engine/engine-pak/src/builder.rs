@@ -1,3 +1,4 @@
+use crate::archive_name::{ArchiveNameError, is_reserved_windows_device, validate_archive_stem};
 use crate::{
     ArchiveCatalog, ArchiveId, ArchiveWriter, BlobId, BlobOptions, CatalogAsset, CatalogLimits,
     Codec, ContentHash, PakError, WriterOptions,
@@ -73,6 +74,38 @@ pub struct BuildInput {
     pub codec: Option<Codec>,
     pub chunk_size: Option<u64>,
     pub zstd_level: Option<i32>,
+}
+
+/// One explicit source-file to virtual-path mapping for [`build_archive_set`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildFileInput {
+    /// Source file on disk. It must be an existing regular file, not a symlink.
+    pub source: PathBuf,
+    /// Canonical destination inside the archive namespace.
+    pub path: VirtualPath,
+    pub codec: Option<Codec>,
+    pub chunk_size: Option<u64>,
+    pub zstd_level: Option<i32>,
+}
+
+impl BuildFileInput {
+    pub fn new(source: impl Into<PathBuf>, path: VirtualPath) -> Self {
+        Self {
+            source: source.into(),
+            path,
+            codec: None,
+            chunk_size: None,
+            zstd_level: None,
+        }
+    }
+}
+
+/// An explicitly ordered archive in a programmatic archive-set build.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgrammaticArchive {
+    /// Archive name without the `.rvepak` suffix.
+    pub name: String,
+    pub inputs: Vec<BuildFileInput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,7 +205,6 @@ pub struct BuildReport {
 /// prepass for every expanded source; execution checks each canonical owner's stream again.
 #[derive(Debug)]
 pub struct BuildPlan {
-    root: PathBuf,
     destination: PathBuf,
     archives: Vec<PlannedArchive>,
     deduplicate: bool,
@@ -198,8 +230,19 @@ struct PlannedArchive {
 }
 
 #[derive(Debug)]
+struct ExpandedInput {
+    path: VirtualPath,
+    source_root: PathBuf,
+    source: PathBuf,
+    compression: BuildCompression,
+}
+
+type ExpandedArchive = (String, Vec<ExpandedInput>);
+
+#[derive(Debug)]
 struct PlannedInput {
     path: VirtualPath,
+    source_root: PathBuf,
     source: PathBuf,
     size: u64,
     content_hash: Option<ContentHash>,
@@ -326,25 +369,7 @@ pub fn preflight(manifest: BuildManifest, options: BuildOptions) -> Result<Build
     }
     validate_compression(manifest.defaults)?;
     let source_root = canonical_source_root(&manifest.root)?;
-    let destination_input = absolute_lexical(&manifest.output)
-        .map_err(|error| BuildError::operational(error.to_string()))?;
-    match fs::symlink_metadata(&destination_input) {
-        Ok(_) => {
-            return Err(BuildError::input(format!(
-                "output directory already exists: {}",
-                destination_input.display()
-            )));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(BuildError::operational(format!(
-                "cannot inspect output directory {}: {error}",
-                destination_input.display()
-            )));
-        }
-    }
-    let destination = resolve_missing_path(&destination_input)
-        .map_err(|error| BuildError::operational(error.to_string()))?;
+    let destination = prepare_output_directory(&manifest.output)?;
     if destination.starts_with(&source_root) {
         return Err(BuildError::input(format!(
             "output directory is inside the source root: {}",
@@ -359,7 +384,6 @@ pub fn preflight(manifest: BuildManifest, options: BuildOptions) -> Result<Build
     }
 
     let mut archive_names = BTreeSet::new();
-    let mut virtual_owners = BTreeMap::<VirtualPath, String>::new();
     let mut expanded_archives = Vec::with_capacity(manifest.archives.len());
     for archive in manifest.archives {
         validate_archive_name(&archive.name)?;
@@ -376,32 +400,120 @@ pub fn preflight(manifest: BuildManifest, options: BuildOptions) -> Result<Build
             validate_compression(compression)?;
             expand_selector(&source_root, input, compression, &mut expanded)?;
         }
-        if expanded.is_empty() {
+        expanded_archives.push((archive.name, expanded));
+    }
+
+    finalize_build_plan(destination, expanded_archives, options)
+}
+
+/// Builds an ordered archive set from explicit source-file and virtual-path pairs.
+///
+/// The archive order controls cross-archive deduplication ownership. Archive
+/// names are filename-safe stems; output files are named `<name>.rvepak`.
+pub fn build_archive_set(
+    archives: Vec<ProgrammaticArchive>,
+    output: impl AsRef<Path>,
+    defaults: BuildCompression,
+    options: BuildOptions,
+) -> Result<BuildReport, BuildError> {
+    if archives.is_empty() {
+        return Err(BuildError::input(
+            "archive set must declare at least one archive",
+        ));
+    }
+    validate_compression(defaults)?;
+
+    let destination = prepare_output_directory(output.as_ref())?;
+
+    let mut folded_names = BTreeSet::new();
+    let mut canonical_archives = Vec::with_capacity(archives.len());
+    for archive in archives {
+        validate_programmatic_archive_name(&archive.name)?;
+        if !folded_names.insert(archive.name.to_ascii_lowercase()) {
             return Err(BuildError::input(format!(
-                "archive group {} has no input files",
+                "archive names collide on case-insensitive filesystems: {}",
                 archive.name
             )));
         }
-        let mut expanded_files = Vec::with_capacity(expanded.len());
-        for (path, source, compression) in expanded {
-            if let Some(previous_archive) =
-                virtual_owners.insert(path.clone(), archive.name.clone())
-            {
-                return Err(BuildError::input(format!(
-                    "virtual path {path} is assigned more than once (archives {previous_archive} and {})",
-                    archive.name
-                )));
-            }
-            expanded_files.push((path, source, compression));
+        if archive.inputs.is_empty() {
+            return Err(BuildError::input(format!(
+                "archive {} has no input files",
+                archive.name
+            )));
         }
-        expanded_archives.push((archive.name, expanded_files));
+        let inputs =
+            plan_programmatic_inputs(archive.inputs, defaults, canonical_programmatic_source)?;
+        canonical_archives.push((archive.name, inputs));
     }
 
-    // Validate every assignment and group before reading any complete source for deduplication.
+    let archives = canonical_archives
+        .into_iter()
+        .map(|(name, files)| (format!("{name}.rvepak"), files))
+        .collect();
+    execute(finalize_build_plan(destination, archives, options)?)
+}
+
+fn prepare_output_directory(output: &Path) -> Result<PathBuf, BuildError> {
+    let output_input =
+        absolute_lexical(output).map_err(|error| BuildError::operational(error.to_string()))?;
+    match fs::symlink_metadata(&output_input) {
+        Ok(_) => {
+            return Err(BuildError::input(format!(
+                "output directory already exists: {}",
+                output_input.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(BuildError::operational(format!(
+                "cannot inspect output directory {}: {error}",
+                output_input.display()
+            )));
+        }
+    }
+    let destination = resolve_missing_path(&output_input)
+        .map_err(|error| BuildError::operational(error.to_string()))?;
+    if destination.file_name().is_none_or(|name| name.is_empty()) {
+        return Err(BuildError::input(
+            "output must name a new directory, not a filesystem root",
+        ));
+    }
+    Ok(destination)
+}
+
+fn finalize_build_plan(
+    destination: PathBuf,
+    expanded_archives: Vec<ExpandedArchive>,
+    options: BuildOptions,
+) -> Result<BuildPlan, BuildError> {
+    let mut virtual_owners = BTreeMap::<VirtualPath, String>::new();
+    for (name, expanded) in &expanded_archives {
+        if expanded.is_empty() {
+            return Err(BuildError::input(format!(
+                "archive group {name} has no input files"
+            )));
+        }
+        for input in expanded {
+            if let Some(previous_archive) = virtual_owners.insert(input.path.clone(), name.clone())
+            {
+                return Err(BuildError::input(format!(
+                    "virtual path {} is assigned more than once (archives {previous_archive} and {name})",
+                    input.path
+                )));
+            }
+        }
+    }
+
     let mut planned_archives = Vec::with_capacity(expanded_archives.len());
     for (name, expanded) in expanded_archives {
         let mut planned_inputs = Vec::with_capacity(expanded.len());
-        for (path, source, compression) in expanded {
+        for input in expanded {
+            let ExpandedInput {
+                path,
+                source_root,
+                source,
+                compression,
+            } = input;
             let (size, content_hash) = if options.deduplicate {
                 hash_source(&source_root, &source)?
             } else {
@@ -416,6 +528,7 @@ pub fn preflight(manifest: BuildManifest, options: BuildOptions) -> Result<Build
             };
             planned_inputs.push(PlannedInput {
                 path,
+                source_root,
                 source,
                 size,
                 content_hash: options.deduplicate.then_some(content_hash),
@@ -428,7 +541,6 @@ pub fn preflight(manifest: BuildManifest, options: BuildOptions) -> Result<Build
         });
     }
     Ok(BuildPlan {
-        root: source_root,
         destination,
         archives: planned_archives,
         deduplicate: options.deduplicate,
@@ -508,7 +620,7 @@ fn execute_with_publish_hook(
                     size: input.size,
                 };
                 if let Some(owner) = local_owners.get(&key) {
-                    verify_prehashed_source(&plan.root, input)?;
+                    verify_prehashed_source(input)?;
                     writer
                         .add_alias(path.clone(), owner.blob_id)
                         .map_err(|error| {
@@ -527,7 +639,7 @@ fn execute_with_publish_hook(
                     continue;
                 }
                 if let Some(owner) = global_owners.get(&key) {
-                    verify_prehashed_source(&plan.root, input)?;
+                    verify_prehashed_source(input)?;
                     writer
                         .add_external(path.clone(), owner.archive_id, owner.blob_id)
                         .map_err(|error| {
@@ -553,7 +665,7 @@ fn execute_with_publish_hook(
                     );
                     continue;
                 }
-                let blob_id = add_local(&mut writer, &plan.root, input, Some(hash))?;
+                let blob_id = add_local(&mut writer, input, Some(hash))?;
                 let pending = PendingOwner {
                     path: input.path.clone(),
                     blob_id,
@@ -563,7 +675,7 @@ fn execute_with_publish_hook(
                 new_owners.push((key, pending));
                 owners.push((archive.name.clone(), input.path.clone(), blob_id));
             } else {
-                let blob_id = add_local(&mut writer, &plan.root, input, None)?;
+                let blob_id = add_local(&mut writer, input, None)?;
                 owners.push((archive.name.clone(), input.path.clone(), blob_id));
             }
         }
@@ -702,11 +814,10 @@ fn execute_with_publish_hook(
 
 fn add_local(
     writer: &mut ArchiveWriter<File>,
-    root: &Path,
     input: &PlannedInput,
     expected_hash: Option<ContentHash>,
 ) -> Result<BlobId, BuildError> {
-    let source = open_checked_source(root, &input.source)?;
+    let source = open_checked_source(&input.source_root, &input.source)?;
     writer
         .add_local_with_options(
             input.path.clone(),
@@ -836,15 +947,7 @@ fn validate_archive_name(name: &str) -> Result<(), BuildError> {
             "unsafe archive basename {name:?}"
         )));
     }
-    let device = stem.split('.').next().unwrap_or(stem).to_ascii_uppercase();
-    if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || device
-            .strip_prefix("COM")
-            .is_some_and(is_reserved_device_number)
-        || device
-            .strip_prefix("LPT")
-            .is_some_and(is_reserved_device_number)
-    {
+    if is_reserved_windows_device(stem) {
         return Err(BuildError::input(format!(
             "reserved Windows archive name {name:?}"
         )));
@@ -852,8 +955,89 @@ fn validate_archive_name(name: &str) -> Result<(), BuildError> {
     Ok(())
 }
 
-fn is_reserved_device_number(value: &str) -> bool {
-    matches!(value, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+fn validate_programmatic_archive_name(name: &str) -> Result<(), BuildError> {
+    match validate_archive_stem(name) {
+        Ok(()) => Ok(()),
+        Err(ArchiveNameError::InvalidStem) => Err(BuildError::input(format!(
+            "unsafe archive name {name:?}; expected 1-64 ASCII letters, digits, underscores, or hyphens"
+        ))),
+        Err(ArchiveNameError::ReservedWindowsName) => Err(BuildError::input(format!(
+            "reserved Windows archive name {name:?}"
+        ))),
+    }
+}
+
+fn canonical_programmatic_source(source: &Path) -> Result<PathBuf, BuildError> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        BuildError::input(format!(
+            "cannot inspect input {}: {error}",
+            source.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(BuildError::input(format!(
+            "input must be a regular file, not a symlink: {}",
+            source.display()
+        )));
+    }
+    let canonical = fs::canonicalize(source).map_err(|error| {
+        BuildError::input(format!(
+            "cannot resolve input {}: {error}",
+            source.display()
+        ))
+    })?;
+    let canonical_metadata = fs::symlink_metadata(&canonical).map_err(|error| {
+        BuildError::input(format!(
+            "cannot inspect input {}: {error}",
+            canonical.display()
+        ))
+    })?;
+    if canonical_metadata.file_type().is_symlink() || !canonical_metadata.is_file() {
+        return Err(BuildError::input(format!(
+            "input must resolve to a regular file: {}",
+            source.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn expand_programmatic_input(
+    path: VirtualPath,
+    source: PathBuf,
+    compression: BuildCompression,
+) -> Result<ExpandedInput, BuildError> {
+    let source_root = source.parent().ok_or_else(|| {
+        BuildError::input(format!(
+            "input has no parent directory: {}",
+            source.display()
+        ))
+    })?;
+    Ok(ExpandedInput {
+        path,
+        source_root: source_root.to_path_buf(),
+        source,
+        compression,
+    })
+}
+
+fn plan_programmatic_inputs(
+    inputs: Vec<BuildFileInput>,
+    defaults: BuildCompression,
+    canonicalize_source: impl Fn(&Path) -> Result<PathBuf, BuildError>,
+) -> Result<Vec<ExpandedInput>, BuildError> {
+    inputs
+        .into_iter()
+        .map(|input| {
+            let compression = BuildCompression {
+                codec: input.codec.unwrap_or(defaults.codec),
+                chunk_size: input.chunk_size.unwrap_or(defaults.chunk_size),
+                zstd_level: input.zstd_level.unwrap_or(defaults.zstd_level),
+            };
+            validate_compression(compression)?;
+            let source = canonicalize_source(&input.source)?;
+            expand_programmatic_input(input.path, source, compression)
+        })
+        .collect()
 }
 
 fn canonical_source_root(root: &Path) -> Result<PathBuf, BuildError> {
@@ -881,7 +1065,7 @@ fn expand_selector(
     root: &Path,
     input: &BuildInput,
     compression: BuildCompression,
-    output: &mut Vec<(VirtualPath, PathBuf, BuildCompression)>,
+    output: &mut Vec<ExpandedInput>,
 ) -> Result<(), BuildError> {
     let selected = if input.path == Path::new(".") {
         root.to_path_buf()
@@ -914,15 +1098,16 @@ fn expand_selector(
         )));
     }
     if metadata.is_file() {
-        output.push((
-            virtual_path_from_relative(root, &canonical)?,
-            canonical,
+        output.push(ExpandedInput {
+            path: virtual_path_from_relative(root, &canonical)?,
+            source_root: root.to_path_buf(),
+            source: canonical,
             compression,
-        ));
+        });
     } else if metadata.is_dir() {
         let before = output.len();
         walk_directory(root, &canonical, compression, output)?;
-        output[before..].sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        output[before..].sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
     } else {
         return Err(BuildError::input(format!(
             "input selector is not a regular file or directory: {}",
@@ -936,7 +1121,7 @@ fn walk_directory(
     root: &Path,
     directory: &Path,
     compression: BuildCompression,
-    output: &mut Vec<(VirtualPath, PathBuf, BuildCompression)>,
+    output: &mut Vec<ExpandedInput>,
 ) -> Result<(), BuildError> {
     let mut entries = fs::read_dir(directory)
         .map_err(|error| {
@@ -979,11 +1164,12 @@ fn walk_directory(
                     path.display()
                 )));
             }
-            output.push((
-                virtual_path_from_relative(root, &canonical)?,
-                canonical,
+            output.push(ExpandedInput {
+                path: virtual_path_from_relative(root, &canonical)?,
+                source_root: root.to_path_buf(),
+                source: canonical,
                 compression,
-            ));
+            });
         } else {
             return Err(BuildError::input(format!(
                 "unsupported input type: {}",
@@ -1066,8 +1252,8 @@ fn hash_source(root: &Path, path: &Path) -> Result<(u64, ContentHash), BuildErro
     Ok((size, ContentHash::from_bytes(*hasher.finalize().as_bytes())))
 }
 
-fn verify_prehashed_source(root: &Path, input: &PlannedInput) -> Result<(), BuildError> {
-    let (size, content_hash) = hash_source(root, &input.source)?;
+fn verify_prehashed_source(input: &PlannedInput) -> Result<(), BuildError> {
+    let (size, content_hash) = hash_source(&input.source_root, &input.source)?;
     if size != input.size || input.content_hash != Some(content_hash) {
         return Err(BuildError::input(format!(
             "input changed after preflight: {}",
@@ -1320,10 +1506,37 @@ fn platform_publish_noreplace(_source: &Path, _destination: &Path) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildErrorKind, BuildOptions, execute_with_publish_hook, parse_manifest, preflight,
+        BuildCompression, BuildErrorKind, BuildFileInput, BuildOptions, ProgrammaticArchive,
+        build_archive_set, execute_with_publish_hook, parse_manifest, plan_programmatic_inputs,
+        preflight,
     };
+    use crate::{ArchiveCatalog, Codec};
+    use engine_files::VirtualPath;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn virtual_path(value: &str) -> VirtualPath {
+        VirtualPath::parse(value).unwrap()
+    }
+
+    fn programmatic_archive(name: &str, source: PathBuf, path: &str) -> ProgrammaticArchive {
+        ProgrammaticArchive {
+            name: name.into(),
+            inputs: vec![BuildFileInput::new(source, virtual_path(path))],
+        }
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "rvepak-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn publication_race_preserves_existing_destination_and_cleans_staging() {
@@ -1395,6 +1608,195 @@ mod tests {
             .collect::<Vec<_>>();
         entries.sort();
         assert_eq!(entries, ["assets", "output"].map(std::ffi::OsString::from));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn programmatic_archive_build_uses_explicit_order_for_dedup_ownership() {
+        let base = temp_dir("programmatic-order");
+        let first_source = base.join("first.bin");
+        let second_source = base.join("second.bin");
+        fs::write(&first_source, b"shared payload").unwrap();
+        fs::write(&second_source, b"shared payload").unwrap();
+        let output = base.join("output");
+
+        let report = build_archive_set(
+            vec![
+                programmatic_archive("first", first_source, "/first.bin"),
+                programmatic_archive("second", second_source, "/second.bin"),
+            ],
+            &output,
+            BuildCompression::default(),
+            BuildOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.archives.len(), 2);
+        assert_eq!(report.archives[0].name, "first.rvepak");
+        assert_eq!(report.archives[1].name, "second.rvepak");
+
+        let catalog =
+            ArchiveCatalog::open_directory(&output, Default::default(), Default::default())
+                .unwrap();
+        let ids = catalog
+            .archive_paths()
+            .map(|(id, path)| (path.file_stem().unwrap().to_string_lossy().into_owned(), id))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let entries = catalog.entries().unwrap();
+        let first = entries
+            .iter()
+            .find(|entry| entry.path == virtual_path("/first.bin"))
+            .unwrap();
+        let second = entries
+            .iter()
+            .find(|entry| entry.path == virtual_path("/second.bin"))
+            .unwrap();
+        assert_eq!(first.archive_id, ids["first"]);
+        assert_eq!(first.owner_archive_id, ids["first"]);
+        assert_eq!(second.archive_id, ids["second"]);
+        assert_eq!(second.owner_archive_id, ids["first"]);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn programmatic_input_plan_keeps_a_separate_root_for_each_source() {
+        #[cfg(windows)]
+        let sources = [
+            PathBuf::from(r"D:\generated\registry.toml"),
+            PathBuf::from(r"C:\temporary\project.toml"),
+        ];
+        #[cfg(not(windows))]
+        let sources = [
+            PathBuf::from("/synthetic-d/generated/registry.toml"),
+            PathBuf::from("/synthetic-c/temporary/project.toml"),
+        ];
+
+        let inputs = sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                BuildFileInput::new(source, virtual_path(&format!("/generated/{index}.toml")))
+            })
+            .collect();
+        let planned = plan_programmatic_inputs(inputs, BuildCompression::default(), |source| {
+            Ok(source.to_path_buf())
+        })
+        .unwrap();
+
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].source_root, sources[0].parent().unwrap());
+        assert_eq!(planned[1].source_root, sources[1].parent().unwrap());
+        assert!(!planned[0].source_root.starts_with(&planned[1].source_root));
+        assert!(!planned[1].source_root.starts_with(&planned[0].source_root));
+    }
+
+    #[test]
+    fn programmatic_archive_build_rejects_invalid_inputs_and_preserves_existing_output() {
+        let base = temp_dir("programmatic-errors");
+        let source = base.join("source.bin");
+        fs::write(&source, b"source").unwrap();
+        let output = base.join("existing");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("keep.txt"), b"keep").unwrap();
+
+        let build = |archives| {
+            build_archive_set(
+                archives,
+                base.join("new-output"),
+                BuildCompression::default(),
+                BuildOptions::default(),
+            )
+        };
+        assert!(build(vec![programmatic_archive("bad.name", source.clone(), "/a")]).is_err());
+        assert!(build(vec![programmatic_archive("CON", source.clone(), "/a")]).is_err());
+        assert!(
+            build(vec![
+                programmatic_archive("one", source.clone(), "/same"),
+                programmatic_archive("two", source.clone(), "/same")
+            ])
+            .is_err()
+        );
+        let mut entries_before = fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries_before.sort();
+        assert!(
+            build(vec![programmatic_archive(
+                "one",
+                base.join("missing.bin"),
+                "/a",
+            )])
+            .is_err()
+        );
+        let failed_output = base.join("new-output");
+        assert!(!failed_output.exists());
+        let mut entries_after = fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries_after.sort();
+        assert_eq!(entries_after, entries_before);
+        assert!(build(vec![programmatic_archive("one", base.clone(), "/a")]).is_err());
+        assert!(
+            build(vec![ProgrammaticArchive {
+                name: "one".into(),
+                inputs: vec![]
+            }])
+            .is_err()
+        );
+
+        let error = build_archive_set(
+            vec![programmatic_archive("one", source, "/a")],
+            &output,
+            BuildCompression::default(),
+            BuildOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), BuildErrorKind::Input);
+        assert_eq!(fs::read(output.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn programmatic_archive_build_rejects_symlink_sources() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir("programmatic-symlink");
+        let source = base.join("source.bin");
+        let link = base.join("link.bin");
+        fs::write(&source, b"source").unwrap();
+        symlink(&source, &link).unwrap();
+        let error = build_archive_set(
+            vec![programmatic_archive("one", link, "/a")],
+            base.join("output"),
+            BuildCompression::default(),
+            BuildOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), BuildErrorKind::Input);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn programmatic_build_honors_per_file_compression_overrides() {
+        let base = temp_dir("programmatic-compression");
+        let source = base.join("source.bin");
+        fs::write(&source, b"uncompressed").unwrap();
+        let mut input = BuildFileInput::new(&source, virtual_path("/raw.bin"));
+        input.codec = Some(Codec::None);
+        let report = build_archive_set(
+            vec![ProgrammaticArchive {
+                name: "base".into(),
+                inputs: vec![input],
+            }],
+            base.join("output"),
+            BuildCompression::default(),
+            BuildOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.owners[0].codec, Codec::None);
         let _ = fs::remove_dir_all(base);
     }
 }

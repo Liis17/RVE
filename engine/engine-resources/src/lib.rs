@@ -14,12 +14,26 @@ pub use service::{ResourceHandle, ResourceRequest, ResourceStat, ResourceSystem}
 
 use std::path::PathBuf;
 
+/// Selects how resource bytes are discovered at startup.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum SourceMode {
+    /// Select loose files when no archives exist, otherwise validate all archives.
+    #[default]
+    Auto,
+    /// Read only loose files and ignore all `.rvepak` entries in the root.
+    Loose,
+    /// Load the archive set declared by `/rve/assets.toml` in the base archive.
+    Registry,
+}
+
 /// Settings for the resource coordinator, bounded worker queue, and read budgets.
 #[derive(Clone, Debug)]
 pub struct ResourceConfig {
     /// Directory containing loose resources and top-level `.rvepak` archives.
     /// Relative paths are interpreted from the process working directory.
     pub root: PathBuf,
+    /// Startup selection for loose files and packed archives.
+    pub source_mode: SourceMode,
     /// Number of synchronous I/O workers. The default is available parallelism,
     /// clamped to one through four workers.
     pub worker_count: usize,
@@ -45,6 +59,7 @@ impl Default for ResourceConfig {
             .clamp(1, 4);
         Self {
             root: PathBuf::from("assets"),
+            source_mode: SourceMode::default(),
             worker_count,
             queue_capacity: 128,
             max_total_index_bytes: 256 * 1024 * 1024,

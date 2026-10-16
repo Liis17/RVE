@@ -26,6 +26,10 @@ pub enum ResourceErrorKind {
     MissingOwner,
     MissingBlob,
     InvalidConfiguration,
+    MissingBaseArchive,
+    MissingRegistry,
+    InvalidRegistry,
+    ArchiveSetMismatch,
     BackingChanged,
 }
 
@@ -49,6 +53,10 @@ pub enum ResourceError {
         limit: u64,
     },
     InvalidConfiguration(String),
+    MissingBaseArchive(String),
+    MissingRegistry(String),
+    InvalidRegistry(String),
+    ArchiveSetMismatch(String),
     PathOutsideRoot(String),
     NonRegularFile(String),
     QueueFull,
@@ -87,6 +95,10 @@ impl ResourceError {
             Self::InvalidRange { .. } => ResourceErrorKind::InvalidRange,
             Self::BudgetExceeded { .. } => ResourceErrorKind::BudgetExceeded,
             Self::InvalidConfiguration(_) => ResourceErrorKind::InvalidConfiguration,
+            Self::MissingBaseArchive(_) => ResourceErrorKind::MissingBaseArchive,
+            Self::MissingRegistry(_) => ResourceErrorKind::MissingRegistry,
+            Self::InvalidRegistry(_) => ResourceErrorKind::InvalidRegistry,
+            Self::ArchiveSetMismatch(_) => ResourceErrorKind::ArchiveSetMismatch,
             Self::PathOutsideRoot(_) => ResourceErrorKind::PathOutsideRoot,
             Self::NonRegularFile(_) => ResourceErrorKind::NonRegularFile,
             Self::QueueFull => ResourceErrorKind::QueueFull,
@@ -136,6 +148,10 @@ impl fmt::Display for ResourceError {
                 )
             }
             Self::InvalidConfiguration(message) => f.write_str(message),
+            Self::MissingBaseArchive(message)
+            | Self::MissingRegistry(message)
+            | Self::InvalidRegistry(message)
+            | Self::ArchiveSetMismatch(message) => f.write_str(message),
             Self::PathOutsideRoot(path) => write!(f, "resource path {path} escapes its root"),
             Self::NonRegularFile(path) => write!(f, "resource path {path} is not a regular file"),
             Self::QueueFull => f.write_str("resource request queue is full"),

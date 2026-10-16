@@ -111,3 +111,26 @@ The `engine-pak` crate exposes `Archive` for immutable metadata, `stat`, sorted 
 `engine-files::ReadAt` supplies checked `u64` positional reads and is injectable for recording and sparse test readers. A caller-provided source must keep its bytes stable for the lifetime of an opened `Archive`. Unix `FileSource` uses positional `read_at`. Windows `seek_read` moves the file cursor, so one source serializes its own cursor access; file-backed archive payload reads and worker reopenings use independent file handles and verify ArchiveId before reading payload bytes. No archive-wide mutex serializes worker reads.
 
 The `engine-pak` library includes a reusable TOML manifest builder, and the `rvepak` tool builds, lists, and verifies top-level archive sets. The `engine-resources` crate provides background reads over loose files and validated archive catalogs. `engine-assets` reads FBX and PNG bytes through this service, and sandbox starts it before preparing content; see the component contracts in `Obsidian/RVEVault/Engine/EngineResources.md`, `EngineAssets.md`, and `Sandbox.md`.
+
+## Archive set registry
+
+`/rve/assets.toml` is a set-level convention used to select and validate a collection of `.rvepak` files. It is not part of the RVEPAK wire format: each archive remains an independent v1 or v2 file.
+
+The registry uses TOML format version 1:
+
+```toml
+format = 1
+archives = ["base", "shared", "scene-main", "weapons"]
+
+[assets]
+"/rve/assets.toml" = "base"
+"/rve/project.toml" = "base"
+"/scenes/main.rvescene" = "base"
+"/models/cube.fbx" = "shared"
+```
+
+Archive names are 1–64 ASCII letters, digits, `_` or `-`, unique without ASCII case sensitivity, and may not be reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, or `LPT1`–`LPT9`, case-insensitively). The required `base` archive is first and is stored as `base.rvepak`; every other file is named `<name>.rvepak`, and every non-base archive declares at least one path. The `[assets]` entry for `/rve/assets.toml` must assign that path to `base`; the file itself must be stored locally in `base.rvepak`. No other `/rve/` path is required by the registry format. Unknown fields and versions other than 1 are rejected. The complete set of top-level `.rvepak` files must match the registry exactly.
+
+Each key under `[assets]` is parsed by `engine-files::VirtualPath`. The value names the archive whose file table declares that path. It does not name the archive that physically owns the bytes: a deduplicated path in `shared.rvepak` may externally reference a blob in `base.rvepak` while the registry still assigns the path to `shared`. Validation compares the complete registry and catalog in both directions and uses this declaring-archive identity.
+
+`base.rvepak` stores `/rve/assets.toml` locally and can be opened alone to read its own declared paths. Build archive order with base first so deduplication can create references from later archives to base without making base depend on another archive. `engine-pak::ArchiveSetRegistry` parses, serializes, and validates this convention; `engine-resources::SourceMode::Registry` loads it at startup using the fixed `base.rvepak` filename.

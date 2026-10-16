@@ -58,7 +58,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 - `sandbox` зависит от `engine-core`, `engine-project`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
 - `engine-project` зависит от `engine-files`, serde и toml. `BootstrapConfig` читает `bootstrap.rves`, а `ProjectSettings` разбирает `project.rveproject`; общая валидация virtual paths использует `engine-files::VirtualPath`.
-- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets` и sandbox читают через его handle. `engine-files` не имеет внешних зависимостей.
+- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; он содержит и wire-формат архивов, и отдельный TOML-контракт `ArchiveSetRegistry`. Инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets` и sandbox читают через его handle. `engine-files` не имеет внешних зависимостей.
 - `engine-scene` зависит от glam, `engine-files`, serde и toml: документы `.rvescene` используют `VirtualPath`, а `World` рассчитывает сцены независимо от renderer и script runtime. Sandbox передаёт вычисленные матрицы через API renderer.
 - `engine-script` зависит от `engine-scene` и `mlua` с Lua 5.4 и vendored исходниками. Он связывает `World` с Lua и heavy-скриптами, не зависит от runtime, renderer или window; Lua state остаётся на scripts thread, а отдельный interrupt handle можно передать другому потоку.
 - `engine-assets` зависит от `engine-resources`, ufbx и png; от renderer и окна не зависит. `Assets::model_dependencies` использует тот же поиск внешних текстур и stat-источник, что и `load_model`, чтобы builder мог собрать зависимости без декодирования PNG.
@@ -71,13 +71,15 @@ RVE — workspace игрового движка на Rust. Его рабочий
 
 ## Файловые источники и RVEPAK
 
-`engine-files::VirtualPath` задаёт case-sensitive UTF-8 namespace ресурсов, а `ReadAt` и `FileSource` читают абсолютные `u64`-диапазоны без общего archive lock. `engine-pak::Archive` читает legacy v1 и проверяет секции v2 (96-байтовый заголовок, индекс, data), открывает range reads по пересекающимся чанкам и проверяет chunk/full-blob BLAKE3. `ArchiveCatalog` смешивает версии, проверяет уникальность полного virtual path и связывает external references только с local blob указанного владельца. `ArchiveWriter` пишет v2 через временный spool и возвращает ArchiveId и BlobId/hash map для следующих архивов. Нормативная раскладка обеих версий описана в [`docs/rvepak-format.md`](../../docs/rvepak-format.md).
+`engine-files::VirtualPath` задаёт case-sensitive UTF-8 namespace ресурсов, а `ReadAt` и `FileSource` читают абсолютные `u64`-диапазоны без общего archive lock. `engine-pak::Archive` читает legacy v1 и проверяет секции v2 (96-байтовый заголовок, индекс, data), открывает range reads по пересекающимся чанкам и проверяет chunk/full-blob BLAKE3. `ArchiveCatalog` смешивает версии, проверяет уникальность полного virtual path и связывает external references только с local blob указанного владельца; `CatalogAsset::archive_id` отдельно сохраняет архив, объявивший путь. `ArchiveWriter` пишет v2 через временный spool и возвращает ArchiveId и BlobId/hash map для следующих архивов. Нормативная раскладка обеих версий описана в [`docs/rvepak-format.md`](../../docs/rvepak-format.md).
 
 `engine-pak::preflight` раскрывает и проверяет все inputs manifest до BLAKE3 prepass и записи, а `execute` строит весь набор в staging directory, проверяет его через `ArchiveCatalog` и публикует с атомарным запретом замены существующего output. `tools/rvepak` предоставляет команды `build`, `list` и `verify`; только `verify` повторно декодирует все unique local blobs. Manifest и политика dedup описаны в [[Engine/EnginePak]].
 
+`engine-pak::build_archive_set` принимает явные файлы, virtual paths и compression overrides, формирует тот же build plan и использует общий `execute`; порядок архивов задаёт владельца при deduplication. Для каждого программного входа корнем служит родительский каталог канонического файла, поэтому файлы могут быть на разных дисках. `ArchiveSetRegistry` описывает каталог набора в `/rve/assets.toml`: запись реестра назначает этот путь архиву `base`, base содержит его локально, а остальные записи `assets` указывают declaring archive. Это соглашение набора, не часть wire-формата `.rvepak`.
+
 Чтение ограничивается configurable index, result, chunk и memory budgets. `ReadControl` резервирует footprint результата, stored/decoded чанка и codec workspace до аллокаций и позволяет отменить чтение между чанками. На Windows `seek_read` меняет file cursor, поэтому file-backed payload reads и worker reopenings используют независимые handles с проверкой ArchiveId; на Unix исходный positional handle остаётся закреплён за Archive.
 
-Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. `engine-resources` выбирает packed-only режим при наличии архивов и loose режим без них, ограничивает очередь и memory footprint и выполняет чтение в background workers. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; sandbox использует `assets` как root по умолчанию.
+Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. `engine-resources::ResourceConfig` выбирает `SourceMode::Auto` (старое обнаружение packed/loose), `Loose` (только файлы) или `Registry` (base → `/rve/assets.toml` → точный состав архива → каталог и сверка путей). Любая ошибка Registry останавливает startup до запуска workers. Сервис ограничивает очередь и memory footprint и выполняет чтение в background workers. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; sandbox использует `assets` как root по умолчанию с `Auto`.
 
 ## Основные потоки
 
@@ -89,7 +91,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 `AllowMultipleInstances` и `AppIcon`. Sandbox применяет размеры и заголовок; из новых
 полей он применяет только `WindowTitle`, а `AllowMultipleInstances` и `AppIcon`
 разбирает и игнорирует. Размеры окна по умолчанию — 1280×720. После этих проверок
-`ResourceSystem::start` открывает `assets` (или проверяет его архивный каталог), затем
+`ResourceSystem::start` открывает `assets` в `SourceMode::Auto` (или проверяет его архивный каталог), затем
 `Assets::with_resources` загружает CPU-содержимое кадра до создания окна. Это происходит
 и для процедурных сцен; отсутствующий loose root допустим, а ошибка архива или ресурса
 завершает запуск с кодом 2. FBX разбирается через `ufbx::load_memory` на вызывающем
