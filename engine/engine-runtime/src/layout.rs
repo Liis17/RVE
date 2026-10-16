@@ -16,6 +16,30 @@ pub(crate) fn normalize_layout_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// Returns the directory holding release `Engine/` and `Assets/`.
+///
+/// On macOS a player inside `<Name>.app/Contents/MacOS` reads them from
+/// `Contents/Resources`; otherwise they sit next to the executable.
+pub(crate) fn release_root(exe_dir: &Path) -> PathBuf {
+    if cfg!(target_os = "macos")
+        && let Some(resources) = app_bundle_resources(exe_dir)
+    {
+        return resources;
+    }
+    exe_dir.to_owned()
+}
+
+fn app_bundle_resources(exe_dir: &Path) -> Option<PathBuf> {
+    let contents = exe_dir.parent()?;
+    let bundle = contents.parent()?;
+    let is_bundle = exe_dir.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
+    is_bundle.then(|| contents.join("Resources"))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectSettingsLocation {
     File(PathBuf),
@@ -52,7 +76,7 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
-    use super::{Layout, ProjectSettingsLocation};
+    use super::{Layout, ProjectSettingsLocation, app_bundle_resources};
     use engine_resources::SourceMode;
     use std::path::Path;
 
@@ -69,6 +93,31 @@ mod tests {
             layout.project_settings,
             ProjectSettingsLocation::Resource("/rve/project.toml")
         );
+    }
+
+    #[test]
+    fn app_bundle_executable_reads_release_files_from_contents_resources() {
+        assert_eq!(
+            app_bundle_resources(Path::new("/Applications/Demo Game.app/Contents/MacOS")),
+            Some(Path::new("/Applications/Demo Game.app/Contents/Resources").into())
+        );
+        assert_eq!(
+            app_bundle_resources(Path::new("/opt/Demo.APP/Contents/MacOS")),
+            Some(Path::new("/opt/Demo.APP/Contents/Resources").into())
+        );
+        for not_bundle in [
+            "/opt/game",
+            "/opt/game/Contents/MacOS",
+            "/opt/Demo.app/MacOS",
+            "/opt/Demo.app/Contents",
+            "MacOS",
+        ] {
+            assert_eq!(
+                app_bundle_resources(Path::new(not_bundle)),
+                None,
+                "{not_bundle}"
+            );
+        }
     }
 
     #[test]

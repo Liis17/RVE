@@ -59,22 +59,37 @@ pub(crate) fn build_distribution(
     ensure_output_missing(&output)?;
 
     let staging = TempDir::create(&output_parent, "rve-build-output")?;
-    let engine_dir = staging.path().join("Engine");
-    fs::create_dir_all(&engine_dir).map_err(|error| {
-        BuildError::operational(format!(
-            "не удалось создать {}: {error}",
-            engine_dir.display()
-        ))
-    })?;
+    // Finder opens a bare executable through Terminal, so macOS releases are `.app` bundles.
+    #[cfg(target_os = "macos")]
+    let (resources_dir, binary_dir) = {
+        let contents = staging
+            .path()
+            .join(format!("{executable_name}.app"))
+            .join("Contents");
+        create_dir_all(&contents.join("MacOS"))?;
+        let settings = &project.settings;
+        let plist = platform::info_plist(
+            &executable_name,
+            &settings.name,
+            &settings.id,
+            &settings.version,
+        );
+        write_file(&contents.join("Info.plist"), plist.as_bytes())?;
+        (contents.join("Resources"), contents.join("MacOS"))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (resources_dir, binary_dir) = (staging.path().to_owned(), staging.path().to_owned());
+    let engine_dir = resources_dir.join("Engine");
+    create_dir_all(&engine_dir)?;
     copy_file(&project.bootstrap_path, &engine_dir.join("bootstrap.rves"))?;
-    let assets_dir = staging.path().join("Assets");
+    let assets_dir = resources_dir.join("Assets");
     build_project_archives(&project, &assets_dir)?;
     validate_staged_archives(&assets_dir)?;
 
     #[cfg(target_os = "macos")]
     platform::copy_macos_vulkan_files(&vulkan_files, &engine_dir)?;
 
-    let output_binary = staging.path().join(executable_name);
+    let output_binary = binary_dir.join(executable_name);
     copy_file(&executable, &output_binary)?;
     match platform::publish_directory_no_replace(staging.path(), &output) {
         Ok(()) => Ok(()),
@@ -511,6 +526,12 @@ fn repo_root() -> Result<PathBuf, BuildError> {
         ))
     })?;
     normalize_build_path(&root)
+}
+
+fn create_dir_all(path: &Path) -> Result<(), BuildError> {
+    fs::create_dir_all(path).map_err(|error| {
+        BuildError::operational(format!("не удалось создать {}: {error}", path.display()))
+    })
 }
 
 fn copy_file(source: &Path, destination: &Path) -> Result<(), BuildError> {

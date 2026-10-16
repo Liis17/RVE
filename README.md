@@ -398,6 +398,9 @@ cargo run -p rve-player -- --project /path/to/project --frames 300
 | Dev | `<project>/bootstrap.rves` | `<project>/Assets`, loose files | `<project>/project.rveproject` |
 | Release | `exe_dir/Engine/bootstrap.rves` | `exe_dir/Assets`, registry mode | `/rve/project.toml` из ResourceHandle |
 
+На macOS, если исполняемый файл находится в `<Name>.app/Contents/MacOS`, вместо
+`exe_dir` используется `Contents/Resources` этого бандла.
+
 `--frames N` — необязательное положительное число презентаций `Presented`; по достижении лимита приложение завершает работу с кодом 0. Заголовок окна берётся из `WindowTitle`, если он задан, иначе из `ProjectSettings.name`. `AppIcon` в bootstrap — virtual path в Assets; ошибка загрузки иконки завершает запуск до открытия окна.
 
 | Код | Значение |
@@ -432,16 +435,26 @@ Output публикуется атомарно и должен ещё не су�
 сборщик повторно проверяет архивный каталог и реестр из `base.rvepak`. Раскладка:
 
 ```text
-demo-out/
-├── RVE Demo                 # RVE Demo.exe на Windows
+demo-out/                    # Windows
+├── RVE Demo.exe
 ├── Engine/
 │   └── bootstrap.rves
 └── Assets/
     ├── base.rvepak
     └── *.rvepak
+
+demo-out/                    # macOS
+└── RVE Demo.app/
+    └── Contents/
+        ├── Info.plist
+        ├── MacOS/RVE Demo
+        └── Resources/
+            ├── Engine/      # bootstrap.rves и Vulkan-файлы
+            └── Assets/
 ```
 
-На macOS в `Engine/` также копируются `libvulkan.1.dylib`, `libMoltenVK.dylib` и
+На macOS релиз собирается как `.app`, чтобы запуск из Finder не открывал Terminal.
+Бандл не подписывается и пока не получает `.icns`-иконку. В `Engine/` также копируются `libvulkan.1.dylib`, `libMoltenVK.dylib` и
 `MoltenVK_icd.json`. Если задан `--vulkan-sdk`, поиск выполняется только в нём;
 иначе источники ищутся в `VULKAN_SDK`, затем в Homebrew (`/opt/homebrew`, `/usr/local`).
 Для Homebrew дополнительно проверяется
