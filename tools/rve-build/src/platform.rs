@@ -29,6 +29,54 @@ pub(crate) fn rewrite_icd_manifest(source: &[u8]) -> Result<Vec<u8>, BuildError>
     Ok(bytes)
 }
 
+/// Builds `Contents/Info.plist` for the macOS `.app` player bundle.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn info_plist(executable: &str, name: &str, id: &str, version: &str) -> String {
+    // CFBundleIdentifier allows only alphanumerics, hyphens and periods.
+    let identifier = format!("rve.game.{}", id.replace('_', "-"));
+    let entries = [
+        ("CFBundleDevelopmentRegion", "en"),
+        ("CFBundleExecutable", executable),
+        ("CFBundleIdentifier", &identifier),
+        ("CFBundleInfoDictionaryVersion", "6.0"),
+        ("CFBundleName", name),
+        ("CFBundleDisplayName", name),
+        ("CFBundlePackageType", "APPL"),
+        ("CFBundleShortVersionString", version),
+        ("CFBundleVersion", version),
+    ];
+    let mut plist = String::from(concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+        "<plist version=\"1.0\">\n<dict>\n",
+    ));
+    for (key, value) in entries {
+        plist.push_str(&format!(
+            "\t<key>{key}</key>\n\t<string>{}</string>\n",
+            escape_xml(value)
+        ));
+    }
+    plist.push_str("\t<key>NSHighResolutionCapable</key>\n\t<true/>\n</dict>\n</plist>\n");
+    plist
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn escape_xml(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VulkanFiles {
@@ -260,7 +308,7 @@ pub(crate) fn verify_group_icon(executable: &Path) -> Result<(), BuildError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_vulkan_files, rewrite_icd_manifest, vulkan_sources};
+    use super::{find_vulkan_files, info_plist, rewrite_icd_manifest, vulkan_sources};
     use crate::temporary::TempDir;
     use std::fs;
 
@@ -273,6 +321,22 @@ mod tests {
         assert_eq!(value["ICD"]["api_version"], "1.3.0");
         assert!(rewrite_icd_manifest(br#"{"ICD":{}}"#).is_err());
         assert!(rewrite_icd_manifest(b"broken json").is_err());
+    }
+
+    #[test]
+    fn info_plist_names_executable_and_escapes_project_values() {
+        let plist = info_plist(
+            "Tom_s Game",
+            "Tom's <Game> & Co",
+            "tom_game-2",
+            "1.0 \"beta\"",
+        );
+        assert!(plist.contains("<key>CFBundleExecutable</key>\n\t<string>Tom_s Game</string>"));
+        assert!(plist.contains("<string>rve.game.tom-game-2</string>"));
+        assert!(plist.contains("<string>Tom&apos;s &lt;Game&gt; &amp; Co</string>"));
+        assert!(plist.contains("<string>1.0 &quot;beta&quot;</string>"));
+        assert!(plist.contains("<string>APPL</string>"));
+        assert!(plist.ends_with("</dict>\n</plist>\n"));
     }
 
     #[test]

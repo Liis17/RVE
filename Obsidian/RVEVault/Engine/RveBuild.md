@@ -25,7 +25,15 @@ dev-режиме. Инструмент является внешним crate wor
 собираются во временном sibling-каталоге output, затем публикуются атомарно без
 замены существующего каталога. `base.rvepak` содержит сцены, иконку,
 `/rve/project.toml` и `/rve/assets.toml`. Runtime получает bootstrap из
-`<exe_dir>/Engine/bootstrap.rves`, а наборы архивов из `<exe_dir>/Assets`.
+`Engine/bootstrap.rves`, а наборы архивов из `Assets/` корня релиза (см.
+[[Engine/EngineRuntime]]).
+
+На Windows корень релиза — сам output: executable, `Engine/` и `Assets/` лежат рядом.
+На macOS output содержит `<player>.app`: executable в `Contents/MacOS`, `Engine/` и
+`Assets/` в `Contents/Resources`, `Contents/Info.plist` генерирует
+`platform::info_plist` (`CFBundleIdentifier` = `rve.game.<id>` с заменой `_` на `-`,
+версия из `ProjectSettings.version`). Бандл нужен, чтобы запуск из Finder не открывал
+Terminal. Бандл не подписывается, `.icns` из AppIcon не создаётся.
 
 ## Назначение архивов
 
@@ -87,7 +95,7 @@ Cargo stdout разбирается построчно: обычный текс�
 сборки проверяется `RT_GROUP_ICON`. Для этой операции нужен Windows SDK resource
 compiler. Если AppIcon не задан, build script не добавляет ресурс.
 
-На macOS в `Engine/` копируются `libvulkan.1.dylib`,
+На macOS в `Contents/Resources/Engine/` копируются `libvulkan.1.dylib`,
 `libMoltenVK.dylib` и `MoltenVK_icd.json` с относительным `ICD.library_path`.
 Если передан `--vulkan-sdk`, используется только этот каталог; допустимы его корневой
 layout и подкаталог `macOS`. Без явного пути источники проверяются в порядке

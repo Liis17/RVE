@@ -1,0 +1,38 @@
+[[assets]]
+path = "/models/neko.fbx"
+archive = "neko"
+
+[[assets]]
+path = "/models/tx.png"
+archive = "neko"
+
+[[assets]]
+path = "/scripts/rotate.lua"
+archive = "neko"
+
+[[objects]]
+id = "camera"
+name = "Camera"
+[objects.transform]
+position = [0.0, 0.0, 5.5]
+[objects.camera]
+fov_deg = 45.0
+near = 0.1
+far = 100.0
+
+[[objects]]
+id = "turntable"
+name = "Rotation pivot"
+[[objects.lite_scripts]]
+path = "/scripts/rotate.lua"
+params = { speed = 30.0 }
+
+[[objects]]
+id = "neko"
+name = "Neko"
+parent = "turntable"
+[objects.transform]
+position = [0.0, -0.318, 0.0]
+[objects.mesh_renderer]
+model = "/models/neko.fbx"
+texture = "/models/tx.png"

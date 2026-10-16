@@ -67,6 +67,12 @@ cargo run -p rve-build -- build ../examples/demo-game --output ../demo-out
 сборщик, а третья создаёт релиз в указанном каталоге. Каталог релиза должен
 отсутствовать до сборки.
 
+На macOS релиз создаётся как `demo-out/RVE Demo.app`: открой его в Finder для
+запуска без Terminal. Ресурсы и Vulkan-библиотеки находятся внутри бандла в
+`Contents/Resources`. На Windows исполняемый файл, `Engine/` и `Assets/` остаются
+рядом в каталоге релиза. Подробности — в [описании сборщика](Obsidian/RVEVault/Engine/RveBuild.md)
+и [runtime-путей](Obsidian/RVEVault/Engine/EngineRuntime.md).
+
 ## Архивы ресурсов
 
 Инструмент `rvepak` собирает, просматривает и проверяет наборы архивов по

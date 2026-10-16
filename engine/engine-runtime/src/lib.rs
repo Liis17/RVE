@@ -19,7 +19,7 @@ use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_script::{HeavyRegistry, ScriptInterruptHandle};
 use engine_window::{RedrawMode, WindowConfig, WindowIcon};
 use hardware::hardware_issues;
-use layout::{Layout, ProjectSettingsLocation, normalize_layout_path};
+use layout::{Layout, ProjectSettingsLocation, normalize_layout_path, release_root};
 use module_host::ModuleHost;
 use pipeline::{
     Clock, MonotonicClock, RuntimeStatus, ScriptStartupError, ScriptThreadConfig, start_scripts,
@@ -33,8 +33,8 @@ use sysinfo::{CpuRefreshKind, System};
 
 /// Runs an RVE game using the release layout or a loose-file development project.
 pub fn run_player(register_heavy: fn(&mut HeavyRegistry)) -> ExitCode {
-    let exe_dir = match executable_dir() {
-        Ok(exe_dir) => exe_dir,
+    let release_root = match executable_dir() {
+        Ok(exe_dir) => release_root(&exe_dir),
         Err(error) => {
             return fail(
                 2,
@@ -44,7 +44,7 @@ pub fn run_player(register_heavy: fn(&mut HeavyRegistry)) -> ExitCode {
     };
     // SAFETY: this is the first runtime operation that can affect process-wide
     // Vulkan configuration, and no runtime, resource, or activation thread exists yet.
-    unsafe { engine_platform::prepare_vulkan_environment(&exe_dir) };
+    unsafe { engine_platform::prepare_vulkan_environment(&release_root) };
     let activation = PendingActivation::default();
 
     let args = match PlayerArgs::parse(std::env::args_os().skip(1)) {
@@ -55,7 +55,7 @@ pub fn run_player(register_heavy: fn(&mut HeavyRegistry)) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    run_from_args(exe_dir, args, activation, register_heavy)
+    run_from_args(release_root, args, activation, register_heavy)
 }
 
 fn executable_dir() -> Result<PathBuf, String> {
@@ -68,7 +68,7 @@ fn executable_dir() -> Result<PathBuf, String> {
 }
 
 fn run_from_args(
-    exe_dir: PathBuf,
+    release_root: PathBuf,
     args: PlayerArgs,
     activation: PendingActivation,
     register_heavy: fn(&mut HeavyRegistry),
@@ -87,7 +87,7 @@ fn run_from_args(
             };
             Layout::dev(&project)
         }
-        None => Layout::release(&exe_dir),
+        None => Layout::release(&release_root),
     };
     let bootstrap = match BootstrapConfig::load(&layout.bootstrap) {
         Ok(config) => config,
