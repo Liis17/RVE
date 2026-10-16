@@ -5,3 +5,7 @@ version = "1.0.0"
 [[scenes]]
 path = "/scenes/neko.rvescene"
 enabled = true
+
+[[scenes]]
+path = "/scenes/main.rvescene"
+enabled = false

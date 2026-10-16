@@ -2,7 +2,7 @@ use engine_assets::Assets;
 use engine_project::ProjectSettings;
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem, SourceMode};
 use engine_scene::{SceneDocument, World};
-use engine_script::{HeavyRegistry, ScriptHost, ScriptTime};
+use engine_script::{HeavyRegistry, ScriptEventLevel, ScriptHost, ScriptTime};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -76,7 +76,10 @@ fn check_demo(root: &Path, mode: SourceMode) {
         }
     }
     host.destroy(&mut world, ScriptTime::default());
-    assert!(host.drain_events().is_empty());
+    let events = host.drain_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].level, ScriptEventLevel::Info);
+    assert_eq!(events[0].message, "Rotate started");
     resources.shutdown().unwrap();
 }
 
@@ -86,6 +89,11 @@ fn source_model_texture_and_rotation() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("../project/Assets"),
         SourceMode::Loose,
     );
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../project/Assets/scenes/main.rvescene"),
+    )
+    .unwrap();
+    SceneDocument::parse("/scenes/main.rvescene", &source).unwrap();
 }
 
 #[test]

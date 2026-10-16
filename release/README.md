@@ -17,7 +17,28 @@ Release-плеер запускается без отдельного консо
 - `scene-neko.rvepak` — FBX, PNG и Lua-скрипт вращения.
 
 Player читает ресурсы через реестр RVEPAK; исходники из `project/Assets`
-для запуска готовой сборки не требуются. Сборка Windows не проверена на macOS.
+для запуска готовой сборки не требуются. Для переноса Windows-сборки можно
+распаковать `NekoDemo.zip`.
+
+## Запуск готовой сборки macOS
+
+Откройте `Neko Demo.app` двойным щелчком в Finder. Terminal не требуется.
+Сборка предназначена для Apple Silicon. Для переноса копируйте весь `.app`
+целиком или распакуйте `Neko Demo.zip`.
+
+Внутри бандла находятся:
+
+- `Contents/MacOS/Neko Demo` — release player;
+- `Contents/Resources/Assets/base.rvepak` — сцена и настройки/реестр проекта;
+- `Contents/Resources/Assets/neko.rvepak` — FBX, PNG и Lua-скрипт;
+- `Contents/Resources/Engine/` — bootstrap и Vulkan/MoltenVK.
+
+Сохранённая macOS-сборка использует `main.rvescene` без направленного света.
+В общем исходном проекте стартовой остаётся `neko.rvescene` с мягким освещением;
+вариант `main.rvescene` сохранён выключенной сценой. Для его сборки включите
+`main.rvescene` и выключите `neko.rvescene` в `project/project.rveproject`.
+Оба варианта используют исходные модель и текстуру, центрирование и вращение 30°/с.
+Имя общего проекта — `NekoDemo`: при пересборке на macOS получится `NekoDemo.app`.
 
 ## Повторная сборка
 
@@ -33,6 +54,11 @@ cargo run -p rve-build --locked -- build ../release/project --output ../release/
 В этой рабочей копии `project/.rve` связан с `build/neko-project-cache`, чтобы
 артефакты компиляции хранились в `build/`.
 
+Для macOS используйте тот же исходный проект и свободный output, например
+`../release/neko-macos-rebuilt`. Чтобы кэш компиляции оставался в `build/` без
+локальной ссылки `.rve`, сначала скопируйте `release/project` в
+`build/neko-rebuild-project`, исключив `.rve`, и собирайте эту копию.
+
 ## Проверки
 
 После сборки, из `build/`:
@@ -46,3 +72,12 @@ cargo test --manifest-path ../release/tests/Cargo.toml --locked
 архива исходникам, загрузку FBX/PNG и вращение через настоящий Lua host:
 нулевой шаг времени, скорость, полный оборот и дробный шаг.
 Вторая команда отдельно проверяет Vulkan-путь готового player.
+
+Архивы сохранённого macOS-бандла можно проверить из `build/`:
+
+```sh
+cargo run -p rvepak --locked -- verify "../release/Neko Demo.app/Contents/Resources/Assets"
+```
+
+Пересобранная Windows-версия проверяется на Windows. Проверка запуска macOS-бандла
+после объединения изменений требует macOS.

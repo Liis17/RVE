@@ -15,8 +15,13 @@ Parent: [[Index]]
 
 | Режим | Bootstrap | Корень assets | Настройки проекта |
 |---|---|---|---|
-| Release | `exe_dir/Engine/bootstrap.rves` | `exe_dir/Assets`, `SourceMode::Registry` | `/rve/project.toml` через `ResourceHandle` |
+| Release | `<release_root>/Engine/bootstrap.rves` | `<release_root>/Assets`, `SourceMode::Registry` | `/rve/project.toml` через `ResourceHandle` |
 | Dev (`--project <dir>`) | `<project>/bootstrap.rves` | `<project>/Assets`, `SourceMode::Loose` | `<project>/project.rveproject` |
+
+`release_root` (`engine/engine-runtime/src/layout.rs`) — каталог исполняемого файла.
+На macOS, если executable находится в `<Name>.app/Contents/MacOS`, это
+`Contents/Resources` того же бандла: Finder запускает «голый» исполняемый файл через
+Terminal, поэтому `rve-build` публикует macOS-релиз как `.app`.
 
 Заголовок окна берётся из bootstrap, затем из `ProjectSettings.name`. `AppIcon`
 загружается через `Assets::load_texture` до создания окна; ошибка загрузки относится
@@ -24,7 +29,7 @@ Parent: [[Index]]
 
 ## Потоки и протокол запуска
 
-Первой runtime-операцией после получения пути executable вызывается `unsafe engine_platform::prepare_vulkan_environment(exe_dir)`. Она выполняется до создания потоков. Затем создаётся `PendingActivation`, которая сохраняет ранний сигнал singleton activation до `WindowProxy`.
+Первой runtime-операцией после получения пути executable вызывается `unsafe engine_platform::prepare_vulkan_environment(release_root)`. Она выполняется до создания потоков. Затем создаётся `PendingActivation`, которая сохраняет ранний сигнал singleton activation до `WindowProxy`.
 
 После разбора CLI, bootstrap и загрузки настроек runtime пытается захватить
 `InstanceLock` по `ProjectSettings.id`, если bootstrap запрещает несколько

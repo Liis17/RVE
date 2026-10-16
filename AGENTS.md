@@ -104,7 +104,7 @@ cargo run -p sandbox -- --frames 300 --resize-test
 `Имя=Значение` на строку: `WindowSizeX`, `WindowSizeY`, `WindowTitle`,
 `AllowMultipleInstances` (`true`/`false`) и необязательный `AppIcon` (virtual path в
 `Assets`). Sandbox читает файл из cwd; `rve-player` использует `Engine/bootstrap.rves`
-рядом с exe в release layout или файл в каталоге проекта при `--project`.
+рядом с exe (на macOS — в `Contents/Resources` `.app`) в release layout или файл в каталоге проекта при `--project`.
 При первой подготовке файл можно создать копированием `bootstrap.rves.example` в
 `build/bootstrap.rves`; существующий файл настроек не перезаписывай. Отсутствующий
 файл или параметр сохраняет соответствующее значение по умолчанию (размер окна —
