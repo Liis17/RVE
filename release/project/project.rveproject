@@ -1,0 +1,7 @@
+id = "neko-demo"
+name = "NekoDemo"
+version = "1.0.0"
+
+[[scenes]]
+path = "/scenes/neko.rvescene"
+enabled = true
