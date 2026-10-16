@@ -264,6 +264,9 @@ fn write_generated_player(
                 .to_owned()
         }
     };
+    let main_source = format!(
+        "#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = \"windows\")]\n\n{main_source}"
+    );
     let src_dir = player_dir.join("src");
     fs::create_dir_all(&src_dir).map_err(|error| {
         BuildError::operational(format!("не удалось создать {}: {error}", src_dir.display()))
@@ -839,6 +842,57 @@ mod tests {
                 .unwrap()
                 .contains("engine_runtime::run_player(game_heavy::register)")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn generated_release_player_uses_gui_subsystem_and_debug_uses_console() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-player-subsystem").unwrap();
+        let project = sample_project(root.path(), None);
+        for heavy in [false, true] {
+            let player_dir = root.path().join(if heavy { "heavy" } else { "lite" });
+            fs::create_dir_all(&player_dir).unwrap();
+            let dependency = super::HeavyDependency {
+                path: root.path().to_owned(),
+                package: "fixture-heavy".to_owned(),
+            };
+            write_generated_player(&project, &player_dir, heavy.then_some(&dependency)).unwrap();
+            let source_path = player_dir.join("src/main.rs");
+            let source = fs::read_to_string(&source_path).unwrap();
+            // Replace only runtime dependencies; compile the actual generated entry point.
+            fs::write(&source_path, format!(
+                "{source}\nmod engine_runtime {{\n    pub fn run_player(_: fn(&mut ())) -> std::process::ExitCode {{\n        std::process::ExitCode::SUCCESS\n    }}\n}}\nmod game_heavy {{ pub fn register(_: &mut ()) {{}} }}\n"
+            )).unwrap();
+            for (debug_assertions, expected) in [("yes", 3_u16), ("no", 2_u16)] {
+                let executable = player_dir.join(format!("player-{debug_assertions}.exe"));
+                let output = std::process::Command::new(
+                    std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+                )
+                .arg("--edition=2024")
+                .arg("-C")
+                .arg(format!("debug-assertions={debug_assertions}"))
+                .arg(&source_path)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let bytes = fs::read(&executable).unwrap();
+                let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+                assert_eq!(&bytes[pe_offset..pe_offset + 4], b"PE\0\0");
+                // Subsystem is at offset 68 in both PE32 and PE32+ optional headers.
+                let offset = pe_offset + 24 + 68;
+                let subsystem = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+                assert_eq!(
+                    subsystem, expected,
+                    "heavy={heavy}, debug_assertions={debug_assertions}"
+                );
+            }
+        }
     }
 
     #[test]
