@@ -13,7 +13,7 @@ RVE — игровой движок на Rust с выводом через Vulka
 | `engine-platform-macos` | macOS: загрузка Vulkan, MoltenVK portability и Metal surface | Работает |
 | `engine-render` | Vulkan renderer: меши в offscreen-кадре и blit в swapchain | Работает |
 | `engine-files` | Канонические virtual paths и позиционное чтение файлов | Работает |
-| `engine-pak` | Чтение, запись и проверка каталогов RVEPAK v1 | Работает |
+| `engine-pak` | Запись RVEPAK v2, чтение v1/v2 и проверка каталогов | Работает |
 | `engine-resources` | Фоновое чтение loose и packed бинарных ресурсов | Работает |
 | `rvepak` | Сборка, просмотр и проверка наборов RVEPAK из TOML manifest | Работает |
 | `engine-scene` | Игровые объекты, компоненты и сцены | Скелет |
@@ -33,7 +33,7 @@ manifest builder. `engine-resources` запускает bounded worker pool дл
 files или RVEPAK, а инструмент `rvepak` собирает opaque файлы любого типа.
 `engine-assets` получает через сервис байты FBX и PNG и декодирует их в CPU-данные;
 sandbox загружает их до создания окна, а GPU upload остаётся на потоке renderer.
-Wire contract описан в [RVEPAK v1 format](docs/rvepak-format.md).
+Wire contract описан в [RVEPAK archive format](docs/rvepak-format.md).
 
 ### Сборка архивов ресурсов
 

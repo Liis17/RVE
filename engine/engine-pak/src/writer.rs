@@ -1,11 +1,15 @@
 use crate::format::{
     ArchiveId, BlobId, ChunkDescriptor, Codec, ContentHash, DEFAULT_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL,
     FileReference, HEADER_SIZE, LocalBlob, MAX_LOGICAL_CHUNK_SIZE, encode_header, encode_index,
+    encoded_index_size,
 };
 use crate::{PakError, Result};
 use engine_files::VirtualPath;
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const WRITER_ZSTD_WINDOW_LOG: u32 = 23;
 
@@ -55,12 +59,70 @@ impl Default for WriterOptions {
 
 pub struct ArchiveWriter<W> {
     sink: W,
+    spool: SpoolFile,
     options: WriterOptions,
     files: BTreeMap<VirtualPath, FileReference>,
     blobs: BTreeMap<BlobId, LocalBlob>,
     next_blob_id: u64,
     chunk_count: u32,
     poisoned: bool,
+}
+
+struct SpoolFile {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl SpoolFile {
+    fn create(directory: &Path) -> Result<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..128 {
+            let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!(
+                ".rvepak-spool-{}-{sequence}.tmp",
+                std::process::id()
+            ));
+            let mut options = OpenOptions::new();
+            options.write(true).read(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        file: Some(file),
+                        path,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(PakError::io_path(path, error)),
+            }
+        }
+        Err(PakError::InvalidConfiguration(
+            "cannot allocate a unique RVEPAK spool file".into(),
+        ))
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("spool file is available")
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        drop(self.file.take());
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for SpoolFile {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
 }
 
 pub struct FinishedArchive<W> {
@@ -77,7 +139,15 @@ impl<W> FinishedArchive<W> {
 }
 
 impl<W: Write + Seek> ArchiveWriter<W> {
-    pub fn new(mut sink: W, options: WriterOptions) -> Result<Self> {
+    pub fn new(sink: W, options: WriterOptions) -> Result<Self> {
+        Self::with_spool_dir(sink, options, std::env::temp_dir())
+    }
+
+    pub fn with_spool_dir(
+        mut sink: W,
+        options: WriterOptions,
+        directory: impl AsRef<Path>,
+    ) -> Result<Self> {
         validate_options(&options)?;
         let existing_len = sink.seek(SeekFrom::End(0)).map_err(PakError::io)?;
         if existing_len != 0 {
@@ -85,10 +155,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 "archive output must be empty".into(),
             ));
         }
-        sink.write_all(&[0; HEADER_SIZE as usize])
-            .map_err(PakError::io)?;
         Ok(Self {
             sink,
+            spool: SpoolFile::create(directory.as_ref())?,
             options,
             files: BTreeMap::new(),
             blobs: BTreeMap::new(),
@@ -162,6 +231,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             }
             Err(error) => {
                 self.poisoned = true;
+                let _ = self.spool.cleanup();
                 Err(error)
             }
         }
@@ -215,17 +285,38 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
     pub fn finish(mut self) -> Result<FinishedArchive<W>> {
         self.ensure_writable()?;
+        let index_len = encoded_index_size(&self.files, &self.blobs, self.options.max_index_bytes)?;
+        let index_offset = HEADER_SIZE;
+        let data_offset = index_offset
+            .checked_add(index_len)
+            .ok_or_else(|| PakError::InvalidConfiguration("data offset overflow".into()))?;
+        for blob in self.blobs.values_mut() {
+            for chunk in &mut blob.chunks {
+                chunk.offset = chunk.offset.checked_add(data_offset).ok_or_else(|| {
+                    PakError::InvalidConfiguration("chunk offset overflow".into())
+                })?;
+            }
+        }
         let index = encode_index(&self.files, &self.blobs, self.options.max_index_bytes)?;
-        let index_offset = self.sink.stream_position().map_err(PakError::io)?;
-        let index_len = u64::try_from(index.len())
-            .map_err(|_| PakError::InvalidConfiguration("index size overflow".into()))?;
+        debug_assert_eq!(index.len() as u64, index_len);
+        let data_len = self
+            .spool
+            .file_mut()
+            .metadata()
+            .map_err(PakError::io)?
+            .len();
         let archive_id = ArchiveId::from_bytes(*blake3::hash(&index).as_bytes());
-        self.sink.write_all(&index).map_err(PakError::io)?;
-        let header = encode_header(index_offset, index_len, archive_id);
-        self.sink.seek(SeekFrom::Start(0)).map_err(PakError::io)?;
+        let header = encode_header(index_offset, index_len, data_offset, data_len, archive_id);
         self.sink.write_all(&header).map_err(PakError::io)?;
+        self.sink.write_all(&index).map_err(PakError::io)?;
+        self.spool
+            .file_mut()
+            .seek(SeekFrom::Start(0))
+            .map_err(PakError::io)?;
+        std::io::copy(self.spool.file_mut(), &mut self.sink).map_err(PakError::io)?;
         self.sink.flush().map_err(PakError::io)?;
         self.sink.seek(SeekFrom::End(0)).map_err(PakError::io)?;
+        self.spool.cleanup().map_err(PakError::io)?;
         let blobs = self
             .blobs
             .iter()
@@ -273,8 +364,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             content_hasher.update(decoded);
             let chunk_hash = *blake3::hash(decoded).as_bytes();
             let stored = encode_chunk(blob_options.codec, decoded, blob_options.zstd_level)?;
-            let offset = self.sink.stream_position().map_err(PakError::io)?;
-            self.sink.write_all(&stored).map_err(PakError::io)?;
+            let offset = self
+                .spool
+                .file_mut()
+                .stream_position()
+                .map_err(PakError::io)?;
+            self.spool
+                .file_mut()
+                .write_all(&stored)
+                .map_err(PakError::io)?;
             let decoded_len = u64::try_from(read).map_err(|_| {
                 PakError::InvalidConfiguration("decoded chunk size overflow".into())
             })?;

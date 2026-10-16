@@ -1,4 +1,4 @@
-//! Reader, writer, and catalog for the version 1 RVEPAK archive format.
+//! Reader, writer, and catalog for the RVEPAK archive format.
 
 mod builder;
 mod catalog;

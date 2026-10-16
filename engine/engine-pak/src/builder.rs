@@ -489,9 +489,11 @@ fn execute_with_publish_hook(
                 archive_path.display()
             ))
         })?;
-        let mut writer = ArchiveWriter::new(output, WriterOptions::default()).map_err(|error| {
-            BuildError::operational(format!("cannot initialize {}: {error}", archive.name))
-        })?;
+        let mut writer =
+            ArchiveWriter::with_spool_dir(output, WriterOptions::default(), staging.path())
+                .map_err(|error| {
+                    BuildError::operational(format!("cannot initialize {}: {error}", archive.name))
+                })?;
         let mut local_owners = BTreeMap::<ContentKey, PendingOwner>::new();
         let mut new_owners = Vec::<(ContentKey, PendingOwner)>::new();
 

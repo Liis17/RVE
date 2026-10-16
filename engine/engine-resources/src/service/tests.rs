@@ -2,7 +2,7 @@ use super::*;
 use engine_files::ReadAt;
 use engine_pak::{
     Archive, ArchiveCatalog, ArchiveId, ArchiveWriter, BlobId, BlobOptions, CatalogLimits, Codec,
-    HEADER_SIZE, WriterOptions,
+    WriterOptions,
 };
 use std::future::Future;
 use std::io;
@@ -490,7 +490,7 @@ impl ReadGate {
 struct RecordingReader {
     bytes: Vec<u8>,
     payload_start: u64,
-    index_start: u64,
+    payload_end: u64,
     payload_reads: AtomicUsize,
     gate: Arc<ReadGate>,
 }
@@ -502,7 +502,7 @@ impl ReadAt for RecordingReader {
 
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         let end = offset.saturating_add(buffer.len() as u64);
-        if offset < self.index_start && end > self.payload_start {
+        if offset < self.payload_end && end > self.payload_start {
             self.payload_reads.fetch_add(1, Ordering::AcqRel);
             self.gate.enter_and_wait();
         }
@@ -519,7 +519,8 @@ impl ReadAt for RecordingReader {
 
 struct MissingPayloadReader {
     bytes: Vec<u8>,
-    index_start: u64,
+    payload_start: u64,
+    payload_end: u64,
 }
 
 impl ReadAt for MissingPayloadReader {
@@ -528,7 +529,8 @@ impl ReadAt for MissingPayloadReader {
     }
 
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
-        if (HEADER_SIZE..self.index_start).contains(&offset) {
+        let end = offset.saturating_add(buffer.len() as u64);
+        if offset < self.payload_end && end > self.payload_start {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "injected missing archive backing payload",
@@ -549,11 +551,12 @@ fn catalog_with_reader(
     bytes: Vec<u8>,
     gate: Arc<ReadGate>,
 ) -> (Arc<ArchiveCatalog>, Arc<RecordingReader>) {
-    let index_start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let index_start = index_offset(&bytes);
+    let (payload_start, payload_end) = payload_range(&bytes, index_start);
     let reader = Arc::new(RecordingReader {
         bytes,
-        payload_start: engine_pak::HEADER_SIZE,
-        index_start,
+        payload_start,
+        payload_end,
         payload_reads: AtomicUsize::new(0),
         gate,
     });
@@ -564,12 +567,37 @@ fn catalog_with_reader(
     (Arc::new(catalog), reader)
 }
 
+fn payload_range(bytes: &[u8], index_start: u64) -> (u64, u64) {
+    match u32::from_le_bytes(bytes[8..12].try_into().unwrap()) {
+        1 => (64, index_start),
+        2 => (
+            u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            bytes.len() as u64,
+        ),
+        version => panic!("unexpected archive version {version}"),
+    }
+}
+
+fn index_offset(bytes: &[u8]) -> u64 {
+    let field = if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == 1 {
+        16
+    } else {
+        24
+    };
+    u64::from_le_bytes(bytes[field..field + 8].try_into().unwrap())
+}
+
 #[test]
 fn backing_io_not_found_is_distinct_from_a_missing_virtual_resource() {
     let root = TempDirectory::new();
     let bytes = archive_bytes(Codec::None, 4, &[("exists.bin", b"data")]);
-    let index_start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let reader = Arc::new(MissingPayloadReader { bytes, index_start });
+    let index_start = index_offset(&bytes);
+    let (payload_start, payload_end) = payload_range(&bytes, index_start);
+    let reader = Arc::new(MissingPayloadReader {
+        bytes,
+        payload_start,
+        payload_end,
+    });
     let archive = Archive::open_shared(reader).unwrap();
     let mut catalog = ArchiveCatalog::new(CatalogLimits::default());
     catalog.insert(archive).unwrap();
