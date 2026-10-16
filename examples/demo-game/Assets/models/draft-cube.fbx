@@ -1,0 +1,23 @@
+; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+}
+Objects:  {
+	Geometry: 1000, "Geometry::DraftCube", "Mesh" {
+		Vertices: *24 {
+			a: -1,-1,-1,1,-1,-1,1,1,-1,-1,1,-1,-1,-1,1,1,-1,1,1,1,1,-1,1,1
+		}
+		PolygonVertexIndex: *24 {
+			a: 0,1,2,-4,4,7,6,-6,0,4,5,-2,1,5,6,-3,2,6,7,-4,3,7,4,-1
+		}
+		GeometryVersion: 124
+	}
+	Model: 2000, "Model::DraftCube", "Mesh" {
+		Version: 232
+	}
+}
+Connections:  {
+	C: "OO",1000,2000
+	C: "OO",2000,0
+}

@@ -8,7 +8,7 @@ Parent: [[Index]]
 
 ## Layout проекта
 
-Все базовые пути вычисляются от каталога текущего исполняемого файла или `--project`, а не от cwd. На Windows `Layout` использует абсолютные пути без verbatim-префикса `\\?\`: `engine-files` и `engine-resources` разбирают virtual path с `/`, который в verbatim-пути не является разделителем. На Unix существующие пути канонизируются; каталог `--project` проверяется до создания `Layout`.
+Все базовые пути вычисляются от каталога текущего исполняемого файла или `--project`, а не от cwd. На Windows `Layout` получает абсолютный путь и удаляет verbatim-префикс через `engine_files::strip_windows_verbatim_prefix`; ограничения Windows-форм описаны в [[Engine/EngineFiles]]. На Unix существующие пути канонизируются; каталог `--project` проверяется до создания `Layout`.
 
 | Режим | Bootstrap | Корень assets | Настройки проекта |
 |---|---|---|---|
@@ -69,6 +69,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 ## Зависимости и взаимодействия
 
 - Использует `engine-project` для `BootstrapConfig` и `ProjectSettings`, [[Engine/EngineResources]] и [[Engine/EngineAssets]] для загрузки содержимого.
+- Использует [[Engine/EngineFiles]] для нормализации Windows filesystem path в `Layout`.
 - Использует [[Engine/EngineScene]] для `SceneDocument`, `World`, камеры и света; [[Engine/EngineScript]] остаётся на scripts thread и не становится `Send`.
 - Передаёт окно через [[Engine/EngineWindow]], общую Vulkan-работу через [[Engine/EngineRender]] и платформенную подготовку, диалог и singleton API через [[Engine/EnginePlatform]].
 - Renderer создаётся на главном потоке в `init`, затем передаётся render thread. Менять зависимости и поведение upstream-крейтов для runtime не требуется.

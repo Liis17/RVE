@@ -21,6 +21,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EngineScene]] | Формат сцен `.rvescene`, runtime-граф `World`, камеры, трансформации и свет |
 | [[Engine/EngineScript]] | Lua host, реестр Rust-скриптов, lifecycle и отмена выполнения Lua |
 | [[Engine/EngineRuntime]] | Runtime игры: layout проекта, потоки сцены, скриптов и рендера, завершение и коды выхода |
+| [[Engine/RveBuild]] | Сборка релиза проекта в player и набор RVEPAK |
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |
 
 Пустые модули `engine-audio`, `engine-physics`, `engine-network` и `engine-neural`, а также скелет `engine-editor` описаны в [[Architecture]]; отдельных заметок для них нет.

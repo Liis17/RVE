@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 engine-assets = { path = "../engine-assets" }
+engine-files = { path = "../engine-files" }
 engine-audio = { path = "../engine-audio" }
 engine-neural = { path = "../engine-neural" }
 engine-network = { path = "../engine-network" }

@@ -1,0 +1,16 @@
+id = "demo-game"
+name = "RVE Demo"
+version = "1.0.0"
+heavy_scripts = "HeavyScripts"
+
+[[scenes]]
+path = "/scenes/main.rvescene"
+enabled = true
+
+[[scenes]]
+path = "/scenes/second.rvescene"
+enabled = true
+
+[[scenes]]
+path = "/scenes/draft.rvescene"
+enabled = false

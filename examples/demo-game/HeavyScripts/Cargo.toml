@@ -1,0 +1,12 @@
+[workspace]
+
+[package]
+name = "demo-heavy-scripts"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+engine-script = { path = "../../../engine/engine-script" }

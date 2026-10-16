@@ -42,7 +42,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EngineWindow]] — цикл окна на winit.
 - [[Engine/EnginePlatform]] — общий интерфейс и отдельные адаптеры Windows/macOS.
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
-- [[Engine/EngineFiles]] — канонические virtual paths и `ReadAt` для позиционного чтения.
+- [[Engine/EngineFiles]] — канонические virtual paths, Windows filesystem path normalization и `ReadAt` для позиционного чтения.
 - `engine-project` — настройки проекта и bootstrap-конфигурация для приложений и инструментов.
 - [[Engine/EnginePak]] — версия 1 архива, потоковый writer, reader и каталог архивов.
 - [[Engine/EngineResources]] — фоновый доступ к loose files и RVEPAK через ограниченный worker pool.
@@ -51,6 +51,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EngineScene]] — формат `.rvescene`, его проверка и runtime-граф `World` с камерами, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
 - [[Engine/EngineScript]] — Lua host и реестр heavy-скриптов; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
 - [[Engine/EngineRuntime]] — потоки игры, порядок запуска, ограниченный конвейер кадров и завершение; библиотека запуска используется бинарником `rve-player`.
+- [[Engine/RveBuild]] — сборка релиза из проекта, раскладка архивов и генерация player crate.
 - [[Engine/Sandbox]] — приложение, соединяющее core, window, render, assets и scene.
 
 `engine-audio`, `engine-physics`, `engine-network` и `engine-neural` — пустые модули-заглушки: каждый предоставляет `new()` и `run(stop)`, который ждёт сигнал остановки. Их доменные runtime и полная документация появятся позже. `engine-editor` пока остаётся скелетом без реализации.
@@ -58,7 +59,8 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 ## Направления зависимостей
 
 - `sandbox` зависит от `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
-- `rve-player` зависит от `engine-runtime`; runtime соединяет `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `engine-script` и пустые доменные модули. flume обслуживает управляющие каналы и ограниченную очередь снимков; sysinfo сверяет RAM и CPU с требованиями проекта.
+- `rve-player` зависит от `engine-runtime`; runtime соединяет `engine-project`, `engine-files`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `engine-script` и пустые доменные модули. `engine-files` снимает Windows verbatim-префикс в `Layout`; flume обслуживает управляющие каналы и ограниченную очередь снимков, sysinfo сверяет RAM и CPU с требованиями проекта.
+- `rve-build` использует `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak` и `engine-files`: проверяет включённые сцены и ресурсы, назначает архивы и генерирует player crate с абсолютной зависимостью от `engine-runtime` текущего checkout. Платформенный конвейер macOS дополнительно собирает Vulkan loader и MoltenVK в релиз; подробности — в [[Engine/RveBuild]].
 - `engine-project` зависит от `engine-files`, serde и toml. `BootstrapConfig` читает `bootstrap.rves`, а `ProjectSettings` разбирает `project.rveproject`; общая валидация virtual paths использует `engine-files::VirtualPath`.
 - `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; он содержит и wire-формат архивов, и отдельный TOML-контракт `ArchiveSetRegistry`. Инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets` и sandbox читают через его handle. `engine-files` не имеет внешних зависимостей.
 - `engine-scene` зависит от glam, `engine-files`, serde и toml: документы `.rvescene` используют `VirtualPath`, а `World` рассчитывает сцены независимо от renderer и script runtime. Sandbox передаёт вычисленные матрицы через API renderer.
@@ -82,6 +84,8 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 Чтение ограничивается configurable index, result, chunk и memory budgets. `ReadControl` резервирует footprint результата, stored/decoded чанка и codec workspace до аллокаций и позволяет отменить чтение между чанками. На Windows `seek_read` меняет file cursor, поэтому file-backed payload reads и worker reopenings используют независимые handles с проверкой ArchiveId; на Unix исходный positional handle остаётся закреплён за Archive.
 
 Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. `engine-resources::ResourceConfig` выбирает `SourceMode::Auto` (старое обнаружение packed/loose), `Loose` (только файлы) или `Registry` (base → `/rve/assets.toml` → точный состав архива → каталог и сверка путей). Любая ошибка Registry останавливает startup до запуска workers. Сервис ограничивает очередь и memory footprint и выполняет чтение в background workers. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; sandbox использует `assets` как root по умолчанию с `Auto`.
+
+`tools/rve-build` использует `SourceMode::Loose` для проекта, разбирает только включённые сцены и собирает потребляемые ими ресурсы, AppIcon и внешние FBX-текстуры. Он задаёт распределение файлов через `ArchiveSetRegistry`: сцены и служебные TOML находятся в `base`, явные архивы сохраняются, а остальные ресурсы получают `scene-<stem>` или `shared`. `build_archive_set` вызывается с порядком `base`, `shared`, затем именованные архивы. Полный конвейер, правила назначения и ограничения платформенной упаковки описаны в [[Engine/RveBuild]].
 
 ## Основные потоки
 
