@@ -10,13 +10,13 @@ Parent: [[Index]]
 
 | Файл | Значимый символ | Роль |
 |---|---|---|
-| `engine/sandbox/src/main.rs` | `parse_args`, `load_content`, `Sandbox`, `WindowHandler`, `main` | Разбор CLI, загрузка ресурсов, инициализация renderer, кадры и коды завершения |
+| `engine/sandbox/src/main.rs` | `parse_args`, `load_content`, `Sandbox`, `WindowHandler`, `main` | Подготовка Vulkan-окружения до потоков, разбор CLI, загрузка ресурсов, инициализация renderer, кадры и коды завершения |
 | `engine/sandbox/src/content.rs` | `Content`, `Mesh` | Меши и текстуры кадра из демонстрационной сцены или модели; вписывание модели в единичный куб, окружение и замена текстур |
 | `engine/sandbox/src/scene.rs` | `Scene`, `plane_mesh`, `cube_mesh`, `checker_texture`, `triangle_view_projection`, `cube_view_projection`, `shadows_light_view_projection` | Геометрия и параметры демонстрационных сцен; камеры и свет используют [[Engine/EngineScene]] |
 | `engine/sandbox/src/debug_overlay.rs` | `DebugOverlay` | Метрики `--debug-overlay`, их история и геометрия панели со шрифтом font8x8 |
 | `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Общий разбор и загрузка начальных настроек `bootstrap.rves` |
 | `bootstrap.rves.example` | `WindowSizeX`, `WindowSizeY`, `WindowTitle`, `AllowMultipleInstances` | Шаблон локального файла настроек |
-| `engine/sandbox/Cargo.toml` | зависимости `engine-core`, `engine-project`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `glam`, `sysinfo`, `font8x8` | Сборка приложения из рабочих крейтов, сцена, загрузка ресурсов, статистика и bitmap-шрифт оверлея |
+| `engine/sandbox/Cargo.toml` | зависимости `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `glam`, `sysinfo`, `font8x8` | Сборка приложения из рабочих крейтов, подготовка Vulkan-окружения, сцена, загрузка ресурсов, статистика и bitmap-шрифт оверлея |
 
 ## Публичные контракты
 
@@ -52,6 +52,7 @@ Parent: [[Index]]
 
 ## Зависимости и взаимодействия
 
+- Первая операция `main` получает канонический `exe_dir` и вызывает `unsafe engine_platform::prepare_vulkan_environment` с SAFETY-условием: до этого не разбираются аргументы, не запускаются ресурсы и не создаются потоки. При отсутствии bundled-файлов вызов ничего не меняет.
 - Использует [[Engine/EngineCore]] для `Time`.
 - Через [[Engine/EngineWindow]] реализует `WindowHandler`.
 - После проверки аргументов и `bootstrap.rves` запускает [[Engine/EngineResources]] с корнем `ASSETS_DIR` (`assets` в рабочем каталоге); верхнеуровневый `.rvepak` выбирает packed-only режим.

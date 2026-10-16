@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает и проверяет документы сцен `.rvescene`, строит runtime-граф `World` и выдаёт мировые матрицы, камеру, свет и меши для кадра. `engine-script` запускает Lua и зарегистрированные Rust-скрипты для объектов сцены. Демонстрационная сцена sandbox пока остаётся процедурной: вращающийся куб и плоскость показывают отбрасываемые тени. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений, а также редактор пока не реализованы.
+RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает и проверяет документы сцен `.rvescene`, строит runtime-граф `World` и выдаёт мировые матрицы, камеру, свет и меши для кадра. `engine-script` запускает Lua и зарегистрированные Rust-скрипты для объектов сцены. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений пока представлены пустыми потоками-заглушками; редактор также остаётся без реализации.
 
 ## Стек
 
@@ -19,8 +19,8 @@ RVE — workspace игрового движка на Rust. Его рабочий
 | serde 1.0.229, toml 0.8.23 | Строгая типизированная конфигурация manifest для builder | `engine/engine-pak/src/builder.rs` |
 | zstd 0.14.2 | Независимые Zstandard frames в RVEPAK | `engine/engine-pak/src` |
 | lz4_flex 0.14.0 | Независимые LZ4 blocks в RVEPAK | `engine/engine-pak/src` |
-| flume 0.11.1 | Bounded request queues и runtime-agnostic async receive в ресурсном сервисе | `engine/engine-resources/Cargo.toml` |
-| sysinfo 0.39.6 (только фича `system`) | Память и загрузка CPU процесса для `--debug-overlay` | `engine/sandbox/src/debug_overlay.rs` |
+| flume 0.11.1 | Bounded очереди ресурсов и снимков кадров, каналы управления потоками runtime | `engine/engine-resources/Cargo.toml`, `engine/engine-runtime/Cargo.toml` |
+| sysinfo 0.39.6 (только фича `system`) | Проверка RAM и логических CPU в runtime, метрики `--debug-overlay` | `engine/engine-runtime/Cargo.toml`, `engine/sandbox/src/debug_overlay.rs` |
 | font8x8 0.3.1 | Bitmap-шрифт 8×8 оверлея | `engine/sandbox/src/debug_overlay.rs` |
 | ufbx 0.11.5 | Загрузка FBX; C-библиотека собирается через `cc` | `engine/engine-assets/src/lib.rs` |
 | png 0.18.1 | Декодирование PNG | `engine/engine-assets/src/lib.rs` |
@@ -50,13 +50,15 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG в память CPU, без зависимости от renderer.
 - [[Engine/EngineScene]] — формат `.rvescene`, его проверка и runtime-граф `World` с камерами, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
 - [[Engine/EngineScript]] — Lua host и реестр heavy-скриптов; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
+- [[Engine/EngineRuntime]] — потоки игры, порядок запуска, ограниченный конвейер кадров и завершение; библиотека запуска используется бинарником `rve-player`.
 - [[Engine/Sandbox]] — приложение, соединяющее core, window, render, assets и scene.
 
 `engine-audio`, `engine-physics`, `engine-network` и `engine-neural` — пустые модули-заглушки: каждый предоставляет `new()` и `run(stop)`, который ждёт сигнал остановки. Их доменные runtime и полная документация появятся позже. `engine-editor` пока остаётся скелетом без реализации.
 
 ## Направления зависимостей
 
-- `sandbox` зависит от `engine-core`, `engine-project`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
+- `sandbox` зависит от `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
+- `rve-player` зависит от `engine-runtime`; runtime соединяет `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `engine-script` и пустые доменные модули. flume обслуживает управляющие каналы и ограниченную очередь снимков; sysinfo сверяет RAM и CPU с требованиями проекта.
 - `engine-project` зависит от `engine-files`, serde и toml. `BootstrapConfig` читает `bootstrap.rves`, а `ProjectSettings` разбирает `project.rveproject`; общая валидация virtual paths использует `engine-files::VirtualPath`.
 - `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; он содержит и wire-формат архивов, и отдельный TOML-контракт `ArchiveSetRegistry`. Инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets` и sandbox читают через его handle. `engine-files` не имеет внешних зависимостей.
 - `engine-scene` зависит от glam, `engine-files`, serde и toml: документы `.rvescene` используют `VirtualPath`, а `World` рассчитывает сцены независимо от renderer и script runtime. Sandbox передаёт вычисленные матрицы через API renderer.
@@ -67,7 +69,7 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
 - `engine-core`, `engine-audio`, `engine-physics`, `engine-network`, `engine-neural` и `engine-editor` не имеют внешних зависимостей.
 
-Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-project/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-script/Cargo.toml`, `engine/engine-script/src`, `engine/engine-assets/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-network/Cargo.toml`, `engine/engine-neural/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
+Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-project/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-script/Cargo.toml`, `engine/engine-script/src`, `engine/engine-assets/Cargo.toml`, `engine/engine-runtime/Cargo.toml`, `engine/rve-player/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-network/Cargo.toml`, `engine/engine-neural/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
 
 ## Файловые источники и RVEPAK
 
@@ -102,6 +104,14 @@ startup-потоке, внешние текстуры читаются чере�
 При выходе `WindowHandler::exiting` вызывается до освобождения окна. Sandbox удаляет renderer в этом callback; после возврата из event loop сначала уничтожается `Sandbox`, затем `ResourceSystem` joins coordinator и workers.
 
 Источники: `engine/engine-project/src/bootstrap.rs`, `engine/engine-project/src/project_settings.rs`, `engine/sandbox/src/main.rs`, `engine/engine-window/src/lib.rs`.
+
+### Игровой runtime
+
+`rve-player` вызывает `engine_runtime::run_player`. Runtime сначала канонизирует каталог текущего исполняемого файла и вызывает `prepare_vulkan_environment` до создания потоков. Release layout использует `Engine/bootstrap.rves`, `Assets` в режиме Registry и `/rve/project.toml` из ResourceHandle; dev layout от `--project` использует `bootstrap.rves`, `Assets` в режиме Loose и `project.rveproject` из каталога проекта. Ни один путь не зависит от текущего рабочего каталога. После загрузки настроек runtime применяет singleton lock по `ProjectSettings.id`, проверяет Vulkan-устройство, RAM и CPU, затем на startup-потоке читает сцену, FBX/PNG и исходники Lua.
+
+До открытия окна runtime запускает четыре именованных доменных потока и `rve-scripts`; scripts сначала подтверждают загрузку Lua. После этого `engine-window` создаёт OnDemand-окно. В `init` главный поток создаёт renderer и загружает GPU-ресурсы, затем отправляет scripts сообщение `Go` и передаёт renderer render-потоку. Scripts строят `FrameSnapshot` в ограниченную очередь ёмкостью 1, render-поток выбирает кадры и команды управления через flume Selector и создаёт `Frame` из актуального размера окна. При occlusion или нулевом размере render отбрасывает снимки, а scripts продолжают обновляться с `background_tick_hz` через control-канал и injected clock. Полный протокол, guards и порядок уничтожения описаны в [[Engine/EngineRuntime]].
+
+Источники: `engine/engine-runtime/src/lib.rs`, `engine/engine-runtime/src/player.rs`, `engine/engine-runtime/src/pipeline.rs`, `engine/engine-runtime/src/scene.rs`, `engine/rve-player/src/main.rs`.
 
 ### Vulkan-кадр
 

@@ -12,6 +12,7 @@ engine-assets = { path = "../engine-assets" }
 engine-resources = { path = "../engine-resources" }
 engine-scene = { path = "../engine-scene" }
 engine-project = { path = "../engine-project" }
+engine-platform = { path = "../engine-platform" }
 font8x8.workspace = true
 glam.workspace = true
 sysinfo.workspace = true

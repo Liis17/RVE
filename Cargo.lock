@@ -527,6 +527,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-runtime"
+version = "0.1.0"
+dependencies = [
+ "engine-assets",
+ "engine-audio",
+ "engine-network",
+ "engine-neural",
+ "engine-physics",
+ "engine-platform",
+ "engine-project",
+ "engine-render",
+ "engine-resources",
+ "engine-scene",
+ "engine-script",
+ "engine-window",
+ "flume",
+ "glam",
+ "sysinfo",
+]
+
+[[package]]
 name = "engine-scene"
 version = "0.1.0"
 dependencies = [
@@ -1615,6 +1636,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rve-player"
+version = "0.1.0"
+dependencies = [
+ "engine-runtime",
+]
+
+[[package]]
 name = "rvepak"
 version = "0.1.0"
 dependencies = [
@@ -1639,6 +1667,7 @@ dependencies = [
  "engine-core",
  "engine-files",
  "engine-pak",
+ "engine-platform",
  "engine-project",
  "engine-render",
  "engine-resources",
