@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. Его рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. Математические компоненты камер, трансформаций и света предоставляет `engine-scene`; демонстрационная сцена с вращающимся кубом и плоскостью показывает отбрасываемые тени. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Физика, звук и редактор пока не реализованы.
+RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает и проверяет документы сцен `.rvescene`, строит runtime-граф `World` и выдаёт мировые матрицы, камеру, свет и меши для кадра. `engine-script` запускает Lua и зарегистрированные Rust-скрипты для объектов сцены. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений пока представлены пустыми потоками-заглушками; редактор также остаётся без реализации.
 
 ## Стек
 
@@ -19,11 +19,12 @@ RVE — workspace игрового движка на Rust. Его рабочий
 | serde 1.0.229, toml 0.8.23 | Строгая типизированная конфигурация manifest для builder | `engine/engine-pak/src/builder.rs` |
 | zstd 0.14.2 | Независимые Zstandard frames в RVEPAK | `engine/engine-pak/src` |
 | lz4_flex 0.14.0 | Независимые LZ4 blocks в RVEPAK | `engine/engine-pak/src` |
-| flume 0.11.1 | Bounded request queues и runtime-agnostic async receive в ресурсном сервисе | `engine/engine-resources/Cargo.toml` |
-| sysinfo 0.39.6 (только фича `system`) | Память и загрузка CPU процесса для `--debug-overlay` | `engine/sandbox/src/debug_overlay.rs` |
+| flume 0.11.1 | Bounded очереди ресурсов и снимков кадров, каналы управления потоками runtime | `engine/engine-resources/Cargo.toml`, `engine/engine-runtime/Cargo.toml` |
+| sysinfo 0.39.6 (только фича `system`) | Проверка RAM и логических CPU в runtime, метрики `--debug-overlay` | `engine/engine-runtime/Cargo.toml`, `engine/sandbox/src/debug_overlay.rs` |
 | font8x8 0.3.1 | Bitmap-шрифт 8×8 оверлея | `engine/sandbox/src/debug_overlay.rs` |
 | ufbx 0.11.5 | Загрузка FBX; C-библиотека собирается через `cc` | `engine/engine-assets/src/lib.rs` |
 | png 0.18.1 | Декодирование PNG | `engine/engine-assets/src/lib.rs` |
+| mlua 0.12.2 (`lua54`, `vendored`) | Lua host для lite-скриптов без системной Lua | `engine/engine-script/Cargo.toml` |
 | ash-window 0.13.0 | Surface и обязательные instance extensions через платформенный адаптер | `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml` |
 | raw-window-handle 0.6.2 | Передача display/window handles в renderer | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
 | Vulkan 1.3 | Dynamic rendering, synchronization2 и графический вывод | `engine/engine-render/src/lib.rs` |
@@ -41,57 +42,78 @@ RVE — workspace игрового движка на Rust. Его рабочий
 - [[Engine/EngineWindow]] — цикл окна на winit.
 - [[Engine/EnginePlatform]] — общий интерфейс и отдельные адаптеры Windows/macOS.
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
-- [[Engine/EngineFiles]] — канонические virtual paths и `ReadAt` для позиционного чтения.
-- [[Engine/EnginePak]] — версия 1 архива, потоковый writer, reader и каталог архивов.
+- [[Engine/EngineFiles]] — канонические virtual paths, Windows filesystem path normalization и `ReadAt` для позиционного чтения.
+- [[Engine/EngineProject]] — общие форматы настроек проекта и bootstrap для приложений и инструментов.
+- [[Engine/EnginePak]] — чтение RVEPAK v1/v2, запись v2, потоковый writer и каталог архивов.
 - [[Engine/EngineResources]] — фоновый доступ к loose files и RVEPAK через ограниченный worker pool.
 - `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG в память CPU, без зависимости от renderer.
-- [[Engine/EngineScene]] — камеры, трансформации и свет на glam, независимо от renderer.
+- [[Engine/EngineScene]] — формат `.rvescene`, его проверка и runtime-граф `World` с камерами, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
+- [[Engine/EngineScript]] — Lua host и реестр heavy-скриптов; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
+- [[Engine/EngineRuntime]] — потоки игры, порядок запуска, ограниченный конвейер кадров и завершение; библиотека запуска используется бинарником `rve-player`.
+- [[Engine/RveBuild]] — сборка релиза из проекта, раскладка архивов и генерация player crate.
 - [[Engine/Sandbox]] — приложение, соединяющее core, window, render, assets и scene.
 
-Три оставшихся крейта — скелеты: `engine-physics`, `engine-audio`, `engine-editor`. Их `src/lib.rs` содержат только комментарии назначения; типов, модулей и зависимостей пока нет.
+`engine-audio`, `engine-physics`, `engine-network` и `engine-neural` — пустые модули-заглушки: каждый предоставляет `new()` и `run(stop)`, который ждёт сигнал остановки. Их доменные runtime и полная документация появятся позже. `engine-editor` пока остаётся скелетом без реализации.
 
 ## Направления зависимостей
 
-- `sandbox` зависит от `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
-- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets` и sandbox читают через его handle. `engine-files` не имеет внешних зависимостей.
-- `engine-scene` зависит от glam и не зависит от renderer; sandbox передаёт его вычисленные матрицы через API renderer.
-- `engine-assets` зависит от `engine-resources`, ufbx и png; от renderer и окна не зависит.
+- `sandbox` зависит от `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
+- `rve-player` зависит от `engine-runtime`; runtime соединяет `engine-project`, `engine-files`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `engine-script` и пустые доменные модули. `engine-files` снимает Windows verbatim-префикс в `Layout`; flume обслуживает управляющие каналы и ограниченную очередь снимков, sysinfo сверяет RAM и CPU с требованиями проекта.
+- `rve-build` использует `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak` и `engine-files`: проверяет включённые сцены и ресурсы, назначает архивы и генерирует player crate с абсолютной зависимостью от `engine-runtime` текущего checkout. Платформенный конвейер macOS дополнительно собирает Vulkan loader и MoltenVK в релиз; подробности — в [[Engine/RveBuild]].
+- `engine-project` зависит от `engine-files`, serde и toml; контракты файлов и их потребители описаны в [[Engine/EngineProject]].
+- `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; он содержит и wire-формат архивов, и отдельный TOML-контракт `ArchiveSetRegistry`. Инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets`, sandbox и runtime получают данные через его handle. `engine-files` не имеет внешних зависимостей.
+- `engine-scene` зависит от glam, `engine-files`, serde и toml: документы `.rvescene` используют `VirtualPath`, а `World` рассчитывает сцены независимо от renderer и script runtime. Runtime игры использует документы и `World`; sandbox продолжает строить процедурную демонстрационную сцену на математических компонентах.
+- `engine-script` зависит от `engine-scene` и `mlua` с Lua 5.4 и vendored исходниками. Он связывает `World` с Lua и heavy-скриптами, не зависит от runtime, renderer или window; Lua state остаётся на scripts thread, а отдельный interrupt handle можно передать другому потоку.
+- `engine-assets` зависит от `engine-resources`, ufbx и png; от renderer и окна не зависит. `Assets::model_dependencies` использует тот же поиск внешних текстур и stat-источник, что и `load_model`, чтобы builder мог собрать зависимости без декодирования PNG.
 - `engine-window` зависит от winit.
 - `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit и glam; naga — его build-зависимость.
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
-- `engine-core` и три крейта-скелета не имеют внешних зависимостей.
+- `engine-core`, `engine-audio`, `engine-physics`, `engine-network`, `engine-neural` и `engine-editor` не имеют внешних зависимостей.
 
-Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-assets/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
+Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-project/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-script/Cargo.toml`, `engine/engine-script/src`, `engine/engine-assets/Cargo.toml`, `engine/engine-runtime/Cargo.toml`, `engine/rve-player/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-network/Cargo.toml`, `engine/engine-neural/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
 
 ## Файловые источники и RVEPAK
 
-`engine-files::VirtualPath` задаёт case-sensitive UTF-8 namespace ресурсов, а `ReadAt` и `FileSource` читают абсолютные `u64`-диапазоны без общего archive lock. `engine-pak::Archive` проверяет header/index, открывает range reads по пересекающимся чанкам и проверяет chunk/full-blob BLAKE3. `ArchiveCatalog` проверяет уникальность полного virtual path и связывает external references только с local blob указанного владельца. `ArchiveWriter` записывает каждый локальный blob потоково и возвращает ArchiveId и BlobId/hash map для следующих архивов. Точная публичная раскладка v1 описана в [`docs/rvepak-format.md`](../../docs/rvepak-format.md).
+`engine-files::VirtualPath` задаёт case-sensitive UTF-8 namespace ресурсов, а `ReadAt` и `FileSource` читают абсолютные `u64`-диапазоны без общего archive lock. `engine-pak::Archive` читает legacy v1 и проверяет секции v2 (96-байтовый заголовок, индекс, data), открывает range reads по пересекающимся чанкам и проверяет chunk/full-blob BLAKE3. `ArchiveCatalog` смешивает версии, проверяет уникальность полного virtual path и связывает external references только с local blob указанного владельца; `CatalogAsset::archive_id` отдельно сохраняет архив, объявивший путь. `ArchiveWriter` пишет v2 через временный spool и возвращает ArchiveId и BlobId/hash map для следующих архивов. Нормативная раскладка обеих версий описана в [`docs/rvepak-format.md`](../../docs/rvepak-format.md).
 
 `engine-pak::preflight` раскрывает и проверяет все inputs manifest до BLAKE3 prepass и записи, а `execute` строит весь набор в staging directory, проверяет его через `ArchiveCatalog` и публикует с атомарным запретом замены существующего output. `tools/rvepak` предоставляет команды `build`, `list` и `verify`; только `verify` повторно декодирует все unique local blobs. Manifest и политика dedup описаны в [[Engine/EnginePak]].
 
+`engine-pak::build_archive_set` принимает явные файлы, virtual paths и compression overrides, формирует тот же build plan и использует общий `execute`; порядок архивов задаёт владельца при deduplication. Для каждого программного входа корнем служит родительский каталог канонического файла, поэтому файлы могут быть на разных дисках. `ArchiveSetRegistry` описывает каталог набора в `/rve/assets.toml`: запись реестра назначает этот путь архиву `base`, base содержит его локально, а остальные записи `assets` указывают declaring archive. Это соглашение набора, не часть wire-формата `.rvepak`.
+
 Чтение ограничивается configurable index, result, chunk и memory budgets. `ReadControl` резервирует footprint результата, stored/decoded чанка и codec workspace до аллокаций и позволяет отменить чтение между чанками. На Windows `seek_read` меняет file cursor, поэтому file-backed payload reads и worker reopenings используют независимые handles с проверкой ArchiveId; на Unix исходный positional handle остаётся закреплён за Archive.
 
-Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. `engine-resources` выбирает packed-only режим при наличии архивов и loose режим без них, ограничивает очередь и memory footprint и выполняет чтение в background workers. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; sandbox использует `assets` как root по умолчанию.
+Каталог обнаруживает верхнеуровневые `.rvepak` файлы без loose-file fallback. `engine-resources::ResourceConfig` выбирает `SourceMode::Auto` (старое обнаружение packed/loose), `Loose` (только файлы) или `Registry` (base → `/rve/assets.toml` → точный состав архива → каталог и сверка путей). Любая ошибка Registry останавливает startup до запуска workers. Сервис ограничивает очередь и memory footprint и выполняет чтение в background workers. Builder принимает любые opaque bytes и размещает архивы верхнего уровня; sandbox использует `assets` как root по умолчанию с `Auto`.
+
+`tools/rve-build` использует `SourceMode::Loose` для проекта, разбирает только включённые сцены и собирает потребляемые ими ресурсы, AppIcon и внешние FBX-текстуры. Он задаёт распределение файлов через `ArchiveSetRegistry`: сцены и служебные TOML находятся в `base`, явные архивы сохраняются, а остальные ресурсы получают `scene-<stem>` или `shared`. `build_archive_set` вызывается с порядком `base`, `shared`, затем именованные архивы. Полный конвейер, правила назначения и ограничения платформенной упаковки описаны в [[Engine/RveBuild]].
 
 ## Основные потоки
 
 ### Запуск и цикл окна
 
-`engine/sandbox/src/main.rs` разбирает аргументы и загружает начальный размер окна
-через `bootstrap::load` из `bootstrap.rves` в рабочем каталоге. После этих проверок
-`ResourceSystem::start` открывает `assets` (или проверяет его архивный каталог), затем
+`engine/sandbox/src/main.rs` разбирает аргументы и загружает `BootstrapConfig` через
+`engine_project::BootstrapConfig::load`. Sandbox применяет размер и заголовок окна;
+прочие bootstrap-поля разбираются, но не меняют его поведение. Поля, defaults и
+расположение файлов для приложений описаны в [[Engine/EngineProject]]. После этих проверок
+`ResourceSystem::start` открывает `assets` в `SourceMode::Auto` (или проверяет его архивный каталог), затем
 `Assets::with_resources` загружает CPU-содержимое кадра до создания окна. Это происходит
 и для процедурных сцен; отсутствующий loose root допустим, а ошибка архива или ресурса
 завершает запуск с кодом 2. FBX разбирается через `ufbx::load_memory` на вызывающем
 startup-потоке, внешние текстуры читаются через тот же handle, GPU upload выполняется
-позже при renderer initialization. Параметры `WindowSizeX` и `WindowSizeY` задают
-физический размер; отсутствующие параметры или файл сохраняют defaults 1280×720.
+позже при renderer initialization.
 `engine-window` создаёт event loop и окно в `resumed`, после чего вызывает `WindowHandler::init`. В каждом `about_to_wait` вызывается `update`, а затем запрашивается перерисовка; `frame` вызывается при `RedrawRequested`. Изменения размеров передаются в физических пикселях через `resized`.
 
 При выходе `WindowHandler::exiting` вызывается до освобождения окна. Sandbox удаляет renderer в этом callback; после возврата из event loop сначала уничтожается `Sandbox`, затем `ResourceSystem` joins coordinator и workers.
 
-Источники: `engine/engine-window/src/lib.rs`, `engine/sandbox/src/main.rs`, `engine/sandbox/src/bootstrap.rs`.
+Источники: `engine/engine-project/src/bootstrap.rs`, `engine/engine-project/src/project_settings.rs`, `engine/sandbox/src/main.rs`, `engine/engine-window/src/lib.rs`.
+
+### Игровой runtime
+
+`rve-player` вызывает `engine_runtime::run_player`. Runtime сначала канонизирует каталог текущего исполняемого файла и вызывает `prepare_vulkan_environment` до создания потоков. Release layout использует `Engine/bootstrap.rves`, `Assets` в режиме Registry и `/rve/project.toml` из ResourceHandle; dev layout от `--project` использует `bootstrap.rves`, `Assets` в режиме Loose и `project.rveproject` из каталога проекта. Ни один путь не зависит от текущего рабочего каталога. После загрузки настроек runtime применяет singleton lock по `ProjectSettings.id`, проверяет Vulkan-устройство, RAM и CPU, затем на startup-потоке читает сцену, FBX/PNG и исходники Lua.
+
+До открытия окна runtime запускает четыре именованных доменных потока и `rve-scripts`; scripts сначала подтверждают загрузку Lua. После этого `engine-window` создаёт OnDemand-окно. В `init` главный поток создаёт renderer и загружает GPU-ресурсы, затем отправляет scripts сообщение `Go` и передаёт renderer render-потоку. Scripts строят `FrameSnapshot` в ограниченную очередь ёмкостью 1, render-поток выбирает кадры и команды управления через flume Selector и создаёт `Frame` из актуального размера окна. При occlusion или нулевом размере render отбрасывает снимки, а scripts продолжают обновляться с `background_tick_hz` через control-канал и injected clock. Полный протокол, guards и порядок уничтожения описаны в [[Engine/EngineRuntime]].
+
+Источники: `engine/engine-runtime/src/lib.rs`, `engine/engine-runtime/src/player.rs`, `engine/engine-runtime/src/pipeline.rs`, `engine/engine-runtime/src/scene.rs`, `engine/rve-player/src/main.rs`.
 
 ### Vulkan-кадр
 

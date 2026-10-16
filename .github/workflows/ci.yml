@@ -36,7 +36,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.has_changes == 'true' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     env:
       CARGO_PACKAGES: ${{ needs.changes.outputs.packages }}
     defaults:
@@ -76,6 +76,13 @@ jobs:
         run: |
           read -r -a packages <<< "$CARGO_PACKAGES"
           cargo test "${packages[@]}" --locked
+      - name: Install Vulkan runtime for demo build
+        if: ${{ runner.os == 'macOS' && (contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime')) }}
+        run: brew install vulkan-loader molten-vk
+      - name: Build demo game
+        if: ${{ contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime') }}
+        working-directory: build
+        run: cargo run -p rve-build --locked -- build ../examples/demo-game --output demo-out
 
   ci:
     name: CI

@@ -1,6 +1,6 @@
 # RVE
 
-RVE — игровой движок на Rust с выводом через Vulkan. Рабочий путь включает счётчик времени, окно на winit, камеры, трансформации, направленный свет и отбрасывание теней в offscreen-изображение с выводом в swapchain. `engine/sandbox` служит примером запуска и проверки этого пути: по умолчанию показывает вращающийся куб над плоскостью с движущимися камерой и солнцем; доступны также треугольник, прежняя сцена куба и модели FBX из `build/assets`.
+RVE — игровой движок на Rust с выводом через Vulkan. `rve-player` запускает сцены проекта, а `engine/sandbox` служит отдельным примером и ручной проверкой рабочего пути: по умолчанию показывает вращающийся куб над плоскостью с движущимися камерой и солнцем; доступны также треугольник, прежняя сцена куба и модели FBX из `build/assets`.
 
 ## Крейт-пакеты
 
@@ -13,23 +13,30 @@ RVE — игровой движок на Rust с выводом через Vulka
 | `engine-platform-macos` | macOS: загрузка Vulkan, MoltenVK portability и Metal surface | Работает |
 | `engine-render` | Vulkan renderer: меши в offscreen-кадре и blit в swapchain | Работает |
 | `engine-files` | Канонические virtual paths и позиционное чтение файлов | Работает |
-| `engine-pak` | Чтение, запись и проверка каталогов RVEPAK v1 | Работает |
-| `engine-resources` | Фоновое чтение loose и packed бинарных ресурсов | Работает |
+| `engine-pak` | Запись RVEPAK v2, чтение v1/v2, реестр набора и проверка каталогов | Работает |
+| `engine-resources` | Фоновое чтение loose, packed и registry-наборов ресурсов | Работает |
 | `rvepak` | Сборка, просмотр и проверка наборов RVEPAK из TOML manifest | Работает |
-| `engine-scene` | Игровые объекты, компоненты и сцены | Скелет |
+| `engine-scene` | Игровые объекты, компоненты и сцены | Работает |
+| `engine-script` | Lua и зарегистрированные Rust-скрипты сцен | Работает |
+| `engine-runtime` | Запуск игры: layout проекта, потоки сцены, скриптов и рендера | Работает |
+| `engine-project` | Форматы настроек проекта и запуска | Работает |
 | `engine-assets` | Загрузка FBX и PNG через фоновый сервис ресурсов | Работает |
+| `rve-build` | Сборка релизной игры из project directory и запуск dev-проекта | Работает |
 | `engine-physics` | Столкновения и физическая симуляция | Скелет |
 | `engine-audio` | Воспроизведение и управление игровым звуком | Скелет |
+| `engine-network` | Сетевые игровые сервисы | Скелет |
+| `engine-neural` | Нейросетевые игровые вычисления | Скелет |
 | `engine-editor` | Графический редактор сцен и ресурсов | Скелет |
 | `sandbox` | Оконное приложение для проверки движка | Работает |
+| `rve-player` | Игровой плеер release- и dev-проектов | Работает |
 
 `engine-files` и `engine-pak` предоставляют виртуальные пути и архивы с positional
 reads, потоковой записью, диапазонными чтениями, межархивными ссылками и reusable
 manifest builder. `engine-resources` запускает bounded worker pool для чтения loose
 files или RVEPAK, а инструмент `rvepak` собирает opaque файлы любого типа.
 `engine-assets` получает через сервис байты FBX и PNG и декодирует их в CPU-данные;
-sandbox загружает их до создания окна, а GPU upload остаётся на потоке renderer.
-Wire contract описан в [RVEPAK v1 format](docs/rvepak-format.md).
+sandbox и `engine-runtime` загружают их до создания окна, а GPU upload остаётся на потоке renderer.
+Wire contract описан в [RVEPAK archive format](docs/rvepak-format.md).
 
 ### Сборка архивов ресурсов
 
@@ -69,6 +76,16 @@ overrides. Чтобы сохранить каждый input самостояте
 межархивную зависимость; `verify` потоково проверяет каждый уникальный local blob.
 Успех возвращает код 0, ошибки аргументов, manifest или входных данных — 2,
 операционные ошибки ввода-вывода и повреждённого архива — 1.
+Программный `engine-pak::build_archive_set` принимает упорядоченные явные пары
+«файл-источник → virtual path»; первым передавай `base`, чтобы deduplication в
+следующих архивах ссылалась на его локальные blobs.
+
+Для готовой игры `engine-pak::ArchiveSetRegistry` проверяет `/rve/assets.toml` —
+реестр уровня набора, отдельный от wire-формата `.rvepak`. В нём перечислены архивы
+и архив, объявляющий каждый virtual path. В записи реестра `/rve/assets.toml`
+назначен `base`, а `base.rvepak` содержит реестр локально и всегда открывается первым;
+полный состав файлов набора должен совпасть с его списком.
+Подробности и пример TOML — в [формате RVEPAK](docs/rvepak-format.md).
 
 ### Фоновое чтение ресурсов
 
@@ -85,6 +102,9 @@ transient/pending-result memory budget 512 MiB. Лимит индекса изм
 формата, а не память распарсенных метаданных; она может быть больше и не входит
 в бюджет чтений. Полный контракт и ограничения описаны в
 [`EngineResources`](Obsidian/RVEVault/Engine/EngineResources.md).
+`ResourceConfig::source_mode` по умолчанию `Auto` сохраняет это поведение;
+`Loose` игнорирует все `.rvepak`, а `Registry` читает реестр из фиксированного
+`base.rvepak`, сверяет набор и проверяет объявления путей до запуска workers.
 При запуске sandbox сначала проверяет аргументы и `bootstrap.rves`, затем открывает
 каталог ресурсов до подготовки содержимого — даже для процедурной сцены. Верхнеуровневый
 `.rvepak` переключает `assets` в packed-only режим; повреждённый архив, неверный владелец
@@ -115,7 +135,7 @@ brew install molten-vk vulkan-loader
 
 ## Платформенная структура
 
-`engine-render` использует общий интерфейс `engine-platform`; Cargo выбирает адаптер по целевой ОС. Загрузка Vulkan, интеграция поверхности окна и требования платформы находятся в `engine-platform-windows` и `engine-platform-macos`. Общая отрисовка остаётся в `engine-render`, оконный цикл на winit — в `engine-window`, приложение — в `sandbox`. Адаптеры не зависят от renderer. Остальные ОС пока не имеют адаптеров.
+`engine-render` использует общий интерфейс `engine-platform`; Cargo выбирает адаптер по целевой ОС. Загрузка Vulkan, интеграция поверхности окна и требования платформы находятся в `engine-platform-windows` и `engine-platform-macos`. Общая отрисовка остаётся в `engine-render`, оконный цикл на winit — в `engine-window`, runtime игры — в `engine-runtime`, отдельные приложения — `rve-player` и `sandbox`. Перед запуском runtime вызывает `prepare_vulkan_environment` до создания потоков. Адаптеры не зависят от renderer. Остальные ОС пока не имеют адаптеров.
 
 ## Сборка и проверки
 
@@ -198,6 +218,8 @@ cp ../bootstrap.rves.example bootstrap.rves
 ```text
 WindowSizeX=1280
 WindowSizeY=720
+WindowTitle=RVE Sandbox
+AllowMultipleInstances=true
 ```
 
 Одна строка задаёт один параметр; имена чувствительны к регистру. Размеры
@@ -207,6 +229,13 @@ WindowSizeY=720
 по умолчанию: 1280 по X, 720 по Y. Некорректные значения, неизвестные или повторные
 параметры, строки без `=` и ошибки чтения файла останавливают запуск с кодом 2;
 ошибка разбора содержит имя файла и номер строки.
+
+Также поддерживаются `WindowTitle=<текст>` (непустое значение после первого `=`,
+пробелы по краям обрезаются), `AllowMultipleInstances=true|false` (по умолчанию
+`true`) и `AppIcon=<virtual path>` (необязательный путь внутри `assets`, например
+`/ui/game.png`). Bootstrap разбирает и проверяет все эти поля, но sandbox применяет
+из новых полей только заголовок окна; `AllowMultipleInstances` и `AppIcon` он
+принимает и игнорирует.
 
 Размер читается при старте; изменение файла применяется при следующем запуске.
 Файл в `build/` не попадает в Git; шаблон `bootstrap.rves.example` хранится в репозитории.
@@ -261,6 +290,179 @@ cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
 На самой Windows используется MSVC, на macOS — clang.
 
 Эта проверка не заменяет сборку и запуск на Windows.
+
+## Проект игры
+
+Каталог проекта содержит `project.rveproject`, `bootstrap.rves`, `Assets/` и,
+необязательно, `HeavyScripts/` — crate с Rust-скриптами. Пример целиком находится
+в [examples/demo-game](examples/demo-game/).
+
+`project.rveproject` — TOML. `id` — ключ singleton lock, когда в bootstrap задано
+`AllowMultipleInstances=false`; `name` — имя игры и запасной заголовок окна;
+`version` — непустая строка. Стартует первая включённая сцена в списке, и хотя бы
+одна сцена должна быть включена. `heavy_scripts` задаёт необязательный относительный
+путь к crate. `requirements.min_ram_mb` и `min_cpu_threads` — минимальные требования
+(0 означает отсутствие минимума); `runtime.background_tick_hz` задаёт частоту
+обновления скриптов при свёрнутом или скрытом окне (по умолчанию 30 Гц).
+
+```toml
+id = "demo-game"
+name = "RVE Demo"
+version = "1.0.0"
+heavy_scripts = "HeavyScripts"
+[[scenes]]
+path = "/scenes/main.rvescene"
+enabled = true
+```
+
+`.rvescene` — TOML: `[[assets]]` объявляет virtual paths и необязательное имя
+`archive`; `[[objects]]` задаёт `id`, необязательные `name` и `parent`, `transform`
+и компоненты `camera`, `mesh_renderer`, `directional_light`, `lite_scripts`,
+`heavy_scripts`. Поворот задаётся в градусах с порядком Эйлера Unity YXZ; камера
+смотрит вдоль локальной оси −Z. В сцене требуется ровно одна камера и допускается
+не более одного направленного света.
+
+Минимальная валидная сцена на основе `Assets/scenes/main.rvescene`:
+
+```toml
+[[assets]]
+path = "/models/shared-cube.fbx"
+
+[[assets]]
+path = "/scripts/rotate.lua"
+
+[[objects]]
+id = "camera"
+name = "Camera"
+[objects.transform]
+position = [0.0, 0.0, 6.0]
+[objects.camera]
+fov_deg = 55.0
+near = 0.1
+far = 100.0
+
+[[objects]]
+id = "shared-cube"
+name = "Shared Cube"
+[objects.transform]
+position = [0.0, 0.0, 0.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[[objects.lite_scripts]]
+path = "/scripts/rotate.lua"
+params = { speed = 30.0 }
+```
+
+Lite-скрипт возвращает таблицу с необязательными `on_start(self)`,
+`on_update(self, dt)` и `on_destroy(self)`. Он получает `self.transform` с векторами
+`position`, `rotation`, `scale` (каждый с `x/y/z`), `self.params`, `self.object.id`,
+`self.object.name`, `rve.log`, `rve.time.elapsed` и `rve.time.frame`:
+
+```lua
+local Rotate = {}
+function Rotate:on_update(dt)
+  local rotation = self.transform.rotation
+  self.transform.rotation = {
+    x = rotation.x,
+    y = rotation.y + (self.params.speed or 30.0) * dt,
+    z = rotation.z
+  }
+end
+return Rotate
+```
+
+Lua-песочница открывает базовую библиотеку и `table`, `string`, `math`, `utf8`;
+`dofile`, `loadfile`, `require` и библиотеки `coroutine`, `io`, `os`, `package` и
+`debug` недоступны. Ошибка callback или неконечная трансформация отключает
+экземпляр. Crate `HeavyScripts/` реализует
+`engine_script::HeavyScript` и экспортирует `pub fn register(registry: &mut engine_script::HeavyRegistry)`;
+паника callback отключает экземпляр. Полная схема
+описана в [EngineScene](Obsidian/RVEVault/Engine/EngineScene.md), настройки проекта —
+в [EngineProject](Obsidian/RVEVault/Engine/EngineProject.md).
+
+## rve-player
+
+`rve-player` запускает сцену из проекта. Из `build/` dev-режим задаётся каталогом проекта:
+
+```sh
+cargo run -p rve-player -- --project /path/to/project
+cargo run -p rve-player -- --project /path/to/project --frames 300
+```
+
+Без `--project` используется release layout рядом с исполняемым файлом. После выбора
+режима пути bootstrap, ресурсов и настроек привязаны к `exe_dir` или каталогу проекта,
+а не к текущему рабочему каталогу.
+
+| Режим | Bootstrap | Ресурсы | Настройки проекта |
+|---|---|---|---|
+| Dev | `<project>/bootstrap.rves` | `<project>/Assets`, loose files | `<project>/project.rveproject` |
+| Release | `exe_dir/Engine/bootstrap.rves` | `exe_dir/Assets`, registry mode | `/rve/project.toml` из ResourceHandle |
+
+`--frames N` — необязательное положительное число презентаций `Presented`; по достижении лимита приложение завершает работу с кодом 0. Заголовок окна берётся из `WindowTitle`, если он задан, иначе из `ProjectSettings.name`. `AppIcon` в bootstrap — virtual path в Assets; ошибка загрузки иконки завершает запуск до открытия окна.
+
+| Код | Значение |
+|---:|---|
+| 0 | Обычное закрытие, лимит кадров или успешная активация уже запущенного экземпляра |
+| 1 | Ошибка ОС при захвате singleton lock, ошибка окна, renderer или runtime, паника потока либо timeout завершения render/scripts |
+| 2 | Ошибка CLI, layout, конфигурации, ресурсов, сцены, иконки или загрузки скриптов до окна |
+| 3 | Ошибка Vulkan probe, отсутствие подходящего устройства или нехватка RAM/логических CPU; stderr и системный диалог |
+| 4 | Экземпляр уже запущен, но активация не удалась; ошибка ОС при захвате singleton lock возвращает 1 |
+
+Коды 1 и 2 выводят ошибки только в stderr. Сборка и ручная проверка выполняются из `build/`; фактический Vulkan runtime требует подходящего loader и GPU.
+
+## rve-build
+
+`rve-build` готовит релиз из проекта и может собрать и запустить dev-плеер:
+
+```sh
+cargo run -p rve-build -- build ../examples/demo-game --output demo-out
+cargo run -p rve-build -- run ../examples/demo-game -- --frames 120
+```
+
+Команда `build` проверяет `project.rveproject`, `bootstrap.rves` и только включённые
+сцены. В набор входят файлы этих сцен, объявленные ими ресурсы, внешние PNG-текстуры
+FBX-моделей и `AppIcon`; остальные файлы проекта не копируются. Сцены и настройки
+плеера помещаются в `base.rvepak`; явно назначенный архив имеет приоритет, иначе
+ресурс одной сцены попадает в `scene-<имя-сцены>`, а общий для нескольких сцен — в
+`shared`. Иконка всегда находится в `base`.
+
+Output публикуется атомарно и должен ещё не существовать. Исполняемый файл получает
+имя из `ProjectSettings.name` после замены недопустимых символов на `_`; `Engine`,
+`Assets` и зарезервированные имена устройств Windows отклоняются. Перед публикацией
+сборщик повторно проверяет архивный каталог и реестр из `base.rvepak`. Раскладка:
+
+```text
+demo-out/
+├── RVE Demo                 # RVE Demo.exe на Windows
+├── Engine/
+│   └── bootstrap.rves
+└── Assets/
+    ├── base.rvepak
+    └── *.rvepak
+```
+
+На macOS в `Engine/` также копируются `libvulkan.1.dylib`, `libMoltenVK.dylib` и
+`MoltenVK_icd.json`. Если задан `--vulkan-sdk`, поиск выполняется только в нём;
+иначе источники ищутся в `VULKAN_SDK`, затем в Homebrew (`/opt/homebrew`, `/usr/local`).
+Для Homebrew дополнительно проверяется
+`etc/vulkan/icd.d`, куда формула может связывать ICD-манифест. Для сборки такого
+релиза на машине должны быть доступны Vulkan loader и MoltenVK, например
+`brew install vulkan-loader molten-vk`. При распространении этих библиотек учитывай
+их лицензию Apache-2.0.
+На Windows для встраивания `AppIcon` в `.exe` требуется Windows SDK resource
+compiler (`rc.exe`), который устанавливается вместе с Visual Studio Build Tools.
+Если проект не задаёт `AppIcon`, ресурс иконки не создаётся.
+
+Сгенерированный player использует абсолютный путь checkout для `engine-runtime`,
+поэтому `rve-build` работает из checkout RVE и не предназначен для установки как
+самостоятельный сборщик. `run` собирает этот же крейт в debug, передаёт ему
+`--project <абсолютный-путь>` и возвращает код завершения плеера.
+
+`examples/demo-game/` — пример проекта: две включённые сцены используют общую FBX
+модель и внешнюю текстуру, вторая сцена добавляет ресурс в `props`, а отключённая
+draft-сцена и неиспользуемый файл исключаются. `HeavyScripts/` содержит крейт
+`demo-heavy-scripts` с зарегистрированным Rust-скриптом `Bobber`; Lua-скрипт
+вращения загружается как lite script.
 
 ## Границы текущего renderer
 

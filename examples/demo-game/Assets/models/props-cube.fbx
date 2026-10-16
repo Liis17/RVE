@@ -1,0 +1,69 @@
+; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+}
+GlobalSettings:  {
+	Version: 1000
+}
+Objects:  {
+	Geometry: 1000, "Geometry::Cube", "Mesh" {
+		Vertices: *24 {
+			a: -1,-1,-1,1,-1,-1,1,1,-1,-1,1,-1,-1,-1,1,1,-1,1,1,1,1,-1,1,1
+		}
+		PolygonVertexIndex: *24 {
+			a: 0,1,2,-4,4,7,6,-6,0,4,5,-2,1,5,6,-3,2,6,7,-4,3,7,4,-1
+		}
+		GeometryVersion: 124
+		LayerElementUV: 0 {
+			Version: 101
+			Name: "UVMap"
+			MappingInformationType: "ByPolygonVertex"
+			ReferenceInformationType: "IndexToDirect"
+			UV: *8 {
+				a: 0,0,1,0,1,1,0,1
+			}
+			UVIndex: *24 {
+				a: 0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3
+			}
+		}
+		LayerElementMaterial: 0 {
+			Version: 101
+			Name: ""
+			MappingInformationType: "AllSame"
+			ReferenceInformationType: "IndexToDirect"
+			Materials: *1 {
+				a: 0
+			}
+		}
+		Layer: 0 {
+			Version: 100
+			LayerElement:  {
+				Type: "LayerElementUV"
+				TypedIndex: 0
+			}
+			LayerElement:  {
+				Type: "LayerElementMaterial"
+				TypedIndex: 0
+			}
+		}
+	}
+	Model: 2000, "Model::Cube", "Mesh" {
+		Version: 232
+	}
+	Material: 3000, "Material::Paint", "" {
+		Version: 102
+		ShadingModel: "lambert"
+	}
+	Texture: 4000, "Texture::Props", "" {
+		Type: "TextureVideoClip"
+		FileName: "../textures/props.png"
+		RelativeFilename: "../textures/props.png"
+	}
+}
+Connections:  {
+	C: "OO",1000,2000
+	C: "OO",2000,0
+	C: "OO",3000,2000
+	C: "OP",4000,3000, "DiffuseColor"
+}

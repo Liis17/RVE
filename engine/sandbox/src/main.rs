@@ -1,4 +1,3 @@
-mod bootstrap;
 mod content;
 mod debug_overlay;
 mod scene;
@@ -7,11 +6,13 @@ use content::Content;
 use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
+use engine_project::BootstrapConfig;
 use engine_render::{DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId};
 use engine_resources::{ResourceConfig, ResourceSystem};
-use engine_window::{PhysicalSize, Window, WindowHandler, run};
+use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use scene::Scene;
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -433,6 +434,28 @@ impl WindowHandler for Sandbox {
 }
 
 fn main() -> ExitCode {
+    with_executable_directory(std::env::current_exe(), |exe_dir| {
+        // SAFETY: called before parsing, resource startup, or any other thread creation.
+        unsafe { engine_platform::prepare_vulkan_environment(exe_dir) };
+    });
+    main_after_vulkan_environment()
+}
+
+fn with_executable_directory(
+    executable: Result<PathBuf, std::io::Error>,
+    prepare: impl FnOnce(&Path),
+) {
+    let Some(exe_dir) = executable
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    prepare(&exe_dir);
+}
+
+fn main_after_vulkan_environment() -> ExitCode {
     let options = match parse_args(env::args().skip(1)) {
         Ok(options) => options,
         Err(error) => {
@@ -441,12 +464,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config = match bootstrap::load() {
+    let bootstrap = match BootstrapConfig::load("bootstrap.rves") {
         Ok(config) => config,
         Err(error) => {
             eprintln!("Ошибка настроек: {error}");
             return ExitCode::from(2);
         }
+    };
+    let default_window = WindowConfig::default();
+    let config = WindowConfig {
+        title: bootstrap.window_title.unwrap_or(default_window.title),
+        width: bootstrap.window_size_x.unwrap_or(default_window.width),
+        height: bootstrap.window_size_y.unwrap_or(default_window.height),
+        ..WindowConfig::default()
     };
     let mut resources = match ResourceSystem::start(ResourceConfig {
         root: ASSETS_DIR.into(),
@@ -492,13 +522,25 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Content, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args};
+    use super::{
+        Content, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args,
+        with_executable_directory,
+    };
     use engine_assets::Assets;
     use engine_resources::{ResourceConfig, ResourceSystem};
 
     fn sandbox(options: Options) -> Sandbox {
         let content = Content::from_scene(options.scene);
         Sandbox::new(options, content)
+    }
+
+    #[test]
+    fn missing_current_exe_skips_vulkan_environment_preparation() {
+        let mut prepared = false;
+        with_executable_directory(Err(std::io::Error::other("current_exe failed")), |_| {
+            prepared = true
+        });
+        assert!(!prepared);
     }
 
     #[test]

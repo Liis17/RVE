@@ -1,0 +1,26 @@
+[package]
+name = "engine-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+engine-assets = { path = "../engine-assets" }
+engine-files = { path = "../engine-files" }
+engine-audio = { path = "../engine-audio" }
+engine-neural = { path = "../engine-neural" }
+engine-network = { path = "../engine-network" }
+engine-physics = { path = "../engine-physics" }
+engine-platform = { path = "../engine-platform" }
+engine-project = { path = "../engine-project" }
+engine-render = { path = "../engine-render" }
+engine-resources = { path = "../engine-resources" }
+engine-scene = { path = "../engine-scene" }
+engine-script = { path = "../engine-script" }
+engine-window = { path = "../engine-window" }
+flume.workspace = true
+glam.workspace = true
+sysinfo.workspace = true

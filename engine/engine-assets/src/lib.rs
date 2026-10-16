@@ -4,7 +4,7 @@
 //! вида `/model/cube.fbx`: такой путь указывает на файл `assets/model/cube.fbx`.
 
 use engine_resources::{ResourceError, ResourceErrorKind, ResourceHandle, ResourceStat};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -209,6 +209,64 @@ impl Assets {
         load_fbx(&bytes, &virtual_asset_path(asset_path), &path, self)
     }
 
+    /// Возвращает внешние PNG-зависимости FBX без декодирования изображений.
+    ///
+    /// Встроенные изображения пропускаются. Внешние пути возвращаются как
+    /// канонические virtual paths с ведущим `/`, в порядке использования моделью.
+    pub fn model_dependencies(&self, asset_path: &str) -> Result<Vec<String>, AssetError> {
+        let path = self.resolve(asset_path)?;
+        require_extension(&path, "fbx")?;
+        let bytes = self.read_asset(asset_path, &path)?;
+        let virtual_path = virtual_asset_path(asset_path);
+        let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
+        if !scene_has_triangles(&scene) {
+            return Err(AssetError::Decode {
+                path,
+                message: "в модели нет треугольников".to_owned(),
+            });
+        }
+        let mut dependencies = Vec::new();
+        let mut seen_textures = HashSet::new();
+
+        for node in scene.nodes.iter() {
+            let Some(mesh) = node.mesh.as_ref() else {
+                continue;
+            };
+            let materials = if node.materials.is_empty() {
+                &mesh.materials
+            } else {
+                &node.materials
+            };
+            for part in mesh.material_parts.iter() {
+                if part.num_triangles == 0 {
+                    continue;
+                }
+                let Some(texture) = materials
+                    .get(part.index as usize)
+                    .and_then(|material| diffuse_texture(material))
+                else {
+                    continue;
+                };
+                if !seen_textures.insert(texture.element.element_id) || !texture.content.is_empty()
+                {
+                    continue;
+                }
+                let dependency = resolve_external_texture(
+                    &virtual_path,
+                    &path,
+                    texture,
+                    self,
+                    |asset_path, _| Ok(asset_path.to_owned()),
+                )?;
+                if !dependencies.contains(&dependency) {
+                    dependencies.push(dependency);
+                }
+            }
+        }
+
+        Ok(dependencies)
+    }
+
     fn read_asset(&self, asset_path: &str, path: &Path) -> Result<Vec<u8>, AssetError> {
         let Some(resources) = &self.resources else {
             return read_legacy(&self.root, path);
@@ -403,24 +461,7 @@ fn load_fbx(
         path: path.to_owned(),
         message,
     };
-    let options = ufbx::LoadOpts {
-        filename: virtual_path.into(),
-        path_separator: b'/',
-        load_external_files: false,
-        open_main_file_with_default: false,
-        open_file_cb: Default::default(),
-        target_axes: ufbx::CoordinateAxes {
-            right: ufbx::CoordinateAxis::PositiveX,
-            up: ufbx::CoordinateAxis::PositiveY,
-            front: ufbx::CoordinateAxis::PositiveZ,
-        },
-        target_unit_meters: 1.0,
-        space_conversion: ufbx::SpaceConversion::ModifyGeometry,
-        generate_missing_normals: true,
-        ..Default::default()
-    };
-    let scene = ufbx::load_memory(bytes, options)
-        .map_err(|error| decode_error(format!("ошибка FBX: {error:?}")))?;
+    let scene = load_fbx_scene(bytes, virtual_path, path)?;
 
     let mut model = Model {
         meshes: Vec::new(),
@@ -510,6 +551,43 @@ fn diffuse_texture(material: &ufbx::Material) -> Option<&ufbx::Texture> {
         .find(|texture| texture.type_ == ufbx::TextureType::File)
 }
 
+fn load_fbx_scene(
+    bytes: &[u8],
+    virtual_path: &str,
+    path: &Path,
+) -> Result<ufbx::SceneRoot, AssetError> {
+    let options = ufbx::LoadOpts {
+        filename: virtual_path.into(),
+        path_separator: b'/',
+        load_external_files: false,
+        open_main_file_with_default: false,
+        open_file_cb: Default::default(),
+        target_axes: ufbx::CoordinateAxes {
+            right: ufbx::CoordinateAxis::PositiveX,
+            up: ufbx::CoordinateAxis::PositiveY,
+            front: ufbx::CoordinateAxis::PositiveZ,
+        },
+        target_unit_meters: 1.0,
+        space_conversion: ufbx::SpaceConversion::ModifyGeometry,
+        generate_missing_normals: true,
+        ..Default::default()
+    };
+    ufbx::load_memory(bytes, options).map_err(|error| AssetError::Decode {
+        path: path.to_owned(),
+        message: format!("ошибка FBX: {error:?}"),
+    })
+}
+
+fn scene_has_triangles(scene: &ufbx::Scene) -> bool {
+    scene.nodes.iter().any(|node| {
+        node.mesh.as_ref().is_some_and(|mesh| {
+            mesh.material_parts
+                .iter()
+                .any(|part| part.num_triangles > 0)
+        })
+    })
+}
+
 fn load_fbx_texture(
     model_virtual_path: &str,
     model: &Path,
@@ -525,6 +603,28 @@ fn load_fbx_texture(
             ),
         });
     }
+    resolve_external_texture(
+        model_virtual_path,
+        model,
+        texture,
+        assets,
+        |asset_path, path| {
+            let bytes = assets.read_asset(asset_path, path)?;
+            decode_png(&bytes).map_err(|message| AssetError::Decode {
+                path: path.to_owned(),
+                message,
+            })
+        },
+    )
+}
+
+fn resolve_external_texture<T>(
+    model_virtual_path: &str,
+    model: &Path,
+    texture: &ufbx::Texture,
+    assets: &Assets,
+    mut use_candidate: impl FnMut(&str, &Path) -> Result<T, AssetError>,
+) -> Result<T, AssetError> {
     let tried = texture_candidates(
         model_virtual_path,
         &texture.filename,
@@ -544,12 +644,11 @@ fn load_fbx_texture(
             Ok(_) => {}
         }
         require_extension(&path, "png")?;
-        let bytes = match assets.read_asset(&asset_path, &path) {
+        match use_candidate(&asset_path, &path) {
             Err(error) if is_missing_texture_candidate(&error) => continue,
             Err(error) => return Err(error),
-            Ok(bytes) => bytes,
-        };
-        return decode_png(&bytes).map_err(|message| AssetError::Decode { path, message });
+            Ok(value) => return Ok(value),
+        }
     }
     let name = [
         &texture.relative_filename,
@@ -1069,6 +1168,84 @@ mod tests {
             assert_eq!(actual.meshes[0].texture, Some(0), "{actual:?}");
             assert_eq!(actual.textures.len(), 1);
             assert_eq!(actual.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
+        }
+    }
+
+    #[test]
+    fn model_dependencies_returns_external_paths_for_legacy_and_resource_sources() {
+        let temp = TempAssets::new("model-dependencies");
+        temp.write(
+            "model/relative.fbx",
+            quad_fbx(Some("../texture/paint.png")).as_bytes(),
+        );
+        temp.write("texture/paint.png", b"not decoded as PNG");
+        let assets = temp.assets();
+        let dependencies = assets.model_dependencies("/model/relative.fbx").unwrap();
+        assert_eq!(dependencies, ["/texture/paint.png"]);
+
+        let (_system, resource_assets) = temp.resource_assets();
+        assert_eq!(
+            resource_assets
+                .model_dependencies("/model/relative.fbx")
+                .unwrap(),
+            dependencies
+        );
+    }
+
+    #[test]
+    fn model_dependencies_preserves_missing_texture_error_and_returns_empty_without_textures() {
+        let temp = TempAssets::new("model-dependencies-missing");
+        temp.write("model/missing.fbx", quad_fbx(Some("lost.png")).as_bytes());
+        temp.write("model/plain.fbx", quad_fbx(None).as_bytes());
+        let video = format!(
+            "\tVideo: 5000, \"Video::Paint\", \"Clip\" {{\n\t\tType: \"Clip\"\n\t\tFileName: \"embedded.png\"\n\t\tRelativeFilename: \"embedded.png\"\n\t\tContent: \"{}\"\n\t}}\n",
+            base64(&rgba_png())
+        );
+        let embedded_fbx = quad_fbx(Some("embedded.png"))
+            .replace("Objects:  {\n", &format!("Objects:  {{\n{video}"))
+            .replace(
+                "Connections:  {\n",
+                "Connections:  {\n\tC: \"OO\",5000,4000\n",
+            );
+        temp.write("model/embedded.fbx", embedded_fbx.as_bytes());
+        let assets = temp.assets();
+        assert!(
+            assets
+                .model_dependencies("/model/plain.fbx")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            assets
+                .model_dependencies("/model/embedded.fbx")
+                .unwrap()
+                .is_empty()
+        );
+
+        let load_error = assets.load_model("/model/missing.fbx").unwrap_err();
+        let dependencies_error = assets.model_dependencies("/model/missing.fbx").unwrap_err();
+        match (load_error, dependencies_error) {
+            (
+                AssetError::MissingTexture {
+                    model: load_model,
+                    texture: load_texture,
+                    tried: load_tried,
+                },
+                AssetError::MissingTexture {
+                    model: dependencies_model,
+                    texture: dependencies_texture,
+                    tried: dependencies_tried,
+                },
+            ) => {
+                assert_eq!(dependencies_model, load_model);
+                assert_eq!(dependencies_texture, load_texture);
+                assert_eq!(dependencies_tried, load_tried);
+            }
+            (load_error, dependency_error) => {
+                panic!(
+                    "expected matching MissingTexture errors, got {load_error:?} and {dependency_error:?}"
+                )
+            }
         }
     }
 

@@ -1,0 +1,51 @@
+[[assets]]
+path = "/models/shared-cube.fbx"
+
+[[assets]]
+path = "/models/props-cube.fbx"
+archive = "props"
+
+[[assets]]
+path = "/scripts/rotate.lua"
+
+[[objects]]
+id = "camera"
+name = "Camera"
+[objects.transform]
+position = [0.0, 0.0, 8.0]
+[objects.camera]
+fov_deg = 55.0
+near = 0.1
+far = 100.0
+
+[[objects]]
+id = "sun"
+name = "Directional Light"
+[objects.transform]
+rotation = [35.0, 30.0, 0.0]
+[objects.directional_light]
+color = [1.0, 0.95, 0.82]
+ambient = [0.18, 0.18, 0.2]
+shadows = true
+shadow_center = [0.0, 0.0, 0.0]
+shadow_radius = 8.0
+
+[[objects]]
+id = "shared-cube"
+name = "Shared Cube"
+[objects.transform]
+position = [-1.1, 0.0, 0.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[[objects.lite_scripts]]
+path = "/scripts/rotate.lua"
+params = { speed = 24.0 }
+
+[[objects]]
+id = "props-cube"
+name = "Props Cube"
+[objects.transform]
+position = [1.1, 0.0, 0.0]
+scale = [0.75, 0.75, 0.75]
+[objects.mesh_renderer]
+model = "/models/props-cube.fbx"

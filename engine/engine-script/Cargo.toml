@@ -1,0 +1,12 @@
+[package]
+name = "engine-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+engine-scene = { path = "../engine-scene" }
+mlua.workspace = true

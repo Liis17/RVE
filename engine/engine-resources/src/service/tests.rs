@@ -1,8 +1,8 @@
 use super::*;
 use engine_files::ReadAt;
 use engine_pak::{
-    Archive, ArchiveCatalog, ArchiveId, ArchiveWriter, BlobId, BlobOptions, CatalogLimits, Codec,
-    HEADER_SIZE, WriterOptions,
+    Archive, ArchiveCatalog, ArchiveId, ArchiveSetRegistry, ArchiveWriter, BlobId, BlobOptions,
+    CatalogLimits, Codec, WriterOptions,
 };
 use std::future::Future;
 use std::io;
@@ -40,12 +40,39 @@ impl Drop for TempDirectory {
 fn config(root: impl Into<PathBuf>) -> ResourceConfig {
     ResourceConfig {
         root: root.into(),
+        source_mode: crate::SourceMode::Auto,
         worker_count: 1,
         queue_capacity: 2,
         max_total_index_bytes: 1024 * 1024,
         max_result_bytes: 1024 * 1024,
         max_memory_bytes: 512 * 1024 * 1024,
     }
+}
+
+fn config_with_mode(root: impl Into<PathBuf>, source_mode: crate::SourceMode) -> ResourceConfig {
+    ResourceConfig {
+        source_mode,
+        ..config(root)
+    }
+}
+
+fn registry_text(assignments: &[(&str, &str)]) -> String {
+    let assets = assignments
+        .iter()
+        .map(|(path, archive)| (virtual_path(path), (*archive).to_owned()))
+        .collect();
+    ArchiveSetRegistry::new(vec!["base".into(), "shared".into()], assets)
+        .unwrap()
+        .to_toml()
+        .unwrap()
+}
+
+fn write_archive_file(root: &Path, name: &str, files: &[(&str, &[u8])]) {
+    fs::write(
+        root.join(format!("{name}.rvepak")),
+        archive_bytes(Codec::None, 4, files),
+    )
+    .unwrap();
 }
 
 fn virtual_path(path: &str) -> VirtualPath {
@@ -93,6 +120,16 @@ fn start_error(root: &Path) -> ResourceError {
     }
 }
 
+fn start_error_with_mode(root: &Path, source_mode: crate::SourceMode) -> ResourceError {
+    match ResourceSystem::start(config_with_mode(root, source_mode)) {
+        Err(error) => error,
+        Ok(mut system) => {
+            let _ = system.shutdown();
+            panic!("expected resource startup to fail");
+        }
+    }
+}
+
 #[test]
 fn chooses_packed_only_when_archives_exist_and_allows_missing_loose_root() {
     let packed_root = TempDirectory::new();
@@ -125,6 +162,214 @@ fn chooses_packed_only_when_archives_exist_and_allows_missing_loose_root() {
     let error = system.handle().stat("missing").unwrap().wait().unwrap_err();
     assert_eq!(error.kind(), crate::ResourceErrorKind::NotFound);
     drop(system);
+}
+
+#[test]
+fn loose_mode_ignores_even_a_corrupt_neighboring_archive() {
+    let root = TempDirectory::new();
+    fs::write(root.path().join("loose.bin"), b"loose bytes").unwrap();
+    fs::write(root.path().join("broken.rvepak"), b"not a RVEPAK archive").unwrap();
+
+    let system =
+        ResourceSystem::start(config_with_mode(root.path(), crate::SourceMode::Loose)).unwrap();
+    assert_eq!(
+        system
+            .handle()
+            .read_all("loose.bin")
+            .unwrap()
+            .wait()
+            .unwrap(),
+        b"loose bytes"
+    );
+    drop(system);
+}
+
+#[test]
+fn registry_mode_reads_base_manifest_then_opens_the_validated_archive_set() {
+    let root = TempDirectory::new();
+    let registry = registry_text(&[
+        ("/rve/assets.toml", "base"),
+        ("/rve/project.toml", "base"),
+        ("/models/cube.fbx", "shared"),
+    ]);
+    write_archive_file(
+        root.path(),
+        "base",
+        &[
+            ("/rve/assets.toml", registry.as_bytes()),
+            ("/rve/project.toml", b"project"),
+        ],
+    );
+    write_archive_file(root.path(), "shared", &[("/models/cube.fbx", b"mesh")]);
+
+    let system =
+        ResourceSystem::start(config_with_mode(root.path(), crate::SourceMode::Registry)).unwrap();
+    let handle = system.handle();
+    assert_eq!(
+        handle.read_all("/models/cube.fbx").unwrap().wait().unwrap(),
+        b"mesh"
+    );
+    assert_eq!(
+        handle.read_all("/rve/assets.toml").unwrap().wait().unwrap(),
+        registry.as_bytes()
+    );
+    drop(system);
+}
+
+#[test]
+fn registry_startup_reports_missing_base_registry_invalid_registry_and_archive_set_mismatch() {
+    let no_base = TempDirectory::new();
+    let error = start_error_with_mode(no_base.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::MissingBaseArchive);
+
+    let no_registry = TempDirectory::new();
+    write_archive_file(
+        no_registry.path(),
+        "base",
+        &[("/rve/project.toml", b"project")],
+    );
+    let error = start_error_with_mode(no_registry.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::MissingRegistry);
+
+    let invalid = TempDirectory::new();
+    write_archive_file(
+        invalid.path(),
+        "base",
+        &[(
+            "/rve/assets.toml",
+            b"format = 77\narchives = []\n[assets]\n",
+        )],
+    );
+    let error = start_error_with_mode(invalid.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::InvalidRegistry);
+    assert!(error.to_string().contains("unsupported registry version"));
+
+    let extra = TempDirectory::new();
+    let registry = registry_text(&[
+        ("/rve/assets.toml", "base"),
+        ("/rve/project.toml", "base"),
+        ("/models/cube.fbx", "shared"),
+    ]);
+    write_archive_file(
+        extra.path(),
+        "base",
+        &[
+            ("/rve/assets.toml", registry.as_bytes()),
+            ("/rve/project.toml", b"project"),
+        ],
+    );
+    write_archive_file(extra.path(), "shared", &[("/models/cube.fbx", b"mesh")]);
+    fs::write(
+        extra.path().join("extra.rvepak"),
+        b"ignored until catalog open",
+    )
+    .unwrap();
+    let error = start_error_with_mode(extra.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::ArchiveSetMismatch);
+    assert!(error.to_string().contains("extra.rvepak"));
+
+    let missing = TempDirectory::new();
+    write_archive_file(
+        missing.path(),
+        "base",
+        &[
+            ("/rve/assets.toml", registry.as_bytes()),
+            ("/rve/project.toml", b"project"),
+        ],
+    );
+    let error = start_error_with_mode(missing.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::ArchiveSetMismatch);
+    assert!(error.to_string().contains("shared.rvepak"));
+}
+
+#[test]
+fn registry_startup_rejects_non_regular_base_non_utf8_registry_and_external_registry() {
+    let directory_base = TempDirectory::new();
+    fs::create_dir(directory_base.path().join("base.rvepak")).unwrap();
+    let error = start_error_with_mode(directory_base.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::NonRegularFile);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let symlink_base = TempDirectory::new();
+        fs::write(symlink_base.path().join("target"), b"not an archive").unwrap();
+        symlink(
+            symlink_base.path().join("target"),
+            symlink_base.path().join("base.rvepak"),
+        )
+        .unwrap();
+        let error = start_error_with_mode(symlink_base.path(), crate::SourceMode::Registry);
+        assert_eq!(error.kind(), crate::ResourceErrorKind::NonRegularFile);
+    }
+
+    let invalid_utf8 = TempDirectory::new();
+    write_archive_file(
+        invalid_utf8.path(),
+        "base",
+        &[("/rve/assets.toml", &[0xff, 0xfe])],
+    );
+    let error = start_error_with_mode(invalid_utf8.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::InvalidRegistry);
+    assert!(error.to_string().contains("not valid UTF-8"));
+
+    let external_registry = TempDirectory::new();
+    let mut owner_writer =
+        ArchiveWriter::new(io::Cursor::new(Vec::new()), WriterOptions::default()).unwrap();
+    let owner_blob = owner_writer
+        .add_local(
+            virtual_path("/rve/assets.toml"),
+            &b"registry bytes"[..],
+            None,
+        )
+        .unwrap();
+    let owner = owner_writer.finish().unwrap();
+    let owner_id = owner.archive_id;
+    fs::write(
+        external_registry.path().join("shared.rvepak"),
+        owner.into_inner().into_inner(),
+    )
+    .unwrap();
+
+    let mut base_writer =
+        ArchiveWriter::new(io::Cursor::new(Vec::new()), WriterOptions::default()).unwrap();
+    base_writer
+        .add_external(virtual_path("/rve/assets.toml"), owner_id, owner_blob)
+        .unwrap();
+    let base = base_writer.finish().unwrap().into_inner().into_inner();
+    fs::write(external_registry.path().join("base.rvepak"), base).unwrap();
+    let error = start_error_with_mode(external_registry.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::InvalidRegistry);
+    assert!(error.to_string().contains("must be stored locally"));
+}
+
+#[test]
+fn registry_rejects_paths_declared_by_the_wrong_archive() {
+    let root = TempDirectory::new();
+    let registry = registry_text(&[
+        ("/rve/assets.toml", "base"),
+        ("/rve/project.toml", "base"),
+        ("/models/cube.fbx", "shared"),
+        ("/models/extra.fbx", "shared"),
+    ]);
+    write_archive_file(
+        root.path(),
+        "base",
+        &[
+            ("/rve/assets.toml", registry.as_bytes()),
+            ("/rve/project.toml", b"project"),
+            ("/models/cube.fbx", b"mesh"),
+        ],
+    );
+    write_archive_file(root.path(), "shared", &[("/models/extra.fbx", b"extra")]);
+    let error = start_error_with_mode(root.path(), crate::SourceMode::Registry);
+    assert_eq!(error.kind(), crate::ResourceErrorKind::ArchiveSetMismatch);
+    assert!(
+        error
+            .to_string()
+            .contains("declared by base.rvepak but registry assigns it to shared.rvepak")
+    );
 }
 
 #[test]
@@ -490,7 +735,7 @@ impl ReadGate {
 struct RecordingReader {
     bytes: Vec<u8>,
     payload_start: u64,
-    index_start: u64,
+    payload_end: u64,
     payload_reads: AtomicUsize,
     gate: Arc<ReadGate>,
 }
@@ -502,7 +747,7 @@ impl ReadAt for RecordingReader {
 
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         let end = offset.saturating_add(buffer.len() as u64);
-        if offset < self.index_start && end > self.payload_start {
+        if offset < self.payload_end && end > self.payload_start {
             self.payload_reads.fetch_add(1, Ordering::AcqRel);
             self.gate.enter_and_wait();
         }
@@ -519,7 +764,8 @@ impl ReadAt for RecordingReader {
 
 struct MissingPayloadReader {
     bytes: Vec<u8>,
-    index_start: u64,
+    payload_start: u64,
+    payload_end: u64,
 }
 
 impl ReadAt for MissingPayloadReader {
@@ -528,7 +774,8 @@ impl ReadAt for MissingPayloadReader {
     }
 
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
-        if (HEADER_SIZE..self.index_start).contains(&offset) {
+        let end = offset.saturating_add(buffer.len() as u64);
+        if offset < self.payload_end && end > self.payload_start {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "injected missing archive backing payload",
@@ -549,11 +796,12 @@ fn catalog_with_reader(
     bytes: Vec<u8>,
     gate: Arc<ReadGate>,
 ) -> (Arc<ArchiveCatalog>, Arc<RecordingReader>) {
-    let index_start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let index_start = index_offset(&bytes);
+    let (payload_start, payload_end) = payload_range(&bytes, index_start);
     let reader = Arc::new(RecordingReader {
         bytes,
-        payload_start: engine_pak::HEADER_SIZE,
-        index_start,
+        payload_start,
+        payload_end,
         payload_reads: AtomicUsize::new(0),
         gate,
     });
@@ -564,12 +812,37 @@ fn catalog_with_reader(
     (Arc::new(catalog), reader)
 }
 
+fn payload_range(bytes: &[u8], index_start: u64) -> (u64, u64) {
+    match u32::from_le_bytes(bytes[8..12].try_into().unwrap()) {
+        1 => (64, index_start),
+        2 => (
+            u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            bytes.len() as u64,
+        ),
+        version => panic!("unexpected archive version {version}"),
+    }
+}
+
+fn index_offset(bytes: &[u8]) -> u64 {
+    let field = if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == 1 {
+        16
+    } else {
+        24
+    };
+    u64::from_le_bytes(bytes[field..field + 8].try_into().unwrap())
+}
+
 #[test]
 fn backing_io_not_found_is_distinct_from_a_missing_virtual_resource() {
     let root = TempDirectory::new();
     let bytes = archive_bytes(Codec::None, 4, &[("exists.bin", b"data")]);
-    let index_start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let reader = Arc::new(MissingPayloadReader { bytes, index_start });
+    let index_start = index_offset(&bytes);
+    let (payload_start, payload_end) = payload_range(&bytes, index_start);
+    let reader = Arc::new(MissingPayloadReader {
+        bytes,
+        payload_start,
+        payload_end,
+    });
     let archive = Archive::open_shared(reader).unwrap();
     let mut catalog = ArchiveCatalog::new(CatalogLimits::default());
     catalog.insert(archive).unwrap();

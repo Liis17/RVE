@@ -1,6 +1,5 @@
 use crate::format::{
-    ArchiveId, BlobId, ChunkDescriptor, Codec, ContentHash, FileReference, HEADER_SIZE, LocalBlob,
-    decode_header,
+    ArchiveId, BlobId, ChunkDescriptor, Codec, ContentHash, FileReference, LocalBlob, read_header,
 };
 use crate::{PakError, Result};
 use engine_files::{FileSource, ReadAt, VirtualPath};
@@ -137,6 +136,10 @@ pub struct Archive {
     archive_id: ArchiveId,
     index_offset: u64,
     index_len: u64,
+    #[cfg(windows)]
+    data_offset: u64,
+    #[cfg(windows)]
+    data_len: u64,
     files: BTreeMap<VirtualPath, FileReference>,
     blobs: BTreeMap<BlobId, LocalBlob>,
     limits: ArchiveLimits,
@@ -179,14 +182,7 @@ impl Archive {
     ) -> Result<Self> {
         limits.validate()?;
         let file_len = source.len().map_err(PakError::io)?;
-        if file_len < HEADER_SIZE {
-            return Err(PakError::corrupt("archive is shorter than its header"));
-        }
-        let mut header_bytes = [0; HEADER_SIZE as usize];
-        source
-            .read_exact_at(0, &mut header_bytes)
-            .map_err(PakError::io)?;
-        let header = decode_header(&header_bytes, file_len)?;
+        let header = read_header(source.as_ref(), file_len)?;
         if header.index_len > limits.max_index_bytes {
             return Err(PakError::BudgetExceeded {
                 requested: header.index_len,
@@ -204,8 +200,12 @@ impl Archive {
                 "index checksum does not match archive id",
             ));
         }
+        let data_end = header
+            .data_offset
+            .checked_add(header.data_len)
+            .ok_or_else(|| PakError::corrupt("data extent overflow"))?;
         let (files, blobs) =
-            crate::format::parse_index(&index_bytes, header.index_offset, &limits)?;
+            crate::format::parse_index(&index_bytes, header.data_offset, data_end, &limits)?;
 
         Ok(Self {
             source,
@@ -213,6 +213,10 @@ impl Archive {
             archive_id: header.archive_id,
             index_offset: header.index_offset,
             index_len: header.index_len,
+            #[cfg(windows)]
+            data_offset: header.data_offset,
+            #[cfg(windows)]
+            data_len: header.data_len,
             files,
             blobs,
             limits,
@@ -710,12 +714,12 @@ impl Archive {
                 FileSource::open(path).map_err(|error| PakError::io_path(path.clone(), error))?,
             );
             let file_len = source.len().map_err(PakError::io)?;
-            let mut header = [0; HEADER_SIZE as usize];
-            source.read_exact_at(0, &mut header).map_err(PakError::io)?;
-            let opened = decode_header(&header, file_len)?;
+            let opened = read_header(source.as_ref(), file_len)?;
             if opened.archive_id != self.archive_id
                 || opened.index_offset != self.index_offset
                 || opened.index_len != self.index_len
+                || opened.data_offset != self.data_offset
+                || opened.data_len != self.data_len
             {
                 return Err(PakError::BackingChanged);
             }

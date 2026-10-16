@@ -79,6 +79,7 @@ pub fn discover_archives(root: impl AsRef<Path>) -> Result<Vec<DiscoveredArchive
 /// Validated namespace for one or more archives and their local payload owners.
 pub struct ArchiveCatalog {
     archives: BTreeMap<ArchiveId, Arc<Archive>>,
+    archive_paths: BTreeMap<ArchiveId, PathBuf>,
     paths: BTreeMap<VirtualPath, (ArchiveId, FileReference)>,
     total_index_bytes: u64,
     limits: CatalogLimits,
@@ -94,6 +95,7 @@ impl ArchiveCatalog {
     pub fn new(limits: CatalogLimits) -> Self {
         Self {
             archives: BTreeMap::new(),
+            archive_paths: BTreeMap::new(),
             paths: BTreeMap::new(),
             total_index_bytes: 0,
             limits,
@@ -123,7 +125,8 @@ impl ArchiveCatalog {
                 .max_index_bytes
                 .min(remaining_index_budget);
             let archive = Archive::open_file_with_limits(&item.path, per_archive_limits)?;
-            catalog.insert(archive)?;
+            let id = catalog.insert(archive)?;
+            catalog.archive_paths.insert(id, item.path);
         }
         catalog.validate()?;
         Ok(catalog)
@@ -192,6 +195,14 @@ impl ArchiveCatalog {
 
     pub fn archive_ids(&self) -> impl Iterator<Item = ArchiveId> + '_ {
         self.archives.keys().copied()
+    }
+
+    /// Returns the on-disk archive paths when this catalog was opened from a directory.
+    /// Catalogs populated with [`insert`](Self::insert) have no associated file path.
+    pub fn archive_paths(&self) -> impl Iterator<Item = (ArchiveId, &Path)> + '_ {
+        self.archive_paths
+            .iter()
+            .map(|(id, path)| (*id, path.as_path()))
     }
 
     pub fn list(&self) -> impl Iterator<Item = &VirtualPath> {

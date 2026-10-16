@@ -8,6 +8,7 @@ from affected_packages import affected_packages, changed_paths
 
 
 ROOT = Path("/workspace")
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def package(name, dependencies=(), directory=None, dependency_directories=None):
@@ -77,7 +78,8 @@ class PackageSelectionTests(unittest.TestCase):
     def test_shared_or_unrecognized_files_select_every_package(self):
         for path in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-toolchain.toml",
                      ".github/workflows/ci.yml", ".github/scripts/affected_packages.py",
-                     "shared/input.bin", "engine/deleted/src/lib.rs", "engine/audio-extra/lib.rs"]:
+                     "examples/demo-game/project.rveproject", "shared/input.bin",
+                     "engine/deleted/src/lib.rs", "engine/audio-extra/lib.rs"]:
             with self.subTest(path=path):
                 self.assertEqual(self.select([path]), self.all_packages)
         self.assertEqual(self.select(None), self.all_packages)
@@ -122,6 +124,68 @@ class PackageSelectionTests(unittest.TestCase):
         self.assertEqual(self.select(["tools/rvepak/src/main.rs"]), ["rvepak"])
         self.assertEqual(self.select(["engine/engine-pak/src/builder.rs"]),
                          ["engine-pak", "engine-resources", "rvepak"])
+
+    def test_rve_build_and_runtime_edges_and_demo_ci_condition(self):
+        files = "engine/engine-files"
+        pak = "engine/engine-pak"
+        project = "engine/engine-project"
+        scene = "engine/engine-scene"
+        resources = "engine/engine-resources"
+        assets = "engine/engine-assets"
+        runtime = "engine/engine-runtime"
+        self.metadata["packages"] = [
+            package("engine-files", directory=files),
+            package("engine-pak", ["engine-files"], directory=pak,
+                    dependency_directories={"engine-files": files}),
+            package("engine-project", ["engine-files"], directory=project,
+                    dependency_directories={"engine-files": files}),
+            package("engine-scene", ["engine-files"], directory=scene,
+                    dependency_directories={"engine-files": files}),
+            package("engine-resources", ["engine-files", "engine-pak"],
+                    directory=resources,
+                    dependency_directories={"engine-files": files, "engine-pak": pak}),
+            package("engine-assets", ["engine-resources"], directory=assets,
+                    dependency_directories={"engine-resources": resources}),
+            package("engine-runtime", ["engine-assets", "engine-project",
+                                       "engine-resources", "engine-scene"],
+                    directory=runtime,
+                    dependency_directories={
+                        "engine-assets": assets,
+                        "engine-project": project,
+                        "engine-resources": resources,
+                        "engine-scene": scene,
+                    }),
+            package("rve-player", ["engine-runtime"], directory="engine/rve-player",
+                    dependency_directories={"engine-runtime": runtime}),
+            package("rve-build", ["engine-assets", "engine-files", "engine-pak",
+                                   "engine-project", "engine-resources", "engine-scene"],
+                    directory="tools/rve-build",
+                    dependency_directories={
+                        "engine-assets": assets,
+                        "engine-files": files,
+                        "engine-pak": pak,
+                        "engine-project": project,
+                        "engine-resources": resources,
+                        "engine-scene": scene,
+                    }),
+        ]
+        self.metadata["workspace_members"] = [
+            package["name"] for package in self.metadata["packages"]
+        ]
+
+        build_changes = self.select(["tools/rve-build/src/main.rs"])
+        self.assertEqual(build_changes, ["rve-build"])
+        runtime_changes = self.select(["engine/engine-runtime/src/lib.rs"])
+        self.assertEqual(runtime_changes, ["engine-runtime", "rve-player"])
+        self.assertNotIn("rve-build", runtime_changes)
+
+        workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
+        demo_step = workflow.split("- name: Build demo game", 1)[1]
+        condition = demo_step.splitlines()[1]
+        self.assertIn("contains(needs.changes.outputs.packages, 'rve-build')", condition)
+        self.assertIn("contains(needs.changes.outputs.packages, 'engine-runtime')", condition)
+        self.assertTrue("rve-build" in build_changes)
+        self.assertTrue("engine-runtime" in runtime_changes)
 
     def test_resource_asset_sandbox_consumers_are_selected_transitively(self):
         resources = "engine/engine-resources"

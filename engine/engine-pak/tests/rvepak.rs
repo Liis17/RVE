@@ -1,9 +1,9 @@
 use engine_files::{ReadAt, VirtualPath};
 use engine_pak::{
-    Archive, ArchiveCatalog, ArchiveLimits, ArchiveWriter, BlobOptions, CatalogLimits, Codec,
-    ContentHash, MemoryFootprint, PakError, ReadControl, ReadReservation, WriterOptions,
+    Archive, ArchiveCatalog, ArchiveLimits, ArchiveWriter, BlobId, BlobOptions, CatalogLimits,
+    Codec, ContentHash, MemoryFootprint, PakError, ReadControl, ReadReservation, WriterOptions,
 };
-use std::io::{Cursor, Write};
+use std::io::{self, Cursor, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
@@ -12,6 +12,44 @@ use std::sync::{Arc, Mutex, Weak};
 struct MemorySource {
     bytes: Arc<Vec<u8>>,
     reads: Option<Arc<Mutex<Vec<Range<u64>>>>>,
+}
+
+struct FailingSink {
+    inner: Cursor<Vec<u8>>,
+    fail_after: u64,
+}
+
+impl FailingSink {
+    fn new(fail_after: u64) -> Self {
+        Self {
+            inner: Cursor::new(Vec::new()),
+            fail_after,
+        }
+    }
+}
+
+impl Write for FailingSink {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let position = self.inner.position();
+        if position >= self.fail_after {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected output failure",
+            ));
+        }
+        let allowed = buffer.len().min((self.fail_after - position) as usize);
+        self.inner.write(&buffer[..allowed])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Seek for FailingSink {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
 }
 
 impl MemorySource {
@@ -160,38 +198,114 @@ fn zstd_frame(content: &[u8], checksum: bool) -> Vec<u8> {
 fn archive_bytes_with_zstd_frame(content: &[u8], frame: &[u8]) -> Vec<u8> {
     let archive = archive_bytes(Codec::Zstd, content.len() as u64, "asset", content);
     let old_index_offset = index_offset(&archive);
-    let mut index = archive[old_index_offset..].to_vec();
+    let mut index = archive[old_index_offset..old_index_offset + index_len(&archive)].to_vec();
     let blob_entry = 8 + 4 + "asset".len() + 1 + 8;
     let chunk_descriptor = blob_entry + 8 + 1 + 8 + 8 + 32 + 4;
-    put_u64(&mut index, chunk_descriptor, 64);
+    let data_start = engine_pak::HEADER_SIZE + index.len() as u64;
+    put_u64(&mut index, chunk_descriptor, data_start);
     put_u64(&mut index, chunk_descriptor + 8, frame.len() as u64);
-
-    let mut bytes = archive[..64].to_vec();
-    bytes.extend_from_slice(frame);
-    let new_index_offset = bytes.len() as u64;
-    put_u64(&mut bytes, 16, new_index_offset);
-    bytes.extend_from_slice(&index);
-    refresh_index_hash(&mut bytes);
-    bytes
+    build_v2_archive(index, frame)
 }
 
 fn hash(content: &[u8]) -> ContentHash {
     ContentHash::from_bytes(*blake3::hash(content).as_bytes())
 }
 
+struct HeaderLayout {
+    index_offset_field: usize,
+    index_len_field: usize,
+    data_offset: HeaderValue,
+    archive_id_offset: usize,
+}
+
+enum HeaderValue {
+    Fixed(usize),
+    Field(usize),
+}
+
+fn header_layout(bytes: &[u8]) -> HeaderLayout {
+    match archive_version(bytes) {
+        1 => HeaderLayout {
+            index_offset_field: 16,
+            index_len_field: 24,
+            data_offset: HeaderValue::Fixed(64),
+            archive_id_offset: 32,
+        },
+        2 => HeaderLayout {
+            index_offset_field: 24,
+            index_len_field: 32,
+            data_offset: HeaderValue::Field(40),
+            archive_id_offset: 56,
+        },
+        version => panic!("unexpected archive version {version}"),
+    }
+}
+
 fn index_offset(bytes: &[u8]) -> usize {
-    u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize
+    let field = header_layout(bytes).index_offset_field;
+    u64::from_le_bytes(bytes[field..field + 8].try_into().unwrap()) as usize
 }
 
 fn index_len(bytes: &[u8]) -> usize {
-    u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize
+    let field = header_layout(bytes).index_len_field;
+    u64::from_le_bytes(bytes[field..field + 8].try_into().unwrap()) as usize
+}
+
+fn index_bytes(bytes: &[u8]) -> &[u8] {
+    let start = index_offset(bytes);
+    &bytes[start..start + index_len(bytes)]
+}
+
+fn archive_version(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+}
+
+fn data_offset(bytes: &[u8]) -> usize {
+    match header_layout(bytes).data_offset {
+        HeaderValue::Fixed(value) => value,
+        HeaderValue::Field(field) => {
+            u64::from_le_bytes(bytes[field..field + 8].try_into().unwrap()) as usize
+        }
+    }
+}
+
+fn archive_id_offset(bytes: &[u8]) -> usize {
+    header_layout(bytes).archive_id_offset
 }
 
 fn refresh_index_hash(bytes: &mut [u8]) {
     let start = index_offset(bytes);
     let end = start + index_len(bytes);
     let hash = *blake3::hash(&bytes[start..end]).as_bytes();
-    bytes[32..64].copy_from_slice(&hash);
+    let id_offset = archive_id_offset(bytes);
+    bytes[id_offset..id_offset + 32].copy_from_slice(&hash);
+}
+
+fn build_v2_archive(index: Vec<u8>, payload: &[u8]) -> Vec<u8> {
+    let data_offset = engine_pak::HEADER_SIZE + index.len() as u64;
+    let archive_id = *blake3::hash(&index).as_bytes();
+    let header = v2_header(index.len() as u64, payload.len() as u64, archive_id);
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&index);
+    assert_eq!(bytes.len() as u64, data_offset);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn v2_header(index_len: u64, data_len: u64, archive_id: [u8; 32]) -> [u8; 96] {
+    let index_offset = engine_pak::HEADER_SIZE;
+    let data_offset = index_offset + index_len;
+    let mut header = [0; 96];
+    header[..8].copy_from_slice(b"RVEPAK\0\0");
+    put_u32(&mut header, 8, 2);
+    put_u32(&mut header, 16, 96);
+    put_u32(&mut header, 20, 2);
+    put_u64(&mut header, 24, index_offset);
+    put_u64(&mut header, 32, index_len);
+    put_u64(&mut header, 40, data_offset);
+    put_u64(&mut header, 48, data_len);
+    header[56..88].copy_from_slice(&archive_id);
+    header
 }
 
 fn reindex(mut bytes: Vec<u8>, mutate: impl FnOnce(&mut [u8])) -> Vec<u8> {
@@ -293,6 +407,8 @@ fn reads_opaque_bytes_unicode_paths_empty_assets_and_all_codecs() {
 fn range_reads_touch_only_intersecting_chunks_and_validate_bounds() {
     let data = b"abcdefghijkl";
     let bytes = archive_bytes(Codec::Zstd, 4, "asset.bin", data);
+    let data_start = data_offset(&bytes) as u64;
+    let data_end = bytes.len() as u64;
     let (source, reads) = MemorySource::recording(bytes);
     let archive = Archive::open(source).unwrap();
     reads.lock().unwrap().clear();
@@ -300,7 +416,7 @@ fn range_reads_touch_only_intersecting_chunks_and_validate_bounds() {
     assert_eq!(archive.read_range(&path("asset.bin"), 5..7).unwrap(), b"fg");
     let touched = reads.lock().unwrap().clone();
     assert_eq!(touched.len(), 1);
-    assert!(touched[0].start >= 64 && touched[0].end <= index_offset_from_reads(&archive));
+    assert!(touched[0].start >= data_start && touched[0].end <= data_end);
 
     assert_eq!(
         archive.read_range(&path("asset.bin"), 3..9).unwrap(),
@@ -335,11 +451,6 @@ fn range_reads_touch_only_intersecting_chunks_and_validate_bounds() {
         archive.read_range(&path("missing"), 0..0),
         Err(PakError::NotFound(_))
     ));
-}
-
-// Kept as a separate helper so the recording test does not infer chunk boundaries from reads.
-fn index_offset_from_reads(archive: &Archive) -> u64 {
-    archive.index_offset()
 }
 
 #[test]
@@ -398,7 +509,8 @@ fn read_budget_rejects_before_allocating_or_touching_payload() {
 #[test]
 fn chunk_and_full_blob_checksums_detect_payload_corruption() {
     let mut broken_chunk = archive_bytes(Codec::None, 4, "asset", b"data");
-    broken_chunk[64] ^= 1;
+    let payload_offset = data_offset(&broken_chunk);
+    broken_chunk[payload_offset] ^= 1;
     let archive = Archive::open(MemorySource::new(broken_chunk)).unwrap();
     assert!(matches!(
         archive.read_all(&path("asset")),
@@ -527,6 +639,215 @@ fn external_references_resolve_only_through_a_validated_catalog() {
 }
 
 #[test]
+fn mixed_v1_v2_catalog_resolves_external_references_in_both_directions() {
+    let mut v2_owner_writer = ArchiveWriter::new(
+        Cursor::new(Vec::new()),
+        WriterOptions {
+            codec: Codec::None,
+            ..WriterOptions::default()
+        },
+    )
+    .unwrap();
+    let v2_blob = v2_owner_writer
+        .add_local(path("v2-owner.bin"), b"owned by v2".as_slice(), None)
+        .unwrap();
+    let (v2_owner_bytes, v2_owner_id) = finish(v2_owner_writer);
+
+    let (v1_bytes, v1_id) = v1_archive_with_external(v2_owner_id, v2_blob);
+    let mut v2_dependent_writer =
+        ArchiveWriter::new(Cursor::new(Vec::new()), WriterOptions::default()).unwrap();
+    v2_dependent_writer
+        .add_external(path("v1-link.bin"), v1_id, BlobId::from_u64(0))
+        .unwrap();
+    let (v2_dependent_bytes, _) = finish(v2_dependent_writer);
+
+    let mut catalog = ArchiveCatalog::default();
+    catalog
+        .insert(Archive::open(MemorySource::new(v1_bytes)).unwrap())
+        .unwrap();
+    catalog
+        .insert(Archive::open(MemorySource::new(v2_owner_bytes)).unwrap())
+        .unwrap();
+    catalog
+        .insert(Archive::open(MemorySource::new(v2_dependent_bytes)).unwrap())
+        .unwrap();
+    catalog.validate().unwrap();
+    assert_eq!(
+        catalog.read_all(&path("v2-link.bin")).unwrap(),
+        b"owned by v2"
+    );
+    assert_eq!(
+        catalog.read_all(&path("v1-link.bin")).unwrap(),
+        [0x00, 0xff, 0x41]
+    );
+    assert_eq!(
+        catalog.read_all(&path("v1-local.bin")).unwrap(),
+        [0x00, 0xff, 0x41]
+    );
+}
+
+fn v1_archive_with_external(
+    owner_archive_id: engine_pak::ArchiveId,
+    owner_blob_id: BlobId,
+) -> (Vec<u8>, engine_pak::ArchiveId) {
+    let fixture = from_hex(include_str!("fixtures/v1-none.hex").trim());
+    let original_index_offset = index_offset(&fixture);
+    let original_index = index_bytes(&fixture);
+    let old_path_len = u32::from_le_bytes(original_index[8..12].try_into().unwrap()) as usize;
+    let blob_table_start = 8 + 4 + old_path_len + 1 + 8;
+    let mut index = Vec::new();
+    index.extend_from_slice(&2_u32.to_le_bytes());
+    index.extend_from_slice(&1_u32.to_le_bytes());
+    append_v1_local_path(&mut index, "v1-local.bin", BlobId::from_u64(0));
+    append_v1_external_path(&mut index, "v2-link.bin", owner_archive_id, owner_blob_id);
+    index.extend_from_slice(&original_index[blob_table_start..]);
+
+    let payload = &fixture[64..original_index_offset];
+    let index_offset = 64 + payload.len();
+    let archive_id = engine_pak::ArchiveId::from_bytes(*blake3::hash(&index).as_bytes());
+    let mut header = [0; 64];
+    header[..8].copy_from_slice(b"RVEPAK\0\0");
+    put_u32(&mut header, 8, 1);
+    put_u64(&mut header, 16, index_offset as u64);
+    put_u64(&mut header, 24, index.len() as u64);
+    header[32..64].copy_from_slice(archive_id.as_bytes());
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&index);
+    (bytes, archive_id)
+}
+
+fn append_v1_local_path(index: &mut Vec<u8>, path_text: &str, blob_id: BlobId) {
+    index.extend_from_slice(&(path_text.len() as u32).to_le_bytes());
+    index.extend_from_slice(path_text.as_bytes());
+    index.push(0);
+    index.extend_from_slice(&blob_id.get().to_le_bytes());
+}
+
+fn append_v1_external_path(
+    index: &mut Vec<u8>,
+    path_text: &str,
+    archive_id: engine_pak::ArchiveId,
+    blob_id: BlobId,
+) {
+    index.extend_from_slice(&(path_text.len() as u32).to_le_bytes());
+    index.extend_from_slice(path_text.as_bytes());
+    index.push(1);
+    index.extend_from_slice(archive_id.as_bytes());
+    index.extend_from_slice(&blob_id.get().to_le_bytes());
+}
+
+#[test]
+fn writer_creates_valid_empty_v2_archive() {
+    let (bytes, _) =
+        finish(ArchiveWriter::new(Cursor::new(Vec::new()), WriterOptions::default()).unwrap());
+    assert_eq!(archive_version(&bytes), 2);
+    assert_eq!(u64::from_le_bytes(bytes[48..56].try_into().unwrap()), 0);
+    let archive = Archive::open(MemorySource::new(bytes)).unwrap();
+    assert_eq!(archive.list().count(), 0);
+    assert_eq!(archive.verify().unwrap().local_blobs_verified, 0);
+}
+
+#[test]
+fn writer_spool_is_removed_after_success_error_and_drop() {
+    let spool_dir = temporary_archive_path("spool-dir").with_extension("dir");
+    std::fs::create_dir(&spool_dir).unwrap();
+    let spool_count = || std::fs::read_dir(&spool_dir).unwrap().count();
+
+    let mut writer = ArchiveWriter::with_spool_dir(
+        Cursor::new(Vec::new()),
+        WriterOptions {
+            codec: Codec::None,
+            ..WriterOptions::default()
+        },
+        &spool_dir,
+    )
+    .unwrap();
+    writer
+        .add_local(path("success.bin"), b"ok".as_slice(), None)
+        .unwrap();
+    assert_eq!(spool_count(), 1);
+    let _ = writer.finish().unwrap();
+    assert_eq!(spool_count(), 0);
+
+    let mut writer = ArchiveWriter::with_spool_dir(
+        Cursor::new(Vec::new()),
+        WriterOptions {
+            codec: Codec::None,
+            ..WriterOptions::default()
+        },
+        &spool_dir,
+    )
+    .unwrap();
+    assert!(matches!(
+        writer.add_local(
+            path("error.bin"),
+            b"wrong".as_slice(),
+            Some(hash(b"expected"))
+        ),
+        Err(PakError::SourceMismatch { .. })
+    ));
+    assert_eq!(spool_count(), 0);
+    assert!(matches!(writer.finish(), Err(PakError::PoisonedWriter)));
+
+    let mut writer = ArchiveWriter::with_spool_dir(
+        FailingSink::new(engine_pak::HEADER_SIZE + 1),
+        WriterOptions {
+            codec: Codec::None,
+            ..WriterOptions::default()
+        },
+        &spool_dir,
+    )
+    .unwrap();
+    writer
+        .add_local(path("sink-error.bin"), b"payload".as_slice(), None)
+        .unwrap();
+    assert_eq!(spool_count(), 1);
+    assert!(matches!(
+        writer.finish(),
+        Err(PakError::Io { source, .. }) if source.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert_eq!(spool_count(), 0);
+
+    let writer = ArchiveWriter::with_spool_dir(
+        Cursor::new(Vec::new()),
+        WriterOptions::default(),
+        &spool_dir,
+    )
+    .unwrap();
+    assert_eq!(spool_count(), 1);
+    drop(writer);
+    assert_eq!(spool_count(), 0);
+    std::fs::remove_dir(spool_dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn writer_spool_uses_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let spool_dir = temporary_archive_path("spool-permissions").with_extension("dir");
+    std::fs::create_dir(&spool_dir).unwrap();
+    let writer = ArchiveWriter::with_spool_dir(
+        Cursor::new(Vec::new()),
+        WriterOptions::default(),
+        &spool_dir,
+    )
+    .unwrap();
+    let spool_path = std::fs::read_dir(&spool_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mode = std::fs::metadata(&spool_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    drop(writer);
+    std::fs::remove_dir(spool_dir).unwrap();
+}
+
+#[test]
 fn catalog_rejects_duplicate_archive_ids_and_namespace_paths() {
     let same = archive_bytes(Codec::None, 4, "same/path", b"same");
     let mut duplicate_id_catalog = ArchiveCatalog::default();
@@ -556,6 +877,7 @@ fn archive_handles_are_owned_and_reopen_checks_replacement_identity() {
     let file_path = temporary_archive_path("lifetime");
     std::fs::write(&file_path, &bytes).unwrap();
     let archive = Archive::open_file(&file_path).unwrap();
+    assert_eq!(archive.read_all(&path("asset")).unwrap(), b"stable");
     let replacement = archive_bytes(Codec::None, 4, "asset", b"replaced");
     let replacement_path = temporary_archive_path("replacement");
     std::fs::write(&replacement_path, replacement).unwrap();
@@ -583,6 +905,67 @@ fn archive_handles_are_owned_and_reopen_checks_replacement_identity() {
 
     drop(archive);
     let _ = std::fs::remove_file(replacement_path);
+    std::fs::remove_file(file_path).unwrap();
+}
+
+#[test]
+fn v1_file_backed_reader_detects_replacement() {
+    let file_path = temporary_archive_path("v1-replacement");
+    let replacement_path = temporary_archive_path("v1-replacement-new");
+    std::fs::write(
+        &file_path,
+        from_hex(include_str!("fixtures/v1-none.hex").trim()),
+    )
+    .unwrap();
+    let archive = Archive::open_file(&file_path).unwrap();
+    assert_eq!(
+        archive.read_all(&path("golden.bin")).unwrap(),
+        [0x00, 0xff, 0x41]
+    );
+    std::fs::write(
+        &replacement_path,
+        archive_bytes(Codec::None, 4, "golden.bin", b"replacement"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::fs::rename(&replacement_path, &file_path).unwrap();
+    #[cfg(windows)]
+    std::fs::write(&file_path, std::fs::read(&replacement_path).unwrap()).unwrap();
+
+    assert!(matches!(
+        archive.reopen_for_worker(),
+        Err(PakError::BackingChanged)
+    ));
+    #[cfg(windows)]
+    assert!(matches!(
+        archive.read_all(&path("golden.bin")),
+        Err(PakError::BackingChanged)
+    ));
+    #[cfg(unix)]
+    assert_eq!(
+        archive.read_all(&path("golden.bin")).unwrap(),
+        [0x00, 0xff, 0x41]
+    );
+
+    drop(archive);
+    let _ = std::fs::remove_file(replacement_path);
+    std::fs::remove_file(file_path).unwrap();
+}
+
+#[test]
+fn file_backed_reader_reads_the_v1_golden_fixture() {
+    let file_path = temporary_archive_path("v1-file-backed");
+    std::fs::write(
+        &file_path,
+        from_hex(include_str!("fixtures/v1-none.hex").trim()),
+    )
+    .unwrap();
+    let archive = Archive::open_file(&file_path).unwrap();
+    assert_eq!(
+        archive.read_all(&path("golden.bin")).unwrap(),
+        [0x00, 0xff, 0x41]
+    );
+    drop(archive);
     std::fs::remove_file(file_path).unwrap();
 }
 
@@ -629,8 +1012,13 @@ fn parser_rejects_bad_headers_counts_codecs_sizes_and_overlapping_extents() {
     ));
 
     let mut index_overflow = original.clone();
-    put_u64(&mut index_overflow, 16, u64::MAX);
-    put_u64(&mut index_overflow, 24, 8);
+    let layout = header_layout(&index_overflow);
+    put_u64(
+        &mut index_overflow,
+        layout.index_offset_field,
+        engine_pak::HEADER_SIZE,
+    );
+    put_u64(&mut index_overflow, layout.index_len_field, u64::MAX);
     assert!(matches!(
         Archive::open(MemorySource::new(index_overflow)),
         Err(PakError::Corrupt(_))
@@ -707,8 +1095,8 @@ fn parser_rejects_bad_headers_counts_codecs_sizes_and_overlapping_extents() {
     ));
 
     let data_overlaps_index = reindex(original.clone(), |index| {
-        let index_offset = index_offset(&original);
-        put_u64(index, blob_entry_offset() + 61, (index_offset - 1) as u64);
+        let data_offset = data_offset(&original);
+        put_u64(index, blob_entry_offset() + 61, (data_offset - 1) as u64);
     });
     assert!(matches!(
         Archive::open(MemorySource::new(data_overlaps_index)),
@@ -760,22 +1148,94 @@ fn parser_rejects_bad_headers_counts_codecs_sizes_and_overlapping_extents() {
 }
 
 #[test]
+fn v2_header_rejects_each_invalid_section_boundary_and_reserved_field() {
+    let original = archive_bytes(Codec::None, 4, "a", b"data");
+
+    let mut bad_header_length = original.clone();
+    put_u32(&mut bad_header_length, 16, 95);
+    assert!(matches!(
+        Archive::open(MemorySource::new(bad_header_length)),
+        Err(PakError::Corrupt(_))
+    ));
+
+    let mut bad_section_count = original.clone();
+    put_u32(&mut bad_section_count, 20, 1);
+    assert!(matches!(
+        Archive::open(MemorySource::new(bad_section_count)),
+        Err(PakError::Corrupt(_))
+    ));
+
+    let mut bad_index_offset = original.clone();
+    put_u64(&mut bad_index_offset, 24, 97);
+    assert!(matches!(
+        Archive::open(MemorySource::new(bad_index_offset)),
+        Err(PakError::Corrupt(_))
+    ));
+
+    let mut data_gap = original.clone();
+    let data_start = data_offset(&data_gap) as u64;
+    put_u64(&mut data_gap, 40, data_start + 1);
+    assert!(matches!(
+        Archive::open(MemorySource::new(data_gap)),
+        Err(PakError::Corrupt(_))
+    ));
+
+    let mut data_overflow = original.clone();
+    put_u64(&mut data_overflow, 48, u64::MAX);
+    assert!(matches!(
+        Archive::open(MemorySource::new(data_overflow)),
+        Err(PakError::Corrupt(_))
+    ));
+
+    let mut data_not_at_end = original.clone();
+    let data_len = u64::from_le_bytes(data_not_at_end[48..56].try_into().unwrap());
+    put_u64(&mut data_not_at_end, 48, data_len - 1);
+    assert!(matches!(
+        Archive::open(MemorySource::new(data_not_at_end)),
+        Err(PakError::Corrupt(_))
+    ));
+
+    let mut nonzero_reserved = original.clone();
+    nonzero_reserved[88] = 1;
+    assert!(matches!(
+        Archive::open(MemorySource::new(nonzero_reserved)),
+        Err(PakError::Corrupt(_))
+    ));
+
+    let mut unknown_version = original;
+    put_u32(&mut unknown_version, 8, 77);
+    assert!(matches!(
+        Archive::open(MemorySource::new(unknown_version)),
+        Err(PakError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn v2_chunk_extent_cannot_run_past_file_end() {
+    let original = archive_bytes(Codec::None, 4, "a", b"data");
+    let file_end = original.len() as u64;
+    let out_of_file = reindex(original, |index| {
+        put_u64(index, blob_entry_offset() + 61, file_end - 1);
+    });
+    assert!(matches!(
+        Archive::open(MemorySource::new(out_of_file)),
+        Err(PakError::Corrupt(_))
+    ));
+}
+
+#[test]
 fn zstd_window_limit_rejects_oversized_window_before_decoder_work() {
     let base = archive_bytes(Codec::None, 1, "a", b"x");
     let start = index_offset(&base);
-    let mut index = base[start..].to_vec();
+    let mut index = base[start..start + index_len(&base)].to_vec();
     let blob = blob_entry_offset();
     let chunk = blob + 61;
     index[blob + 8] = 1; // Zstandard
     put_u64(&mut index, chunk + 8, 6);
     let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xf8]; // 2 TiB advertised window; truncated frame body.
-    let new_index_offset = 64 + frame.len() as u64;
-    let mut bytes = base[..64].to_vec();
-    bytes.extend_from_slice(&frame);
-    bytes.extend_from_slice(&index);
-    put_u64(&mut bytes, 16, new_index_offset);
-    put_u64(&mut bytes, 24, index.len() as u64);
-    bytes[32..64].copy_from_slice(blake3::hash(&index).as_bytes());
+    let data_start = engine_pak::HEADER_SIZE + index.len() as u64;
+    put_u64(&mut index, chunk, data_start);
+    let bytes = build_v2_archive(index, &frame);
 
     let archive = Archive::open(MemorySource::new(bytes.clone())).unwrap();
     assert!(matches!(
@@ -784,7 +1244,8 @@ fn zstd_window_limit_rejects_oversized_window_before_decoder_work() {
     ));
 
     let mut reserved_bit = bytes.clone();
-    reserved_bit[68] |= 0x08;
+    let reserved_byte = data_offset(&reserved_bit) + 4;
+    reserved_bit[reserved_byte] |= 0x08;
     let archive = Archive::open(MemorySource::new(reserved_bit)).unwrap();
     assert!(matches!(
         archive.read_all(&path("a")),
@@ -796,20 +1257,16 @@ fn zstd_window_limit_rejects_oversized_window_before_decoder_work() {
 fn zstd_rejects_concatenated_frames_in_one_chunk() {
     let base = archive_bytes(Codec::Zstd, 4, "a", b"x");
     let old_index_offset = index_offset(&base);
-    let mut index = base[old_index_offset..].to_vec();
+    let mut index = base[old_index_offset..old_index_offset + index_len(&base)].to_vec();
     let chunk = blob_entry_offset() + 61;
     let stored_len = u64::from_le_bytes(index[chunk + 8..chunk + 16].try_into().unwrap()) as usize;
-    let mut payload = base[64..64 + stored_len].to_vec();
+    let payload_start = data_offset(&base);
+    let mut payload = base[payload_start..payload_start + stored_len].to_vec();
     payload.extend_from_slice(&zstd::bulk::compress(b"y", 3).unwrap());
     put_u64(&mut index, chunk + 8, payload.len() as u64);
-    let new_index_offset = 64 + payload.len() as u64;
-    let mut header = base[..64].to_vec();
-    put_u64(&mut header, 16, new_index_offset);
-    put_u64(&mut header, 24, index.len() as u64);
-    header[32..64].copy_from_slice(blake3::hash(&index).as_bytes());
-    let mut bytes = header;
-    bytes.extend_from_slice(&payload);
-    bytes.extend_from_slice(&index);
+    let data_start = engine_pak::HEADER_SIZE + index.len() as u64;
+    put_u64(&mut index, chunk, data_start);
+    let bytes = build_v2_archive(index, &payload);
 
     let archive = Archive::open(MemorySource::new(bytes)).unwrap();
     assert!(matches!(
@@ -822,23 +1279,25 @@ fn zstd_rejects_concatenated_frames_in_one_chunk() {
 fn a_sparse_archive_can_read_a_chunk_above_four_gibibytes() {
     let compact = archive_bytes(Codec::None, 8, "a", b"abc");
     let old_index_offset = index_offset(&compact);
-    let index = &compact[old_index_offset..];
+    let index = &compact[old_index_offset..old_index_offset + index_len(&compact)];
     let mut shifted_index = index.to_vec();
     let blob = blob_entry_offset();
     let chunk = blob + 61;
     let data_offset = (1_u64 << 32) + 19;
     put_u64(&mut shifted_index, chunk, data_offset);
-    let new_index_offset = data_offset + 3;
-
-    let mut header = compact[..64].to_vec();
-    put_u64(&mut header, 16, new_index_offset);
-    header[32..64].copy_from_slice(blake3::hash(&shifted_index).as_bytes());
+    let archive_data_offset = engine_pak::HEADER_SIZE + shifted_index.len() as u64;
+    let file_len = data_offset + 3;
+    let header = v2_header(
+        shifted_index.len() as u64,
+        file_len - archive_data_offset,
+        *blake3::hash(&shifted_index).as_bytes(),
+    );
     let source = SparseSource {
-        len: new_index_offset + shifted_index.len() as u64,
+        len: file_len,
         regions: vec![
-            (0, header),
+            (0, header.to_vec()),
+            (engine_pak::HEADER_SIZE, shifted_index.clone()),
             (data_offset, b"abc".to_vec()),
-            (new_index_offset, shifted_index),
         ],
     };
     let archive = Archive::open(source).unwrap();
@@ -903,7 +1362,67 @@ fn catalog_total_index_budget_is_applied_before_each_archive_is_opened() {
 }
 
 #[test]
-fn none_codec_archive_matches_committed_v1_golden_fixture() {
+fn reader_opens_the_immutable_v1_golden_fixture() {
+    let bytes = from_hex(include_str!("fixtures/v1-none.hex").trim());
+    assert_eq!(archive_version(&bytes), 1);
+    let archive = Archive::open(MemorySource::new(bytes)).unwrap();
+    assert_eq!(
+        archive.read_all(&path("golden.bin")).unwrap(),
+        [0x00, 0xff, 0x41]
+    );
+}
+
+#[test]
+fn reader_rejects_truncated_golden_archives() {
+    let v1 = from_hex(include_str!("fixtures/v1-none.hex").trim());
+    for length in [0, 11, 12, 63] {
+        assert!(
+            matches!(
+                Archive::open(MemorySource::new(v1[..length].to_vec())),
+                Err(PakError::Corrupt(_))
+            ),
+            "truncated v1 archive of {length} bytes should be corrupt"
+        );
+    }
+
+    let v2 = from_hex(include_str!("fixtures/v2-none.hex").trim());
+    for length in [0, 11, 12, 63, 64, 95] {
+        assert!(
+            matches!(
+                Archive::open(MemorySource::new(v2[..length].to_vec())),
+                Err(PakError::Corrupt(_))
+            ),
+            "truncated v2 archive of {length} bytes should be corrupt"
+        );
+    }
+}
+
+#[test]
+fn v1_header_rejects_overflowing_or_nonterminal_index_extent() {
+    let original = from_hex(include_str!("fixtures/v1-none.hex").trim());
+
+    let mut index_overflow = original.clone();
+    put_u64(&mut index_overflow, 16, u64::MAX);
+    put_u64(&mut index_overflow, 24, 1);
+    assert!(matches!(
+        Archive::open(MemorySource::new(index_overflow)),
+        Err(PakError::Corrupt(_))
+    ));
+
+    let mut index_does_not_end_at_file_end = original.clone();
+    put_u64(
+        &mut index_does_not_end_at_file_end,
+        24,
+        index_len(&original) as u64 + 1,
+    );
+    assert!(matches!(
+        Archive::open(MemorySource::new(index_does_not_end_at_file_end)),
+        Err(PakError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn none_codec_writer_matches_v2_golden_fixture_and_round_trips() {
     let mut writer = ArchiveWriter::new(
         Cursor::new(Vec::new()),
         WriterOptions {
@@ -917,12 +1436,30 @@ fn none_codec_archive_matches_committed_v1_golden_fixture() {
         .add_local(path("golden.bin"), [0x00, 0xff, 0x41].as_slice(), None)
         .unwrap();
     let (bytes, _) = finish(writer);
-    assert_eq!(hex(&bytes), include_str!("fixtures/v1-none.hex").trim());
+    assert_eq!(archive_version(&bytes), 2);
+    assert_eq!(hex(&bytes), include_str!("fixtures/v2-none.hex").trim());
     let archive = Archive::open(MemorySource::new(bytes)).unwrap();
     assert_eq!(
         archive.read_all(&path("golden.bin")).unwrap(),
         [0x00, 0xff, 0x41]
     );
+}
+
+fn from_hex(input: &str) -> Vec<u8> {
+    let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
+    assert!(remainder.is_empty());
+    pairs
+        .iter()
+        .map(|pair| {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => panic!("invalid hex digit"),
+            };
+            digit(pair[0]) * 16 + digit(pair[1])
+        })
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {

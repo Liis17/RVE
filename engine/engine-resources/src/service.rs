@@ -1,8 +1,8 @@
-use crate::{ResourceConfig, ResourceError};
+use crate::{ResourceConfig, ResourceError, SourceMode};
 use engine_files::{FileSource, ReadAt, VirtualPath};
 use engine_pak::{
-    ArchiveCatalog, ArchiveLimits, CatalogLimits, MemoryFootprint, PakError, ReadControl,
-    ReadReservation, discover_archives,
+    Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, CatalogLimits, MemoryFootprint,
+    PakError, ReadControl, ReadReservation, discover_archives,
 };
 use flume::{Receiver, Selector, Sender, TryRecvError, TrySendError};
 use std::fs::{self, File};
@@ -853,18 +853,19 @@ impl Drop for WorkerPool {
 }
 
 fn open_backend(config: &ResourceConfig) -> Result<Backend, ResourceError> {
+    match &config.source_mode {
+        SourceMode::Auto => open_auto_backend(config),
+        SourceMode::Loose => Ok(Backend::Loose(config.root.clone())),
+        SourceMode::Registry => open_registry_backend(config),
+    }
+}
+
+fn open_auto_backend(config: &ResourceConfig) -> Result<Backend, ResourceError> {
     match discover_archives(&config.root) {
         Ok(discovered) if discovered.is_empty() => Ok(Backend::Loose(config.root.clone())),
         Ok(_) => {
-            let archive_limits = ArchiveLimits {
-                max_read_result_bytes: config.max_result_bytes,
-                max_read_memory_bytes: config.max_memory_bytes,
-                ..ArchiveLimits::default()
-            };
-            let catalog_limits = CatalogLimits {
-                max_total_index_bytes: config.max_total_index_bytes,
-                ..CatalogLimits::default()
-            };
+            let archive_limits = archive_limits(config);
+            let catalog_limits = catalog_limits(config);
             let catalog =
                 ArchiveCatalog::open_directory(&config.root, archive_limits, catalog_limits)?;
             Ok(Backend::Packed(Arc::new(catalog)))
@@ -873,6 +874,95 @@ fn open_backend(config: &ResourceConfig) -> Result<Backend, ResourceError> {
             Ok(Backend::Loose(config.root.clone()))
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+fn open_registry_backend(config: &ResourceConfig) -> Result<Backend, ResourceError> {
+    let base_path = config.root.join("base.rvepak");
+    let metadata = match fs::symlink_metadata(&base_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ResourceError::MissingBaseArchive(format!(
+                "base archive is missing: {}",
+                base_path.display()
+            )));
+        }
+        Err(source) => {
+            return Err(ResourceError::Io {
+                path: Some(base_path),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ResourceError::NonRegularFile(
+            base_path.display().to_string(),
+        ));
+    }
+
+    let archive_limits = archive_limits(config);
+    let base_archive = Archive::open_file_with_limits(&base_path, archive_limits.clone())?;
+    let registry_path = VirtualPath::parse("/rve/assets.toml")
+        .expect("registry path is a valid compile-time virtual path");
+    let registry_bytes = match base_archive.read_all(&registry_path) {
+        Ok(bytes) => bytes,
+        Err(PakError::NotFound(_)) => {
+            return Err(ResourceError::MissingRegistry(
+                "base archive does not contain /rve/assets.toml".into(),
+            ));
+        }
+        Err(PakError::MissingOwner(_)) => {
+            return Err(ResourceError::InvalidRegistry(
+                "/rve/assets.toml must be stored locally in base.rvepak".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    drop(base_archive);
+    let registry_source = String::from_utf8(registry_bytes).map_err(|error| {
+        ResourceError::InvalidRegistry(format!("/rve/assets.toml is not valid UTF-8: {error}"))
+    })?;
+    let registry = ArchiveSetRegistry::parse(&registry_source)
+        .map_err(|error| ResourceError::InvalidRegistry(error.to_string()))?;
+    registry
+        .validate_archive_files(&config.root)
+        .map_err(|error| ResourceError::ArchiveSetMismatch(error.to_string()))?;
+
+    let catalog =
+        ArchiveCatalog::open_directory(&config.root, archive_limits, catalog_limits(config))?;
+    let archive_ids = catalog
+        .archive_paths()
+        .map(|(id, path)| {
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    ResourceError::ArchiveSetMismatch(format!(
+                        "archive filename is not valid UTF-8: {}",
+                        path.display()
+                    ))
+                })?;
+            Ok((name.to_owned(), id))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, ResourceError>>()?;
+    registry
+        .validate_against_catalog(&catalog, &archive_ids, &config.root)
+        .map_err(|error| ResourceError::ArchiveSetMismatch(error.to_string()))?;
+    Ok(Backend::Packed(Arc::new(catalog)))
+}
+
+fn archive_limits(config: &ResourceConfig) -> ArchiveLimits {
+    ArchiveLimits {
+        max_read_result_bytes: config.max_result_bytes,
+        max_read_memory_bytes: config.max_memory_bytes,
+        ..ArchiveLimits::default()
+    }
+}
+
+fn catalog_limits(config: &ResourceConfig) -> CatalogLimits {
+    CatalogLimits {
+        max_total_index_bytes: config.max_total_index_bytes,
+        ..CatalogLimits::default()
     }
 }
 

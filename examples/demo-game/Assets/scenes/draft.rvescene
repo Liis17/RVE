@@ -1,0 +1,14 @@
+[[assets]]
+path = "/models/draft-cube.fbx"
+
+[[objects]]
+id = "camera"
+[objects.camera]
+fov_deg = 60.0
+near = 0.1
+far = 100.0
+
+[[objects]]
+id = "draft-cube"
+[objects.mesh_renderer]
+model = "/models/draft-cube.fbx"

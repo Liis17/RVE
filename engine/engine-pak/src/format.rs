@@ -1,10 +1,12 @@
 use crate::{PakError, Result};
-use engine_files::VirtualPath;
+use engine_files::{ReadAt, VirtualPath};
 use std::fmt;
 
 pub const MAGIC: [u8; 8] = *b"RVEPAK\0\0";
-pub const VERSION: u32 = 1;
-pub const HEADER_SIZE: u64 = 64;
+pub const VERSION: u32 = 2;
+pub const HEADER_SIZE: u64 = 96;
+pub(crate) const LEGACY_VERSION: u32 = 1;
+pub(crate) const LEGACY_HEADER_SIZE: u64 = 64;
 pub const DEFAULT_CHUNK_SIZE: u64 = 256 * 1024;
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 pub const MAX_LOGICAL_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
@@ -124,19 +126,37 @@ pub(crate) struct ParsedHeader {
     pub archive_id: ArchiveId,
     pub index_offset: u64,
     pub index_len: u64,
+    pub data_offset: u64,
+    pub data_len: u64,
 }
 
-pub(crate) fn decode_header(
-    bytes: &[u8; HEADER_SIZE as usize],
-    file_len: u64,
-) -> Result<ParsedHeader> {
-    if bytes[..8] != MAGIC {
+pub(crate) fn read_header(source: &dyn ReadAt, file_len: u64) -> Result<ParsedHeader> {
+    if file_len < 12 {
+        return Err(PakError::corrupt("archive is shorter than its header"));
+    }
+    let mut prefix = [0; 12];
+    source.read_exact_at(0, &mut prefix).map_err(PakError::io)?;
+    if prefix[..8] != MAGIC {
         return Err(PakError::corrupt("bad magic"));
     }
+    let version = read_u32(&prefix, 8)?;
+    let header_size = header_size_for_version(version)?;
+    if file_len < header_size {
+        return Err(PakError::corrupt("archive is shorter than its header"));
+    }
+    let mut bytes = vec![0; header_size as usize];
+    source.read_exact_at(0, &mut bytes).map_err(PakError::io)?;
+    decode_header(&bytes, file_len)
+}
 
+pub(crate) fn decode_header(bytes: &[u8], file_len: u64) -> Result<ParsedHeader> {
+    if bytes.len() < 12 || bytes[..8] != MAGIC {
+        return Err(PakError::corrupt("bad magic"));
+    }
     let version = read_u32(bytes, 8)?;
-    if version != VERSION {
-        return Err(PakError::Unsupported(format!("archive version {version}")));
+    let required_header_size = header_size_for_version(version)?;
+    if bytes.len() < required_header_size as usize || file_len < required_header_size {
+        return Err(PakError::corrupt("archive is shorter than its header"));
     }
 
     let flags = read_u32(bytes, 12)?;
@@ -144,41 +164,102 @@ pub(crate) fn decode_header(
         return Err(PakError::Unsupported(format!("header flags 0x{flags:08x}")));
     }
 
-    let index_offset = read_u64(bytes, 16)?;
-    let index_len = read_u64(bytes, 24)?;
+    if version == LEGACY_VERSION {
+        let index_offset = read_u64(bytes, 16)?;
+        let index_len = read_u64(bytes, 24)?;
+        let index_end = index_offset
+            .checked_add(index_len)
+            .ok_or_else(|| PakError::corrupt("index extent overflow"))?;
+        if index_offset < LEGACY_HEADER_SIZE || index_end != file_len {
+            return Err(PakError::corrupt(
+                "index must end at the end of the archive",
+            ));
+        }
+        let mut index_hash = [0; 32];
+        index_hash.copy_from_slice(&bytes[32..64]);
+        return Ok(ParsedHeader {
+            archive_id: ArchiveId(index_hash),
+            index_offset,
+            index_len,
+            data_offset: LEGACY_HEADER_SIZE,
+            data_len: index_offset - LEGACY_HEADER_SIZE,
+        });
+    }
+
+    if read_u32(bytes, 16)? != HEADER_SIZE as u32 {
+        return Err(PakError::corrupt("invalid v2 header length"));
+    }
+    if read_u32(bytes, 20)? != 2 {
+        return Err(PakError::corrupt("invalid v2 section count"));
+    }
+    let index_offset = read_u64(bytes, 24)?;
+    let index_len = read_u64(bytes, 32)?;
+    let data_offset = read_u64(bytes, 40)?;
+    let data_len = read_u64(bytes, 48)?;
+    if index_offset != HEADER_SIZE {
+        return Err(PakError::corrupt("v2 index does not follow header"));
+    }
     let index_end = index_offset
         .checked_add(index_len)
         .ok_or_else(|| PakError::corrupt("index extent overflow"))?;
-    if index_offset < HEADER_SIZE || index_end != file_len {
+    if data_offset != index_end {
+        return Err(PakError::corrupt("v2 data does not follow index"));
+    }
+    let data_end = data_offset
+        .checked_add(data_len)
+        .ok_or_else(|| PakError::corrupt("data extent overflow"))?;
+    if data_end != file_len {
         return Err(PakError::corrupt(
-            "index must end at the end of the archive",
+            "v2 data extent does not end at archive end",
         ));
     }
-
+    if bytes[88..96].iter().any(|byte| *byte != 0) {
+        return Err(PakError::corrupt("v2 reserved bytes are nonzero"));
+    }
     let mut index_hash = [0; 32];
-    index_hash.copy_from_slice(&bytes[32..64]);
-
+    index_hash.copy_from_slice(&bytes[56..88]);
     Ok(ParsedHeader {
         archive_id: ArchiveId(index_hash),
         index_offset,
         index_len,
+        data_offset,
+        data_len,
     })
 }
 
-pub(crate) fn encode_header(index_offset: u64, index_len: u64, archive_id: ArchiveId) -> [u8; 64] {
-    let mut bytes = [0; 64];
+fn header_size_for_version(version: u32) -> Result<u64> {
+    match version {
+        LEGACY_VERSION => Ok(LEGACY_HEADER_SIZE),
+        VERSION => Ok(HEADER_SIZE),
+        value => Err(PakError::Unsupported(format!("archive version {value}"))),
+    }
+}
+
+pub(crate) fn encode_header(
+    index_offset: u64,
+    index_len: u64,
+    data_offset: u64,
+    data_len: u64,
+    archive_id: ArchiveId,
+) -> [u8; HEADER_SIZE as usize] {
+    let mut bytes = [0; HEADER_SIZE as usize];
     bytes[..8].copy_from_slice(&MAGIC);
     bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
     bytes[12..16].copy_from_slice(&0_u32.to_le_bytes());
-    bytes[16..24].copy_from_slice(&index_offset.to_le_bytes());
-    bytes[24..32].copy_from_slice(&index_len.to_le_bytes());
-    bytes[32..64].copy_from_slice(archive_id.as_bytes());
+    bytes[16..20].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+    bytes[20..24].copy_from_slice(&2_u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&index_offset.to_le_bytes());
+    bytes[32..40].copy_from_slice(&index_len.to_le_bytes());
+    bytes[40..48].copy_from_slice(&data_offset.to_le_bytes());
+    bytes[48..56].copy_from_slice(&data_len.to_le_bytes());
+    bytes[56..88].copy_from_slice(archive_id.as_bytes());
     bytes
 }
 
 pub(crate) fn parse_index(
     bytes: &[u8],
-    index_offset: u64,
+    data_offset: u64,
+    data_end: u64,
     limits: &crate::ArchiveLimits,
 ) -> Result<(
     std::collections::BTreeMap<VirtualPath, FileReference>,
@@ -315,7 +396,7 @@ pub(crate) fn parse_index(
             let end = offset
                 .checked_add(stored_len)
                 .ok_or_else(|| PakError::corrupt("chunk extent overflow"))?;
-            if offset < HEADER_SIZE || end > index_offset {
+            if offset < data_offset || end > data_end {
                 return Err(PakError::corrupt(
                     "chunk extent is outside archive data region",
                 ));
@@ -376,14 +457,14 @@ pub(crate) fn parse_index(
     Ok((files, blobs))
 }
 
-pub(crate) fn encode_index(
+pub(crate) fn encoded_index_size(
     files: &std::collections::BTreeMap<VirtualPath, FileReference>,
     blobs: &std::collections::BTreeMap<BlobId, LocalBlob>,
     max_bytes: u64,
-) -> Result<Vec<u8>> {
-    let file_count = u32::try_from(files.len())
+) -> Result<u64> {
+    u32::try_from(files.len())
         .map_err(|_| PakError::InvalidConfiguration("too many file paths".into()))?;
-    let blob_count = u32::try_from(blobs.len())
+    u32::try_from(blobs.len())
         .map_err(|_| PakError::InvalidConfiguration("too many local blobs".into()))?;
     let mut size = 8_u64;
     for (path, reference) in files {
@@ -415,6 +496,19 @@ pub(crate) fn encode_index(
             limit: max_bytes,
         });
     }
+    Ok(size)
+}
+
+pub(crate) fn encode_index(
+    files: &std::collections::BTreeMap<VirtualPath, FileReference>,
+    blobs: &std::collections::BTreeMap<BlobId, LocalBlob>,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let file_count = u32::try_from(files.len())
+        .map_err(|_| PakError::InvalidConfiguration("too many file paths".into()))?;
+    let blob_count = u32::try_from(blobs.len())
+        .map_err(|_| PakError::InvalidConfiguration("too many local blobs".into()))?;
+    let size = encoded_index_size(files, blobs, max_bytes)?;
     let capacity = usize::try_from(size)
         .map_err(|_| PakError::InvalidConfiguration("index does not fit address space".into()))?;
     let mut bytes = Vec::new();

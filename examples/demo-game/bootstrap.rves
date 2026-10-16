@@ -1,0 +1,5 @@
+WindowSizeX=1280
+WindowSizeY=720
+WindowTitle=RVE Demo
+AllowMultipleInstances=false
+AppIcon=/icons/app.png

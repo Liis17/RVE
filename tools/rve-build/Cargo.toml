@@ -1,0 +1,22 @@
+[package]
+name = "rve-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-assets = { path = "../../engine/engine-assets" }
+engine-files = { path = "../../engine/engine-files" }
+engine-pak = { path = "../../engine/engine-pak" }
+engine-project = { path = "../../engine/engine-project" }
+engine-resources = { path = "../../engine/engine-resources" }
+engine-scene = { path = "../../engine/engine-scene" }
+libc.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+png.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }

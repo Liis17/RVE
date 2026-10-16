@@ -10,13 +10,13 @@ Parent: [[Index]]
 
 | Файл | Значимый символ | Роль |
 |---|---|---|
-| `engine/sandbox/src/main.rs` | `parse_args`, `load_content`, `Sandbox`, `WindowHandler`, `main` | Разбор CLI, загрузка ресурсов, инициализация renderer, кадры и коды завершения |
+| `engine/sandbox/src/main.rs` | `parse_args`, `load_content`, `Sandbox`, `WindowHandler`, `main` | Подготовка Vulkan-окружения до потоков, разбор CLI, загрузка ресурсов, инициализация renderer, кадры и коды завершения |
 | `engine/sandbox/src/content.rs` | `Content`, `Mesh` | Меши и текстуры кадра из демонстрационной сцены или модели; вписывание модели в единичный куб, окружение и замена текстур |
 | `engine/sandbox/src/scene.rs` | `Scene`, `plane_mesh`, `cube_mesh`, `checker_texture`, `triangle_view_projection`, `cube_view_projection`, `shadows_light_view_projection` | Геометрия и параметры демонстрационных сцен; камеры и свет используют [[Engine/EngineScene]] |
 | `engine/sandbox/src/debug_overlay.rs` | `DebugOverlay` | Метрики `--debug-overlay`, их история и геометрия панели со шрифтом font8x8 |
-| `engine/sandbox/src/bootstrap.rs` | `load` | Чтение и проверка начального размера окна из рабочего каталога |
-| `bootstrap.rves.example` | `WindowSizeX`, `WindowSizeY` | Шаблон локального файла настроек |
-| `engine/sandbox/Cargo.toml` | зависимости `engine-core`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `glam`, `sysinfo`, `font8x8` | Сборка приложения из рабочих крейтов, сцена, загрузка ресурсов, статистика и bitmap-шрифт оверлея |
+| `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Общий разбор и загрузка начальных настроек `bootstrap.rves` |
+| `bootstrap.rves.example` | `WindowSizeX`, `WindowSizeY`, `WindowTitle`, `AllowMultipleInstances` | Шаблон локального файла настроек |
+| `engine/sandbox/Cargo.toml` | зависимости `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `glam`, `sysinfo`, `font8x8` | Сборка приложения из рабочих крейтов, подготовка Vulkan-окружения, сцена, загрузка ресурсов, статистика и bitmap-шрифт оверлея |
 
 ## Публичные контракты
 
@@ -34,19 +34,16 @@ Parent: [[Index]]
 
 Повторные или неизвестные флаги, отсутствие значения, некорректное значение и сочетание `--scene triangle --model …` дают код 2. Ошибка запуска `ResourceSystem` или загрузки содержимого (`AssetError`) выводится как `Ошибка ресурса: …` и даёт код 2 до создания окна. Это относится и к повреждённым архивам, отсутствующим владельцам и дублирующим virtual paths при процедурной сцене. При сочетании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка окна или renderer даёт код 1; успешное закрытие или завершение лимита — код 0.
 
-Перед созданием окна `bootstrap::load` читает `bootstrap.rves` из текущего рабочего
-каталога (обычно `build/`). `WindowSizeX` и `WindowSizeY` задают начальные ширину и
-высоту клиентской области в физических пикселях. Формат — `Имя=Значение`, один
-параметр на строку, значения — положительные `u32`. Пустые строки и пробелы вокруг
-имени/значения допускаются, регистр имён учитывается. Если файла или параметра нет,
-сохраняется соответствующее значение `WindowConfig::default()` (1280×720).
-Ошибки чтения, неверный синтаксис, значения, неизвестные и повторные параметры
-завершают запуск с кодом 2 до создания окна. Ошибки разбора содержат файл и номер строки.
-Настройки читаются один раз при запуске. Шаблон хранится в репозитории, локальный
-`build/bootstrap.rves` игнорируется Git и не перезаписывается приложением.
+Перед созданием окна sandbox загружает `BootstrapConfig` из `bootstrap.rves` в cwd
+(обычно `build/`). Он применяет размер и заголовок окна; `AllowMultipleInstances` и
+`AppIcon` разбираются, но sandbox их не использует. Поля, defaults, ошибки и пути
+bootstrap для остальных потребителей описаны в [[Engine/EngineProject]]. Ошибка
+настроек завершается кодом 2 до создания окна. Шаблон хранится в репозитории,
+локальный `build/bootstrap.rves` игнорируется Git и не перезаписывается приложением.
 
 ## Зависимости и взаимодействия
 
+- Первая операция `main` получает канонический `exe_dir` и вызывает `unsafe engine_platform::prepare_vulkan_environment` с SAFETY-условием: до этого не разбираются аргументы, не запускаются ресурсы и не создаются потоки. При отсутствии bundled-файлов вызов ничего не меняет.
 - Использует [[Engine/EngineCore]] для `Time`.
 - Через [[Engine/EngineWindow]] реализует `WindowHandler`.
 - После проверки аргументов и `bootstrap.rves` запускает [[Engine/EngineResources]] с корнем `ASSETS_DIR` (`assets` в рабочем каталоге); верхнеуровневый `.rvepak` выбирает packed-only режим.

@@ -7,3 +7,4 @@ license.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 ash.workspace = true
 ash-window.workspace = true
+windows-sys.workspace = true
