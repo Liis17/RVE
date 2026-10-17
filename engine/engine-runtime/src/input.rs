@@ -157,9 +157,117 @@ fn map_mouse_button(button: WindowMouseButton) -> MouseButton {
 
 #[cfg(test)]
 mod tests {
-    use super::InputAccumulator;
+    use super::{InputAccumulator, map_key, map_mouse_button};
     use engine_script::{Key, MouseButton};
     use engine_window::{Key as WindowKey, MouseButton as WindowMouseButton};
+
+    #[test]
+    fn every_window_key_maps_to_the_matching_script_key() {
+        let keys = [
+            WindowKey::A,
+            WindowKey::B,
+            WindowKey::C,
+            WindowKey::D,
+            WindowKey::E,
+            WindowKey::F,
+            WindowKey::G,
+            WindowKey::H,
+            WindowKey::I,
+            WindowKey::J,
+            WindowKey::K,
+            WindowKey::L,
+            WindowKey::M,
+            WindowKey::N,
+            WindowKey::O,
+            WindowKey::P,
+            WindowKey::Q,
+            WindowKey::R,
+            WindowKey::S,
+            WindowKey::T,
+            WindowKey::U,
+            WindowKey::V,
+            WindowKey::W,
+            WindowKey::X,
+            WindowKey::Y,
+            WindowKey::Z,
+            WindowKey::Digit0,
+            WindowKey::Digit1,
+            WindowKey::Digit2,
+            WindowKey::Digit3,
+            WindowKey::Digit4,
+            WindowKey::Digit5,
+            WindowKey::Digit6,
+            WindowKey::Digit7,
+            WindowKey::Digit8,
+            WindowKey::Digit9,
+            WindowKey::F1,
+            WindowKey::F2,
+            WindowKey::F3,
+            WindowKey::F4,
+            WindowKey::F5,
+            WindowKey::F6,
+            WindowKey::F7,
+            WindowKey::F8,
+            WindowKey::F9,
+            WindowKey::F10,
+            WindowKey::F11,
+            WindowKey::F12,
+            WindowKey::ArrowUp,
+            WindowKey::ArrowDown,
+            WindowKey::ArrowLeft,
+            WindowKey::ArrowRight,
+            WindowKey::Space,
+            WindowKey::Enter,
+            WindowKey::Escape,
+            WindowKey::Tab,
+            WindowKey::Backspace,
+            WindowKey::ShiftLeft,
+            WindowKey::ShiftRight,
+            WindowKey::ControlLeft,
+            WindowKey::ControlRight,
+            WindowKey::AltLeft,
+            WindowKey::AltRight,
+            WindowKey::SuperLeft,
+            WindowKey::SuperRight,
+        ];
+
+        for key in keys {
+            let mapped = map_key(key);
+            assert_eq!(
+                mapped as u32, key as u32,
+                "key {key:?} has a different ABI code"
+            );
+            assert_eq!(
+                Key::from_name(&format!("{key:?}")),
+                Some(mapped),
+                "key {key:?} maps to a different ABI variant"
+            );
+        }
+    }
+
+    #[test]
+    fn every_window_mouse_button_maps_to_the_matching_script_button() {
+        let buttons = [
+            WindowMouseButton::Left,
+            WindowMouseButton::Right,
+            WindowMouseButton::Middle,
+            WindowMouseButton::Back,
+            WindowMouseButton::Forward,
+        ];
+
+        for button in buttons {
+            let mapped = map_mouse_button(button);
+            assert_eq!(
+                mapped as u32, button as u32,
+                "mouse button {button:?} has a different ABI code"
+            );
+            assert_eq!(
+                MouseButton::from_name(&format!("{button:?}")),
+                Some(mapped),
+                "mouse button {button:?} maps to a different ABI variant"
+            );
+        }
+    }
 
     #[test]
     fn key_edges_persist_until_the_frame_is_taken_and_repeat_does_not_press_again() {
