@@ -1,4 +1,5 @@
 use crate::activation::PendingActivation;
+use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::ModuleHost;
 use crate::pipeline::{
     ExitRequester, FrameSnapshot, RENDER_THREAD, RenderControl, RenderThreadConfig, RuntimeStatus,
@@ -7,9 +8,9 @@ use crate::pipeline::{
 use crate::scene::{PreparedRenderAssets, upload_scene};
 use engine_render::{Renderer, RendererConfig};
 use engine_script::ScriptInterruptHandle;
-use engine_window::{Window, WindowConfig, WindowHandler, WindowProxy, run};
+use engine_window::{Key, MouseButton, Window, WindowConfig, WindowHandler, WindowProxy, run};
 use flume::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct WindowExit(WindowProxy);
@@ -32,6 +33,7 @@ pub(crate) struct PlayerConfig {
     pub script_stopped_rx: std::sync::mpsc::Receiver<()>,
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
+    pub input: Arc<Mutex<InputAccumulator>>,
 }
 
 pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
@@ -47,6 +49,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         script_stopped_rx,
         interrupt,
         status,
+        input,
     } = config;
     let mut handler = PlayerWindow {
         frame_limit,
@@ -64,6 +67,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         window_exit: None,
         render_started: false,
         cleaned: false,
+        input,
     };
     let run_result = run(window, &mut handler);
     handler.cleanup();
@@ -92,6 +96,7 @@ struct PlayerWindow<'a> {
     window_exit: Option<Arc<dyn ExitRequester>>,
     render_started: bool,
     cleaned: bool,
+    input: Arc<Mutex<InputAccumulator>>,
 }
 
 impl PlayerWindow<'_> {
@@ -285,6 +290,30 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn occluded(&mut self, occluded: bool) {
         let _ = self.render_tx.send(RenderControl::Occluded(occluded));
+    }
+
+    fn key(&mut self, key: Key, pressed: bool) {
+        lock_input(&self.input).key(key, pressed);
+    }
+
+    fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
+        lock_input(&self.input).mouse_button(button, pressed);
+    }
+
+    fn cursor_moved(&mut self, x: f64, y: f64) {
+        lock_input(&self.input).cursor_moved(x, y);
+    }
+
+    fn mouse_motion(&mut self, dx: f64, dy: f64) {
+        lock_input(&self.input).mouse_motion(dx, dy);
+    }
+
+    fn mouse_wheel(&mut self, dx: f32, dy: f32) {
+        lock_input(&self.input).mouse_wheel(dx, dy);
+    }
+
+    fn focused(&mut self, focused: bool) {
+        lock_input(&self.input).focused(focused);
     }
 
     fn exiting(&mut self) {

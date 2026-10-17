@@ -4,7 +4,7 @@ use crate::lite::{self, ActiveCall, ActiveSource, EventQueue, LuaInstance};
 use crate::transaction::{
     MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction,
 };
-use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
+use crate::types::{ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTime, ScriptTransform};
 use engine_scene::{LocalTransform, ObjectHandle, World};
 use mlua::{Error as LuaError, Lua, Table};
 use std::cell::{Cell, RefCell};
@@ -116,6 +116,7 @@ pub struct ScriptHost {
     interruption_reported: bool,
     started: bool,
     destroyed: bool,
+    input: ScriptInput,
 }
 
 #[derive(Clone, Copy)]
@@ -184,6 +185,7 @@ impl ScriptHost {
             interruption_reported: false,
             started: false,
             destroyed: false,
+            input: ScriptInput::default(),
         };
         let mut classes: HashMap<String, Table> = HashMap::new();
 
@@ -207,8 +209,8 @@ impl ScriptHost {
                         object.handle,
                         &source_label,
                         false,
-                        host.queued_messages.len(),
-                        host.queued_bytes,
+                        host.input,
+                        (host.queued_messages.len(), host.queued_bytes),
                     );
                     let _active_call = ActiveCallGuard::new(
                         &host.active_call,
@@ -260,8 +262,8 @@ impl ScriptHost {
                         object.handle,
                         &source,
                         false,
-                        host.queued_messages.len(),
-                        host.queued_bytes,
+                        host.input,
+                        (host.queued_messages.len(), host.queued_bytes),
                     );
                     let result = AbiScriptInstance::create(
                         descriptor,
@@ -307,6 +309,11 @@ impl ScriptHost {
         self.interrupt.clone()
     }
 
+    /// Replaces the input snapshot used by the next update and its lifecycle callbacks.
+    pub fn set_input(&mut self, input: ScriptInput) {
+        self.input = input;
+    }
+
     /// Runs on_start once. update also calls start automatically if needed.
     pub fn start(&mut self, world: &mut World, time: ScriptTime) {
         if self.started || self.destroyed {
@@ -333,6 +340,7 @@ impl ScriptHost {
             return;
         }
         self.destroyed = true;
+        self.input.clear_frame_transients();
         if self.started {
             self.run_phase(world, Phase::Destroy, time);
         }
@@ -461,6 +469,7 @@ impl ScriptHost {
             active_source,
             active_call,
             transaction,
+            input,
             queued_messages,
             queued_bytes,
             lua,
@@ -478,8 +487,8 @@ impl ScriptHost {
             instance.handle,
             &instance.source,
             true,
-            queued_messages.len(),
-            *queued_bytes,
+            *input,
+            (queued_messages.len(), *queued_bytes),
         );
         let transaction_ptr = transaction as *mut ScriptTransaction;
         let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {

@@ -118,6 +118,8 @@ startup-потоке, внешние текстуры читаются чере�
 
 Источники: `engine/engine-runtime/src/lib.rs`, `engine/engine-runtime/src/player.rs`, `engine/engine-runtime/src/pipeline.rs`, `engine/engine-runtime/src/scene.rs`, `engine/rve-player/src/main.rs`.
 
+Ввод следует через отдельный поток событий: `engine-window` переводит winit в собственные `Key`/`MouseButton` и вызывает `WindowHandler`; `PlayerWindow` на главном потоке коротко обновляет `Arc<Mutex<InputAccumulator>>`. Scripts thread перед каждым update забирает кадровый snapshot и передаёт его Lua и Rust ABI через `ScriptInput`. Потеря фокуса и Background генерируют released edges и очищают удерживаемое состояние; детали описаны в [[Engine/EngineWindow]], [[Engine/EngineRuntime]], [[Engine/EngineScript]] и [[Engine/RveSdk]].
+
 ### Vulkan-кадр
 
 `Renderer::new` загружает Vulkan loader и создаёт surface через `engine-platform`; объединяет требования платформы с расширениями surface/swapchain и конфигурации. Общий renderer создаёт instance с флагами адаптера и выбирает физическое устройство с API не ниже 1.3, поддержкой dynamic rendering и synchronization2, общей graphics/present queue family и подходящими форматами. Дискретное устройство получает приоритет. При нулевом начальном размере создание swapchain и per-frame offscreen-targets откладывается; общая shadow map создаётся при инициализации renderer.

@@ -5,6 +5,7 @@
 
 pub mod abi;
 
+pub use abi::{Key, MouseButton};
 use abi::{
     RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
     RveHost, RveParams, RveStr, RveTime, RveTransform, RveValue, RveValueData,
@@ -191,6 +192,11 @@ pub struct Context<'a> {
     _not_send_or_sync: PhantomData<*const ()>,
 }
 
+/// Read-only snapshot of keyboard, mouse, and wheel input for the current script callback.
+pub struct Input<'a> {
+    host: &'a RveHost,
+}
+
 /// Copyable handle to a scene object. It remains stable while its scene is loaded and may be
 /// stored in a script struct. Every operation on it requires the current callback's `Context`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,6 +238,11 @@ impl<'a> Context<'a> {
     /// Returns the host's time snapshot for this lifecycle call.
     pub fn time(&self) -> RveTime {
         self.host.time
+    }
+
+    /// Returns the input snapshot available during this callback.
+    pub fn input(&self) -> Input<'_> {
+        Input { host: self.host }
     }
 
     /// Returns this script object's stable runtime handle.
@@ -317,6 +328,70 @@ impl<'a> Context<'a> {
         }
         // SAFETY: the host keeps returned strings alive through the current guest callback.
         unsafe { value.to_str().ok().map(str::to_owned) }
+    }
+}
+
+impl Input<'_> {
+    /// Returns whether a key is currently held.
+    pub fn key_down(&self, key: Key) -> bool {
+        self.key_state(key) & abi::RVE_INPUT_DOWN != 0
+    }
+
+    /// Returns whether a key became held in this frame.
+    pub fn key_pressed(&self, key: Key) -> bool {
+        self.key_state(key) & abi::RVE_INPUT_PRESSED != 0
+    }
+
+    /// Returns whether a key became released in this frame.
+    pub fn key_released(&self, key: Key) -> bool {
+        self.key_state(key) & abi::RVE_INPUT_RELEASED != 0
+    }
+
+    /// Returns whether a mouse button is currently held.
+    pub fn mouse_down(&self, button: MouseButton) -> bool {
+        self.mouse_button_state(button) & abi::RVE_INPUT_DOWN != 0
+    }
+
+    /// Returns whether a mouse button became held in this frame.
+    pub fn mouse_pressed(&self, button: MouseButton) -> bool {
+        self.mouse_button_state(button) & abi::RVE_INPUT_PRESSED != 0
+    }
+
+    /// Returns whether a mouse button became released in this frame.
+    pub fn mouse_released(&self, button: MouseButton) -> bool {
+        self.mouse_button_state(button) & abi::RVE_INPUT_RELEASED != 0
+    }
+
+    /// Returns the cursor position in physical window pixels.
+    pub fn cursor(&self) -> [f32; 2] {
+        self.input_vector(self.host.cursor_position)
+    }
+
+    /// Returns accumulated raw mouse motion since the preceding script update.
+    pub fn mouse_delta(&self) -> [f32; 2] {
+        self.input_vector(self.host.mouse_delta)
+    }
+
+    /// Returns accumulated wheel motion in lines since the preceding script update.
+    pub fn wheel(&self) -> [f32; 2] {
+        self.input_vector(self.host.wheel_delta)
+    }
+
+    fn key_state(&self, key: Key) -> u32 {
+        // SAFETY: the host pointer remains valid during this script callback.
+        unsafe { (self.host.key_state)(self.host.ctx, key as u32) }
+    }
+
+    fn mouse_button_state(&self, button: MouseButton) -> u32 {
+        // SAFETY: the host pointer remains valid during this script callback.
+        unsafe { (self.host.mouse_button_state)(self.host.ctx, button as u32) }
+    }
+
+    fn input_vector(&self, callback: abi::RveInputVectorFn) -> [f32; 2] {
+        let mut value = [0.0; 2];
+        // SAFETY: the host pointer and output slot remain valid during this script callback.
+        let _ = unsafe { callback(self.host.ctx, &mut value) };
+        value
     }
 }
 

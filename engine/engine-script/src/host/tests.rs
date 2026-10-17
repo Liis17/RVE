@@ -1,5 +1,5 @@
 use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError};
-use crate::{ScriptEventLevel, ScriptLibrary, ScriptTime};
+use crate::{Key, MouseButton, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime};
 use engine_scene::{SceneDocument, World};
 use rve_sdk::{Context, Params, Script, Value};
 use std::collections::BTreeMap;
@@ -39,6 +39,176 @@ fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .iter()
         .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
         .collect()
+}
+
+#[test]
+fn lua_input_api_reads_the_shared_frame_snapshot() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+function Input:on_update()
+  local x, y = rve.input.cursor()
+  local dx, dy = rve.input.mouse_delta()
+  local wx, wy = rve.input.wheel()
+  if rve.input.key_down("W") and rve.input.key_pressed("W")
+      and rve.input.key_released("A")
+      and rve.input.mouse_down("Left") and rve.input.mouse_pressed("Left")
+      and rve.input.mouse_released("Right")
+      and x == 40 and y == 60 and dx == 2.5 and dy == -3
+      and wx == 1 and wy == 0.5 then
+    rve.log_info("Lua input snapshot")
+  else
+    error("input snapshot mismatch")
+  end
+end
+return Input
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("input.lua", source)]), None).unwrap();
+    let mut input = ScriptInput::default();
+    input.set_key(Key::W, true);
+    input.set_key(Key::A, true);
+    input.set_key(Key::A, false);
+    input.set_mouse_button(MouseButton::Left, true);
+    input.set_mouse_button(MouseButton::Right, true);
+    input.set_mouse_button(MouseButton::Right, false);
+    input.set_cursor(40.0, 60.0);
+    input.add_mouse_delta(2.5, -3.0);
+    input.add_wheel(1.0, 0.5);
+    host.set_input(input);
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "Lua input snapshot"
+    }));
+}
+
+#[test]
+fn lua_destroy_clears_input_edges_and_deltas_but_keeps_down_and_cursor() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+function Input:on_update()
+  local x, y = rve.input.cursor()
+  local dx, dy = rve.input.mouse_delta()
+  local wx, wy = rve.input.wheel()
+  if rve.input.key_down("W") and rve.input.key_pressed("W")
+      and rve.input.key_released("A")
+      and rve.input.mouse_down("Left") and rve.input.mouse_pressed("Left")
+      and rve.input.mouse_released("Right")
+      and x == 40 and y == 60 and dx == 2.5 and dy == -3
+      and wx == 1 and wy == 0.5 then
+    rve.log_info("input update visible")
+  else
+    error("input update mismatch")
+  end
+end
+function Input:on_destroy()
+  local x, y = rve.input.cursor()
+  local dx, dy = rve.input.mouse_delta()
+  local wx, wy = rve.input.wheel()
+  if not rve.input.key_down("W") or rve.input.key_pressed("W")
+      or rve.input.key_released("W") or rve.input.key_down("A")
+      or rve.input.key_pressed("A") or rve.input.key_released("A")
+      or not rve.input.mouse_down("Left") or rve.input.mouse_pressed("Left")
+      or rve.input.mouse_released("Left") or rve.input.mouse_down("Right")
+      or rve.input.mouse_pressed("Right") or rve.input.mouse_released("Right")
+      or x ~= 40 or y ~= 60 or dx ~= 0 or dy ~= 0 or wx ~= 0 or wy ~= 0 then
+    error("input destroy mismatch")
+  end
+  rve.log_info("destroy input cleared")
+end
+return Input
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("input.lua", source)]), None).unwrap();
+    let mut input = ScriptInput::default();
+    input.set_key(Key::W, true);
+    input.set_key(Key::A, true);
+    input.set_key(Key::A, false);
+    input.set_mouse_button(MouseButton::Left, true);
+    input.set_mouse_button(MouseButton::Right, true);
+    input.set_mouse_button(MouseButton::Right, false);
+    input.set_cursor(40.0, 60.0);
+    input.add_mouse_delta(2.5, -3.0);
+    input.add_wheel(1.0, 0.5);
+    host.set_input(input);
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "input update visible"
+    }));
+
+    host.destroy(&mut world, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "destroy input cleared"
+    }));
+}
+
+#[test]
+fn lua_input_rejects_unknown_key_names() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+function Input:on_update()
+  rve.input.key_down("UnknownKey")
+end
+return Input
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("input.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("unknown input key")
+    }));
+}
+
+#[test]
+fn lua_input_rejects_unknown_mouse_button_names() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+function Input:on_update()
+  rve.input.mouse_down("Extra")
+end
+return Input
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("input.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("unknown mouse button")
+    }));
 }
 
 struct LabeledHeavy {

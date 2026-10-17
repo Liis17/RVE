@@ -2,8 +2,239 @@
 
 use std::ffi::c_void;
 
-/// Version of the script ABI. It remains provisional until the API is finalized.
+/// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
 pub const RVE_SCRIPT_ABI_VERSION: u32 = 1;
+
+/// Input state bit: the key or button is currently held.
+pub const RVE_INPUT_DOWN: u32 = 1;
+/// Input state bit: the key or button became held in this frame.
+pub const RVE_INPUT_PRESSED: u32 = 2;
+/// Input state bit: the key or button became released in this frame.
+pub const RVE_INPUT_RELEASED: u32 = 4;
+
+/// Stable key codes shared by the host ABI and the Rust guest API.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Key {
+    A = 0,
+    B = 1,
+    C = 2,
+    D = 3,
+    E = 4,
+    F = 5,
+    G = 6,
+    H = 7,
+    I = 8,
+    J = 9,
+    K = 10,
+    L = 11,
+    M = 12,
+    N = 13,
+    O = 14,
+    P = 15,
+    Q = 16,
+    R = 17,
+    S = 18,
+    T = 19,
+    U = 20,
+    V = 21,
+    W = 22,
+    X = 23,
+    Y = 24,
+    Z = 25,
+    Digit0 = 26,
+    Digit1 = 27,
+    Digit2 = 28,
+    Digit3 = 29,
+    Digit4 = 30,
+    Digit5 = 31,
+    Digit6 = 32,
+    Digit7 = 33,
+    Digit8 = 34,
+    Digit9 = 35,
+    F1 = 36,
+    F2 = 37,
+    F3 = 38,
+    F4 = 39,
+    F5 = 40,
+    F6 = 41,
+    F7 = 42,
+    F8 = 43,
+    F9 = 44,
+    F10 = 45,
+    F11 = 46,
+    F12 = 47,
+    ArrowUp = 48,
+    ArrowDown = 49,
+    ArrowLeft = 50,
+    ArrowRight = 51,
+    Space = 52,
+    Enter = 53,
+    Escape = 54,
+    Tab = 55,
+    Backspace = 56,
+    ShiftLeft = 57,
+    ShiftRight = 58,
+    ControlLeft = 59,
+    ControlRight = 60,
+    AltLeft = 61,
+    AltRight = 62,
+    SuperLeft = 63,
+    SuperRight = 64,
+}
+
+impl Key {
+    /// Converts an API name to a key.
+    pub fn from_name(name: &str) -> Option<Self> {
+        if let [letter @ b'A'..=b'Z'] = name.as_bytes() {
+            return Self::from_code(u32::from(*letter - b'A'));
+        }
+        if let Some(digit) = name.strip_prefix("Digit")
+            && let [digit @ b'0'..=b'9'] = digit.as_bytes()
+        {
+            return Self::from_code(26 + u32::from(*digit - b'0'));
+        }
+        if let Some(function_key) = name.strip_prefix('F') {
+            let number = match function_key.as_bytes() {
+                [number @ b'1'..=b'9'] => u32::from(*number - b'0'),
+                [b'1', tens @ b'0'..=b'2'] => 10 + u32::from(*tens - b'0'),
+                _ => 0,
+            };
+            if (1..=12).contains(&number) {
+                return Self::from_code(35 + number);
+            }
+        }
+        match name {
+            "ArrowUp" => Some(Self::ArrowUp),
+            "ArrowDown" => Some(Self::ArrowDown),
+            "ArrowLeft" => Some(Self::ArrowLeft),
+            "ArrowRight" => Some(Self::ArrowRight),
+            "Space" => Some(Self::Space),
+            "Enter" => Some(Self::Enter),
+            "Escape" => Some(Self::Escape),
+            "Tab" => Some(Self::Tab),
+            "Backspace" => Some(Self::Backspace),
+            "ShiftLeft" => Some(Self::ShiftLeft),
+            "ShiftRight" => Some(Self::ShiftRight),
+            "ControlLeft" => Some(Self::ControlLeft),
+            "ControlRight" => Some(Self::ControlRight),
+            "AltLeft" => Some(Self::AltLeft),
+            "AltRight" => Some(Self::AltRight),
+            "SuperLeft" => Some(Self::SuperLeft),
+            "SuperRight" => Some(Self::SuperRight),
+            _ => None,
+        }
+    }
+
+    /// Converts a stable ABI key code to a key when it is supported.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
+            0 => Self::A,
+            1 => Self::B,
+            2 => Self::C,
+            3 => Self::D,
+            4 => Self::E,
+            5 => Self::F,
+            6 => Self::G,
+            7 => Self::H,
+            8 => Self::I,
+            9 => Self::J,
+            10 => Self::K,
+            11 => Self::L,
+            12 => Self::M,
+            13 => Self::N,
+            14 => Self::O,
+            15 => Self::P,
+            16 => Self::Q,
+            17 => Self::R,
+            18 => Self::S,
+            19 => Self::T,
+            20 => Self::U,
+            21 => Self::V,
+            22 => Self::W,
+            23 => Self::X,
+            24 => Self::Y,
+            25 => Self::Z,
+            26 => Self::Digit0,
+            27 => Self::Digit1,
+            28 => Self::Digit2,
+            29 => Self::Digit3,
+            30 => Self::Digit4,
+            31 => Self::Digit5,
+            32 => Self::Digit6,
+            33 => Self::Digit7,
+            34 => Self::Digit8,
+            35 => Self::Digit9,
+            36 => Self::F1,
+            37 => Self::F2,
+            38 => Self::F3,
+            39 => Self::F4,
+            40 => Self::F5,
+            41 => Self::F6,
+            42 => Self::F7,
+            43 => Self::F8,
+            44 => Self::F9,
+            45 => Self::F10,
+            46 => Self::F11,
+            47 => Self::F12,
+            48 => Self::ArrowUp,
+            49 => Self::ArrowDown,
+            50 => Self::ArrowLeft,
+            51 => Self::ArrowRight,
+            52 => Self::Space,
+            53 => Self::Enter,
+            54 => Self::Escape,
+            55 => Self::Tab,
+            56 => Self::Backspace,
+            57 => Self::ShiftLeft,
+            58 => Self::ShiftRight,
+            59 => Self::ControlLeft,
+            60 => Self::ControlRight,
+            61 => Self::AltLeft,
+            62 => Self::AltRight,
+            63 => Self::SuperLeft,
+            64 => Self::SuperRight,
+            _ => return None,
+        })
+    }
+}
+
+/// Stable mouse-button codes shared by the host ABI and the Rust guest API.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MouseButton {
+    Left = 0,
+    Right = 1,
+    Middle = 2,
+    Back = 3,
+    Forward = 4,
+}
+
+impl MouseButton {
+    /// Converts an API name to a mouse button.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Left" => Some(Self::Left),
+            "Right" => Some(Self::Right),
+            "Middle" => Some(Self::Middle),
+            "Back" => Some(Self::Back),
+            "Forward" => Some(Self::Forward),
+            _ => None,
+        }
+    }
+
+    /// Converts a stable ABI mouse-button code to a button when it is supported.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Left),
+            1 => Some(Self::Right),
+            2 => Some(Self::Middle),
+            3 => Some(Self::Back),
+            4 => Some(Self::Forward),
+            _ => None,
+        }
+    }
+}
 
 /// Value tag for a boolean.
 pub const RVE_VALUE_BOOL: u32 = 0;
@@ -259,6 +490,12 @@ pub type RveSendFn = unsafe extern "C" fn(
 /// Host callback that stages a broadcast message.
 pub type RveBroadcastFn =
     unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, value: *const RveValue) -> bool;
+/// Reads the down/pressed/released bit flags for one stable key code.
+pub type RveKeyStateFn = unsafe extern "C" fn(ctx: *mut c_void, key: u32) -> u32;
+/// Reads the down/pressed/released bit flags for one stable mouse-button code.
+pub type RveMouseButtonStateFn = unsafe extern "C" fn(ctx: *mut c_void, button: u32) -> u32;
+/// Copies one input vector into a guest-provided output slot.
+pub type RveInputVectorFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut [f32; 2]) -> bool;
 
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
@@ -289,6 +526,16 @@ pub struct RveHost {
     pub send: RveSendFn,
     /// Message-broadcast callback.
     pub broadcast: RveBroadcastFn,
+    /// Key-state callback.
+    pub key_state: RveKeyStateFn,
+    /// Mouse-button-state callback.
+    pub mouse_button_state: RveMouseButtonStateFn,
+    /// Cursor-position callback.
+    pub cursor_position: RveInputVectorFn,
+    /// Mouse-delta callback.
+    pub mouse_delta: RveInputVectorFn,
+    /// Wheel-delta callback.
+    pub wheel_delta: RveInputVectorFn,
 }
 
 /// Guest factory callback.
@@ -369,3 +616,71 @@ unsafe impl Sync for RveValue {}
 unsafe impl Sync for RveParamEntry {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
+
+#[cfg(test)]
+mod tests {
+    use super::{Key, MouseButton};
+
+    #[test]
+    fn key_codes_and_names_are_stable() {
+        assert_eq!(Key::A as u32, 0);
+        assert_eq!(Key::Z as u32, 25);
+        assert_eq!(Key::Digit0 as u32, 26);
+        assert_eq!(Key::Digit9 as u32, 35);
+        assert_eq!(Key::F1 as u32, 36);
+        assert_eq!(Key::F12 as u32, 47);
+        assert_eq!(Key::SuperRight as u32, 64);
+
+        for code in 0..=(Key::SuperRight as u32) {
+            assert_eq!(Key::from_code(code).map(|key| key as u32), Some(code));
+        }
+        assert_eq!(Key::from_code(Key::SuperRight as u32 + 1), None);
+
+        assert_eq!(Key::from_name("F1"), Some(Key::F1));
+        assert_eq!(Key::from_name("F12"), Some(Key::F12));
+        assert_eq!(Key::from_name("Digit9"), Some(Key::Digit9));
+        assert_eq!(Key::from_name("ControlRight"), Some(Key::ControlRight));
+        assert_eq!(Key::from_name("A"), Some(Key::A));
+        assert_eq!(Key::from_name("Space"), Some(Key::Space));
+        assert_eq!(Key::from_name("UnknownKey"), None);
+
+        for code in 0..=25_u32 {
+            let name = char::from(b'A' + code as u8).to_string();
+            assert_eq!(
+                Key::from_name(&name).map(|key| key as u32),
+                Some(code),
+                "key name {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_button_codes_and_names_are_stable() {
+        assert_eq!(MouseButton::Left as u32, 0);
+        assert_eq!(MouseButton::Right as u32, 1);
+        assert_eq!(MouseButton::Middle as u32, 2);
+        assert_eq!(MouseButton::Back as u32, 3);
+        assert_eq!(MouseButton::Forward as u32, 4);
+
+        for code in 0..=(MouseButton::Forward as u32) {
+            assert_eq!(
+                MouseButton::from_code(code).map(|button| button as u32),
+                Some(code)
+            );
+        }
+        assert_eq!(
+            MouseButton::from_code(MouseButton::Forward as u32 + 1),
+            None
+        );
+
+        assert_eq!(MouseButton::from_name("Left"), Some(MouseButton::Left));
+        assert_eq!(MouseButton::from_name("Right"), Some(MouseButton::Right));
+        assert_eq!(MouseButton::from_name("Middle"), Some(MouseButton::Middle));
+        assert_eq!(MouseButton::from_name("Back"), Some(MouseButton::Back));
+        assert_eq!(
+            MouseButton::from_name("Forward"),
+            Some(MouseButton::Forward)
+        );
+        assert_eq!(MouseButton::from_name("UnknownButton"), None);
+    }
+}

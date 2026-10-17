@@ -1,5 +1,5 @@
 use crate::lite::EventQueue;
-use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTransform};
+use crate::types::{ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
 use engine_scene::{LocalTransform, ObjectHandle, ParamValue, World};
 use std::collections::HashMap;
 
@@ -96,6 +96,7 @@ pub(crate) struct ScriptTransaction {
     queued_message_count: usize,
     queued_message_bytes: usize,
     overflowed_messages: usize,
+    input: ScriptInput,
     #[cfg(test)]
     peak_pending_bytes: usize,
 }
@@ -113,6 +114,7 @@ impl Default for ScriptTransaction {
             queued_message_count: 0,
             queued_message_bytes: 0,
             overflowed_messages: 0,
+            input: ScriptInput::default(),
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
@@ -126,24 +128,29 @@ impl ScriptTransaction {
         self_object: ObjectHandle,
         source: &str,
         writable: bool,
-        queued_message_count: usize,
-        queued_message_bytes: usize,
+        input: ScriptInput,
+        queued_messages: (usize, usize),
     ) {
         self.world = world;
         self.self_object = Some(self_object);
         self.writable = writable;
+        self.input = input;
         self.source.clear();
         self.source.push_str(source);
         self.pending_transforms.clear();
         self.pending_messages.clear();
         self.pending_bytes = 0;
-        self.queued_message_count = queued_message_count;
-        self.queued_message_bytes = queued_message_bytes;
+        self.queued_message_count = queued_messages.0;
+        self.queued_message_bytes = queued_messages.1;
         self.overflowed_messages = 0;
     }
 
     pub(crate) fn writable(&self) -> bool {
         self.writable
+    }
+
+    pub(crate) fn input(&self) -> &ScriptInput {
+        &self.input
     }
 
     fn world(&self) -> Option<&World> {

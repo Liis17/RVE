@@ -3,6 +3,7 @@
 mod activation;
 mod cli;
 mod hardware;
+mod input;
 mod layout;
 mod module_host;
 mod pipeline;
@@ -29,7 +30,7 @@ use pipeline::{
 use scene::{PreparedScene, load_scene};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sysinfo::{CpuRefreshKind, System};
 
@@ -220,6 +221,7 @@ fn run_from_args(
     let (render_tx, render_rx) = flume::unbounded();
     let interrupt = ScriptInterruptHandle::new();
     let status = Arc::new(RuntimeStatus::default());
+    let input = Arc::new(Mutex::new(input::InputAccumulator::default()));
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
     let script_thread = match start_scripts(
         &mut modules,
@@ -238,6 +240,7 @@ fn run_from_args(
             frame_tx,
             render_tx: render_tx.clone(),
             status: Arc::clone(&status),
+            input: Arc::clone(&input),
         },
     ) {
         Ok(ready) => ready,
@@ -282,6 +285,7 @@ fn run_from_args(
             script_stopped_rx: script_thread.stopped,
             interrupt,
             status: Arc::clone(&status),
+            input,
         },
         &mut modules,
     );

@@ -66,6 +66,11 @@ impl<'a> AbiCallContext<'a> {
             world_matrix: host_world_matrix,
             send: host_send,
             broadcast: host_broadcast,
+            key_state: host_key_state,
+            mouse_button_state: host_mouse_button_state,
+            cursor_position: host_cursor_position,
+            mouse_delta: host_mouse_delta,
+            wheel_delta: host_wheel_delta,
         }
     }
 
@@ -481,6 +486,43 @@ unsafe extern "C" fn host_broadcast(
     })
 }
 
+unsafe extern "C" fn host_key_state(ctx: *mut c_void, key: u32) -> u32 {
+    guarded(ctx, 0, |context| context.transaction.input().key_state(key))
+}
+
+unsafe extern "C" fn host_mouse_button_state(ctx: *mut c_void, button: u32) -> u32 {
+    guarded(ctx, 0, |context| {
+        context.transaction.input().mouse_button_state(button)
+    })
+}
+
+unsafe extern "C" fn host_cursor_position(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
+    host_input_vector(ctx, out, |input| input.cursor())
+}
+
+unsafe extern "C" fn host_mouse_delta(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
+    host_input_vector(ctx, out, |input| input.mouse_delta())
+}
+
+unsafe extern "C" fn host_wheel_delta(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
+    host_input_vector(ctx, out, |input| input.wheel())
+}
+
+fn host_input_vector(
+    ctx: *mut c_void,
+    out: *mut [f32; 2],
+    value: impl FnOnce(&crate::types::ScriptInput) -> [f32; 2],
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: output was checked and points to the guest's writable stack slot.
+        unsafe { *out = value(context.transaction.input()) };
+        true
+    })
+}
+
 unsafe fn read_message_value(value: *const RveValue) -> Result<(ParamValue, usize), String> {
     if value.is_null() {
         return Err("null message value".to_owned());
@@ -660,5 +702,28 @@ mod tests {
         assert_eq!(events[1].level, ScriptEventLevel::Warn);
         assert_eq!(events[2].level, ScriptEventLevel::Error);
         assert_eq!(events[3].level, ScriptEventLevel::Error);
+    }
+
+    #[test]
+    fn unknown_input_codes_return_zero_and_vectors_are_readable_during_create() {
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
+        let host = context.host(ScriptTime::default());
+        let mut cursor = [1.0; 2];
+        let mut mouse_delta = [1.0; 2];
+        let mut wheel = [1.0; 2];
+
+        // SAFETY: the host context and output slots remain live for these callbacks.
+        unsafe {
+            assert_eq!((host.key_state)(host.ctx, u32::MAX), 0);
+            assert_eq!((host.mouse_button_state)(host.ctx, u32::MAX), 0);
+            assert!((host.cursor_position)(host.ctx, &mut cursor));
+            assert!((host.mouse_delta)(host.ctx, &mut mouse_delta));
+            assert!((host.wheel_delta)(host.ctx, &mut wheel));
+        }
+        assert_eq!(cursor, [0.0; 2]);
+        assert_eq!(mouse_delta, [0.0; 2]);
+        assert_eq!(wheel, [0.0; 2]);
     }
 }

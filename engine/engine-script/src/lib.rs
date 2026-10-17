@@ -11,4 +11,7 @@ mod types;
 pub use engine_scene::ParamValue;
 pub use host::{ScriptHost, ScriptInterruptHandle, ScriptLoadError};
 pub use library::{ScriptLibrary, ScriptLibraryError};
-pub use types::{ScriptEvent, ScriptEventLevel, ScriptParams, ScriptTime, ScriptTransform};
+pub use rve_sdk::{Key, MouseButton};
+pub use types::{
+    ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
+};

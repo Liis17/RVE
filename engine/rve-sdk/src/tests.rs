@@ -1,9 +1,9 @@
 use crate::abi::{
-    RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveHeader, RveHost,
-    RveModule, RveParamEntry, RveParams, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform,
-    RveValue, RveValueData,
+    RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY,
+    RVE_VALUE_STR, RveArray, RveHeader, RveHost, RveModule, RveParamEntry, RveParams,
+    RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
-use crate::{Context, Params, Script, Value};
+use crate::{Context, Key, MouseButton, Params, Script, Value};
 use std::ffi::c_void;
 
 struct Probe {
@@ -141,6 +141,11 @@ struct HostState {
     matrix: [f32; 16],
     sent: Vec<(String, String, Value)>,
     broadcasts: Vec<(String, Value)>,
+    key_flags: u32,
+    mouse_flags: u32,
+    cursor: [f32; 2],
+    mouse_delta: [f32; 2],
+    wheel: [f32; 2],
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -243,6 +248,54 @@ unsafe extern "C" fn set_local(ctx: *mut c_void, _: u64, transform: *const RveTr
     true
 }
 
+unsafe extern "C" fn key_state(ctx: *mut c_void, key: u32) -> u32 {
+    // SAFETY: test host points to a live HostState for the guest call.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    if key == Key::W as u32 {
+        state.key_flags
+    } else {
+        0
+    }
+}
+
+unsafe extern "C" fn mouse_button_state(ctx: *mut c_void, button: u32) -> u32 {
+    // SAFETY: test host points to a live HostState for the guest call.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    if button == MouseButton::Left as u32 {
+        state.mouse_flags
+    } else {
+        0
+    }
+}
+
+unsafe fn input_vector(
+    ctx: *mut c_void,
+    out: *mut [f32; 2],
+    select: fn(&HostState) -> [f32; 2],
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: test host points to a live HostState and out is supplied by the ABI caller.
+    unsafe { *out = select(&*ctx.cast::<HostState>()) };
+    true
+}
+
+unsafe extern "C" fn cursor_position(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
+    // SAFETY: pointers are forwarded to the checked helper.
+    unsafe { input_vector(ctx, out, |state| state.cursor) }
+}
+
+unsafe extern "C" fn mouse_delta(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
+    // SAFETY: pointers are forwarded to the checked helper.
+    unsafe { input_vector(ctx, out, |state| state.mouse_delta) }
+}
+
+unsafe extern "C" fn wheel_delta(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
+    // SAFETY: pointers are forwarded to the checked helper.
+    unsafe { input_vector(ctx, out, |state| state.wheel) }
+}
+
 fn host(state: &mut HostState) -> RveHost {
     state.matrix = [2.0; 16];
     RveHost {
@@ -262,6 +315,11 @@ fn host(state: &mut HostState) -> RveHost {
         world_matrix,
         send,
         broadcast,
+        key_state,
+        mouse_button_state,
+        cursor_position,
+        mouse_delta,
+        wheel_delta,
     }
 }
 
@@ -333,6 +391,31 @@ fn export_scripts_macro_exposes_a_static_module_pointer() {
     let module = unsafe { &*module };
     assert_eq!(module.header.abi_version, RVE_SCRIPT_ABI_VERSION);
     assert_eq!(module.script_count, 1);
+}
+
+#[test]
+fn guest_input_wrapper_reads_states_and_pointer_vectors() {
+    let mut state = HostState {
+        key_flags: RVE_INPUT_DOWN | RVE_INPUT_PRESSED,
+        mouse_flags: RVE_INPUT_RELEASED,
+        cursor: [12.0, 34.0],
+        mouse_delta: [1.5, -2.0],
+        wheel: [0.0, 0.75],
+        ..HostState::default()
+    };
+    let host = host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let input = context.input();
+
+    assert!(input.key_down(Key::W));
+    assert!(input.key_pressed(Key::W));
+    assert!(!input.key_released(Key::W));
+    assert!(!input.key_down(Key::A));
+    assert!(input.mouse_released(MouseButton::Left));
+    assert!(!input.mouse_down(MouseButton::Left));
+    assert_eq!(input.cursor(), [12.0, 34.0]);
+    assert_eq!(input.mouse_delta(), [1.5, -2.0]);
+    assert_eq!(input.wheel(), [0.0, 0.75]);
 }
 
 #[test]

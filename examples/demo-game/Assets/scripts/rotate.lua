@@ -6,6 +6,9 @@ function Rotate:on_start()
 end
 
 function Rotate:on_update(dt)
+  if rve.input.key_pressed("Space") then
+    rve.log_info("Space pressed")
+  end
   local rotation = self.transform.rotation
   self.transform.rotation = {
     x = rotation.x,

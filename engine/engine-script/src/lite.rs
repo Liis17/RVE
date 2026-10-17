@@ -2,13 +2,16 @@ use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
     ScriptTransaction,
 };
-use crate::types::{ScriptEvent, ScriptEventLevel, ScriptParams, ScriptTime, ScriptTransform};
+use crate::types::{
+    ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
+};
 use engine_scene::{ObjectHandle, ParamValue};
 use mlua::chunk::ChunkMode;
 use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, StdLib,
     Table, UserData, UserDataFields, Value, VmState,
 };
+use rve_sdk::{Key, MouseButton};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -128,7 +131,8 @@ pub(crate) fn create_lua(
     )?;
     rve.set("find", find_function(&lua, active_call.clone())?)?;
     rve.set("send", send_function(&lua, active_call.clone())?)?;
-    rve.set("broadcast", broadcast_function(&lua, active_call)?)?;
+    rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
+    rve.set("input", input_table(&lua, active_call)?)?;
     globals.set("rve", rve)?;
     Ok(LuaState {
         lua,
@@ -439,6 +443,90 @@ fn broadcast_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Functi
                 .broadcast(&name, value, value_size)
                 .map_err(|error| queue_message_error(error, ""))?;
             Ok(())
+        })
+    })
+}
+
+fn input_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let input = lua.create_table()?;
+    input.set(
+        "key_down",
+        key_input_function(lua, active_call.clone(), ScriptInput::key_down)?,
+    )?;
+    input.set(
+        "key_pressed",
+        key_input_function(lua, active_call.clone(), ScriptInput::key_pressed)?,
+    )?;
+    input.set(
+        "key_released",
+        key_input_function(lua, active_call.clone(), ScriptInput::key_released)?,
+    )?;
+    input.set(
+        "mouse_down",
+        mouse_input_function(lua, active_call.clone(), ScriptInput::mouse_down)?,
+    )?;
+    input.set(
+        "mouse_pressed",
+        mouse_input_function(lua, active_call.clone(), ScriptInput::mouse_pressed)?,
+    )?;
+    input.set(
+        "mouse_released",
+        mouse_input_function(lua, active_call.clone(), ScriptInput::mouse_released)?,
+    )?;
+    input.set(
+        "cursor",
+        input_vector_function(lua, active_call.clone(), ScriptInput::cursor)?,
+    )?;
+    input.set(
+        "mouse_delta",
+        input_vector_function(lua, active_call.clone(), ScriptInput::mouse_delta)?,
+    )?;
+    input.set(
+        "wheel",
+        input_vector_function(lua, active_call, ScriptInput::wheel)?,
+    )?;
+    Ok(input)
+}
+
+fn key_input_function(
+    lua: &Lua,
+    active_call: ActiveCall,
+    state: fn(&ScriptInput, Key) -> bool,
+) -> mlua::Result<Function> {
+    lua.create_function(move |_, name: LuaString| {
+        let name = name.to_str()?;
+        let key = Key::from_name(name.as_ref())
+            .ok_or_else(|| LuaError::runtime(format!("unknown input key {name:?}")))?;
+        with_active_call(&active_call, |transaction| {
+            Ok(state(transaction.input(), key))
+        })
+    })
+}
+
+fn mouse_input_function(
+    lua: &Lua,
+    active_call: ActiveCall,
+    state: fn(&ScriptInput, MouseButton) -> bool,
+) -> mlua::Result<Function> {
+    lua.create_function(move |_, name: LuaString| {
+        let name = name.to_str()?;
+        let button = MouseButton::from_name(name.as_ref())
+            .ok_or_else(|| LuaError::runtime(format!("unknown mouse button {name:?}")))?;
+        with_active_call(&active_call, |transaction| {
+            Ok(state(transaction.input(), button))
+        })
+    })
+}
+
+fn input_vector_function(
+    lua: &Lua,
+    active_call: ActiveCall,
+    value: fn(&ScriptInput) -> [f32; 2],
+) -> mlua::Result<Function> {
+    lua.create_function(move |_, ()| {
+        with_active_call(&active_call, |transaction| {
+            let [x, y] = value(transaction.input());
+            Ok((x, y))
         })
     })
 }

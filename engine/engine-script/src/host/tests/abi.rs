@@ -10,7 +10,7 @@ use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost, RveModule, RveParams, RveScriptDesc,
     RveStatus, RveStr, RveTransform, RveValue,
 };
-use rve_sdk::{Params, Script, Value};
+use rve_sdk::{Key, MouseButton, Params, Script, Value};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -35,6 +35,28 @@ struct Probe {
     panic_host_log: bool,
     panic_destroy: bool,
     panic_drop: bool,
+}
+
+struct InputProbe;
+
+fn input_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(InputProbe))
+}
+
+impl Script for InputProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let input = ctx.input();
+        assert!(input.key_down(Key::W));
+        assert!(input.key_pressed(Key::W));
+        assert!(input.key_released(Key::A));
+        assert!(input.mouse_down(MouseButton::Left));
+        assert!(input.mouse_pressed(MouseButton::Left));
+        assert!(input.mouse_released(MouseButton::Right));
+        assert_eq!(input.cursor(), [40.0, 60.0]);
+        assert_eq!(input.mouse_delta(), [2.5, -3.0]);
+        assert_eq!(input.wheel(), [1.0, 0.5]);
+        ctx.log_info("ABI input snapshot");
+    }
 }
 
 impl Script for Probe {
@@ -278,6 +300,7 @@ fn sdk_module() -> &'static RveModule {
         "DoubleWrite" => double_write_factory,
         "Message" => message_factory,
         "Limits" => limit_message_factory,
+        "InputProbe" => input_probe_factory,
     }
 }
 
@@ -384,6 +407,36 @@ fn matching_version_rejects_an_invalid_header_size_before_reading_the_table() {
             found: 0,
         }) if size == std::mem::size_of::<RveHeader>()
     ));
+}
+
+#[test]
+fn abi_guest_reads_the_script_input_snapshot_from_a_module() {
+    let _lock = test_lock();
+    let mut world = scripted_world("InputProbe", "{}");
+    let library = library();
+    let mut host = load_host(&world, &library);
+    let mut input = crate::ScriptInput::default();
+    input.set_key(Key::W, true);
+    input.set_key(Key::A, true);
+    input.set_key(Key::A, false);
+    input.set_mouse_button(MouseButton::Left, true);
+    input.set_mouse_button(MouseButton::Right, true);
+    input.set_mouse_button(MouseButton::Right, false);
+    input.set_cursor(40.0, 60.0);
+    input.add_mouse_delta(2.5, -3.0);
+    input.add_wheel(1.0, 0.5);
+    assert_eq!(input.key_state(u32::MAX), 0);
+    host.set_input(input);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 1,
+        },
+    );
+
+    assert_eq!(message_list(&mut host), ["ABI input snapshot"]);
 }
 
 fn invalid_name_module() -> &'static RveModule {
