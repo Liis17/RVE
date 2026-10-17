@@ -1,4 +1,5 @@
 import copy
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -133,6 +134,8 @@ class PackageSelectionTests(unittest.TestCase):
         resources = "engine/engine-resources"
         assets = "engine/engine-assets"
         runtime = "engine/engine-runtime"
+        script = "engine/engine-script"
+        sdk = "engine/rve-sdk"
         self.metadata["packages"] = [
             package("engine-files", directory=files),
             package("engine-pak", ["engine-files"], directory=pak,
@@ -146,19 +149,24 @@ class PackageSelectionTests(unittest.TestCase):
                     dependency_directories={"engine-files": files, "engine-pak": pak}),
             package("engine-assets", ["engine-resources"], directory=assets,
                     dependency_directories={"engine-resources": resources}),
+            package("rve-sdk", directory=sdk),
+            package("engine-script", ["engine-scene", "rve-sdk"], directory=script,
+                    dependency_directories={"engine-scene": scene, "rve-sdk": sdk}),
             package("engine-runtime", ["engine-assets", "engine-project",
-                                       "engine-resources", "engine-scene"],
+                                       "engine-resources", "engine-scene", "engine-script"],
                     directory=runtime,
                     dependency_directories={
                         "engine-assets": assets,
                         "engine-project": project,
                         "engine-resources": resources,
                         "engine-scene": scene,
+                        "engine-script": script,
                     }),
             package("rve-player", ["engine-runtime"], directory="engine/rve-player",
                     dependency_directories={"engine-runtime": runtime}),
             package("rve-build", ["engine-assets", "engine-files", "engine-pak",
-                                   "engine-project", "engine-resources", "engine-scene"],
+                                   "engine-project", "engine-resources", "engine-scene",
+                                   "engine-script"],
                     directory="tools/rve-build",
                     dependency_directories={
                         "engine-assets": assets,
@@ -167,6 +175,7 @@ class PackageSelectionTests(unittest.TestCase):
                         "engine-project": project,
                         "engine-resources": resources,
                         "engine-scene": scene,
+                        "engine-script": script,
                     }),
         ]
         self.metadata["workspace_members"] = [
@@ -178,14 +187,25 @@ class PackageSelectionTests(unittest.TestCase):
         runtime_changes = self.select(["engine/engine-runtime/src/lib.rs"])
         self.assertEqual(runtime_changes, ["engine-runtime", "rve-player"])
         self.assertNotIn("rve-build", runtime_changes)
+        player_changes = self.select(["engine/rve-player/src/main.rs"])
+        self.assertEqual(player_changes, ["rve-player"])
+        script_changes = self.select(["engine/engine-script/src/library.rs"])
+        self.assertEqual(
+            script_changes,
+            ["engine-runtime", "engine-script", "rve-build", "rve-player"],
+        )
 
         workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
-        demo_step = workflow.split("- name: Build demo game", 1)[1]
-        condition = demo_step.splitlines()[1]
-        self.assertIn("contains(needs.changes.outputs.packages, 'rve-build')", condition)
-        self.assertIn("contains(needs.changes.outputs.packages, 'engine-runtime')", condition)
+        demo_condition = next(
+            line for line in workflow.splitlines() if "BUILD_DEMO_GAME: ${{" in line
+        )
+        for name in ["rve-build", "engine-runtime", "rve-player", "engine-script", "rve-sdk"]:
+            self.assertIn(f"contains(needs.changes.outputs.packages, '{name}')", demo_condition)
+        self.assertIn("env.BUILD_DEMO_GAME == 'true'", workflow)
         self.assertTrue("rve-build" in build_changes)
         self.assertTrue("engine-runtime" in runtime_changes)
+        self.assertEqual(self.select(["engine/rve-sdk/src/lib.rs"]),
+                         ["engine-runtime", "engine-script", "rve-build", "rve-player", "rve-sdk"])
 
     def test_resource_asset_sandbox_consumers_are_selected_transitively(self):
         resources = "engine/engine-resources"
@@ -254,10 +274,12 @@ class ChangeRangeTests(unittest.TestCase):
                          ["engine/audio/src/lib.rs", "engine/sandbox/tests/cli.rs"])
 
     def test_rename_reports_old_and_new_owner_and_preserves_unusual_filenames(self):
-        self.git("mv", "engine/core/src/lib.rs", "engine/core/src/new\nname.rs")
+        unusual_name = "new\nname.rs" if os.name != "nt" else "new name.rs"
+        renamed_path = f"engine/core/src/{unusual_name}"
+        self.git("mv", "engine/core/src/lib.rs", renamed_path)
         self.git("commit", "-m", "rename")
         paths = changed_paths(self.root, "push", {"before": self.base, "after": "HEAD"})
-        self.assertEqual(paths, ["engine/core/src/lib.rs", "engine/core/src/new\nname.rs"])
+        self.assertEqual(paths, ["engine/core/src/lib.rs", renamed_path])
 
     def test_deleted_files_are_included(self):
         self.git("rm", "engine/core/src/lib.rs")

@@ -1,4 +1,4 @@
-use engine_script::{HeavyScript, ParamValue, ScriptContext, ScriptParams};
+use rve_sdk::{Context, Params, Script, Value};
 
 struct Bobber {
     base_y: f32,
@@ -6,23 +6,29 @@ struct Bobber {
     speed: f32,
 }
 
-impl HeavyScript for Bobber {
-    fn on_start(&mut self, context: &mut ScriptContext<'_>) {
+impl Script for Bobber {
+    fn on_start(&mut self, context: &mut Context<'_>) {
         self.base_y = context.transform.position[1];
-        context.log("Bobber started");
+        context.log_info("Bobber started");
     }
 
-    fn on_update(&mut self, context: &mut ScriptContext<'_>, _dt: f32) {
-        let phase = context.time.elapsed as f32 * self.speed;
+    fn on_update(&mut self, context: &mut Context<'_>, _dt: f32) {
+        let phase = context.time().elapsed as f32 * self.speed;
         context.transform.position[1] = self.base_y + phase.sin() * self.amplitude;
+    }
+
+    fn on_message(&mut self, context: &mut Context<'_>, sender: &str, name: &str, value: &Value) {
+        if name == "demo_ready" {
+            context.log_info(format!("Bobber received {name} from {sender}: {value:?}"));
+        }
     }
 }
 
-fn number(params: &ScriptParams, name: &str, default: f32) -> Result<f32, String> {
+fn number(params: &Params, name: &str, default: f32) -> Result<f32, String> {
     let value = match params.get(name) {
         None => default,
-        Some(ParamValue::Int(value)) => *value as f32,
-        Some(ParamValue::Float(value)) => *value as f32,
+        Some(Value::Int(value)) => *value as f32,
+        Some(Value::Float(value)) => *value as f32,
         Some(_) => return Err(format!("{name} must be a number")),
     };
     if value.is_finite() {
@@ -32,7 +38,7 @@ fn number(params: &ScriptParams, name: &str, default: f32) -> Result<f32, String
     }
 }
 
-fn create_bobber(params: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
+fn create_bobber(params: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(Bobber {
         base_y: 0.0,
         amplitude: number(params, "amplitude", 0.15)?,
@@ -40,9 +46,5 @@ fn create_bobber(params: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> 
     }))
 }
 
-pub fn register(registry: &mut engine_script::HeavyRegistry) {
-    registry
-        .register("Bobber", create_bobber)
-        .expect("Bobber is registered once with a valid name");
-}
+rve_sdk::export_scripts! { "Bobber" => create_bobber }
 

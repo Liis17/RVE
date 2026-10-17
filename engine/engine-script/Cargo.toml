@@ -9,4 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 engine-scene = { path = "../engine-scene" }
+libloading.workspace = true
 mlua.workspace = true
+rve-sdk = { path = "../rve-sdk" }

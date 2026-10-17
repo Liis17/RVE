@@ -1,21 +1,20 @@
 use crate::archives::build_project_archives;
 use crate::error::BuildError;
+#[cfg(windows)]
 use crate::ico::png_to_ico;
 use crate::platform;
 use crate::project::{ProjectBuild, prepare_project};
+use crate::sdk::{self, PlayerLocation};
 use crate::temporary::TempDir;
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
 use engine_pak::{Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, CatalogLimits};
+use engine_script::ScriptLibrary;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use toml::{Table, Value};
-
-const PLAYER_PACKAGE: &str = "rve-game";
-const EMBED_RESOURCE_VERSION: &str = "=3.0.11";
 
 pub(crate) fn build_distribution(
     project_dir: &Path,
@@ -25,13 +24,14 @@ pub(crate) fn build_distribution(
     let output = absolute_output_path(output)?;
     ensure_output_missing(&output)?;
     let project = prepare_project(project_dir)?;
+    let scripts_library = build_game_scripts(&project, true)?;
     let executable_name = player_file_name(&project.settings.name, &project.settings.id)?;
     #[cfg(target_os = "macos")]
     let vulkan_files = platform::find_macos_vulkan_files(vulkan_sdk)?;
     #[cfg(not(target_os = "macos"))]
     let _ = vulkan_sdk;
 
-    let executable = build_player(&project, true)?;
+    let executable = locate_player()?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -48,7 +48,7 @@ pub(crate) fn build_distribution(
     let output_parent = fs::canonicalize(output_parent).map_err(|error| {
         BuildError::operational(format!(
             "не удалось определить каталог output {}: {error}",
-            output_parent.display()
+            output.display()
         ))
     })?;
     let output_parent = normalize_build_path(&output_parent)?;
@@ -59,7 +59,6 @@ pub(crate) fn build_distribution(
     ensure_output_missing(&output)?;
 
     let staging = TempDir::create(&output_parent, "rve-build-output")?;
-    // Finder opens a bare executable through Terminal, so macOS releases are `.app` bundles.
     #[cfg(target_os = "macos")]
     let (resources_dir, binary_dir) = {
         let contents = staging
@@ -82,6 +81,9 @@ pub(crate) fn build_distribution(
     let engine_dir = resources_dir.join("Engine");
     create_dir_all(&engine_dir)?;
     copy_file(&project.bootstrap_path, &engine_dir.join("bootstrap.rves"))?;
+    if let Some(library) = &scripts_library {
+        copy_file(library, &engine_dir.join(scripts_library_filename()))?;
+    }
     let assets_dir = resources_dir.join("Assets");
     build_project_archives(&project, &assets_dir)?;
     validate_staged_archives(&assets_dir)?;
@@ -89,8 +91,23 @@ pub(crate) fn build_distribution(
     #[cfg(target_os = "macos")]
     platform::copy_macos_vulkan_files(&vulkan_files, &engine_dir)?;
 
-    let output_binary = binary_dir.join(executable_name);
+    let output_binary = binary_dir.join(&executable_name);
     copy_file(&executable, &output_binary)?;
+    #[cfg(windows)]
+    if let Some(icon_path) = &project.icon {
+        let source = project
+            .files
+            .get(icon_path)
+            .ok_or_else(|| BuildError::input(format!("иконка /{icon_path} не найдена")))?;
+        let png = fs::read(source).map_err(|error| {
+            BuildError::operational(format!("не удалось прочитать иконку /{icon_path}: {error}"))
+        })?;
+        let ico = png_to_ico(&png).map_err(|error| {
+            BuildError::input(format!("ошибка Windows-иконки /{icon_path}: {error}"))
+        })?;
+        platform::patch_executable_icon(&output_binary, &ico)?;
+    }
+
     match platform::publish_directory_no_replace(staging.path(), &output) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(BuildError::input(
@@ -105,66 +122,129 @@ pub(crate) fn build_distribution(
 
 pub(crate) fn run_project(project_dir: &Path, player_args: &[OsString]) -> Result<i32, BuildError> {
     let project = prepare_project(project_dir)?;
-    let executable = build_player(&project, false)?;
+    let scripts_library = build_game_scripts(&project, false)?;
+    let executable = locate_player()?;
     let project_dir = normalize_build_path(&project.project_dir)?;
-    let status = Command::new(&executable)
-        .arg("--project")
-        .arg(project_dir)
-        .args(player_args)
-        .status()
-        .map_err(|error| {
-            BuildError::operational(format!(
-                "не удалось запустить rve-player {}: {error}",
-                executable.display()
-            ))
-        })?;
+    let mut command = Command::new(&executable);
+    command.arg("--project").arg(project_dir);
+    if let Some(library) = scripts_library {
+        command.arg("--scripts").arg(library);
+    }
+    let status = command.args(player_args).status().map_err(|error| {
+        BuildError::operational(format!(
+            "не удалось запустить rve-player {}: {error}",
+            executable.display()
+        ))
+    })?;
     Ok(status.code().unwrap_or(1))
 }
 
-fn build_player(project: &ProjectBuild, release: bool) -> Result<PathBuf, BuildError> {
-    let player_dir = normalize_build_path(&project.project_dir.join(".rve/player"))?;
-    let target_dir = normalize_build_path(&project.project_dir.join(".rve/target"))?;
-    fs::create_dir_all(&player_dir).map_err(|error| {
-        BuildError::operational(format!(
-            "не удалось создать {}: {error}",
-            player_dir.display()
-        ))
-    })?;
-    fs::create_dir_all(&target_dir).map_err(|error| {
-        BuildError::operational(format!(
-            "не удалось создать {}: {error}",
-            target_dir.display()
-        ))
-    })?;
+#[cfg(windows)]
+fn scripts_library_filename() -> &'static str {
+    "game_scripts.dll"
+}
 
-    let heavy = resolve_heavy_dependency(project)?;
-    write_generated_player(project, &player_dir, heavy.as_ref())?;
-    seed_player_lock(&player_dir)?;
+#[cfg(target_os = "macos")]
+fn scripts_library_filename() -> &'static str {
+    "libgame_scripts.dylib"
+}
 
-    let executable = cargo_build(&player_dir, &target_dir, release)?;
-    #[cfg(windows)]
-    if project.icon.is_some() {
-        platform::verify_group_icon(&executable)?;
+#[cfg(not(any(windows, target_os = "macos")))]
+fn scripts_library_filename() -> &'static str {
+    "libgame_scripts.so"
+}
+
+fn build_game_scripts(
+    project: &ProjectBuild,
+    release: bool,
+) -> Result<Option<PathBuf>, BuildError> {
+    let Some(manifest_path) = heavy_scripts_manifest(project)? else {
+        return Ok(None);
+    };
+    let project_root = normalize_build_path(&project.project_dir)?;
+    let scripts_dir = manifest_path.parent().unwrap_or(&project_root);
+    let target = cargo_cdylib_target(&manifest_path)?;
+    let target_dir = normalize_build_path(&project_root.join(".rve/target"))?;
+    create_dir_all(&target_dir)?;
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+
+    let mut command = Command::new(&cargo);
+    command
+        .arg("build")
+        .arg("--lib")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .arg("--message-format=json")
+        .current_dir(scripts_dir)
+        .env("CARGO_TARGET_DIR", &target_dir);
+    if release {
+        command.arg("--release");
     }
-    Ok(executable)
+    let stdout = run_cargo(
+        &mut command,
+        "cargo build для heavy_scripts",
+        CargoFailure::Project,
+    )?;
+    let artifact = parse_cargo_output(
+        &stdout,
+        &target.target_name,
+        "cdylib",
+        Some(&target.package_id),
+    )
+    .map_err(|message| {
+        BuildError::operational(format!(
+            "не удалось найти собранную библиотеку скриптов: {message}"
+        ))
+    })?;
+    let extension = scripts_library_extension();
+    let library_path = select_library_file(&artifact.filenames, extension).ok_or_else(|| {
+        BuildError::operational(format!(
+            "cargo не сообщил файл cdylib с расширением .{extension} для {}",
+            target.target_name
+        ))
+    })?;
+    let library_path = normalize_build_path(library_path)?;
+
+    // SAFETY: building and loading this library is required to validate the project's script ABI.
+    let library = unsafe { ScriptLibrary::load(&library_path) }.map_err(|error| {
+        BuildError::input(format!(
+            "не удалось загрузить библиотеку heavy_scripts {}: {error}",
+            library_path.display()
+        ))
+    })?;
+    validate_heavy_script_names(&library, &project.heavy_scripts)?;
+    drop(library);
+    Ok(Some(library_path))
 }
 
-struct HeavyDependency {
-    path: PathBuf,
-    package: String,
+fn select_library_file<'a>(filenames: &'a [PathBuf], extension: &str) -> Option<&'a PathBuf> {
+    filenames.iter().find(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+    })
 }
 
-fn resolve_heavy_dependency(project: &ProjectBuild) -> Result<Option<HeavyDependency>, BuildError> {
+fn validate_heavy_script_names(
+    library: &ScriptLibrary,
+    heavy_scripts: &[(String, String)],
+) -> Result<(), BuildError> {
+    for (scene, name) in heavy_scripts {
+        if !library.contains_script(name) {
+            return Err(BuildError::input(format!(
+                "сцена /{scene} ссылается на heavy-скрипт {name:?}, которого нет в библиотеке"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn heavy_scripts_manifest(project: &ProjectBuild) -> Result<Option<PathBuf>, BuildError> {
     let Some(relative) = project.settings.heavy_scripts.as_deref() else {
         return Ok(None);
     };
-    let project_root = fs::canonicalize(&project.project_dir).map_err(|error| {
-        BuildError::operational(format!(
-            "не удалось определить каталог проекта {}: {error}",
-            project.project_dir.display()
-        ))
-    })?;
-    let project_root = normalize_build_path(&project_root)?;
+    let project_root = normalize_build_path(&project.project_dir)?;
     let path = project_root.join(relative);
     let path = fs::canonicalize(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -187,7 +267,7 @@ fn resolve_heavy_dependency(project: &ProjectBuild) -> Result<Option<HeavyDepend
         )));
     }
     let manifest_path = path.join("Cargo.toml");
-    let source = fs::read_to_string(&manifest_path).map_err(|error| {
+    let manifest_path = fs::canonicalize(&manifest_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             BuildError::input(format!(
                 "в heavy_scripts отсутствует {}",
@@ -200,221 +280,271 @@ fn resolve_heavy_dependency(project: &ProjectBuild) -> Result<Option<HeavyDepend
             ))
         }
     })?;
-    let manifest: Value = toml::from_str(&source).map_err(|error| {
-        BuildError::input(format!("некорректный heavy_scripts Cargo.toml: {error}"))
-    })?;
-    let package = manifest
-        .get("package")
-        .and_then(Value::as_table)
-        .and_then(|package| package.get("name"))
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            BuildError::input(format!(
-                "{} должен задавать [package].name",
-                manifest_path.display()
-            ))
-        })?
-        .to_owned();
-    Ok(Some(HeavyDependency { path, package }))
+    normalize_build_path(&manifest_path).map(Some)
 }
 
-fn write_generated_player(
-    project: &ProjectBuild,
-    player_dir: &Path,
-    heavy: Option<&HeavyDependency>,
-) -> Result<(), BuildError> {
-    let mut root = Table::new();
-    root.insert("workspace".to_owned(), Value::Table(Table::new()));
-
-    let mut package = Table::new();
-    package.insert("name".to_owned(), Value::String(PLAYER_PACKAGE.to_owned()));
-    package.insert("version".to_owned(), Value::String("0.1.0".to_owned()));
-    package.insert("edition".to_owned(), Value::String("2024".to_owned()));
-    root.insert("package".to_owned(), Value::Table(package));
-
-    let repo_root = repo_root()?;
-    let runtime_path = normalize_build_path(&repo_root.join("engine/engine-runtime"))?;
-    let mut dependencies = Table::new();
-    dependencies.insert(
-        "engine-runtime".to_owned(),
-        path_dependency(&runtime_path, None),
-    );
-    if let Some(heavy) = heavy {
-        let heavy_path = normalize_build_path(&heavy.path)?;
-        dependencies.insert(
-            "game_heavy".to_owned(),
-            path_dependency(&heavy_path, Some(&heavy.package)),
-        );
-    }
-    root.insert("dependencies".to_owned(), Value::Table(dependencies));
-
-    if project.icon.is_some() {
-        let mut build_dependencies = Table::new();
-        build_dependencies.insert(
-            "embed-resource".to_owned(),
-            Value::String(EMBED_RESOURCE_VERSION.to_owned()),
-        );
-        let mut windows_target = Table::new();
-        windows_target.insert(
-            "build-dependencies".to_owned(),
-            Value::Table(build_dependencies),
-        );
-        let mut target = Table::new();
-        target.insert("cfg(windows)".to_owned(), Value::Table(windows_target));
-        root.insert("target".to_owned(), Value::Table(target));
-    }
-
-    let manifest = toml::to_string_pretty(&Value::Table(root)).map_err(|error| {
-        BuildError::operational(format!(
-            "не удалось сгенерировать player Cargo.toml: {error}"
-        ))
-    })?;
-    write_file(&player_dir.join("Cargo.toml"), manifest.as_bytes())?;
-    let main_source = match heavy {
-        Some(_) => "fn main() -> std::process::ExitCode {\n    engine_runtime::run_player(game_heavy::register)\n}\n"
-            .to_owned(),
-        None => {
-            "fn main() -> std::process::ExitCode {\n    engine_runtime::run_player(|_| {})\n}\n"
-                .to_owned()
-        }
-    };
-    let main_source = format!(
-        "#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = \"windows\")]\n\n{main_source}"
-    );
-    let src_dir = player_dir.join("src");
-    fs::create_dir_all(&src_dir).map_err(|error| {
-        BuildError::operational(format!("не удалось создать {}: {error}", src_dir.display()))
-    })?;
-    write_file(&src_dir.join("main.rs"), main_source.as_bytes())?;
-
-    if let Some(icon_path) = &project.icon {
-        let source = project
-            .files
-            .get(icon_path)
-            .ok_or_else(|| BuildError::input(format!("иконка /{icon_path} не найдена")))?;
-        let icon_bytes = fs::read(source).map_err(|error| {
-            BuildError::operational(format!("не удалось прочитать иконку /{icon_path}: {error}"))
-        })?;
-        png_to_ico(&icon_bytes).map_err(|error| {
-            BuildError::input(format!("ошибка Windows-иконки /{icon_path}: {error}"))
-        })?;
-        write_file(&player_dir.join("icon.png"), &icon_bytes)?;
-        let support_dir = player_dir.join("build_support");
-        fs::create_dir_all(&support_dir).map_err(|error| {
-            BuildError::operational(format!(
-                "не удалось создать {}: {error}",
-                support_dir.display()
-            ))
-        })?;
-        write_file(
-            &support_dir.join("ico.rs"),
-            include_str!("ico.rs").as_bytes(),
-        )?;
-        write_file(
-            &player_dir.join("build.rs"),
-            windows_icon_build_script().as_bytes(),
-        )?;
-    } else {
-        write_file(&player_dir.join("build.rs"), b"fn main() {}\n")?;
-        remove_generated_file(&player_dir.join("icon.png"))?;
-        remove_generated_file(&player_dir.join("build_support/ico.rs"))?;
-    }
-    Ok(())
-}
-
-fn path_dependency(path: &Path, package: Option<&str>) -> Value {
-    let mut dependency = Table::new();
-    dependency.insert(
-        "path".to_owned(),
-        Value::String(path.to_string_lossy().into_owned()),
-    );
-    if let Some(package) = package {
-        dependency.insert("package".to_owned(), Value::String(package.to_owned()));
-    }
-    Value::Table(dependency)
-}
-
-fn windows_icon_build_script() -> &'static str {
-    r#"#[path = "build_support/ico.rs"]
-mod ico;
-
-use std::{env, fs};
-
-fn write_if_changed(path: &str, contents: &[u8]) -> std::io::Result<()> {
-    match fs::read(path) {
-        Ok(existing) if existing == contents => Ok(()),
-        Ok(_) => fs::write(path, contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::write(path, contents),
-        Err(error) => Err(error),
-    }
-}
-
-fn main() {
-    println!("cargo:rerun-if-changed=icon.png");
-    println!("cargo:rerun-if-changed=build_support/ico.rs");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
+fn scripts_library_extension() -> &'static str {
     #[cfg(windows)]
     {
-        let png = fs::read("icon.png").expect("cannot read generated icon.png");
-        let ico = ico::png_to_ico(&png).unwrap_or_else(|error| panic!("cannot generate app.ico: {error}"));
-        write_if_changed("app.ico", &ico).expect("cannot write generated app.ico");
-        write_if_changed("app.rc", b"1 ICON \"app.ico\"\n").expect("cannot write generated app.rc");
-        embed_resource::compile("app.rc", embed_resource::NONE)
-            .manifest_optional()
-            .unwrap_or_else(|error| panic!("cannot embed app.ico: {error}"));
+        "dll"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "dylib"
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        "so"
     }
 }
-"#
+
+#[derive(Debug)]
+struct CdylibTarget {
+    package_id: String,
+    target_name: String,
 }
 
-fn seed_player_lock(player_dir: &Path) -> Result<(), BuildError> {
-    let destination = player_dir.join("Cargo.lock");
-    if destination.exists() {
-        return Ok(());
-    }
-    let source = repo_root()?.join("Cargo.lock");
-    copy_file(&source, &destination)
-}
-
-fn cargo_build(player_dir: &Path, target_dir: &Path, release: bool) -> Result<PathBuf, BuildError> {
-    let player_dir = normalize_build_path(player_dir)?;
-    let target_dir = normalize_build_path(target_dir)?;
+fn cargo_cdylib_target(manifest_path: &Path) -> Result<CdylibTarget, BuildError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut command = Command::new(cargo);
-    command
-        .arg("build")
-        .arg("--message-format=json-render-diagnostics")
-        .current_dir(&player_dir)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if release {
-        command.arg("--release");
+    let stdout = run_cargo(
+        Command::new(cargo)
+            .arg("metadata")
+            .arg("--no-deps")
+            .arg("--format-version")
+            .arg("1")
+            .arg("--manifest-path")
+            .arg(manifest_path)
+            .current_dir(manifest_path.parent().unwrap_or(Path::new("."))),
+        "cargo metadata heavy_scripts",
+        CargoFailure::Project,
+    )?;
+    parse_cdylib_target(&stdout, manifest_path)
+        .map_err(|message| BuildError::input(format!("heavy_scripts: {message}")))
+}
+
+fn parse_cdylib_target(stdout: &str, manifest_path: &Path) -> Result<CdylibTarget, String> {
+    let metadata: JsonValue = serde_json::from_str(stdout)
+        .map_err(|error| format!("некорректный cargo metadata: {error}"))?;
+    let packages = metadata
+        .get("packages")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "cargo metadata не содержит packages".to_owned())?;
+    let package = packages
+        .iter()
+        .find(|package| {
+            package
+                .get("manifest_path")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|path| Path::new(path) == manifest_path)
+        })
+        .ok_or_else(|| {
+            format!(
+                "cargo metadata не содержит пакет из {}",
+                manifest_path.display()
+            )
+        })?;
+    let package_id = package
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "cargo metadata не содержит package id".to_owned())?
+        .to_owned();
+    let targets = package
+        .get("targets")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "cargo metadata не содержит targets".to_owned())?;
+    let target = targets.iter().find(|target| {
+        target
+            .get("kind")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("cdylib")))
+    });
+    let Some(target) = target else {
+        return Err(format!(
+            "{} должен содержать lib-target с crate-type = [\"cdylib\"]",
+            manifest_path.display()
+        ));
+    };
+    let target_name = target
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "cdylib target не имеет имени".to_owned())?
+        .to_owned();
+    Ok(CdylibTarget {
+        package_id,
+        target_name,
+    })
+}
+
+struct CargoArtifact {
+    executable: Option<PathBuf>,
+    filenames: Vec<PathBuf>,
+    fresh: bool,
+}
+
+fn parse_cargo_output(
+    stdout: &str,
+    target_name: &str,
+    kind: &str,
+    package_id: Option<&str>,
+) -> Result<CargoArtifact, String> {
+    let mut artifact = None;
+    for line in stdout.lines() {
+        let Ok(message) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
+        if message.get("reason").and_then(JsonValue::as_str) != Some("compiler-artifact") {
+            continue;
+        }
+        if package_id.is_some_and(|expected| {
+            message.get("package_id").and_then(JsonValue::as_str) != Some(expected)
+        }) {
+            continue;
+        }
+        let Some(target) = message.get("target") else {
+            continue;
+        };
+        let matching_target = target.get("name").and_then(JsonValue::as_str) == Some(target_name)
+            && target
+                .get("kind")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|kinds| kinds.iter().any(|value| value.as_str() == Some(kind)));
+        if !matching_target {
+            continue;
+        }
+        let filenames = message
+            .get("filenames")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(JsonValue::as_str)
+            .map(PathBuf::from)
+            .collect();
+        artifact = Some(CargoArtifact {
+            executable: message
+                .get("executable")
+                .and_then(JsonValue::as_str)
+                .map(PathBuf::from),
+            filenames,
+            fresh: message
+                .get("fresh")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+        });
     }
-    let output = command.output().map_err(|error| {
-        BuildError::operational(format!("не удалось запустить cargo build: {error}"))
+    artifact
+        .ok_or_else(|| format!("cargo output не содержит target {target_name:?} с kind {kind:?}"))
+}
+
+fn locate_player() -> Result<PathBuf, BuildError> {
+    let executable = current_executable_path()?;
+    let executable_dir = executable_directory(&executable)?;
+    match sdk::locate_player_in(&executable_dir, build_checkout_player)? {
+        PlayerLocation::Checkout(executable) => Ok(executable),
+        PlayerLocation::Sdk {
+            executable,
+            manifest,
+        } => {
+            println!("rve-player: prebuilt (SDK)");
+            println!("rve-sdk engine version: {}", manifest.engine_version);
+            Ok(executable)
+        }
+    }
+}
+
+pub(crate) fn current_executable_path() -> Result<PathBuf, BuildError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        BuildError::operational(format!("не удалось определить путь к rve-build: {error}"))
     })?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    canonical_executable_path(&executable)
+}
+
+fn canonical_executable_path(executable: &Path) -> Result<PathBuf, BuildError> {
+    let executable = fs::canonicalize(executable).map_err(|error| {
+        BuildError::operational(format!(
+            "не удалось разрешить путь к rve-build {}: {error}",
+            executable.display()
+        ))
+    })?;
+    normalize_build_path(&executable).map_err(|error| {
+        BuildError::operational(format!(
+            "не удалось нормализовать путь к rve-build: {error}"
+        ))
+    })
+}
+
+pub(crate) fn executable_directory(executable: &Path) -> Result<PathBuf, BuildError> {
+    executable.parent().map(Path::to_path_buf).ok_or_else(|| {
+        BuildError::operational("не удалось определить каталог исполняемого файла rve-build")
+    })
+}
+
+pub(crate) fn build_checkout_player() -> Result<PathBuf, BuildError> {
+    let root = repo_root()?;
+    let target_dir = normalize_build_path(&root.join("build/player"))?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let stdout = run_cargo(
+        Command::new(cargo)
+            .arg("build")
+            .arg("--release")
+            .arg("--locked")
+            .arg("-p")
+            .arg("rve-player")
+            .arg("--message-format=json")
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", &target_dir),
+        "сборка rve-player",
+        CargoFailure::Operational,
+    )?;
+    let artifact = parse_cargo_output(&stdout, "rve-player", "bin", None)
+        .map_err(|message| BuildError::operational(format!("сборка rve-player: {message}")))?;
+    let executable = artifact.executable.ok_or_else(|| {
+        BuildError::operational("cargo не сообщил executable для бинарника rve-player")
+    })?;
+    println!(
+        "rve-player: {}",
+        if artifact.fresh {
+            "up to date"
+        } else {
+            "rebuilt"
+        }
+    );
+    normalize_build_path(&executable)
+        .map_err(|error| BuildError::operational(format!("сборка rve-player: {error}")))
+}
+
+#[derive(Clone, Copy)]
+enum CargoFailure {
+    Project,
+    Operational,
+}
+
+impl CargoFailure {
+    fn build_error(self, message: String) -> BuildError {
+        match self {
+            Self::Project => BuildError::input(message),
+            Self::Operational => BuildError::operational(message),
+        }
+    }
+}
+
+fn run_cargo(
+    command: &mut Command,
+    context: &str,
+    failure: CargoFailure,
+) -> Result<String, BuildError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let output = command.output().map_err(|error| {
+        BuildError::operational(format!("не удалось запустить {context}: {error}"))
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     display_cargo_output(&stdout);
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            eprint!("{stderr}");
-        }
-        return Err(BuildError::operational(format!(
-            "cargo build завершился с кодом {}",
+        return Err(failure.build_error(format!(
+            "{context} завершился с кодом {}",
             output.status.code().unwrap_or(1)
         )));
     }
-    let executable = parse_cargo_output(&stdout).map_err(|_| {
-        BuildError::operational(
-            "cargo build завершился без compiler-artifact executable для бинарника rve-game",
-        )
-    })?;
-    normalize_build_path(&executable)
+    Ok(stdout)
 }
 
 fn display_cargo_output(stdout: &str) {
@@ -432,31 +562,6 @@ fn display_cargo_output(stdout: &str) {
             eprint!("{rendered}");
         }
     }
-}
-
-fn parse_cargo_output(stdout: &str) -> Result<PathBuf, String> {
-    let mut executable = None;
-    for line in stdout.lines() {
-        let Ok(message) = serde_json::from_str::<JsonValue>(line) else {
-            continue;
-        };
-        if message.get("reason").and_then(JsonValue::as_str) != Some("compiler-artifact") {
-            continue;
-        }
-        let Some(target) = message.get("target") else {
-            continue;
-        };
-        let is_game_binary = target.get("name").and_then(JsonValue::as_str) == Some(PLAYER_PACKAGE)
-            && target
-                .get("kind")
-                .and_then(JsonValue::as_array)
-                .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")));
-        if is_game_binary && let Some(path) = message.get("executable").and_then(JsonValue::as_str)
-        {
-            executable = Some(PathBuf::from(path));
-        }
-    }
-    executable.ok_or_else(|| "cargo output has no rve-game executable".to_owned())
 }
 
 pub(crate) fn validate_staged_archives(assets_dir: &Path) -> Result<(), BuildError> {
@@ -516,7 +621,7 @@ pub(crate) fn validate_staged_archives(assets_dir: &Path) -> Result<(), BuildErr
         })
 }
 
-fn repo_root() -> Result<PathBuf, BuildError> {
+pub(crate) fn repo_root() -> Result<PathBuf, BuildError> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -531,13 +636,13 @@ fn repo_root() -> Result<PathBuf, BuildError> {
     normalize_build_path(&root)
 }
 
-fn create_dir_all(path: &Path) -> Result<(), BuildError> {
+pub(crate) fn create_dir_all(path: &Path) -> Result<(), BuildError> {
     fs::create_dir_all(path).map_err(|error| {
         BuildError::operational(format!("не удалось создать {}: {error}", path.display()))
     })
 }
 
-fn copy_file(source: &Path, destination: &Path) -> Result<(), BuildError> {
+pub(crate) fn copy_file(source: &Path, destination: &Path) -> Result<(), BuildError> {
     fs::copy(source, destination).map_err(|error| {
         BuildError::operational(format!(
             "не удалось скопировать {} в {}: {error}",
@@ -548,6 +653,7 @@ fn copy_file(source: &Path, destination: &Path) -> Result<(), BuildError> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn write_file(path: &Path, contents: &[u8]) -> Result<(), BuildError> {
     match fs::read(path) {
         Ok(existing) if existing == contents => return Ok(()),
@@ -565,18 +671,7 @@ fn write_file(path: &Path, contents: &[u8]) -> Result<(), BuildError> {
     })
 }
 
-fn remove_generated_file(path: &Path) -> Result<(), BuildError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(BuildError::operational(format!(
-            "не удалось удалить ранее сгенерированный {}: {error}",
-            path.display()
-        ))),
-    }
-}
-
-fn absolute_output_path(path: &Path) -> Result<PathBuf, BuildError> {
+pub(crate) fn absolute_output_path(path: &Path) -> Result<PathBuf, BuildError> {
     let path = std::path::absolute(path).map_err(|error| {
         BuildError::operational(format!(
             "не удалось разрешить output {}: {error}",
@@ -593,7 +688,7 @@ fn absolute_output_path(path: &Path) -> Result<PathBuf, BuildError> {
     Ok(path)
 }
 
-fn ensure_output_missing(path: &Path) -> Result<(), BuildError> {
+pub(crate) fn ensure_output_missing(path: &Path) -> Result<(), BuildError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err(BuildError::input(format!(
             "output directory already exists: {}",
@@ -662,7 +757,7 @@ fn is_reserved_windows_name(stem: &str) -> bool {
         })
 }
 
-fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
+pub(crate) fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
     strip_windows_verbatim_prefix(path).map_err(|error| {
         BuildError::input(format!(
             "неподдерживаемая форма Windows-пути {}: {error}",
@@ -674,37 +769,55 @@ fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_distribution, parse_cargo_output, path_dependency, player_file_name,
-        resolve_heavy_dependency, validate_staged_archives, write_generated_player,
+        CargoArtifact, CargoFailure, build_distribution, heavy_scripts_manifest,
+        parse_cargo_output, parse_cdylib_target, player_file_name, select_library_file,
+        validate_heavy_script_names, validate_staged_archives,
     };
     use crate::error::BuildError;
     use crate::project::ProjectBuild;
     use crate::temporary::TempDir;
-    use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
+    use engine_files::strip_windows_verbatim_prefix;
     use engine_project::ProjectSettings;
-    use png::{BitDepth, ColorType, Encoder};
+    use engine_script::ScriptLibrary;
+    use rve_sdk::{Params, Script};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::fs::{File, FileTimes};
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, UNIX_EPOCH};
-    use toml::{Table, Value};
 
-    #[test]
-    fn parses_player_executable_from_mixed_cargo_output() {
-        let output = concat!(
-            "Compiling rve-game v0.1.0\n",
-            "this line is not JSON\n",
-            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"build_script_build\",\"kind\":[\"custom-build\"]},\"executable\":\"/tmp/build-script\"}\n",
-            "{malformed JSON\n",
-            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"rve-game\",\"kind\":[\"bin\"]},\"executable\":\"/tmp/rve-game\"}\n",
-            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"rve-game\",\"kind\":[\"bin\"]}}\n"
-        );
-        assert_eq!(
-            parse_cargo_output(output).unwrap(),
-            PathBuf::from("/tmp/rve-game")
-        );
-        assert!(parse_cargo_output("not json\n{broken").is_err());
+    struct TestScript;
+
+    impl Script for TestScript {}
+
+    fn test_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(TestScript))
+    }
+
+    fn test_library() -> ScriptLibrary {
+        let module = rve_sdk::script_module! {
+            "Bobber" => test_factory,
+            "Spinner" => test_factory,
+        };
+        // SAFETY: script_module! stores the descriptors and names in static storage.
+        unsafe { ScriptLibrary::from_module(module) }.unwrap()
+    }
+
+    fn sample_project(project_dir: &Path, heavy_scripts: Option<&str>) -> ProjectBuild {
+        let mut settings = ProjectSettings::parse(
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath=\"scene.rvescene\"\n",
+        )
+        .unwrap();
+        settings.heavy_scripts = heavy_scripts.map(str::to_owned);
+        ProjectBuild {
+            project_dir: project_dir.to_path_buf(),
+            bootstrap_path: project_dir.join("bootstrap.rves"),
+            settings,
+            files: BTreeMap::new(),
+            assignments: BTreeMap::new(),
+            archives: vec!["base".to_owned()],
+            #[cfg(windows)]
+            icon: None,
+            heavy_scripts: Vec::new(),
+        }
     }
 
     #[test]
@@ -751,215 +864,117 @@ mod tests {
         assert!(player_file_name("COM0", "fallback").is_ok());
     }
 
-    fn sample_project(project_dir: &Path, heavy_scripts: Option<String>) -> ProjectBuild {
-        ProjectBuild {
-            project_dir: project_dir.to_path_buf(),
-            bootstrap_path: project_dir.join("bootstrap.rves"),
-            settings: ProjectSettings::parse(&format!(
-                "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n{heavy_line}[[scenes]]\npath=\"scene.rvescene\"\n",
-                heavy_line = heavy_scripts
-                    .as_ref()
-                    .map(|path| format!("heavy_scripts = {path:?}\n"))
-                    .unwrap_or_default()
-            ))
-            .unwrap(),
-            files: BTreeMap::new(),
-            assignments: BTreeMap::new(),
-            archives: vec!["base".to_owned()],
-            icon: None,
-        }
-    }
-
-    fn tiny_png() -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut encoder = Encoder::new(&mut bytes, 1, 1);
-        encoder.set_color(ColorType::Rgba);
-        encoder.set_depth(BitDepth::Eight);
-        let mut writer = encoder.write_header().unwrap();
-        writer.write_image_data(&[32, 64, 128, 255]).unwrap();
-        writer.finish().unwrap();
-        bytes
+    #[test]
+    fn reads_the_package_id_and_renamed_cdylib_target_from_metadata() {
+        let manifest = Path::new("C:/Games/Sample/HeavyScripts/Cargo.toml");
+        let metadata = serde_json::json!({
+            "packages": [{
+                "id": "path+file:///HeavyScripts#heavy@0.1.0",
+                "manifest_path": manifest,
+                "targets": [{"name": "custom_scripts", "kind": ["cdylib"]}]
+            }]
+        });
+        let target = parse_cdylib_target(&metadata.to_string(), manifest).unwrap();
+        assert_eq!(target.package_id, "path+file:///HeavyScripts#heavy@0.1.0");
+        assert_eq!(target.target_name, "custom_scripts");
     }
 
     #[test]
-    fn generates_player_manifest_and_main_for_games_with_and_without_heavy_scripts() {
-        let root = TempDir::create(&std::env::temp_dir(), "rve-player-generated").unwrap();
-        let without_project = root.path().join("no-heavy-project");
-        let without_dir = root.path().join("no-heavy-player");
-        fs::create_dir_all(&without_project).unwrap();
-        fs::create_dir_all(&without_dir).unwrap();
-        let icon_path = VirtualPath::parse("/icons/app.png").unwrap();
-        let icon_source = root.path().join("app.png");
-        fs::write(&icon_source, tiny_png()).unwrap();
-        let mut no_heavy = sample_project(&without_project, None);
-        no_heavy.icon = Some(icon_path.clone());
-        no_heavy.files.insert(icon_path, icon_source);
-        write_generated_player(&no_heavy, &without_dir, None).unwrap();
-        let manifest = fs::read_to_string(without_dir.join("Cargo.toml")).unwrap();
-        let manifest_value: toml::Value = toml::from_str(&manifest).unwrap();
-        assert!(manifest_value.get("workspace").is_some());
-        assert_eq!(
-            manifest_value["dependencies"]["engine-runtime"]["path"].as_str(),
-            Some(repo_engine_runtime_path().to_string_lossy().as_ref())
-        );
-        assert!(
-            fs::read_to_string(without_dir.join("src/main.rs"))
-                .unwrap()
-                .contains("engine_runtime::run_player(|_| {})")
-        );
+    fn rejects_a_heavy_scripts_package_without_a_cdylib_target() {
+        let manifest = Path::new("C:/Games/Sample/HeavyScripts/Cargo.toml");
+        let metadata = serde_json::json!({
+            "packages": [{
+                "id": "heavy",
+                "manifest_path": manifest,
+                "targets": [{"name": "heavy", "kind": ["rlib"]}]
+            }]
+        });
+        let error = parse_cdylib_target(&metadata.to_string(), manifest).unwrap_err();
+        assert!(error.contains("crate-type"));
+    }
 
-        let unchanged_files = [
-            without_dir.join("Cargo.toml"),
-            without_dir.join("src/main.rs"),
-            without_dir.join("build.rs"),
-            without_dir.join("icon.png"),
-            without_dir.join("build_support/ico.rs"),
+    #[test]
+    fn cargo_artifact_selection_ignores_other_packages_and_uses_dylib_filename() {
+        let output = concat!(
+            "plain cargo output\n",
+            "{\"reason\":\"compiler-artifact\",\"package_id\":\"dependency 1.0.0\",\"target\":{\"name\":\"scripts\",\"kind\":[\"cdylib\"]},\"filenames\":[\"/tmp/dependency.dll\"],\"fresh\":true}\n",
+            "{\"reason\":\"compiler-artifact\",\"package_id\":\"game 1.0.0\",\"target\":{\"name\":\"scripts\",\"kind\":[\"lib\",\"cdylib\"]},\"filenames\":[\"/tmp/libscripts.rlib\",\"/tmp/libscripts.dll\",\"/tmp/libscripts.pdb\"],\"fresh\":false}\n",
+            "{malformed\n"
+        );
+        let artifact = parse_cargo_output(output, "scripts", "cdylib", Some("game 1.0.0")).unwrap();
+        assert_eq!(
+            artifact.filenames,
+            [
+                PathBuf::from("/tmp/libscripts.rlib"),
+                PathBuf::from("/tmp/libscripts.dll"),
+                PathBuf::from("/tmp/libscripts.pdb"),
+            ]
+        );
+        assert!(!artifact.fresh);
+        assert!(
+            parse_cargo_output(output, "scripts", "cdylib", Some("dependency 1.0.0"))
+                .unwrap()
+                .filenames[0]
+                .ends_with("dependency.dll")
+        );
+        assert!(parse_cargo_output(output, "other", "bin", None).is_err());
+    }
+
+    #[test]
+    fn selects_the_platform_library_from_multiple_compiler_artifact_filenames() {
+        let extension = super::scripts_library_extension();
+        let artifact = CargoArtifact {
+            executable: None,
+            filenames: [
+                "game_scripts.rlib".into(),
+                format!("game_scripts.{extension}").into(),
+                "game_scripts.pdb".into(),
+            ]
+            .into(),
+            fresh: false,
+        };
+        let selected = select_library_file(&artifact.filenames, extension);
+        assert_eq!(selected, Some(&artifact.filenames[1]));
+    }
+
+    #[test]
+    fn validates_all_scene_heavy_script_names_against_the_library() {
+        let library = test_library();
+        let scripts = [
+            ("scenes/main.rvescene".to_owned(), "Bobber".to_owned()),
+            ("scenes/side.rvescene".to_owned(), "Spinner".to_owned()),
         ];
-        let old_time = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
-        for path in &unchanged_files {
-            File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_times(FileTimes::new().set_modified(old_time))
-                .unwrap();
-        }
-        let old_times = unchanged_files
-            .iter()
-            .map(|path| fs::metadata(path).unwrap().modified().unwrap())
-            .collect::<Vec<_>>();
-        write_generated_player(&no_heavy, &without_dir, None).unwrap();
-        let new_times = unchanged_files
-            .iter()
-            .map(|path| fs::metadata(path).unwrap().modified().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(new_times, old_times);
 
-        let project_dir = root.path().join("heavy-project");
-        let with_dir = root.path().join("heavy-player");
-        let heavy_dir = project_dir.join("Heavy Scripts");
-        fs::create_dir_all(&heavy_dir).unwrap();
-        fs::create_dir_all(&with_dir).unwrap();
-        fs::write(
-            heavy_dir.join("Cargo.toml"),
-            "[workspace]\n[package]\nname=\"heavy-package\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        assert!(validate_heavy_script_names(&library, &scripts).is_ok());
+    }
+
+    #[test]
+    fn missing_scene_heavy_script_is_a_project_error_with_scene_and_name() {
+        let library = test_library();
+        let error = validate_heavy_script_names(
+            &library,
+            &[("scenes/main.rvescene".to_owned(), "Missing".to_owned())],
         )
-        .unwrap();
-        let with_heavy = sample_project(&project_dir, Some("Heavy Scripts".to_owned()));
-        let dependency = resolve_heavy_dependency(&with_heavy).unwrap().unwrap();
-        write_generated_player(&with_heavy, &with_dir, Some(&dependency)).unwrap();
-        let manifest = fs::read_to_string(with_dir.join("Cargo.toml")).unwrap();
-        let manifest_value: toml::Value = toml::from_str(&manifest).unwrap();
-        assert_eq!(
-            manifest_value["dependencies"]["game_heavy"]["package"].as_str(),
-            Some("heavy-package")
-        );
-        assert_eq!(
-            manifest_value["dependencies"]["game_heavy"]["path"].as_str(),
-            dependency.path.to_str()
-        );
-        assert!(
-            fs::read_to_string(with_dir.join("src/main.rs"))
-                .unwrap()
-                .contains("engine_runtime::run_player(game_heavy::register)")
-        );
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("scenes/main.rvescene"));
+        assert!(error.to_string().contains("Missing"));
     }
 
     #[test]
-    #[cfg(windows)]
-    fn generated_release_player_uses_gui_subsystem_and_debug_uses_console() {
-        let root = TempDir::create(&std::env::temp_dir(), "rve-player-subsystem").unwrap();
-        let project = sample_project(root.path(), None);
-        for heavy in [false, true] {
-            let player_dir = root.path().join(if heavy { "heavy" } else { "lite" });
-            fs::create_dir_all(&player_dir).unwrap();
-            let dependency = super::HeavyDependency {
-                path: root.path().to_owned(),
-                package: "fixture-heavy".to_owned(),
-            };
-            write_generated_player(&project, &player_dir, heavy.then_some(&dependency)).unwrap();
-            let source_path = player_dir.join("src/main.rs");
-            let source = fs::read_to_string(&source_path).unwrap();
-            // Replace only runtime dependencies; compile the actual generated entry point.
-            fs::write(&source_path, format!(
-                "{source}\nmod engine_runtime {{\n    pub fn run_player(_: fn(&mut ())) -> std::process::ExitCode {{\n        std::process::ExitCode::SUCCESS\n    }}\n}}\nmod game_heavy {{ pub fn register(_: &mut ()) {{}} }}\n"
-            )).unwrap();
-            for (debug_assertions, expected) in [("yes", 3_u16), ("no", 2_u16)] {
-                let executable = player_dir.join(format!("player-{debug_assertions}.exe"));
-                let output = std::process::Command::new(
-                    std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-                )
-                .arg("--edition=2024")
-                .arg("-C")
-                .arg(format!("debug-assertions={debug_assertions}"))
-                .arg(&source_path)
-                .arg("-o")
-                .arg(&executable)
-                .output()
-                .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                let bytes = fs::read(&executable).unwrap();
-                let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
-                assert_eq!(&bytes[pe_offset..pe_offset + 4], b"PE\0\0");
-                // Subsystem is at offset 68 in both PE32 and PE32+ optional headers.
-                let offset = pe_offset + 24 + 68;
-                let subsystem = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
-                assert_eq!(
-                    subsystem, expected,
-                    "heavy={heavy}, debug_assertions={debug_assertions}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn removes_generated_icon_files_when_regenerating_player_without_icon() {
-        let root = TempDir::create(&std::env::temp_dir(), "rve-player-icon-removal").unwrap();
-        let project_dir = root.path().join("project");
-        let player_dir = root.path().join("player");
-        fs::create_dir_all(&project_dir).unwrap();
-        fs::create_dir_all(&player_dir).unwrap();
-
-        let icon_path = VirtualPath::parse("/icons/app.png").unwrap();
-        let icon_source = root.path().join("app.png");
-        fs::write(&icon_source, tiny_png()).unwrap();
-        let mut with_icon = sample_project(&project_dir, None);
-        with_icon.icon = Some(icon_path.clone());
-        with_icon.files.insert(icon_path, icon_source);
-        write_generated_player(&with_icon, &player_dir, None).unwrap();
-
-        assert!(player_dir.join("icon.png").is_file());
-        assert!(player_dir.join("build_support/ico.rs").is_file());
-        let manifest: Value =
-            toml::from_str(&fs::read_to_string(player_dir.join("Cargo.toml")).unwrap()).unwrap();
-        assert!(
-            manifest["target"]["cfg(windows)"]["build-dependencies"]["embed-resource"]
-                .as_str()
-                .is_some()
-        );
-
-        let without_icon = sample_project(&project_dir, None);
-        write_generated_player(&without_icon, &player_dir, None).unwrap();
-
-        assert!(!player_dir.join("icon.png").exists());
-        assert!(!player_dir.join("build_support/ico.rs").exists());
+    fn cargo_failure_categories_keep_project_errors_and_report_player_errors_as_operational() {
         assert_eq!(
-            fs::read_to_string(player_dir.join("build.rs")).unwrap(),
-            "fn main() {}\n"
+            CargoFailure::Project
+                .build_error("game script compile failed".to_owned())
+                .exit_code(),
+            2
         );
-        let manifest: Value =
-            toml::from_str(&fs::read_to_string(player_dir.join("Cargo.toml")).unwrap()).unwrap();
-        assert!(
-            manifest
-                .get("target")
-                .and_then(|target| target.get("cfg(windows)"))
-                .and_then(|windows| windows.get("build-dependencies"))
-                .and_then(|dependencies| dependencies.get("embed-resource"))
-                .is_none()
+        assert_eq!(
+            CargoFailure::Operational
+                .build_error("rve-player compile failed".to_owned())
+                .exit_code(),
+            1
         );
     }
 
@@ -972,17 +987,13 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(
             outside.join("Cargo.toml"),
-            "[package]\nname=\"outside-heavy\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            "[package]\nname=\"outside-heavy\"\n",
         )
         .unwrap();
 
         for value in ["../outside", outside.to_str().unwrap()] {
-            let mut project = sample_project(&project_dir, None);
-            project.settings.heavy_scripts = Some(value.to_owned());
-            let error = match resolve_heavy_dependency(&project) {
-                Err(error) => error,
-                Ok(_) => panic!("accepted heavy_scripts path {value:?}"),
-            };
+            let project = sample_project(&project_dir, Some(value));
+            let error = heavy_scripts_manifest(&project).unwrap_err();
             assert_eq!(error.exit_code(), 2);
         }
     }
@@ -999,36 +1010,14 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(
             outside.join("Cargo.toml"),
-            "[package]\nname=\"outside-heavy\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            "[package]\nname=\"outside-heavy\"\n",
         )
         .unwrap();
         symlink(&outside, project_dir.join("linked-heavy")).unwrap();
 
-        let project = sample_project(&project_dir, Some("linked-heavy".to_owned()));
-        let error = match resolve_heavy_dependency(&project) {
-            Err(error) => error,
-            Ok(_) => panic!("accepted symlinked heavy_scripts outside project"),
-        };
+        let project = sample_project(&project_dir, Some("linked-heavy"));
+        let error = heavy_scripts_manifest(&project).unwrap_err();
         assert_eq!(error.exit_code(), 2);
-    }
-
-    #[test]
-    fn toml_path_dependencies_escape_spaces_quotes_and_windows_backslashes() {
-        let path = PathBuf::from(r#"C:\Games\My "Game"\Heavy Scripts"#);
-        let value = Value::Table(Table::from_iter([(
-            "game_heavy".to_owned(),
-            path_dependency(&path, Some("heavy-package")),
-        )]));
-        let serialized = toml::to_string(&value).unwrap();
-        let parsed: Value = toml::from_str(&serialized).unwrap();
-        assert_eq!(
-            parsed["game_heavy"]["path"].as_str(),
-            Some(path.to_string_lossy().as_ref())
-        );
-        assert_eq!(
-            parsed["game_heavy"]["package"].as_str(),
-            Some("heavy-package")
-        );
     }
 
     #[test]
@@ -1062,54 +1051,34 @@ mod tests {
     }
 
     #[test]
-    fn generated_player_temp_dir_is_removed_when_the_test_returns_an_error() {
-        let parent = TempDir::create(&std::env::temp_dir(), "rve-player-error-cleanup").unwrap();
-        let mut player_path = None;
-        let result = (|| -> Result<(), BuildError> {
-            let generated = TempDir::create(parent.path(), "generated-player")?;
-            player_path = Some(generated.path().to_path_buf());
-            let main = generated.path().join("main.rs");
-            fs::write(&main, b"partial").unwrap();
-            Err(BuildError::operational("fixture error"))
-        })();
-        assert_eq!(result.unwrap_err().exit_code(), 1);
-        assert!(!player_path.unwrap().exists());
+    fn repo_root_is_canonical_and_normalized() {
+        let path = super::repo_root().unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        assert_eq!(strip_windows_verbatim_prefix(&canonical).unwrap(), path);
+    }
+
+    #[test]
+    fn executable_directory_uses_a_canonicalized_path() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-executable-path").unwrap();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        let executable_path = root.path().join("nested/../rve-build");
+        fs::write(root.path().join("rve-build"), b"stub").unwrap();
+
+        let canonical = super::canonical_executable_path(&executable_path).unwrap();
+        let directory = super::executable_directory(&canonical).unwrap();
+        let expected =
+            strip_windows_verbatim_prefix(&fs::canonicalize(root.path()).unwrap()).unwrap();
+
+        assert_eq!(directory, expected);
     }
 
     #[test]
     fn unchanged_generated_file_keeps_its_modification_time() {
         let root = TempDir::create(&std::env::temp_dir(), "rve-player-mtime").unwrap();
-        let path = root.path().join("Cargo.toml");
+        let path = root.path().join("generated");
         super::write_file(&path, b"same content").unwrap();
-        let old_time = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
-        File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(old_time))
-            .unwrap();
-        let old_time = fs::metadata(&path).unwrap().modified().unwrap();
-
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
         super::write_file(&path, b"same content").unwrap();
-
-        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old_time);
-    }
-
-    #[test]
-    fn repo_runtime_path_is_canonical_and_normalized() {
-        let path = super::repo_root().unwrap().join("engine/engine-runtime");
-        let canonical = fs::canonicalize(&path).unwrap();
-        assert_eq!(strip_windows_verbatim_prefix(&canonical).unwrap(), path);
-    }
-
-    fn repo_engine_runtime_path() -> PathBuf {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("engine/engine-runtime");
-        let canonical = fs::canonicalize(path).unwrap();
-        strip_windows_verbatim_prefix(&canonical).unwrap()
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
     }
 }

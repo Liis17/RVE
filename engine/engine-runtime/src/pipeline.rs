@@ -1,3 +1,4 @@
+use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use engine_render::{
     DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId, Renderer, TextureId,
@@ -6,12 +7,13 @@ use engine_scene::camera::Camera;
 use engine_scene::light::shadow_view_projection;
 use engine_scene::{LightState, ObjectHandle, World};
 use engine_script::{
-    HeavyRegistry, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
+    ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary, ScriptTime,
 };
 use flume::{Receiver, RecvTimeoutError, Selector, Sender, TryRecvError};
 use glam::Vec3;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -129,7 +131,9 @@ pub(crate) trait ExitRequester: Send + Sync {
 pub(crate) struct ScriptThreadConfig {
     pub scene_name: String,
     pub sources: std::collections::BTreeMap<String, String>,
-    pub registry: HeavyRegistry,
+    pub scripts_library: Option<PathBuf>,
+    #[cfg(test)]
+    pub script_module: Option<&'static rve_sdk::abi::RveModule>,
     pub interrupt: ScriptInterruptHandle,
     pub clock: Arc<dyn Clock>,
     pub background_tick_hz: u32,
@@ -138,6 +142,7 @@ pub(crate) struct ScriptThreadConfig {
     pub frame_tx: Sender<Arc<FrameSnapshot>>,
     pub render_tx: Sender<RenderControl>,
     pub status: Arc<RuntimeStatus>,
+    pub input: Arc<Mutex<InputAccumulator>>,
 }
 
 pub(crate) struct ScriptThreadHandle {
@@ -266,20 +271,36 @@ fn scripts_thread(
     let ScriptThreadConfig {
         scene_name,
         sources,
-        registry,
+        scripts_library,
+        #[cfg(test)]
+        script_module,
         interrupt,
         clock,
         background_tick_hz,
         control_rx,
         frame_tx,
         render_tx,
+        input,
         ..
     } = config;
+    let library = match load_script_library(
+        scripts_library.as_deref(),
+        #[cfg(test)]
+        script_module,
+    ) {
+        Ok(library) => library,
+        Err(error) => {
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(Err(ScriptStartupError::Load(error)));
+            }
+            return;
+        }
+    };
     let mut scripts = match ScriptHost::load_with_interrupt(
         &world,
         &scene_name,
         &sources,
-        &registry,
+        library.as_ref(),
         interrupt.clone(),
     ) {
         Ok(scripts) => scripts,
@@ -297,11 +318,15 @@ fn scripts_thread(
     }
 
     let mut background = false;
+    let mut applied_background = false;
     let gpu_scene = loop {
         match control_rx.recv() {
             Ok(ScriptControl::Go(scene)) => break Some(scene),
             Ok(ScriptControl::Shutdown) | Err(_) => break None,
-            Ok(ScriptControl::Background(value)) => background = value,
+            Ok(ScriptControl::Background(value)) => {
+                background = value;
+                sync_input_background(&input, background, &mut applied_background);
+            }
         }
     };
     let Some(gpu_scene) = gpu_scene else {
@@ -309,6 +334,8 @@ fn scripts_thread(
         print_script_events(scripts.drain_events());
         return;
     };
+
+    sync_input_background(&input, background, &mut applied_background);
 
     let mut frame_number = 0_u64;
     let mut last_tick = clock.now();
@@ -324,15 +351,19 @@ fn scripts_thread(
         now.saturating_add(if background { interval } else { Duration::ZERO });
 
     loop {
-        if background
-            && !wait_background_tick(
+        sync_input_background(&input, background, &mut applied_background);
+        if background {
+            if !wait_background_tick(
                 &control_rx,
                 clock.as_ref(),
                 &mut background,
                 next_background_tick,
-            )
-        {
-            break;
+            ) {
+                break;
+            }
+            if !background {
+                continue;
+            }
         }
         if !background {
             match control_rx.try_recv() {
@@ -356,6 +387,8 @@ fn scripts_thread(
             elapsed: now.as_secs_f64(),
             frame: frame_number,
         };
+        let input_frame = lock_input(&input).take_frame();
+        scripts.set_input(input_frame);
         scripts.update(&mut world, dt, time);
         print_script_events(scripts.drain_events());
         if background {
@@ -392,6 +425,37 @@ fn scripts_thread(
     let _ = render_tx.send(RenderControl::Shutdown);
 }
 
+fn sync_input_background(
+    input: &Mutex<InputAccumulator>,
+    background: bool,
+    applied_background: &mut bool,
+) {
+    if *applied_background != background {
+        lock_input(input).set_background(background);
+        *applied_background = background;
+    }
+}
+
+fn load_script_library(
+    path: Option<&Path>,
+    #[cfg(test)] module: Option<&'static rve_sdk::abi::RveModule>,
+) -> Result<Option<ScriptLibrary>, String> {
+    #[cfg(test)]
+    if let Some(module) = module {
+        // SAFETY: test modules are generated by `rve_sdk::script_module!` and live for the process.
+        return unsafe { ScriptLibrary::from_module(std::ptr::from_ref(module)) }
+            .map(Some)
+            .map_err(|error| error.to_string());
+    }
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    // SAFETY: script libraries are native code supplied by the project being run.
+    unsafe { ScriptLibrary::load(path) }
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 fn make_snapshot(scene: engine_scene::SceneFrame, gpu_scene: &GpuSceneTable) -> FrameSnapshot {
     let mut draws = Vec::new();
     for instance in scene.meshes {
@@ -414,6 +478,7 @@ fn print_script_events(events: Vec<ScriptEvent>) {
     for event in events {
         match event.level {
             ScriptEventLevel::Info => println!("[script] {event}"),
+            ScriptEventLevel::Warn => eprintln!("[script warn] {event}"),
             ScriptEventLevel::Error => eprintln!("[script] {event}"),
         }
     }
@@ -659,22 +724,26 @@ mod tests {
         Clock, ExitRequester, FrameSnapshot, GpuSceneTable, RenderBackend, RenderControl,
         RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
         ScriptThreadConfig, render_loop, render_snapshot, render_thread, send_snapshot,
-        wait_background_tick,
+        sync_input_background, wait_background_tick,
     };
+    use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
     use engine_render::{DrawCommand, FrameStatus};
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
     use engine_scene::{SceneDocument, World};
-    use engine_script::{
-        HeavyRegistry, HeavyScript, ScriptContext, ScriptInterruptHandle, ScriptParams,
-    };
+    use engine_script::{Key, ScriptInterruptHandle};
     use glam::Vec3;
+    use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
+
+    fn test_input() -> Arc<Mutex<InputAccumulator>> {
+        Arc::new(Mutex::new(InputAccumulator::default()))
+    }
 
     #[derive(Default)]
     struct FakeBackend {
@@ -750,16 +819,72 @@ mod tests {
 
     static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct InputObservation {
+        key_down: bool,
+        key_pressed: bool,
+        key_released: bool,
+    }
+
+    static INPUT_PROBE: Mutex<Option<(mpsc::Sender<InputObservation>, mpsc::Receiver<()>)>> =
+        Mutex::new(None);
+
+    struct InputProbe;
+
+    impl Script for InputProbe {
+        fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+            let input = ctx.input();
+            let observation = InputObservation {
+                key_down: input.key_down(Key::A),
+                key_pressed: input.key_pressed(Key::A),
+                key_released: input.key_released(Key::A),
+            };
+            let probe = INPUT_PROBE.lock().unwrap();
+            let (observations, continue_rx) = probe.as_ref().unwrap();
+            observations.send(observation).unwrap();
+            continue_rx.recv().unwrap();
+        }
+    }
+
+    fn input_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(InputProbe))
+    }
+
     struct DestroyProbe;
 
-    impl HeavyScript for DestroyProbe {
-        fn on_destroy(&mut self, _ctx: &mut ScriptContext<'_>) {
+    impl Script for DestroyProbe {
+        fn on_destroy(&mut self, _ctx: &mut Context<'_>) {
             DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    fn destroy_probe_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
+    fn destroy_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
         Ok(Box::new(DestroyProbe))
+    }
+
+    struct TickProbe;
+
+    impl Script for TickProbe {
+        fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+            ctx.transform.position[0] += 1.0;
+        }
+    }
+
+    fn tick_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(TickProbe))
+    }
+
+    fn script_module() -> &'static rve_sdk::abi::RveModule {
+        rve_sdk::script_module! {
+            "DestroyProbe" => destroy_probe_factory,
+            "TickProbe" => tick_probe_factory,
+        }
+    }
+
+    fn input_probe_module() -> &'static rve_sdk::abi::RveModule {
+        rve_sdk::script_module! {
+            "InputProbe" => input_probe_factory,
+        }
     }
 
     struct FakeExit(mpsc::Sender<()>);
@@ -901,16 +1026,31 @@ mod tests {
         worker.join().unwrap();
     }
 
-    struct TickProbe;
-
-    impl HeavyScript for TickProbe {
-        fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _dt: f32) {
-            ctx.transform.position[0] += 1.0;
+    #[test]
+    fn background_sync_releases_held_input_once() {
+        let input = test_input();
+        {
+            let mut accumulator = lock_input(&input);
+            accumulator.focused(true);
+            accumulator.key(engine_window::Key::A, true);
         }
-    }
+        let mut applied_background = false;
 
-    fn tick_probe_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-        Ok(Box::new(TickProbe))
+        sync_input_background(&input, true, &mut applied_background);
+        let frame = lock_input(&input).take_frame();
+        assert!(!frame.key_down(Key::A));
+        assert!(!frame.key_pressed(Key::A));
+        assert!(frame.key_released(Key::A));
+
+        sync_input_background(&input, true, &mut applied_background);
+        let frame = lock_input(&input).take_frame();
+        assert!(!frame.key_released(Key::A));
+
+        sync_input_background(&input, false, &mut applied_background);
+        lock_input(&input).key(engine_window::Key::A, true);
+        let frame = lock_input(&input).take_frame();
+        assert!(frame.key_down(Key::A));
+        assert!(frame.key_pressed(Key::A));
     }
 
     #[test]
@@ -921,8 +1061,6 @@ mod tests {
         )
         .unwrap();
         let world = World::from_document(&document).unwrap();
-        let mut registry = HeavyRegistry::new();
-        registry.register("TickProbe", tick_probe_factory).unwrap();
         let mut modules = ModuleHost::new();
         let clock = Arc::new(FakeClock::default());
         let waiting_rx = clock.observe_waits();
@@ -935,7 +1073,8 @@ mod tests {
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
                 sources: BTreeMap::new(),
-                registry,
+                scripts_library: None,
+                script_module: Some(script_module()),
                 interrupt: ScriptInterruptHandle::new(),
                 clock: clock.clone(),
                 background_tick_hz: 1,
@@ -944,6 +1083,7 @@ mod tests {
                 frame_tx,
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
+                input: test_input(),
             },
         )
         .unwrap();
@@ -981,6 +1121,121 @@ mod tests {
         assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
         modules.join_named(SCRIPTS_THREAD).unwrap();
         assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn scripts_input_edges_follow_background_transitions() {
+        let (observation_tx, observation_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        *INPUT_PROBE.lock().unwrap() = Some((observation_tx, continue_rx));
+
+        let document = SceneDocument::parse(
+            "startup.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects.heavy_scripts]]\nname = \"InputProbe\"\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let mut modules = ModuleHost::new();
+        let clock = Arc::new(FakeClock::default());
+        let waiting_rx = clock.observe_waits();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, _frame_rx) = flume::bounded(1);
+        let (render_tx, render_rx) = flume::unbounded();
+        let input = test_input();
+        {
+            let mut accumulator = lock_input(&input);
+            accumulator.focused(true);
+            accumulator.key(engine_window::Key::A, true);
+        }
+        let script_thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "startup.rvescene".to_owned(),
+                sources: BTreeMap::new(),
+                scripts_library: None,
+                script_module: Some(input_probe_module()),
+                interrupt: ScriptInterruptHandle::new(),
+                clock: clock.clone(),
+                background_tick_hz: 1,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::new(RuntimeStatus::default()),
+                input: Arc::clone(&input),
+            },
+        )
+        .unwrap();
+        script_thread
+            .ready
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+
+        script_tx.send(ScriptControl::Background(true)).unwrap();
+        script_tx
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        clock.advance(Duration::from_secs(1));
+        script_tx.send(ScriptControl::Background(true)).unwrap();
+        assert_eq!(
+            observation_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputObservation {
+                key_down: false,
+                key_pressed: false,
+                key_released: true,
+            }
+        );
+        continue_tx.send(()).unwrap();
+
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        script_tx.send(ScriptControl::Background(false)).unwrap();
+        assert_eq!(
+            observation_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputObservation {
+                key_down: false,
+                key_pressed: false,
+                key_released: false,
+            }
+        );
+        lock_input(&input).key(engine_window::Key::A, true);
+        continue_tx.send(()).unwrap();
+        assert_eq!(
+            observation_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputObservation {
+                key_down: true,
+                key_pressed: true,
+                key_released: false,
+            }
+        );
+
+        script_tx.send(ScriptControl::Background(true)).unwrap();
+        continue_tx.send(()).unwrap();
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        clock.advance(Duration::from_secs(1));
+        script_tx.send(ScriptControl::Background(true)).unwrap();
+        assert_eq!(
+            observation_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputObservation {
+                key_down: false,
+                key_pressed: false,
+                key_released: true,
+            }
+        );
+        continue_tx.send(()).unwrap();
+
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        script_tx.send(ScriptControl::Shutdown).unwrap();
+        script_thread
+            .stopped
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
+        modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(modules.shutdown().is_empty());
+        *INPUT_PROBE.lock().unwrap() = None;
     }
 
     #[test]
@@ -1112,7 +1367,8 @@ mod tests {
                     "scripts/bad.lua".to_owned(),
                     "this is not valid Lua !!!".to_owned(),
                 )]),
-                registry: HeavyRegistry::new(),
+                scripts_library: None,
+                script_module: None,
                 interrupt,
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
@@ -1121,6 +1377,7 @@ mod tests {
                 frame_tx,
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
+                input: test_input(),
             },
         )
         .unwrap();
@@ -1134,6 +1391,50 @@ mod tests {
     }
 
     #[test]
+    fn script_library_load_error_is_reported_before_ready() {
+        let document = SceneDocument::parse(
+            "startup.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let mut modules = ModuleHost::new();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, _frame_rx) = flume::bounded(1);
+        let (render_tx, _render_rx) = flume::unbounded();
+        let library = std::env::temp_dir()
+            .join(format!("rve-missing-script-library-{}", std::process::id()))
+            .join("game_scripts.dll");
+        let script_thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "startup.rvescene".to_owned(),
+                sources: BTreeMap::new(),
+                scripts_library: Some(library),
+                script_module: None,
+                interrupt: ScriptInterruptHandle::new(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 30,
+                control_tx: script_tx,
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::new(RuntimeStatus::default()),
+                input: test_input(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            script_thread.ready.recv().unwrap(),
+            Err(ScriptStartupError::Load(_))
+        ));
+        assert!(modules.shutdown().is_empty());
+        script_thread.stopped.try_recv().unwrap();
+    }
+
+    #[test]
     fn graceful_script_shutdown_runs_on_destroy_before_interrupt() {
         DESTROY_CALLS.store(0, Ordering::SeqCst);
         let document = SceneDocument::parse(
@@ -1142,10 +1443,6 @@ mod tests {
         )
         .unwrap();
         let world = World::from_document(&document).unwrap();
-        let mut registry = HeavyRegistry::new();
-        registry
-            .register("DestroyProbe", destroy_probe_factory)
-            .unwrap();
         let mut modules = ModuleHost::new();
         let (script_tx, script_rx) = flume::unbounded();
         let (frame_tx, frame_rx) = flume::bounded(1);
@@ -1157,7 +1454,8 @@ mod tests {
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
                 sources: BTreeMap::new(),
-                registry,
+                scripts_library: None,
+                script_module: Some(script_module()),
                 interrupt: interrupt.clone(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
@@ -1166,6 +1464,7 @@ mod tests {
                 frame_tx,
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
+                input: test_input(),
             },
         )
         .unwrap();
@@ -1215,7 +1514,8 @@ mod tests {
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
                 sources: BTreeMap::new(),
-                registry: HeavyRegistry::new(),
+                scripts_library: None,
+                script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(PanicClock),
                 background_tick_hz: 30,
@@ -1224,6 +1524,7 @@ mod tests {
                 frame_tx,
                 render_tx,
                 status: Arc::clone(&status),
+                input: test_input(),
             },
         )
         .unwrap();

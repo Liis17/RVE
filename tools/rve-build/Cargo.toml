@@ -10,8 +10,11 @@ engine-files = { path = "../../engine/engine-files" }
 engine-pak = { path = "../../engine/engine-pak" }
 engine-project = { path = "../../engine/engine-project" }
 engine-resources = { path = "../../engine/engine-resources" }
+engine-script = { path = "../../engine/engine-script" }
 engine-scene = { path = "../../engine/engine-scene" }
 libc.workspace = true
+rve-sdk = { path = "../../engine/rve-sdk" }
+serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 

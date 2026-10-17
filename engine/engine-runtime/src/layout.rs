@@ -16,6 +16,22 @@ pub(crate) fn normalize_layout_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+pub(crate) fn normalize_scripts_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    #[cfg(windows)]
+    {
+        strip_windows_verbatim_prefix(&absolute)
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::canonicalize(&absolute) {
+            Ok(path) => Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(absolute),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Returns the directory holding release `Engine/` and `Assets/`.
 ///
 /// On macOS a player inside `<Name>.app/Contents/MacOS` reads them from
@@ -50,15 +66,23 @@ pub(crate) enum ProjectSettingsLocation {
 pub(crate) struct Layout {
     pub bootstrap: PathBuf,
     pub assets: PathBuf,
+    pub scripts_library: Option<PathBuf>,
     pub source_mode: SourceMode,
     pub project_settings: ProjectSettingsLocation,
 }
 
 impl Layout {
     pub fn release(exe_dir: &Path) -> Self {
+        #[cfg(windows)]
+        let scripts_library = Some(exe_dir.join("Engine/game_scripts.dll"));
+        #[cfg(target_os = "macos")]
+        let scripts_library = Some(exe_dir.join("Engine/libgame_scripts.dylib"));
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let scripts_library = None;
         Self {
             bootstrap: exe_dir.join("Engine/bootstrap.rves"),
             assets: exe_dir.join("Assets"),
+            scripts_library,
             source_mode: SourceMode::Registry,
             project_settings: ProjectSettingsLocation::Resource("/rve/project.toml"),
         }
@@ -68,9 +92,19 @@ impl Layout {
         Self {
             bootstrap: project_dir.join("bootstrap.rves"),
             assets: project_dir.join("Assets"),
+            scripts_library: None,
             source_mode: SourceMode::Loose,
             project_settings: ProjectSettingsLocation::File(project_dir.join("project.rveproject")),
         }
+    }
+
+    pub fn scripts_library_path(&self, override_path: Option<PathBuf>) -> Option<PathBuf> {
+        override_path.or_else(|| {
+            self.scripts_library
+                .as_ref()
+                .filter(|path| path.is_file())
+                .cloned()
+        })
     }
 }
 
@@ -88,6 +122,18 @@ mod tests {
             Path::new("/opt/game/Engine/bootstrap.rves")
         );
         assert_eq!(layout.assets, Path::new("/opt/game/Assets"));
+        #[cfg(windows)]
+        assert_eq!(
+            layout.scripts_library,
+            Some(Path::new("/opt/game/Engine/game_scripts.dll").into())
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            layout.scripts_library,
+            Some(Path::new("/opt/game/Engine/libgame_scripts.dylib").into())
+        );
+        #[cfg(not(any(windows, target_os = "macos")))]
+        assert_eq!(layout.scripts_library, None);
         assert_eq!(layout.source_mode, SourceMode::Registry);
         assert_eq!(
             layout.project_settings,
@@ -125,10 +171,54 @@ mod tests {
         let layout = Layout::dev(Path::new("/tmp/demo"));
         assert_eq!(layout.bootstrap, Path::new("/tmp/demo/bootstrap.rves"));
         assert_eq!(layout.assets, Path::new("/tmp/demo/Assets"));
+        assert_eq!(layout.scripts_library, None);
         assert_eq!(layout.source_mode, SourceMode::Loose);
         assert_eq!(
             layout.project_settings,
             ProjectSettingsLocation::File(Path::new("/tmp/demo/project.rveproject").into())
         );
+    }
+
+    #[test]
+    fn explicit_scripts_path_overrides_release_library_and_dev_never_auto_selects_one() {
+        let override_path = std::env::temp_dir().join("custom/game-scripts.dll");
+        let release = Layout::release(Path::new("/opt/game"));
+        assert_eq!(
+            release.scripts_library_path(Some(override_path.clone())),
+            Some(override_path.clone())
+        );
+        let dev = Layout::dev(Path::new("/tmp/game"));
+        assert_eq!(dev.scripts_library_path(None), None);
+        assert_eq!(
+            dev.scripts_library_path(Some(override_path.clone())),
+            Some(override_path)
+        );
+    }
+
+    #[test]
+    fn release_library_is_selected_only_when_the_file_exists() {
+        let root = std::env::temp_dir().join(format!("rve-layout-scripts-{}", std::process::id()));
+        let layout = Layout::release(&root);
+        let Some(library) = layout.scripts_library.clone() else {
+            return;
+        };
+        assert_eq!(layout.scripts_library_path(None), None);
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(&library, b"test library path").unwrap();
+        assert_eq!(layout.scripts_library_path(None), Some(library));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relative_scripts_path_is_absolute_from_cwd_without_a_file() {
+        let relative =
+            Path::new(&format!("rve-missing-scripts-{}", std::process::id())).join("game.dll");
+        let cwd = std::env::current_dir().unwrap();
+
+        let absolute = super::normalize_scripts_path(&relative).unwrap();
+
+        assert!(absolute.is_absolute());
+        assert!(absolute.starts_with(cwd));
+        assert!(absolute.ends_with(relative));
     }
 }

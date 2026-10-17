@@ -1,16 +1,21 @@
 use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError};
-use crate::{
-    HeavyRegistrationError, HeavyRegistry, HeavyScript, ScriptContext, ScriptEventLevel,
-    ScriptParams, ScriptTime,
-};
-use engine_scene::{ParamValue, SceneDocument, World};
+use crate::{Key, MouseButton, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime};
+use engine_scene::{SceneDocument, World};
+use rve_sdk::{Context, Params, Script, Value};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 fn world(source: &str) -> World {
-    let document = SceneDocument::parse("test.rvescene", source).unwrap();
+    let source = if source.contains("[objects.camera]") {
+        source.to_owned()
+    } else {
+        format!(
+            "{source}\n[[objects]]\nid = \"__test_camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n"
+        )
+    };
+    let document = SceneDocument::parse("test.rvescene", &source).unwrap();
     World::from_document(&document).unwrap()
 }
 
@@ -36,39 +41,182 @@ fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn labeled_registry() -> HeavyRegistry {
-    let mut registry = HeavyRegistry::new();
-    registry.register("Log", labeled_factory).unwrap();
-    registry
-}
+#[test]
+fn lua_input_api_reads_the_shared_frame_snapshot() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+function Input:on_update()
+  local x, y = rve.input.cursor()
+  local dx, dy = rve.input.mouse_delta()
+  local wx, wy = rve.input.wheel()
+  if rve.input.key_down("W") and rve.input.key_pressed("W")
+      and rve.input.key_released("A")
+      and rve.input.mouse_down("Left") and rve.input.mouse_pressed("Left")
+      and rve.input.mouse_released("Right")
+      and x == 40 and y == 60 and dx == 2.5 and dy == -3
+      and wx == 1 and wy == 0.5 then
+    rve.log_info("Lua input snapshot")
+  else
+    error("input snapshot mismatch")
+  end
+end
+return Input
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("input.lua", source)]), None).unwrap();
+    let mut input = ScriptInput::default();
+    input.set_key(Key::W, true);
+    input.set_key(Key::A, true);
+    input.set_key(Key::A, false);
+    input.set_mouse_button(MouseButton::Left, true);
+    input.set_mouse_button(MouseButton::Right, true);
+    input.set_mouse_button(MouseButton::Right, false);
+    input.set_cursor(40.0, 60.0);
+    input.add_mouse_delta(2.5, -3.0);
+    input.add_wheel(1.0, 0.5);
+    host.set_input(input);
+    host.update(&mut world, 0.1, ScriptTime::default());
 
-fn empty_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    Ok(Box::new(KeepAliveHeavy))
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "Lua input snapshot"
+    }));
 }
 
 #[test]
-fn heavy_registry_rejects_duplicate_and_invalid_names() {
-    let mut registry = HeavyRegistry::new();
-    registry.register("Valid_2", empty_factory).unwrap();
-    registry.register("x".repeat(64), empty_factory).unwrap();
-    assert_eq!(
-        registry.register("Valid_2", empty_factory),
-        Err(HeavyRegistrationError::DuplicateName("Valid_2".to_owned()))
+fn lua_destroy_clears_input_edges_and_deltas_but_keeps_down_and_cursor() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
     );
-    for name in ["", "bad-name", "é", &"x".repeat(65)] {
-        assert!(matches!(
-            registry.register(name, empty_factory),
-            Err(HeavyRegistrationError::InvalidName(_))
-        ));
-    }
+    let source = r#"
+local Input = {}
+function Input:on_update()
+  local x, y = rve.input.cursor()
+  local dx, dy = rve.input.mouse_delta()
+  local wx, wy = rve.input.wheel()
+  if rve.input.key_down("W") and rve.input.key_pressed("W")
+      and rve.input.key_released("A")
+      and rve.input.mouse_down("Left") and rve.input.mouse_pressed("Left")
+      and rve.input.mouse_released("Right")
+      and x == 40 and y == 60 and dx == 2.5 and dy == -3
+      and wx == 1 and wy == 0.5 then
+    rve.log_info("input update visible")
+  else
+    error("input update mismatch")
+  end
+end
+function Input:on_destroy()
+  local x, y = rve.input.cursor()
+  local dx, dy = rve.input.mouse_delta()
+  local wx, wy = rve.input.wheel()
+  if not rve.input.key_down("W") or rve.input.key_pressed("W")
+      or rve.input.key_released("W") or rve.input.key_down("A")
+      or rve.input.key_pressed("A") or rve.input.key_released("A")
+      or not rve.input.mouse_down("Left") or rve.input.mouse_pressed("Left")
+      or rve.input.mouse_released("Left") or rve.input.mouse_down("Right")
+      or rve.input.mouse_pressed("Right") or rve.input.mouse_released("Right")
+      or x ~= 40 or y ~= 60 or dx ~= 0 or dy ~= 0 or wx ~= 0 or wy ~= 0 then
+    error("input destroy mismatch")
+  end
+  rve.log_info("destroy input cleared")
+end
+return Input
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("input.lua", source)]), None).unwrap();
+    let mut input = ScriptInput::default();
+    input.set_key(Key::W, true);
+    input.set_key(Key::A, true);
+    input.set_key(Key::A, false);
+    input.set_mouse_button(MouseButton::Left, true);
+    input.set_mouse_button(MouseButton::Right, true);
+    input.set_mouse_button(MouseButton::Right, false);
+    input.set_cursor(40.0, 60.0);
+    input.add_mouse_delta(2.5, -3.0);
+    input.add_wheel(1.0, 0.5);
+    host.set_input(input);
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "input update visible"
+    }));
+
+    host.destroy(&mut world, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "destroy input cleared"
+    }));
+}
+
+#[test]
+fn lua_input_rejects_unknown_key_names() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+function Input:on_update()
+  rve.input.key_down("UnknownKey")
+end
+return Input
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("input.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("unknown input key")
+    }));
+}
+
+#[test]
+fn lua_input_rejects_unknown_mouse_button_names() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+function Input:on_update()
+  rve.input.mouse_down("Extra")
+end
+return Input
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("input.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("unknown mouse button")
+    }));
 }
 
 struct LabeledHeavy {
     label: String,
 }
 
-fn labeled_factory(params: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    let Some(ParamValue::String(label)) = params.get("label") else {
+fn labeled_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let Some(Value::String(label)) = params.get("label") else {
         return Err("missing string parameter label".to_owned());
     };
     Ok(Box::new(LabeledHeavy {
@@ -76,18 +224,118 @@ fn labeled_factory(params: &ScriptParams) -> Result<Box<dyn HeavyScript>, String
     }))
 }
 
-impl HeavyScript for LabeledHeavy {
-    fn on_start(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log(format!("{}:start", self.label));
+impl Script for LabeledHeavy {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info(format!("{}:start", self.label));
     }
 
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _dt: f32) {
-        ctx.log(format!("{}:update", self.label));
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        ctx.log_info(format!("{}:update", self.label));
     }
 
-    fn on_destroy(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log(format!("{}:destroy", self.label));
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info(format!("{}:destroy", self.label));
     }
+}
+
+struct ParamsAndTransformHeavy;
+
+fn params_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let expected = Params::from([
+        ("flag".to_owned(), Value::Bool(true)),
+        ("count".to_owned(), Value::Int(17)),
+        ("ratio".to_owned(), Value::Float(1.25)),
+        ("title".to_owned(), Value::String("hello".to_owned())),
+        (
+            "values".to_owned(),
+            Value::Array(vec![
+                Value::Int(2),
+                Value::Bool(false),
+                Value::String("x".to_owned()),
+            ]),
+        ),
+    ]);
+    if params == &expected {
+        Ok(Box::new(ParamsAndTransformHeavy))
+    } else {
+        Err("parameter values differ".to_owned())
+    }
+}
+
+impl Script for ParamsAndTransformHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        ctx.transform.position[0] += 1.0;
+    }
+}
+
+struct PanicHeavy;
+
+fn panic_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PanicHeavy))
+}
+
+impl Script for PanicHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _: f32) {
+        ctx.transform.position[0] = 99.0;
+        panic!("expected heavy panic");
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info("panic instance destroyed");
+    }
+}
+
+struct KeepAliveHeavy;
+
+fn keep_alive_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(KeepAliveHeavy))
+}
+
+impl Script for KeepAliveHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _: f32) {
+        ctx.transform.position[1] += 1.0;
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info("healthy heavy destroyed");
+    }
+}
+
+struct NonFiniteHeavy;
+
+fn non_finite_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(NonFiniteHeavy))
+}
+
+impl Script for NonFiniteHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _: f32) {
+        ctx.transform.position[0] = f32::NAN;
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info("non-finite instance destroyed");
+    }
+}
+
+fn fail_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Err("factory refused parameters".to_owned())
+}
+
+fn test_module() -> &'static rve_sdk::abi::RveModule {
+    rve_sdk::script_module! {
+        "Log" => labeled_factory,
+        "Params" => params_factory,
+        "Panic" => panic_factory,
+        "KeepAlive" => keep_alive_factory,
+        "NonFinite" => non_finite_factory,
+        "Fail" => fail_factory,
+    }
+}
+
+fn test_library() -> ScriptLibrary {
+    // SAFETY: the SDK macro returns an immutable process-lifetime table.
+    unsafe { ScriptLibrary::from_module(std::ptr::from_ref(test_module())) }
+        .expect("test script module is valid")
 }
 
 fn event_messages(host: &mut ScriptHost) -> Vec<String> {
@@ -134,11 +382,12 @@ function Script:on_update() rve.log(self.params.label .. ":update") end
 function Script:on_destroy() rve.log(self.params.label .. ":destroy") end
 return Script
 "#;
+    let library = test_library();
     let mut host = ScriptHost::load(
         &world,
         "scene",
         &sources(&[("a.lua", lite_source), ("b.lua", lite_source)]),
-        &labeled_registry(),
+        Some(&library),
     )
     .unwrap();
 
@@ -212,44 +461,11 @@ return Script
         &world,
         "scene",
         &sources(&[("auto-start.lua", source)]),
-        &HeavyRegistry::new(),
+        None,
     )
     .unwrap();
     host.update(&mut world, 0.1, ScriptTime::default());
     assert_eq!(event_messages(&mut host), ["start", "update"]);
-}
-
-struct ParamsAndTransformHeavy;
-
-fn params_factory(params: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    let expected = BTreeMap::from([
-        ("flag", ParamValue::Bool(true)),
-        ("count", ParamValue::Int(17)),
-        ("ratio", ParamValue::Float(1.25)),
-        ("title", ParamValue::String("hello".to_owned())),
-        (
-            "values",
-            ParamValue::Array(vec![
-                ParamValue::Int(2),
-                ParamValue::Bool(false),
-                ParamValue::String("x".to_owned()),
-            ]),
-        ),
-    ]);
-    if expected
-        .iter()
-        .all(|(key, value)| params.get(*key) == Some(value))
-    {
-        Ok(Box::new(ParamsAndTransformHeavy))
-    } else {
-        Err("parameter values differ".to_owned())
-    }
-}
-
-impl HeavyScript for ParamsAndTransformHeavy {
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _dt: f32) {
-        ctx.transform.position[0] += 1.0;
-    }
 }
 
 #[test]
@@ -273,13 +489,12 @@ return Script
     let mut world = one_camera(&format!(
         "[[assets]]\npath = \"/params.lua\"\n[[objects.lite_scripts]]\npath = \"/params.lua\"\nparams = {params}\n[[objects.heavy_scripts]]\nname = \"Params\"\nparams = {params}\n"
     ));
-    let mut registry = HeavyRegistry::new();
-    registry.register("Params", params_factory).unwrap();
+    let library = test_library();
     let mut host = ScriptHost::load(
         &world,
         "scene",
         &sources(&[("params.lua", source)]),
-        &registry,
+        Some(&library),
     )
     .unwrap();
 
@@ -309,13 +524,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath = \"/log.lua\"\n[[objects.lite_scripts]]\npath = \"/log.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "level",
-        &sources(&[("log.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "level", &sources(&[("log.lua", source)]), None).unwrap();
     host.start(
         &mut world,
         ScriptTime {
@@ -348,13 +558,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath = \"/bytes.lua\"\n[[objects.lite_scripts]]\npath = \"/bytes.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("bytes.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("bytes.lua", source)]), None).unwrap();
 
     host.start(&mut world, ScriptTime::default());
 
@@ -393,7 +598,7 @@ return Script
         &world,
         "scene",
         &sources(&[("a.lua", a), ("b.lua", b)]),
-        &HeavyRegistry::new(),
+        None,
     )
     .unwrap();
 
@@ -418,13 +623,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath = \"/frame.lua\"\n[[objects.lite_scripts]]\npath = \"/frame.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("frame.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("frame.lua", source)]), None).unwrap();
 
     host.start(
         &mut world,
@@ -462,7 +662,7 @@ return Script
         &world,
         "scene",
         &sources(&[("bad.lua", bad), ("healthy.lua", healthy)]),
-        &HeavyRegistry::new(),
+        None,
     )
     .unwrap();
     host.start(&mut world, ScriptTime::default());
@@ -500,48 +700,13 @@ return Script
     assert_eq!(transform.position.x, 2.0);
 }
 
-struct PanicHeavy;
-
-fn panic_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    Ok(Box::new(PanicHeavy))
-}
-
-impl HeavyScript for PanicHeavy {
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _: f32) {
-        ctx.transform.position[0] = 99.0;
-        panic!("expected heavy panic");
-    }
-
-    fn on_destroy(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log("panic instance destroyed");
-    }
-}
-
-struct KeepAliveHeavy;
-
-fn keep_alive_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    Ok(Box::new(KeepAliveHeavy))
-}
-
-impl HeavyScript for KeepAliveHeavy {
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _: f32) {
-        ctx.transform.position[1] += 1.0;
-    }
-
-    fn on_destroy(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log("healthy heavy destroyed");
-    }
-}
-
 #[test]
 fn heavy_panic_disables_that_instance_but_other_heavy_scripts_continue() {
     let mut world = one_camera(
         "[objects.transform]\nposition=[8.0, 0.0, 0.0]\n[[objects.heavy_scripts]]\nname=\"Panic\"\n[[objects.heavy_scripts]]\nname=\"KeepAlive\"\n",
     );
-    let mut registry = HeavyRegistry::new();
-    registry.register("Panic", panic_factory).unwrap();
-    registry.register("KeepAlive", keep_alive_factory).unwrap();
-    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), &registry).unwrap();
+    let library = test_library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
     host.start(&mut world, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
@@ -567,30 +732,13 @@ fn heavy_panic_disables_that_instance_but_other_heavy_scripts_continue() {
     );
 }
 
-struct NonFiniteHeavy;
-
-fn non_finite_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    Ok(Box::new(NonFiniteHeavy))
-}
-
-impl HeavyScript for NonFiniteHeavy {
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _: f32) {
-        ctx.transform.position[0] = f32::NAN;
-    }
-
-    fn on_destroy(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log("non-finite instance destroyed");
-    }
-}
-
 #[test]
 fn non_finite_heavy_transform_disables_instance_and_rolls_back() {
     let mut world = one_camera(
         "[[objects.heavy_scripts]]\nname=\"NonFinite\"\n[objects.transform]\nposition=[8.0, 2.0, 3.0]\n",
     );
-    let mut registry = HeavyRegistry::new();
-    registry.register("NonFinite", non_finite_factory).unwrap();
-    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), &registry).unwrap();
+    let library = test_library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
     host.start(&mut world, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
     host.destroy(&mut world, ScriptTime::default());
@@ -627,7 +775,7 @@ return Script
             &world,
             "scene",
             &sources(&[("bad-transform.lua", &source)]),
-            &HeavyRegistry::new(),
+            None,
         )
         .unwrap();
         host.start(&mut world, ScriptTime::default());
@@ -661,13 +809,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath=\"/rollback.lua\"\n[objects.transform]\nposition=[4.0, 0.0, 0.0]\n[[objects.lite_scripts]]\npath=\"/rollback.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("rollback.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("rollback.lua", source)]), None).unwrap();
 
     host.start(&mut world, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
@@ -700,14 +843,9 @@ fn load_rejects_syntax_non_table_and_non_function_callbacks_with_path() {
         let world = one_camera(
             "[[assets]]\npath=\"/bad.lua\"\n[[objects.lite_scripts]]\npath=\"/bad.lua\"\n",
         );
-        let error = ScriptHost::load(
-            &world,
-            "scene",
-            &sources(&[("bad.lua", source)]),
-            &HeavyRegistry::new(),
-        )
-        .err()
-        .expect("invalid lite script should fail to load");
+        let error = ScriptHost::load(&world, "scene", &sources(&[("bad.lua", source)]), None)
+            .err()
+            .expect("invalid lite script should fail to load");
         assert!(matches!(
             error,
             ScriptLoadError::Lite { ref path, ref message }
@@ -717,47 +855,37 @@ fn load_rejects_syntax_non_table_and_non_function_callbacks_with_path() {
 }
 
 #[test]
-fn load_rejects_unknown_heavy_factory_and_factory_errors() {
+fn load_rejects_heavy_scripts_without_a_library_or_registration() {
     let unknown_world = one_camera("[[objects.heavy_scripts]]\nname=\"Missing\"\n");
-    let error = ScriptHost::load(
-        &unknown_world,
-        "scene",
-        &BTreeMap::new(),
-        &HeavyRegistry::new(),
-    )
-    .err()
-    .expect("unknown heavy script should fail to load");
+    let error = ScriptHost::load(&unknown_world, "scene", &BTreeMap::new(), None)
+        .err()
+        .expect("unknown heavy script should fail to load");
     assert_eq!(
         error,
         ScriptLoadError::Heavy {
             object_id: "camera".to_owned(),
             name: "Missing".to_owned(),
-            message: "no factory is registered for this name".to_owned(),
+            message:
+                "no script library is loaded; pass --scripts <path> or place the library in Engine/"
+                    .to_owned(),
         }
     );
 
-    fn fail_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-        Err("factory refused parameters".to_owned())
-    }
-    let mut registry = HeavyRegistry::new();
-    registry.register("Fail", fail_factory).unwrap();
-    let failed_world = one_camera("[[objects.heavy_scripts]]\nname=\"Fail\"\n");
+    let library = test_library();
+    let unknown_name = ScriptHost::load(&unknown_world, "scene", &BTreeMap::new(), Some(&library))
+        .err()
+        .expect("unregistered heavy script should fail to load");
     assert!(matches!(
-        ScriptHost::load(&failed_world, "scene", &BTreeMap::new(), &registry),
-        Err(ScriptLoadError::Heavy { ref message, .. })
-            if message == "factory refused parameters"
+        unknown_name,
+        ScriptLoadError::Heavy { ref message, .. }
+            if message.contains("does not register this name")
     ));
 
-    fn panic_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-        panic!("expected factory panic")
-    }
-    let mut panic_registry = HeavyRegistry::new();
-    panic_registry.register("Panic", panic_factory).unwrap();
-    let panic_world = one_camera("[[objects.heavy_scripts]]\nname=\"Panic\"\n");
+    let failed_world = one_camera("[[objects.heavy_scripts]]\nname=\"Fail\"\n");
     assert!(matches!(
-        ScriptHost::load(&panic_world, "scene", &BTreeMap::new(), &panic_registry),
+        ScriptHost::load(&failed_world, "scene", &BTreeMap::new(), Some(&library)),
         Err(ScriptLoadError::Heavy { ref message, .. })
-            if message.contains("factory panicked: expected factory panic")
+            if message == "factory refused parameters"
     ));
 }
 
@@ -785,13 +913,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath=\"/sandbox.lua\"\n[[objects.lite_scripts]]\npath=\"/sandbox.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("sandbox.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("sandbox.lua", source)]), None).unwrap();
     host.start(&mut world, ScriptTime::default());
     assert!(host.drain_events().is_empty());
 }
@@ -805,13 +928,8 @@ return Script
 "#;
     let mut world =
         one_camera("[[assets]]\npath=\"/gc.lua\"\n[[objects.lite_scripts]]\npath=\"/gc.lua\"\n");
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("gc.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("gc.lua", source)]), None).unwrap();
 
     host.start(&mut world, ScriptTime::default());
 
@@ -838,13 +956,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath=\"/memory.lua\"\n[[objects.lite_scripts]]\npath=\"/memory.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("memory.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("memory.lua", source)]), None).unwrap();
 
     host.start(&mut world, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
@@ -897,7 +1010,7 @@ return Script
         &world,
         "scene",
         &sources(&[("a.lua", a), ("b.lua", b)]),
-        &HeavyRegistry::new(),
+        None,
     )
     .unwrap();
 
@@ -936,11 +1049,12 @@ params = { label = "camera-heavy" }
 "#,
     );
     let handle = ScriptInterruptHandle::new();
+    let library = test_library();
     let mut host = ScriptHost::load_with_interrupt(
         &world,
         "scene",
         &sources(&[]),
-        &labeled_registry(),
+        Some(&library),
         handle.clone(),
     )
     .unwrap();
@@ -986,13 +1100,8 @@ end
 function Script:on_destroy() rve.log("loop destroyed") end
 return Script
 "#;
-        let mut host = ScriptHost::load(
-            &world,
-            "scene",
-            &sources(&[("loop.lua", source)]),
-            &HeavyRegistry::new(),
-        )
-        .unwrap();
+        let mut host =
+            ScriptHost::load(&world, "scene", &sources(&[("loop.lua", source)]), None).unwrap();
         let signal = host
             .lua
             .create_function(move |_, ()| {
@@ -1030,11 +1139,12 @@ return Script
         "[[assets]]\npath=\"/pre-interrupted.lua\"\n[[objects.lite_scripts]]\npath=\"/pre-interrupted.lua\"\n[[objects.heavy_scripts]]\nname=\"Log\"\nparams={label=\"camera-heavy\"}\n",
     );
     let handle = ScriptInterruptHandle::new();
+    let library = test_library();
     let mut host = ScriptHost::load_with_interrupt(
         &world,
         "scene",
         &sources(&[("pre-interrupted.lua", source)]),
-        &labeled_registry(),
+        Some(&library),
         handle.clone(),
     )
     .unwrap();
@@ -1086,7 +1196,7 @@ fn interrupt_handle_cancels_infinite_top_level_chunk_during_load() {
             &world,
             "scene",
             &sources(&[("load-loop.lua", source)]),
-            &HeavyRegistry::new(),
+            None,
             worker_handle,
         )
         .map(|_| ());
@@ -1103,3 +1213,731 @@ fn interrupt_handle_cancels_infinite_top_level_chunk_during_load() {
             if path == "load-loop.lua" && message.to_lowercase().contains("interrupted")
     ));
 }
+
+#[test]
+fn lua_object_writes_are_transactional_and_world_matrices_are_phase_snapshots() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/objects.lua"
+[[objects]]
+id = "sender"
+name = "Sender"
+[objects.transform]
+position = [1.0, 0.0, 0.0]
+[[objects.lite_scripts]]
+path = "/objects.lua"
+params = { role = "sender" }
+[[objects]]
+id = "target"
+name = "Target"
+[objects.transform]
+position = [2.0, 0.0, 0.0]
+[[objects.lite_scripts]]
+path = "/objects.lua"
+params = { role = "target" }
+[[objects]]
+id = "external"
+name = "External"
+[objects.transform]
+position = [4.0, 0.0, 0.0]
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local own = assert(rve.find(self.object.id))
+  local matrix = own:world_matrix()
+  if self.params.role == "sender" then
+    if rve.time.frame == 1 then
+      assert(own.id == "sender" and own.name == "Sender")
+      local external = assert(rve.find("external"))
+      local transform = external:get_transform()
+      transform.position = { x = 5, y = 0, z = 0 }
+      external:set_transform(transform)
+      assert(external:world_matrix()[13] == 4)
+
+      local through_handle = own:get_transform()
+      through_handle.position = { x = 99, y = 0, z = 0 }
+      own:set_transform(through_handle)
+      self.transform.position = { x = 1, y = 3, z = 0 }
+      assert(matrix[13] == 1)
+    else
+      assert(matrix[13] == 1)
+    end
+  elseif rve.time.frame == 1 then
+    assert(matrix[13] == 2)
+    local through_handle = own:get_transform()
+    through_handle.position = { x = 88, y = 0, z = 0 }
+    own:set_transform(through_handle)
+  else
+    assert(matrix[13] == 88)
+  end
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("objects.lua", source)]), None).unwrap();
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    let sender = world
+        .local_transform(world.handle("sender").unwrap())
+        .unwrap();
+    let target = world
+        .local_transform(world.handle("target").unwrap())
+        .unwrap();
+    let external = world
+        .local_transform(world.handle("external").unwrap())
+        .unwrap();
+    assert_eq!(sender.position.to_array(), [1.0, 3.0, 0.0]);
+    assert_eq!(target.position.to_array(), [88.0, 0.0, 0.0]);
+    assert_eq!(external.position.to_array(), [5.0, 0.0, 0.0]);
+    assert!(host.drain_events().is_empty());
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.2,
+            frame: 2,
+        },
+    );
+    assert!(host.drain_events().is_empty());
+}
+
+#[test]
+fn lua_messages_from_start_and_on_message_are_delivered_in_order_on_later_updates() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/messages.lua"
+[[objects]]
+id = "sender"
+name = "Sender"
+[[objects.lite_scripts]]
+path = "/messages.lua"
+params = { role = "sender" }
+[[objects]]
+id = "receiver"
+name = "Receiver"
+[[objects.lite_scripts]]
+path = "/messages.lua"
+params = { role = "receiver" }
+[[objects]]
+id = "observer"
+name = "Observer"
+[[objects.lite_scripts]]
+path = "/messages.lua"
+params = { role = "observer" }
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_start()
+  if self.params.role == "sender" then
+    rve.send("receiver", "one", { "hello", 2, false })
+    rve.broadcast("fan", "ready")
+  end
+end
+function Script:on_message(sender, name, value)
+  if name == "one" then
+    assert(value[1] == "hello" and value[2] == 2 and value[3] == false)
+    rve.send("sender", "reply", { "ok" })
+  end
+  rve.log_info(self.params.role .. ":" .. name .. ":" .. sender)
+end
+function Script:on_update()
+  rve.log_info(self.params.role .. ":update")
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("messages.lua", source)]), None).unwrap();
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    assert_eq!(
+        event_messages(&mut host),
+        [
+            "receiver:one:sender",
+            "sender:fan:sender",
+            "receiver:fan:sender",
+            "observer:fan:sender",
+            "sender:update",
+            "receiver:update",
+            "observer:update",
+        ]
+    );
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.2,
+            frame: 2,
+        },
+    );
+    assert_eq!(
+        event_messages(&mut host),
+        [
+            "sender:reply:receiver",
+            "sender:update",
+            "receiver:update",
+            "observer:update",
+        ]
+    );
+}
+
+#[test]
+fn lua_message_and_update_callbacks_share_one_world_matrix_snapshot() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/sender.lua"
+[[assets]]
+path = "/target.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/sender.lua"
+[[objects]]
+id = "target"
+[objects.transform]
+position = [2.0, 0.0, 0.0]
+[[objects.lite_scripts]]
+path = "/target.lua"
+"#,
+    );
+    let sender = r#"
+local Script = {}
+function Script:on_start() rve.send("target", "move", true) end
+return Script
+"#;
+    let target = r#"
+local Script = {}
+function Script:on_message(_, name)
+  if name == "move" then
+    local object = rve.find("target")
+    local transform = object:get_transform()
+    transform.position = { x = 10, y = 0, z = 0 }
+    object:set_transform(transform)
+    assert(object:world_matrix()[13] == 2)
+    rve.log_info("message matrix 2")
+  end
+end
+function Script:on_update()
+  local matrix = rve.find("target"):world_matrix()
+  if rve.time.frame == 1 then
+    assert(matrix[13] == 2)
+    rve.log_info("update matrix 2")
+  else
+    assert(matrix[13] == 10)
+    rve.log_info("update matrix 10")
+  end
+end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("sender.lua", sender), ("target.lua", target)]),
+        None,
+    )
+    .unwrap();
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    assert_eq!(
+        event_messages(&mut host),
+        ["message matrix 2", "update matrix 2"]
+    );
+    assert_eq!(
+        world
+            .local_transform(world.handle("target").unwrap())
+            .unwrap()
+            .position
+            .x,
+        10.0
+    );
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.2,
+            frame: 2,
+        },
+    );
+    assert_eq!(event_messages(&mut host), ["update matrix 10"]);
+}
+
+#[test]
+fn lua_failed_send_rolls_back_earlier_messages_and_unknown_targets_are_errors() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/send.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/send.lua"
+params = { role = "sender" }
+[[objects]]
+id = "receiver"
+[[objects.lite_scripts]]
+path = "/send.lua"
+params = { role = "receiver" }
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_start()
+  if self.params.role == "sender" then
+    rve.send("receiver", "must_rollback", 1)
+    rve.send("missing", "unknown", 2)
+  end
+end
+function Script:on_message(_, name)
+  rve.log_info("received:" .. name)
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("send.lua", source)]), None).unwrap();
+    let sender = world.handle("sender").unwrap();
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.2,
+            frame: 2,
+        },
+    );
+
+    let events = host.drain_events();
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event.message.contains("target \"missing\" does not exist")
+    }));
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.message.contains("received:"))
+    );
+    assert_eq!(
+        world.local_transform(sender).unwrap().position.to_array(),
+        [0.0; 3]
+    );
+}
+
+#[test]
+fn lua_message_error_rolls_back_its_transaction_and_disables_the_receiver() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/messages.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/messages.lua"
+params = { role = "sender" }
+[[objects]]
+id = "receiver"
+[[objects.lite_scripts]]
+path = "/messages.lua"
+params = { role = "receiver" }
+[[objects]]
+id = "observer"
+[[objects.lite_scripts]]
+path = "/messages.lua"
+params = { role = "observer" }
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_start()
+  if self.params.role == "sender" then
+    rve.send("receiver", "fail", true)
+    rve.send("receiver", "later", true)
+  end
+end
+function Script:on_message(_, name)
+  if self.params.role == "receiver" and name == "fail" then
+    local transform = rve.find("receiver"):get_transform()
+    transform.position = { x = 9, y = 0, z = 0 }
+    rve.find("receiver"):set_transform(transform)
+    rve.send("observer", "must_rollback", true)
+    rve.send("missing", "error", true)
+  elseif self.params.role == "observer" then
+    rve.log_info("observer received " .. name)
+  end
+end
+function Script:on_update()
+  if self.params.role == "receiver" then rve.log_info("receiver update") end
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("messages.lua", source)]), None).unwrap();
+    let receiver = world.handle("receiver").unwrap();
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+
+    assert_eq!(
+        world.local_transform(receiver).unwrap().position.to_array(),
+        [0.0; 3]
+    );
+    let events = host.drain_events();
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event.source == "scene/receiver/messages.lua"
+            && event.message.contains("target \"missing\" does not exist")
+    }));
+    assert!(events.iter().all(|event| {
+        !event.message.contains("receiver update") && !event.message.contains("observer received")
+    }));
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.2,
+            frame: 2,
+        },
+    );
+    assert!(host.drain_events().is_empty());
+}
+
+#[test]
+fn lua_message_limit_drops_excess_without_disabling_sender() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/sender.lua"
+[[assets]]
+path = "/receiver.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/sender.lua"
+[[objects]]
+id = "receiver"
+[[objects.lite_scripts]]
+path = "/receiver.lua"
+params = { count = 0 }
+"#,
+    );
+    let sender = r#"
+local Script = {}
+function Script:on_start()
+  for i = 1, 4100 do rve.send("receiver", "bulk", i) end
+end
+function Script:on_update() rve.log_info("sender remains enabled") end
+return Script
+"#;
+    let receiver = r#"
+local Script = {}
+function Script:on_message(_, name)
+  if name == "bulk" then self.params.count = self.params.count + 1 end
+end
+function Script:on_update() rve.log_info("received " .. self.params.count) end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("sender.lua", sender), ("receiver.lua", receiver)]),
+        None,
+    )
+    .unwrap();
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    let events = host.drain_events();
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("dropped 4 message(s)")
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "sender remains enabled")
+    );
+    assert!(events.iter().any(|event| event.message == "received 4096"));
+}
+
+#[test]
+fn lua_message_byte_budget_drops_excess_in_order_without_disabling_sender() {
+    const MESSAGE_COUNT: usize = 132;
+    const MESSAGE_VALUE_BYTES: usize = 65_536;
+    let max_bytes = crate::transaction::MAX_MESSAGE_BYTES_PER_FRAME;
+    let mut expected_bytes = 0usize;
+    let expected_delivery_count = (1..=MESSAGE_COUNT)
+        .take_while(|index| {
+            let name = format!("bulk{index}");
+            let message_bytes = std::mem::size_of::<engine_scene::ParamValue>()
+                + "sender".len()
+                + name.len()
+                + MESSAGE_VALUE_BYTES;
+            if expected_bytes.saturating_add(message_bytes) > max_bytes {
+                return false;
+            }
+            expected_bytes += message_bytes;
+            true
+        })
+        .count();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/sender.lua"
+[[assets]]
+path = "/receiver.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/sender.lua"
+[[objects]]
+id = "receiver"
+[[objects.lite_scripts]]
+path = "/receiver.lua"
+"#,
+    );
+    let sender = format!(
+        r#"
+local Script = {{}}
+function Script:on_start()
+  for i = 1, {MESSAGE_COUNT} do
+    rve.send("receiver", "bulk" .. i, string.rep("x", {MESSAGE_VALUE_BYTES}))
+  end
+end
+function Script:on_update() rve.log_info("sender remains enabled") end
+return Script
+"#
+    );
+    let receiver = r#"
+local Script = {}
+function Script:on_message(_, name) rve.log_info("received " .. name) end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("sender.lua", &sender), ("receiver.lua", receiver)]),
+        None,
+    )
+    .unwrap();
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    let events = host.drain_events();
+    let delivered = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .message
+                .strip_prefix("received bulk")
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(delivered, (1..=expected_delivery_count).collect::<Vec<_>>());
+    let overflow_errors = events
+        .iter()
+        .filter(|event| {
+            event.level == ScriptEventLevel::Error && event.message.contains("message queue limits")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(overflow_errors.len(), 1);
+    assert!(overflow_errors[0].message.contains(&format!(
+        "dropped {} message(s)",
+        MESSAGE_COUNT - expected_delivery_count
+    )));
+    assert_eq!(host.transaction.peak_pending_bytes(), expected_bytes);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "sender remains enabled")
+    );
+}
+
+#[test]
+fn lua_creation_phases_reject_object_writes_and_messages() {
+    for (path, source) in [
+        (
+            "write.lua",
+            r#"local object = rve.find("camera"); local transform = object:get_transform(); object:set_transform(transform); return {}"#,
+        ),
+        (
+            "send.lua",
+            r#"rve.send("camera", "early", true); return {}"#,
+        ),
+        (
+            "broadcast.lua",
+            r#"rve.broadcast("early", true); return {}"#,
+        ),
+    ] {
+        let world = one_camera(&format!(
+            "[[assets]]\npath = \"/{path}\"\n[[objects.lite_scripts]]\npath = \"/{path}\"\n"
+        ));
+        let handle = world.handle("camera").unwrap();
+        let before = *world.local_transform(handle).unwrap();
+        let result = ScriptHost::load(&world, "scene", &sources(&[(path, source)]), None);
+        assert!(
+            matches!(result, Err(ScriptLoadError::Lite { message, .. }) if message.contains("unavailable during script creation"))
+        );
+        assert_eq!(*world.local_transform(handle).unwrap(), before);
+    }
+}
+
+#[test]
+fn lua_warning_logging_keeps_the_warn_level() {
+    let source = r#"
+local Script = {}
+function Script:on_start() rve.log_warn("watch this") end
+return Script
+"#;
+    let mut world = one_camera(
+        "[[assets]]\npath = \"/warn.lua\"\n[[objects.lite_scripts]]\npath = \"/warn.lua\"\n",
+    );
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("warn.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let events = host.drain_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].level, ScriptEventLevel::Warn);
+    assert_eq!(events[0].message, "watch this");
+}
+
+#[test]
+fn lua_error_rolls_back_multiple_object_writes_and_messages_but_keeps_logs() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/rollback.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/rollback.lua"
+params = { role = "sender" }
+[[objects]]
+id = "receiver"
+[[objects.lite_scripts]]
+path = "/rollback.lua"
+params = { role = "receiver" }
+[[objects]]
+id = "external"
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  if self.params.role == "sender" then
+    local own = rve.find("sender")
+    local own_transform = own:get_transform()
+    own_transform.position = { x = 10, y = 0, z = 0 }
+    own:set_transform(own_transform)
+    local external = rve.find("external")
+    local other_transform = external:get_transform()
+    other_transform.position = { x = 20, y = 0, z = 0 }
+    external:set_transform(other_transform)
+    rve.send("receiver", "rolled_back", true)
+    rve.log_info("log survives rollback")
+    error("transaction failure")
+  end
+end
+function Script:on_message(_, name) rve.log_info("received:" .. name) end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("rollback.lua", source)]), None).unwrap();
+    let sender = world.handle("sender").unwrap();
+    let external = world.handle("external").unwrap();
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.2,
+            frame: 2,
+        },
+    );
+
+    assert_eq!(
+        world.local_transform(sender).unwrap().position.to_array(),
+        [0.0; 3]
+    );
+    assert_eq!(
+        world.local_transform(external).unwrap().position.to_array(),
+        [0.0; 3]
+    );
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "log survives rollback")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message.contains("transaction failure"))
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.message.contains("received:"))
+    );
+}
+
+mod abi;

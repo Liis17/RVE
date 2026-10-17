@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-`engine-runtime` связывает настройки проекта, ресурсы, сцену, скрипты, окно и renderer в игровое приложение. Публичный вход — `engine_runtime::run_player(register_heavy: fn(&mut HeavyRegistry)) -> ExitCode`; бинарник `engine/rve-player` передаёт пустой callback регистрации heavy-скриптов. Runtime не переносит оконную или Vulkan-логику в `engine-project`, `engine-window` либо `engine-platform`.
+`engine-runtime` связывает настройки проекта, ресурсы, сцену, скрипты, окно и renderer в игровое приложение. Публичный вход — `engine_runtime::run_player() -> ExitCode`; бинарник `engine/rve-player` вызывает его без параметров. Runtime не переносит оконную или Vulkan-логику в `engine-project`, `engine-window` либо `engine-platform`.
 
 Схема `bootstrap.rves` и `project.rveproject`, defaults и их проверка описаны в
 [[Engine/EngineProject]]. Здесь зафиксированы только runtime-пути и использование.
@@ -22,6 +22,15 @@ Parent: [[Index]]
 На macOS, если executable находится в `<Name>.app/Contents/MacOS`, это
 `Contents/Resources` того же бандла: Finder запускает «голый» исполняемый файл через
 Terminal, поэтому `rve-build` публикует macOS-релиз как `.app`.
+
+Параметр `--scripts <path>` задаёт ABI-библиотеку Rust-скриптов. В release layout,
+если параметр не задан, runtime выбирает `Engine/game_scripts.dll` на Windows или
+`Engine/libgame_scripts.dylib` на macOS, только если файл существует. В dev-режиме
+`--project` автоматического поиска нет: библиотеку передают через `--scripts`.
+Параметр разрешён и в release-режиме и перекрывает стандартный путь. Повтор,
+отсутствующее значение и значение, начинающееся с `--`, являются ошибкой CLI с
+кодом 2. Относительный путь `--scripts` разрешается от текущего рабочего каталога и
+приводится к абсолютному; существующие пути нормализуются по правилам платформы.
 
 Заголовок окна берётся из bootstrap, затем из `ProjectSettings.name`. `AppIcon`
 загружается через `Assets::load_texture` до создания окна; ошибка загрузки относится
@@ -41,7 +50,7 @@ Terminal, поэтому `rve-build` публикует macOS-релиз как 
 
 Затем выполняется проверка hardware requirements: подходящее устройство Vulkan, RAM и число логических CPU. Ошибка `probe_devices`, отсутствие подходящего устройства или недостаток ресурсов выводятся в stderr и системный диалог; код выхода 3. CPU-загрузка сцены идёт до окна: `SceneDocument` строит `World`, FBX кэшируется по пути модели, override PNG заменяет текстуры всех мешей соответствующего объекта, а lite-файлы читаются как UTF-8 через `ResourceHandle`.
 
-`ModuleHost` начинает владеть потоками при их первом старте. Он запускает `rve-audio`, `rve-physics`, `rve-network` и `rve-neural`, затем именованный поток `rve-scripts`. Scripts thread создаёт `ScriptHost::load_with_interrupt` с заранее переданным `ScriptInterruptHandle` и сообщает `Ready` до создания окна. Ошибка Lua загрузки даёт код 2; ошибка запуска потока или его паника — код 1.
+`ModuleHost` начинает владеть потоками при их первом старте. Он запускает `rve-audio`, `rve-physics`, `rve-network` и `rve-neural`, затем именованный поток `rve-scripts`. На этом потоке runtime сначала загружает `ScriptLibrary` (если задан путь), затем создаёт `ScriptHost::load_with_interrupt` с библиотекой и заранее переданным `ScriptInterruptHandle`. Только после этого поток сообщает `Ready`, до создания окна. Ошибка загрузки библиотеки или Lua даёт код 2; ошибка запуска потока или его паника — код 1. `ScriptLibrary` намеренно не выгружает динамический модуль.
 
 После Ready `engine-window` запускает `WindowConfig` с `RedrawMode::OnDemand`. `WindowHandler::init` на главном потоке создаёт `Renderer`, загружает меши и текстуры, запускает `rve-render` и отправляет scripts сообщение `Go` с GPU-таблицей. Render thread — единственный владелец renderer после передачи; он строит `Frame` с фиксированным clear color `[0.1, 0.1, 0.12, 1.0]` и вызывает `render_frame`.
 
@@ -49,9 +58,11 @@ Terminal, поэтому `rve-build` публикует macOS-релиз как 
 
 Scripts thread выполняет `start`, затем цикл `update(dt)` → `World::build_frame` → `FrameSnapshot`. Время приходит из монотонного `Clock`; `dt` отражает фактически прошедшее время. Снимки передаются через `flume::bounded(1)`, а отправитель выбирает между готовностью очереди и control-каналом через `Selector`, поэтому заполненная очередь не блокирует Shutdown.
 
-Render thread выбирает между snapshots и resize/occlusion/shutdown control-каналом. `view_projection` пересчитывается по последнему размеру окна. Нулевой размер или occlusion приостанавливает отрисовку; render отбрасывает уже поставленный снимок, а scripts получают Background и продолжают вызывать `update` с частотой `ProjectSettings.runtime.background_tick_hz` ([[Engine/EngineProject]]), не собирая и не отправляя новые snapshots. Если `Background(true)` пришёл до `Go` (например, при нулевом начальном размере окна), scripts запоминают последнее значение до handshake и начинают сразу в соответствующем режиме. Ожидание следующего фонового тика выполняется через `recv_timeout` и injected clock, без `sleep`. Восстановление окна возвращает scripts в обычный цикл и публикацию snapshots.
+Оконный поток передаёт события в `Arc<Mutex<InputAccumulator>>` короткими операциями. Перед каждым `ScriptHost::update` scripts thread забирает `take_frame`: удерживаемые клавиши и кнопки сохраняются, pressed/released и накопленные mouse/wheel delta сбрасываются. `ScriptInput` копируется в host, поэтому все экземпляры и message callbacks одного update видят один снимок. Потеря фокуса и вход в Background освобождают все удерживаемые клавиши и кнопки с `released` edge. Фоновый snapshot не содержит удерживаемого ввода, кроме ещё не выданных `released` от сброса; новые события в Background отбрасываются. До первого `CursorMoved` позиция курсора равна `[0, 0]`; `CursorLeft` не обрабатывается, поэтому последняя позиция сохраняется после выхода из окна, потери фокуса и перехода в Background. Mouse/wheel delta сбрасываются.
 
-`drain_events` выводится runtime: Info в stdout, Error в stderr с префиксом `[script]`. При штатном shutdown scripts thread сначала вызывает `destroy` (`on_destroy`), а runtime ждёт его завершения до 2 секунд. При timeout `ScriptInterruptHandle` прерывает зависший lite Lua-код; затем runtime ждёт ещё до 2 секунд через stopped-канал. Если scripts всё ещё не остановились (например, heavy-скрипт блокирует поток), runtime отсоединяет handle без `join`, пишет ошибку и возвращает код 1. Interrupted lite callbacks не получают `on_destroy` согласно контракту [[Engine/EngineScript]]. При ошибке или панике renderer interrupt подаётся сразу.
+Render thread выбирает между snapshots и resize/occlusion/shutdown control-каналом. `view_projection` пересчитывается по последнему размеру окна. Нулевой размер или occlusion приостанавливает отрисовку; render отбрасывает уже поставленный снимок, а scripts получают Background и продолжают вызывать `update` с частотой `ProjectSettings.runtime.background_tick_hz` ([[Engine/EngineProject]]), не собирая и не отправляя новые snapshots. При смене в Background накопитель освобождает клавиши/кнопки и выдаёт `released` один раз; фоновые тики получают только эти края, без удерживаемого ввода, но с последней известной позицией курсора и нулевыми дельтами. Клавиша, зажатая во время Background (или до получения фокуса), после возврата не считается удерживаемой, пока её не нажмут снова. Если `Background(true)` пришёл до `Go` (например, при нулевом начальном размере окна), scripts запоминают последнее значение до handshake и начинают сразу в соответствующем режиме. Ожидание следующего фонового тика выполняется через `recv_timeout` и injected clock, без `sleep`. Восстановление окна возвращает scripts в обычный цикл и публикацию snapshots.
+
+`drain_events` выводится runtime: Info в stdout, Error в stderr с префиксом `[script]`. При штатном shutdown scripts thread сначала вызывает `destroy` (`on_destroy`), после чего уничтожает `ScriptHost` и экземпляры на том же потоке; runtime ждёт его завершения до 2 секунд. При timeout `ScriptInterruptHandle` прерывает зависший lite Lua-код; затем runtime ждёт ещё до 2 секунд через stopped-канал. Если scripts всё ещё не остановились (например, ABI-скрипт блокирует поток), runtime отсоединяет handle без `join`, пишет ошибку и возвращает код 1. Interrupted lite callbacks не получают `on_destroy` согласно контракту [[Engine/EngineScript]]. При ошибке или панике renderer interrupt подаётся сразу.
 
 ## Завершение и ошибки
 
@@ -61,7 +72,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 |---:|---|
 | 0 | Успешный выход, `--frames` после N успешных презентаций или активация уже работающего экземпляра |
 | 1 | Ошибка ОС при acquire singleton lock, ошибка окна/renderer/runtime, паника потока или timeout аварийного завершения render/scripts |
-| 2 | Ошибка CLI, layout/bootstrap, проекта, ресурсов, сцены, icon или загрузки Lua до окна |
+| 2 | Ошибка CLI, layout/bootstrap, проекта, ресурсов, сцены, icon или загрузки Lua/ABI-библиотеки до окна |
 | 3 | Vulkan probe/device или системные RAM/CPU требования; stderr и системный диалог |
 | 4 | Экземпляр уже запущен, но активация не удалась (включая timeout; ошибка ОС при acquire возвращает 1) |
 
@@ -72,13 +83,14 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 | Файл | Ответственность |
 |---|---|
 | `engine/engine-runtime/src/lib.rs` | `run_player`, layout startup, resources, project lock, hardware check и lifecycle модулей |
-| `engine/engine-runtime/src/cli.rs` | `--project`, `--frames` и usage |
-| `engine/engine-runtime/src/layout.rs` | release/dev пути |
+| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames` и usage |
+| `engine/engine-runtime/src/layout.rs` | release/dev пути и выбор ABI-библиотеки |
 | `engine/engine-runtime/src/activation.rs` | `PendingActivation` и single-instance handshake |
 | `engine/engine-runtime/src/hardware.rs` | чистое решение по device/RAM/CPU требованиям |
 | `engine/engine-runtime/src/module_host.rs` | именованные потоки, stop/join в обратном порядке, panic collection и detach |
 | `engine/engine-runtime/src/scene.rs` | CPU-preload сцены и загрузка GPU-таблицы ресурсов |
 | `engine/engine-runtime/src/pipeline.rs` | snapshots, script/render loops, fakeable backend и status guard |
+| `engine/engine-runtime/src/input.rs` | `InputAccumulator`, переходы состояния и кадровые input snapshots |
 | `engine/engine-runtime/src/player.rs` | `WindowHandler`, renderer handoff и shutdown окна |
 | `engine/rve-player/src/main.rs` | бинарный entry point |
 

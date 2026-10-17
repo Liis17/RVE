@@ -36,7 +36,7 @@ pub(crate) fn png_to_ico(png: &[u8]) -> Result<Vec<u8>, String> {
     Ok(ico)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::png_to_ico;
 

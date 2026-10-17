@@ -39,6 +39,7 @@ jobs:
     timeout-minutes: 40
     env:
       CARGO_PACKAGES: ${{ needs.changes.outputs.packages }}
+      BUILD_DEMO_GAME: ${{ contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime') || contains(needs.changes.outputs.packages, 'rve-player') || contains(needs.changes.outputs.packages, 'engine-script') || contains(needs.changes.outputs.packages, 'rve-sdk') }}
     defaults:
       run:
         shell: bash
@@ -49,6 +50,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.x"
       - name: Create build directory
         shell: bash
         run: mkdir -p build
@@ -77,12 +82,33 @@ jobs:
           read -r -a packages <<< "$CARGO_PACKAGES"
           cargo test "${packages[@]}" --locked
       - name: Install Vulkan runtime for demo build
-        if: ${{ runner.os == 'macOS' && (contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime')) }}
+        if: ${{ runner.os == 'macOS' && env.BUILD_DEMO_GAME == 'true' }}
         run: brew install vulkan-loader molten-vk
       - name: Build demo game
-        if: ${{ contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime') }}
+        if: ${{ env.BUILD_DEMO_GAME == 'true' }}
         working-directory: build
         run: cargo run -p rve-build --locked -- build ../examples/demo-game --output demo-out
+      - name: Check rve-build checkout cache and SDK isolation
+        if: ${{ env.BUILD_DEMO_GAME == 'true' }}
+        working-directory: build
+        env:
+          PYTHONUTF8: "1"
+        run: python -B ../.github/scripts/check_rve_build_sdk.py
+      - name: Check Windows GUI-player argument diagnostics
+        if: ${{ runner.os == 'Windows' && env.BUILD_DEMO_GAME == 'true' }}
+        shell: pwsh
+        working-directory: build
+        run: |
+          $player = Join-Path $PWD 'player\release\rve-player.exe'
+          $stderrPath = Join-Path $env:RUNNER_TEMP ("rve-player-stderr-" + [guid]::NewGuid().ToString("N") + ".txt")
+          try {
+            $process = Start-Process -FilePath $player -ArgumentList @('--bogus') -RedirectStandardError $stderrPath -Wait -PassThru -NoNewWindow
+            $stderr = Get-Content -Raw $stderrPath
+            if ($process.ExitCode -ne 2) { throw "expected exit code 2, got $($process.ExitCode); stderr: $stderr" }
+            if (-not $stderr.Contains('Ошибка аргументов')) { throw "argument error missing from stderr: $stderr" }
+          } finally {
+            Remove-Item -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+          }
 
   ci:
     name: CI

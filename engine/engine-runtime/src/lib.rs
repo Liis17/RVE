@@ -3,6 +3,7 @@
 mod activation;
 mod cli;
 mod hardware;
+mod input;
 mod layout;
 mod module_host;
 mod pipeline;
@@ -16,10 +17,12 @@ use engine_platform::{Acquire, ActivationError, InstanceLock, activate_running_i
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_render::probe_devices;
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
-use engine_script::{HeavyRegistry, ScriptInterruptHandle};
+use engine_script::ScriptInterruptHandle;
 use engine_window::{RedrawMode, WindowConfig, WindowIcon};
 use hardware::hardware_issues;
-use layout::{Layout, ProjectSettingsLocation, normalize_layout_path, release_root};
+use layout::{
+    Layout, ProjectSettingsLocation, normalize_layout_path, normalize_scripts_path, release_root,
+};
 use module_host::ModuleHost;
 use pipeline::{
     Clock, MonotonicClock, RuntimeStatus, ScriptStartupError, ScriptThreadConfig, start_scripts,
@@ -27,12 +30,12 @@ use pipeline::{
 use scene::{PreparedScene, load_scene};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sysinfo::{CpuRefreshKind, System};
 
 /// Runs an RVE game using the release layout or a loose-file development project.
-pub fn run_player(register_heavy: fn(&mut HeavyRegistry)) -> ExitCode {
+pub fn run_player() -> ExitCode {
     let release_root = match executable_dir() {
         Ok(exe_dir) => release_root(&exe_dir),
         Err(error) => {
@@ -55,7 +58,7 @@ pub fn run_player(register_heavy: fn(&mut HeavyRegistry)) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    run_from_args(release_root, args, activation, register_heavy)
+    run_from_args(release_root, args, activation)
 }
 
 fn executable_dir() -> Result<PathBuf, String> {
@@ -71,7 +74,6 @@ fn run_from_args(
     release_root: PathBuf,
     args: PlayerArgs,
     activation: PendingActivation,
-    register_heavy: fn(&mut HeavyRegistry),
 ) -> ExitCode {
     let layout = match args.project {
         Some(project) => {
@@ -89,6 +91,22 @@ fn run_from_args(
         }
         None => Layout::release(&release_root),
     };
+    let scripts_override = match args.scripts.as_deref() {
+        Some(path) => match normalize_scripts_path(path) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                return fail(
+                    2,
+                    format!(
+                        "не удалось разрешить путь --scripts {}: {error}",
+                        path.display()
+                    ),
+                );
+            }
+        },
+        None => None,
+    };
+    let scripts_library = layout.scripts_library_path(scripts_override);
     let bootstrap = match BootstrapConfig::load(&layout.bootstrap) {
         Ok(config) => config,
         Err(error) => return fail(2, format!("ошибка bootstrap: {error}")),
@@ -184,19 +202,6 @@ fn run_from_args(
         Err(error) => return fail(2, format!("ошибка загрузки сцены: {error}")),
     };
 
-    let mut registry = HeavyRegistry::new();
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        register_heavy(&mut registry);
-    })) {
-        return fail(
-            1,
-            format!(
-                "паника при регистрации heavy-скриптов: {}",
-                panic_message(payload)
-            ),
-        );
-    }
-
     let mut modules = ModuleHost::new();
     if let Err(error) = start_empty_modules(&mut modules) {
         for error in modules.shutdown() {
@@ -216,6 +221,7 @@ fn run_from_args(
     let (render_tx, render_rx) = flume::unbounded();
     let interrupt = ScriptInterruptHandle::new();
     let status = Arc::new(RuntimeStatus::default());
+    let input = Arc::new(Mutex::new(input::InputAccumulator::default()));
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
     let script_thread = match start_scripts(
         &mut modules,
@@ -223,7 +229,9 @@ fn run_from_args(
         ScriptThreadConfig {
             scene_name: name,
             sources,
-            registry,
+            scripts_library,
+            #[cfg(test)]
+            script_module: None,
             interrupt: interrupt.clone(),
             clock,
             background_tick_hz: project.runtime.background_tick_hz,
@@ -232,6 +240,7 @@ fn run_from_args(
             frame_tx,
             render_tx: render_tx.clone(),
             status: Arc::clone(&status),
+            input: Arc::clone(&input),
         },
     ) {
         Ok(ready) => ready,
@@ -276,6 +285,7 @@ fn run_from_args(
             script_stopped_rx: script_thread.stopped,
             interrupt,
             status: Arc::clone(&status),
+            input,
         },
         &mut modules,
     );
@@ -397,16 +407,6 @@ fn start_empty_modules(modules: &mut ModuleHost) -> std::io::Result<()> {
 fn fail(code: u8, message: impl AsRef<str>) -> ExitCode {
     eprintln!("{}", message.as_ref());
     ExitCode::from(code)
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "неизвестная причина паники".to_owned()
-    }
 }
 
 #[cfg(test)]

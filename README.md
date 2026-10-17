@@ -53,22 +53,38 @@ cargo run -p sandbox -- --frames 120 --render-scale 0.5
 ## Запуск и сборка игры
 
 Пример проекта находится в [examples/demo-game](examples/demo-game). Он содержит
-настройки проекта, сцены, ресурсы, Lua-скрипт и пример Rust-скрипта.
+настройки проекта, сцены, ресурсы, Lua-скрипт и Rust-скрипт, собранный как `cdylib`
+через `rve-sdk`.
 
 Из каталога `build/`:
 
 ```sh
-cargo run -p rve-player -- --project ../examples/demo-game
 cargo run -p rve-build -- run ../examples/demo-game -- --frames 120
 cargo run -p rve-build -- build ../examples/demo-game --output ../demo-out
+cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist
 ```
 
-Первая команда запускает проект в режиме разработки. Вторая запускает его через
-сборщик, а третья создаёт релиз в указанном каталоге. Каталог релиза должен
-отсутствовать до сборки.
+`rve-build run` собирает игру и запускает её через release-player. `rve-build build`
+создаёт релиз в указанном каталоге, который должен отсутствовать до сборки. Для
+прямого запуска player CLI имеет вид
+`rve-player [--project <dir>] [--scripts <path>] [--frames N]`.
+
+Команда `rve-build sdk` собирает release `rve-player` и создаёт переносимый каталог
+с `rve-build`, player, исходниками `rve-sdk` и маркером `rve-sdk.toml`. Игровой
+crate подключает SDK через path `../rve-sdk-dist/rve-sdk` в `Cargo.toml`. Рядом с
+`rve-build` маркер включает SDK-режим: checkout движка не нужен, а совместимость
+проверяется по ABI и паре `ARCH-OS` текущей платформы. Без маркера используется
+checkout-режим и release player собирается один раз в `build/player`.
+
+В dev-режиме `rve-player` загружает Rust-скрипты только при явном `--scripts`;
+release-плеер автоматически ищет библиотеку в `Engine/`, а этот параметр позволяет
+переопределить путь. `rve-build run` сам собирает `heavy_scripts` из настроек проекта
+как cdylib и передаёт её плееру; `rve-build build` копирует её в релиз под
+платформенным именем. Сцены с heavy-скриптами требуют `heavy_scripts` в
+`project.rveproject`; формат crate описан в [RveSdk](Obsidian/RVEVault/Engine/RveSdk.md).
 
 На Windows release-плеер собирается как оконное приложение и не открывает консоль.
-При запуске через `run` debug-плеер сохраняет консоль для диагностики.
+Для ручной диагностики debug-бинарник можно запустить из `build` через Cargo.
 
 На macOS релиз создаётся как `demo-out/RVE Demo.app`: открой его в Finder для
 запуска без Terminal. Ресурсы и Vulkan-библиотеки находятся внутри бандла в

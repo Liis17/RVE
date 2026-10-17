@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение
 
-`engine-window` предоставляет оконный цикл на winit: создаёт одно окно, вызывает обработчик приложения и передаёт события закрытия, изменения размера и перерисовки.
+`engine-window` предоставляет оконный цикл на winit: создаёт одно окно, вызывает обработчик приложения и передаёт события закрытия, изменения размера, перерисовки и пользовательского ввода.
 
 ## Источники
 
@@ -28,11 +28,25 @@ Parent: [[Index]]
 | `WindowHandler::update(&mut self, window: &Window) -> bool` | Вызывается из `about_to_wait`; `false` завершает цикл, по умолчанию возвращает `true` |
 | `WindowHandler::close_requested(&mut self) -> bool` | `true` немедленно завершает цикл; `false` оставляет окно открытым до `WindowProxy::request_exit`; по умолчанию `true` |
 | `WindowHandler::occluded(&mut self, occluded: bool)` | Получает состояние из `WindowEvent::Occluded`; по умолчанию ничего не делает. Событие доставляется не на всех платформах: на Windows свёрнутое окно видно как `resized(0, 0)`, поэтому потребитель учитывает оба сигнала |
+| `WindowHandler::key(&mut self, key: Key, pressed: bool)` | Передаёт поддерживаемую физическую клавишу; повторные события `KeyEvent::repeat` не передаются |
+| `WindowHandler::mouse_button(&mut self, button: MouseButton, pressed: bool)` | Передаёт нажим/отпускание поддерживаемой кнопки мыши |
+| `WindowHandler::cursor_moved(&mut self, x: f64, y: f64)` | Координаты курсора относительно окна в физических пикселях |
+| `WindowHandler::mouse_motion(&mut self, dx: f64, dy: f64)` | Относительное движение устройства из `DeviceEvent::MouseMotion`; вызывается, только когда окно в фокусе |
+| `WindowHandler::mouse_wheel(&mut self, dx: f32, dy: f32)` | Накопитель получает величины прокрутки в строках |
+| `WindowHandler::focused(&mut self, focused: bool)` | Начальное состояние после создания окна, до `init`, и дальнейшие изменения фокуса |
 | `WindowHandler::exiting(&mut self)` | Вызывается при завершении до освобождения окна; по умолчанию ничего не делает |
 | `run(config, handler: &mut impl WindowHandler) -> Result<(), WindowError>` | Запускает event loop и оставляет обработчик у вызывающего кода |
 | `WindowError` | Ошибка event loop, создания окна или RGBA-иконки; реализует `Display` и `Error` |
 
 Крейт также реэкспортирует `winit::window::Window` и `winit::dpi::PhysicalSize`.
+
+Все добавленные методы ввода имеют пустые default-реализации, поэтому обработчики, которым ввод не нужен, сохраняют прежнее поведение.
+
+## Клавиши и колесо
+
+Публичные `Key` и `MouseButton` принадлежат `engine-window`; типы winit не входят в сигнатуры обработчика. `Key` — подмножество `KeyCode`: `A`–`Z`, `Digit0`–`Digit9`, `F1`–`F12`, стрелки, `Space`, `Enter`, `Escape`, `Tab`, `Backspace` и левые/правые `Shift`, `Control`, `Alt`, `Super`. `MouseButton` включает `Left`, `Right`, `Middle`, `Back` и `Forward`; остальные клавиши и кнопки игнорируются.
+
+Клавиатура определяется по физическому `PhysicalKey::Code`. `LineDelta` передаётся без преобразования; `PixelDelta` делится на 120 физических пикселей за строку. Runtime маппит эти собственные типы на стабильные коды `rve-sdk`.
 
 ## Зависимости и взаимодействия
 
@@ -48,5 +62,7 @@ Parent: [[Index]]
 - `CloseRequested` завершает цикл, если `close_requested` вернул `true`; `false` позволяет приложению завершить его позже через `WindowProxy::request_exit`.
 - `false` из `init`, `update` или `frame` завершает цикл.
 - `resized` получает физический размер из события winit.
+- `CursorMoved` использует физические пиксели относительно верхнего левого угла окна; `DeviceEvent::MouseMotion` передаёт относительное движение устройства. На Windows используется raw input; на macOS движение может включать системное ускорение — это не проверено.
+- На macOS при зажатом `Cmd` система может не прислать key-up для других клавиш; тогда клавиша останется down до потери фокуса. Это известное ограничение платформы, но в проекте оно не проверено.
 - Фокус и выход из фоновых потоков передаются в главный поток через внутренние user events; ранний запрос фокуса применяется после создания окна.
 - Sandbox освобождает renderer из `exiting`; затем окно освобождается, а сохранённую ошибку можно проверить после `run`.
