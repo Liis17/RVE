@@ -1,4 +1,6 @@
+use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
 use crate::heavy::{HeavyRegistry, HeavyScript};
+use crate::library::ScriptLibrary;
 use crate::lite::{self, ActiveSource, EventQueue, LuaInstance};
 use crate::types::{ScriptContext, ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_scene::{LocalTransform, ObjectHandle, World};
@@ -79,7 +81,12 @@ impl Default for ScriptInterruptHandle {
 
 enum ScriptKind {
     Lite(LuaInstance),
-    Heavy(Box<dyn HeavyScript>),
+    Heavy(HeavyInstance),
+}
+
+enum HeavyInstance {
+    Static(Box<dyn HeavyScript>),
+    Abi(AbiScriptInstance),
 }
 
 struct ScriptInstance {
@@ -143,6 +150,23 @@ impl ScriptHost {
         scene_name: &str,
         sources: &BTreeMap<String, String>,
         registry: &HeavyRegistry,
+        interrupt: ScriptInterruptHandle,
+    ) -> Result<Self, ScriptLoadError> {
+        Self::load_with_library(world, scene_name, sources, registry, None, interrupt)
+    }
+
+    /// Temporary entry point for loading scripts from an ABI library during the migration.
+    ///
+    /// Library and static names must be disjoint. A duplicate name is a load error even though
+    /// either implementation could be selected, keeping the scene's binding unambiguous. This
+    /// method will be replaced when [`ScriptHost::load`] and [`ScriptHost::load_with_interrupt`]
+    /// accept a library directly.
+    pub fn load_with_library(
+        world: &World,
+        scene_name: &str,
+        sources: &BTreeMap<String, String>,
+        registry: &HeavyRegistry,
+        library: Option<&ScriptLibrary>,
         interrupt: ScriptInterruptHandle,
     ) -> Result<Self, ScriptLoadError> {
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -214,7 +238,53 @@ impl ScriptHost {
             }
 
             for script in &object.heavy_scripts {
-                let Some(factory) = registry.factory(&script.name) else {
+                let factory = registry.factory(&script.name);
+                let descriptor = library.and_then(|library| library.script(&script.name));
+                if factory.is_some() && descriptor.is_some() {
+                    return Err(ScriptLoadError::Heavy {
+                        object_id: object.id.clone(),
+                        name: script.name.clone(),
+                        message: "name is registered in both the ABI library and static registry"
+                            .to_owned(),
+                    });
+                }
+                if let Some(descriptor) = descriptor {
+                    let self_object =
+                        abi_object_handle(object.handle).ok_or_else(|| ScriptLoadError::Heavy {
+                            object_id: object.id.clone(),
+                            name: script.name.clone(),
+                            message: "object handle cannot be represented by the script ABI"
+                                .to_owned(),
+                        })?;
+                    let source = event_source(scene_name, &object.id, &script.name);
+                    let instance = AbiScriptInstance::create(
+                        descriptor,
+                        &script.params,
+                        AbiScriptCall {
+                            self_object,
+                            object_id: &object.id,
+                            object_name: &object.name,
+                            transform,
+                            events: &host.events,
+                            source: &source,
+                        },
+                    )
+                    .map_err(|message| ScriptLoadError::Heavy {
+                        object_id: object.id.clone(),
+                        name: script.name.clone(),
+                        message,
+                    })?;
+                    host.instances.push(ScriptInstance {
+                        handle: object.handle,
+                        object_id: object.id.clone(),
+                        object_name: object.name.clone(),
+                        source,
+                        kind: ScriptKind::Heavy(HeavyInstance::Abi(instance)),
+                        enabled: true,
+                    });
+                    continue;
+                }
+                let Some(factory) = factory else {
                     return Err(ScriptLoadError::Heavy {
                         object_id: object.id.clone(),
                         name: script.name.clone(),
@@ -237,7 +307,7 @@ impl ScriptHost {
                     object_id: object.id.clone(),
                     object_name: object.name.clone(),
                     source: event_source(scene_name, &object.id, &script.name),
-                    kind: ScriptKind::Heavy(instance),
+                    kind: ScriptKind::Heavy(HeavyInstance::Static(instance)),
                     enabled: true,
                 });
             }
@@ -288,7 +358,7 @@ impl ScriptHost {
     }
 
     fn run_phase(&mut self, world: &mut World, phase: Phase, time: ScriptTime) {
-        let events = self.events.clone();
+        let events = &self.events;
         let time_error = lite::set_time(&self.lua_time, time)
             .err()
             .map(|error| error.to_string());
@@ -304,7 +374,7 @@ impl ScriptHost {
             }
             let Some(local) = world.local_transform(instance.handle).copied() else {
                 instance.enabled = false;
-                push_error(&events, instance, "object no longer exists".to_owned());
+                push_error(events, instance, "object no longer exists".to_owned());
                 continue;
             };
             let initial = script_transform(local);
@@ -324,7 +394,7 @@ impl ScriptHost {
                             .map_err(|error| error.to_string()),
                     }
                 }
-                ScriptKind::Heavy(script) => {
+                ScriptKind::Heavy(HeavyInstance::Static(script)) => {
                     let mut transform = initial;
                     let events = self.events.clone();
                     let source = instance.source.clone();
@@ -353,6 +423,30 @@ impl ScriptHost {
                         }
                     }
                 }
+                ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
+                    let self_object = abi_object_handle(instance.handle);
+                    match self_object {
+                        Some(self_object) => script.invoke(
+                            match phase {
+                                Phase::Start => AbiPhase::Start,
+                                Phase::Update(dt) => AbiPhase::Update(dt),
+                                Phase::Destroy => AbiPhase::Destroy,
+                            },
+                            time,
+                            AbiScriptCall {
+                                self_object,
+                                object_id: &instance.object_id,
+                                object_name: &instance.object_name,
+                                transform: initial,
+                                events,
+                                source: &instance.source,
+                            },
+                        ),
+                        None => {
+                            Err("object handle cannot be represented by the script ABI".to_owned())
+                        }
+                    }
+                }
             };
 
             if matches!(&instance.kind, ScriptKind::Lite(_)) && self.interrupt.is_interrupted() {
@@ -367,13 +461,13 @@ impl ScriptHost {
                         world.set_local_transform(instance.handle, local_transform(transform))
                     {
                         instance.enabled = false;
-                        push_error(&events, instance, error.to_string());
+                        push_error(events, instance, error.to_string());
                     }
                 }
                 Ok(_) => {
                     instance.enabled = false;
                     push_error(
-                        &events,
+                        events,
                         instance,
                         "script produced a non-finite transform".to_owned(),
                     );
@@ -385,7 +479,7 @@ impl ScriptHost {
                     {
                         observed_interrupt = true;
                     } else {
-                        push_error(&events, instance, message);
+                        push_error(events, instance, message);
                     }
                 }
             }
@@ -414,6 +508,12 @@ impl ScriptHost {
             }
         }
     }
+}
+
+fn abi_object_handle(handle: ObjectHandle) -> Option<u64> {
+    u64::try_from(handle.index())
+        .ok()
+        .and_then(|index| index.checked_add(1))
 }
 
 fn script_transform(transform: LocalTransform) -> ScriptTransform {

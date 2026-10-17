@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает и проверяет документы сцен `.rvescene`, строит runtime-граф `World` и выдаёт мировые матрицы, камеру, свет и меши для кадра. `engine-script` запускает Lua и зарегистрированные Rust-скрипты для объектов сцены. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений пока представлены пустыми потоками-заглушками; редактор также остаётся без реализации.
+RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает и проверяет документы сцен `.rvescene`, строит runtime-граф `World` и выдаёт мировые матрицы, камеру, свет и меши для кадра. `engine-script` запускает Lua и Rust-скрипты из статического реестра или ABI-библиотеки. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений пока представлены пустыми потоками-заглушками; редактор также остаётся без реализации.
 
 ## Стек
 
@@ -25,6 +25,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 | ufbx 0.11.5 | Загрузка FBX; C-библиотека собирается через `cc` | `engine/engine-assets/src/lib.rs` |
 | png 0.18.1 | Декодирование PNG | `engine/engine-assets/src/lib.rs` |
 | mlua 0.12.2 (`lua54`, `vendored`) | Lua host для lite-скриптов без системной Lua | `engine/engine-script/Cargo.toml` |
+| libloading 0.9.0 | Динамическая загрузка библиотек Rust-скриптов | `engine/engine-script/Cargo.toml`, `engine/engine-script/src/library.rs` |
 | ash-window 0.13.0 | Surface и обязательные instance extensions через платформенный адаптер | `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml` |
 | raw-window-handle 0.6.2 | Передача display/window handles в renderer | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
 | Vulkan 1.3 | Dynamic rendering, synchronization2 и графический вывод | `engine/engine-render/src/lib.rs` |
@@ -49,7 +50,8 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG в память CPU, без зависимости от renderer.
 - [[Engine/EngineScene]] — формат `.rvescene`, его проверка и runtime-граф `World` с камерами, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
-- [[Engine/EngineScript]] — Lua host и реестр heavy-скриптов; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
+- [[Engine/EngineScript]] — Lua host, статический реестр Rust-скриптов и загрузчик ABI-библиотеки; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
+- [[Engine/RveSdk]] — независимый SDK с C ABI и guest API для игровых `cdylib`.
 - [[Engine/EngineRuntime]] — потоки игры, порядок запуска, ограниченный конвейер кадров и завершение; библиотека запуска используется бинарником `rve-player`.
 - [[Engine/RveBuild]] — сборка релиза из проекта, раскладка архивов и генерация player crate.
 - [[Engine/Sandbox]] — приложение, соединяющее core, window, render, assets и scene.
@@ -64,14 +66,15 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - `engine-project` зависит от `engine-files`, serde и toml; контракты файлов и их потребители описаны в [[Engine/EngineProject]].
 - `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; он содержит и wire-формат архивов, и отдельный TOML-контракт `ArchiveSetRegistry`. Инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets`, sandbox и runtime получают данные через его handle. `engine-files` не имеет внешних зависимостей.
 - `engine-scene` зависит от glam, `engine-files`, serde и toml: документы `.rvescene` используют `VirtualPath`, а `World` рассчитывает сцены независимо от renderer и script runtime. Runtime игры использует документы и `World`; sandbox продолжает строить процедурную демонстрационную сцену на математических компонентах.
-- `engine-script` зависит от `engine-scene` и `mlua` с Lua 5.4 и vendored исходниками. Он связывает `World` с Lua и heavy-скриптами, не зависит от runtime, renderer или window; Lua state остаётся на scripts thread, а отдельный interrupt handle можно передать другому потоку.
+- `engine-script` зависит от `engine-scene`, `mlua` с Lua 5.4 и vendored исходниками, `rve-sdk` и `libloading`. Он связывает `World` с Lua и Rust-скриптами из статического реестра или ABI-библиотеки, не зависит от runtime, renderer или window; Lua state остаётся на scripts thread, а отдельный interrupt handle можно передать другому потоку.
+- `rve-sdk` — самостоятельный крейт без зависимостей; он задаёт C ABI и гостевой API для игровых `cdylib`.
 - `engine-assets` зависит от `engine-resources`, ufbx и png; от renderer и окна не зависит. `Assets::model_dependencies` использует тот же поиск внешних текстур и stat-источник, что и `load_model`, чтобы builder мог собрать зависимости без декодирования PNG.
 - `engine-window` зависит от winit.
 - `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit и glam; naga — его build-зависимость.
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
 - `engine-core`, `engine-audio`, `engine-physics`, `engine-network`, `engine-neural` и `engine-editor` не имеют внешних зависимостей.
 
-Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-project/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-script/Cargo.toml`, `engine/engine-script/src`, `engine/engine-assets/Cargo.toml`, `engine/engine-runtime/Cargo.toml`, `engine/rve-player/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-network/Cargo.toml`, `engine/engine-neural/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
+Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-project/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-script/Cargo.toml`, `engine/engine-script/src`, `engine/engine-script/src/library.rs`, `engine/rve-sdk/Cargo.toml`, `engine/engine-assets/Cargo.toml`, `engine/engine-runtime/Cargo.toml`, `engine/rve-player/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-network/Cargo.toml`, `engine/engine-neural/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
 
 ## Файловые источники и RVEPAK
 

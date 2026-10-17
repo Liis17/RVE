@@ -23,6 +23,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 | `Obsidian/RVEVault/Engine/EngineResources.md` | Фоновое чтение loose и packed бинарных ресурсов |
 | `Obsidian/RVEVault/Engine/EngineAssets.md` | Ресурсы: FBX и PNG из `assets` |
 | `Obsidian/RVEVault/Engine/EngineScript.md` | Lua и Rust-скрипты сцен |
+| `Obsidian/RVEVault/Engine/RveSdk.md` | C ABI и гостевой API Rust-скриптов |
 | `Obsidian/RVEVault/Engine/EngineRuntime.md` | Игровой runtime и player |
 | `Obsidian/RVEVault/Engine/RveBuild.md` | Сборка проекта в release player |
 | `Obsidian/RVEVault/Engine/Sandbox.md` | Пример приложения и CLI |

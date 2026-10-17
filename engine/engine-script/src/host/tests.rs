@@ -1103,3 +1103,5 @@ fn interrupt_handle_cancels_infinite_top_level_chunk_during_load() {
             if path == "load-loop.lua" && message.to_lowercase().contains("interrupted")
     ));
 }
+
+mod abi;

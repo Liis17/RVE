@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-`engine-script` связывает `engine-scene::World` с lite-скриптами Lua 5.4 и heavy-скриптами Rust, зарегистрированными игрой. Крейт не зависит от runtime, renderer, window или платформенных адаптеров. `ScriptHost` и один принадлежащий ему `mlua::Lua` создаются на потоке скриптов; `engine-script` собирается без feature `send`, поэтому host остаётся `!Send`.
+`engine-script` связывает `engine-scene::World` с lite-скриптами Lua 5.4 и heavy-скриптами Rust, переданными статическим реестром или ABI-библиотекой. Крейт не зависит от runtime, renderer, window или платформенных адаптеров; ABI-сторона использует `rve-sdk` и `libloading`. `ScriptHost` и один принадлежащий ему `mlua::Lua` создаются на потоке скриптов; `engine-script` собирается без feature `send`, поэтому host остаётся `!Send`.
 
 ## Контракт
 
@@ -16,6 +16,14 @@ Parent: [[Index]]
 - Каждый lite-файл компилируется один раз в собственном `_ENV`; все экземпляры этого файла используют его класс и окружение. Таблица `rve` и вложенная таблица `rve.time` общие для всех файлов и изменяемы скриптами. Хост сохраняет ссылку на `rve.time` и в начале каждой фазы обновляет `elapsed` и `frame` через raw-запись, не вызывая Lua-метаметоды. `rve.log(...)` и `print(...)` используют захваченную функцию Lua `tostring`, соединяют аргументы пробелом и добавляют `Info` в очередь событий. Строки с неверным UTF-8 записываются с заменой некорректных последовательностей на `�`.
 - `frame` передаётся как Lua integer до `i64::MAX`; большее значение передаётся как float, поэтому возможна потеря точности.
 - `HeavyScript: Send` задаёт lifecycle Rust-скрипта. Игровой крейт регистрирует фабрики через `HeavyRegistry::register`. Имя должно быть ASCII `[A-Za-z0-9_]{1,64}`. Неверное имя и повторная регистрация возвращают `HeavyRegistrationError`, а не панику.
+
+## Rust ABI
+
+`ScriptLibrary::load` и `ScriptLibrary::from_module` — `unsafe`: загрузка исполняет native-инициализаторы, а вызывающая сторона `from_module` гарантирует корректность, неизменность и время жизни `'static` таблицы и всех её данных. После открытия динамической библиотеки host не выгружает её даже при ошибке поиска entry point или проверок ABI. До привязки скриптов сцены загрузчик проверяет наличие entry point, сначала читает заголовок и сверяет версию и размер, затем проверяет таблицу, UTF-8 имён, допустимый формат `[A-Za-z0-9_]{1,64}` и дубликаты.
+
+`ScriptHost::load_with_library` — временная точка входа перехода: она принимает ABI-библиотеку вместе со статическим реестром. Если heavy-скрипт сцены найден в обоих источниках, загрузка завершается ошибкой; обычные `load` и `load_with_interrupt` пока не принимают библиотеку напрямую. Успешно созданный ABI-экземпляр получает `drop` ровно один раз при освобождении host, в том числе если позже загрузка сцены завершилась ошибкой. Если host callback паникует при `create`, вызов отклоняется; когда guest уже вернул успешный ненулевой экземпляр, host вызывает для него `drop` ровно один раз. В `create` запись локальной трансформации через `set_local` отклоняется. Host-функции `find_object`, `object_id`, `object_name`, `get_local` и `set_local` сейчас обслуживают только собственный объект скрипта: для другого handle они возвращают `0` или `false`. Callback `message` объявлен в ABI, но host его пока не вызывает.
+
+Паника внутри host-функции перехватывается, помечает текущий вызов как `poisoned` и превращает его в ошибку независимо от статуса guest callback. Такой callback отключает экземпляр; его изменения трансформации не записываются в `World`. Сейчас ABI-уровень `Warn` записывается как `Error`, поскольку отдельного уровня предупреждений в событиях host пока нет. Контракт C ABI и гостевого API описан в [[Engine/RveSdk]].
 
 ## Lua sandbox и ошибки
 
@@ -33,4 +41,4 @@ Runtime error Lua, panic heavy-скрипта или не конечная тр�
 
 ## Источники
 
-`engine/engine-script/src/host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/heavy.rs`, `engine/engine-script/src/types.rs`.
+`engine/engine-script/src/host.rs`, `engine/engine-script/src/library.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/heavy.rs`, `engine/engine-script/src/types.rs`, `engine/rve-sdk/Cargo.toml`.
