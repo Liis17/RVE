@@ -1,7 +1,11 @@
 id = "neko-demo"
-name = "Neko Demo"
+name = "NekoDemo"
 version = "1.0.0"
 
 [[scenes]]
-path = "/scenes/main.rvescene"
+path = "/scenes/neko.rvescene"
 enabled = true
+
+[[scenes]]
+path = "/scenes/main.rvescene"
+enabled = false

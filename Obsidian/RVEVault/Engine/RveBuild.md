@@ -67,6 +67,10 @@ dependency `game_heavy`, а `main.rs` вызывает
 оба разбирают JSON-сообщение Cargo, чтобы найти `rve-game` executable. `run`
 запускает его с `--project <absolute-project-dir>` и переданными аргументами.
 
+На Windows сгенерированный player при выключенных `debug_assertions` (обычная
+release-сборка) использует `windows_subsystem = "windows"`: запуск `.exe` не создаёт
+консоль. Debug-сборка сохраняет консоль для диагностики. На macOS атрибут не применяется.
+
 Все пути, передаваемые Cargo или player, очищаются от Windows verbatim-префикса:
 path dependencies в manifest, `CARGO_TARGET_DIR`, рабочий каталог Cargo и аргумент
 `--project`. Корень checkout сначала canonicalize-ится, чтобы engine-runtime и

@@ -8,7 +8,7 @@ function Rotate:on_update(dt)
   local rotation = self.transform.rotation
   self.transform.rotation = {
     x = rotation.x,
-    y = rotation.y + (self.params.speed or 30.0) * dt,
+    y = (rotation.y + (self.params.speed or 30.0) * dt) % 360.0,
     z = rotation.z
   }
 end
