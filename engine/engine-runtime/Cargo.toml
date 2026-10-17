@@ -24,3 +24,6 @@ engine-window = { path = "../engine-window" }
 flume.workspace = true
 glam.workspace = true
 sysinfo.workspace = true
+
+[dev-dependencies]
+rve-sdk = { path = "../rve-sdk" }

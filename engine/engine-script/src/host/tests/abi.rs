@@ -1,6 +1,6 @@
 use super::world;
+use crate::ScriptTime;
 use crate::host::{ScriptHost, ScriptLoadError};
-use crate::{HeavyRegistry, ScriptInterruptHandle, ScriptTime};
 use engine_scene::World;
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost, RveModule, RveParams, RveScriptDesc,
@@ -142,14 +142,7 @@ fn empty_sources() -> BTreeMap<String, String> {
 }
 
 fn load(world: &World, library: &crate::ScriptLibrary) -> Result<ScriptHost, ScriptLoadError> {
-    ScriptHost::load_with_library(
-        world,
-        "scene",
-        &empty_sources(),
-        &HeavyRegistry::default(),
-        Some(library),
-        ScriptInterruptHandle::new(),
-    )
+    ScriptHost::load(world, "scene", &empty_sources(), Some(library))
 }
 
 fn load_host(world: &World, library: &crate::ScriptLibrary) -> ScriptHost {
@@ -676,32 +669,4 @@ fn panic_in_guest_drop_emits_an_error_event() {
         event.level == crate::ScriptEventLevel::Error && event.message == "ABI script drop panicked"
     }));
     assert_eq!(PROBE_DROPS.load(Ordering::SeqCst), 1);
-}
-
-struct Legacy;
-
-impl crate::HeavyScript for Legacy {}
-
-fn legacy_factory(_: &crate::ScriptParams) -> Result<Box<dyn crate::HeavyScript>, String> {
-    Ok(Box::new(Legacy))
-}
-
-#[test]
-fn abi_and_static_registry_name_collision_is_a_load_error() {
-    let library = library();
-    let mut registry = HeavyRegistry::new();
-    registry.register("Probe", legacy_factory).unwrap();
-    let world = scripted_world("Probe", "{}");
-    let result = ScriptHost::load_with_library(
-        &world,
-        "scene",
-        &empty_sources(),
-        &registry,
-        Some(&library),
-        ScriptInterruptHandle::new(),
-    );
-    assert!(matches!(
-        result,
-        Err(ScriptLoadError::Heavy { message, .. }) if message.contains("both")
-    ));
 }

@@ -39,6 +39,7 @@ jobs:
     timeout-minutes: 40
     env:
       CARGO_PACKAGES: ${{ needs.changes.outputs.packages }}
+      BUILD_DEMO_GAME: ${{ contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime') || contains(needs.changes.outputs.packages, 'rve-player') || contains(needs.changes.outputs.packages, 'engine-script') || contains(needs.changes.outputs.packages, 'rve-sdk') }}
     defaults:
       run:
         shell: bash
@@ -77,10 +78,10 @@ jobs:
           read -r -a packages <<< "$CARGO_PACKAGES"
           cargo test "${packages[@]}" --locked
       - name: Install Vulkan runtime for demo build
-        if: ${{ runner.os == 'macOS' && (contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime')) }}
+        if: ${{ runner.os == 'macOS' && env.BUILD_DEMO_GAME == 'true' }}
         run: brew install vulkan-loader molten-vk
       - name: Build demo game
-        if: ${{ contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime') }}
+        if: ${{ env.BUILD_DEMO_GAME == 'true' }}
         working-directory: build
         run: cargo run -p rve-build --locked -- build ../examples/demo-game --output demo-out
 

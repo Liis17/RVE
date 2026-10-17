@@ -1,11 +1,13 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Использование: rve-player [--project <dir>] [--frames N]";
+pub(crate) const USAGE: &str =
+    "Использование: rve-player [--project <dir>] [--scripts <path>] [--frames N]";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PlayerArgs {
     pub project: Option<PathBuf>,
+    pub scripts: Option<PathBuf>,
     pub frames: Option<u64>,
 }
 
@@ -43,6 +45,18 @@ impl PlayerArgs {
                         })?;
                     parsed.frames = Some(frames);
                 }
+                Some("--scripts") => {
+                    if parsed.scripts.is_some() {
+                        return Err("параметр --scripts указан повторно".to_owned());
+                    }
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "укажите путь после --scripts".to_owned())?;
+                    if value.to_string_lossy().starts_with("--") {
+                        return Err("укажите путь после --scripts".to_owned());
+                    }
+                    parsed.scripts = Some(PathBuf::from(value));
+                }
                 Some(other) => return Err(format!("неизвестный аргумент {other:?}")),
                 None => return Err("аргументы должны быть в UTF-8".to_owned()),
             }
@@ -55,6 +69,7 @@ impl PlayerArgs {
 mod tests {
     use super::PlayerArgs;
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     fn parse(args: &[&str]) -> Result<PlayerArgs, String> {
         PlayerArgs::parse(args.iter().map(OsString::from))
@@ -66,6 +81,7 @@ mod tests {
             parse(&["--project", "my game", "--frames", "120"]).unwrap(),
             PlayerArgs {
                 project: Some("my game".into()),
+                scripts: None,
                 frames: Some(120),
             }
         );
@@ -73,8 +89,15 @@ mod tests {
             parse(&["--frames", "1", "--project", "./game"]).unwrap(),
             PlayerArgs {
                 project: Some("./game".into()),
+                scripts: None,
                 frames: Some(1),
             }
+        );
+        assert_eq!(
+            parse(&["--scripts", "scripts/game.dll", "--project", "game"])
+                .unwrap()
+                .scripts,
+            Some(PathBuf::from("scripts/game.dll"))
         );
     }
 
@@ -91,6 +114,9 @@ mod tests {
             vec!["--frames", "-1"],
             vec!["--frames", "18446744073709551616"],
             vec!["--frames", "1.5"],
+            vec!["--scripts", "scripts.dll", "--scripts", "other.dll"],
+            vec!["--scripts"],
+            vec!["--scripts", "--project", "game"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }

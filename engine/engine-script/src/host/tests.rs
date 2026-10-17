@@ -1,9 +1,7 @@
 use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError};
-use crate::{
-    HeavyRegistrationError, HeavyRegistry, HeavyScript, ScriptContext, ScriptEventLevel,
-    ScriptParams, ScriptTime,
-};
-use engine_scene::{ParamValue, SceneDocument, World};
+use crate::{ScriptEventLevel, ScriptLibrary, ScriptTime};
+use engine_scene::{SceneDocument, World};
+use rve_sdk::{Context, Params, Script, Value};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::thread;
@@ -36,39 +34,12 @@ fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn labeled_registry() -> HeavyRegistry {
-    let mut registry = HeavyRegistry::new();
-    registry.register("Log", labeled_factory).unwrap();
-    registry
-}
-
-fn empty_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    Ok(Box::new(KeepAliveHeavy))
-}
-
-#[test]
-fn heavy_registry_rejects_duplicate_and_invalid_names() {
-    let mut registry = HeavyRegistry::new();
-    registry.register("Valid_2", empty_factory).unwrap();
-    registry.register("x".repeat(64), empty_factory).unwrap();
-    assert_eq!(
-        registry.register("Valid_2", empty_factory),
-        Err(HeavyRegistrationError::DuplicateName("Valid_2".to_owned()))
-    );
-    for name in ["", "bad-name", "é", &"x".repeat(65)] {
-        assert!(matches!(
-            registry.register(name, empty_factory),
-            Err(HeavyRegistrationError::InvalidName(_))
-        ));
-    }
-}
-
 struct LabeledHeavy {
     label: String,
 }
 
-fn labeled_factory(params: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    let Some(ParamValue::String(label)) = params.get("label") else {
+fn labeled_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let Some(Value::String(label)) = params.get("label") else {
         return Err("missing string parameter label".to_owned());
     };
     Ok(Box::new(LabeledHeavy {
@@ -76,18 +47,118 @@ fn labeled_factory(params: &ScriptParams) -> Result<Box<dyn HeavyScript>, String
     }))
 }
 
-impl HeavyScript for LabeledHeavy {
-    fn on_start(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log(format!("{}:start", self.label));
+impl Script for LabeledHeavy {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info(format!("{}:start", self.label));
     }
 
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _dt: f32) {
-        ctx.log(format!("{}:update", self.label));
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        ctx.log_info(format!("{}:update", self.label));
     }
 
-    fn on_destroy(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log(format!("{}:destroy", self.label));
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info(format!("{}:destroy", self.label));
     }
+}
+
+struct ParamsAndTransformHeavy;
+
+fn params_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let expected = Params::from([
+        ("flag".to_owned(), Value::Bool(true)),
+        ("count".to_owned(), Value::Int(17)),
+        ("ratio".to_owned(), Value::Float(1.25)),
+        ("title".to_owned(), Value::String("hello".to_owned())),
+        (
+            "values".to_owned(),
+            Value::Array(vec![
+                Value::Int(2),
+                Value::Bool(false),
+                Value::String("x".to_owned()),
+            ]),
+        ),
+    ]);
+    if params == &expected {
+        Ok(Box::new(ParamsAndTransformHeavy))
+    } else {
+        Err("parameter values differ".to_owned())
+    }
+}
+
+impl Script for ParamsAndTransformHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
+        ctx.transform.position[0] += 1.0;
+    }
+}
+
+struct PanicHeavy;
+
+fn panic_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PanicHeavy))
+}
+
+impl Script for PanicHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _: f32) {
+        ctx.transform.position[0] = 99.0;
+        panic!("expected heavy panic");
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info("panic instance destroyed");
+    }
+}
+
+struct KeepAliveHeavy;
+
+fn keep_alive_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(KeepAliveHeavy))
+}
+
+impl Script for KeepAliveHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _: f32) {
+        ctx.transform.position[1] += 1.0;
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info("healthy heavy destroyed");
+    }
+}
+
+struct NonFiniteHeavy;
+
+fn non_finite_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(NonFiniteHeavy))
+}
+
+impl Script for NonFiniteHeavy {
+    fn on_update(&mut self, ctx: &mut Context<'_>, _: f32) {
+        ctx.transform.position[0] = f32::NAN;
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context<'_>) {
+        ctx.log_info("non-finite instance destroyed");
+    }
+}
+
+fn fail_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Err("factory refused parameters".to_owned())
+}
+
+fn test_module() -> &'static rve_sdk::abi::RveModule {
+    rve_sdk::script_module! {
+        "Log" => labeled_factory,
+        "Params" => params_factory,
+        "Panic" => panic_factory,
+        "KeepAlive" => keep_alive_factory,
+        "NonFinite" => non_finite_factory,
+        "Fail" => fail_factory,
+    }
+}
+
+fn test_library() -> ScriptLibrary {
+    // SAFETY: the SDK macro returns an immutable process-lifetime table.
+    unsafe { ScriptLibrary::from_module(std::ptr::from_ref(test_module())) }
+        .expect("test script module is valid")
 }
 
 fn event_messages(host: &mut ScriptHost) -> Vec<String> {
@@ -134,11 +205,12 @@ function Script:on_update() rve.log(self.params.label .. ":update") end
 function Script:on_destroy() rve.log(self.params.label .. ":destroy") end
 return Script
 "#;
+    let library = test_library();
     let mut host = ScriptHost::load(
         &world,
         "scene",
         &sources(&[("a.lua", lite_source), ("b.lua", lite_source)]),
-        &labeled_registry(),
+        Some(&library),
     )
     .unwrap();
 
@@ -212,44 +284,11 @@ return Script
         &world,
         "scene",
         &sources(&[("auto-start.lua", source)]),
-        &HeavyRegistry::new(),
+        None,
     )
     .unwrap();
     host.update(&mut world, 0.1, ScriptTime::default());
     assert_eq!(event_messages(&mut host), ["start", "update"]);
-}
-
-struct ParamsAndTransformHeavy;
-
-fn params_factory(params: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    let expected = BTreeMap::from([
-        ("flag", ParamValue::Bool(true)),
-        ("count", ParamValue::Int(17)),
-        ("ratio", ParamValue::Float(1.25)),
-        ("title", ParamValue::String("hello".to_owned())),
-        (
-            "values",
-            ParamValue::Array(vec![
-                ParamValue::Int(2),
-                ParamValue::Bool(false),
-                ParamValue::String("x".to_owned()),
-            ]),
-        ),
-    ]);
-    if expected
-        .iter()
-        .all(|(key, value)| params.get(*key) == Some(value))
-    {
-        Ok(Box::new(ParamsAndTransformHeavy))
-    } else {
-        Err("parameter values differ".to_owned())
-    }
-}
-
-impl HeavyScript for ParamsAndTransformHeavy {
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _dt: f32) {
-        ctx.transform.position[0] += 1.0;
-    }
 }
 
 #[test]
@@ -273,13 +312,12 @@ return Script
     let mut world = one_camera(&format!(
         "[[assets]]\npath = \"/params.lua\"\n[[objects.lite_scripts]]\npath = \"/params.lua\"\nparams = {params}\n[[objects.heavy_scripts]]\nname = \"Params\"\nparams = {params}\n"
     ));
-    let mut registry = HeavyRegistry::new();
-    registry.register("Params", params_factory).unwrap();
+    let library = test_library();
     let mut host = ScriptHost::load(
         &world,
         "scene",
         &sources(&[("params.lua", source)]),
-        &registry,
+        Some(&library),
     )
     .unwrap();
 
@@ -309,13 +347,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath = \"/log.lua\"\n[[objects.lite_scripts]]\npath = \"/log.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "level",
-        &sources(&[("log.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "level", &sources(&[("log.lua", source)]), None).unwrap();
     host.start(
         &mut world,
         ScriptTime {
@@ -348,13 +381,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath = \"/bytes.lua\"\n[[objects.lite_scripts]]\npath = \"/bytes.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("bytes.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("bytes.lua", source)]), None).unwrap();
 
     host.start(&mut world, ScriptTime::default());
 
@@ -393,7 +421,7 @@ return Script
         &world,
         "scene",
         &sources(&[("a.lua", a), ("b.lua", b)]),
-        &HeavyRegistry::new(),
+        None,
     )
     .unwrap();
 
@@ -418,13 +446,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath = \"/frame.lua\"\n[[objects.lite_scripts]]\npath = \"/frame.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("frame.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("frame.lua", source)]), None).unwrap();
 
     host.start(
         &mut world,
@@ -462,7 +485,7 @@ return Script
         &world,
         "scene",
         &sources(&[("bad.lua", bad), ("healthy.lua", healthy)]),
-        &HeavyRegistry::new(),
+        None,
     )
     .unwrap();
     host.start(&mut world, ScriptTime::default());
@@ -500,48 +523,13 @@ return Script
     assert_eq!(transform.position.x, 2.0);
 }
 
-struct PanicHeavy;
-
-fn panic_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    Ok(Box::new(PanicHeavy))
-}
-
-impl HeavyScript for PanicHeavy {
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _: f32) {
-        ctx.transform.position[0] = 99.0;
-        panic!("expected heavy panic");
-    }
-
-    fn on_destroy(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log("panic instance destroyed");
-    }
-}
-
-struct KeepAliveHeavy;
-
-fn keep_alive_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    Ok(Box::new(KeepAliveHeavy))
-}
-
-impl HeavyScript for KeepAliveHeavy {
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _: f32) {
-        ctx.transform.position[1] += 1.0;
-    }
-
-    fn on_destroy(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log("healthy heavy destroyed");
-    }
-}
-
 #[test]
 fn heavy_panic_disables_that_instance_but_other_heavy_scripts_continue() {
     let mut world = one_camera(
         "[objects.transform]\nposition=[8.0, 0.0, 0.0]\n[[objects.heavy_scripts]]\nname=\"Panic\"\n[[objects.heavy_scripts]]\nname=\"KeepAlive\"\n",
     );
-    let mut registry = HeavyRegistry::new();
-    registry.register("Panic", panic_factory).unwrap();
-    registry.register("KeepAlive", keep_alive_factory).unwrap();
-    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), &registry).unwrap();
+    let library = test_library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
     host.start(&mut world, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
@@ -567,30 +555,13 @@ fn heavy_panic_disables_that_instance_but_other_heavy_scripts_continue() {
     );
 }
 
-struct NonFiniteHeavy;
-
-fn non_finite_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-    Ok(Box::new(NonFiniteHeavy))
-}
-
-impl HeavyScript for NonFiniteHeavy {
-    fn on_update(&mut self, ctx: &mut ScriptContext<'_>, _: f32) {
-        ctx.transform.position[0] = f32::NAN;
-    }
-
-    fn on_destroy(&mut self, ctx: &mut ScriptContext<'_>) {
-        ctx.log("non-finite instance destroyed");
-    }
-}
-
 #[test]
 fn non_finite_heavy_transform_disables_instance_and_rolls_back() {
     let mut world = one_camera(
         "[[objects.heavy_scripts]]\nname=\"NonFinite\"\n[objects.transform]\nposition=[8.0, 2.0, 3.0]\n",
     );
-    let mut registry = HeavyRegistry::new();
-    registry.register("NonFinite", non_finite_factory).unwrap();
-    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), &registry).unwrap();
+    let library = test_library();
+    let mut host = ScriptHost::load(&world, "scene", &BTreeMap::new(), Some(&library)).unwrap();
     host.start(&mut world, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
     host.destroy(&mut world, ScriptTime::default());
@@ -627,7 +598,7 @@ return Script
             &world,
             "scene",
             &sources(&[("bad-transform.lua", &source)]),
-            &HeavyRegistry::new(),
+            None,
         )
         .unwrap();
         host.start(&mut world, ScriptTime::default());
@@ -661,13 +632,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath=\"/rollback.lua\"\n[objects.transform]\nposition=[4.0, 0.0, 0.0]\n[[objects.lite_scripts]]\npath=\"/rollback.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("rollback.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("rollback.lua", source)]), None).unwrap();
 
     host.start(&mut world, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
@@ -700,14 +666,9 @@ fn load_rejects_syntax_non_table_and_non_function_callbacks_with_path() {
         let world = one_camera(
             "[[assets]]\npath=\"/bad.lua\"\n[[objects.lite_scripts]]\npath=\"/bad.lua\"\n",
         );
-        let error = ScriptHost::load(
-            &world,
-            "scene",
-            &sources(&[("bad.lua", source)]),
-            &HeavyRegistry::new(),
-        )
-        .err()
-        .expect("invalid lite script should fail to load");
+        let error = ScriptHost::load(&world, "scene", &sources(&[("bad.lua", source)]), None)
+            .err()
+            .expect("invalid lite script should fail to load");
         assert!(matches!(
             error,
             ScriptLoadError::Lite { ref path, ref message }
@@ -717,47 +678,37 @@ fn load_rejects_syntax_non_table_and_non_function_callbacks_with_path() {
 }
 
 #[test]
-fn load_rejects_unknown_heavy_factory_and_factory_errors() {
+fn load_rejects_heavy_scripts_without_a_library_or_registration() {
     let unknown_world = one_camera("[[objects.heavy_scripts]]\nname=\"Missing\"\n");
-    let error = ScriptHost::load(
-        &unknown_world,
-        "scene",
-        &BTreeMap::new(),
-        &HeavyRegistry::new(),
-    )
-    .err()
-    .expect("unknown heavy script should fail to load");
+    let error = ScriptHost::load(&unknown_world, "scene", &BTreeMap::new(), None)
+        .err()
+        .expect("unknown heavy script should fail to load");
     assert_eq!(
         error,
         ScriptLoadError::Heavy {
             object_id: "camera".to_owned(),
             name: "Missing".to_owned(),
-            message: "no factory is registered for this name".to_owned(),
+            message:
+                "no script library is loaded; pass --scripts <path> or place the library in Engine/"
+                    .to_owned(),
         }
     );
 
-    fn fail_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-        Err("factory refused parameters".to_owned())
-    }
-    let mut registry = HeavyRegistry::new();
-    registry.register("Fail", fail_factory).unwrap();
-    let failed_world = one_camera("[[objects.heavy_scripts]]\nname=\"Fail\"\n");
+    let library = test_library();
+    let unknown_name = ScriptHost::load(&unknown_world, "scene", &BTreeMap::new(), Some(&library))
+        .err()
+        .expect("unregistered heavy script should fail to load");
     assert!(matches!(
-        ScriptHost::load(&failed_world, "scene", &BTreeMap::new(), &registry),
-        Err(ScriptLoadError::Heavy { ref message, .. })
-            if message == "factory refused parameters"
+        unknown_name,
+        ScriptLoadError::Heavy { ref message, .. }
+            if message.contains("does not register this name")
     ));
 
-    fn panic_factory(_: &ScriptParams) -> Result<Box<dyn HeavyScript>, String> {
-        panic!("expected factory panic")
-    }
-    let mut panic_registry = HeavyRegistry::new();
-    panic_registry.register("Panic", panic_factory).unwrap();
-    let panic_world = one_camera("[[objects.heavy_scripts]]\nname=\"Panic\"\n");
+    let failed_world = one_camera("[[objects.heavy_scripts]]\nname=\"Fail\"\n");
     assert!(matches!(
-        ScriptHost::load(&panic_world, "scene", &BTreeMap::new(), &panic_registry),
+        ScriptHost::load(&failed_world, "scene", &BTreeMap::new(), Some(&library)),
         Err(ScriptLoadError::Heavy { ref message, .. })
-            if message.contains("factory panicked: expected factory panic")
+            if message == "factory refused parameters"
     ));
 }
 
@@ -785,13 +736,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath=\"/sandbox.lua\"\n[[objects.lite_scripts]]\npath=\"/sandbox.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("sandbox.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("sandbox.lua", source)]), None).unwrap();
     host.start(&mut world, ScriptTime::default());
     assert!(host.drain_events().is_empty());
 }
@@ -805,13 +751,8 @@ return Script
 "#;
     let mut world =
         one_camera("[[assets]]\npath=\"/gc.lua\"\n[[objects.lite_scripts]]\npath=\"/gc.lua\"\n");
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("gc.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("gc.lua", source)]), None).unwrap();
 
     host.start(&mut world, ScriptTime::default());
 
@@ -838,13 +779,8 @@ return Script
     let mut world = one_camera(
         "[[assets]]\npath=\"/memory.lua\"\n[[objects.lite_scripts]]\npath=\"/memory.lua\"\n",
     );
-    let mut host = ScriptHost::load(
-        &world,
-        "scene",
-        &sources(&[("memory.lua", source)]),
-        &HeavyRegistry::new(),
-    )
-    .unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("memory.lua", source)]), None).unwrap();
 
     host.start(&mut world, ScriptTime::default());
     host.update(&mut world, 0.1, ScriptTime::default());
@@ -897,7 +833,7 @@ return Script
         &world,
         "scene",
         &sources(&[("a.lua", a), ("b.lua", b)]),
-        &HeavyRegistry::new(),
+        None,
     )
     .unwrap();
 
@@ -936,11 +872,12 @@ params = { label = "camera-heavy" }
 "#,
     );
     let handle = ScriptInterruptHandle::new();
+    let library = test_library();
     let mut host = ScriptHost::load_with_interrupt(
         &world,
         "scene",
         &sources(&[]),
-        &labeled_registry(),
+        Some(&library),
         handle.clone(),
     )
     .unwrap();
@@ -986,13 +923,8 @@ end
 function Script:on_destroy() rve.log("loop destroyed") end
 return Script
 "#;
-        let mut host = ScriptHost::load(
-            &world,
-            "scene",
-            &sources(&[("loop.lua", source)]),
-            &HeavyRegistry::new(),
-        )
-        .unwrap();
+        let mut host =
+            ScriptHost::load(&world, "scene", &sources(&[("loop.lua", source)]), None).unwrap();
         let signal = host
             .lua
             .create_function(move |_, ()| {
@@ -1030,11 +962,12 @@ return Script
         "[[assets]]\npath=\"/pre-interrupted.lua\"\n[[objects.lite_scripts]]\npath=\"/pre-interrupted.lua\"\n[[objects.heavy_scripts]]\nname=\"Log\"\nparams={label=\"camera-heavy\"}\n",
     );
     let handle = ScriptInterruptHandle::new();
+    let library = test_library();
     let mut host = ScriptHost::load_with_interrupt(
         &world,
         "scene",
         &sources(&[("pre-interrupted.lua", source)]),
-        &labeled_registry(),
+        Some(&library),
         handle.clone(),
     )
     .unwrap();
@@ -1086,7 +1019,7 @@ fn interrupt_handle_cancels_infinite_top_level_chunk_during_load() {
             &world,
             "scene",
             &sources(&[("load-loop.lua", source)]),
-            &HeavyRegistry::new(),
+            None,
             worker_handle,
         )
         .map(|_| ());

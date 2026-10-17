@@ -6,6 +6,22 @@ Parent: [[Index]]
 
 `rve-sdk` — самостоятельный крейт без зависимостей, который задаёт C ABI и гостевой Rust API для игровых скриптов, собираемых в `cdylib`. Он не зависит от движка и включает `Script`, `Context`, `Transform`, а также owned-типы значений и параметров. Host-side загрузка и вызовы описаны в [[Engine/EngineScript]].
 
+Игровой crate подключает SDK как зависимость и объявляет cdylib-target:
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rve-sdk = { path = "<checkout>/engine/rve-sdk" }
+```
+
+Реализация создаёт тип, реализующий `rve_sdk::Script`, и функцию-фабрику,
+принимающую `&rve_sdk::Params`. `rve_sdk::export_scripts!` экспортирует ABI entry
+point с именами heavy-скриптов, на которые ссылаются сцены. Пример —
+`examples/demo-game/HeavyScripts`; `rve-build` проверяет cdylib и имена скриптов при
+сборке проекта ([[Engine/RveBuild]]).
+
 ## Контракт ABI
 
 - Версия ABI задаётся `RVE_SCRIPT_ABI_VERSION` (текущее значение — `1`; версия предварительная, пока API скриптов не зафиксирован). `RveModule` начинается с `RveHeader` с версией и размером заголовка; host сначала читает и проверяет его и только затем интерпретирует таблицу скриптов.

@@ -545,6 +545,7 @@ dependencies = [
  "engine-window",
  "flume",
  "glam",
+ "rve-sdk",
  "sysinfo",
 ]
 
@@ -1664,10 +1665,11 @@ dependencies = [
  "engine-project",
  "engine-resources",
  "engine-scene",
+ "engine-script",
  "libc",
  "png",
+ "rve-sdk",
  "serde_json",
- "toml",
  "windows-sys 0.61.2",
 ]
 

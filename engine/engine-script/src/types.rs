@@ -30,22 +30,6 @@ impl ScriptTransform {
     }
 }
 
-/// Context passed to a heavy script callback.
-pub struct ScriptContext<'a> {
-    pub object_id: &'a str,
-    pub object_name: &'a str,
-    pub transform: &'a mut ScriptTransform,
-    pub time: ScriptTime,
-    pub(crate) logger: &'a mut dyn FnMut(String),
-}
-
-impl ScriptContext<'_> {
-    /// Appends an informational event to the owning ScriptHost.
-    pub fn log(&mut self, message: impl Into<String>) {
-        (self.logger)(message.into());
-    }
-}
-
 /// Severity for buffered script events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScriptEventLevel {

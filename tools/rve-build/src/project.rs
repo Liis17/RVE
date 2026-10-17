@@ -18,7 +18,9 @@ pub(crate) struct ProjectBuild {
     pub(crate) files: BTreeMap<VirtualPath, PathBuf>,
     pub(crate) assignments: BTreeMap<VirtualPath, String>,
     pub(crate) archives: Vec<String>,
+    #[cfg(windows)]
     pub(crate) icon: Option<VirtualPath>,
+    pub(crate) heavy_scripts: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -101,6 +103,7 @@ fn prepare_with_resources(
     let handle = resources.handle();
     let assets = Assets::with_resources(handle.clone());
     let mut enabled_scenes = Vec::new();
+    let mut heavy_scripts = Vec::new();
     let mut usages = BTreeMap::<VirtualPath, AssetUsage>::new();
     let mut base_paths = BTreeSet::<VirtualPath>::new();
 
@@ -122,6 +125,12 @@ fn prepare_with_resources(
         })?;
         let document = SceneDocument::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
+        heavy_scripts.extend(document.objects.iter().flat_map(|object| {
+            object
+                .heavy_scripts
+                .iter()
+                .map(|script| (path.to_string(), script.name.clone()))
+        }));
 
         base_paths.insert(path.clone());
         let scene_index = enabled_scenes.len();
@@ -199,6 +208,8 @@ fn prepare_with_resources(
     let assignments = assign_archives(&enabled_scenes, &usages, &base_paths, icon.as_ref())?;
     let archives = archive_order(&assignments);
 
+    validate_heavy_scripts_configured(&settings, &heavy_scripts)?;
+
     Ok(ProjectBuild {
         project_dir,
         bootstrap_path,
@@ -206,8 +217,24 @@ fn prepare_with_resources(
         files,
         assignments,
         archives,
+        #[cfg(windows)]
         icon,
+        heavy_scripts,
     })
+}
+
+fn validate_heavy_scripts_configured(
+    settings: &ProjectSettings,
+    heavy_scripts: &[(String, String)],
+) -> Result<(), BuildError> {
+    if settings.heavy_scripts.is_none()
+        && let Some((scene, name)) = heavy_scripts.first()
+    {
+        return Err(BuildError::input(format!(
+            "сцена /{scene} ссылается на heavy-скрипт {name:?}, но в project.rveproject не задан heavy_scripts"
+        )));
+    }
+    Ok(())
 }
 
 fn assign_archives(
@@ -430,12 +457,30 @@ fn extension_is(path: &str, extension: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetUsage, EnabledScene, assign_archives};
+    use super::{AssetUsage, EnabledScene, assign_archives, validate_heavy_scripts_configured};
     use engine_files::VirtualPath;
+    use engine_project::ProjectSettings;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn path(value: &str) -> VirtualPath {
         VirtualPath::parse(value).unwrap()
+    }
+
+    #[test]
+    fn heavy_scene_reference_requires_a_scripts_library_setting() {
+        let settings = ProjectSettings::parse(
+            "id = \"demo\"\nname = \"Demo\"\nversion = \"1\"\n[[scenes]]\npath = \"scenes/main.rvescene\"\n",
+        )
+        .unwrap();
+        let error = validate_heavy_scripts_configured(
+            &settings,
+            &[("/scenes/main.rvescene".to_owned(), "Bobber".to_owned())],
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("/scenes/main.rvescene"));
+        assert!(error.to_string().contains("Bobber"));
+        assert!(error.to_string().contains("heavy_scripts"));
     }
 
     fn scenes() -> Vec<EnabledScene> {

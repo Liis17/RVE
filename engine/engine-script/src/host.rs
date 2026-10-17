@@ -1,16 +1,13 @@
 use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
-use crate::heavy::{HeavyRegistry, HeavyScript};
 use crate::library::ScriptLibrary;
 use crate::lite::{self, ActiveSource, EventQueue, LuaInstance};
-use crate::types::{ScriptContext, ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
+use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_scene::{LocalTransform, ObjectHandle, World};
 use mlua::{Lua, Table};
-use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -46,7 +43,8 @@ impl fmt::Display for ScriptLoadError {
 
 impl Error for ScriptLoadError {}
 
-/// Cloneable, sticky cancellation signal for Lua execution. Heavy scripts cannot be interrupted.
+/// Cloneable, sticky cancellation signal for Lua execution. ABI callbacks run synchronously and
+/// cannot be interrupted.
 #[derive(Clone, Debug)]
 pub struct ScriptInterruptHandle {
     interrupted: Arc<AtomicBool>,
@@ -85,7 +83,6 @@ enum ScriptKind {
 }
 
 enum HeavyInstance {
-    Static(Box<dyn HeavyScript>),
     Abi(AbiScriptInstance),
 }
 
@@ -101,7 +98,7 @@ struct ScriptInstance {
 /// Binds scene objects to one Lua state and their heavy script instances.
 ///
 /// A host belongs on the scripts thread. Its interrupt handle is safe to clone and send to
-/// another thread; it only cancels Lua execution, not Rust heavy scripts.
+/// another thread; it only cancels Lua execution, not Rust ABI scripts.
 pub struct ScriptHost {
     lua: Lua,
     instances: Vec<ScriptInstance>,
@@ -131,41 +128,24 @@ impl ScriptHost {
         world: &World,
         scene_name: &str,
         sources: &BTreeMap<String, String>,
-        registry: &HeavyRegistry,
+        library: Option<&ScriptLibrary>,
     ) -> Result<Self, ScriptLoadError> {
         Self::load_with_interrupt(
             world,
             scene_name,
             sources,
-            registry,
+            library,
             ScriptInterruptHandle::new(),
         )
     }
 
     /// Loads scripts using a handle that may be interrupted from another thread before or during
-    /// loading. Lua top-level chunks are cancellable; heavy factories are synchronous Rust code
-    /// and cannot be interrupted.
+    /// loading. Lua top-level chunks are cancellable; ABI callbacks are synchronous and cannot be
+    /// interrupted.
     pub fn load_with_interrupt(
         world: &World,
         scene_name: &str,
         sources: &BTreeMap<String, String>,
-        registry: &HeavyRegistry,
-        interrupt: ScriptInterruptHandle,
-    ) -> Result<Self, ScriptLoadError> {
-        Self::load_with_library(world, scene_name, sources, registry, None, interrupt)
-    }
-
-    /// Temporary entry point for loading scripts from an ABI library during the migration.
-    ///
-    /// Library and static names must be disjoint. A duplicate name is a load error even though
-    /// either implementation could be selected, keeping the scene's binding unambiguous. This
-    /// method will be replaced when [`ScriptHost::load`] and [`ScriptHost::load_with_interrupt`]
-    /// accept a library directly.
-    pub fn load_with_library(
-        world: &World,
-        scene_name: &str,
-        sources: &BTreeMap<String, String>,
-        registry: &HeavyRegistry,
         library: Option<&ScriptLibrary>,
         interrupt: ScriptInterruptHandle,
     ) -> Result<Self, ScriptLoadError> {
@@ -238,16 +218,7 @@ impl ScriptHost {
             }
 
             for script in &object.heavy_scripts {
-                let factory = registry.factory(&script.name);
                 let descriptor = library.and_then(|library| library.script(&script.name));
-                if factory.is_some() && descriptor.is_some() {
-                    return Err(ScriptLoadError::Heavy {
-                        object_id: object.id.clone(),
-                        name: script.name.clone(),
-                        message: "name is registered in both the ABI library and static registry"
-                            .to_owned(),
-                    });
-                }
                 if let Some(descriptor) = descriptor {
                     let self_object =
                         abi_object_handle(object.handle).ok_or_else(|| ScriptLoadError::Heavy {
@@ -284,31 +255,14 @@ impl ScriptHost {
                     });
                     continue;
                 }
-                let Some(factory) = factory else {
-                    return Err(ScriptLoadError::Heavy {
-                        object_id: object.id.clone(),
-                        name: script.name.clone(),
-                        message: "no factory is registered for this name".to_owned(),
-                    });
-                };
-                let instance = catch_unwind(AssertUnwindSafe(|| factory(&script.params)))
-                    .map_err(|payload| ScriptLoadError::Heavy {
-                        object_id: object.id.clone(),
-                        name: script.name.clone(),
-                        message: format!("factory panicked: {}", panic_message(payload)),
-                    })?
-                    .map_err(|message| ScriptLoadError::Heavy {
-                        object_id: object.id.clone(),
-                        name: script.name.clone(),
-                        message,
-                    })?;
-                host.instances.push(ScriptInstance {
-                    handle: object.handle,
+                return Err(ScriptLoadError::Heavy {
                     object_id: object.id.clone(),
-                    object_name: object.name.clone(),
-                    source: event_source(scene_name, &object.id, &script.name),
-                    kind: ScriptKind::Heavy(HeavyInstance::Static(instance)),
-                    enabled: true,
+                    name: script.name.clone(),
+                    message: if library.is_none() {
+                        "no script library is loaded; pass --scripts <path> or place the library in Engine/".to_owned()
+                    } else {
+                        "the script library does not register this name".to_owned()
+                    },
                 });
             }
         }
@@ -316,7 +270,7 @@ impl ScriptHost {
     }
 
     /// Returns the host's sticky interrupt handle. An interrupt skips and disables lite instances
-    /// at the next phase or lite-call boundary; heavy scripts continue to run.
+    /// at the next phase or lite-call boundary; ABI scripts continue to run.
     pub fn interrupt_handle(&self) -> ScriptInterruptHandle {
         self.interrupt.clone()
     }
@@ -392,35 +346,6 @@ impl ScriptHost {
                             })
                             .and_then(|()| lite_instance.transform())
                             .map_err(|error| error.to_string()),
-                    }
-                }
-                ScriptKind::Heavy(HeavyInstance::Static(script)) => {
-                    let mut transform = initial;
-                    let events = self.events.clone();
-                    let source = instance.source.clone();
-                    let mut logger = move |message| {
-                        events.borrow_mut().push(ScriptEvent {
-                            level: ScriptEventLevel::Info,
-                            source: source.clone(),
-                            message,
-                        });
-                    };
-                    let mut context = ScriptContext {
-                        object_id: &instance.object_id,
-                        object_name: &instance.object_name,
-                        transform: &mut transform,
-                        time,
-                        logger: &mut logger,
-                    };
-                    match catch_unwind(AssertUnwindSafe(|| match phase {
-                        Phase::Start => script.on_start(&mut context),
-                        Phase::Update(dt) => script.on_update(&mut context, dt),
-                        Phase::Destroy => script.on_destroy(&mut context),
-                    })) {
-                        Ok(()) => Ok(transform),
-                        Err(payload) => {
-                            Err(format!("heavy script panicked: {}", panic_message(payload)))
-                        }
                     }
                 }
                 ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
@@ -542,16 +467,6 @@ fn push_error(events: &EventQueue, instance: &ScriptInstance, message: String) {
 
 fn event_source(scene_name: &str, object_id: &str, script_name: &str) -> String {
     format!("{scene_name}/{object_id}/{script_name}")
-}
-
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else {
-        "non-string panic payload".to_owned()
-    }
 }
 
 #[cfg(test)]

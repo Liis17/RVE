@@ -2,7 +2,7 @@ use engine_assets::Assets;
 use engine_project::ProjectSettings;
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem, SourceMode};
 use engine_scene::{SceneDocument, World};
-use engine_script::{HeavyRegistry, ScriptEventLevel, ScriptHost, ScriptTime};
+use engine_script::{ScriptEventLevel, ScriptHost, ScriptTime};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -46,7 +46,7 @@ fn check_demo(root: &Path, mode: SourceMode) {
         "scripts/rotate.lua".to_owned(),
         text(&handle, "/scripts/rotate.lua"),
     )]);
-    let mut host = ScriptHost::load(&world, "neko", &sources, &HeavyRegistry::default()).unwrap();
+    let mut host = ScriptHost::load(&world, "neko", &sources, None).unwrap();
     let initial = world.object_by_id("turntable").unwrap().transform;
     let initial_frame = world.build_frame().0;
     for (frame, dt, expected) in [

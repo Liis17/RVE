@@ -254,14 +254,142 @@ pub(crate) fn publish_directory_no_replace(source: &Path, destination: &Path) ->
 }
 
 #[cfg(windows)]
-pub(crate) fn verify_group_icon(executable: &Path) -> Result<(), BuildError> {
+pub(crate) fn patch_executable_icon(executable: &Path, ico: &[u8]) -> Result<(), BuildError> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::LibraryLoader::{
+        BeginUpdateResourceW, EndUpdateResourceW, UpdateResourceW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{RT_GROUP_ICON, RT_ICON};
+
+    let icons = ico_images(ico)?;
+    let executable_wide = executable
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let update = unsafe { BeginUpdateResourceW(executable_wide.as_ptr(), 0) };
+    if update.is_null() {
+        return Err(BuildError::operational(format!(
+            "не удалось открыть {} для обновления иконки: {}",
+            executable.display(),
+            io::Error::last_os_error()
+        )));
+    }
+
+    let update_result = (|| {
+        let mut group = ico[..6].to_vec();
+        for (index, (entry, bytes)) in icons.iter().enumerate() {
+            let resource_id = u16::try_from(index + 1).map_err(|_| {
+                BuildError::input("ICO содержит слишком много изображений для Windows resource ID")
+            })?;
+            let size = u32::try_from(bytes.len())
+                .map_err(|_| BuildError::input("ICO resource превышает 4 GiB"))?;
+            let resource_name = std::ptr::without_provenance::<u16>(resource_id as usize);
+            let icon_saved = unsafe {
+                UpdateResourceW(
+                    update,
+                    RT_ICON,
+                    resource_name,
+                    0,
+                    bytes.as_ptr().cast::<c_void>(),
+                    size,
+                )
+            };
+            if icon_saved == 0 {
+                return Err(BuildError::operational(format!(
+                    "не удалось записать RT_ICON {resource_id} в {}: {}",
+                    executable.display(),
+                    io::Error::last_os_error()
+                )));
+            }
+            group.extend_from_slice(&entry[..12]);
+            group.extend_from_slice(&resource_id.to_le_bytes());
+        }
+        let group_name = std::ptr::without_provenance::<u16>(1);
+        let group_size = u32::try_from(group.len())
+            .map_err(|_| BuildError::input("RT_GROUP_ICON превышает 4 GiB"))?;
+        let group_saved = unsafe {
+            UpdateResourceW(
+                update,
+                RT_GROUP_ICON,
+                group_name,
+                0,
+                group.as_ptr().cast::<c_void>(),
+                group_size,
+            )
+        };
+        if group_saved == 0 {
+            return Err(BuildError::operational(format!(
+                "не удалось записать RT_GROUP_ICON в {}: {}",
+                executable.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    })();
+    let discarded = if update_result.is_err() { 1 } else { 0 };
+    let end_result = unsafe { EndUpdateResourceW(update, discarded) };
+    update_result?;
+    if end_result == 0 {
+        return Err(BuildError::operational(format!(
+            "не удалось сохранить ресурсы иконки в {}: {}",
+            executable.display(),
+            io::Error::last_os_error()
+        )));
+    }
+    verify_group_icon(
+        executable,
+        &icons
+            .iter()
+            .map(|(_, bytes)| bytes.to_vec())
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[cfg(windows)]
+type IcoImage<'a> = (&'a [u8], &'a [u8]);
+
+#[cfg(windows)]
+fn ico_images(ico: &[u8]) -> Result<Vec<IcoImage<'_>>, BuildError> {
+    if ico.len() < 6 || ico[..4] != [0, 0, 1, 0] {
+        return Err(BuildError::input("некорректная ICO directory header"));
+    }
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    let directory_end = 6_usize
+        .checked_add(count.checked_mul(16).ok_or_else(|| {
+            BuildError::input("размер ICO directory переполняет адресное пространство")
+        })?)
+        .filter(|end| *end <= ico.len())
+        .ok_or_else(|| BuildError::input("ICO directory обрезан"))?;
+    if count == 0 {
+        return Err(BuildError::input("ICO не содержит изображений"));
+    }
+    let mut images = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = 6 + index * 16;
+        let entry = &ico[start..start + 16];
+        let size = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
+        let offset = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
+        let end = offset
+            .checked_add(size)
+            .filter(|end| *end <= ico.len() && offset >= directory_end)
+            .ok_or_else(|| BuildError::input("ICO image data обрезан или пересекает directory"))?;
+        images.push((entry, &ico[offset..end]));
+    }
+    Ok(images)
+}
+
+#[cfg(windows)]
+fn verify_group_icon(executable: &Path, expected: &[Vec<u8>]) -> Result<(), BuildError> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
     use windows_sys::Win32::Foundation::FreeLibrary;
     use windows_sys::Win32::System::LibraryLoader::{
-        FindResourceW, LOAD_LIBRARY_AS_DATAFILE, LoadLibraryExW,
+        FindResourceW, LOAD_LIBRARY_AS_DATAFILE, LoadLibraryExW, LoadResource, LockResource,
+        SizeofResource,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::RT_GROUP_ICON;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{RT_GROUP_ICON, RT_ICON};
 
     let executable_wide = executable
         .as_os_str()
@@ -282,20 +410,80 @@ pub(crate) fn verify_group_icon(executable: &Path) -> Result<(), BuildError> {
             io::Error::last_os_error()
         )));
     }
-    let resource = unsafe {
-        FindResourceW(
-            module,
-            std::ptr::without_provenance::<u16>(1),
-            RT_GROUP_ICON,
-        )
-    };
+    let result = (|| {
+        let resource = unsafe {
+            FindResourceW(
+                module,
+                std::ptr::without_provenance::<u16>(1),
+                RT_GROUP_ICON,
+            )
+        };
+        if resource.is_null() {
+            return Err(BuildError::operational(format!(
+                "в {} отсутствует Windows RT_GROUP_ICON resource",
+                executable.display()
+            )));
+        }
+        let size = unsafe { SizeofResource(module, resource) } as usize;
+        let loaded = unsafe { LoadResource(module, resource) };
+        let data = unsafe { LockResource(loaded) }.cast::<u8>();
+        if data.is_null() || size < 6 {
+            return Err(BuildError::operational(format!(
+                "в {} повреждён Windows RT_GROUP_ICON resource",
+                executable.display()
+            )));
+        }
+        let group = unsafe { std::slice::from_raw_parts(data, size) };
+        if group[..4] != [0, 0, 1, 0] {
+            return Err(BuildError::operational(format!(
+                "в {} некорректный Windows RT_GROUP_ICON header",
+                executable.display()
+            )));
+        }
+        let count = u16::from_le_bytes([group[4], group[5]]) as usize;
+        if count != expected.len() || size < 6 + count * 14 {
+            return Err(BuildError::operational(format!(
+                "в {} неверное число Windows icon resources",
+                executable.display()
+            )));
+        }
+        for (index, expected_bytes) in expected.iter().enumerate() {
+            let entry = 6 + index * 14;
+            let resource_id = u16::from_le_bytes([group[entry + 12], group[entry + 13]]);
+            let icon = unsafe {
+                FindResourceW(
+                    module,
+                    std::ptr::without_provenance::<u16>(resource_id as usize),
+                    RT_ICON,
+                )
+            };
+            if icon.is_null() {
+                return Err(BuildError::operational(format!(
+                    "в {} RT_GROUP_ICON ссылается на отсутствующий RT_ICON {resource_id}",
+                    executable.display()
+                )));
+            }
+            let icon_size = unsafe { SizeofResource(module, icon) } as usize;
+            let icon_loaded = unsafe { LoadResource(module, icon) };
+            let icon_data = unsafe { LockResource(icon_loaded) }.cast::<u8>();
+            if icon_data.is_null() || icon_size != expected_bytes.len() {
+                return Err(BuildError::operational(format!(
+                    "Windows RT_ICON {resource_id} в {} имеет неверный размер",
+                    executable.display()
+                )));
+            }
+            let icon_bytes = unsafe { std::slice::from_raw_parts(icon_data, icon_size) };
+            if icon_bytes != expected_bytes {
+                return Err(BuildError::operational(format!(
+                    "байты Windows RT_ICON {resource_id} в {} отличаются от ICO",
+                    executable.display()
+                )));
+            }
+        }
+        Ok(())
+    })();
     let release_result = unsafe { FreeLibrary(module) };
-    if resource.is_null() {
-        return Err(BuildError::operational(format!(
-            "в {} отсутствует Windows RT_GROUP_ICON resource",
-            executable.display()
-        )));
-    }
+    result?;
     if release_result == 0 {
         return Err(BuildError::operational(format!(
             "не удалось закрыть resource handle для {}: {}",
@@ -443,5 +631,32 @@ mod tests {
 
         assert_eq!(fs::read(destination.join("file")).unwrap(), b"published");
         assert!(!source.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn patches_only_the_copied_executable_and_verifies_icon_resources() {
+        use super::{patch_executable_icon, verify_group_icon};
+        use png::{BitDepth, ColorType, Encoder};
+
+        let root = TempDir::create(&std::env::temp_dir(), "rve-icon-resource").unwrap();
+        let source = std::env::current_exe().unwrap();
+        let original = fs::read(&source).unwrap();
+        let copy = root.path().join("copy.exe");
+        fs::copy(&source, &copy).unwrap();
+
+        let mut png = Vec::new();
+        let mut encoder = Encoder::new(&mut png, 1, 1);
+        encoder.set_color(ColorType::Rgba);
+        encoder.set_depth(BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[32, 64, 128, 255]).unwrap();
+        writer.finish().unwrap();
+        let ico = crate::ico::png_to_ico(&png).unwrap();
+        patch_executable_icon(&copy, &ico).unwrap();
+        verify_group_icon(&copy, &[png]).unwrap();
+
+        assert_ne!(fs::read(&copy).unwrap(), original);
+        assert_eq!(fs::read(&source).unwrap(), original);
     }
 }

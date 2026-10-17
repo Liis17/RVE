@@ -1,6 +1,7 @@
 mod archives;
 mod cli;
 mod error;
+#[cfg(windows)]
 mod ico;
 mod platform;
 mod player;

@@ -1,5 +1,4 @@
 use crate::abi_string::{AbiStringError, read_abi_str};
-use crate::heavy::valid_heavy_name;
 use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveModule, RveScriptDesc};
 use std::collections::HashMap;
 use std::error::Error;
@@ -175,4 +174,16 @@ impl ScriptLibrary {
     pub(crate) fn script(&self, name: &str) -> Option<&'static RveScriptDesc> {
         self.scripts.get(name).copied()
     }
+
+    /// Returns whether this library registers a script with the given scene name.
+    pub fn contains_script(&self, name: &str) -> bool {
+        self.scripts.contains_key(name)
+    }
+}
+
+pub(crate) fn valid_heavy_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
