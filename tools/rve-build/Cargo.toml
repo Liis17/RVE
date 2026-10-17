@@ -13,11 +13,13 @@ engine-resources = { path = "../../engine/engine-resources" }
 engine-script = { path = "../../engine/engine-script" }
 engine-scene = { path = "../../engine/engine-scene" }
 libc.workspace = true
+rve-sdk = { path = "../../engine/rve-sdk" }
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 png.workspace = true
-rve-sdk = { path = "../../engine/rve-sdk" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }

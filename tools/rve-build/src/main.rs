@@ -6,6 +6,7 @@ mod ico;
 mod platform;
 mod player;
 mod project;
+mod sdk;
 mod temporary;
 
 use cli::CommandLine;
@@ -33,6 +34,13 @@ fn main() {
             player_args,
         }) => match player::run_project(&project_dir, &player_args) {
             Ok(code) => code,
+            Err(error) => {
+                eprintln!("rve-build: {error}");
+                error.exit_code()
+            }
+        },
+        Ok(CommandLine::Sdk { output }) => match sdk::build_sdk(&output) {
+            Ok(()) => 0,
             Err(error) => {
                 eprintln!("rve-build: {error}");
                 error.exit_code()

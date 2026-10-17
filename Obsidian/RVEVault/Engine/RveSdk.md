@@ -13,8 +13,15 @@ Parent: [[Index]]
 crate-type = ["cdylib"]
 
 [dependencies]
-rve-sdk = { path = "<checkout>/engine/rve-sdk" }
+rve-sdk = { path = "<sdk>/rve-sdk" }
 ```
+
+Каталог `<sdk>` создаётся командой `rve-build sdk --output <dir>` из checkout и
+содержит standalone crate `rve-sdk/` без `target/`. Для разработки из checkout можно
+указывать `../../engine/rve-sdk`; собранный SDK подключается тем же path-зависимым
+способом без исходников движка. При распространении пары бинарников `rve-build` и
+`rve-player` сохраняйте рядом `rve-sdk.toml`: он включает SDK-режим и фиксирует ABI
+и платформу.
 
 Реализация создаёт тип, реализующий `rve_sdk::Script`, и функцию-фабрику,
 принимающую `&rve_sdk::Params`. `rve_sdk::export_scripts!` экспортирует ABI entry

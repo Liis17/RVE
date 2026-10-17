@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build --help";
+pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir>\n  rve-build --help";
 
 pub(crate) enum CommandLine {
     Help,
@@ -13,6 +13,9 @@ pub(crate) enum CommandLine {
     Run {
         project_dir: PathBuf,
         player_args: Vec<OsString>,
+    },
+    Sdk {
+        output: PathBuf,
     },
 }
 
@@ -28,9 +31,34 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandL
     match command.to_str() {
         Some("build") => parse_build(args),
         Some("run") => parse_run(args),
+        Some("sdk") => parse_sdk(args),
         Some(value) => Err(format!("неизвестная команда {value:?}")),
         None => Err("имя команды должно быть текстом UTF-8".to_owned()),
     }
+}
+
+fn parse_sdk(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, String> {
+    let mut output = None;
+    while let Some(argument) = args.next() {
+        if is_help(&argument) {
+            return Ok(CommandLine::Help);
+        }
+        match argument.to_str() {
+            Some("--output") => {
+                if output.is_some() {
+                    return Err("параметр --output указан повторно".to_owned());
+                }
+                output =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "после --output требуется каталог".to_owned()
+                    })?));
+            }
+            Some(value) => return Err(format!("неизвестный аргумент sdk: {value:?}")),
+            None => return Err("аргумент sdk должен быть текстом UTF-8".to_owned()),
+        }
+    }
+    let output = output.ok_or_else(|| "для sdk требуется --output <dir>".to_owned())?;
+    Ok(CommandLine::Sdk { output })
 }
 
 fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, String> {
@@ -130,6 +158,10 @@ mod tests {
             CommandLine::Help
         ));
         assert!(matches!(
+            parse(args(&["sdk", "--help"])).unwrap(),
+            CommandLine::Help
+        ));
+        assert!(matches!(
             parse(args(&[
                 "build", "my project", "--output", "out dir", "--vulkan-sdk", "sdk"
             ]))
@@ -145,6 +177,10 @@ mod tests {
             CommandLine::Run { player_args, .. }
                 if player_args == args(&["--frames", "120"])
         ));
+        assert!(matches!(
+            parse(args(&["sdk", "--output", "sdk dir"])).unwrap(),
+            CommandLine::Sdk { output } if output == Path::new("sdk dir")
+        ));
     }
 
     #[test]
@@ -154,6 +190,10 @@ mod tests {
             vec!["build", "game", "--output", "out", "--output", "other"],
             vec!["build", "game", "--output"],
             vec!["run", "game", "--frames", "20"],
+            vec!["sdk"],
+            vec!["sdk", "--output"],
+            vec!["sdk", "--output", "out", "--output", "other"],
+            vec!["sdk", "--bad"],
         ] {
             assert!(parse(args(&values)).is_err(), "accepted {values:?}");
         }

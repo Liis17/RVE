@@ -61,12 +61,20 @@ cargo run -p sandbox -- --frames 120 --render-scale 0.5
 ```sh
 cargo run -p rve-build -- run ../examples/demo-game -- --frames 120
 cargo run -p rve-build -- build ../examples/demo-game --output ../demo-out
+cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist
 ```
 
 `rve-build run` собирает игру и запускает её через release-player. `rve-build build`
 создаёт релиз в указанном каталоге, который должен отсутствовать до сборки. Для
 прямого запуска player CLI имеет вид
 `rve-player [--project <dir>] [--scripts <path>] [--frames N]`.
+
+Команда `rve-build sdk` собирает release `rve-player` и создаёт переносимый каталог
+с `rve-build`, player, исходниками `rve-sdk` и маркером `rve-sdk.toml`. Игровой
+crate подключает SDK через path `../rve-sdk-dist/rve-sdk` в `Cargo.toml`. Рядом с
+`rve-build` маркер включает SDK-режим: checkout движка не нужен, а совместимость
+проверяется по ABI и паре `ARCH-OS` текущей платформы. Без маркера используется
+checkout-режим и release player собирается один раз в `build/player`.
 
 В dev-режиме `rve-player` загружает Rust-скрипты только при явном `--scripts`;
 release-плеер автоматически ищет библиотеку в `Engine/`, а этот параметр позволяет

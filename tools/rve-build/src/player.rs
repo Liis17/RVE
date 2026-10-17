@@ -4,6 +4,7 @@ use crate::error::BuildError;
 use crate::ico::png_to_ico;
 use crate::platform;
 use crate::project::{ProjectBuild, prepare_project};
+use crate::sdk::{self, PlayerLocation};
 use crate::temporary::TempDir;
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
 use engine_pak::{Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, CatalogLimits};
@@ -435,6 +436,49 @@ fn parse_cargo_output(
 }
 
 fn locate_player() -> Result<PathBuf, BuildError> {
+    let executable = current_executable_path()?;
+    let executable_dir = executable_directory(&executable)?;
+    match sdk::locate_player_in(&executable_dir, build_checkout_player)? {
+        PlayerLocation::Checkout(executable) => Ok(executable),
+        PlayerLocation::Sdk {
+            executable,
+            manifest,
+        } => {
+            println!("rve-player: prebuilt (SDK)");
+            println!("rve-sdk engine version: {}", manifest.engine_version);
+            Ok(executable)
+        }
+    }
+}
+
+pub(crate) fn current_executable_path() -> Result<PathBuf, BuildError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        BuildError::operational(format!("не удалось определить путь к rve-build: {error}"))
+    })?;
+    canonical_executable_path(&executable)
+}
+
+fn canonical_executable_path(executable: &Path) -> Result<PathBuf, BuildError> {
+    let executable = fs::canonicalize(executable).map_err(|error| {
+        BuildError::operational(format!(
+            "не удалось разрешить путь к rve-build {}: {error}",
+            executable.display()
+        ))
+    })?;
+    normalize_build_path(&executable).map_err(|error| {
+        BuildError::operational(format!(
+            "не удалось нормализовать путь к rve-build: {error}"
+        ))
+    })
+}
+
+pub(crate) fn executable_directory(executable: &Path) -> Result<PathBuf, BuildError> {
+    executable.parent().map(Path::to_path_buf).ok_or_else(|| {
+        BuildError::operational("не удалось определить каталог исполняемого файла rve-build")
+    })
+}
+
+pub(crate) fn build_checkout_player() -> Result<PathBuf, BuildError> {
     let root = repo_root()?;
     let target_dir = normalize_build_path(&root.join("build/player"))?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
@@ -577,7 +621,7 @@ pub(crate) fn validate_staged_archives(assets_dir: &Path) -> Result<(), BuildErr
         })
 }
 
-fn repo_root() -> Result<PathBuf, BuildError> {
+pub(crate) fn repo_root() -> Result<PathBuf, BuildError> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -592,13 +636,13 @@ fn repo_root() -> Result<PathBuf, BuildError> {
     normalize_build_path(&root)
 }
 
-fn create_dir_all(path: &Path) -> Result<(), BuildError> {
+pub(crate) fn create_dir_all(path: &Path) -> Result<(), BuildError> {
     fs::create_dir_all(path).map_err(|error| {
         BuildError::operational(format!("не удалось создать {}: {error}", path.display()))
     })
 }
 
-fn copy_file(source: &Path, destination: &Path) -> Result<(), BuildError> {
+pub(crate) fn copy_file(source: &Path, destination: &Path) -> Result<(), BuildError> {
     fs::copy(source, destination).map_err(|error| {
         BuildError::operational(format!(
             "не удалось скопировать {} в {}: {error}",
@@ -627,7 +671,7 @@ fn write_file(path: &Path, contents: &[u8]) -> Result<(), BuildError> {
     })
 }
 
-fn absolute_output_path(path: &Path) -> Result<PathBuf, BuildError> {
+pub(crate) fn absolute_output_path(path: &Path) -> Result<PathBuf, BuildError> {
     let path = std::path::absolute(path).map_err(|error| {
         BuildError::operational(format!(
             "не удалось разрешить output {}: {error}",
@@ -644,7 +688,7 @@ fn absolute_output_path(path: &Path) -> Result<PathBuf, BuildError> {
     Ok(path)
 }
 
-fn ensure_output_missing(path: &Path) -> Result<(), BuildError> {
+pub(crate) fn ensure_output_missing(path: &Path) -> Result<(), BuildError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err(BuildError::input(format!(
             "output directory already exists: {}",
@@ -713,7 +757,7 @@ fn is_reserved_windows_name(stem: &str) -> bool {
         })
 }
 
-fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
+pub(crate) fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
     strip_windows_verbatim_prefix(path).map_err(|error| {
         BuildError::input(format!(
             "неподдерживаемая форма Windows-пути {}: {error}",
@@ -1011,6 +1055,21 @@ mod tests {
         let path = super::repo_root().unwrap();
         let canonical = fs::canonicalize(&path).unwrap();
         assert_eq!(strip_windows_verbatim_prefix(&canonical).unwrap(), path);
+    }
+
+    #[test]
+    fn executable_directory_uses_a_canonicalized_path() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-executable-path").unwrap();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        let executable_path = root.path().join("nested/../rve-build");
+        fs::write(root.path().join("rve-build"), b"stub").unwrap();
+
+        let canonical = super::canonical_executable_path(&executable_path).unwrap();
+        let directory = super::executable_directory(&canonical).unwrap();
+        let expected =
+            strip_windows_verbatim_prefix(&fs::canonicalize(root.path()).unwrap()).unwrap();
+
+        assert_eq!(directory, expected);
     }
 
     #[test]

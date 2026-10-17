@@ -51,12 +51,31 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 
 ## Player и Rust-скрипты
 
-`rve-build` не генерирует отдельный player crate. `locate_player` собирает checkout
-пакет `rve-player` командой `cargo build --release --locked -p rve-player` из корня
-репозитория и задаёт `CARGO_TARGET_DIR=<checkout>/build/player`. Путь к исполняемому
-файлу берётся из Cargo `compiler-artifact`; вывод сообщает `rve-player: rebuilt` или
-`rve-player: up to date` по полю `fresh` этого артефакта. Поэтому сборщик должен быть
-запущен из checkout движка, а проектные файлы player не создаются.
+`rve-build` не генерирует отдельный player crate. Режим определяется наличием
+`rve-sdk.toml` рядом с исполняемым файлом `rve-build`.
+
+Без маркера используется checkout-режим: `locate_player` собирает пакет `rve-player`
+командой `cargo build --release --locked -p rve-player` из корня репозитория и задаёт
+`CARGO_TARGET_DIR=<checkout>/build/player`. Путь к исполняемому файлу берётся из Cargo
+`compiler-artifact`; вывод сообщает `rve-player: rebuilt` или `rve-player: up to date`
+по полю `fresh` этого артефакта.
+
+С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
+`engine_version`, `abi_version` и `target`. `abi_version` должен совпадать с
+`RVE_SCRIPT_ABI_VERSION`; `target` должен совпадать с парой `ARCH-OS`, например
+`x86_64-windows` или `aarch64-macos`. `rve-build` запускает соседний
+`rve-player[.exe]` и сообщает `rve-player: prebuilt (SDK)`. Отсутствующий player,
+ошибка TOML, несовпадение ABI или платформы завершают команду операционной ошибкой.
+SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходникам checkout.
+
+`rve-build sdk --output <dir>` доступна только в checkout-режиме. Она собирает
+release `rve-player` в `build/player`, затем атомарно публикует новый каталог без
+замены существующего. Каталог содержит `rve-build[.exe]`, `rve-player[.exe]`,
+`rve-sdk.toml` и `rve-sdk/Cargo.toml` с деревом `rve-sdk/src/**`; `target/` не
+копируется. `rve-build` копирует собственный запущенный executable. При debug-сборке
+команда предупреждает об этом; для распространяемого SDK рекомендуется запускать
+`cargo run --release -p rve-build -- sdk --output <dir>`. Клиентский crate указывает
+на `<sdk>/rve-sdk` как path-зависимость (см. [[Engine/RveSdk]]).
 
 Если `project.rveproject` содержит `heavy_scripts`, каталог обязан содержать
 `Cargo.toml` с lib-target `crate-type = ["cdylib"]`. Сборщик читает Cargo metadata,
@@ -72,13 +91,14 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 кодом 2. ABI и модель гостевого crate описаны в [[Engine/RveSdk]].
 
 Команда `run` собирает скрипты в debug-профиле, берёт release `rve-player` из
-`build/player` и запускает его как `--project <absolute-project-dir> [--scripts
+checkout `build/player` или соседнего каталога SDK и запускает его как `--project <absolute-project-dir> [--scripts
 <library>]`, затем передаёт пользовательские аргументы. Если скриптов нет, `--scripts`
 не добавляется. На Windows release-player — GUI executable и не открывает консоль;
 debug-сборку player можно запустить вручную командой `cargo run -p rve-player`;
 она сохраняет консоль для диагностики.
 
-Команда `build` собирает release cdylib и тот же release-player, затем копирует
+Команда `build` собирает release cdylib и checkout release-player либо использует
+соседний prebuilt player из SDK, затем копирует
 исполняемый файл в релиз и библиотеку в `Engine/` под фиксированным именем
 `game_scripts.dll` (Windows) или `libgame_scripts.dylib` (macOS). Windows executable,
 `Engine/` и `Assets/` размещаются рядом; на macOS executable входит в
@@ -124,4 +144,4 @@ MoltenVK (Apache-2.0).
 требует совместимое устройство.
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,
-`archives.rs`, `player.rs`, `ico.rs`, `platform.rs`, `temporary.rs`.
+`archives.rs`, `player.rs`, `sdk.rs`, `ico.rs`, `platform.rs`, `temporary.rs`.
