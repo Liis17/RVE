@@ -34,6 +34,7 @@ impl ScriptTransform {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScriptEventLevel {
     Info,
+    Warn,
     Error,
 }
 

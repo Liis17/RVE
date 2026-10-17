@@ -5,6 +5,7 @@ mod abi_string;
 mod host;
 mod library;
 mod lite;
+mod transaction;
 mod types;
 
 pub use engine_scene::ParamValue;

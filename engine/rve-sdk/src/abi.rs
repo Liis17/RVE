@@ -18,7 +18,7 @@ pub const RVE_VALUE_ARRAY: u32 = 4;
 
 /// Informational log severity.
 pub const RVE_LOG_INFO: u32 = 0;
-/// Reserved warning log severity.
+/// Warning log severity.
 pub const RVE_LOG_WARN: u32 = 1;
 /// Error log severity.
 pub const RVE_LOG_ERROR: u32 = 2;
@@ -246,6 +246,19 @@ pub type RveGetLocalFn =
 /// Host callback that stages an object's local transform.
 pub type RveSetLocalFn =
     unsafe extern "C" fn(ctx: *mut c_void, object: u64, transform: *const RveTransform) -> bool;
+/// Host callback that copies an object's column-major world matrix.
+pub type RveWorldMatrixFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut [f32; 16]) -> bool;
+/// Host callback that stages a message for one object.
+pub type RveSendFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    target_id: RveStr,
+    name: RveStr,
+    value: *const RveValue,
+) -> bool;
+/// Host callback that stages a broadcast message.
+pub type RveBroadcastFn =
+    unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, value: *const RveValue) -> bool;
 
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
@@ -270,6 +283,12 @@ pub struct RveHost {
     pub get_local: RveGetLocalFn,
     /// Local-transform write callback.
     pub set_local: RveSetLocalFn,
+    /// World-matrix callback.
+    pub world_matrix: RveWorldMatrixFn,
+    /// Message-send callback.
+    pub send: RveSendFn,
+    /// Message-broadcast callback.
+    pub broadcast: RveBroadcastFn,
 }
 
 /// Guest factory callback.

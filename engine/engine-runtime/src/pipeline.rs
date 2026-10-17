@@ -452,6 +452,7 @@ fn print_script_events(events: Vec<ScriptEvent>) {
     for event in events {
         match event.level {
             ScriptEventLevel::Info => println!("[script] {event}"),
+            ScriptEventLevel::Warn => eprintln!("[script warn] {event}"),
             ScriptEventLevel::Error => eprintln!("[script] {event}"),
         }
     }

@@ -1,10 +1,13 @@
 use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
 use crate::library::ScriptLibrary;
-use crate::lite::{self, ActiveSource, EventQueue, LuaInstance};
+use crate::lite::{self, ActiveCall, ActiveSource, EventQueue, LuaInstance};
+use crate::transaction::{
+    MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction,
+};
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_scene::{LocalTransform, ObjectHandle, World};
-use mlua::{Lua, Table};
-use std::cell::RefCell;
+use mlua::{Error as LuaError, Lua, Table};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -88,8 +91,6 @@ enum HeavyInstance {
 
 struct ScriptInstance {
     handle: ObjectHandle,
-    object_id: String,
-    object_name: String,
     source: String,
     kind: ScriptKind,
     enabled: bool,
@@ -104,6 +105,11 @@ pub struct ScriptHost {
     instances: Vec<ScriptInstance>,
     events: EventQueue,
     active_source: ActiveSource,
+    active_call: ActiveCall,
+    transaction: ScriptTransaction,
+    queued_messages: Vec<PendingMessage>,
+    queued_bytes: usize,
+    delivery_messages: Vec<PendingMessage>,
     lua_time: Table,
     interrupt: ScriptInterruptHandle,
     scene_name: String,
@@ -116,6 +122,7 @@ pub struct ScriptHost {
 enum Phase {
     Start,
     Update(f32),
+    Message,
     Destroy,
 }
 
@@ -151,9 +158,11 @@ impl ScriptHost {
     ) -> Result<Self, ScriptLoadError> {
         let events = Rc::new(RefCell::new(Vec::new()));
         let active_source = Rc::new(RefCell::new(scene_name.to_owned()));
+        let active_call = Rc::new(Cell::new(std::ptr::null_mut()));
         let lua_state = lite::create_lua(
             events.clone(),
             active_source.clone(),
+            active_call.clone(),
             interrupt.interrupted.clone(),
         )
         .map_err(|error| ScriptLoadError::LuaHost(error.to_string()))?;
@@ -164,6 +173,11 @@ impl ScriptHost {
             instances: Vec::new(),
             events,
             active_source,
+            active_call,
+            transaction: ScriptTransaction::default(),
+            queued_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
+            queued_bytes: 0,
+            delivery_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             lua_time: lua_state.time,
             interrupt,
             scene_name: scene_name.to_owned(),
@@ -186,12 +200,27 @@ impl ScriptHost {
                 let class = if let Some(class) = classes.get(path) {
                     class.clone()
                 } else {
-                    *host.active_source.borrow_mut() = event_source(scene_name, &object.id, path);
-                    let class = lite::compile_class(&host.lua, &base_environment, path, source)
-                        .map_err(|message| ScriptLoadError::Lite {
-                            path: path.to_owned(),
-                            message,
-                        })?;
+                    let source_label = event_source(scene_name, &object.id, path);
+                    *host.active_source.borrow_mut() = source_label.clone();
+                    host.transaction.begin(
+                        world,
+                        object.handle,
+                        &source_label,
+                        false,
+                        host.queued_messages.len(),
+                        host.queued_bytes,
+                    );
+                    let _active_call = ActiveCallGuard::new(
+                        &host.active_call,
+                        &mut host.transaction as *mut ScriptTransaction,
+                    );
+                    let result = lite::compile_class(&host.lua, &base_environment, path, source);
+                    drop(_active_call);
+                    host.transaction.discard();
+                    let class = result.map_err(|message| ScriptLoadError::Lite {
+                        path: path.to_owned(),
+                        message,
+                    })?;
                     classes.insert(path.to_owned(), class.clone());
                     class
                 };
@@ -209,8 +238,6 @@ impl ScriptHost {
                 })?;
                 host.instances.push(ScriptInstance {
                     handle: object.handle,
-                    object_id: object.id.clone(),
-                    object_name: object.name.clone(),
                     source: event_source(scene_name, &object.id, path),
                     kind: ScriptKind::Lite(instance),
                     enabled: true,
@@ -228,27 +255,32 @@ impl ScriptHost {
                                 .to_owned(),
                         })?;
                     let source = event_source(scene_name, &object.id, &script.name);
-                    let instance = AbiScriptInstance::create(
+                    host.transaction.begin(
+                        world,
+                        object.handle,
+                        &source,
+                        false,
+                        host.queued_messages.len(),
+                        host.queued_bytes,
+                    );
+                    let result = AbiScriptInstance::create(
                         descriptor,
                         &script.params,
                         AbiScriptCall {
                             self_object,
-                            object_id: &object.id,
-                            object_name: &object.name,
-                            transform,
+                            transaction: &mut host.transaction,
                             events: &host.events,
                             source: &source,
                         },
-                    )
-                    .map_err(|message| ScriptLoadError::Heavy {
+                    );
+                    host.transaction.discard();
+                    let instance = result.map_err(|message| ScriptLoadError::Heavy {
                         object_id: object.id.clone(),
                         name: script.name.clone(),
                         message,
                     })?;
                     host.instances.push(ScriptInstance {
                         handle: object.handle,
-                        object_id: object.id.clone(),
-                        object_name: object.name.clone(),
                         source,
                         kind: ScriptKind::Heavy(HeavyInstance::Abi(instance)),
                         enabled: true,
@@ -312,100 +344,35 @@ impl ScriptHost {
     }
 
     fn run_phase(&mut self, world: &mut World, phase: Phase, time: ScriptTime) {
-        let events = &self.events;
+        world.recalculate_world_matrices();
+        if matches!(phase, Phase::Update(_)) {
+            self.deliver_messages(world, time);
+        }
+
         let time_error = lite::set_time(&self.lua_time, time)
             .err()
             .map(|error| error.to_string());
         let mut observed_interrupt = self.interrupt.is_interrupted();
-        for instance in &mut self.instances {
-            if !instance.enabled {
+        for index in 0..self.instances.len() {
+            if !self.instances[index].enabled {
                 continue;
             }
-            if matches!(&instance.kind, ScriptKind::Lite(_)) && self.interrupt.is_interrupted() {
+            if matches!(&self.instances[index].kind, ScriptKind::Lite(_))
+                && self.interrupt.is_interrupted()
+            {
                 observed_interrupt = true;
-                instance.enabled = false;
+                self.instances[index].enabled = false;
                 continue;
             }
-            let Some(local) = world.local_transform(instance.handle).copied() else {
-                instance.enabled = false;
-                push_error(events, instance, "object no longer exists".to_owned());
-                continue;
-            };
-            let initial = script_transform(local);
-            let result = match &mut instance.kind {
-                ScriptKind::Lite(lite_instance) => {
-                    *self.active_source.borrow_mut() = instance.source.clone();
-                    match time_error.as_ref() {
-                        Some(message) => Err(message.clone()),
-                        None => lite_instance
-                            .set_transform(initial)
-                            .and_then(|()| match phase {
-                                Phase::Start => lite_instance.invoke_start(),
-                                Phase::Update(dt) => lite_instance.invoke_update(dt),
-                                Phase::Destroy => lite_instance.invoke_destroy(),
-                            })
-                            .and_then(|()| lite_instance.transform())
-                            .map_err(|error| error.to_string()),
-                    }
+            match self.call_instance(index, world, phase, time, None, time_error.as_deref()) {
+                CallOutcome::Committed => {}
+                CallOutcome::Interrupted => {
+                    observed_interrupt = true;
+                    self.instances[index].enabled = false;
                 }
-                ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
-                    let self_object = abi_object_handle(instance.handle);
-                    match self_object {
-                        Some(self_object) => script.invoke(
-                            match phase {
-                                Phase::Start => AbiPhase::Start,
-                                Phase::Update(dt) => AbiPhase::Update(dt),
-                                Phase::Destroy => AbiPhase::Destroy,
-                            },
-                            time,
-                            AbiScriptCall {
-                                self_object,
-                                object_id: &instance.object_id,
-                                object_name: &instance.object_name,
-                                transform: initial,
-                                events,
-                                source: &instance.source,
-                            },
-                        ),
-                        None => {
-                            Err("object handle cannot be represented by the script ABI".to_owned())
-                        }
-                    }
-                }
-            };
-
-            if matches!(&instance.kind, ScriptKind::Lite(_)) && self.interrupt.is_interrupted() {
-                observed_interrupt = true;
-                instance.enabled = false;
-                continue;
-            }
-
-            match result {
-                Ok(transform) if transform.is_finite() => {
-                    if let Err(error) =
-                        world.set_local_transform(instance.handle, local_transform(transform))
-                    {
-                        instance.enabled = false;
-                        push_error(events, instance, error.to_string());
-                    }
-                }
-                Ok(_) => {
-                    instance.enabled = false;
-                    push_error(
-                        events,
-                        instance,
-                        "script produced a non-finite transform".to_owned(),
-                    );
-                }
-                Err(message) => {
-                    instance.enabled = false;
-                    if matches!(&instance.kind, ScriptKind::Lite(_))
-                        && self.interrupt.is_interrupted()
-                    {
-                        observed_interrupt = true;
-                    } else {
-                        push_error(events, instance, message);
-                    }
+                CallOutcome::Failed(message) => {
+                    self.instances[index].enabled = false;
+                    push_error(&self.events, &self.instances[index], message);
                 }
             }
         }
@@ -424,7 +391,7 @@ impl ScriptHost {
                 }
             }
             if !self.interruption_reported {
-                events.borrow_mut().push(ScriptEvent {
+                self.events.borrow_mut().push(ScriptEvent {
                     level: ScriptEventLevel::Error,
                     source: self.scene_name.clone(),
                     message: "scripts interrupted".to_owned(),
@@ -432,6 +399,215 @@ impl ScriptHost {
                 self.interruption_reported = true;
             }
         }
+    }
+
+    fn deliver_messages(&mut self, world: &mut World, time: ScriptTime) {
+        std::mem::swap(&mut self.queued_messages, &mut self.delivery_messages);
+        self.queued_bytes = 0;
+        if self.delivery_messages.is_empty() {
+            return;
+        }
+        self.delivery_messages.reverse();
+        let time_error = lite::set_time(&self.lua_time, time)
+            .err()
+            .map(|error| error.to_string());
+        while let Some(message) = self.delivery_messages.pop() {
+            for index in 0..self.instances.len() {
+                let instance = &self.instances[index];
+                let is_target = match message.target {
+                    MessageTarget::Object(handle) => instance.handle == handle,
+                    MessageTarget::Broadcast => true,
+                };
+                if !instance.enabled || !is_target {
+                    continue;
+                }
+                if matches!(
+                    &instance.kind,
+                    ScriptKind::Lite(lite) if !lite.has_message_callback()
+                ) {
+                    continue;
+                }
+                match self.call_instance(
+                    index,
+                    world,
+                    Phase::Message,
+                    time,
+                    Some(&message),
+                    time_error.as_deref(),
+                ) {
+                    CallOutcome::Committed => {}
+                    CallOutcome::Interrupted => self.instances[index].enabled = false,
+                    CallOutcome::Failed(message) => {
+                        self.instances[index].enabled = false;
+                        push_error(&self.events, &self.instances[index], message);
+                    }
+                }
+            }
+        }
+    }
+
+    fn call_instance(
+        &mut self,
+        index: usize,
+        world: &mut World,
+        phase: Phase,
+        time: ScriptTime,
+        message: Option<&PendingMessage>,
+        time_error: Option<&str>,
+    ) -> CallOutcome {
+        let Self {
+            instances,
+            events,
+            active_source,
+            active_call,
+            transaction,
+            queued_messages,
+            queued_bytes,
+            lua,
+            interrupt,
+            ..
+        } = self;
+        let instance = &mut instances[index];
+        let Some(local) = world.local_transform(instance.handle).copied() else {
+            transaction.discard();
+            return CallOutcome::Failed("object no longer exists".to_owned());
+        };
+        let initial = script_transform(local);
+        transaction.begin(
+            world,
+            instance.handle,
+            &instance.source,
+            true,
+            queued_messages.len(),
+            *queued_bytes,
+        );
+        let transaction_ptr = transaction as *mut ScriptTransaction;
+        let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {
+            ScriptKind::Lite(lite_instance) => {
+                *active_source.borrow_mut() = instance.source.clone();
+                let _active_call = ActiveCallGuard::new(active_call, transaction_ptr);
+                let callback = match time_error {
+                    Some(message) => Err(LuaError::runtime(message.to_owned())),
+                    None => lite_instance
+                        .set_transform(initial)
+                        .and_then(|()| match phase {
+                            Phase::Start => lite_instance.invoke_start(),
+                            Phase::Update(dt) => lite_instance.invoke_update(dt),
+                            Phase::Message => match message {
+                                Some(message) => lite_instance.invoke_message(
+                                    lua,
+                                    &message.sender_id,
+                                    &message.name,
+                                    &message.value,
+                                ),
+                                None => Err(LuaError::runtime("missing message data")),
+                            },
+                            Phase::Destroy => lite_instance.invoke_destroy(),
+                        }),
+                };
+                callback
+                    .and_then(|()| lite_instance.transform())
+                    .map(Some)
+                    .map_err(|error| error.to_string())
+            }
+            ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
+                let Some(self_object) = abi_object_handle(instance.handle) else {
+                    // SAFETY: the transaction has been started and remains owned by this call.
+                    unsafe { (*transaction_ptr).discard() };
+                    return CallOutcome::Failed(
+                        "object handle cannot be represented by the script ABI".to_owned(),
+                    );
+                };
+                let call = AbiScriptCall {
+                    self_object,
+                    // SAFETY: this is the only transaction borrow for the synchronous ABI call.
+                    transaction: unsafe { &mut *transaction_ptr },
+                    events,
+                    source: &instance.source,
+                };
+                match phase {
+                    Phase::Message => match message {
+                        Some(message) => script.invoke_message(
+                            time,
+                            &message.sender_id,
+                            &message.name,
+                            &message.value,
+                            call,
+                        ),
+                        None => Err("missing message data".to_owned()),
+                    },
+                    Phase::Start => script.invoke(AbiPhase::Start, time, call),
+                    Phase::Update(dt) => script.invoke(AbiPhase::Update(dt), time, call),
+                    Phase::Destroy => script.invoke(AbiPhase::Destroy, time, call),
+                }
+                .map(|()| None)
+            }
+        };
+
+        if matches!(&instance.kind, ScriptKind::Lite(_)) && interrupt.is_interrupted() {
+            // SAFETY: the callback and its call-scoped transaction borrow have returned.
+            unsafe { (*transaction_ptr).discard() };
+            return CallOutcome::Interrupted;
+        }
+
+        match callback_result {
+            Ok(Some(transform)) if transform.is_finite() => {
+                // SAFETY: the callback and its call-scoped transaction borrow have returned.
+                let staged = unsafe {
+                    transform == initial
+                        || (*transaction_ptr).set_local_transform(instance.handle, transform)
+                };
+                if !staged {
+                    // SAFETY: the transaction is still owned by this host call.
+                    unsafe { (*transaction_ptr).discard() };
+                    return CallOutcome::Failed(
+                        "could not stage the script object's local transform".to_owned(),
+                    );
+                }
+            }
+            Ok(Some(_)) => {
+                // SAFETY: the callback and its call-scoped transaction borrow have returned.
+                unsafe { (*transaction_ptr).discard() };
+                return CallOutcome::Failed("script produced a non-finite transform".to_owned());
+            }
+            Ok(None) => {}
+            Err(message) => {
+                // SAFETY: the callback and its call-scoped transaction borrow have returned.
+                unsafe { (*transaction_ptr).discard() };
+                return CallOutcome::Failed(message);
+            }
+        }
+
+        // SAFETY: the callback and all call-scoped transaction borrows have returned.
+        match unsafe { (*transaction_ptr).commit(world, queued_messages, queued_bytes, events) } {
+            Ok(()) => CallOutcome::Committed,
+            Err(message) => CallOutcome::Failed(message),
+        }
+    }
+}
+
+enum CallOutcome {
+    Committed,
+    Interrupted,
+    Failed(String),
+}
+
+struct ActiveCallGuard {
+    active_call: ActiveCall,
+}
+
+impl ActiveCallGuard {
+    fn new(active_call: &ActiveCall, transaction: *mut ScriptTransaction) -> Self {
+        active_call.set(transaction);
+        Self {
+            active_call: active_call.clone(),
+        }
+    }
+}
+
+impl Drop for ActiveCallGuard {
+    fn drop(&mut self) {
+        self.active_call.set(std::ptr::null_mut());
     }
 }
 
@@ -446,14 +622,6 @@ fn script_transform(transform: LocalTransform) -> ScriptTransform {
         position: transform.position.to_array(),
         rotation: transform.rotation_deg.to_array(),
         scale: transform.scale.to_array(),
-    }
-}
-
-fn local_transform(transform: ScriptTransform) -> LocalTransform {
-    LocalTransform {
-        position: transform.position.into(),
-        rotation_deg: transform.rotation.into(),
-        scale: transform.scale.into(),
     }
 }
 

@@ -1,32 +1,32 @@
 use crate::abi_string::read_abi_str;
 use crate::lite::EventQueue;
+use crate::transaction::{
+    MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
+    ScriptTransaction,
+};
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_scene::ParamValue;
 use rve_sdk::abi::{
-    RVE_LOG_ERROR, RVE_LOG_INFO, RVE_LOG_WARN, RveArray, RveHost, RveParamEntry, RveParams,
-    RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_LOG_ERROR, RVE_LOG_INFO, RVE_LOG_WARN, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
+    RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveHost, RveParamEntry, RveParams, RveScriptDesc,
+    RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub(crate) struct AbiCallContext<'a> {
-    pub(crate) self_object: u64,
-    pub(crate) object_id: &'a str,
-    pub(crate) object_name: &'a str,
-    pub(crate) transform: RveTransform,
-    pub(crate) events: &'a EventQueue,
-    pub(crate) source: &'a str,
-    pub(crate) error: Option<String>,
-    pub(crate) poisoned: bool,
-    can_write_transform: bool,
+    self_object: u64,
+    transaction: &'a mut ScriptTransaction,
+    events: EventQueue,
+    source: &'a str,
+    error: Option<String>,
+    poisoned: bool,
 }
 
 pub(crate) struct AbiScriptCall<'a> {
     pub(crate) self_object: u64,
-    pub(crate) object_id: &'a str,
-    pub(crate) object_name: &'a str,
-    pub(crate) transform: ScriptTransform,
+    pub(crate) transaction: &'a mut ScriptTransaction,
     pub(crate) events: &'a EventQueue,
     pub(crate) source: &'a str,
 }
@@ -34,27 +34,17 @@ pub(crate) struct AbiScriptCall<'a> {
 impl<'a> AbiCallContext<'a> {
     pub(crate) fn new(
         self_object: u64,
-        object_id: &'a str,
-        object_name: &'a str,
-        transform: ScriptTransform,
-        events: &'a EventQueue,
+        transaction: &'a mut ScriptTransaction,
+        events: &EventQueue,
         source: &'a str,
-        can_write_transform: bool,
     ) -> Self {
         Self {
             self_object,
-            object_id,
-            object_name,
-            transform: RveTransform {
-                position: transform.position,
-                rotation_deg: transform.rotation,
-                scale: transform.scale,
-            },
-            events,
+            transaction,
+            events: events.clone(),
             source,
             error: None,
             poisoned: false,
-            can_write_transform,
         }
     }
 
@@ -73,10 +63,13 @@ impl<'a> AbiCallContext<'a> {
             object_name: host_object_name,
             get_local: host_get_local,
             set_local: host_set_local,
+            world_matrix: host_world_matrix,
+            send: host_send,
+            broadcast: host_broadcast,
         }
     }
 
-    pub(crate) fn callback_result(&mut self, status: RveStatus) -> Result<ScriptTransform, String> {
+    pub(crate) fn callback_result(&mut self, status: RveStatus) -> Result<(), String> {
         if self.poisoned {
             return Err("host callback panicked; ABI call is poisoned".to_owned());
         }
@@ -87,11 +80,7 @@ impl<'a> AbiCallContext<'a> {
                 RveStatus::Ok => unreachable!(),
             }));
         }
-        Ok(ScriptTransform {
-            position: self.transform.position,
-            rotation: self.transform.rotation_deg,
-            scale: self.transform.scale,
-        })
+        Ok(())
     }
 }
 
@@ -109,19 +98,12 @@ impl AbiScriptInstance {
         call: AbiScriptCall<'_>,
     ) -> Result<Self, String> {
         let params = OwnedAbiParams::new(params);
-        let mut context = AbiCallContext::new(
-            call.self_object,
-            call.object_id,
-            call.object_name,
-            call.transform,
-            call.events,
-            call.source,
-            false,
-        );
+        let mut context =
+            AbiCallContext::new(call.self_object, call.transaction, call.events, call.source);
         let mut instance = std::ptr::null_mut();
         let status = {
             let host = context.host(ScriptTime::default());
-            // SAFETY: all callback data and borrowed parameters remain alive through create.
+            // SAFETY: callback context and borrowed parameters remain live through create.
             unsafe { (descriptor.create)(&host, &params.abi, &mut instance) }
         };
         let poisoned = context.poisoned;
@@ -161,16 +143,9 @@ impl AbiScriptInstance {
         phase: AbiPhase,
         time: ScriptTime,
         call: AbiScriptCall<'_>,
-    ) -> Result<ScriptTransform, String> {
-        let mut context = AbiCallContext::new(
-            call.self_object,
-            call.object_id,
-            call.object_name,
-            call.transform,
-            call.events,
-            call.source,
-            true,
-        );
+    ) -> Result<(), String> {
+        let mut context =
+            AbiCallContext::new(call.self_object, call.transaction, call.events, call.source);
         let status = {
             let host = context.host(time);
             // SAFETY: this instance came from its matching descriptor's successful create call.
@@ -181,6 +156,27 @@ impl AbiScriptInstance {
                     AbiPhase::Destroy => (self.descriptor.destroy)(self.instance, &host),
                 }
             }
+        };
+        context.callback_result(status)
+    }
+
+    pub(crate) fn invoke_message(
+        &mut self,
+        time: ScriptTime,
+        sender: &str,
+        name: &str,
+        value: &ParamValue,
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), String> {
+        let value = OwnedAbiValue::new(value);
+        let sender = RveStr::from_str_ref(sender);
+        let name = RveStr::from_str_ref(name);
+        let mut context =
+            AbiCallContext::new(call.self_object, call.transaction, call.events, call.source);
+        let status = {
+            let host = context.host(time);
+            // SAFETY: message data, instance, and host remain live throughout the callback.
+            unsafe { (self.descriptor.message)(self.instance, &host, sender, name, &value.value) }
         };
         context.callback_result(status)
     }
@@ -258,10 +254,7 @@ unsafe extern "C" fn host_log(ctx: *mut c_void, level: u32, message: RveStr) {
         }
         let level = match level {
             RVE_LOG_INFO => ScriptEventLevel::Info,
-            RVE_LOG_WARN => {
-                // The host currently exposes only Info and Error event levels.
-                ScriptEventLevel::Error
-            }
+            RVE_LOG_WARN => ScriptEventLevel::Warn,
             RVE_LOG_ERROR => ScriptEventLevel::Error,
             _ => ScriptEventLevel::Error,
         };
@@ -275,43 +268,70 @@ unsafe extern "C" fn host_log(ctx: *mut c_void, level: u32, message: RveStr) {
 
 unsafe extern "C" fn host_find_object(ctx: *mut c_void, id: RveStr) -> u64 {
     guarded(ctx, 0, |context| {
-        if unsafe { read_abi_str(id) }.is_ok_and(|id| id == context.object_id) {
-            context.self_object
-        } else {
-            0
-        }
+        let Ok(id) = (unsafe { read_abi_str(id) }) else {
+            return 0;
+        };
+        context
+            .transaction
+            .handle_by_id(id)
+            .and_then(|handle| context.transaction.abi_handle(handle))
+            .unwrap_or(0)
     })
 }
 
 unsafe extern "C" fn host_object_id(ctx: *mut c_void, object: u64, out: *mut RveStr) -> bool {
     guarded(ctx, false, |context| {
-        if object != context.self_object || out.is_null() {
+        if out.is_null() {
             return false;
         }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(id) = context.transaction.object_id(handle) else {
+            return false;
+        };
         // SAFETY: output was checked and points to the caller's stack slot.
-        unsafe { *out = RveStr::from_str_ref(context.object_id) };
+        unsafe { *out = RveStr::from_str_ref(id) };
         true
     })
 }
 
 unsafe extern "C" fn host_object_name(ctx: *mut c_void, object: u64, out: *mut RveStr) -> bool {
     guarded(ctx, false, |context| {
-        if object != context.self_object || out.is_null() {
+        if out.is_null() {
             return false;
         }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(name) = context.transaction.object_name(handle) else {
+            return false;
+        };
         // SAFETY: output was checked and points to the caller's stack slot.
-        unsafe { *out = RveStr::from_str_ref(context.object_name) };
+        unsafe { *out = RveStr::from_str_ref(name) };
         true
     })
 }
 
 unsafe extern "C" fn host_get_local(ctx: *mut c_void, object: u64, out: *mut RveTransform) -> bool {
     guarded(ctx, false, |context| {
-        if object != context.self_object || out.is_null() {
+        if out.is_null() {
             return false;
         }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(transform) = context.transaction.local_transform(handle) else {
+            return false;
+        };
         // SAFETY: output was checked and points to the caller's stack slot.
-        unsafe { *out = context.transform };
+        unsafe {
+            *out = RveTransform {
+                position: transform.position,
+                rotation_deg: transform.rotation,
+                scale: transform.scale,
+            }
+        };
         true
     })
 }
@@ -322,13 +342,199 @@ unsafe extern "C" fn host_set_local(
     transform: *const RveTransform,
 ) -> bool {
     guarded(ctx, false, |context| {
-        if !context.can_write_transform || object != context.self_object || transform.is_null() {
+        if transform.is_null() {
             return false;
         }
         // SAFETY: transform was checked non-null and is valid for this callback.
-        context.transform = unsafe { *transform };
+        let transform = unsafe { *transform };
+        let transform = ScriptTransform {
+            position: transform.position,
+            rotation: transform.rotation_deg,
+            scale: transform.scale,
+        };
+        context.transaction.set_local_from_abi(object, transform)
+    })
+}
+
+unsafe extern "C" fn host_world_matrix(ctx: *mut c_void, object: u64, out: *mut [f32; 16]) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(matrix) = context.transaction.world_matrix(handle) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the caller's stack slot.
+        unsafe { *out = matrix };
         true
     })
+}
+
+unsafe extern "C" fn host_send(
+    ctx: *mut c_void,
+    target_id: RveStr,
+    name: RveStr,
+    value: *const RveValue,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if !context.transaction.writable() {
+            return false;
+        }
+        if target_id.len > MAX_MESSAGE_TARGET_ID_BYTES {
+            return false;
+        }
+        let target_id = match unsafe { read_abi_str(target_id) } {
+            Ok(target_id) => target_id,
+            Err(error) => {
+                context.error = Some(format!("invalid message target id: {error:?}"));
+                return false;
+            }
+        };
+        if name.len > MAX_MESSAGE_NAME_BYTES {
+            context.error = Some(format!(
+                "message name exceeds {MAX_MESSAGE_NAME_BYTES} bytes"
+            ));
+            return false;
+        }
+        let name = match unsafe { read_abi_str(name) } {
+            Ok(name) => name,
+            Err(error) => {
+                context.error = Some(format!("invalid message name: {error:?}"));
+                return false;
+            }
+        };
+        // SAFETY: `value` is provided by the guest for the duration of this ABI callback.
+        let (value, value_size) = match unsafe { read_message_value(value) } {
+            Ok(value) => value,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        match context.transaction.send(target_id, name, value, value_size) {
+            Ok(()) => true,
+            Err(QueueMessageError::UnknownTarget | QueueMessageError::ReadOnly) => false,
+            Err(QueueMessageError::InvalidName) => {
+                context.error = Some(format!(
+                    "message name exceeds {MAX_MESSAGE_NAME_BYTES} bytes"
+                ));
+                false
+            }
+            Err(QueueMessageError::InvalidValue) => {
+                context.error =
+                    Some("message value is invalid or exceeds the message limits".to_owned());
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_broadcast(
+    ctx: *mut c_void,
+    name: RveStr,
+    value: *const RveValue,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if !context.transaction.writable() {
+            return false;
+        }
+        if name.len > MAX_MESSAGE_NAME_BYTES {
+            context.error = Some(format!(
+                "message name exceeds {MAX_MESSAGE_NAME_BYTES} bytes"
+            ));
+            return false;
+        }
+        let name = match unsafe { read_abi_str(name) } {
+            Ok(name) => name,
+            Err(error) => {
+                context.error = Some(format!("invalid message name: {error:?}"));
+                return false;
+            }
+        };
+        // SAFETY: `value` is provided by the guest for the duration of this ABI callback.
+        let (value, value_size) = match unsafe { read_message_value(value) } {
+            Ok(value) => value,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        match context.transaction.broadcast(name, value, value_size) {
+            Ok(()) => true,
+            Err(QueueMessageError::ReadOnly) => false,
+            Err(QueueMessageError::UnknownTarget) => unreachable!(),
+            Err(QueueMessageError::InvalidName) => {
+                context.error = Some(format!(
+                    "message name exceeds {MAX_MESSAGE_NAME_BYTES} bytes"
+                ));
+                false
+            }
+            Err(QueueMessageError::InvalidValue) => {
+                context.error =
+                    Some("message value is invalid or exceeds the message limits".to_owned());
+                false
+            }
+        }
+    })
+}
+
+unsafe fn read_message_value(value: *const RveValue) -> Result<(ParamValue, usize), String> {
+    if value.is_null() {
+        return Err("null message value".to_owned());
+    }
+    // SAFETY: the guest passes the value pointer for the duration of this host callback.
+    let mut budget = MessageValueBudget::new();
+    let value = unsafe { read_message_value_inner(*value, 0, &mut budget) }?;
+    Ok((value, budget.estimated_size()))
+}
+
+unsafe fn read_message_value_inner(
+    value: RveValue,
+    depth: usize,
+    budget: &mut MessageValueBudget,
+) -> Result<ParamValue, String> {
+    budget.enter(depth).map_err(str::to_owned)?;
+    match value.tag {
+        RVE_VALUE_BOOL => Ok(ParamValue::Bool(unsafe { value.data.boolean })),
+        RVE_VALUE_INT => Ok(ParamValue::Int(unsafe { value.data.integer })),
+        RVE_VALUE_FLOAT => {
+            let value = unsafe { value.data.float };
+            if value.is_finite() {
+                Ok(ParamValue::Float(value))
+            } else {
+                Err("message numbers must be finite".to_owned())
+            }
+        }
+        RVE_VALUE_STR => {
+            let string = unsafe { value.data.string };
+            budget.add_string(string.len).map_err(str::to_owned)?;
+            let string = unsafe { read_abi_str(string) }
+                .map_err(|error| format!("message string is invalid: {error:?}"))?;
+            Ok(ParamValue::String(string.to_owned()))
+        }
+        RVE_VALUE_ARRAY => {
+            let array = unsafe { value.data.array };
+            if array.len > budget.remaining_elements() {
+                return Err("message value contains more than 1024 elements".to_owned());
+            }
+            if array.len == 0 {
+                return Ok(ParamValue::Array(Vec::new()));
+            }
+            if array.ptr.is_null() {
+                return Err("null array values".to_owned());
+            }
+            let values = unsafe { std::slice::from_raw_parts(array.ptr, array.len) };
+            let mut owned = Vec::with_capacity(array.len);
+            for value in values.iter().copied() {
+                owned.push(unsafe { read_message_value_inner(value, depth + 1, budget) }?);
+            }
+            Ok(ParamValue::Array(owned))
+        }
+        tag => Err(format!("unknown value tag {tag}")),
+    }
 }
 
 struct OwnedAbiValue {
@@ -437,22 +643,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn warning_error_and_unknown_log_levels_are_errors() {
+    fn warning_logs_keep_the_warn_level() {
         let events = EventQueue::default();
-        let transform = ScriptTransform {
-            position: [0.0; 3],
-            rotation: [0.0; 3],
-            scale: [1.0; 3],
-        };
-        let mut context = AbiCallContext::new(
-            1,
-            "object",
-            "Object",
-            transform,
-            &events,
-            "scene/object/Probe",
-            true,
-        );
+        let mut transaction = ScriptTransaction::default();
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/object/Probe");
         let host = context.host(ScriptTime::default());
         // SAFETY: the host context and strings remain live for these callbacks.
         unsafe {
@@ -463,7 +657,7 @@ mod tests {
         }
         let events = events.borrow();
         assert_eq!(events[0].level, ScriptEventLevel::Info);
-        assert_eq!(events[1].level, ScriptEventLevel::Error);
+        assert_eq!(events[1].level, ScriptEventLevel::Warn);
         assert_eq!(events[2].level, ScriptEventLevel::Error);
         assert_eq!(events[3].level, ScriptEventLevel::Error);
     }

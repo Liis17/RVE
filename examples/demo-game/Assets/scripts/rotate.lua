@@ -1,7 +1,8 @@
 local Rotate = {}
 
 function Rotate:on_start()
-  rve.log("Rotate started")
+  rve.log_info("Rotate started; broadcasting demo_ready")
+  rve.broadcast("demo_ready", "Lua start callback")
 end
 
 function Rotate:on_update(dt)

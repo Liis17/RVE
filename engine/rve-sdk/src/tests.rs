@@ -20,6 +20,11 @@ impl Script for Probe {
         assert_eq!(ctx.time().elapsed, 12.5);
         assert_eq!(ctx.object_id().as_deref(), Some("camera"));
         assert_eq!(ctx.object_name().as_deref(), Some("Camera"));
+        let camera = ctx.find("camera").expect("camera exists");
+        assert_eq!(camera.id(ctx).as_deref(), Some("camera"));
+        assert_eq!(camera.name(ctx).as_deref(), Some("Camera"));
+        assert_eq!(camera.transform(ctx).unwrap().position, [0.0; 3]);
+        assert_eq!(camera.world_matrix(ctx), Some([2.0; 16]));
         ctx.log_info("guest log");
         ctx.transform.position[0] = 7.0;
         assert!(self.panic_start.then(|| panic!("start panic")).is_none());
@@ -37,11 +42,14 @@ impl Script for Probe {
         }
     }
 
-    fn on_message(&mut self, sender: &str, name: &str, _: &Value) {
+    fn on_message(&mut self, ctx: &mut Context<'_>, sender: &str, name: &str, _: &Value) {
         if self.panic_message {
             panic!("message panic");
         }
         self.last_message = format!("{sender}:{name}");
+        let nested = Value::Array(vec![Value::Int(9), Value::String("sdk".to_owned())]);
+        assert!(ctx.send("camera", "reply", &nested));
+        assert!(ctx.broadcast("notice", &Value::Bool(true)));
     }
 
     fn on_destroy(&mut self, ctx: &mut Context<'_>) {
@@ -130,6 +138,9 @@ struct HostState {
     error: Option<String>,
     transform: RveTransform,
     logs: Vec<String>,
+    matrix: [f32; 16],
+    sent: Vec<(String, String, Value)>,
+    broadcasts: Vec<(String, Value)>,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -148,8 +159,13 @@ unsafe extern "C" fn log(ctx: *mut c_void, _: u32, message: RveStr) {
         .push(unsafe { message.to_str() }.unwrap().to_owned());
 }
 
-unsafe extern "C" fn find_object(_: *mut c_void, _: RveStr) -> u64 {
-    0
+unsafe extern "C" fn find_object(_: *mut c_void, id: RveStr) -> u64 {
+    // SAFETY: SDK tests pass a valid id string during the callback.
+    if unsafe { id.to_str() }.unwrap() == "camera" {
+        1
+    } else {
+        0
+    }
 }
 
 unsafe extern "C" fn object_id(_: *mut c_void, _: u64, out: *mut RveStr) -> bool {
@@ -179,6 +195,45 @@ unsafe extern "C" fn get_local(ctx: *mut c_void, _: u64, out: *mut RveTransform)
     true
 }
 
+unsafe extern "C" fn world_matrix(ctx: *mut c_void, _: u64, out: *mut [f32; 16]) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: test host points to a live HostState and out is supplied by the ABI caller.
+    unsafe { *out = (&*ctx.cast::<HostState>()).matrix };
+    true
+}
+
+unsafe extern "C" fn send(
+    ctx: *mut c_void,
+    target: RveStr,
+    name: RveStr,
+    value: *const RveValue,
+) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: test host and message pointers remain live through this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let target = unsafe { target.to_str() }.unwrap().to_owned();
+    let name = unsafe { name.to_str() }.unwrap().to_owned();
+    let value = unsafe { (*value).into_owned() }.unwrap();
+    state.sent.push((target, name, value));
+    true
+}
+
+unsafe extern "C" fn broadcast(ctx: *mut c_void, name: RveStr, value: *const RveValue) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: test host and message pointers remain live through this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let name = unsafe { name.to_str() }.unwrap().to_owned();
+    let value = unsafe { (*value).into_owned() }.unwrap();
+    state.broadcasts.push((name, value));
+    true
+}
+
 unsafe extern "C" fn set_local(ctx: *mut c_void, _: u64, transform: *const RveTransform) -> bool {
     if transform.is_null() {
         return false;
@@ -189,6 +244,7 @@ unsafe extern "C" fn set_local(ctx: *mut c_void, _: u64, transform: *const RveTr
 }
 
 fn host(state: &mut HostState) -> RveHost {
+    state.matrix = [2.0; 16];
     RveHost {
         ctx: (state as *mut HostState).cast(),
         time: RveTime {
@@ -203,6 +259,9 @@ fn host(state: &mut HostState) -> RveHost {
         object_name,
         get_local,
         set_local,
+        world_matrix,
+        send,
+        broadcast,
     }
 }
 
@@ -379,6 +438,15 @@ fn guest_wrappers_invoke_update_message_and_destroy_and_report_their_panics() {
     );
     assert_eq!(state.transform.position[1], 2.0);
     assert_eq!(state.logs, ["guest update", "message:sender:greet"]);
+    assert_eq!(
+        state.sent,
+        [(
+            "camera".to_owned(),
+            "reply".to_owned(),
+            Value::Array(vec![Value::Int(9), Value::String("sdk".to_owned())])
+        )]
+    );
+    assert_eq!(state.broadcasts, [("notice".to_owned(), Value::Bool(true))]);
     // SAFETY: the instance and host remain live for the callback.
     assert_eq!(unsafe { (script.destroy)(instance, &host) }, RveStatus::Ok);
     assert_eq!(

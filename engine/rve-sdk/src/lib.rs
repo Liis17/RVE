@@ -5,7 +5,10 @@
 
 pub mod abi;
 
-use abi::{RveHost, RveParams, RveStr, RveTime, RveTransform, RveValue};
+use abi::{
+    RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
+    RveHost, RveParams, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
@@ -171,7 +174,7 @@ pub trait Script: 'static {
     /// Called for each update with the frame delta in seconds.
     fn on_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
     /// Called when a message is delivered to this script.
-    fn on_message(&mut self, _sender: &str, _name: &str, _value: &Value) {}
+    fn on_message(&mut self, _ctx: &mut Context<'_>, _sender: &str, _name: &str, _value: &Value) {}
     /// Called when the script host is destroyed after this instance has started.
     fn on_destroy(&mut self, _ctx: &mut Context<'_>) {}
 }
@@ -186,6 +189,13 @@ pub struct Context<'a> {
     /// Mutable local transform of this script's object.
     pub transform: Transform,
     _not_send_or_sync: PhantomData<*const ()>,
+}
+
+/// Copyable handle to a scene object. It remains stable while its scene is loaded and may be
+/// stored in a script struct. Every operation on it requires the current callback's `Context`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Object {
+    handle: u64,
 }
 
 impl<'a> Context<'a> {
@@ -234,6 +244,35 @@ impl<'a> Context<'a> {
         self.object_string(self.host.object_name)
     }
 
+    /// Finds a scene object by its stable scene id.
+    pub fn find(&self, id: &str) -> Option<Object> {
+        // SAFETY: the host pointer and borrowed id are valid for this callback.
+        let handle = unsafe { (self.host.find_object)(self.host.ctx, RveStr::from_str_ref(id)) };
+        (handle != 0).then_some(Object { handle })
+    }
+
+    /// Stages a message for the object with `target_id`. Returns false for an unknown target or
+    /// when the current phase does not allow mutations.
+    pub fn send(&mut self, target_id: &str, name: &str, value: &Value) -> bool {
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: strings and the recursive ABI value remain alive for the duration of this call.
+        unsafe {
+            (self.host.send)(
+                self.host.ctx,
+                RveStr::from_str_ref(target_id),
+                RveStr::from_str_ref(name),
+                &value.value,
+            )
+        }
+    }
+
+    /// Stages a message for every enabled script instance.
+    pub fn broadcast(&mut self, name: &str, value: &Value) -> bool {
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: the name and recursive ABI value remain alive for the duration of this call.
+        unsafe { (self.host.broadcast)(self.host.ctx, RveStr::from_str_ref(name), &value.value) }
+    }
+
     /// Appends an informational event to the host's script event queue.
     pub fn log_info(&self, message: impl AsRef<str>) {
         // SAFETY: the string is borrowed only for the host call.
@@ -241,6 +280,30 @@ impl<'a> Context<'a> {
             (self.host.log)(
                 self.host.ctx,
                 abi::RVE_LOG_INFO,
+                RveStr::from_str_ref(message.as_ref()),
+            )
+        }
+    }
+
+    /// Appends a warning event to the host's script event queue.
+    pub fn log_warn(&self, message: impl AsRef<str>) {
+        // SAFETY: the string is borrowed only for the host call.
+        unsafe {
+            (self.host.log)(
+                self.host.ctx,
+                abi::RVE_LOG_WARN,
+                RveStr::from_str_ref(message.as_ref()),
+            )
+        }
+    }
+
+    /// Appends an error event to the host's script event queue.
+    pub fn log_error(&self, message: impl AsRef<str>) {
+        // SAFETY: the string is borrowed only for the host call.
+        unsafe {
+            (self.host.log)(
+                self.host.ctx,
+                abi::RVE_LOG_ERROR,
                 RveStr::from_str_ref(message.as_ref()),
             )
         }
@@ -254,6 +317,119 @@ impl<'a> Context<'a> {
         }
         // SAFETY: the host keeps returned strings alive through the current guest callback.
         unsafe { value.to_str().ok().map(str::to_owned) }
+    }
+}
+
+impl Object {
+    /// Returns this object's local transform, including earlier writes in the current callback.
+    pub fn transform(&self, ctx: &mut Context<'_>) -> Option<Transform> {
+        let mut transform = RveTransform::default();
+        // SAFETY: the host pointer and output slot are valid during this guest callback.
+        if !unsafe { (ctx.host.get_local)(ctx.host.ctx, self.handle, &mut transform) } {
+            return None;
+        }
+        Some(transform.into())
+    }
+
+    /// Stages this object's local transform.
+    pub fn set_transform(&self, ctx: &mut Context<'_>, transform: Transform) -> bool {
+        let transform: RveTransform = transform.into();
+        // SAFETY: the host pointer and transform are valid during this guest callback.
+        unsafe { (ctx.host.set_local)(ctx.host.ctx, self.handle, &transform) }
+    }
+
+    /// Returns this object's column-major world matrix snapshot.
+    pub fn world_matrix(&self, ctx: &mut Context<'_>) -> Option<[f32; 16]> {
+        let mut matrix = [0.0; 16];
+        // SAFETY: the host pointer and output slot are valid during this guest callback.
+        if !unsafe { (ctx.host.world_matrix)(ctx.host.ctx, self.handle, &mut matrix) } {
+            return None;
+        }
+        Some(matrix)
+    }
+
+    /// Returns this object's stable scene id.
+    pub fn id(&self, ctx: &mut Context<'_>) -> Option<String> {
+        Self::object_string(ctx, self.handle, ctx.host.object_id)
+    }
+
+    /// Returns this object's display name.
+    pub fn name(&self, ctx: &mut Context<'_>) -> Option<String> {
+        Self::object_string(ctx, self.handle, ctx.host.object_name)
+    }
+
+    fn object_string(
+        ctx: &Context<'_>,
+        handle: u64,
+        callback: abi::RveObjectStringFn,
+    ) -> Option<String> {
+        let mut value = RveStr::empty();
+        // SAFETY: the host pointer and output slot are valid during this guest callback.
+        if !unsafe { callback(ctx.host.ctx, handle, &mut value) } {
+            return None;
+        }
+        // SAFETY: the host keeps returned strings alive through the current guest callback.
+        unsafe { value.to_str().ok().map(str::to_owned) }
+    }
+}
+
+struct BorrowedAbiValue<'a> {
+    value: RveValue,
+    _children: Vec<BorrowedAbiValue<'a>>,
+    _array: Vec<RveValue>,
+    _lifetime: PhantomData<&'a Value>,
+}
+
+impl<'a> BorrowedAbiValue<'a> {
+    fn new(value: &'a Value) -> Self {
+        match value {
+            Value::Bool(value) => Self::leaf(RveValue {
+                tag: RVE_VALUE_BOOL,
+                data: RveValueData { boolean: *value },
+            }),
+            Value::Int(value) => Self::leaf(RveValue {
+                tag: RVE_VALUE_INT,
+                data: RveValueData { integer: *value },
+            }),
+            Value::Float(value) => Self::leaf(RveValue {
+                tag: RVE_VALUE_FLOAT,
+                data: RveValueData { float: *value },
+            }),
+            Value::String(value) => Self::leaf(RveValue {
+                tag: RVE_VALUE_STR,
+                data: RveValueData {
+                    string: RveStr::from_str_ref(value),
+                },
+            }),
+            Value::Array(values) => {
+                let children = values.iter().map(Self::new).collect::<Vec<_>>();
+                let array = children.iter().map(|child| child.value).collect::<Vec<_>>();
+                let value = RveValue {
+                    tag: RVE_VALUE_ARRAY,
+                    data: RveValueData {
+                        array: RveArray {
+                            ptr: array.as_ptr(),
+                            len: array.len(),
+                        },
+                    },
+                };
+                Self {
+                    value,
+                    _children: children,
+                    _array: array,
+                    _lifetime: PhantomData,
+                }
+            }
+        }
+    }
+
+    fn leaf(value: RveValue) -> Self {
+        Self {
+            value,
+            _children: Vec::new(),
+            _array: Vec::new(),
+            _lifetime: PhantomData,
+        }
     }
 }
 
@@ -349,8 +525,8 @@ pub mod __private {
                 unsafe { (*value).into_owned() }.map_err(|error: ValueError| error.to_string())?;
             // SAFETY: instance and host are valid for this callback.
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
-            let context = Context::new(unsafe { &*host })?;
-            instance.0.on_message(sender, name, &value);
+            let mut context = Context::new(unsafe { &*host })?;
+            instance.0.on_message(&mut context, sender, name, &value);
             context.commit()
         }));
         status_from_result(host, result)

@@ -16,6 +16,12 @@ impl Script for Bobber {
         let phase = context.time().elapsed as f32 * self.speed;
         context.transform.position[1] = self.base_y + phase.sin() * self.amplitude;
     }
+
+    fn on_message(&mut self, context: &mut Context<'_>, sender: &str, name: &str, value: &Value) {
+        if name == "demo_ready" {
+            context.log_info(format!("Bobber received {name} from {sender}: {value:?}"));
+        }
+    }
 }
 
 fn number(params: &Params, name: &str, default: f32) -> Result<f32, String> {
