@@ -145,6 +145,7 @@ impl SceneRenderer {
                     mesh: *mesh,
                     texture: replacement.or(*texture),
                     model: instance.model.to_cols_array_2d(),
+                    casts_shadow: true,
                 }));
         }
         self.scene_draws = self.draws.len();
@@ -162,6 +163,7 @@ impl SceneRenderer {
                 mesh: grid,
                 texture: None,
                 model: Mat4::from_scale(Vec3::splat(grid_scale(distance))).to_cols_array_2d(),
+                casts_shadow: false,
             });
         }
         Ok(())

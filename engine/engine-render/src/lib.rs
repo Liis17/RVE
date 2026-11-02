@@ -101,6 +101,8 @@ pub struct DrawCommand {
     pub mesh: MeshId,
     pub texture: Option<TextureId>,
     pub model: [[f32; 4]; 4],
+    /// Попадает ли меш в shadow map; на получение тени не влияет.
+    pub casts_shadow: bool,
 }
 
 /// Направленный свет и фоновое освещение сцены в линейном RGB.
@@ -3638,6 +3640,10 @@ fn record_draws(
     }
 }
 
+fn shadow_casters(draws: &[DrawCommand]) -> impl Iterator<Item = &DrawCommand> {
+    draws.iter().filter(|draw| draw.casts_shadow)
+}
+
 fn record_shadow_draws(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -3674,7 +3680,7 @@ fn record_shadow_draws(
             &[],
         );
     }
-    for draw in shadow.draws {
+    for draw in shadow_casters(shadow.draws) {
         let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
             continue;
         };
@@ -4664,10 +4670,11 @@ mod tests {
         index_bytes, material_sampler_info, mip_extent, mip_level_count, missing_extensions,
         missing_texture_format_features, normal_matrix, offscreen_previous_use,
         overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
-        scene_viewport, select_composite_alpha, select_surface_extent, texture_mip_blit_region,
-        texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
-        texture_mip_source_barrier, texture_upload_barrier, timestamp_duration, validate_draws,
-        validate_mesh, validate_overlay, validate_render_scale, validate_texture, vertex_bytes,
+        scene_viewport, select_composite_alpha, select_surface_extent, shadow_casters,
+        texture_mip_blit_region, texture_mip_destination_shader_barrier,
+        texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
+        timestamp_duration, validate_draws, validate_mesh, validate_overlay, validate_render_scale,
+        validate_texture, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -5144,11 +5151,25 @@ mod tests {
     }
 
     #[test]
+    fn shadow_pass_skips_draws_that_do_not_cast_shadows() {
+        let draw = |mesh, casts_shadow| DrawCommand {
+            mesh: MeshId(mesh),
+            texture: None,
+            model: IDENTITY,
+            casts_shadow,
+        };
+        let draws = [draw(0, true), draw(1, false), draw(2, true)];
+        let casters: Vec<_> = shadow_casters(&draws).map(|draw| draw.mesh.0).collect();
+        assert_eq!(casters, [0, 2]);
+    }
+
+    #[test]
     fn draw_validation_rejects_unknown_meshes_and_textures() {
         let draw = |mesh, texture: Option<usize>| DrawCommand {
             mesh: MeshId(mesh),
             texture: texture.map(TextureId),
             model: IDENTITY,
+            casts_shadow: true,
         };
         let slots = |count: usize| vec![Some(()); count];
         assert!(validate_draws(&[], &slots(0), &slots(1)).is_ok());
@@ -5169,6 +5190,7 @@ mod tests {
             mesh: MeshId(mesh),
             texture: texture.map(TextureId),
             model: IDENTITY,
+            casts_shadow: true,
         };
         let alive = vec![Some(()), Some(())];
         let destroyed = vec![Some(()), None];
