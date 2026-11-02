@@ -142,7 +142,7 @@ pub(crate) fn upload_scene(
                 })
                 .collect::<Vec<_>>();
             let mesh_id = renderer.create_mesh(&vertices, &mesh.indices)?;
-            let texture_id = match mesh.texture {
+            let texture_id = match mesh.material.base_color_texture {
                 Some(index) => {
                     if let Some(texture_id) = model_textures.get(&(path.clone(), index)) {
                         Some(*texture_id)

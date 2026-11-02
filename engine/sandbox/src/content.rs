@@ -77,7 +77,7 @@ impl Content {
                     })
                     .collect(),
                 indices: mesh.indices,
-                texture: mesh.texture,
+                texture: mesh.material.base_color_texture,
                 environment: false,
             })
             .collect::<Vec<_>>();
@@ -144,7 +144,7 @@ fn fit_to_unit_cube(min: Vec3, max: Vec3) -> Mat4 {
 mod tests {
     use super::{Content, fit_to_unit_cube};
     use crate::scene::{Scene, cube_mesh};
-    use engine_assets::{Model, ModelMesh, ModelVertex, TextureData};
+    use engine_assets::{Model, ModelMaterial, ModelMesh, ModelVertex, TextureData};
     use glam::Vec3;
 
     fn texture(value: u8) -> TextureData {
@@ -170,12 +170,15 @@ mod tests {
                         vertex([10.0, 2.0, 1.0]),
                     ],
                     indices: vec![0, 1, 2],
-                    texture: Some(0),
+                    material: ModelMaterial {
+                        base_color_texture: Some(0),
+                        ..ModelMaterial::default()
+                    },
                 },
                 ModelMesh {
                     vertices: vec![vertex([12.0, 1.0, 0.5]); 3],
                     indices: vec![0, 1, 2],
-                    texture: None,
+                    material: ModelMaterial::default(),
                 },
             ],
             textures: vec![texture(7)],
