@@ -72,6 +72,8 @@ impl Drop for OpenProject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_scene::{SceneDocument, World};
+    use glam::Vec3;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -147,6 +149,51 @@ mod tests {
             let path = format!("models/{model}.fbx");
             let (min, max) = project.assets.load_model(&path).unwrap().bounds().unwrap();
             assert_eq!(max[0] - min[0], 2.0, "{path}");
+        }
+    }
+
+    #[test]
+    fn demo_model_normals_point_out_of_the_cube() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let project = OpenProject::open(Path::new(dir)).unwrap();
+        for model in ["draft-cube", "props-cube", "shared-cube"] {
+            let path = format!("models/{model}.fbx");
+            let model = project.assets.load_model(&path).unwrap();
+            for vertex in model.meshes.iter().flat_map(|mesh| &mesh.vertices) {
+                let outward: f32 = vertex
+                    .position
+                    .iter()
+                    .zip(vertex.normal)
+                    .map(|(p, n)| p * n)
+                    .sum();
+                assert!(outward > 0.0, "{path}: {vertex:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn demo_scenes_stand_on_the_floor_under_a_sun_shining_from_above() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let project = OpenProject::open(Path::new(dir)).unwrap();
+        for scene in ["main", "second"] {
+            let path = format!("{dir}/Assets/scenes/{scene}.rvescene");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let document = SceneDocument::parse(path.as_str(), &text).unwrap();
+            let mut world = World::from_document(&document).unwrap();
+            let (frame, _) = world.build_frame();
+            assert!(frame.light.direction[1] < 0.0, "{path}");
+            assert!(!frame.meshes.is_empty(), "{path}");
+            for instance in &frame.meshes {
+                let object = world.object(instance.object).unwrap();
+                let model = object.mesh_renderer.as_ref().unwrap().model.as_str();
+                let model = project
+                    .assets
+                    .load_model(model.trim_start_matches('/'))
+                    .unwrap();
+                let (min, _) = model.bounds().unwrap();
+                let lowest = instance.model.transform_point3(Vec3::from_array(min)).y;
+                assert!(lowest >= -1e-5, "{path}: {lowest}");
+            }
         }
     }
 
