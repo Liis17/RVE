@@ -5,6 +5,9 @@ FBXHeaderExtension:  {
 }
 GlobalSettings:  {
 	Version: 1000
+	Properties70:  {
+		P: "UnitScaleFactor", "double", "Number", "",100
+	}
 }
 Objects:  {
 	Geometry: 1000, "Geometry::Cube", "Mesh" {

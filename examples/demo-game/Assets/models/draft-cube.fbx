@@ -3,6 +3,12 @@ FBXHeaderExtension:  {
 	FBXHeaderVersion: 1003
 	FBXVersion: 7400
 }
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UnitScaleFactor", "double", "Number", "",100
+	}
+}
 Objects:  {
 	Geometry: 1000, "Geometry::DraftCube", "Mesh" {
 		Vertices: *24 {

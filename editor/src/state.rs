@@ -88,6 +88,12 @@ pub struct EditorState {
     pub previews: PreviewCache,
     pub viewport_texture: Option<egui::TextureId>,
     pub scene_view: SceneViewInfo,
+    pub game_viewport_texture: Option<egui::TextureId>,
+    pub game_view: SceneViewInfo,
+    /// Id камеры вкладки Game; панель заменяет отсутствующую камеру первой в документе.
+    pub game_camera: Option<String>,
+    /// Объект с новой моделью: после её загрузки камера покажет его, если он почти не виден.
+    pub pending_frame: Option<String>,
     /// CPU-модели, загруженные для отрисовки: по ним работают picking и фокус камеры.
     pub models: HashMap<String, Arc<Model>>,
     edit_world: Option<(u64, World)>,
@@ -115,6 +121,10 @@ impl EditorState {
             previews: PreviewCache::default(),
             viewport_texture: None,
             scene_view: SceneViewInfo::default(),
+            game_viewport_texture: None,
+            game_view: SceneViewInfo::default(),
+            game_camera: None,
+            pending_frame: None,
             models: HashMap::new(),
             edit_world: None,
         }
@@ -122,6 +132,11 @@ impl EditorState {
 
     pub fn is_playing(&self) -> bool {
         self.play.is_some()
+    }
+
+    /// Курсор над изображением сцены: ввод Play-режима относится к игре.
+    pub fn pointer_over_view(&self) -> bool {
+        self.scene_view.hovered || self.game_view.hovered
     }
 
     pub fn action(&mut self, action: Action) {
@@ -171,6 +186,8 @@ impl EditorState {
         self.edit_world = None;
         self.gizmo_drag = None;
         self.hierarchy_rename = None;
+        self.game_camera = None;
+        self.pending_frame = None;
     }
 
     /// Выполняет правку сцены и пишет ошибку в консоль; в Play-режиме документ не меняется.
@@ -195,15 +212,18 @@ impl EditorState {
         self.edit_scene(|scene| scene.create_object(kind, parent));
     }
 
-    /// Создаёт объект из перетащенного ресурса, если это модель.
-    pub fn create_from_asset(&mut self, path: &str, parent: Option<&str>) {
+    /// Создаёт объект из перетащенного ресурса, если это модель; `position` — локальная позиция.
+    pub fn create_from_asset(&mut self, path: &str, parent: Option<&str>, position: [f32; 3]) {
         if AssetKind::of(path) != AssetKind::Model {
             self.log
                 .error(format!("{path}: на сцену можно перетащить только .fbx"));
             return;
         }
         match VirtualPath::parse(path) {
-            Ok(path) => self.create_object(&NewObject::Mesh(path), parent),
+            Ok(path) => {
+                let kind = NewObject::Mesh(path, position);
+                self.pending_frame = self.edit_scene(|scene| scene.create_object(&kind, parent));
+            }
             Err(_) => self.log.error(format!("{path}: некорректный путь ресурса")),
         }
     }
@@ -247,7 +267,7 @@ mod tests {
     #[test]
     fn failed_edit_is_logged_and_leaves_the_scene_unchanged() {
         let mut state = state_with_scene();
-        state.create_object(&NewObject::Camera, None);
+        state.create_object(&NewObject::DirectionalLight, None);
         assert_eq!(state.log.entries().count(), 1);
         assert_eq!(state.scene.as_ref().unwrap().document().objects.len(), 2);
     }
@@ -255,10 +275,17 @@ mod tests {
     #[test]
     fn dropping_a_non_model_asset_is_rejected() {
         let mut state = state_with_scene();
-        state.create_from_asset("textures/a.png", None);
+        state.create_from_asset("textures/a.png", None, [0.0; 3]);
         assert_eq!(state.log.entries().count(), 1);
-        state.create_from_asset("models/a.fbx", None);
-        assert_eq!(state.scene.as_ref().unwrap().document().objects.len(), 3);
+        assert_eq!(state.pending_frame, None);
+        state.create_from_asset("models/a.fbx", None, [1.0, 0.0, 3.0]);
+        let scene = state.scene.as_ref().unwrap();
+        assert_eq!(scene.document().objects.len(), 3);
+        let id = state.pending_frame.as_deref().unwrap();
+        assert_eq!(
+            scene.object(id).unwrap().transform.position,
+            [1.0, 0.0, 3.0]
+        );
     }
 
     #[test]

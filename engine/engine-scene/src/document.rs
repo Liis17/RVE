@@ -169,11 +169,11 @@ impl SceneDocument {
             }
         }
 
-        if camera_count != 1 {
+        if camera_count == 0 {
             return Err(SceneError::new(
                 source,
                 None,
-                format!("сцена должна содержать ровно одну камеру, найдено {camera_count}"),
+                "сцена должна содержать хотя бы одну камеру",
             ));
         }
         if light_count > 1 {
@@ -950,12 +950,20 @@ scale=[1.0,1.0,0.0]
     }
 
     #[test]
-    fn scene_requires_exactly_one_camera_and_at_most_one_light() {
+    fn scene_requires_a_camera_and_at_most_one_light() {
         assert!(parse("[[objects]]\nid=\"empty\"\n").is_err());
         let two_cameras = format!(
             "{VALID}\n[[objects]]\nid=\"second\"\n[objects.camera]\nfov_deg=60.0\nnear=0.1\nfar=20.0\n"
         );
-        assert!(parse(&two_cameras).is_err());
+        assert_eq!(
+            parse(&two_cameras)
+                .unwrap()
+                .objects
+                .iter()
+                .filter(|object| object.camera.is_some())
+                .count(),
+            2
+        );
         let two_lights = format!(
             "{VALID}\n[[objects]]\nid=\"sun1\"\n[objects.directional_light]\n[[objects]]\nid=\"sun2\"\n[objects.directional_light]\n"
         );

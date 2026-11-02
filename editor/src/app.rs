@@ -7,11 +7,14 @@ use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
 use crate::state::{Action, EditorState, UnsavedPrompt};
 use crate::ui;
+use crate::ui::scene_view::bounding_sphere;
 use crate::ui_render::{ConvertedMesh, UiBridge};
 use crate::viewport::render::SceneRenderer;
 use egui_dock::DockState;
 use engine_files::VirtualPath;
-use engine_render::{FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive};
+use engine_render::{
+    FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
+};
 use engine_script::ScriptLibrary;
 use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
 use std::path::{Path, PathBuf};
@@ -376,6 +379,10 @@ impl EditorApp {
         if self.state.viewport_texture.is_none() {
             self.state.viewport_texture = Some(self.bridge.register_viewport(gpu.scene.viewport));
         }
+        if self.state.game_viewport_texture.is_none() {
+            self.state.game_viewport_texture =
+                Some(self.bridge.register_viewport(gpu.scene.game_viewport));
+        }
 
         let raw_input = egui_state.take_egui_input(window);
         let state = &mut self.state;
@@ -405,12 +412,9 @@ impl EditorApp {
             self.state.log.push_script_events(events);
         }
 
-        let view = self.state.scene_view;
-        let status = if view.visible && view.size[0] > 0 && view.size[1] > 0 {
-            render_scene_frame(gpu, &mut self.state, view.size, &ui_primitives)?
-        } else {
-            render_ui_only(&mut gpu.renderer, &ui_primitives)?
-        };
+        // Камера могла сместиться к новой модели: гизмо и маркеры нужно перестроить.
+        let framing = self.state.pending_frame.is_some();
+        let status = render_scene_frame(gpu, &mut self.state, &ui_primitives)?;
 
         self.bridge
             .managed
@@ -425,7 +429,7 @@ impl EditorApp {
             .is_some_and(|play| !play.is_paused());
         let size = window.inner_size();
         let skipped = status == FrameStatus::Skipped && size.width != 0 && size.height != 0;
-        if playing_now || skipped || repaint_delay.is_zero() {
+        if playing_now || skipped || framing || repaint_delay.is_zero() {
             window.request_redraw();
             self.repaint_at = None;
         } else {
@@ -435,20 +439,29 @@ impl EditorApp {
     }
 }
 
-/// Кадр со сценой в панели Scene. Без мира сцены рисуется только интерфейс.
+/// Кадр с видимыми панелями Scene и Game. Без мира сцены рисуется только интерфейс.
 fn render_scene_frame(
     gpu: &mut GpuState,
     state: &mut EditorState,
-    [width, height]: [u32; 2],
     ui: &[UiPrimitive<'_>],
 ) -> Result<FrameStatus, RenderError> {
-    gpu.renderer
-        .resize_viewport(gpu.scene.viewport, width, height)?;
+    let drawable = |view: crate::state::SceneViewInfo| {
+        (view.visible && view.size[0] > 0 && view.size[1] > 0).then_some(view.size)
+    };
+    let scene_size = drawable(state.scene_view);
+    let game_size = drawable(state.game_view);
+    if scene_size.is_none() && game_size.is_none() {
+        return render_ui_only(&mut gpu.renderer, ui, &[]);
+    }
     let playing = state.is_playing();
-    let editor_camera = state.camera.camera();
-    let grid_camera_distance = (!playing).then_some(state.camera.distance);
+    let game_camera_id = state.game_camera.clone();
+    // Сетка нужна только панели Scene вне Play-режима.
+    let grid_camera_distance = scene_size
+        .filter(|_| !playing)
+        .map(|_| state.camera.distance);
+    let pending_frame = state.pending_frame.take();
     let Some(parts) = state.frame_parts() else {
-        return render_ui_only(&mut gpu.renderer, ui);
+        return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
     gpu.scene.sync_assets(
         &mut gpu.renderer,
@@ -473,36 +486,99 @@ fn render_scene_frame(
         &scene_frame,
         grid_camera_distance,
     )?;
-    let camera = if playing {
-        scene_frame.camera
-    } else {
-        editor_camera
-    };
+    let game_camera = game_camera_id
+        .and_then(|id| parts.world.handle(&id))
+        .and_then(|handle| parts.world.camera_of(handle))
+        .unwrap_or(scene_frame.camera);
     let has_light = parts
         .world
         .objects()
         .iter()
         .any(|object| object.directional_light.is_some());
-    let frame = gpu.scene.frame(
-        camera.view_projection(width, height),
-        &scene_frame.light,
-        has_light,
-    );
+    let frame_target = pending_frame.and_then(|id| {
+        let object = parts.world.object_by_id(&id)?;
+        let model = parts
+            .models
+            .get(object.mesh_renderer.as_ref()?.model.as_str())?;
+        Some(bounding_sphere(
+            parts.world.world_matrix(object.handle)?,
+            model.bounds()?,
+        ))
+    });
+    if let Some((center, radius)) = frame_target
+        && state.camera.needs_framing(center, radius)
+    {
+        state.camera.focus(center, radius);
+    }
+    let scene_camera = if playing {
+        scene_frame.camera
+    } else {
+        state.camera.camera()
+    };
+
+    if let Some([width, height]) = scene_size {
+        gpu.renderer
+            .resize_viewport(gpu.scene.viewport, width, height)?;
+    }
+    if let Some([width, height]) = game_size {
+        gpu.renderer
+            .resize_viewport(gpu.scene.game_viewport, width, height)?;
+    }
+    let scene_view = scene_size.map(|[width, height]| {
+        gpu.scene.frame(
+            scene_camera.view_projection(width, height),
+            &scene_frame.light,
+            has_light,
+            true,
+        )
+    });
+    let game_view = game_size.map(|[width, height]| {
+        gpu.scene.frame(
+            game_camera.view_projection(width, height),
+            &scene_frame.light,
+            has_light,
+            false,
+        )
+    });
+    let mut scenes = Vec::with_capacity(2);
+    if let Some(frame) = &scene_view {
+        scenes.push((gpu.scene.viewport, frame));
+    }
+    if let Some(frame) = &game_view {
+        scenes.push((gpu.scene.game_viewport, frame));
+    }
+    let drawn = scenes
+        .iter()
+        .map(|(viewport, _)| *viewport)
+        .collect::<Vec<_>>();
+    let primitives = visible_primitives(ui, &drawn);
     gpu.renderer
-        .render_frame_with_ui(Some((gpu.scene.viewport, &frame)), ui, WINDOW_CLEAR)
+        .render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR)
 }
 
-/// Кадр без сцены: примитивы с изображением viewport здесь недопустимы и отбрасываются.
+/// Примитивы без изображений viewport, которые не рисуются в этом кадре.
+fn visible_primitives<'a>(
+    primitives: &[UiPrimitive<'a>],
+    drawn: &[ViewportId],
+) -> Vec<UiPrimitive<'a>> {
+    primitives
+        .iter()
+        .filter(|primitive| match primitive.image {
+            UiImage::Texture(_) => true,
+            UiImage::Viewport(viewport) => drawn.contains(&viewport),
+        })
+        .copied()
+        .collect()
+}
+
+/// Кадр без сцены.
 fn render_ui_only(
     renderer: &mut Renderer,
     primitives: &[UiPrimitive<'_>],
+    drawn: &[ViewportId],
 ) -> Result<FrameStatus, RenderError> {
-    let filtered = primitives
-        .iter()
-        .filter(|primitive| matches!(primitive.image, UiImage::Texture(_)))
-        .copied()
-        .collect::<Vec<_>>();
-    renderer.render_frame_with_ui(None, &filtered, WINDOW_CLEAR)
+    let filtered = visible_primitives(primitives, drawn);
+    renderer.render_frame_with_ui(&[], &filtered, WINDOW_CLEAR)
 }
 
 impl WindowHandler for EditorApp {
@@ -624,7 +700,7 @@ impl WindowHandler for EditorApp {
     }
 
     fn key(&mut self, key: Key, pressed: bool) {
-        if (!pressed || self.state.scene_view.hovered)
+        if (!pressed || self.state.pointer_over_view())
             && let Some(play) = &mut self.state.play
         {
             play.input_mut()
@@ -633,7 +709,7 @@ impl WindowHandler for EditorApp {
     }
 
     fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
-        if (!pressed || self.state.scene_view.hovered)
+        if (!pressed || self.state.pointer_over_view())
             && let Some(play) = &mut self.state.play
         {
             play.input_mut()

@@ -250,6 +250,7 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
         });
     });
     if model_choice.is_some() || texture_choice.is_some() {
+        let model_changed = model_choice.is_some();
         let model = model_choice.map_or(Some(mesh.model.clone()), |path| parse_path(state, &path));
         let texture = match texture_choice {
             None => Some(mesh.texture.clone()),
@@ -257,7 +258,10 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
             Some(path) => parse_path(state, &path).map(Some),
         };
         if let (Some(model), Some(texture)) = (model, texture) {
-            state.edit_scene(|scene| scene.set_mesh(id, model, texture));
+            let changed = state.edit_scene(|scene| scene.set_mesh(id, model, texture));
+            if changed.is_some() && model_changed {
+                state.pending_frame = Some(id.to_owned());
+            }
         }
     }
     if remove {
@@ -466,8 +470,11 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                 for model in state.assets_of_kind(AssetKind::Model) {
                     if ui.button(&model).clicked()
                         && let Some(path) = parse_path(state, &model)
+                        && state
+                            .edit_scene(|scene| scene.set_mesh(id, path, None))
+                            .is_some()
                     {
-                        state.edit_scene(|scene| scene.set_mesh(id, path, None));
+                        state.pending_frame = Some(id.to_owned());
                     }
                 }
             });

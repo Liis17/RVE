@@ -4,11 +4,13 @@ use super::*;
 use crate::layout::default_layout;
 use crate::project::OpenProject;
 use crate::scene_edit::{EditorScene, NewObject};
+use crate::state::AssetDrag;
 use crate::viewport::camera::project_point;
 use crate::viewport::gizmo::GizmoTool;
 use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
 use engine_assets::{Model, ModelMesh, ModelVertex};
 use engine_files::VirtualPath;
+use glam::Vec3;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -148,7 +150,9 @@ fn harness_with_cube() -> (Harness, String) {
     let mut harness = Harness::new();
     let scene = harness.scene_mut();
     let model = VirtualPath::parse("/cube.fbx").unwrap();
-    let id = scene.create_object(&NewObject::Mesh(model), None).unwrap();
+    let id = scene
+        .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+        .unwrap();
     let mut transform = scene.object(&id).unwrap().transform;
     transform.position = CUBE_POSITION.to_array();
     scene.set_transform(&id, transform, None).unwrap();
@@ -328,4 +332,45 @@ fn tool_shortcuts_apply_unless_a_text_field_has_focus() {
     });
     output.textures_delta.clear();
     assert_eq!(harness.state.tool, GizmoTool::Rotate);
+}
+
+#[test]
+fn dropping_a_model_on_the_scene_places_it_on_the_floor_under_the_cursor() {
+    let mut harness = Harness::new();
+    harness.panel(Vec::new(), scene_view::show);
+    let at = pos2(640.0, 500.0);
+    harness.panel(vec![Event::PointerMoved(at)], scene_view::show);
+    egui::DragAndDrop::set_payload(&harness.ctx, AssetDrag("models/a.fbx".to_owned()));
+    harness.panel(
+        vec![button(at, PointerButton::Primary, false)],
+        scene_view::show,
+    );
+
+    let id = harness.state.pending_frame.clone().unwrap();
+    let position = harness.scene().object(&id).unwrap().transform.position;
+    assert_eq!(position[1], 0.0);
+    let [width, height] = harness.state.scene_view.size;
+    let view_projection = harness.state.camera.camera().view_projection(width, height);
+    let [u, v] = project_point(view_projection, Vec3::from_array(position)).unwrap();
+    assert!((u - 0.5).abs() < 0.02, "{u}");
+    assert!(v > 0.6, "{v}");
+}
+
+#[test]
+fn game_view_shows_the_image_and_takes_a_camera_from_the_scene() {
+    let mut harness = Harness::new();
+    harness.panel(Vec::new(), game_view::show);
+    assert!(harness.state.game_view.visible);
+    assert!(harness.state.game_view.size[0] > 0);
+    assert_eq!(harness.state.game_camera.as_deref(), Some("camera"));
+
+    // Камера исчезла из сцены: вкладка возвращается к первой.
+    harness.state.game_camera = Some("deleted".to_owned());
+    harness.panel(Vec::new(), game_view::show);
+    assert_eq!(harness.state.game_camera.as_deref(), Some("camera"));
+
+    harness.state.scene = None;
+    harness.state.game_view.visible = false;
+    harness.panel(Vec::new(), game_view::show);
+    assert!(!harness.state.game_view.visible);
 }

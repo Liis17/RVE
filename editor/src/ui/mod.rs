@@ -1,6 +1,7 @@
 //! Панели и диалоги редактора.
 
 pub mod console;
+pub mod game_view;
 pub mod hierarchy;
 pub mod inspector;
 pub mod project_panel;
@@ -18,6 +19,8 @@ use egui_dock::{DockArea, DockState, Style};
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab>) {
     state.scene_view.visible = false;
     state.scene_view.hovered = false;
+    state.game_view.visible = false;
+    state.game_view.hovered = false;
     toolbar::handle_shortcuts(ui.ctx(), state);
     toolbar::show(ui, state, dock);
     show_status_bar(ui, state);

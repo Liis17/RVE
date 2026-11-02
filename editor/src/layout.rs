@@ -8,6 +8,7 @@ use egui_dock::{DockState, NodeIndex, TabViewer};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tab {
     Scene,
+    Game,
     Hierarchy,
     Inspector,
     Project,
@@ -15,8 +16,9 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Scene,
+        Self::Game,
         Self::Hierarchy,
         Self::Inspector,
         Self::Project,
@@ -26,6 +28,7 @@ impl Tab {
     pub fn title(self) -> &'static str {
         match self {
             Self::Scene => "Scene",
+            Self::Game => "Game",
             Self::Hierarchy => "Hierarchy",
             Self::Inspector => "Inspector",
             Self::Project => "Project",
@@ -34,9 +37,9 @@ impl Tab {
     }
 }
 
-/// Раскладка в стиле Unity: в центре Scene, слева Hierarchy, справа Inspector, снизу Project и Console.
+/// Раскладка в стиле Unity: в центре Scene и Game, слева Hierarchy, справа Inspector, снизу Project и Console.
 pub fn default_layout() -> DockState<Tab> {
-    let mut dock = DockState::new(vec![Tab::Scene]);
+    let mut dock = DockState::new(vec![Tab::Scene, Tab::Game]);
     let surface = dock.main_surface_mut();
     let [center, _inspector] = surface.split_right(NodeIndex::root(), 0.78, vec![Tab::Inspector]);
     let [center, _hierarchy] = surface.split_left(center, 0.22, vec![Tab::Hierarchy]);
@@ -67,6 +70,7 @@ impl TabViewer for EditorTabs<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match tab {
             Tab::Scene => ui::scene_view::show(ui, self.state),
+            Tab::Game => ui::game_view::show(ui, self.state),
             Tab::Hierarchy => ui::hierarchy::show(ui, self.state),
             Tab::Inspector => ui::inspector::show(ui, self.state),
             Tab::Project => ui::project_panel::show(ui, self.state),
@@ -75,7 +79,7 @@ impl TabViewer for EditorTabs<'_> {
     }
 
     fn clear_background(&self, tab: &Tab) -> bool {
-        *tab != Tab::Scene
+        !matches!(tab, Tab::Scene | Tab::Game)
     }
 
     /// Панели сами управляют прокруткой; изображение сцены занимает всю область.

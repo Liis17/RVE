@@ -850,30 +850,30 @@ impl Renderer {
         )
     }
 
-    /// Рисует необязательную сцену в viewport target и UI прямо в swapchain image.
+    /// Рисует сцены в их viewport targets и UI прямо в swapchain image.
     ///
     /// `clear` очищает окно перед UI и задаётся в значениях формата swapchain. `Frame::overlay`
-    /// здесь не используется. `UiImage::Viewport` может ссылаться только на viewport из `scene`;
-    /// примитивы viewport нулевого размера пропускаются вместе со scene pass.
+    /// здесь не используется. Каждый viewport может встречаться в `scenes` один раз, и
+    /// `UiImage::Viewport` может ссылаться только на них; примитивы viewport нулевого размера
+    /// пропускаются вместе с его scene pass. GPU-время измеряет только первую нарисованную сцену.
     pub fn render_frame_with_ui(
         &mut self,
-        scene: Option<(ViewportId, &Frame<'_>)>,
+        scenes: &[(ViewportId, &Frame<'_>)],
         ui: &[UiPrimitive<'_>],
         clear: [f32; 4],
     ) -> Result<FrameStatus, RenderError> {
-        let scene_uniforms = match scene {
-            Some((viewport, frame)) => {
-                validate_draws(frame.draws, &self.meshes, &self.textures)?;
-                self.viewports
-                    .get(viewport.0)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(unknown_viewport)?;
-                Some(frame_uniform_bytes(frame)?)
-            }
-            None => None,
-        };
+        validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
+        let mut scene_uniforms = Vec::with_capacity(scenes.len());
+        for (viewport, frame) in scenes {
+            validate_draws(frame.draws, &self.meshes, &self.textures)?;
+            self.viewports
+                .get(viewport.0)
+                .and_then(Option::as_ref)
+                .ok_or_else(unknown_viewport)?;
+            scene_uniforms.push(frame_uniform_bytes(frame)?);
+        }
         let packed = pack_ui(ui, self.output_extent)?;
-        self.validate_ui_images(&packed, scene.map(|(viewport, _)| viewport))?;
+        self.validate_ui_images(&packed, scenes)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(FrameStatus::Skipped);
         }
@@ -920,47 +920,54 @@ impl Renderer {
             &packed.indices,
         )?;
         let image_available = frame_resources.image_available;
-        let frame_uniforms =
-            self.frame_uniforms
-                .get(frame_slot)
-                .ok_or(RenderError::InvalidState(
-                    "нет uniform-буфера текущего кадра",
-                ))?;
-        if let Some(uniforms) = &scene_uniforms {
-            frame_uniforms.buffer.write(uniforms)?;
-        }
-        let frame_set = frame_uniforms.set;
-        // Fence слота завершён, поэтому прежние изображения слота свободны. Выделение идёт до
-        // acquire, чтобы ошибка памяти не оставила захваченный image и сигнальный semaphore.
-        let mut rendered_viewport = None;
-        if let Some((viewport, _)) = scene {
-            let sampler = self
+        // Fence слота завершён, поэтому прежние изображения и uniform-буферы слота свободны.
+        // Выделение идёт до acquire, чтобы ошибка памяти не оставила захваченный image и
+        // сигнальный semaphore.
+        let target_resources = ViewportTargetResources {
+            image_set_layout: self.texture_set_layout()?,
+            image_sampler: self
                 .ui_sampler
-                .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?;
-            let layout = self.texture_set_layout()?;
-            let physical_device = self.physical_device;
+                .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?,
+            frame_set_layout: self.frame_set_layout()?,
+            shadow_view: self
+                .shadow_image
+                .as_ref()
+                .ok_or(RenderError::InvalidState("shadow map отсутствует"))?
+                .view,
+            shadow_sampler: self
+                .shadow_sampler
+                .ok_or(RenderError::InvalidState("shadow sampler отсутствует"))?,
+        };
+        let physical_device = self.physical_device;
+        let mut rendered = Vec::with_capacity(scenes.len());
+        for ((viewport, frame), uniforms) in scenes.iter().zip(&scene_uniforms) {
             let entry = self.viewports[viewport.0]
                 .as_mut()
                 .ok_or_else(unknown_viewport)?;
             let extent = entry.extent;
-            if extent.width != 0 && extent.height != 0 {
-                let slot_target = &mut entry.targets[frame_slot];
-                if slot_target
-                    .as_ref()
-                    .is_none_or(|target| target.extent != extent)
-                {
-                    *slot_target = None;
-                    *slot_target = Some(ViewportTarget::new(
-                        &instance,
-                        &device,
-                        physical_device,
-                        extent,
-                        layout,
-                        sampler,
-                    )?);
-                }
-                rendered_viewport = Some(viewport);
+            if extent.width == 0 || extent.height == 0 {
+                continue;
             }
+            let slot_target = &mut entry.targets[frame_slot];
+            if slot_target
+                .as_ref()
+                .is_none_or(|target| target.extent != extent)
+            {
+                *slot_target = None;
+                *slot_target = Some(ViewportTarget::new(
+                    &instance,
+                    &device,
+                    physical_device,
+                    extent,
+                    &target_resources,
+                )?);
+            }
+            let frame_set = slot_target
+                .as_ref()
+                .ok_or_else(unknown_viewport)?
+                .frame_set
+                .write(uniforms)?;
+            rendered.push((*viewport, *frame, frame_set));
         }
 
         let Some((image_index, acquire_suboptimal)) = acquire_image(
@@ -979,7 +986,7 @@ impl Renderer {
             let (set, image_is_linear) = match draw.image {
                 UiImage::Texture(texture) => (self.ui_texture(texture)?.texture.set, false),
                 UiImage::Viewport(viewport) => {
-                    if rendered_viewport != Some(viewport) {
+                    if !rendered.iter().any(|(drawn, _, _)| *drawn == viewport) {
                         continue;
                     }
                     let target = self.viewports[viewport.0]
@@ -995,42 +1002,44 @@ impl Renderer {
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
-        let scene_pass = match (scene, rendered_viewport) {
-            (Some((_, frame)), Some(_)) => {
-                let pipeline_layout = self
-                    .pipeline_layout
-                    .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
-                Some((
-                    frame,
+        let pipeline_layout = self
+            .pipeline_layout
+            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+        let shadow_pipeline = self
+            .shadow_pipeline
+            .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?;
+        let scene_pipeline = self
+            .pipeline
+            .ok_or(RenderError::InvalidState("pipeline отсутствует"))?;
+        let slot_timestamps = self.frames[frame_slot].timestamps;
+        let scene_passes = rendered
+            .iter()
+            .enumerate()
+            .map(|(index, (viewport, frame, frame_set))| {
+                (
+                    *viewport,
                     ShadowPass {
-                        pipeline: self
-                            .shadow_pipeline
-                            .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?,
+                        pipeline: shadow_pipeline,
                         pipeline_layout,
-                        frame_set,
+                        frame_set: *frame_set,
                         meshes: &self.meshes,
                         draws: frame.draws,
                         enabled: frame.shadow_view_projection.is_some(),
                     },
                     ScenePass {
-                        pipeline: self
-                            .pipeline
-                            .ok_or(RenderError::InvalidState("pipeline отсутствует"))?,
+                        pipeline: scene_pipeline,
                         pipeline_layout,
-                        frame_set,
+                        frame_set: *frame_set,
                         meshes: &self.meshes,
                         textures: &self.textures,
                         draws: frame.draws,
                         clear_color: frame.clear_color,
-                        timestamps: self.frames[frame_slot].timestamps,
+                        timestamps: slot_timestamps.filter(|_| index == 0),
                     },
-                ))
-            }
-            _ => None,
-        };
-        let timestamps = scene_pass
-            .as_ref()
-            .is_some_and(|(_, _, pass)| pass.timestamps.is_some());
+                )
+            })
+            .collect::<Vec<_>>();
+        let timestamps = !scene_passes.is_empty() && slot_timestamps.is_some();
         let shadow_image = self
             .shadow_image
             .as_ref()
@@ -1059,11 +1068,13 @@ impl Renderer {
         };
 
         begin_command_buffer(&device, command_buffer)?;
-        if let (Some((_, shadow, pass)), Some(viewport)) = (&scene_pass, rendered_viewport)
-            && let Some(target) = self.viewports[viewport.0]
+        for (viewport, shadow, pass) in &scene_passes {
+            let Some(target) = self.viewports[viewport.0]
                 .as_mut()
                 .and_then(|entry| entry.targets[frame_slot].as_mut())
-        {
+            else {
+                continue;
+            };
             let extent = target.extent;
             record_scene(
                 &device,
@@ -1118,14 +1129,16 @@ impl Renderer {
     fn validate_ui_images(
         &self,
         packed: &PackedUi,
-        scene: Option<ViewportId>,
+        scenes: &[(ViewportId, &Frame<'_>)],
     ) -> Result<(), RenderError> {
         for draw in &packed.draws {
             match draw.image {
                 UiImage::Texture(texture) => {
                     self.ui_texture(texture)?;
                 }
-                UiImage::Viewport(viewport) if Some(viewport) != scene => {
+                UiImage::Viewport(viewport)
+                    if !scenes.iter().any(|(scene, _)| *scene == viewport) =>
+                {
                     return Err(RenderError::InvalidTexture(
                         "UI ссылается на viewport, который не рисуется в этом кадре".to_owned(),
                     ));
@@ -1452,13 +1465,10 @@ impl Renderer {
             .shadow_image
             .as_ref()
             .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
-        let shadow_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(shadow_image.view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let shadow_sampler_info = [vk::DescriptorImageInfo::default().sampler(
-            self.shadow_sampler
-                .ok_or(RenderError::InvalidState("shadow sampler отсутствует"))?,
-        )];
+        let shadow_view = shadow_image.view;
+        let shadow_sampler = self
+            .shadow_sampler
+            .ok_or(RenderError::InvalidState("shadow sampler отсутствует"))?;
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
@@ -1490,29 +1500,7 @@ impl Renderer {
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 &[0; FRAME_UNIFORMS_SIZE],
             )?;
-            let buffer_info = [vk::DescriptorBufferInfo::default()
-                .buffer(buffer.buffer)
-                .offset(0)
-                .range(FRAME_UNIFORMS_SIZE as vk::DeviceSize)];
-            let writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .buffer_info(&buffer_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&shadow_image_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(2)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&shadow_sampler_info),
-            ];
-            // SAFETY: the set and buffer are alive and no command buffer uses the set yet.
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            write_frame_set(&device, set, &buffer, shadow_view, shadow_sampler);
             self.frame_uniforms.push(FrameUniforms { buffer, set });
         }
         Ok(())
@@ -2903,6 +2891,133 @@ impl OffscreenTarget {
     }
 }
 
+/// Заполняет набор дескрипторов кадра: uniform-буфер и общую shadow map.
+fn write_frame_set(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    buffer: &HostBuffer,
+    shadow_view: vk::ImageView,
+    shadow_sampler: vk::Sampler,
+) {
+    let buffer_info = [vk::DescriptorBufferInfo::default()
+        .buffer(buffer.buffer)
+        .offset(0)
+        .range(FRAME_UNIFORMS_SIZE as vk::DeviceSize)];
+    let shadow_image_info = [vk::DescriptorImageInfo::default()
+        .image_view(shadow_view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let shadow_sampler_info = [vk::DescriptorImageInfo::default().sampler(shadow_sampler)];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&buffer_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&shadow_image_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .image_info(&shadow_sampler_info),
+    ];
+    // SAFETY: the set and buffer are alive and no command buffer uses the set yet.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
+
+/// Общие объекты renderer, нужные каждой цели viewport.
+struct ViewportTargetResources {
+    image_set_layout: vk::DescriptorSetLayout,
+    image_sampler: vk::Sampler,
+    frame_set_layout: vk::DescriptorSetLayout,
+    shadow_view: vk::ImageView,
+    shadow_sampler: vk::Sampler,
+}
+
+/// Uniform-буфер сцены одной цели: у каждой сцены кадра своя камера.
+struct ViewportFrameSet {
+    device: ash::Device,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    buffer: HostBuffer,
+}
+
+impl ViewportFrameSet {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        resources: &ViewportTargetResources,
+    ) -> Result<Self, RenderError> {
+        let buffer = HostBuffer::new(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &[0; FRAME_UNIFORMS_SIZE],
+        )?;
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        // SAFETY: the pool holds exactly the descriptors of one frame set.
+        let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+        let layouts = [resources.frame_set_layout];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&layouts);
+        // SAFETY: the pool was sized for this set and the layout is alive.
+        let sets = unsafe { device.allocate_descriptor_sets(&allocate_info) };
+        let set = match sets {
+            Ok(sets) => sets[0],
+            Err(error) => {
+                // SAFETY: no set was allocated from the new pool and no command buffer uses it.
+                unsafe { device.destroy_descriptor_pool(pool, None) };
+                return Err(error.into());
+            }
+        };
+        write_frame_set(
+            device,
+            set,
+            &buffer,
+            resources.shadow_view,
+            resources.shadow_sampler,
+        );
+        Ok(Self {
+            device: device.clone(),
+            pool,
+            set,
+            buffer,
+        })
+    }
+
+    /// Записывает uniform-данные кадра; вызывается после ожидания fence слота цели.
+    fn write(&self, uniforms: &[u8]) -> Result<vk::DescriptorSet, RenderError> {
+        self.buffer.write(uniforms)?;
+        Ok(self.set)
+    }
+}
+
+impl Drop for ViewportFrameSet {
+    fn drop(&mut self) {
+        // SAFETY: the set is dropped only after fences of the submissions using it were waited.
+        unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
+    }
+}
+
 /// Цель рендера сцены одного кадрового слота, которую UI читает как текстуру.
 struct ViewportTarget {
     device: ash::Device,
@@ -2910,6 +3025,7 @@ struct ViewportTarget {
     set: vk::DescriptorSet,
     extent: vk::Extent2D,
     offscreen: OffscreenTarget,
+    frame_set: ViewportFrameSet,
 }
 
 impl ViewportTarget {
@@ -2918,8 +3034,7 @@ impl ViewportTarget {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         extent: vk::Extent2D,
-        set_layout: vk::DescriptorSetLayout,
-        sampler: vk::Sampler,
+        resources: &ViewportTargetResources,
     ) -> Result<Self, RenderError> {
         let offscreen = OffscreenTarget::new(
             instance,
@@ -2928,13 +3043,20 @@ impl ViewportTarget {
             extent,
             vk::ImageUsageFlags::SAMPLED,
         )?;
-        let (pool, set) = allocate_image_set(device, set_layout, offscreen.color.view, sampler)?;
+        let frame_set = ViewportFrameSet::new(instance, device, physical_device, resources)?;
+        let (pool, set) = allocate_image_set(
+            device,
+            resources.image_set_layout,
+            offscreen.color.view,
+            resources.image_sampler,
+        )?;
         Ok(Self {
             device: device.clone(),
             pool,
             set,
             extent,
             offscreen,
+            frame_set,
         })
     }
 }
@@ -4337,6 +4459,22 @@ fn index_bytes(indices: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
 }
 
+/// Viewport рисуется в кадре один раз: его цель и uniform-буфер принадлежат одной сцене.
+fn validate_scene_viewports(
+    viewports: impl Iterator<Item = ViewportId>,
+) -> Result<(), RenderError> {
+    let mut seen = Vec::new();
+    for viewport in viewports {
+        if seen.contains(&viewport) {
+            return Err(RenderError::InvalidTexture(
+                "viewport указан в кадре несколько раз".to_owned(),
+            ));
+        }
+        seen.push(viewport);
+    }
+    Ok(())
+}
+
 /// Байты `FrameUniforms` в порядке std140: две матрицы и четыре `vec4`.
 fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
     let light = frame.light;
@@ -5164,6 +5302,13 @@ mod tests {
             transform_normal(&normal_matrix(&mirror), [0.0, 1.0, 0.0]),
             [0.0, 1.0, 0.0],
         );
+    }
+
+    #[test]
+    fn a_viewport_may_be_rendered_only_once_per_frame() {
+        use super::{ViewportId, validate_scene_viewports};
+        assert!(validate_scene_viewports([ViewportId(0), ViewportId(1)].into_iter()).is_ok());
+        assert!(validate_scene_viewports([ViewportId(1), ViewportId(1)].into_iter()).is_err());
     }
 
     #[test]

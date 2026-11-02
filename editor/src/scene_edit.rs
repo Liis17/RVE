@@ -35,12 +35,13 @@ shadow_radius = 20.0
 "#;
 
 /// Вид объекта, создаваемого из меню или перетаскиванием ресурса.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum NewObject {
     Empty,
     Camera,
     DirectionalLight,
-    Mesh(VirtualPath),
+    /// Модель и локальная позиция нового объекта.
+    Mesh(VirtualPath, [f32; 3]),
 }
 
 /// Открытая сцена с выделением и историей правок.
@@ -208,7 +209,7 @@ impl EditorScene {
             NewObject::Empty => ("object".to_owned(), "Empty".to_owned()),
             NewObject::Camera => ("camera".to_owned(), "Camera".to_owned()),
             NewObject::DirectionalLight => ("light".to_owned(), "Directional Light".to_owned()),
-            NewObject::Mesh(path) => {
+            NewObject::Mesh(path, _) => {
                 let stem = path
                     .as_str()
                     .rsplit('/')
@@ -244,7 +245,8 @@ impl EditorScene {
                     object.transform.rotation = [50.0, 30.0, 0.0];
                     object.directional_light = Some(default_light());
                 }
-                NewObject::Mesh(path) => {
+                NewObject::Mesh(path, position) => {
+                    object.transform.position = *position;
                     ensure_asset(document, path);
                     object.mesh_renderer = Some(MeshRenderer {
                         model: path.clone(),
@@ -548,9 +550,15 @@ mod tests {
         let mut scene = scene();
         let model = path("/models/My Cube.v2.fbx");
         let first = scene
-            .create_object(&NewObject::Mesh(model.clone()), None)
+            .create_object(&NewObject::Mesh(model.clone(), [1.0, 0.0, 2.0]), None)
             .unwrap();
-        scene.create_object(&NewObject::Mesh(model), None).unwrap();
+        assert_eq!(
+            scene.object(&first).unwrap().transform.position,
+            [1.0, 0.0, 2.0]
+        );
+        scene
+            .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+            .unwrap();
         assert_eq!(first, "My-Cube");
         assert_eq!(scene.document().assets.len(), 1);
     }
@@ -559,8 +567,10 @@ mod tests {
     fn invalid_edit_is_rolled_back_with_a_message() {
         let mut scene = scene();
         let revision = scene.revision();
-        let error = scene.create_object(&NewObject::Camera, None).unwrap_err();
-        assert!(error.contains("камер"));
+        let error = scene
+            .create_object(&NewObject::DirectionalLight, None)
+            .unwrap_err();
+        assert!(error.contains("directional_light"));
         assert_eq!(scene.document().objects.len(), 2);
         assert_eq!(scene.revision(), revision);
         assert!(!scene.can_undo());
@@ -617,9 +627,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicating_the_camera_is_rejected() {
+    fn cameras_can_be_added_and_duplicated_but_the_light_cannot() {
         let mut scene = scene();
-        assert!(scene.duplicate_object("camera").is_err());
+        let created = scene.create_object(&NewObject::Camera, None).unwrap();
+        let copy = scene.duplicate_object("camera").unwrap();
+        for id in [created, copy] {
+            assert!(scene.object(&id).unwrap().camera.is_some());
+        }
+        assert!(scene.duplicate_object("sun").is_err());
     }
 
     #[test]

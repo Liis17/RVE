@@ -175,7 +175,8 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
                 }
                 for model in models {
                     if ui.button(&model).clicked() {
-                        state.create_from_asset(&model, None);
+                        let position = state.camera.target.to_array();
+                        state.create_from_asset(&model, None, position);
                     }
                 }
             });

@@ -191,7 +191,12 @@ fn apply(state: &mut EditorState, command: Command) {
             state.edit_scene(|scene| scene.set_parent(&id, parent.as_deref()));
         }
         Command::CreateFromAsset(path, parent) => {
-            state.create_from_asset(&path, parent.as_deref());
+            // Корневой объект появляется в центре вида, дочерний — в начале координат родителя.
+            let position = match parent {
+                Some(_) => [0.0; 3],
+                None => state.camera.target.to_array(),
+            };
+            state.create_from_asset(&path, parent.as_deref(), position);
         }
         Command::CreateChild(parent) => {
             let parent = (!parent.is_empty()).then_some(parent.as_str());

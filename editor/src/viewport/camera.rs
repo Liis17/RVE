@@ -4,6 +4,8 @@ use engine_scene::camera::Camera;
 use glam::{Mat4, Vec3};
 
 const MIN_DISTANCE: f32 = 0.05;
+/// Меньшая сфера занимает на экране единицы пикселей, и её легко не заметить.
+const MIN_VISIBLE_RADIUS_PER_DISTANCE: f32 = 0.02;
 const MAX_DISTANCE: f32 = 5000.0;
 const MAX_PITCH: f32 = 1.54;
 const ORBIT_RADIANS_PER_POINT: f32 = 0.006;
@@ -93,6 +95,12 @@ impl EditorCamera {
         self.target += -self.back() * forward + self.right() * right + Vec3::Y * up;
     }
 
+    /// Сфера почти не видна: камера внутри неё или сфера занимает лишь несколько пикселей.
+    pub fn needs_framing(self, center: Vec3, radius: f32) -> bool {
+        let distance = self.eye().distance(center);
+        distance <= radius || radius < distance * MIN_VISIBLE_RADIUS_PER_DISTANCE
+    }
+
     /// Показывает сферу целиком, сохраняя направление взгляда.
     pub fn focus(&mut self, center: Vec3, radius: f32) {
         self.target = center;
@@ -133,12 +141,45 @@ pub fn project_point(view_projection: Mat4, point: Vec3) -> Option<[f32; 2]> {
     Some([(clip.x / clip.w + 1.0) * 0.5, (1.0 - clip.y / clip.w) * 0.5])
 }
 
+/// Точка луча на плоскости пола `y = 0`, если она впереди и не дальше `max_distance`.
+pub fn ground_point(ray: Ray, max_distance: f32) -> Option<Vec3> {
+    if ray.direction.y.abs() < 1e-5 {
+        return None;
+    }
+    let t = -ray.origin.y / ray.direction.y;
+    (t > 0.0 && t <= max_distance).then(|| ray.origin + ray.direction * t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn assert_near(a: Vec3, b: Vec3) {
         assert!((a - b).length() < 1e-3, "{a} != {b}");
+    }
+
+    #[test]
+    fn only_tiny_or_surrounding_objects_need_framing() {
+        let camera = EditorCamera::default();
+        let center = camera.target;
+        assert!(camera.needs_framing(center, 0.02));
+        assert!(camera.needs_framing(center, camera.distance * 2.0));
+        assert!(!camera.needs_framing(center, 1.0));
+    }
+
+    #[test]
+    fn ground_point_is_where_the_ray_meets_the_floor_within_reach() {
+        let ray = Ray {
+            origin: Vec3::new(1.0, 2.0, 0.0),
+            direction: Vec3::new(0.0, -1.0, 0.0),
+        };
+        assert_near(ground_point(ray, 10.0).unwrap(), Vec3::new(1.0, 0.0, 0.0));
+        assert!(ground_point(ray, 1.0).is_none());
+        let upward = Ray {
+            direction: Vec3::Y,
+            ..ray
+        };
+        assert!(ground_point(upward, 10.0).is_none());
     }
 
     #[test]

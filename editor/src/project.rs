@@ -140,6 +140,17 @@ mod tests {
     }
 
     #[test]
+    fn demo_models_are_large_enough_to_see_from_the_scene_cameras() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let project = OpenProject::open(Path::new(dir)).unwrap();
+        for model in ["draft-cube", "props-cube", "shared-cube"] {
+            let path = format!("models/{model}.fbx");
+            let (min, max) = project.assets.load_model(&path).unwrap().bounds().unwrap();
+            assert_eq!(max[0] - min[0], 2.0, "{path}");
+        }
+    }
+
+    #[test]
     fn demo_project_opens_and_lists_its_start_scene() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
         let project = OpenProject::open(Path::new(dir)).unwrap();

@@ -26,20 +26,25 @@ struct GpuModel {
 /// запоминается и пишется в консоль один раз, пока кэш не будет сброшен.
 pub struct SceneRenderer {
     pub viewport: ViewportId,
+    pub game_viewport: ViewportId,
     models: HashMap<String, Option<GpuModel>>,
     textures: HashMap<String, Option<TextureId>>,
     grid: Option<MeshId>,
+    /// Команды кадра; сетка, если есть, идёт последней после `scene_draws` команд мира.
     draws: Vec<DrawCommand>,
+    scene_draws: usize,
 }
 
 impl SceneRenderer {
     pub fn new(renderer: &mut Renderer) -> Result<Self, RenderError> {
         Ok(Self {
             viewport: renderer.create_viewport(1, 1)?,
+            game_viewport: renderer.create_viewport(1, 1)?,
             models: HashMap::new(),
             textures: HashMap::new(),
             grid: None,
             draws: Vec::new(),
+            scene_draws: 0,
         })
     }
 
@@ -112,7 +117,7 @@ impl SceneRenderer {
         Ok(())
     }
 
-    /// Строит команды отрисовки кадра мира; сетка рисуется только при редактировании.
+    /// Строит команды отрисовки кадра мира; `grid_camera_distance` добавляет сетку.
     pub fn build_draws(
         &mut self,
         renderer: &mut Renderer,
@@ -142,6 +147,7 @@ impl SceneRenderer {
                     model: instance.model.to_cols_array_2d(),
                 }));
         }
+        self.scene_draws = self.draws.len();
         if let Some(distance) = grid_camera_distance {
             let grid = match self.grid {
                 Some(grid) => grid,
@@ -161,12 +167,13 @@ impl SceneRenderer {
         Ok(())
     }
 
-    /// Собирает `Frame` для заданной матрицы камеры.
+    /// Собирает `Frame` для заданной матрицы камеры; `with_grid` включает сетку редактора.
     pub fn frame(
         &self,
         view_projection: Mat4,
         light: &LightState,
         scene_has_light: bool,
+        with_grid: bool,
     ) -> Frame<'_> {
         let (light, shadow) = frame_light(light, scene_has_light);
         Frame {
@@ -174,7 +181,11 @@ impl SceneRenderer {
             view_projection: view_projection.to_cols_array_2d(),
             shadow_view_projection: shadow,
             light,
-            draws: &self.draws,
+            draws: if with_grid {
+                &self.draws
+            } else {
+                &self.draws[..self.scene_draws]
+            },
             overlay: &[],
         }
     }

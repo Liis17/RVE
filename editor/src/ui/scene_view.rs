@@ -1,7 +1,7 @@
 //! Панель Scene: изображение сцены, камера редактора, выделение и гизмо.
 
 use crate::state::{AssetDrag, EditorState};
-use crate::viewport::camera::{Ray, project_point, screen_ray};
+use crate::viewport::camera::{Ray, ground_point, project_point, screen_ray};
 use crate::viewport::gizmo::{GizmoDrag, GizmoTool, gizmo_axes};
 use crate::viewport::picking::{nearest_hit, ray_model};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
@@ -19,6 +19,8 @@ const HANDLE_HIT_POINTS: f32 = 8.0;
 const MARKER_HIT_POINTS: f32 = 12.0;
 const RING_SEGMENTS: usize = 64;
 const FLY_UNITS_PER_SECOND: f32 = 6.0;
+/// Брошенная модель ложится на пол не дальше этого числа расстояний до цели камеры.
+const MAX_DROP_DISTANCE_FACTOR: f32 = 10.0;
 
 /// Точка на экране внутри прямоугольника панели.
 fn to_screen(view_projection: Mat4, rect: Rect, point: Vec3) -> Option<Pos2> {
@@ -77,7 +79,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     handle_camera(ui, state, &response, rect);
     let view_projection = state.camera.camera().view_projection(width, height);
     if let Some(asset) = response.dnd_release_payload::<AssetDrag>() {
-        state.create_from_asset(&asset.0, None);
+        let drop_point = ui
+            .input(|input| input.pointer.latest_pos())
+            .and_then(|pointer| pointer_ray(view_projection, rect, pointer))
+            .and_then(|ray| ground_point(ray, state.camera.distance * MAX_DROP_DISTANCE_FACTOR))
+            .unwrap_or(state.camera.target);
+        state.create_from_asset(&asset.0, None, drop_point.to_array());
     }
 
     let Some(markers) = collect_markers(state) else {
@@ -94,7 +101,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
 }
 
 /// Передаёт положение курсора и прокрутку над сценой в ввод скриптов.
-fn feed_play_pointer(ui: &egui::Ui, state: &mut EditorState, rect: Rect, pixels_per_point: f32) {
+pub(super) fn feed_play_pointer(
+    ui: &egui::Ui,
+    state: &mut EditorState,
+    rect: Rect,
+    pixels_per_point: f32,
+) {
     let (pointer, delta, scroll) = ui.input(|input| {
         (
             input.pointer.latest_pos(),
@@ -468,15 +480,18 @@ pub fn focus_selection(state: &mut EditorState) {
         .and_then(|mesh| state.models.get(mesh.model.as_str()))
         .and_then(|model| model.bounds());
     let (center, radius) = match bounds {
-        Some((min, max)) => {
-            let (min, max) = (Vec3::from_array(min), Vec3::from_array(max));
-            let center = matrix.transform_point3((min + max) * 0.5);
-            let corner = matrix.transform_vector3((max - min) * 0.5);
-            (center, corner.length())
-        }
+        Some(bounds) => bounding_sphere(matrix, bounds),
         None => (matrix.w_axis.truncate(), 1.0),
     };
     state.camera.focus(center, radius);
+}
+
+/// Мировая сфера вокруг границ модели, размещённой матрицей `matrix`.
+pub fn bounding_sphere(matrix: Mat4, (min, max): ([f32; 3], [f32; 3])) -> (Vec3, f32) {
+    let (min, max) = (Vec3::from_array(min), Vec3::from_array(max));
+    let center = matrix.transform_point3((min + max) * 0.5);
+    let corner = matrix.transform_vector3((max - min) * 0.5);
+    (center, corner.length())
 }
 
 #[cfg(test)]
