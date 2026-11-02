@@ -22,6 +22,8 @@ Parent: [[Index]]
 | `RedrawMode` | `Continuous` использует `ControlFlow::Poll` и запрашивает кадр в каждом `about_to_wait`; `OnDemand` использует `ControlFlow::Wait` и не запрашивает кадр автоматически |
 | `WindowProxy` | Cloneable потокобезопасный handle: `request_focus` восстанавливает и фокусирует окно, `request_exit` завершает цикл на главном потоке; запросы после завершения цикла игнорируются |
 | `WindowHandler::attach_proxy(&mut self, proxy)` | Вызывается один раз после создания event loop и до `init`; реализация по умолчанию ничего не делает |
+| `WindowHandler::window_event(&mut self, window: &Window, event: &WindowEvent)` | Получает каждое событие своего окна до остальных методов; нужен библиотекам, которым требуются исходные события (текст, IME, DPI, модификаторы). По умолчанию ничего не делает, существующие методы вызываются как прежде. `WindowEvent` реэкспортируется из крейта |
+| `WindowHandler::next_wakeup(&mut self) -> Option<Instant>` | Запрашивается после каждого `update` в режиме `OnDemand`: цикл ждёт событие, но не дольше этого момента (`ControlFlow::WaitUntil`), и снова вызывает `update`. `None` — ждать только событие. В `Continuous` не используется |
 | `WindowHandler::init(&mut self, window: Arc<Window>) -> bool` | Вызывается при создании окна; `false` завершает цикл |
 | `WindowHandler::frame(&mut self, window: &Window) -> bool` | Вызывается на `RedrawRequested`; `false` завершает цикл |
 | `WindowHandler::resized(&mut self, width: u32, height: u32)` | Размеры клиентской области в физических пикселях; по умолчанию ничего не делает |

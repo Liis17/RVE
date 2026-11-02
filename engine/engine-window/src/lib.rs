@@ -3,14 +3,16 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::error::{EventLoopError, OsError};
-use winit::event::{DeviceEvent, ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, MouseScrollDelta};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, WindowId};
 
 pub use winit::dpi::PhysicalSize;
+pub use winit::event::WindowEvent;
 pub use winit::window::Window;
 
 /// Поддерживаемый набор физических клавиш.
@@ -261,6 +263,14 @@ impl RedrawMode {
             Self::OnDemand => ControlFlow::Wait,
         }
     }
+
+    /// `OnDemand` ждёт событие, но не дольше запрошенного обработчиком момента.
+    fn control_flow_with_wakeup(self, wakeup: Option<Instant>) -> ControlFlow {
+        match (self, wakeup) {
+            (Self::OnDemand, Some(deadline)) => ControlFlow::WaitUntil(deadline),
+            _ => self.control_flow(),
+        }
+    }
 }
 
 enum InternalEvent {
@@ -325,6 +335,18 @@ impl Error for WindowError {
 pub trait WindowHandler {
     /// Получает proxy после создания цикла событий и до `init`.
     fn attach_proxy(&mut self, _proxy: WindowProxy) {}
+
+    /// Получает каждое событие окна до его обработки остальными методами.
+    ///
+    /// Нужен библиотекам, которым требуются исходные события: текст, IME, DPI, модификаторы.
+    fn window_event(&mut self, _window: &Window, _event: &WindowEvent) {}
+
+    /// Момент, когда цикл в режиме `OnDemand` должен проснуться и вызвать `update`.
+    ///
+    /// Запрашивается после каждого `update`; `None` — ждать только события.
+    fn next_wakeup(&mut self) -> Option<Instant> {
+        None
+    }
 
     /// Вызывается один раз после создания окна.
     fn init(&mut self, window: Arc<Window>) -> bool;
@@ -498,6 +520,10 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
             return;
         }
 
+        if let Some(window) = self.window.as_ref() {
+            self.handler.window_event(window, &event);
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 if self.should_exit_on_close_requested() {
@@ -573,6 +599,9 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                 self.stop(event_loop);
             } else if self.config.redraw == RedrawMode::Continuous {
                 window.request_redraw();
+            } else {
+                let wakeup = self.handler.next_wakeup();
+                event_loop.set_control_flow(self.config.redraw.control_flow_with_wakeup(wakeup));
             }
         }
     }
@@ -639,6 +668,23 @@ mod tests {
     fn redraw_modes_select_the_expected_control_flow() {
         assert_eq!(RedrawMode::Continuous.control_flow(), ControlFlow::Poll);
         assert_eq!(RedrawMode::OnDemand.control_flow(), ControlFlow::Wait);
+    }
+
+    #[test]
+    fn handler_wakeup_limits_only_the_on_demand_wait() {
+        let deadline = Instant::now();
+        assert_eq!(
+            RedrawMode::OnDemand.control_flow_with_wakeup(Some(deadline)),
+            ControlFlow::WaitUntil(deadline)
+        );
+        assert_eq!(
+            RedrawMode::OnDemand.control_flow_with_wakeup(None),
+            ControlFlow::Wait
+        );
+        assert_eq!(
+            RedrawMode::Continuous.control_flow_with_wakeup(Some(deadline)),
+            ControlFlow::Poll
+        );
     }
 
     #[test]
