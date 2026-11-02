@@ -995,6 +995,7 @@ mod tests {
     #[test]
     fn background_scheduler_uses_injected_clock_and_control_recv_timeout() {
         let clock = Arc::new(FakeClock::default());
+        let waiting_rx = clock.observe_waits();
         let (control_tx, control_rx) = flume::unbounded();
         let clock_for_wait = Arc::clone(&clock);
         let (done_tx, done_rx) = mpsc::channel();
@@ -1016,10 +1017,12 @@ mod tests {
                 let _ = done_tx.send(now);
             }
         });
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         clock.advance(Duration::from_millis(100));
         control_tx.send(ScriptControl::Background(true)).unwrap();
         assert_eq!(done_rx.recv().unwrap(), Duration::from_millis(100));
         assert!(done_rx.try_recv().is_err());
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         clock.advance(Duration::from_millis(100));
         control_tx.send(ScriptControl::Background(true)).unwrap();
         assert_eq!(done_rx.recv().unwrap(), Duration::from_millis(200));

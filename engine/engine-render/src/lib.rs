@@ -351,6 +351,7 @@ pub struct Renderer {
     /// Наносекунд на один тик timestamp.
     timestamp_period: f32,
     pending_gpu_time: Option<Duration>,
+    texture_sampler_anisotropy: Option<f32>,
     frame_set_layout: Option<vk::DescriptorSetLayout>,
     texture_set_layout: Option<vk::DescriptorSetLayout>,
     frame_descriptor_pool: Option<vk::DescriptorPool>,
@@ -406,6 +407,7 @@ impl Renderer {
             timestamp_valid_bits: 0,
             timestamp_period: 0.0,
             pending_gpu_time: None,
+            texture_sampler_anisotropy: None,
             frame_set_layout: None,
             texture_set_layout: None,
             frame_descriptor_pool: None,
@@ -802,6 +804,7 @@ impl Renderer {
         self.surface_format = choice.surface_format;
         self.timestamp_valid_bits = choice.timestamp_valid_bits;
         self.timestamp_period = choice.timestamp_period;
+        self.texture_sampler_anisotropy = choice.texture_sampler_anisotropy;
         self.capabilities = Capabilities {
             device_name: choice.device_name,
             vendor_id: choice.vendor_id,
@@ -819,7 +822,8 @@ impl Renderer {
             .map(|name| name.as_ptr())
             .collect::<Vec<_>>();
         let features = vk::PhysicalDeviceFeatures::default()
-            .tessellation_shader(self.capabilities.tessellation_shader);
+            .tessellation_shader(self.capabilities.tessellation_shader)
+            .sampler_anisotropy(self.texture_sampler_anisotropy.is_some());
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
@@ -931,15 +935,8 @@ impl Renderer {
         self.texture_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&texture_layout_info, None) }?);
 
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT)
-            .max_lod(0.0);
-        // SAFETY: the sampler uses core filtering and addressing modes without anisotropy.
+        let sampler_info = material_sampler_info(self.texture_sampler_anisotropy);
+        // SAFETY: sampler anisotropy is enabled only when the selected device supports it.
         self.sampler = Some(unsafe { device.create_sampler(&sampler_info, None) }?);
 
         let shadow_image = self
@@ -1044,14 +1041,17 @@ impl Renderer {
     fn upload_texture(&self, width: u32, height: u32, rgba: &[u8]) -> Result<Texture, RenderError> {
         let device = self.device()?;
         let extent = vk::Extent2D { width, height };
+        let mip_levels = mip_level_count(width, height);
         let image = DeviceImage::new(
             self.instance()?,
             device,
             self.physical_device,
             extent,
             TEXTURE_FORMAT,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-            color_subresource_range(),
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            color_mip_subresource_range(0, mip_levels),
         )?;
         let staging = HostBuffer::new(
             self.instance()?,
@@ -1061,17 +1061,7 @@ impl Renderer {
             rgba,
         )?;
         self.submit_once(|command_buffer| {
-            let to_transfer = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image.image)
-                .subresource_range(color_subresource_range());
+            let to_transfer = texture_upload_barrier(image.image, mip_levels);
             pipeline_barrier(device, command_buffer, to_transfer);
             let region = [vk::BufferImageCopy::default()
                 .buffer_offset(0)
@@ -1091,17 +1081,43 @@ impl Renderer {
                     &region,
                 )
             };
-            let to_shader = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image.image)
-                .subresource_range(color_subresource_range());
+            let mut source_extent = extent;
+            for mip_level in 1..mip_levels {
+                let source_range = color_mip_subresource_range(mip_level - 1, 1);
+                pipeline_barrier(
+                    device,
+                    command_buffer,
+                    texture_mip_source_barrier(image.image, source_range),
+                );
+
+                let destination_extent = mip_extent(width, height, mip_level);
+                let region = [texture_mip_blit_region(
+                    mip_level - 1,
+                    source_extent,
+                    destination_extent,
+                )];
+                // SAFETY: adjacent mip levels are distinct, in bounds, and use the same blit-capable format.
+                unsafe {
+                    device.cmd_blit_image(
+                        command_buffer,
+                        image.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        image.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &region,
+                        vk::Filter::LINEAR,
+                    )
+                };
+                pipeline_barrier(
+                    device,
+                    command_buffer,
+                    texture_mip_shader_barrier(image.image, source_range),
+                );
+                source_extent = destination_extent;
+            }
+
+            let final_range = color_mip_subresource_range(mip_levels - 1, 1);
+            let to_shader = texture_mip_destination_shader_barrier(image.image, final_range);
             pipeline_barrier(device, command_buffer, to_shader);
         })?;
         drop(staging);
@@ -1644,6 +1660,7 @@ struct DeviceChoice {
     api_version: u32,
     discrete: bool,
     tessellation_shader: bool,
+    texture_sampler_anisotropy: Option<f32>,
     timestamp_valid_bits: u32,
     timestamp_period: f32,
 }
@@ -1664,6 +1681,7 @@ struct DeviceEvaluation {
 struct DeviceInspection {
     report: DeviceReport,
     tessellation_shader: bool,
+    texture_sampler_anisotropy: Option<f32>,
     timestamp_period: f32,
     queue_families: Vec<vk::QueueFamilyProperties>,
     graphics_queue_family_indices: Vec<u32>,
@@ -1734,6 +1752,10 @@ fn inspect_device(
     let mut features_2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features_13);
     unsafe { instance.get_physical_device_features2(physical_device, &mut features_2) };
     let tessellation_shader = features_2.features.tessellation_shader != vk::FALSE;
+    let texture_sampler_anisotropy = sampler_anisotropy(
+        features_2.features.sampler_anisotropy != vk::FALSE,
+        properties.limits.max_sampler_anisotropy,
+    );
 
     // SAFETY: extension enumeration is read-only for the live physical device.
     let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
@@ -1774,6 +1796,7 @@ fn inspect_device(
     Ok(DeviceInspection {
         report,
         tessellation_shader,
+        texture_sampler_anisotropy,
         timestamp_period: properties.limits.timestamp_period,
         queue_families,
         graphics_queue_family_indices: evaluation.graphics_queue_family_indices,
@@ -1853,14 +1876,13 @@ fn choose_device(
         let texture_properties = unsafe {
             instance.get_physical_device_format_properties(physical_device, TEXTURE_FORMAT)
         };
-        let texture_features = vk::FormatFeatureFlags::SAMPLED_IMAGE
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
-            | vk::FormatFeatureFlags::TRANSFER_DST;
-        if !texture_properties
-            .optimal_tiling_features
-            .contains(texture_features)
-        {
-            reasons.push("R8G8B8A8_SRGB не поддерживает выборку текстур".to_owned());
+        let missing_texture_features =
+            missing_texture_format_features(texture_properties.optimal_tiling_features);
+        if !missing_texture_features.is_empty() {
+            reasons.push(format!(
+                "R8G8B8A8_SRGB не поддерживает возможности: {}",
+                missing_texture_features.join(", ")
+            ));
         }
 
         // SAFETY: the surface and physical device belong to the same live instance.
@@ -1922,6 +1944,7 @@ fn choose_device(
             api_version: inspection.report.api_version,
             discrete: inspection.report.discrete,
             tessellation_shader: inspection.tessellation_shader,
+            texture_sampler_anisotropy: inspection.texture_sampler_anisotropy,
             timestamp_valid_bits,
             timestamp_period: inspection.timestamp_period,
         });
@@ -2270,7 +2293,7 @@ impl DeviceImage {
                 height: extent.height,
                 depth: 1,
             })
-            .mip_levels(1)
+            .mip_levels(subresource_range.level_count)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -2309,7 +2332,7 @@ impl DeviceImage {
             .format(format)
             .components(vk::ComponentMapping::default())
             .subresource_range(subresource_range);
-        // SAFETY: image view matches the bound image format and its single subresource.
+        // SAFETY: image view range matches the image's concrete mip and array-layer counts.
         target.view = unsafe { device.create_image_view(&view_info, None) }?;
         Ok(target)
     }
@@ -2877,11 +2900,191 @@ fn pipeline_barrier(
     unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 }
 
+fn mip_level_count(width: u32, height: u32) -> u32 {
+    32 - width.max(height).leading_zeros()
+}
+
+fn mip_extent(width: u32, height: u32, mip_level: u32) -> vk::Extent2D {
+    vk::Extent2D {
+        width: (width >> mip_level).max(1),
+        height: (height >> mip_level).max(1),
+    }
+}
+
+fn texture_mip_blit_region(
+    source_mip_level: u32,
+    source_extent: vk::Extent2D,
+    destination_extent: vk::Extent2D,
+) -> vk::ImageBlit {
+    vk::ImageBlit::default()
+        .src_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(source_mip_level)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .src_offsets([
+            vk::Offset3D::default(),
+            vk::Offset3D {
+                x: source_extent.width as i32,
+                y: source_extent.height as i32,
+                z: 1,
+            },
+        ])
+        .dst_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(source_mip_level + 1)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .dst_offsets([
+            vk::Offset3D::default(),
+            vk::Offset3D {
+                x: destination_extent.width as i32,
+                y: destination_extent.height as i32,
+                z: 1,
+            },
+        ])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn texture_image_barrier(
+    image: vk::Image,
+    subresource_range: vk::ImageSubresourceRange,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_stage_mask: vk::PipelineStageFlags2,
+    src_access_mask: vk::AccessFlags2,
+    dst_stage_mask: vk::PipelineStageFlags2,
+    dst_access_mask: vk::AccessFlags2,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage_mask)
+        .src_access_mask(src_access_mask)
+        .dst_stage_mask(dst_stage_mask)
+        .dst_access_mask(dst_access_mask)
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource_range)
+}
+
+fn texture_upload_barrier(image: vk::Image, mip_levels: u32) -> vk::ImageMemoryBarrier2<'static> {
+    texture_image_barrier(
+        image,
+        color_mip_subresource_range(0, mip_levels),
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::PipelineStageFlags2::NONE,
+        vk::AccessFlags2::NONE,
+        vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::BLIT,
+        vk::AccessFlags2::TRANSFER_WRITE,
+    )
+}
+
+fn texture_mip_source_barrier(
+    image: vk::Image,
+    subresource_range: vk::ImageSubresourceRange,
+) -> vk::ImageMemoryBarrier2<'static> {
+    texture_image_barrier(
+        image,
+        subresource_range,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::BLIT,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::BLIT,
+        vk::AccessFlags2::TRANSFER_READ,
+    )
+}
+
+fn texture_mip_shader_barrier(
+    image: vk::Image,
+    subresource_range: vk::ImageSubresourceRange,
+) -> vk::ImageMemoryBarrier2<'static> {
+    texture_image_barrier(
+        image,
+        subresource_range,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::BLIT,
+        vk::AccessFlags2::TRANSFER_READ,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    )
+}
+
+fn texture_mip_destination_shader_barrier(
+    image: vk::Image,
+    subresource_range: vk::ImageSubresourceRange,
+) -> vk::ImageMemoryBarrier2<'static> {
+    texture_image_barrier(
+        image,
+        subresource_range,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::BLIT,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    )
+}
+
+fn material_sampler_info(anisotropy: Option<f32>) -> vk::SamplerCreateInfo<'static> {
+    let mut info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+        .min_lod(0.0)
+        .max_lod(vk::LOD_CLAMP_NONE);
+    info = match anisotropy {
+        Some(max_anisotropy) => info.anisotropy_enable(true).max_anisotropy(max_anisotropy),
+        None => info.anisotropy_enable(false).max_anisotropy(1.0),
+    };
+    info
+}
+
+fn sampler_anisotropy(supported: bool, device_limit: f32) -> Option<f32> {
+    if supported {
+        Some(16.0_f32.min(device_limit))
+    } else {
+        None
+    }
+}
+
+fn missing_texture_format_features(supported: vk::FormatFeatureFlags) -> Vec<&'static str> {
+    [
+        (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+        (
+            vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            "SAMPLED_IMAGE_FILTER_LINEAR",
+        ),
+        (vk::FormatFeatureFlags::TRANSFER_SRC, "TRANSFER_SRC"),
+        (vk::FormatFeatureFlags::TRANSFER_DST, "TRANSFER_DST"),
+        (vk::FormatFeatureFlags::BLIT_SRC, "BLIT_SRC"),
+        (vk::FormatFeatureFlags::BLIT_DST, "BLIT_DST"),
+    ]
+    .into_iter()
+    .filter_map(|(feature, name)| (!supported.contains(feature)).then_some(name))
+    .collect()
+}
+
 fn color_subresource_range() -> vk::ImageSubresourceRange {
+    color_mip_subresource_range(0, 1)
+}
+
+fn color_mip_subresource_range(base_mip_level: u32, level_count: u32) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
+        .base_mip_level(base_mip_level)
+        .level_count(level_count)
         .base_array_layer(0)
         .layer_count(1)
 }
@@ -3351,8 +3554,11 @@ mod tests {
         RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER, TextureId, Vertex,
         best_device_index, check_extensions, classify_acquire_result,
         classify_probe_instance_failure, deduplicate_names, evaluate_device, frame_uniform_bytes,
-        index_bytes, missing_extensions, normal_matrix, overlay_vertex_bytes, push_constant_bytes,
-        scaled_extent, scene_viewport, select_composite_alpha, select_surface_extent,
+        index_bytes, material_sampler_info, mip_extent, mip_level_count, missing_extensions,
+        missing_texture_format_features, normal_matrix, overlay_vertex_bytes, push_constant_bytes,
+        sampler_anisotropy, scaled_extent, scene_viewport, select_composite_alpha,
+        select_surface_extent, texture_mip_blit_region, texture_mip_destination_shader_barrier,
+        texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
         timestamp_duration, validate_draws, validate_mesh, validate_overlay, validate_render_scale,
         validate_texture, vertex_bytes,
     };
@@ -3368,6 +3574,200 @@ mod tests {
     #[test]
     fn renderer_is_send() {
         assert_send::<Renderer>();
+    }
+
+    #[test]
+    fn texture_mip_chains_cover_square_odd_npot_and_thin_images() {
+        let cases = [
+            (8, 8, vec![(8, 8), (4, 4), (2, 2), (1, 1)]),
+            (7, 5, vec![(7, 5), (3, 2), (1, 1)]),
+            (13, 9, vec![(13, 9), (6, 4), (3, 2), (1, 1)]),
+            (1, 1, vec![(1, 1)]),
+            (1, 9, vec![(1, 9), (1, 4), (1, 2), (1, 1)]),
+            (9, 1, vec![(9, 1), (4, 1), (2, 1), (1, 1)]),
+        ];
+
+        for (width, height, expected) in cases {
+            let levels = mip_level_count(width, height);
+            let actual = (0..levels)
+                .map(|level| {
+                    let extent = mip_extent(width, height, level);
+                    (extent.width, extent.height)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(levels, expected.len() as u32, "{width}x{height}");
+            assert_eq!(actual, expected, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn texture_mip_blit_region_uses_adjacent_levels_and_floor_extents() {
+        let region = texture_mip_blit_region(
+            1,
+            vk::Extent2D {
+                width: 6,
+                height: 4,
+            },
+            vk::Extent2D {
+                width: 3,
+                height: 2,
+            },
+        );
+
+        assert_eq!(region.src_subresource.mip_level, 1);
+        assert_eq!(region.dst_subresource.mip_level, 2);
+        assert_eq!(region.src_subresource.layer_count, 1);
+        assert_eq!(region.dst_subresource.layer_count, 1);
+        assert_eq!(region.src_offsets[1].x, 6);
+        assert_eq!(region.src_offsets[1].y, 4);
+        assert_eq!(region.dst_offsets[1].x, 3);
+        assert_eq!(region.dst_offsets[1].y, 2);
+    }
+
+    #[test]
+    fn texture_mip_barriers_cover_the_chain_and_publish_each_level() {
+        let image = vk::Image::null();
+        let levels = mip_level_count(16, 1);
+        let initial = texture_upload_barrier(image, levels);
+        assert_eq!(initial.image, image);
+        assert_eq!(initial.subresource_range.base_mip_level, 0);
+        assert_eq!(initial.subresource_range.level_count, levels);
+        assert_eq!(initial.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(initial.new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(initial.src_stage_mask, vk::PipelineStageFlags2::NONE);
+        assert_eq!(initial.src_access_mask, vk::AccessFlags2::NONE);
+        assert_eq!(
+            initial.dst_stage_mask,
+            vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::BLIT
+        );
+        assert_eq!(initial.dst_access_mask, vk::AccessFlags2::TRANSFER_WRITE);
+        assert_eq!(initial.src_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+        assert_eq!(initial.dst_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+
+        for mip_level in 0..levels - 1 {
+            let range = super::color_mip_subresource_range(mip_level, 1);
+            let source = texture_mip_source_barrier(image, range);
+            assert_eq!(source.subresource_range.base_mip_level, mip_level);
+            assert_eq!(source.subresource_range.level_count, 1);
+            assert_eq!(source.old_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            assert_eq!(source.new_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            assert_eq!(
+                source.src_stage_mask,
+                vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::BLIT
+            );
+            assert_eq!(source.src_access_mask, vk::AccessFlags2::TRANSFER_WRITE);
+            assert_eq!(source.dst_stage_mask, vk::PipelineStageFlags2::BLIT);
+            assert_eq!(source.dst_access_mask, vk::AccessFlags2::TRANSFER_READ);
+            assert_eq!(source.src_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+            assert_eq!(source.dst_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+
+            let sampled = texture_mip_shader_barrier(image, range);
+            assert_eq!(sampled.subresource_range.base_mip_level, mip_level);
+            assert_eq!(sampled.subresource_range.level_count, 1);
+            assert_eq!(sampled.old_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            assert_eq!(
+                sampled.new_layout,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            );
+            assert_eq!(sampled.src_stage_mask, vk::PipelineStageFlags2::BLIT);
+            assert_eq!(sampled.src_access_mask, vk::AccessFlags2::TRANSFER_READ);
+            assert_eq!(
+                sampled.dst_stage_mask,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER
+            );
+            assert_eq!(
+                sampled.dst_access_mask,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+            );
+            assert_eq!(sampled.src_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+            assert_eq!(sampled.dst_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+        }
+
+        let final_level = texture_mip_destination_shader_barrier(
+            image,
+            super::color_mip_subresource_range(levels - 1, 1),
+        );
+        assert_eq!(final_level.subresource_range.base_mip_level, levels - 1);
+        assert_eq!(final_level.subresource_range.level_count, 1);
+        assert_eq!(
+            final_level.old_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL
+        );
+        assert_eq!(
+            final_level.new_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+        assert_eq!(
+            final_level.src_stage_mask,
+            vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::BLIT
+        );
+        assert_eq!(
+            final_level.src_access_mask,
+            vk::AccessFlags2::TRANSFER_WRITE
+        );
+        assert_eq!(
+            final_level.dst_stage_mask,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER
+        );
+        assert_eq!(
+            final_level.dst_access_mask,
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+        );
+        assert_eq!(final_level.src_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+        assert_eq!(final_level.dst_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+    }
+
+    #[test]
+    fn material_sampler_enables_mip_filtering_and_optional_anisotropy() {
+        let cases = [
+            (false, 16.0, None),
+            (true, 8.0, Some(8.0)),
+            (true, 32.0, Some(16.0)),
+        ];
+
+        for (supported, device_limit, expected_anisotropy) in cases {
+            let anisotropy = sampler_anisotropy(supported, device_limit);
+            assert_eq!(anisotropy, expected_anisotropy);
+            let info = material_sampler_info(anisotropy);
+            assert_eq!(info.mag_filter, vk::Filter::LINEAR);
+            assert_eq!(info.min_filter, vk::Filter::LINEAR);
+            assert_eq!(info.mipmap_mode, vk::SamplerMipmapMode::LINEAR);
+            assert_eq!(info.min_lod, 0.0);
+            assert_eq!(info.max_lod, vk::LOD_CLAMP_NONE);
+            assert_eq!(
+                info.anisotropy_enable == vk::TRUE,
+                expected_anisotropy.is_some()
+            );
+            assert_eq!(info.max_anisotropy, expected_anisotropy.unwrap_or(1.0));
+        }
+    }
+
+    #[test]
+    fn texture_device_requirements_report_each_missing_format_feature() {
+        let features = [
+            (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+            (
+                vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+                "SAMPLED_IMAGE_FILTER_LINEAR",
+            ),
+            (vk::FormatFeatureFlags::TRANSFER_SRC, "TRANSFER_SRC"),
+            (vk::FormatFeatureFlags::TRANSFER_DST, "TRANSFER_DST"),
+            (vk::FormatFeatureFlags::BLIT_SRC, "BLIT_SRC"),
+            (vk::FormatFeatureFlags::BLIT_DST, "BLIT_DST"),
+        ];
+
+        let required_features = features
+            .iter()
+            .fold(vk::FormatFeatureFlags::empty(), |required, (feature, _)| {
+                required | *feature
+            });
+        assert!(missing_texture_format_features(required_features).is_empty());
+        for (feature, name) in features {
+            assert_eq!(
+                missing_texture_format_features(required_features & !feature),
+                [name]
+            );
+        }
     }
 
     #[test]
