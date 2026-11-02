@@ -1,0 +1,8 @@
+{
+  "ICD": {
+    "api_version": "1.4.0",
+    "is_portability_driver": true,
+    "library_path": "./libMoltenVK.dylib"
+  },
+  "file_format_version": "1.0.0"
+}

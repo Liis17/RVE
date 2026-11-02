@@ -1,0 +1,18 @@
+[package]
+name = "neko-demo-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+engine-assets = { path = "../../engine/engine-assets" }
+engine-project = { path = "../../engine/engine-project" }
+engine-resources = { path = "../../engine/engine-resources" }
+engine-scene = { path = "../../engine/engine-scene" }
+engine-script = { path = "../../engine/engine-script" }
+
+[[test]]
+name = "demo"
+path = "demo.rs"
