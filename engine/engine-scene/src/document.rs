@@ -76,7 +76,8 @@ impl SceneDocument {
         &self.source_label
     }
 
-    pub(crate) fn validate(&self) -> Result<(), SceneError> {
+    /// Проверяет идентификаторы, ссылки, числа и мировые базисы уже изменённого документа.
+    pub fn validate(&self) -> Result<(), SceneError> {
         let source = &self.source_label;
         let mut asset_paths = HashSet::with_capacity(self.assets.len());
         for asset in &self.assets {
@@ -816,6 +817,17 @@ fov_deg = 60.0
 near = 0.1
 far = 100.0
 "#;
+
+    #[test]
+    fn validate_checks_a_document_changed_after_parsing() {
+        let mut document = parse(VALID).unwrap();
+        assert!(document.validate().is_ok());
+        document.objects[0].camera.as_mut().unwrap().near = -1.0;
+        let error = document.validate().unwrap_err();
+        assert_eq!(error.object_id.as_deref(), Some("camera"));
+        document.objects.clear();
+        assert!(document.validate().unwrap_err().message.contains("камер"));
+    }
 
     fn parse(input: &str) -> Result<SceneDocument, super::SceneError> {
         SceneDocument::parse("scenes/test.rvescene", input)
