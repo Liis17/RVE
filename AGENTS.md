@@ -27,6 +27,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 | `Obsidian/RVEVault/Engine/EngineRuntime.md` | Игровой runtime и player |
 | `Obsidian/RVEVault/Engine/RveBuild.md` | Сборка проекта в release player |
 | `Obsidian/RVEVault/Engine/Sandbox.md` | Пример приложения и CLI |
+| `Obsidian/RVEVault/Engine/RveEditor.md` | Графический редактор сцен |
 
 ### Чтение памяти
 
@@ -65,6 +66,8 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
   - `rve-build`: `engine-assets`, `engine-files`, `engine-pak`, `engine-project`,
     `engine-resources`, `engine-scene`.
   - `rve-player`: `engine-runtime`.
+  - `rve-editor`: `engine-assets`, `engine-files`, `engine-project`, `engine-render`,
+    `engine-resources`, `engine-scene`, `engine-script`, `engine-window`.
 - При изменении `engine-platform` проверяй общий интерфейс, адаптеры `engine-platform-windows` и `engine-platform-macos` и вызовы из renderer.
 - Контракты: учитывай `WindowHandler`, `WindowConfig`, `RendererConfig`, `FrameStatus`, ошибки библиотек, CLI sandbox и коды завершения. При их изменении проверяй производителей и потребителей.
 - Платформы: учитывай Windows с Vulkan-драйвером и macOS с Vulkan loader и MoltenVK. Меняй только затронутые платформы и явно указывай непроверенные.
@@ -96,6 +99,7 @@ cargo run -p sandbox
 cargo run -p sandbox -- --frames 120
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
 cargo run -p sandbox -- --frames 300 --resize-test
+cargo run -p rve-editor -- --project ../examples/demo-game
 ~~~
 
 Для CLI и границ текущего Vulkan пути смотри `README.md`; для контрактов — соответствующие заметки в `Obsidian/RVEVault/`.

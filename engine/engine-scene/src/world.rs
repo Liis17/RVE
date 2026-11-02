@@ -219,6 +219,12 @@ impl World {
         self.world_matrices.get(handle.0).copied()
     }
 
+    /// Камера объекта по текущим мировым матрицам; `None`, если камеры нет или базис невалиден.
+    pub fn camera_of(&self, handle: ObjectHandle) -> Option<Camera> {
+        let settings = self.object(handle)?.camera?;
+        camera_from_matrix(self.world_matrix(handle)?, settings)
+    }
+
     /// Пересчитывает мировые матрицы в порядке от родителя к потомкам.
     pub fn recalculate_world_matrices(&mut self) {
         for handle in &self.topological_order {
@@ -232,15 +238,22 @@ impl World {
 
     /// Строит кадр и возвращает первые предупреждения о невалидных базисах.
     /// Для камеры или света сохраняется последнее валидное динамическое состояние.
+    /// Камера кадра — первая в порядке документа; остальные на кадр не влияют.
     pub fn build_frame(&mut self) -> (SceneFrame, Vec<SceneWarning>) {
         self.recalculate_world_matrices();
         let mut warnings = Vec::new();
         let mut camera = self.last_valid_camera;
         let mut light = self.last_valid_light;
+        let main_camera = self
+            .objects
+            .iter()
+            .position(|object| object.camera.is_some());
 
         for index in 0..self.objects.len() {
             let matrix = self.world_matrices[index];
-            let camera_settings = self.objects[index].camera;
+            let camera_settings = self.objects[index]
+                .camera
+                .filter(|_| main_camera == Some(index));
             let light_settings = self.objects[index].directional_light;
             if let Some(settings) = camera_settings {
                 if let Some(value) = camera_from_matrix(matrix, settings) {
@@ -579,6 +592,41 @@ scale=[0.0,0.0,0.0]
             world.object(handle).unwrap().transform.position,
             transform.position
         );
+    }
+
+    #[test]
+    fn first_camera_in_the_document_drives_the_frame_and_others_stay_readable() {
+        let document = SceneDocument::parse(
+            "cameras.rvescene",
+            r#"
+[[objects]]
+id="main"
+[objects.transform]
+position=[1.0,0.0,0.0]
+[objects.camera]
+fov_deg=60.0
+near=0.1
+far=10.0
+[[objects]]
+id="second"
+[objects.transform]
+position=[2.0,0.0,0.0]
+[objects.camera]
+fov_deg=40.0
+near=0.1
+far=10.0
+"#,
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        assert_eq!(world.build_frame().0.camera.position.x, 1.0);
+        let second = world.handle("second").unwrap();
+        assert_eq!(world.camera_of(second).unwrap().position.x, 2.0);
+        let mut moved = *world.local_transform(second).unwrap();
+        moved.position.x = 5.0;
+        world.set_local_transform(second, moved).unwrap();
+        assert_eq!(world.build_frame().0.camera.position.x, 1.0);
+        assert_eq!(world.camera_of(second).unwrap().position.x, 5.0);
     }
 
     #[test]

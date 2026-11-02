@@ -48,6 +48,14 @@ class PackageSelectionTests(unittest.TestCase):
     def select(self, paths):
         return affected_packages(self.metadata, paths)
 
+    def test_root_level_application_package_owns_its_paths(self):
+        self.metadata["packages"].append(
+            package("rve-editor", ["render"], directory="editor")
+        )
+        self.metadata["workspace_members"].append("rve-editor")
+        self.assertEqual(self.select(["editor/src/main.rs"]), ["rve-editor"])
+        self.assertIn("rve-editor", self.select(["engine/render/src/lib.rs"]))
+
     def test_independent_package_does_not_select_other_projects(self):
         self.assertEqual(self.select(["engine/audio/src/lib.rs"]), ["audio"])
 
