@@ -147,6 +147,9 @@ impl SceneDocument {
                     require_asset_path(source, object, &asset_paths, texture, "текстура")?;
                     require_extension(source, object, texture, "png", "текстура")?;
                 }
+                if let Some(material) = &mesh.material {
+                    validate_material_override(source, object, &asset_paths, material)?;
+                }
             }
             for script in &object.lite_scripts {
                 require_asset_path(source, object, &asset_paths, &script.path, "lite-скрипт")?;
@@ -286,14 +289,46 @@ pub struct CameraComponent {
     pub far: f32,
 }
 
-/// Экземпляр FBX и необязательная замена PNG-текстуры.
+/// Экземпляр FBX, необязательная замена base-color PNG и override материала.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshRenderer {
     #[serde(with = "virtual_path_serde")]
     pub model: VirtualPath,
-    #[serde(default, with = "option_virtual_path_serde")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_virtual_path_serde"
+    )]
     pub texture: Option<VirtualPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<MaterialOverride>,
+}
+
+/// Необязательные замены факторов и текстур FBX-материала.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_color: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metallic: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness: Option<f32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_virtual_path_serde"
+    )]
+    pub metallic_roughness_texture: Option<VirtualPath>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_virtual_path_serde"
+    )]
+    pub normal_texture: Option<VirtualPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_scale: Option<f32>,
 }
 
 /// Цвет направленного света, ambient и необязательная проекция теней.
@@ -570,6 +605,18 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, key, path))
             }));
+            if let Some(material) = renderer.get("material").and_then(toml::Value::as_table) {
+                paths.extend(
+                    ["metallic_roughness_texture", "normal_texture"]
+                        .into_iter()
+                        .filter_map(|key| {
+                            material
+                                .get(key)
+                                .and_then(toml::Value::as_str)
+                                .map(|path| (object_id, key, path))
+                        }),
+                );
+            }
         }
         if let Some(scripts) = object.get("lite_scripts").and_then(toml::Value::as_array) {
             paths.extend(scripts.iter().filter_map(|script| {
@@ -616,6 +663,63 @@ fn require_asset_path(
             format!("{kind} /{} отсутствует в [[assets]]", path.as_str()),
         ))
     }
+}
+
+fn validate_material_override(
+    source: &str,
+    object: &SceneObject,
+    assets: &HashSet<VirtualPath>,
+    material: &MaterialOverride,
+) -> Result<(), SceneError> {
+    let invalid_factor = |field: &str| {
+        SceneError::new(
+            source,
+            Some(&object.id),
+            format!("{field} должен быть конечным и находиться в диапазоне [0, 1]"),
+        )
+    };
+    if material.base_color.is_some_and(|color| {
+        color
+            .into_iter()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    }) {
+        return Err(invalid_factor("material.base_color"));
+    }
+    if material
+        .metallic
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(invalid_factor("material.metallic"));
+    }
+    if material
+        .roughness
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(invalid_factor("material.roughness"));
+    }
+    if material
+        .normal_scale
+        .is_some_and(|value| !value.is_finite())
+    {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "material.normal_scale должен быть конечным",
+        ));
+    }
+    for (path, kind) in [
+        (
+            material.metallic_roughness_texture.as_ref(),
+            "metallic-roughness текстура",
+        ),
+        (material.normal_texture.as_ref(), "normal текстура"),
+    ] {
+        if let Some(path) = path {
+            require_asset_path(source, object, assets, path, kind)?;
+            require_extension(source, object, path, "png", kind)?;
+        }
+    }
+    Ok(())
 }
 
 fn require_extension(
@@ -972,6 +1076,134 @@ scale=[1.0,1.0,0.0]
             "[[assets]]\npath=\"/models/A.FBX\"\n[[assets]]\npath=\"/textures/A.PNG\"\n[[assets]]\npath=\"/scripts/a.LUA\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/A.FBX\"\ntexture=\"/textures/A.PNG\"\n[[objects.lite_scripts]]\npath=\"/scripts/a.LUA\"\n"
         );
         assert!(parse(&good).is_ok());
+    }
+
+    #[test]
+    fn material_override_round_trips_and_legacy_mesh_renderer_defaults() {
+        let input = format!(
+            "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/textures/mr.png\"\n[[assets]]\npath=\"/textures/normal.png\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\nbase_color=[0.2,0.4,0.6]\nmetallic=0.7\nroughness=0.3\nmetallic_roughness_texture=\"/textures/mr.png\"\nnormal_texture=\"/textures/normal.png\"\nnormal_scale=0.5\n"
+        );
+        let document = parse(&input).unwrap();
+        let material = document.objects[1]
+            .mesh_renderer
+            .as_ref()
+            .unwrap()
+            .material
+            .as_ref()
+            .unwrap();
+        assert_eq!(material.base_color, Some([0.2, 0.4, 0.6]));
+        assert_eq!(material.metallic, Some(0.7));
+        assert_eq!(material.roughness, Some(0.3));
+        assert_eq!(
+            material
+                .metallic_roughness_texture
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "textures/mr.png"
+        );
+        assert_eq!(
+            material.normal_texture.as_ref().unwrap().as_str(),
+            "textures/normal.png"
+        );
+        assert_eq!(material.normal_scale, Some(0.5));
+
+        let serialized = document.to_toml().unwrap();
+        let round_trip = parse(&serialized).unwrap();
+        assert_eq!(
+            round_trip.objects[1]
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .material
+                .as_ref()
+                .unwrap()
+                .metallic,
+            Some(0.7)
+        );
+        assert!(!serialized.contains("material = \""), "{serialized}");
+
+        let partial = parse(&format!(
+            "[[assets]]\npath=\"/models/a.fbx\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\nroughness=0.4\n"
+        ))
+        .unwrap()
+        .to_toml()
+        .unwrap();
+        assert!(partial.contains("roughness = 0.4"), "{partial}");
+        assert!(!partial.contains("base_color"), "{partial}");
+        assert!(!partial.contains("metallic ="), "{partial}");
+        assert!(!partial.contains("normal_scale"), "{partial}");
+
+        let legacy = parse(&format!(
+            "[[assets]]\npath=\"/models/a.fbx\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n"
+        ))
+        .unwrap();
+        assert!(
+            legacy.objects[1]
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .material
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn material_override_rejects_unknown_fields_out_of_range_factors_and_non_finite_scale() {
+        let scene = |material: &str| {
+            format!(
+                "[[assets]]\npath=\"/models/a.fbx\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\n{material}\n"
+            )
+        };
+        assert!(parse(&scene("unexpected=true")).is_err());
+        for values in [
+            "base_color=[-0.1,0.5,0.5]",
+            "base_color=[0.5,1.1,0.5]",
+            "base_color=[nan,0.5,0.5]",
+            "metallic=-0.01",
+            "metallic=1.01",
+            "metallic=nan",
+            "roughness=-0.01",
+            "roughness=1.01",
+            "roughness=inf",
+            "normal_scale=nan",
+            "normal_scale=inf",
+        ] {
+            assert!(parse(&scene(values)).is_err(), "accepted {values}");
+        }
+        assert!(
+            parse(&scene(
+                "base_color=[0,1,0.5]\nmetallic=0\nroughness=1\nnormal_scale=-2"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn material_override_paths_must_be_valid_declared_png_assets() {
+        let scene = |assets: &str, material: &str| {
+            format!(
+                "{assets}\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\n{material}\n"
+            )
+        };
+        let model = "[[assets]]\npath=\"/models/a.fbx\"";
+        error(
+            &scene(model, "normal_texture=\"/textures/missing.png\""),
+            "отсутствует в [[assets]]",
+        );
+        let wrong_extension = format!("{model}\n[[assets]]\npath=\"/textures/normal.jpg\"");
+        error(
+            &scene(&wrong_extension, "normal_texture=\"/textures/normal.jpg\""),
+            "расширение .png",
+        );
+        let invalid_path = scene(model, "normal_texture=\"/textures/../normal.png\"");
+        let error = parse(&invalid_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("normal_texture /textures/../normal.png: некорректный virtual path"),
+            "{error}"
+        );
     }
 
     #[test]
