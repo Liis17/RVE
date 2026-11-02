@@ -7,12 +7,14 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-const SHADERS: [(&str, naga::ShaderStage); 5] = [
+const SHADERS: [(&str, naga::ShaderStage); 7] = [
     ("mesh.vert", naga::ShaderStage::Vertex),
     ("mesh.frag", naga::ShaderStage::Fragment),
     ("shadow.vert", naga::ShaderStage::Vertex),
     ("overlay.vert", naga::ShaderStage::Vertex),
     ("overlay.frag", naga::ShaderStage::Fragment),
+    ("ui.vert", naga::ShaderStage::Vertex),
+    ("ui.frag", naga::ShaderStage::Fragment),
 ];
 
 fn main() {

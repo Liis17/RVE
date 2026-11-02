@@ -8,11 +8,22 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+use ui::{
+    PackedUi, RetireQueue, UiDraw, is_srgb_format, pack_ui, validate_texture_region,
+    validate_viewport_size,
+};
+
+mod ui;
+
+pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+/// egui хранит значения в гамма-пространстве, поэтому они читаются без перевода; шейдер сам
+/// переводит результат для sRGB-swapchain, и смешивание в этом случае идёт в линейном пространстве.
+const UI_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const SHADOW_MAP_SIZE: u32 = 2048;
 /// Максимальное ожидание swapchain image перед пропуском кадра.
 const ACQUIRE_TIMEOUT_NS: u64 = 100_000_000;
@@ -32,7 +43,10 @@ const SURFACE_FORMAT_FEATURES: vk::FormatFeatureFlags = vk::FormatFeatureFlags::
     vk::FormatFeatureFlags::BLIT_DST.as_raw()
         | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND.as_raw(),
 );
+const UI_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.vert.spv"));
+const UI_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.frag.spv"));
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
+const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 /// Два timestamp на слот кадра: перед shadow pass и после scene pass.
 const TIMESTAMP_QUERY_COUNT: u32 = 2;
 /// Белая текстура 1x1 создаётся при инициализации и используется для `texture: None`.
@@ -346,6 +360,10 @@ pub struct Renderer {
     shadow_pipeline: Option<vk::Pipeline>,
     overlay_pipeline_layout: Option<vk::PipelineLayout>,
     overlay_pipeline: Option<vk::Pipeline>,
+    ui_pipeline_layout: Option<vk::PipelineLayout>,
+    ui_pipeline: Option<vk::Pipeline>,
+    /// Линейный sampler с `CLAMP_TO_EDGE`: `REPEAT` дал бы артефакты на краях атласа шрифтов.
+    ui_sampler: Option<vk::Sampler>,
     /// Значащие биты timestamp очереди; ноль — измерение времени GPU недоступно.
     timestamp_valid_bits: u32,
     /// Наносекунд на один тик timestamp.
@@ -359,8 +377,13 @@ pub struct Renderer {
     shadow_sampler: Option<vk::Sampler>,
     shadow_image: Option<DeviceImage>,
     max_texture_size: u32,
-    meshes: Vec<MeshBuffers>,
-    textures: Vec<Texture>,
+    /// Индекс — `MeshId`; слот удалённого меша остаётся пустым, id не используются повторно.
+    meshes: Vec<Option<MeshBuffers>>,
+    /// Индекс — `TextureId`; слот удалённой текстуры остаётся пустым.
+    textures: Vec<Option<Texture>>,
+    ui_textures: Vec<Option<UiTexture>>,
+    viewports: Vec<Option<Viewport>>,
+    retired: RetireQueue<RetiredResource>,
     frames: Vec<FrameResources>,
     frame_slot: usize,
     swapchain: Option<SwapchainBundle>,
@@ -403,6 +426,9 @@ impl Renderer {
             shadow_pipeline: None,
             overlay_pipeline_layout: None,
             overlay_pipeline: None,
+            ui_pipeline_layout: None,
+            ui_pipeline: None,
+            ui_sampler: None,
             timestamp_valid_bits: 0,
             timestamp_period: 0.0,
             pending_gpu_time: None,
@@ -416,6 +442,9 @@ impl Renderer {
             max_texture_size: 0,
             meshes: Vec::new(),
             textures: Vec::new(),
+            ui_textures: Vec::new(),
+            viewports: Vec::new(),
+            retired: RetireQueue::new(FRAMES_IN_FLIGHT),
             frames: Vec::new(),
             frame_slot: 0,
             swapchain: None,
@@ -477,12 +506,23 @@ impl Renderer {
             vk::BufferUsageFlags::INDEX_BUFFER,
             index_bytes(indices),
         )?;
-        self.meshes.push(MeshBuffers {
+        self.meshes.push(Some(MeshBuffers {
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
-        });
+        }));
         Ok(MeshId(self.meshes.len() - 1))
+    }
+
+    /// Удаляет меш; буферы освобождаются после завершения отправленных кадров.
+    pub fn destroy_mesh(&mut self, mesh: MeshId) -> Result<(), RenderError> {
+        let buffers = self
+            .meshes
+            .get_mut(mesh.0)
+            .and_then(Option::take)
+            .ok_or(RenderError::InvalidMesh("MeshId не принадлежит renderer"))?;
+        self.retired.retire(RetiredResource::Mesh(buffers));
+        Ok(())
     }
 
     /// Загружает sRGB-текстуру RGBA8 со строками сверху вниз и ждёт завершения копирования.
@@ -494,13 +534,175 @@ impl Renderer {
     ) -> Result<TextureId, RenderError> {
         validate_texture(width, height, rgba.len(), self.max_texture_size)?;
         let texture = self.upload_texture(width, height, rgba)?;
-        self.textures.push(texture);
+        self.textures.push(Some(texture));
         Ok(TextureId(self.textures.len() - 1))
+    }
+
+    /// Удаляет текстуру; ресурсы освобождаются после завершения отправленных кадров.
+    pub fn destroy_texture(&mut self, texture: TextureId) -> Result<(), RenderError> {
+        let unknown =
+            || RenderError::InvalidTexture("TextureId не принадлежит renderer".to_owned());
+        // Встроенная белая текстура не выдаётся наружу и нужна всем DrawCommand без текстуры.
+        if texture.0 == WHITE_TEXTURE {
+            return Err(unknown());
+        }
+        let resource = self
+            .textures
+            .get_mut(texture.0)
+            .and_then(Option::take)
+            .ok_or_else(unknown)?;
+        self.retired.retire(RetiredResource::Texture(resource));
+        Ok(())
+    }
+
+    /// Наибольшая сторона изображения, поддерживаемая GPU.
+    pub fn max_texture_size(&self) -> u32 {
+        self.max_texture_size
+    }
+
+    /// Загружает UI-текстуру RGBA8: предумноженный цвет в гамма-пространстве, строки сверху вниз.
+    pub fn create_ui_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<UiTextureId, RenderError> {
+        validate_texture(width, height, rgba.len(), self.max_texture_size)?;
+        let sampler = self
+            .ui_sampler
+            .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?;
+        let texture = self.upload_image(UI_TEXTURE_FORMAT, sampler, width, height, rgba)?;
+        self.ui_textures.push(Some(UiTexture {
+            texture,
+            extent: vk::Extent2D { width, height },
+        }));
+        Ok(UiTextureId(self.ui_textures.len() - 1))
+    }
+
+    /// Перезаписывает область UI-текстуры и ждёт завершения копирования.
+    ///
+    /// Барьер в той же очереди упорядочивает запись относительно уже отправленных кадров.
+    pub fn update_ui_texture(
+        &mut self,
+        texture: UiTextureId,
+        region: [u32; 4],
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
+        let target = self.ui_texture(texture)?;
+        validate_texture_region(region, target.extent, rgba.len())?;
+        let image = target.texture.image.image;
+        let device = self.device()?;
+        let staging = HostBuffer::new(
+            self.instance()?,
+            device,
+            self.physical_device,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            rgba,
+        )?;
+        let [x, y, width, height] = region;
+        self.submit_once(|command_buffer| {
+            // Прежний layout сохраняет остальную часть изображения: это важно для атласа шрифтов.
+            let to_transfer = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_subresource_range());
+            pipeline_barrier(device, command_buffer, to_transfer);
+            let copy = [vk::BufferImageCopy::default()
+                .image_subresource(color_subresource_layers())
+                .image_offset(vk::Offset3D {
+                    x: x as i32,
+                    y: y as i32,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })];
+            // SAFETY: the region was validated against the image and staging holds its texels.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    staging.buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &copy,
+                )
+            };
+            let to_shader = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_subresource_range());
+            pipeline_barrier(device, command_buffer, to_shader);
+        })
+    }
+
+    /// Удаляет UI-текстуру; ресурсы освобождаются после завершения отправленных кадров.
+    pub fn free_ui_texture(&mut self, texture: UiTextureId) -> Result<(), RenderError> {
+        self.ui_texture(texture)?;
+        if let Some(resource) = self.ui_textures[texture.0].take() {
+            self.retired.retire(RetiredResource::UiTexture(resource));
+        }
+        Ok(())
+    }
+
+    /// Создаёт цель рендера сцены для UI. Изображения выделяются при первом кадре.
+    pub fn create_viewport(&mut self, width: u32, height: u32) -> Result<ViewportId, RenderError> {
+        validate_viewport_size(width, height, self.max_texture_size)?;
+        self.viewports.push(Some(Viewport {
+            extent: vk::Extent2D { width, height },
+            targets: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
+        }));
+        Ok(ViewportId(self.viewports.len() - 1))
+    }
+
+    /// Запоминает размер в физических пикселях; ноль пропускает scene pass этого viewport.
+    ///
+    /// Изображения каждого кадрового слота заменяются при его следующем кадре после ожидания
+    /// fence: они используются только своим слотом, поэтому ждать простоя GPU не нужно.
+    pub fn resize_viewport(
+        &mut self,
+        viewport: ViewportId,
+        width: u32,
+        height: u32,
+    ) -> Result<(), RenderError> {
+        validate_viewport_size(width, height, self.max_texture_size)?;
+        self.viewports
+            .get_mut(viewport.0)
+            .and_then(Option::as_mut)
+            .ok_or_else(unknown_viewport)?
+            .extent = vk::Extent2D { width, height };
+        Ok(())
+    }
+
+    /// Удаляет viewport; изображения освобождаются после завершения отправленных кадров.
+    pub fn free_viewport(&mut self, viewport: ViewportId) -> Result<(), RenderError> {
+        let resource = self
+            .viewports
+            .get_mut(viewport.0)
+            .and_then(Option::take)
+            .ok_or_else(unknown_viewport)?;
+        self.retired.retire(RetiredResource::Viewport(resource));
+        Ok(())
     }
 
     /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
-        validate_draws(frame.draws, self.meshes.len(), self.textures.len())?;
+        validate_draws(frame.draws, &self.meshes, &self.textures)?;
         validate_overlay(frame.overlay)?;
         let uniforms = frame_uniform_bytes(frame)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
@@ -537,6 +739,7 @@ impl Renderer {
         )? {
             self.pending_gpu_time = Some(gpu_time);
         }
+        self.retired.slot_completed(frame_slot);
         // Fence слота дождались, поэтому GPU больше не читает вершины оверлея этого слота.
         frame_resources.write_overlay(&instance, &device, self.physical_device, frame.overlay)?;
         let timestamps = frame_resources.timestamps;
@@ -549,40 +752,30 @@ impl Renderer {
         // Fence слота дождались, поэтому GPU больше не читает этот буфер.
         frame_uniforms.buffer.write(&uniforms)?;
         let frame_set = frame_uniforms.set;
-        // SAFETY: swapchain живёт в self до окончания acquire и получает валидный semaphore.
-        let acquire_result = unsafe {
-            swapchain_loader.acquire_next_image(
-                swapchain_handle,
-                ACQUIRE_TIMEOUT_NS,
-                image_available,
-                vk::Fence::null(),
-            )
-        };
-        let (image_index, acquire_suboptimal) = match classify_acquire_result(acquire_result) {
-            AcquireAction::Acquired {
-                image_index,
-                suboptimal,
-            } => (image_index, suboptimal),
-            AcquireAction::OutOfDate => {
-                self.swapchain_dirty = true;
-                return Ok(FrameStatus::Skipped);
-            }
-            AcquireAction::Skipped => {
-                // TIMEOUT/NOT_READY do not signal image_available; the fence is still signaled,
-                // frame_slot is unchanged, and reset_fences runs only after a successful acquire.
-                return Ok(FrameStatus::Skipped);
-            }
-            AcquireAction::Failed(error) => return Err(RenderError::Vulkan(error)),
-        };
-        let image_index = image_index as usize;
-        if image_index >= image_count {
-            self.swapchain_dirty = true;
-            return Err(RenderError::InvalidState(
-                "Vulkan вернул неверный индекс swapchain image",
-            ));
-        }
-
         let offscreen_extent = scaled_extent(swapchain.extent, self.config.render_scale);
+        // Цели создаются при первом кадре: редактору они не нужны. Выделение идёт до acquire,
+        // чтобы ошибка памяти не оставила захваченный image и сигнальный semaphore.
+        let frame_resources = &mut self.frames[frame_slot];
+        if frame_resources.target.is_none() {
+            frame_resources.target = Some(OffscreenTarget::new(
+                &instance,
+                &device,
+                self.physical_device,
+                offscreen_extent,
+                vk::ImageUsageFlags::TRANSFER_SRC,
+            )?);
+        }
+        let Some((image_index, acquire_suboptimal)) = acquire_image(
+            &swapchain_loader,
+            swapchain_handle,
+            image_available,
+            image_count,
+            &mut self.swapchain_dirty,
+        )?
+        else {
+            return Ok(FrameStatus::Skipped);
+        };
+
         let shadow = ShadowPass {
             pipeline: self
                 .shadow_pipeline
@@ -615,7 +808,7 @@ impl Renderer {
         };
         let frame_resources = &mut self.frames[frame_slot];
         let overlay =
-            match &frame_resources.overlay_buffer {
+            match &frame_resources.overlay_buffer.buffer {
                 Some(buffer) if !frame.overlay.is_empty() => Some(OverlayPass {
                     pipeline: self
                         .overlay_pipeline
@@ -647,13 +840,328 @@ impl Renderer {
             overlay.as_ref(),
         )?;
 
+        self.submit_and_present(
+            image_index,
+            acquire_suboptimal,
+            vk::PipelineStageFlags2::TRANSFER,
+            timestamps.is_some(),
+        )
+    }
+
+    /// Рисует необязательную сцену в viewport target и UI прямо в swapchain image.
+    ///
+    /// `clear` очищает окно перед UI и задаётся в значениях формата swapchain. `Frame::overlay`
+    /// здесь не используется. `UiImage::Viewport` может ссылаться только на viewport из `scene`;
+    /// примитивы viewport нулевого размера пропускаются вместе со scene pass.
+    pub fn render_frame_with_ui(
+        &mut self,
+        scene: Option<(ViewportId, &Frame<'_>)>,
+        ui: &[UiPrimitive<'_>],
+        clear: [f32; 4],
+    ) -> Result<FrameStatus, RenderError> {
+        let scene_uniforms = match scene {
+            Some((viewport, frame)) => {
+                validate_draws(frame.draws, &self.meshes, &self.textures)?;
+                self.viewports
+                    .get(viewport.0)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(unknown_viewport)?;
+                Some(frame_uniform_bytes(frame)?)
+            }
+            None => None,
+        };
+        let packed = pack_ui(ui, self.output_extent)?;
+        self.validate_ui_images(&packed, scene.map(|(viewport, _)| viewport))?;
+        if self.output_extent.width == 0 || self.output_extent.height == 0 {
+            return Ok(FrameStatus::Skipped);
+        }
+        if self.swapchain_dirty || self.swapchain.is_none() {
+            self.recreate_swapchain()?;
+            return Ok(FrameStatus::Skipped);
+        }
+
+        let instance = self.instance()?.clone();
+        let device = self.device()?.clone();
+        let swapchain_loader = self.swapchain_loader()?.clone();
+        let frame_slot = self.frame_slot;
+        let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
+            "swapchain отсутствует после создания",
+        ))?;
+        let frame_resources = self
+            .frames
+            .get_mut(frame_slot)
+            .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
+        let command_buffer = frame_resources.command_buffer;
+        // SAFETY: fence принадлежит текущему слоту; его прошлая работа завершается перед повторным использованием.
+        unsafe { device.wait_for_fences(&[frame_resources.fence], true, u64::MAX) }?;
+        if let Some(gpu_time) = frame_resources.read_gpu_time(
+            &device,
+            self.timestamp_valid_bits,
+            self.timestamp_period,
+        )? {
+            self.pending_gpu_time = Some(gpu_time);
+        }
+        self.retired.slot_completed(frame_slot);
+        // Fence слота дождались, поэтому GPU больше не читает буферы этого слота.
+        frame_resources.ui_vertices.write(
+            &instance,
+            &device,
+            self.physical_device,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &packed.vertices,
+        )?;
+        frame_resources.ui_indices.write(
+            &instance,
+            &device,
+            self.physical_device,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &packed.indices,
+        )?;
+        let image_available = frame_resources.image_available;
+        let frame_uniforms =
+            self.frame_uniforms
+                .get(frame_slot)
+                .ok_or(RenderError::InvalidState(
+                    "нет uniform-буфера текущего кадра",
+                ))?;
+        if let Some(uniforms) = &scene_uniforms {
+            frame_uniforms.buffer.write(uniforms)?;
+        }
+        let frame_set = frame_uniforms.set;
+        // Fence слота завершён, поэтому прежние изображения слота свободны. Выделение идёт до
+        // acquire, чтобы ошибка памяти не оставила захваченный image и сигнальный semaphore.
+        let mut rendered_viewport = None;
+        if let Some((viewport, _)) = scene {
+            let sampler = self
+                .ui_sampler
+                .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?;
+            let layout = self.texture_set_layout()?;
+            let physical_device = self.physical_device;
+            let entry = self.viewports[viewport.0]
+                .as_mut()
+                .ok_or_else(unknown_viewport)?;
+            let extent = entry.extent;
+            if extent.width != 0 && extent.height != 0 {
+                let slot_target = &mut entry.targets[frame_slot];
+                if slot_target
+                    .as_ref()
+                    .is_none_or(|target| target.extent != extent)
+                {
+                    *slot_target = None;
+                    *slot_target = Some(ViewportTarget::new(
+                        &instance,
+                        &device,
+                        physical_device,
+                        extent,
+                        layout,
+                        sampler,
+                    )?);
+                }
+                rendered_viewport = Some(viewport);
+            }
+        }
+
+        let Some((image_index, acquire_suboptimal)) = acquire_image(
+            &swapchain_loader,
+            swapchain.handle,
+            image_available,
+            swapchain.images.len(),
+            &mut self.swapchain_dirty,
+        )?
+        else {
+            return Ok(FrameStatus::Skipped);
+        };
+
+        let mut draws = Vec::with_capacity(packed.draws.len());
+        for draw in &packed.draws {
+            let (set, image_is_linear) = match draw.image {
+                UiImage::Texture(texture) => (self.ui_texture(texture)?.texture.set, false),
+                UiImage::Viewport(viewport) => {
+                    if rendered_viewport != Some(viewport) {
+                        continue;
+                    }
+                    let target = self.viewports[viewport.0]
+                        .as_ref()
+                        .and_then(|entry| entry.targets[frame_slot].as_ref())
+                        .ok_or_else(unknown_viewport)?;
+                    (target.set, true)
+                }
+            };
+            draws.push((*draw, set, image_is_linear));
+        }
+
+        let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
+            "swapchain отсутствует после создания",
+        ))?;
+        let scene_pass = match (scene, rendered_viewport) {
+            (Some((_, frame)), Some(_)) => {
+                let pipeline_layout = self
+                    .pipeline_layout
+                    .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+                Some((
+                    frame,
+                    ShadowPass {
+                        pipeline: self
+                            .shadow_pipeline
+                            .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?,
+                        pipeline_layout,
+                        frame_set,
+                        meshes: &self.meshes,
+                        draws: frame.draws,
+                        enabled: frame.shadow_view_projection.is_some(),
+                    },
+                    ScenePass {
+                        pipeline: self
+                            .pipeline
+                            .ok_or(RenderError::InvalidState("pipeline отсутствует"))?,
+                        pipeline_layout,
+                        frame_set,
+                        meshes: &self.meshes,
+                        textures: &self.textures,
+                        draws: frame.draws,
+                        clear_color: frame.clear_color,
+                        timestamps: self.frames[frame_slot].timestamps,
+                    },
+                ))
+            }
+            _ => None,
+        };
+        let timestamps = scene_pass
+            .as_ref()
+            .is_some_and(|(_, _, pass)| pass.timestamps.is_some());
+        let shadow_image = self
+            .shadow_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
+        let ui_pass = UiPass {
+            pipeline: self
+                .ui_pipeline
+                .ok_or(RenderError::InvalidState("UI pipeline отсутствует"))?,
+            pipeline_layout: self
+                .ui_pipeline_layout
+                .ok_or(RenderError::InvalidState("UI pipeline layout отсутствует"))?,
+            vertex_buffer: self.frames[frame_slot]
+                .ui_vertices
+                .buffer
+                .as_ref()
+                .map(|buffer| buffer.buffer),
+            index_buffer: self.frames[frame_slot]
+                .ui_indices
+                .buffer
+                .as_ref()
+                .map(|buffer| buffer.buffer),
+            framebuffer_is_srgb: is_srgb_format(self.surface_format.format),
+            draws: &draws,
+            view: swapchain.views[image_index],
+            clear,
+        };
+
+        begin_command_buffer(&device, command_buffer)?;
+        if let (Some((_, shadow, pass)), Some(viewport)) = (&scene_pass, rendered_viewport)
+            && let Some(target) = self.viewports[viewport.0]
+                .as_mut()
+                .and_then(|entry| entry.targets[frame_slot].as_mut())
+        {
+            let extent = target.extent;
+            record_scene(
+                &device,
+                command_buffer,
+                &mut target.offscreen,
+                shadow_image,
+                extent,
+                shadow,
+                pass,
+            );
+            let to_sampled = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(target.offscreen.color.image)
+                .subresource_range(color_subresource_range());
+            pipeline_barrier(&device, command_buffer, to_sampled);
+            target.offscreen.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        }
+        record_ui(
+            &device,
+            command_buffer,
+            swapchain.images[image_index],
+            swapchain.extent,
+            &ui_pass,
+        );
+        // SAFETY: command recording is complete before the command buffer is submitted.
+        unsafe { device.end_command_buffer(command_buffer) }?;
+
+        self.submit_and_present(
+            image_index,
+            acquire_suboptimal,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            timestamps,
+        )
+    }
+
+    fn ui_texture(&self, texture: UiTextureId) -> Result<&UiTexture, RenderError> {
+        self.ui_textures
+            .get(texture.0)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                RenderError::InvalidTexture("UiTextureId не принадлежит renderer".to_owned())
+            })
+    }
+
+    fn validate_ui_images(
+        &self,
+        packed: &PackedUi,
+        scene: Option<ViewportId>,
+    ) -> Result<(), RenderError> {
+        for draw in &packed.draws {
+            match draw.image {
+                UiImage::Texture(texture) => {
+                    self.ui_texture(texture)?;
+                }
+                UiImage::Viewport(viewport) if Some(viewport) != scene => {
+                    return Err(RenderError::InvalidTexture(
+                        "UI ссылается на viewport, который не рисуется в этом кадре".to_owned(),
+                    ));
+                }
+                UiImage::Viewport(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Отправляет записанный command buffer текущего слота и показывает изображение.
+    ///
+    /// `wait_stage` — стадия первого обращения к swapchain image в этом command buffer.
+    fn submit_and_present(
+        &mut self,
+        image_index: usize,
+        acquire_suboptimal: bool,
+        wait_stage: vk::PipelineStageFlags2,
+        timestamps_written: bool,
+    ) -> Result<FrameStatus, RenderError> {
+        let device = self.device()?.clone();
+        let swapchain_loader = self.swapchain_loader()?.clone();
+        let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
+            "swapchain отсутствует после создания",
+        ))?;
+        let frame_slot = self.frame_slot;
+        let fence = self.frames[frame_slot].fence;
+        let image_available = self.frames[frame_slot].image_available;
+        let command_buffer = self.frames[frame_slot].command_buffer;
+        let swapchain_handle = swapchain.handle;
+
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
         // SAFETY: эта точка — непосредственно перед submit, которому принадлежит fence.
         unsafe { device.reset_fences(&[fence]) }?;
 
         let wait_infos = [vk::SemaphoreSubmitInfo::default()
             .semaphore(image_available)
-            .stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .stage_mask(wait_stage)
             .device_index(0)];
         let command_infos = [vk::CommandBufferSubmitInfo::default()
             .command_buffer(command_buffer)
@@ -670,7 +1178,7 @@ impl Renderer {
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
         unsafe { device.queue_submit2(self.queue, &submit_info, fence) }?;
         // Результаты timestamp читаются после следующего ожидания fence этого слота.
-        self.frames[frame_slot].timestamps_pending = timestamps.is_some();
+        self.frames[frame_slot].timestamps_pending = timestamps_written;
 
         let wait_semaphores = [render_finished];
         let swapchains = [swapchain_handle];
@@ -861,8 +1369,9 @@ impl Renderer {
         self.create_mesh_pipeline()?;
         self.create_shadow_pipeline()?;
         self.create_overlay_pipeline()?;
+        self.create_ui_pipeline()?;
         let white = self.upload_texture(1, 1, &[255; 4])?;
-        self.textures.push(white);
+        self.textures.push(Some(white));
 
         if self.output_extent.width != 0 && self.output_extent.height != 0 {
             self.recreate_swapchain()?;
@@ -1042,6 +1551,20 @@ impl Renderer {
 
     /// Копирует пиксели через staging-буфер в device-local image и создаёт её дескрипторы.
     fn upload_texture(&self, width: u32, height: u32, rgba: &[u8]) -> Result<Texture, RenderError> {
+        let sampler = self
+            .sampler
+            .ok_or(RenderError::InvalidState("sampler отсутствует"))?;
+        self.upload_image(TEXTURE_FORMAT, sampler, width, height, rgba)
+    }
+
+    fn upload_image(
+        &self,
+        format: vk::Format,
+        sampler: vk::Sampler,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<Texture, RenderError> {
         let device = self.device()?;
         let extent = vk::Extent2D { width, height };
         let image = DeviceImage::new(
@@ -1049,7 +1572,7 @@ impl Renderer {
             device,
             self.physical_device,
             extent,
-            TEXTURE_FORMAT,
+            format,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
             color_subresource_range(),
         )?;
@@ -1112,46 +1635,12 @@ impl Renderer {
             set: vk::DescriptorSet::null(),
             image,
         };
-        let pool_sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1),
-        ];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(1)
-            .pool_sizes(&pool_sizes);
-        // SAFETY: the pool holds the single descriptor set of this texture.
-        texture.pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
-        let layouts = [self.texture_set_layout()?];
-        let allocate_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(texture.pool)
-            .set_layouts(&layouts);
-        // SAFETY: the pool was sized for one set of this layout.
-        texture.set = unsafe { device.allocate_descriptor_sets(&allocate_info) }?[0];
-        let image_info = [vk::DescriptorImageInfo::default()
-            .image_view(texture.image.view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let sampler_info = [vk::DescriptorImageInfo::default().sampler(
-            self.sampler
-                .ok_or(RenderError::InvalidState("sampler отсутствует"))?,
-        )];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(texture.set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(&image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(texture.set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .image_info(&sampler_info),
-        ];
-        // SAFETY: the set, image view and sampler are alive and the set is not in use.
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        (texture.pool, texture.set) = allocate_image_set(
+            device,
+            self.texture_set_layout()?,
+            texture.image.view,
+            sampler,
+        )?;
         Ok(texture)
     }
 
@@ -1471,6 +1960,117 @@ impl Renderer {
         Ok(())
     }
 
+    /// Pipeline UI: индексированные треугольники с предумноженной альфой прямо в swapchain image.
+    fn create_ui_pipeline(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(0.0);
+        // SAFETY: the sampler uses core linear filtering and clamp-to-edge addressing.
+        self.ui_sampler = Some(unsafe { device.create_sampler(&sampler_info, None) }?);
+
+        let push_constant_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(UI_PUSH_CONSTANTS_SIZE as u32)];
+        let set_layouts = [self.texture_set_layout()?];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant_ranges);
+        // SAFETY: the set layout is alive and the push-constant range fits in the guaranteed 128 bytes.
+        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
+        self.ui_pipeline_layout = Some(layout);
+
+        let vertex_module = ShaderModule::new(&device, UI_VERTEX_SHADER)?;
+        let fragment_module = ShaderModule::new(&device, UI_FRAGMENT_SHADER)?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_module.handle)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_module.handle)
+                .name(c"main"),
+        ];
+        let vertex_bindings = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<UiVertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let vertex_attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(std::mem::offset_of!(UiVertex, position) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(std::mem::offset_of!(UiVertex, uv) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(2)
+                .binding(0)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .offset(std::mem::offset_of!(UiVertex, color) as u32),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let color_formats = [self.surface_format.format];
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering_info)];
+        // SAFETY: shader modules, layout and the surface color format are valid for this device.
+        let pipelines = unsafe {
+            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+        }
+        .map_err(|(_, error)| RenderError::Vulkan(error))?;
+        self.ui_pipeline = pipelines.into_iter().next();
+        Ok(())
+    }
+
     fn recreate_swapchain(&mut self) -> Result<(), RenderError> {
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(());
@@ -1492,19 +2092,9 @@ impl Renderer {
             self.output_extent,
             old_swapchain,
         )?;
-        let render_extent = scaled_extent(new_swapchain.extent, self.config.render_scale);
-        let mut targets = Vec::with_capacity(self.frames.len());
-        for _ in 0..self.frames.len() {
-            targets.push(OffscreenTarget::new(
-                self.instance()?,
-                self.device()?,
-                self.physical_device,
-                render_extent,
-            )?);
-        }
         self.swapchain = Some(new_swapchain);
-        for (frame, target) in self.frames.iter_mut().zip(targets) {
-            frame.target = Some(target);
+        for frame in &mut self.frames {
+            frame.target = None;
         }
         self.swapchain_dirty = false;
         Ok(())
@@ -1565,6 +2155,9 @@ impl Drop for Renderer {
         }
         self.swapchain.take();
         self.frames.clear();
+        self.retired.clear();
+        self.viewports.clear();
+        self.ui_textures.clear();
         self.meshes.clear();
         self.textures.clear();
         self.frame_uniforms.clear();
@@ -1575,6 +2168,10 @@ impl Drop for Renderer {
             }
             if let Some(sampler) = self.sampler.take() {
                 // SAFETY: every texture descriptor referencing the sampler was destroyed above.
+                unsafe { device.destroy_sampler(sampler, None) };
+            }
+            if let Some(sampler) = self.ui_sampler.take() {
+                // SAFETY: every UI texture and viewport descriptor referencing the sampler is gone.
                 unsafe { device.destroy_sampler(sampler, None) };
             }
             if let Some(sampler) = self.shadow_sampler.take() {
@@ -1602,6 +2199,14 @@ impl Drop for Renderer {
                 unsafe { device.destroy_pipeline(pipeline, None) };
             }
             if let Some(layout) = self.overlay_pipeline_layout.take() {
+                // SAFETY: the only pipeline created with this layout was destroyed above.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+            if let Some(pipeline) = self.ui_pipeline.take() {
+                // SAFETY: the device is idle, so no command buffer uses this pipeline.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            if let Some(layout) = self.ui_pipeline_layout.take() {
                 // SAFETY: the only pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
@@ -2088,9 +2693,10 @@ struct FrameResources {
     fence: vk::Fence,
     image_available: vk::Semaphore,
     target: Option<OffscreenTarget>,
-    /// Вершины оверлея этого слота и ёмкость буфера в байтах.
-    overlay_buffer: Option<HostBuffer>,
-    overlay_capacity: usize,
+    /// Вершины оверлея этого слота.
+    overlay_buffer: GrowingBuffer,
+    ui_vertices: GrowingBuffer,
+    ui_indices: GrowingBuffer,
     /// Пул из двух timestamp: перед shadow pass и после scene pass; `None`, если очередь их не поддерживает.
     timestamps: Option<vk::QueryPool>,
     /// Timestamp записаны и отправлены, но ещё не прочитаны.
@@ -2109,8 +2715,9 @@ impl FrameResources {
             fence: vk::Fence::null(),
             image_available: vk::Semaphore::null(),
             target: None,
-            overlay_buffer: None,
-            overlay_capacity: 0,
+            overlay_buffer: GrowingBuffer::default(),
+            ui_vertices: GrowingBuffer::default(),
+            ui_indices: GrowingBuffer::default(),
             timestamps: None,
             timestamps_pending: false,
         };
@@ -2166,26 +2773,53 @@ impl FrameResources {
         physical_device: vk::PhysicalDevice,
         vertices: &[OverlayVertex],
     ) -> Result<(), RenderError> {
-        if vertices.is_empty() {
+        self.overlay_buffer.write(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            overlay_vertex_bytes(vertices),
+        )
+    }
+}
+
+/// Host-visible буфер кадрового слота, растущий до следующей степени двойки.
+#[derive(Default)]
+struct GrowingBuffer {
+    buffer: Option<HostBuffer>,
+    capacity: usize,
+}
+
+impl GrowingBuffer {
+    /// Копирует данные в начало буфера. Вызывается после ожидания fence слота,
+    /// когда GPU уже не читает прежний буфер; пустые данные буфер не меняют.
+    fn write(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        usage: vk::BufferUsageFlags,
+        bytes: &[u8],
+    ) -> Result<(), RenderError> {
+        if bytes.is_empty() {
             return Ok(());
         }
-        let bytes = overlay_vertex_bytes(vertices);
-        if self.overlay_buffer.is_none() || self.overlay_capacity < bytes.len() {
+        if self.buffer.is_none() || self.capacity < bytes.len() {
             let capacity = bytes.len().next_power_of_two();
-            self.overlay_buffer = None;
-            self.overlay_capacity = 0;
-            self.overlay_buffer = Some(HostBuffer::new(
+            self.buffer = None;
+            self.capacity = 0;
+            self.buffer = Some(HostBuffer::new(
                 instance,
                 device,
                 physical_device,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
+                usage,
                 &vec![0; capacity],
             )?);
-            self.overlay_capacity = capacity;
+            self.capacity = capacity;
         }
-        self.overlay_buffer
+        self.buffer
             .as_ref()
-            .ok_or(RenderError::InvalidState("буфер оверлея отсутствует"))?
+            .ok_or(RenderError::InvalidState("буфер кадра отсутствует"))?
             .write(bytes)
     }
 }
@@ -2219,6 +2853,7 @@ impl OffscreenTarget {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         extent: vk::Extent2D,
+        output_usage: vk::ImageUsageFlags,
     ) -> Result<Self, RenderError> {
         Ok(Self {
             color: DeviceImage::new(
@@ -2227,7 +2862,7 @@ impl OffscreenTarget {
                 physical_device,
                 extent,
                 OFFSCREEN_FORMAT,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | output_usage,
                 color_subresource_range(),
             )?,
             depth: DeviceImage::new(
@@ -2242,6 +2877,169 @@ impl OffscreenTarget {
             layout: vk::ImageLayout::UNDEFINED,
         })
     }
+}
+
+/// Цель рендера сцены одного кадрового слота, которую UI читает как текстуру.
+struct ViewportTarget {
+    device: ash::Device,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    extent: vk::Extent2D,
+    offscreen: OffscreenTarget,
+}
+
+impl ViewportTarget {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        extent: vk::Extent2D,
+        set_layout: vk::DescriptorSetLayout,
+        sampler: vk::Sampler,
+    ) -> Result<Self, RenderError> {
+        let offscreen = OffscreenTarget::new(
+            instance,
+            device,
+            physical_device,
+            extent,
+            vk::ImageUsageFlags::SAMPLED,
+        )?;
+        let (pool, set) = allocate_image_set(device, set_layout, offscreen.color.view, sampler)?;
+        Ok(Self {
+            device: device.clone(),
+            pool,
+            set,
+            extent,
+            offscreen,
+        })
+    }
+}
+
+impl Drop for ViewportTarget {
+    fn drop(&mut self) {
+        // SAFETY: the target is dropped only after fences of the submissions using it were waited.
+        unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
+    }
+}
+
+/// Запрошенный размер viewport и его цели по кадровым слотам.
+struct Viewport {
+    extent: vk::Extent2D,
+    targets: Vec<Option<ViewportTarget>>,
+}
+
+struct UiTexture {
+    texture: Texture,
+    extent: vk::Extent2D,
+}
+
+/// Ресурс, ожидающий завершения отправленных кадров; освобождается своим `Drop`.
+enum RetiredResource {
+    Mesh(#[allow(dead_code)] MeshBuffers),
+    Texture(#[allow(dead_code)] Texture),
+    UiTexture(#[allow(dead_code)] UiTexture),
+    Viewport(#[allow(dead_code)] Viewport),
+}
+
+fn unknown_viewport() -> RenderError {
+    RenderError::InvalidTexture("ViewportId не принадлежит renderer".to_owned())
+}
+
+/// Создаёт пул на один набор и записывает в него изображение и sampler.
+fn allocate_image_set(
+    device: &ash::Device,
+    layout: vk::DescriptorSetLayout,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+) -> Result<(vk::DescriptorPool, vk::DescriptorSet), RenderError> {
+    let pool_sizes = [
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1),
+    ];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(1)
+        .pool_sizes(&pool_sizes);
+    // SAFETY: the pool holds the single descriptor set of this image.
+    let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+    let layouts = [layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool)
+        .set_layouts(&layouts);
+    // SAFETY: the pool was sized for one set of this layout.
+    let set = match unsafe { device.allocate_descriptor_sets(&allocate_info) } {
+        Ok(sets) => sets[0],
+        Err(error) => {
+            // SAFETY: the pool has no allocated sets and is not in use.
+            unsafe { device.destroy_descriptor_pool(pool, None) };
+            return Err(RenderError::Vulkan(error));
+        }
+    };
+    let image_info = [vk::DescriptorImageInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let sampler_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&image_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .image_info(&sampler_info),
+    ];
+    // SAFETY: the set, image view and sampler are alive and the set is not in use.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    Ok((pool, set))
+}
+
+/// Получает swapchain image; `None` означает, что кадр нужно пропустить.
+fn acquire_image(
+    swapchain_loader: &ash::khr::swapchain::Device,
+    swapchain: vk::SwapchainKHR,
+    image_available: vk::Semaphore,
+    image_count: usize,
+    swapchain_dirty: &mut bool,
+) -> Result<Option<(usize, bool)>, RenderError> {
+    // SAFETY: swapchain живёт в renderer до окончания acquire и получает валидный semaphore.
+    let acquire_result = unsafe {
+        swapchain_loader.acquire_next_image(
+            swapchain,
+            ACQUIRE_TIMEOUT_NS,
+            image_available,
+            vk::Fence::null(),
+        )
+    };
+    let (image_index, suboptimal) = match classify_acquire_result(acquire_result) {
+        AcquireAction::Acquired {
+            image_index,
+            suboptimal,
+        } => (image_index, suboptimal),
+        AcquireAction::OutOfDate => {
+            *swapchain_dirty = true;
+            return Ok(None);
+        }
+        AcquireAction::Skipped => {
+            // TIMEOUT/NOT_READY do not signal image_available; the fence is still signaled,
+            // frame_slot is unchanged, and reset_fences runs only after a successful acquire.
+            return Ok(None);
+        }
+        AcquireAction::Failed(error) => return Err(RenderError::Vulkan(error)),
+    };
+    let image_index = image_index as usize;
+    if image_index >= image_count {
+        *swapchain_dirty = true;
+        return Err(RenderError::InvalidState(
+            "Vulkan вернул неверный индекс swapchain image",
+        ));
+    }
+    Ok(Some((image_index, suboptimal)))
 }
 
 struct DeviceImage {
@@ -2345,28 +3143,90 @@ fn record_frame(
     scene: &ScenePass<'_>,
     overlay: Option<&OverlayPass>,
 ) -> Result<(), RenderError> {
+    begin_command_buffer(device, command_buffer)?;
+    record_scene(
+        device,
+        command_buffer,
+        target,
+        shadow_image,
+        render_extent,
+        shadow,
+        scene,
+    );
+
+    let source_barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(target.color.image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, source_barrier);
+    record_output_pass(
+        device,
+        command_buffer,
+        target.color.image,
+        output_image,
+        render_extent,
+        output_extent,
+        overlay,
+    );
+    // SAFETY: command recording is complete before the command buffer is submitted.
+    unsafe { device.end_command_buffer(command_buffer) }?;
+    target.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+    Ok(())
+}
+
+fn begin_command_buffer(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+) -> Result<(), RenderError> {
     // SAFETY: this frame's command buffer is no longer in flight because its fence was waited.
     unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty()) }?;
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     // SAFETY: the command buffer was reset and belongs to the renderer's graphics command pool.
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
+    Ok(())
+}
 
+/// Стадия и доступ последнего использования цвета offscreen-цели до следующего кадра.
+fn offscreen_previous_use(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    match layout {
+        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        ),
+        _ => (
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+        ),
+    }
+}
+
+/// Записывает shadow и scene pass; цвет цели остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
+fn record_scene(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    target: &mut OffscreenTarget,
+    shadow_image: &DeviceImage,
+    render_extent: vk::Extent2D,
+    shadow: &ShadowPass<'_>,
+    scene: &ScenePass<'_>,
+) {
     if let Some(pool) = scene.timestamps {
         // SAFETY: the slot fence was waited, so these queries are not in use; reset happens outside rendering.
         unsafe { device.cmd_reset_query_pool(command_buffer, pool, 0, TIMESTAMP_QUERY_COUNT) };
     }
+    let (previous_stage, previous_access) = offscreen_previous_use(target.layout);
     let scene_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(if target.layout == vk::ImageLayout::UNDEFINED {
-            vk::PipelineStageFlags2::NONE
-        } else {
-            vk::PipelineStageFlags2::TRANSFER
-        })
-        .src_access_mask(if target.layout == vk::ImageLayout::UNDEFINED {
-            vk::AccessFlags2::NONE
-        } else {
-            vk::AccessFlags2::TRANSFER_READ
-        })
+        .src_stage_mask(previous_stage)
+        .src_access_mask(previous_access)
         .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
         .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
         .old_layout(target.layout)
@@ -2518,40 +3378,14 @@ fn record_frame(
             );
         }
     }
-
-    let source_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(target.color.image)
-        .subresource_range(color_subresource_range());
-    pipeline_barrier(device, command_buffer, source_barrier);
-    record_output_pass(
-        device,
-        command_buffer,
-        target.color.image,
-        output_image,
-        render_extent,
-        output_extent,
-        overlay,
-    );
-    // SAFETY: command recording is complete before the command buffer is submitted.
-    unsafe { device.end_command_buffer(command_buffer) }?;
-    target.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-    Ok(())
 }
 
 struct ScenePass<'a> {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
-    meshes: &'a [MeshBuffers],
-    textures: &'a [Texture],
+    meshes: &'a [Option<MeshBuffers>],
+    textures: &'a [Option<Texture>],
     draws: &'a [DrawCommand],
     clear_color: [f32; 4],
     timestamps: Option<vk::QueryPool>,
@@ -2562,9 +3396,21 @@ struct ShadowPass<'a> {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
-    meshes: &'a [MeshBuffers],
+    meshes: &'a [Option<MeshBuffers>],
     draws: &'a [DrawCommand],
     enabled: bool,
+}
+
+/// Рисование UI в swapchain image; `draws` хранит вызов, его набор и признак линейного изображения.
+struct UiPass<'a> {
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    vertex_buffer: Option<vk::Buffer>,
+    index_buffer: Option<vk::Buffer>,
+    framebuffer_is_srgb: bool,
+    draws: &'a [(UiDraw, vk::DescriptorSet, bool)],
+    view: vk::ImageView,
+    clear: [f32; 4],
 }
 
 /// Рисование вершин оверлея поверх swapchain image после blit.
@@ -2610,8 +3456,12 @@ fn record_draws(
     }
     for draw in scene.draws {
         // Индексы проверены validate_draws до начала кадра.
-        let mesh = &scene.meshes[draw.mesh.0];
-        let texture = &scene.textures[draw.texture.map_or(WHITE_TEXTURE, |texture| texture.0)];
+        let (Some(mesh), Some(texture)) = (
+            &scene.meshes[draw.mesh.0],
+            &scene.textures[draw.texture.map_or(WHITE_TEXTURE, |texture| texture.0)],
+        ) else {
+            continue;
+        };
         let push_constants = push_constant_bytes(&draw.model);
         // SAFETY: mesh buffers and textures stay alive until the device is idle and match the pipeline layout.
         unsafe {
@@ -2679,7 +3529,9 @@ fn record_shadow_draws(
         );
     }
     for draw in shadow.draws {
-        let mesh = &shadow.meshes[draw.mesh.0];
+        let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
+            continue;
+        };
         let push_constants = push_constant_bytes(&draw.model);
         // SAFETY: draw ids were checked before recording; the buffers and frame set stay alive.
         unsafe {
@@ -2864,6 +3716,119 @@ fn record_overlay(
         device.cmd_draw(command_buffer, overlay.vertex_count, 1, 0, 0);
         device.cmd_end_rendering(command_buffer);
     }
+}
+
+/// Очищает swapchain image, рисует UI и переводит изображение в present layout.
+fn record_ui(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    output_image: vk::Image,
+    output_extent: vk::Extent2D,
+    ui: &UiPass<'_>,
+) {
+    // Стадия совпадает с ожиданием acquire semaphore в submit этого command buffer.
+    let to_attachment = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(
+            vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        )
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(output_image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, to_attachment);
+
+    let color_attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(ui.view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .clear_value(vk::ClearValue {
+            color: vk::ClearColorValue { float32: ui.clear },
+        })];
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: output_extent,
+        })
+        .layer_count(1)
+        .color_attachments(&color_attachment);
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: output_extent.width as f32,
+        height: output_extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    // SAFETY: the view belongs to the output image and the pipeline matches the swapchain format.
+    unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
+    if let (Some(vertex_buffer), Some(index_buffer)) = (ui.vertex_buffer, ui.index_buffer)
+        && !ui.draws.is_empty()
+    {
+        // SAFETY: inside dynamic rendering; the buffers were written after the slot fence.
+        unsafe {
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, ui.pipeline);
+            device.cmd_set_viewport(command_buffer, 0, &viewport);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex_buffer], &[0]);
+            device.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk::IndexType::UINT32);
+        }
+        for (draw, set, image_is_linear) in ui.draws {
+            let push_constants = float_bytes::<UI_PUSH_CONSTANTS_SIZE>(&[
+                viewport[0].width,
+                viewport[0].height,
+                f32::from(u8::from(ui.framebuffer_is_srgb)),
+                f32::from(u8::from(*image_is_linear)),
+            ]);
+            // SAFETY: the set, scissor and index range were validated before recording; the
+            // descriptor's image stays alive until the fences of this submission are waited.
+            unsafe {
+                device.cmd_set_scissor(command_buffer, 0, &[draw.scissor]);
+                device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    ui.pipeline_layout,
+                    0,
+                    &[*set],
+                    &[],
+                );
+                device.cmd_push_constants(
+                    command_buffer,
+                    ui.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    &push_constants,
+                );
+                device.cmd_draw_indexed(
+                    command_buffer,
+                    draw.index_count,
+                    1,
+                    draw.first_index,
+                    draw.vertex_offset,
+                    0,
+                );
+            }
+        }
+    }
+    // SAFETY: this matches the preceding cmd_begin_rendering call.
+    unsafe { device.cmd_end_rendering(command_buffer) };
+
+    let present_barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_access_mask(vk::AccessFlags2::NONE)
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(output_image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, present_barrier);
 }
 
 fn pipeline_barrier(
@@ -3080,17 +4045,20 @@ fn validate_mesh(vertex_count: usize, indices: &[u32]) -> Result<(), RenderError
     Ok(())
 }
 
-fn validate_draws(
+fn validate_draws<M, T>(
     draws: &[DrawCommand],
-    mesh_count: usize,
-    texture_count: usize,
+    meshes: &[Option<M>],
+    textures: &[Option<T>],
 ) -> Result<(), RenderError> {
-    if draws.iter().any(|draw| draw.mesh.0 >= mesh_count) {
+    if draws
+        .iter()
+        .any(|draw| !meshes.get(draw.mesh.0).is_some_and(Option::is_some))
+    {
         return Err(RenderError::InvalidMesh("MeshId не принадлежит renderer"));
     }
     if draws.iter().any(|draw| {
         draw.texture
-            .is_some_and(|texture| texture.0 >= texture_count)
+            .is_some_and(|texture| !textures.get(texture.0).is_some_and(Option::is_some))
     }) {
         return Err(RenderError::InvalidTexture(
             "TextureId не принадлежит renderer".to_owned(),
@@ -3348,13 +4316,13 @@ mod tests {
         AcquireAction, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
         FRAME_UNIFORMS_SIZE, Frame, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, MeshId,
         OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure,
-        RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER, TextureId, Vertex,
-        best_device_index, check_extensions, classify_acquire_result,
+        RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER, TextureId, UI_FRAGMENT_SHADER,
+        UI_VERTEX_SHADER, Vertex, best_device_index, check_extensions, classify_acquire_result,
         classify_probe_instance_failure, deduplicate_names, evaluate_device, frame_uniform_bytes,
-        index_bytes, missing_extensions, normal_matrix, overlay_vertex_bytes, push_constant_bytes,
-        scaled_extent, scene_viewport, select_composite_alpha, select_surface_extent,
-        timestamp_duration, validate_draws, validate_mesh, validate_overlay, validate_render_scale,
-        validate_texture, vertex_bytes,
+        index_bytes, missing_extensions, normal_matrix, offscreen_previous_use,
+        overlay_vertex_bytes, push_constant_bytes, scaled_extent, scene_viewport,
+        select_composite_alpha, select_surface_extent, timestamp_duration, validate_draws,
+        validate_mesh, validate_overlay, validate_render_scale, validate_texture, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -3566,6 +4534,8 @@ mod tests {
             SHADOW_VERTEX_SHADER,
             OVERLAY_VERTEX_SHADER,
             OVERLAY_FRAGMENT_SHADER,
+            UI_VERTEX_SHADER,
+            UI_FRAGMENT_SHADER,
         ] {
             let words = ash::util::read_spv(&mut std::io::Cursor::new(shader)).unwrap();
             assert_eq!(words[0], 0x0723_0203);
@@ -3641,16 +4611,58 @@ mod tests {
             texture: texture.map(TextureId),
             model: IDENTITY,
         };
-        assert!(validate_draws(&[], 0, 1).is_ok());
-        assert!(validate_draws(&[draw(0, None), draw(1, Some(1))], 2, 2).is_ok());
+        let slots = |count: usize| vec![Some(()); count];
+        assert!(validate_draws(&[], &slots(0), &slots(1)).is_ok());
+        assert!(validate_draws(&[draw(0, None), draw(1, Some(1))], &slots(2), &slots(2)).is_ok());
         assert!(matches!(
-            validate_draws(&[draw(0, None), draw(2, None)], 2, 2),
+            validate_draws(&[draw(0, None), draw(2, None)], &slots(2), &slots(2)),
             Err(RenderError::InvalidMesh(_))
         ));
         assert!(matches!(
-            validate_draws(&[draw(0, Some(2))], 1, 2),
+            validate_draws(&[draw(0, Some(2))], &slots(1), &slots(2)),
             Err(RenderError::InvalidTexture(_))
         ));
+    }
+
+    #[test]
+    fn draw_validation_rejects_destroyed_meshes_and_textures() {
+        let draw = |mesh, texture: Option<usize>| DrawCommand {
+            mesh: MeshId(mesh),
+            texture: texture.map(TextureId),
+            model: IDENTITY,
+        };
+        let alive = vec![Some(()), Some(())];
+        let destroyed = vec![Some(()), None];
+        assert!(matches!(
+            validate_draws(&[draw(1, None)], &destroyed, &alive),
+            Err(RenderError::InvalidMesh(_))
+        ));
+        assert!(matches!(
+            validate_draws(&[draw(0, Some(1))], &alive, &destroyed),
+            Err(RenderError::InvalidTexture(_))
+        ));
+    }
+
+    #[test]
+    fn offscreen_barrier_source_follows_the_previous_use_of_the_target() {
+        assert_eq!(
+            offscreen_previous_use(vk::ImageLayout::UNDEFINED),
+            (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+        );
+        assert_eq!(
+            offscreen_previous_use(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            (
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ
+            )
+        );
+        assert_eq!(
+            offscreen_previous_use(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+            )
+        );
     }
 
     #[test]
