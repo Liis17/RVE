@@ -34,7 +34,7 @@ pub fn ray_triangle(ray: Ray, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
 pub fn ray_model(ray: Ray, model: &Model, model_matrix: Mat4) -> Option<f32> {
     let mut nearest: Option<f32> = None;
     for mesh in &model.meshes {
-        for triangle in mesh.indices.chunks_exact(3) {
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let vertex = |index: u32| {
                 model_matrix
                     .transform_point3(Vec3::from_array(mesh.vertices[index as usize].position))
