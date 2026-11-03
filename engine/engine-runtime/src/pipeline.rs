@@ -418,9 +418,11 @@ fn scripts_thread(
 
         let (scene_frame, warnings) = world.build_frame();
         for warning in warnings {
-            eprintln!(
+            log::warn!(
                 "[scene] {}: объект {}: {}",
-                warning.source, warning.object_id, warning.message
+                warning.source,
+                warning.object_id,
+                warning.message
             );
         }
         let snapshot = Arc::new(make_snapshot(scene_frame, &world, &gpu_scene));
@@ -515,12 +517,23 @@ fn selected_level<'a, T>(
 }
 
 fn print_script_events(events: Vec<ScriptEvent>) {
+    log_script_events_with(&events, log::logger());
+}
+
+fn log_script_events_with(events: &[ScriptEvent], logger: &dyn log::Log) {
     for event in events {
-        match event.level {
-            ScriptEventLevel::Info => println!("[script] {event}"),
-            ScriptEventLevel::Warn => eprintln!("[script warn] {event}"),
-            ScriptEventLevel::Error => eprintln!("[script] {event}"),
-        }
+        let (level, text) = match event.level {
+            ScriptEventLevel::Info => (log::Level::Info, format!("[script] {event}")),
+            ScriptEventLevel::Warn => (log::Level::Warn, format!("[script warn] {event}")),
+            ScriptEventLevel::Error => (log::Level::Error, format!("[script] {event}")),
+        };
+        let args = format_args!("{text}");
+        let record = log::Record::builder()
+            .args(args)
+            .level(level)
+            .target(&event.source)
+            .build();
+        logger.log(&record);
     }
 }
 
@@ -763,18 +776,21 @@ mod tests {
     use super::{
         Clock, ExitRequester, FrameSnapshot, GpuSceneTable, RenderBackend, RenderControl,
         RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
-        ScriptThreadConfig, make_snapshot, render_loop, render_snapshot, render_thread,
-        selected_level, send_snapshot, sync_input_background, wait_background_tick,
+        ScriptThreadConfig, log_script_events_with, make_snapshot, render_loop, render_snapshot,
+        render_thread, selected_level, send_snapshot, sync_input_background, wait_background_tick,
     };
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
+    use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
     use engine_render::{DrawCommand, FrameStatus};
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
     use engine_scene::{SceneDocument, World};
-    use engine_script::{Key, ScriptHost, ScriptInterruptHandle, ScriptTime};
+    use engine_script::{
+        Key, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
+    };
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
@@ -784,6 +800,49 @@ mod tests {
 
     fn test_input() -> Arc<Mutex<InputAccumulator>> {
         Arc::new(Mutex::new(InputAccumulator::default()))
+    }
+
+    #[test]
+    fn script_events_keep_their_log_levels_and_prefixes() {
+        let sink = Arc::new(Mutex::new(ConsoleBuffer::with_capacity(4)));
+        let logger = ConsoleLogger::new(Some(sink.clone()));
+        log_script_events_with(
+            &[
+                ScriptEvent {
+                    level: ScriptEventLevel::Info,
+                    source: "scene/script".into(),
+                    message: "info".into(),
+                },
+                ScriptEvent {
+                    level: ScriptEventLevel::Warn,
+                    source: "scene/script".into(),
+                    message: "warn".into(),
+                },
+                ScriptEvent {
+                    level: ScriptEventLevel::Error,
+                    source: "scene/script".into(),
+                    message: "error".into(),
+                },
+            ],
+            &logger,
+        );
+        let lines = sink.lock().unwrap().snapshot();
+        assert_eq!(
+            lines.iter().map(|line| line.level).collect::<Vec<_>>(),
+            [ConsoleLevel::Info, ConsoleLevel::Warn, ConsoleLevel::Error]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "[script] scene/script: info",
+                "[script warn] scene/script: warn",
+                "[script] scene/script: error"
+            ]
+        );
+        assert_eq!(lines[0].source, "scene/script");
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

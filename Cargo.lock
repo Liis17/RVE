@@ -729,6 +729,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "engine-platform",
+ "log",
  "naga",
  "raw-window-handle",
 ]
@@ -748,6 +749,7 @@ version = "0.1.0"
 dependencies = [
  "engine-assets",
  "engine-audio",
+ "engine-console",
  "engine-files",
  "engine-network",
  "engine-neural",
@@ -761,6 +763,7 @@ dependencies = [
  "engine-window",
  "flume",
  "glam",
+ "log",
  "rve-sdk",
  "sysinfo",
 ]
@@ -2371,6 +2374,7 @@ dependencies = [
  "egui-winit",
  "egui_dock",
  "engine-assets",
+ "engine-console",
  "engine-files",
  "engine-project",
  "engine-render",

@@ -12,6 +12,7 @@ path = "src/main.rs"
 egui.workspace = true
 egui-winit.workspace = true
 egui_dock = { workspace = true, features = ["serde"] }
+engine-console = { path = "../engine/engine-console" }
 engine-assets = { path = "../engine/engine-assets" }
 engine-files = { path = "../engine/engine-files" }
 engine-project = { path = "../engine/engine-project" }

@@ -13,6 +13,7 @@ use crate::ui::scene_view::bounding_sphere;
 use crate::ui_render::{ConvertedMesh, UiBridge};
 use crate::viewport::render::SceneRenderer;
 use egui_dock::DockState;
+use engine_console::{ConsoleBuffer, ConsoleLevel, install_logger};
 use engine_files::VirtualPath;
 use engine_render::{
     FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
@@ -21,7 +22,7 @@ use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
 use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Цвет окна за панелями; всё окно закрыто UI, поэтому заметен только при первом кадре.
@@ -41,6 +42,7 @@ pub struct EditorApp {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     bridge: UiBridge,
+    engine_log: Arc<Mutex<ConsoleBuffer>>,
     repaint_at: Option<Instant>,
     /// Ревизия сцены в последней копии автосохранения и время записи.
     autosaved_revision: Option<u64>,
@@ -58,6 +60,7 @@ struct GpuState {
 
 impl EditorApp {
     pub fn new(project: Option<PathBuf>, scripts: Option<PathBuf>) -> Self {
+        let engine_log = editor_log_buffer();
         let mut state = EditorState::new(scripts);
         let settings = SettingsStore::default_location();
         let (user, problem) = settings
@@ -78,6 +81,7 @@ impl EditorApp {
             egui_ctx: egui::Context::default(),
             egui_state: None,
             bridge: UiBridge::default(),
+            engine_log,
             repaint_at: None,
             autosaved_revision: None,
             last_autosave: Instant::now(),
@@ -771,6 +775,7 @@ impl EditorApp {
 
     /// Рисует кадр; ошибка renderer завершает приложение.
     fn draw_frame(&mut self, window: &Window) -> Result<(), RenderError> {
+        self.drain_engine_log();
         let (Some(gpu), Some(egui_state)) = (&mut self.gpu, &mut self.egui_state) else {
             return Ok(());
         };
@@ -840,6 +845,29 @@ impl EditorApp {
         }
         Ok(())
     }
+
+    fn drain_engine_log(&mut self) {
+        let lines = self
+            .engine_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_lines();
+        for line in lines {
+            let level = match line.level {
+                ConsoleLevel::Info => LogLevel::Info,
+                ConsoleLevel::Warn => LogLevel::Warn,
+                ConsoleLevel::Error => LogLevel::Error,
+            };
+            self.state.log.push(level, line.text);
+        }
+    }
+}
+
+fn editor_log_buffer() -> Arc<Mutex<ConsoleBuffer>> {
+    static BUFFER: OnceLock<Arc<Mutex<ConsoleBuffer>>> = OnceLock::new();
+    let buffer = Arc::clone(BUFFER.get_or_init(|| Arc::new(Mutex::new(ConsoleBuffer::default()))));
+    let _ = install_logger(Some(buffer.clone()));
+    buffer
 }
 
 /// Кадр с видимыми панелями Scene и Game. Без мира сцены рисуется только интерфейс.

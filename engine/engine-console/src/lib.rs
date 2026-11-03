@@ -77,6 +77,14 @@ impl ConsoleBuffer {
         self.lines.iter().cloned().collect()
     }
 
+    pub fn take_lines(&mut self) -> Vec<ConsoleLine> {
+        if self.lines.is_empty() {
+            return Vec::new();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.lines.drain(..).collect()
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

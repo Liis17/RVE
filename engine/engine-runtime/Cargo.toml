@@ -8,6 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+engine-console = { path = "../engine-console" }
 engine-assets = { path = "../engine-assets" }
 engine-files = { path = "../engine-files" }
 engine-audio = { path = "../engine-audio" }
@@ -23,6 +24,7 @@ engine-script = { path = "../engine-script" }
 engine-window = { path = "../engine-window" }
 flume.workspace = true
 glam.workspace = true
+log.workspace = true
 sysinfo.workspace = true
 
 [dev-dependencies]

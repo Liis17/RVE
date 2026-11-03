@@ -75,7 +75,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         status.record_failure(format!("ошибка оконного цикла: {error}"));
     }
     if let Some(message) = status.failure_message() {
-        eprintln!("Ошибка runtime: {message}");
+        log::error!("Ошибка runtime: {message}");
     }
     status.exit_code()
 }
@@ -181,13 +181,13 @@ fn wait_for_scripts_or_detach(
     match stopped.recv_timeout(timeout) {
         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            eprintln!("поток скриптов не остановился за {timeout:?}; прерываю Lua");
+            log::error!("поток скриптов не остановился за {timeout:?}; прерываю Lua");
             status.record_failure(format!("поток скриптов не остановился за {timeout:?}"));
             interrupt.interrupt();
             match stopped.recv_timeout(timeout) {
                 Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    eprintln!(
+                    log::error!(
                         "поток скриптов не завершился после прерывания за {timeout:?}; отсоединяю его"
                     );
                     status.record_failure(format!(
@@ -210,7 +210,7 @@ fn wait_for_render_or_detach(
     if stopped.recv_timeout(timeout).is_ok() || status.render_stopped() {
         return true;
     }
-    eprintln!("поток рендера не остановился за 2 секунды; отсоединяю его");
+    log::error!("поток рендера не остановился за 2 секунды; отсоединяю его");
     status.record_failure("поток рендера не остановился за 2 секунды".to_owned());
     modules.detach(RENDER_THREAD);
     false

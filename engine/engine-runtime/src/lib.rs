@@ -13,6 +13,7 @@ mod scene;
 use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_or_activate};
 use cli::{PlayerArgs, USAGE};
 use engine_assets::{Assets, TextureData};
+use engine_console::install_logger;
 use engine_platform::{Acquire, ActivationError, InstanceLock, activate_running_instance};
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_render::probe_devices;
@@ -36,6 +37,15 @@ use sysinfo::{CpuRefreshKind, System};
 
 /// Runs an RVE game using the release layout or a loose-file development project.
 pub fn run_player() -> ExitCode {
+    let args = match PlayerArgs::parse(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("Ошибка аргументов: {error}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let _ = install_logger(None);
     let release_root = match executable_dir() {
         Ok(exe_dir) => release_root(&exe_dir),
         Err(error) => {
@@ -49,15 +59,6 @@ pub fn run_player() -> ExitCode {
     // Vulkan configuration, and no runtime, resource, or activation thread exists yet.
     unsafe { engine_platform::prepare_vulkan_environment(&release_root) };
     let activation = PendingActivation::default();
-
-    let args = match PlayerArgs::parse(std::env::args_os().skip(1)) {
-        Ok(args) => args,
-        Err(error) => {
-            eprintln!("Ошибка аргументов: {error}");
-            eprintln!("{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
     run_from_args(release_root, args, activation)
 }
 
@@ -150,14 +151,14 @@ fn run_from_args(
             InstanceOutcome::Continue(lock) => instance_lock = Some(lock),
             InstanceOutcome::Activated => {
                 if let Err(error) = resources.shutdown() {
-                    eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+                    log::error!("Ошибка завершения ресурсного сервиса: {error}");
                 }
                 drop(instance_lock.take());
                 return ExitCode::SUCCESS;
             }
             InstanceOutcome::Failure { code, message } => {
                 if let Err(error) = resources.shutdown() {
-                    eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+                    log::error!("Ошибка завершения ресурсного сервиса: {error}");
                 }
                 drop(instance_lock.take());
                 return fail(code, message);
@@ -179,10 +180,10 @@ fn run_from_args(
     );
     if !issues.is_empty() {
         let message = issues.join("\n");
-        eprintln!("{message}");
+        log::error!("{message}");
         engine_platform::show_error_dialog("RVE: системные требования", &message);
         if let Err(error) = resources.shutdown() {
-            eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+            log::error!("Ошибка завершения ресурсного сервиса: {error}");
         }
         drop(instance_lock.take());
         return ExitCode::from(3);
@@ -205,7 +206,7 @@ fn run_from_args(
     let mut modules = ModuleHost::new();
     if let Err(error) = start_empty_modules(&mut modules) {
         for error in modules.shutdown() {
-            eprintln!("Ошибка остановки модуля: {error}");
+            log::error!("Ошибка остановки модуля: {error}");
         }
         return fail(1, format!("не удалось запустить модуль: {error}"));
     }
@@ -247,17 +248,17 @@ fn run_from_args(
         Err(error) => {
             let shutdown_errors = modules.shutdown();
             for error in shutdown_errors {
-                eprintln!("Ошибка остановки модуля: {error}");
+                log::error!("Ошибка остановки модуля: {error}");
             }
             return fail(1, format!("не удалось запустить поток скриптов: {error}"));
         }
     };
     if let Err((code, message)) = scripts_ready_result(script_thread.ready.recv()) {
         for error in modules.shutdown() {
-            eprintln!("Ошибка остановки модуля: {error}");
+            log::error!("Ошибка остановки модуля: {error}");
         }
         if let Err(error) = resources.shutdown() {
-            eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+            log::error!("Ошибка завершения ресурсного сервиса: {error}");
         }
         drop(instance_lock.take());
         return fail(code, message);
@@ -291,11 +292,11 @@ fn run_from_args(
     );
     let mut code = code;
     for error in modules.shutdown() {
-        eprintln!("Ошибка завершения модуля: {error}");
+        log::error!("Ошибка завершения модуля: {error}");
         code = 1;
     }
     if let Err(error) = resources.shutdown() {
-        eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+        log::error!("Ошибка завершения ресурсного сервиса: {error}");
         if code == 0 {
             code = 1;
         }
@@ -405,7 +406,7 @@ fn start_empty_modules(modules: &mut ModuleHost) -> std::io::Result<()> {
 }
 
 fn fail(code: u8, message: impl AsRef<str>) -> ExitCode {
-    eprintln!("{}", message.as_ref());
+    log::error!("{}", message.as_ref());
     ExitCode::from(code)
 }
 
