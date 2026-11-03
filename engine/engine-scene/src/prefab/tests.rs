@@ -1,0 +1,556 @@
+use super::*;
+use crate::World;
+
+const CAMERA: &str =
+    "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n";
+
+/// Набор префабов в памяти; загрузчик разбирает их как `.rveprefab`.
+struct Library(BTreeMap<String, String>);
+
+impl Library {
+    fn new(entries: &[(&str, &str)]) -> Self {
+        Self(
+            entries
+                .iter()
+                .map(|(path, text)| ((*path).to_owned(), (*text).to_owned()))
+                .collect(),
+        )
+    }
+
+    fn expand(&self, document: &SceneDocument) -> Result<Expansion, SceneError> {
+        expand(document, &mut |path| self.load(path))
+    }
+
+    fn load(&self, path: &VirtualPath) -> Result<SceneDocument, SceneError> {
+        let label = format!("/{}", path.as_str());
+        let text = self
+            .0
+            .get(path.as_str())
+            .ok_or_else(|| SceneError::new(&label, None, "не найден"))?;
+        SceneDocument::parse_prefab(label, text)
+    }
+}
+
+fn scene(text: &str) -> SceneDocument {
+    SceneDocument::parse("scene.rvescene", text).unwrap()
+}
+
+const DOOR: &str = r#"
+[[assets]]
+path = "/models/door.fbx"
+[[assets]]
+path = "/scripts/rotate.lua"
+[[objects]]
+id = "frame"
+name = "Frame"
+[objects.transform]
+position = [0.0, 0.0, 0.0]
+[objects.mesh_renderer]
+model = "/models/door.fbx"
+[objects.mesh_renderer.material]
+metallic = 0.2
+roughness = 0.4
+[[objects]]
+id = "handle"
+parent = "frame"
+[objects.transform]
+position = [0.5, 1.0, 0.0]
+rotation = [0.0, 45.0, 0.0]
+[objects.mesh_renderer]
+model = "/models/door.fbx"
+[[objects.lite_scripts]]
+path = "/scripts/rotate.lua"
+params = { speed = 10.0, axis = "y" }
+"#;
+
+fn door_scene(instance_body: &str) -> String {
+    format!(
+        "[[assets]]\npath = \"/prefabs/door.rveprefab\"\n[[assets]]\npath = \"/textures/gold.png\"\n[[assets]]\npath = \"/models/gold.fbx\"\n{CAMERA}[[objects]]\nid = \"room\"\n[[instances]]\nid = \"door1\"\nprefab = \"/prefabs/door.rveprefab\"\n{instance_body}"
+    )
+}
+
+fn object<'a>(document: &'a SceneDocument, id: &str) -> &'a SceneObject {
+    document
+        .objects
+        .iter()
+        .find(|object| object.id == id)
+        .unwrap_or_else(|| panic!("{id} missing"))
+}
+
+#[test]
+fn one_level_instance_gets_mapped_ids_parents_and_instance_fields() {
+    let library = Library::new(&[("prefabs/door.rveprefab", DOOR)]);
+    let document = scene(&door_scene(
+        "name = \"Door\"\nparent = \"room\"\n[instances.transform]\nposition = [2.0, 0.0, 0.0]\n",
+    ));
+    let expansion = library.expand(&document).unwrap();
+    let expanded = &expansion.document;
+    assert!(expanded.is_expanded());
+    let ids: Vec<_> = expanded
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect();
+    assert_eq!(ids, ["camera", "room", "door1", "door1.handle"]);
+    let root = object(expanded, "door1");
+    assert_eq!(root.name.as_deref(), Some("Door"));
+    assert_eq!(root.parent.as_deref(), Some("room"));
+    assert_eq!(root.transform.position, [2.0, 0.0, 0.0]);
+    assert_eq!(
+        object(expanded, "door1.handle").parent.as_deref(),
+        Some("door1")
+    );
+    assert_eq!(
+        expansion.prefabs,
+        [VirtualPath::parse("prefabs/door.rveprefab").unwrap()]
+    );
+    assert_eq!(
+        expansion.origins["door1.handle"],
+        ObjectOrigin {
+            instance: "door1".into(),
+            target: "handle".into()
+        }
+    );
+    assert_eq!(expansion.origins["door1"].target, "frame");
+    assert!(!expansion.origins.contains_key("room"));
+    let paths: Vec<_> = expanded
+        .assets
+        .iter()
+        .map(|asset| asset.path.as_str())
+        .collect();
+    assert!(paths.contains(&"models/door.fbx"));
+    assert!(paths.contains(&"scripts/rotate.lua"));
+    let mut world = World::from_document(expanded).unwrap();
+    let handle = world.handle("door1.handle").unwrap();
+    assert!(world.world_matrix(handle).is_some());
+    world.build_frame();
+}
+
+#[test]
+fn nested_prefabs_produce_dotted_ids_and_outer_overrides_win() {
+    let lock = "[[assets]]\npath = \"/models/door.fbx\"\n[[objects]]\nid = \"body\"\n[[objects]]\nid = \"bolt\"\nparent = \"body\"\nname = \"Bolt\"\n[objects.mesh_renderer]\nmodel = \"/models/door.fbx\"\n";
+    let door = "[[assets]]\npath = \"/prefabs/lock.rveprefab\"\n[[objects]]\nid = \"frame\"\n[[instances]]\nid = \"lock\"\nparent = \"frame\"\nprefab = \"/prefabs/lock.rveprefab\"\n[[instances.overrides]]\ntarget = \"bolt\"\nname = \"Inner\"\ntransform = { position = [1.0, 2.0, 3.0] }\n";
+    let library = Library::new(&[
+        ("prefabs/door.rveprefab", door),
+        ("prefabs/lock.rveprefab", lock),
+    ]);
+    let document = scene(&door_scene(
+        "[[instances.overrides]]\ntarget = \"lock.bolt\"\nname = \"Outer\"\n",
+    ));
+    let expansion = library.expand(&document).unwrap();
+    let expanded = &expansion.document;
+    let bolt = object(expanded, "door1.lock.bolt");
+    assert_eq!(bolt.name.as_deref(), Some("Outer"));
+    assert_eq!(bolt.transform.position, [1.0, 2.0, 3.0]);
+    assert_eq!(bolt.parent.as_deref(), Some("door1.lock"));
+    assert_eq!(
+        object(expanded, "door1.lock").parent.as_deref(),
+        Some("door1")
+    );
+    assert_eq!(expansion.prefabs.len(), 2);
+    assert_eq!(expansion.origins["door1.lock.bolt"].target, "lock.bolt");
+}
+
+#[test]
+fn overrides_change_only_the_given_fields() {
+    let library = Library::new(&[("prefabs/door.rveprefab", DOOR)]);
+    let document = scene(&door_scene(
+        r#"[[instances.overrides]]
+target = "handle"
+name = "Gold handle"
+transform = { position = [0.1, 1.0, 0.0] }
+mesh_renderer = { model = "/models/gold.fbx", texture = "/textures/gold.png" }
+lite_params = [{ path = "/scripts/rotate.lua", params = { speed = 90.0 } }]
+[[instances.overrides]]
+target = "frame"
+mesh_renderer = { material = { metallic = 0.9 } }
+"#,
+    ));
+    let expanded = library.expand(&document).unwrap().document;
+    let handle = object(&expanded, "door1.handle");
+    assert_eq!(handle.name.as_deref(), Some("Gold handle"));
+    assert_eq!(handle.transform.position, [0.1, 1.0, 0.0]);
+    assert_eq!(handle.transform.rotation, [0.0, 45.0, 0.0]);
+    let mesh = handle.mesh_renderer.as_ref().unwrap();
+    assert_eq!(mesh.model.as_str(), "models/gold.fbx");
+    assert_eq!(mesh.texture.as_ref().unwrap().as_str(), "textures/gold.png");
+    let params = &handle.lite_scripts[0].params;
+    assert_eq!(params["speed"], ParamValue::Float(90.0));
+    assert_eq!(params["axis"], ParamValue::String("y".into()));
+    let material = object(&expanded, "door1")
+        .mesh_renderer
+        .as_ref()
+        .unwrap()
+        .material
+        .as_ref()
+        .unwrap();
+    assert_eq!(material.metallic, Some(0.9));
+    assert_eq!(material.roughness, Some(0.4));
+}
+
+#[test]
+fn instance_fields_win_over_a_root_override() {
+    let library = Library::new(&[("prefabs/door.rveprefab", DOOR)]);
+    let document = scene(&door_scene(
+        "name = \"Instance\"\n[[instances.overrides]]\ntarget = \"frame\"\nname = \"Override\"\n",
+    ));
+    let expanded = library.expand(&document).unwrap().document;
+    assert_eq!(object(&expanded, "door1").name.as_deref(), Some("Instance"));
+}
+
+#[test]
+fn camera_and_light_overrides_replace_whole_components_and_heavy_params_merge() {
+    let prefab = "[[objects]]\nid = \"rig\"\n[objects.camera]\nfov_deg = 50.0\nnear = 0.1\nfar = 10.0\n[[objects]]\nid = \"sun\"\nparent = \"rig\"\n[objects.directional_light]\nshadows = false\n[[objects.heavy_scripts]]\nname = \"Bobber\"\nparams = { speed = 1.0, amplitude = 0.5 }\n";
+    let library = Library::new(&[("prefabs/rig.rveprefab", prefab)]);
+    let document = scene(
+        "[[assets]]\npath = \"/prefabs/rig.rveprefab\"\n[[instances]]\nid = \"rig\"\nprefab = \"/prefabs/rig.rveprefab\"\n[[instances.overrides]]\ntarget = \"rig\"\ncamera = { fov_deg = 70.0, near = 0.5, far = 50.0 }\n[[instances.overrides]]\ntarget = \"sun\"\ndirectional_light = { color = [1.0, 0.5, 0.5] }\nheavy_params = [{ name = \"Bobber\", params = { speed = 2.0 } }]\n",
+    );
+    let expanded = library.expand(&document).unwrap().document;
+    let camera = object(&expanded, "rig").camera.unwrap();
+    assert_eq!((camera.fov_deg, camera.near, camera.far), (70.0, 0.5, 50.0));
+    let sun = object(&expanded, "rig.sun");
+    assert_eq!(sun.directional_light.unwrap().color, [1.0, 0.5, 0.5]);
+    let params = &sun.heavy_scripts[0].params;
+    assert_eq!(params["speed"], ParamValue::Float(2.0));
+    assert_eq!(params["amplitude"], ParamValue::Float(0.5));
+}
+
+#[test]
+fn camera_only_in_a_prefab_satisfies_the_scene() {
+    let prefab =
+        "[[objects]]\nid = \"eye\"\n[objects.camera]\nfov_deg = 50.0\nnear = 0.1\nfar = 10.0\n";
+    let library = Library::new(&[("prefabs/eye.rveprefab", prefab)]);
+    let document = scene(
+        "[[assets]]\npath = \"/prefabs/eye.rveprefab\"\n[[instances]]\nid = \"player\"\nprefab = \"/prefabs/eye.rveprefab\"\n",
+    );
+    let expanded = library.expand(&document).unwrap().document;
+    World::from_document(&expanded).unwrap();
+    assert!(World::from_document(&document).is_err());
+}
+
+#[test]
+fn a_second_light_from_a_prefab_is_rejected() {
+    let prefab = "[[objects]]\nid = \"lamp\"\n[objects.directional_light]\n";
+    let library = Library::new(&[("prefabs/lamp.rveprefab", prefab)]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n{CAMERA}[[objects]]\nid = \"sun\"\n[objects.directional_light]\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n"
+    ));
+    let error = library.expand(&document).unwrap_err();
+    assert!(error.message.contains("directional_light"), "{error}");
+}
+
+#[test]
+fn prefab_cycles_are_reported_with_the_chain() {
+    let a = "[[assets]]\npath = \"/b.rveprefab\"\n[[instances]]\nid = \"b\"\nprefab = \"/b.rveprefab\"\n";
+    let b = "[[assets]]\npath = \"/a.rveprefab\"\n[[instances]]\nid = \"a\"\nprefab = \"/a.rveprefab\"\n";
+    let library = Library::new(&[("a.rveprefab", a), ("b.rveprefab", b)]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/a.rveprefab\"\n{CAMERA}[[instances]]\nid = \"x\"\nprefab = \"/a.rveprefab\"\n"
+    ));
+    let error = library.expand(&document).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("/a.rveprefab -> /b.rveprefab -> /a.rveprefab"),
+        "{error}"
+    );
+
+    let selfish = "[[assets]]\npath = \"/s.rveprefab\"\n[[instances]]\nid = \"s\"\nprefab = \"/s.rveprefab\"\n";
+    let library = Library::new(&[("s.rveprefab", selfish)]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/s.rveprefab\"\n{CAMERA}[[instances]]\nid = \"x\"\nprefab = \"/s.rveprefab\"\n"
+    ));
+    assert!(
+        library
+            .expand(&document)
+            .unwrap_err()
+            .message
+            .contains("цикл")
+    );
+}
+
+#[test]
+fn nesting_deeper_than_the_limit_is_rejected() {
+    let mut entries = Vec::new();
+    for level in 0..=MAX_PREFAB_DEPTH {
+        let text = if level == MAX_PREFAB_DEPTH {
+            "[[objects]]\nid = \"leaf\"\n".to_owned()
+        } else {
+            let next = level + 1;
+            format!(
+                "[[assets]]\npath = \"/p{next}.rveprefab\"\n[[instances]]\nid = \"n\"\nprefab = \"/p{next}.rveprefab\"\n"
+            )
+        };
+        entries.push((format!("p{level}.rveprefab"), text));
+    }
+    let refs: Vec<_> = entries
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let library = Library::new(&refs);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/p0.rveprefab\"\n{CAMERA}[[instances]]\nid = \"x\"\nprefab = \"/p0.rveprefab\"\n"
+    ));
+    let error = library.expand(&document).unwrap_err();
+    assert!(error.message.contains("вложенность"), "{error}");
+
+    // На один уровень меньше — допустимо.
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/p1.rveprefab\"\n{CAMERA}[[instances]]\nid = \"x\"\nprefab = \"/p1.rveprefab\"\n"
+    ));
+    library.expand(&document).unwrap();
+}
+
+#[test]
+fn expanded_ids_longer_than_the_limit_are_rejected() {
+    let long = "a".repeat(63);
+    let inner = format!(
+        "[[objects]]\nid = \"{long}\"\n[[objects]]\nid = \"{long}2\"\nparent = \"{long}\"\n"
+    );
+    let outer = format!(
+        "[[assets]]\npath = \"/inner.rveprefab\"\n[[objects]]\nid = \"r\"\n[[instances]]\nid = \"{long}\"\nparent = \"r\"\nprefab = \"/inner.rveprefab\"\n"
+    );
+    let library = Library::new(&[("inner.rveprefab", &inner), ("outer.rveprefab", &outer)]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/outer.rveprefab\"\n{CAMERA}[[instances]]\nid = \"{long}\"\nprefab = \"/outer.rveprefab\"\n"
+    ));
+    // `L.L.L2`: 63 + 1 + 63 + 1 + 64 = 192 байта; ещё один уровень даёт 256.
+    library.expand(&document).unwrap();
+    let wrapper = format!(
+        "[[assets]]\npath = \"/outer.rveprefab\"\n[[objects]]\nid = \"w\"\n[[instances]]\nid = \"{long}\"\nparent = \"w\"\nprefab = \"/outer.rveprefab\"\n"
+    );
+    let library = Library::new(&[
+        ("inner.rveprefab", &inner),
+        ("outer.rveprefab", &outer),
+        ("wrapper.rveprefab", &wrapper),
+    ]);
+    let document = scene(&format!(
+        "[[assets]]\npath = \"/wrapper.rveprefab\"\n{CAMERA}[[instances]]\nid = \"{long}\"\nprefab = \"/wrapper.rveprefab\"\n"
+    ));
+    let error = library.expand(&document).unwrap_err();
+    assert!(error.message.contains("255"), "{error}");
+}
+
+#[test]
+fn unknown_targets_and_missing_components_are_errors() {
+    let library = Library::new(&[("prefabs/door.rveprefab", DOOR)]);
+    let missing = scene(&door_scene(
+        "[[instances.overrides]]\ntarget = \"knob\"\nname = \"x\"\n",
+    ));
+    assert!(
+        library
+            .expand(&missing)
+            .unwrap_err()
+            .message
+            .contains("knob")
+    );
+    let no_camera = scene(&door_scene(
+        "[[instances.overrides]]\ntarget = \"handle\"\ncamera = { fov_deg = 60.0, near = 0.1, far = 10.0 }\n",
+    ));
+    assert!(
+        library
+            .expand(&no_camera)
+            .unwrap_err()
+            .message
+            .contains("camera")
+    );
+    let no_script = scene(&door_scene(
+        "[[instances.overrides]]\ntarget = \"frame\"\nlite_params = [{ path = \"/scripts/rotate.lua\", params = { speed = 1 } }]\n",
+    ));
+    assert!(library.expand(&no_script).is_err());
+}
+
+#[test]
+fn parents_may_point_inside_an_instance_and_missing_parents_fail_after_expansion() {
+    let library = Library::new(&[("prefabs/door.rveprefab", DOOR)]);
+    let mut text = door_scene("");
+    text.push_str("[[objects]]\nid = \"sign\"\nparent = \"door1.handle\"\n");
+    let document = SceneDocument::parse("scene.rvescene", &text).unwrap();
+    let expanded = library.expand(&document).unwrap().document;
+    assert_eq!(
+        object(&expanded, "sign").parent.as_deref(),
+        Some("door1.handle")
+    );
+
+    let mut text = door_scene("");
+    text.push_str("[[objects]]\nid = \"sign\"\nparent = \"door1.knob\"\n");
+    let document = SceneDocument::parse("scene.rvescene", &text).unwrap();
+    assert!(
+        library
+            .expand(&document)
+            .unwrap_err()
+            .message
+            .contains("door1.knob")
+    );
+}
+
+#[test]
+fn conflicting_archives_from_prefabs_fail_and_the_scene_archive_wins() {
+    let a = "[[assets]]\npath = \"/models/door.fbx\"\narchive = \"doors\"\n[[objects]]\nid = \"a\"\n[objects.mesh_renderer]\nmodel = \"/models/door.fbx\"\n";
+    let b = "[[assets]]\npath = \"/models/door.fbx\"\narchive = \"props\"\n[[objects]]\nid = \"b\"\n[objects.mesh_renderer]\nmodel = \"/models/door.fbx\"\n";
+    let library = Library::new(&[("a.rveprefab", a), ("b.rveprefab", b)]);
+    let instances = "[[instances]]\nid = \"x\"\nprefab = \"/a.rveprefab\"\n[[instances]]\nid = \"y\"\nprefab = \"/b.rveprefab\"\n";
+    let declared = "[[assets]]\npath = \"/a.rveprefab\"\n[[assets]]\npath = \"/b.rveprefab\"\n";
+    let document = scene(&format!("{declared}{CAMERA}{instances}"));
+    assert!(
+        library
+            .expand(&document)
+            .unwrap_err()
+            .message
+            .contains("doors")
+    );
+
+    let document = scene(&format!(
+        "{declared}[[assets]]\npath = \"/models/door.fbx\"\narchive = \"scene\"\n{CAMERA}{instances}"
+    ));
+    let expanded = library.expand(&document).unwrap().document;
+    let asset = expanded
+        .assets
+        .iter()
+        .find(|asset| asset.path.as_str() == "models/door.fbx")
+        .unwrap();
+    assert_eq!(asset.archive.as_deref(), Some("scene"));
+}
+
+#[test]
+fn local_rules_are_checked_at_parse() {
+    let invalid = [
+        // Префаб не объявлен в [[assets]].
+        format!("{CAMERA}[[instances]]\nid = \"x\"\nprefab = \"/door.rveprefab\"\n"),
+        // Неверное расширение.
+        format!(
+            "[[assets]]\npath = \"/door.rvescene\"\n{CAMERA}[[instances]]\nid = \"x\"\nprefab = \"/door.rvescene\"\n"
+        ),
+        // Точка в авторском id и повтор id объекта.
+        door_scene("").replace("id = \"door1\"", "id = \"door.1\""),
+        door_scene("").replace("id = \"door1\"", "id = \"room\""),
+        // Повтор target и override с ресурсом, не объявленным в документе экземпляра.
+        door_scene(
+            "[[instances.overrides]]\ntarget = \"handle\"\n[[instances.overrides]]\ntarget = \"handle\"\n",
+        ),
+        door_scene(
+            "[[instances.overrides]]\ntarget = \"handle\"\nmesh_renderer = { model = \"/models/silver.fbx\" }\n",
+        ),
+        door_scene("[[instances.overrides]]\ntarget = \"bad target\"\n"),
+        door_scene("[[instances.overrides]]\ntarget = \"handle\"\nunknown = 1\n"),
+        door_scene(
+            "[[instances.overrides]]\ntarget = \"handle\"\ntransform = { skew = [1.0, 0.0, 0.0] }\n",
+        ),
+    ];
+    for text in invalid {
+        assert!(
+            SceneDocument::parse("scene.rvescene", &text).is_err(),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn prefab_documents_need_exactly_one_root_but_no_camera() {
+    SceneDocument::parse_prefab("p.rveprefab", "[[objects]]\nid = \"a\"\n").unwrap();
+    assert!(
+        SceneDocument::parse_prefab(
+            "p.rveprefab",
+            "[[objects]]\nid = \"a\"\n[[objects]]\nid = \"b\"\n"
+        )
+        .is_err()
+    );
+    assert!(SceneDocument::parse_prefab("p.rveprefab", "").is_err());
+    assert!(SceneDocument::parse("p.rvescene", "[[objects]]\nid = \"a\"\n").is_err());
+    let loaded_as_scene = Library::new(&[]);
+    let document = scene(&door_scene(""));
+    let error = expand(&document, &mut |_| {
+        SceneDocument::parse("door.rveprefab", CAMERA)
+    })
+    .unwrap_err();
+    assert!(error.message.contains("не как префаб"), "{error}");
+    drop(loaded_as_scene);
+}
+
+#[test]
+fn instances_round_trip_and_scenes_without_them_do_not_change() {
+    let text = door_scene(
+        "parent = \"room\"\n[instances.transform]\nposition = [2.0, 0.0, 0.0]\n[[instances.overrides]]\ntarget = \"handle\"\ntransform = { position = [0.1, 1.0, 0.0] }\nlite_params = [{ path = \"/scripts/rotate.lua\", params = { speed = 90.0 } }]\n",
+    );
+    let document = scene(&text);
+    let saved = document.to_toml().unwrap();
+    let reparsed = SceneDocument::parse("scene.rvescene", &saved).unwrap();
+    assert_eq!(reparsed.to_toml().unwrap(), saved);
+    let instance = &reparsed.instances[0];
+    assert_eq!(instance.parent.as_deref(), Some("room"));
+    let change = &instance.overrides[0];
+    assert_eq!(
+        change.transform,
+        Some(TransformOverride {
+            position: Some([0.1, 1.0, 0.0]),
+            ..TransformOverride::default()
+        })
+    );
+
+    for name in ["main", "second"] {
+        let path = format!(
+            "{}/../../examples/demo-game/Assets/scenes/{name}.rvescene",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = SceneDocument::parse(path.as_str(), &text).unwrap();
+        if document.instances.is_empty() {
+            assert!(!document.to_toml().unwrap().contains("instances"), "{path}");
+        }
+    }
+    let plain = scene(CAMERA);
+    assert!(!plain.to_toml().unwrap().contains("instances"));
+}
+
+#[test]
+fn expanded_documents_are_not_saved() {
+    let library = Library::new(&[("prefabs/door.rveprefab", DOOR)]);
+    let expanded = library.expand(&scene(&door_scene(""))).unwrap().document;
+    assert!(expanded.to_toml().is_err());
+}
+
+#[test]
+fn world_rejects_unexpanded_documents_without_panicking() {
+    let mut text = door_scene("");
+    text.push_str("[[objects]]\nid = \"sign\"\nparent = \"door1.handle\"\n");
+    let document = SceneDocument::parse("scene.rvescene", &text).unwrap();
+    assert!(World::from_document(&document).is_err());
+}
+
+#[test]
+fn expand_without_overrides_skips_only_that_instance() {
+    let library = Library::new(&[("prefabs/door.rveprefab", DOOR)]);
+    let document = scene(&format!(
+        "{}[[instances.overrides]]\ntarget = \"handle\"\nname = \"Gold\"\n[[instances]]\nid = \"door2\"\nprefab = \"/prefabs/door.rveprefab\"\n[[instances.overrides]]\ntarget = \"handle\"\nname = \"Silver\"\n",
+        door_scene("")
+    ));
+    let plain = expand_without_overrides(&document, "door1", &mut |path| library.load(path))
+        .unwrap()
+        .document;
+    assert_eq!(object(&plain, "door1.handle").name, None);
+    assert_eq!(
+        object(&plain, "door2.handle").name.as_deref(),
+        Some("Silver")
+    );
+}
+
+#[test]
+fn documents_without_instances_validate_as_before() {
+    let path = format!(
+        "{}/../../examples/demo-game/Assets/scenes/second.rvescene",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    let document = SceneDocument::parse(path.as_str(), &text).unwrap();
+    let expansion = expand(&document, &mut |_| unreachable!()).unwrap();
+    assert_eq!(expansion.document.objects.len(), document.objects.len());
+    assert!(expansion.prefabs.is_empty());
+    // Без экземпляров отсутствующий родитель — ошибка разбора, как раньше.
+    assert!(
+        SceneDocument::parse(
+            "s.rvescene",
+            &format!("{CAMERA}[[objects]]\nid = \"x\"\nparent = \"nope\"\n")
+        )
+        .is_err()
+    );
+}
