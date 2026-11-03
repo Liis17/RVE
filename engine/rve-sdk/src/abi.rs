@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 
 /// Oldest script ABI version accepted by the host.
-pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 1;
+pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
 pub const RVE_SCRIPT_ABI_VERSION: u32 = 3;
 

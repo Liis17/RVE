@@ -408,31 +408,16 @@ fn version_mismatch_does_not_read_the_module_table() {
 }
 
 #[test]
-fn legacy_abi_v1_and_v2_descriptors_load_without_parameter_fields() {
+fn legacy_abi_v1_and_v2_descriptors_are_rejected() {
     for version in [1, 2] {
         let module = legacy_probe_module(version);
-        // SAFETY: the leaked module and v1-layout descriptor remain immutable for this test.
-        let library = unsafe { crate::ScriptLibrary::from_module(module) }
-            .expect("legacy module is supported");
-        assert!(library.schema("Probe").is_none());
-
-        let mut world = scripted_world("Probe", &format!(r#"{{ label = "abi-v{version}" }}"#));
-        let mut host = load_host(&world, &library);
-        host.start(
-            &mut world,
-            ScriptTime {
-                elapsed: 3.5,
-                frame: 17,
-            },
-        );
-        assert!(
-            message_list(&mut host)
-                .iter()
-                .any(|message| message == &format!("start:abi-v{version}"))
-        );
+        // SAFETY: the leaked module is immutable; rejection reads only its header.
+        assert!(matches!(
+            unsafe { crate::ScriptLibrary::from_module(module) },
+            Err(crate::ScriptLibraryError::AbiVersion { found, .. }) if found == version
+        ));
     }
 }
-
 fn legacy_probe_module(version: u32) -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
