@@ -34,19 +34,78 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     }
 
     show_unsaved_prompt(ui.ctx(), state);
+    show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
+    state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
+}
+
+fn show_recovery_prompt(ctx: &egui::Context, state: &mut EditorState) {
+    let Some(prompt) = &state.recovery_prompt else {
+        return;
+    };
+    let name = prompt
+        .scene
+        .as_ref()
+        .map_or("untitled", |path| path.as_str())
+        .to_owned();
+    egui::Modal::new(egui::Id::new("recover_autosave")).show(ctx, |ui| {
+        ui.set_max_width(380.0);
+        ui.heading("Autosave found");
+        ui.label(format!(
+            "Найдены несохранённые изменения {name} от прошлого сеанса. Восстановить их?"
+        ));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Restore").clicked() {
+                state.action(Action::RestoreAutosave);
+            }
+            if ui.button("Discard").clicked() {
+                state.action(Action::DiscardAutosave);
+            }
+        });
+    });
 }
 
 fn show_status_bar(ui: &mut egui::Ui, state: &EditorState) {
+    let frame_seconds = ui.input(|input| input.stable_dt);
     egui::Panel::bottom("status_bar").show(ui, |ui| {
         ui.horizontal(|ui| {
-            let latest = state.log.entries().next_back();
-            match latest {
-                Some(entry) => ui.label(console::entry_text(entry)),
-                None => ui.label(""),
-            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(scene_status(state, frame_seconds));
+                ui.separator();
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if let Some(entry) = state.log.entries().next_back() {
+                        ui.add(egui::Label::new(console::entry_text(entry)).truncate());
+                    }
+                });
+            });
         });
     });
+}
+
+/// Сводка справа в строке состояния: сцена, признак правок, число объектов и FPS в Play.
+fn scene_status(state: &EditorState, frame_seconds: f32) -> String {
+    let Some(scene) = &state.scene else {
+        return String::new();
+    };
+    let mut parts = vec![
+        scene
+            .path()
+            .map_or("untitled", |path| path.as_str())
+            .to_owned(),
+    ];
+    if scene.is_dirty() {
+        parts.push("* unsaved".to_owned());
+    }
+    parts.push(format!("{} objects", scene.document().objects.len()));
+    if let Some(play) = &state.play {
+        if play.is_paused() {
+            parts.push("Paused".to_owned());
+        } else if frame_seconds > 0.0 {
+            parts.push(format!("{:.0} FPS", 1.0 / frame_seconds));
+        }
+    }
+    parts.join("  |  ")
 }
 
 fn show_welcome(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -57,7 +116,36 @@ fn show_welcome(ui: &mut egui::Ui, state: &mut EditorState) {
         if ui.button("Open Project…").clicked() {
             state.action(Action::OpenProject);
         }
+        if !state.recent_projects.is_empty() {
+            ui.add_space(16.0);
+            ui.label("Recent Projects");
+            ui.add_space(4.0);
+            recent_projects(ui, state);
+        }
     });
+}
+
+/// Список недавних проектов. Отсутствующие проекты помечены и недоступны;
+/// Remove Missing убирает их из списка.
+pub(crate) fn recent_projects(ui: &mut egui::Ui, state: &mut EditorState) {
+    let is_project = |dir: &std::path::Path| dir.join("project.rveproject").is_file();
+    let mut any_missing = false;
+    for dir in &state.recent_projects {
+        let exists = is_project(dir);
+        any_missing |= !exists;
+        let label = if exists {
+            dir.display().to_string()
+        } else {
+            format!("{} (не найден)", dir.display())
+        };
+        if ui.add_enabled(exists, egui::Button::new(label)).clicked() {
+            state.actions.push(Action::OpenProjectAt(dir.clone()));
+            ui.close();
+        }
+    }
+    if any_missing && ui.button("Remove Missing").clicked() {
+        state.recent_projects.retain(|dir| is_project(dir));
+    }
 }
 
 fn show_unsaved_prompt(ctx: &egui::Context, state: &mut EditorState) {

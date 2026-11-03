@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 egui.workspace = true
 egui-winit.workspace = true
-egui_dock.workspace = true
+egui_dock = { workspace = true, features = ["serde"] }
 engine-assets = { path = "../engine/engine-assets" }
 engine-files = { path = "../engine/engine-files" }
 engine-project = { path = "../engine/engine-project" }
@@ -22,3 +22,5 @@ engine-script = { path = "../engine/engine-script" }
 engine-window = { path = "../engine/engine-window" }
 glam.workspace = true
 rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true

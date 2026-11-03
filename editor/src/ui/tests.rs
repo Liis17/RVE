@@ -103,12 +103,33 @@ fn button(pos: Pos2, button: PointerButton, pressed: bool) -> Event {
 }
 
 fn key(key: egui::Key) -> Event {
+    key_with(key, Modifiers::NONE)
+}
+
+fn key_with(key: egui::Key, modifiers: Modifiers) -> Event {
     Event::Key {
         key,
         physical_key: None,
         pressed: true,
         repeat: false,
-        modifiers: Modifiers::NONE,
+        modifiers,
+    }
+}
+
+impl Harness {
+    /// Кадр только с обработкой горячих клавиш; модификаторы держатся весь кадр.
+    fn shortcuts(&mut self, mut events: Vec<Event>, modifiers: Modifiers) {
+        events.insert(0, Event::ModifiersChanged(modifiers));
+        let input = self.input(events);
+        let state = &mut self.state;
+        let mut output = self.ctx.run_ui(input, |ui| {
+            toolbar::handle_shortcuts(ui.ctx(), state);
+        });
+        output.textures_delta.clear();
+    }
+
+    fn press(&mut self, key: egui::Key, modifiers: Modifiers) {
+        self.shortcuts(vec![key_with(key, modifiers)], modifiers);
     }
 }
 
@@ -155,7 +176,9 @@ fn harness_with_cube() -> (Harness, String) {
         .unwrap();
     let mut transform = scene.object(&id).unwrap().transform;
     transform.position = CUBE_POSITION.to_array();
-    scene.set_transform(&id, transform, None).unwrap();
+    scene
+        .set_transforms(&[(id.clone(), transform)], None)
+        .unwrap();
     scene.select(None);
     harness.state.models.insert("cube.fbx".to_owned(), cube());
     // Первый кадр определяет размер панели.
@@ -256,6 +279,90 @@ fn dragging_the_move_handle_moves_along_the_axis_as_one_undo_step() {
     );
 }
 
+impl Harness {
+    fn click_with(&mut self, at: Pos2, modifiers: Modifiers, panel: Panel) {
+        let changed = Event::ModifiersChanged(modifiers);
+        let press = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        self.panel(vec![changed.clone(), Event::PointerMoved(at)], panel);
+        self.panel(vec![changed.clone(), press(true)], panel);
+        self.panel(vec![changed.clone(), press(false)], panel);
+        self.panel(vec![Event::ModifiersChanged(Modifiers::NONE)], panel);
+    }
+}
+
+#[test]
+fn ctrl_click_builds_a_group_that_the_move_handle_drags_as_one_undo_step() {
+    let (mut harness, first) = harness_with_cube();
+    let second_position = Vec3::new(0.0, 0.0, 3.0);
+    let scene = harness.scene_mut();
+    let model = VirtualPath::parse("/cube.fbx").unwrap();
+    let second = scene
+        .create_object(&NewObject::Mesh(model, second_position.to_array()), None)
+        .unwrap();
+    scene.select(None);
+    harness.panel(Vec::new(), scene_view::show);
+
+    let first_center = harness.project(CUBE_POSITION);
+    let second_center = harness.project(second_position);
+    harness.click(first_center, scene_view::show);
+    harness.click_with(second_center, Modifiers::COMMAND, scene_view::show);
+    assert_eq!(
+        harness.scene().selected_ids(),
+        [first.clone(), second.clone()]
+    );
+    // Ctrl-щелчок по выделенному снимает только его.
+    harness.click_with(second_center, Modifiers::COMMAND, scene_view::show);
+    assert_eq!(harness.scene().selected_ids(), std::slice::from_ref(&first));
+    harness.click_with(second_center, Modifiers::SHIFT, scene_view::show);
+    assert_eq!(
+        harness.scene().selected_ids(),
+        [first.clone(), second.clone()]
+    );
+
+    // Гизмо стоит в среднем положении группы.
+    let center = (CUBE_POSITION + second_position) * 0.5;
+    let handle = center.distance(harness.state.camera.eye()) * 0.18;
+    let grab = harness.project(center + Vec3::Y * handle * 0.8);
+    harness.drag(
+        grab,
+        grab - vec2(0.0, 60.0),
+        PointerButton::Primary,
+        scene_view::show,
+    );
+    let y = |harness: &Harness, id: &str| harness.scene().object(id).unwrap().transform.position;
+    let (a, b) = (y(&harness, &first), y(&harness, &second));
+    assert!(a[1] > 0.1, "{a:?}");
+    assert!((a[1] - b[1]).abs() < 1e-5, "{a:?} {b:?}");
+    assert_eq!((a[0], b[2]), (CUBE_POSITION.x, second_position.z));
+    assert!(harness.scene_mut().undo());
+    assert_eq!(y(&harness, &first), CUBE_POSITION.to_array());
+    assert_eq!(y(&harness, &second), second_position.to_array());
+}
+
+#[test]
+fn enabled_snapping_moves_the_object_in_whole_steps() {
+    let (mut harness, id) = harness_with_cube();
+    harness.state.snap.enabled = true;
+    harness.state.snap.move_step = 0.5;
+    harness.scene_mut().select(Some(id.as_str()));
+    harness.panel(Vec::new(), scene_view::show);
+    let grab = y_handle_grab(&harness);
+    harness.drag(
+        grab,
+        grab - vec2(0.0, 90.0),
+        PointerButton::Primary,
+        scene_view::show,
+    );
+    let y = harness.scene().object(&id).unwrap().transform.position[1];
+    assert!(y >= 0.5, "{y}");
+    assert!((y / 0.5 - (y / 0.5).round()).abs() < 1e-4, "{y}");
+}
+
 #[test]
 fn dragging_the_scale_handle_changes_only_that_axis() {
     let (mut harness, id) = harness_with_cube();
@@ -332,6 +439,331 @@ fn tool_shortcuts_apply_unless_a_text_field_has_focus() {
     });
     output.textures_delta.clear();
     assert_eq!(harness.state.tool, GizmoTool::Rotate);
+}
+
+#[test]
+fn showing_the_inspector_keeps_hdr_light_colors_and_material_overrides_unchanged() {
+    let mut harness = Harness::new();
+    let scene = harness.scene_mut();
+    scene
+        .edit_object("sun", None, |object| {
+            object.directional_light.as_mut().unwrap().color = [2.5, 1.5, 0.5];
+            Ok(())
+        })
+        .unwrap();
+    let model = VirtualPath::parse("/cube.fbx").unwrap();
+    let mesh = scene
+        .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+        .unwrap();
+    scene
+        .set_material(
+            &mesh,
+            Some(engine_scene::document::MaterialOverride {
+                base_color: Some([0.2, 0.4, 0.6]),
+                metallic: Some(0.5),
+                roughness: None,
+                metallic_roughness_texture: None,
+                normal_texture: None,
+                normal_scale: Some(2.0),
+            }),
+            None,
+        )
+        .unwrap();
+    let before = harness.scene().document().to_toml().unwrap();
+    let revision = harness.scene().revision();
+    for selected in ["sun", mesh.as_str()] {
+        harness.scene_mut().select(Some(selected));
+        for _ in 0..2 {
+            harness.panel(Vec::new(), inspector::show);
+        }
+    }
+    assert_eq!(harness.scene().revision(), revision);
+    assert_eq!(harness.scene().document().to_toml().unwrap(), before);
+}
+
+#[test]
+fn start_screen_opens_an_existing_recent_project_and_skips_missing_ones() {
+    let mut harness = Harness::new();
+    harness.state.scene = None;
+    let demo = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/demo-game"
+    ));
+    let missing = std::path::PathBuf::from("this/project/does/not/exist");
+    harness.state.recent_projects = vec![missing, demo.clone()];
+    harness.panel(Vec::new(), show_welcome);
+    // Строки списка находятся просмотром центра экрана сверху вниз.
+    for y in (240..720).step_by(4) {
+        harness.click(pos2(640.0, y as f32), show_welcome);
+        // Выше списка находится кнопка Open Project.
+        harness
+            .state
+            .actions
+            .retain(|action| *action != Action::OpenProject);
+        if !harness.state.actions.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(harness.state.actions, [Action::OpenProjectAt(demo.clone())]);
+
+    // Кнопка Remove Missing — последняя строка списка.
+    harness.state.actions.clear();
+    for y in (240..720).step_by(4).rev() {
+        harness.click(pos2(640.0, y as f32), show_welcome);
+        if harness.state.recent_projects.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(harness.state.recent_projects, [demo]);
+    assert!(harness.state.actions.is_empty());
+}
+
+#[test]
+fn recovery_prompt_offers_restore_and_blocks_escape() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.state.recovery_prompt = Some(crate::state::RecoveryPrompt {
+        scene: None,
+        contents: String::new(),
+    });
+    harness.press(egui::Key::Escape, Modifiers::NONE);
+    assert_eq!(harness.scene().selection(), Some("camera"));
+
+    let mut dock = default_layout();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness.ctx.run_ui(input, |ui| show(ui, state, &mut dock));
+        output.textures_delta.clear();
+    };
+    frame(&mut harness, Vec::new());
+    // Кнопки окна находятся просмотром середины экрана; Restore стоит левее Discard.
+    'search: for y in (330..440).step_by(6) {
+        for x in (480..800).step_by(16) {
+            let at = pos2(x as f32, y as f32);
+            frame(&mut harness, vec![Event::PointerMoved(at)]);
+            frame(&mut harness, vec![button(at, PointerButton::Primary, true)]);
+            frame(
+                &mut harness,
+                vec![button(at, PointerButton::Primary, false)],
+            );
+            if !harness.state.actions.is_empty() {
+                break 'search;
+            }
+        }
+    }
+    assert_eq!(harness.state.actions, [Action::RestoreAutosave]);
+}
+
+#[test]
+fn status_bar_summarises_the_scene_and_play_frame_rate() {
+    let mut harness = Harness::new();
+    assert_eq!(scene_status(&harness.state, 0.02), "untitled  |  2 objects");
+    harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    let document = harness.scene().document().clone();
+    harness.state.play =
+        Some(crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap());
+    assert_eq!(
+        scene_status(&harness.state, 0.02),
+        "untitled  |  * unsaved  |  3 objects  |  50 FPS"
+    );
+    harness.state.play.as_mut().unwrap().set_paused(true);
+    assert!(scene_status(&harness.state, 0.02).ends_with("Paused"));
+    harness.state.scene = None;
+    assert_eq!(scene_status(&harness.state, 0.02), "");
+}
+
+#[test]
+fn ctrl_shift_z_redoes_instead_of_undoing() {
+    let mut harness = Harness::new();
+    let id = harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    harness.press(egui::Key::Z, Modifiers::COMMAND);
+    assert!(harness.scene().object(&id).is_none());
+    harness.press(egui::Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+    assert!(harness.scene().object(&id).is_some());
+    assert!(!harness.scene().can_redo());
+}
+
+#[test]
+fn copy_puts_objects_on_the_os_clipboard_and_paste_inserts_them() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    let input = harness.input(vec![Event::Copy]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        toolbar::handle_shortcuts(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    let copied = output
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("Copy кладёт текст в буфер ОС");
+
+    harness.shortcuts(vec![Event::Paste(copied.clone())], Modifiers::NONE);
+    let scene = harness.scene();
+    assert_eq!(scene.document().objects.len(), 3);
+    let pasted = scene.selection().unwrap();
+    assert_ne!(pasted, "camera");
+    assert!(scene.object(pasted).unwrap().camera.is_some());
+
+    // Чужой текст и вставка в текстовое поле объектов не создают.
+    harness.shortcuts(vec![Event::Paste("hello".to_owned())], Modifiers::NONE);
+    assert_eq!(harness.scene().document().objects.len(), 3);
+    assert_eq!(harness.state.log.entries().count(), 0);
+    let text_id = egui::Id::new("focused_text");
+    let mut text = String::new();
+    let input = harness.input(Vec::new());
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+        ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
+    });
+    output.textures_delta.clear();
+    let input = harness.input(vec![Event::Paste(copied)]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+        toolbar::handle_shortcuts(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    assert_eq!(harness.scene().document().objects.len(), 3);
+}
+
+#[test]
+fn escape_that_closes_a_text_field_keeps_the_selection() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    let text_id = egui::Id::new("search");
+    let mut text = String::new();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>, focus: bool| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness.ctx.run_ui(input, |ui| {
+            toolbar::handle_shortcuts(ui.ctx(), state);
+            ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+            if focus {
+                ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
+            }
+            // Как в конце `ui::show`.
+            state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
+        });
+        output.textures_delta.clear();
+    };
+    frame(&mut harness, Vec::new(), true);
+    frame(&mut harness, Vec::new(), false);
+    // egui снимает фокус по Esc до построения UI этого кадра.
+    frame(&mut harness, vec![key(egui::Key::Escape)], false);
+    assert_eq!(harness.scene().selection(), Some("camera"));
+    // Следующий Esc вне поля снимает выделение.
+    frame(&mut harness, vec![key(egui::Key::Escape)], false);
+    assert_eq!(harness.scene().selection(), None);
+}
+
+#[test]
+fn shortcuts_do_not_edit_the_scene_behind_a_modal() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.state.recovery_prompt = Some(crate::state::RecoveryPrompt {
+        scene: None,
+        contents: String::new(),
+    });
+    harness.press(egui::Key::D, Modifiers::COMMAND);
+    harness.press(egui::Key::Delete, Modifiers::NONE);
+    assert_eq!(harness.scene().document().objects.len(), 2);
+    assert!(!harness.scene().is_dirty());
+}
+
+#[test]
+fn losing_the_selection_mid_drag_starts_a_new_history_entry() {
+    let (mut harness, id) = harness_with_cube();
+    harness.scene_mut().select(Some(id.as_str()));
+    harness.panel(Vec::new(), scene_view::show);
+    let grab = y_handle_grab(&harness);
+    harness.panel(vec![Event::PointerMoved(grab)], scene_view::show);
+    harness.panel(
+        vec![button(grab, PointerButton::Primary, true)],
+        scene_view::show,
+    );
+    for step in 1..=3 {
+        let at = grab - vec2(0.0, 20.0 * step as f32);
+        harness.panel(vec![Event::PointerMoved(at)], scene_view::show);
+    }
+    assert!(harness.state.gizmo_drag.is_some());
+    let dragged = harness.scene().object(&id).unwrap().transform;
+    harness.scene_mut().select(None);
+    harness.panel(Vec::new(), scene_view::show);
+    assert!(harness.state.gizmo_drag.is_none());
+
+    let key = format!("{id}/gizmo");
+    let moved = engine_scene::SceneTransform {
+        position: [9.0, 9.0, 9.0],
+        ..dragged
+    };
+    harness
+        .scene_mut()
+        .set_transforms(&[(id.clone(), moved)], Some(&key))
+        .unwrap();
+    assert!(harness.scene_mut().undo());
+    assert_eq!(
+        harness.scene().object(&id).unwrap().transform.position,
+        dragged.position
+    );
+}
+
+#[test]
+fn ctrl_d_duplicates_the_selection() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.press(egui::Key::D, Modifiers::COMMAND);
+    let scene = harness.scene();
+    assert_eq!(scene.document().objects.len(), 3);
+    let copy = scene.selection().unwrap();
+    assert_ne!(copy, "camera");
+    assert!(scene.object(copy).unwrap().camera.is_some());
+}
+
+#[test]
+fn f2_starts_renaming_and_escape_clears_the_selection() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    assert_eq!(
+        harness.state.hierarchy_rename,
+        Some(("camera".to_owned(), "Camera".to_owned()))
+    );
+    harness.state.hierarchy_rename = None;
+    harness.press(egui::Key::Escape, Modifiers::NONE);
+    assert_eq!(harness.scene().selection(), None);
+}
+
+#[test]
+fn escape_keeps_the_selection_while_a_dialog_is_open_or_playing() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.state.project_dialog = Some(project_panel::ProjectDialog::NewFolder {
+        name: String::new(),
+    });
+    harness.press(egui::Key::Escape, Modifiers::NONE);
+    assert_eq!(harness.scene().selection(), Some("camera"));
+
+    harness.state.project_dialog = None;
+    let document = harness.scene().document().clone();
+    harness.state.play =
+        Some(crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap());
+    harness.press(egui::Key::Escape, Modifiers::NONE);
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    assert_eq!(harness.scene().selection(), Some("camera"));
+    assert_eq!(harness.state.hierarchy_rename, None);
 }
 
 #[test]

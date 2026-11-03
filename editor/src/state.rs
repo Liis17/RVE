@@ -5,9 +5,10 @@ use crate::console::ConsoleLog;
 use crate::play::PlaySession;
 use crate::previews::PreviewCache;
 use crate::project::OpenProject;
-use crate::scene_edit::{EditorScene, NewObject};
+use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::EditorCamera;
-use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool};
+use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
+use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
 use engine_files::VirtualPath;
 use engine_scene::World;
@@ -24,6 +25,8 @@ pub enum Action {
     /// `None` — выбрать файл в диалоге.
     OpenScene(Option<String>),
     OpenProject,
+    /// Открыть проект из списка недавних.
+    OpenProjectAt(PathBuf),
     Save,
     SaveAs,
     Exit,
@@ -37,6 +40,18 @@ pub enum Action {
     SaveThen(Box<Action>),
     /// Выполнить действие, отбросив несохранённые изменения.
     Discard(Box<Action>),
+    /// Открыть сцену из найденного автосохранения.
+    RestoreAutosave,
+    /// Удалить найденное автосохранение.
+    DiscardAutosave,
+}
+
+/// Найденное при открытии сцены автосохранение.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryPrompt {
+    /// Сцена копии; `None` — несохранённая новая сцена.
+    pub scene: Option<VirtualPath>,
+    pub contents: String,
 }
 
 /// Подтверждение действия при несохранённых изменениях сцены.
@@ -65,6 +80,7 @@ pub struct FrameParts<'a> {
     pub world: &'a mut World,
     pub project: &'a OpenProject,
     pub models: &'a mut HashMap<String, Arc<Model>>,
+    pub loader: &'a mut ModelLoader,
     pub log: &'a mut ConsoleLog,
 }
 
@@ -74,17 +90,29 @@ pub struct EditorState {
     pub log: ConsoleLog,
     pub tool: GizmoTool,
     pub space: GizmoSpace,
+    pub snap: SnapSettings,
     pub camera: EditorCamera,
     pub gizmo_drag: Option<GizmoDrag>,
     pub play: Option<PlaySession>,
     pub scripts_path: Option<PathBuf>,
+    /// Недавние проекты из настроек пользователя, последний открытый — первым.
+    pub recent_projects: Vec<PathBuf>,
     pub library: Option<ScriptLibrary>,
     pub actions: Vec<Action>,
     pub unsaved_prompt: Option<UnsavedPrompt>,
+    pub recovery_prompt: Option<RecoveryPrompt>,
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
+    /// В прошлом кадре фокус был в текстовом поле: Esc этого кадра закрывает поле,
+    /// а не снимает выделение.
+    pub text_focused_last_frame: bool,
+    /// Строки поиска панелей Hierarchy и Project.
+    pub hierarchy_filter: String,
+    pub project_filter: String,
+    /// Компонент, скопированный в Inspector для вставки в объекты.
+    pub component_clipboard: Option<Component>,
     pub previews: PreviewCache,
     pub viewport_texture: Option<egui::TextureId>,
     pub scene_view: SceneViewInfo,
@@ -96,6 +124,8 @@ pub struct EditorState {
     pub pending_frame: Option<String>,
     /// CPU-модели, загруженные для отрисовки: по ним работают picking и фокус камеры.
     pub models: HashMap<String, Arc<Model>>,
+    /// Фоновый разбор FBX для `models`.
+    pub model_loader: ModelLoader,
     edit_world: Option<(u64, World)>,
 }
 
@@ -107,17 +137,24 @@ impl EditorState {
             log: ConsoleLog::default(),
             tool: GizmoTool::Move,
             space: GizmoSpace::Global,
+            snap: SnapSettings::default(),
             camera: EditorCamera::default(),
             gizmo_drag: None,
             play: None,
             scripts_path,
+            recent_projects: Vec::new(),
             library: None,
             actions: Vec::new(),
             unsaved_prompt: None,
+            recovery_prompt: None,
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_dialog: None,
             hierarchy_rename: None,
+            text_focused_last_frame: false,
+            hierarchy_filter: String::new(),
+            project_filter: String::new(),
+            component_clipboard: None,
             previews: PreviewCache::default(),
             viewport_texture: None,
             scene_view: SceneViewInfo::default(),
@@ -126,6 +163,7 @@ impl EditorState {
             game_camera: None,
             pending_frame: None,
             models: HashMap::new(),
+            model_loader: ModelLoader::default(),
             edit_world: None,
         }
     }
@@ -184,6 +222,7 @@ impl EditorState {
             world,
             project: self.project.as_ref()?,
             models: &mut self.models,
+            loader: &mut self.model_loader,
             log: &mut self.log,
         })
     }

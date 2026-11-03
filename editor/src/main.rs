@@ -2,6 +2,7 @@
 
 mod app;
 mod assets_fs;
+mod autosave;
 mod cli;
 mod console;
 mod input;
@@ -10,6 +11,7 @@ mod play;
 mod previews;
 mod project;
 mod scene_edit;
+mod settings;
 mod state;
 mod ui;
 mod ui_render;
