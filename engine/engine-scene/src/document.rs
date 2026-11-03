@@ -212,6 +212,7 @@ impl SceneDocument {
         let mut camera_count = 0;
         let mut active_camera_count = 0;
         let mut light_count = 0;
+        let mut environment_count = 0;
         for object in &self.objects {
             if let Some(parent) = &object.parent
                 && !local_only
@@ -247,6 +248,10 @@ impl SceneDocument {
             if let Some(light) = &object.directional_light {
                 light_count += 1;
                 validate_light(source, object, light)?;
+            }
+            if let Some(environment) = &object.environment {
+                environment_count += 1;
+                validate_environment(source, &object.id, &asset_paths, environment)?;
             }
             if let Some(mesh) = &object.mesh_renderer {
                 require_asset_path(source, &object.id, &asset_paths, &mesh.model, "модель")?;
@@ -376,6 +381,15 @@ impl SceneDocument {
                 ),
             ));
         }
+        if environment_count > 1 {
+            return Err(SceneError::new(
+                source,
+                None,
+                format!(
+                    "в сцене допускается не более одного environment, найдено {environment_count}"
+                ),
+            ));
+        }
         if local_only {
             return Ok(());
         }
@@ -440,6 +454,8 @@ pub struct SceneObject {
     pub lod_group: Option<LodGroup>,
     #[serde(default)]
     pub directional_light: Option<DirectionalLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]
@@ -607,6 +623,39 @@ pub struct DirectionalLightComponent {
     pub shadow_distance: f32,
     #[serde(default = "default_shadow_cascades")]
     pub shadow_cascades: u8,
+}
+
+/// Окружение сцены: Radiance HDR panorama или процедурное небо.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentComponent {
+    #[serde(with = "option_virtual_path_serde")]
+    pub hdr: Option<VirtualPath>,
+    pub procedural: Option<ProceduralSkyComponent>,
+    pub intensity: f32,
+    pub skybox: bool,
+}
+
+impl Default for EnvironmentComponent {
+    fn default() -> Self {
+        Self {
+            hdr: None,
+            procedural: None,
+            intensity: 1.0,
+            skybox: true,
+        }
+    }
+}
+
+/// Параметры процедурного неба в линейном RGB.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProceduralSkyComponent {
+    pub zenith_color: [f32; 3],
+    pub horizon_color: [f32; 3],
+    pub ground_color: [f32; 3],
+    pub sun_size_deg: f32,
+    pub sun_intensity: f32,
 }
 
 /// Скаляр или массив значений параметра скрипта.
@@ -790,6 +839,63 @@ fn validate_light(
     Ok(())
 }
 
+pub(crate) fn validate_environment(
+    source: &str,
+    object_id: &str,
+    assets: &HashSet<VirtualPath>,
+    environment: &EnvironmentComponent,
+) -> Result<(), SceneError> {
+    if environment.hdr.is_some() == environment.procedural.is_some() {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "environment должен задавать ровно один источник: hdr или procedural",
+        ));
+    }
+    if !environment.intensity.is_finite() || environment.intensity < 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "environment.intensity должен быть конечным и >= 0",
+        ));
+    }
+    if let Some(path) = &environment.hdr {
+        require_asset_path(source, object_id, assets, path, "HDR environment")?;
+        require_extension(source, object_id, path, "hdr", "HDR environment")?;
+    }
+    if let Some(sky) = environment.procedural {
+        if [sky.zenith_color, sky.horizon_color, sky.ground_color]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                "environment.procedural цвета должны содержать конечные компоненты >= 0",
+            ));
+        }
+        if !sky.sun_size_deg.is_finite()
+            || !(0.0..=180.0).contains(&sky.sun_size_deg)
+            || sky.sun_size_deg == 0.0
+        {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                "environment.procedural.sun_size_deg должен быть конечным и в диапазоне (0, 180]",
+            ));
+        }
+        if !sky.sun_intensity.is_finite() || sky.sun_intensity < 0.0 {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                "environment.procedural.sun_intensity должен быть конечным и >= 0",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_params(
     source: &str,
     object: &SceneObject,
@@ -873,6 +979,14 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                     .get("settings")
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, "camera.settings", path)),
+            );
+        }
+        if let Some(environment) = object.get("environment").and_then(toml::Value::as_table) {
+            paths.extend(
+                environment
+                    .get("hdr")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| (object_id, "environment.hdr", path)),
             );
         }
         if let Some(group) = object.get("lod_group").and_then(toml::Value::as_table)
@@ -1951,5 +2065,82 @@ scale=[1.0,1.0,0.0]
             !renderer_error.contains("invalid virtual path"),
             "{renderer_error}"
         );
+    }
+
+    #[test]
+    fn environment_sources_are_exclusive_validated_and_round_trip() {
+        let hdr = r#"
+[[assets]]
+path="/environment/sky.hdr"
+[[objects]]
+id="camera"
+[objects.camera]
+[[objects]]
+id="environment"
+[objects.environment]
+hdr="/environment/sky.hdr"
+intensity=1.5
+skybox=false
+"#;
+        let document = SceneDocument::parse("environment.rvescene", hdr).unwrap();
+        let saved = document.to_toml().unwrap();
+        let reparsed = SceneDocument::parse("environment.rvescene", &saved).unwrap();
+        assert_eq!(reparsed.to_toml().unwrap(), saved);
+
+        let procedural = r#"
+[[objects]]
+id="camera"
+[objects.camera]
+[[objects]]
+id="environment"
+[objects.environment]
+[objects.environment.procedural]
+zenith_color=[0.1, 0.2, 0.4]
+horizon_color=[0.8, 0.7, 0.5]
+ground_color=[0.1, 0.1, 0.1]
+sun_size_deg=2.0
+sun_intensity=4.0
+"#;
+        assert!(SceneDocument::parse("procedural.rvescene", procedural).is_ok());
+
+        let empty = format!("{VALID}\n[[objects]]\nid=\"environment\"\n[objects.environment]\n");
+        let error = SceneDocument::parse("empty-environment.rvescene", &empty).unwrap_err();
+        assert!(error.message.contains("ровно один источник"));
+
+        let both = format!(
+            "{hdr}\n[objects.environment.procedural]\nzenith_color=[1.0,1.0,1.0]\nhorizon_color=[1.0,1.0,1.0]\nground_color=[0.0,0.0,0.0]\nsun_size_deg=1.0\nsun_intensity=1.0\n"
+        );
+        let error = SceneDocument::parse("both-environment.rvescene", &both).unwrap_err();
+        assert!(error.message.contains("ровно один источник"));
+
+        let bad_extension = hdr.replace("/environment/sky.hdr", "/environment/sky.png");
+        let error = SceneDocument::parse("bad-extension.rvescene", &bad_extension).unwrap_err();
+        assert!(error.message.contains("расширение .hdr"));
+        let negative_intensity = hdr.replace("intensity=1.5", "intensity=-1.0");
+        let error =
+            SceneDocument::parse("bad-intensity.rvescene", &negative_intensity).unwrap_err();
+        assert!(error.message.contains("environment.intensity"));
+        let invalid_sun = procedural.replace("sun_size_deg=2.0", "sun_size_deg=181.0");
+        let error = SceneDocument::parse("bad-sun.rvescene", &invalid_sun).unwrap_err();
+        assert!(error.message.contains("sun_size_deg"));
+
+        let two = format!(
+            "{hdr}\n[[objects]]\nid=\"second\"\n[objects.environment]\nhdr=\"/environment/sky.hdr\"\n"
+        );
+        let error = SceneDocument::parse("two-environments.rvescene", &two).unwrap_err();
+        assert!(error.message.contains("не более одного environment"));
+    }
+
+    #[test]
+    fn environment_rejects_unknown_fields_and_undeclared_assets() {
+        let unknown = format!(
+            "{VALID}\n[[objects]]\nid=\"environment\"\n[objects.environment]\nhdr=\"/sky.hdr\"\nunknown=true\n"
+        );
+        assert!(SceneDocument::parse("unknown-environment.rvescene", &unknown).is_err());
+        let missing = format!(
+            "{VALID}\n[[objects]]\nid=\"environment\"\n[objects.environment]\nhdr=\"/sky.hdr\"\n"
+        );
+        let error = SceneDocument::parse("missing-environment.rvescene", &missing).unwrap_err();
+        assert!(error.message.contains("отсутствует в [[assets]]"));
     }
 }

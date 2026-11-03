@@ -1,18 +1,20 @@
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, FrameStatus,
-    MaterialId, MeshId, Renderer, SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper,
-    ViewSettings,
+    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, MaterialId, MeshId,
+    ProceduralSky, Renderer, SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_scene::camera::Camera;
 use engine_scene::light::cascade_view_projections;
-use engine_scene::{AntiAliasing, CameraSettings, LightState, ObjectHandle, Tonemapper, World};
+use engine_scene::{
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, ObjectHandle, Tonemapper, World,
+};
 use engine_script::{
     ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary, ScriptTime,
 };
 use flume::{Receiver, RecvTimeoutError, Selector, Sender, TryRecvError};
-use glam::Vec3;
+use glam::{Mat3, Vec3};
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -28,12 +30,38 @@ pub(crate) struct FrameSnapshot {
     pub camera: Camera,
     pub view: CameraSettings,
     pub light: LightState,
+    pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SceneEnvironmentSnapshot {
+    pub key: EnvironmentCacheKey,
+    pub source: EnvironmentSnapshotSource,
+    pub intensity: f32,
+    pub rotation: [[f32; 3]; 3],
+    pub skybox: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum EnvironmentSnapshotSource {
+    Hdr(Arc<EnvironmentSource>),
+    Procedural(ProceduralSky),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EnvironmentCacheKey {
+    Hdr(String),
+    Procedural {
+        colors_and_sun: [u32; 11],
+        sun_direction: [i32; 3],
+    },
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
     pub by_object: HashMap<ObjectHandle, Vec<Vec<(MeshId, MaterialId)>>>,
+    pub environments: HashMap<String, Arc<EnvironmentSource>>,
 }
 
 #[derive(Debug)]
@@ -175,11 +203,15 @@ pub(crate) enum ScriptStartupError {
 
 pub(crate) struct VulkanBackend {
     renderer: Renderer,
+    current_environment: Option<(EnvironmentCacheKey, EnvironmentId)>,
 }
 
 impl VulkanBackend {
     pub fn new(renderer: Renderer) -> Self {
-        Self { renderer }
+        Self {
+            renderer,
+            current_environment: None,
+        }
     }
 }
 
@@ -211,6 +243,45 @@ impl RenderBackend for VulkanBackend {
             .map(|matrix| matrix.to_cols_array_2d())
             .collect()
         });
+        let environment = match &snapshot.environment {
+            Some(environment) => {
+                let id = match &self.current_environment {
+                    Some((key, id)) if key == &environment.key => *id,
+                    _ => {
+                        let id = match &environment.source {
+                            EnvironmentSnapshotSource::Hdr(source) => {
+                                self.renderer.create_environment(source)
+                            }
+                            EnvironmentSnapshotSource::Procedural(sky) => self
+                                .renderer
+                                .create_environment(&EnvironmentSource::Procedural(*sky)),
+                        }
+                        .map_err(|error| error.to_string())?;
+                        if let Some((_, previous)) = self.current_environment.take() {
+                            self.renderer
+                                .destroy_environment(previous)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        self.current_environment = Some((environment.key.clone(), id));
+                        id
+                    }
+                };
+                Some(FrameEnvironment {
+                    id,
+                    intensity: environment.intensity,
+                    rotation: environment.rotation,
+                    skybox: environment.skybox,
+                })
+            }
+            None => {
+                if let Some((_, id)) = self.current_environment.take() {
+                    self.renderer
+                        .destroy_environment(id)
+                        .map_err(|error| error.to_string())?;
+                }
+                None
+            }
+        };
         let frame = Frame {
             clear_color: [
                 snapshot.view.render.clear_color[0],
@@ -218,12 +289,13 @@ impl RenderBackend for VulkanBackend {
                 snapshot.view.render.clear_color[2],
                 1.0,
             ],
-            view_projection: snapshot
-                .camera
-                .view_projection(width, height)
-                .to_cols_array_2d(),
+            camera: FrameCamera {
+                view: snapshot.camera.view().to_cols_array_2d(),
+                projection: snapshot.camera.projection(width, height).to_cols_array_2d(),
+                position: snapshot.camera.position.to_array(),
+            },
+            environment,
             shadow_cascades: &shadow_cascades,
-            camera_position: snapshot.camera.position.to_array(),
             light,
             draws: &snapshot.draws,
             overlay: &[],
@@ -309,6 +381,7 @@ fn scripts_thread(
         control_rx,
         frame_tx,
         render_tx,
+        status,
         input,
         ..
     } = config;
@@ -432,7 +505,13 @@ fn scripts_thread(
                 warning.source, warning.object_id, warning.message
             );
         }
-        let snapshot = Arc::new(make_snapshot(scene_frame, &world, &gpu_scene));
+        let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene) {
+            Ok(snapshot) => Arc::new(snapshot),
+            Err(error) => {
+                status.record_failure(error);
+                break;
+            }
+        };
         match send_snapshot(&frame_tx, &control_rx, snapshot, &mut background) {
             SendOutcome::Sent => {}
             SendOutcome::Background => {
@@ -489,7 +568,7 @@ fn make_snapshot(
     scene: engine_scene::SceneFrame,
     world: &World,
     gpu_scene: &GpuSceneTable,
-) -> FrameSnapshot {
+) -> Result<FrameSnapshot, String> {
     let mut draws = Vec::new();
     let camera_position = scene.camera.position;
     for instance in scene.meshes {
@@ -506,11 +585,86 @@ fn make_snapshot(
             casts_shadow: true,
         }));
     }
-    FrameSnapshot {
+    let environment = resolve_environment_snapshot(scene.environment.as_ref(), gpu_scene)?;
+    Ok(FrameSnapshot {
         camera: scene.camera,
         view: scene.view,
         light: scene.light,
+        environment,
         draws,
+    })
+}
+
+fn resolve_environment_snapshot(
+    state: Option<&EnvironmentState>,
+    gpu_scene: &GpuSceneTable,
+) -> Result<Option<SceneEnvironmentSnapshot>, String> {
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let component = &state.component;
+    let (key, source) = match (&component.hdr, component.procedural) {
+        (Some(path), None) => {
+            let path = path.as_str().to_owned();
+            let source = gpu_scene
+                .environments
+                .get(&path)
+                .cloned()
+                .ok_or_else(|| format!("не загружены HDR данные окружения {path}"))?;
+            (
+                EnvironmentCacheKey::Hdr(path.clone()),
+                EnvironmentSnapshotSource::Hdr(source),
+            )
+        }
+        (None, Some(procedural)) => {
+            let world_sun = state.sun_direction.unwrap_or([0.0, 1.0, 0.0]);
+            let world_sun = Vec3::from_array(world_sun).normalize_or_zero();
+            let rotation = Mat3::from_cols_array_2d(&state.rotation);
+            let local_sun = (rotation.transpose() * world_sun).normalize_or_zero();
+            let sky = ProceduralSky {
+                zenith_color: procedural.zenith_color,
+                horizon_color: procedural.horizon_color,
+                ground_color: procedural.ground_color,
+                sun_size_deg: procedural.sun_size_deg,
+                sun_intensity: procedural.sun_intensity,
+                sun_direction: local_sun.to_array(),
+            };
+            (
+                procedural_environment_key(sky),
+                EnvironmentSnapshotSource::Procedural(sky),
+            )
+        }
+        _ => return Err("окружение должно иметь ровно один источник".to_owned()),
+    };
+    Ok(Some(SceneEnvironmentSnapshot {
+        key,
+        source,
+        intensity: component.intensity,
+        rotation: state.rotation,
+        skybox: component.skybox,
+    }))
+}
+
+fn procedural_environment_key(sky: ProceduralSky) -> EnvironmentCacheKey {
+    let colors_and_sun = [
+        sky.zenith_color[0].to_bits(),
+        sky.zenith_color[1].to_bits(),
+        sky.zenith_color[2].to_bits(),
+        sky.horizon_color[0].to_bits(),
+        sky.horizon_color[1].to_bits(),
+        sky.horizon_color[2].to_bits(),
+        sky.ground_color[0].to_bits(),
+        sky.ground_color[1].to_bits(),
+        sky.ground_color[2].to_bits(),
+        sky.sun_size_deg.to_bits(),
+        sky.sun_intensity.to_bits(),
+    ];
+    let sun_direction = sky
+        .sun_direction
+        .map(|value| (value * 4096.0).round() as i32);
+    EnvironmentCacheKey::Procedural {
+        colors_and_sun,
+        sun_direction,
     }
 }
 
@@ -770,15 +924,17 @@ fn render_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        Clock, ExitRequester, FrameSnapshot, GpuSceneTable, RenderBackend, RenderControl,
-        RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
-        ScriptThreadConfig, make_snapshot, render_loop, render_snapshot, render_thread,
-        selected_level, send_snapshot, sync_input_background, wait_background_tick,
+        Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
+        GpuSceneTable, RenderBackend, RenderControl, RenderThreadConfig, RuntimeStatus,
+        SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig, make_snapshot,
+        procedural_environment_key, render_loop, render_snapshot, render_thread, selected_level,
+        send_snapshot, sync_input_background, wait_background_tick,
     };
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
     use engine_render::{DrawCommand, FrameStatus};
+    use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
@@ -787,6 +943,7 @@ mod tests {
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
@@ -1001,6 +1158,7 @@ distance=2.0
             },
             view: CameraSettings::default(),
             light: LightState::default(),
+            environment: None,
             draws: Vec::<DrawCommand>::new(),
         }
     }
@@ -1023,8 +1181,69 @@ distance=2.0
             .set_camera_settings(world.active_camera(), settings)
             .unwrap();
         let (frame, _) = world.build_frame();
-        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default());
+        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default()).unwrap();
         assert_eq!(snapshot.view, settings);
+    }
+
+    #[test]
+    fn hdr_environment_is_resolved_from_prepared_scene_assets() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[assets]]\npath=\"/environment/sky.hdr\"\n[[objects]]\nid=\"camera\"\n[objects.camera]\n[[objects]]\nid=\"sky\"\n[objects.environment]\nhdr=\"/environment/sky.hdr\"\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let (frame, warnings) = world.build_frame();
+        assert!(warnings.is_empty());
+        assert!(make_snapshot(frame.clone(), &world, &GpuSceneTable::default()).is_err());
+
+        let source = Arc::new(EnvironmentSource::Equirect {
+            width: 2,
+            height: 1,
+            rgb: vec![0.1; 6],
+        });
+        let scene = GpuSceneTable {
+            environments: HashMap::from([("environment/sky.hdr".to_owned(), source)]),
+            ..GpuSceneTable::default()
+        };
+        let snapshot = make_snapshot(frame, &world, &scene).unwrap();
+        let environment = snapshot.environment.unwrap();
+        assert_eq!(
+            environment.key,
+            EnvironmentCacheKey::Hdr("environment/sky.hdr".to_owned())
+        );
+        assert!(matches!(
+            environment.source,
+            EnvironmentSnapshotSource::Hdr(source)
+                if matches!(source.as_ref(), EnvironmentSource::Equirect { width: 2, height: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn procedural_environment_cache_tracks_quantized_sun_direction() {
+        let sky = ProceduralSky {
+            zenith_color: [0.2, 0.35, 0.65],
+            horizon_color: [0.65, 0.7, 0.75],
+            ground_color: [0.12, 0.11, 0.1],
+            sun_size_deg: 1.0,
+            sun_intensity: 1.0,
+            sun_direction: [0.0, 1.0, 0.0],
+        };
+        let key = procedural_environment_key(sky);
+        assert_eq!(
+            key,
+            procedural_environment_key(ProceduralSky {
+                sun_direction: [0.0, 1.0, 0.00005],
+                ..sky
+            })
+        );
+        assert_ne!(
+            key,
+            procedural_environment_key(ProceduralSky {
+                sun_direction: [0.0, 1.0, 0.0003],
+                ..sky
+            })
+        );
     }
 
     #[test]
@@ -1060,7 +1279,7 @@ return Script
 
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty());
-        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default());
+        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default()).unwrap();
         assert_eq!(snapshot.view.color.exposure_ev, 2.5);
         assert!(host.drain_events().is_empty());
     }

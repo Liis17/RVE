@@ -2,7 +2,8 @@ use crate::pipeline::GpuSceneTable;
 use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, TextureData};
 use engine_files::VirtualPath;
 use engine_render::{
-    AlphaMode, Material, MaterialId, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
+    AlphaMode, EnvironmentSource, Material, MaterialId, RenderError, Renderer, TextureColorSpace,
+    TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::CameraSettings;
@@ -11,6 +12,7 @@ use engine_scene::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
+use std::sync::Arc;
 
 pub(crate) struct ObjectModel {
     pub object: ObjectHandle,
@@ -21,6 +23,7 @@ pub(crate) struct ObjectModel {
 pub(crate) struct PreparedRenderAssets {
     pub models: HashMap<String, Model>,
     pub textures: HashMap<String, TextureData>,
+    pub environments: HashMap<String, Arc<EnvironmentSource>>,
     pub objects: Vec<ObjectModel>,
 }
 
@@ -111,10 +114,28 @@ fn prepare_scene_with_model_loader(
 
     let mut models = HashMap::new();
     let mut textures = HashMap::new();
+    let mut environments = HashMap::new();
     let mut objects = Vec::new();
     let mut lite_paths = std::collections::BTreeSet::new();
 
     for object in world.objects() {
+        if let Some(path) = object
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.hdr.as_ref())
+        {
+            let key = path.as_str().to_owned();
+            if let std::collections::hash_map::Entry::Vacant(entry) = environments.entry(key) {
+                let image = assets
+                    .load_hdr(entry.key())
+                    .map_err(|error| format!("{scene_path}: {error}"))?;
+                entry.insert(Arc::new(EnvironmentSource::Equirect {
+                    width: image.width,
+                    height: image.height,
+                    rgb: image.rgb,
+                }));
+            }
+        }
         if let Some(mesh) = &object.mesh_renderer {
             let mut levels = vec![(
                 mesh.model.as_str().to_owned(),
@@ -194,6 +215,7 @@ fn prepare_scene_with_model_loader(
         render_assets: PreparedRenderAssets {
             models,
             textures,
+            environments,
             objects,
         },
     })
@@ -366,7 +388,10 @@ pub(crate) fn upload_scene(
         gpu_models.insert(path.clone(), gpu_meshes);
     }
 
-    let mut table = GpuSceneTable::default();
+    let mut table = GpuSceneTable {
+        environments: assets.environments.clone(),
+        ..GpuSceneTable::default()
+    };
     for object in &assets.objects {
         let mut levels = Vec::with_capacity(object.levels.len());
         for (model_path, replacement_texture) in &object.levels {
@@ -531,7 +556,7 @@ mod tests {
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
-    use engine_render::{AlphaMode, TextureColorSpace};
+    use engine_render::{AlphaMode, EnvironmentSource, TextureColorSpace};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::{MaterialAlphaMode, MaterialOverride, SceneDocument, World};
     use std::cell::Cell;
@@ -693,6 +718,49 @@ id = "camera"
         );
         assert!(prepared.world.handle("spinner1").is_some());
         assert!(prepared.sources.contains_key("scripts/spin.lua"));
+    }
+
+    #[test]
+    fn load_scene_prepares_hdr_environment_assets_introduced_by_prefabs() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"/prefabs/sky.rveprefab\"\n{CAMERA_SCENE}\n[[instances]]\nid = \"sky\"\nprefab = \"/prefabs/sky.rveprefab\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        project.write(
+            "prefabs/sky.rveprefab",
+            b"[[assets]]\npath = \"/environment/sky.hdr\"\n[[objects]]\nid = \"environment\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n",
+        );
+        project.write(
+            "environment/sky.hdr",
+            b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n\x80\x80\x80\x81\x40\x60\x80\x82",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let EnvironmentSource::Equirect { width, height, rgb } = prepared
+            .render_assets
+            .environments
+            .get("environment/sky.hdr")
+            .unwrap()
+            .as_ref()
+        else {
+            panic!("HDR environment should be prepared as an equirectangular image");
+        };
+        assert_eq!((*width, *height), (2, 1));
+        assert_eq!(rgb.len(), 6);
+        assert!(
+            prepared
+                .world
+                .object_by_id("sky")
+                .unwrap()
+                .environment
+                .is_some()
+        );
     }
 
     #[test]

@@ -31,6 +31,19 @@ shadow_distance = 80.0
 shadow_cascades = 4
 
 [[objects]]
+id = "environment"
+name = "Environment"
+[objects.environment]
+intensity = 1.0
+skybox = true
+[objects.environment.procedural]
+zenith_color = [0.18, 0.32, 0.58]
+horizon_color = [0.68, 0.74, 0.82]
+ground_color = [0.12, 0.11, 0.10]
+sun_size_deg = 1.0
+sun_intensity = 1.0
+
+[[objects]]
 id = "shared-cube"
 name = "Shared Cube"
 [objects.transform]

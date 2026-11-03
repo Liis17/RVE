@@ -15,6 +15,25 @@ type ShaderBuild = (
 );
 
 const SHADERS: &[ShaderBuild] = &[
+    (
+        "equirect_to_cube.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "equirect_to_cube.comp.spv",
+    ),
+    ("sky.comp", naga::ShaderStage::Compute, &[], "sky.comp.spv"),
+    (
+        "irradiance.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "irradiance.comp.spv",
+    ),
+    (
+        "prefilter.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "prefilter.comp.spv",
+    ),
     ("mesh.vert", naga::ShaderStage::Vertex, &[], "mesh.vert.spv"),
     (
         "mesh.frag",
@@ -77,6 +96,18 @@ const SHADERS: &[ShaderBuild] = &[
         naga::ShaderStage::Fragment,
         &[],
         "output.frag.spv",
+    ),
+    (
+        "skybox.vert",
+        naga::ShaderStage::Vertex,
+        &[],
+        "skybox.vert.spv",
+    ),
+    (
+        "skybox.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "skybox.frag.spv",
     ),
 ];
 

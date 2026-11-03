@@ -9,13 +9,15 @@ use engine_core::Time;
 use engine_files::VirtualPath;
 use engine_project::BootstrapConfig;
 use engine_render::{
-    AlphaMode, AntiAliasing as RenderAntiAliasing, DrawCommand, Frame, FrameStatus, Material,
-    MaterialId, MeshId, Renderer, RendererConfig, TextureColorSpace, TextureId,
-    Tonemapper as RenderTonemapper, ViewSettings,
+    AlphaMode, AntiAliasing as RenderAntiAliasing, DrawCommand, EnvironmentId, EnvironmentSource,
+    Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId, MeshId, ProceduralSky,
+    Renderer, RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
+    ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
+use glam::{Mat4, Vec3};
 use scene::Scene;
 use std::collections::HashMap;
 use std::env;
@@ -24,7 +26,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials] [--model /путь.fbx] [--texture /путь.png] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -38,8 +40,15 @@ struct Options {
     model: Option<String>,
     /// Путь PNG внутри `assets`, заменяющий base-color texture сцены или модели.
     texture: Option<String>,
+    environment: Option<EnvironmentMode>,
     /// Показывать панель FPS, памяти и загрузки CPU/GPU.
     debug_overlay: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EnvironmentMode {
+    Procedural,
+    Hdr(String),
 }
 
 fn parse_args<I, S>(args: I) -> Result<Options, String>
@@ -55,6 +64,7 @@ where
     let mut scene = None;
     let mut model = None;
     let mut texture = None;
+    let mut environment = None;
     let mut debug_overlay = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -151,6 +161,32 @@ where
                         .ok_or_else(|| "после --texture требуется путь в assets".to_owned())?,
                 );
             }
+            "--environment" => {
+                if environment.is_some() {
+                    return Err("флаг --environment указан повторно".to_owned());
+                }
+                let value = args.next().ok_or_else(|| {
+                    "после --environment требуется procedural или путь .hdr".to_owned()
+                })?;
+                environment = Some(if value == "procedural" {
+                    EnvironmentMode::Procedural
+                } else {
+                    let path = VirtualPath::parse(&value)
+                        .map_err(|error| format!("некорректный путь --environment: {error}"))?;
+                    let is_hdr = path
+                        .as_str()
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.rsplit_once('.'))
+                        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("hdr"));
+                    if !is_hdr {
+                        return Err(
+                            "--environment должен указывать на procedural или .hdr".to_owned()
+                        );
+                    }
+                    EnvironmentMode::Hdr(path.as_str().to_owned())
+                });
+            }
             _ => return Err(format!("неизвестный аргумент: {argument}")),
         }
     }
@@ -168,6 +204,7 @@ where
         scene: scene.unwrap_or_default(),
         model,
         texture,
+        environment,
         debug_overlay,
     })
 }
@@ -202,6 +239,43 @@ fn load_content(options: &Options, assets: &Assets) -> Result<Content, AssetErro
     Ok(content)
 }
 
+fn load_environment(
+    mode: Option<&EnvironmentMode>,
+    assets: &Assets,
+    content: &Content,
+) -> Result<Option<EnvironmentSource>, String> {
+    match mode {
+        None => Ok(None),
+        Some(EnvironmentMode::Hdr(path)) => {
+            let image = assets
+                .load_hdr(path)
+                .map_err(|error| format!("{path}: {error}"))?;
+            Ok(Some(EnvironmentSource::Equirect {
+                width: image.width,
+                height: image.height,
+                rgb: image.rgb,
+            }))
+        }
+        Some(EnvironmentMode::Procedural) => {
+            let light = content.light(0.0);
+            let sun_direction = -Vec3::from_array(light.direction).normalize_or_zero();
+            let sun_direction = if sun_direction.length_squared() > 1e-8 {
+                sun_direction.to_array()
+            } else {
+                Vec3::Y.to_array()
+            };
+            Ok(Some(EnvironmentSource::Procedural(ProceduralSky {
+                zenith_color: [0.2, 0.35, 0.65],
+                horizon_color: [0.65, 0.7, 0.75],
+                ground_color: [0.12, 0.11, 0.1],
+                sun_size_deg: 1.0,
+                sun_intensity: 1.0,
+                sun_direction,
+            })))
+        }
+    }
+}
+
 #[derive(Default)]
 struct ResizeTest {
     initial_requested: bool,
@@ -215,6 +289,8 @@ struct ResizeTest {
 struct Sandbox {
     renderer: Option<Renderer>,
     content: Content,
+    environment_source: Option<EnvironmentSource>,
+    environment: Option<EnvironmentId>,
     camera_settings: CameraSettings,
     meshes: Vec<(MeshId, MaterialId, bool)>,
     size: PhysicalSize<u32>,
@@ -227,13 +303,20 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    fn new(options: Options, content: Content, mut camera_settings: CameraSettings) -> Self {
+    fn new(
+        options: Options,
+        content: Content,
+        mut camera_settings: CameraSettings,
+        environment_source: Option<EnvironmentSource>,
+    ) -> Self {
         if let Some(render_scale) = options.render_scale {
             camera_settings.render.render_scale = render_scale;
         }
         Self {
             renderer: None,
             content,
+            environment_source,
+            environment: None,
             camera_settings,
             meshes: Vec::new(),
             size: PhysicalSize::new(0, 0),
@@ -446,6 +529,15 @@ impl WindowHandler for Sandbox {
                     self.failure = Some(error);
                     return false;
                 }
+                if let Some(source) = &self.environment_source {
+                    match renderer.create_environment(source) {
+                        Ok(environment) => self.environment = Some(environment),
+                        Err(error) => {
+                            self.failure = Some(format!("ошибка создания environment: {error}"));
+                            return false;
+                        }
+                    }
+                }
                 if self.options.debug_overlay {
                     self.debug_overlay = Some(DebugOverlay::new(
                         &renderer.capabilities().device_name,
@@ -498,6 +590,30 @@ impl WindowHandler for Sandbox {
             self.size.height,
             self.camera_settings,
         );
+        let view_projection = self.content.view_projection(
+            elapsed,
+            self.size.width,
+            self.size.height,
+            self.camera_settings,
+        );
+        let (view, projection) = self
+            .content
+            .motion
+            .camera_at(elapsed, self.camera_settings)
+            .map(|camera| {
+                (
+                    camera.view(),
+                    camera.projection(self.size.width, self.size.height),
+                )
+            })
+            .unwrap_or_else(|| {
+                if self.content.motion == Scene::Cube {
+                    let view = Mat4::from_translation(Vec3::new(0.0, 0.0, -3.0));
+                    (view, view_projection * view.inverse())
+                } else {
+                    (Mat4::IDENTITY, view_projection)
+                }
+            });
         let frame = Frame {
             clear_color: [
                 self.camera_settings.render.clear_color[0],
@@ -505,17 +621,18 @@ impl WindowHandler for Sandbox {
                 self.camera_settings.render.clear_color[2],
                 1.0,
             ],
-            view_projection: self
-                .content
-                .view_projection(
-                    elapsed,
-                    self.size.width,
-                    self.size.height,
-                    self.camera_settings,
-                )
-                .to_cols_array_2d(),
+            camera: FrameCamera {
+                view: view.to_cols_array_2d(),
+                projection: projection.to_cols_array_2d(),
+                position: self.content.motion.camera_position(elapsed),
+            },
+            environment: self.environment.map(|id| FrameEnvironment {
+                id,
+                intensity: 1.0,
+                rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                skybox: true,
+            }),
             shadow_cascades: &shadow_cascades,
-            camera_position: self.content.motion.camera_position(elapsed),
             light: self.content.light(elapsed),
             draws: &draws,
             overlay,
@@ -671,7 +788,15 @@ fn main_after_vulkan_environment() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut app = Sandbox::new(options, content, camera_settings);
+    let environment_source = match load_environment(options.environment.as_ref(), &assets, &content)
+    {
+        Ok(environment) => environment,
+        Err(error) => {
+            eprintln!("Ошибка environment: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut app = Sandbox::new(options, content, camera_settings, environment_source);
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
     let mut exit_code = match (run_result, failure) {
@@ -698,15 +823,15 @@ fn main_after_vulkan_environment() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CameraSettings, Content, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args,
-        with_executable_directory,
+        CameraSettings, Content, EnvironmentMode, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox,
+        Scene, parse_args, with_executable_directory,
     };
     use engine_assets::Assets;
     use engine_resources::{ResourceConfig, ResourceSystem};
 
     fn sandbox(options: Options) -> Sandbox {
         let content = Content::from_scene(options.scene);
-        Sandbox::new(options, content, CameraSettings::default())
+        Sandbox::new(options, content, CameraSettings::default(), None)
     }
 
     #[test]
@@ -761,7 +886,7 @@ mod tests {
         let options = parse_args(["--render-scale", "0.4"]).unwrap();
         let mut settings = CameraSettings::default();
         settings.render.render_scale = 0.75;
-        let sandbox = Sandbox::new(options, Content::from_scene(Scene::Cube), settings);
+        let sandbox = Sandbox::new(options, Content::from_scene(Scene::Cube), settings, None);
         assert_eq!(sandbox.camera_settings.render.render_scale, 0.4);
     }
 
@@ -806,6 +931,7 @@ mod tests {
             scene: Scene::Cube,
             model: None,
             texture: None,
+            environment: None,
             debug_overlay: false,
         });
         sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
@@ -879,6 +1005,14 @@ mod tests {
         assert_eq!(options.texture.as_deref(), Some("/texture/paint.png"));
         assert!(options.debug_overlay);
 
+        let procedural = parse_args(["--environment", "procedural"]).unwrap();
+        assert_eq!(procedural.environment, Some(EnvironmentMode::Procedural));
+        let hdr = parse_args(["--environment", "/environment/sky.hdr"]).unwrap();
+        assert_eq!(
+            hdr.environment,
+            Some(EnvironmentMode::Hdr("environment/sky.hdr".to_owned()))
+        );
+
         let options = parse_args(["--model", "/model/cube.fbx"]).unwrap();
         assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
         assert_eq!(options.texture, None);
@@ -927,6 +1061,9 @@ mod tests {
             vec!["--model", "/a.fbx", "--model", "/b.fbx"],
             vec!["--texture"],
             vec!["--texture", "/a.png", "--texture", "/b.png"],
+            vec!["--environment"],
+            vec!["--environment", "/environment/sky.png"],
+            vec!["--environment", "procedural", "--environment", "procedural"],
             vec!["--debug-overlay", "--debug-overlay"],
             vec!["--debug-overlay", "1"],
             vec!["--model", "/model/cube.fbx", "--scene", "triangle"],

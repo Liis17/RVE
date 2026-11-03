@@ -954,6 +954,8 @@ fn render_scene_frame(
         game_camera.position,
         grid_camera_distance,
     )?;
+    gpu.scene
+        .sync_environment(&mut gpu.renderer, scene_frame.environment.as_ref())?;
     let scene_shadow_cascades = scene_size.map_or_else(Vec::new, |[width, height]| {
         SceneRenderer::shadow_cascades(scene_camera, width, height, &scene_frame.light, has_light)
     });
@@ -970,22 +972,26 @@ fn render_scene_frame(
     }
     let scene_view = scene_size.map(|[width, height]| {
         gpu.scene.frame(
-            scene_camera.view_projection(width, height),
-            scene_camera.position,
+            scene_camera,
+            width,
+            height,
             scene_settings,
             &scene_frame.light,
             has_light,
+            scene_frame.environment.as_ref(),
             &scene_shadow_cascades,
             true,
         )
     });
     let game_view = game_size.map(|[width, height]| {
         gpu.scene.frame(
-            game_camera.view_projection(width, height),
-            game_camera.position,
+            game_camera,
+            width,
+            height,
             game_settings,
             &scene_frame.light,
             has_light,
+            scene_frame.environment.as_ref(),
             &game_shadow_cascades,
             false,
         )

@@ -558,6 +558,46 @@ fn instances_round_trip_and_scenes_without_them_do_not_change() {
 }
 
 #[test]
+fn environment_prefab_override_replaces_the_whole_component() {
+    let prefab = r#"
+[[objects]]
+id="root"
+[objects.environment]
+intensity=0.5
+[objects.environment.procedural]
+zenith_color=[0.1, 0.2, 0.3]
+horizon_color=[0.4, 0.5, 0.6]
+ground_color=[0.0, 0.0, 0.0]
+sun_size_deg=1.0
+sun_intensity=1.0
+"#;
+    let library = Library::new(&[("prefabs/sky.rveprefab", prefab)]);
+    let text = format!(
+        "[[assets]]\npath=\"/prefabs/sky.rveprefab\"\n{CAMERA}[[instances]]\nid=\"sky\"\nprefab=\"/prefabs/sky.rveprefab\"\n[[instances.overrides]]\ntarget=\"root\"\n[instances.overrides.environment]\nintensity=2.0\n[instances.overrides.environment.procedural]\nzenith_color=[0.7, 0.8, 0.9]\nhorizon_color=[0.2, 0.3, 0.4]\nground_color=[0.1, 0.1, 0.1]\nsun_size_deg=4.0\nsun_intensity=5.0\n"
+    );
+    let expanded = library.expand(&scene(&text)).unwrap().document;
+    let environment = object(&expanded, "sky").environment.as_ref().unwrap();
+    assert_eq!(environment.intensity, 2.0);
+    assert_eq!(
+        environment.procedural.unwrap().zenith_color,
+        [0.7, 0.8, 0.9]
+    );
+
+    let inherited_text = format!(
+        "[[assets]]\npath=\"/prefabs/sky.rveprefab\"\n{CAMERA}[[instances]]\nid=\"sky\"\nprefab=\"/prefabs/sky.rveprefab\"\n"
+    );
+    let inherited = library.expand(&scene(&inherited_text)).unwrap().document;
+    assert_eq!(
+        object(&inherited, "sky")
+            .environment
+            .as_ref()
+            .unwrap()
+            .intensity,
+        0.5
+    );
+}
+
+#[test]
 fn expanded_documents_are_not_saved() {
     let library = Library::new(&[("prefabs/door.rveprefab", DOOR)]);
     let expanded = library.expand(&scene(&door_scene(""))).unwrap().document;

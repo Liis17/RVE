@@ -13,12 +13,15 @@ layout(location = 7) out vec3 out_world_position;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view_projection;
+    mat4 inverse_view_projection;
     mat4 shadow_view_projections[4];
     vec4 light_direction;
     vec4 light_color;
     vec4 ambient_color;
     vec4 shadow_params;
     vec4 camera_position;
+    mat4 environment_rotation;
+    vec4 environment_params;
 } frame;
 
 layout(push_constant) uniform PushConstants {

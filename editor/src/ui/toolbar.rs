@@ -263,6 +263,20 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
                     state.create_object(&kind, None);
                 }
             }
+            let already_has_environment = state.scene.as_ref().is_some_and(|scene| {
+                scene
+                    .view()
+                    .objects
+                    .iter()
+                    .any(|object| object.environment.is_some())
+            });
+            if ui
+                .add_enabled(!already_has_environment, egui::Button::new("Environment"))
+                .on_disabled_hover_text("В сцене уже есть Environment")
+                .clicked()
+            {
+                state.create_object(&NewObject::Environment, None);
+            }
             ui.menu_button("Mesh", |ui| {
                 let models = state.assets_of_kind(crate::assets_fs::AssetKind::Model);
                 if models.is_empty() {

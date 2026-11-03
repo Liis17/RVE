@@ -1,7 +1,11 @@
 //! Vulkan-рендерер, форматы изображений и материалы сцены.
 
 use ash::{Entry, vk};
+
+pub mod environment;
+
 use culling::{Frustum, LocalBounds, back_to_front_order};
+pub use environment::{EnvironmentId, EnvironmentSource, ProceduralSky};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use std::collections::HashSet;
 use std::error::Error;
@@ -34,6 +38,8 @@ const SHADOW_CASCADE_COUNT: usize = 4;
 /// Максимальное ожидание swapchain image перед пропуском кадра.
 const ACQUIRE_TIMEOUT_NS: u64 = 100_000_000;
 const NO_GRAPHICS_QUEUE_FAMILY_REASON: &str = "нет graphics queue family";
+const NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON: &str =
+    "нет graphics queue family с поддержкой compute";
 const NO_GRAPHICS_PRESENT_QUEUE_FAMILY_REASON: &str = "нет общей graphics + present queue family";
 const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const MESH_OPAQUE_FRAGMENT_SHADER: &[u8] =
@@ -56,6 +62,13 @@ const FULLSCREEN_VERTEX_SHADER: &[u8] =
 const TONEMAP_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 const OUTPUT_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/output.frag.spv"));
+const EQUIRECT_TO_CUBE_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/equirect_to_cube.comp.spv"));
+const PROCEDURAL_SKY_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.comp.spv"));
+const IRRADIANCE_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/irradiance.comp.spv"));
+const PREFILTER_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prefilter.comp.spv"));
+const SKYBOX_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.vert.spv"));
+const SKYBOX_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.frag.spv"));
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
@@ -67,7 +80,7 @@ const FLAT_NORMAL_TEXTURE: usize = 2;
 const DEFAULT_MATERIAL: usize = 0;
 const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
 const FRAME_UNIFORMS_SIZE: usize =
-    (1 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 5 * size_of::<[f32; 4]>();
+    (3 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 6 * size_of::<[f32; 4]>();
 const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
 const IDENTITY_MATRIX: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
@@ -202,9 +215,29 @@ impl Default for DirectionalLight {
     }
 }
 
+/// Camera matrices and world-space position for one rendered view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameCamera {
+    /// World-to-view matrix, stored by columns.
+    pub view: [[f32; 4]; 4],
+    /// View-to-clip matrix, stored by columns; Vulkan depth is `[0, 1]`.
+    pub projection: [[f32; 4]; 4],
+    pub position: [f32; 3],
+}
+
+/// Environment selected for one view. The id is renderer-local.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameEnvironment {
+    pub id: EnvironmentId,
+    pub intensity: f32,
+    /// World rotation as three column vectors.
+    pub rotation: [[f32; 3]; 3],
+    pub skybox: bool,
+}
+
 /// Описание кадра для [`Renderer::render_frame`].
 ///
-/// `view_projection` переводит мировое пространство в clip space и задаётся по столбцам.
+/// `camera` contains view and projection matrices with Y-up and Vulkan depth `[0, 1]`.
 /// Ось Y clip space направлена вверх, глубина после деления на `w` лежит в `[0, 1]`.
 /// `shadow_cascades` содержит от нуля до четырёх матриц clip space света с той же конвенцией
 /// Y-up и глубиной `[0, 1]`; пустой срез отключает тени. Матрицы должны быть конечными.
@@ -214,9 +247,9 @@ impl Default for DirectionalLight {
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
     pub clear_color: [f32; 4],
-    pub view_projection: [[f32; 4]; 4],
+    pub camera: FrameCamera,
+    pub environment: Option<FrameEnvironment>,
     pub shadow_cascades: &'a [[[f32; 4]; 4]],
-    pub camera_position: [f32; 3],
     pub light: DirectionalLight,
     pub draws: &'a [DrawCommand],
     pub overlay: &'a [OverlayVertex],
@@ -319,6 +352,7 @@ pub enum RenderError {
     InvalidMesh(&'static str),
     InvalidTexture(String),
     InvalidMaterial(String),
+    InvalidEnvironment(String),
 }
 
 impl fmt::Display for RenderError {
@@ -342,6 +376,7 @@ impl fmt::Display for RenderError {
             Self::InvalidMesh(message) => write!(f, "некорректный меш: {message}"),
             Self::InvalidTexture(message) => write!(f, "некорректная текстура: {message}"),
             Self::InvalidMaterial(message) => write!(f, "некорректный материал: {message}"),
+            Self::InvalidEnvironment(message) => write!(f, "некорректное окружение: {message}"),
         }
     }
 }
@@ -488,6 +523,7 @@ pub struct Renderer {
     pipeline: Option<vk::Pipeline>,
     mask_pipeline: Option<vk::Pipeline>,
     blend_pipeline: Option<vk::Pipeline>,
+    skybox_pipeline: Option<vk::Pipeline>,
     shadow_pipeline: Option<vk::Pipeline>,
     post_pipeline_layout: Option<vk::PipelineLayout>,
     tonemap_pipeline: Option<vk::Pipeline>,
@@ -507,6 +543,8 @@ pub struct Renderer {
     texture_sampler_anisotropy: Option<f32>,
     frame_set_layout: Option<vk::DescriptorSetLayout>,
     material_set_layout: Option<vk::DescriptorSetLayout>,
+    environment_set_layout: Option<vk::DescriptorSetLayout>,
+    compute_set_layout: Option<vk::DescriptorSetLayout>,
     texture_set_layout: Option<vk::DescriptorSetLayout>,
     frame_descriptor_pool: Option<vk::DescriptorPool>,
     post_descriptor_pool: Option<vk::DescriptorPool>,
@@ -514,6 +552,15 @@ pub struct Renderer {
     sampler: Option<vk::Sampler>,
     post_sampler: Option<vk::Sampler>,
     shadow_sampler: Option<vk::Sampler>,
+    environment_sampler: Option<vk::Sampler>,
+    equirect_sampler: Option<vk::Sampler>,
+    compute_pipeline_layout: Option<vk::PipelineLayout>,
+    equirect_pipeline: Option<vk::Pipeline>,
+    procedural_sky_pipeline: Option<vk::Pipeline>,
+    irradiance_pipeline: Option<vk::Pipeline>,
+    prefilter_pipeline: Option<vk::Pipeline>,
+    brdf_image: Option<DeviceImage>,
+    environments: Vec<Option<GpuEnvironment>>,
     shadow_image: Option<DeviceImage>,
     shadow_layout: vk::ImageLayout,
     max_texture_size: u32,
@@ -566,6 +613,7 @@ impl Renderer {
             pipeline: None,
             mask_pipeline: None,
             blend_pipeline: None,
+            skybox_pipeline: None,
             shadow_pipeline: None,
             post_pipeline_layout: None,
             tonemap_pipeline: None,
@@ -582,6 +630,8 @@ impl Renderer {
             texture_sampler_anisotropy: None,
             frame_set_layout: None,
             material_set_layout: None,
+            environment_set_layout: None,
+            compute_set_layout: None,
             texture_set_layout: None,
             frame_descriptor_pool: None,
             post_descriptor_pool: None,
@@ -589,6 +639,15 @@ impl Renderer {
             sampler: None,
             post_sampler: None,
             shadow_sampler: None,
+            environment_sampler: None,
+            equirect_sampler: None,
+            compute_pipeline_layout: None,
+            equirect_pipeline: None,
+            procedural_sky_pipeline: None,
+            irradiance_pipeline: None,
+            prefilter_pipeline: None,
+            brdf_image: None,
+            environments: Vec::new(),
             shadow_image: None,
             shadow_layout: vk::ImageLayout::UNDEFINED,
             max_texture_size: 0,
@@ -702,6 +761,45 @@ impl Renderer {
         let texture = Arc::new(self.upload_texture(width, height, rgba, color_space)?);
         self.textures.push(Some(texture));
         Ok(TextureId(self.textures.len() - 1))
+    }
+
+    /// Uploads an equirectangular Radiance image or procedural sky and precomputes its IBL maps.
+    pub fn create_environment(
+        &mut self,
+        source: &EnvironmentSource,
+    ) -> Result<EnvironmentId, RenderError> {
+        environment::validate_source(source)?;
+        if let EnvironmentSource::Equirect { width, height, .. } = source
+            && (*width > self.max_texture_size || *height > self.max_texture_size)
+        {
+            return Err(RenderError::InvalidEnvironment(
+                "equirect dimensions exceed the selected GPU image limit".to_owned(),
+            ));
+        }
+        let environment = self.create_gpu_environment(source)?;
+        self.environments.push(Some(environment));
+        Ok(EnvironmentId(self.environments.len() - 1))
+    }
+
+    /// Retires an environment after submitted frames have stopped using its descriptor set.
+    pub fn destroy_environment(&mut self, environment: EnvironmentId) -> Result<(), RenderError> {
+        if environment.0 == 0 {
+            return Err(RenderError::InvalidEnvironment(
+                "built-in environment cannot be destroyed".to_owned(),
+            ));
+        }
+        let resource = self
+            .environments
+            .get_mut(environment.0)
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                RenderError::InvalidEnvironment(
+                    "EnvironmentId does not belong to renderer".to_owned(),
+                )
+            })?;
+        self.retired
+            .retire(RetiredResource::Environment(Box::new(resource)));
+        Ok(())
     }
 
     /// Создаёт неизменяемый материал, ссылающийся только на текстуры совместимого цветового пространства.
@@ -911,6 +1009,7 @@ impl Renderer {
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         validate_overlay(frame.overlay)?;
         let uniforms = frame_uniform_bytes(frame)?;
+        let (environment_set, skybox) = self.environment_set_for(frame.environment)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(FrameStatus::Skipped);
         }
@@ -1027,11 +1126,16 @@ impl Renderer {
                 .pipeline_layout
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
             frame_set,
+            environment_set,
+            skybox_pipeline: self
+                .skybox_pipeline
+                .ok_or(RenderError::InvalidState("skybox pipeline отсутствует"))?,
+            skybox,
             meshes: &self.meshes,
             materials: &self.materials,
             draws: frame.draws,
-            view_projection: frame.view_projection,
-            camera_position: frame.camera_position,
+            view_projection: multiply_4x4(frame.camera.projection, frame.camera.view),
+            camera_position: frame.camera.position,
             clear_color: frame.clear_color,
             timestamps,
             view: frame.view,
@@ -1105,6 +1209,7 @@ impl Renderer {
     ) -> Result<FrameStatus, RenderError> {
         validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
         let mut scene_uniforms = Vec::with_capacity(scenes.len());
+        let mut scene_environment_sets = Vec::with_capacity(scenes.len());
         for (viewport, frame) in scenes {
             validate_draws(frame.draws, &self.meshes, &self.materials)?;
             self.viewports
@@ -1112,6 +1217,7 @@ impl Renderer {
                 .and_then(Option::as_ref)
                 .ok_or_else(unknown_viewport)?;
             scene_uniforms.push(frame_uniform_bytes(frame)?);
+            scene_environment_sets.push(self.environment_set_for(frame.environment)?);
         }
         let packed = pack_ui(ui, self.output_extent)?;
         self.validate_ui_images(&packed, scenes)?;
@@ -1184,7 +1290,11 @@ impl Renderer {
         };
         let physical_device = self.physical_device;
         let mut rendered = Vec::with_capacity(scenes.len());
-        for ((viewport, frame), uniforms) in scenes.iter().zip(&scene_uniforms) {
+        for (((viewport, frame), uniforms), (environment_set, skybox)) in scenes
+            .iter()
+            .zip(&scene_uniforms)
+            .zip(&scene_environment_sets)
+        {
             let entry = self.viewports[viewport.0]
                 .as_mut()
                 .ok_or_else(unknown_viewport)?;
@@ -1212,6 +1322,10 @@ impl Renderer {
                 *viewport,
                 *frame,
                 frame_set,
+                *environment_set,
+                self.skybox_pipeline
+                    .ok_or(RenderError::InvalidState("skybox pipeline отсутствует"))?,
+                *skybox,
                 target.tonemap_set,
                 target.output_set,
             ));
@@ -1235,7 +1349,7 @@ impl Renderer {
                 UiImage::Viewport(viewport) => {
                     if !rendered
                         .iter()
-                        .any(|(drawn, _, _, _, _)| *drawn == viewport)
+                        .any(|(drawn, _, _, _, _, _, _, _)| *drawn == viewport)
                     {
                         continue;
                     }
@@ -1272,7 +1386,19 @@ impl Renderer {
             .iter()
             .enumerate()
             .map(
-                |(index, (viewport, frame, frame_set, tonemap_set, output_set))| {
+                |(
+                    index,
+                    (
+                        viewport,
+                        frame,
+                        frame_set,
+                        environment_set,
+                        skybox_pipeline,
+                        skybox,
+                        tonemap_set,
+                        output_set,
+                    ),
+                )| {
                     (
                         *viewport,
                         ShadowPass {
@@ -1288,13 +1414,19 @@ impl Renderer {
                             pipeline: scene_pipeline,
                             mask_pipeline,
                             blend_pipeline,
+                            skybox_pipeline: *skybox_pipeline,
                             pipeline_layout,
                             frame_set: *frame_set,
+                            environment_set: *environment_set,
+                            skybox: *skybox,
                             meshes: &self.meshes,
                             materials: &self.materials,
                             draws: frame.draws,
-                            view_projection: frame.view_projection,
-                            camera_position: frame.camera_position,
+                            view_projection: multiply_4x4(
+                                frame.camera.projection,
+                                frame.camera.view,
+                            ),
+                            camera_position: frame.camera.position,
                             clear_color: frame.clear_color,
                             timestamps: slot_timestamps.filter(|_| index == 0),
                             view: frame.view,
@@ -1637,6 +1769,7 @@ impl Renderer {
             .collect::<Vec<_>>();
         let features = vk::PhysicalDeviceFeatures::default()
             .tessellation_shader(self.capabilities.tessellation_shader)
+            .shader_storage_image_extended_formats(true)
             .sampler_anisotropy(self.texture_sampler_anisotropy.is_some());
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
@@ -1676,7 +1809,10 @@ impl Renderer {
         self.create_frame_resources()?;
         self.create_shadow_resources()?;
         self.create_descriptor_resources()?;
+        self.create_environment_resources()?;
+        self.create_default_environment()?;
         self.create_mesh_pipeline()?;
+        self.create_skybox_pipeline()?;
         self.create_shadow_pipeline()?;
         self.create_post_pipelines()?;
         self.create_overlay_pipeline()?;
@@ -1787,6 +1923,44 @@ impl Renderer {
         self.material_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&material_layout_info, None) }?);
 
+        let environment_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let environment_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&environment_bindings);
+        // SAFETY: the bindings match the split-sum IBL and skybox fragment shaders.
+        self.environment_set_layout =
+            Some(unsafe { device.create_descriptor_set_layout(&environment_layout_info, None) }?);
+
         let texture_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -1888,6 +2062,124 @@ impl Renderer {
             frame.tonemap_set = sets[0];
             frame.output_set = sets[1];
         }
+        Ok(())
+    }
+
+    fn create_environment_resources(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let compute_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let compute_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&compute_bindings);
+        // SAFETY: binding types and stages match all four environment compute shaders.
+        self.compute_set_layout =
+            Some(unsafe { device.create_descriptor_set_layout(&compute_layout_info, None) }?);
+        let compute_set_layout = self.compute_set_layout.ok_or(RenderError::InvalidState(
+            "compute descriptor layout отсутствует",
+        ))?;
+        let compute_layouts = [compute_set_layout];
+        let compute_pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&compute_layouts);
+        // SAFETY: the compute pipeline layout contains the only layout used by bake shaders.
+        self.compute_pipeline_layout =
+            Some(unsafe { device.create_pipeline_layout(&compute_pipeline_layout_info, None) }?);
+        let compute_pipeline_layout =
+            self.compute_pipeline_layout
+                .ok_or(RenderError::InvalidState(
+                    "compute pipeline layout отсутствует",
+                ))?;
+        self.equirect_pipeline = Some(create_compute_pipeline(
+            &device,
+            compute_pipeline_layout,
+            EQUIRECT_TO_CUBE_SHADER,
+        )?);
+        self.procedural_sky_pipeline = Some(create_compute_pipeline(
+            &device,
+            compute_pipeline_layout,
+            PROCEDURAL_SKY_SHADER,
+        )?);
+        self.irradiance_pipeline = Some(create_compute_pipeline(
+            &device,
+            compute_pipeline_layout,
+            IRRADIANCE_SHADER,
+        )?);
+        self.prefilter_pipeline = Some(create_compute_pipeline(
+            &device,
+            compute_pipeline_layout,
+            PREFILTER_SHADER,
+        )?);
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .min_lod(0.0)
+            .max_lod(9.0);
+        // SAFETY: cube sampling uses supported linear filtering and clamp-to-edge addressing.
+        self.environment_sampler = Some(unsafe { device.create_sampler(&sampler_info, None) }?);
+        let equirect_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(0.0);
+        // SAFETY: longitude wraps at the equirectangular seam while latitude clamps at its poles.
+        self.equirect_sampler =
+            Some(unsafe { device.create_sampler(&equirect_sampler_info, None) }?);
+
+        let lut = environment::integrate_brdf_lut(64, 256);
+        let lut_bytes = lut
+            .iter()
+            .flat_map(|value| {
+                [
+                    environment::float_to_half(value[0]),
+                    environment::float_to_half(value[1]),
+                ]
+            })
+            .flat_map(u16::to_ne_bytes)
+            .collect::<Vec<_>>();
+        self.brdf_image =
+            Some(self.upload_16bit_image(64, 64, vk::Format::R16G16_SFLOAT, 4, &lut_bytes)?);
+        Ok(())
+    }
+
+    fn create_default_environment(&mut self) -> Result<(), RenderError> {
+        let environment_map = self.upload_cube_constant([0x3c00, 0x3c00, 0x3c00, 0x3c00])?;
+        let irradiance_map = self.upload_cube_constant([
+            environment::float_to_half(std::f32::consts::PI),
+            environment::float_to_half(std::f32::consts::PI),
+            environment::float_to_half(std::f32::consts::PI),
+            0x3c00,
+        ])?;
+        let prefiltered_map = self.upload_cube_constant([0x3c00, 0x3c00, 0x3c00, 0x3c00])?;
+        let default =
+            self.make_gpu_environment(environment_map, irradiance_map, prefiltered_map)?;
+        self.environments.push(Some(default));
         Ok(())
     }
 
@@ -2027,6 +2319,578 @@ impl Renderer {
         drop(staging);
 
         Ok(image)
+    }
+
+    fn upload_16bit_image(
+        &self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        bytes_per_texel: usize,
+        pixels: &[u8],
+    ) -> Result<DeviceImage, RenderError> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|count| count.checked_mul(bytes_per_texel));
+        if width == 0 || height == 0 || expected != Some(pixels.len()) {
+            return Err(RenderError::InvalidEnvironment(
+                "16-bit image data does not match its dimensions".to_owned(),
+            ));
+        }
+        let device = self.device()?;
+        let image = DeviceImage::new(
+            self.instance()?,
+            device,
+            self.physical_device,
+            vk::Extent2D { width, height },
+            format,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            color_mip_subresource_range(0, 1),
+        )?;
+        let staging = HostBuffer::new(
+            self.instance()?,
+            device,
+            self.physical_device,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            pixels,
+        )?;
+        self.submit_once(|command_buffer| {
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::NONE,
+                    vk::AccessFlags2::NONE,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    color_subresource_range(),
+                ),
+            );
+            let region = [vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(color_subresource_layers())
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })];
+            // SAFETY: staging contains the checked texel byte count and the image is transfer-dst.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    staging.buffer,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                )
+            };
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    color_subresource_range(),
+                ),
+            );
+        })?;
+        Ok(image)
+    }
+
+    fn upload_cube_constant(&self, texel: [u16; 4]) -> Result<DeviceImage, RenderError> {
+        let device = self.device()?;
+        let image = DeviceImage::new_cube(
+            self.instance()?,
+            device,
+            self.physical_device,
+            1,
+            OFFSCREEN_FORMAT,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            1,
+        )?;
+        let mut bytes = Vec::with_capacity(6 * size_of::<[u16; 4]>());
+        for _ in 0..6 {
+            for channel in texel {
+                bytes.extend_from_slice(&channel.to_ne_bytes());
+            }
+        }
+        let staging = HostBuffer::new(
+            self.instance()?,
+            device,
+            self.physical_device,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            &bytes,
+        )?;
+        self.submit_once(|command_buffer| {
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::NONE,
+                    vk::AccessFlags2::NONE,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    color_mip_subresource_range(0, 1).layer_count(6),
+                ),
+            );
+            let region = [vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(color_subresource_layers().layer_count(6))
+                .image_extent(vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                })];
+            // SAFETY: the staging buffer contains one RGBA16F texel for each cube face.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    staging.buffer,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                )
+            };
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    color_mip_subresource_range(0, 1).layer_count(6),
+                ),
+            );
+        })?;
+        Ok(image)
+    }
+
+    fn make_gpu_environment(
+        &self,
+        environment_map: DeviceImage,
+        irradiance_map: DeviceImage,
+        prefiltered_map: DeviceImage,
+    ) -> Result<GpuEnvironment, RenderError> {
+        let device = self.device()?;
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(4),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(2),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        let descriptor_pool = OwnedDescriptorPool::new(device, &pool_info)?;
+        let layouts = [self
+            .environment_set_layout
+            .ok_or(RenderError::InvalidState(
+                "environment descriptor layout отсутствует",
+            ))?];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool.handle)
+            .set_layouts(&layouts);
+        // SAFETY: the pool has room for one environment descriptor set.
+        let set = unsafe { device.allocate_descriptor_sets(&allocate_info) }?[0];
+        let brdf = self
+            .brdf_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("BRDF LUT отсутствует"))?;
+        let images = [
+            vk::DescriptorImageInfo::default()
+                .image_view(environment_map.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            vk::DescriptorImageInfo::default()
+                .image_view(irradiance_map.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            vk::DescriptorImageInfo::default()
+                .image_view(prefiltered_map.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            vk::DescriptorImageInfo::default()
+                .image_view(brdf.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+        ];
+        let cube_sampler = [vk::DescriptorImageInfo::default().sampler(
+            self.environment_sampler
+                .ok_or(RenderError::InvalidState("environment sampler отсутствует"))?,
+        )];
+        let brdf_sampler = cube_sampler;
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&images[0..1]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&cube_sampler),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&images[1..2]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&images[2..3]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&images[3..4]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&brdf_sampler),
+        ];
+        // SAFETY: all views, samplers, descriptor pool and layout remain owned by this renderer.
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        Ok(GpuEnvironment {
+            _descriptor_pool: descriptor_pool,
+            set,
+            _environment_map: environment_map,
+            _irradiance_map: irradiance_map,
+            _prefiltered_map: prefiltered_map,
+        })
+    }
+
+    fn create_gpu_environment(
+        &self,
+        source: &EnvironmentSource,
+    ) -> Result<GpuEnvironment, RenderError> {
+        const ENVIRONMENT_SIZE: u32 = 512;
+        const ENVIRONMENT_MIPS: u32 = 10;
+        const IRRADIANCE_SIZE: u32 = 32;
+        const PREFILTER_SIZE: u32 = 128;
+        const PREFILTER_MIPS: u32 = 6;
+        const DISPATCH_COUNT: u32 = ENVIRONMENT_MIPS + 1 + PREFILTER_MIPS;
+
+        let source_image = match source {
+            EnvironmentSource::Equirect { width, height, rgb } => {
+                let mut rgba = Vec::with_capacity(rgb.len() / 3 * 8);
+                for pixel in rgb.as_chunks::<3>().0 {
+                    for channel in pixel {
+                        rgba.extend_from_slice(
+                            &environment::float_to_half(channel.min(65_504.0)).to_ne_bytes(),
+                        );
+                    }
+                    rgba.extend_from_slice(&0x3c00_u16.to_ne_bytes());
+                }
+                Some(self.upload_16bit_image(*width, *height, OFFSCREEN_FORMAT, 8, &rgba)?)
+            }
+            EnvironmentSource::Procedural(_) => None,
+        };
+
+        let cube_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+        let environment_map = DeviceImage::new_cube(
+            self.instance()?,
+            self.device()?,
+            self.physical_device,
+            ENVIRONMENT_SIZE,
+            OFFSCREEN_FORMAT,
+            cube_usage,
+            ENVIRONMENT_MIPS,
+        )?;
+        let irradiance_map = DeviceImage::new_cube(
+            self.instance()?,
+            self.device()?,
+            self.physical_device,
+            IRRADIANCE_SIZE,
+            OFFSCREEN_FORMAT,
+            cube_usage,
+            1,
+        )?;
+        let prefiltered_map = DeviceImage::new_cube(
+            self.instance()?,
+            self.device()?,
+            self.physical_device,
+            PREFILTER_SIZE,
+            OFFSCREEN_FORMAT,
+            cube_usage,
+            PREFILTER_MIPS,
+        )?;
+
+        let environment_sampler = self
+            .environment_sampler
+            .ok_or(RenderError::InvalidState("environment sampler отсутствует"))?;
+        let (environment_pipeline, environment_source_view, environment_source_sampler, sky_params) =
+            match source {
+                EnvironmentSource::Equirect { .. } => (
+                    self.equirect_pipeline
+                        .ok_or(RenderError::InvalidState("equirect pipeline отсутствует"))?,
+                    source_image.as_ref().map(|image| image.view),
+                    self.equirect_sampler,
+                    None,
+                ),
+                EnvironmentSource::Procedural(sky) => {
+                    let length = sky
+                        .sun_direction
+                        .iter()
+                        .map(|value| value * value)
+                        .sum::<f32>()
+                        .sqrt();
+                    let mut parameters = [0.0_f32; 20];
+                    parameters[1] = sky.sun_size_deg;
+                    parameters[4..7].copy_from_slice(&[
+                        sky.sun_direction[0] / length,
+                        sky.sun_direction[1] / length,
+                        sky.sun_direction[2] / length,
+                    ]);
+                    parameters[7] = sky.sun_intensity;
+                    parameters[8..11].copy_from_slice(&sky.zenith_color);
+                    parameters[12..15].copy_from_slice(&sky.horizon_color);
+                    parameters[16..19].copy_from_slice(&sky.ground_color);
+                    (
+                        self.procedural_sky_pipeline
+                            .ok_or(RenderError::InvalidState(
+                                "procedural sky pipeline отсутствует",
+                            ))?,
+                        None,
+                        None,
+                        Some(parameters),
+                    )
+                }
+            };
+
+        let mut dispatches = Vec::with_capacity(DISPATCH_COUNT as usize);
+        for mip_level in 0..ENVIRONMENT_MIPS {
+            let size = (ENVIRONMENT_SIZE >> mip_level).max(1);
+            let mut parameters = sky_params.unwrap_or([0.0; 20]);
+            parameters[0] = size as f32;
+            dispatches.push(EnvironmentDispatch {
+                pipeline: environment_pipeline,
+                source_view: environment_source_view,
+                source_sampler: environment_source_sampler,
+                output_view: environment_map.mip_array_views[mip_level as usize],
+                parameters,
+                size,
+            });
+        }
+        let mut irradiance_parameters = [0.0_f32; 20];
+        irradiance_parameters[0] = IRRADIANCE_SIZE as f32;
+        dispatches.push(EnvironmentDispatch {
+            pipeline: self
+                .irradiance_pipeline
+                .ok_or(RenderError::InvalidState("irradiance pipeline отсутствует"))?,
+            source_view: Some(environment_map.view),
+            source_sampler: Some(environment_sampler),
+            output_view: irradiance_map.mip_array_views[0],
+            parameters: irradiance_parameters,
+            size: IRRADIANCE_SIZE,
+        });
+        for mip_level in 0..PREFILTER_MIPS {
+            let size = (PREFILTER_SIZE >> mip_level).max(1);
+            let mut parameters = [0.0_f32; 20];
+            parameters[0] = size as f32;
+            parameters[1] = mip_level as f32 / (PREFILTER_MIPS - 1) as f32;
+            parameters[2] = ENVIRONMENT_SIZE as f32;
+            dispatches.push(EnvironmentDispatch {
+                pipeline: self
+                    .prefilter_pipeline
+                    .ok_or(RenderError::InvalidState("prefilter pipeline отсутствует"))?,
+                source_view: Some(environment_map.view),
+                source_sampler: Some(environment_sampler),
+                output_view: prefiltered_map.mip_array_views[mip_level as usize],
+                parameters,
+                size,
+            });
+        }
+
+        let device = self.device()?;
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(DISPATCH_COUNT),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(DISPATCH_COUNT),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(DISPATCH_COUNT),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(DISPATCH_COUNT),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(DISPATCH_COUNT)
+            .pool_sizes(&pool_sizes);
+        let compute_pool = OwnedDescriptorPool::new(device, &pool_info)?;
+        let compute_layout = self.compute_set_layout.ok_or(RenderError::InvalidState(
+            "compute descriptor layout отсутствует",
+        ))?;
+        let layouts = vec![compute_layout; dispatches.len()];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(compute_pool.handle)
+            .set_layouts(&layouts);
+        // SAFETY: compute pool was sized for one set per dispatch.
+        let sets = unsafe { device.allocate_descriptor_sets(&allocate_info) }?;
+        let mut parameter_buffers = Vec::with_capacity(dispatches.len());
+        for (dispatch, set) in dispatches.iter().zip(&sets) {
+            let bytes = float_bytes::<80>(&dispatch.parameters);
+            let buffer = HostBuffer::new(
+                self.instance()?,
+                device,
+                self.physical_device,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                &bytes,
+            )?;
+            let buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(buffer.buffer)
+                .offset(0)
+                .range(80)];
+            let output_info = [vk::DescriptorImageInfo::default()
+                .image_view(dispatch.output_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let source_info = dispatch.source_view.map(|view| {
+                [vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+            });
+            let sampler_info = dispatch
+                .source_sampler
+                .map(|sampler| [vk::DescriptorImageInfo::default().sampler(sampler)]);
+            let mut writes = vec![
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&output_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&buffer_info),
+            ];
+            if let Some(source_info) = &source_info {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(*set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(source_info),
+                );
+            }
+            if let Some(sampler_info) = &sampler_info {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(*set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(sampler_info),
+                );
+            }
+            // SAFETY: pool, set, source/output images and uniform buffer remain alive through submission.
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            parameter_buffers.push(buffer);
+        }
+
+        let compute_pipeline_layout =
+            self.compute_pipeline_layout
+                .ok_or(RenderError::InvalidState(
+                    "compute pipeline layout отсутствует",
+                ))?;
+        self.submit_once(|command_buffer| {
+            for image in [&environment_map, &irradiance_map, &prefiltered_map] {
+                pipeline_barrier(
+                    device,
+                    command_buffer,
+                    image_layout_barrier(
+                        image.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::GENERAL,
+                        vk::PipelineStageFlags2::NONE,
+                        vk::AccessFlags2::NONE,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                        color_mip_subresource_range(0, image.mip_array_views.len() as u32)
+                            .layer_count(6),
+                    ),
+                );
+            }
+            for (index, (dispatch, set)) in dispatches.iter().zip(&sets).enumerate() {
+                // SAFETY: each dispatch targets a single in-bounds mip view and six cube layers.
+                unsafe {
+                    device.cmd_bind_pipeline(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        dispatch.pipeline,
+                    );
+                    device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        compute_pipeline_layout,
+                        0,
+                        &[*set],
+                        &[],
+                    );
+                    device.cmd_dispatch(
+                        command_buffer,
+                        dispatch.size.div_ceil(8),
+                        dispatch.size.div_ceil(8),
+                        6,
+                    );
+                }
+                if index + 1 == ENVIRONMENT_MIPS as usize {
+                    pipeline_barrier(
+                        device,
+                        command_buffer,
+                        image_layout_barrier(
+                            environment_map.image,
+                            vk::ImageLayout::GENERAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                            vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            vk::AccessFlags2::SHADER_SAMPLED_READ,
+                            color_mip_subresource_range(0, ENVIRONMENT_MIPS).layer_count(6),
+                        ),
+                    );
+                }
+            }
+            for image in [&irradiance_map, &prefiltered_map] {
+                pipeline_barrier(
+                    device,
+                    command_buffer,
+                    image_layout_barrier(
+                        image.image,
+                        vk::ImageLayout::GENERAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ,
+                        color_mip_subresource_range(0, image.mip_array_views.len() as u32)
+                            .layer_count(6),
+                    ),
+                );
+            }
+        })?;
+        drop(parameter_buffers);
+        drop(compute_pool);
+        self.make_gpu_environment(environment_map, irradiance_map, prefiltered_map)
     }
 
     fn upload_material(&self, material: &Material) -> Result<GpuMaterial, RenderError> {
@@ -2194,7 +3058,14 @@ impl Renderer {
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
             .size(PUSH_CONSTANTS_SIZE as u32)];
-        let set_layouts = [self.frame_set_layout()?, self.material_set_layout()?];
+        let set_layouts = [
+            self.frame_set_layout()?,
+            self.material_set_layout()?,
+            self.environment_set_layout
+                .ok_or(RenderError::InvalidState(
+                    "environment descriptor layout отсутствует",
+                ))?,
+        ];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&push_constant_ranges);
@@ -2375,6 +3246,15 @@ impl Renderer {
         self.pipeline = Some(pipelines.remove(0));
         self.mask_pipeline = Some(pipelines.remove(0));
         self.blend_pipeline = Some(pipelines.remove(0));
+        Ok(())
+    }
+
+    fn create_skybox_pipeline(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let layout = self
+            .pipeline_layout
+            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+        self.skybox_pipeline = Some(create_skybox_graphics_pipeline(&device, layout)?);
         Ok(())
     }
 
@@ -2777,6 +3657,27 @@ impl Renderer {
         ))
     }
 
+    fn environment_set_for(
+        &self,
+        environment: Option<FrameEnvironment>,
+    ) -> Result<(vk::DescriptorSet, bool), RenderError> {
+        let id = environment.map_or(EnvironmentId(0), |environment| environment.id);
+        let set = self
+            .environments
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|environment| environment.set)
+            .ok_or_else(|| {
+                RenderError::InvalidEnvironment(
+                    "EnvironmentId не принадлежит renderer или уже удалён".to_owned(),
+                )
+            })?;
+        Ok((
+            set,
+            environment.is_some_and(|environment| environment.skybox),
+        ))
+    }
+
     fn material_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
         self.material_set_layout.ok_or(RenderError::InvalidState(
             "layout дескрипторов материала отсутствует",
@@ -2799,6 +3700,7 @@ impl Drop for Renderer {
         self.swapchain.take();
         self.frames.clear();
         self.retired.clear();
+        self.environments.clear();
         self.viewports.clear();
         self.ui_textures.clear();
         self.meshes.clear();
@@ -2830,6 +3732,18 @@ impl Drop for Renderer {
                 // SAFETY: the frame descriptor pool referencing the sampler was destroyed above.
                 unsafe { device.destroy_sampler(sampler, None) };
             }
+            if let Some(sampler) = self.environment_sampler.take() {
+                // SAFETY: all environment descriptor pools were destroyed above.
+                unsafe { device.destroy_sampler(sampler, None) };
+            }
+            if let Some(sampler) = self.equirect_sampler.take() {
+                // SAFETY: environment baking is synchronous and all compute sets were freed.
+                unsafe { device.destroy_sampler(sampler, None) };
+            }
+            if let Some(image) = self.brdf_image.take() {
+                // SAFETY: environment descriptor sets were destroyed above.
+                drop(image);
+            }
             if let Some(image) = self.shadow_image.take() {
                 // SAFETY: the frame descriptor pool is gone and the device is idle.
                 drop(image);
@@ -2842,6 +3756,7 @@ impl Drop for Renderer {
                 self.pipeline.take(),
                 self.mask_pipeline.take(),
                 self.blend_pipeline.take(),
+                self.skybox_pipeline.take(),
             ]
             .into_iter()
             .flatten()
@@ -2860,12 +3775,28 @@ impl Drop for Renderer {
                 // SAFETY: the device is idle, so no command buffer uses these pipelines.
                 unsafe { device.destroy_pipeline(pipeline, None) };
             }
+            for pipeline in [
+                self.equirect_pipeline.take(),
+                self.procedural_sky_pipeline.take(),
+                self.irradiance_pipeline.take(),
+                self.prefilter_pipeline.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                // SAFETY: synchronous environment bakes and all frame submissions have completed.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
             if let Some(layout) = self.pipeline_layout.take() {
                 // SAFETY: the only pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
             if let Some(layout) = self.post_pipeline_layout.take() {
                 // SAFETY: all pipelines created with this layout were destroyed above.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+            if let Some(layout) = self.compute_pipeline_layout.take() {
+                // SAFETY: every compute pipeline using this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
             if let Some(pipeline) = self.overlay_pipeline.take() {
@@ -2887,6 +3818,8 @@ impl Drop for Renderer {
             for layout in [
                 self.frame_set_layout.take(),
                 self.material_set_layout.take(),
+                self.environment_set_layout.take(),
+                self.compute_set_layout.take(),
                 self.texture_set_layout.take(),
             ]
             .into_iter()
@@ -2938,6 +3871,8 @@ struct DeviceFacts {
     synchronization2: bool,
     supported_extensions: HashSet<String>,
     graphics_queue_families: Vec<bool>,
+    compute_queue_families: Vec<bool>,
+    storage_image_extended_formats: bool,
     offscreen_format_features: vk::FormatFeatureFlags,
 }
 
@@ -2983,10 +3918,13 @@ fn evaluate_device(facts: &DeviceFacts, required_extensions: &[CString]) -> Devi
     if !facts.synchronization2 {
         reasons.push("не поддерживается synchronization2".to_owned());
     }
+    if !facts.storage_image_extended_formats {
+        reasons.push("не поддерживается shaderStorageImageExtendedFormats".to_owned());
+    }
     let missing_offscreen = missing_offscreen_format_features(facts.offscreen_format_features);
     if !missing_offscreen.is_empty() {
         reasons.push(format!(
-            "R16G16B16A16_SFLOAT не поддерживает HDR scene и blending: {}",
+            "R16G16B16A16_SFLOAT не поддерживает HDR scene и compute storage: {}",
             missing_offscreen.join(", ")
         ));
     }
@@ -3000,10 +3938,26 @@ fn evaluate_device(facts: &DeviceFacts, required_extensions: &[CString]) -> Devi
         .graphics_queue_families
         .iter()
         .enumerate()
-        .filter_map(|(index, supports_graphics)| supports_graphics.then_some(index as u32))
+        .filter_map(|(index, supports_graphics)| {
+            (*supports_graphics
+                && facts
+                    .compute_queue_families
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false))
+            .then_some(index as u32)
+        })
         .collect::<Vec<_>>();
     if graphics_queue_family_indices.is_empty() {
-        reasons.push(NO_GRAPHICS_QUEUE_FAMILY_REASON.to_owned());
+        if facts
+            .graphics_queue_families
+            .iter()
+            .any(|supports| *supports)
+        {
+            reasons.push(NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON.to_owned());
+        } else {
+            reasons.push(NO_GRAPHICS_QUEUE_FAMILY_REASON.to_owned());
+        }
     }
     DeviceEvaluation {
         reasons,
@@ -3023,14 +3977,25 @@ fn inspect_device(
         .into_owned();
 
     // SAFETY: device feature query uses a valid physical device and a properly initialized pNext chain.
+    let (tessellation_shader, storage_image_extended_formats, texture_sampler_anisotropy) = {
+        let mut features_2 = vk::PhysicalDeviceFeatures2::default();
+        // SAFETY: querying core features uses a valid physical device and null pNext chain.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features_2) };
+        (
+            features_2.features.tessellation_shader != vk::FALSE,
+            features_2.features.shader_storage_image_extended_formats != vk::FALSE,
+            sampler_anisotropy(
+                features_2.features.sampler_anisotropy != vk::FALSE,
+                properties.limits.max_sampler_anisotropy,
+            ),
+        )
+    };
     let mut features_13 = vk::PhysicalDeviceVulkan13Features::default();
     let mut features_2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features_13);
+    // SAFETY: querying Vulkan 1.3 feature structures uses a valid pNext chain.
     unsafe { instance.get_physical_device_features2(physical_device, &mut features_2) };
-    let tessellation_shader = features_2.features.tessellation_shader != vk::FALSE;
-    let texture_sampler_anisotropy = sampler_anisotropy(
-        features_2.features.sampler_anisotropy != vk::FALSE,
-        properties.limits.max_sampler_anisotropy,
-    );
+    let dynamic_rendering = features_13.dynamic_rendering != vk::FALSE;
+    let synchronization2 = features_13.synchronization2 != vk::FALSE;
 
     // SAFETY: extension enumeration is read-only for the live physical device.
     let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
@@ -3052,8 +4017,8 @@ fn inspect_device(
     .optimal_tiling_features;
     let facts = DeviceFacts {
         api_version: properties.api_version,
-        dynamic_rendering: features_13.dynamic_rendering != vk::FALSE,
-        synchronization2: features_13.synchronization2 != vk::FALSE,
+        dynamic_rendering,
+        synchronization2,
         supported_extensions,
         graphics_queue_families: queue_families
             .iter()
@@ -3061,6 +4026,13 @@ fn inspect_device(
                 family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
             })
             .collect(),
+        compute_queue_families: queue_families
+            .iter()
+            .map(|family| {
+                family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+            })
+            .collect(),
+        storage_image_extended_formats,
         offscreen_format_features,
     };
     let evaluation = evaluate_device(&facts, required_extensions);
@@ -3852,6 +4824,53 @@ enum RetiredResource {
     Material(#[allow(dead_code)] GpuMaterial),
     UiTexture(#[allow(dead_code)] UiTexture),
     Viewport(#[allow(dead_code)] Viewport),
+    Environment(#[allow(dead_code)] Box<GpuEnvironment>),
+}
+
+struct OwnedDescriptorPool {
+    device: ash::Device,
+    handle: vk::DescriptorPool,
+}
+
+impl OwnedDescriptorPool {
+    fn new(
+        device: &ash::Device,
+        info: &vk::DescriptorPoolCreateInfo<'_>,
+    ) -> Result<Self, RenderError> {
+        // SAFETY: caller sizes the pool for the descriptor sets it will allocate.
+        let handle = unsafe { device.create_descriptor_pool(info, None) }?;
+        Ok(Self {
+            device: device.clone(),
+            handle,
+        })
+    }
+}
+
+impl Drop for OwnedDescriptorPool {
+    fn drop(&mut self) {
+        if self.handle != vk::DescriptorPool::null() {
+            // SAFETY: the owner is retired only after frames stop using its descriptor set.
+            unsafe { self.device.destroy_descriptor_pool(self.handle, None) };
+        }
+    }
+}
+
+struct GpuEnvironment {
+    _descriptor_pool: OwnedDescriptorPool,
+    set: vk::DescriptorSet,
+    _environment_map: DeviceImage,
+    _irradiance_map: DeviceImage,
+    _prefiltered_map: DeviceImage,
+}
+
+#[derive(Clone, Copy)]
+struct EnvironmentDispatch {
+    pipeline: vk::Pipeline,
+    source_view: Option<vk::ImageView>,
+    source_sampler: Option<vk::Sampler>,
+    output_view: vk::ImageView,
+    parameters: [f32; 20],
+    size: u32,
 }
 
 fn unknown_viewport() -> RenderError {
@@ -4017,6 +5036,7 @@ struct DeviceImage {
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     layer_views: Vec<vk::ImageView>,
+    mip_array_views: Vec<vk::ImageView>,
 }
 
 impl DeviceImage {
@@ -4076,6 +5096,57 @@ impl DeviceImage {
         subresource_range: vk::ImageSubresourceRange,
         array_layers: u32,
     ) -> Result<Self, RenderError> {
+        Self::new_with_layers_kind(
+            instance,
+            device,
+            physical_device,
+            extent,
+            format,
+            usage,
+            subresource_range,
+            array_layers,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_cube(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        size: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        mip_levels: u32,
+    ) -> Result<Self, RenderError> {
+        Self::new_with_layers_kind(
+            instance,
+            device,
+            physical_device,
+            vk::Extent2D {
+                width: size,
+                height: size,
+            },
+            format,
+            usage,
+            color_mip_subresource_range(0, mip_levels),
+            6,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_layers_kind(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        subresource_range: vk::ImageSubresourceRange,
+        array_layers: u32,
+        cube_compatible: bool,
+    ) -> Result<Self, RenderError> {
         if array_layers == 0 {
             return Err(RenderError::InvalidConfig(
                 "image должен иметь хотя бы один слой",
@@ -4084,6 +5155,11 @@ impl DeviceImage {
         let mut subresource_range = subresource_range;
         subresource_range.layer_count = array_layers;
         let image_info = vk::ImageCreateInfo::default()
+            .flags(if cube_compatible {
+                vk::ImageCreateFlags::CUBE_COMPATIBLE
+            } else {
+                vk::ImageCreateFlags::empty()
+            })
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D {
@@ -4106,6 +5182,7 @@ impl DeviceImage {
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
             layer_views: Vec::new(),
+            mip_array_views: Vec::new(),
         };
         // SAFETY: image was created by this device and remains alive.
         let requirements = unsafe { device.get_image_memory_requirements(target.image) };
@@ -4127,7 +5204,9 @@ impl DeviceImage {
         unsafe { device.bind_image_memory(target.image, target.memory, 0) }?;
         let view_info = vk::ImageViewCreateInfo::default()
             .image(target.image)
-            .view_type(if array_layers == 1 {
+            .view_type(if cube_compatible {
+                vk::ImageViewType::CUBE
+            } else if array_layers == 1 {
                 vk::ImageViewType::TYPE_2D
             } else {
                 vk::ImageViewType::TYPE_2D_ARRAY
@@ -4151,12 +5230,32 @@ impl DeviceImage {
                     .push(unsafe { device.create_image_view(&layer_view_info, None) }?);
             }
         }
+        if cube_compatible {
+            for mip_level in 0..subresource_range.level_count {
+                let mip_view_info = vk::ImageViewCreateInfo::default()
+                    .image(target.image)
+                    .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+                    .format(format)
+                    .components(vk::ComponentMapping::default())
+                    .subresource_range(
+                        color_mip_subresource_range(mip_level, 1).layer_count(array_layers),
+                    );
+                // SAFETY: each storage view addresses one mip and all six cube-compatible layers.
+                target
+                    .mip_array_views
+                    .push(unsafe { device.create_image_view(&mip_view_info, None) }?);
+            }
+        }
         Ok(target)
     }
 }
 
 impl Drop for DeviceImage {
     fn drop(&mut self) {
+        for view in self.mip_array_views.drain(..) {
+            // SAFETY: each mip view is an owned child and is destroyed before its image.
+            unsafe { self.device.destroy_image_view(view, None) };
+        }
         for view in self.layer_views.drain(..) {
             // SAFETY: each layer view is an owned child of the image and is destroyed first.
             unsafe { self.device.destroy_image_view(view, None) };
@@ -4448,6 +5547,60 @@ fn record_scene(
     );
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
+    if scene.skybox {
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                target.color.image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                color_subresource_range(),
+            ),
+        );
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                target.depth.image,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+                depth_subresource_range(),
+            ),
+        );
+        let color_attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(target.color.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let depth_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(target.depth.view)
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE);
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: render_extent,
+            })
+            .layer_count(1)
+            .color_attachments(&color_attachment)
+            .depth_attachment(&depth_attachment);
+        // SAFETY: skybox loads the preceding scene attachments and does not write depth.
+        unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
+        record_skybox(device, command_buffer, render_extent, scene);
+        // SAFETY: this matches the preceding dynamic-rendering begin call.
+        unsafe { device.cmd_end_rendering(command_buffer) };
+    }
     if has_transparent_draws(scene) {
         let color_to_blend = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -4517,6 +5670,46 @@ fn record_scene(
     target.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
 }
 
+fn record_skybox(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    render_extent: vk::Extent2D,
+    scene: &ScenePass<'_>,
+) {
+    let viewport = [scene_viewport(render_extent)];
+    let scissor = [vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: render_extent,
+    }];
+    // SAFETY: called inside dynamic rendering with a compatible color/depth skybox pipeline.
+    unsafe {
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            scene.skybox_pipeline,
+        );
+        device.cmd_set_viewport(command_buffer, 0, &viewport);
+        device.cmd_set_scissor(command_buffer, 0, &scissor);
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            scene.pipeline_layout,
+            0,
+            &[scene.frame_set],
+            &[],
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            scene.pipeline_layout,
+            2,
+            &[scene.environment_set],
+            &[],
+        );
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DrawPass {
     OpaqueAndMask,
@@ -4527,8 +5720,11 @@ struct ScenePass<'a> {
     pipeline: vk::Pipeline,
     mask_pipeline: vk::Pipeline,
     blend_pipeline: vk::Pipeline,
+    skybox_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
+    environment_set: vk::DescriptorSet,
+    skybox: bool,
     meshes: &'a [Option<MeshBuffers>],
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
@@ -4595,6 +5791,14 @@ fn record_draws(
             scene.pipeline_layout,
             0,
             &[scene.frame_set],
+            &[],
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            scene.pipeline_layout,
+            2,
+            &[scene.environment_set],
             &[],
         );
     }
@@ -5209,6 +6413,30 @@ fn pipeline_barrier(
     unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 }
 
+#[allow(clippy::too_many_arguments)]
+fn image_layout_barrier(
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    source_stage: vk::PipelineStageFlags2,
+    source_access: vk::AccessFlags2,
+    destination_stage: vk::PipelineStageFlags2,
+    destination_access: vk::AccessFlags2,
+    range: vk::ImageSubresourceRange,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(source_stage)
+        .src_access_mask(source_access)
+        .dst_stage_mask(destination_stage)
+        .dst_access_mask(destination_access)
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(range)
+}
+
 fn mip_level_count(width: u32, height: u32) -> u32 {
     32 - width.max(height).leading_zeros()
 }
@@ -5411,6 +6639,7 @@ fn missing_offscreen_format_features(supported: vk::FormatFeatureFlags) -> Vec<&
             vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
             "SAMPLED_IMAGE_FILTER_LINEAR",
         ),
+        (vk::FormatFeatureFlags::STORAGE_IMAGE, "STORAGE_IMAGE"),
     ]
     .into_iter()
     .filter_map(|(feature, name)| (!supported.contains(feature)).then_some(name))
@@ -5538,6 +6767,110 @@ impl Drop for ShaderModule {
         // SAFETY: shader modules may be destroyed once pipeline creation has returned.
         unsafe { self.device.destroy_shader_module(self.handle, None) };
     }
+}
+
+fn create_compute_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    compute_shader: &[u8],
+) -> Result<vk::Pipeline, RenderError> {
+    let module = ShaderModule::new(device, compute_shader)?;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(module.handle)
+        .name(c"main");
+    let info = vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(layout);
+    // SAFETY: shader module and pipeline layout are valid for this compute pipeline.
+    let mut pipelines = match unsafe {
+        device.create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+    } {
+        Ok(pipelines) => pipelines,
+        Err((pipelines, error)) => {
+            for pipeline in pipelines {
+                // SAFETY: partial compute pipelines were returned by this device.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            return Err(error.into());
+        }
+    };
+    pipelines
+        .pop()
+        .ok_or(RenderError::InvalidState("compute pipeline не создан"))
+}
+
+fn create_skybox_graphics_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+) -> Result<vk::Pipeline, RenderError> {
+    let vertex_module = ShaderModule::new(device, SKYBOX_VERTEX_SHADER)?;
+    let fragment_module = ShaderModule::new(device, SKYBOX_FRAGMENT_SHADER)?;
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex_module.handle)
+            .name(c"main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment_module.handle)
+            .name(c"main"),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(false)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+    let color_attachments = [vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let color_blend =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_attachments);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let color_formats = [OFFSCREEN_FORMAT];
+    let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&color_formats)
+        .depth_attachment_format(DEPTH_FORMAT);
+    let info = [vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(layout)
+        .push_next(&mut rendering_info)];
+    // SAFETY: shaders, layout, color/depth formats and dynamic rendering state are valid.
+    let mut pipelines =
+        match unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &info, None) } {
+            Ok(pipelines) => pipelines,
+            Err((pipelines, error)) => {
+                for pipeline in pipelines {
+                    // SAFETY: partial graphics pipelines were returned by this device.
+                    unsafe { device.destroy_pipeline(pipeline, None) };
+                }
+                return Err(error.into());
+            }
+        };
+    pipelines
+        .pop()
+        .ok_or(RenderError::InvalidState("skybox pipeline не создан"))
 }
 
 fn create_post_pipeline(
@@ -5965,7 +7298,7 @@ fn index_bytes(indices: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
 }
 
-/// Байты `FrameUniforms` в порядке std140: пять матриц и пять `vec4`.
+/// Байты `FrameUniforms` в порядке std140: шесть матриц и шесть `vec4`.
 /// Viewport рисуется в кадре один раз: его цель и uniform-буфер принадлежат одной сцене.
 fn validate_scene_viewports(
     viewports: impl Iterator<Item = ViewportId>,
@@ -5984,6 +7317,27 @@ fn validate_scene_viewports(
 
 fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
     validate_view_settings(frame.view)?;
+    if !frame
+        .camera
+        .view
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite())
+        || !frame
+            .camera
+            .projection
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+        || !frame.camera.position.into_iter().all(f32::is_finite)
+    {
+        return Err(RenderError::InvalidConfig(
+            "camera matrices and position must be finite",
+        ));
+    }
+    if let Some(environment) = frame.environment {
+        validate_frame_environment(environment)?;
+    }
     let light = frame.light;
     let [x, y, z] = light.direction;
     let length_squared = x * x + y * y + z * z;
@@ -6007,20 +7361,25 @@ fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], R
         ));
     }
 
+    let view_projection = multiply_4x4(frame.camera.projection, frame.camera.view);
+    let inverse_view_projection = environment::inverse4x4(view_projection).ok_or(
+        RenderError::InvalidConfig("camera view-projection matrix must be invertible"),
+    )?;
     let mut values = [0.0; FRAME_UNIFORMS_SIZE / size_of::<f32>()];
-    values[..16].copy_from_slice(frame.view_projection.as_flattened());
+    values[..16].copy_from_slice(view_projection.as_flattened());
+    values[16..32].copy_from_slice(inverse_view_projection.as_flattened());
     for cascade in 0..SHADOW_CASCADE_COUNT {
-        let start = 16 + cascade * 16;
+        let start = 32 + cascade * 16;
         let matrix = frame
             .shadow_cascades
             .get(cascade)
             .unwrap_or(&IDENTITY_MATRIX);
         values[start..start + 16].copy_from_slice(matrix.as_flattened());
     }
-    values[80..84].copy_from_slice(&[x, y, z, 0.0]);
-    values[84..88].copy_from_slice(&[light.color[0], light.color[1], light.color[2], 0.0]);
-    values[88..92].copy_from_slice(&[light.ambient[0], light.ambient[1], light.ambient[2], 0.0]);
-    values[92..96].copy_from_slice(&[
+    values[96..100].copy_from_slice(&[x, y, z, 0.0]);
+    values[100..104].copy_from_slice(&[light.color[0], light.color[1], light.color[2], 0.0]);
+    values[104..108].copy_from_slice(&[light.ambient[0], light.ambient[1], light.ambient[2], 0.0]);
+    values[108..112].copy_from_slice(&[
         if frame.shadow_cascades.is_empty() {
             0.0
         } else {
@@ -6030,13 +7389,87 @@ fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], R
         frame.shadow_cascades.len() as f32,
         0.0,
     ]);
-    values[96..100].copy_from_slice(&[
-        frame.camera_position[0],
-        frame.camera_position[1],
-        frame.camera_position[2],
+    values[112..116].copy_from_slice(&[
+        frame.camera.position[0],
+        frame.camera.position[1],
+        frame.camera.position[2],
         0.0,
     ]);
+    let (rotation, intensity, skybox, present) =
+        frame
+            .environment
+            .map_or((IDENTITY_MATRIX, 0.0, 0.0, 0.0), |environment| {
+                let [[a, b, c], [d, e, f], [g, h, i]] = environment.rotation;
+                (
+                    [
+                        [a, b, c, 0.0],
+                        [d, e, f, 0.0],
+                        [g, h, i, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                    environment.intensity,
+                    if environment.skybox { 1.0 } else { 0.0 },
+                    1.0,
+                )
+            });
+    values[116..132].copy_from_slice(rotation.as_flattened());
+    values[132..136].copy_from_slice(&[intensity, skybox, present, 0.0]);
     Ok(float_bytes(&values))
+}
+
+fn validate_frame_environment(environment: FrameEnvironment) -> Result<(), RenderError> {
+    if !environment.intensity.is_finite() || environment.intensity < 0.0 {
+        return Err(RenderError::InvalidConfig(
+            "environment intensity must be finite and non-negative",
+        ));
+    }
+    if !environment
+        .rotation
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite())
+    {
+        return Err(RenderError::InvalidConfig(
+            "environment rotation must be finite",
+        ));
+    }
+    let columns = environment.rotation;
+    let dot = |left: [f32; 3], right: [f32; 3]| {
+        left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+    };
+    if columns
+        .iter()
+        .any(|column| (dot(*column, *column) - 1.0).abs() > 1e-3)
+        || (0..3)
+            .any(|left| (left + 1..3).any(|right| dot(columns[left], columns[right]).abs() > 1e-3))
+    {
+        return Err(RenderError::InvalidConfig(
+            "environment rotation must be an orthonormal basis",
+        ));
+    }
+    let cross = [
+        columns[0][1] * columns[1][2] - columns[0][2] * columns[1][1],
+        columns[0][2] * columns[1][0] - columns[0][0] * columns[1][2],
+        columns[0][0] * columns[1][1] - columns[0][1] * columns[1][0],
+    ];
+    if dot(cross, columns[2]) < 0.999 {
+        return Err(RenderError::InvalidConfig(
+            "environment rotation must preserve orientation",
+        ));
+    }
+    Ok(())
+}
+
+fn multiply_4x4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0; 4]; 4];
+    for column in 0..4 {
+        for row in 0..4 {
+            result[column][row] = (0..4)
+                .map(|index| left[index][row] * right[column][index])
+                .sum();
+        }
+    }
+    result
 }
 
 /// Байты push constants: матрица модели, затем матрица нормалей; обе по столбцам.
@@ -6273,28 +7706,28 @@ mod tests {
     use super::culling::{Frustum, LocalBounds};
     use super::{
         AcquireAction, AlphaMode, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight,
-        DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT,
+        DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, FrameCamera, LDR_FORMAT,
         MATERIAL_UNIFORMS_SIZE, MESH_BLEND_FRAGMENT_SHADER, MESH_MASK_FRAGMENT_SHADER,
         MESH_OPAQUE_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId,
-        OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER,
-        OverlayVertex, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
-        SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER, SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER,
-        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
-        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
-        check_extensions, classify_acquire_result, classify_probe_instance_failure,
-        deduplicate_names, derivative_tangent_basis, evaluate_device, frame_uniform_bytes,
-        index_bytes, inverse_extent, material_sampler_info, material_uniform_bytes, mip_extent,
-        mip_level_count, missing_extensions, missing_offscreen_format_features,
-        missing_post_format_features, missing_texture_format_features, normal_matrix,
-        offscreen_previous_use, overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy,
-        scaled_extent, scene_viewport, select_composite_alpha, select_surface_extent,
-        shadow_caster_is_outside, shadow_casters, shadow_layout_source, shadow_subresource_range,
-        texture_format, texture_format_reasons, texture_mip_blit_region,
-        texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
-        texture_mip_source_barrier, texture_upload_barrier, timestamp_duration,
-        transform_tangent_normal, validate_draws, validate_material, validate_mesh,
-        validate_overlay, validate_render_scale, validate_texture, validate_view_settings,
-        vertex_bytes,
+        NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON, OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER,
+        OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure,
+        RenderError, Renderer, RendererConfig, SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER,
+        SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER,
+        TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex,
+        ViewSettings, best_device_index, check_extensions, classify_acquire_result,
+        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
+        evaluate_device, frame_uniform_bytes, index_bytes, inverse_extent, material_sampler_info,
+        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
+        missing_offscreen_format_features, missing_post_format_features,
+        missing_texture_format_features, normal_matrix, offscreen_previous_use,
+        overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
+        scene_viewport, select_composite_alpha, select_surface_extent, shadow_caster_is_outside,
+        shadow_casters, shadow_layout_source, shadow_subresource_range, texture_format,
+        texture_format_reasons, texture_mip_blit_region, texture_mip_destination_shader_barrier,
+        texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
+        timestamp_duration, transform_tangent_normal, validate_draws, validate_material,
+        validate_mesh, validate_overlay, validate_render_scale, validate_texture,
+        validate_view_settings, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -6554,7 +7987,8 @@ mod tests {
         let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
             | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
             | vk::FormatFeatureFlags::SAMPLED_IMAGE
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::STORAGE_IMAGE;
         assert_eq!(OFFSCREEN_FORMAT, vk::Format::R16G16B16A16_SFLOAT);
         assert!(missing_offscreen_format_features(required).is_empty());
         for (feature, name) in [
@@ -6568,6 +8002,7 @@ mod tests {
                 vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
                 "SAMPLED_IMAGE_FILTER_LINEAR",
             ),
+            (vk::FormatFeatureFlags::STORAGE_IMAGE, "STORAGE_IMAGE"),
         ] {
             assert_eq!(
                 missing_offscreen_format_features(required & !feature),
@@ -6584,14 +8019,56 @@ mod tests {
             synchronization2: true,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![true],
+            compute_queue_families: vec![true],
+            storage_image_extended_formats: true,
             offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::STORAGE_IMAGE,
         };
         let evaluation = evaluate_device(&facts, &[]);
         assert_eq!(evaluation.reasons.len(), 1);
         assert!(evaluation.reasons[0].contains("R16G16B16A16_SFLOAT"));
         assert!(evaluation.reasons[0].contains("COLOR_ATTACHMENT_BLEND"));
+    }
+
+    #[test]
+    fn device_evaluation_requires_compute_on_the_selected_graphics_queue_and_extended_formats() {
+        let mut facts = DeviceFacts {
+            api_version: vk::API_VERSION_1_3,
+            dynamic_rendering: true,
+            synchronization2: true,
+            supported_extensions: HashSet::new(),
+            graphics_queue_families: vec![true],
+            compute_queue_families: vec![false],
+            storage_image_extended_formats: false,
+            offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::STORAGE_IMAGE,
+        };
+        let reasons = evaluate_device(&facts, &[]).reasons;
+        assert!(reasons.contains(&NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON.to_owned()));
+        assert!(
+            reasons.contains(&"не поддерживается shaderStorageImageExtendedFormats".to_owned())
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|reason| reason.contains("STORAGE_IMAGE"))
+        );
+
+        facts.compute_queue_families[0] = true;
+        facts.storage_image_extended_formats = true;
+        facts.offscreen_format_features &= !vk::FormatFeatureFlags::STORAGE_IMAGE;
+        let reasons = evaluate_device(&facts, &[]).reasons;
+        assert!(!reasons.contains(&NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON.to_owned()));
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("STORAGE_IMAGE"))
+        );
     }
 
     #[test]
@@ -6661,10 +8138,13 @@ mod tests {
                 "VK_KHR_portability_subset".to_owned(),
             ]),
             graphics_queue_families: vec![false, true],
+            compute_queue_families: vec![false, true],
+            storage_image_extended_formats: true,
             offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
                 | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::STORAGE_IMAGE,
         };
         let required = [
             CString::new("VK_KHR_swapchain").unwrap(),
@@ -6685,10 +8165,13 @@ mod tests {
             synchronization2: true,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![true],
+            compute_queue_families: vec![true],
+            storage_image_extended_formats: true,
             offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
                 | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::STORAGE_IMAGE,
         };
 
         let evaluation = evaluate_device(&facts, &[]);
@@ -6721,10 +8204,13 @@ mod tests {
             synchronization2: false,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![false, false],
+            compute_queue_families: vec![false, false],
+            storage_image_extended_formats: true,
             offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
                 | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::STORAGE_IMAGE,
         };
         let required = [
             CString::new("VK_KHR_swapchain").unwrap(),
@@ -7478,42 +8964,40 @@ mod tests {
         let cascades = [matrix(17.0), matrix(33.0), matrix(49.0), matrix(65.0)];
         let frame = Frame {
             clear_color: [0.0; 4],
-            view_projection: matrix(1.0),
+            camera: FrameCamera {
+                view: IDENTITY,
+                projection: IDENTITY,
+                position: [10.0, 11.0, 12.0],
+            },
+            environment: None,
             shadow_cascades: &cascades,
-            camera_position: [10.0, 11.0, 12.0],
             light,
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),
         };
         let values = floats(&frame_uniform_bytes(&frame).unwrap());
-        assert_eq!(FRAME_UNIFORMS_SIZE, 400);
-        assert_eq!(
-            &values[0..16],
-            &(1..=16).map(|x| x as f32).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &values[16..32],
-            &(17..=32).map(|x| x as f32).collect::<Vec<_>>()
-        );
-        for (cascade, start) in [(1, 32), (2, 48), (3, 64)] {
+        assert_eq!(FRAME_UNIFORMS_SIZE, 544);
+        assert_eq!(&values[0..16], IDENTITY.as_flattened());
+        assert_eq!(&values[16..32], IDENTITY.as_flattened());
+        for (cascade, start) in [(0, 32), (1, 48), (2, 64), (3, 80)] {
             let expected = (1..=16)
-                .map(|offset| start as f32 + offset as f32)
+                .map(|offset| (cascade as f32 * 16.0) + 17.0 + offset as f32 - 1.0)
                 .collect::<Vec<_>>();
             assert_eq!(&values[start..start + 16], expected.as_slice());
             assert_eq!(cascades[cascade].as_flattened(), expected.as_slice());
         }
-        assert_eq!(&values[80..84], &[1.0, 2.0, 3.0, 0.0]);
-        assert_eq!(&values[84..88], &[4.0, 5.0, 6.0, 0.0]);
-        assert_eq!(&values[88..92], &[7.0, 8.0, 9.0, 0.0]);
-        assert_eq!(&values[92..96], &[1.0, 1.0 / 2048.0, 4.0, 0.0]);
-        assert_eq!(&values[96..100], &[10.0, 11.0, 12.0, 0.0]);
+        assert_eq!(&values[96..100], &[1.0, 2.0, 3.0, 0.0]);
+        assert_eq!(&values[100..104], &[4.0, 5.0, 6.0, 0.0]);
+        assert_eq!(&values[104..108], &[7.0, 8.0, 9.0, 0.0]);
+        assert_eq!(&values[108..112], &[1.0, 1.0 / 2048.0, 4.0, 0.0]);
+        assert_eq!(&values[112..116], &[10.0, 11.0, 12.0, 0.0]);
 
         let no_shadows = Frame {
             shadow_cascades: &[],
             ..frame
         };
-        assert_eq!(floats(&frame_uniform_bytes(&no_shadows).unwrap())[92], 0.0);
+        assert_eq!(floats(&frame_uniform_bytes(&no_shadows).unwrap())[108], 0.0);
     }
 
     #[test]
@@ -7527,9 +9011,13 @@ mod tests {
                 matches!(
                     frame_uniform_bytes(&Frame {
                         clear_color: [0.0; 4],
-                        view_projection: IDENTITY,
+                        camera: FrameCamera {
+                            view: IDENTITY,
+                            projection: IDENTITY,
+                            position: [0.0; 3],
+                        },
+                        environment: None,
                         shadow_cascades: &[],
-                        camera_position: [0.0; 3],
                         light,
                         draws: &[],
                         overlay: &[],
@@ -7546,9 +9034,13 @@ mod tests {
         let invalid_cascades = [invalid];
         let frame = Frame {
             clear_color: [0.0; 4],
-            view_projection: IDENTITY,
+            camera: FrameCamera {
+                view: IDENTITY,
+                projection: IDENTITY,
+                position: [0.0; 3],
+            },
+            environment: None,
             shadow_cascades: &invalid_cascades,
-            camera_position: [0.0; 3],
             light: DirectionalLight::default(),
             draws: &[],
             overlay: &[],
@@ -7565,9 +9057,13 @@ mod tests {
         let too_many = [IDENTITY; 5];
         let frame = Frame {
             clear_color: [0.0; 4],
-            view_projection: IDENTITY,
+            camera: FrameCamera {
+                view: IDENTITY,
+                projection: IDENTITY,
+                position: [0.0; 3],
+            },
+            environment: None,
             shadow_cascades: &too_many,
-            camera_position: [0.0; 3],
             light: DirectionalLight::default(),
             draws: &[],
             overlay: &[],

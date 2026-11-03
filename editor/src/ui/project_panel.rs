@@ -143,6 +143,7 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
         AssetKind::CameraSettings => "CAMERA",
         AssetKind::Model => "FBX",
         AssetKind::Texture => "PNG",
+        AssetKind::Hdr => "HDR",
         AssetKind::Script => "LUA",
         AssetKind::Other => "FILE",
     }
@@ -163,14 +164,18 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
             rect.min + egui::vec2(16.0, 4.0),
             egui::vec2(TILE_SIZE - 32.0, TILE_SIZE - 32.0),
         );
-        let preview = (!entry.is_dir && AssetKind::of(&entry.path) == AssetKind::Texture)
-            .then(|| {
-                let project = state.project.as_ref();
-                state.previews.get(&entry.path, || {
-                    project.and_then(|project| project.assets_dir.resolve(&entry.path).ok())
-                })
+        let preview = (!entry.is_dir
+            && matches!(
+                AssetKind::of(&entry.path),
+                AssetKind::Texture | AssetKind::Hdr
+            ))
+        .then(|| {
+            let project = state.project.as_ref();
+            state.previews.get(&entry.path, || {
+                project.and_then(|project| project.assets_dir.resolve(&entry.path).ok())
             })
-            .flatten();
+        })
+        .flatten();
         match preview {
             Some(texture) => {
                 painter.image(

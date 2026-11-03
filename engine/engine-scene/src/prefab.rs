@@ -5,10 +5,10 @@
 //! остальные объекты — `<экземпляр>.<id в префабе>`, у вложенных — `a.b.c`.
 
 use crate::document::{
-    CameraComponent, DirectionalLightComponent, DocumentKind, MaterialAlphaMode, MaterialOverride,
-    ParamValue, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
-    option_virtual_path_serde, require_asset_path, require_extension, valid_ascii_name,
-    validate_material_override, virtual_path_serde,
+    CameraComponent, DirectionalLightComponent, DocumentKind, EnvironmentComponent,
+    MaterialAlphaMode, MaterialOverride, ParamValue, SceneAsset, SceneDocument, SceneError,
+    SceneObject, SceneTransform, option_virtual_path_serde, require_asset_path, require_extension,
+    valid_ascii_name, validate_environment, validate_material_override, virtual_path_serde,
 };
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,8 @@ pub struct PrefabOverride {
     pub camera: Option<CameraComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directional_light: Option<DirectionalLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentComponent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lite_params: Vec<LiteParamsOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -230,6 +232,13 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .ok_or("override directional_light: у объекта нет directional_light")?;
         *target = light;
     }
+    if let Some(environment) = &change.environment {
+        let target = object
+            .environment
+            .as_mut()
+            .ok_or("override environment: у объекта нет environment")?;
+        *target = environment.clone();
+    }
     for params in &change.lite_params {
         let mut found = false;
         for script in &mut object.lite_scripts {
@@ -383,6 +392,9 @@ pub(crate) fn validate_instances(
                     "camerasettings",
                     "настройки камеры override",
                 )?;
+            }
+            if let Some(environment) = &change.environment {
+                validate_environment(source, id, assets, environment)?;
             }
         }
     }

@@ -500,6 +500,9 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.directional_light.is_some() {
         base.directional_light = outer.directional_light;
     }
+    if outer.environment.is_some() {
+        base.environment = outer.environment.clone();
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -528,6 +531,7 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.mesh_renderer.is_none()
         && change.camera.is_none()
         && change.directional_light.is_none()
+        && change.environment.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -596,6 +600,11 @@ pub(crate) fn object_override(
     match (base.directional_light, edited.directional_light) {
         (None, None) => {}
         (Some(from), Some(to)) => change.directional_light = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.environment, &edited.environment) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.environment = (to != from).then(|| to.clone()),
         _ => return Err(COMPONENTS.to_owned()),
     }
     if base.lite_scripts.len() != edited.lite_scripts.len()
@@ -734,6 +743,7 @@ pub enum OverrideField {
     Mesh,
     Camera,
     Light,
+    Environment,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -758,6 +768,7 @@ impl EditorScene {
             OverrideField::Mesh => change.mesh_renderer.is_some(),
             OverrideField::Camera => change.camera.is_some(),
             OverrideField::Light => change.directional_light.is_some(),
+            OverrideField::Environment => change.environment.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -794,6 +805,7 @@ impl EditorScene {
                     OverrideField::Mesh => change.mesh_renderer = None,
                     OverrideField::Camera => change.camera = None,
                     OverrideField::Light => change.directional_light = None,
+                    OverrideField::Environment => change.environment = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }
@@ -912,6 +924,13 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
         .and_then(|camera| camera.settings.clone())
     {
         paths.push(settings);
+    }
+    if let Some(hdr) = change
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.hdr.clone())
+    {
+        paths.push(hdr);
     }
     paths
 }
@@ -1235,6 +1254,58 @@ mod tests {
         transform.position[1] = 1.0;
         scene.set_transform("door.handle", transform, None).unwrap();
         assert!(scene.object_override("door.handle").is_none());
+    }
+
+    #[test]
+    fn environment_prefab_override_replaces_the_component_and_registers_hdr_asset() {
+        let prefab = "[[assets]]\npath = \"/environment/original.hdr\"\n[[objects]]\nid = \"sky\"\n[objects.environment]\nhdr = \"/environment/original.hdr\"\n";
+        let files = Files::with(&[("prefabs/sky.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/sky.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("sky", None, |object| {
+                object.environment.as_mut().unwrap().hdr = Some(path("/environment/changed.hdr"));
+                Ok(())
+            })
+            .unwrap();
+        let change = scene.object_override("sky").unwrap();
+        assert_eq!(
+            change.environment.as_ref().unwrap().hdr,
+            Some(path("/environment/changed.hdr"))
+        );
+        assert!(scene.is_overridden("sky", &OverrideField::Environment));
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/environment/changed.hdr"))
+        );
+        let (_, applied) = scene.prefab_with_override("sky").unwrap();
+        assert_eq!(
+            applied.objects[0].environment.as_ref().unwrap().hdr,
+            Some(path("/environment/changed.hdr"))
+        );
+
+        scene
+            .revert_field("sky", &OverrideField::Environment)
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("sky")
+                .unwrap()
+                .environment
+                .as_ref()
+                .unwrap()
+                .hdr,
+            Some(path("/environment/original.hdr"))
+        );
     }
 
     #[test]

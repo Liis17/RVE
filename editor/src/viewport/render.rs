@@ -6,16 +6,19 @@ use crate::viewport::model_loader::ModelLoader;
 use engine_assets::{Model, ModelAlphaMode};
 use engine_render::AlphaMode;
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, Material, MaterialId,
-    MeshId, RenderError, Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId,
+    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, Material, MaterialId, MeshId,
+    ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId,
     Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
 use engine_scene::light::cascade_view_projections;
 use engine_scene::world::ObjectHandle;
-use engine_scene::{AntiAliasing, CameraSettings, LightState, SceneFrame, Tonemapper, World};
-use glam::{Mat4, Vec3};
+use engine_scene::{
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, SceneFrame, Tonemapper, World,
+};
+use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -34,10 +37,21 @@ pub struct SceneRenderer {
     pub game_viewport: ViewportId,
     models: HashMap<String, Option<GpuModel>>,
     textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
+    environment_sources: HashMap<String, Option<Arc<EnvironmentSource>>>,
+    current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
     object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     grid: Option<MeshId>,
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EditorEnvironmentKey {
+    Hdr(String),
+    Procedural {
+        colors_and_sun: [u32; 11],
+        sun_direction: [i32; 3],
+    },
 }
 
 impl SceneRenderer {
@@ -47,6 +61,8 @@ impl SceneRenderer {
             game_viewport: renderer.create_viewport(1, 1)?,
             models: HashMap::new(),
             textures: HashMap::new(),
+            environment_sources: HashMap::new(),
+            current_environment: None,
             object_materials: HashMap::new(),
             grid: None,
             scene_draws: Vec::new(),
@@ -60,6 +76,10 @@ impl SceneRenderer {
         renderer: &mut Renderer,
         cpu_models: &mut HashMap<String, Arc<Model>>,
     ) -> Result<(), RenderError> {
+        if let Some((_, environment)) = self.current_environment.take() {
+            renderer.destroy_environment(environment)?;
+        }
+        self.environment_sources.clear();
         for model in self.models.drain().filter_map(|(_, model)| model) {
             destroy_model(renderer, model)?;
         }
@@ -84,6 +104,7 @@ impl SceneRenderer {
         loader: &mut ModelLoader,
         log: &mut ConsoleLog,
     ) -> Result<(), RenderError> {
+        let mut active_environments = HashSet::new();
         for (path, loaded) in loader.finished() {
             let gpu = match loaded {
                 Ok(model) => {
@@ -102,6 +123,28 @@ impl SceneRenderer {
             }
         }
         for object in world.objects() {
+            if let Some(path) = object
+                .environment
+                .as_ref()
+                .and_then(|environment| environment.hdr.as_ref())
+            {
+                let path = path.as_str();
+                active_environments.insert(path.to_owned());
+                if !self.environment_sources.contains_key(path) {
+                    let source = match project.assets.load_hdr(path) {
+                        Ok(image) => Some(Arc::new(EnvironmentSource::Equirect {
+                            width: image.width,
+                            height: image.height,
+                            rgb: image.rgb,
+                        })),
+                        Err(error) => {
+                            log.error(format!("{path}: {error}"));
+                            None
+                        }
+                    };
+                    self.environment_sources.insert(path.to_owned(), source);
+                }
+            }
             let Some(mesh) = &object.mesh_renderer else {
                 continue;
             };
@@ -160,6 +203,8 @@ impl SceneRenderer {
                 }
             }
         }
+        self.environment_sources
+            .retain(|path, _| active_environments.contains(path));
         Ok(())
     }
 
@@ -263,15 +308,18 @@ impl SceneRenderer {
     #[allow(clippy::too_many_arguments)]
     pub fn frame<'a>(
         &'a self,
-        view_projection: Mat4,
-        camera_position: Vec3,
+        camera: Camera,
+        width: u32,
+        height: u32,
         settings: CameraSettings,
         light: &LightState,
         scene_has_light: bool,
+        environment_state: Option<&EnvironmentState>,
         shadow_cascades: &'a [[[f32; 4]; 4]],
         with_grid: bool,
     ) -> Frame<'a> {
         let light = frame_light(light, scene_has_light);
+        let environment = self.frame_environment(environment_state);
         Frame {
             clear_color: [
                 settings.render.clear_color[0],
@@ -279,9 +327,13 @@ impl SceneRenderer {
                 settings.render.clear_color[2],
                 1.0,
             ],
-            view_projection: view_projection.to_cols_array_2d(),
+            camera: FrameCamera {
+                view: camera.view().to_cols_array_2d(),
+                projection: camera.projection(width, height).to_cols_array_2d(),
+                position: camera.position.to_array(),
+            },
+            environment,
             shadow_cascades,
-            camera_position: camera_position.to_array(),
             light,
             draws: if with_grid {
                 &self.scene_draws
@@ -303,6 +355,62 @@ impl SceneRenderer {
                 },
             },
         }
+    }
+
+    pub fn sync_environment(
+        &mut self,
+        renderer: &mut Renderer,
+        state: Option<&EnvironmentState>,
+    ) -> Result<(), RenderError> {
+        let Some(state) = state else {
+            if let Some((_, environment)) = self.current_environment.take() {
+                renderer.destroy_environment(environment)?;
+            }
+            return Ok(());
+        };
+        let key = editor_environment_key(state);
+        if self
+            .current_environment
+            .as_ref()
+            .is_some_and(|(current, _)| current == &key)
+        {
+            return Ok(());
+        }
+        let source = if let Some(path) = &state.component.hdr {
+            self.environment_sources
+                .get(path.as_str())
+                .and_then(Option::as_ref)
+                .map(|source| renderer.create_environment(source))
+        } else {
+            editor_procedural_sky(state)
+                .map(|sky| renderer.create_environment(&EnvironmentSource::Procedural(sky)))
+        };
+        let Some(id) = source.transpose()? else {
+            if let Some((_, environment)) = self.current_environment.take() {
+                renderer.destroy_environment(environment)?;
+            }
+            return Ok(());
+        };
+        if let Some((_, environment)) = self.current_environment.take() {
+            renderer.destroy_environment(environment)?;
+        }
+        self.current_environment = Some((key, id));
+        Ok(())
+    }
+
+    fn frame_environment(&self, state: Option<&EnvironmentState>) -> Option<FrameEnvironment> {
+        let state = state?;
+        let key = editor_environment_key(state);
+        let (_, id) = self
+            .current_environment
+            .as_ref()
+            .filter(|(current, _)| current == &key)?;
+        Some(FrameEnvironment {
+            id: *id,
+            intensity: state.component.intensity,
+            rotation: state.rotation,
+            skybox: state.component.skybox,
+        })
     }
 
     pub fn shadow_cascades(
@@ -691,6 +799,54 @@ fn frame_light(light: &LightState, scene_has_light: bool) -> DirectionalLight {
     }
 }
 
+fn editor_environment_key(state: &EnvironmentState) -> EditorEnvironmentKey {
+    if let Some(path) = &state.component.hdr {
+        return EditorEnvironmentKey::Hdr(path.as_str().to_owned());
+    }
+    let sky = editor_procedural_sky(state).unwrap_or(ProceduralSky {
+        zenith_color: [0.2, 0.35, 0.65],
+        horizon_color: [0.65, 0.7, 0.75],
+        ground_color: [0.12, 0.11, 0.1],
+        sun_size_deg: 1.0,
+        sun_intensity: 1.0,
+        sun_direction: [0.0, 1.0, 0.0],
+    });
+    EditorEnvironmentKey::Procedural {
+        colors_and_sun: [
+            sky.zenith_color[0].to_bits(),
+            sky.zenith_color[1].to_bits(),
+            sky.zenith_color[2].to_bits(),
+            sky.horizon_color[0].to_bits(),
+            sky.horizon_color[1].to_bits(),
+            sky.horizon_color[2].to_bits(),
+            sky.ground_color[0].to_bits(),
+            sky.ground_color[1].to_bits(),
+            sky.ground_color[2].to_bits(),
+            sky.sun_size_deg.to_bits(),
+            sky.sun_intensity.to_bits(),
+        ],
+        sun_direction: sky
+            .sun_direction
+            .map(|value| (value * 4096.0).round() as i32),
+    }
+}
+
+fn editor_procedural_sky(state: &EnvironmentState) -> Option<ProceduralSky> {
+    let procedural = state.component.procedural?;
+    let world_sun = state.sun_direction.unwrap_or([0.0, 1.0, 0.0]);
+    let world_sun = Vec3::from_array(world_sun).normalize_or_zero();
+    let rotation = Mat3::from_cols_array_2d(&state.rotation);
+    let sun_direction = (rotation.transpose() * world_sun).normalize_or_zero();
+    Some(ProceduralSky {
+        zenith_color: procedural.zenith_color,
+        horizon_color: procedural.horizon_color,
+        ground_color: procedural.ground_color,
+        sun_size_deg: procedural.sun_size_deg,
+        sun_intensity: procedural.sun_intensity,
+        sun_direction: sun_direction.to_array(),
+    })
+}
+
 /// Шаг сетки — степень десяти по расстоянию камеры: линии сохраняют толщину на экране.
 fn grid_scale(camera_distance: f32) -> f32 {
     10_f32.powf(camera_distance.max(1e-3).log10().floor())
@@ -746,7 +902,7 @@ fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
 mod tests {
     use super::*;
     use engine_files::VirtualPath;
-    use engine_scene::LodLevel;
+    use engine_scene::{EnvironmentComponent, LodLevel, ProceduralSkyComponent};
 
     fn camera() -> Camera {
         Camera {
@@ -757,6 +913,42 @@ mod tests {
             near: 0.1,
             far: 100.0,
         }
+    }
+
+    #[test]
+    fn environment_cache_key_ignores_frame_controls_and_quantizes_sun_direction() {
+        let state = EnvironmentState {
+            component: EnvironmentComponent {
+                hdr: None,
+                procedural: Some(ProceduralSkyComponent {
+                    zenith_color: [0.2, 0.35, 0.65],
+                    horizon_color: [0.65, 0.7, 0.75],
+                    ground_color: [0.12, 0.11, 0.1],
+                    sun_size_deg: 1.0,
+                    sun_intensity: 1.0,
+                }),
+                intensity: 1.0,
+                skybox: true,
+            },
+            rotation: Mat3::IDENTITY.to_cols_array_2d(),
+            sun_direction: Some([0.0, 1.0, 0.0]),
+        };
+        let key = editor_environment_key(&state);
+        let mut frame_controls = state.clone();
+        frame_controls.component.intensity = 2.0;
+        frame_controls.component.skybox = false;
+        assert_eq!(key, editor_environment_key(&frame_controls));
+
+        let mut small_sun_change = state.clone();
+        small_sun_change.sun_direction = Some([0.0, 1.0, 0.00005]);
+        assert_eq!(key, editor_environment_key(&small_sun_change));
+        small_sun_change.sun_direction = Some([0.0, 0.99, 0.14]);
+        assert_ne!(key, editor_environment_key(&small_sun_change));
+
+        let mut hdr = state;
+        hdr.component.hdr = Some(VirtualPath::parse("/environment/sky.hdr").unwrap());
+        hdr.component.procedural = None;
+        assert_ne!(key, editor_environment_key(&hdr));
     }
 
     #[test]

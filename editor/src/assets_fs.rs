@@ -24,6 +24,7 @@ pub enum AssetKind {
     CameraSettings,
     Model,
     Texture,
+    Hdr,
     Script,
     Other,
 }
@@ -41,6 +42,7 @@ impl AssetKind {
             Some("camerasettings") => Self::CameraSettings,
             Some("fbx") => Self::Model,
             Some("png") => Self::Texture,
+            Some("hdr") => Self::Hdr,
             Some("lua") => Self::Script,
             _ => Self::Other,
         }

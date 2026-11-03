@@ -4,14 +4,14 @@ Parent: [[Index]]
 
 ## Назначение
 
-`engine-assets` загружает модели FBX и текстуры PNG в память CPU. `Assets::with_resources` читает байты через [[Engine/EngineResources]] из loose files или RVEPAK; `Assets::new(root)` сохраняет совместимый файловый API. Крейт не зависит от renderer; `engine-runtime` и [[Engine/Sandbox]] переводят CPU-данные в ресурсы [[Engine/EngineRender]].
+`engine-assets` загружает модели FBX, текстуры PNG и environment panoramas Radiance HDR в память CPU. `Assets::with_resources` читает байты через [[Engine/EngineResources]] из loose files или RVEPAK; `Assets::new(root)` сохраняет совместимый файловый API. Крейт не зависит от renderer; `engine-runtime`, редактор и [[Engine/Sandbox]] переводят CPU-данные в ресурсы [[Engine/EngineRender]].
 
 ## Источники
 
 | Файл | Значимый символ | Роль |
 |---|---|---|
-| `engine/engine-assets/src/lib.rs` | `ASSETS_DIR`, `Assets`, `Model`, `ModelMesh`, `ModelMaterial`, `ModelVertex`, `TextureData`, `AssetError`, `decode_png` | Пути ресурсов, загрузка FBX через ufbx и PNG через png |
-| `engine/engine-assets/Cargo.toml` | `engine-resources`, `ufbx`, `png` | Чтение и stat ресурсов, разбор FBX и декодирование PNG |
+| `engine/engine-assets/src/lib.rs` | `ASSETS_DIR`, `Assets`, `Model`, `ModelMesh`, `ModelMaterial`, `ModelVertex`, `TextureData`, `HdrImageData`, `AssetError`, `decode_png`, `decode_hdr` | Пути ресурсов, загрузка FBX через ufbx, PNG через png и Radiance HDR RGBE |
+| `engine/engine-assets/Cargo.toml` | `engine-resources`, `ufbx`, `png` | Чтение и stat ресурсов, разбор FBX и PNG; Radiance RGBE декодируется встроенным кодом без новой зависимости |
 
 ## Публичные контракты
 
@@ -21,9 +21,12 @@ Parent: [[Index]]
 | `Assets::new(root)`, `Assets::with_resources(handle)`, `Assets::root()` | Каталог, в котором ищутся ресурсы; сервисный вариант сохраняет root из handle |
 | `Assets::resolve(&self, asset_path: &str) -> Result<PathBuf, AssetError>` | `/model/cube.fbx` → `<root>/model/cube.fbx`; ведущий `/` необязателен. Разделитель — `/`. Пустой путь, пустые компоненты, `.`, `..`, `\` и `:` дают `InvalidPath`, поэтому путь не выходит за пределы каталога ресурсов |
 | `Assets::load_texture(&self, asset_path) -> Result<TextureData, AssetError>` | Требует расширение `.png` (регистр не важен), читает resource bytes и декодирует их |
+| `Assets::load_hdr(&self, asset_path) -> Result<HdrImageData, AssetError>` | Требует расширение `.hdr` (регистр не важен), использует тот же loose/packed resource source и декодирует Radiance RGBE |
 | `Assets::load_model(&self, asset_path) -> Result<Model, AssetError>` | Требует расширение `.fbx`, читает FBX в память и загружает используемые FBX-текстуры PNG |
 | `Assets::model_dependencies(&self, asset_path) -> Result<Vec<String>, AssetError>` | Возвращает уникальные внешние PNG как ведущие `/` virtual paths в порядке base-color, normal, roughness, metallic, emissive, occlusion и opacity. Проверяет кандидаты через общий с `load_model` resolver и `stat` того же loose/packed источника, не читая и не декодируя PNG. Embedded-текстуры и metallic/roughness-карты классических шейдеров пропускаются; отсутствующая внешняя текстура даёт тот же `MissingTexture` |
 | `decode_png(bytes) -> Result<TextureData, String>` | Любой цветовой тип и глубина PNG → RGBA8: палитра раскрывается, 16 бит усекаются до старшего байта, серый и RGB получают непрозрачную альфу. Предел памяти декодера — 512 МиБ |
+| `decode_hdr(bytes) -> Result<HdrImageData, String>` | Принимает `#?RADIANCE`/`#?RGBE`, `FORMAT=32-bit_rle_rgbe` и resolution только `-Y height +X width`. Декодирует flat RGBE и Radiance new-style scanline RLE в линейный RGB `f32`; ограничивает размеры, пиксельные буферы и промежуточные аллокации бюджетом 512 МиБ и проверяет переполнения до выделения памяти |
+| `HdrImageData` | `width`, `height`, `rgb: Vec<f32>`; три линейных неотрицательных канала на пиксель, scanlines сверху вниз. Другие orientations/форматы HDR отвергаются как `AssetError::Decode` |
 | `TextureData` | `width`, `height`, `rgba: Vec<u8>` — RGBA8 по строкам сверху вниз; цветовое пространство задаётся использованием: base-color и emissive — sRGB, metallic-roughness, normal и occlusion — linear |
 | `Model` | `meshes: Vec<ModelMesh>` и `textures: Vec<TextureData>`; `bounds()` возвращает минимальный и максимальный углы всех вершин или `None` без вершин |
 | `ModelMesh` | Часть модели с одним материалом: `vertices`, `indices` (каждые три — треугольник) и `material` |
@@ -54,7 +57,7 @@ Parent: [[Index]]
 
 ## Ограничения
 
-- Поддерживаются только FBX и PNG; другие форматы моделей и изображений, а также встроенные в FBX не-PNG изображения дают ошибку.
+- Поддерживаются FBX и PNG для моделей/текстур и Radiance RGBE `.hdr` для environment. Другие форматы моделей и изображений, а также встроенные в FBX не-PNG изображения дают ошибку.
 - Анимации, скиннинг, камеры и источники света из FBX игнорируются; читается только статическая геометрия в позе файла.
 - Поддерживаются base color, metallic-roughness, tangent-space normal, emissive, occlusion и opacity для описанных выше ufbx map fields; остальные PBR-свойства, bump и normal-map mip filtering не реализованы. Alpha mask не выводится из FBX: загрузчик задаёт Opaque или Blend, а cutoff mask задаётся сценой.
 - Загрузка синхронная и без кэша между вызовами.

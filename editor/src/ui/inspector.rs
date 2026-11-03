@@ -1,13 +1,16 @@
 //! Панель Inspector: поля и компоненты выбранного объекта.
 
 use crate::assets_fs::AssetKind;
-use crate::scene_edit::{Component, ComponentKind, OverrideField, default_light};
+use crate::scene_edit::{
+    Component, ComponentKind, OverrideField, default_environment, default_light,
+};
 use crate::state::{Action, AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode,
-    ParamSchema, ParamSpec, ParamValue, SceneObject, SceneTransform,
+    CameraComponent, EnvironmentComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS,
+    MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, ProceduralSkyComponent, SceneObject,
+    SceneTransform,
 };
 use std::collections::BTreeMap;
 
@@ -127,6 +130,9 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     }
     if object.directional_light.is_some() {
         show_light(ui, state, object);
+    }
+    if let Some(environment) = &object.environment {
+        show_environment(ui, state, id, environment);
     }
     for index in 0..object.lite_scripts.len() {
         show_lite_script(ui, state, object, index);
@@ -1044,6 +1050,174 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
     run_menu_action(state, id, ComponentKind::DirectionalLight, action);
 }
 
+fn show_environment(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    environment: &EnvironmentComponent,
+) {
+    let field = OverrideField::Environment;
+    let action = component_header(
+        ui,
+        "Environment",
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::Environment)),
+        true,
+        |ui| {
+            let mut value = environment.clone();
+            let mut procedural = value.procedural.is_some();
+            let mut hdr = value
+                .hdr
+                .as_ref()
+                .map(|path| path.as_str().to_owned())
+                .unwrap_or_default();
+            let mut changed = false;
+            let mut hdr_assets = state.assets_of_kind(AssetKind::Hdr);
+            if !hdr.is_empty() && !hdr_assets.contains(&hdr) {
+                hdr_assets.push(hdr.clone());
+            }
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .radio_value(&mut procedural, true, "Procedural")
+                    .changed();
+                if ui
+                    .add_enabled(
+                        !hdr_assets.is_empty(),
+                        egui::RadioButton::new(!procedural, "Radiance HDR"),
+                    )
+                    .clicked()
+                {
+                    procedural = false;
+                    changed = true;
+                }
+                if !procedural && hdr_assets.is_empty() {
+                    ui.label("Нет .hdr ресурсов");
+                }
+            });
+            egui::Grid::new("environment_component")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Intensity");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut value.intensity)
+                                .speed(0.05)
+                                .range(0.0..=f32::MAX),
+                        )
+                        .changed();
+                    ui.end_row();
+                    ui.label("Skybox");
+                    changed |= ui.checkbox(&mut value.skybox, "").changed();
+                    ui.end_row();
+                    if procedural {
+                        let sky = value.procedural.get_or_insert(ProceduralSkyComponent {
+                            zenith_color: [0.18, 0.32, 0.58],
+                            horizon_color: [0.68, 0.74, 0.82],
+                            ground_color: [0.12, 0.11, 0.10],
+                            sun_size_deg: 1.0,
+                            sun_intensity: 1.0,
+                        });
+                        let (picked, zenith) = color_row(ui, "Zenith", &mut sky.zenith_color);
+                        changed |= picked || zenith.changed();
+                        let (picked, horizon) = color_row(ui, "Horizon", &mut sky.horizon_color);
+                        changed |= picked || horizon.changed();
+                        let (picked, ground) = color_row(ui, "Ground", &mut sky.ground_color);
+                        changed |= picked || ground.changed();
+                        ui.label("Sun Size");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut sky.sun_size_deg)
+                                    .speed(0.05)
+                                    .range(0.001..=180.0),
+                            )
+                            .changed();
+                        ui.end_row();
+                        ui.label("Sun Intensity");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut sky.sun_intensity)
+                                    .speed(0.05)
+                                    .range(0.0..=f32::MAX),
+                            )
+                            .changed();
+                        ui.end_row();
+                    } else {
+                        ui.label("HDR Panorama");
+                        if let Some(path) = asset_picker(ui, "environment_hdr", &hdr, &hdr_assets) {
+                            hdr = path;
+                            changed = true;
+                        }
+                        ui.end_row();
+                    }
+                });
+            value.procedural =
+                procedural.then_some(value.procedural.unwrap_or(ProceduralSkyComponent {
+                    zenith_color: [0.18, 0.32, 0.58],
+                    horizon_color: [0.68, 0.74, 0.82],
+                    ground_color: [0.12, 0.11, 0.10],
+                    sun_size_deg: 1.0,
+                    sun_intensity: 1.0,
+                }));
+            value.hdr = if procedural || hdr.is_empty() {
+                None
+            } else {
+                parse_path(state, &hdr)
+            };
+            if changed {
+                value.intensity = if value.intensity.is_finite() {
+                    value.intensity.max(0.0)
+                } else {
+                    0.0
+                };
+                if let Some(sky) = &mut value.procedural {
+                    for color in [
+                        &mut sky.zenith_color,
+                        &mut sky.horizon_color,
+                        &mut sky.ground_color,
+                    ] {
+                        for channel in color {
+                            *channel = if channel.is_finite() {
+                                channel.max(0.0)
+                            } else {
+                                0.0
+                            };
+                        }
+                    }
+                    sky.sun_size_deg = sky.sun_size_deg.clamp(0.001, 180.0);
+                    sky.sun_intensity = if sky.sun_intensity.is_finite() {
+                        sky.sun_intensity.max(0.0)
+                    } else {
+                        0.0
+                    };
+                }
+                if procedural || value.hdr.is_some() {
+                    let key = format!("{id}/environment");
+                    state.edit_scene(|scene| {
+                        scene.edit_object(id, Some(&key), |object| {
+                            object.environment = Some(value);
+                            Ok(())
+                        })
+                    });
+                }
+            }
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| {
+            scene.edit_object(id, None, |object| {
+                object.environment = None;
+                Ok(())
+            })
+        });
+    }
+    run_menu_action(state, id, ComponentKind::Environment, action);
+}
+
 fn show_lite_script(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -1443,6 +1617,24 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                     Ok(())
                 })
             });
+        }
+        if object.environment.is_none() {
+            let already_has_environment = state.scene.as_ref().is_some_and(|scene| {
+                scene
+                    .view()
+                    .objects
+                    .iter()
+                    .any(|object| object.environment.is_some())
+            });
+            if ui
+                .add_enabled(!already_has_environment, egui::Button::new("Environment"))
+                .on_disabled_hover_text("В сцене уже есть Environment")
+                .clicked()
+            {
+                state.edit_scene(|scene| {
+                    scene.set_component(id, Component::Environment(default_environment()))
+                });
+            }
         }
         ui.menu_button("Lua Script", |ui| {
             for script in state.assets_of_kind(AssetKind::Script) {

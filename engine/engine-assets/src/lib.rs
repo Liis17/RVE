@@ -16,6 +16,7 @@ pub const ASSETS_DIR: &str = "assets";
 
 /// Предел памяти декодера PNG; хватает на текстуру 8192x8192 RGBA с запасом.
 const PNG_DECODE_LIMIT: usize = 512 * 1024 * 1024;
+const HDR_DECODE_LIMIT: usize = 512 * 1024 * 1024;
 
 /// Пиксели RGBA8 по строкам сверху вниз. Цветовое пространство задаёт использующий материал:
 /// base-color карты являются sRGB, metallic-roughness и normal карты — linear.
@@ -24,6 +25,14 @@ pub struct TextureData {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// Линейные RGB-пиксели Radiance HDR сверху вниз.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HdrImageData {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: Vec<f32>,
 }
 
 /// Вершина модели в метрах; оси: +X вправо, +Y вверх, +Z к зрителю.
@@ -247,6 +256,21 @@ impl Assets {
         require_extension(&path, "png")?;
         let bytes = self.read_asset(asset_path, &path)?;
         decode_png(&bytes).map_err(|message| AssetError::Decode { path, message })
+    }
+
+    /// Загружает Radiance HDR equirectangular изображение.
+    pub fn load_hdr(&self, asset_path: &str) -> Result<HdrImageData, AssetError> {
+        let path = self.resolve(asset_path)?;
+        require_extension(&path, "hdr")?;
+        let stat = self.stat_asset(asset_path, &path)?;
+        if stat.size > HDR_DECODE_LIMIT as u64 {
+            return Err(AssetError::Decode {
+                path,
+                message: "HDR превышает предел памяти декодера 512 MiB".to_owned(),
+            });
+        }
+        let bytes = self.read_asset(asset_path, &path)?;
+        decode_hdr(&bytes).map_err(|message| AssetError::Decode { path, message })
     }
 
     /// Загружает FBX-модель с её PNG-текстурами материалов.
@@ -505,6 +529,191 @@ pub fn decode_png(bytes: &[u8]) -> Result<TextureData, String> {
         height: frame.height,
         rgba,
     })
+}
+
+/// Декодирует Radiance RGBE в линейные float RGB.
+pub fn decode_hdr(bytes: &[u8]) -> Result<HdrImageData, String> {
+    if bytes.len() > HDR_DECODE_LIMIT {
+        return Err("HDR превышает предел памяти декодера 512 MiB".to_owned());
+    }
+    let mut cursor = 0;
+    let magic = hdr_line(bytes, &mut cursor)?;
+    if magic != b"#?RADIANCE" && magic != b"#?RGBE" {
+        return Err("ожидается заголовок #?RADIANCE или #?RGBE".to_owned());
+    }
+    let mut has_format = false;
+    loop {
+        let line = hdr_line(bytes, &mut cursor)?;
+        if line.is_empty() {
+            break;
+        }
+        if line == b"FORMAT=32-bit_rle_rgbe" {
+            has_format = true;
+        }
+    }
+    if !has_format {
+        return Err("ожидается FORMAT=32-bit_rle_rgbe".to_owned());
+    }
+    let resolution = hdr_line(bytes, &mut cursor)?;
+    let resolution =
+        std::str::from_utf8(resolution).map_err(|_| "строка ориентации HDR должна быть ASCII")?;
+    let mut parts = resolution.split_ascii_whitespace();
+    let (Some(y_axis), Some(height_text), Some(x_axis), Some(width_text)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err("поддерживается только ориентация -Y H +X W".to_owned());
+    };
+    if y_axis != "-Y" || x_axis != "+X" || parts.next().is_some() {
+        return Err("поддерживается только ориентация -Y H +X W".to_owned());
+    }
+    let height = height_text
+        .parse::<u32>()
+        .map_err(|_| "некорректная высота HDR")?;
+    let width = width_text
+        .parse::<u32>()
+        .map_err(|_| "некорректная ширина HDR")?;
+    if width == 0 || height == 0 {
+        return Err("размеры HDR должны быть больше нуля".to_owned());
+    }
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or("размеры HDR переполняют память")?;
+    let float_count = pixel_count
+        .checked_mul(3)
+        .ok_or("размеры HDR переполняют память")?;
+    let output_bytes = float_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("размеры HDR переполняют память")?;
+    let scanline_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or("размер строки HDR переполняет память")?;
+    if bytes
+        .len()
+        .checked_add(output_bytes)
+        .and_then(|size| size.checked_add(scanline_bytes))
+        .is_none_or(|size| size > HDR_DECODE_LIMIT)
+    {
+        return Err("HDR превышает предел памяти декодера 512 MiB".to_owned());
+    }
+    let mut rgb = Vec::new();
+    rgb.try_reserve_exact(float_count)
+        .map_err(|_| "не удалось выделить память для HDR")?;
+    rgb.resize(float_count, 0.0);
+    let mut scanline = Vec::new();
+    scanline
+        .try_reserve_exact(scanline_bytes)
+        .map_err(|_| "не удалось выделить память для строки HDR")?;
+    scanline.resize(scanline_bytes, 0);
+
+    for row in 0..height as usize {
+        let marker = take_hdr_bytes(bytes, &mut cursor, 4)?;
+        let rle_width = ((marker[2] as usize) << 8) | marker[3] as usize;
+        if (8..=0x7fff).contains(&width)
+            && marker[0] == 2
+            && marker[1] == 2
+            && rle_width == width as usize
+        {
+            for channel in 0..4 {
+                decode_hdr_channel(bytes, &mut cursor, &mut scanline, width as usize, channel)?;
+            }
+            for x in 0..width as usize {
+                let rgbe = [
+                    scanline[x],
+                    scanline[width as usize + x],
+                    scanline[2 * width as usize + x],
+                    scanline[3 * width as usize + x],
+                ];
+                write_hdr_pixel(&mut rgb, row * width as usize + x, rgbe);
+            }
+        } else {
+            let row_bytes = width as usize * 4;
+            scanline[..4].copy_from_slice(marker);
+            let remaining = row_bytes - 4;
+            scanline[4..row_bytes].copy_from_slice(take_hdr_bytes(bytes, &mut cursor, remaining)?);
+            for x in 0..width as usize {
+                let offset = x * 4;
+                write_hdr_pixel(
+                    &mut rgb,
+                    row * width as usize + x,
+                    scanline[offset..offset + 4].try_into().unwrap(),
+                );
+            }
+        }
+    }
+    Ok(HdrImageData { width, height, rgb })
+}
+
+fn hdr_line<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
+    let tail = bytes
+        .get(*cursor..)
+        .ok_or_else(|| "неожиданный конец HDR".to_owned())?;
+    let length = tail
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| "неожиданный конец строки HDR".to_owned())?;
+    let mut line = &tail[..length];
+    if line.last() == Some(&b'\r') {
+        line = &line[..line.len() - 1];
+    }
+    *cursor += length + 1;
+    Ok(line)
+}
+
+fn take_hdr_bytes<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<&'a [u8], String> {
+    let end = (*cursor)
+        .checked_add(count)
+        .ok_or_else(|| "смещение HDR переполняется".to_owned())?;
+    let result = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| "данные HDR обрезаны".to_owned())?;
+    *cursor = end;
+    Ok(result)
+}
+
+fn decode_hdr_channel(
+    bytes: &[u8],
+    cursor: &mut usize,
+    scanline: &mut [u8],
+    width: usize,
+    channel: usize,
+) -> Result<(), String> {
+    let mut written = 0;
+    while written < width {
+        let code = take_hdr_bytes(bytes, cursor, 1)?[0] as usize;
+        if code == 0 {
+            return Err("некорректный нулевой run в HDR".to_owned());
+        }
+        let count = if code > 128 { code - 128 } else { code };
+        if count > width - written {
+            return Err("run HDR выходит за ширину строки".to_owned());
+        }
+        let output_start = channel * width + written;
+        if code > 128 {
+            let value = take_hdr_bytes(bytes, cursor, 1)?[0];
+            scanline[output_start..output_start + count].fill(value);
+        } else {
+            let values = take_hdr_bytes(bytes, cursor, count)?;
+            scanline[output_start..output_start + count].copy_from_slice(values);
+        }
+        written += count;
+    }
+    Ok(())
+}
+
+fn write_hdr_pixel(rgb: &mut [f32], index: usize, rgbe: [u8; 4]) {
+    let output = index * 3;
+    if rgbe[3] == 0 {
+        rgb[output..output + 3].fill(0.0);
+        return;
+    }
+    let scale = 2.0_f32.powi(i32::from(rgbe[3]) - 136);
+    rgb[output] = (f32::from(rgbe[0]) + 0.5) * scale;
+    rgb[output + 1] = (f32::from(rgbe[1]) + 0.5) * scale;
+    rgb[output + 2] = (f32::from(rgbe[2]) + 0.5) * scale;
 }
 
 fn load_fbx(
@@ -1320,7 +1529,7 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::{
         AssetError, Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex,
-        TextureData, decode_png, is_missing_texture_candidate, map_resource_error,
+        TextureData, decode_hdr, decode_png, is_missing_texture_candidate, map_resource_error,
         pack_metallic_roughness, supports_metallic_roughness, texture_candidates,
     };
     use engine_files::VirtualPath;
@@ -1432,6 +1641,95 @@ mod tests {
             png::BitDepth::Eight,
             &[1, 2, 3, 4, 5, 6, 7, 8],
         )
+    }
+
+    fn hdr_header(width: u32, height: u32) -> Vec<u8> {
+        format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {height} +X {width}\n").into_bytes()
+    }
+
+    #[test]
+    fn decodes_flat_and_new_style_rle_radiance_hdr() {
+        let mut flat = hdr_header(2, 1);
+        flat.extend_from_slice(&[128, 64, 32, 129, 0, 0, 0, 0]);
+        let decoded = decode_hdr(&flat).unwrap();
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(decoded.rgb.len(), 6);
+        assert!((decoded.rgb[0] - 1.003_906_3).abs() < 1e-6);
+        assert!((decoded.rgb[1] - 0.50390625).abs() < 1e-6);
+        assert!((decoded.rgb[2] - 0.25390625).abs() < 1e-6);
+        assert_eq!(&decoded.rgb[3..], &[0.0; 3]);
+
+        let mut rle = hdr_header(8, 1);
+        rle.extend_from_slice(&[2, 2, 0, 8]);
+        for value in [128, 64, 32, 129] {
+            rle.extend_from_slice(&[136, value]);
+        }
+        let decoded = decode_hdr(&rle).unwrap();
+        assert_eq!((decoded.width, decoded.height), (8, 1));
+        assert_eq!(decoded.rgb.len(), 24);
+        for pixel in decoded.rgb.as_chunks::<3>().0 {
+            assert!((pixel[0] - decoded.rgb[0]).abs() < 1e-6);
+            assert!((pixel[1] - decoded.rgb[1]).abs() < 1e-6);
+            assert!((pixel[2] - decoded.rgb[2]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_invalid_orientation_format_and_budgeted_hdr() {
+        let mut truncated = hdr_header(2, 1);
+        truncated.extend_from_slice(&[128, 64, 32, 129]);
+        assert!(decode_hdr(&truncated).unwrap_err().contains("обрезаны"));
+
+        let mut invalid_run = hdr_header(8, 1);
+        invalid_run.extend_from_slice(&[2, 2, 0, 8, 137, 4]);
+        assert!(decode_hdr(&invalid_run).unwrap_err().contains("run HDR"));
+        let mut zero_run = hdr_header(8, 1);
+        zero_run.extend_from_slice(&[2, 2, 0, 8, 0]);
+        assert!(decode_hdr(&zero_run).unwrap_err().contains("нулевой run"));
+
+        let wrong_format = b"#?RADIANCE\nFORMAT=32-bit_rgbe\n\n-Y 1 +X 1\n";
+        assert!(decode_hdr(wrong_format).unwrap_err().contains("FORMAT"));
+        let wrong_orientation = b"#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n+Y 1 +X 1\n";
+        assert!(
+            decode_hdr(wrong_orientation)
+                .unwrap_err()
+                .contains("ориентация")
+        );
+        let excessive_resolution = format!(
+            "#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1 {}\n",
+            "x ".repeat(100_000)
+        );
+        assert!(
+            decode_hdr(excessive_resolution.as_bytes())
+                .unwrap_err()
+                .contains("ориентация")
+        );
+        let oversized = hdr_header(u32::MAX, u32::MAX);
+        assert!(decode_hdr(&oversized).unwrap_err().contains("размеры HDR"));
+    }
+
+    #[test]
+    fn loads_hdr_from_resource_backed_loose_and_packed_sources() {
+        let mut fixture = hdr_header(1, 1);
+        fixture.extend_from_slice(&[128, 64, 32, 129]);
+        let loose = TempAssets::new("hdr-loose");
+        loose.write("environment/sky.hdr", &fixture);
+        let (_system, assets) = loose.resource_assets();
+        let expected = assets.load_hdr("/environment/sky.hdr").unwrap();
+        assert_eq!((expected.width, expected.height), (1, 1));
+
+        let packed = TempAssets::new("hdr-packed");
+        write_archive(
+            &packed.root,
+            "assets.rvepak",
+            &[("environment/sky.hdr", &fixture)],
+        );
+        let (_system, assets) = packed.resource_assets();
+        assert_eq!(assets.load_hdr("environment/sky.hdr").unwrap(), expected);
+        assert!(matches!(
+            assets.load_hdr("environment/sky.png"),
+            Err(AssetError::UnsupportedFormat { .. })
+        ));
     }
 
     /// Квадрат 2x2 в плоскости XY с нормалью +Z и UV на весь квадрат.

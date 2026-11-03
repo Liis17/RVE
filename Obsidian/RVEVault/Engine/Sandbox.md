@@ -31,6 +31,7 @@ Parent: [[Index]]
 | `--scene triangle\|cube\|shadows\|materials` | Демонстрационная сцена; по умолчанию `shadows` |
 | `--model /путь.fbx` | Модель FBX из `assets`; сочетание допустимо со сценами `cube`, `shadows` и `materials`, но не с `triangle` |
 | `--texture /путь.png` | PNG из `assets`, заменяющий base-color map всех мешей сцены или модели |
+| `--environment procedural\|/путь.hdr` | Использует procedural sky либо Radiance `.hdr` из `assets` для IBL и skybox; поддерживает end-to-end проверку с `--resize-test` |
 | `--debug-overlay` | Панель метрик в левом верхнем углу окна |
 
 Повторные или неизвестные флаги, отсутствие значения, некорректное значение и сочетание `--scene triangle --model …` дают код 2. Ошибка запуска `ResourceSystem`, загрузки содержимого (`AssetError`) или разбора `.camerasettings` выводится до создания окна и даёт код 2. Это относится и к повреждённым архивам, отсутствующим владельцам и дублирующим virtual paths при процедурной сцене. При сочетании `--resize-test` и `--frames` требуется N ≥ 120. Ошибка окна или renderer даёт код 1; успешное закрытие или завершение лимита — код 0.
@@ -50,7 +51,7 @@ bootstrap для остальных потребителей описаны в [
 - После проверки аргументов и `bootstrap.rves` запускает [[Engine/EngineResources]] с корнем `ASSETS_DIR` (`assets` в рабочем каталоге); верхнеуровневый `.rvepak` выбирает packed-only режим.
 - Через [[Engine/EngineAssets]] и `Assets::with_resources` загружает модель и заменяющую текстуру до запуска цикла окна. FBX/PNG декодируются на startup-потоке; `ResourceSystem` остаётся жив после уничтожения `Sandbox` и renderer. Настройки камеры читаются тем же ресурсным сервисом и проверяются как `.camerasettings`.
 - Через [[Engine/EngineScene]] получает матрицы камеры, модели и света для выбранной сцены; FOV и clipping planes камеры сцены `shadows` берутся из `CameraSettings::projection`, а showcase `materials` сохраняет собственную проекцию.
-- Через [[Engine/EngineRender]] создаёт Vulkan renderer, загружает меши, sRGB base-color textures, linear metallic-roughness/normal textures и immutable материалы, затем вызывает `render_frame` с `Frame`: матрица и позиция камеры, матрица света, параметры освещения, HDR clear color, per-camera `ViewSettings` и `DrawCommand` с `MaterialId` на меш. Субъект получает матрицу движения и fit, окружение — identity. С `--debug-overlay` также передаются вершины панели в `Frame::overlay`, иначе пустой срез.
+- Через [[Engine/EngineRender]] создаёт Vulkan renderer, загружает меши, sRGB base-color textures, linear metallic-roughness/normal textures, immutable материалы и выбранный environment, затем вызывает `render_frame` с `FrameCamera { view, projection, position }`, optional `FrameEnvironment`, light, HDR clear color, per-camera `ViewSettings` и `DrawCommand` с `MaterialId` на меш. `--environment procedural` создаёт тестовое процедурное небо; путь `/...hdr` загружает Radiance panorama. Объект получает матрицу движения и fit, окружение — identity. С `--debug-overlay` также передаются вершины панели в `Frame::overlay`, иначе пустой срез.
 
 ## Ограничения и важные детали
 

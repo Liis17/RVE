@@ -21,10 +21,10 @@ Parent: [[Index]]
 | `editor/src/autosave.rs` | `AutosaveStore` | Копии несохранённых сцен и их восстановление |
 | `editor/src/assets_fs.rs` | `AssetsDir` | Файловые операции в `Assets/` с проверкой путей |
 | `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose |
-| `editor/src/previews.rs` | `PreviewCache` | Фоновое декодирование PNG и LRU-кэш UI-текстур |
+| `editor/src/previews.rs` | `PreviewCache` | Фоновое декодирование PNG/Radiance HDR, tone mapping HDR thumbnails и LRU-кэш UI-текстур |
 | `editor/src/build.rs` | `BuildJob`, `locate_build_tool` | File → Build Player: дочерний процесс `rve-build` и его вывод в Console |
 | `editor/src/play.rs` | `PlaySession`, `Watchdog` | Копия мира и скрипты на главном потоке, прерывание зависшего Lua |
-| `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэш ресурсов, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
+| `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
 | `editor/src/ui/` | `show`, `scene_view`, `game_view`, `hierarchy`, `inspector`, `project_panel`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
 
 ## Публичные контракты
@@ -43,7 +43,7 @@ Parent: [[Index]]
 
 `EditorApp::frame` сначала выполняет накопленные действия, затем `draw_frame`: загрузка готовых превью, `egui::Context::run_ui`, обработка platform output, применение `TexturesDelta`, тесселяция, шаг Play, подготовка сцены и один вызов `Renderer::render_frame_with_ui`, после него — освобождение текстур egui. Размеры viewport берутся из прямоугольников панелей Scene и Game этого же кадра, поэтому изображение не отстаёт от раскладки. Scene и Game рисуются отдельными scene pass; скрытая панель свой pass не выполняет, поэтому вкладки в одной группе стоят как одна сцена.
 
-Каждый viewport получает собственный список draws, позицию камеры и camera-relative shadow cascades. Scene использует камеру редактора вне Play и камеру сцены в Play; Game использует выбранную игровую камеру, поэтому параметры проекции и каскады считаются отдельно для каждой панели. Сетка добавляется только к списку Scene. Обе панели используют общие кэши FBX/PNG и могут независимо выбрать разные LOD одного объекта.
+Каждый viewport получает собственный список draws, `FrameCamera`, environment и camera-relative shadow cascades. Scene использует камеру редактора вне Play и камеру сцены в Play; Game использует выбранную игровую камеру, поэтому проекция, environment transform и каскады считаются отдельно для каждой панели. Сетка добавляется только к списку Scene. Обе панели используют общие кэши FBX/PNG/HDR и могут независимо выбрать разные LOD одного объекта.
 
 Окно работает в `RedrawMode::OnDemand`: кадр запрашивают события egui-winit, отложенный repaint egui через `WindowHandler::next_wakeup`, незавершённые превью и модели и пропущенный кадр. В Play вне паузы кадр запрашивается постоянно. Срок автосохранения тоже входит в `next_wakeup`, а копия пишется в `WindowHandler::update`, поэтому последняя правка перед простоем записывается без перерисовки.
 
@@ -64,6 +64,8 @@ Parent: [[Index]]
 Модель, брошенная на Scene, ложится на пол `y = 0` под курсором, а при промахе мимо пола — в цель камеры; брошенная в корень Hierarchy или созданная из меню появляется в цели камеры, дочерняя — в начале координат родителя. После загрузки новой модели камера наводится на неё только если объект почти не виден: занимает единицы пикселей или камера внутри него (`EditorCamera::needs_framing`). Модели FBX читаются в метрах по единице файла, поэтому файл без `UnitScaleFactor` считается сантиметровым.
 
 `SceneRenderer` кэширует GPU-материалы FBX и загружает base-color/emissive карты как sRGB, normal/metallic-roughness/occlusion — как linear. `MeshRenderer.texture` заменяет base-color map, а optional scene material override заменяет только заданные факторы, alpha mode/cutoff и карты; материалы замен при этом кэшируются отдельно для каждой object part. Scene и Game viewport показывают mask/blend материалы тем же renderer; alpha-cutout поверхности сохраняют форму в shadow map.
+
+Компонент `Environment` создаётся из toolbar и редактируется в Inspector: HDR asset picker или процедурные цвета/солнце, intensity и skybox. На сцену допускается один environment; его HDR path включается в `[[assets]]`, prefab overrides заменяют компонент целиком, а copy/paste и undo/redo сохраняют весь компонент. `SceneRenderer` читает `.hdr` и кэширует запечённый GPU environment по источнику и procedural inputs; направление солнца квантуется для cache key. Изменение source или параметров заменяет ресурс и просит renderer отложить его уничтожение. Project panel показывает `.hdr` и формирует фоновое tone-mapped thumbnail.
 
 `LOD Group` доступна только объекту с `Mesh Renderer`. Inspector позволяет выбрать FBX-модель и optional PNG-текстуру каждого уровня, задать возрастающие origin-distance thresholds и optional cull distance; пустая текстура наследует mesh texture или FBX material. `EditorScene::set_lod_group` добавляет пути уровней в assets сцены, а полная валидация перед каждой правкой откатывает невалидный порядок/число уровней с сообщением в Console. Удаление `Mesh Renderer` вместе с группой является одной undo/redo правкой.
 
@@ -164,7 +166,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - Нет file watcher: список ресурсов обновляется кнопкой Refresh и после операций самого редактора. Refresh также сбрасывает GPU-кэш моделей и текстур.
 - Edit-world кэшируется по revision сцены. Если asset настроек камеры отсутствует или невалиден, редактор один раз за revision сообщает ошибку и оставляет все камеры с defaults, сохраняя доступность viewport; Play и runtime продолжают считать такую ошибку фатальной. После исправления файла настройки подхватятся при перестроении edit-world (например, при повторном открытии сцены), так как file watcher нет.
 - Переименование и удаление файла в Project не обновляют ссылки в сценах, включая префабы.
-- Текстуры PNG сцены загружаются синхронно при первом появлении, модели FBX и превью PNG — в фоне. Начатый разбор FBX нельзя прервать: после Refresh он доводится до конца, а результат отбрасывается.
+- Текстуры PNG сцены и HDR environments загружаются синхронно при первом появлении, модели FBX и превью PNG/HDR — в фоне. Начатый разбор FBX нельзя прервать: после Refresh он доводится до конца, а результат отбрасывается.
 - Автосохранение работает в цикле кадра: зависший ABI-скрипт останавливает и его, поэтому последняя копия может отставать от документа до 30 секунд.
 - Egui смешивает цвета в гамма-пространстве; при sRGB swapchain смешивание идёт в линейном, поэтому полупрозрачные элементы выглядят немного иначе, чем в типичных приложениях egui.
 - Панели можно вынести в плавающие окна внутри главного окна; отдельные системные окна не поддерживаются.

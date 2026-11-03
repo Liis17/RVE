@@ -10,12 +10,15 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view_projection;
+    mat4 inverse_view_projection;
     mat4 shadow_view_projections[4];
     vec4 light_direction;
     vec4 light_color;
     vec4 ambient_color;
     vec4 shadow_params;
     vec4 camera_position;
+    mat4 environment_rotation;
+    vec4 environment_params;
 } frame;
 
 layout(set = 0, binding = 1) uniform texture2DArray shadow_map;
@@ -33,6 +36,13 @@ layout(set = 1, binding = 3) uniform texture2D normal_texture;
 layout(set = 1, binding = 4) uniform texture2D emissive_texture;
 layout(set = 1, binding = 5) uniform texture2D occlusion_texture;
 layout(set = 1, binding = 6) uniform sampler material_sampler;
+
+layout(set = 2, binding = 0) uniform textureCube environment_map;
+layout(set = 2, binding = 1) uniform sampler environment_sampler;
+layout(set = 2, binding = 2) uniform textureCube irradiance_map;
+layout(set = 2, binding = 3) uniform textureCube prefiltered_map;
+layout(set = 2, binding = 4) uniform texture2D brdf_lut;
+layout(set = 2, binding = 5) uniform sampler brdf_sampler;
 
 const float PI = 3.14159265358979323846;
 
@@ -69,15 +79,6 @@ float visibility_smith_ggx_correlated(float normal_dot_light, float normal_dot_v
 vec3 fresnel_schlick(float view_dot_half, vec3 f0) {
     float factor = pow(1.0 - clamp(view_dot_half, 0.0, 1.0), 5.0);
     return f0 + (1.0 - f0) * factor;
-}
-
-vec3 env_brdf_approx(vec3 f0, float roughness, float normal_dot_view) {
-    vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
-    vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
-    vec4 r = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * normal_dot_view)) * r.x + r.y;
-    vec2 ab = vec2(-1.04, 1.04) * a004 + r.zw;
-    return f0 * ab.x + ab.y;
 }
 
 void main() {
@@ -198,9 +199,28 @@ void main() {
 
     vec3 direct = (diffuse + specular) * normal_dot_light
         * frame.light_color.rgb * shadow * PI;
-    vec3 ambient = frame.ambient_color.rgb
-        * (diffuse_color + env_brdf_approx(f0, effective_roughness, normal_dot_view))
-        * mix(1.0, occlusion, material.alpha_parameters.w);
+    vec3 reflected = reflect(-view, normal);
+    mat3 world_to_environment = transpose(mat3(frame.environment_rotation));
+    vec3 environment_normal = world_to_environment * normal;
+    vec3 environment_reflection = world_to_environment * reflected;
+    vec3 irradiance = textureLod(
+        samplerCube(irradiance_map, environment_sampler), environment_normal, 0.0
+    ).rgb;
+    float prefilter_lod = effective_roughness * 5.0;
+    vec3 prefiltered = textureLod(
+        samplerCube(prefiltered_map, environment_sampler), environment_reflection, prefilter_lod
+    ).rgb;
+    vec2 brdf = texture(
+        sampler2D(brdf_lut, brdf_sampler), vec2(normal_dot_view, effective_roughness)
+    ).rg;
+    vec3 indirect_diffuse = irradiance * diffuse_color / PI;
+    vec3 indirect_specular = prefiltered * (f0 * brdf.x + brdf.y);
+    float environment_weight = frame.environment_params.z;
+    vec3 ambient = mix(
+        frame.ambient_color.rgb * (indirect_diffuse + indirect_specular),
+        frame.environment_params.x * (indirect_diffuse + indirect_specular),
+        environment_weight
+    ) * mix(1.0, occlusion, material.alpha_parameters.w);
     vec3 emissive = material.emissive.rgb * emissive_sample;
     out_color = vec4(ambient + direct + emissive, output_alpha);
 }

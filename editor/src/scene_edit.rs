@@ -3,9 +3,9 @@
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, DirectionalLightComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin,
-    PrefabInstance, PrefabOverride, SceneAsset, SceneDocument, SceneError, SceneObject,
-    SceneTransform,
+    CameraComponent, DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup,
+    MeshRenderer, ObjectOrigin, PrefabInstance, PrefabOverride, ProceduralSkyComponent, SceneAsset,
+    SceneDocument, SceneError, SceneObject, SceneTransform,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -59,6 +59,7 @@ pub enum NewObject {
     Empty,
     Camera,
     DirectionalLight,
+    Environment,
     /// Модель и локальная позиция нового объекта.
     Mesh(VirtualPath, [f32; 3]),
     /// Экземпляр префаба и локальная позиция его корня.
@@ -73,6 +74,7 @@ pub enum ComponentKind {
     MeshRenderer,
     LodGroup,
     DirectionalLight,
+    Environment,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -83,6 +85,7 @@ pub enum Component {
     MeshRenderer(MeshRenderer),
     LodGroup(LodGroup),
     DirectionalLight(DirectionalLightComponent),
+    Environment(EnvironmentComponent),
 }
 
 impl Component {
@@ -93,6 +96,7 @@ impl Component {
             Self::MeshRenderer(_) => ComponentKind::MeshRenderer,
             Self::LodGroup(_) => ComponentKind::LodGroup,
             Self::DirectionalLight(_) => ComponentKind::DirectionalLight,
+            Self::Environment(_) => ComponentKind::Environment,
         }
     }
 
@@ -104,6 +108,7 @@ impl Component {
             ComponentKind::MeshRenderer => Self::MeshRenderer(object.mesh_renderer.clone()?),
             ComponentKind::LodGroup => Self::LodGroup(object.lod_group.clone()?),
             ComponentKind::DirectionalLight => Self::DirectionalLight(object.directional_light?),
+            ComponentKind::Environment => Self::Environment(object.environment.clone()?),
         })
     }
 
@@ -120,6 +125,7 @@ impl Component {
             }),
             ComponentKind::LodGroup => return None,
             ComponentKind::DirectionalLight => Self::DirectionalLight(default_light()),
+            ComponentKind::Environment => Self::Environment(default_environment()),
         })
     }
 
@@ -134,6 +140,7 @@ impl Component {
             Self::MeshRenderer(value) => object.mesh_renderer = Some(value),
             Self::LodGroup(value) => object.lod_group = Some(value),
             Self::DirectionalLight(value) => object.directional_light = Some(value),
+            Self::Environment(value) => object.environment = Some(value),
         }
     }
 }
@@ -470,6 +477,7 @@ impl EditorScene {
             NewObject::Empty => ("object".to_owned(), "Empty".to_owned()),
             NewObject::Camera => ("camera".to_owned(), "Camera".to_owned()),
             NewObject::DirectionalLight => ("light".to_owned(), "Directional Light".to_owned()),
+            NewObject::Environment => ("environment".to_owned(), "Environment".to_owned()),
             NewObject::Mesh(path, _) | NewObject::Prefab(path, _) => {
                 let stem = file_stem(path);
                 (stem.to_owned(), stem.to_owned())
@@ -485,6 +493,7 @@ impl EditorScene {
             mesh_renderer: None,
             lod_group: None,
             directional_light: None,
+            environment: None,
             lite_scripts: Vec::new(),
             heavy_scripts: Vec::new(),
         };
@@ -509,6 +518,7 @@ impl EditorScene {
                     object.transform.rotation = [50.0, 30.0, 0.0];
                     object.directional_light = Some(default_light());
                 }
+                NewObject::Environment => object.environment = Some(default_environment()),
                 NewObject::Mesh(path, position) => {
                     object.transform.position = *position;
                     ensure_asset(document, path);
@@ -1293,6 +1303,22 @@ pub fn default_camera() -> CameraComponent {
     CameraComponent::default()
 }
 
+/// Процедурное окружение по умолчанию для нового компонента.
+pub fn default_environment() -> EnvironmentComponent {
+    EnvironmentComponent {
+        hdr: None,
+        procedural: Some(ProceduralSkyComponent {
+            zenith_color: [0.18, 0.32, 0.58],
+            horizon_color: [0.68, 0.74, 0.82],
+            ground_color: [0.12, 0.11, 0.10],
+            sun_size_deg: 1.0,
+            sun_intensity: 1.0,
+        }),
+        intensity: 1.0,
+        skybox: true,
+    }
+}
+
 /// Добавляет в список ресурсов сцены все пути, на которые ссылаются компоненты объекта.
 fn register_object_assets(
     document: &mut SceneDocument,
@@ -1333,6 +1359,13 @@ fn register_object_assets(
         .and_then(|camera| camera.settings.as_ref())
     {
         ensure_asset(document, settings);
+    }
+    if let Some(hdr) = object
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.hdr.as_ref())
+    {
+        ensure_asset(document, hdr);
     }
     Ok(())
 }
@@ -1501,6 +1534,27 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(scene.selection(), Some(second.as_str()));
         assert!(scene.is_dirty());
+    }
+
+    #[test]
+    fn environment_object_is_valid_and_scene_allows_only_one() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Environment, None).unwrap();
+        let environment = scene.object(&id).unwrap().environment.as_ref().unwrap();
+        assert!(environment.hdr.is_none());
+        assert!(environment.procedural.is_some());
+        assert!(environment.skybox);
+        assert!(scene.document().validate().is_ok());
+        assert!(scene.create_object(&NewObject::Environment, None).is_err());
+        assert_eq!(
+            scene
+                .view()
+                .objects
+                .iter()
+                .filter(|object| object.environment.is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]
