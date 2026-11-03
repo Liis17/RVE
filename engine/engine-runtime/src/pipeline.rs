@@ -399,6 +399,9 @@ impl RenderBackend for VulkanBackend {
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
+                    AntiAliasing::Taa => RenderAntiAliasing::Taa,
+                    AntiAliasing::Fsr => RenderAntiAliasing::Fsr,
+                    AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
             reset_history: false,
@@ -500,6 +503,9 @@ impl RenderBackend for VulkanBackend {
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
+                    AntiAliasing::Taa => RenderAntiAliasing::Taa,
+                    AntiAliasing::Fsr => RenderAntiAliasing::Fsr,
+                    AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
             reset_history: false,

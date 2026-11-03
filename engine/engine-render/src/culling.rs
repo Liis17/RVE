@@ -76,6 +76,22 @@ impl Frustum {
         }
     }
 
+    pub fn from_view_projection_with_padding(
+        mut columns: [[f32; 4]; 4],
+        padding_ndc: [f32; 2],
+    ) -> Self {
+        if !padding_ndc.into_iter().all(f32::is_finite) {
+            return Self { planes: None };
+        }
+        let x_scale = 1.0 + padding_ndc[0].abs();
+        let y_scale = 1.0 + padding_ndc[1].abs();
+        for column in &mut columns {
+            column[0] /= x_scale;
+            column[1] /= y_scale;
+        }
+        Self::from_view_projection(columns)
+    }
+
     /// Returns false only when all transformed bounds corners are outside one clip plane.
     pub fn intersects(self, model: [[f32; 4]; 4], bounds: LocalBounds) -> bool {
         let Some(planes) = self.planes else {
@@ -395,6 +411,15 @@ mod tests {
             bounds([-1.0, -0.1, -0.1], [1.0, 0.1, 0.1])
         ));
         assert!(frustum.intersects(IDENTITY, bounds([-100.0; 3], [100.0; 3])));
+    }
+
+    #[test]
+    fn ndc_padding_keeps_jitter_shifted_bounds_visible() {
+        let frustum = Frustum::from_view_projection(IDENTITY);
+        let padded = Frustum::from_view_projection_with_padding(IDENTITY, [0.1, 0.0]);
+        let small = bounds([-0.01; 3], [0.01; 3]);
+        assert!(!frustum.intersects(translated(1.05, 0.0, 0.5), small));
+        assert!(padded.intersects(translated(1.05, 0.0, 0.5), small));
     }
 
     #[test]

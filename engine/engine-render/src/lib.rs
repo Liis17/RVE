@@ -14,6 +14,7 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+use temporal::{Extent as TemporalExtent, TemporalKey, TemporalPlan, TemporalState};
 use ui::{
     PackedUi, RetireQueue, UiDraw, is_srgb_format, pack_ui, validate_texture_region,
     validate_viewport_size,
@@ -21,6 +22,7 @@ use ui::{
 
 mod clusters;
 mod culling;
+mod temporal;
 mod ui;
 
 include!(concat!(env!("OUT_DIR"), "/render_constants.rs"));
@@ -71,6 +73,7 @@ const FULLSCREEN_VERTEX_SHADER: &[u8] =
 const TONEMAP_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 const OUTPUT_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/output.frag.spv"));
+const TAA_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/taa.frag.spv"));
 const EQUIRECT_TO_CUBE_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/equirect_to_cube.comp.spv"));
 const PROCEDURAL_SKY_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.comp.spv"));
@@ -81,6 +84,7 @@ const SKYBOX_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
+const TAA_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const PIPELINE_CACHE_HEADER_SIZE: usize = size_of::<vk::PipelineCacheHeaderVersionOne>();
 /// Два timestamp на слот кадра: перед cluster compute и после tonemap pass.
 const TIMESTAMP_QUERY_COUNT: u32 = 2;
@@ -371,6 +375,9 @@ pub enum AntiAliasing {
     #[default]
     Fxaa,
     None,
+    Taa,
+    Fsr,
+    Dlss,
 }
 
 impl AntiAliasing {
@@ -378,7 +385,14 @@ impl AntiAliasing {
         match self {
             Self::Fxaa => 0,
             Self::None => 1,
+            Self::Taa => 2,
+            Self::Fsr => 3,
+            Self::Dlss => 4,
         }
+    }
+
+    const fn is_temporal(self) -> bool {
+        matches!(self, Self::Taa | Self::Fsr | Self::Dlss)
     }
 }
 
@@ -715,6 +729,9 @@ pub struct Renderer {
     cluster_pipeline: Option<vk::Pipeline>,
     cluster_pipeline_layout: Option<vk::PipelineLayout>,
     post_pipeline_layout: Option<vk::PipelineLayout>,
+    taa_set_layout: Option<vk::DescriptorSetLayout>,
+    taa_pipeline_layout: Option<vk::PipelineLayout>,
+    taa_pipeline: Option<vk::Pipeline>,
     tonemap_pipeline: Option<vk::Pipeline>,
     output_pipeline: Option<vk::Pipeline>,
     viewport_output_pipeline: Option<vk::Pipeline>,
@@ -763,6 +780,7 @@ pub struct Renderer {
     materials: Vec<Option<GpuMaterial>>,
     ui_textures: Vec<Option<UiTexture>>,
     viewports: Vec<Option<Viewport>>,
+    screen_temporal: TemporalView,
     retired: RetireQueue<RetiredResource>,
     frames: Vec<FrameResources>,
     frame_slot: usize,
@@ -818,6 +836,9 @@ impl Renderer {
             cluster_pipeline: None,
             cluster_pipeline_layout: None,
             post_pipeline_layout: None,
+            taa_set_layout: None,
+            taa_pipeline_layout: None,
+            taa_pipeline: None,
             tonemap_pipeline: None,
             output_pipeline: None,
             viewport_output_pipeline: None,
@@ -860,6 +881,7 @@ impl Renderer {
             materials: Vec::new(),
             ui_textures: Vec::new(),
             viewports: Vec::new(),
+            screen_temporal: TemporalView::default(),
             retired: RetireQueue::new(FRAMES_IN_FLIGHT),
             frames: Vec::new(),
             frame_slot: 0,
@@ -1293,6 +1315,7 @@ impl Renderer {
         self.viewports.push(Some(Viewport {
             extent: vk::Extent2D { width, height },
             targets: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
+            temporal: TemporalView::default(),
         }));
         Ok(ViewportId(self.viewports.len() - 1))
     }
@@ -1331,17 +1354,25 @@ impl Renderer {
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         validate_overlay(frame.overlay)?;
+        self.miss_unlisted_viewports(&[]);
         let output_extent = self
             .swapchain
             .as_ref()
             .map_or(self.output_extent, |swapchain| swapchain.extent);
         let render_extent = scaled_extent(output_extent, frame.view.render_scale);
-        let prepared = prepare_frame(frame, render_extent)?;
+        let temporal_plan = self.screen_temporal.state.plan(
+            temporal_key(render_extent, output_extent, frame.view.anti_aliasing),
+            multiply_4x4(frame.camera.projection, frame.camera.view),
+            frame.reset_history,
+        );
+        let prepared = prepare_frame_with_temporal(frame, render_extent, Some(temporal_plan))?;
         let (environment_set, skybox) = self.environment_set_for(frame.environment)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
+            self.screen_temporal.state.missed();
             return Ok(FrameStatus::Skipped);
         }
         if self.swapchain_dirty || self.swapchain.is_none() {
+            self.screen_temporal.state.missed();
             self.recreate_swapchain()?;
             return Ok(FrameStatus::Skipped);
         }
@@ -1360,9 +1391,20 @@ impl Renderer {
         self.poll_uploads()?;
         self.flush_uploads()?;
         self.retired.slot_completed(frame_slot);
+        if frame.view.anti_aliasing.is_temporal() {
+            ensure_temporal_history(
+                &instance,
+                &device,
+                self.physical_device,
+                &mut self.screen_temporal,
+                output_extent,
+                &mut self.retired,
+            )?;
+        }
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
+        let taa_set_layout = self.taa_set_layout()?;
         let frame_resources = self
             .frames
             .get_mut(frame_slot)
@@ -1424,18 +1466,18 @@ impl Renderer {
         let post_sampler = self
             .post_sampler
             .ok_or(RenderError::InvalidState("post sampler отсутствует"))?;
-        let target_changed = frame_resources
-            .target
-            .as_ref()
-            .is_none_or(|target| target.render_extent != render_extent);
+        let target_changed = frame_resources.target.as_ref().is_none_or(|target| {
+            target.render_extent != render_extent || target.output_extent != output_extent
+        });
         if target_changed {
-            let target = FrameTarget::new(&instance, &device, self.physical_device, render_extent)?;
-            write_image_set(
+            let target = FrameTarget::new(
+                &instance,
                 &device,
-                frame_resources.tonemap_set,
-                target.scene.color.view,
-                post_sampler,
-            );
+                self.physical_device,
+                render_extent,
+                output_extent,
+                taa_set_layout,
+            )?;
             write_image_set(
                 &device,
                 frame_resources.output_set,
@@ -1444,6 +1486,37 @@ impl Renderer {
             );
             frame_resources.target = Some(target);
         }
+        let target = frame_resources
+            .target
+            .as_ref()
+            .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
+        let tonemap_source = if frame.view.anti_aliasing.is_temporal() {
+            let history = self
+                .screen_temporal
+                .history
+                .as_ref()
+                .ok_or(RenderError::InvalidState("TAA history отсутствует"))?;
+            write_taa_image_set(
+                &device,
+                target.taa_set,
+                post_sampler,
+                [
+                    target.scene.color.view,
+                    target.scene.velocity.view,
+                    target.scene.depth.view,
+                    history.images[temporal_plan.read_history].view,
+                ],
+            );
+            history.images[temporal_plan.write_history].view
+        } else {
+            target.scene.color.view
+        };
+        write_image_set(
+            &device,
+            frame_resources.tonemap_set,
+            tonemap_source,
+            post_sampler,
+        );
         let Some((image_index, acquire_suboptimal)) = acquire_image(
             &swapchain_loader,
             swapchain_handle,
@@ -1452,6 +1525,7 @@ impl Renderer {
             &mut self.swapchain_dirty,
         )?
         else {
+            self.screen_temporal.state.missed();
             return Ok(FrameStatus::Skipped);
         };
 
@@ -1509,6 +1583,11 @@ impl Renderer {
             materials: &self.materials,
             draws: frame.draws,
             view_projection: multiply_4x4(frame.camera.projection, frame.camera.view),
+            culling_padding: [
+                temporal_plan.jitter_ndc[0].abs(),
+                temporal_plan.jitter_ndc[1].abs(),
+            ],
+            temporal_plan,
             camera_position: frame.camera.position,
             clear_color: frame.clear_color,
             timestamps,
@@ -1536,7 +1615,24 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
         let mut shadow_layout = self.shadow_layout;
         let mut local_shadow_layout = self.local_shadow_layout;
-        record_frame(
+        let temporal_record = if frame.view.anti_aliasing.is_temporal() {
+            let history = self
+                .screen_temporal
+                .history
+                .as_ref()
+                .ok_or(RenderError::InvalidState("TAA history отсутствует"))?;
+            Some((
+                history,
+                temporal_plan,
+                self.taa_pipeline
+                    .ok_or(RenderError::InvalidState("TAA pipeline отсутствует"))?,
+                self.taa_pipeline_layout
+                    .ok_or(RenderError::InvalidState("TAA pipeline layout отсутствует"))?,
+            ))
+        } else {
+            None
+        };
+        if let Err(error) = record_frame(
             &device,
             command_buffer,
             target,
@@ -1561,15 +1657,29 @@ impl Renderer {
             &shadow,
             &scene,
             overlay.as_ref(),
-        )?;
+            temporal_record,
+        ) {
+            self.screen_temporal.state.missed();
+            return Err(error);
+        }
         self.shadow_layout = shadow_layout;
         self.local_shadow_layout = local_shadow_layout;
 
+        let temporal_submissions = [TemporalSubmission {
+            view: TemporalViewId::Screen,
+            plan: temporal_plan,
+            layouts: frame
+                .view
+                .anti_aliasing
+                .is_temporal()
+                .then_some([vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; 2]),
+        }];
         self.submit_and_present(
             image_index,
             acquire_suboptimal,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             timestamps.is_some(),
+            &temporal_submissions,
         )
     }
 
@@ -1586,6 +1696,8 @@ impl Renderer {
         clear: [f32; 4],
     ) -> Result<FrameStatus, RenderError> {
         validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
+        self.screen_temporal.state.missed();
+        self.miss_unlisted_viewports(scenes);
         let mut prepared_scenes = Vec::with_capacity(scenes.len());
         let mut scene_environment_sets = Vec::with_capacity(scenes.len());
         for (viewport, frame) in scenes {
@@ -1598,18 +1710,31 @@ impl Renderer {
                 .as_ref()
                 .ok_or_else(unknown_viewport)?
                 .extent;
-            prepared_scenes.push(prepare_frame(
-                frame,
-                scaled_extent(extent, frame.view.render_scale),
-            )?);
+            let render_extent = scaled_extent(extent, frame.view.render_scale);
+            let plan = self.viewports[viewport.0]
+                .as_ref()
+                .ok_or_else(unknown_viewport)?
+                .temporal
+                .state
+                .plan(
+                    temporal_key(render_extent, extent, frame.view.anti_aliasing),
+                    multiply_4x4(frame.camera.projection, frame.camera.view),
+                    frame.reset_history,
+                );
+            prepared_scenes.push((
+                prepare_frame_with_temporal(frame, render_extent, Some(plan))?,
+                plan,
+            ));
             scene_environment_sets.push(self.environment_set_for(frame.environment)?);
         }
         let packed = pack_ui(ui, self.output_extent)?;
         self.validate_ui_images(&packed, scenes)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
+            self.miss_all_temporal_views();
             return Ok(FrameStatus::Skipped);
         }
         if self.swapchain_dirty || self.swapchain.is_none() {
+            self.miss_all_temporal_views();
             self.recreate_swapchain()?;
             return Ok(FrameStatus::Skipped);
         }
@@ -1628,6 +1753,25 @@ impl Renderer {
         self.poll_uploads()?;
         self.flush_uploads()?;
         self.retired.slot_completed(frame_slot);
+        for ((viewport, frame), _) in scenes.iter().zip(&prepared_scenes) {
+            let extent = self.viewports[viewport.0]
+                .as_ref()
+                .ok_or_else(unknown_viewport)?
+                .extent;
+            if extent.width > 0 && extent.height > 0 && frame.view.anti_aliasing.is_temporal() {
+                let entry = self.viewports[viewport.0]
+                    .as_mut()
+                    .ok_or_else(unknown_viewport)?;
+                ensure_temporal_history(
+                    &instance,
+                    &device,
+                    self.physical_device,
+                    &mut entry.temporal,
+                    extent,
+                    &mut self.retired,
+                )?;
+            }
+        }
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
@@ -1664,6 +1808,7 @@ impl Renderer {
         // сигнальный semaphore.
         let target_resources = ViewportTargetResources {
             image_set_layout: self.texture_set_layout()?,
+            taa_set_layout: self.taa_set_layout()?,
             image_sampler: self
                 .ui_sampler
                 .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?,
@@ -1687,7 +1832,7 @@ impl Renderer {
         };
         let physical_device = self.physical_device;
         let mut rendered = Vec::with_capacity(scenes.len());
-        for (((viewport, frame), prepared), (environment_set, skybox)) in scenes
+        for (((viewport, frame), (prepared, plan)), (environment_set, skybox)) in scenes
             .iter()
             .zip(&prepared_scenes)
             .zip(&scene_environment_sets)
@@ -1697,6 +1842,7 @@ impl Renderer {
                 .ok_or_else(unknown_viewport)?;
             let extent = entry.extent;
             if extent.width == 0 || extent.height == 0 {
+                entry.temporal.state.missed();
                 continue;
             }
             let render_extent = scaled_extent(extent, frame.view.render_scale);
@@ -1714,6 +1860,33 @@ impl Renderer {
                 )?);
             }
             let target = slot_target.as_mut().ok_or_else(unknown_viewport)?;
+            let tonemap_source = if frame.view.anti_aliasing.is_temporal() {
+                let history = entry
+                    .temporal
+                    .history
+                    .as_ref()
+                    .ok_or(RenderError::InvalidState("TAA history отсутствует"))?;
+                write_taa_image_set(
+                    &device,
+                    target.taa_set,
+                    target_resources.post_sampler,
+                    [
+                        target.scene.color.view,
+                        target.scene.velocity.view,
+                        target.scene.depth.view,
+                        history.images[plan.read_history].view,
+                    ],
+                );
+                history.images[plan.write_history].view
+            } else {
+                target.scene.color.view
+            };
+            write_image_set(
+                &device,
+                target.tonemap_set,
+                tonemap_source,
+                target_resources.post_sampler,
+            );
             let frame_set = target.frame_set.write(
                 &instance,
                 &device,
@@ -1726,6 +1899,7 @@ impl Renderer {
             rendered.push((
                 *viewport,
                 *frame,
+                *plan,
                 frame_set,
                 *environment_set,
                 self.skybox_pipeline
@@ -1745,6 +1919,7 @@ impl Renderer {
             &mut self.swapchain_dirty,
         )?
         else {
+            self.miss_all_temporal_views();
             return Ok(FrameStatus::Skipped);
         };
 
@@ -1755,7 +1930,7 @@ impl Renderer {
                 UiImage::Viewport(viewport) => {
                     if !rendered
                         .iter()
-                        .any(|(drawn, _, _, _, _, _, _, _, _)| *drawn == viewport)
+                        .any(|(drawn, _, _, _, _, _, _, _, _, _)| *drawn == viewport)
                     {
                         continue;
                     }
@@ -1808,6 +1983,7 @@ impl Renderer {
                     (
                         viewport,
                         frame,
+                        plan,
                         frame_set,
                         environment_set,
                         skybox_pipeline,
@@ -1848,6 +2024,8 @@ impl Renderer {
                                 frame.camera.projection,
                                 frame.camera.view,
                             ),
+                            culling_padding: [plan.jitter_ndc[0].abs(), plan.jitter_ndc[1].abs()],
+                            temporal_plan: *plan,
                             camera_position: frame.camera.position,
                             clear_color: frame.clear_color,
                             timestamps: slot_timestamps.filter(|_| index == 0),
@@ -1906,10 +2084,10 @@ impl Renderer {
             "post pipeline layout отсутствует",
         ))?;
         for (viewport, shadow, pass, tonemap_set, output_set) in &scene_passes {
-            let Some(target) = self.viewports[viewport.0]
-                .as_mut()
-                .and_then(|entry| entry.targets[frame_slot].as_mut())
-            else {
+            let Some(entry) = self.viewports[viewport.0].as_mut() else {
+                continue;
+            };
+            let Some(target) = entry.targets[frame_slot].as_mut() else {
                 continue;
             };
             record_scene(
@@ -1924,25 +2102,66 @@ impl Renderer {
                 shadow,
                 pass,
             );
+            let (tonemap_source, tonemap_layout, tonemap_extent, output_source_extent) =
+                if pass.view.anti_aliasing.is_temporal() {
+                    let history = entry
+                        .temporal
+                        .history
+                        .as_ref()
+                        .ok_or(RenderError::InvalidState("TAA history отсутствует"))?;
+                    record_taa_pass(
+                        &device,
+                        command_buffer,
+                        &mut target.scene,
+                        history,
+                        target.taa_set,
+                        pass.frame_set,
+                        target.extent,
+                        self.taa_pipeline
+                            .ok_or(RenderError::InvalidState("TAA pipeline отсутствует"))?,
+                        self.taa_pipeline_layout
+                            .ok_or(RenderError::InvalidState("TAA pipeline layout отсутствует"))?,
+                        pass.temporal_plan,
+                    );
+                    (
+                        &history.images[pass.temporal_plan.write_history],
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        target.extent,
+                        target.extent,
+                    )
+                } else {
+                    (
+                        &target.scene.color,
+                        target.scene.layout,
+                        target.render_extent,
+                        target.render_extent,
+                    )
+                };
             record_tonemap_pass(
                 &device,
                 command_buffer,
-                &mut target.scene,
+                tonemap_source,
+                tonemap_layout,
                 &target.ldr,
-                target.render_extent,
+                &mut target.ldr_layout,
+                tonemap_extent,
                 *tonemap_set,
                 tonemap_pipeline,
                 post_pipeline_layout,
                 pass.view,
                 pass.timestamps,
             );
+            if !pass.view.anti_aliasing.is_temporal() {
+                target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            }
             record_output_pass(
                 &device,
                 command_buffer,
                 target.output.image,
                 target.output.view,
-                target.render_extent,
+                output_source_extent,
                 target.extent,
+                target.output_layout,
                 *output_set,
                 viewport_output_pipeline,
                 post_pipeline_layout,
@@ -1951,6 +2170,7 @@ impl Renderer {
                 None,
                 true,
             );
+            target.output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         }
         record_ui(
             &device,
@@ -1964,11 +2184,27 @@ impl Renderer {
         self.shadow_layout = shadow_layout;
         self.local_shadow_layout = local_shadow_layout;
 
+        let temporal_submissions = rendered
+            .iter()
+            .map(
+                |(viewport, _, plan, _, _, _, _, _, _, _)| TemporalSubmission {
+                    view: TemporalViewId::Viewport(*viewport),
+                    plan: *plan,
+                    layouts: plan
+                        .key
+                        .anti_aliasing
+                        .is_temporal()
+                        .then_some([vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; 2]),
+                },
+            )
+            .collect::<Vec<_>>();
+
         self.submit_and_present(
             image_index,
             acquire_suboptimal,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             timestamps,
+            &temporal_submissions,
         )
     }
 
@@ -2004,6 +2240,54 @@ impl Renderer {
         Ok(())
     }
 
+    fn miss_all_temporal_views(&mut self) {
+        self.screen_temporal.state.missed();
+        for viewport in self.viewports.iter_mut().flatten() {
+            viewport.temporal.state.missed();
+        }
+    }
+
+    fn miss_unlisted_viewports(&mut self, scenes: &[(ViewportId, &Frame<'_>)]) {
+        for (index, viewport) in self.viewports.iter_mut().enumerate() {
+            if let Some(viewport) = viewport
+                && !scenes.iter().any(|(listed, _)| listed.0 == index)
+            {
+                viewport.temporal.state.missed();
+            }
+        }
+    }
+
+    fn commit_temporal_submissions(&mut self, submissions: &[TemporalSubmission]) {
+        for submission in submissions {
+            let temporal = match submission.view {
+                TemporalViewId::Screen => &mut self.screen_temporal,
+                TemporalViewId::Viewport(viewport) => {
+                    let Some(Some(viewport)) = self.viewports.get_mut(viewport.0) else {
+                        continue;
+                    };
+                    &mut viewport.temporal
+                }
+            };
+            temporal.state.submitted(submission.plan);
+            if let (Some(history), Some(layouts)) = (&mut temporal.history, submission.layouts) {
+                history.layouts = layouts;
+            }
+        }
+    }
+
+    fn miss_temporal_submissions(&mut self, submissions: &[TemporalSubmission]) {
+        for submission in submissions {
+            match submission.view {
+                TemporalViewId::Screen => self.screen_temporal.state.missed(),
+                TemporalViewId::Viewport(viewport) => {
+                    if let Some(Some(viewport)) = self.viewports.get_mut(viewport.0) {
+                        viewport.temporal.state.missed();
+                    }
+                }
+            }
+        }
+    }
+
     /// Отправляет записанный command buffer текущего слота и показывает изображение.
     ///
     /// `wait_stage` — стадия первого обращения к swapchain image в этом command buffer.
@@ -2013,6 +2297,7 @@ impl Renderer {
         acquire_suboptimal: bool,
         wait_stage: vk::PipelineStageFlags2,
         timestamps_written: bool,
+        temporal_submissions: &[TemporalSubmission],
     ) -> Result<FrameStatus, RenderError> {
         let device = self.device()?.clone();
         let swapchain_loader = self.swapchain_loader()?.clone();
@@ -2046,7 +2331,11 @@ impl Renderer {
             .command_buffer_infos(&command_infos)
             .signal_semaphore_infos(&signal_infos)];
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
-        unsafe { device.queue_submit2(self.queue, &submit_info, fence) }?;
+        if let Err(error) = unsafe { device.queue_submit2(self.queue, &submit_info, fence) } {
+            self.miss_temporal_submissions(temporal_submissions);
+            return Err(RenderError::Vulkan(error));
+        }
+        self.commit_temporal_submissions(temporal_submissions);
         // Результаты timestamp читаются после следующего ожидания fence этого слота.
         self.frames[frame_slot].timestamps_pending = timestamps_written;
 
@@ -2461,6 +2750,38 @@ impl Renderer {
         // SAFETY: UI and viewport shaders use one sampled image and one sampler.
         self.texture_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&texture_layout_info, None) }?);
+
+        let taa_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let taa_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&taa_bindings);
+        // SAFETY: the layout matches the TAA shader's four images and shared sampler.
+        self.taa_set_layout =
+            Some(unsafe { device.create_descriptor_set_layout(&taa_layout_info, None) }?);
 
         let sampler_info = material_sampler_info(self.texture_sampler_anisotropy);
         // SAFETY: sampler anisotropy is enabled only when the selected device supports it.
@@ -3980,6 +4301,24 @@ impl Renderer {
             LDR_FORMAT,
             OUTPUT_FRAGMENT_SHADER,
         )?);
+        let taa_set_layouts = [self.taa_set_layout()?, self.frame_set_layout()?];
+        let taa_push_constants = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(TAA_PUSH_CONSTANTS_SIZE as u32)];
+        let taa_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&taa_set_layouts)
+            .push_constant_ranges(&taa_push_constants);
+        // SAFETY: the TAA descriptor layouts and 16-byte fragment range match taa.frag.
+        let taa_layout = unsafe { device.create_pipeline_layout(&taa_layout_info, None) }?;
+        self.taa_pipeline_layout = Some(taa_layout);
+        self.taa_pipeline = Some(create_post_pipeline(
+            &device,
+            cache,
+            taa_layout,
+            OFFSCREEN_FORMAT,
+            TAA_FRAGMENT_SHADER,
+        )?);
         Ok(())
     }
 
@@ -4306,6 +4645,12 @@ impl Renderer {
             "layout дескрипторов UI-текстуры отсутствует",
         ))
     }
+
+    fn taa_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
+        self.taa_set_layout.ok_or(RenderError::InvalidState(
+            "layout дескрипторов TAA отсутствует",
+        ))
+    }
 }
 
 impl Drop for Renderer {
@@ -4321,6 +4666,7 @@ impl Drop for Renderer {
         self.retired.clear();
         self.environments.clear();
         self.viewports.clear();
+        self.screen_temporal.history.take();
         self.ui_textures.clear();
         self.meshes.clear();
         self.materials.clear();
@@ -4395,6 +4741,7 @@ impl Drop for Renderer {
                 self.tonemap_pipeline.take(),
                 self.output_pipeline.take(),
                 self.viewport_output_pipeline.take(),
+                self.taa_pipeline.take(),
             ]
             .into_iter()
             .flatten()
@@ -4421,6 +4768,10 @@ impl Drop for Renderer {
             }
             if let Some(layout) = self.post_pipeline_layout.take() {
                 // SAFETY: all pipelines created with this layout were destroyed above.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+            if let Some(layout) = self.taa_pipeline_layout.take() {
+                // SAFETY: the TAA pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
             if let Some(layout) = self.compute_pipeline_layout.take() {
@@ -4453,6 +4804,7 @@ impl Drop for Renderer {
                 self.environment_set_layout.take(),
                 self.compute_set_layout.take(),
                 self.texture_set_layout.take(),
+                self.taa_set_layout.take(),
             ]
             .into_iter()
             .flatten()
@@ -5282,6 +5634,7 @@ struct OffscreenTarget {
     depth: DeviceImage,
     layout: vk::ImageLayout,
     velocity_layout: vk::ImageLayout,
+    depth_layout: vk::ImageLayout,
 }
 
 impl OffscreenTarget {
@@ -5321,14 +5674,19 @@ impl OffscreenTarget {
             )?,
             layout: vk::ImageLayout::UNDEFINED,
             velocity_layout: vk::ImageLayout::UNDEFINED,
+            depth_layout: vk::ImageLayout::UNDEFINED,
         })
     }
 }
 
 struct FrameTarget {
+    _taa_pool: OwnedDescriptorPool,
+    taa_set: vk::DescriptorSet,
     scene: OffscreenTarget,
     ldr: DeviceImage,
+    ldr_layout: vk::ImageLayout,
     render_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
 }
 
 impl FrameTarget {
@@ -5337,19 +5695,28 @@ impl FrameTarget {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         render_extent: vk::Extent2D,
+        output_extent: vk::Extent2D,
+        taa_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
+        let scene = OffscreenTarget::new(instance, device, physical_device, render_extent)?;
+        let ldr = DeviceImage::new(
+            instance,
+            device,
+            physical_device,
+            output_extent,
+            LDR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            color_subresource_range(),
+        )?;
+        let (taa_pool, taa_set) = allocate_taa_image_set(device, taa_set_layout)?;
         Ok(Self {
-            scene: OffscreenTarget::new(instance, device, physical_device, render_extent)?,
-            ldr: DeviceImage::new(
-                instance,
-                device,
-                physical_device,
-                render_extent,
-                LDR_FORMAT,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                color_subresource_range(),
-            )?,
+            _taa_pool: taa_pool,
+            taa_set,
+            scene,
+            ldr,
+            ldr_layout: vk::ImageLayout::UNDEFINED,
             render_extent,
+            output_extent,
         })
     }
 }
@@ -5463,6 +5830,7 @@ fn write_local_light_descriptor(
 /// Общие объекты renderer, нужные каждой цели viewport.
 struct ViewportTargetResources {
     image_set_layout: vk::DescriptorSetLayout,
+    taa_set_layout: vk::DescriptorSetLayout,
     image_sampler: vk::Sampler,
     post_sampler: vk::Sampler,
     frame_set_layout: vk::DescriptorSetLayout,
@@ -5637,6 +6005,8 @@ struct ViewportTarget {
     device: ash::Device,
     ui_pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
+    _taa_pool: OwnedDescriptorPool,
+    taa_set: vk::DescriptorSet,
     post_pool: vk::DescriptorPool,
     tonemap_set: vk::DescriptorSet,
     output_set: vk::DescriptorSet,
@@ -5644,7 +6014,9 @@ struct ViewportTarget {
     render_extent: vk::Extent2D,
     scene: OffscreenTarget,
     ldr: DeviceImage,
+    ldr_layout: vk::ImageLayout,
     output: DeviceImage,
+    output_layout: vk::ImageLayout,
     frame_set: ViewportFrameSet,
 }
 
@@ -5662,7 +6034,7 @@ impl ViewportTarget {
             instance,
             device,
             physical_device,
-            render_extent,
+            extent,
             LDR_FORMAT,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             color_subresource_range(),
@@ -5677,6 +6049,7 @@ impl ViewportTarget {
             color_subresource_range(),
         )?;
         let frame_set = ViewportFrameSet::new(instance, device, physical_device, resources)?;
+        let (taa_pool, taa_set) = allocate_taa_image_set(device, resources.taa_set_layout)?;
         let (post_pool, post_sets) = allocate_post_image_sets(
             device,
             resources.image_set_layout,
@@ -5700,6 +6073,8 @@ impl ViewportTarget {
             device: device.clone(),
             ui_pool,
             set,
+            _taa_pool: taa_pool,
+            taa_set,
             post_pool,
             tonemap_set: post_sets[0],
             output_set: post_sets[1],
@@ -5707,7 +6082,9 @@ impl ViewportTarget {
             render_extent,
             scene,
             ldr,
+            ldr_layout: vk::ImageLayout::UNDEFINED,
             output,
+            output_layout: vk::ImageLayout::UNDEFINED,
             frame_set,
         })
     }
@@ -5727,6 +6104,108 @@ impl Drop for ViewportTarget {
 struct Viewport {
     extent: vk::Extent2D,
     targets: Vec<Option<ViewportTarget>>,
+    temporal: TemporalView,
+}
+
+#[derive(Default)]
+struct TemporalView {
+    state: TemporalState,
+    history: Option<TemporalHistory>,
+}
+
+struct TemporalHistory {
+    extent: vk::Extent2D,
+    images: [DeviceImage; 2],
+    layouts: [vk::ImageLayout; 2],
+}
+
+impl TemporalHistory {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        extent: vk::Extent2D,
+    ) -> Result<Self, RenderError> {
+        let images = [
+            DeviceImage::new(
+                instance,
+                device,
+                physical_device,
+                extent,
+                OFFSCREEN_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                color_subresource_range(),
+            )?,
+            DeviceImage::new(
+                instance,
+                device,
+                physical_device,
+                extent,
+                OFFSCREEN_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                color_subresource_range(),
+            )?,
+        ];
+        Ok(Self {
+            extent,
+            images,
+            layouts: [vk::ImageLayout::UNDEFINED; 2],
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TemporalViewId {
+    Screen,
+    Viewport(ViewportId),
+}
+
+#[derive(Clone, Copy)]
+struct TemporalSubmission {
+    view: TemporalViewId,
+    plan: TemporalPlan,
+    layouts: Option<[vk::ImageLayout; 2]>,
+}
+
+fn ensure_temporal_history(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    temporal: &mut TemporalView,
+    output_extent: vk::Extent2D,
+    retired: &mut RetireQueue<RetiredResource>,
+) -> Result<(), RenderError> {
+    if temporal
+        .history
+        .as_ref()
+        .is_some_and(|history| history.extent == output_extent)
+    {
+        return Ok(());
+    }
+    let replacement = TemporalHistory::new(instance, device, physical_device, output_extent)?;
+    if let Some(previous) = temporal.history.replace(replacement) {
+        retired.retire(RetiredResource::TemporalHistory(previous), 0);
+    }
+    Ok(())
+}
+
+fn temporal_key(
+    render_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
+    anti_aliasing: AntiAliasing,
+) -> TemporalKey {
+    TemporalKey {
+        render_extent: TemporalExtent {
+            width: render_extent.width,
+            height: render_extent.height,
+        },
+        output_extent: TemporalExtent {
+            width: output_extent.width,
+            height: output_extent.height,
+        },
+        anti_aliasing,
+        debug_view: 0,
+    }
 }
 
 struct UiTexture {
@@ -5753,6 +6232,7 @@ enum RetiredResource {
     Material(#[allow(dead_code)] GpuMaterial),
     UiTexture(#[allow(dead_code)] UiTexture),
     Viewport(#[allow(dead_code)] Viewport),
+    TemporalHistory(#[allow(dead_code)] TemporalHistory),
     Environment(#[allow(dead_code)] Box<GpuEnvironment>),
 }
 
@@ -5913,6 +6393,61 @@ fn write_image_set(
             .image_info(&sampler_info),
     ];
     // SAFETY: the set, image view and sampler are alive and the set is not in use.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
+
+fn allocate_taa_image_set(
+    device: &ash::Device,
+    layout: vk::DescriptorSetLayout,
+) -> Result<(OwnedDescriptorPool, vk::DescriptorSet), RenderError> {
+    let pool_sizes = [
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(4),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1),
+    ];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(1)
+        .pool_sizes(&pool_sizes);
+    let pool = OwnedDescriptorPool::new(device, &pool_info)?;
+    let layouts = [layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool.handle)
+        .set_layouts(&layouts);
+    // SAFETY: the pool and layout are sized for the one TAA descriptor set.
+    let sets = unsafe { device.allocate_descriptor_sets(&allocate_info) }?;
+    Ok((pool, sets[0]))
+}
+
+fn write_taa_image_set(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    views: [vk::ImageView; 4],
+) {
+    let image_infos = views.map(|view| {
+        vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+    });
+    let sampler_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
+    let image_writes = std::array::from_fn::<_, 4, _>(|index| {
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(index as u32)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(std::slice::from_ref(&image_infos[index]))
+    });
+    let sampler_write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(4)
+        .descriptor_type(vk::DescriptorType::SAMPLER)
+        .image_info(&sampler_info);
+    let mut writes = image_writes.to_vec();
+    writes.push(sampler_write);
+    // SAFETY: the owning frame-slot fence has completed before these descriptors are updated.
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
 
@@ -6226,6 +6761,12 @@ fn record_frame(
     shadow: &ShadowPass<'_>,
     scene: &ScenePass<'_>,
     overlay: Option<&OverlayPass>,
+    temporal: Option<(
+        &TemporalHistory,
+        TemporalPlan,
+        vk::Pipeline,
+        vk::PipelineLayout,
+    )>,
 ) -> Result<(), RenderError> {
     begin_command_buffer(device, command_buffer)?;
     record_scene(
@@ -6240,25 +6781,59 @@ fn record_frame(
         shadow,
         scene,
     );
+    let (tonemap_source, tonemap_source_layout, tonemap_extent, output_source_extent) =
+        if let Some((history, plan, taa_pipeline, taa_layout)) = temporal {
+            record_taa_pass(
+                device,
+                command_buffer,
+                &mut target.scene,
+                history,
+                target.taa_set,
+                scene.frame_set,
+                target.output_extent,
+                taa_pipeline,
+                taa_layout,
+                plan,
+            );
+            (
+                &history.images[plan.write_history],
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                target.output_extent,
+                target.output_extent,
+            )
+        } else {
+            (
+                &target.scene.color,
+                target.scene.layout,
+                target.render_extent,
+                target.render_extent,
+            )
+        };
     record_tonemap_pass(
         device,
         command_buffer,
-        &mut target.scene,
+        tonemap_source,
+        tonemap_source_layout,
         &target.ldr,
-        target.render_extent,
+        &mut target.ldr_layout,
+        tonemap_extent,
         tonemap_set,
         tonemap_pipeline,
         post_pipeline_layout,
         view,
         scene.timestamps,
     );
+    if temporal.is_none() {
+        target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    }
     record_output_pass(
         device,
         command_buffer,
         output_image,
         output_view,
-        target.render_extent,
+        output_source_extent,
         output_extent,
+        vk::ImageLayout::UNDEFINED,
         output_set,
         output_pipeline,
         post_pipeline_layout,
@@ -6375,25 +6950,21 @@ fn record_scene(
         ),
     );
     target.velocity_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-    // Глубина не сохраняется между кадрами, поэтому прошлое содержимое отбрасывается.
-    let depth_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
-        .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-        .dst_stage_mask(
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-        )
-        .dst_access_mask(
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        )
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(target.depth.image)
-        .subresource_range(depth_subresource_range());
+    let (depth_stage, depth_access) = offscreen_previous_use(target.depth_layout);
+    let depth_barrier = image_layout_barrier(
+        target.depth.image,
+        target.depth_layout,
+        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+        depth_stage,
+        depth_access,
+        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        depth_subresource_range(),
+    );
     pipeline_barrier(device, command_buffer, depth_barrier);
+    target.depth_layout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
     if shadow.shadow_cascades.is_empty() {
         if *shadow_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
             let (source_stage, source_access) = shadow_layout_source(*shadow_layout);
@@ -6736,6 +7307,7 @@ fn record_scene(
         ),
     );
     target.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    target.depth_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 }
 
 fn record_local_shadow_layers(
@@ -6886,6 +7458,8 @@ struct ScenePass<'a> {
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
     view_projection: [[f32; 4]; 4],
+    culling_padding: [f32; 2],
+    temporal_plan: TemporalPlan,
     camera_position: [f32; 3],
     clear_color: [f32; 4],
     timestamps: Option<vk::QueryPool>,
@@ -6961,7 +7535,8 @@ fn record_draws(
             &[],
         );
     }
-    let frustum = Frustum::from_view_projection(scene.view_projection);
+    let frustum =
+        Frustum::from_view_projection_with_padding(scene.view_projection, scene.culling_padding);
     let sorted = matches!(pass, DrawPass::Blend).then(|| {
         back_to_front_order(scene.draws, scene.camera_position, |draw| {
             scene.meshes.get(draw.mesh.0)?.as_ref()?.bounds
@@ -7225,8 +7800,10 @@ fn scene_viewport(extent: vk::Extent2D) -> vk::Viewport {
 fn record_tonemap_pass(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
-    source: &mut OffscreenTarget,
+    source: &DeviceImage,
+    source_layout: vk::ImageLayout,
     output: &DeviceImage,
+    output_layout: &mut vk::ImageLayout,
     extent: vk::Extent2D,
     set: vk::DescriptorSet,
     pipeline: vk::Pipeline,
@@ -7234,29 +7811,37 @@ fn record_tonemap_pass(
     view: ViewSettings,
     timestamps: Option<vk::QueryPool>,
 ) {
-    let source_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-        .old_layout(source.layout)
-        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(source.color.image)
-        .subresource_range(color_subresource_range());
-    pipeline_barrier(device, command_buffer, source_barrier);
-    let output_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-        .src_access_mask(vk::AccessFlags2::NONE)
-        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(output.image)
-        .subresource_range(color_subresource_range());
+    if source_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        let (source_stage, source_access) = match source_layout {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            ),
+            _ => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+        };
+        let source_barrier = image_layout_barrier(
+            source.image,
+            source_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            source_stage,
+            source_access,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            color_subresource_range(),
+        );
+        pipeline_barrier(device, command_buffer, source_barrier);
+    }
+    let (output_stage, output_access) = offscreen_previous_use(*output_layout);
+    let output_barrier = image_layout_barrier(
+        output.image,
+        *output_layout,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        output_stage,
+        output_access,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        color_subresource_range(),
+    );
     pipeline_barrier(device, command_buffer, output_barrier);
 
     let attachment = [vk::RenderingAttachmentInfo::default()
@@ -7334,7 +7919,140 @@ fn record_tonemap_pass(
         .image(output.image)
         .subresource_range(color_subresource_range());
     pipeline_barrier(device, command_buffer, sampled);
-    source.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    *output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_taa_pass(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    scene: &mut OffscreenTarget,
+    history: &TemporalHistory,
+    taa_set: vk::DescriptorSet,
+    frame_set: vk::DescriptorSet,
+    output_extent: vk::Extent2D,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    plan: TemporalPlan,
+) {
+    let scene_to_sample = image_layout_barrier(
+        scene.color.image,
+        scene.layout,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+        color_subresource_range(),
+    );
+    pipeline_barrier(device, command_buffer, scene_to_sample);
+
+    let read_layout = history.layouts[plan.read_history];
+    if read_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                history.images[plan.read_history].image,
+                read_layout,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::NONE,
+                vk::AccessFlags2::NONE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+                color_subresource_range(),
+            ),
+        );
+    }
+    let write_image = &history.images[plan.write_history];
+    let (write_stage, write_access) = match history.layouts[plan.write_history] {
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        ),
+        _ => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+    };
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            write_image.image,
+            history.layouts[plan.write_history],
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            write_stage,
+            write_access,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            color_subresource_range(),
+        ),
+    );
+
+    let attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(write_image.view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: output_extent,
+    };
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(area)
+        .layer_count(1)
+        .color_attachments(&attachment);
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: output_extent.width as f32,
+        height: output_extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let push_constants = float_bytes::<TAA_PUSH_CONSTANTS_SIZE>(&[
+        plan.jitter_render_pixels[0],
+        plan.jitter_render_pixels[1],
+        f32::from(u8::from(plan.history_valid)),
+        f32::from(u8::from(plan.reset_history)),
+    ]);
+    // SAFETY: both sampled sets and the output attachment match the TAA pipeline layouts.
+    unsafe {
+        device.cmd_begin_rendering(command_buffer, &rendering_info);
+        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_set_viewport(command_buffer, 0, &viewport);
+        device.cmd_set_scissor(command_buffer, 0, &[area]);
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline_layout,
+            0,
+            &[taa_set, frame_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            command_buffer,
+            pipeline_layout,
+            vk::ShaderStageFlags::FRAGMENT,
+            0,
+            &push_constants,
+        );
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.cmd_end_rendering(command_buffer);
+    }
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            write_image.image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            color_subresource_range(),
+        ),
+    );
+    scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7345,6 +8063,7 @@ fn record_output_pass(
     output_view: vk::ImageView,
     source_extent: vk::Extent2D,
     output_extent: vk::Extent2D,
+    previous_output_layout: vk::ImageLayout,
     set: vk::DescriptorSet,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
@@ -7353,7 +8072,21 @@ fn record_output_pass(
     overlay: Option<&OverlayPass>,
     sample_output: bool,
 ) {
-    let to_attachment = output_attachment_barrier(output_image);
+    let to_attachment = if sample_output {
+        let (source_stage, source_access) = offscreen_previous_use(previous_output_layout);
+        image_layout_barrier(
+            output_image,
+            previous_output_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            source_stage,
+            source_access,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            color_subresource_range(),
+        )
+    } else {
+        output_attachment_barrier(output_image)
+    };
     pipeline_barrier(device, command_buffer, to_attachment);
 
     let area = vk::Rect2D {
@@ -9007,7 +9740,7 @@ fn index_bytes(indices: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
 }
 
-/// Байты `FrameUniforms` в порядке std140: восемь матриц и восемь `vec4`.
+/// Байты `FrameUniforms` в порядке std140: девять матриц и девять `vec4`.
 /// Viewport рисуется в кадре один раз: его цель и uniform-буфер принадлежат одной сцене.
 fn validate_scene_viewports(
     viewports: impl Iterator<Item = ViewportId>,
@@ -9054,12 +9787,24 @@ struct LocalShadowPlan {
     matrices: Vec<[[f32; 4]; 4]>,
 }
 
+#[cfg(test)]
 fn prepare_frame(
     frame: &Frame<'_>,
     render_extent: vk::Extent2D,
 ) -> Result<PreparedFrame, RenderError> {
+    prepare_frame_with_temporal(frame, render_extent, None)
+}
+
+fn prepare_frame_with_temporal(
+    frame: &Frame<'_>,
+    render_extent: vk::Extent2D,
+    temporal: Option<TemporalPlan>,
+) -> Result<PreparedFrame, RenderError> {
     let shadow_requests = index_local_light_shadows(frame.lights, frame.local_light_shadows)?;
-    let lights = select_local_light_entries(frame.camera, frame.lights)?;
+    let culling_padding = temporal.map_or([0.0; 2], |plan| {
+        [plan.jitter_ndc[0].abs(), plan.jitter_ndc[1].abs()]
+    });
+    let lights = select_local_light_entries(frame.camera, frame.lights, culling_padding)?;
     let (depth_range, cluster_bounds) = match camera_cluster_bounds(frame.camera.projection) {
         Ok(bounds) => bounds,
         // Unlit frames also support clip-space cameras, such as sandbox's triangle.
@@ -9073,7 +9818,8 @@ fn prepare_frame(
         Err(error) => return Err(error),
     };
     let shadow_plan = select_local_shadow_slots(&lights, &shadow_requests, frame.camera.position);
-    let uniforms = frame_uniform_bytes_with_count(frame, lights.len(), depth_range, render_extent)?;
+    let uniforms =
+        frame_uniform_bytes_with_count(frame, lights.len(), depth_range, render_extent, temporal)?;
     let light_bytes =
         local_light_bytes_for_selected(&lights, &shadow_plan.assignments, frame.camera.view)?;
     Ok(PreparedFrame {
@@ -9089,7 +9835,7 @@ fn select_local_lights(
     camera: FrameCamera,
     lights: &[LocalLight],
 ) -> Result<Vec<LocalLight>, RenderError> {
-    Ok(select_local_light_entries(camera, lights)?
+    Ok(select_local_light_entries(camera, lights, [0.0; 2])?
         .into_iter()
         .map(|selected| selected.light)
         .collect())
@@ -9098,6 +9844,7 @@ fn select_local_lights(
 fn select_local_light_entries(
     camera: FrameCamera,
     lights: &[LocalLight],
+    culling_padding: [f32; 2],
 ) -> Result<Vec<SelectedLocalLight>, RenderError> {
     if !camera.position.into_iter().all(f32::is_finite)
         || !camera.view.iter().flatten().all(|value| value.is_finite())
@@ -9112,7 +9859,7 @@ fn select_local_light_entries(
         ));
     }
     let view_projection = multiply_4x4(camera.projection, camera.view);
-    let frustum = Frustum::from_view_projection(view_projection);
+    let frustum = Frustum::from_view_projection_with_padding(view_projection, culling_padding);
     let mut visible = Vec::with_capacity(lights.len().min(MAX_RENDERED_LIGHTS));
     for (index, light) in lights.iter().copied().enumerate() {
         let light = validate_local_light(light)?;
@@ -9624,6 +10371,7 @@ fn frame_uniform_bytes_with_count(
     local_light_count: usize,
     depth_range: DepthRange,
     render_extent: vk::Extent2D,
+    temporal: Option<TemporalPlan>,
 ) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
     validate_view_settings(frame.view)?;
     if !frame
@@ -9731,8 +10479,14 @@ fn frame_uniform_bytes_with_count(
         render_extent.width.max(1) as f32,
         render_extent.height.max(1) as f32,
     ]);
-    values[160..176].copy_from_slice(view_projection.as_flattened());
-    values[176..180].copy_from_slice(&[0.0; 4]);
+    let previous_view_projection = temporal
+        .map(|plan| plan.previous_view_projection)
+        .unwrap_or(view_projection);
+    values[160..176].copy_from_slice(previous_view_projection.as_flattened());
+    let [jitter_x, jitter_y, lod_bias] = temporal.map_or([0.0; 3], |plan| {
+        [plan.jitter_ndc[0], plan.jitter_ndc[1], plan.lod_bias]
+    });
+    values[176..180].copy_from_slice(&[jitter_x, jitter_y, lod_bias, 0.0]);
     Ok(float_bytes(&values))
 }
 
@@ -11376,7 +12130,7 @@ mod tests {
             },
         });
         let indexed = index_local_light_shadows(&lights, &requests).unwrap();
-        let selected = select_local_light_entries(camera([0.0; 3]), &lights).unwrap();
+        let selected = select_local_light_entries(camera([0.0; 3]), &lights, [0.0; 2]).unwrap();
         assert_eq!(selected.len(), MAX_RENDERED_LIGHTS);
         assert_eq!(selected[0].source_index, MAX_RENDERED_LIGHTS);
         assert_eq!(selected[MAX_RENDERED_LIGHTS - 1].source_index, 1);
@@ -12265,6 +13019,66 @@ mod tests {
     }
 
     #[test]
+    fn temporal_frame_uniforms_pack_previous_unjittered_view_and_render_parameters() {
+        let current = perspective_projection();
+        let mut previous = current;
+        previous[3][0] += 0.25;
+        let key = super::temporal::TemporalKey {
+            render_extent: super::temporal::Extent {
+                width: 640,
+                height: 360,
+            },
+            output_extent: super::temporal::Extent {
+                width: 1280,
+                height: 720,
+            },
+            anti_aliasing: AntiAliasing::Taa,
+            debug_view: 0,
+        };
+        let mut state = super::temporal::TemporalState::default();
+        let first = state.plan(key, previous, false);
+        state.submitted(first);
+        let plan = state.plan(key, current, false);
+        let frame = Frame {
+            clear_color: [0.0; 4],
+            camera: FrameCamera {
+                view: IDENTITY,
+                projection: current,
+                position: [0.0; 3],
+            },
+            environment: None,
+            shadow_cascades: &[],
+            light: DirectionalLight::default(),
+            lights: &[],
+            local_light_shadows: &[],
+            draws: &[],
+            overlay: &[],
+            view: ViewSettings {
+                anti_aliasing: AntiAliasing::Taa,
+                ..ViewSettings::default()
+            },
+            reset_history: false,
+        };
+        let uniforms = super::prepare_frame_with_temporal(
+            &frame,
+            vk::Extent2D {
+                width: 640,
+                height: 360,
+            },
+            Some(plan),
+        )
+        .unwrap()
+        .uniforms;
+        let values = floats(&uniforms);
+        assert_eq!(&values[0..16], current.as_flattened());
+        assert_eq!(&values[160..176], previous.as_flattened());
+        assert_eq!(
+            &values[176..180],
+            &[plan.jitter_ndc[0], plan.jitter_ndc[1], -1.0, 0.0]
+        );
+    }
+
+    #[test]
     fn frame_uniforms_reject_zero_light_or_non_finite_shadow_matrix() {
         for direction in [[0.0; 3], [f32::NAN, 0.0, 0.0], [f32::INFINITY, 0.0, 0.0]] {
             let light = DirectionalLight {
@@ -12391,6 +13205,9 @@ mod tests {
         assert_eq!(Tonemapper::None.code(), 2);
         assert_eq!(AntiAliasing::Fxaa.code(), 0);
         assert_eq!(AntiAliasing::None.code(), 1);
+        assert_eq!(AntiAliasing::Taa.code(), 2);
+        assert_eq!(AntiAliasing::Fsr.code(), 3);
+        assert_eq!(AntiAliasing::Dlss.code(), 4);
     }
 
     #[test]

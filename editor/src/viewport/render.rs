@@ -375,6 +375,9 @@ impl SceneRenderer {
                 anti_aliasing: match settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
+                    AntiAliasing::Taa => RenderAntiAliasing::Taa,
+                    AntiAliasing::Fsr => RenderAntiAliasing::Fsr,
+                    AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
             reset_history: false,

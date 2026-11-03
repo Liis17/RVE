@@ -118,6 +118,7 @@ const SHADERS: &[ShaderBuild] = &[
         &[],
         "output.frag.spv",
     ),
+    ("taa.frag", naga::ShaderStage::Fragment, &[], "taa.frag.spv"),
     (
         "skybox.vert",
         naga::ShaderStage::Vertex,
