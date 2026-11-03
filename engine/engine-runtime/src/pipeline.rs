@@ -2,13 +2,15 @@ use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, MaterialId, MeshId,
-    ProceduralSky, Renderer, SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, LocalLight, MaterialId,
+    MeshId, ProceduralSky, Renderer, SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper,
+    ViewSettings,
 };
 use engine_scene::camera::Camera;
 use engine_scene::light::cascade_view_projections;
 use engine_scene::{
-    AntiAliasing, CameraSettings, EnvironmentState, LightState, ObjectHandle, Tonemapper, World,
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, ObjectHandle,
+    Tonemapper, World,
 };
 use engine_script::{
     ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary, ScriptTime,
@@ -30,6 +32,7 @@ pub(crate) struct FrameSnapshot {
     pub camera: Camera,
     pub view: CameraSettings,
     pub light: LightState,
+    pub local_lights: Vec<LocalLight>,
     pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
 }
@@ -295,6 +298,7 @@ impl RenderBackend for VulkanBackend {
                 position: snapshot.camera.position.to_array(),
             },
             environment,
+            lights: &snapshot.local_lights,
             shadow_cascades: &shadow_cascades,
             light,
             draws: &snapshot.draws,
@@ -586,13 +590,51 @@ fn make_snapshot(
         }));
     }
     let environment = resolve_environment_snapshot(scene.environment.as_ref(), gpu_scene)?;
+    let local_lights = render_local_lights(&scene.local_lights);
     Ok(FrameSnapshot {
         camera: scene.camera,
         view: scene.view,
         light: scene.light,
+        local_lights,
         environment,
         draws,
     })
+}
+
+fn render_local_lights(states: &[LocalLightState]) -> Vec<LocalLight> {
+    states
+        .iter()
+        .map(|state| match *state {
+            LocalLightState::Point {
+                position,
+                color,
+                intensity,
+                range,
+                ..
+            } => LocalLight::Point {
+                position,
+                color_intensity: color.map(|component| component * intensity),
+                range,
+            },
+            LocalLightState::Spot {
+                position,
+                direction,
+                color,
+                intensity,
+                range,
+                inner_angle_deg,
+                outer_angle_deg,
+                ..
+            } => LocalLight::Spot {
+                position,
+                direction,
+                color_intensity: color.map(|component| component * intensity),
+                range,
+                cos_inner_angle: inner_angle_deg.to_radians().cos().max(0.0),
+                cos_outer_angle: outer_angle_deg.to_radians().cos().max(0.0),
+            },
+        })
+        .collect()
 }
 
 fn resolve_environment_snapshot(
@@ -927,18 +969,18 @@ mod tests {
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
         GpuSceneTable, RenderBackend, RenderControl, RenderThreadConfig, RuntimeStatus,
         SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig, make_snapshot,
-        procedural_environment_key, render_loop, render_snapshot, render_thread, selected_level,
-        send_snapshot, sync_input_background, wait_background_tick,
+        procedural_environment_key, render_local_lights, render_loop, render_snapshot,
+        render_thread, selected_level, send_snapshot, sync_input_background, wait_background_tick,
     };
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
-    use engine_render::{DrawCommand, FrameStatus};
+    use engine_render::{DrawCommand, FrameStatus, LocalLight};
     use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
-    use engine_scene::{SceneDocument, World};
+    use engine_scene::{LocalLightState, SceneDocument, World};
     use engine_script::{Key, ScriptHost, ScriptInterruptHandle, ScriptTime};
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
@@ -1158,9 +1200,72 @@ distance=2.0
             },
             view: CameraSettings::default(),
             light: LightState::default(),
+            local_lights: Vec::new(),
             environment: None,
             draws: Vec::<DrawCommand>::new(),
         }
+    }
+
+    #[test]
+    fn runtime_maps_scene_local_lights_to_renderer_factors_and_cosines() {
+        let scene = [
+            LocalLightState::Point {
+                position: [1.0, 2.0, 3.0],
+                color: [0.5, 1.0, 2.0],
+                intensity: 4.0,
+                range: 8.0,
+                shadows: true,
+            },
+            LocalLightState::Spot {
+                position: [0.0, 1.0, 2.0],
+                direction: [0.0, 0.0, -1.0],
+                color: [1.0, 0.5, 0.25],
+                intensity: 2.0,
+                range: 12.0,
+                inner_angle_deg: 10.0,
+                outer_angle_deg: 25.0,
+                shadows: false,
+            },
+        ];
+        let mapped = render_local_lights(&scene);
+        assert_eq!(
+            mapped[0],
+            LocalLight::Point {
+                position: [1.0, 2.0, 3.0],
+                color_intensity: [2.0, 4.0, 8.0],
+                range: 8.0,
+            }
+        );
+        assert!(matches!(
+            mapped[1],
+            LocalLight::Spot {
+                color_intensity: [2.0, 1.0, 0.5],
+                range: 12.0,
+                cos_inner_angle,
+                cos_outer_angle,
+                ..
+            } if (cos_inner_angle - 10.0_f32.to_radians().cos()).abs() < 1e-6
+                && (cos_outer_angle - 25.0_f32.to_radians().cos()).abs() < 1e-6
+        ));
+
+        let ninety_degree = LocalLightState::Spot {
+            position: [0.0; 3],
+            direction: [0.0, 0.0, -1.0],
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 5.0,
+            inner_angle_deg: 90.0,
+            outer_angle_deg: 90.0,
+            shadows: false,
+        };
+        assert!(matches!(
+            render_local_lights(&[ninety_degree])[0],
+            LocalLight::Spot {
+                cos_inner_angle: 0.0,
+                cos_outer_angle: 0.0,
+                ..
+            }
+        ));
     }
 
     #[test]

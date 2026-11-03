@@ -500,6 +500,12 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.directional_light.is_some() {
         base.directional_light = outer.directional_light;
     }
+    if outer.point_light.is_some() {
+        base.point_light = outer.point_light;
+    }
+    if outer.spot_light.is_some() {
+        base.spot_light = outer.spot_light;
+    }
     if outer.environment.is_some() {
         base.environment = outer.environment.clone();
     }
@@ -531,6 +537,8 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.mesh_renderer.is_none()
         && change.camera.is_none()
         && change.directional_light.is_none()
+        && change.point_light.is_none()
+        && change.spot_light.is_none()
         && change.environment.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
@@ -600,6 +608,16 @@ pub(crate) fn object_override(
     match (base.directional_light, edited.directional_light) {
         (None, None) => {}
         (Some(from), Some(to)) => change.directional_light = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.point_light, edited.point_light) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.point_light = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.spot_light, edited.spot_light) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.spot_light = (to != from).then_some(to),
         _ => return Err(COMPONENTS.to_owned()),
     }
     match (&base.environment, &edited.environment) {
@@ -743,6 +761,8 @@ pub enum OverrideField {
     Mesh,
     Camera,
     Light,
+    PointLight,
+    SpotLight,
     Environment,
     LiteParams(VirtualPath),
     HeavyParams(String),
@@ -768,6 +788,8 @@ impl EditorScene {
             OverrideField::Mesh => change.mesh_renderer.is_some(),
             OverrideField::Camera => change.camera.is_some(),
             OverrideField::Light => change.directional_light.is_some(),
+            OverrideField::PointLight => change.point_light.is_some(),
+            OverrideField::SpotLight => change.spot_light.is_some(),
             OverrideField::Environment => change.environment.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
@@ -805,6 +827,8 @@ impl EditorScene {
                     OverrideField::Mesh => change.mesh_renderer = None,
                     OverrideField::Camera => change.camera = None,
                     OverrideField::Light => change.directional_light = None,
+                    OverrideField::PointLight => change.point_light = None,
+                    OverrideField::SpotLight => change.spot_light = None,
                     OverrideField::Environment => change.environment = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
@@ -1305,6 +1329,68 @@ mod tests {
                 .unwrap()
                 .hdr,
             Some(path("/environment/original.hdr"))
+        );
+    }
+
+    #[test]
+    fn local_light_prefab_overrides_replace_whole_components_and_revert() {
+        let prefab = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\ncolor = [0.8, 0.6, 0.4]\nintensity = 1.0\nrange = 5.0\n[objects.spot_light]\ncolor = [0.4, 0.6, 0.8]\nintensity = 2.0\nrange = 7.0\ninner_angle_deg = 10.0\nouter_angle_deg = 20.0\n";
+        let files = Files::with(&[("prefabs/lamp.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/lamp.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("lamp", None, |object| {
+                let point = object.point_light.as_mut().unwrap();
+                point.color = [1.5, 0.25, 0.1];
+                point.intensity = 4.0;
+                point.range = 12.0;
+                point.shadows = true;
+                let spot = object.spot_light.as_mut().unwrap();
+                spot.intensity = 3.5;
+                spot.range = 15.0;
+                spot.inner_angle_deg = 14.0;
+                spot.outer_angle_deg = 32.0;
+                Ok(())
+            })
+            .unwrap();
+        let change = scene.object_override("lamp").unwrap();
+        assert_eq!(
+            change.point_light,
+            scene.object("lamp").unwrap().point_light
+        );
+        assert_eq!(change.spot_light, scene.object("lamp").unwrap().spot_light);
+        assert!(scene.is_overridden("lamp", &OverrideField::PointLight));
+        assert!(scene.is_overridden("lamp", &OverrideField::SpotLight));
+        let (_, applied) = scene.prefab_with_override("lamp").unwrap();
+        assert_eq!(applied.objects[0].point_light, change.point_light);
+        assert_eq!(applied.objects[0].spot_light, change.spot_light);
+
+        scene
+            .revert_field("lamp", &OverrideField::PointLight)
+            .unwrap();
+        scene
+            .revert_field("lamp", &OverrideField::SpotLight)
+            .unwrap();
+        assert!(!scene.is_overridden("lamp", &OverrideField::PointLight));
+        assert!(!scene.is_overridden("lamp", &OverrideField::SpotLight));
+        assert_eq!(
+            scene.object("lamp").unwrap().point_light.unwrap().range,
+            5.0
+        );
+        assert_eq!(
+            scene
+                .object("lamp")
+                .unwrap()
+                .spot_light
+                .unwrap()
+                .outer_angle_deg,
+            20.0
         );
     }
 

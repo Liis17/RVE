@@ -4,8 +4,8 @@ use crate::CameraSettings;
 use crate::camera::Camera;
 use crate::document::{
     CameraComponent, DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript,
-    LodGroup, SceneDocument, SceneError, SceneObject, camera_from_matrix,
-    light_direction_from_matrix,
+    LodGroup, PointLightComponent, SceneDocument, SceneError, SceneObject, SpotLightComponent,
+    camera_from_matrix, light_direction_from_matrix,
 };
 use crate::light::ShadowSettings;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
@@ -77,6 +77,8 @@ pub struct WorldObject {
     pub camera: Option<CameraComponent>,
     pub camera_settings: Option<CameraSettings>,
     pub directional_light: Option<DirectionalLightComponent>,
+    pub point_light: Option<PointLightComponent>,
+    pub spot_light: Option<SpotLightComponent>,
     pub environment: Option<EnvironmentComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
@@ -102,6 +104,34 @@ impl Default for LightState {
     }
 }
 
+/// Пересчитанный локальный источник света в мировом пространстве.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LocalLightState {
+    Point {
+        position: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        shadows: bool,
+    },
+    Spot {
+        position: [f32; 3],
+        direction: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        inner_angle_deg: f32,
+        outer_angle_deg: f32,
+        shadows: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LastValidLocalLights {
+    point: Option<LocalLightState>,
+    spot: Option<LocalLightState>,
+}
+
 /// Экземпляр меша с handle объекта и мировой матрицей.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeshInstance {
@@ -115,6 +145,7 @@ pub struct SceneFrame {
     pub camera: Camera,
     pub view: CameraSettings,
     pub light: LightState,
+    pub local_lights: Vec<LocalLightState>,
     pub environment: Option<EnvironmentState>,
     pub meshes: Vec<MeshInstance>,
 }
@@ -147,6 +178,7 @@ pub struct World {
     active_camera: ObjectHandle,
     last_valid_camera: Option<(Camera, CameraSettings)>,
     last_valid_light: LightState,
+    last_valid_local_lights: Vec<LastValidLocalLights>,
     last_valid_environment: Option<EnvironmentState>,
     invalid_basis_reported: HashSet<ObjectHandle>,
 }
@@ -202,6 +234,7 @@ impl World {
         let (world_matrices, order) =
             calculate_world_matrices(&transforms, &parents, &object_ids, document.source_label())?;
         let world_rotations = calculate_world_rotations(&transforms, &parents, &order);
+        let object_count = objects.len();
         let mut world = Self {
             source_label: document.source_label().to_owned(),
             world_matrices,
@@ -223,6 +256,7 @@ impl World {
                 .expect("SceneDocument validation requires a camera"),
             last_valid_camera: None,
             last_valid_light: LightState::default(),
+            last_valid_local_lights: vec![LastValidLocalLights::default(); object_count],
             invalid_basis_reported: HashSet::new(),
             last_valid_environment: None,
         };
@@ -372,12 +406,15 @@ impl World {
         let mut warnings = Vec::new();
         let mut camera_state = self.last_valid_camera;
         let mut light = self.last_valid_light;
+        let mut local_lights = Vec::new();
 
         for index in 0..self.objects.len() {
             let matrix = self.world_matrices[index];
             let camera_settings = (self.active_camera.0 == index)
                 .then(|| self.objects[index].camera_settings.unwrap_or_default());
             let light_settings = self.objects[index].directional_light;
+            let point_settings = self.objects[index].point_light;
+            let spot_settings = self.objects[index].spot_light;
             if let Some(settings) = camera_settings {
                 if let Some(value) = camera_from_matrix(matrix, settings) {
                     let state = (value, settings);
@@ -399,6 +436,48 @@ impl World {
                         &mut warnings,
                     );
                 }
+            }
+            if let Some(settings) = point_settings {
+                if let Some(position) = local_light_position_from_matrix(matrix) {
+                    self.last_valid_local_lights[index].point = Some(LocalLightState::Point {
+                        position,
+                        color: settings.color,
+                        intensity: settings.intensity,
+                        range: settings.range,
+                        shadows: settings.shadows,
+                    });
+                } else {
+                    self.warn_invalid_basis(ObjectHandle(index), "точечного света", &mut warnings);
+                }
+            } else {
+                self.last_valid_local_lights[index].point = None;
+            }
+            if let Some(settings) = spot_settings {
+                if let (Some(position), Some(direction)) = (
+                    local_light_position_from_matrix(matrix),
+                    light_direction_from_matrix(matrix),
+                ) {
+                    self.last_valid_local_lights[index].spot = Some(LocalLightState::Spot {
+                        position,
+                        direction,
+                        color: settings.color,
+                        intensity: settings.intensity,
+                        range: settings.range,
+                        inner_angle_deg: settings.inner_angle_deg,
+                        outer_angle_deg: settings.outer_angle_deg,
+                        shadows: settings.shadows,
+                    });
+                } else {
+                    self.warn_invalid_basis(ObjectHandle(index), "spot света", &mut warnings);
+                }
+            } else {
+                self.last_valid_local_lights[index].spot = None;
+            }
+            if let Some(state) = self.last_valid_local_lights[index].point {
+                local_lights.push(state);
+            }
+            if let Some(state) = self.last_valid_local_lights[index].spot {
+                local_lights.push(state);
             }
         }
 
@@ -444,6 +523,7 @@ impl World {
                 camera,
                 view,
                 light,
+                local_lights,
                 environment,
                 meshes,
             },
@@ -483,6 +563,8 @@ fn world_object(
         camera: object.camera.clone(),
         camera_settings: object.camera.as_ref().map(|_| CameraSettings::default()),
         directional_light: object.directional_light,
+        point_light: object.point_light,
+        spot_light: object.spot_light,
         environment: object.environment.clone(),
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
@@ -577,6 +659,14 @@ fn light_state(settings: DirectionalLightComponent, direction: [f32; 3]) -> Ligh
             cascades: settings.shadow_cascades,
         }),
     }
+}
+
+fn local_light_position_from_matrix(matrix: Mat4) -> Option<[f32; 3]> {
+    if !matrix.is_finite() {
+        return None;
+    }
+    let position = matrix.w_axis.truncate();
+    position.is_finite().then(|| position.to_array())
 }
 
 #[cfg(test)]
@@ -984,6 +1074,70 @@ id="second"
         let (second, warnings) = world.build_frame();
         assert_eq!(second.light, previous);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn local_light_world_position_and_spot_direction_follow_full_hierarchy_matrix() {
+        let scene = format!(
+            "{CAMERA_SCENE}\n[[objects]]\nid=\"rig\"\n[objects.transform]\nposition=[3.0,2.0,-4.0]\nrotation=[15.0,35.0,5.0]\nscale=[-2.0,3.0,0.75]\n[[objects]]\nid=\"lamp\"\nparent=\"rig\"\n[objects.transform]\nposition=[1.0,0.5,-2.0]\nrotation=[20.0,-10.0,30.0]\n[objects.point_light]\nrange=15.0\n[[objects]]\nid=\"spot\"\nparent=\"rig\"\n[objects.transform]\nposition=[-1.0,0.25,2.0]\nrotation=[10.0,25.0,0.0]\n[objects.spot_light]\n"
+        );
+        let mut world = World::from_document(&parse(&scene)).unwrap();
+        let frame = world.build_frame().0;
+        let lamp_matrix = world.world_matrix(world.handle("lamp").unwrap()).unwrap();
+        let spot_matrix = world.world_matrix(world.handle("spot").unwrap()).unwrap();
+        let expected_position = lamp_matrix.w_axis.truncate().to_array();
+        let expected_spot_position = spot_matrix.w_axis.truncate().to_array();
+        let expected_direction = spot_matrix
+            .transform_vector3(Vec3::NEG_Z)
+            .normalize()
+            .to_array();
+        assert_eq!(frame.local_lights.len(), 2);
+        assert!(matches!(
+            frame.local_lights[0],
+            super::LocalLightState::Point { position, range: 15.0, .. }
+                if position == expected_position
+        ));
+        assert!(matches!(
+            frame.local_lights[1],
+            super::LocalLightState::Spot { position, direction, .. }
+                if position == expected_spot_position
+                    && Vec3::from_array(direction).abs_diff_eq(Vec3::from_array(expected_direction), 1e-6)
+        ));
+    }
+
+    #[test]
+    fn dynamic_invalid_spot_basis_keeps_last_valid_state_and_warns_once() {
+        let scene = format!("{CAMERA_SCENE}\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\n");
+        let mut world = World::from_document(&parse(&scene)).unwrap();
+        let handle = world.handle("spot").unwrap();
+        let previous = world.build_frame().0.local_lights;
+        world
+            .set_local_transform(
+                handle,
+                LocalTransform {
+                    scale: Vec3::new(1.0, 1.0, 0.0),
+                    ..LocalTransform::default()
+                },
+            )
+            .unwrap();
+        let (first, warnings) = world.build_frame();
+        assert_eq!(first.local_lights, previous);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].object_id, "spot");
+        assert!(warnings[0].message.contains("spot"));
+        let (second, warnings) = world.build_frame();
+        assert_eq!(second.local_lights, previous);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn invalid_initial_spot_basis_is_rejected() {
+        let scene = format!(
+            "{CAMERA_SCENE}\n[[objects]]\nid=\"spot\"\n[objects.transform]\nscale=[1.0,1.0,0.0]\n[objects.spot_light]\n"
+        );
+        let error = SceneDocument::parse("invalid-spot.rvescene", &scene).unwrap_err();
+        assert_eq!(error.object_id.as_deref(), Some("spot"));
+        assert!(error.message.contains("spot_light"));
     }
 
     #[test]

@@ -257,6 +257,8 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
                 ("Create Empty", NewObject::Empty),
                 ("Camera", NewObject::Camera),
                 ("Directional Light", NewObject::DirectionalLight),
+                ("Point Light", NewObject::PointLight),
+                ("Spot Light", NewObject::SpotLight),
             ];
             for (label, kind) in items {
                 if ui.button(label).clicked() {

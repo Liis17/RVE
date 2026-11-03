@@ -614,6 +614,7 @@ impl WindowHandler for Sandbox {
                     (Mat4::IDENTITY, view_projection)
                 }
             });
+        let local_lights = self.content.local_lights();
         let frame = Frame {
             clear_color: [
                 self.camera_settings.render.clear_color[0],
@@ -634,6 +635,7 @@ impl WindowHandler for Sandbox {
             }),
             shadow_cascades: &shadow_cascades,
             light: self.content.light(elapsed),
+            lights: &local_lights,
             draws: &draws,
             overlay,
             view: ViewSettings {

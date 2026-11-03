@@ -249,6 +249,12 @@ impl SceneDocument {
                 light_count += 1;
                 validate_light(source, object, light)?;
             }
+            if let Some(light) = &object.point_light {
+                validate_point_light(source, object, light)?;
+            }
+            if let Some(light) = &object.spot_light {
+                validate_spot_light(source, object, light)?;
+            }
             if let Some(environment) = &object.environment {
                 environment_count += 1;
                 validate_environment(source, &object.id, &asset_paths, environment)?;
@@ -420,6 +426,13 @@ impl SceneDocument {
                     "мировое направление directional_light должно быть конечным и ненулевым",
                 ));
             }
+            if object.spot_light.is_some() && light_direction_from_matrix(matrix).is_none() {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    "мировое направление spot_light должно быть конечным и ненулевым",
+                ));
+            }
         }
         Ok(())
     }
@@ -454,6 +467,10 @@ pub struct SceneObject {
     pub lod_group: Option<LodGroup>,
     #[serde(default)]
     pub directional_light: Option<DirectionalLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_light: Option<PointLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_light: Option<SpotLightComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
     #[serde(default)]
@@ -623,6 +640,54 @@ pub struct DirectionalLightComponent {
     pub shadow_distance: f32,
     #[serde(default = "default_shadow_cascades")]
     pub shadow_cascades: u8,
+}
+
+/// Локальный точечный источник света.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PointLightComponent {
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    /// Зарезервировано для реализации теней локальных источников.
+    pub shadows: bool,
+}
+
+impl Default for PointLightComponent {
+    fn default() -> Self {
+        Self {
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 10.0,
+            shadows: false,
+        }
+    }
+}
+
+/// Локальный конический источник света, направленный вдоль мирового −Z объекта.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpotLightComponent {
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_angle_deg: f32,
+    pub outer_angle_deg: f32,
+    /// Зарезервировано для реализации теней локальных источников.
+    pub shadows: bool,
+}
+
+impl Default for SpotLightComponent {
+    fn default() -> Self {
+        Self {
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 10.0,
+            inner_angle_deg: 20.0,
+            outer_angle_deg: 30.0,
+            shadows: false,
+        }
+    }
 }
 
 /// Окружение сцены: Radiance HDR panorama или процедурное небо.
@@ -834,6 +899,84 @@ fn validate_light(
             source,
             Some(&object.id),
             "directional_light.shadow_cascades должен быть в диапазоне 1..=4",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_point_light(
+    source: &str,
+    object: &SceneObject,
+    light: &PointLightComponent,
+) -> Result<(), SceneError> {
+    if !light
+        .color
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+    {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "point_light.color должен содержать конечные компоненты >= 0",
+        ));
+    }
+    if !light.intensity.is_finite() || light.intensity < 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "point_light.intensity должен быть конечным и >= 0",
+        ));
+    }
+    if !light.range.is_finite() || light.range <= 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "point_light.range должен быть конечным и > 0",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_spot_light(
+    source: &str,
+    object: &SceneObject,
+    light: &SpotLightComponent,
+) -> Result<(), SceneError> {
+    if !light
+        .color
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+    {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "spot_light.color должен содержать конечные компоненты >= 0",
+        ));
+    }
+    if !light.intensity.is_finite() || light.intensity < 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "spot_light.intensity должен быть конечным и >= 0",
+        ));
+    }
+    if !light.range.is_finite() || light.range <= 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "spot_light.range должен быть конечным и > 0",
+        ));
+    }
+    if !light.inner_angle_deg.is_finite()
+        || !light.outer_angle_deg.is_finite()
+        || light.inner_angle_deg <= 0.0
+        || light.inner_angle_deg > light.outer_angle_deg
+        || light.outer_angle_deg > 90.0
+    {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "spot_light angles должны удовлетворять 0 < inner_angle_deg <= outer_angle_deg <= 90",
         ));
     }
     Ok(())
@@ -1964,6 +2107,77 @@ scale=[1.0,1.0,0.0]
         ))
         .unwrap();
         assert!(shadow_enabled.objects[1].directional_light.unwrap().shadows);
+    }
+
+    #[test]
+    fn local_light_defaults_round_trip_and_validate_all_factors() {
+        let input = format!(
+            "{VALID}\n[[objects]]\nid=\"point\"\n[objects.point_light]\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\n"
+        );
+        let document = parse(&input).unwrap();
+        let point = document.objects[1].point_light.unwrap();
+        assert_eq!(point.color, [1.0; 3]);
+        assert_eq!(point.intensity, 1.0);
+        assert_eq!(point.range, 10.0);
+        assert!(!point.shadows);
+        let spot = document.objects[2].spot_light.unwrap();
+        assert_eq!(spot.color, [1.0; 3]);
+        assert_eq!(spot.intensity, 1.0);
+        assert_eq!(spot.range, 10.0);
+        assert_eq!(spot.inner_angle_deg, 20.0);
+        assert_eq!(spot.outer_angle_deg, 30.0);
+        assert!(!spot.shadows);
+        assert!(parse(&document.to_toml().unwrap()).is_ok());
+
+        for field in [
+            "color=[-1.0,1.0,1.0]",
+            "color=[nan,1.0,1.0]",
+            "intensity=-1.0",
+            "intensity=inf",
+            "range=0.0",
+            "range=nan",
+            "unknown=true",
+        ] {
+            let input =
+                format!("{VALID}\n[[objects]]\nid=\"point\"\n[objects.point_light]\n{field}\n");
+            assert!(parse(&input).is_err(), "accepted point_light.{field}");
+            let input =
+                format!("{VALID}\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\n{field}\n");
+            assert!(parse(&input).is_err(), "accepted spot_light.{field}");
+        }
+        for (inner, outer) in [
+            ("0.0", "30.0"),
+            ("31.0", "30.0"),
+            ("20.0", "91.0"),
+            ("nan", "30.0"),
+            ("20.0", "inf"),
+        ] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\ninner_angle_deg={inner}\nouter_angle_deg={outer}\n"
+            );
+            assert!(
+                parse(&input).is_err(),
+                "accepted spot cone {inner}..{outer}"
+            );
+        }
+        assert!(parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\ninner_angle_deg=90.0\nouter_angle_deg=90.0\n"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn local_lights_are_unlimited_and_independent_of_directional_light_limit() {
+        let mut input = VALID.to_owned();
+        for index in 0..40 {
+            input.push_str(&format!(
+                "\n[[objects]]\nid=\"point-{index}\"\n[objects.point_light]\n"
+            ));
+        }
+        input.push_str("\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\n");
+        assert!(parse(&input).is_ok());
+        input.push_str("\n[[objects]]\nid=\"sun2\"\n[objects.directional_light]\n");
+        assert!(parse(&input).is_err());
     }
 
     #[test]

@@ -18,8 +18,8 @@ pub use camera_settings::{
 pub use document::{
     CameraComponent, DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript,
     LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer,
-    ParamValue, ProceduralSkyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
-    SceneTransform,
+    ParamValue, PointLightComponent, ProceduralSkyComponent, SceneAsset, SceneDocument, SceneError,
+    SceneObject, SceneTransform, SpotLightComponent,
 };
 pub use params::{ParamKind, ParamSchema, ParamSpec};
 pub use prefab::{
@@ -28,6 +28,6 @@ pub use prefab::{
     expand_without_overrides,
 };
 pub use world::{
-    EnvironmentState, LightState, LocalTransform, MeshInstance, ObjectHandle, SceneFrame,
-    SceneWarning, World, WorldObject,
+    EnvironmentState, LightState, LocalLightState, LocalTransform, MeshInstance, ObjectHandle,
+    SceneFrame, SceneWarning, World, WorldObject,
 };

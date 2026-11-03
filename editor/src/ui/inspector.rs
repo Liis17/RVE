@@ -9,8 +9,8 @@ use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
     CameraComponent, EnvironmentComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS,
-    MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, ProceduralSkyComponent, SceneObject,
-    SceneTransform,
+    MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
+    ProceduralSkyComponent, SceneObject, SceneTransform, SpotLightComponent,
 };
 use std::collections::BTreeMap;
 
@@ -130,6 +130,12 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     }
     if object.directional_light.is_some() {
         show_light(ui, state, object);
+    }
+    if let Some(light) = object.point_light {
+        show_point_light(ui, state, id, light);
+    }
+    if let Some(light) = object.spot_light {
+        show_spot_light(ui, state, id, light);
     }
     if let Some(environment) = &object.environment {
         show_environment(ui, state, id, environment);
@@ -1050,6 +1056,146 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
     run_menu_action(state, id, ComponentKind::DirectionalLight, action);
 }
 
+fn show_point_light(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    light: PointLightComponent,
+) {
+    let field = OverrideField::PointLight;
+    let action = component_header(
+        ui,
+        "Point Light",
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::PointLight)),
+        true,
+        |ui| {
+            egui::Grid::new("point_light")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    let mut value = light;
+                    let (picked, color) = color_row(ui, "Color", &mut value.color);
+                    ui.label("Intensity");
+                    let intensity = ui.add(
+                        egui::DragValue::new(&mut value.intensity)
+                            .speed(0.05)
+                            .range(0.0..=f32::MAX),
+                    );
+                    ui.end_row();
+                    ui.label("Range");
+                    let range = ui.add(
+                        egui::DragValue::new(&mut value.range)
+                            .speed(0.05)
+                            .range(f32::MIN_POSITIVE..=f32::MAX),
+                    );
+                    ui.end_row();
+                    ui.label("Shadows");
+                    let shadows = ui.checkbox(&mut value.shadows, "");
+                    ui.end_row();
+                    let response = color | intensity | range | shadows;
+                    commit_picker(state, ui, id, "point_light", picked, |object| {
+                        object.point_light = Some(value);
+                    });
+                    if !picked {
+                        commit(state, id, "point_light", &response, |object| {
+                            object.point_light = Some(value);
+                        });
+                    }
+                });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| {
+            scene.edit_object(id, None, |object| {
+                object.point_light = None;
+                Ok(())
+            })
+        });
+    }
+    run_menu_action(state, id, ComponentKind::PointLight, action);
+}
+
+fn show_spot_light(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    light: SpotLightComponent,
+) {
+    let field = OverrideField::SpotLight;
+    let action = component_header(
+        ui,
+        "Spot Light",
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::SpotLight)),
+        true,
+        |ui| {
+            egui::Grid::new("spot_light").num_columns(2).show(ui, |ui| {
+                let mut value = light;
+                let (picked, color) = color_row(ui, "Color", &mut value.color);
+                ui.label("Intensity");
+                let intensity = ui.add(
+                    egui::DragValue::new(&mut value.intensity)
+                        .speed(0.05)
+                        .range(0.0..=f32::MAX),
+                );
+                ui.end_row();
+                ui.label("Range");
+                let range = ui.add(
+                    egui::DragValue::new(&mut value.range)
+                        .speed(0.05)
+                        .range(f32::MIN_POSITIVE..=f32::MAX),
+                );
+                ui.end_row();
+                ui.label("Inner Angle");
+                let inner = ui.add(
+                    egui::DragValue::new(&mut value.inner_angle_deg)
+                        .speed(0.5)
+                        .range(0.01..=value.outer_angle_deg),
+                );
+                ui.end_row();
+                ui.label("Outer Angle");
+                let outer = ui.add(
+                    egui::DragValue::new(&mut value.outer_angle_deg)
+                        .speed(0.5)
+                        .range(value.inner_angle_deg..=90.0),
+                );
+                ui.end_row();
+                ui.label("Shadows");
+                let shadows = ui.checkbox(&mut value.shadows, "");
+                ui.end_row();
+                let response = color | intensity | range | inner | outer | shadows;
+                commit_picker(state, ui, id, "spot_light", picked, |object| {
+                    object.spot_light = Some(value);
+                });
+                if !picked {
+                    commit(state, id, "spot_light", &response, |object| {
+                        object.spot_light = Some(value);
+                    });
+                }
+            });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| {
+            scene.edit_object(id, None, |object| {
+                object.spot_light = None;
+                Ok(())
+            })
+        });
+    }
+    run_menu_action(state, id, ComponentKind::SpotLight, action);
+}
+
 fn show_environment(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -1616,6 +1762,16 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                     object.directional_light = Some(default_light());
                     Ok(())
                 })
+            });
+        }
+        if object.point_light.is_none() && ui.button("Point Light").clicked() {
+            state.edit_scene(|scene| {
+                scene.set_component(id, Component::PointLight(PointLightComponent::default()))
+            });
+        }
+        if object.spot_light.is_none() && ui.button("Spot Light").clicked() {
+            state.edit_scene(|scene| {
+                scene.set_component(id, Component::SpotLight(SpotLightComponent::default()))
             });
         }
         if object.environment.is_none() {

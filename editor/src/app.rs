@@ -11,7 +11,7 @@ use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt};
 use crate::ui;
 use crate::ui::scene_view::bounding_sphere;
 use crate::ui_render::{ConvertedMesh, UiBridge};
-use crate::viewport::render::SceneRenderer;
+use crate::viewport::render::{SceneRenderer, render_local_lights};
 use egui_dock::DockState;
 use engine_files::VirtualPath;
 use engine_render::{
@@ -946,6 +946,7 @@ fn render_scene_frame(
     let Some(parts) = state.frame_parts() else {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
+    let local_lights = render_local_lights(&scene_frame.local_lights);
     gpu.scene.build_draws(
         &mut gpu.renderer,
         parts.world,
@@ -977,6 +978,7 @@ fn render_scene_frame(
             height,
             scene_settings,
             &scene_frame.light,
+            &local_lights,
             has_light,
             scene_frame.environment.as_ref(),
             &scene_shadow_cascades,
@@ -990,6 +992,7 @@ fn render_scene_frame(
             height,
             game_settings,
             &scene_frame.light,
+            &local_lights,
             has_light,
             scene_frame.environment.as_ref(),
             &game_shadow_cascades,

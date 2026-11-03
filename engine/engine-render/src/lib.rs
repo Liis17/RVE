@@ -21,6 +21,8 @@ use ui::{
 mod culling;
 mod ui;
 
+include!(concat!(env!("OUT_DIR"), "/render_constants.rs"));
+
 pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -80,8 +82,9 @@ const FLAT_NORMAL_TEXTURE: usize = 2;
 const DEFAULT_MATERIAL: usize = 0;
 const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
 const FRAME_UNIFORMS_SIZE: usize =
-    (3 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 6 * size_of::<[f32; 4]>();
+    (3 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 7 * size_of::<[f32; 4]>();
 const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
+const LOCAL_LIGHT_GPU_SIZE: usize = 4 * size_of::<[f32; 4]>();
 const IDENTITY_MATRIX: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -204,6 +207,25 @@ pub struct DirectionalLight {
     pub ambient: [f32; 3],
 }
 
+/// A point or spot light accepted by the renderer. `color_intensity` is linear RGB after
+/// multiplying the scene color by its intensity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LocalLight {
+    Point {
+        position: [f32; 3],
+        color_intensity: [f32; 3],
+        range: f32,
+    },
+    Spot {
+        position: [f32; 3],
+        direction: [f32; 3],
+        color_intensity: [f32; 3],
+        range: f32,
+        cos_inner_angle: f32,
+        cos_outer_angle: f32,
+    },
+}
+
 impl Default for DirectionalLight {
     /// Свет сверху слева со стороны камеры, смотрящей вдоль -Z.
     fn default() -> Self {
@@ -251,6 +273,7 @@ pub struct Frame<'a> {
     pub environment: Option<FrameEnvironment>,
     pub shadow_cascades: &'a [[[f32; 4]; 4]],
     pub light: DirectionalLight,
+    pub lights: &'a [LocalLight],
     pub draws: &'a [DrawCommand],
     pub overlay: &'a [OverlayVertex],
     pub view: ViewSettings,
@@ -1008,7 +1031,7 @@ impl Renderer {
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         validate_overlay(frame.overlay)?;
-        let uniforms = frame_uniform_bytes(frame)?;
+        let prepared = prepare_frame(frame)?;
         let (environment_set, skybox) = self.environment_set_for(frame.environment)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(FrameStatus::Skipped);
@@ -1050,12 +1073,34 @@ impl Renderer {
         let timestamps = frame_resources.timestamps;
         let frame_uniforms =
             self.frame_uniforms
-                .get(frame_slot)
+                .get_mut(frame_slot)
                 .ok_or(RenderError::InvalidState(
                     "нет uniform-буфера текущего кадра",
                 ))?;
         // Fence слота дождались, поэтому GPU больше не читает этот буфер.
-        frame_uniforms.buffer.write(&uniforms)?;
+        frame_uniforms.buffer.write(&prepared.uniforms)?;
+        let local_light_bytes = local_light_bytes(&prepared.lights);
+        let replaced_light_buffer = frame_uniforms.local_lights.write_keep_old(
+            &instance,
+            &device,
+            self.physical_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            &local_light_bytes,
+        )?;
+        if replaced_light_buffer.is_some() {
+            let light_buffer = frame_uniforms
+                .local_lights
+                .buffer
+                .as_ref()
+                .ok_or(RenderError::InvalidState("local light buffer отсутствует"))?;
+            write_local_light_descriptor(
+                &device,
+                frame_uniforms.set,
+                light_buffer,
+                frame_uniforms.local_lights.capacity,
+            );
+        }
+        drop(replaced_light_buffer);
         let frame_set = frame_uniforms.set;
         let render_extent = scaled_extent(swapchain.extent, frame.view.render_scale);
         // Цели создаются при первом кадре: редактору они не нужны. Выделение идёт до acquire,
@@ -1208,7 +1253,7 @@ impl Renderer {
         clear: [f32; 4],
     ) -> Result<FrameStatus, RenderError> {
         validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
-        let mut scene_uniforms = Vec::with_capacity(scenes.len());
+        let mut prepared_scenes = Vec::with_capacity(scenes.len());
         let mut scene_environment_sets = Vec::with_capacity(scenes.len());
         for (viewport, frame) in scenes {
             validate_draws(frame.draws, &self.meshes, &self.materials)?;
@@ -1216,7 +1261,7 @@ impl Renderer {
                 .get(viewport.0)
                 .and_then(Option::as_ref)
                 .ok_or_else(unknown_viewport)?;
-            scene_uniforms.push(frame_uniform_bytes(frame)?);
+            prepared_scenes.push(prepare_frame(frame)?);
             scene_environment_sets.push(self.environment_set_for(frame.environment)?);
         }
         let packed = pack_ui(ui, self.output_extent)?;
@@ -1290,9 +1335,9 @@ impl Renderer {
         };
         let physical_device = self.physical_device;
         let mut rendered = Vec::with_capacity(scenes.len());
-        for (((viewport, frame), uniforms), (environment_set, skybox)) in scenes
+        for (((viewport, frame), prepared), (environment_set, skybox)) in scenes
             .iter()
-            .zip(&scene_uniforms)
+            .zip(&prepared_scenes)
             .zip(&scene_environment_sets)
         {
             let entry = self.viewports[viewport.0]
@@ -1316,8 +1361,14 @@ impl Renderer {
                     &target_resources,
                 )?);
             }
-            let target = slot_target.as_ref().ok_or_else(unknown_viewport)?;
-            let frame_set = target.frame_set.write(uniforms)?;
+            let target = slot_target.as_mut().ok_or_else(unknown_viewport)?;
+            let frame_set = target.frame_set.write(
+                &instance,
+                &device,
+                physical_device,
+                &prepared.uniforms,
+                &prepared.lights,
+            )?;
             rendered.push((
                 *viewport,
                 *frame,
@@ -1874,6 +1925,11 @@ impl Renderer {
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let frame_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&frame_bindings);
@@ -2011,11 +2067,14 @@ impl Renderer {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(self.frames.len() as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(self.frames.len() as u32),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(self.frames.len() as u32)
             .pool_sizes(&pool_sizes);
-        // SAFETY: the pool holds one uniform, sampled image and sampler set per frame slot.
+        // SAFETY: the pool holds one frame uniform, two images, two samplers and a light SSBO per slot.
         let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
         self.frame_descriptor_pool = Some(pool);
         let layouts = vec![self.frame_set_layout()?; self.frames.len()];
@@ -2032,8 +2091,30 @@ impl Renderer {
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 &[0; FRAME_UNIFORMS_SIZE],
             )?;
-            write_frame_set(&device, set, &buffer, shadow_view, shadow_sampler);
-            self.frame_uniforms.push(FrameUniforms { buffer, set });
+            let light_bytes = local_light_bytes(&[]);
+            let light_buffer = HostBuffer::new(
+                self.instance()?,
+                &device,
+                self.physical_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                &light_bytes,
+            )?;
+            write_frame_set(
+                &device,
+                set,
+                &buffer,
+                &light_buffer,
+                shadow_view,
+                shadow_sampler,
+            );
+            self.frame_uniforms.push(FrameUniforms {
+                buffer,
+                set,
+                local_lights: GrowingBuffer {
+                    buffer: Some(light_buffer),
+                    capacity: light_bytes.len(),
+                },
+            });
         }
 
         let post_set_count = (self.frames.len() * 2) as u32;
@@ -3732,12 +3813,12 @@ impl Drop for Renderer {
         self.meshes.clear();
         self.materials.clear();
         self.textures.clear();
-        self.frame_uniforms.clear();
         if let Some(device) = self.device.as_ref() {
             if let Some(pool) = self.frame_descriptor_pool.take() {
                 // SAFETY: the device is idle; destroying the pool frees its frame sets.
                 unsafe { device.destroy_descriptor_pool(pool, None) };
             }
+            self.frame_uniforms.clear();
             if let Some(pool) = self.post_descriptor_pool.take() {
                 // SAFETY: frame targets are gone; destroying the pool frees their post sets.
                 unsafe { device.destroy_descriptor_pool(pool, None) };
@@ -4497,26 +4578,37 @@ impl GrowingBuffer {
         usage: vk::BufferUsageFlags,
         bytes: &[u8],
     ) -> Result<(), RenderError> {
+        drop(self.write_keep_old(instance, device, physical_device, usage, bytes)?);
+        Ok(())
+    }
+
+    /// Grows a descriptor-backed slot buffer without dropping its prior buffer until the
+    /// descriptor has been redirected by the caller.
+    fn write_keep_old(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        usage: vk::BufferUsageFlags,
+        bytes: &[u8],
+    ) -> Result<Option<HostBuffer>, RenderError> {
         if bytes.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         if self.buffer.is_none() || self.capacity < bytes.len() {
             let capacity = bytes.len().next_power_of_two();
-            self.buffer = None;
-            self.capacity = 0;
-            self.buffer = Some(HostBuffer::new(
-                instance,
-                device,
-                physical_device,
-                usage,
-                &vec![0; capacity],
-            )?);
+            let mut data = vec![0; capacity];
+            data[..bytes.len()].copy_from_slice(bytes);
+            let new_buffer = HostBuffer::new(instance, device, physical_device, usage, &data)?;
+            let previous = self.buffer.replace(new_buffer);
             self.capacity = capacity;
+            return Ok(previous);
         }
         self.buffer
             .as_ref()
             .ok_or(RenderError::InvalidState("буфер кадра отсутствует"))?
-            .write(bytes)
+            .write(bytes)?;
+        Ok(None)
     }
 }
 
@@ -4603,11 +4695,12 @@ impl FrameTarget {
     }
 }
 
-/// Заполняет набор дескрипторов кадра: uniform-буфер и общую shadow map.
+/// Заполняет набор дескрипторов кадра: uniform, shadow map и локальные источники.
 fn write_frame_set(
     device: &ash::Device,
     set: vk::DescriptorSet,
     buffer: &HostBuffer,
+    local_lights: &HostBuffer,
     shadow_view: vk::ImageView,
     shadow_sampler: vk::Sampler,
 ) {
@@ -4619,6 +4712,10 @@ fn write_frame_set(
         .image_view(shadow_view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
     let shadow_sampler_info = [vk::DescriptorImageInfo::default().sampler(shadow_sampler)];
+    let local_light_info = [vk::DescriptorBufferInfo::default()
+        .buffer(local_lights.buffer)
+        .offset(0)
+        .range(LOCAL_LIGHT_GPU_SIZE as vk::DeviceSize)];
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(set)
@@ -4635,8 +4732,32 @@ fn write_frame_set(
             .dst_binding(2)
             .descriptor_type(vk::DescriptorType::SAMPLER)
             .image_info(&shadow_sampler_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&local_light_info),
     ];
-    // SAFETY: the set and buffer are alive and no command buffer uses the set yet.
+    // SAFETY: all resources are alive and no command buffer uses the set yet.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
+
+fn write_local_light_descriptor(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    buffer: &HostBuffer,
+    range: usize,
+) {
+    let info = [vk::DescriptorBufferInfo::default()
+        .buffer(buffer.buffer)
+        .offset(0)
+        .range(range as vk::DeviceSize)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(3)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&info)];
+    // SAFETY: the owning slot fence has completed and both old/new buffers remain alive through update.
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
 
@@ -4656,6 +4777,7 @@ struct ViewportFrameSet {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     buffer: HostBuffer,
+    local_lights: GrowingBuffer,
 }
 
 impl ViewportFrameSet {
@@ -4672,6 +4794,14 @@ impl ViewportFrameSet {
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &[0; FRAME_UNIFORMS_SIZE],
         )?;
+        let light_bytes = local_light_bytes(&[]);
+        let light_buffer = HostBuffer::new(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            &light_bytes,
+        )?;
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
@@ -4682,11 +4812,14 @@ impl ViewportFrameSet {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
             .pool_sizes(&pool_sizes);
-        // SAFETY: the pool holds exactly the descriptors of one frame set.
+        // SAFETY: the pool holds exactly one frame set and its light storage buffer.
         let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
         let layouts = [resources.frame_set_layout];
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
@@ -4706,6 +4839,7 @@ impl ViewportFrameSet {
             device,
             set,
             &buffer,
+            &light_buffer,
             resources.shadow_view,
             resources.shadow_sampler,
         );
@@ -4714,12 +4848,42 @@ impl ViewportFrameSet {
             pool,
             set,
             buffer,
+            local_lights: GrowingBuffer {
+                buffer: Some(light_buffer),
+                capacity: light_bytes.len(),
+            },
         })
     }
 
-    /// Записывает uniform-данные кадра; вызывается после ожидания fence слота цели.
-    fn write(&self, uniforms: &[u8]) -> Result<vk::DescriptorSet, RenderError> {
+    /// Записывает frame uniform и локальные lights после ожидания fence viewport-слота.
+    fn write(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        uniforms: &[u8],
+        lights: &[LocalLight],
+    ) -> Result<vk::DescriptorSet, RenderError> {
         self.buffer.write(uniforms)?;
+        let bytes = local_light_bytes(lights);
+        let replaced = self.local_lights.write_keep_old(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            &bytes,
+        )?;
+        if replaced.is_some() {
+            let buffer = self
+                .local_lights
+                .buffer
+                .as_ref()
+                .ok_or(RenderError::InvalidState(
+                    "viewport local light buffer отсутствует",
+                ))?;
+            write_local_light_descriptor(device, self.set, buffer, self.local_lights.capacity);
+        }
+        drop(replaced);
         Ok(self.set)
     }
 }
@@ -6973,6 +7137,7 @@ fn create_post_pipeline(
 struct FrameUniforms {
     buffer: HostBuffer,
     set: vk::DescriptorSet,
+    local_lights: GrowingBuffer,
 }
 
 /// Текстура в device-local памяти; материал выбирает её цветовое пространство.
@@ -7324,7 +7489,7 @@ fn index_bytes(indices: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
 }
 
-/// Байты `FrameUniforms` в порядке std140: шесть матриц и шесть `vec4`.
+/// Байты `FrameUniforms` в порядке std140: семь матриц и семь `vec4`.
 /// Viewport рисуется в кадре один раз: его цель и uniform-буфер принадлежат одной сцене.
 fn validate_scene_viewports(
     viewports: impl Iterator<Item = ViewportId>,
@@ -7341,7 +7506,279 @@ fn validate_scene_viewports(
     Ok(())
 }
 
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+struct GpuLocalLight {
+    position_range: [f32; 4],
+    direction_type: [f32; 4],
+    color_intensity: [f32; 4],
+    cone_params: [f32; 4],
+}
+
+struct PreparedFrame {
+    uniforms: [u8; FRAME_UNIFORMS_SIZE],
+    lights: Vec<LocalLight>,
+}
+
+fn prepare_frame(frame: &Frame<'_>) -> Result<PreparedFrame, RenderError> {
+    let lights = select_local_lights(frame.camera, frame.lights)?;
+    let uniforms = frame_uniform_bytes_with_count(frame, lights.len())?;
+    Ok(PreparedFrame { uniforms, lights })
+}
+
+fn select_local_lights(
+    camera: FrameCamera,
+    lights: &[LocalLight],
+) -> Result<Vec<LocalLight>, RenderError> {
+    if !camera.position.into_iter().all(f32::is_finite)
+        || !camera.view.iter().flatten().all(|value| value.is_finite())
+        || !camera
+            .projection
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    {
+        return Err(RenderError::InvalidConfig(
+            "camera matrices and position must be finite",
+        ));
+    }
+    let view_projection = multiply_4x4(camera.projection, camera.view);
+    let frustum = Frustum::from_view_projection(view_projection);
+    let mut visible = Vec::with_capacity(lights.len().min(MAX_FORWARD_LIGHTS));
+    for (index, light) in lights.iter().copied().enumerate() {
+        let light = validate_local_light(light)?;
+        if local_light_visible(frustum, light) {
+            visible.push((
+                index,
+                local_light_contribution(camera.position, light),
+                light,
+            ));
+        }
+    }
+    visible.sort_by(
+        |(left_index, left_score, _), (right_index, right_score, _)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
+    Ok(visible
+        .into_iter()
+        .take(MAX_FORWARD_LIGHTS)
+        .map(|(_, _, light)| light)
+        .collect())
+}
+
+fn validate_local_light(light: LocalLight) -> Result<LocalLight, RenderError> {
+    let validate_common = |position: [f32; 3], color: [f32; 3], range: f32| {
+        if !position.into_iter().all(f32::is_finite) {
+            return Err(RenderError::InvalidConfig(
+                "local light position must contain finite values",
+            ));
+        }
+        if !color
+            .into_iter()
+            .all(|value| value.is_finite() && value >= 0.0)
+        {
+            return Err(RenderError::InvalidConfig(
+                "local light color_intensity must contain finite non-negative values",
+            ));
+        }
+        if !range.is_finite() || range <= 0.0 {
+            return Err(RenderError::InvalidConfig(
+                "local light range must be finite and positive",
+            ));
+        }
+        Ok(())
+    };
+    match light {
+        LocalLight::Point {
+            position,
+            color_intensity,
+            range,
+        } => {
+            validate_common(position, color_intensity, range)?;
+            Ok(light)
+        }
+        LocalLight::Spot {
+            position,
+            direction,
+            color_intensity,
+            range,
+            cos_inner_angle,
+            cos_outer_angle,
+        } => {
+            validate_common(position, color_intensity, range)?;
+            if !direction.into_iter().all(f32::is_finite) {
+                return Err(RenderError::InvalidConfig(
+                    "spot light direction must contain finite values",
+                ));
+            }
+            let length = direction
+                .into_iter()
+                .map(|value| f64::from(value) * f64::from(value))
+                .sum::<f64>()
+                .sqrt();
+            if !length.is_finite() || length <= f64::EPSILON {
+                return Err(RenderError::InvalidConfig(
+                    "spot light direction must be non-zero",
+                ));
+            }
+            if !cos_inner_angle.is_finite()
+                || !cos_outer_angle.is_finite()
+                || cos_inner_angle < 0.0
+                || cos_inner_angle > 1.0
+                || cos_outer_angle < 0.0
+                || cos_outer_angle > cos_inner_angle
+            {
+                return Err(RenderError::InvalidConfig(
+                    "spot light cos angles must satisfy 0 <= cos_outer <= cos_inner <= 1",
+                ));
+            }
+            Ok(LocalLight::Spot {
+                position,
+                direction: direction.map(|value| (f64::from(value) / length) as f32),
+                color_intensity,
+                range,
+                cos_inner_angle,
+                cos_outer_angle,
+            })
+        }
+    }
+}
+
+fn local_light_visible(frustum: Frustum, light: LocalLight) -> bool {
+    match light {
+        LocalLight::Point {
+            position, range, ..
+        } => frustum.intersects_sphere(position, range),
+        LocalLight::Spot {
+            position,
+            direction,
+            range,
+            cos_outer_angle,
+            ..
+        } => frustum.intersects_spot_sector(position, direction, range, cos_outer_angle),
+    }
+}
+
+fn local_light_contribution(camera: [f32; 3], light: LocalLight) -> f64 {
+    let (position, color, range) = match light {
+        LocalLight::Point {
+            position,
+            color_intensity,
+            range,
+        }
+        | LocalLight::Spot {
+            position,
+            color_intensity,
+            range,
+            ..
+        } => (position, color_intensity, range),
+    };
+    let distance_squared = (0..3)
+        .map(|axis| {
+            let delta = f64::from(camera[axis]) - f64::from(position[axis]);
+            delta * delta
+        })
+        .sum::<f64>();
+    let range = f64::from(range);
+    let normalized_distance_squared = distance_squared / (range * range);
+    let range_window =
+        (1.0 - normalized_distance_squared * normalized_distance_squared).clamp(0.0, 1.0);
+    let spot_weight = match light {
+        LocalLight::Point { .. } => 1.0,
+        LocalLight::Spot {
+            position,
+            direction,
+            cos_inner_angle,
+            cos_outer_angle,
+            ..
+        } => {
+            let delta = std::array::from_fn::<_, 3, _>(|axis| {
+                f64::from(camera[axis]) - f64::from(position[axis])
+            });
+            if distance_squared <= 1e-12 {
+                1.0
+            } else {
+                let inverse_distance = distance_squared.sqrt().recip();
+                let ray_cosine = (0..3)
+                    .map(|axis| f64::from(direction[axis]) * delta[axis])
+                    .sum::<f64>()
+                    * inverse_distance;
+                let outer = f64::from(cos_outer_angle.max(0.0));
+                let inner = f64::from(cos_inner_angle);
+                if inner - outer <= 1e-7 {
+                    f64::from(ray_cosine >= outer)
+                } else {
+                    let amount = ((ray_cosine - outer) / (inner - outer)).clamp(0.0, 1.0);
+                    amount * amount * (3.0 - 2.0 * amount)
+                }
+            }
+        }
+    };
+    let luminance =
+        f64::from(color[0]) * 0.2126 + f64::from(color[1]) * 0.7152 + f64::from(color[2]) * 0.0722;
+    luminance * range_window * range_window * spot_weight / distance_squared.max(1e-4)
+}
+
+fn local_light_bytes(lights: &[LocalLight]) -> Vec<u8> {
+    let mut packed = Vec::with_capacity(lights.len().max(1));
+    for light in lights {
+        packed.push(match *light {
+            LocalLight::Point {
+                position,
+                color_intensity,
+                range,
+            } => GpuLocalLight {
+                position_range: [position[0], position[1], position[2], range],
+                direction_type: [0.0; 4],
+                color_intensity: [
+                    color_intensity[0],
+                    color_intensity[1],
+                    color_intensity[2],
+                    0.0,
+                ],
+                cone_params: [0.0; 4],
+            },
+            LocalLight::Spot {
+                position,
+                direction,
+                color_intensity,
+                range,
+                cos_inner_angle,
+                cos_outer_angle,
+            } => GpuLocalLight {
+                position_range: [position[0], position[1], position[2], range],
+                direction_type: [direction[0], direction[1], direction[2], 1.0],
+                color_intensity: [
+                    color_intensity[0],
+                    color_intensity[1],
+                    color_intensity[2],
+                    0.0,
+                ],
+                cone_params: [cos_inner_angle, cos_outer_angle, 0.0, 0.0],
+            },
+        });
+    }
+    if packed.is_empty() {
+        packed.push(GpuLocalLight::default());
+    }
+    // SAFETY: GpuLocalLight is repr(C), aligned, and contains only four initialized vec4 fields.
+    unsafe {
+        std::slice::from_raw_parts(packed.as_ptr().cast(), size_of_val(packed.as_slice())).to_vec()
+    }
+}
+
+#[cfg(test)]
 fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
+    prepare_frame(frame).map(|prepared| prepared.uniforms)
+}
+
+fn frame_uniform_bytes_with_count(
+    frame: &Frame<'_>,
+    local_light_count: usize,
+) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
     validate_view_settings(frame.view)?;
     if !frame
         .camera
@@ -7440,6 +7877,7 @@ fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], R
             });
     values[116..132].copy_from_slice(rotation.as_flattened());
     values[132..136].copy_from_slice(&[intensity, skybox, present, 0.0]);
+    values[136..140].copy_from_slice(&[local_light_count as f32, 0.0, 0.0, 0.0]);
     Ok(float_bytes(&values))
 }
 
@@ -7732,28 +8170,30 @@ mod tests {
     use super::culling::{Frustum, LocalBounds};
     use super::{
         AcquireAction, AlphaMode, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight,
-        DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, FrameCamera, LDR_FORMAT,
-        MATERIAL_UNIFORMS_SIZE, MESH_BLEND_FRAGMENT_SHADER, MESH_MASK_FRAGMENT_SHADER,
-        MESH_OPAQUE_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId,
-        NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON, OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER,
-        OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure,
-        RenderError, Renderer, RendererConfig, SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER,
-        SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER,
-        TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex,
-        ViewSettings, best_device_index, check_extensions, classify_acquire_result,
-        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
-        evaluate_device, frame_uniform_bytes, index_bytes, inverse_extent, material_sampler_info,
-        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
-        missing_offscreen_format_features, missing_post_format_features,
+        DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, FrameCamera,
+        GpuLocalLight, LDR_FORMAT, LocalLight, MATERIAL_UNIFORMS_SIZE, MAX_FORWARD_LIGHTS,
+        MESH_BLEND_FRAGMENT_SHADER, MESH_MASK_FRAGMENT_SHADER, MESH_OPAQUE_FRAGMENT_SHADER,
+        MESH_VERTEX_SHADER, Material, MaterialId, MeshId, NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON,
+        OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER,
+        OverlayVertex, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
+        SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER, SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER,
+        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
+        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
+        check_extensions, classify_acquire_result, classify_probe_instance_failure,
+        deduplicate_names, derivative_tangent_basis, evaluate_device, frame_uniform_bytes,
+        index_bytes, inverse_extent, local_light_bytes, local_light_contribution,
+        material_sampler_info, material_uniform_bytes, mip_extent, mip_level_count,
+        missing_extensions, missing_offscreen_format_features, missing_post_format_features,
         missing_texture_format_features, normal_matrix, offscreen_previous_use,
         overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
-        scene_viewport, select_composite_alpha, select_surface_extent, shadow_caster_is_outside,
-        shadow_casters, shadow_layout_source, shadow_subresource_range, texture_format,
-        texture_format_reasons, texture_mip_blit_region, texture_mip_destination_shader_barrier,
-        texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
-        timestamp_duration, transform_tangent_normal, validate_draws, validate_material,
-        validate_mesh, validate_overlay, validate_render_scale, validate_texture,
-        validate_view_settings, vertex_bytes,
+        scene_viewport, select_composite_alpha, select_local_lights, select_surface_extent,
+        shadow_caster_is_outside, shadow_casters, shadow_layout_source, shadow_subresource_range,
+        texture_format, texture_format_reasons, texture_mip_blit_region,
+        texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
+        texture_mip_source_barrier, texture_upload_barrier, timestamp_duration,
+        transform_tangent_normal, validate_draws, validate_material, validate_mesh,
+        validate_overlay, validate_render_scale, validate_texture, validate_view_settings,
+        vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -8518,6 +8958,241 @@ mod tests {
             .collect()
     }
 
+    fn perspective_projection() -> [[f32; 4]; 4] {
+        let near = 0.1;
+        let far = 20.0;
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, far / (near - far), -1.0],
+            [0.0, 0.0, near * far / (near - far), 0.0],
+        ]
+    }
+
+    fn unproject(projection: [[f32; 4]; 4], ndc: [f32; 3]) -> [f32; 3] {
+        let inverse = super::environment::inverse4x4(projection).unwrap();
+        let point = std::array::from_fn::<_, 4, _>(|row| {
+            inverse[0][row] * ndc[0]
+                + inverse[1][row] * ndc[1]
+                + inverse[2][row] * ndc[2]
+                + inverse[3][row]
+        });
+        [
+            point[0] / point[3],
+            point[1] / point[3],
+            point[2] / point[3],
+        ]
+    }
+
+    fn project(projection: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
+        let clip = std::array::from_fn::<_, 4, _>(|row| {
+            projection[0][row] * point[0]
+                + projection[1][row] * point[1]
+                + projection[2][row] * point[2]
+                + projection[3][row]
+        });
+        [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]]
+    }
+
+    fn camera(position: [f32; 3]) -> FrameCamera {
+        FrameCamera {
+            view: IDENTITY,
+            projection: perspective_projection(),
+            position,
+        }
+    }
+
+    fn point(position: [f32; 3], color_intensity: [f32; 3], range: f32) -> LocalLight {
+        LocalLight::Point {
+            position,
+            color_intensity,
+            range,
+        }
+    }
+
+    fn spot(
+        position: [f32; 3],
+        direction: [f32; 3],
+        range: f32,
+        cos_inner_angle: f32,
+        cos_outer_angle: f32,
+    ) -> LocalLight {
+        LocalLight::Spot {
+            position,
+            direction,
+            color_intensity: [1.0; 3],
+            range,
+            cos_inner_angle,
+            cos_outer_angle,
+        }
+    }
+
+    #[test]
+    fn local_light_ssbo_uses_the_tested_std430_layout_and_valid_empty_binding() {
+        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 64);
+        assert_eq!(std::mem::align_of::<GpuLocalLight>(), 16);
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, position_range), 0);
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, direction_type), 16);
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, color_intensity), 32);
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, cone_params), 48);
+        assert_eq!(local_light_bytes(&[]).len(), 64);
+        assert_eq!(floats(&local_light_bytes(&[])), [0.0; 16]);
+
+        let packed = local_light_bytes(&[
+            point([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 7.0),
+            spot([8.0, 9.0, 10.0], [0.0, 0.0, -1.0], 11.0, 0.8, 0.5),
+        ]);
+        assert_eq!(packed.len(), 2 * 64);
+        let values = floats(&packed);
+        assert_eq!(
+            &values[0..16],
+            &[
+                1.0, 2.0, 3.0, 7.0, 0.0, 0.0, 0.0, 0.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            ]
+        );
+        assert_eq!(
+            &values[16..32],
+            &[
+                8.0, 9.0, 10.0, 11.0, 0.0, 0.0, -1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.8, 0.5, 0.0, 0.0
+            ]
+        );
+    }
+
+    #[test]
+    fn local_light_selection_uses_actual_projection_boundaries_and_both_shapes() {
+        let camera = camera([0.0; 3]);
+        let boundary = unproject(camera.projection, [1.0, 0.0, 0.5]);
+        let projected_boundary = project(camera.projection, boundary);
+        assert!((projected_boundary[0] - 1.0).abs() < 1e-5);
+        assert!((projected_boundary[2] - 0.5).abs() < 1e-5);
+
+        let point_on_boundary = point(boundary, [1.0; 3], 0.02);
+        assert_eq!(
+            select_local_lights(camera, &[point_on_boundary])
+                .unwrap()
+                .len(),
+            1
+        );
+        let point_outside = point(
+            [boundary[0] + 0.2, boundary[1], boundary[2]],
+            [1.0; 3],
+            0.02,
+        );
+        assert!(
+            select_local_lights(camera, &[point_outside])
+                .unwrap()
+                .is_empty()
+        );
+
+        let camera_inside_sphere = point([0.0, 0.0, -0.5], [1.0; 3], 1.0);
+        assert_eq!(
+            select_local_lights(camera, &[camera_inside_sphere])
+                .unwrap()
+                .len(),
+            1
+        );
+        let camera_inside_cone = spot([0.0, 0.0, -2.0], [0.0, 0.0, 1.0], 4.0, 0.9, 0.8);
+        assert_eq!(
+            select_local_lights(camera, &[camera_inside_cone])
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let outside_apex = [boundary[0] + 0.08, boundary[1], boundary[2]];
+        let cone_reaches_boundary = spot(
+            outside_apex,
+            [-0.6, 0.0, -0.8],
+            0.5,
+            10.0_f32.to_radians().cos(),
+            10.0_f32.to_radians().cos(),
+        );
+        assert_eq!(
+            select_local_lights(camera, &[cone_reaches_boundary])
+                .unwrap()
+                .len(),
+            1
+        );
+        let cone_points_away = spot(outside_apex, [1.0, 0.0, 0.0], 0.5, 0.99, 0.99);
+        assert!(
+            select_local_lights(camera, &[cone_points_away])
+                .unwrap()
+                .is_empty()
+        );
+
+        let wide_cone = spot(
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, -1.0],
+            3.0,
+            45.0_f32.to_radians().cos(),
+            0.0,
+        );
+        assert_eq!(select_local_lights(camera, &[wide_cone]).unwrap().len(), 1);
+        let narrow_cone = spot([0.0, 0.0, -2.0], [0.0, 0.0, 1.0], 4.0, 1.0, 0.5);
+        assert_eq!(
+            select_local_lights(camera, &[narrow_cone]).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn local_light_selection_validates_every_input_and_caps_by_contribution_stably() {
+        let camera = camera([0.0; 3]);
+        let mut invalid_extra = vec![point([0.0, 0.0, -1.0], [1.0; 3], 2.0); MAX_FORWARD_LIGHTS];
+        invalid_extra.push(point([0.0, 0.0, -1.0], [1.0; 3], f32::NAN));
+        assert!(matches!(
+            select_local_lights(camera, &invalid_extra),
+            Err(RenderError::InvalidConfig(_))
+        ));
+        for invalid in [
+            point([0.0, 0.0, -1.0], [-1.0, 1.0, 1.0], 2.0),
+            point([f32::INFINITY, 0.0, -1.0], [1.0; 3], 2.0),
+            spot([0.0, 0.0, -1.0], [0.0; 3], 2.0, 0.8, 0.5),
+            spot([0.0, 0.0, -1.0], [0.0, 0.0, -1.0], 2.0, 1.001, 0.5),
+            spot([0.0, 0.0, -1.0], [0.0, 0.0, -1.0], 2.0, 0.5, 0.8),
+            spot([0.0, 0.0, -1.0], [0.0, 0.0, -1.0], 2.0, 0.8, -0.001),
+        ] {
+            assert!(matches!(
+                select_local_lights(camera, &[invalid]),
+                Err(RenderError::InvalidConfig(_))
+            ));
+        }
+
+        let tied = (0..MAX_FORWARD_LIGHTS + 8)
+            .map(|index| point([0.0, 0.0, 0.0], [1.0; 3], (index + 1) as f32))
+            .collect::<Vec<_>>();
+        let selected = select_local_lights(camera, &tied).unwrap();
+        assert_eq!(selected.len(), MAX_FORWARD_LIGHTS);
+        for (index, light) in selected.iter().enumerate() {
+            assert_eq!(*light, point([0.0, 0.0, 0.0], [1.0; 3], (index + 1) as f32));
+        }
+
+        let sorted = select_local_lights(
+            camera,
+            &[
+                point([0.0, 0.0, -5.0], [1.0; 3], 10.0),
+                point([0.0, 0.0, -1.0], [1.0; 3], 10.0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(sorted[0], point([0.0, 0.0, -1.0], [1.0; 3], 10.0));
+    }
+
+    #[test]
+    fn spot_cone_score_uses_light_ray_sign_and_equal_angles_are_a_hard_edge() {
+        let forward = spot([0.0; 3], [0.0, 0.0, -1.0], 5.0, 0.8, 0.8);
+        assert!(local_light_contribution([0.0, 0.0, -1.0], forward) > 0.0);
+        assert_eq!(local_light_contribution([0.0, 0.0, 1.0], forward), 0.0);
+        let extreme = spot(
+            [-f32::MAX, -f32::MAX, 0.0],
+            [1.0, -1.0, 0.0],
+            f32::MAX,
+            0.9,
+            0.8,
+        );
+        assert!(local_light_contribution([f32::MAX, f32::MAX, 0.0], extreme).is_finite());
+    }
+
     fn transform_normal(matrix: &[[f32; 4]; 4], normal: [f32; 3]) -> [f32; 3] {
         let [x, y, z] = std::array::from_fn(|row| {
             (0..3)
@@ -8998,12 +9673,13 @@ mod tests {
             environment: None,
             shadow_cascades: &cascades,
             light,
+            lights: &[],
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),
         };
         let values = floats(&frame_uniform_bytes(&frame).unwrap());
-        assert_eq!(FRAME_UNIFORMS_SIZE, 544);
+        assert_eq!(FRAME_UNIFORMS_SIZE, 560);
         assert_eq!(&values[0..16], IDENTITY.as_flattened());
         assert_eq!(&values[16..32], IDENTITY.as_flattened());
         for (cascade, start) in [(0, 32), (1, 48), (2, 64), (3, 80)] {
@@ -9018,6 +9694,7 @@ mod tests {
         assert_eq!(&values[104..108], &[7.0, 8.0, 9.0, 0.0]);
         assert_eq!(&values[108..112], &[1.0, 1.0 / 2048.0, 4.0, 0.0]);
         assert_eq!(&values[112..116], &[10.0, 11.0, 12.0, 0.0]);
+        assert_eq!(&values[136..140], &[0.0; 4]);
 
         let no_shadows = Frame {
             shadow_cascades: &[],
@@ -9045,6 +9722,7 @@ mod tests {
                         environment: None,
                         shadow_cascades: &[],
                         light,
+                        lights: &[],
                         draws: &[],
                         overlay: &[],
                         view: ViewSettings::default(),
@@ -9068,6 +9746,7 @@ mod tests {
             environment: None,
             shadow_cascades: &invalid_cascades,
             light: DirectionalLight::default(),
+            lights: &[],
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),
@@ -9091,6 +9770,7 @@ mod tests {
             environment: None,
             shadow_cascades: &too_many,
             light: DirectionalLight::default(),
+            lights: &[],
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),

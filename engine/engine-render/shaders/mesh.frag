@@ -19,10 +19,22 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 camera_position;
     mat4 environment_rotation;
     vec4 environment_params;
+    vec4 local_light_params;
 } frame;
 
 layout(set = 0, binding = 1) uniform texture2DArray shadow_map;
 layout(set = 0, binding = 2) uniform samplerShadow shadow_sampler;
+
+struct LocalLightData {
+    vec4 position_range;
+    vec4 direction_type;
+    vec4 color_intensity;
+    vec4 cone_params;
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer LocalLightBuffer {
+    LocalLightData lights[];
+} local_light_buffer;
 
 layout(set = 1, binding = 0) uniform MaterialUniforms {
     vec4 base_color;
@@ -79,6 +91,51 @@ float visibility_smith_ggx_correlated(float normal_dot_light, float normal_dot_v
 vec3 fresnel_schlick(float view_dot_half, vec3 f0) {
     float factor = pow(1.0 - clamp(view_dot_half, 0.0, 1.0), 5.0);
     return f0 + (1.0 - f0) * factor;
+}
+
+vec3 direct_brdf(
+    vec3 light,
+    vec3 normal,
+    vec3 view,
+    vec3 f0,
+    vec3 base_color,
+    float metallic,
+    float alpha,
+    float normal_dot_view
+) {
+    vec3 half_vector = safe_normalize(view + light, normal);
+    float normal_dot_light = max(dot(normal, light), 0.0);
+    float normal_dot_half = max(dot(normal, half_vector), 0.0);
+    vec3 fresnel = fresnel_schlick(max(dot(half_vector, view), 0.0), f0);
+    float distribution = distribution_ggx(normal_dot_half, alpha);
+    float visibility = visibility_smith_ggx_correlated(
+        normal_dot_light,
+        normal_dot_view,
+        alpha
+    );
+    vec3 diffuse_color = (1.0 - metallic) * base_color;
+    vec3 diffuse = (1.0 - fresnel) * diffuse_color / PI;
+    vec3 specular = distribution * visibility * fresnel;
+    return (diffuse + specular) * normal_dot_light * PI;
+}
+
+float range_attenuation(float distance_squared, float range) {
+    float normalized_distance = sqrt(distance_squared) / range;
+    float window = clamp(1.0 - pow(normalized_distance, 4.0), 0.0, 1.0);
+    return window * window / max(distance_squared, 1e-4);
+}
+
+float spot_attenuation(
+    vec3 light_ray,
+    vec3 direction,
+    float cos_inner_angle,
+    float cos_outer_angle
+) {
+    float ray_cosine = dot(light_ray, direction);
+    if (cos_inner_angle <= cos_outer_angle + 1e-6) {
+        return ray_cosine >= cos_outer_angle ? 1.0 : 0.0;
+    }
+    return smoothstep(cos_outer_angle, cos_inner_angle, ray_cosine);
 }
 
 void main() {
@@ -149,24 +206,11 @@ void main() {
     float alpha = effective_roughness * effective_roughness;
     vec3 f0 = mix(vec3(0.04), base_color, metallic);
 
-    vec3 light = safe_normalize(-frame.light_direction.xyz, geometric_normal);
     vec3 view = safe_normalize(frame.camera_position.xyz - in_world_position, geometric_normal);
-    vec3 half_vector = safe_normalize(view + light, geometric_normal);
     float normal_dot_view = max(dot(normal, view), 1e-4);
-    float normal_dot_light = max(dot(normal, light), 0.0);
-    float normal_dot_half = max(dot(normal, half_vector), 0.0);
-    vec3 fresnel = fresnel_schlick(max(dot(half_vector, view), 0.0), f0);
-    float distribution = distribution_ggx(normal_dot_half, alpha);
-    float visibility = visibility_smith_ggx_correlated(
-        normal_dot_light,
-        normal_dot_view,
-        alpha
-    );
     vec3 diffuse_color = (1.0 - metallic) * base_color;
-    vec3 diffuse = (1.0 - fresnel) * diffuse_color / PI;
-    vec3 specular = distribution * visibility * fresnel;
-
-    float geometric_light_dot = dot(geometric_normal, light);
+    vec3 directional_light = safe_normalize(-frame.light_direction.xyz, geometric_normal);
+    float geometric_light_dot = dot(geometric_normal, directional_light);
     float shadow = 1.0;
     if (frame.shadow_params.x > 0.5) {
         for (int cascade = 0; cascade < int(frame.shadow_params.z); ++cascade) {
@@ -197,8 +241,49 @@ void main() {
         }
     }
 
-    vec3 direct = (diffuse + specular) * normal_dot_light
-        * frame.light_color.rgb * shadow * PI;
+    vec3 direct = direct_brdf(
+        directional_light,
+        normal,
+        view,
+        f0,
+        base_color,
+        metallic,
+        alpha,
+        normal_dot_view
+    ) * frame.light_color.rgb * shadow;
+    int local_light_count = clamp(
+        int(frame.local_light_params.x + 0.5),
+        0,
+        MAX_FORWARD_LIGHTS
+    );
+    for (int light_index = 0; light_index < local_light_count; ++light_index) {
+        LocalLightData local_light = local_light_buffer.lights[light_index];
+        vec3 light_delta = local_light.position_range.xyz - in_world_position;
+        float distance_squared = dot(light_delta, light_delta);
+        vec3 local_light_direction = safe_normalize(light_delta, geometric_normal);
+        float attenuation = range_attenuation(
+            distance_squared,
+            local_light.position_range.w
+        );
+        if (local_light.direction_type.w > 0.5) {
+            attenuation *= spot_attenuation(
+                -local_light_direction,
+                local_light.direction_type.xyz,
+                local_light.cone_params.x,
+                local_light.cone_params.y
+            );
+        }
+        direct += direct_brdf(
+            local_light_direction,
+            normal,
+            view,
+            f0,
+            base_color,
+            metallic,
+            alpha,
+            normal_dot_view
+        ) * local_light.color_intensity.rgb * attenuation;
+    }
     vec3 reflected = reflect(-view, normal);
     mat3 world_to_environment = transpose(mat3(frame.environment_rotation));
     vec3 environment_normal = world_to_environment * normal;

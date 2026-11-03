@@ -5,7 +5,7 @@ use crate::scene::{
     plane_mesh, shadows_light_direction, sinusoidal_normal_texture,
 };
 use engine_assets::{Model, ModelAlphaMode, ModelMaterial, TextureData};
-use engine_render::{DirectionalLight, SHADOW_MAP_RESOLUTION, Vertex};
+use engine_render::{DirectionalLight, LocalLight, SHADOW_MAP_RESOLUTION, Vertex};
 use engine_scene::light::cascade_view_projections;
 use engine_scene::{CameraSettings, ShadowSettings};
 use glam::{Mat4, Vec3};
@@ -199,6 +199,27 @@ impl Content {
             color: SHADOWS_LIGHT_COLOR,
             ambient: SHADOWS_AMBIENT,
         }
+    }
+
+    pub fn local_lights(&self) -> Vec<LocalLight> {
+        if !matches!(self.motion, Scene::Shadows | Scene::Materials) {
+            return Vec::new();
+        }
+        vec![
+            LocalLight::Point {
+                position: [-2.2, 2.0, 1.5],
+                color_intensity: [4.0, 1.25, 0.35],
+                range: 8.0,
+            },
+            LocalLight::Spot {
+                position: [2.2, 3.0, 1.8],
+                direction: [-0.55, -0.72, -0.43],
+                color_intensity: [0.35, 1.5, 4.5],
+                range: 10.0,
+                cos_inner_angle: 15.0_f32.to_radians().cos(),
+                cos_outer_angle: 27.0_f32.to_radians().cos(),
+            },
+        ]
     }
 
     pub fn shadow_cascades(
@@ -404,6 +425,7 @@ mod tests {
         assert_eq!(content.meshes[1].material.base_color_texture, None);
         assert_eq!(content.light(0.0).color, [1.0; 3]);
         assert_eq!(content.light(0.0).ambient, [0.15; 3]);
+        assert_eq!(content.local_lights().len(), 2);
         let cascades = content.shadow_cascades(0.0, 1280, 720, CameraSettings::default());
         assert_eq!(cascades.len(), 4);
         assert!(
@@ -417,6 +439,7 @@ mod tests {
             Content::from_scene(Scene::Cube).light(0.0),
             engine_render::DirectionalLight::default()
         );
+        assert!(Content::from_scene(Scene::Cube).local_lights().is_empty());
         assert!(
             Content::from_scene(Scene::Cube)
                 .shadow_cascades(0.0, 1280, 720, CameraSettings::default())

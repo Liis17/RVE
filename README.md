@@ -55,7 +55,8 @@ cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
 сцены `triangle`, `cube`, `shadows` и `materials`, модели FBX, текстуры PNG, ограничение
 числа кадров, изменение размера окна и отладочный оверлей. Настройки проекции,
 exposure, tonemapping, anti-aliasing и render scale задаются файлом
-`.camerasettings`; явный `--render-scale` перекрывает масштаб из него.
+`.camerasettings`; явный `--render-scale` перекрывает масштаб из него. Сцены
+`shadows` и `materials` также показывают point и spot освещение.
 
 Настройки окна sandbox необязательны. Чтобы изменить их, скопируй шаблон
 `bootstrap.rves.example` в `build/bootstrap.rves`.
@@ -165,6 +166,8 @@ tonemapper = "aces"
 Код, использующий engine-render, тоже требует миграции. Поле `RendererConfig::render_scale` удалено: масштаб, exposure, tonemapper и anti-aliasing теперь передаются в `Frame` через `view: ViewSettings`, а позиция камеры — через `camera_position`.
 
 В `DrawCommand` поле `texture` заменено на `material: Option<MaterialId>`. Создавай `Material` через `Renderer::create_material`; карты base color, metallic-roughness и normal можно загружать с нужным пространством цвета через `Renderer::create_texture_with_color_space`. Полный текущий контракт описан в [заметке renderer](Obsidian/RVEVault/Engine/EngineRender.md).
+
+`Frame` дополнен `lights: &[LocalLight]`; для кадров без локальных источников передавай `&[]`. Renderer выбирает из них до 32 видимых point/spot lights. Поле `shadows` компонентов сцены пока сохраняется для совместимости с будущей реализацией локальных теней.
 
 ## Архивы ресурсов
 

@@ -7,16 +7,17 @@ use engine_assets::{Model, ModelAlphaMode};
 use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, Material, MaterialId, MeshId,
-    ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId,
-    Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, LocalLight, Material, MaterialId,
+    MeshId, ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace,
+    TextureId, Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
 use engine_scene::light::cascade_view_projections;
 use engine_scene::world::ObjectHandle;
 use engine_scene::{
-    AntiAliasing, CameraSettings, EnvironmentState, LightState, SceneFrame, Tonemapper, World,
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, SceneFrame,
+    Tonemapper, World,
 };
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -313,6 +314,7 @@ impl SceneRenderer {
         height: u32,
         settings: CameraSettings,
         light: &LightState,
+        local_lights: &'a [LocalLight],
         scene_has_light: bool,
         environment_state: Option<&EnvironmentState>,
         shadow_cascades: &'a [[[f32; 4]; 4]],
@@ -335,6 +337,7 @@ impl SceneRenderer {
             environment,
             shadow_cascades,
             light,
+            lights: local_lights,
             draws: if with_grid {
                 &self.scene_draws
             } else {
@@ -799,6 +802,42 @@ fn frame_light(light: &LightState, scene_has_light: bool) -> DirectionalLight {
     }
 }
 
+pub(crate) fn render_local_lights(states: &[LocalLightState]) -> Vec<LocalLight> {
+    states
+        .iter()
+        .map(|state| match *state {
+            LocalLightState::Point {
+                position,
+                color,
+                intensity,
+                range,
+                ..
+            } => LocalLight::Point {
+                position,
+                color_intensity: color.map(|component| component * intensity),
+                range,
+            },
+            LocalLightState::Spot {
+                position,
+                direction,
+                color,
+                intensity,
+                range,
+                inner_angle_deg,
+                outer_angle_deg,
+                ..
+            } => LocalLight::Spot {
+                position,
+                direction,
+                color_intensity: color.map(|component| component * intensity),
+                range,
+                cos_inner_angle: inner_angle_deg.to_radians().cos().max(0.0),
+                cos_outer_angle: outer_angle_deg.to_radians().cos().max(0.0),
+            },
+        })
+        .collect()
+}
+
 fn editor_environment_key(state: &EnvironmentState) -> EditorEnvironmentKey {
     if let Some(path) = &state.component.hdr {
         return EditorEnvironmentKey::Hdr(path.as_str().to_owned());
@@ -1076,6 +1115,67 @@ id = "camera"
         assert!(
             SceneRenderer::shadow_cascades(camera(), 1280, 720, &without_shadow, true).is_empty()
         );
+    }
+
+    #[test]
+    fn editor_maps_scene_local_lights_for_each_viewport_frame() {
+        let states = [
+            LocalLightState::Point {
+                position: [1.0, 2.0, 3.0],
+                color: [0.25, 0.5, 1.0],
+                intensity: 4.0,
+                range: 9.0,
+                shadows: true,
+            },
+            LocalLightState::Spot {
+                position: [0.0, 0.0, 1.0],
+                direction: [0.0, 0.0, -1.0],
+                color: [1.0, 0.5, 0.25],
+                intensity: 2.0,
+                range: 12.0,
+                inner_angle_deg: 15.0,
+                outer_angle_deg: 30.0,
+                shadows: false,
+            },
+        ];
+        let lights = render_local_lights(&states);
+        assert_eq!(
+            lights[0],
+            LocalLight::Point {
+                position: [1.0, 2.0, 3.0],
+                color_intensity: [1.0, 2.0, 4.0],
+                range: 9.0,
+            }
+        );
+        assert!(matches!(
+            lights[1],
+            LocalLight::Spot {
+                color_intensity: [2.0, 1.0, 0.5],
+                cos_inner_angle,
+                cos_outer_angle,
+                ..
+            } if (cos_inner_angle - 15.0_f32.to_radians().cos()).abs() < 1e-6
+                && (cos_outer_angle - 30.0_f32.to_radians().cos()).abs() < 1e-6
+        ));
+
+        let ninety_degree = LocalLightState::Spot {
+            position: [0.0; 3],
+            direction: [0.0, 0.0, -1.0],
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 5.0,
+            inner_angle_deg: 90.0,
+            outer_angle_deg: 90.0,
+            shadows: false,
+        };
+        assert!(matches!(
+            render_local_lights(&[ninety_degree])[0],
+            LocalLight::Spot {
+                cos_inner_angle: 0.0,
+                cos_outer_angle: 0.0,
+                ..
+            }
+        ));
     }
 
     #[test]

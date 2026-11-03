@@ -272,6 +272,37 @@ fn camera_and_light_overrides_replace_whole_components_and_heavy_params_merge() 
 }
 
 #[test]
+fn point_and_spot_prefab_overrides_replace_whole_components() {
+    let prefab = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\ncolor = [0.2, 0.4, 0.8]\nintensity = 1.0\nrange = 4.0\nshadows = true\n[objects.spot_light]\ncolor = [0.8, 0.4, 0.2]\nintensity = 2.0\nrange = 6.0\ninner_angle_deg = 12.0\nouter_angle_deg = 24.0\nshadows = true\n";
+    let library = Library::new(&[("prefabs/lamp.rveprefab", prefab)]);
+    let document = scene(
+        "[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\npoint_light = { intensity = 4.0 }\nspot_light = { outer_angle_deg = 42.0 }\n",
+    );
+    let expanded = library.expand(&document).unwrap().document;
+    let lamp = object(&expanded, "lamp");
+    assert_eq!(
+        lamp.point_light,
+        Some(crate::PointLightComponent {
+            color: [1.0; 3],
+            intensity: 4.0,
+            range: 10.0,
+            shadows: false,
+        })
+    );
+    assert_eq!(
+        lamp.spot_light,
+        Some(crate::SpotLightComponent {
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 10.0,
+            inner_angle_deg: 20.0,
+            outer_angle_deg: 42.0,
+            shadows: false,
+        })
+    );
+}
+
+#[test]
 fn camera_only_in_a_prefab_satisfies_the_scene() {
     let prefab = "[[objects]]\nid = \"eye\"\n[objects.camera]\n";
     let library = Library::new(&[("prefabs/eye.rveprefab", prefab)]);

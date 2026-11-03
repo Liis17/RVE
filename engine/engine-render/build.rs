@@ -7,6 +7,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+const MAX_FORWARD_LIGHTS: usize = 32;
+
 type ShaderBuild = (
     &'static str,
     naga::ShaderStage,
@@ -113,6 +115,11 @@ const SHADERS: &[ShaderBuild] = &[
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo задаёт OUT_DIR"));
+    fs::write(
+        out_dir.join("render_constants.rs"),
+        format!("pub const MAX_FORWARD_LIGHTS: usize = {MAX_FORWARD_LIGHTS};\n"),
+    )
+    .expect("не удалось записать constants renderer");
     let mut frontend = glsl::Frontend::default();
     for &(name, stage, defines, output) in SHADERS {
         let path = PathBuf::from("shaders").join(name);
@@ -125,6 +132,12 @@ fn main() {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
         );
+        if name == "mesh.frag" {
+            shader_options.defines.insert(
+                "MAX_FORWARD_LIGHTS".to_owned(),
+                MAX_FORWARD_LIGHTS.to_string(),
+            );
+        }
         let module = frontend
             .parse(&shader_options, &source)
             .unwrap_or_else(|error| {

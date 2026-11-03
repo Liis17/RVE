@@ -44,6 +44,41 @@ sun_size_deg = 1.0
 sun_intensity = 1.0
 
 [[objects]]
+id = "lighting-rig"
+name = "Local Lights"
+[objects.transform]
+position = [0.0, 0.0, 0.0]
+rotation = [0.0, 8.0, 0.0]
+scale = [1.25, 0.9, 1.1]
+
+[[objects]]
+id = "warm-point"
+name = "Warm Point Light"
+parent = "lighting-rig"
+[objects.transform]
+position = [-2.4, 2.2, 1.2]
+[objects.point_light]
+color = [1.0, 0.42, 0.16]
+intensity = 35.0
+range = 9.0
+shadows = false
+
+[[objects]]
+id = "cool-spot"
+name = "Cool Spot Light"
+parent = "lighting-rig"
+[objects.transform]
+position = [2.4, 3.2, 1.5]
+rotation = [-32.0, -38.0, 0.0]
+[objects.spot_light]
+color = [0.22, 0.52, 1.0]
+intensity = 48.0
+range = 11.0
+inner_angle_deg = 14.0
+outer_angle_deg = 28.0
+shadows = false
+
+[[objects]]
 id = "shared-cube"
 name = "Shared Cube"
 [objects.transform]

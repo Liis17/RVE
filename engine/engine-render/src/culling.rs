@@ -114,6 +114,93 @@ impl Frustum {
         }
         true
     }
+
+    /// Returns false only when a finite sphere is completely outside one clip plane.
+    pub fn intersects_sphere(self, center: [f32; 3], radius: f32) -> bool {
+        let Some(planes) = self.planes else {
+            return true;
+        };
+        if !center.into_iter().all(f32::is_finite) || !radius.is_finite() || radius < 0.0 {
+            return true;
+        }
+        for plane in planes {
+            let normal_length = plane[0..3]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            if !normal_length.is_finite() || normal_length <= f32::EPSILON {
+                return true;
+            }
+            let distance =
+                (plane[0] * center[0] + plane[1] * center[1] + plane[2] * center[2] + plane[3])
+                    / normal_length;
+            if !distance.is_finite() {
+                return true;
+            }
+            if distance < -radius {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Conservatively culls a spherical sector using the maximum support along each frustum plane.
+    pub fn intersects_spot_sector(
+        self,
+        apex: [f32; 3],
+        direction: [f32; 3],
+        range: f32,
+        cos_outer_angle: f32,
+    ) -> bool {
+        let Some(planes) = self.planes else {
+            return true;
+        };
+        if !apex.into_iter().all(f32::is_finite)
+            || !direction.into_iter().all(f32::is_finite)
+            || !range.is_finite()
+            || range <= 0.0
+            || !cos_outer_angle.is_finite()
+            || !(-1.0..=1.0).contains(&cos_outer_angle)
+        {
+            return true;
+        }
+        let direction_length = dot3(direction, direction).sqrt();
+        if !direction_length.is_finite() || direction_length <= f32::EPSILON {
+            return true;
+        }
+        let direction = direction.map(|component| component / direction_length);
+        let outer_angle = cos_outer_angle.clamp(0.0, 1.0).acos();
+        for plane in planes {
+            let normal_length = plane[0..3]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            if !normal_length.is_finite() || normal_length <= f32::EPSILON {
+                return true;
+            }
+            let normal = [
+                plane[0] / normal_length,
+                plane[1] / normal_length,
+                plane[2] / normal_length,
+            ];
+            let apex_distance = dot3(normal, apex) + plane[3] / normal_length;
+            if !apex_distance.is_finite() {
+                return true;
+            }
+            let normal_angle = dot3(normal, direction).clamp(-1.0, 1.0).acos();
+            let maximum_direction_dot = (normal_angle - outer_angle).max(0.0).cos().max(0.0);
+            if apex_distance + range * maximum_direction_dot < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
 }
 
 /// Indices ordered back-to-front by distance to each transformed world AABB center.
