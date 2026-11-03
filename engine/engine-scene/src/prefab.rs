@@ -5,10 +5,11 @@
 //! остальные объекты — `<экземпляр>.<id в префабе>`, у вложенных — `a.b.c`.
 
 use crate::document::{
-    CameraComponent, DirectionalLightComponent, DocumentKind, MaterialOverride, ParamValue,
-    SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform, option_virtual_path_serde,
-    require_asset_path, require_extension, valid_ascii_name, validate_material_override,
-    virtual_path_serde,
+    CameraComponent, DirectionalLightComponent, DocumentKind, EnvironmentComponent,
+    MaterialAlphaMode, MaterialOverride, ParamValue, PointLightComponent, SceneAsset,
+    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
+    option_virtual_path_serde, require_asset_path, require_extension, valid_ascii_name,
+    validate_environment, validate_material_override, virtual_path_serde,
 };
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,12 @@ pub struct PrefabOverride {
     pub camera: Option<CameraComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directional_light: Option<DirectionalLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_light: Option<PointLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_light: Option<SpotLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentComponent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lite_params: Vec<LiteParamsOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -230,6 +237,27 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .ok_or("override directional_light: у объекта нет directional_light")?;
         *target = light;
     }
+    if let Some(light) = change.point_light {
+        let target = object
+            .point_light
+            .as_mut()
+            .ok_or("override point_light: у объекта нет point_light")?;
+        *target = light;
+    }
+    if let Some(light) = change.spot_light {
+        let target = object
+            .spot_light
+            .as_mut()
+            .ok_or("override spot_light: у объекта нет spot_light")?;
+        *target = light;
+    }
+    if let Some(environment) = &change.environment {
+        let target = object
+            .environment
+            .as_mut()
+            .ok_or("override environment: у объекта нет environment")?;
+        *target = environment.clone();
+    }
     for params in &change.lite_params {
         let mut found = false;
         for script in &mut object.lite_scripts {
@@ -273,14 +301,41 @@ fn merge_material(target: &mut MaterialOverride, change: &MaterialOverride) {
     if change.roughness.is_some() {
         target.roughness = change.roughness;
     }
+    if change.emissive.is_some() {
+        target.emissive = change.emissive;
+    }
+    if change.opacity.is_some() {
+        target.opacity = change.opacity;
+    }
+    if change.alpha_mode.is_some() {
+        target.alpha_mode = change.alpha_mode;
+        if change.alpha_mode != Some(MaterialAlphaMode::Mask) {
+            target.alpha_cutoff = None;
+        }
+    }
+    if change.alpha_cutoff.is_some() {
+        target.alpha_cutoff = change.alpha_cutoff;
+    }
     if change.metallic_roughness_texture.is_some() {
         target.metallic_roughness_texture = change.metallic_roughness_texture.clone();
     }
     if change.normal_texture.is_some() {
         target.normal_texture = change.normal_texture.clone();
     }
+    if change.emissive_texture.is_some() {
+        target.emissive_texture = change.emissive_texture.clone();
+    }
+    if change.occlusion_texture.is_some() {
+        target.occlusion_texture = change.occlusion_texture.clone();
+    }
     if change.normal_scale.is_some() {
         target.normal_scale = change.normal_scale;
+    }
+    if change.occlusion_strength.is_some() {
+        target.occlusion_strength = change.occlusion_strength;
+    }
+    if change.double_sided.is_some() {
+        target.double_sided = change.double_sided;
     }
 }
 
@@ -359,6 +414,9 @@ pub(crate) fn validate_instances(
                     "camerasettings",
                     "настройки камеры override",
                 )?;
+            }
+            if let Some(environment) = &change.environment {
+                validate_environment(source, id, assets, environment)?;
             }
         }
     }

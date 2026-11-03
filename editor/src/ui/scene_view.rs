@@ -191,6 +191,8 @@ fn collect_markers(state: &mut EditorState) -> Option<Vec<Marker>> {
                     Some("CAM")
                 } else if object.directional_light.is_some() {
                     Some("SUN")
+                } else if object.point_light.is_some() || object.spot_light.is_some() {
+                    Some("LGT")
                 } else {
                     None
                 };

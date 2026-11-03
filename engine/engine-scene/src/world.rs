@@ -3,10 +3,12 @@
 use crate::CameraSettings;
 use crate::camera::Camera;
 use crate::document::{
-    CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, LodGroup, SceneDocument,
-    SceneError, SceneObject, camera_from_matrix, light_direction_from_matrix,
+    CameraComponent, DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript,
+    LodGroup, PointLightComponent, SceneDocument, SceneError, SceneObject, SpotLightComponent,
+    camera_from_matrix, light_direction_from_matrix,
 };
-use glam::{EulerRot, Mat4, Quat, Vec3};
+use crate::light::ShadowSettings;
+use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Стабильный индекс объекта в порядке документа, принадлежащий [`World`].
@@ -75,6 +77,9 @@ pub struct WorldObject {
     pub camera: Option<CameraComponent>,
     pub camera_settings: Option<CameraSettings>,
     pub directional_light: Option<DirectionalLightComponent>,
+    pub point_light: Option<PointLightComponent>,
+    pub spot_light: Option<SpotLightComponent>,
+    pub environment: Option<EnvironmentComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
 }
@@ -85,7 +90,7 @@ pub struct LightState {
     pub direction: [f32; 3],
     pub color: [f32; 3],
     pub ambient: [f32; 3],
-    pub shadow: Option<(Vec3, f32)>,
+    pub shadow: Option<ShadowSettings>,
 }
 
 impl Default for LightState {
@@ -97,6 +102,34 @@ impl Default for LightState {
             shadow: None,
         }
     }
+}
+
+/// Пересчитанный локальный источник света в мировом пространстве.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LocalLightState {
+    Point {
+        position: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        shadows: bool,
+    },
+    Spot {
+        position: [f32; 3],
+        direction: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        inner_angle_deg: f32,
+        outer_angle_deg: f32,
+        shadows: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LastValidLocalLights {
+    point: Option<LocalLightState>,
+    spot: Option<LocalLightState>,
 }
 
 /// Экземпляр меша с handle объекта и мировой матрицей.
@@ -112,7 +145,17 @@ pub struct SceneFrame {
     pub camera: Camera,
     pub view: CameraSettings,
     pub light: LightState,
+    pub local_lights: Vec<LocalLightState>,
+    pub environment: Option<EnvironmentState>,
     pub meshes: Vec<MeshInstance>,
+}
+
+/// Текущий источник окружения, мировая ориентация владельца и направление солнечного света.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvironmentState {
+    pub component: EnvironmentComponent,
+    pub rotation: [[f32; 3]; 3],
+    pub sun_direction: Option<[f32; 3]>,
 }
 
 /// Нефатальное предупреждение о базисе, возвращаемое один раз для объекта.
@@ -131,9 +174,12 @@ pub struct World {
     indices_by_id: HashMap<String, ObjectHandle>,
     topological_order: Vec<ObjectHandle>,
     world_matrices: Vec<Mat4>,
+    world_rotations: Vec<Quat>,
     active_camera: ObjectHandle,
     last_valid_camera: Option<(Camera, CameraSettings)>,
     last_valid_light: LightState,
+    last_valid_local_lights: Vec<LastValidLocalLights>,
+    last_valid_environment: Option<EnvironmentState>,
     invalid_basis_reported: HashSet<ObjectHandle>,
 }
 
@@ -187,9 +233,12 @@ impl World {
             .collect::<Vec<_>>();
         let (world_matrices, order) =
             calculate_world_matrices(&transforms, &parents, &object_ids, document.source_label())?;
+        let world_rotations = calculate_world_rotations(&transforms, &parents, &order);
+        let object_count = objects.len();
         let mut world = Self {
             source_label: document.source_label().to_owned(),
             world_matrices,
+            world_rotations,
             objects,
             indices_by_id,
             topological_order: order.into_iter().map(ObjectHandle).collect(),
@@ -207,7 +256,9 @@ impl World {
                 .expect("SceneDocument validation requires a camera"),
             last_valid_camera: None,
             last_valid_light: LightState::default(),
+            last_valid_local_lights: vec![LastValidLocalLights::default(); object_count],
             invalid_basis_reported: HashSet::new(),
+            last_valid_environment: None,
         };
         let _ = world.build_frame();
         Ok(world)
@@ -339,6 +390,11 @@ impl World {
             let parent = object.parent.map(|parent| parent.0);
             self.world_matrices[handle.0] =
                 compose_world_matrix(local, parent, &self.world_matrices);
+            let local_rotation = rotation_quat(object.transform);
+            self.world_rotations[handle.0] = match parent {
+                Some(parent) => (self.world_rotations[parent] * local_rotation).normalize(),
+                None => local_rotation,
+            };
         }
     }
 
@@ -350,12 +406,15 @@ impl World {
         let mut warnings = Vec::new();
         let mut camera_state = self.last_valid_camera;
         let mut light = self.last_valid_light;
+        let mut local_lights = Vec::new();
 
         for index in 0..self.objects.len() {
             let matrix = self.world_matrices[index];
             let camera_settings = (self.active_camera.0 == index)
                 .then(|| self.objects[index].camera_settings.unwrap_or_default());
             let light_settings = self.objects[index].directional_light;
+            let point_settings = self.objects[index].point_light;
+            let spot_settings = self.objects[index].spot_light;
             if let Some(settings) = camera_settings {
                 if let Some(value) = camera_from_matrix(matrix, settings) {
                     let state = (value, settings);
@@ -378,6 +437,48 @@ impl World {
                     );
                 }
             }
+            if let Some(settings) = point_settings {
+                if let Some(position) = local_light_position_from_matrix(matrix) {
+                    self.last_valid_local_lights[index].point = Some(LocalLightState::Point {
+                        position,
+                        color: settings.color,
+                        intensity: settings.intensity,
+                        range: settings.range,
+                        shadows: settings.shadows,
+                    });
+                } else {
+                    self.warn_invalid_basis(ObjectHandle(index), "точечного света", &mut warnings);
+                }
+            } else {
+                self.last_valid_local_lights[index].point = None;
+            }
+            if let Some(settings) = spot_settings {
+                if let (Some(position), Some(direction)) = (
+                    local_light_position_from_matrix(matrix),
+                    light_direction_from_matrix(matrix),
+                ) {
+                    self.last_valid_local_lights[index].spot = Some(LocalLightState::Spot {
+                        position,
+                        direction,
+                        color: settings.color,
+                        intensity: settings.intensity,
+                        range: settings.range,
+                        inner_angle_deg: settings.inner_angle_deg,
+                        outer_angle_deg: settings.outer_angle_deg,
+                        shadows: settings.shadows,
+                    });
+                } else {
+                    self.warn_invalid_basis(ObjectHandle(index), "spot света", &mut warnings);
+                }
+            } else {
+                self.last_valid_local_lights[index].spot = None;
+            }
+            if let Some(state) = self.last_valid_local_lights[index].point {
+                local_lights.push(state);
+            }
+            if let Some(state) = self.last_valid_local_lights[index].spot {
+                local_lights.push(state);
+            }
         }
 
         // from_document проверяет сцену и сразу фиксирует её первый валидный базис камеры.
@@ -392,12 +493,38 @@ impl World {
                 model: self.world_matrices[object.handle.0],
             })
             .collect();
+        let has_light = self
+            .objects
+            .iter()
+            .any(|object| object.directional_light.is_some());
+        let environment_owner = self
+            .objects
+            .iter()
+            .position(|object| object.environment.is_some());
+        let environment = environment_owner.and_then(|index| {
+            let component = self.objects[index].environment.as_ref()?.clone();
+            let rotation = self.world_rotations[index];
+            let length_squared = rotation.length_squared();
+            if !rotation.is_finite() || !length_squared.is_finite() || length_squared <= 1e-12 {
+                self.warn_invalid_basis(ObjectHandle(index), "environment", &mut warnings);
+                return self.last_valid_environment.clone();
+            }
+            let state = EnvironmentState {
+                component,
+                rotation: Mat3::from_quat(rotation.normalize()).to_cols_array_2d(),
+                sun_direction: has_light.then(|| light.direction.map(|value| -value)),
+            };
+            self.last_valid_environment = Some(state.clone());
+            Some(state)
+        });
 
         (
             SceneFrame {
                 camera,
                 view,
                 light,
+                local_lights,
+                environment,
                 meshes,
             },
             warnings,
@@ -436,6 +563,9 @@ fn world_object(
         camera: object.camera.clone(),
         camera_settings: object.camera.as_ref().map(|_| CameraSettings::default()),
         directional_light: object.directional_light,
+        point_light: object.point_light,
+        spot_light: object.spot_light,
+        environment: object.environment.clone(),
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
     }
@@ -454,6 +584,27 @@ pub(crate) fn calculate_world_matrices(
             compose_world_matrix(transforms[index].matrix(), parents[index], &world_matrices);
     }
     Ok((world_matrices, order))
+}
+
+fn calculate_world_rotations(
+    transforms: &[LocalTransform],
+    parents: &[Option<usize>],
+    order: &[usize],
+) -> Vec<Quat> {
+    let mut world_rotations = vec![Quat::IDENTITY; transforms.len()];
+    for &index in order {
+        let local = rotation_quat(transforms[index]);
+        world_rotations[index] = match parents[index] {
+            Some(parent) => (world_rotations[parent] * local).normalize(),
+            None => local,
+        };
+    }
+    world_rotations
+}
+
+fn rotation_quat(transform: LocalTransform) -> Quat {
+    let rotation = transform.rotation_deg * (std::f32::consts::PI / 180.0);
+    Quat::from_euler(EulerRot::YXZ, rotation.y, rotation.x, rotation.z).normalize()
 }
 
 fn topological_order(
@@ -503,20 +654,26 @@ fn light_state(settings: DirectionalLightComponent, direction: [f32; 3]) -> Ligh
         direction,
         color: settings.color,
         ambient: settings.ambient,
-        shadow: settings.shadows.then(|| {
-            (
-                Vec3::from_array(settings.shadow_center),
-                settings.shadow_radius.unwrap(),
-            )
+        shadow: settings.shadows.then_some(ShadowSettings {
+            distance: settings.shadow_distance,
+            cascades: settings.shadow_cascades,
         }),
     }
+}
+
+fn local_light_position_from_matrix(matrix: Mat4) -> Option<[f32; 3]> {
+    if !matrix.is_finite() {
+        return None;
+    }
+    let position = matrix.w_axis.truncate();
+    position.is_finite().then(|| position.to_array())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{LocalTransform, ObjectHandle, World};
-    use crate::SceneDocument;
-    use glam::{Mat4, Quat, Vec3};
+    use crate::{SceneDocument, light::ShadowSettings};
+    use glam::{Mat3, Mat4, Quat, Vec3};
 
     const CAMERA_SCENE: &str = r#"
 [[objects]]
@@ -629,12 +786,57 @@ rotation=[0.0,90.0,0.0]
         assert_eq!(frame.light.shadow, None);
 
         let scene = format!(
-            "{CAMERA_SCENE}\n[[objects]]\nid=\"sun\"\n[objects.transform]\nrotation=[0.0,90.0,0.0]\n[objects.directional_light]\nshadows=true\nshadow_radius=5.0\n"
+            "{CAMERA_SCENE}\n[[objects]]\nid=\"sun\"\n[objects.transform]\nrotation=[0.0,90.0,0.0]\n[objects.directional_light]\nshadows=true\nshadow_distance=50.0\nshadow_cascades=2\n"
         );
         let mut world = World::from_document(&parse(&scene)).unwrap();
         let (frame, _) = world.build_frame();
         assert!(Vec3::from_array(frame.light.direction).abs_diff_eq(Vec3::NEG_X, 1e-5));
-        assert_eq!(frame.light.shadow, Some((Vec3::ZERO, 5.0)));
+        assert_eq!(
+            frame.light.shadow,
+            Some(ShadowSettings {
+                distance: 50.0,
+                cascades: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn environment_uses_owner_world_rotation_and_directional_light_sun_direction() {
+        let scene = r#"
+[[objects]]
+id="camera"
+[objects.camera]
+[[objects]]
+id="rig"
+[objects.transform]
+rotation=[0.0, 30.0, 0.0]
+[[objects]]
+id="environment"
+parent="rig"
+[objects.transform]
+rotation=[0.0, 45.0, 0.0]
+[objects.environment]
+[objects.environment.procedural]
+zenith_color=[0.2, 0.3, 0.5]
+horizon_color=[0.8, 0.7, 0.5]
+ground_color=[0.1, 0.1, 0.1]
+sun_size_deg=3.0
+sun_intensity=2.0
+[[objects]]
+id="sun"
+parent="rig"
+[objects.directional_light]
+"#;
+        let mut world = World::from_document(&parse(scene)).unwrap();
+        let frame = world.build_frame().0;
+        let environment = frame.environment.unwrap();
+        let expected = Quat::from_rotation_y(75.0_f32.to_radians());
+        let actual_rotation = Mat3::from_cols_array_2d(&environment.rotation);
+        assert!(actual_rotation.abs_diff_eq(Mat3::from_quat(expected), 1e-5));
+        let expected_sun = Quat::from_rotation_y(30.0_f32.to_radians()) * Vec3::Z;
+        assert!(
+            Vec3::from_array(environment.sun_direction.unwrap()).abs_diff_eq(expected_sun, 1e-5)
+        );
     }
 
     #[test]
@@ -872,6 +1074,70 @@ id="second"
         let (second, warnings) = world.build_frame();
         assert_eq!(second.light, previous);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn local_light_world_position_and_spot_direction_follow_full_hierarchy_matrix() {
+        let scene = format!(
+            "{CAMERA_SCENE}\n[[objects]]\nid=\"rig\"\n[objects.transform]\nposition=[3.0,2.0,-4.0]\nrotation=[15.0,35.0,5.0]\nscale=[-2.0,3.0,0.75]\n[[objects]]\nid=\"lamp\"\nparent=\"rig\"\n[objects.transform]\nposition=[1.0,0.5,-2.0]\nrotation=[20.0,-10.0,30.0]\n[objects.point_light]\nrange=15.0\n[[objects]]\nid=\"spot\"\nparent=\"rig\"\n[objects.transform]\nposition=[-1.0,0.25,2.0]\nrotation=[10.0,25.0,0.0]\n[objects.spot_light]\n"
+        );
+        let mut world = World::from_document(&parse(&scene)).unwrap();
+        let frame = world.build_frame().0;
+        let lamp_matrix = world.world_matrix(world.handle("lamp").unwrap()).unwrap();
+        let spot_matrix = world.world_matrix(world.handle("spot").unwrap()).unwrap();
+        let expected_position = lamp_matrix.w_axis.truncate().to_array();
+        let expected_spot_position = spot_matrix.w_axis.truncate().to_array();
+        let expected_direction = spot_matrix
+            .transform_vector3(Vec3::NEG_Z)
+            .normalize()
+            .to_array();
+        assert_eq!(frame.local_lights.len(), 2);
+        assert!(matches!(
+            frame.local_lights[0],
+            super::LocalLightState::Point { position, range: 15.0, .. }
+                if position == expected_position
+        ));
+        assert!(matches!(
+            frame.local_lights[1],
+            super::LocalLightState::Spot { position, direction, .. }
+                if position == expected_spot_position
+                    && Vec3::from_array(direction).abs_diff_eq(Vec3::from_array(expected_direction), 1e-6)
+        ));
+    }
+
+    #[test]
+    fn dynamic_invalid_spot_basis_keeps_last_valid_state_and_warns_once() {
+        let scene = format!("{CAMERA_SCENE}\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\n");
+        let mut world = World::from_document(&parse(&scene)).unwrap();
+        let handle = world.handle("spot").unwrap();
+        let previous = world.build_frame().0.local_lights;
+        world
+            .set_local_transform(
+                handle,
+                LocalTransform {
+                    scale: Vec3::new(1.0, 1.0, 0.0),
+                    ..LocalTransform::default()
+                },
+            )
+            .unwrap();
+        let (first, warnings) = world.build_frame();
+        assert_eq!(first.local_lights, previous);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].object_id, "spot");
+        assert!(warnings[0].message.contains("spot"));
+        let (second, warnings) = world.build_frame();
+        assert_eq!(second.local_lights, previous);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn invalid_initial_spot_basis_is_rejected() {
+        let scene = format!(
+            "{CAMERA_SCENE}\n[[objects]]\nid=\"spot\"\n[objects.transform]\nscale=[1.0,1.0,0.0]\n[objects.spot_light]\n"
+        );
+        let error = SceneDocument::parse("invalid-spot.rvescene", &scene).unwrap_err();
+        assert_eq!(error.object_id.as_deref(), Some("spot"));
+        assert!(error.message.contains("spot_light"));
     }
 
     #[test]

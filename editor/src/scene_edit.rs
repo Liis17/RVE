@@ -3,9 +3,10 @@
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, DirectionalLightComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin,
-    PrefabInstance, PrefabOverride, SceneAsset, SceneDocument, SceneError, SceneObject,
-    SceneTransform,
+    CameraComponent, DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup,
+    MeshRenderer, ObjectOrigin, PointLightComponent, PrefabInstance, PrefabOverride,
+    ProceduralSkyComponent, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
+    SpotLightComponent,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -49,7 +50,8 @@ name = "Directional Light"
 rotation = [50.0, 30.0, 0.0]
 [objects.directional_light]
 shadows = true
-shadow_radius = 20.0
+shadow_distance = 20.0
+shadow_cascades = 4
 "#;
 
 /// Вид объекта, создаваемого из меню или перетаскиванием ресурса.
@@ -58,6 +60,9 @@ pub enum NewObject {
     Empty,
     Camera,
     DirectionalLight,
+    PointLight,
+    SpotLight,
+    Environment,
     /// Модель и локальная позиция нового объекта.
     Mesh(VirtualPath, [f32; 3]),
     /// Экземпляр префаба и локальная позиция его корня.
@@ -72,6 +77,9 @@ pub enum ComponentKind {
     MeshRenderer,
     LodGroup,
     DirectionalLight,
+    PointLight,
+    SpotLight,
+    Environment,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -82,6 +90,9 @@ pub enum Component {
     MeshRenderer(MeshRenderer),
     LodGroup(LodGroup),
     DirectionalLight(DirectionalLightComponent),
+    PointLight(PointLightComponent),
+    SpotLight(SpotLightComponent),
+    Environment(EnvironmentComponent),
 }
 
 impl Component {
@@ -92,6 +103,9 @@ impl Component {
             Self::MeshRenderer(_) => ComponentKind::MeshRenderer,
             Self::LodGroup(_) => ComponentKind::LodGroup,
             Self::DirectionalLight(_) => ComponentKind::DirectionalLight,
+            Self::PointLight(_) => ComponentKind::PointLight,
+            Self::SpotLight(_) => ComponentKind::SpotLight,
+            Self::Environment(_) => ComponentKind::Environment,
         }
     }
 
@@ -103,6 +117,9 @@ impl Component {
             ComponentKind::MeshRenderer => Self::MeshRenderer(object.mesh_renderer.clone()?),
             ComponentKind::LodGroup => Self::LodGroup(object.lod_group.clone()?),
             ComponentKind::DirectionalLight => Self::DirectionalLight(object.directional_light?),
+            ComponentKind::PointLight => Self::PointLight(object.point_light?),
+            ComponentKind::SpotLight => Self::SpotLight(object.spot_light?),
+            ComponentKind::Environment => Self::Environment(object.environment.clone()?),
         })
     }
 
@@ -119,6 +136,9 @@ impl Component {
             }),
             ComponentKind::LodGroup => return None,
             ComponentKind::DirectionalLight => Self::DirectionalLight(default_light()),
+            ComponentKind::PointLight => Self::PointLight(PointLightComponent::default()),
+            ComponentKind::SpotLight => Self::SpotLight(SpotLightComponent::default()),
+            ComponentKind::Environment => Self::Environment(default_environment()),
         })
     }
 
@@ -133,6 +153,9 @@ impl Component {
             Self::MeshRenderer(value) => object.mesh_renderer = Some(value),
             Self::LodGroup(value) => object.lod_group = Some(value),
             Self::DirectionalLight(value) => object.directional_light = Some(value),
+            Self::PointLight(value) => object.point_light = Some(value),
+            Self::SpotLight(value) => object.spot_light = Some(value),
+            Self::Environment(value) => object.environment = Some(value),
         }
     }
 }
@@ -469,6 +492,9 @@ impl EditorScene {
             NewObject::Empty => ("object".to_owned(), "Empty".to_owned()),
             NewObject::Camera => ("camera".to_owned(), "Camera".to_owned()),
             NewObject::DirectionalLight => ("light".to_owned(), "Directional Light".to_owned()),
+            NewObject::PointLight => ("point_light".to_owned(), "Point Light".to_owned()),
+            NewObject::SpotLight => ("spot_light".to_owned(), "Spot Light".to_owned()),
+            NewObject::Environment => ("environment".to_owned(), "Environment".to_owned()),
             NewObject::Mesh(path, _) | NewObject::Prefab(path, _) => {
                 let stem = file_stem(path);
                 (stem.to_owned(), stem.to_owned())
@@ -484,6 +510,9 @@ impl EditorScene {
             mesh_renderer: None,
             lod_group: None,
             directional_light: None,
+            point_light: None,
+            spot_light: None,
+            environment: None,
             lite_scripts: Vec::new(),
             heavy_scripts: Vec::new(),
         };
@@ -508,6 +537,9 @@ impl EditorScene {
                     object.transform.rotation = [50.0, 30.0, 0.0];
                     object.directional_light = Some(default_light());
                 }
+                NewObject::PointLight => object.point_light = Some(PointLightComponent::default()),
+                NewObject::SpotLight => object.spot_light = Some(SpotLightComponent::default()),
+                NewObject::Environment => object.environment = Some(default_environment()),
                 NewObject::Mesh(path, position) => {
                     object.transform.position = *position;
                     ensure_asset(document, path);
@@ -1092,6 +1124,8 @@ impl EditorScene {
                 for texture in [
                     &material.metallic_roughness_texture,
                     &material.normal_texture,
+                    &material.emissive_texture,
+                    &material.occlusion_texture,
                 ]
                 .into_iter()
                 .flatten()
@@ -1261,8 +1295,8 @@ pub fn default_light() -> DirectionalLightComponent {
         color: [1.0; 3],
         ambient: [0.18, 0.18, 0.2],
         shadows: true,
-        shadow_center: [0.0; 3],
-        shadow_radius: Some(20.0),
+        shadow_distance: 20.0,
+        shadow_cascades: 4,
     }
 }
 
@@ -1290,6 +1324,22 @@ pub fn default_camera() -> CameraComponent {
     CameraComponent::default()
 }
 
+/// Процедурное окружение по умолчанию для нового компонента.
+pub fn default_environment() -> EnvironmentComponent {
+    EnvironmentComponent {
+        hdr: None,
+        procedural: Some(ProceduralSkyComponent {
+            zenith_color: [0.18, 0.32, 0.58],
+            horizon_color: [0.68, 0.74, 0.82],
+            ground_color: [0.12, 0.11, 0.10],
+            sun_size_deg: 1.0,
+            sun_intensity: 1.0,
+        }),
+        intensity: 1.0,
+        skybox: true,
+    }
+}
+
 /// Добавляет в список ресурсов сцены все пути, на которые ссылаются компоненты объекта.
 fn register_object_assets(
     document: &mut SceneDocument,
@@ -1302,6 +1352,8 @@ fn register_object_assets(
             mesh.texture.as_ref(),
             material.and_then(|material| material.metallic_roughness_texture.as_ref()),
             material.and_then(|material| material.normal_texture.as_ref()),
+            material.and_then(|material| material.emissive_texture.as_ref()),
+            material.and_then(|material| material.occlusion_texture.as_ref()),
         ]
         .into_iter()
         .flatten()
@@ -1329,6 +1381,13 @@ fn register_object_assets(
     {
         ensure_asset(document, settings);
     }
+    if let Some(hdr) = object
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.hdr.as_ref())
+    {
+        ensure_asset(document, hdr);
+    }
     Ok(())
 }
 
@@ -1336,9 +1395,16 @@ fn is_empty_material(material: &MaterialOverride) -> bool {
     material.base_color.is_none()
         && material.metallic.is_none()
         && material.roughness.is_none()
+        && material.emissive.is_none()
+        && material.opacity.is_none()
+        && material.alpha_mode.is_none()
+        && material.alpha_cutoff.is_none()
         && material.metallic_roughness_texture.is_none()
         && material.normal_texture.is_none()
+        && material.emissive_texture.is_none()
+        && material.occlusion_texture.is_none()
         && material.normal_scale.is_none()
+        && material.occlusion_strength.is_none()
 }
 
 pub fn write_atomic(file: &Path, contents: &[u8]) -> Result<(), String> {
@@ -1489,6 +1555,27 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(scene.selection(), Some(second.as_str()));
         assert!(scene.is_dirty());
+    }
+
+    #[test]
+    fn environment_object_is_valid_and_scene_allows_only_one() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Environment, None).unwrap();
+        let environment = scene.object(&id).unwrap().environment.as_ref().unwrap();
+        assert!(environment.hdr.is_none());
+        assert!(environment.procedural.is_some());
+        assert!(environment.skybox);
+        assert!(scene.document().validate().is_ok());
+        assert!(scene.create_object(&NewObject::Environment, None).is_err());
+        assert_eq!(
+            scene
+                .view()
+                .objects
+                .iter()
+                .filter(|object| object.environment.is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1911,6 +1998,7 @@ mod tests {
                         normal_texture: None,
                         normal_scale: Some(0.5),
                         double_sided: None,
+                        ..MaterialOverride::default()
                     });
                 Ok(())
             })
@@ -1942,6 +2030,7 @@ mod tests {
             normal_texture: None,
             normal_scale: None,
             double_sided: None,
+            ..MaterialOverride::default()
         }
     }
 
@@ -1957,15 +2046,29 @@ mod tests {
             .unwrap();
         let mut textured = material(Some(0.3));
         textured.normal_texture = Some(path("/textures/n.png"));
+        textured.emissive = Some([1.0, 0.25, 0.0]);
+        textured.emissive_texture = Some(path("/textures/emissive.png"));
+        textured.occlusion_texture = Some(path("/textures/occlusion.png"));
+        textured.occlusion_strength = Some(0.4);
         scene.set_material(&id, Some(textured), None).unwrap();
-        assert!(
-            scene
-                .document()
-                .assets
-                .iter()
-                .any(|asset| asset.path.as_str() == "textures/n.png")
-        );
+        let assets = scene
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(assets.contains(&"textures/n.png"));
+        assert!(assets.contains(&"textures/emissive.png"));
+        assert!(assets.contains(&"textures/occlusion.png"));
         assert_eq!(mesh_material(&scene, &id).unwrap().roughness, Some(0.3));
+        assert_eq!(
+            mesh_material(&scene, &id).unwrap().emissive,
+            Some([1.0, 0.25, 0.0])
+        );
+        assert_eq!(
+            mesh_material(&scene, &id).unwrap().occlusion_strength,
+            Some(0.4)
+        );
         scene.set_material(&id, Some(material(None)), None).unwrap();
         assert!(mesh_material(&scene, &id).is_none());
         assert!(scene.undo());
@@ -2028,6 +2131,99 @@ mod tests {
             .unwrap();
         assert_eq!(mesh.model.as_str(), "a.fbx");
         assert!(mesh.texture.is_none());
+    }
+
+    #[test]
+    fn point_and_spot_components_copy_paste_reset_and_undo_as_whole_values() {
+        let mut source = scene();
+        let point_id = source.create_object(&NewObject::PointLight, None).unwrap();
+        source
+            .edit_object(&point_id, None, |object| {
+                let light = object.point_light.as_mut().unwrap();
+                light.color = [0.5, 0.25, 2.0];
+                light.intensity = 3.0;
+                light.range = 14.0;
+                Ok(())
+            })
+            .unwrap();
+        let point =
+            Component::read(source.object(&point_id).unwrap(), ComponentKind::PointLight).unwrap();
+        let spot_id = source.create_object(&NewObject::SpotLight, None).unwrap();
+        source
+            .edit_object(&spot_id, None, |object| {
+                let light = object.spot_light.as_mut().unwrap();
+                light.intensity = 2.5;
+                light.inner_angle_deg = 12.0;
+                light.outer_angle_deg = 24.0;
+                Ok(())
+            })
+            .unwrap();
+        let spot =
+            Component::read(source.object(&spot_id).unwrap(), ComponentKind::SpotLight).unwrap();
+
+        let mut target = scene();
+        let target_id = target.create_object(&NewObject::Empty, None).unwrap();
+        target.set_component(&target_id, point).unwrap();
+        target.set_component(&target_id, spot).unwrap();
+        assert_eq!(
+            target
+                .object(&target_id)
+                .unwrap()
+                .point_light
+                .unwrap()
+                .range,
+            14.0
+        );
+        assert_eq!(
+            target
+                .object(&target_id)
+                .unwrap()
+                .spot_light
+                .unwrap()
+                .outer_angle_deg,
+            24.0
+        );
+
+        let clipboard = objects_to_clipboard(&[
+            source.object(&point_id).unwrap().clone(),
+            source.object(&spot_id).unwrap().clone(),
+        ])
+        .unwrap();
+        let copied = objects_from_clipboard(&clipboard).unwrap().unwrap();
+        assert_eq!(
+            copied[0].point_light,
+            source.object(&point_id).unwrap().point_light
+        );
+        assert_eq!(
+            copied[1].spot_light,
+            source.object(&spot_id).unwrap().spot_light
+        );
+
+        let reset = Component::reset(
+            target.object(&target_id).unwrap(),
+            ComponentKind::PointLight,
+        )
+        .unwrap();
+        target.set_component(&target_id, reset).unwrap();
+        assert_eq!(
+            target.object(&target_id).unwrap().point_light,
+            Some(PointLightComponent::default())
+        );
+        assert!(target.undo());
+        assert_eq!(
+            target
+                .object(&target_id)
+                .unwrap()
+                .point_light
+                .unwrap()
+                .range,
+            14.0
+        );
+        assert!(target.redo());
+        assert_eq!(
+            target.object(&target_id).unwrap().point_light,
+            Some(PointLightComponent::default())
+        );
     }
 
     #[test]

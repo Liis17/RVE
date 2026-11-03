@@ -28,8 +28,8 @@ rotation = [-35.0, 30.0, 0.0]
 color = [1.0, 0.95, 0.82]
 ambient = [0.18, 0.18, 0.2]
 shadows = true
-shadow_center = [0.0, 1.0, 0.0]
-shadow_radius = 8.0
+shadow_distance = 80.0
+shadow_cascades = 4
 
 [[objects]]
 id = "shared-cube"

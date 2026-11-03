@@ -212,6 +212,7 @@ impl SceneDocument {
         let mut camera_count = 0;
         let mut active_camera_count = 0;
         let mut light_count = 0;
+        let mut environment_count = 0;
         for object in &self.objects {
             if let Some(parent) = &object.parent
                 && !local_only
@@ -247,6 +248,16 @@ impl SceneDocument {
             if let Some(light) = &object.directional_light {
                 light_count += 1;
                 validate_light(source, object, light)?;
+            }
+            if let Some(light) = &object.point_light {
+                validate_point_light(source, object, light)?;
+            }
+            if let Some(light) = &object.spot_light {
+                validate_spot_light(source, object, light)?;
+            }
+            if let Some(environment) = &object.environment {
+                environment_count += 1;
+                validate_environment(source, &object.id, &asset_paths, environment)?;
             }
             if let Some(mesh) = &object.mesh_renderer {
                 require_asset_path(source, &object.id, &asset_paths, &mesh.model, "модель")?;
@@ -376,6 +387,15 @@ impl SceneDocument {
                 ),
             ));
         }
+        if environment_count > 1 {
+            return Err(SceneError::new(
+                source,
+                None,
+                format!(
+                    "в сцене допускается не более одного environment, найдено {environment_count}"
+                ),
+            ));
+        }
         if local_only {
             return Ok(());
         }
@@ -404,6 +424,13 @@ impl SceneDocument {
                     source,
                     Some(&object.id),
                     "мировое направление directional_light должно быть конечным и ненулевым",
+                ));
+            }
+            if object.spot_light.is_some() && light_direction_from_matrix(matrix).is_none() {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    "мировое направление spot_light должно быть конечным и ненулевым",
                 ));
             }
         }
@@ -440,6 +467,12 @@ pub struct SceneObject {
     pub lod_group: Option<LodGroup>,
     #[serde(default)]
     pub directional_light: Option<DirectionalLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_light: Option<PointLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_light: Option<SpotLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]
@@ -536,6 +569,15 @@ pub struct LodLevel {
     pub distance: f32,
 }
 
+/// Режим обработки альфа-канала в переопределении материала.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialAlphaMode {
+    Opaque,
+    Mask,
+    Blend,
+}
+
 /// Необязательные замены факторов, текстур и двусторонности FBX-материала.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -546,6 +588,14 @@ pub struct MaterialOverride {
     pub metallic: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roughness: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emissive: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_mode: Option<MaterialAlphaMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_cutoff: Option<f32>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -558,8 +608,22 @@ pub struct MaterialOverride {
         with = "option_virtual_path_serde"
     )]
     pub normal_texture: Option<VirtualPath>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_virtual_path_serde"
+    )]
+    pub emissive_texture: Option<VirtualPath>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_virtual_path_serde"
+    )]
+    pub occlusion_texture: Option<VirtualPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normal_scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occlusion_strength: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub double_sided: Option<bool>,
 }
@@ -574,10 +638,91 @@ pub struct DirectionalLightComponent {
     pub ambient: [f32; 3],
     #[serde(default)]
     pub shadows: bool,
-    #[serde(default = "zero3")]
-    pub shadow_center: [f32; 3],
-    #[serde(default)]
-    pub shadow_radius: Option<f32>,
+    #[serde(default = "default_shadow_distance")]
+    pub shadow_distance: f32,
+    #[serde(default = "default_shadow_cascades")]
+    pub shadow_cascades: u8,
+}
+
+/// Локальный точечный источник света.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PointLightComponent {
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    /// Запрашивает шестислойные point shadows; при range ниже минимума теней источник остаётся освещённым без тени.
+    pub shadows: bool,
+}
+
+impl Default for PointLightComponent {
+    fn default() -> Self {
+        Self {
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 10.0,
+            shadows: false,
+        }
+    }
+}
+
+/// Локальный конический источник света, направленный вдоль мирового −Z объекта.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpotLightComponent {
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_angle_deg: f32,
+    pub outer_angle_deg: f32,
+    /// Запрашивает spot shadow; при range ниже минимума теней источник остаётся освещённым без тени.
+    pub shadows: bool,
+}
+
+impl Default for SpotLightComponent {
+    fn default() -> Self {
+        Self {
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 10.0,
+            inner_angle_deg: 20.0,
+            outer_angle_deg: 30.0,
+            shadows: false,
+        }
+    }
+}
+
+/// Окружение сцены: Radiance HDR panorama или процедурное небо.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentComponent {
+    #[serde(with = "option_virtual_path_serde")]
+    pub hdr: Option<VirtualPath>,
+    pub procedural: Option<ProceduralSkyComponent>,
+    pub intensity: f32,
+    pub skybox: bool,
+}
+
+impl Default for EnvironmentComponent {
+    fn default() -> Self {
+        Self {
+            hdr: None,
+            procedural: None,
+            intensity: 1.0,
+            skybox: true,
+        }
+    }
+}
+
+/// Параметры процедурного неба в линейном RGB.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProceduralSkyComponent {
+    pub zenith_color: [f32; 3],
+    pub horizon_color: [f32; 3],
+    pub ground_color: [f32; 3],
+    pub sun_size_deg: f32,
+    pub sun_intensity: f32,
 }
 
 /// Скаляр или массив значений параметра скрипта.
@@ -744,25 +889,154 @@ fn validate_light(
             "directional_light.ambient должен содержать конечные компоненты >= 0",
         ));
     }
-    if !light.shadow_center.into_iter().all(f32::is_finite)
-        || light
-            .shadow_radius
-            .is_some_and(|radius| !radius.is_finite())
-    {
+    if !light.shadow_distance.is_finite() || light.shadow_distance <= 0.0 {
         return Err(SceneError::new(
             source,
             Some(&object.id),
-            "параметры тени должны быть конечными",
+            "directional_light.shadow_distance должен быть конечным и > 0",
         ));
     }
-    if light.shadow_radius.is_some_and(|radius| radius <= 0.0)
-        || (light.shadows && light.shadow_radius.is_none())
+    if !(1..=crate::light::MAX_SHADOW_CASCADES).contains(&light.shadow_cascades) {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "directional_light.shadow_cascades должен быть в диапазоне 1..=4",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_point_light(
+    source: &str,
+    object: &SceneObject,
+    light: &PointLightComponent,
+) -> Result<(), SceneError> {
+    if !light
+        .color
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
     {
         return Err(SceneError::new(
             source,
             Some(&object.id),
-            "shadow_radius должен быть > 0 и обязателен при shadows = true",
+            "point_light.color должен содержать конечные компоненты >= 0",
         ));
+    }
+    if !light.intensity.is_finite() || light.intensity < 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "point_light.intensity должен быть конечным и >= 0",
+        ));
+    }
+    if !light.range.is_finite() || light.range <= 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "point_light.range должен быть конечным и > 0",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_spot_light(
+    source: &str,
+    object: &SceneObject,
+    light: &SpotLightComponent,
+) -> Result<(), SceneError> {
+    if !light
+        .color
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+    {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "spot_light.color должен содержать конечные компоненты >= 0",
+        ));
+    }
+    if !light.intensity.is_finite() || light.intensity < 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "spot_light.intensity должен быть конечным и >= 0",
+        ));
+    }
+    if !light.range.is_finite() || light.range <= 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "spot_light.range должен быть конечным и > 0",
+        ));
+    }
+    if !light.inner_angle_deg.is_finite()
+        || !light.outer_angle_deg.is_finite()
+        || light.inner_angle_deg <= 0.0
+        || light.inner_angle_deg > light.outer_angle_deg
+        || light.outer_angle_deg > 90.0
+    {
+        return Err(SceneError::new(
+            source,
+            Some(&object.id),
+            "spot_light angles должны удовлетворять 0 < inner_angle_deg <= outer_angle_deg <= 90",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_environment(
+    source: &str,
+    object_id: &str,
+    assets: &HashSet<VirtualPath>,
+    environment: &EnvironmentComponent,
+) -> Result<(), SceneError> {
+    if environment.hdr.is_some() == environment.procedural.is_some() {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "environment должен задавать ровно один источник: hdr или procedural",
+        ));
+    }
+    if !environment.intensity.is_finite() || environment.intensity < 0.0 {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "environment.intensity должен быть конечным и >= 0",
+        ));
+    }
+    if let Some(path) = &environment.hdr {
+        require_asset_path(source, object_id, assets, path, "HDR environment")?;
+        require_extension(source, object_id, path, "hdr", "HDR environment")?;
+    }
+    if let Some(sky) = environment.procedural {
+        if [sky.zenith_color, sky.horizon_color, sky.ground_color]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                "environment.procedural цвета должны содержать конечные компоненты >= 0",
+            ));
+        }
+        if !sky.sun_size_deg.is_finite()
+            || !(0.0..=180.0).contains(&sky.sun_size_deg)
+            || sky.sun_size_deg == 0.0
+        {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                "environment.procedural.sun_size_deg должен быть конечным и в диапазоне (0, 180]",
+            ));
+        }
+        if !sky.sun_intensity.is_finite() || sky.sun_intensity < 0.0 {
+            return Err(SceneError::new(
+                source,
+                Some(object_id),
+                "environment.procedural.sun_intensity должен быть конечным и >= 0",
+            ));
+        }
     }
     Ok(())
 }
@@ -828,14 +1102,19 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
             }));
             if let Some(material) = renderer.get("material").and_then(toml::Value::as_table) {
                 paths.extend(
-                    ["metallic_roughness_texture", "normal_texture"]
-                        .into_iter()
-                        .filter_map(|key| {
-                            material
-                                .get(key)
-                                .and_then(toml::Value::as_str)
-                                .map(|path| (object_id, key, path))
-                        }),
+                    [
+                        "metallic_roughness_texture",
+                        "normal_texture",
+                        "emissive_texture",
+                        "occlusion_texture",
+                    ]
+                    .into_iter()
+                    .filter_map(|key| {
+                        material
+                            .get(key)
+                            .and_then(toml::Value::as_str)
+                            .map(|path| (object_id, key, path))
+                    }),
                 );
             }
         }
@@ -845,6 +1124,14 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                     .get("settings")
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, "camera.settings", path)),
+            );
+        }
+        if let Some(environment) = object.get("environment").and_then(toml::Value::as_table) {
+            paths.extend(
+                environment
+                    .get("hdr")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| (object_id, "environment.hdr", path)),
             );
         }
         if let Some(group) = object.get("lod_group").and_then(toml::Value::as_table)
@@ -963,6 +1250,38 @@ pub(crate) fn validate_material_override(
     {
         return Err(invalid_factor("material.roughness"));
     }
+    if material.emissive.is_some_and(|color| {
+        color
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.0)
+    }) {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "material.emissive должен содержать конечные неотрицательные значения",
+        ));
+    }
+    for (field, value) in [
+        ("material.opacity", material.opacity),
+        ("material.occlusion_strength", material.occlusion_strength),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            return Err(invalid_factor(field));
+        }
+    }
+    if material
+        .alpha_cutoff
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(invalid_factor("material.alpha_cutoff"));
+    }
+    if material.alpha_cutoff.is_some() && material.alpha_mode != Some(MaterialAlphaMode::Mask) {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "material.alpha_cutoff разрешён только при alpha_mode = \"mask\"",
+        ));
+    }
     if material
         .normal_scale
         .is_some_and(|value| !value.is_finite())
@@ -979,6 +1298,8 @@ pub(crate) fn validate_material_override(
             "metallic-roughness текстура",
         ),
         (material.normal_texture.as_ref(), "normal текстура"),
+        (material.emissive_texture.as_ref(), "emissive текстура"),
+        (material.occlusion_texture.as_ref(), "occlusion текстура"),
     ] {
         if let Some(path) = path {
             require_asset_path(source, object_id, assets, path, kind)?;
@@ -1031,6 +1352,14 @@ fn one3() -> [f32; 3] {
 
 fn default_ambient() -> [f32; 3] {
     [0.15; 3]
+}
+
+fn default_shadow_distance() -> f32 {
+    100.0
+}
+
+fn default_shadow_cascades() -> u8 {
+    crate::light::MAX_SHADOW_CASCADES
 }
 
 fn validated_world_matrices(
@@ -1176,7 +1505,7 @@ pub(crate) mod option_virtual_path_serde {
 
 #[cfg(test)]
 mod tests {
-    use super::{LodGroup, LodLevel, MAX_LOD_LEVELS, ParamValue, SceneDocument};
+    use super::{LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, ParamValue, SceneDocument};
     use engine_files::VirtualPath;
 
     const VALID: &str = r#"
@@ -1287,6 +1616,7 @@ id = "camera"
 
         let serialized = document.to_toml().unwrap();
         let round_trip = parse(&serialized).unwrap();
+        assert!(!serialized.contains("double_sided"), "{serialized}");
         assert_eq!(
             round_trip.objects[1].lod_group.as_ref().unwrap().levels[1].distance,
             20.0
@@ -1548,7 +1878,7 @@ scale=[1.0,1.0,0.0]
     #[test]
     fn material_override_round_trips_and_legacy_mesh_renderer_defaults() {
         let input = format!(
-            "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/textures/mr.png\"\n[[assets]]\npath=\"/textures/normal.png\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\nbase_color=[0.2,0.4,0.6]\nmetallic=0.7\nroughness=0.3\nmetallic_roughness_texture=\"/textures/mr.png\"\nnormal_texture=\"/textures/normal.png\"\nnormal_scale=0.5\n"
+            "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/textures/mr.png\"\n[[assets]]\npath=\"/textures/normal.png\"\n[[assets]]\npath=\"/textures/emissive.png\"\n[[assets]]\npath=\"/textures/occlusion.png\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\nbase_color=[0.2,0.4,0.6]\nmetallic=0.7\nroughness=0.3\nemissive=[2.0,0.5,4.0]\nopacity=0.65\nalpha_mode=\"mask\"\nalpha_cutoff=0.35\nocclusion_strength=0.6\nmetallic_roughness_texture=\"/textures/mr.png\"\nnormal_texture=\"/textures/normal.png\"\nemissive_texture=\"/textures/emissive.png\"\nocclusion_texture=\"/textures/occlusion.png\"\nnormal_scale=0.5\n"
         );
         let document = parse(&input).unwrap();
         let material = document.objects[1]
@@ -1561,6 +1891,11 @@ scale=[1.0,1.0,0.0]
         assert_eq!(material.base_color, Some([0.2, 0.4, 0.6]));
         assert_eq!(material.metallic, Some(0.7));
         assert_eq!(material.roughness, Some(0.3));
+        assert_eq!(material.emissive, Some([2.0, 0.5, 4.0]));
+        assert_eq!(material.opacity, Some(0.65));
+        assert_eq!(material.alpha_mode, Some(MaterialAlphaMode::Mask));
+        assert_eq!(material.alpha_cutoff, Some(0.35));
+        assert_eq!(material.occlusion_strength, Some(0.6));
         assert_eq!(
             material
                 .metallic_roughness_texture
@@ -1572,6 +1907,14 @@ scale=[1.0,1.0,0.0]
         assert_eq!(
             material.normal_texture.as_ref().unwrap().as_str(),
             "textures/normal.png"
+        );
+        assert_eq!(
+            material.emissive_texture.as_ref().unwrap().as_str(),
+            "textures/emissive.png"
+        );
+        assert_eq!(
+            material.occlusion_texture.as_ref().unwrap().as_str(),
+            "textures/occlusion.png"
         );
         assert_eq!(material.normal_scale, Some(0.5));
         assert_eq!(material.double_sided, None);
@@ -1667,8 +2010,19 @@ scale=[1.0,1.0,0.0]
             "roughness=-0.01",
             "roughness=1.01",
             "roughness=inf",
+            "opacity=-0.01",
+            "opacity=1.01",
+            "opacity=nan",
+            "occlusion_strength=-0.01",
+            "occlusion_strength=1.01",
+            "emissive=[-0.1,0.0,0.0]",
+            "emissive=[0.0,nan,0.0]",
             "normal_scale=nan",
             "normal_scale=inf",
+            "alpha_mode=\"unknown\"",
+            "alpha_cutoff=-0.01",
+            "alpha_mode=\"blend\"\nalpha_cutoff=0.5",
+            "alpha_cutoff=0.5",
         ] {
             assert!(parse(&scene(values)).is_err(), "accepted {values}");
         }
@@ -1678,6 +2032,7 @@ scale=[1.0,1.0,0.0]
             ))
             .is_ok()
         );
+        assert!(parse(&scene("alpha_mode=\"mask\"\nalpha_cutoff=1.0")).is_ok());
     }
 
     #[test]
@@ -1697,6 +2052,17 @@ scale=[1.0,1.0,0.0]
             &scene(&wrong_extension, "normal_texture=\"/textures/normal.jpg\""),
             "расширение .png",
         );
+        for field in ["emissive_texture", "occlusion_texture"] {
+            error(
+                &scene(model, &format!("{field}=\"/textures/missing.png\"")),
+                "отсутствует в [[assets]]",
+            );
+            let wrong_extension = format!("{model}\n[[assets]]\npath=\"/textures/map.jpg\"");
+            error(
+                &scene(&wrong_extension, &format!("{field}=\"/textures/map.jpg\"")),
+                "расширение .png",
+            );
+        }
         let invalid_path = scene(model, "normal_texture=\"/textures/../normal.png\"");
         let error = parse(&invalid_path).unwrap_err();
         assert!(
@@ -1723,10 +2089,6 @@ scale=[1.0,1.0,0.0]
             "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\ncolor=[nan,1.0,1.0]\n"
         );
         assert!(parse(&light_nan).is_err());
-        let shadow_center_nan = format!(
-            "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadow_center=[0.0,inf,0.0]\n"
-        );
-        assert!(parse(&shadow_center_nan).is_err());
         let param_inf = format!(
             "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{speed=inf}}\n[[assets]]\npath=\"/s.lua\"\n"
         );
@@ -1734,24 +2096,32 @@ scale=[1.0,1.0,0.0]
     }
 
     #[test]
-    fn light_defaults_shadow_requirements_and_nonnegative_colors_are_checked() {
-        let no_shadow_radius = format!(
-            "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadows=true\n"
-        );
-        assert!(parse(&no_shadow_radius).is_err());
-        for radius in ["0.0", "-1.0", "nan", "inf"] {
+    fn light_defaults_shadow_settings_and_nonnegative_colors_are_checked() {
+        for distance in ["0.0", "-1.0", "nan", "inf", "-inf"] {
             let input = format!(
-                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadows=true\nshadow_radius={radius}\n"
-            );
-            assert!(parse(&input).is_err(), "accepted radius {radius}");
-        }
-        for radius in ["0.0", "-1.0"] {
-            let input = format!(
-                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadows=false\nshadow_radius={radius}\n"
+                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadow_distance={distance}\n"
             );
             assert!(
                 parse(&input).is_err(),
-                "accepted shadow_radius {radius} without shadows"
+                "accepted shadow distance {distance}"
+            );
+        }
+        for cascades in ["0", "5"] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadow_cascades={cascades}\n"
+            );
+            assert!(
+                parse(&input).is_err(),
+                "accepted shadow cascades {cascades}"
+            );
+        }
+        for removed_field in ["shadow_center=[0.0,0.0,0.0]", "shadow_radius=5.0"] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\n{removed_field}\n"
+            );
+            assert!(
+                parse(&input).is_err(),
+                "accepted removed field {removed_field}"
             );
         }
         let negative_color = format!(
@@ -1766,7 +2136,85 @@ scale=[1.0,1.0,0.0]
         assert_eq!(light.color, [1.0; 3]);
         assert_eq!(light.ambient, [0.15; 3]);
         assert!(!light.shadows);
-        assert_eq!(light.shadow_center, [0.0; 3]);
+        assert_eq!(light.shadow_distance, 100.0);
+        assert_eq!(light.shadow_cascades, 4);
+
+        let shadow_enabled = parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadows=true\n"
+        ))
+        .unwrap();
+        assert!(shadow_enabled.objects[1].directional_light.unwrap().shadows);
+    }
+
+    #[test]
+    fn local_light_defaults_round_trip_and_validate_all_factors() {
+        let input = format!(
+            "{VALID}\n[[objects]]\nid=\"point\"\n[objects.point_light]\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\n"
+        );
+        let document = parse(&input).unwrap();
+        let point = document.objects[1].point_light.unwrap();
+        assert_eq!(point.color, [1.0; 3]);
+        assert_eq!(point.intensity, 1.0);
+        assert_eq!(point.range, 10.0);
+        assert!(!point.shadows);
+        let spot = document.objects[2].spot_light.unwrap();
+        assert_eq!(spot.color, [1.0; 3]);
+        assert_eq!(spot.intensity, 1.0);
+        assert_eq!(spot.range, 10.0);
+        assert_eq!(spot.inner_angle_deg, 20.0);
+        assert_eq!(spot.outer_angle_deg, 30.0);
+        assert!(!spot.shadows);
+        assert!(parse(&document.to_toml().unwrap()).is_ok());
+
+        for field in [
+            "color=[-1.0,1.0,1.0]",
+            "color=[nan,1.0,1.0]",
+            "intensity=-1.0",
+            "intensity=inf",
+            "range=0.0",
+            "range=nan",
+            "unknown=true",
+        ] {
+            let input =
+                format!("{VALID}\n[[objects]]\nid=\"point\"\n[objects.point_light]\n{field}\n");
+            assert!(parse(&input).is_err(), "accepted point_light.{field}");
+            let input =
+                format!("{VALID}\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\n{field}\n");
+            assert!(parse(&input).is_err(), "accepted spot_light.{field}");
+        }
+        for (inner, outer) in [
+            ("0.0", "30.0"),
+            ("31.0", "30.0"),
+            ("20.0", "91.0"),
+            ("nan", "30.0"),
+            ("20.0", "inf"),
+        ] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\ninner_angle_deg={inner}\nouter_angle_deg={outer}\n"
+            );
+            assert!(
+                parse(&input).is_err(),
+                "accepted spot cone {inner}..{outer}"
+            );
+        }
+        assert!(parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"spot\"\n[objects.spot_light]\ninner_angle_deg=90.0\nouter_angle_deg=90.0\n"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn local_lights_are_unlimited_and_independent_of_directional_light_limit() {
+        let mut input = VALID.to_owned();
+        for index in 0..40 {
+            input.push_str(&format!(
+                "\n[[objects]]\nid=\"point-{index}\"\n[objects.point_light]\n"
+            ));
+        }
+        input.push_str("\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\n");
+        assert!(parse(&input).is_ok());
+        input.push_str("\n[[objects]]\nid=\"sun2\"\n[objects.directional_light]\n");
+        assert!(parse(&input).is_err());
     }
 
     #[test]
@@ -1868,5 +2316,82 @@ scale=[1.0,1.0,0.0]
             !renderer_error.contains("invalid virtual path"),
             "{renderer_error}"
         );
+    }
+
+    #[test]
+    fn environment_sources_are_exclusive_validated_and_round_trip() {
+        let hdr = r#"
+[[assets]]
+path="/environment/sky.hdr"
+[[objects]]
+id="camera"
+[objects.camera]
+[[objects]]
+id="environment"
+[objects.environment]
+hdr="/environment/sky.hdr"
+intensity=1.5
+skybox=false
+"#;
+        let document = SceneDocument::parse("environment.rvescene", hdr).unwrap();
+        let saved = document.to_toml().unwrap();
+        let reparsed = SceneDocument::parse("environment.rvescene", &saved).unwrap();
+        assert_eq!(reparsed.to_toml().unwrap(), saved);
+
+        let procedural = r#"
+[[objects]]
+id="camera"
+[objects.camera]
+[[objects]]
+id="environment"
+[objects.environment]
+[objects.environment.procedural]
+zenith_color=[0.1, 0.2, 0.4]
+horizon_color=[0.8, 0.7, 0.5]
+ground_color=[0.1, 0.1, 0.1]
+sun_size_deg=2.0
+sun_intensity=4.0
+"#;
+        assert!(SceneDocument::parse("procedural.rvescene", procedural).is_ok());
+
+        let empty = format!("{VALID}\n[[objects]]\nid=\"environment\"\n[objects.environment]\n");
+        let error = SceneDocument::parse("empty-environment.rvescene", &empty).unwrap_err();
+        assert!(error.message.contains("ровно один источник"));
+
+        let both = format!(
+            "{hdr}\n[objects.environment.procedural]\nzenith_color=[1.0,1.0,1.0]\nhorizon_color=[1.0,1.0,1.0]\nground_color=[0.0,0.0,0.0]\nsun_size_deg=1.0\nsun_intensity=1.0\n"
+        );
+        let error = SceneDocument::parse("both-environment.rvescene", &both).unwrap_err();
+        assert!(error.message.contains("ровно один источник"));
+
+        let bad_extension = hdr.replace("/environment/sky.hdr", "/environment/sky.png");
+        let error = SceneDocument::parse("bad-extension.rvescene", &bad_extension).unwrap_err();
+        assert!(error.message.contains("расширение .hdr"));
+        let negative_intensity = hdr.replace("intensity=1.5", "intensity=-1.0");
+        let error =
+            SceneDocument::parse("bad-intensity.rvescene", &negative_intensity).unwrap_err();
+        assert!(error.message.contains("environment.intensity"));
+        let invalid_sun = procedural.replace("sun_size_deg=2.0", "sun_size_deg=181.0");
+        let error = SceneDocument::parse("bad-sun.rvescene", &invalid_sun).unwrap_err();
+        assert!(error.message.contains("sun_size_deg"));
+
+        let two = format!(
+            "{hdr}\n[[objects]]\nid=\"second\"\n[objects.environment]\nhdr=\"/environment/sky.hdr\"\n"
+        );
+        let error = SceneDocument::parse("two-environments.rvescene", &two).unwrap_err();
+        assert!(error.message.contains("не более одного environment"));
+    }
+
+    #[test]
+    fn environment_rejects_unknown_fields_and_undeclared_assets() {
+        let unknown = format!(
+            "{VALID}\n[[objects]]\nid=\"environment\"\n[objects.environment]\nhdr=\"/sky.hdr\"\nunknown=true\n"
+        );
+        assert!(SceneDocument::parse("unknown-environment.rvescene", &unknown).is_err());
+        let missing = format!(
+            "{VALID}\n[[objects]]\nid=\"environment\"\n[objects.environment]\nhdr=\"/sky.hdr\"\n"
+        );
+        let error = SceneDocument::parse("missing-environment.rvescene", &missing).unwrap_err();
+        assert!(error.message.contains("отсутствует в [[assets]]"));
     }
 }

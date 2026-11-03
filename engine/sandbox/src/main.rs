@@ -4,18 +4,20 @@ mod scene;
 
 use content::Content;
 use debug_overlay::DebugOverlay;
-use engine_assets::{ASSETS_DIR, AssetError, Assets};
+use engine_assets::{ASSETS_DIR, AssetError, Assets, ModelAlphaMode};
 use engine_core::Time;
 use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, BootstrapPresentMode};
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DrawCommand, Frame, FrameStatus, Material, MaterialId,
-    MeshId, Renderer, RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
+    AlphaMode, AntiAliasing as RenderAntiAliasing, DrawCommand, EnvironmentId, EnvironmentSource,
+    Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId, MeshId, ProceduralSky,
+    Renderer, RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
     ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
+use glam::{Mat4, Vec3};
 use scene::Scene;
 use std::collections::HashMap;
 use std::env;
@@ -24,7 +26,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials] [--model /путь.fbx] [--texture /путь.png] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials|clustered] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -38,8 +40,15 @@ struct Options {
     model: Option<String>,
     /// Путь PNG внутри `assets`, заменяющий base-color texture сцены или модели.
     texture: Option<String>,
+    environment: Option<EnvironmentMode>,
     /// Показывать панель FPS, памяти и загрузки CPU/GPU.
     debug_overlay: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EnvironmentMode {
+    Procedural,
+    Hdr(String),
 }
 
 fn parse_args<I, S>(args: I) -> Result<Options, String>
@@ -55,6 +64,7 @@ where
     let mut scene = None;
     let mut model = None;
     let mut texture = None;
+    let mut environment = None;
     let mut debug_overlay = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -125,11 +135,12 @@ where
                     return Err("флаг --scene указан повторно".to_owned());
                 }
                 let value = args.next().ok_or_else(|| {
-                    "после --scene требуется triangle, cube, shadows или materials".to_owned()
+                    "после --scene требуется triangle, cube, shadows, materials или clustered"
+                        .to_owned()
                 })?;
                 scene = Some(Scene::parse(&value).ok_or_else(|| {
                     format!(
-                        "неизвестная сцена: {value}; доступны triangle, cube, shadows и materials"
+                        "неизвестная сцена: {value}; доступны triangle, cube, shadows, materials и clustered"
                     )
                 })?);
             }
@@ -151,6 +162,32 @@ where
                         .ok_or_else(|| "после --texture требуется путь в assets".to_owned())?,
                 );
             }
+            "--environment" => {
+                if environment.is_some() {
+                    return Err("флаг --environment указан повторно".to_owned());
+                }
+                let value = args.next().ok_or_else(|| {
+                    "после --environment требуется procedural или путь .hdr".to_owned()
+                })?;
+                environment = Some(if value == "procedural" {
+                    EnvironmentMode::Procedural
+                } else {
+                    let path = VirtualPath::parse(&value)
+                        .map_err(|error| format!("некорректный путь --environment: {error}"))?;
+                    let is_hdr = path
+                        .as_str()
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.rsplit_once('.'))
+                        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("hdr"));
+                    if !is_hdr {
+                        return Err(
+                            "--environment должен указывать на procedural или .hdr".to_owned()
+                        );
+                    }
+                    EnvironmentMode::Hdr(path.as_str().to_owned())
+                });
+            }
             _ => return Err(format!("неизвестный аргумент: {argument}")),
         }
     }
@@ -168,6 +205,7 @@ where
         scene: scene.unwrap_or_default(),
         model,
         texture,
+        environment,
         debug_overlay,
     })
 }
@@ -202,6 +240,43 @@ fn load_content(options: &Options, assets: &Assets) -> Result<Content, AssetErro
     Ok(content)
 }
 
+fn load_environment(
+    mode: Option<&EnvironmentMode>,
+    assets: &Assets,
+    content: &Content,
+) -> Result<Option<EnvironmentSource>, String> {
+    match mode {
+        None => Ok(None),
+        Some(EnvironmentMode::Hdr(path)) => {
+            let image = assets
+                .load_hdr(path)
+                .map_err(|error| format!("{path}: {error}"))?;
+            Ok(Some(EnvironmentSource::Equirect {
+                width: image.width,
+                height: image.height,
+                rgb: image.rgb,
+            }))
+        }
+        Some(EnvironmentMode::Procedural) => {
+            let light = content.light(0.0);
+            let sun_direction = -Vec3::from_array(light.direction).normalize_or_zero();
+            let sun_direction = if sun_direction.length_squared() > 1e-8 {
+                sun_direction.to_array()
+            } else {
+                Vec3::Y.to_array()
+            };
+            Ok(Some(EnvironmentSource::Procedural(ProceduralSky {
+                zenith_color: [0.2, 0.35, 0.65],
+                horizon_color: [0.65, 0.7, 0.75],
+                ground_color: [0.12, 0.11, 0.1],
+                sun_size_deg: 1.0,
+                sun_intensity: 1.0,
+                sun_direction,
+            })))
+        }
+    }
+}
+
 #[derive(Default)]
 struct ResizeTest {
     initial_requested: bool,
@@ -215,6 +290,8 @@ struct ResizeTest {
 struct Sandbox {
     renderer: Option<Renderer>,
     content: Content,
+    environment_source: Option<EnvironmentSource>,
+    environment: Option<EnvironmentId>,
     camera_settings: CameraSettings,
     present_mode: Option<BootstrapPresentMode>,
     pipeline_cache_path: Option<PathBuf>,
@@ -234,6 +311,7 @@ impl Sandbox {
         options: Options,
         content: Content,
         mut camera_settings: CameraSettings,
+        environment_source: Option<EnvironmentSource>,
         present_mode: Option<BootstrapPresentMode>,
         pipeline_cache_path: Option<PathBuf>,
         pipeline_cache: Vec<u8>,
@@ -244,6 +322,8 @@ impl Sandbox {
         Self {
             renderer: None,
             content,
+            environment_source,
+            environment: None,
             camera_settings,
             present_mode,
             pipeline_cache_path,
@@ -379,16 +459,51 @@ impl Sandbox {
                     )
                 })
                 .transpose()?;
+            let emissive_texture = mesh
+                .material
+                .emissive_texture
+                .map(|index| {
+                    upload_content_texture(
+                        renderer,
+                        &self.content.textures,
+                        &mut texture_cache,
+                        index,
+                        TextureColorSpace::Srgb,
+                    )
+                })
+                .transpose()?;
+            let occlusion_texture = mesh
+                .material
+                .occlusion_texture
+                .map(|index| {
+                    upload_content_texture(
+                        renderer,
+                        &self.content.textures,
+                        &mut texture_cache,
+                        index,
+                        TextureColorSpace::Linear,
+                    )
+                })
+                .transpose()?;
             let material_id = renderer
                 .create_material(&Material {
                     base_color: mesh.material.base_color,
                     metallic: mesh.material.metallic,
                     roughness: mesh.material.roughness,
+                    emissive: mesh.material.emissive,
+                    opacity: mesh.material.opacity,
+                    alpha_mode: match mesh.material.alpha_mode {
+                        ModelAlphaMode::Opaque => AlphaMode::Opaque,
+                        ModelAlphaMode::Blend => AlphaMode::Blend,
+                    },
                     double_sided: mesh.material.double_sided,
                     base_color_texture,
                     metallic_roughness_texture,
                     normal_texture,
+                    emissive_texture,
+                    occlusion_texture,
                     normal_scale: mesh.material.normal_scale,
+                    occlusion_strength: mesh.material.occlusion_strength,
                 })
                 .map_err(|error| format!("ошибка создания материала: {error}"))?;
             self.meshes.push((id, material_id, mesh.environment));
@@ -448,6 +563,15 @@ impl WindowHandler for Sandbox {
                     self.failure = Some(error);
                     return false;
                 }
+                if let Some(source) = &self.environment_source {
+                    match renderer.create_environment(source) {
+                        Ok(environment) => self.environment = Some(environment),
+                        Err(error) => {
+                            self.failure = Some(format!("ошибка создания environment: {error}"));
+                            return false;
+                        }
+                    }
+                }
                 if self.options.debug_overlay {
                     self.debug_overlay = Some(DebugOverlay::new(
                         &renderer.capabilities().device_name,
@@ -494,6 +618,38 @@ impl WindowHandler for Sandbox {
             Some(overlay) => overlay.update(Instant::now(), gpu_time),
             None => &[],
         };
+        let shadow_cascades = self.content.shadow_cascades(
+            elapsed,
+            self.size.width,
+            self.size.height,
+            self.camera_settings,
+        );
+        let view_projection = self.content.view_projection(
+            elapsed,
+            self.size.width,
+            self.size.height,
+            self.camera_settings,
+        );
+        let (view, projection) = self
+            .content
+            .motion
+            .camera_at(elapsed, self.camera_settings)
+            .map(|camera| {
+                (
+                    camera.view(),
+                    camera.projection(self.size.width, self.size.height),
+                )
+            })
+            .unwrap_or_else(|| {
+                if self.content.motion == Scene::Cube {
+                    let view = Mat4::from_translation(Vec3::new(0.0, 0.0, -3.0));
+                    (view, view_projection * view.inverse())
+                } else {
+                    (Mat4::IDENTITY, view_projection)
+                }
+            });
+        let local_lights = self.content.local_lights();
+        let local_light_shadows = self.content.local_light_shadows();
         let frame = Frame {
             clear_color: [
                 self.camera_settings.render.clear_color[0],
@@ -501,21 +657,21 @@ impl WindowHandler for Sandbox {
                 self.camera_settings.render.clear_color[2],
                 1.0,
             ],
-            view_projection: self
-                .content
-                .view_projection(
-                    elapsed,
-                    self.size.width,
-                    self.size.height,
-                    self.camera_settings,
-                )
-                .to_cols_array_2d(),
-            shadow_view_projection: self
-                .content
-                .shadow_view_projection(elapsed)
-                .map(|matrix| matrix.to_cols_array_2d()),
-            camera_position: self.content.motion.camera_position(elapsed),
+            camera: FrameCamera {
+                view: view.to_cols_array_2d(),
+                projection: projection.to_cols_array_2d(),
+                position: self.content.motion.camera_position(elapsed),
+            },
+            environment: self.environment.map(|id| FrameEnvironment {
+                id,
+                intensity: 1.0,
+                rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                skybox: true,
+            }),
+            shadow_cascades: &shadow_cascades,
             light: self.content.light(elapsed),
+            lights: &local_lights,
+            local_light_shadows: &local_light_shadows,
             draws: &draws,
             overlay,
             view: ViewSettings {
@@ -671,12 +827,21 @@ fn main_after_vulkan_environment() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let environment_source = match load_environment(options.environment.as_ref(), &assets, &content)
+    {
+        Ok(environment) => environment,
+        Err(error) => {
+            eprintln!("Ошибка environment: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let pipeline_cache_path = engine_platform::pipeline_cache_path("sandbox");
     let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
     let mut app = Sandbox::new(
         options,
         content,
         camera_settings,
+        environment_source,
         present_mode,
         pipeline_cache_path,
         pipeline_cache,
@@ -708,8 +873,8 @@ fn main_after_vulkan_environment() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CameraSettings, Content, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args,
-        with_executable_directory,
+        CameraSettings, Content, EnvironmentMode, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox,
+        Scene, parse_args, with_executable_directory,
     };
     use engine_assets::Assets;
     use engine_resources::{ResourceConfig, ResourceSystem};
@@ -720,6 +885,7 @@ mod tests {
             options,
             content,
             CameraSettings::default(),
+            None,
             None,
             None,
             Vec::new(),
@@ -784,6 +950,7 @@ mod tests {
             settings,
             None,
             None,
+            None,
             Vec::new(),
         );
         assert_eq!(sandbox.camera_settings.render.render_scale, 0.4);
@@ -830,6 +997,7 @@ mod tests {
             scene: Scene::Cube,
             model: None,
             texture: None,
+            environment: None,
             debug_overlay: false,
         });
         sandbox.report_resize(RESIZE_SIZE.width, RESIZE_SIZE.height);
@@ -903,12 +1071,20 @@ mod tests {
         assert_eq!(options.texture.as_deref(), Some("/texture/paint.png"));
         assert!(options.debug_overlay);
 
+        let procedural = parse_args(["--environment", "procedural"]).unwrap();
+        assert_eq!(procedural.environment, Some(EnvironmentMode::Procedural));
+        let hdr = parse_args(["--environment", "/environment/sky.hdr"]).unwrap();
+        assert_eq!(
+            hdr.environment,
+            Some(EnvironmentMode::Hdr("environment/sky.hdr".to_owned()))
+        );
+
         let options = parse_args(["--model", "/model/cube.fbx"]).unwrap();
         assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
         assert_eq!(options.texture, None);
-        for scene in ["shadows", "cube", "materials"] {
+        for scene in ["shadows", "cube", "materials", "clustered"] {
             let options = parse_args(["--scene", scene, "--model", "/model/cube.fbx"])
-                .expect("cube, shadow and material scenes may load a model");
+                .expect("non-triangle scenes may load a model");
             assert_eq!(options.scene, Scene::parse(scene).unwrap());
             assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
         }
@@ -951,6 +1127,9 @@ mod tests {
             vec!["--model", "/a.fbx", "--model", "/b.fbx"],
             vec!["--texture"],
             vec!["--texture", "/a.png", "--texture", "/b.png"],
+            vec!["--environment"],
+            vec!["--environment", "/environment/sky.png"],
+            vec!["--environment", "procedural", "--environment", "procedural"],
             vec!["--debug-overlay", "--debug-overlay"],
             vec!["--debug-overlay", "1"],
             vec!["--model", "/model/cube.fbx", "--scene", "triangle"],

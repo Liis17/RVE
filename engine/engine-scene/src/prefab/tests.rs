@@ -162,7 +162,7 @@ mesh_renderer = { model = "/models/gold.fbx", texture = "/textures/gold.png" }
 lite_params = [{ path = "/scripts/rotate.lua", params = { speed = 90.0 } }]
 [[instances.overrides]]
 target = "frame"
-mesh_renderer = { material = { metallic = 0.9 } }
+mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opacity = 0.4, alpha_mode = "mask", alpha_cutoff = 0.25, occlusion_strength = 0.7, double_sided = false } }
 "#,
     ));
     let expanded = library.expand(&document).unwrap().document;
@@ -185,6 +185,34 @@ mesh_renderer = { material = { metallic = 0.9 } }
         .unwrap();
     assert_eq!(material.metallic, Some(0.9));
     assert_eq!(material.roughness, Some(0.4));
+    assert_eq!(material.emissive, Some([1.5, 0.2, 0.0]));
+    assert_eq!(material.opacity, Some(0.4));
+    assert_eq!(material.alpha_mode, Some(crate::MaterialAlphaMode::Mask));
+    assert_eq!(material.alpha_cutoff, Some(0.25));
+    assert_eq!(material.occlusion_strength, Some(0.7));
+    assert_eq!(material.double_sided, Some(false));
+}
+
+#[test]
+fn alpha_mode_override_removes_inherited_mask_cutoff() {
+    let alpha_door = DOOR.replace(
+        "roughness = 0.4",
+        "roughness = 0.4\nalpha_mode = \"mask\"\nalpha_cutoff = 0.4",
+    );
+    let library = Library::new(&[("prefabs/door.rveprefab", &alpha_door)]);
+    let document = scene(&door_scene(
+        "[[instances.overrides]]\ntarget = \"frame\"\nmesh_renderer = { material = { alpha_mode = \"blend\" } }\n",
+    ));
+    let expanded = library.expand(&document).unwrap().document;
+    let material = object(&expanded, "door1")
+        .mesh_renderer
+        .as_ref()
+        .unwrap()
+        .material
+        .as_ref()
+        .unwrap();
+    assert_eq!(material.alpha_mode, Some(crate::MaterialAlphaMode::Blend));
+    assert_eq!(material.alpha_cutoff, None);
 }
 
 #[test]
@@ -227,7 +255,11 @@ fn camera_and_light_overrides_replace_whole_components_and_heavy_params_merge() 
         "cameras/override.camerasettings"
     );
     let sun = object(&expanded, "rig.sun");
-    assert_eq!(sun.directional_light.unwrap().color, [1.0, 0.5, 0.5]);
+    let light = sun.directional_light.unwrap();
+    assert_eq!(light.color, [1.0, 0.5, 0.5]);
+    assert!(!light.shadows);
+    assert_eq!(light.shadow_distance, 100.0);
+    assert_eq!(light.shadow_cascades, 4);
     let params = &sun.heavy_scripts[0].params;
     assert_eq!(params["speed"], ParamValue::Float(2.0));
     assert_eq!(params["amplitude"], ParamValue::Float(0.5));
@@ -238,6 +270,37 @@ fn camera_and_light_overrides_replace_whole_components_and_heavy_params_merge() 
     )
     .unwrap_err();
     assert!(missing_camera_settings.message.contains("camerasettings"));
+}
+
+#[test]
+fn point_and_spot_prefab_overrides_replace_whole_components() {
+    let prefab = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\ncolor = [0.2, 0.4, 0.8]\nintensity = 1.0\nrange = 4.0\nshadows = true\n[objects.spot_light]\ncolor = [0.8, 0.4, 0.2]\nintensity = 2.0\nrange = 6.0\ninner_angle_deg = 12.0\nouter_angle_deg = 24.0\nshadows = true\n";
+    let library = Library::new(&[("prefabs/lamp.rveprefab", prefab)]);
+    let document = scene(
+        "[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\npoint_light = { intensity = 4.0 }\nspot_light = { outer_angle_deg = 42.0 }\n",
+    );
+    let expanded = library.expand(&document).unwrap().document;
+    let lamp = object(&expanded, "lamp");
+    assert_eq!(
+        lamp.point_light,
+        Some(crate::PointLightComponent {
+            color: [1.0; 3],
+            intensity: 4.0,
+            range: 10.0,
+            shadows: false,
+        })
+    );
+    assert_eq!(
+        lamp.spot_light,
+        Some(crate::SpotLightComponent {
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 10.0,
+            inner_angle_deg: 20.0,
+            outer_angle_deg: 42.0,
+            shadows: false,
+        })
+    );
 }
 
 #[test]
@@ -524,6 +587,46 @@ fn instances_round_trip_and_scenes_without_them_do_not_change() {
     }
     let plain = scene(CAMERA);
     assert!(!plain.to_toml().unwrap().contains("instances"));
+}
+
+#[test]
+fn environment_prefab_override_replaces_the_whole_component() {
+    let prefab = r#"
+[[objects]]
+id="root"
+[objects.environment]
+intensity=0.5
+[objects.environment.procedural]
+zenith_color=[0.1, 0.2, 0.3]
+horizon_color=[0.4, 0.5, 0.6]
+ground_color=[0.0, 0.0, 0.0]
+sun_size_deg=1.0
+sun_intensity=1.0
+"#;
+    let library = Library::new(&[("prefabs/sky.rveprefab", prefab)]);
+    let text = format!(
+        "[[assets]]\npath=\"/prefabs/sky.rveprefab\"\n{CAMERA}[[instances]]\nid=\"sky\"\nprefab=\"/prefabs/sky.rveprefab\"\n[[instances.overrides]]\ntarget=\"root\"\n[instances.overrides.environment]\nintensity=2.0\n[instances.overrides.environment.procedural]\nzenith_color=[0.7, 0.8, 0.9]\nhorizon_color=[0.2, 0.3, 0.4]\nground_color=[0.1, 0.1, 0.1]\nsun_size_deg=4.0\nsun_intensity=5.0\n"
+    );
+    let expanded = library.expand(&scene(&text)).unwrap().document;
+    let environment = object(&expanded, "sky").environment.as_ref().unwrap();
+    assert_eq!(environment.intensity, 2.0);
+    assert_eq!(
+        environment.procedural.unwrap().zenith_color,
+        [0.7, 0.8, 0.9]
+    );
+
+    let inherited_text = format!(
+        "[[assets]]\npath=\"/prefabs/sky.rveprefab\"\n{CAMERA}[[instances]]\nid=\"sky\"\nprefab=\"/prefabs/sky.rveprefab\"\n"
+    );
+    let inherited = library.expand(&scene(&inherited_text)).unwrap().document;
+    assert_eq!(
+        object(&inherited, "sky")
+            .environment
+            .as_ref()
+            .unwrap()
+            .intensity,
+        0.5
+    );
 }
 
 #[test]

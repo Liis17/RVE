@@ -6,8 +6,9 @@ use super::{
 };
 use engine_files::VirtualPath;
 use engine_scene::{
-    HeavyParamsOverride, LiteParamsOverride, MaterialOverride, MeshRendererOverride,
-    PrefabInstance, PrefabOverride, SceneDocument, SceneObject, SceneTransform, TransformOverride,
+    HeavyParamsOverride, LiteParamsOverride, MaterialAlphaMode, MaterialOverride,
+    MeshRendererOverride, PrefabInstance, PrefabOverride, SceneDocument, SceneObject,
+    SceneTransform, TransformOverride,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -425,6 +426,8 @@ fn material_paths(material: &MaterialOverride) -> impl Iterator<Item = VirtualPa
         .metallic_roughness_texture
         .iter()
         .chain(&material.normal_texture)
+        .chain(&material.emissive_texture)
+        .chain(&material.occlusion_texture)
         .cloned()
 }
 
@@ -497,6 +500,15 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.directional_light.is_some() {
         base.directional_light = outer.directional_light;
     }
+    if outer.point_light.is_some() {
+        base.point_light = outer.point_light;
+    }
+    if outer.spot_light.is_some() {
+        base.spot_light = outer.spot_light;
+    }
+    if outer.environment.is_some() {
+        base.environment = outer.environment.clone();
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -525,6 +537,9 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.mesh_renderer.is_none()
         && change.camera.is_none()
         && change.directional_light.is_none()
+        && change.point_light.is_none()
+        && change.spot_light.is_none()
+        && change.environment.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -595,6 +610,21 @@ pub(crate) fn object_override(
         (Some(from), Some(to)) => change.directional_light = (to != from).then_some(to),
         _ => return Err(COMPONENTS.to_owned()),
     }
+    match (base.point_light, edited.point_light) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.point_light = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.spot_light, edited.spot_light) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.spot_light = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.environment, &edited.environment) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.environment = (to != from).then(|| to.clone()),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
     if base.lite_scripts.len() != edited.lite_scripts.len()
         || base
             .lite_scripts
@@ -663,16 +693,33 @@ fn material_diff(
             (_, to) => Ok(to.clone()),
         }
     }
+    let alpha_mode = field(&from.alpha_mode, &to.alpha_mode)?;
+    let alpha_cutoff = if to
+        .alpha_mode
+        .is_some_and(|mode| mode != MaterialAlphaMode::Mask)
+        && to.alpha_cutoff.is_none()
+    {
+        None
+    } else {
+        field(&from.alpha_cutoff, &to.alpha_cutoff)?
+    };
     Ok(MaterialOverride {
         base_color: field(&from.base_color, &to.base_color)?,
         metallic: field(&from.metallic, &to.metallic)?,
         roughness: field(&from.roughness, &to.roughness)?,
+        emissive: field(&from.emissive, &to.emissive)?,
+        opacity: field(&from.opacity, &to.opacity)?,
+        alpha_mode,
+        alpha_cutoff,
         metallic_roughness_texture: field(
             &from.metallic_roughness_texture,
             &to.metallic_roughness_texture,
         )?,
         normal_texture: field(&from.normal_texture, &to.normal_texture)?,
+        emissive_texture: field(&from.emissive_texture, &to.emissive_texture)?,
+        occlusion_texture: field(&from.occlusion_texture, &to.occlusion_texture)?,
         normal_scale: field(&from.normal_scale, &to.normal_scale)?,
+        occlusion_strength: field(&from.occlusion_strength, &to.occlusion_strength)?,
         double_sided: field(&from.double_sided, &to.double_sided)?,
     })
 }
@@ -682,13 +729,29 @@ fn merge_material(target: &mut MaterialOverride, change: &MaterialOverride) {
     target.base_color = change.base_color.or(target.base_color);
     target.metallic = change.metallic.or(target.metallic);
     target.roughness = change.roughness.or(target.roughness);
+    target.emissive = change.emissive.or(target.emissive);
+    target.opacity = change.opacity.or(target.opacity);
+    if change.alpha_mode.is_some() {
+        target.alpha_mode = change.alpha_mode;
+        if change.alpha_mode != Some(MaterialAlphaMode::Mask) {
+            target.alpha_cutoff = None;
+        }
+    }
+    target.alpha_cutoff = change.alpha_cutoff.or(target.alpha_cutoff);
     if change.metallic_roughness_texture.is_some() {
         target.metallic_roughness_texture = change.metallic_roughness_texture.clone();
     }
     if change.normal_texture.is_some() {
         target.normal_texture = change.normal_texture.clone();
     }
+    if change.emissive_texture.is_some() {
+        target.emissive_texture = change.emissive_texture.clone();
+    }
+    if change.occlusion_texture.is_some() {
+        target.occlusion_texture = change.occlusion_texture.clone();
+    }
     target.normal_scale = change.normal_scale.or(target.normal_scale);
+    target.occlusion_strength = change.occlusion_strength.or(target.occlusion_strength);
     target.double_sided = change.double_sided.or(target.double_sided);
 }
 
@@ -700,6 +763,9 @@ pub enum OverrideField {
     Mesh,
     Camera,
     Light,
+    PointLight,
+    SpotLight,
+    Environment,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -724,6 +790,9 @@ impl EditorScene {
             OverrideField::Mesh => change.mesh_renderer.is_some(),
             OverrideField::Camera => change.camera.is_some(),
             OverrideField::Light => change.directional_light.is_some(),
+            OverrideField::PointLight => change.point_light.is_some(),
+            OverrideField::SpotLight => change.spot_light.is_some(),
+            OverrideField::Environment => change.environment.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -760,6 +829,9 @@ impl EditorScene {
                     OverrideField::Mesh => change.mesh_renderer = None,
                     OverrideField::Camera => change.camera = None,
                     OverrideField::Light => change.directional_light = None,
+                    OverrideField::PointLight => change.point_light = None,
+                    OverrideField::SpotLight => change.spot_light = None,
+                    OverrideField::Environment => change.environment = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }
@@ -879,15 +951,25 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
     {
         paths.push(settings);
     }
+    if let Some(hdr) = change
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.hdr.clone())
+    {
+        paths.push(hdr);
+    }
     paths
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{Component, EditorScene, NewObject, PrefabLoader};
-    use super::OverrideField;
+    use super::{OverrideField, material_diff, material_paths, merge_material};
     use engine_files::VirtualPath;
-    use engine_scene::{ParamValue, SceneDocument, SceneError, SceneTransform, World};
+    use engine_scene::{
+        MaterialAlphaMode, MaterialOverride, ParamValue, SceneDocument, SceneError, SceneTransform,
+        World,
+    };
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -952,6 +1034,46 @@ mod tests {
             )
             .unwrap();
         (files, scene, id)
+    }
+
+    #[test]
+    fn material_diff_keeps_stage_one_fields_and_texture_dependencies() {
+        let before = MaterialOverride::default();
+        let after = MaterialOverride {
+            emissive: Some([2.0, 0.5, 1.0]),
+            opacity: Some(0.65),
+            alpha_mode: Some(MaterialAlphaMode::Mask),
+            alpha_cutoff: Some(0.4),
+            emissive_texture: Some(path("/textures/emissive.png")),
+            occlusion_texture: Some(path("/textures/occlusion.png")),
+            occlusion_strength: Some(0.7),
+            ..MaterialOverride::default()
+        };
+        let difference = material_diff(&before, &after).unwrap();
+        assert_eq!(difference, after);
+        assert_eq!(
+            material_paths(&difference)
+                .map(|path| path.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["textures/emissive.png", "textures/occlusion.png"]
+        );
+    }
+
+    #[test]
+    fn material_diff_clears_mask_cutoff_when_mode_changes() {
+        let before = MaterialOverride {
+            alpha_mode: Some(MaterialAlphaMode::Mask),
+            alpha_cutoff: Some(0.4),
+            ..MaterialOverride::default()
+        };
+        let after = MaterialOverride {
+            alpha_mode: Some(MaterialAlphaMode::Blend),
+            ..MaterialOverride::default()
+        };
+        let difference = material_diff(&before, &after).unwrap();
+        let mut merged = before;
+        merge_material(&mut merged, &difference);
+        assert_eq!(merged, after);
     }
 
     fn nested_door_scene() -> (Files, EditorScene) {
@@ -1158,6 +1280,120 @@ mod tests {
         transform.position[1] = 1.0;
         scene.set_transform("door.handle", transform, None).unwrap();
         assert!(scene.object_override("door.handle").is_none());
+    }
+
+    #[test]
+    fn environment_prefab_override_replaces_the_component_and_registers_hdr_asset() {
+        let prefab = "[[assets]]\npath = \"/environment/original.hdr\"\n[[objects]]\nid = \"sky\"\n[objects.environment]\nhdr = \"/environment/original.hdr\"\n";
+        let files = Files::with(&[("prefabs/sky.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/sky.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("sky", None, |object| {
+                object.environment.as_mut().unwrap().hdr = Some(path("/environment/changed.hdr"));
+                Ok(())
+            })
+            .unwrap();
+        let change = scene.object_override("sky").unwrap();
+        assert_eq!(
+            change.environment.as_ref().unwrap().hdr,
+            Some(path("/environment/changed.hdr"))
+        );
+        assert!(scene.is_overridden("sky", &OverrideField::Environment));
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/environment/changed.hdr"))
+        );
+        let (_, applied) = scene.prefab_with_override("sky").unwrap();
+        assert_eq!(
+            applied.objects[0].environment.as_ref().unwrap().hdr,
+            Some(path("/environment/changed.hdr"))
+        );
+
+        scene
+            .revert_field("sky", &OverrideField::Environment)
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("sky")
+                .unwrap()
+                .environment
+                .as_ref()
+                .unwrap()
+                .hdr,
+            Some(path("/environment/original.hdr"))
+        );
+    }
+
+    #[test]
+    fn local_light_prefab_overrides_replace_whole_components_and_revert() {
+        let prefab = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\ncolor = [0.8, 0.6, 0.4]\nintensity = 1.0\nrange = 5.0\n[objects.spot_light]\ncolor = [0.4, 0.6, 0.8]\nintensity = 2.0\nrange = 7.0\ninner_angle_deg = 10.0\nouter_angle_deg = 20.0\n";
+        let files = Files::with(&[("prefabs/lamp.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/lamp.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("lamp", None, |object| {
+                let point = object.point_light.as_mut().unwrap();
+                point.color = [1.5, 0.25, 0.1];
+                point.intensity = 4.0;
+                point.range = 12.0;
+                point.shadows = true;
+                let spot = object.spot_light.as_mut().unwrap();
+                spot.intensity = 3.5;
+                spot.range = 15.0;
+                spot.inner_angle_deg = 14.0;
+                spot.outer_angle_deg = 32.0;
+                Ok(())
+            })
+            .unwrap();
+        let change = scene.object_override("lamp").unwrap();
+        assert_eq!(
+            change.point_light,
+            scene.object("lamp").unwrap().point_light
+        );
+        assert_eq!(change.spot_light, scene.object("lamp").unwrap().spot_light);
+        assert!(scene.is_overridden("lamp", &OverrideField::PointLight));
+        assert!(scene.is_overridden("lamp", &OverrideField::SpotLight));
+        let (_, applied) = scene.prefab_with_override("lamp").unwrap();
+        assert_eq!(applied.objects[0].point_light, change.point_light);
+        assert_eq!(applied.objects[0].spot_light, change.spot_light);
+
+        scene
+            .revert_field("lamp", &OverrideField::PointLight)
+            .unwrap();
+        scene
+            .revert_field("lamp", &OverrideField::SpotLight)
+            .unwrap();
+        assert!(!scene.is_overridden("lamp", &OverrideField::PointLight));
+        assert!(!scene.is_overridden("lamp", &OverrideField::SpotLight));
+        assert_eq!(
+            scene.object("lamp").unwrap().point_light.unwrap().range,
+            5.0
+        );
+        assert_eq!(
+            scene
+                .object("lamp")
+                .unwrap()
+                .spot_light
+                .unwrap()
+                .outer_angle_deg,
+            20.0
+        );
     }
 
     #[test]

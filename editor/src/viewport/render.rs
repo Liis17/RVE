@@ -3,17 +3,26 @@
 use crate::console::ConsoleLog;
 use crate::project::OpenProject;
 use crate::viewport::model_loader::ModelLoader;
-use engine_assets::Model;
+use engine_assets::{Model, ModelAlphaMode};
+use engine_render::AlphaMode;
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, Material, MaterialId,
-    MeshId, RenderError, Renderer, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
-    Vertex, ViewSettings, ViewportId,
+    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, LocalLight, LocalLightShadow,
+    LocalLightShadowMatrices, Material, MaterialId, MeshId, ProceduralSky, RenderError, Renderer,
+    SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex,
+    ViewSettings, ViewportId,
 };
+use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
-use engine_scene::light::shadow_view_projection;
+use engine_scene::light::{
+    cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
+};
 use engine_scene::world::ObjectHandle;
-use engine_scene::{AntiAliasing, CameraSettings, LightState, SceneFrame, Tonemapper, World};
-use glam::{Mat4, Vec3};
+use engine_scene::{
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, SceneFrame,
+    Tonemapper, World,
+};
+use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -32,11 +41,22 @@ pub struct SceneRenderer {
     pub game_viewport: ViewportId,
     models: HashMap<String, Option<GpuModel>>,
     textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
+    environment_sources: HashMap<String, Option<Arc<EnvironmentSource>>>,
+    current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
     object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     grid: Option<MeshId>,
     grid_material: Option<MaterialId>,
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EditorEnvironmentKey {
+    Hdr(String),
+    Procedural {
+        colors_and_sun: [u32; 11],
+        sun_direction: [i32; 3],
+    },
 }
 
 impl SceneRenderer {
@@ -46,6 +66,8 @@ impl SceneRenderer {
             game_viewport: renderer.create_viewport(1, 1)?,
             models: HashMap::new(),
             textures: HashMap::new(),
+            environment_sources: HashMap::new(),
+            current_environment: None,
             object_materials: HashMap::new(),
             grid: None,
             grid_material: None,
@@ -60,6 +82,10 @@ impl SceneRenderer {
         renderer: &mut Renderer,
         cpu_models: &mut HashMap<String, Arc<Model>>,
     ) -> Result<(), RenderError> {
+        if let Some((_, environment)) = self.current_environment.take() {
+            renderer.destroy_environment(environment)?;
+        }
+        self.environment_sources.clear();
         for model in self.models.drain().filter_map(|(_, model)| model) {
             destroy_model(renderer, model)?;
         }
@@ -84,6 +110,7 @@ impl SceneRenderer {
         loader: &mut ModelLoader,
         log: &mut ConsoleLog,
     ) -> Result<(), RenderError> {
+        let mut active_environments = HashSet::new();
         for (path, loaded) in loader.finished() {
             let gpu = match loaded {
                 Ok(model) => {
@@ -102,6 +129,28 @@ impl SceneRenderer {
             }
         }
         for object in world.objects() {
+            if let Some(path) = object
+                .environment
+                .as_ref()
+                .and_then(|environment| environment.hdr.as_ref())
+            {
+                let path = path.as_str();
+                active_environments.insert(path.to_owned());
+                if !self.environment_sources.contains_key(path) {
+                    let source = match project.assets.load_hdr(path) {
+                        Ok(image) => Some(Arc::new(EnvironmentSource::Equirect {
+                            width: image.width,
+                            height: image.height,
+                            rgb: image.rgb,
+                        })),
+                        Err(error) => {
+                            log.error(format!("{path}: {error}"));
+                            None
+                        }
+                    };
+                    self.environment_sources.insert(path.to_owned(), source);
+                }
+            }
             let Some(mesh) = &object.mesh_renderer else {
                 continue;
             };
@@ -144,6 +193,14 @@ impl SceneRenderer {
                         .normal_texture
                         .as_ref()
                         .map(|path| (path.as_str(), TextureColorSpace::Linear)),
+                    override_material
+                        .emissive_texture
+                        .as_ref()
+                        .map(|path| (path.as_str(), TextureColorSpace::Srgb)),
+                    override_material
+                        .occlusion_texture
+                        .as_ref()
+                        .map(|path| (path.as_str(), TextureColorSpace::Linear)),
                 ]
                 .into_iter()
                 .flatten()
@@ -152,6 +209,8 @@ impl SceneRenderer {
                 }
             }
         }
+        self.environment_sources
+            .retain(|path, _| active_environments.contains(path));
         Ok(())
     }
 
@@ -263,16 +322,23 @@ impl SceneRenderer {
     }
 
     /// Собирает `Frame` для заданной матрицы камеры; `with_grid` выбирает Scene draw list.
-    pub fn frame(
-        &self,
-        view_projection: Mat4,
-        camera_position: Vec3,
+    #[allow(clippy::too_many_arguments)]
+    pub fn frame<'a>(
+        &'a self,
+        camera: Camera,
+        width: u32,
+        height: u32,
         settings: CameraSettings,
         light: &LightState,
+        local_lights: &'a [LocalLight],
+        local_light_shadows: &'a [LocalLightShadow],
         scene_has_light: bool,
+        environment_state: Option<&EnvironmentState>,
+        shadow_cascades: &'a [[[f32; 4]; 4]],
         with_grid: bool,
-    ) -> Frame<'_> {
-        let (light, shadow) = frame_light(light, scene_has_light);
+    ) -> Frame<'a> {
+        let light = frame_light(light, scene_has_light);
+        let environment = self.frame_environment(environment_state);
         Frame {
             clear_color: [
                 settings.render.clear_color[0],
@@ -280,10 +346,16 @@ impl SceneRenderer {
                 settings.render.clear_color[2],
                 1.0,
             ],
-            view_projection: view_projection.to_cols_array_2d(),
-            shadow_view_projection: shadow,
-            camera_position: camera_position.to_array(),
+            camera: FrameCamera {
+                view: camera.view().to_cols_array_2d(),
+                projection: camera.projection(width, height).to_cols_array_2d(),
+                position: camera.position.to_array(),
+            },
+            environment,
+            shadow_cascades,
             light,
+            lights: local_lights,
+            local_light_shadows,
             draws: if with_grid {
                 &self.scene_draws
             } else {
@@ -304,6 +376,87 @@ impl SceneRenderer {
                 },
             },
         }
+    }
+
+    pub fn sync_environment(
+        &mut self,
+        renderer: &mut Renderer,
+        state: Option<&EnvironmentState>,
+    ) -> Result<(), RenderError> {
+        let Some(state) = state else {
+            if let Some((_, environment)) = self.current_environment.take() {
+                renderer.destroy_environment(environment)?;
+            }
+            return Ok(());
+        };
+        let key = editor_environment_key(state);
+        if self
+            .current_environment
+            .as_ref()
+            .is_some_and(|(current, _)| current == &key)
+        {
+            return Ok(());
+        }
+        let source = if let Some(path) = &state.component.hdr {
+            self.environment_sources
+                .get(path.as_str())
+                .and_then(Option::as_ref)
+                .map(|source| renderer.create_environment(source))
+        } else {
+            editor_procedural_sky(state)
+                .map(|sky| renderer.create_environment(&EnvironmentSource::Procedural(sky)))
+        };
+        let Some(id) = source.transpose()? else {
+            if let Some((_, environment)) = self.current_environment.take() {
+                renderer.destroy_environment(environment)?;
+            }
+            return Ok(());
+        };
+        if let Some((_, environment)) = self.current_environment.take() {
+            renderer.destroy_environment(environment)?;
+        }
+        self.current_environment = Some((key, id));
+        Ok(())
+    }
+
+    fn frame_environment(&self, state: Option<&EnvironmentState>) -> Option<FrameEnvironment> {
+        let state = state?;
+        let key = editor_environment_key(state);
+        let (_, id) = self
+            .current_environment
+            .as_ref()
+            .filter(|(current, _)| current == &key)?;
+        Some(FrameEnvironment {
+            id: *id,
+            intensity: state.component.intensity,
+            rotation: state.rotation,
+            skybox: state.component.skybox,
+        })
+    }
+
+    pub fn shadow_cascades(
+        camera: Camera,
+        width: u32,
+        height: u32,
+        light: &LightState,
+        scene_has_light: bool,
+    ) -> Vec<[[f32; 4]; 4]> {
+        if !scene_has_light {
+            return Vec::new();
+        }
+        let Some(settings) = light.shadow else {
+            return Vec::new();
+        };
+        cascade_view_projections(
+            camera,
+            width.max(1) as f32 / height.max(1) as f32,
+            Vec3::from_array(light.direction),
+            settings,
+            SHADOW_MAP_RESOLUTION,
+        )
+        .into_iter()
+        .map(|matrix| matrix.to_cols_array_2d())
+        .collect()
     }
 }
 
@@ -408,12 +561,32 @@ fn append_world_draws(
                         .copied()
                         .flatten()
                 });
+            let emissive_texture = override_material
+                .and_then(|material| material.emissive_texture.as_ref())
+                .and_then(|path| {
+                    resources
+                        .textures
+                        .get(&(path.as_str().to_owned(), TextureColorSpace::Srgb))
+                        .copied()
+                        .flatten()
+                });
+            let occlusion_texture = override_material
+                .and_then(|material| material.occlusion_texture.as_ref())
+                .and_then(|path| {
+                    resources
+                        .textures
+                        .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
+                        .copied()
+                        .flatten()
+                });
             let resolved = resolve_material(
                 *base_material,
                 replacement,
                 override_material,
                 mr_texture,
                 normal_texture,
+                emissive_texture,
+                occlusion_texture,
             );
             let material_id = if resolved == *base_material {
                 *base_material_id
@@ -466,6 +639,12 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                 base_color: base.base_color,
                 metallic: base.metallic,
                 roughness: base.roughness,
+                emissive: base.emissive,
+                opacity: base.opacity,
+                alpha_mode: match base.alpha_mode {
+                    ModelAlphaMode::Opaque => AlphaMode::Opaque,
+                    ModelAlphaMode::Blend => AlphaMode::Blend,
+                },
                 base_color_texture: model_texture(
                     renderer,
                     model,
@@ -490,7 +669,24 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     &mut textures_by_role,
                     &mut textures,
                 )?,
+                emissive_texture: model_texture(
+                    renderer,
+                    model,
+                    base.emissive_texture,
+                    TextureColorSpace::Srgb,
+                    &mut textures_by_role,
+                    &mut textures,
+                )?,
+                occlusion_texture: model_texture(
+                    renderer,
+                    model,
+                    base.occlusion_texture,
+                    TextureColorSpace::Linear,
+                    &mut textures_by_role,
+                    &mut textures,
+                )?,
                 normal_scale: base.normal_scale,
+                occlusion_strength: base.occlusion_strength,
                 double_sided: base.double_sided,
             };
             let material_id = renderer.create_material(&material)?;
@@ -559,6 +755,8 @@ fn resolve_material(
     override_material: Option<&MaterialOverride>,
     metallic_roughness_texture: Option<TextureId>,
     normal_texture: Option<TextureId>,
+    emissive_texture: Option<TextureId>,
+    occlusion_texture: Option<TextureId>,
 ) -> Material {
     if let Some(texture) = replacement_texture {
         base.base_color_texture = Some(texture);
@@ -573,14 +771,38 @@ fn resolve_material(
         if let Some(roughness) = override_material.roughness {
             base.roughness = roughness;
         }
+        if let Some(emissive) = override_material.emissive {
+            base.emissive = emissive;
+        }
+        if let Some(opacity) = override_material.opacity {
+            base.opacity = opacity;
+        }
+        if let Some(alpha_mode) = override_material.alpha_mode {
+            base.alpha_mode = match alpha_mode {
+                engine_scene::MaterialAlphaMode::Opaque => AlphaMode::Opaque,
+                engine_scene::MaterialAlphaMode::Mask => AlphaMode::Mask {
+                    cutoff: override_material.alpha_cutoff.unwrap_or(0.5),
+                },
+                engine_scene::MaterialAlphaMode::Blend => AlphaMode::Blend,
+            };
+        }
         if let Some(texture) = metallic_roughness_texture {
             base.metallic_roughness_texture = Some(texture);
         }
         if let Some(texture) = normal_texture {
             base.normal_texture = Some(texture);
         }
+        if let Some(texture) = emissive_texture {
+            base.emissive_texture = Some(texture);
+        }
+        if let Some(texture) = occlusion_texture {
+            base.occlusion_texture = Some(texture);
+        }
         if let Some(scale) = override_material.normal_scale {
             base.normal_scale = scale;
+        }
+        if let Some(strength) = override_material.occlusion_strength {
+            base.occlusion_strength = strength;
         }
         if let Some(double_sided) = override_material.double_sided {
             base.double_sided = double_sided;
@@ -591,24 +813,140 @@ fn resolve_material(
 
 /// Свет кадра. Сцена без directional light показывается светом renderer по умолчанию,
 /// иначе объекты редактора выглядели бы плоско залитыми.
-fn frame_light(
-    light: &LightState,
-    scene_has_light: bool,
-) -> (DirectionalLight, Option<[[f32; 4]; 4]>) {
+fn frame_light(light: &LightState, scene_has_light: bool) -> DirectionalLight {
     if !scene_has_light {
-        return (DirectionalLight::default(), None);
+        return DirectionalLight::default();
     }
-    let shadow = light.shadow.map(|(center, radius)| {
-        shadow_view_projection(Vec3::from_array(light.direction), center, radius).to_cols_array_2d()
+    DirectionalLight {
+        direction: light.direction,
+        color: light.color,
+        ambient: light.ambient,
+    }
+}
+
+pub(crate) fn render_local_lights(
+    states: &[LocalLightState],
+) -> (Vec<LocalLight>, Vec<LocalLightShadow>) {
+    let mut lights = Vec::with_capacity(states.len());
+    let mut shadows = Vec::new();
+    for (light_index, state) in states.iter().enumerate() {
+        match *state {
+            LocalLightState::Point {
+                position,
+                color,
+                intensity,
+                range,
+                shadows: casts_shadow,
+            } => {
+                lights.push(LocalLight::Point {
+                    position,
+                    color_intensity: color.map(|component| {
+                        (f64::from(component) * f64::from(intensity)).min(f64::from(f32::MAX))
+                            as f32
+                    }),
+                    range,
+                });
+                if casts_shadow
+                    && let Some(matrices) =
+                        point_shadow_view_projections(Vec3::from_array(position), range)
+                {
+                    shadows.push(LocalLightShadow {
+                        light_index,
+                        matrices: LocalLightShadowMatrices::Point {
+                            matrices: matrices.map(|matrix| matrix.to_cols_array_2d()),
+                        },
+                    });
+                }
+            }
+            LocalLightState::Spot {
+                position,
+                direction,
+                color,
+                intensity,
+                range,
+                inner_angle_deg,
+                outer_angle_deg,
+                shadows: casts_shadow,
+            } => {
+                lights.push(LocalLight::Spot {
+                    position,
+                    direction,
+                    color_intensity: color.map(|component| {
+                        (f64::from(component) * f64::from(intensity)).min(f64::from(f32::MAX))
+                            as f32
+                    }),
+                    range,
+                    cos_inner_angle: inner_angle_deg.to_radians().cos().max(0.0),
+                    cos_outer_angle: outer_angle_deg.to_radians().cos().max(0.0),
+                });
+                if casts_shadow
+                    && let Some(matrix) = spot_shadow_view_projection(
+                        Vec3::from_array(position),
+                        Vec3::from_array(direction),
+                        inner_angle_deg,
+                        outer_angle_deg,
+                        range,
+                    )
+                {
+                    shadows.push(LocalLightShadow {
+                        light_index,
+                        matrices: LocalLightShadowMatrices::Spot {
+                            matrix: matrix.to_cols_array_2d(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+    (lights, shadows)
+}
+
+fn editor_environment_key(state: &EnvironmentState) -> EditorEnvironmentKey {
+    if let Some(path) = &state.component.hdr {
+        return EditorEnvironmentKey::Hdr(path.as_str().to_owned());
+    }
+    let sky = editor_procedural_sky(state).unwrap_or(ProceduralSky {
+        zenith_color: [0.2, 0.35, 0.65],
+        horizon_color: [0.65, 0.7, 0.75],
+        ground_color: [0.12, 0.11, 0.1],
+        sun_size_deg: 1.0,
+        sun_intensity: 1.0,
+        sun_direction: [0.0, 1.0, 0.0],
     });
-    (
-        DirectionalLight {
-            direction: light.direction,
-            color: light.color,
-            ambient: light.ambient,
-        },
-        shadow,
-    )
+    EditorEnvironmentKey::Procedural {
+        colors_and_sun: [
+            sky.zenith_color[0].to_bits(),
+            sky.zenith_color[1].to_bits(),
+            sky.zenith_color[2].to_bits(),
+            sky.horizon_color[0].to_bits(),
+            sky.horizon_color[1].to_bits(),
+            sky.horizon_color[2].to_bits(),
+            sky.ground_color[0].to_bits(),
+            sky.ground_color[1].to_bits(),
+            sky.ground_color[2].to_bits(),
+            sky.sun_size_deg.to_bits(),
+            sky.sun_intensity.to_bits(),
+        ],
+        sun_direction: sky
+            .sun_direction
+            .map(|value| (value * 4096.0).round() as i32),
+    }
+}
+
+fn editor_procedural_sky(state: &EnvironmentState) -> Option<ProceduralSky> {
+    let procedural = state.component.procedural?;
+    let world_sun = state.sun_direction.unwrap_or([0.0, 1.0, 0.0]);
+    let world_sun = Vec3::from_array(world_sun).normalize_or_zero();
+    let rotation = Mat3::from_cols_array_2d(&state.rotation);
+    let sun_direction = (rotation.transpose() * world_sun).normalize_or_zero();
+    Some(ProceduralSky {
+        zenith_color: procedural.zenith_color,
+        horizon_color: procedural.horizon_color,
+        ground_color: procedural.ground_color,
+        sun_size_deg: procedural.sun_size_deg,
+        sun_intensity: procedural.sun_intensity,
+        sun_direction: sun_direction.to_array(),
+    })
 }
 
 /// Шаг сетки — степень десяти по расстоянию камеры: линии сохраняют толщину на экране.
@@ -666,7 +1004,54 @@ fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
 mod tests {
     use super::*;
     use engine_files::VirtualPath;
-    use engine_scene::LodLevel;
+    use engine_scene::{EnvironmentComponent, LodLevel, ProceduralSkyComponent};
+
+    fn camera() -> Camera {
+        Camera {
+            position: Vec3::new(0.0, 0.0, 5.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov_narrow: std::f32::consts::FRAC_PI_4,
+            near: 0.1,
+            far: 100.0,
+        }
+    }
+
+    #[test]
+    fn environment_cache_key_ignores_frame_controls_and_quantizes_sun_direction() {
+        let state = EnvironmentState {
+            component: EnvironmentComponent {
+                hdr: None,
+                procedural: Some(ProceduralSkyComponent {
+                    zenith_color: [0.2, 0.35, 0.65],
+                    horizon_color: [0.65, 0.7, 0.75],
+                    ground_color: [0.12, 0.11, 0.1],
+                    sun_size_deg: 1.0,
+                    sun_intensity: 1.0,
+                }),
+                intensity: 1.0,
+                skybox: true,
+            },
+            rotation: Mat3::IDENTITY.to_cols_array_2d(),
+            sun_direction: Some([0.0, 1.0, 0.0]),
+        };
+        let key = editor_environment_key(&state);
+        let mut frame_controls = state.clone();
+        frame_controls.component.intensity = 2.0;
+        frame_controls.component.skybox = false;
+        assert_eq!(key, editor_environment_key(&frame_controls));
+
+        let mut small_sun_change = state.clone();
+        small_sun_change.sun_direction = Some([0.0, 1.0, 0.00005]);
+        assert_eq!(key, editor_environment_key(&small_sun_change));
+        small_sun_change.sun_direction = Some([0.0, 0.99, 0.14]);
+        assert_ne!(key, editor_environment_key(&small_sun_change));
+
+        let mut hdr = state;
+        hdr.component.hdr = Some(VirtualPath::parse("/environment/sky.hdr").unwrap());
+        hdr.component.procedural = None;
+        assert_ne!(key, editor_environment_key(&hdr));
+    }
 
     #[test]
     fn lod_materials_for_two_viewports_do_not_replace_each_other() {
@@ -771,9 +1156,9 @@ id = "camera"
     #[test]
     fn scene_without_a_light_uses_the_renderer_default_and_no_shadows() {
         let state = LightState::default();
-        let (light, shadow) = frame_light(&state, false);
+        let light = frame_light(&state, false);
         assert_eq!(light.direction, DirectionalLight::default().direction);
-        assert_eq!(shadow, None);
+        assert!(SceneRenderer::shadow_cascades(camera(), 1280, 720, &state, false).is_empty());
     }
 
     #[test]
@@ -782,16 +1167,157 @@ id = "camera"
             direction: [0.0, -1.0, 0.0],
             color: [0.5; 3],
             ambient: [0.1; 3],
-            shadow: Some((Vec3::ZERO, 10.0)),
+            shadow: Some(engine_scene::ShadowSettings {
+                distance: 40.0,
+                cascades: 2,
+            }),
         };
-        let (light, shadow) = frame_light(&state, true);
+        let light = frame_light(&state, true);
         assert_eq!(light.color, [0.5; 3]);
-        assert!(shadow.is_some());
+        assert_eq!(
+            SceneRenderer::shadow_cascades(camera(), 1280, 720, &state, true).len(),
+            2
+        );
         let without_shadow = LightState {
             shadow: None,
             ..state
         };
-        assert_eq!(frame_light(&without_shadow, true).1, None);
+        assert!(
+            SceneRenderer::shadow_cascades(camera(), 1280, 720, &without_shadow, true).is_empty()
+        );
+    }
+
+    #[test]
+    fn editor_maps_scene_local_lights_for_each_viewport_frame() {
+        let states = [
+            LocalLightState::Point {
+                position: [1.0, 2.0, 3.0],
+                color: [0.25, 0.5, 1.0],
+                intensity: 4.0,
+                range: 9.0,
+                shadows: true,
+            },
+            LocalLightState::Spot {
+                position: [0.0, 0.0, 1.0],
+                direction: [0.0, 0.0, -1.0],
+                color: [1.0, 0.5, 0.25],
+                intensity: 2.0,
+                range: 12.0,
+                inner_angle_deg: 15.0,
+                outer_angle_deg: 30.0,
+                shadows: false,
+            },
+        ];
+        let (lights, shadow_matrices) = render_local_lights(&states);
+        assert_eq!(shadow_matrices.len(), 1);
+        assert_eq!(shadow_matrices[0].light_index, 0);
+        assert!(matches!(
+            shadow_matrices[0].matrices,
+            LocalLightShadowMatrices::Point { .. }
+        ));
+        assert_eq!(
+            lights[0],
+            LocalLight::Point {
+                position: [1.0, 2.0, 3.0],
+                color_intensity: [1.0, 2.0, 4.0],
+                range: 9.0,
+            }
+        );
+        assert!(matches!(
+            lights[1],
+            LocalLight::Spot {
+                color_intensity: [2.0, 1.0, 0.5],
+                cos_inner_angle,
+                cos_outer_angle,
+                ..
+            } if (cos_inner_angle - 15.0_f32.to_radians().cos()).abs() < 1e-6
+                && (cos_outer_angle - 30.0_f32.to_radians().cos()).abs() < 1e-6
+        ));
+
+        let ninety_degree = LocalLightState::Spot {
+            position: [0.0; 3],
+            direction: [0.0, 0.0, -1.0],
+            color: [1.0; 3],
+            intensity: 1.0,
+            range: 5.0,
+            inner_angle_deg: 90.0,
+            outer_angle_deg: 90.0,
+            shadows: true,
+        };
+        let (ninety_lights, ninety_shadows) = render_local_lights(&[ninety_degree]);
+        assert!(matches!(
+            ninety_lights[0],
+            LocalLight::Spot {
+                cos_inner_angle: 0.0,
+                cos_outer_angle: 0.0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ninety_shadows.as_slice(),
+            [LocalLightShadow {
+                light_index: 0,
+                matrices: LocalLightShadowMatrices::Spot { .. },
+            }]
+        ));
+    }
+
+    #[test]
+    fn scene_valid_local_light_factors_saturate_without_infinity() {
+        let document = engine_scene::SceneDocument::parse(
+            "lights.rvescene",
+            r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "point"
+[objects.point_light]
+color = [2e38, 1, 0]
+intensity = 2
+range = 10
+[[objects]]
+id = "spot"
+[objects.spot_light]
+color = [2e38, 1, 0]
+intensity = 2
+range = 10
+"#,
+        )
+        .unwrap();
+        let mut world = engine_scene::World::from_document(&document).unwrap();
+        let (lights, _) = render_local_lights(&world.build_frame().0.local_lights);
+        assert_eq!(lights.len(), 2);
+        for light in lights {
+            let color_intensity = match light {
+                LocalLight::Point {
+                    color_intensity, ..
+                }
+                | LocalLight::Spot {
+                    color_intensity, ..
+                } => color_intensity,
+            };
+            assert_eq!(color_intensity, [f32::MAX, 2.0, 0.0]);
+        }
+    }
+    #[test]
+    fn scene_and_game_viewports_build_camera_relative_shadow_cascades() {
+        let light = LightState {
+            shadow: Some(engine_scene::ShadowSettings {
+                distance: 60.0,
+                cascades: 3,
+            }),
+            ..LightState::default()
+        };
+        let first = camera();
+        let mut second = first;
+        second.position += Vec3::X * 12.0;
+        second.target += Vec3::X * 12.0;
+        let first_cascades = SceneRenderer::shadow_cascades(first, 1280, 720, &light, true);
+        let second_cascades = SceneRenderer::shadow_cascades(second, 1280, 720, &light, true);
+        assert_eq!(first_cascades.len(), 3);
+        assert_eq!(second_cascades.len(), 3);
+        assert_ne!(first_cascades[0], second_cascades[0]);
     }
 
     #[test]
@@ -807,18 +1333,30 @@ id = "camera"
             base_color: Some([0.8, 0.7, 0.6]),
             metallic: Some(1.0),
             roughness: None,
+            emissive: Some([2.0, 1.0, 0.5]),
+            opacity: Some(0.4),
+            alpha_mode: Some(engine_scene::MaterialAlphaMode::Mask),
+            alpha_cutoff: Some(0.3),
             metallic_roughness_texture: None,
             normal_texture: None,
+            emissive_texture: None,
+            occlusion_texture: None,
             normal_scale: Some(0.5),
+            occlusion_strength: Some(0.25),
             double_sided: Some(true),
         };
 
-        let resolved = resolve_material(base, None, Some(&override_material), None, None);
+        let resolved =
+            resolve_material(base, None, Some(&override_material), None, None, None, None);
 
         assert_eq!(resolved.base_color, [0.8, 0.7, 0.6]);
         assert_eq!(resolved.metallic, 1.0);
         assert_eq!(resolved.roughness, 0.8);
+        assert_eq!(resolved.emissive, [2.0, 1.0, 0.5]);
+        assert_eq!(resolved.opacity, 0.4);
+        assert_eq!(resolved.alpha_mode, AlphaMode::Mask { cutoff: 0.3 });
         assert_eq!(resolved.normal_scale, 0.5);
+        assert_eq!(resolved.occlusion_strength, 0.25);
         assert_eq!(resolved.base_color_texture, None);
         assert_eq!(resolved.metallic_roughness_texture, None);
         assert_eq!(resolved.normal_texture, None);

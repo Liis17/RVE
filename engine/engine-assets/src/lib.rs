@@ -16,6 +16,7 @@ pub const ASSETS_DIR: &str = "assets";
 
 /// Предел памяти декодера PNG; хватает на текстуру 8192x8192 RGBA с запасом.
 const PNG_DECODE_LIMIT: usize = 512 * 1024 * 1024;
+const HDR_DECODE_LIMIT: usize = 512 * 1024 * 1024;
 
 /// Пиксели RGBA8 по строкам сверху вниз. Цветовое пространство задаёт использующий материал:
 /// base-color карты являются sRGB, metallic-roughness и normal карты — linear.
@@ -24,6 +25,14 @@ pub struct TextureData {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// Линейные RGB-пиксели Radiance HDR сверху вниз.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HdrImageData {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: Vec<f32>,
 }
 
 /// Вершина модели в метрах; оси: +X вправо, +Y вверх, +Z к зрителю.
@@ -44,12 +53,23 @@ pub struct ModelMesh {
     pub material: ModelMaterial,
 }
 
+/// Режим альфа-смешивания, извлечённый из FBX opacity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelAlphaMode {
+    #[default]
+    Opaque,
+    Blend,
+}
+
 /// Линейные факторы, двусторонность и индексы текстур материала модели.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelMaterial {
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
+    pub emissive: [f32; 3],
+    pub opacity: f32,
+    pub alpha_mode: ModelAlphaMode,
     pub double_sided: bool,
     /// Индекс в [`Model::textures`] для sRGB base-color.
     pub base_color_texture: Option<usize>,
@@ -57,7 +77,12 @@ pub struct ModelMaterial {
     pub metallic_roughness_texture: Option<usize>,
     /// Индекс в [`Model::textures`] для линейной tangent-space normal карты.
     pub normal_texture: Option<usize>,
+    /// Индекс в [`Model::textures`] для sRGB emissive карты.
+    pub emissive_texture: Option<usize>,
+    /// Индекс в [`Model::textures`] для линейной ambient-occlusion карты.
+    pub occlusion_texture: Option<usize>,
     pub normal_scale: f32,
+    pub occlusion_strength: f32,
 }
 
 impl Default for ModelMaterial {
@@ -66,11 +91,17 @@ impl Default for ModelMaterial {
             base_color: [1.0; 3],
             metallic: 0.0,
             roughness: 1.0,
+            emissive: [0.0; 3],
+            opacity: 1.0,
+            alpha_mode: ModelAlphaMode::Opaque,
             double_sided: false,
             base_color_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
+            emissive_texture: None,
+            occlusion_texture: None,
             normal_scale: 1.0,
+            occlusion_strength: 1.0,
         }
     }
 }
@@ -229,6 +260,21 @@ impl Assets {
         decode_png(&bytes).map_err(|message| AssetError::Decode { path, message })
     }
 
+    /// Загружает Radiance HDR equirectangular изображение.
+    pub fn load_hdr(&self, asset_path: &str) -> Result<HdrImageData, AssetError> {
+        let path = self.resolve(asset_path)?;
+        require_extension(&path, "hdr")?;
+        let stat = self.stat_asset(asset_path, &path)?;
+        if stat.size > HDR_DECODE_LIMIT as u64 {
+            return Err(AssetError::Decode {
+                path,
+                message: "HDR превышает предел памяти декодера 512 MiB".to_owned(),
+            });
+        }
+        let bytes = self.read_asset(asset_path, &path)?;
+        decode_hdr(&bytes).map_err(|message| AssetError::Decode { path, message })
+    }
+
     /// Загружает FBX-модель с её PNG-текстурами материалов.
     ///
     /// Внешняя текстура ищется по пути, записанному в FBX относительно файла модели,
@@ -275,7 +321,12 @@ impl Assets {
                 let Some(material) = materials.get(part.index as usize) else {
                     continue;
                 };
-                for texture in material_textures(material).into_iter().flatten() {
+                let textures =
+                    material_textures(material).map_err(|message| AssetError::Decode {
+                        path: path.to_owned(),
+                        message: message.to_owned(),
+                    })?;
+                for texture in textures.all().into_iter().flatten() {
                     if !seen_textures.insert(texture.element.element_id)
                         || !texture.content.is_empty()
                     {
@@ -482,6 +533,191 @@ pub fn decode_png(bytes: &[u8]) -> Result<TextureData, String> {
     })
 }
 
+/// Декодирует Radiance RGBE в линейные float RGB.
+pub fn decode_hdr(bytes: &[u8]) -> Result<HdrImageData, String> {
+    if bytes.len() > HDR_DECODE_LIMIT {
+        return Err("HDR превышает предел памяти декодера 512 MiB".to_owned());
+    }
+    let mut cursor = 0;
+    let magic = hdr_line(bytes, &mut cursor)?;
+    if magic != b"#?RADIANCE" && magic != b"#?RGBE" {
+        return Err("ожидается заголовок #?RADIANCE или #?RGBE".to_owned());
+    }
+    let mut has_format = false;
+    loop {
+        let line = hdr_line(bytes, &mut cursor)?;
+        if line.is_empty() {
+            break;
+        }
+        if line == b"FORMAT=32-bit_rle_rgbe" {
+            has_format = true;
+        }
+    }
+    if !has_format {
+        return Err("ожидается FORMAT=32-bit_rle_rgbe".to_owned());
+    }
+    let resolution = hdr_line(bytes, &mut cursor)?;
+    let resolution =
+        std::str::from_utf8(resolution).map_err(|_| "строка ориентации HDR должна быть ASCII")?;
+    let mut parts = resolution.split_ascii_whitespace();
+    let (Some(y_axis), Some(height_text), Some(x_axis), Some(width_text)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err("поддерживается только ориентация -Y H +X W".to_owned());
+    };
+    if y_axis != "-Y" || x_axis != "+X" || parts.next().is_some() {
+        return Err("поддерживается только ориентация -Y H +X W".to_owned());
+    }
+    let height = height_text
+        .parse::<u32>()
+        .map_err(|_| "некорректная высота HDR")?;
+    let width = width_text
+        .parse::<u32>()
+        .map_err(|_| "некорректная ширина HDR")?;
+    if width == 0 || height == 0 {
+        return Err("размеры HDR должны быть больше нуля".to_owned());
+    }
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or("размеры HDR переполняют память")?;
+    let float_count = pixel_count
+        .checked_mul(3)
+        .ok_or("размеры HDR переполняют память")?;
+    let output_bytes = float_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("размеры HDR переполняют память")?;
+    let scanline_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or("размер строки HDR переполняет память")?;
+    if bytes
+        .len()
+        .checked_add(output_bytes)
+        .and_then(|size| size.checked_add(scanline_bytes))
+        .is_none_or(|size| size > HDR_DECODE_LIMIT)
+    {
+        return Err("HDR превышает предел памяти декодера 512 MiB".to_owned());
+    }
+    let mut rgb = Vec::new();
+    rgb.try_reserve_exact(float_count)
+        .map_err(|_| "не удалось выделить память для HDR")?;
+    rgb.resize(float_count, 0.0);
+    let mut scanline = Vec::new();
+    scanline
+        .try_reserve_exact(scanline_bytes)
+        .map_err(|_| "не удалось выделить память для строки HDR")?;
+    scanline.resize(scanline_bytes, 0);
+
+    for row in 0..height as usize {
+        let marker = take_hdr_bytes(bytes, &mut cursor, 4)?;
+        let rle_width = ((marker[2] as usize) << 8) | marker[3] as usize;
+        if (8..=0x7fff).contains(&width)
+            && marker[0] == 2
+            && marker[1] == 2
+            && rle_width == width as usize
+        {
+            for channel in 0..4 {
+                decode_hdr_channel(bytes, &mut cursor, &mut scanline, width as usize, channel)?;
+            }
+            for x in 0..width as usize {
+                let rgbe = [
+                    scanline[x],
+                    scanline[width as usize + x],
+                    scanline[2 * width as usize + x],
+                    scanline[3 * width as usize + x],
+                ];
+                write_hdr_pixel(&mut rgb, row * width as usize + x, rgbe);
+            }
+        } else {
+            let row_bytes = width as usize * 4;
+            scanline[..4].copy_from_slice(marker);
+            let remaining = row_bytes - 4;
+            scanline[4..row_bytes].copy_from_slice(take_hdr_bytes(bytes, &mut cursor, remaining)?);
+            for x in 0..width as usize {
+                let offset = x * 4;
+                write_hdr_pixel(
+                    &mut rgb,
+                    row * width as usize + x,
+                    scanline[offset..offset + 4].try_into().unwrap(),
+                );
+            }
+        }
+    }
+    Ok(HdrImageData { width, height, rgb })
+}
+
+fn hdr_line<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
+    let tail = bytes
+        .get(*cursor..)
+        .ok_or_else(|| "неожиданный конец HDR".to_owned())?;
+    let length = tail
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| "неожиданный конец строки HDR".to_owned())?;
+    let mut line = &tail[..length];
+    if line.last() == Some(&b'\r') {
+        line = &line[..line.len() - 1];
+    }
+    *cursor += length + 1;
+    Ok(line)
+}
+
+fn take_hdr_bytes<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<&'a [u8], String> {
+    let end = (*cursor)
+        .checked_add(count)
+        .ok_or_else(|| "смещение HDR переполняется".to_owned())?;
+    let result = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| "данные HDR обрезаны".to_owned())?;
+    *cursor = end;
+    Ok(result)
+}
+
+fn decode_hdr_channel(
+    bytes: &[u8],
+    cursor: &mut usize,
+    scanline: &mut [u8],
+    width: usize,
+    channel: usize,
+) -> Result<(), String> {
+    let mut written = 0;
+    while written < width {
+        let code = take_hdr_bytes(bytes, cursor, 1)?[0] as usize;
+        if code == 0 {
+            return Err("некорректный нулевой run в HDR".to_owned());
+        }
+        let count = if code > 128 { code - 128 } else { code };
+        if count > width - written {
+            return Err("run HDR выходит за ширину строки".to_owned());
+        }
+        let output_start = channel * width + written;
+        if code > 128 {
+            let value = take_hdr_bytes(bytes, cursor, 1)?[0];
+            scanline[output_start..output_start + count].fill(value);
+        } else {
+            let values = take_hdr_bytes(bytes, cursor, count)?;
+            scanline[output_start..output_start + count].copy_from_slice(values);
+        }
+        written += count;
+    }
+    Ok(())
+}
+
+fn write_hdr_pixel(rgb: &mut [f32], index: usize, rgbe: [u8; 4]) {
+    let output = index * 3;
+    if rgbe[3] == 0 {
+        rgb[output..output + 3].fill(0.0);
+        return;
+    }
+    let scale = 2.0_f32.powi(i32::from(rgbe[3]) - 136);
+    rgb[output] = (f32::from(rgbe[0]) + 0.5) * scale;
+    rgb[output + 1] = (f32::from(rgbe[1]) + 0.5) * scale;
+    rgb[output + 2] = (f32::from(rgbe[2]) + 0.5) * scale;
+}
+
 fn load_fbx(
     bytes: &[u8],
     virtual_path: &str,
@@ -498,8 +734,7 @@ fn load_fbx(
         meshes: Vec::new(),
         textures: Vec::new(),
     };
-    let mut loaded_textures = HashMap::<u32, usize>::new();
-    let mut loaded_metallic_roughness = HashMap::<(Option<u32>, Option<u32>), usize>::new();
+    let mut texture_cache = ModelTextureCache::default();
     let mut triangle = Vec::new();
     for node in scene.nodes.iter() {
         let Some(mesh) = node.mesh.as_ref() else {
@@ -551,8 +786,7 @@ fn load_fbx(
                     path,
                     assets,
                     &mut model,
-                    &mut loaded_textures,
-                    &mut loaded_metallic_roughness,
+                    &mut texture_cache,
                 )?,
                 None => ModelMaterial::default(),
             };
@@ -590,14 +824,67 @@ fn diffuse_texture(material: &ufbx::Material) -> Option<&ufbx::Texture> {
         .find(|texture| texture.type_ == ufbx::TextureType::File)
 }
 
-fn material_textures(material: &ufbx::Material) -> [Option<&ufbx::Texture>; 4] {
+struct MaterialTextures<'a> {
+    base_color: Option<&'a ufbx::Texture>,
+    normal: Option<&'a ufbx::Texture>,
+    roughness: Option<&'a ufbx::Texture>,
+    metalness: Option<&'a ufbx::Texture>,
+    emissive: Option<&'a ufbx::Texture>,
+    occlusion: Option<&'a ufbx::Texture>,
+    opacity: Option<(&'a ufbx::Texture, bool)>,
+}
+
+#[derive(Default)]
+struct ModelTextureCache {
+    loaded_textures: HashMap<u32, usize>,
+    loaded_metallic_roughness: HashMap<(Option<u32>, Option<u32>), usize>,
+    loaded_base_color_opacity: HashMap<(Option<u32>, u32, bool, u32), usize>,
+}
+
+impl MaterialTextures<'_> {
+    fn all(&self) -> [Option<&ufbx::Texture>; 7] {
+        [
+            self.base_color,
+            self.normal,
+            self.roughness,
+            self.metalness,
+            self.emissive,
+            self.occlusion,
+            self.opacity.map(|(texture, _)| texture),
+        ]
+    }
+}
+
+fn material_textures(material: &ufbx::Material) -> Result<MaterialTextures<'_>, &'static str> {
     let pbr = supports_metallic_roughness(material.shader_type);
-    [
-        diffuse_texture(material),
-        file_texture(&material.pbr.normal_map).or_else(|| file_texture(&material.fbx.normal_map)),
-        pbr.then(|| file_texture(&material.pbr.roughness)).flatten(),
-        pbr.then(|| file_texture(&material.pbr.metalness)).flatten(),
-    ]
+    let opacity_map = if material.pbr.opacity.texture.is_some() {
+        Some((&material.pbr.opacity, false))
+    } else if material.fbx.transparency_factor.texture.is_some() {
+        Some((&material.fbx.transparency_factor, true))
+    } else if material.fbx.transparency_color.texture.is_some() {
+        Some((&material.fbx.transparency_color, true))
+    } else {
+        None
+    }
+    .map(|(map, invert)| {
+        map.texture
+            .as_deref()
+            .filter(|texture| texture.type_ == ufbx::TextureType::File)
+            .map(|texture| (texture, invert))
+            .ok_or("opacity texture must be a file texture")
+    })
+    .transpose()?;
+    Ok(MaterialTextures {
+        base_color: diffuse_texture(material),
+        normal: file_texture(&material.pbr.normal_map)
+            .or_else(|| file_texture(&material.fbx.normal_map)),
+        roughness: pbr.then(|| file_texture(&material.pbr.roughness)).flatten(),
+        metalness: pbr.then(|| file_texture(&material.pbr.metalness)).flatten(),
+        emissive: file_texture(&material.pbr.emission_color)
+            .or_else(|| file_texture(&material.fbx.emission_color)),
+        occlusion: file_texture(&material.pbr.ambient_occlusion),
+        opacity: opacity_map,
+    })
 }
 
 fn file_texture(map: &ufbx::MaterialMap) -> Option<&ufbx::Texture> {
@@ -626,11 +913,19 @@ fn load_model_material(
     model_path: &Path,
     assets: &Assets,
     model: &mut Model,
-    loaded_textures: &mut HashMap<u32, usize>,
-    loaded_metallic_roughness: &mut HashMap<(Option<u32>, Option<u32>), usize>,
+    texture_cache: &mut ModelTextureCache,
 ) -> Result<ModelMaterial, AssetError> {
-    let [base_color, normal, roughness, metalness] = material_textures(material);
-    let base_color_texture = base_color
+    let ModelTextureCache {
+        loaded_textures,
+        loaded_metallic_roughness,
+        loaded_base_color_opacity,
+    } = texture_cache;
+    let textures = material_textures(material).map_err(|message| AssetError::Decode {
+        path: model_path.to_owned(),
+        message: message.to_owned(),
+    })?;
+    let base_color_source = textures
+        .base_color
         .map(|texture| {
             load_model_texture(
                 model_virtual_path,
@@ -642,7 +937,8 @@ fn load_model_material(
             )
         })
         .transpose()?;
-    let normal_texture = normal
+    let normal_texture = textures
+        .normal
         .map(|texture| {
             load_model_texture(
                 model_virtual_path,
@@ -657,14 +953,88 @@ fn load_model_material(
     let metallic_roughness_texture = load_metallic_roughness_texture(
         model_virtual_path,
         model_path,
-        (roughness, metalness),
+        (textures.roughness, textures.metalness),
         assets,
         model,
         loaded_textures,
         loaded_metallic_roughness,
     )?;
+    let opacity_texture = textures
+        .opacity
+        .map(|(texture, invert)| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+            .map(|index| (index, invert, texture.element.element_id))
+        })
+        .transpose()?;
+    let base_color_texture = if let Some((opacity_index, invert, opacity_id)) = opacity_texture {
+        let base_id = textures
+            .base_color
+            .map(|texture| texture.element.element_id);
+        // Invert classic FBX transparency after multiplying color and factor.
+        let transparency_scale = if !invert {
+            1.0
+        } else if material.fbx.transparency_factor.texture.is_some() {
+            map_scalar(&material.fbx.transparency_color)
+        } else {
+            map_scalar(&material.fbx.transparency_factor)
+        };
+        let key = (base_id, opacity_id, invert, transparency_scale.to_bits());
+        if let Some(&index) = loaded_base_color_opacity.get(&key) {
+            Some(index)
+        } else {
+            let combined = combine_base_color_opacity(
+                base_color_source.map(|index| &model.textures[index]),
+                &model.textures[opacity_index],
+                invert,
+                transparency_scale,
+            )
+            .map_err(|message| AssetError::Decode {
+                path: model_path.to_owned(),
+                message,
+            })?;
+            model.textures.push(combined);
+            let index = model.textures.len() - 1;
+            loaded_base_color_opacity.insert(key, index);
+            Some(index)
+        }
+    } else {
+        base_color_source
+    };
+    let emissive_texture = textures
+        .emissive
+        .map(|texture| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+        })
+        .transpose()?;
+    let occlusion_texture = textures
+        .occlusion
+        .map(|texture| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+        })
+        .transpose()?;
     let has_metallic_roughness = supports_metallic_roughness(material.shader_type);
-    let base_color_factor = if base_color_texture.is_some() {
+    let base_color_factor = if base_color_source.is_some() {
         [1.0; 3]
     } else if material.pbr.base_color.has_value {
         map_vec3(&material.pbr.base_color)
@@ -678,11 +1048,21 @@ fn load_model_material(
     } else {
         [1.0; 3]
     };
+    let emissive = emissive_factor(material);
+    let opacity = opacity_factor(material);
+    let has_transparent_base_alpha = base_color_texture.is_some_and(|index| {
+        model.textures[index]
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] < 255)
+    });
     Ok(ModelMaterial {
         base_color: base_color_factor,
         metallic: if !has_metallic_roughness {
             0.0
-        } else if metalness.is_some() {
+        } else if textures.metalness.is_some() {
             1.0
         } else if material.pbr.metalness.has_value {
             map_scalar(&material.pbr.metalness)
@@ -690,18 +1070,32 @@ fn load_model_material(
             0.0
         },
         roughness: if has_metallic_roughness
-            && roughness.is_none()
+            && textures.roughness.is_none()
             && material.pbr.roughness.has_value
         {
             map_scalar(&material.pbr.roughness)
         } else {
             1.0
         },
+        emissive,
+        opacity,
+        alpha_mode: if opacity < 1.0 || opacity_texture.is_some() || has_transparent_base_alpha {
+            ModelAlphaMode::Blend
+        } else {
+            ModelAlphaMode::Opaque
+        },
         double_sided: material.features.double_sided.enabled,
         base_color_texture,
         metallic_roughness_texture,
         normal_texture,
+        emissive_texture,
+        occlusion_texture,
         normal_scale: 1.0,
+        occlusion_strength: if material.pbr.ambient_occlusion.has_value {
+            map_scalar(&material.pbr.ambient_occlusion)
+        } else {
+            1.0
+        },
     })
 }
 
@@ -715,6 +1109,82 @@ fn map_vec3(map: &ufbx::MaterialMap) -> [f32; 3] {
         map.value_vec4.y as f32,
         map.value_vec4.z as f32,
     ]
+}
+
+fn emissive_factor(material: &ufbx::Material) -> [f32; 3] {
+    let (color, factor) = if material.pbr.emission_color.has_value
+        || material.pbr.emission_color.texture.is_some()
+        || material.pbr.emission_factor.has_value
+    {
+        (&material.pbr.emission_color, &material.pbr.emission_factor)
+    } else {
+        (&material.fbx.emission_color, &material.fbx.emission_factor)
+    };
+    if !color.has_value && color.texture.is_none() && !factor.has_value {
+        return [0.0; 3];
+    }
+    let color_factor = if color.has_value {
+        map_vec3(color)
+    } else {
+        [1.0; 3]
+    };
+    let scalar = if factor.has_value {
+        map_scalar(factor)
+    } else {
+        1.0
+    };
+    color_factor.map(|channel| channel * scalar)
+}
+
+fn opacity_factor(material: &ufbx::Material) -> f32 {
+    if material.pbr.opacity.has_value || material.pbr.opacity.texture.is_some() {
+        if material.pbr.opacity.has_value {
+            map_scalar(&material.pbr.opacity)
+        } else {
+            1.0
+        }
+    } else if material.fbx.transparency_factor.texture.is_some()
+        || material.fbx.transparency_color.texture.is_some()
+    {
+        // The combined transparency is baked into base color alpha.
+        1.0
+    } else {
+        1.0 - map_scalar(&material.fbx.transparency_factor)
+            * map_scalar(&material.fbx.transparency_color)
+    }
+}
+
+fn combine_base_color_opacity(
+    base_color: Option<&TextureData>,
+    opacity: &TextureData,
+    invert_opacity: bool,
+    transparency_scale: f32,
+) -> Result<TextureData, String> {
+    if base_color.is_some_and(|base| (base.width, base.height) != (opacity.width, opacity.height)) {
+        return Err("base color и opacity карты имеют разные размеры".to_owned());
+    }
+    let mut rgba =
+        base_color.map_or_else(|| vec![255; opacity.rgba.len()], |base| base.rgba.clone());
+    for (pixel, opacity_pixel) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(opacity.rgba.as_chunks::<4>().0.iter())
+    {
+        let opacity = if invert_opacity {
+            (255.0 - f32::from(opacity_pixel[0]) * transparency_scale)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        } else {
+            opacity_pixel[0]
+        };
+        pixel[3] = ((u16::from(pixel[3]) * u16::from(opacity) + 127) / 255) as u8;
+    }
+    Ok(TextureData {
+        width: opacity.width,
+        height: opacity.height,
+        rgba,
+    })
 }
 
 fn load_model_texture(
@@ -1073,9 +1543,9 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetError, Assets, Model, ModelMaterial, ModelMesh, ModelVertex, TextureData, decode_png,
-        is_missing_texture_candidate, map_resource_error, pack_metallic_roughness,
-        supports_metallic_roughness, texture_candidates,
+        AssetError, Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex,
+        TextureData, decode_hdr, decode_png, is_missing_texture_candidate, map_resource_error,
+        pack_metallic_roughness, supports_metallic_roughness, texture_candidates,
     };
     use engine_files::VirtualPath;
     use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
@@ -1186,6 +1656,95 @@ mod tests {
             png::BitDepth::Eight,
             &[1, 2, 3, 4, 5, 6, 7, 8],
         )
+    }
+
+    fn hdr_header(width: u32, height: u32) -> Vec<u8> {
+        format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {height} +X {width}\n").into_bytes()
+    }
+
+    #[test]
+    fn decodes_flat_and_new_style_rle_radiance_hdr() {
+        let mut flat = hdr_header(2, 1);
+        flat.extend_from_slice(&[128, 64, 32, 129, 0, 0, 0, 0]);
+        let decoded = decode_hdr(&flat).unwrap();
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(decoded.rgb.len(), 6);
+        assert!((decoded.rgb[0] - 1.003_906_3).abs() < 1e-6);
+        assert!((decoded.rgb[1] - 0.50390625).abs() < 1e-6);
+        assert!((decoded.rgb[2] - 0.25390625).abs() < 1e-6);
+        assert_eq!(&decoded.rgb[3..], &[0.0; 3]);
+
+        let mut rle = hdr_header(8, 1);
+        rle.extend_from_slice(&[2, 2, 0, 8]);
+        for value in [128, 64, 32, 129] {
+            rle.extend_from_slice(&[136, value]);
+        }
+        let decoded = decode_hdr(&rle).unwrap();
+        assert_eq!((decoded.width, decoded.height), (8, 1));
+        assert_eq!(decoded.rgb.len(), 24);
+        for pixel in decoded.rgb.as_chunks::<3>().0 {
+            assert!((pixel[0] - decoded.rgb[0]).abs() < 1e-6);
+            assert!((pixel[1] - decoded.rgb[1]).abs() < 1e-6);
+            assert!((pixel[2] - decoded.rgb[2]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_invalid_orientation_format_and_budgeted_hdr() {
+        let mut truncated = hdr_header(2, 1);
+        truncated.extend_from_slice(&[128, 64, 32, 129]);
+        assert!(decode_hdr(&truncated).unwrap_err().contains("обрезаны"));
+
+        let mut invalid_run = hdr_header(8, 1);
+        invalid_run.extend_from_slice(&[2, 2, 0, 8, 137, 4]);
+        assert!(decode_hdr(&invalid_run).unwrap_err().contains("run HDR"));
+        let mut zero_run = hdr_header(8, 1);
+        zero_run.extend_from_slice(&[2, 2, 0, 8, 0]);
+        assert!(decode_hdr(&zero_run).unwrap_err().contains("нулевой run"));
+
+        let wrong_format = b"#?RADIANCE\nFORMAT=32-bit_rgbe\n\n-Y 1 +X 1\n";
+        assert!(decode_hdr(wrong_format).unwrap_err().contains("FORMAT"));
+        let wrong_orientation = b"#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n+Y 1 +X 1\n";
+        assert!(
+            decode_hdr(wrong_orientation)
+                .unwrap_err()
+                .contains("ориентация")
+        );
+        let excessive_resolution = format!(
+            "#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1 {}\n",
+            "x ".repeat(100_000)
+        );
+        assert!(
+            decode_hdr(excessive_resolution.as_bytes())
+                .unwrap_err()
+                .contains("ориентация")
+        );
+        let oversized = hdr_header(u32::MAX, u32::MAX);
+        assert!(decode_hdr(&oversized).unwrap_err().contains("размеры HDR"));
+    }
+
+    #[test]
+    fn loads_hdr_from_resource_backed_loose_and_packed_sources() {
+        let mut fixture = hdr_header(1, 1);
+        fixture.extend_from_slice(&[128, 64, 32, 129]);
+        let loose = TempAssets::new("hdr-loose");
+        loose.write("environment/sky.hdr", &fixture);
+        let (_system, assets) = loose.resource_assets();
+        let expected = assets.load_hdr("/environment/sky.hdr").unwrap();
+        assert_eq!((expected.width, expected.height), (1, 1));
+
+        let packed = TempAssets::new("hdr-packed");
+        write_archive(
+            &packed.root,
+            "assets.rvepak",
+            &[("environment/sky.hdr", &fixture)],
+        );
+        let (_system, assets) = packed.resource_assets();
+        assert_eq!(assets.load_hdr("environment/sky.hdr").unwrap(), expected);
+        assert!(matches!(
+            assets.load_hdr("environment/sky.png"),
+            Err(AssetError::UnsupportedFormat { .. })
+        ));
     }
 
     /// Квадрат 2x2 в плоскости XY с нормалью +Z и UV на весь квадрат.
@@ -1955,6 +2514,94 @@ mod tests {
     }
 
     #[test]
+    fn pbr_emissive_and_opacity_maps_load_and_join_opacity_into_base_color_alpha() {
+        let temp = TempAssets::new("pbr-emissive-opacity");
+        let fbx = arnold_quad_fbx(
+            "\t\t\tP: \"emission\", \"Number\", \"\", \"A\", 2.5\n\t\t\tP: \"emissionColor\", \"Color\", \"\", \"A\", 0.2, 0.4, 0.8\n\t\t\tP: \"opacity\", \"Number\", \"\", \"A\", 0.6",
+            &[
+                ("emissionColor", "emissive.png"),
+                ("opacity", "opacity.png"),
+            ],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/emissive.png", &rgba_png());
+        temp.write(
+            "model/opacity.png",
+            &encode_png(
+                2,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[64, 0, 0, 255, 128, 0, 0, 255],
+            ),
+        );
+
+        let assets = temp.assets();
+        let model = assets.load_model("/model/pbr.fbx").unwrap();
+        let material = &model.meshes[0].material;
+        assert_eq!(material.emissive, [0.5, 1.0, 2.0]);
+        assert_eq!(material.opacity, 0.6);
+        assert_eq!(material.alpha_mode, ModelAlphaMode::Blend);
+        let base_color = &model.textures[material.base_color_texture.unwrap()];
+        assert_eq!(base_color.rgba, [255, 255, 255, 64, 255, 255, 255, 128]);
+        assert_eq!(
+            assets.model_dependencies("/model/pbr.fbx").unwrap(),
+            ["/model/emissive.png", "/model/opacity.png"]
+        );
+    }
+
+    #[test]
+    fn pbr_occlusion_map_uses_linear_red_channel_and_is_a_builder_dependency() {
+        let temp = TempAssets::new("pbr-occlusion");
+        let fbx = arnold_quad_fbx(
+            "\t\t\tP: \"3dsMax|ClassIDa\", \"int\", \"Integer\", \"\", -804315648\n\t\t\tP: \"3dsMax|ClassIDb\", \"int\", \"Integer\", \"\", -1099438848\n\t\t\tP: \"3dsMax|main|ao\", \"Number\", \"\", \"A\", 0.35",
+            &[("3dsMax|main|ao", "ao.png")],
+            false,
+        )
+        .replace("\tC: \"OO\",3000,5000\n", "")
+        .replace("ShadingModel: \"lambert\"", "ShadingModel: \"unknown\"");
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/ao.png", &rgba_png());
+
+        let assets = temp.assets();
+        let model = assets.load_model("/model/pbr.fbx").unwrap();
+        let material = &model.meshes[0].material;
+        assert_eq!(material.occlusion_strength, 0.35);
+        assert_eq!(material.occlusion_texture, Some(0));
+        assert_eq!(
+            assets.model_dependencies("/model/pbr.fbx").unwrap(),
+            ["/model/ao.png"]
+        );
+    }
+
+    #[test]
+    fn opacity_maps_with_incompatible_dimensions_fail_instead_of_being_ignored() {
+        let temp = TempAssets::new("pbr-opacity-size-mismatch");
+        let fbx = arnold_quad_fbx(
+            "",
+            &[("baseColor", "base.png"), ("opacity", "opacity.png")],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/base.png", &rgba_png());
+        temp.write(
+            "model/opacity.png",
+            &encode_png(
+                1,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[128, 128, 128, 255],
+            ),
+        );
+
+        let error = temp.assets().load_model("/model/pbr.fbx").unwrap_err();
+        assert!(matches!(error, AssetError::Decode { .. }));
+        assert!(error.to_string().contains("разные размеры"));
+    }
+
+    #[test]
     fn pbr_base_and_normal_maps_load_with_white_base_factor_and_default_normal_scale() {
         let temp = TempAssets::new("pbr-base-normal-maps");
         let fbx = arnold_quad_fbx(
@@ -1982,6 +2629,50 @@ mod tests {
         assert_eq!(material.normal_texture, Some(1));
         assert_eq!(material.normal_scale, 1.0);
         assert_eq!(model.textures.len(), 2);
+    }
+
+    #[test]
+    fn classic_transparency_multiplies_color_and_factor_before_inverting() {
+        let temp = TempAssets::new("classic-transparency");
+        for (color, factor, expected) in [(0.0, 1.0, 1.0), (0.5, 0.5, 0.75), (1.0, 0.0, 1.0)] {
+            let properties = format!(
+                "\t\t\tP: \"TransparentColor\", \"Color\", \"\", \"A\", {color}, {color}, {color}\n\t\t\tP: \"TransparencyFactor\", \"Number\", \"\", \"A\", {factor}"
+            );
+            let fbx =
+                arnold_quad_fbx(&properties, &[], false).replace("\tC: \"OO\",3000,5000\n", "");
+            temp.write("model/classic.fbx", fbx.as_bytes());
+            let model = temp.assets().load_model("/model/classic.fbx").unwrap();
+            assert_eq!(model.meshes[0].material.opacity, expected);
+        }
+    }
+
+    #[test]
+    fn classic_transparency_maps_invert_the_combined_scalar_and_map() {
+        let temp = TempAssets::new("classic-transparency-map");
+        for map in ["TransparentColor", "TransparencyFactor"] {
+            let properties = "\t\t\tP: \"TransparentColor\", \"Color\", \"\", \"A\", 0.5, 0.5, 0.5\n\t\t\tP: \"TransparencyFactor\", \"Number\", \"\", \"A\", 0.5";
+            let fbx = arnold_quad_fbx(properties, &[(map, "transparency.png")], false)
+                .replace("\tC: \"OO\",3000,5000\n", "");
+            temp.write("model/classic.fbx", fbx.as_bytes());
+            temp.write(
+                "model/transparency.png",
+                &encode_png(
+                    1,
+                    1,
+                    png::ColorType::Rgba,
+                    png::BitDepth::Eight,
+                    &[128, 128, 128, 255],
+                ),
+            );
+            let model = temp.assets().load_model("/model/classic.fbx").unwrap();
+            let material = &model.meshes[0].material;
+            assert_eq!(material.opacity, 1.0);
+            assert_eq!(
+                model.textures[material.base_color_texture.unwrap()].rgba[3],
+                191
+            );
+            assert_eq!(material.alpha_mode, ModelAlphaMode::Blend);
+        }
     }
 
     #[test]

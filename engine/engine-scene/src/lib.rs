@@ -9,14 +9,17 @@ pub mod prefab;
 pub mod transform;
 pub mod world;
 
+pub use light::ShadowSettings;
+
 pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,
     ProjectionSettings, Tonemapper,
 };
 pub use document::{
-    CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, LodGroup, LodLevel,
-    MAX_LOD_LEVELS, MaterialOverride, MeshRenderer, ParamValue, SceneAsset, SceneDocument,
-    SceneError, SceneObject, SceneTransform,
+    CameraComponent, DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript,
+    LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer,
+    ParamValue, PointLightComponent, ProceduralSkyComponent, SceneAsset, SceneDocument, SceneError,
+    SceneObject, SceneTransform, SpotLightComponent,
 };
 pub use params::{ParamKind, ParamSchema, ParamSpec};
 pub use prefab::{
@@ -25,6 +28,6 @@ pub use prefab::{
     expand_without_overrides,
 };
 pub use world::{
-    LightState, LocalTransform, MeshInstance, ObjectHandle, SceneFrame, SceneWarning, World,
-    WorldObject,
+    EnvironmentState, LightState, LocalLightState, LocalTransform, MeshInstance, ObjectHandle,
+    SceneFrame, SceneWarning, World, WorldObject,
 };

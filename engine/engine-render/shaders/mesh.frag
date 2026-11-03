@@ -3,32 +3,77 @@
 layout(location = 0) in vec3 in_normal;
 layout(location = 1) in vec2 in_uv;
 layout(location = 2) in vec3 in_color;
-layout(location = 3) in vec4 in_light_clip;
-layout(location = 4) in vec3 in_world_position;
+layout(location = 3) in vec4 in_shadow_clip[4];
+layout(location = 7) in vec3 in_world_position;
 
 layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view_projection;
-    mat4 light_view_projection;
+    mat4 inverse_view_projection;
+    mat4 shadow_view_projections[4];
     vec4 light_direction;
     vec4 light_color;
     vec4 ambient_color;
     vec4 shadow_params;
     vec4 camera_position;
+    mat4 environment_rotation;
+    vec4 environment_params;
+    vec4 local_light_params;
+    mat4 view;
+    vec4 cluster_params;
 } frame;
 
-layout(set = 0, binding = 1) uniform texture2D shadow_map;
-layout(set = 0, binding = 2) uniform sampler shadow_sampler;
+layout(set = 0, binding = 1) uniform texture2DArray shadow_map;
+layout(set = 0, binding = 2) uniform samplerShadow shadow_sampler;
+
+struct LocalLightData {
+    vec4 position_range;
+    vec4 direction_type;
+    vec4 color_intensity;
+    vec4 cone_params;
+    vec4 view_position_range;
+    vec4 view_direction;
+    uvec4 shadow_params;
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer LocalLightBuffer {
+    LocalLightData lights[];
+} local_light_buffer;
+
+struct ClusterRecord {
+    uint count;
+    uint indices[MAX_CLUSTER_LIGHTS];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer ClusterBuffer {
+    ClusterRecord clusters[];
+} cluster_buffer;
+
+layout(set = 0, binding = 6, std430) readonly buffer LocalShadowMatrixBuffer {
+    mat4 matrices[MAX_LOCAL_SHADOW_LAYERS];
+} local_shadow_matrix_buffer;
+layout(set = 0, binding = 7) uniform texture2DArray local_shadow_map;
 
 layout(set = 1, binding = 0) uniform MaterialUniforms {
     vec4 base_color;
     vec4 parameters;
+    vec4 emissive;
+    vec4 alpha_parameters;
 } material;
 layout(set = 1, binding = 1) uniform texture2D base_color_texture;
 layout(set = 1, binding = 2) uniform texture2D metallic_roughness_texture;
 layout(set = 1, binding = 3) uniform texture2D normal_texture;
-layout(set = 1, binding = 4) uniform sampler material_sampler;
+layout(set = 1, binding = 4) uniform texture2D emissive_texture;
+layout(set = 1, binding = 5) uniform texture2D occlusion_texture;
+layout(set = 1, binding = 6) uniform sampler material_sampler;
+
+layout(set = 2, binding = 0) uniform textureCube environment_map;
+layout(set = 2, binding = 1) uniform sampler environment_sampler;
+layout(set = 2, binding = 2) uniform textureCube irradiance_map;
+layout(set = 2, binding = 3) uniform textureCube prefiltered_map;
+layout(set = 2, binding = 4) uniform texture2D brdf_lut;
+layout(set = 2, binding = 5) uniform sampler brdf_sampler;
 
 const float PI = 3.14159265358979323846;
 
@@ -67,21 +112,120 @@ vec3 fresnel_schlick(float view_dot_half, vec3 f0) {
     return f0 + (1.0 - f0) * factor;
 }
 
-vec3 env_brdf_approx(vec3 f0, float roughness, float normal_dot_view) {
-    vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
-    vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
-    vec4 r = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * normal_dot_view)) * r.x + r.y;
-    vec2 ab = vec2(-1.04, 1.04) * a004 + r.zw;
-    return f0 * ab.x + ab.y;
+vec3 direct_brdf(
+    vec3 light,
+    vec3 normal,
+    vec3 view,
+    vec3 f0,
+    vec3 base_color,
+    float metallic,
+    float alpha,
+    float normal_dot_view
+) {
+    vec3 half_vector = safe_normalize(view + light, normal);
+    float normal_dot_light = max(dot(normal, light), 0.0);
+    float normal_dot_half = max(dot(normal, half_vector), 0.0);
+    vec3 fresnel = fresnel_schlick(max(dot(half_vector, view), 0.0), f0);
+    float distribution = distribution_ggx(normal_dot_half, alpha);
+    float visibility = visibility_smith_ggx_correlated(
+        normal_dot_light,
+        normal_dot_view,
+        alpha
+    );
+    vec3 diffuse_color = (1.0 - metallic) * base_color;
+    vec3 diffuse = (1.0 - fresnel) * diffuse_color / PI;
+    vec3 specular = distribution * visibility * fresnel;
+    return (diffuse + specular) * normal_dot_light * PI;
+}
+
+float range_attenuation(float distance_squared, float range) {
+    float normalized_distance = sqrt(distance_squared) / range;
+    float window = clamp(1.0 - pow(normalized_distance, 4.0), 0.0, 1.0);
+    return window * window / max(distance_squared, 1e-4);
+}
+
+float spot_attenuation(
+    vec3 light_ray,
+    vec3 direction,
+    float cos_inner_angle,
+    float cos_outer_angle
+) {
+    float ray_cosine = dot(light_ray, direction);
+    if (cos_inner_angle <= cos_outer_angle + 1e-6) {
+        return ray_cosine >= cos_outer_angle ? 1.0 : 0.0;
+    }
+    return smoothstep(cos_outer_angle, cos_inner_angle, ray_cosine);
+}
+
+uint point_shadow_face_index(vec3 direction) {
+    vec3 magnitude = abs(direction);
+    if (magnitude.x >= magnitude.y && magnitude.x >= magnitude.z) {
+        return direction.x >= 0.0 ? 0u : 1u;
+    }
+    if (magnitude.y >= magnitude.z) {
+        return direction.y >= 0.0 ? 2u : 3u;
+    }
+    return direction.z >= 0.0 ? 4u : 5u;
+}
+
+float local_shadow_visibility(LocalLightData light, vec3 geometric_normal, vec3 to_light) {
+    if (light.shadow_params.z == 0u || light.shadow_params.x >= uint(MAX_LOCAL_SHADOW_LAYERS)) {
+        return 1.0;
+    }
+    uint layer = light.shadow_params.x;
+    if (light.shadow_params.y == 1u) {
+        layer += point_shadow_face_index(in_world_position - light.position_range.xyz);
+    } else if (light.shadow_params.y != 2u) {
+        return 1.0;
+    }
+    if (layer >= uint(MAX_LOCAL_SHADOW_LAYERS)) {
+        return 1.0;
+    }
+    vec4 shadow_clip = local_shadow_matrix_buffer.matrices[layer]
+        * vec4(in_world_position, 1.0);
+    if (shadow_clip.w <= 0.0) {
+        return 1.0;
+    }
+    vec3 shadow_ndc = shadow_clip.xyz / shadow_clip.w;
+    if (any(lessThan(shadow_ndc.xy, vec2(-1.0)))
+        || any(greaterThan(shadow_ndc.xy, vec2(1.0)))
+        || shadow_ndc.z < 0.0 || shadow_ndc.z > 1.0) {
+        return 1.0;
+    }
+    vec2 shadow_uv = vec2(0.5 + 0.5 * shadow_ndc.x, 0.5 - 0.5 * shadow_ndc.y);
+    float bias = max(0.005 * (1.0 - max(dot(geometric_normal, to_light), 0.0)), 0.0005);
+    float visibility = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 offset = vec2(float(x), float(y)) / float(LOCAL_SHADOW_MAP_RESOLUTION);
+            visibility += texture(
+                sampler2DArrayShadow(local_shadow_map, shadow_sampler),
+                vec4(shadow_uv + offset, float(layer), shadow_ndc.z - bias)
+            );
+        }
+    }
+    return visibility / 9.0;
 }
 
 void main() {
     vec4 base_sample = texture(sampler2D(base_color_texture, material_sampler), in_uv);
+    float surface_alpha = base_sample.a * material.alpha_parameters.x;
+#ifdef ALPHA_MASK
+    if (surface_alpha < material.alpha_parameters.y) {
+        discard;
+    }
+    float output_alpha = 1.0;
+#elif defined(ALPHA_BLEND)
+    float output_alpha = surface_alpha;
+#else
+    float output_alpha = 1.0;
+#endif
     vec4 metallic_roughness_sample = texture(
         sampler2D(metallic_roughness_texture, material_sampler), in_uv
     );
     vec3 normal_sample = texture(sampler2D(normal_texture, material_sampler), in_uv).rgb;
+    vec3 emissive_sample = texture(sampler2D(emissive_texture, material_sampler), in_uv).rgb;
+    float occlusion = texture(sampler2D(occlusion_texture, material_sampler), in_uv).r;
 
     vec3 dp1 = dFdx(in_world_position);
     vec3 dp2 = dFdy(in_world_position);
@@ -136,51 +280,141 @@ void main() {
     float alpha = effective_roughness * effective_roughness;
     vec3 f0 = mix(vec3(0.04), base_color, metallic);
 
-    vec3 light = safe_normalize(-frame.light_direction.xyz, geometric_normal);
     vec3 view = safe_normalize(frame.camera_position.xyz - in_world_position, geometric_normal);
-    vec3 half_vector = safe_normalize(view + light, geometric_normal);
     float normal_dot_view = max(dot(normal, view), 1e-4);
-    float normal_dot_light = max(dot(normal, light), 0.0);
-    float normal_dot_half = max(dot(normal, half_vector), 0.0);
-    vec3 fresnel = fresnel_schlick(max(dot(half_vector, view), 0.0), f0);
-    float distribution = distribution_ggx(normal_dot_half, alpha);
-    float visibility = visibility_smith_ggx_correlated(
-        normal_dot_light,
-        normal_dot_view,
-        alpha
-    );
     vec3 diffuse_color = (1.0 - metallic) * base_color;
-    vec3 diffuse = (1.0 - fresnel) * diffuse_color / PI;
-    vec3 specular = distribution * visibility * fresnel;
-
-    float geometric_light_dot = dot(geometric_normal, light);
+    vec3 directional_light = safe_normalize(-frame.light_direction.xyz, geometric_normal);
+    float geometric_light_dot = dot(geometric_normal, directional_light);
     float shadow = 1.0;
-    if (frame.shadow_params.x > 0.5 && in_light_clip.w != 0.0) {
-        vec3 light_ndc = in_light_clip.xyz / in_light_clip.w;
-        vec2 shadow_uv = vec2(0.5 + 0.5 * light_ndc.x, 0.5 - 0.5 * light_ndc.y);
-        if (all(greaterThanEqual(shadow_uv, vec2(0.0)))
-            && all(lessThanEqual(shadow_uv, vec2(1.0)))
-            && light_ndc.z >= 0.0 && light_ndc.z <= 1.0) {
+    if (frame.shadow_params.x > 0.5) {
+        for (int cascade = 0; cascade < int(frame.shadow_params.z); ++cascade) {
+            vec4 light_clip = in_shadow_clip[cascade];
+            if (light_clip.w == 0.0) {
+                continue;
+            }
+            vec3 light_ndc = light_clip.xyz / light_clip.w;
+            vec2 shadow_uv = vec2(0.5 + 0.5 * light_ndc.x, 0.5 - 0.5 * light_ndc.y);
+            if (any(lessThan(shadow_uv, vec2(0.0)))
+                || any(greaterThan(shadow_uv, vec2(1.0)))
+                || light_ndc.z < 0.0 || light_ndc.z > 1.0) {
+                continue;
+            }
             float bias = max(0.005 * (1.0 - max(geometric_light_dot, 0.0)), 0.0005);
-            shadow = 0.0;
+            float cascade_shadow = 0.0;
             for (int y = -1; y <= 1; ++y) {
                 for (int x = -1; x <= 1; ++x) {
                     vec2 offset = vec2(float(x), float(y)) * frame.shadow_params.y;
-                    float shadow_depth = textureLod(
-                        sampler2D(shadow_map, shadow_sampler), shadow_uv + offset, 0.0
-                    ).r;
-                    if (light_ndc.z - bias <= shadow_depth) {
-                        shadow += 1.0;
-                    }
+                    cascade_shadow += texture(
+                        sampler2DArrayShadow(shadow_map, shadow_sampler),
+                        vec4(shadow_uv + offset, float(cascade), light_ndc.z - bias)
+                    );
                 }
             }
-            shadow /= 9.0;
+            shadow = cascade_shadow / 9.0;
+            break;
         }
     }
 
-    vec3 direct = (diffuse + specular) * normal_dot_light
-        * frame.light_color.rgb * shadow * PI;
-    vec3 ambient = frame.ambient_color.rgb
-        * (diffuse_color + env_brdf_approx(f0, effective_roughness, normal_dot_view));
-    out_color = vec4(ambient + direct, 1.0);
+    vec3 direct = direct_brdf(
+        directional_light,
+        normal,
+        view,
+        f0,
+        base_color,
+        metallic,
+        alpha,
+        normal_dot_view
+    ) * frame.light_color.rgb * shadow;
+    float view_depth = -(frame.view * vec4(in_world_position, 1.0)).z;
+    float near_depth = frame.cluster_params.x;
+    float far_depth = frame.cluster_params.y;
+    int slice_z;
+    if (view_depth <= near_depth) {
+        slice_z = 0;
+    } else if (view_depth >= far_depth) {
+        slice_z = CLUSTER_GRID_Z - 1;
+    } else {
+        float normalized_depth = log(view_depth / near_depth) / log(far_depth / near_depth);
+        slice_z = clamp(int(floor(normalized_depth * float(CLUSTER_GRID_Z))), 0, CLUSTER_GRID_Z - 1);
+        float slice_start = near_depth
+            * pow(far_depth / near_depth, float(slice_z) / float(CLUSTER_GRID_Z));
+        if (slice_z > 0 && view_depth < slice_start) {
+            --slice_z;
+        }
+        if (slice_z + 1 < CLUSTER_GRID_Z) {
+            float slice_end = near_depth
+                * pow(far_depth / near_depth, float(slice_z + 1) / float(CLUSTER_GRID_Z));
+            if (view_depth >= slice_end) {
+                ++slice_z;
+            }
+        }
+    }
+    ivec2 tile = ivec2(floor(
+        gl_FragCoord.xy / frame.cluster_params.zw * vec2(CLUSTER_GRID_X, CLUSTER_GRID_Y)
+    ));
+    tile = clamp(tile, ivec2(0), ivec2(CLUSTER_GRID_X - 1, CLUSTER_GRID_Y - 1));
+    uint cluster_index = uint(
+        (slice_z * CLUSTER_GRID_Y + tile.y) * CLUSTER_GRID_X + tile.x
+    );
+    uint local_light_count = min(
+        cluster_buffer.clusters[cluster_index].count,
+        uint(MAX_CLUSTER_LIGHTS)
+    );
+    for (uint light_offset = 0; light_offset < local_light_count; ++light_offset) {
+        uint light_index = cluster_buffer.clusters[cluster_index].indices[light_offset];
+        if (light_index >= uint(frame.local_light_params.x + 0.5)) {
+            continue;
+        }
+        LocalLightData local_light = local_light_buffer.lights[light_index];
+        vec3 light_delta = local_light.position_range.xyz - in_world_position;
+        float distance_squared = dot(light_delta, light_delta);
+        vec3 local_light_direction = safe_normalize(light_delta, geometric_normal);
+        float attenuation = range_attenuation(
+            distance_squared,
+            local_light.position_range.w
+        );
+        if (local_light.direction_type.w > 0.5) {
+            attenuation *= spot_attenuation(
+                -local_light_direction,
+                local_light.direction_type.xyz,
+                local_light.cone_params.x,
+                local_light.cone_params.y
+            );
+        }
+        direct += direct_brdf(
+            local_light_direction,
+            normal,
+            view,
+            f0,
+            base_color,
+            metallic,
+            alpha,
+            normal_dot_view
+        ) * local_light.color_intensity.rgb * attenuation
+            * local_shadow_visibility(local_light, geometric_normal, local_light_direction);
+    }
+    vec3 reflected = reflect(-view, normal);
+    mat3 world_to_environment = transpose(mat3(frame.environment_rotation));
+    vec3 environment_normal = world_to_environment * normal;
+    vec3 environment_reflection = world_to_environment * reflected;
+    vec3 irradiance = textureLod(
+        samplerCube(irradiance_map, environment_sampler), environment_normal, 0.0
+    ).rgb;
+    float prefilter_lod = effective_roughness * 5.0;
+    vec3 prefiltered = textureLod(
+        samplerCube(prefiltered_map, environment_sampler), environment_reflection, prefilter_lod
+    ).rgb;
+    vec2 brdf = texture(
+        sampler2D(brdf_lut, brdf_sampler), vec2(normal_dot_view, effective_roughness)
+    ).rg;
+    vec3 indirect_diffuse = irradiance * diffuse_color / PI;
+    vec3 indirect_specular = prefiltered * (f0 * brdf.x + brdf.y);
+    float environment_weight = frame.environment_params.z;
+    vec3 ambient = mix(
+        frame.ambient_color.rgb * (indirect_diffuse + indirect_specular),
+        frame.environment_params.x * (indirect_diffuse + indirect_specular),
+        environment_weight
+    ) * mix(1.0, occlusion, material.alpha_parameters.w);
+    vec3 emissive = material.emissive.rgb * emissive_sample;
+    out_color = vec4(ambient + direct + emissive, output_alpha);
 }

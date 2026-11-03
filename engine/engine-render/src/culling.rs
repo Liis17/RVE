@@ -1,4 +1,4 @@
-use crate::Vertex;
+use crate::{DrawCommand, Vertex};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LocalBounds {
@@ -114,6 +114,154 @@ impl Frustum {
         }
         true
     }
+
+    /// Returns false only when a finite sphere is completely outside one clip plane.
+    pub fn intersects_sphere(self, center: [f32; 3], radius: f32) -> bool {
+        let Some(planes) = self.planes else {
+            return true;
+        };
+        if !center.into_iter().all(f32::is_finite) || !radius.is_finite() || radius < 0.0 {
+            return true;
+        }
+        for plane in planes {
+            let normal_length = plane[0..3]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            if !normal_length.is_finite() || normal_length <= f32::EPSILON {
+                return true;
+            }
+            let distance =
+                (plane[0] * center[0] + plane[1] * center[1] + plane[2] * center[2] + plane[3])
+                    / normal_length;
+            if !distance.is_finite() {
+                return true;
+            }
+            if distance < -radius {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Conservatively culls a spherical sector using the maximum support along each frustum plane.
+    pub fn intersects_spot_sector(
+        self,
+        apex: [f32; 3],
+        direction: [f32; 3],
+        range: f32,
+        cos_outer_angle: f32,
+    ) -> bool {
+        let Some(planes) = self.planes else {
+            return true;
+        };
+        if !apex.into_iter().all(f32::is_finite)
+            || !direction.into_iter().all(f32::is_finite)
+            || !range.is_finite()
+            || range <= 0.0
+            || !cos_outer_angle.is_finite()
+            || !(-1.0..=1.0).contains(&cos_outer_angle)
+        {
+            return true;
+        }
+        let direction_length = dot3(direction, direction).sqrt();
+        if !direction_length.is_finite() || direction_length <= f32::EPSILON {
+            return true;
+        }
+        let direction = direction.map(|component| component / direction_length);
+        let outer_angle = cos_outer_angle.clamp(0.0, 1.0).acos();
+        for plane in planes {
+            let normal_length = plane[0..3]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            if !normal_length.is_finite() || normal_length <= f32::EPSILON {
+                return true;
+            }
+            let normal = [
+                plane[0] / normal_length,
+                plane[1] / normal_length,
+                plane[2] / normal_length,
+            ];
+            let apex_distance = dot3(normal, apex) + plane[3] / normal_length;
+            if !apex_distance.is_finite() {
+                return true;
+            }
+            let normal_angle = dot3(normal, direction).clamp(-1.0, 1.0).acos();
+            let maximum_direction_dot = (normal_angle - outer_angle).max(0.0).cos().max(0.0);
+            if apex_distance + range * maximum_direction_dot < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+/// Indices ordered back-to-front by distance to each transformed world AABB center.
+pub(crate) fn back_to_front_order(
+    draws: &[DrawCommand],
+    camera_position: [f32; 3],
+    mut bounds_for_draw: impl FnMut(&DrawCommand) -> Option<LocalBounds>,
+) -> Vec<usize> {
+    let mut distances = draws
+        .iter()
+        .enumerate()
+        .map(|(index, draw)| {
+            let distance = bounds_for_draw(draw)
+                .and_then(|bounds| world_aabb_center(draw.model, bounds))
+                .filter(|_| camera_position.into_iter().all(f32::is_finite))
+                .map_or(0.0, |center| {
+                    (0..3)
+                        .map(|axis| {
+                            let delta = center[axis] - camera_position[axis];
+                            delta * delta
+                        })
+                        .sum()
+                });
+            (index, distance)
+        })
+        .collect::<Vec<_>>();
+    distances.sort_by(
+        |(left_index, left_distance), (right_index, right_distance)| {
+            right_distance
+                .total_cmp(left_distance)
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
+    distances.into_iter().map(|(index, _)| index).collect()
+}
+
+fn world_aabb_center(model: [[f32; 4]; 4], bounds: LocalBounds) -> Option<[f32; 3]> {
+    if !bounds.is_valid() || !model.into_iter().flatten().all(f32::is_finite) {
+        return None;
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for x in [bounds.min[0], bounds.max[0]] {
+        for y in [bounds.min[1], bounds.max[1]] {
+            for z in [bounds.min[2], bounds.max[2]] {
+                let world = transform(model, [x, y, z, 1.0]);
+                if !world.into_iter().all(f32::is_finite) || world[3].abs() <= f32::EPSILON {
+                    return None;
+                }
+                for axis in 0..3 {
+                    let position = world[axis] / world[3];
+                    if !position.is_finite() {
+                        return None;
+                    }
+                    min[axis] = min[axis].min(position);
+                    max[axis] = max[axis].max(position);
+                }
+            }
+        }
+    }
+    Some(std::array::from_fn(|axis| (min[axis] + max[axis]) * 0.5))
 }
 
 fn transform(columns: [[f32; 4]; 4], vector: [f32; 4]) -> [f32; 4] {
@@ -131,8 +279,8 @@ fn dot(left: [f32; 4], right: [f32; 4]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frustum, LocalBounds};
-    use crate::Vertex;
+    use super::{Frustum, LocalBounds, back_to_front_order};
+    use crate::{DrawCommand, MeshId, Vertex};
 
     const IDENTITY: [[f32; 4]; 4] = [
         [1.0, 0.0, 0.0, 0.0],
@@ -172,6 +320,47 @@ mod tests {
         model
     }
 
+    fn draw(mesh: usize, model: [[f32; 4]; 4]) -> DrawCommand {
+        DrawCommand {
+            mesh: MeshId(mesh),
+            material: None,
+            model,
+            casts_shadow: true,
+        }
+    }
+
+    #[test]
+    fn transparent_order_is_back_to_front_and_equal_distances_keep_input_order() {
+        let draws = [
+            draw(0, translated(0.0, 0.0, 2.0)),
+            draw(1, translated(0.0, 0.0, -4.0)),
+            draw(2, translated(0.0, 0.0, 4.0)),
+        ];
+        let bounds = bounds([-0.5; 3], [0.5; 3]);
+        assert_eq!(
+            back_to_front_order(&draws, [0.0; 3], |_| Some(bounds)),
+            [1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn transparent_order_uses_world_aabb_centers_and_keeps_unknown_bounds_stable() {
+        let draws = [
+            draw(0, translated(0.0, 0.0, -5.0)),
+            draw(1, translated(0.0, 0.0, -2.0)),
+            draw(2, translated(0.0, 0.0, -2.0)),
+        ];
+        let bounds = [
+            Some(bounds([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])),
+            None,
+            None,
+        ];
+        assert_eq!(
+            back_to_front_order(&draws, [0.0; 3], |draw| bounds[draw.mesh.0]),
+            [0, 1, 2]
+        );
+    }
+
     #[test]
     fn bounds_are_computed_from_all_vertices_and_allow_degenerate_axes() {
         let vertices = make_vertices(&[[-2.0, 0.0, -3.0], [1.0, 0.0, 4.0], [0.5, 0.0, 1.0]]);
@@ -208,7 +397,7 @@ mod tests {
 
     #[test]
     fn scene_shadow_orthographic_matrix_culls_outside_the_shadow_volume() {
-        // Matches shadow_view_projection(NEG_Z, ZERO, 1): a unit orthographic
+        // Matches a unit orthographic light frustum:
         // volume looking from +Z, with DirectX [0, 1] clip depth.
         let light_view_projection = [
             [1.0, 0.0, 0.0, 0.0],

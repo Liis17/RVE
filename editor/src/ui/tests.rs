@@ -477,6 +477,7 @@ fn showing_the_inspector_keeps_hdr_light_colors_and_material_overrides_unchanged
                 normal_texture: None,
                 normal_scale: Some(2.0),
                 double_sided: None,
+                ..engine_scene::document::MaterialOverride::default()
             }),
             None,
         )

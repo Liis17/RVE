@@ -369,6 +369,9 @@ fn world_for_view(view: &engine_scene::SceneDocument) -> Result<World, engine_sc
         mesh_renderer: None,
         lod_group: None,
         directional_light: None,
+        point_light: None,
+        spot_light: None,
+        environment: None,
         lite_scripts: Vec::new(),
         heavy_scripts: Vec::new(),
     });

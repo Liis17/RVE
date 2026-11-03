@@ -1,13 +1,18 @@
 //! Содержимое кадра sandbox: демонстрационная сцена или модель из assets.
 
 use crate::scene::{
-    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, material_sphere_meshes,
-    materials_light_view_projection, materials_plane_mesh, plane_mesh, shadows_light_direction,
-    shadows_light_view_projection, sinusoidal_normal_texture,
+    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, material_sphere_meshes, materials_plane_mesh,
+    plane_mesh, shadows_light_direction, sinusoidal_normal_texture,
 };
-use engine_assets::{Model, ModelMaterial, TextureData};
-use engine_render::{DirectionalLight, Vertex};
-use engine_scene::CameraSettings;
+use engine_assets::{Model, ModelAlphaMode, ModelMaterial, TextureData};
+use engine_render::{
+    DirectionalLight, LocalLight, LocalLightShadow, LocalLightShadowMatrices,
+    SHADOW_MAP_RESOLUTION, Vertex,
+};
+use engine_scene::light::{
+    cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
+};
+use engine_scene::{CameraSettings, ShadowSettings};
 use glam::{Mat4, Vec3};
 
 /// Меш с CPU-материалом и индексами его текстур в [`Content::textures`].
@@ -82,6 +87,21 @@ impl Content {
                     },
                     metallic,
                     roughness,
+                    emissive: if metallic == 0.0 && roughness == 0.0 {
+                        [0.8, 0.08, 0.015]
+                    } else {
+                        [0.0; 3]
+                    },
+                    opacity: if metallic == 1.0 && roughness == 1.0 {
+                        0.5
+                    } else {
+                        1.0
+                    },
+                    alpha_mode: if metallic == 1.0 && roughness == 1.0 {
+                        ModelAlphaMode::Blend
+                    } else {
+                        ModelAlphaMode::Opaque
+                    },
                     ..ModelMaterial::default()
                 },
                 environment: false,
@@ -190,12 +210,103 @@ impl Content {
         }
     }
 
-    pub fn shadow_view_projection(&self, elapsed: f32) -> Option<Mat4> {
-        match self.motion {
-            Scene::Shadows => Some(shadows_light_view_projection(elapsed)),
-            Scene::Materials => Some(materials_light_view_projection(elapsed)),
-            Scene::Triangle | Scene::Cube => None,
+    pub fn local_lights(&self) -> Vec<LocalLight> {
+        if self.motion == Scene::Clustered {
+            let mut lights = (0..144)
+                .map(|index| LocalLight::Point {
+                    position: [0.0; 3],
+                    color_intensity: [
+                        1.8 + (index % 3) as f32 * 0.2,
+                        1.2 + (index % 5) as f32 * 0.1,
+                        0.8 + (index % 7) as f32 * 0.08,
+                    ],
+                    range: 8.0,
+                })
+                .collect::<Vec<_>>();
+            lights.extend((0..16).map(|_| LocalLight::Spot {
+                position: [0.0; 3],
+                direction: [0.0, -1.0, 0.0],
+                color_intensity: [0.5, 0.8, 1.2],
+                range: 8.0,
+                cos_inner_angle: 30.0_f32.to_radians().cos(),
+                cos_outer_angle: 0.0,
+            }));
+            return lights;
         }
+        if !matches!(self.motion, Scene::Shadows | Scene::Materials) {
+            return Vec::new();
+        }
+        vec![
+            LocalLight::Point {
+                position: [-2.2, 2.0, 1.5],
+                color_intensity: [4.0, 1.25, 0.35],
+                range: 8.0,
+            },
+            LocalLight::Spot {
+                position: [2.2, 3.0, 1.8],
+                direction: [-0.55, -0.72, -0.43],
+                color_intensity: [0.35, 1.5, 4.5],
+                range: 10.0,
+                cos_inner_angle: 15.0_f32.to_radians().cos(),
+                cos_outer_angle: 27.0_f32.to_radians().cos(),
+            },
+        ]
+    }
+
+    pub fn local_light_shadows(&self) -> Vec<LocalLightShadow> {
+        if self.motion != Scene::Shadows {
+            return Vec::new();
+        }
+        let mut shadows = Vec::with_capacity(2);
+        if let Some(matrices) = point_shadow_view_projections(Vec3::new(-2.2, 2.0, 1.5), 8.0) {
+            shadows.push(LocalLightShadow {
+                light_index: 0,
+                matrices: LocalLightShadowMatrices::Point {
+                    matrices: matrices.map(|matrix| matrix.to_cols_array_2d()),
+                },
+            });
+        }
+        if let Some(matrix) = spot_shadow_view_projection(
+            Vec3::new(2.2, 3.0, 1.8),
+            Vec3::new(-0.55, -0.72, -0.43),
+            15.0,
+            27.0,
+            10.0,
+        ) {
+            shadows.push(LocalLightShadow {
+                light_index: 1,
+                matrices: LocalLightShadowMatrices::Spot {
+                    matrix: matrix.to_cols_array_2d(),
+                },
+            });
+        }
+        shadows
+    }
+
+    pub fn shadow_cascades(
+        &self,
+        elapsed: f32,
+        width: u32,
+        height: u32,
+        settings: CameraSettings,
+    ) -> Vec<[[f32; 4]; 4]> {
+        let Some(camera) = self.motion.camera_at(elapsed, settings) else {
+            return Vec::new();
+        };
+        let shadow_settings = ShadowSettings {
+            distance: camera.far.min(100.0),
+            cascades: 4,
+        };
+        cascade_view_projections(
+            camera,
+            width.max(1) as f32 / height.max(1) as f32,
+            shadows_light_direction(elapsed),
+            shadow_settings,
+            SHADOW_MAP_RESOLUTION,
+        )
+        .into_iter()
+        .map(|matrix| matrix.to_cols_array_2d())
+        .collect()
     }
 }
 
@@ -213,7 +324,10 @@ fn fit_to_unit_cube(min: Vec3, max: Vec3) -> Mat4 {
 mod tests {
     use super::{CameraSettings, Content, fit_to_unit_cube};
     use crate::scene::{Scene, cube_mesh};
-    use engine_assets::{Model, ModelMaterial, ModelMesh, ModelVertex, TextureData};
+    use engine_assets::{
+        Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex, TextureData,
+    };
+    use engine_render::LocalLight;
     use glam::Vec3;
 
     fn texture(value: u8) -> TextureData {
@@ -248,6 +362,7 @@ mod tests {
                         normal_texture: Some(0),
                         normal_scale: 0.75,
                         double_sided: true,
+                        ..ModelMaterial::default()
                     },
                 },
                 ModelMesh {
@@ -358,7 +473,11 @@ mod tests {
                 content.light(1.5),
                 engine_render::DirectionalLight::default()
             );
-            assert!(content.shadow_view_projection(1.5).is_none());
+            assert!(
+                content
+                    .shadow_cascades(1.5, 800, 600, CameraSettings::default())
+                    .is_empty()
+            );
         }
     }
 
@@ -371,20 +490,78 @@ mod tests {
         assert_eq!(content.meshes[1].material.base_color_texture, None);
         assert_eq!(content.light(0.0).color, [1.0; 3]);
         assert_eq!(content.light(0.0).ambient, [0.15; 3]);
-        assert!(content.shadow_view_projection(0.0).is_some());
+        assert_eq!(content.local_lights().len(), 2);
+        let local_shadows = content.local_light_shadows();
+        assert_eq!(local_shadows.len(), 2);
+        assert_eq!(local_shadows[0].light_index, 0);
+        assert!(matches!(
+            local_shadows[0].matrices,
+            engine_render::LocalLightShadowMatrices::Point { .. }
+        ));
+        assert_eq!(local_shadows[1].light_index, 1);
+        assert!(matches!(
+            local_shadows[1].matrices,
+            engine_render::LocalLightShadowMatrices::Spot { .. }
+        ));
+        let cascades = content.shadow_cascades(0.0, 1280, 720, CameraSettings::default());
+        assert_eq!(cascades.len(), 4);
+        assert!(
+            cascades
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
         assert_eq!(
             Content::from_scene(Scene::Cube).light(0.0),
             engine_render::DirectionalLight::default()
         );
+        assert!(Content::from_scene(Scene::Cube).local_lights().is_empty());
+        assert!(
+            Content::from_scene(Scene::Materials)
+                .local_light_shadows()
+                .is_empty()
+        );
+        assert!(
+            Content::from_scene(Scene::Clustered)
+                .local_light_shadows()
+                .is_empty()
+        );
         assert!(
             Content::from_scene(Scene::Cube)
-                .shadow_view_projection(0.0)
-                .is_none()
+                .shadow_cascades(0.0, 1280, 720, CameraSettings::default())
+                .is_empty()
         );
         assert!(
             Content::from_scene(Scene::Triangle)
-                .shadow_view_projection(0.0)
-                .is_none()
+                .shadow_cascades(0.0, 1280, 720, CameraSettings::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn clustered_scene_provides_same_cluster_overflow_and_mixed_light_stress() {
+        let content = Content::from_scene(Scene::Clustered);
+        let lights = content.local_lights();
+        assert_eq!(lights.len(), 160);
+        assert_eq!(
+            lights
+                .iter()
+                .filter(|light| matches!(light, LocalLight::Point { .. }))
+                .count(),
+            144
+        );
+        assert_eq!(
+            lights
+                .iter()
+                .filter(|light| matches!(light, LocalLight::Spot { .. }))
+                .count(),
+            16
+        );
+        assert!(
+            content
+                .view_projection(0.0, 1280, 720, CameraSettings::default())
+                .is_finite()
         );
     }
 
@@ -413,13 +590,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0.0, 0.25, 0.5, 0.75, 1.0]
         );
+        assert_eq!(content.meshes[0].material.emissive, [0.8, 0.08, 0.015]);
+        assert_eq!(content.meshes[9].material.opacity, 0.5);
+        assert_eq!(content.meshes[9].material.alpha_mode, ModelAlphaMode::Blend);
         let floor = content.meshes.last().unwrap();
         assert!(floor.environment);
         assert_eq!(floor.material.normal_texture, Some(0));
         assert!(floor.material.double_sided);
         assert_eq!(floor.vertices[0].position, [-4.0, -1.0, -4.0]);
         assert_eq!(content.light(0.0).ambient, [0.15; 3]);
-        assert!(content.shadow_view_projection(0.0).is_some());
+        assert_eq!(
+            content
+                .shadow_cascades(0.0, 1280, 720, CameraSettings::default())
+                .len(),
+            4
+        );
     }
 
     #[test]

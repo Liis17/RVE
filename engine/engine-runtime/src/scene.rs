@@ -1,14 +1,18 @@
 use crate::pipeline::GpuSceneTable;
-use engine_assets::{Assets, Model, ModelMaterial, TextureData};
+use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, TextureData};
 use engine_files::VirtualPath;
 use engine_render::{
-    Material, MaterialId, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
+    AlphaMode, EnvironmentSource, Material, MaterialId, RenderError, Renderer, TextureColorSpace,
+    TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::CameraSettings;
-use engine_scene::{MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand};
+use engine_scene::{
+    MaterialAlphaMode, MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
+use std::sync::Arc;
 
 pub(crate) struct ObjectModel {
     pub object: ObjectHandle,
@@ -19,6 +23,7 @@ pub(crate) struct ObjectModel {
 pub(crate) struct PreparedRenderAssets {
     pub models: HashMap<String, Model>,
     pub textures: HashMap<String, TextureData>,
+    pub environments: HashMap<String, Arc<EnvironmentSource>>,
     pub objects: Vec<ObjectModel>,
 }
 
@@ -109,10 +114,28 @@ fn prepare_scene_with_model_loader(
 
     let mut models = HashMap::new();
     let mut textures = HashMap::new();
+    let mut environments = HashMap::new();
     let mut objects = Vec::new();
     let mut lite_paths = std::collections::BTreeSet::new();
 
     for object in world.objects() {
+        if let Some(path) = object
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.hdr.as_ref())
+        {
+            let key = path.as_str().to_owned();
+            if let std::collections::hash_map::Entry::Vacant(entry) = environments.entry(key) {
+                let image = assets
+                    .load_hdr(entry.key())
+                    .map_err(|error| format!("{scene_path}: {error}"))?;
+                entry.insert(Arc::new(EnvironmentSource::Equirect {
+                    width: image.width,
+                    height: image.height,
+                    rgb: image.rgb,
+                }));
+            }
+        }
         if let Some(mesh) = &object.mesh_renderer {
             let mut levels = vec![(
                 mesh.model.as_str().to_owned(),
@@ -153,6 +176,8 @@ fn prepare_scene_with_model_loader(
                     [
                         material.metallic_roughness_texture.as_ref(),
                         material.normal_texture.as_ref(),
+                        material.emissive_texture.as_ref(),
+                        material.occlusion_texture.as_ref(),
                     ]
                     .into_iter()
                     .flatten()
@@ -190,6 +215,7 @@ fn prepare_scene_with_model_loader(
         render_assets: PreparedRenderAssets {
             models,
             textures,
+            environments,
             objects,
         },
     })
@@ -206,11 +232,17 @@ struct ResolvedMaterial {
     base_color: [f32; 3],
     metallic: f32,
     roughness: f32,
+    emissive: [f32; 3],
+    opacity: f32,
+    alpha_mode: AlphaMode,
     double_sided: bool,
     base_color_texture: Option<MaterialTextureSource>,
     metallic_roughness_texture: Option<MaterialTextureSource>,
     normal_texture: Option<MaterialTextureSource>,
+    emissive_texture: Option<MaterialTextureSource>,
+    occlusion_texture: Option<MaterialTextureSource>,
     normal_scale: f32,
+    occlusion_strength: f32,
 }
 
 struct GpuTextureCache<T> {
@@ -262,6 +294,25 @@ fn resolve_material(
         roughness: override_material
             .and_then(|material| material.roughness)
             .unwrap_or(model.roughness),
+        emissive: override_material
+            .and_then(|material| material.emissive)
+            .unwrap_or(model.emissive),
+        opacity: override_material
+            .and_then(|material| material.opacity)
+            .unwrap_or(model.opacity),
+        alpha_mode: match override_material.and_then(|material| material.alpha_mode) {
+            Some(MaterialAlphaMode::Opaque) => AlphaMode::Opaque,
+            Some(MaterialAlphaMode::Mask) => AlphaMode::Mask {
+                cutoff: override_material
+                    .and_then(|material| material.alpha_cutoff)
+                    .unwrap_or(0.5),
+            },
+            Some(MaterialAlphaMode::Blend) => AlphaMode::Blend,
+            None => match model.alpha_mode {
+                ModelAlphaMode::Opaque => AlphaMode::Opaque,
+                ModelAlphaMode::Blend => AlphaMode::Blend,
+            },
+        },
         double_sided: override_material
             .and_then(|material| material.double_sided)
             .unwrap_or(model.double_sided),
@@ -280,9 +331,20 @@ fn resolve_material(
             override_material.and_then(|material| material.normal_texture.as_ref()),
         )
         .or_else(|| model.normal_texture.map(MaterialTextureSource::Model)),
+        emissive_texture: override_texture(
+            override_material.and_then(|material| material.emissive_texture.as_ref()),
+        )
+        .or_else(|| model.emissive_texture.map(MaterialTextureSource::Model)),
+        occlusion_texture: override_texture(
+            override_material.and_then(|material| material.occlusion_texture.as_ref()),
+        )
+        .or_else(|| model.occlusion_texture.map(MaterialTextureSource::Model)),
         normal_scale: override_material
             .and_then(|material| material.normal_scale)
             .unwrap_or(model.normal_scale),
+        occlusion_strength: override_material
+            .and_then(|material| material.occlusion_strength)
+            .unwrap_or(model.occlusion_strength),
     }
 }
 
@@ -330,7 +392,10 @@ pub(crate) fn upload_scene(
         gpu_models.insert(path.clone(), gpu_meshes);
     }
 
-    let mut table = GpuSceneTable::default();
+    let mut table = GpuSceneTable {
+        environments: assets.environments.clone(),
+        ..GpuSceneTable::default()
+    };
     for object in &assets.objects {
         let mut levels = Vec::with_capacity(object.levels.len());
         for (model_path, replacement_texture) in &object.levels {
@@ -405,15 +470,39 @@ fn upload_resolved_material(
         scene_texture_data,
         texture_cache,
     )?;
+    let emissive_texture = upload_material_texture(
+        renderer,
+        resolved.emissive_texture.as_ref(),
+        TextureColorSpace::Srgb,
+        model_path,
+        model,
+        scene_texture_data,
+        texture_cache,
+    )?;
+    let occlusion_texture = upload_material_texture(
+        renderer,
+        resolved.occlusion_texture.as_ref(),
+        TextureColorSpace::Linear,
+        model_path,
+        model,
+        scene_texture_data,
+        texture_cache,
+    )?;
     renderer.create_material(&Material {
         base_color: resolved.base_color,
         metallic: resolved.metallic,
         roughness: resolved.roughness,
+        emissive: resolved.emissive,
+        opacity: resolved.opacity,
+        alpha_mode: resolved.alpha_mode,
         double_sided: resolved.double_sided,
         base_color_texture,
         metallic_roughness_texture,
         normal_texture,
+        emissive_texture,
+        occlusion_texture,
         normal_scale: resolved.normal_scale,
+        occlusion_strength: resolved.occlusion_strength,
     })
 }
 
@@ -470,11 +559,11 @@ mod tests {
         GpuTextureCache, MaterialTextureSource, get_or_insert_texture, load_scene,
         prepare_scene_with_model_loader, resolve_material,
     };
-    use engine_assets::{Assets, Model, ModelMaterial};
+    use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
-    use engine_render::TextureColorSpace;
+    use engine_render::{AlphaMode, EnvironmentSource, TextureColorSpace};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
-    use engine_scene::{MaterialOverride, SceneDocument, World};
+    use engine_scene::{MaterialAlphaMode, MaterialOverride, SceneDocument, World};
     use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -634,6 +723,49 @@ id = "camera"
         );
         assert!(prepared.world.handle("spinner1").is_some());
         assert!(prepared.sources.contains_key("scripts/spin.lua"));
+    }
+
+    #[test]
+    fn load_scene_prepares_hdr_environment_assets_introduced_by_prefabs() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"/prefabs/sky.rveprefab\"\n{CAMERA_SCENE}\n[[instances]]\nid = \"sky\"\nprefab = \"/prefabs/sky.rveprefab\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        project.write(
+            "prefabs/sky.rveprefab",
+            b"[[assets]]\npath = \"/environment/sky.hdr\"\n[[objects]]\nid = \"environment\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n",
+        );
+        project.write(
+            "environment/sky.hdr",
+            b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n\x80\x80\x80\x81\x40\x60\x80\x82",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let EnvironmentSource::Equirect { width, height, rgb } = prepared
+            .render_assets
+            .environments
+            .get("environment/sky.hdr")
+            .unwrap()
+            .as_ref()
+        else {
+            panic!("HDR environment should be prepared as an equirectangular image");
+        };
+        assert_eq!((*width, *height), (2, 1));
+        assert_eq!(rgb.len(), 6);
+        assert!(
+            prepared
+                .world
+                .object_by_id("sky")
+                .unwrap()
+                .environment
+                .is_some()
+        );
     }
 
     #[test]
@@ -825,16 +957,25 @@ id = "camera"
             base_color: [0.2, 0.4, 0.6],
             metallic: 0.7,
             roughness: 0.3,
+            emissive: [0.5, 1.0, 2.0],
+            opacity: 0.8,
+            alpha_mode: ModelAlphaMode::Blend,
             base_color_texture: Some(0),
             metallic_roughness_texture: Some(1),
             normal_texture: Some(2),
+            emissive_texture: Some(3),
+            occlusion_texture: Some(4),
             normal_scale: 0.8,
+            occlusion_strength: 0.6,
             double_sided: true,
         };
         let unchanged = resolve_material(&model, None, None);
         assert_eq!(unchanged.base_color, model.base_color);
         assert_eq!(unchanged.metallic, model.metallic);
         assert_eq!(unchanged.roughness, model.roughness);
+        assert_eq!(unchanged.emissive, model.emissive);
+        assert_eq!(unchanged.opacity, model.opacity);
+        assert_eq!(unchanged.alpha_mode, AlphaMode::Blend);
         assert!(unchanged.double_sided);
         assert_eq!(
             unchanged.base_color_texture,
@@ -849,14 +990,30 @@ id = "camera"
             Some(MaterialTextureSource::Model(2))
         );
         assert_eq!(unchanged.normal_scale, 0.8);
+        assert_eq!(unchanged.occlusion_strength, 0.6);
+        assert_eq!(
+            unchanged.emissive_texture,
+            Some(MaterialTextureSource::Model(3))
+        );
+        assert_eq!(
+            unchanged.occlusion_texture,
+            Some(MaterialTextureSource::Model(4))
+        );
 
         let override_material = MaterialOverride {
             base_color: Some([0.9, 0.8, 0.7]),
             metallic: Some(1.0),
             roughness: None,
+            emissive: Some([3.0, 2.0, 1.0]),
+            opacity: Some(0.4),
+            alpha_mode: Some(MaterialAlphaMode::Mask),
+            alpha_cutoff: Some(0.25),
             metallic_roughness_texture: Some(VirtualPath::parse("/textures/mr.png").unwrap()),
             normal_texture: Some(VirtualPath::parse("/textures/normal.png").unwrap()),
+            emissive_texture: Some(VirtualPath::parse("/textures/emissive.png").unwrap()),
+            occlusion_texture: Some(VirtualPath::parse("/textures/occlusion.png").unwrap()),
             normal_scale: Some(0.5),
+            occlusion_strength: Some(0.2),
             double_sided: Some(false),
         };
         let replacement = resolve_material(
@@ -867,6 +1024,9 @@ id = "camera"
         assert_eq!(replacement.base_color, [0.9, 0.8, 0.7]);
         assert_eq!(replacement.metallic, 1.0);
         assert_eq!(replacement.roughness, model.roughness);
+        assert_eq!(replacement.emissive, [3.0, 2.0, 1.0]);
+        assert_eq!(replacement.opacity, 0.4);
+        assert_eq!(replacement.alpha_mode, AlphaMode::Mask { cutoff: 0.25 });
         assert!(!replacement.double_sided);
         assert_eq!(
             replacement.base_color_texture,
@@ -885,6 +1045,19 @@ id = "camera"
             ))
         );
         assert_eq!(replacement.normal_scale, 0.5);
+        assert_eq!(replacement.occlusion_strength, 0.2);
+        assert_eq!(
+            replacement.emissive_texture,
+            Some(MaterialTextureSource::Scene(
+                "textures/emissive.png".to_owned()
+            ))
+        );
+        assert_eq!(
+            replacement.occlusion_texture,
+            Some(MaterialTextureSource::Scene(
+                "textures/occlusion.png".to_owned()
+            ))
+        );
     }
 
     #[test]

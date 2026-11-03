@@ -1,6 +1,6 @@
 //! Превью PNG для панели Project: декодирование в фоне и LRU-кэш UI-текстур.
 
-use engine_assets::{TextureData, decode_png};
+use engine_assets::{HdrImageData, TextureData, decode_hdr, decode_png};
 use engine_render::{RenderError, Renderer, UiTextureId};
 use engine_ui::render::UiBridge;
 use std::collections::{HashMap, HashSet};
@@ -45,8 +45,18 @@ impl Worker {
                 for (path, file) in request_rx {
                     let decoded = std::fs::read(&file)
                         .map_err(|error| error.to_string())
-                        .and_then(|bytes| decode_png(&bytes))
-                        .map(|data| preview_image(&data, MAX_PREVIEW_SIDE));
+                        .and_then(|bytes| {
+                            if file
+                                .extension()
+                                .and_then(|extension| extension.to_str())
+                                .is_some_and(|extension| extension.eq_ignore_ascii_case("hdr"))
+                            {
+                                decode_hdr(&bytes).map(|data| hdr_preview(&data, MAX_PREVIEW_SIDE))
+                            } else {
+                                decode_png(&bytes)
+                                    .map(|data| preview_image(&data, MAX_PREVIEW_SIDE))
+                            }
+                        });
                     if result_tx.send((path, decoded)).is_err() {
                         break;
                     }
@@ -198,6 +208,33 @@ fn preview_image(source: &TextureData, max_side: u32) -> TextureData {
     }
 }
 
+/// Тонально отображает линейный Radiance HDR в небольшой sRGB-подобный thumbnail.
+fn hdr_preview(source: &HdrImageData, max_side: u32) -> TextureData {
+    let largest = source.width.max(source.height).max(1);
+    let scale = (max_side as f32 / largest as f32).min(1.0);
+    let width = ((source.width as f32 * scale).round() as u32).max(1);
+    let height = ((source.height as f32 * scale).round() as u32).max(1);
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        let source_y = (u64::from(y) * u64::from(source.height) / u64::from(height)) as usize;
+        for x in 0..width {
+            let source_x = (u64::from(x) * u64::from(source.width) / u64::from(width)) as usize;
+            let offset = (source_y * source.width as usize + source_x) * 3;
+            for channel in &source.rgb[offset..offset + 3] {
+                let linear = channel.max(0.0);
+                let mapped = (linear / (1.0 + linear)).powf(1.0 / 2.2);
+                rgba.push((mapped.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            rgba.push(255);
+        }
+    }
+    TextureData {
+        width,
+        height,
+        rgba,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +290,22 @@ mod tests {
             None
         );
         assert!(!asked);
+    }
+
+    #[test]
+    fn hdr_previews_are_tone_mapped_and_bounded() {
+        let preview = hdr_preview(
+            &HdrImageData {
+                width: 2,
+                height: 1,
+                rgb: vec![0.0, 1.0, 4.0, 1.0, 4.0, 16.0],
+            },
+            1,
+        );
+        assert_eq!((preview.width, preview.height), (1, 1));
+        assert_eq!(preview.rgba.len(), 4);
+        assert!(preview.rgba[1] > preview.rgba[0]);
+        assert!(preview.rgba[2] > preview.rgba[1]);
+        assert_eq!(preview.rgba[3], 255);
     }
 }

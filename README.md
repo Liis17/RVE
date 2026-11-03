@@ -45,6 +45,7 @@ Sandbox показывает вращающийся куб над плоскос
 ```sh
 cargo run -p sandbox -- --scene triangle
 cargo run -p sandbox -- --scene materials --frames 300
+cargo run -p sandbox -- --scene clustered --frames 300 --resize-test --debug-overlay
 cargo run -p sandbox -- --model /models/cube.fbx --texture /textures/cube.png
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
 cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
@@ -52,10 +53,11 @@ cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
 
 Ресурсы sandbox размещаются в `build/assets`. Например, путь
 `/models/cube.fbx` указывает на `build/assets/models/cube.fbx`. Поддерживаются
-сцены `triangle`, `cube`, `shadows` и `materials`, модели FBX, текстуры PNG, ограничение
+сцены `triangle`, `cube`, `shadows`, `materials` и `clustered`, модели FBX, текстуры PNG, ограничение
 числа кадров, изменение размера окна и отладочный оверлей. Настройки проекции,
 exposure, tonemapping, anti-aliasing и render scale задаются файлом
-`.camerasettings`; явный `--render-scale` перекрывает масштаб из него.
+`.camerasettings`; явный `--render-scale` перекрывает масштаб из него. Сцены
+`shadows` и `materials` также показывают point и spot освещение.
 
 Настройки окна sandbox необязательны. Чтобы изменить их, скопируй шаблон
 `bootstrap.rves.example` в `build/bootstrap.rves`.
@@ -196,6 +198,8 @@ tonemapper = "aces"
 Код, использующий engine-render, тоже требует миграции. Поле `RendererConfig::render_scale` удалено: масштаб, exposure, tonemapper и anti-aliasing теперь передаются в `Frame` через `view: ViewSettings`, а позиция камеры — через `camera_position`.
 
 В `DrawCommand` поле `texture` заменено на `material: Option<MaterialId>`. Создавай `Material` через `Renderer::create_material`; карты base color, metallic-roughness и normal можно загружать с нужным пространством цвета через `Renderer::create_texture_with_color_space`. Полный текущий контракт описан в [заметке renderer](Obsidian/RVEVault/Engine/EngineRender.md).
+
+`Frame` принимает `lights: &[LocalLight]` и разреженный `local_light_shadows: &[LocalLightShadow]`; каждый запрос ссылается на индекс источника и содержит point- или spot-матрицы. Runtime, редактор и sandbox строят их общими функциями `engine-scene`, а renderer отбирает до 1024 видимых источников и отдельно назначает тени выбранным lights: по расстоянию от камеры, с исходным индексом для равных расстояний, стоимостью 6 слоёв для point и 1 для spot при общем лимите 32. Источники без свободного бюджета освещают без теней. Общий D32-массив 1024×1024 занимает 128 MiB; point-грани идут в порядке +X, −X, +Y, −Y, +Z, −Z. Диапазон света менее 0.001 остаётся освещённым, но не отбрасывает тени; spot с внешним углом 90° сохраняет исходный конус света, а тени покрывают конечный угол чуть меньше 180° из-за сингулярности перспективы. Кластеры имеют сетку 16×9×24 и хранят до 128 индексов; сцена `clustered` по-прежнему показывает стресс-набор из 160 локальных источников. `cargo run -p sandbox -- --scene shadows --frames 300 --resize-test` показывает point/spot-тени и проверяет resize/restore.
 
 ## Архивы ресурсов
 

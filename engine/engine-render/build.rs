@@ -7,29 +7,204 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-const SHADERS: [(&str, naga::ShaderStage); 10] = [
-    ("mesh.vert", naga::ShaderStage::Vertex),
-    ("mesh.frag", naga::ShaderStage::Fragment),
-    ("shadow.vert", naga::ShaderStage::Vertex),
-    ("overlay.vert", naga::ShaderStage::Vertex),
-    ("overlay.frag", naga::ShaderStage::Fragment),
-    ("ui.vert", naga::ShaderStage::Vertex),
-    ("ui.frag", naga::ShaderStage::Fragment),
-    ("fullscreen.vert", naga::ShaderStage::Vertex),
-    ("tonemap.frag", naga::ShaderStage::Fragment),
-    ("output.frag", naga::ShaderStage::Fragment),
+const CLUSTER_GRID_X: u32 = 16;
+const CLUSTER_GRID_Y: u32 = 9;
+const CLUSTER_GRID_Z: u32 = 24;
+const MAX_CLUSTER_LIGHTS: usize = 128;
+const MAX_RENDERED_LIGHTS: usize = 1024;
+const MAX_LOCAL_SHADOW_LAYERS: usize = 32;
+const LOCAL_SHADOW_MAP_RESOLUTION: u32 = 1024;
+const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = 64;
+
+type ShaderBuild = (
+    &'static str,
+    naga::ShaderStage,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+const SHADERS: &[ShaderBuild] = &[
+    (
+        "equirect_to_cube.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "equirect_to_cube.comp.spv",
+    ),
+    ("sky.comp", naga::ShaderStage::Compute, &[], "sky.comp.spv"),
+    (
+        "irradiance.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "irradiance.comp.spv",
+    ),
+    (
+        "prefilter.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "prefilter.comp.spv",
+    ),
+    (
+        "cluster.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "cluster.comp.spv",
+    ),
+    ("mesh.vert", naga::ShaderStage::Vertex, &[], "mesh.vert.spv"),
+    (
+        "mesh.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "mesh.frag.opaque.spv",
+    ),
+    (
+        "mesh.frag",
+        naga::ShaderStage::Fragment,
+        &[("ALPHA_MASK", "1")],
+        "mesh.frag.mask.spv",
+    ),
+    (
+        "mesh.frag",
+        naga::ShaderStage::Fragment,
+        &[("ALPHA_BLEND", "1")],
+        "mesh.frag.blend.spv",
+    ),
+    (
+        "shadow.vert",
+        naga::ShaderStage::Vertex,
+        &[],
+        "shadow.vert.spv",
+    ),
+    (
+        "shadow.vert",
+        naga::ShaderStage::Vertex,
+        &[("LOCAL_SHADOW", "1")],
+        "shadow.local.vert.spv",
+    ),
+    (
+        "shadow.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "shadow.frag.spv",
+    ),
+    (
+        "overlay.vert",
+        naga::ShaderStage::Vertex,
+        &[],
+        "overlay.vert.spv",
+    ),
+    (
+        "overlay.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "overlay.frag.spv",
+    ),
+    ("ui.vert", naga::ShaderStage::Vertex, &[], "ui.vert.spv"),
+    ("ui.frag", naga::ShaderStage::Fragment, &[], "ui.frag.spv"),
+    (
+        "fullscreen.vert",
+        naga::ShaderStage::Vertex,
+        &[],
+        "fullscreen.vert.spv",
+    ),
+    (
+        "tonemap.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "tonemap.frag.spv",
+    ),
+    (
+        "output.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "output.frag.spv",
+    ),
+    (
+        "skybox.vert",
+        naga::ShaderStage::Vertex,
+        &[],
+        "skybox.vert.spv",
+    ),
+    (
+        "skybox.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "skybox.frag.spv",
+    ),
 ];
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo задаёт OUT_DIR"));
+    let cluster_count = CLUSTER_GRID_X * CLUSTER_GRID_Y * CLUSTER_GRID_Z;
+    fs::write(
+        out_dir.join("render_constants.rs"),
+        format!(
+            "pub const CLUSTER_GRID_X: usize = {CLUSTER_GRID_X};\n\
+             pub const CLUSTER_GRID_Y: usize = {CLUSTER_GRID_Y};\n\
+             pub const CLUSTER_GRID_Z: usize = {CLUSTER_GRID_Z};\n\
+             pub const MAX_CLUSTER_LIGHTS: usize = {MAX_CLUSTER_LIGHTS};\n\
+             pub const MAX_RENDERED_LIGHTS: usize = {MAX_RENDERED_LIGHTS};\n\
+             /// Maximum point and spot shadow layers shared by a renderer.\n\
+             pub const MAX_LOCAL_SHADOW_LAYERS: usize = {MAX_LOCAL_SHADOW_LAYERS};\n\
+             /// Resolution of each shared point or spot shadow layer.\n\
+             pub const LOCAL_SHADOW_MAP_RESOLUTION: u32 = {LOCAL_SHADOW_MAP_RESOLUTION};\n\
+             pub const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = {CLUSTER_COMPUTE_LOCAL_SIZE};\n\
+             pub const CLUSTER_COUNT: usize = {cluster_count};\n"
+        ),
+    )
+    .expect("не удалось записать constants renderer");
     let mut frontend = glsl::Frontend::default();
-    for (name, stage) in SHADERS {
+    for &(name, stage, defines, output) in SHADERS {
         let path = PathBuf::from("shaders").join(name);
         println!("cargo::rerun-if-changed={}", path.display());
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("не удалось прочитать {}: {error}", path.display()));
+        let mut shader_options = glsl::Options::from(stage);
+        shader_options.defines.extend(
+            defines
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+        );
+        if name == "mesh.frag" || name == "cluster.comp" {
+            shader_options.defines.extend([
+                ("CLUSTER_GRID_X".to_owned(), CLUSTER_GRID_X.to_string()),
+                ("CLUSTER_GRID_Y".to_owned(), CLUSTER_GRID_Y.to_string()),
+                ("CLUSTER_GRID_Z".to_owned(), CLUSTER_GRID_Z.to_string()),
+                (
+                    "MAX_CLUSTER_LIGHTS".to_owned(),
+                    MAX_CLUSTER_LIGHTS.to_string(),
+                ),
+            ]);
+        }
+        if name == "mesh.frag" {
+            shader_options.defines.extend([
+                (
+                    "MAX_LOCAL_SHADOW_LAYERS".to_owned(),
+                    MAX_LOCAL_SHADOW_LAYERS.to_string(),
+                ),
+                (
+                    "LOCAL_SHADOW_MAP_RESOLUTION".to_owned(),
+                    LOCAL_SHADOW_MAP_RESOLUTION.to_string(),
+                ),
+            ]);
+        }
+        if name == "shadow.vert" && shader_options.defines.contains_key("LOCAL_SHADOW") {
+            shader_options.defines.insert(
+                "MAX_LOCAL_SHADOW_LAYERS".to_owned(),
+                MAX_LOCAL_SHADOW_LAYERS.to_string(),
+            );
+        }
+        if name == "cluster.comp" {
+            shader_options.defines.insert(
+                "MAX_RENDERED_LIGHTS".to_owned(),
+                MAX_RENDERED_LIGHTS.to_string(),
+            );
+            shader_options.defines.insert(
+                "CLUSTER_COMPUTE_LOCAL_SIZE".to_owned(),
+                CLUSTER_COMPUTE_LOCAL_SIZE.to_string(),
+            );
+        }
         let module = frontend
-            .parse(&glsl::Options::from(stage), &source)
+            .parse(&shader_options, &source)
             .unwrap_or_else(|error| {
                 panic!("{name}: {}", error.emit_to_string(&source));
             });
@@ -48,7 +223,7 @@ fn main() {
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect::<Vec<_>>();
-        fs::write(out_dir.join(format!("{name}.spv")), bytes)
-            .unwrap_or_else(|error| panic!("не удалось записать {name}.spv: {error}"));
+        fs::write(out_dir.join(output), bytes)
+            .unwrap_or_else(|error| panic!("не удалось записать {output}: {error}"));
     }
 }

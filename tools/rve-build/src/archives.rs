@@ -178,7 +178,14 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
     fn create_demo_like_project(root: &Path) {
         let assets = root.join("Assets");
         for path in [
-            "scenes", "models", "textures", "icons", "scripts", "cameras",
+            "scenes",
+            "models",
+            "textures",
+            "icons",
+            "scripts",
+            "cameras",
+            "prefabs",
+            "environment",
         ] {
             fs::create_dir_all(assets.join(path)).unwrap();
         }
@@ -194,14 +201,17 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         .unwrap();
         let scene_body = |extra_assets: &str, model: &str| {
             format!(
-                "[[assets]]\npath = \"/models/shared.fbx\"\n[[assets]]\npath = \"/scripts/rotate.lua\"\n[[assets]]\npath = \"/cameras/shared.camerasettings\"\n{extra_assets}\n[[objects]]\nid = \"camera\"\n[objects.camera]\nsettings = \"/cameras/shared.camerasettings\"\n\n[[objects]]\nid = \"light\"\n[objects.directional_light]\nshadows = true\nshadow_radius = 8.0\n[[objects]]\nid = \"mesh\"\n[objects.mesh_renderer]\nmodel = \"{model}\"\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\n"
+                "[[assets]]\npath = \"/models/shared.fbx\"\n[[assets]]\npath = \"/scripts/rotate.lua\"\n[[assets]]\npath = \"/cameras/shared.camerasettings\"\n{extra_assets}\n[[objects]]\nid = \"camera\"\n[objects.camera]\nsettings = \"/cameras/shared.camerasettings\"\n\n[[objects]]\nid = \"light\"\n[objects.directional_light]\nshadows = true\nshadow_distance = 80.0\nshadow_cascades = 4\n[[objects]]\nid = \"mesh\"\n[objects.mesh_renderer]\nmodel = \"{model}\"\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\n"
             )
         };
+        let main_scene = scene_body(
+            "[[assets]]\npath = \"/textures/main-only.png\"\n[[assets]]\npath = \"/prefabs/environment.rveprefab\"\n",
+            "/models/shared.fbx",
+        );
         fs::write(
             assets.join("scenes/main.rvescene"),
-            scene_body(
-                "[[assets]]\npath = \"/textures/main-only.png\"\n",
-                "/models/shared.fbx",
+            format!(
+                "{main_scene}\n[[instances]]\nid = \"sky\"\nprefab = \"/prefabs/environment.rveprefab\"\n"
             ),
         )
         .unwrap();
@@ -216,6 +226,16 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         fs::write(
             assets.join("scenes/draft.rvescene"),
             "this is intentionally invalid",
+        )
+        .unwrap();
+        fs::write(
+            assets.join("prefabs/environment.rveprefab"),
+            "[[assets]]\npath = \"/environment/sky.hdr\"\n\n[[objects]]\nid = \"environment\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n",
+        )
+        .unwrap();
+        fs::write(
+            assets.join("environment/sky.hdr"),
+            b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\x80\x80\x80\x81\x80\x80\x80\x81",
         )
         .unwrap();
         write_fixture_fbx(
@@ -303,6 +323,8 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         assert_eq!(assignments["/models/props.fbx"], "props");
         assert_eq!(assignments["/icons/app.png"], "base");
         assert_eq!(assignments["/textures/main-only.png"], "scene-main");
+        assert_eq!(assignments["/environment/sky.hdr"], "scene-main");
+        assert_eq!(assignments["/prefabs/environment.rveprefab"], "scene-main");
         assert_eq!(assignments["/scenes/main.rvescene"], "base");
         assert!(!assignments.contains_key("/scenes/draft.rvescene"));
         assert!(!assignments.contains_key("/models/draft.fbx"));

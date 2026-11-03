@@ -8,17 +8,23 @@ layout(location = 3) in vec3 in_color;
 layout(location = 0) out vec3 out_normal;
 layout(location = 1) out vec2 out_uv;
 layout(location = 2) out vec3 out_color;
-layout(location = 3) out vec4 out_light_clip;
-layout(location = 4) out vec3 out_world_position;
+layout(location = 3) out vec4 out_shadow_clip[4];
+layout(location = 7) out vec3 out_world_position;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view_projection;
-    mat4 light_view_projection;
+    mat4 inverse_view_projection;
+    mat4 shadow_view_projections[4];
     vec4 light_direction;
     vec4 light_color;
     vec4 ambient_color;
     vec4 shadow_params;
     vec4 camera_position;
+    mat4 environment_rotation;
+    vec4 environment_params;
+    vec4 local_light_params;
+    mat4 view;
+    vec4 cluster_params;
 } frame;
 
 layout(push_constant) uniform PushConstants {
@@ -30,7 +36,9 @@ layout(push_constant) uniform PushConstants {
 void main() {
     vec4 world_position = push_constants.model * vec4(in_position, 1.0);
     gl_Position = frame.view_projection * world_position;
-    out_light_clip = frame.light_view_projection * world_position;
+    for (int cascade = 0; cascade < 4; ++cascade) {
+        out_shadow_clip[cascade] = frame.shadow_view_projections[cascade] * world_position;
+    }
     out_world_position = world_position.xyz;
     out_normal = (push_constants.normal_from_model * vec4(in_normal, 0.0)).xyz;
     out_uv = in_uv;

@@ -1,0 +1,56 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform textureCube source_texture;
+layout(set = 0, binding = 1) uniform sampler source_sampler;
+layout(set = 0, binding = 2, rgba16f) writeonly uniform image2DArray output_image;
+layout(set = 0, binding = 3, std140) uniform EnvironmentParams {
+    vec4 pass_params;
+    vec4 sun_direction_intensity;
+    vec4 zenith_color;
+    vec4 horizon_color;
+    vec4 ground_color;
+} params;
+
+const float PI = 3.14159265358979323846;
+const uint SAMPLE_COUNT = 128u;
+
+vec3 cube_direction(int face, vec2 uv) {
+    if (face == 0) return normalize(vec3(1.0, -uv.y, -uv.x));
+    if (face == 1) return normalize(vec3(-1.0, -uv.y, uv.x));
+    if (face == 2) return normalize(vec3(uv.x, 1.0, uv.y));
+    if (face == 3) return normalize(vec3(uv.x, -1.0, -uv.y));
+    if (face == 4) return normalize(vec3(uv.x, -uv.y, 1.0));
+    return normalize(vec3(-uv.x, -uv.y, -1.0));
+}
+
+float radical_inverse(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+void main() {
+    uvec3 invocation = gl_GlobalInvocationID;
+    uint size = uint(params.pass_params.x);
+    if (invocation.x >= size || invocation.y >= size || invocation.z >= 6u) return;
+    vec2 uv = (vec2(invocation.xy) + vec2(0.5)) / float(size) * 2.0 - 1.0;
+    vec3 normal = cube_direction(int(invocation.z), uv);
+    vec3 up = abs(normal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, normal));
+    vec3 bitangent = cross(normal, tangent);
+    vec3 irradiance = vec3(0.0);
+    for (uint index = 0u; index < SAMPLE_COUNT; ++index) {
+        vec2 xi = vec2(float(index) / float(SAMPLE_COUNT), radical_inverse(index));
+        float phi = 2.0 * PI * xi.x;
+        float radius = sqrt(xi.y);
+        float z = sqrt(1.0 - xi.y);
+        vec3 local_direction = vec3(cos(phi) * radius, sin(phi) * radius, z);
+        vec3 direction = tangent * local_direction.x + bitangent * local_direction.y + normal * local_direction.z;
+        irradiance += textureLod(samplerCube(source_texture, source_sampler), direction, 0.0).rgb;
+    }
+    irradiance *= PI / float(SAMPLE_COUNT);
+    imageStore(output_image, ivec3(invocation), vec4(clamp(irradiance, vec3(0.0), vec3(65504.0)), 1.0));
+}
