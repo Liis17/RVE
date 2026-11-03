@@ -5,8 +5,11 @@ layout(location = 1) in vec2 in_uv;
 layout(location = 2) in vec3 in_color;
 layout(location = 3) in vec4 in_shadow_clip[4];
 layout(location = 7) in vec3 in_world_position;
+layout(location = 8) in vec4 in_current_clip;
+layout(location = 9) in vec4 in_previous_clip;
 
 layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec2 out_velocity;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view_projection;
@@ -22,6 +25,8 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 local_light_params;
     mat4 view;
     vec4 cluster_params;
+    mat4 previous_view_projection;
+    vec4 render_params;
 } frame;
 
 layout(set = 0, binding = 1) uniform texture2DArray shadow_map;
@@ -208,7 +213,9 @@ float local_shadow_visibility(LocalLightData light, vec3 geometric_normal, vec3 
 }
 
 void main() {
-    vec4 base_sample = texture(sampler2D(base_color_texture, material_sampler), in_uv);
+    vec4 base_sample = texture(
+        sampler2D(base_color_texture, material_sampler), in_uv, frame.render_params.z
+    );
     float surface_alpha = base_sample.a * material.alpha_parameters.x;
 #ifdef ALPHA_MASK
     if (surface_alpha < material.alpha_parameters.y) {
@@ -221,11 +228,17 @@ void main() {
     float output_alpha = 1.0;
 #endif
     vec4 metallic_roughness_sample = texture(
-        sampler2D(metallic_roughness_texture, material_sampler), in_uv
+        sampler2D(metallic_roughness_texture, material_sampler), in_uv, frame.render_params.z
     );
-    vec3 normal_sample = texture(sampler2D(normal_texture, material_sampler), in_uv).rgb;
-    vec3 emissive_sample = texture(sampler2D(emissive_texture, material_sampler), in_uv).rgb;
-    float occlusion = texture(sampler2D(occlusion_texture, material_sampler), in_uv).r;
+    vec3 normal_sample = texture(
+        sampler2D(normal_texture, material_sampler), in_uv, frame.render_params.z
+    ).rgb;
+    vec3 emissive_sample = texture(
+        sampler2D(emissive_texture, material_sampler), in_uv, frame.render_params.z
+    ).rgb;
+    float occlusion = texture(
+        sampler2D(occlusion_texture, material_sampler), in_uv, frame.render_params.z
+    ).r;
 
     vec3 dp1 = dFdx(in_world_position);
     vec3 dp2 = dFdy(in_world_position);
@@ -417,4 +430,9 @@ void main() {
     ) * mix(1.0, occlusion, material.alpha_parameters.w);
     vec3 emissive = material.emissive.rgb * emissive_sample;
     out_color = vec4(ambient + direct + emissive, output_alpha);
+    vec2 current_ndc = in_current_clip.xy / in_current_clip.w;
+    vec2 previous_ndc = in_previous_clip.xy / in_previous_clip.w;
+    vec2 current_uv = vec2(current_ndc.x * 0.5 + 0.5, 0.5 - current_ndc.y * 0.5);
+    vec2 previous_uv = vec2(previous_ndc.x * 0.5 + 0.5, 0.5 - previous_ndc.y * 0.5);
+    out_velocity = previous_uv - current_uv;
 }

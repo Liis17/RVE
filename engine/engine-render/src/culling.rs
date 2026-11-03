@@ -325,6 +325,8 @@ mod tests {
             mesh: MeshId(mesh),
             material: None,
             model,
+            previous_model: None,
+            lod_level: 0,
             casts_shadow: true,
         }
     }

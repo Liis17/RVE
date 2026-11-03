@@ -610,6 +610,8 @@ impl WindowHandler for Sandbox {
                 } else {
                     model
                 },
+                previous_model: None,
+                lod_level: 0,
                 casts_shadow: true,
             })
             .collect::<Vec<_>>();
@@ -687,6 +689,7 @@ impl WindowHandler for Sandbox {
                     AntiAliasing::None => RenderAntiAliasing::None,
                 },
             },
+            reset_history: false,
         };
         match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {

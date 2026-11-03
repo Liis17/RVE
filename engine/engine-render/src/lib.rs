@@ -30,6 +30,7 @@ pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 const FRAMES_IN_FLIGHT: usize = 2;
 const DEFAULT_UPLOAD_BATCH_CAPACITY: usize = 64 * 1024 * 1024;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+const VELOCITY_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
 const LDR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const SRGB_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
@@ -87,9 +88,9 @@ const WHITE_SRGB_TEXTURE: usize = 0;
 const WHITE_LINEAR_TEXTURE: usize = 1;
 const FLAT_NORMAL_TEXTURE: usize = 2;
 const DEFAULT_MATERIAL: usize = 0;
-const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
+const PUSH_CONSTANTS_SIZE: usize = 3 * size_of::<[[f32; 4]; 4]>() + size_of::<[u32; 4]>();
 const FRAME_UNIFORMS_SIZE: usize =
-    (4 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 8 * size_of::<[f32; 4]>();
+    (5 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 9 * size_of::<[f32; 4]>();
 const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
 const LOCAL_LIGHT_GPU_SIZE: usize = 7 * size_of::<[f32; 4]>();
 const LOCAL_SHADOW_MATRIX_BUFFER_SIZE: usize = MAX_LOCAL_SHADOW_LAYERS * size_of::<[[f32; 4]; 4]>();
@@ -208,6 +209,10 @@ pub struct DrawCommand {
     pub mesh: MeshId,
     pub material: Option<MaterialId>,
     pub model: [[f32; 4]; 4],
+    /// Previous frame's world transform, or `None` to reuse `model`.
+    pub previous_model: Option<[[f32; 4]; 4]>,
+    /// Selected mesh LOD; zero is the highest detail level.
+    pub lod_level: u8,
     /// Попадает ли меш в shadow map; на получение тени не влияет.
     pub casts_shadow: bool,
 }
@@ -317,6 +322,8 @@ pub struct Frame<'a> {
     pub draws: &'a [DrawCommand],
     pub overlay: &'a [OverlayVertex],
     pub view: ViewSettings,
+    /// Discards temporal history for this view before rendering it.
+    pub reset_history: bool,
 }
 
 /// Настройки масштабирования и обработки цвета одного вида.
@@ -3705,7 +3712,7 @@ impl Renderer {
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&push_constant_ranges);
-        // SAFETY: the vertex push-constant range fits in the guaranteed 128 bytes.
+        // SAFETY: device selection checks the required push-constant range before device creation.
         self.pipeline_layout = Some(unsafe { device.create_pipeline_layout(&layout_info, None) }?);
 
         let vertex_module = ShaderModule::new(&device, MESH_VERTEX_SHADER)?;
@@ -3778,20 +3785,28 @@ impl Renderer {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let velocity_write = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::R | vk::ColorComponentFlags::G);
+        let blend_attachments = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+            velocity_write,
+        ];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-        let transparent_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .color_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(
-                vk::ColorComponentFlags::R
-                    | vk::ColorComponentFlags::G
-                    | vk::ColorComponentFlags::B,
-            )];
+        let transparent_attachments = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .color_write_mask(
+                    vk::ColorComponentFlags::R
+                        | vk::ColorComponentFlags::G
+                        | vk::ColorComponentFlags::B,
+                ),
+            velocity_write,
+        ];
         let transparent_color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&transparent_attachments);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -3810,7 +3825,7 @@ impl Renderer {
         ];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let color_formats = [OFFSCREEN_FORMAT];
+        let color_formats = [OFFSCREEN_FORMAT, VELOCITY_FORMAT];
         let mut opaque_rendering_info = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(DEPTH_FORMAT);
@@ -4496,6 +4511,8 @@ struct DeviceFacts {
     compute_queue_families: Vec<bool>,
     storage_image_extended_formats: bool,
     offscreen_format_features: vk::FormatFeatureFlags,
+    velocity_format_features: vk::FormatFeatureFlags,
+    max_push_constants_size: u32,
 }
 
 struct DeviceEvaluation {
@@ -4548,6 +4565,19 @@ fn evaluate_device(facts: &DeviceFacts, required_extensions: &[CString]) -> Devi
         reasons.push(format!(
             "R16G16B16A16_SFLOAT не поддерживает HDR scene и compute storage: {}",
             missing_offscreen.join(", ")
+        ));
+    }
+    let missing_velocity = missing_velocity_format_features(facts.velocity_format_features);
+    if !missing_velocity.is_empty() {
+        reasons.push(format!(
+            "R16G16_SFLOAT не поддерживает velocity attachment: {}",
+            missing_velocity.join(", ")
+        ));
+    }
+    if facts.max_push_constants_size < PUSH_CONSTANTS_SIZE as u32 {
+        reasons.push(format!(
+            "maxPushConstantsSize меньше {} байт",
+            PUSH_CONSTANTS_SIZE
         ));
     }
     if !facts.extended_dynamic_state {
@@ -4643,6 +4673,9 @@ fn inspect_device(
         instance.get_physical_device_format_properties(physical_device, OFFSCREEN_FORMAT)
     }
     .optimal_tiling_features;
+    let velocity_format_features =
+        unsafe { instance.get_physical_device_format_properties(physical_device, VELOCITY_FORMAT) }
+            .optimal_tiling_features;
     let facts = DeviceFacts {
         api_version: properties.api_version,
         dynamic_rendering,
@@ -4663,6 +4696,8 @@ fn inspect_device(
             .collect(),
         storage_image_extended_formats,
         offscreen_format_features,
+        velocity_format_features,
+        max_push_constants_size: properties.limits.max_push_constants_size,
     };
     let evaluation = evaluate_device(&facts, required_extensions);
     let srgb_features = unsafe {
@@ -4677,6 +4712,7 @@ fn inspect_device(
     reasons.extend(cluster_device_limit_reasons(&properties.limits));
     reasons.extend(texture_format_reasons(srgb_features, linear_features));
     reasons.extend(shadow_image_device_reasons(instance, physical_device));
+    reasons.extend(velocity_image_device_reasons(instance, physical_device));
     let report = DeviceReport {
         name,
         vendor_id: properties.vendor_id,
@@ -4766,6 +4802,28 @@ fn shadow_array_limits_suitable(properties: &vk::ImageFormatProperties) -> bool 
     properties.max_array_layers >= MAX_LOCAL_SHADOW_LAYERS as u32
         && properties.max_extent.width >= SHADOW_MAP_RESOLUTION
         && properties.max_extent.height >= SHADOW_MAP_RESOLUTION
+}
+
+fn velocity_image_device_reasons(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Vec<String> {
+    // SAFETY: image-format support is queried for the live physical device.
+    match unsafe {
+        instance.get_physical_device_image_format_properties(
+            physical_device,
+            VELOCITY_FORMAT,
+            vk::ImageType::TYPE_2D,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageCreateFlags::empty(),
+        )
+    } {
+        Ok(_) => Vec::new(),
+        Err(error) => vec![format!(
+            "R16G16_SFLOAT image usage does not support velocity attachment sampling: {error}"
+        )],
+    }
 }
 
 fn best_device_index<T>(
@@ -5220,8 +5278,10 @@ impl Drop for FrameResources {
 
 struct OffscreenTarget {
     color: DeviceImage,
+    velocity: DeviceImage,
     depth: DeviceImage,
     layout: vk::ImageLayout,
+    velocity_layout: vk::ImageLayout,
 }
 
 impl OffscreenTarget {
@@ -5241,16 +5301,26 @@ impl OffscreenTarget {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 color_subresource_range(),
             )?,
+            velocity: DeviceImage::new(
+                instance,
+                device,
+                physical_device,
+                extent,
+                VELOCITY_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                color_subresource_range(),
+            )?,
             depth: DeviceImage::new(
                 instance,
                 device,
                 physical_device,
                 extent,
                 DEPTH_FORMAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 depth_subresource_range(),
             )?,
             layout: vk::ImageLayout::UNDEFINED,
+            velocity_layout: vk::ImageLayout::UNDEFINED,
         })
     }
 }
@@ -6289,6 +6359,22 @@ fn record_scene(
         .image(target.color.image)
         .subresource_range(color_subresource_range());
     pipeline_barrier(device, command_buffer, scene_barrier);
+    let (velocity_stage, velocity_access) = offscreen_previous_use(target.velocity_layout);
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            target.velocity.image,
+            target.velocity_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            velocity_stage,
+            velocity_access,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            color_subresource_range(),
+        ),
+    );
+    target.velocity_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
     // Глубина не сохраняется между кадрами, поэтому прошлое содержимое отбрасывается.
     let depth_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
@@ -6410,16 +6496,26 @@ fn record_scene(
         shadow,
     );
 
-    let color_attachment = [vk::RenderingAttachmentInfo::default()
-        .image_view(target.color.view)
-        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .clear_value(vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: scene.clear_color,
-            },
-        })];
+    let color_attachment = [
+        vk::RenderingAttachmentInfo::default()
+            .image_view(target.color.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: scene.clear_color,
+                },
+            }),
+        vk::RenderingAttachmentInfo::default()
+            .image_view(target.velocity.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.0; 4] },
+            }),
+    ];
     let depth_attachment = vk::RenderingAttachmentInfo::default()
         .image_view(target.depth.view)
         .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -6469,6 +6565,20 @@ fn record_scene(
             device,
             command_buffer,
             image_layout_barrier(
+                target.velocity.image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                color_subresource_range(),
+            ),
+        );
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
                 target.depth.image,
                 vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
@@ -6480,11 +6590,18 @@ fn record_scene(
                 depth_subresource_range(),
             ),
         );
-        let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(target.color.view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE)];
+        let color_attachment = [
+            vk::RenderingAttachmentInfo::default()
+                .image_view(target.color.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE),
+            vk::RenderingAttachmentInfo::default()
+                .image_view(target.velocity.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE),
+        ];
         let depth_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(target.depth.view)
             .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -6519,6 +6636,17 @@ fn record_scene(
             .image(target.color.image)
             .subresource_range(color_subresource_range());
         pipeline_barrier(device, command_buffer, color_to_blend);
+        let velocity_to_blend = image_layout_barrier(
+            target.velocity.image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            color_subresource_range(),
+        );
+        pipeline_barrier(device, command_buffer, velocity_to_blend);
         let depth_to_blend = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(
                 vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
@@ -6540,11 +6668,18 @@ fn record_scene(
             .image(target.depth.image)
             .subresource_range(depth_subresource_range());
         pipeline_barrier(device, command_buffer, depth_to_blend);
-        let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(target.color.view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE)];
+        let color_attachment = [
+            vk::RenderingAttachmentInfo::default()
+                .image_view(target.color.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE),
+            vk::RenderingAttachmentInfo::default()
+                .image_view(target.velocity.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE),
+        ];
         let depth_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(target.depth.view)
             .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -6570,6 +6705,36 @@ fn record_scene(
         // SAFETY: this matches the preceding transparent cmd_begin_rendering call.
         unsafe { device.cmd_end_rendering(command_buffer) };
     }
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            target.velocity.image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            color_subresource_range(),
+        ),
+    );
+    target.velocity_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            target.depth.image,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            depth_subresource_range(),
+        ),
+    );
     target.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
 }
 
@@ -6851,7 +7016,11 @@ fn record_draws(
             }
             rasterization_state = Some(next_rasterization_state);
         }
-        let push_constants = push_constant_bytes(&draw.model);
+        let push_constants = push_constant_bytes(
+            &draw.model,
+            draw.previous_model.as_ref().unwrap_or(&draw.model),
+            draw.lod_level,
+        );
         // SAFETY: mesh buffers and material descriptors stay alive until this frame's fence completes.
         unsafe {
             device.cmd_bind_descriptor_sets(
@@ -6984,7 +7153,11 @@ fn record_shadow_draws(
             }
             rasterization_state = Some(next_rasterization_state);
         }
-        let push_constants = push_constant_bytes(&draw.model);
+        let push_constants = push_constant_bytes(
+            &draw.model,
+            draw.previous_model.as_ref().unwrap_or(&draw.model),
+            draw.lod_level,
+        );
         // SAFETY: draw ids were checked before recording; material descriptors and buffers stay alive.
         unsafe {
             device.cmd_bind_descriptor_sets(
@@ -7680,6 +7853,16 @@ fn missing_offscreen_format_features(supported: vk::FormatFeatureFlags) -> Vec<&
     .collect()
 }
 
+fn missing_velocity_format_features(supported: vk::FormatFeatureFlags) -> Vec<&'static str> {
+    [
+        (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
+        (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+    ]
+    .into_iter()
+    .filter_map(|(feature, name)| (!supported.contains(feature)).then_some(name))
+    .collect()
+}
+
 fn texture_format(color_space: TextureColorSpace) -> vk::Format {
     match color_space {
         TextureColorSpace::Srgb => SRGB_TEXTURE_FORMAT,
@@ -7970,14 +8153,18 @@ fn create_skybox_graphics_pipeline(
         .depth_test_enable(true)
         .depth_write_enable(false)
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
-    let color_attachments = [vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let color_attachments = [
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::R | vk::ColorComponentFlags::G),
+    ];
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-    let color_formats = [OFFSCREEN_FORMAT];
+    let color_formats = [OFFSCREEN_FORMAT, VELOCITY_FORMAT];
     let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&color_formats)
         .depth_attachment_format(DEPTH_FORMAT);
@@ -9544,6 +9731,8 @@ fn frame_uniform_bytes_with_count(
         render_extent.width.max(1) as f32,
         render_extent.height.max(1) as f32,
     ]);
+    values[160..176].copy_from_slice(view_projection.as_flattened());
+    values[176..180].copy_from_slice(&[0.0; 4]);
     Ok(float_bytes(&values))
 }
 
@@ -9602,13 +9791,19 @@ fn multiply_4x4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     result
 }
 
-/// Байты push constants: матрица модели, затем матрица нормалей; обе по столбцам.
-fn push_constant_bytes(model: &[[f32; 4]; 4]) -> [u8; PUSH_CONSTANTS_SIZE] {
+/// Push constants: model, normal matrix, previous model and one uvec4 of draw parameters.
+fn push_constant_bytes(
+    model: &[[f32; 4]; 4],
+    previous_model: &[[f32; 4]; 4],
+    lod_level: u8,
+) -> [u8; PUSH_CONSTANTS_SIZE] {
     let normal_from_model = normal_matrix(model);
-    let mut values = [0.0; PUSH_CONSTANTS_SIZE / size_of::<f32>()];
-    values[..16].copy_from_slice(model.as_flattened());
-    values[16..].copy_from_slice(normal_from_model.as_flattened());
-    float_bytes(&values)
+    let mut bytes = [0; PUSH_CONSTANTS_SIZE];
+    bytes[..64].copy_from_slice(&float_bytes::<64>(model.as_flattened()));
+    bytes[64..128].copy_from_slice(&float_bytes::<64>(normal_from_model.as_flattened()));
+    bytes[128..192].copy_from_slice(&float_bytes::<64>(previous_model.as_flattened()));
+    bytes[192..196].copy_from_slice(&(lod_level as u32).to_ne_bytes());
+    bytes
 }
 
 fn float_bytes<const N: usize>(values: &[f32]) -> [u8; N] {
@@ -9847,19 +10042,20 @@ mod tests {
         MESH_MASK_FRAGMENT_SHADER, MESH_OPAQUE_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material,
         MaterialId, MeshId, NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON, OFFSCREEN_FORMAT,
         OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex,
-        PIPELINE_CACHE_HEADER_SIZE, PipelineCacheIdentity, PresentMode, ProbeInstanceFailure,
-        RenderError, Renderer, RendererConfig, SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER,
-        SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER,
-        TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex,
-        ViewSettings, align_upload_offset, best_device_index, check_extensions,
-        classify_acquire_result, classify_probe_instance_failure, cluster_device_limit_reasons,
-        deduplicate_names, derivative_tangent_basis, draw_rasterization_state, evaluate_device,
-        frame_uniform_bytes, index_bytes, index_local_light_shadows, inverse_extent,
-        local_light_bytes, local_light_bytes_for_selected, local_light_contribution,
-        local_shadow_matrix_bytes, material_sampler_info, material_uniform_bytes,
-        mesh_upload_layout, mip_extent, mip_level_count, missing_extensions,
-        missing_offscreen_format_features, missing_post_format_features,
-        missing_texture_format_features, normal_matrix, offscreen_previous_use,
+        PIPELINE_CACHE_HEADER_SIZE, PUSH_CONSTANTS_SIZE, PipelineCacheIdentity, PresentMode,
+        ProbeInstanceFailure, RenderError, Renderer, RendererConfig, SHADOW_CASCADE_COUNT,
+        SHADOW_FRAGMENT_SHADER, SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE,
+        TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER,
+        UI_VERTEX_SHADER, VELOCITY_FORMAT, Vertex, ViewSettings, align_upload_offset,
+        best_device_index, check_extensions, classify_acquire_result,
+        classify_probe_instance_failure, cluster_device_limit_reasons, deduplicate_names,
+        derivative_tangent_basis, draw_rasterization_state, evaluate_device, frame_uniform_bytes,
+        index_bytes, index_local_light_shadows, inverse_extent, local_light_bytes,
+        local_light_bytes_for_selected, local_light_contribution, local_shadow_matrix_bytes,
+        material_sampler_info, material_uniform_bytes, mesh_upload_layout, mip_extent,
+        mip_level_count, missing_extensions, missing_offscreen_format_features,
+        missing_post_format_features, missing_texture_format_features,
+        missing_velocity_format_features, normal_matrix, offscreen_previous_use,
         overlay_vertex_bytes, point_shadow_face_index, push_constant_bytes, sampler_anisotropy,
         scaled_extent, scene_viewport, select_composite_alpha, select_local_light_entries,
         select_local_lights, select_local_shadow_slots, select_present_mode, select_surface_extent,
@@ -10227,6 +10423,23 @@ mod tests {
     }
 
     #[test]
+    fn velocity_format_requires_color_attachment_and_sampling() {
+        let required =
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        assert_eq!(VELOCITY_FORMAT, vk::Format::R16G16_SFLOAT);
+        assert!(missing_velocity_format_features(required).is_empty());
+        for (feature, name) in [
+            (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
+            (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+        ] {
+            assert_eq!(
+                missing_velocity_format_features(required & !feature),
+                [name]
+            );
+        }
+    }
+
+    #[test]
     fn device_report_explains_missing_hdr_blend_support() {
         let facts = DeviceFacts {
             api_version: vk::API_VERSION_1_3,
@@ -10241,11 +10454,40 @@ mod tests {
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
                 | vk::FormatFeatureFlags::STORAGE_IMAGE,
+            velocity_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            max_push_constants_size: 256,
         };
         let evaluation = evaluate_device(&facts, &[]);
         assert_eq!(evaluation.reasons.len(), 1);
         assert!(evaluation.reasons[0].contains("R16G16B16A16_SFLOAT"));
         assert!(evaluation.reasons[0].contains("COLOR_ATTACHMENT_BLEND"));
+    }
+
+    #[test]
+    fn device_report_rejects_push_constant_limit_below_draw_layout() {
+        let facts = DeviceFacts {
+            api_version: vk::API_VERSION_1_3,
+            dynamic_rendering: true,
+            synchronization2: true,
+            extended_dynamic_state: true,
+            supported_extensions: HashSet::new(),
+            graphics_queue_families: vec![true],
+            compute_queue_families: vec![true],
+            storage_image_extended_formats: true,
+            offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::STORAGE_IMAGE,
+            velocity_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            max_push_constants_size: 207,
+        };
+        let reasons = evaluate_device(&facts, &[]).reasons;
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("maxPushConstantsSize"));
+        assert!(reasons[0].contains("208"));
     }
 
     #[test]
@@ -10338,6 +10580,9 @@ mod tests {
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
                 | vk::FormatFeatureFlags::STORAGE_IMAGE,
+            velocity_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            max_push_constants_size: 256,
         };
         let reasons = evaluate_device(&facts, &[]).reasons;
         assert!(reasons.contains(&NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON.to_owned()));
@@ -10437,6 +10682,9 @@ mod tests {
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
                 | vk::FormatFeatureFlags::STORAGE_IMAGE,
+            velocity_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            max_push_constants_size: 256,
         };
         let required = [
             CString::new("VK_KHR_swapchain").unwrap(),
@@ -10465,6 +10713,9 @@ mod tests {
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
                 | vk::FormatFeatureFlags::STORAGE_IMAGE,
+            velocity_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            max_push_constants_size: 256,
         };
 
         let evaluation = evaluate_device(&facts, &[]);
@@ -10505,6 +10756,9 @@ mod tests {
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
                 | vk::FormatFeatureFlags::STORAGE_IMAGE,
+            velocity_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            max_push_constants_size: 256,
         };
         let required = [
             CString::new("VK_KHR_swapchain").unwrap(),
@@ -10977,6 +11231,7 @@ mod tests {
                 draws: &[],
                 overlay: &[],
                 view: ViewSettings::default(),
+                reset_history: false,
             };
             assert!(frame_uniform_bytes(&frame).is_ok());
         }
@@ -11451,6 +11706,8 @@ mod tests {
             mesh: MeshId(mesh),
             material: None,
             model: IDENTITY,
+            previous_model: None,
+            lod_level: 0,
             casts_shadow,
         };
         let draws = [draw(0, true), draw(1, false), draw(2, true), draw(3, true)];
@@ -11472,6 +11729,8 @@ mod tests {
             mesh: MeshId(0),
             material: None,
             model: IDENTITY,
+            previous_model: None,
+            lod_level: 0,
             casts_shadow: true,
         };
         let bounds = LocalBounds {
@@ -11513,6 +11772,8 @@ mod tests {
             mesh: MeshId(mesh),
             material: material.map(MaterialId),
             model: IDENTITY,
+            previous_model: None,
+            lod_level: 0,
             casts_shadow: true,
         };
         let slots = |count: usize| vec![Some(()); count];
@@ -11803,6 +12064,8 @@ mod tests {
             mesh: MeshId(mesh),
             material: material.map(MaterialId),
             model: IDENTITY,
+            previous_model: None,
+            lod_level: 0,
             casts_shadow: true,
         };
         let alive_meshes = vec![Some(()), Some(())];
@@ -11871,13 +12134,21 @@ mod tests {
         let mut model = IDENTITY;
         model[0][0] = 2.0;
         model[3] = [5.0, 6.0, 7.0, 1.0];
-        let values = floats(&push_constant_bytes(&model));
-        assert_eq!(values.len(), 32);
+        let mut previous_model = IDENTITY;
+        previous_model[3] = [2.0, 3.0, 4.0, 1.0];
+        let bytes = push_constant_bytes(&model, &previous_model, 6);
+        let values = floats(&bytes[..192]);
+        assert_eq!(PUSH_CONSTANTS_SIZE, 208);
+        assert_eq!(values.len(), 48);
         assert_eq!(&values[..4], &[2.0, 0.0, 0.0, 0.0]);
         assert_eq!(&values[12..16], &[5.0, 6.0, 7.0, 1.0]);
         // Матрица нормалей пропорциональна обратной транспонированной: масштаб X делит нормаль X.
         assert_eq!(&values[16..20], &[1.0, 0.0, 0.0, 0.0]);
         assert_eq!(&values[20..24], &[0.0, 2.0, 0.0, 0.0]);
+        assert_eq!(&values[32..36], &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&values[44..48], &[2.0, 3.0, 4.0, 1.0]);
+        assert_eq!(u32::from_ne_bytes(bytes[192..196].try_into().unwrap()), 6);
+        assert_eq!(&bytes[196..], &[0; 12]);
     }
 
     #[test]
@@ -11954,9 +12225,10 @@ mod tests {
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),
+            reset_history: false,
         };
         let values = floats(&frame_uniform_bytes(&frame).unwrap());
-        assert_eq!(FRAME_UNIFORMS_SIZE, 640);
+        assert_eq!(FRAME_UNIFORMS_SIZE, 720);
         let view_projection = perspective_projection();
         assert_eq!(&values[0..16], view_projection.as_flattened());
         assert_eq!(
@@ -11982,6 +12254,8 @@ mod tests {
         assert!((values[156] - 0.1).abs() < 1e-5);
         assert!((values[157] - 20.0).abs() < 1e-3);
         assert_eq!(&values[158..160], &[1.0, 1.0]);
+        assert_eq!(&values[160..176], view_projection.as_flattened());
+        assert_eq!(&values[176..180], &[0.0; 4]);
 
         let no_shadows = Frame {
             shadow_cascades: &[],
@@ -12014,6 +12288,7 @@ mod tests {
                         draws: &[],
                         overlay: &[],
                         view: ViewSettings::default(),
+                        reset_history: false,
                     }),
                     Err(RenderError::InvalidConfig(_))
                 ),
@@ -12039,6 +12314,7 @@ mod tests {
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),
+            reset_history: false,
         };
         assert!(matches!(
             frame_uniform_bytes(&frame),
@@ -12064,6 +12340,7 @@ mod tests {
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),
+            reset_history: false,
         };
         assert!(matches!(
             frame_uniform_bytes(&frame),

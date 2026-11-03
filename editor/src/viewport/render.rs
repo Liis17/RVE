@@ -315,6 +315,8 @@ impl SceneRenderer {
                 mesh: grid,
                 material: Some(grid_material),
                 model: Mat4::from_scale(Vec3::splat(grid_scale(distance))).to_cols_array_2d(),
+                previous_model: None,
+                lod_level: 0,
                 casts_shadow: false,
             });
         }
@@ -375,6 +377,7 @@ impl SceneRenderer {
                     AntiAliasing::None => RenderAntiAliasing::None,
                 },
             },
+            reset_history: false,
         }
     }
 
@@ -609,6 +612,8 @@ fn append_world_draws(
                 mesh: *mesh_id,
                 material: Some(material_id),
                 model: instance.model.to_cols_array_2d(),
+                previous_model: None,
+                lod_level: 0,
                 casts_shadow: true,
             });
         }

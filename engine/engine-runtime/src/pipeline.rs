@@ -401,6 +401,7 @@ impl RenderBackend for VulkanBackend {
                     AntiAliasing::None => RenderAntiAliasing::None,
                 },
             },
+            reset_history: false,
         };
         self.renderer
             .render_frame(&frame)
@@ -501,6 +502,7 @@ impl RenderBackend for VulkanBackend {
                     AntiAliasing::None => RenderAntiAliasing::None,
                 },
             },
+            reset_history: false,
         };
         let vertices = [
             UiVertex {
@@ -897,6 +899,8 @@ fn make_snapshot(
             mesh: *mesh,
             material: Some(*material),
             model: instance.model.to_cols_array_2d(),
+            previous_model: None,
+            lod_level: 0,
             casts_shadow: true,
         }));
     }
