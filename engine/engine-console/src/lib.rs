@@ -229,6 +229,9 @@ pub struct CommandCatalog {
 
 impl CommandCatalog {
     pub fn register(&mut self, spec: CommandSpec) -> Result<(), CatalogError> {
+        if !valid_command_name(&spec.name) {
+            return Err(CatalogError::InvalidName(spec.name));
+        }
         if is_reserved_command(&spec.name) {
             return Err(CatalogError::Reserved(spec.name));
         }
@@ -259,6 +262,7 @@ impl CommandCatalog {
             },
         ];
         commands.extend(self.commands.values().cloned());
+        commands.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         commands
     }
 
