@@ -23,6 +23,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 | `Obsidian/RVEVault/Engine/EngineResources.md` | Фоновое чтение loose и packed бинарных ресурсов |
 | `Obsidian/RVEVault/Engine/EngineAssets.md` | Ресурсы: FBX и PNG из `assets` |
 | `Obsidian/RVEVault/Engine/EngineScript.md` | Lua и Rust-скрипты сцен |
+| `Obsidian/RVEVault/Engine/EngineConsole.md` | Буфер лога, команды и общий egui developer console |
 | `Obsidian/RVEVault/Engine/RveSdk.md` | C ABI и гостевой API Rust-скриптов |
 | `Obsidian/RVEVault/Engine/EngineRuntime.md` | Игровой runtime и player |
 | `Obsidian/RVEVault/Engine/RveBuild.md` | Сборка проекта в release player |
@@ -62,12 +63,13 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
   - `engine-runtime`: `engine-assets`, `engine-files`, `engine-audio`,
     `engine-neural`, `engine-network`, `engine-physics`, `engine-platform`,
     `engine-project`, `engine-render`, `engine-resources`, `engine-scene`,
-    `engine-script`, `engine-window`.
+    `engine-script`, `engine-window`, `engine-console`, `engine-ui`.
   - `rve-build`: `engine-assets`, `engine-files`, `engine-pak`, `engine-project`,
     `engine-resources`, `engine-scene`.
   - `rve-player`: `engine-runtime`.
   - `rve-editor`: `engine-assets`, `engine-files`, `engine-project`, `engine-render`,
-    `engine-resources`, `engine-scene`, `engine-script`, `engine-window`.
+    `engine-resources`, `engine-scene`, `engine-script`, `engine-window`,
+    `engine-console`, `engine-ui`.
 - При изменении `engine-platform` проверяй общий интерфейс, адаптеры `engine-platform-windows` и `engine-platform-macos` и вызовы из renderer.
 - Контракты: учитывай `WindowHandler`, `WindowConfig`, `RendererConfig`, `FrameStatus`, ошибки библиотек, CLI sandbox и коды завершения. При их изменении проверяй производителей и потребителей.
 - Платформы: учитывай Windows с Vulkan-драйвером и macOS с Vulkan loader и MoltenVK. Меняй только затронутые платформы и явно указывай непроверенные.

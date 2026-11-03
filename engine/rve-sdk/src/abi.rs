@@ -5,7 +5,7 @@ use std::ffi::c_void;
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 3;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 4;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -568,6 +568,11 @@ pub type RveSetCameraSettingsFn =
 pub type RveActiveCameraFn = unsafe extern "C" fn(ctx: *mut c_void) -> u64;
 /// Stages the active camera selection.
 pub type RveSetActiveCameraFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> bool;
+/// Host command registration callback; returns `RveStatus` as a `u32`.
+pub type RveRegisterCommandFn =
+    unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, description: RveStr) -> u32;
+/// Host command unregistration callback; returns `RveStatus` as a `u32`.
+pub type RveUnregisterCommandFn = unsafe extern "C" fn(ctx: *mut c_void, name: RveStr) -> u32;
 
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
@@ -616,6 +621,10 @@ pub struct RveHost {
     pub active_camera: Option<RveActiveCameraFn>,
     /// Stages the active camera selection; present in ABI v2.
     pub set_active_camera: Option<RveSetActiveCameraFn>,
+    /// Registers a command owned by the active script; appended in ABI v4.
+    pub register_command: Option<RveRegisterCommandFn>,
+    /// Unregisters a command owned by the active script; appended in ABI v4.
+    pub unregister_command: Option<RveUnregisterCommandFn>,
 }
 
 /// Guest factory callback.
@@ -642,6 +651,14 @@ pub type RveMessageFn = unsafe extern "C" fn(
 pub type RveDestroyFn = RveStartFn;
 /// Guest instance destructor callback.
 pub type RveDropFn = unsafe extern "C" fn(instance: *mut c_void) -> RveStatus;
+/// Guest command callback.
+pub type RveCommandFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    name: RveStr,
+    args: *const RveStr,
+    arg_count: usize,
+) -> RveStatus;
 
 /// Script descriptor layout used by ABI versions 1 and 2.
 #[repr(C)]
@@ -662,10 +679,33 @@ pub struct RveScriptDescV1 {
     pub drop: RveDropFn,
 }
 
-/// One exported guest script implementation.
+/// Script descriptor layout used by ABI version 3.
+#[repr(C)]
+pub struct RveScriptDescV3 {
+    /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
+    pub name: RveStr,
+    /// Creates one guest instance.
+    pub create: RveCreateFn,
+    /// Runs the instance's start callback.
+    pub start: RveStartFn,
+    /// Runs the instance's update callback.
+    pub update: RveUpdateFn,
+    /// Runs the instance's message callback.
+    pub message: RveMessageFn,
+    /// Runs the instance's destroy callback.
+    pub destroy: RveDestroyFn,
+    /// Releases one successfully created instance.
+    pub drop: RveDropFn,
+    /// Declared parameters in declaration order; null only when `param_count` is zero.
+    pub params: *const RveParamDesc,
+    /// Number of parameter descriptors. Zero means the script declares no schema.
+    pub param_count: usize,
+}
+
+/// One exported guest script implementation in ABI version 4.
 ///
-/// The parameter fields were appended in ABI version 3. Versions 1 and 2 use
-/// [`RveScriptDescV1`] and are normalized by the host before use.
+/// The optional command callback was appended in v4. Versions 1 and 2 use
+/// [`RveScriptDescV1`], and version 3 uses [`RveScriptDescV3`]; both are normalized by the host.
 #[repr(C)]
 pub struct RveScriptDesc {
     /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
@@ -686,6 +726,8 @@ pub struct RveScriptDesc {
     pub params: *const RveParamDesc,
     /// Number of parameter descriptors. Zero means the script declares no schema.
     pub param_count: usize,
+    /// Optional callback for console commands registered by this script.
+    pub command: Option<RveCommandFn>,
 }
 
 /// Parameter kind: boolean.
@@ -758,6 +800,7 @@ unsafe impl Sync for RveValue {}
 unsafe impl Sync for RveParamEntry {}
 unsafe impl Sync for RveParamDesc {}
 unsafe impl Sync for RveScriptDescV1 {}
+unsafe impl Sync for RveScriptDescV3 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 

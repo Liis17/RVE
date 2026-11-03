@@ -1500,7 +1500,7 @@ impl Renderer {
             if validation_available {
                 enabled_layers.push(validation_layer);
             } else {
-                eprintln!(
+                log::warn!(
                     "VK_LAYER_KHRONOS_validation отсутствует; продолжаю без validation layer"
                 );
             }

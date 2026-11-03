@@ -1,8 +1,10 @@
 //! Play-режим: копия мира сцены и скрипты на главном потоке редактора.
 
+use engine_console::{CommandCatalog, CommandLine};
 use engine_scene::{SceneDocument, World};
 use engine_script::{
-    ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary, ScriptTime,
+    CommandError, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
+    ScriptTime,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -199,6 +201,19 @@ impl PlaySession {
     /// Вводит состояние кнопок и клавиш для следующего обновления.
     pub fn input_mut(&mut self) -> &mut ScriptInput {
         &mut self.input
+    }
+
+    pub fn command_catalog(&self) -> CommandCatalog {
+        self.host.command_catalog()
+    }
+
+    /// Executes a console callback under the same watchdog used for Play updates.
+    pub fn execute_command(&mut self, command: &CommandLine) -> Result<(), CommandError> {
+        self.watchdog
+            .set_deadline(Some(Instant::now() + self.time_limit));
+        let result = self.host.execute_command(&mut self.world, command);
+        self.watchdog.set_deadline(None);
+        result
     }
 
     /// Выполняет один кадр скриптов, если сцена не на паузе.
@@ -398,5 +413,33 @@ return S
                 .iter()
                 .any(|event| event.message == "space")
         );
+    }
+
+    #[test]
+    fn console_commands_register_and_execute_in_play() {
+        let script = r#"
+local S = {}
+function S:on_start()
+  rve.console.register("echo", function(args)
+    rve.console.write(args[1], "warning")
+  end, "write one argument")
+end
+return S
+"#;
+        let mut session = start(script).unwrap();
+        session.tick();
+        assert_eq!(
+            session.command_catalog().get("echo").unwrap().description,
+            "write one argument"
+        );
+        session
+            .execute_command(&CommandLine {
+                name: "echo".to_owned(),
+                args: vec!["hello".to_owned()],
+            })
+            .unwrap();
+        let event = session.drain_events().pop().unwrap();
+        assert_eq!(event.level, engine_script::ScriptEventLevel::Warn);
+        assert_eq!(event.message, "hello");
     }
 }

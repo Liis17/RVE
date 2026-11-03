@@ -1,10 +1,13 @@
 use crate::abi_string::read_abi_str;
-use crate::lite::EventQueue;
+use crate::lite::{
+    CommandGeneration, EventQueue, LuaCommands, RegisteredCommandCallback, RegisteredLuaCommand,
+};
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
     ScriptTransaction,
 };
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
+use engine_console::CommandSpec;
 use engine_scene::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, ParamValue,
     ProjectionSettings, Tonemapper,
@@ -25,6 +28,10 @@ pub(crate) struct AbiCallContext<'a> {
     transaction: &'a mut ScriptTransaction,
     events: EventQueue,
     source: &'a str,
+    commands: LuaCommands,
+    commands_generation: CommandGeneration,
+    command_owner: usize,
+    commands_allowed: bool,
     error: Option<String>,
     poisoned: bool,
 }
@@ -34,6 +41,17 @@ pub(crate) struct AbiScriptCall<'a> {
     pub(crate) transaction: &'a mut ScriptTransaction,
     pub(crate) events: &'a EventQueue,
     pub(crate) source: &'a str,
+    pub(crate) commands: &'a LuaCommands,
+    pub(crate) commands_generation: &'a CommandGeneration,
+    pub(crate) command_owner: usize,
+    pub(crate) commands_allowed: bool,
+}
+
+pub(crate) struct AbiCommandAccess<'a> {
+    commands: &'a LuaCommands,
+    generation: &'a CommandGeneration,
+    owner: usize,
+    allowed: bool,
 }
 
 impl<'a> AbiCallContext<'a> {
@@ -48,6 +66,31 @@ impl<'a> AbiCallContext<'a> {
             transaction,
             events: events.clone(),
             source,
+            commands: std::rc::Rc::new(std::cell::RefCell::new(BTreeMap::new())),
+            commands_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
+            command_owner: 0,
+            commands_allowed: false,
+            error: None,
+            poisoned: false,
+        }
+    }
+
+    pub(crate) fn with_commands(
+        self_object: u64,
+        transaction: &'a mut ScriptTransaction,
+        events: &EventQueue,
+        source: &'a str,
+        command_access: AbiCommandAccess<'a>,
+    ) -> Self {
+        Self {
+            self_object,
+            transaction,
+            events: events.clone(),
+            source,
+            commands: command_access.commands.clone(),
+            commands_generation: command_access.generation.clone(),
+            command_owner: command_access.owner,
+            commands_allowed: command_access.allowed,
             error: None,
             poisoned: false,
         }
@@ -80,6 +123,8 @@ impl<'a> AbiCallContext<'a> {
             set_camera_settings: Some(host_set_camera_settings),
             active_camera: Some(host_active_camera),
             set_active_camera: Some(host_set_active_camera),
+            register_command: self.commands_allowed.then_some(host_register_command),
+            unregister_command: self.commands_allowed.then_some(host_unregister_command),
         }
     }
 
@@ -93,6 +138,26 @@ impl<'a> AbiCallContext<'a> {
                 RveStatus::Panicked => "ABI script callback panicked".to_owned(),
                 RveStatus::Ok => unreachable!(),
             }));
+        }
+        Ok(())
+    }
+
+    fn command_result(&mut self, status: RveStatus) -> Result<(), (String, bool)> {
+        if self.poisoned {
+            return Err((
+                "host callback panicked; ABI call is poisoned".to_owned(),
+                true,
+            ));
+        }
+        if status != RveStatus::Ok {
+            return Err((
+                self.error.take().unwrap_or_else(|| match status {
+                    RveStatus::Error => "ABI command callback returned Error".to_owned(),
+                    RveStatus::Panicked => "ABI command callback panicked".to_owned(),
+                    RveStatus::Ok => unreachable!(),
+                }),
+                status == RveStatus::Panicked,
+            ));
         }
         Ok(())
     }
@@ -158,8 +223,19 @@ impl AbiScriptInstance {
         time: ScriptTime,
         call: AbiScriptCall<'_>,
     ) -> Result<(), String> {
-        let mut context =
-            AbiCallContext::new(call.self_object, call.transaction, call.events, call.source);
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
         let status = {
             let host = context.host(time);
             // SAFETY: this instance came from its matching descriptor's successful create call.
@@ -185,14 +261,65 @@ impl AbiScriptInstance {
         let value = OwnedAbiValue::new(value);
         let sender = RveStr::from_str_ref(sender);
         let name = RveStr::from_str_ref(name);
-        let mut context =
-            AbiCallContext::new(call.self_object, call.transaction, call.events, call.source);
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
         let status = {
             let host = context.host(time);
             // SAFETY: message data, instance, and host remain live throughout the callback.
             unsafe { (self.descriptor.message)(self.instance, &host, sender, name, &value.value) }
         };
         context.callback_result(status)
+    }
+
+    pub(crate) fn invoke_command(
+        &mut self,
+        time: ScriptTime,
+        name: &str,
+        args: &[String],
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), (String, bool)> {
+        let Some(callback) = self.descriptor.command else {
+            return Err(("ABI script has no command callback".to_owned(), false));
+        };
+        let args: Vec<_> = args.iter().map(|arg| RveStr::from_str_ref(arg)).collect();
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: true,
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
+        let status = {
+            let host = context.host(time);
+            // SAFETY: name and arguments are borrowed for the duration of the synchronous callback.
+            unsafe {
+                callback(
+                    self.instance,
+                    &host,
+                    RveStr::from_str_ref(name),
+                    args.as_ptr(),
+                    args.len(),
+                )
+            }
+        };
+        context.command_result(status)
     }
 }
 
@@ -440,6 +567,99 @@ unsafe extern "C" fn host_active_camera(ctx: *mut c_void) -> u64 {
 unsafe extern "C" fn host_set_active_camera(ctx: *mut c_void, object: u64) -> bool {
     guarded(ctx, false, |context| {
         context.transaction.set_active_camera_from_abi(object)
+    })
+}
+
+unsafe extern "C" fn host_register_command(
+    ctx: *mut c_void,
+    name: RveStr,
+    description: RveStr,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        if !context.commands_allowed {
+            context.error = Some("console commands are unavailable in this callback".to_owned());
+            return RveStatus::Error as u32;
+        }
+        let name = match unsafe { read_abi_str(name) } {
+            Ok(name) => name,
+            Err(error) => {
+                context.error = Some(format!("invalid console command name: {error:?}"));
+                return RveStatus::Error as u32;
+            }
+        };
+        let description = match unsafe { read_abi_str(description) } {
+            Ok(description) => description,
+            Err(error) => {
+                context.error = Some(format!("invalid console command description: {error:?}"));
+                return RveStatus::Error as u32;
+            }
+        };
+        let spec = match CommandSpec::new(name, description) {
+            Ok(spec) => spec,
+            Err(error) => {
+                context.error = Some(error.to_string());
+                return RveStatus::Error as u32;
+            }
+        };
+        if context.commands.borrow().contains_key(&spec.name) {
+            context.error = Some(format!(
+                "console command {:?} is already registered",
+                spec.name
+            ));
+            return RveStatus::Error as u32;
+        }
+        context.commands.borrow_mut().insert(
+            spec.name.clone(),
+            RegisteredLuaCommand {
+                owner: context.command_owner,
+                spec,
+                callback: RegisteredCommandCallback::Abi,
+            },
+        );
+        context
+            .commands_generation
+            .set(context.commands_generation.get().wrapping_add(1));
+        RveStatus::Ok as u32
+    })
+}
+
+unsafe extern "C" fn host_unregister_command(ctx: *mut c_void, name: RveStr) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        if !context.commands_allowed {
+            context.error = Some("console commands are unavailable in this callback".to_owned());
+            return RveStatus::Error as u32;
+        }
+        let name = match unsafe { read_abi_str(name) } {
+            Ok(name) => name,
+            Err(error) => {
+                context.error = Some(format!("invalid console command name: {error:?}"));
+                return RveStatus::Error as u32;
+            }
+        };
+        {
+            let mut commands = context.commands.borrow_mut();
+            let Some(command) = commands.get(name) else {
+                context.error = Some(format!("unknown console command {name:?}"));
+                return RveStatus::Error as u32;
+            };
+            if command.owner != context.command_owner {
+                context.error = Some(format!(
+                    "script cannot unregister command {name:?} owned by another instance"
+                ));
+                return RveStatus::Error as u32;
+            }
+            if matches!(&command.callback, RegisteredCommandCallback::Lua(_)) {
+                context.error = Some(format!(
+                    "script cannot unregister command {name:?} owned by another script type"
+                ));
+                return RveStatus::Error as u32;
+            }
+            commands.remove(name);
+        }
+        context
+            .commands_generation
+            .set(context.commands_generation.get().wrapping_add(1));
+        RveStatus::Ok as u32
     })
 }
 

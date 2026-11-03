@@ -10,19 +10,25 @@ use crate::settings::{SettingsStore, UserSettings};
 use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt};
 use crate::ui;
 use crate::ui::scene_view::bounding_sphere;
-use crate::ui_render::{ConvertedMesh, UiBridge};
 use crate::viewport::render::SceneRenderer;
 use egui_dock::DockState;
+use engine_console::{
+    CommandCatalog, ConsoleBuffer, ConsoleLevel, ConsoleLine, install_logger, parse_command_line,
+};
 use engine_files::VirtualPath;
 use engine_render::{
     FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
 };
 use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
+use engine_ui::console::ConsoleOverlay;
+use engine_ui::render::{ConvertedMesh, UiBridge};
 use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use winit::event::ElementState;
+use winit::keyboard::{KeyCode, PhysicalKey};
 
 /// Цвет окна за панелями; всё окно закрыто UI, поэтому заметен только при первом кадре.
 const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
@@ -40,7 +46,9 @@ pub struct EditorApp {
     gpu: Option<GpuState>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
+    console_overlay: ConsoleOverlay,
     bridge: UiBridge,
+    engine_log: Arc<Mutex<ConsoleBuffer>>,
     repaint_at: Option<Instant>,
     /// Ревизия сцены в последней копии автосохранения и время записи.
     autosaved_revision: Option<u64>,
@@ -58,6 +66,7 @@ struct GpuState {
 
 impl EditorApp {
     pub fn new(project: Option<PathBuf>, scripts: Option<PathBuf>) -> Self {
+        let engine_log = editor_log_buffer();
         let mut state = EditorState::new(scripts);
         let settings = SettingsStore::default_location();
         let (user, problem) = settings
@@ -77,7 +86,9 @@ impl EditorApp {
             gpu: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
+            console_overlay: ConsoleOverlay::default(),
             bridge: UiBridge::default(),
+            engine_log,
             repaint_at: None,
             autosaved_revision: None,
             last_autosave: Instant::now(),
@@ -92,6 +103,18 @@ impl EditorApp {
         eprintln!("ошибка renderer: {error}");
         self.exit_code = 1;
         self.exit = true;
+    }
+
+    fn toggle_console(&mut self) -> bool {
+        if !toggle_console(&mut self.state, &mut self.console_overlay) {
+            return false;
+        }
+        if self.state.console_open
+            && let Some(play) = &mut self.state.play
+        {
+            play.input_mut().release_all();
+        }
+        true
     }
 
     fn open_project(&mut self, dir: &Path) {
@@ -771,6 +794,7 @@ impl EditorApp {
 
     /// Рисует кадр; ошибка renderer завершает приложение.
     fn draw_frame(&mut self, window: &Window) -> Result<(), RenderError> {
+        self.drain_engine_log();
         let (Some(gpu), Some(egui_state)) = (&mut self.gpu, &mut self.egui_state) else {
             return Ok(());
         };
@@ -786,11 +810,36 @@ impl EditorApp {
         }
 
         let raw_input = egui_state.take_egui_input(window);
+        let console_lines = if self.state.console_open {
+            snapshot_console_lines(&self.state)
+        } else {
+            Vec::new()
+        };
+        let command_catalog = self
+            .state
+            .play
+            .as_ref()
+            .map_or_else(CommandCatalog::default, |play| play.command_catalog());
         let state = &mut self.state;
         let dock = &mut self.dock;
+        let console_overlay = &mut self.console_overlay;
+        let console_open = state.console_open;
+        let mut console_output = Default::default();
         let mut output = self.egui_ctx.run_ui(raw_input, |ui| {
             ui::show(ui, state, dock);
+            if console_open && let Some(rect) = state.game_view.rect {
+                console_output =
+                    console_overlay.show(ui.ctx(), rect, &console_lines, &command_catalog);
+            }
+            if console_output.toggled {
+                state.console_open = console_overlay.is_open();
+            }
+            state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
         });
+        if let Some(command) = console_output.submitted {
+            submit_console_command(&mut self.state, &command);
+            window.request_redraw();
+        }
         egui_state.handle_platform_output(window, std::mem::take(&mut output.platform_output));
         let repaint_delay = output
             .viewport_output
@@ -840,6 +889,113 @@ impl EditorApp {
         }
         Ok(())
     }
+
+    fn drain_engine_log(&mut self) {
+        let lines = self
+            .engine_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_lines();
+        for line in lines {
+            let level = match line.level {
+                ConsoleLevel::Info => LogLevel::Info,
+                ConsoleLevel::Warn => LogLevel::Warn,
+                ConsoleLevel::Error => LogLevel::Error,
+            };
+            self.state.log.push(level, line.text);
+        }
+    }
+}
+
+fn console_modal_open(state: &EditorState) -> bool {
+    state.unsaved_prompt.is_some()
+        || state.project_dialog.is_some()
+        || state.recovery_prompt.is_some()
+        || state.apply_prompt.is_some()
+}
+
+fn toggle_console(state: &mut EditorState, overlay: &mut ConsoleOverlay) -> bool {
+    if console_modal_open(state) {
+        return false;
+    }
+    state.console_open = !state.console_open;
+    overlay.set_open(state.console_open);
+    true
+}
+
+fn snapshot_console_lines(state: &EditorState) -> Vec<ConsoleLine> {
+    state
+        .log
+        .entries()
+        .map(|entry| ConsoleLine {
+            level: match entry.level {
+                LogLevel::Info => ConsoleLevel::Info,
+                LogLevel::Warn => ConsoleLevel::Warn,
+                LogLevel::Error => ConsoleLevel::Error,
+            },
+            source: "editor".to_owned(),
+            text: entry.message.clone(),
+        })
+        .collect()
+}
+
+fn submit_console_command(state: &mut EditorState, text: &str) {
+    let command = match parse_command_line(text) {
+        Ok(command) => command,
+        Err(error) => {
+            state.log.info(format!("> {text}"));
+            state.log.error(error.to_string());
+            return;
+        }
+    };
+    if command.name == "clear" {
+        if !command.args.is_empty() {
+            state.log.info(format!("> {text}"));
+            state.log.error("usage: clear");
+            return;
+        }
+        state.log.clear();
+        state.log.info(format!("> {text}"));
+        return;
+    }
+
+    state.log.info(format!("> {text}"));
+    if command.name == "help" {
+        if command.args.len() > 1 {
+            state.log.error("usage: help [prefix]");
+            return;
+        }
+        let catalog = state
+            .play
+            .as_ref()
+            .map_or_else(CommandCatalog::default, |play| play.command_catalog());
+        let entries = catalog.help(command.args.first().map_or("", String::as_str));
+        if entries.is_empty() {
+            state.log.info("no commands match the prefix");
+        } else {
+            for entry in entries {
+                state.log.info(entry);
+            }
+        }
+        return;
+    }
+
+    let Some(play) = &mut state.play else {
+        state.log.error("доступно только в Play");
+        return;
+    };
+    let result = play.execute_command(&command);
+    state.log.push_script_events(play.drain_events());
+    if let Err(error) = result {
+        state.log.error(error.to_string());
+    }
+}
+
+fn editor_log_buffer() -> Arc<Mutex<ConsoleBuffer>> {
+    static BUFFER: OnceLock<Arc<Mutex<ConsoleBuffer>>> = OnceLock::new();
+    let buffer = Arc::clone(BUFFER.get_or_init(|| Arc::new(Mutex::new(ConsoleBuffer::default()))));
+    let _ = install_logger(Some(buffer.clone()));
+    buffer
 }
 
 /// Кадр с видимыми панелями Scene и Game. Без мира сцены рисуется только интерфейс.
@@ -1064,6 +1220,22 @@ impl WindowHandler for EditorApp {
     }
 
     fn window_event(&mut self, window: &Window, event: &WindowEvent) {
+        if let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = event
+            && event.physical_key == PhysicalKey::Code(KeyCode::Backquote)
+        {
+            if event.state == ElementState::Pressed
+                && !event.repeat
+                && !*is_synthetic
+                && self.toggle_console()
+            {
+                window.request_redraw();
+            }
+            return;
+        }
         if let WindowEvent::DroppedFile(path) = event
             && self.state.project.is_some()
         {
@@ -1153,6 +1325,9 @@ impl WindowHandler for EditorApp {
     }
 
     fn key(&mut self, key: Key, pressed: bool) {
+        if self.state.console_open {
+            return;
+        }
         if (!pressed || self.state.pointer_over_view())
             && let Some(play) = &mut self.state.play
         {
@@ -1162,6 +1337,9 @@ impl WindowHandler for EditorApp {
     }
 
     fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
+        if self.state.console_open {
+            return;
+        }
         if (!pressed || self.state.pointer_over_view())
             && let Some(play) = &mut self.state.play
         {
@@ -1174,5 +1352,128 @@ impl WindowHandler for EditorApp {
         if !focused && let Some(play) = &mut self.state.play {
             play.input_mut().release_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, Key, Modifiers, RawInput, Rect, pos2, vec2};
+    use engine_scene::SceneDocument;
+
+    fn console_frame(
+        ctx: &egui::Context,
+        overlay: &mut ConsoleOverlay,
+        events: Vec<Event>,
+    ) -> engine_ui::console::ConsoleOutput {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let input = RawInput {
+            screen_rect: Some(rect),
+            events,
+            ..RawInput::default()
+        };
+        let mut console_output = Default::default();
+        let mut full_output = ctx.run_ui(input, |_ui| {
+            console_output = overlay.show(ctx, rect, &[], &CommandCatalog::default());
+        });
+        full_output.textures_delta.clear();
+        console_output
+    }
+
+    #[test]
+    fn backquote_toggle_respects_editor_modals() {
+        let mut state = EditorState::new(None);
+        let mut overlay = ConsoleOverlay::default();
+        assert!(toggle_console(&mut state, &mut overlay));
+        assert!(state.console_open);
+        assert!(overlay.is_open());
+        assert!(toggle_console(&mut state, &mut overlay));
+        assert!(!state.console_open);
+
+        state.apply_prompt = Some("camera".to_owned());
+        assert!(!toggle_console(&mut state, &mut overlay));
+        assert!(!state.console_open);
+        assert!(!overlay.is_open());
+    }
+
+    #[test]
+    fn enter_submits_help_to_the_editor_console_log() {
+        let mut state = EditorState::new(None);
+        let ctx = egui::Context::default();
+        let mut overlay = ConsoleOverlay::default();
+        state.console_open = true;
+        overlay.set_open(true);
+        console_frame(&ctx, &mut overlay, Vec::new());
+        console_frame(&ctx, &mut overlay, vec![Event::Text("help".to_owned())]);
+        let output = console_frame(
+            &ctx,
+            &mut overlay,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert_eq!(output.submitted.as_deref(), Some("help"));
+        submit_console_command(&mut state, output.submitted.as_deref().unwrap());
+        assert!(
+            state
+                .log
+                .entries()
+                .any(|entry| entry.message.starts_with("help —"))
+        );
+    }
+
+    #[test]
+    fn clear_builtin_keeps_only_its_command_echo() {
+        let mut state = EditorState::new(None);
+        state.log.push(LogLevel::Warn, "old output");
+        submit_console_command(&mut state, "clear");
+        assert_eq!(state.log.entries().count(), 1);
+        assert_eq!(state.log.entries().next().unwrap().message, "> clear");
+    }
+
+    #[test]
+    fn script_commands_work_in_play_and_other_commands_are_rejected_outside_play() {
+        let mut state = EditorState::new(None);
+        submit_console_command(&mut state, "scene.reload");
+        assert!(state.log.entries().any(|entry| {
+            entry.level == LogLevel::Error && entry.message == "доступно только в Play"
+        }));
+
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/console.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+        )
+        .unwrap();
+        let script = r#"
+local S = {}
+function S:on_start()
+  rve.console.register("editor.echo", function(args)
+    rve.console.write(args[1], "warning")
+  end, "write an editor message")
+end
+return S
+"#;
+        state.play = Some(PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap());
+        state.play.as_mut().unwrap().tick();
+        submit_console_command(&mut state, "editor.echo hello");
+        assert!(
+            state
+                .log
+                .entries()
+                .any(|entry| { entry.level == LogLevel::Warn && entry.message.ends_with("hello") })
+        );
     }
 }

@@ -92,6 +92,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 | `engine/engine-runtime/src/pipeline.rs` | snapshots, script/render loops, fakeable backend и status guard |
 | `engine/engine-runtime/src/input.rs` | `InputAccumulator`, переходы состояния и кадровые input snapshots |
 | `engine/engine-runtime/src/player.rs` | `WindowHandler`, renderer handoff и shutdown окна |
+| `engine/engine-runtime/src/console.rs` | UI snapshots, latest-only slot и интеграция console-команд с scripts thread |
 | `engine/rve-player/src/main.rs` | бинарный entry point |
 
 ## Зависимости и взаимодействия
@@ -102,3 +103,22 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 - Передаёт окно через [[Engine/EngineWindow]], общую Vulkan-работу через [[Engine/EngineRender]] и платформенную подготовку, диалог и singleton API через [[Engine/EnginePlatform]].
 - Renderer создаётся на главном потоке в `init`, затем передаётся render thread. Менять зависимости и поведение upstream-крейтов для runtime не требуется.
 - Пустые `engine-audio`, `engine-physics`, `engine-network`, `engine-neural` запускаются как отдельные управляемые потоки; доменной работы пока не выполняют.
+
+## Developer console
+
+Runtime всегда зависит от `engine-console` для process logger; `dev-console` включает
+консольный UI и event plumbing через `engine-ui`, egui, egui-winit и winit. Эта feature
+включена у `rve-player` по умолчанию. `run_player` проверяет CLI до установки logger;
+после установки уровни Info/Warn/Error идут в stdout/stderr, а при dev console также в
+общий scrollback sink. Distribution player собирается с выключенными default features,
+поэтому не содержит реализации overlay.
+
+Ввод Backquote открывает/закрывает console без ввода символа. Пока overlay открыт,
+game input не попадает в snapshot скрипта; при закрытии и потере фокуса held keys
+освобождаются через `InputAccumulator`. Скриптовый поток принимает команду до
+следующего update, использует `ScriptHost::execute_command`, а изменения каталога
+публикует snapshot-ом. UI кадры передаются render thread через bounded latest-only slot:
+при замене кадра накапливается `TexturesDelta`, но отбрасывается старая геометрия.
+Overlay создаётся по требованию и освобождает managed textures при закрытии и teardown;
+без открытого UI остаётся обычный `render_frame` путь. Подробный контракт —
+[[Engine/EngineConsole]].

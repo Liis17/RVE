@@ -26,13 +26,14 @@ pub(crate) enum PlayerLocation {
 
 pub(crate) fn locate_player_in(
     executable_dir: &Path,
-    checkout_player: impl FnOnce() -> Result<PathBuf, BuildError>,
+    flavor: player::PlayerFlavor,
+    checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<PathBuf, BuildError>,
 ) -> Result<PlayerLocation, BuildError> {
     let marker = executable_dir.join(SDK_MARKER);
     let contents = match fs::read_to_string(&marker) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return checkout_player()
+            return checkout_player(flavor)
                 .map(PlayerLocation::Checkout)
                 .map_err(|error| {
                     BuildError::operational(format!(
@@ -55,7 +56,7 @@ pub(crate) fn locate_player_in(
     })?;
     validate_sdk_manifest(&manifest)?;
 
-    let executable = executable_dir.join(player_filename());
+    let executable = executable_dir.join(player_filename(flavor));
     if !executable.is_file() {
         return Err(BuildError::operational(format!(
             "в SDK отсутствует {} рядом с rve-build; повторно соберите SDK из checkout командой `rve-build sdk --output <dir>`",
@@ -90,11 +91,12 @@ fn validate_sdk_manifest(manifest: &SdkManifest) -> Result<(), BuildError> {
     Ok(())
 }
 
-fn player_filename() -> &'static str {
-    if cfg!(windows) {
-        "rve-player.exe"
-    } else {
-        "rve-player"
+fn player_filename(flavor: player::PlayerFlavor) -> &'static str {
+    match (cfg!(windows), flavor) {
+        (true, player::PlayerFlavor::Distribution) => "rve-player.exe",
+        (true, player::PlayerFlavor::Dev) => "rve-player-dev.exe",
+        (false, player::PlayerFlavor::Distribution) => "rve-player",
+        (false, player::PlayerFlavor::Dev) => "rve-player-dev",
     }
 }
 
@@ -116,8 +118,13 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
 
     let rve_build = player::current_executable_path()?;
     let executable_dir = player::executable_directory(&rve_build)?;
-    let location = locate_player_in(&executable_dir, player::build_checkout_player)?;
+    let location = locate_player_in(
+        &executable_dir,
+        player::PlayerFlavor::Distribution,
+        player::build_checkout_player,
+    )?;
     let rve_player = checkout_player_for_sdk(location)?;
+    let rve_player_dev = player::build_checkout_player(player::PlayerFlavor::Dev)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -146,6 +153,7 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
         &SdkSources {
             rve_build: &rve_build,
             rve_player: &rve_player,
+            rve_player_dev: &rve_player_dev,
             rve_sdk: &root.join("engine/rve-sdk"),
             engine_version: env!("CARGO_PKG_VERSION"),
             abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
@@ -183,6 +191,7 @@ fn checkout_player_for_sdk(location: PlayerLocation) -> Result<PathBuf, BuildErr
 struct SdkSources<'a> {
     rve_build: &'a Path,
     rve_player: &'a Path,
+    rve_player_dev: &'a Path,
     rve_sdk: &'a Path,
     engine_version: &'a str,
     abi_version: u32,
@@ -191,7 +200,14 @@ struct SdkSources<'a> {
 
 fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), BuildError> {
     player::copy_file(sources.rve_build, &staging.join(rve_build_filename()))?;
-    player::copy_file(sources.rve_player, &staging.join(player_filename()))?;
+    player::copy_file(
+        sources.rve_player,
+        &staging.join(player_filename(player::PlayerFlavor::Distribution)),
+    )?;
+    player::copy_file(
+        sources.rve_player_dev,
+        &staging.join(player_filename(player::PlayerFlavor::Dev)),
+    )?;
 
     let sdk_directory = staging.join("rve-sdk");
     player::create_dir_all(&sdk_directory)?;
@@ -240,9 +256,10 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), BuildError> {
 mod tests {
     use super::{
         PlayerLocation, SdkManifest, SdkSources, assemble_sdk_layout, checkout_player_for_sdk,
-        current_target, locate_player_in,
+        current_target, locate_player_in, player_filename,
     };
     use crate::error::BuildError;
+    use crate::player::PlayerFlavor;
     use crate::temporary::TempDir;
     use std::fs;
     use std::path::PathBuf;
@@ -252,11 +269,11 @@ mod tests {
     }
 
     fn player_name() -> &'static str {
-        if cfg!(windows) {
-            "rve-player.exe"
-        } else {
-            "rve-player"
-        }
+        player_filename(PlayerFlavor::Distribution)
+    }
+
+    fn dev_player_name() -> &'static str {
+        player_filename(PlayerFlavor::Dev)
     }
 
     fn build_name() -> &'static str {
@@ -275,14 +292,18 @@ mod tests {
     fn marker_absence_selects_checkout_and_calls_injected_locator() {
         let root = temp_dir("rve-sdk-no-marker");
         let checkout_player = PathBuf::from("checkout/rve-player");
-        let found = locate_player_in(root.path(), || Ok(checkout_player.clone())).unwrap();
+        let found = locate_player_in(root.path(), PlayerFlavor::Dev, |flavor| {
+            assert_eq!(flavor, PlayerFlavor::Dev);
+            Ok(checkout_player.clone())
+        })
+        .unwrap();
         assert!(matches!(found, PlayerLocation::Checkout(path) if path == checkout_player));
     }
 
     #[test]
     fn checkout_failure_hints_that_the_sdk_marker_may_be_missing() {
         let root = temp_dir("rve-sdk-checkout-error");
-        let error = locate_player_in(root.path(), || {
+        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
             Err(BuildError::operational("checkout unavailable"))
         })
         .unwrap_err();
@@ -303,12 +324,35 @@ mod tests {
         let executable = root.path().join(player_name());
         fs::write(&executable, b"prebuilt player").unwrap();
 
-        let found = locate_player_in(root.path(), || panic!("checkout must not be used")).unwrap();
+        let found = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap();
         assert!(matches!(
             found,
             PlayerLocation::Sdk { executable: path, manifest }
                 if path == executable && manifest.engine_version == "0.1.0"
         ));
+    }
+
+    #[test]
+    fn sdk_location_selects_the_requested_dev_player() {
+        let root = temp_dir("rve-sdk-dev-player");
+        fs::write(
+            root.path().join("rve-sdk.toml"),
+            sdk_marker(rve_sdk::abi::RVE_SCRIPT_ABI_VERSION, &current_target()),
+        )
+        .unwrap();
+        let executable = root.path().join(dev_player_name());
+        fs::write(&executable, b"dev player").unwrap();
+
+        let found = locate_player_in(root.path(), PlayerFlavor::Dev, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap();
+        assert!(
+            matches!(found, PlayerLocation::Sdk { executable: path, .. } if path == executable)
+        );
     }
 
     #[test]
@@ -336,8 +380,10 @@ mod tests {
         )
         .unwrap();
 
-        let error =
-            locate_player_in(root.path(), || panic!("checkout must not be used")).unwrap_err();
+        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap_err();
         assert_eq!(error.exit_code(), 1);
         assert!(error.to_string().contains("rve-player"));
         assert!(error.to_string().contains("rve-build sdk"));
@@ -352,9 +398,28 @@ mod tests {
         )
         .unwrap();
 
-        let error =
-            locate_player_in(root.path(), || panic!("checkout must not be used")).unwrap_err();
+        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("ABI version"));
+    }
+
+    #[test]
+    fn sdk_marker_rejects_legacy_abi_v3_for_the_v4_sdk() {
+        let root = temp_dir("rve-sdk-legacy-abi");
+        fs::write(
+            root.path().join("rve-sdk.toml"),
+            sdk_marker(3, &current_target()),
+        )
+        .unwrap();
+
+        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("ABI version 3"));
+        assert!(error.to_string().contains("ожидаемой версией 4"));
     }
 
     #[test]
@@ -366,8 +431,10 @@ mod tests {
         )
         .unwrap();
 
-        let error =
-            locate_player_in(root.path(), || panic!("checkout must not be used")).unwrap_err();
+        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("target"));
     }
 
@@ -376,8 +443,10 @@ mod tests {
         let root = temp_dir("rve-sdk-invalid-toml");
         fs::write(root.path().join("rve-sdk.toml"), "abi_version = [\n").unwrap();
 
-        let error =
-            locate_player_in(root.path(), || panic!("checkout must not be used")).unwrap_err();
+        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("SDK-маркер"));
     }
 
@@ -391,6 +460,7 @@ mod tests {
         fs::create_dir_all(sdk_source.join("target")).unwrap();
         fs::write(source.join("rve-build"), b"build binary").unwrap();
         fs::write(source.join("rve-player"), b"player binary").unwrap();
+        fs::write(source.join("rve-player-dev"), b"dev player binary").unwrap();
         fs::write(
             sdk_source.join("Cargo.toml"),
             b"[package]\nname = \"rve-sdk\"\n",
@@ -407,12 +477,14 @@ mod tests {
 
         let rve_build = source.join("rve-build");
         let rve_player = source.join("rve-player");
+        let rve_player_dev = source.join("rve-player-dev");
         let target = current_target();
         assemble_sdk_layout(
             &staging,
             &SdkSources {
                 rve_build: &rve_build,
                 rve_player: &rve_player,
+                rve_player_dev: &rve_player_dev,
                 rve_sdk: &sdk_source,
                 engine_version: "0.1.0-test",
                 abi_version: 42,
@@ -428,6 +500,10 @@ mod tests {
         assert_eq!(
             fs::read(staging.join(player_name())).unwrap(),
             b"player binary"
+        );
+        assert_eq!(
+            fs::read(staging.join(dev_player_name())).unwrap(),
+            b"dev player binary"
         );
         assert_eq!(
             fs::read(staging.join("rve-sdk/Cargo.toml")).unwrap(),

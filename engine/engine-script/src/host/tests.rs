@@ -1,5 +1,6 @@
 use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError};
 use crate::{Key, MouseButton, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime};
+use engine_console::CommandLine;
 use engine_scene::{SceneDocument, World};
 use rve_sdk::{Context, Params, Script, Value};
 use std::collections::BTreeMap;
@@ -2251,4 +2252,358 @@ fn lite_properties_honours_the_interrupt() {
     let interrupt = ScriptInterruptHandle::new();
     interrupt.interrupt();
     assert!(crate::lite_properties("loop.lua", "while true do end", &interrupt).is_err());
+}
+
+#[test]
+fn lua_console_write_routes_levels_and_rejects_unknown_levels() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/console.lua"
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+    );
+    let source = r#"
+local Console = {}
+function Console:on_start()
+  rve.console.write("info")
+  rve.console.write("warning", "warning")
+  rve.console.write("error", "error")
+  rve.console.write("log alias", "log")
+  rve.console.write("warn alias", "warn")
+end
+return Console
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("console.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let events = host.drain_events();
+    assert_eq!(
+        events.iter().map(|event| event.level).collect::<Vec<_>>(),
+        [
+            ScriptEventLevel::Info,
+            ScriptEventLevel::Warn,
+            ScriptEventLevel::Error,
+            ScriptEventLevel::Info,
+            ScriptEventLevel::Warn
+        ]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.source.contains("console.lua"))
+    );
+
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/bad.lua"
+[[objects.lite_scripts]]
+path = "/bad.lua"
+"#,
+    );
+    let source = r#"
+local Console = {}
+function Console:on_start() rve.console.write("bad", "trace") end
+return Console
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("bad.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("unknown console level")
+    }));
+}
+
+#[test]
+fn lua_console_commands_receive_string_args_return_info_and_commit_changes() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/console.lua"
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+    );
+    let source = r#"
+local Console = {}
+function Console:on_start()
+  rve.console.register("move", function(args)
+    local object = assert(rve.find("camera"))
+    local transform = object:get_transform()
+    transform.position = { x = tonumber(args[1]), y = 0, z = 0 }
+    object:set_transform(transform)
+    return args[2]
+  end, "move the camera")
+end
+return Console
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("console.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    assert_eq!(host.commands_generation(), 1);
+    assert_eq!(
+        host.command_catalog().get("move").unwrap().description,
+        "move the camera"
+    );
+
+    host.execute_command(
+        &mut world,
+        &CommandLine {
+            name: "MOVE".into(),
+            args: vec!["4.5".into(), "moved".into()],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        world
+            .local_transform(world.handle("camera").unwrap())
+            .unwrap()
+            .position
+            .x,
+        4.5
+    );
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| { event.level == ScriptEventLevel::Info && event.message == "moved" })
+    );
+}
+
+#[test]
+fn lua_console_rejects_invalid_reserved_and_duplicate_command_names() {
+    for name in ["Bad", "help", "same"] {
+        let mut world = one_camera(
+            r#"
+[[assets]]
+path = "/console.lua"
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+        );
+        let registration = if name == "same" {
+            "rve.console.register(\"same\", function() end); rve.console.register(\"same\", function() end)".to_owned()
+        } else {
+            format!("rve.console.register(\"{name}\", function() end)")
+        };
+        let source = format!(
+            "local Console = {{}}; function Console:on_start() {registration} end; return Console"
+        );
+        let mut host =
+            ScriptHost::load(&world, "scene", &sources(&[("console.lua", &source)]), None).unwrap();
+        host.start(&mut world, ScriptTime::default());
+        assert!(
+            host.drain_events()
+                .iter()
+                .any(|event| event.level == ScriptEventLevel::Error)
+        );
+        assert!(host.command_catalog().get("same").is_none());
+        assert_eq!(
+            host.commands_generation(),
+            if name == "same" { 2 } else { 0 }
+        );
+    }
+}
+
+#[test]
+fn lua_console_cannot_unregister_another_instances_command() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/owner.lua"
+[[assets]]
+path = "/foreign.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects.lite_scripts]]
+path = "/owner.lua"
+[[objects]]
+id = "other"
+[[objects.lite_scripts]]
+path = "/foreign.lua"
+"#,
+    );
+    let owner = r#"
+local Script = {}
+function Script:on_start() rve.console.register("owned", function() end) end
+return Script
+"#;
+    let foreign = r#"
+local Script = {}
+function Script:on_start() rve.console.unregister("owned") end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("owner.lua", owner), ("foreign.lua", foreign)]),
+        None,
+    )
+    .unwrap();
+    host.start(&mut world, ScriptTime::default());
+    assert!(host.command_catalog().get("owned").is_some());
+    assert_eq!(host.commands_generation(), 1);
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("another instance")
+    }));
+}
+
+#[test]
+fn lua_console_registration_is_only_available_inside_a_callback() {
+    let world = one_camera(
+        r#"
+[[assets]]
+path = "/console.lua"
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+    );
+    let source = r#"
+rve.console.register("outside", function() end)
+return {}
+"#;
+    let error = ScriptHost::load(&world, "scene", &sources(&[("console.lua", source)]), None)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, ScriptLoadError::Lite { message, .. } if message.contains("only available during script callbacks"))
+    );
+}
+
+#[test]
+fn lua_console_command_failures_roll_back_but_keep_the_instance_enabled() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/console.lua"
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+    );
+    let source = r#"
+local Console = { attempts = 0 }
+function Console:on_start()
+  rve.console.register("mutate", function(args)
+    self.attempts = self.attempts + 1
+    local object = assert(rve.find("camera"))
+    local transform = object:get_transform()
+    transform.position = { x = 9, y = 0, z = 0 }
+    object:set_transform(transform)
+    if self.attempts == 1 then error("command failed") end
+    return args[1]
+  end)
+end
+return Console
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("console.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let command = CommandLine {
+        name: "mutate".into(),
+        args: vec!["success".into()],
+    };
+    assert!(matches!(
+        host.execute_command(&mut world, &command),
+        Err(crate::CommandError::Failed(message)) if message.contains("command failed")
+    ));
+    assert_eq!(
+        world
+            .local_transform(world.handle("camera").unwrap())
+            .unwrap()
+            .position
+            .x,
+        0.0
+    );
+    assert!(host.command_catalog().get("mutate").is_some());
+    host.execute_command(&mut world, &command).unwrap();
+    assert_eq!(
+        world
+            .local_transform(world.handle("camera").unwrap())
+            .unwrap()
+            .position
+            .x,
+        9.0
+    );
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message == "success")
+    );
+}
+
+#[test]
+fn lua_console_commands_are_removed_on_unregister_disable_and_destroy() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/console.lua"
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+    );
+    let source = r#"
+local Console = {}
+function Console:on_start()
+  rve.console.register("temporary", function() end)
+end
+function Console:on_update() error("disable") end
+return Console
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("console.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.command_catalog().get("temporary").is_none());
+    assert_eq!(host.commands_generation(), 2);
+    assert!(matches!(
+        host.execute_command(
+            &mut world,
+            &CommandLine {
+                name: "missing".into(),
+                args: vec![]
+            }
+        ),
+        Err(crate::CommandError::Unknown(_))
+    ));
+
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/console.lua"
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+    );
+    let source = r#"
+local Console = {}
+function Console:on_start() rve.console.register("temporary", function() end) end
+function Console:on_update() rve.console.unregister("temporary") end
+return Console
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("console.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.command_catalog().get("temporary").is_none());
+    assert_eq!(host.commands_generation(), 2);
+
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/console.lua"
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+    );
+    let source = r#"
+local Console = {}
+function Console:on_start() rve.console.register("temporary", function() end) end
+return Console
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("console.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    host.destroy(&mut world, ScriptTime::default());
+    assert!(host.command_catalog().get("temporary").is_none());
+    assert_eq!(host.commands_generation(), 2);
 }
