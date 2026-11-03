@@ -157,7 +157,7 @@ pub(crate) fn float_to_half(value: f32) -> u16 {
     if exponent >= 31 {
         return sign | 0x7c00 | u16::from(mantissa != 0);
     }
-    sign | ((exponent as u16) << 10) | ((mantissa + 0x1000) >> 13) as u16
+    sign | (((exponent as u16) << 10) + ((mantissa + 0x1000) >> 13) as u16)
 }
 
 /// Inverts a column-major 4×4 matrix, returning `None` for singular or non-finite input.
@@ -300,6 +300,9 @@ mod tests {
         assert_eq!(float_to_half(1.0), 0x3c00);
         assert_eq!(float_to_half(2.0), 0x4000);
         assert_eq!(float_to_half(65504.0), 0x7bff);
+        assert_eq!(float_to_half(1.9999), 0x4000);
+        assert_eq!(float_to_half(7.9999), 0x4800);
+        assert_eq!(float_to_half(-1.9999), 0xc000);
     }
 
     fn multiply(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {

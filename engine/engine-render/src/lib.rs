@@ -2659,10 +2659,10 @@ impl Renderer {
                         sky.sun_direction[1] / length,
                         sky.sun_direction[2] / length,
                     ]);
-                    parameters[7] = sky.sun_intensity;
-                    parameters[8..11].copy_from_slice(&sky.zenith_color);
-                    parameters[12..15].copy_from_slice(&sky.horizon_color);
-                    parameters[16..19].copy_from_slice(&sky.ground_color);
+                    parameters[7] = sky.sun_intensity.min(65_504.0);
+                    parameters[8..11].copy_from_slice(&sky.zenith_color.map(|v| v.min(65_504.0)));
+                    parameters[12..15].copy_from_slice(&sky.horizon_color.map(|v| v.min(65_504.0)));
+                    parameters[16..19].copy_from_slice(&sky.ground_color.map(|v| v.min(65_504.0)));
                     (
                         self.procedural_sky_pipeline
                             .ok_or(RenderError::InvalidState(
@@ -2680,10 +2680,27 @@ impl Renderer {
             let size = (ENVIRONMENT_SIZE >> mip_level).max(1);
             let mut parameters = sky_params.unwrap_or([0.0; 20]);
             parameters[0] = size as f32;
+            if mip_level > 0 {
+                parameters[1] = -1.0;
+                parameters[3] = (mip_level - 1) as f32;
+            }
             dispatches.push(EnvironmentDispatch {
-                pipeline: environment_pipeline,
-                source_view: environment_source_view,
-                source_sampler: environment_source_sampler,
+                pipeline: if mip_level == 0 {
+                    environment_pipeline
+                } else {
+                    self.prefilter_pipeline
+                        .ok_or(RenderError::InvalidState("prefilter pipeline отсутствует"))?
+                },
+                source_view: if mip_level == 0 {
+                    environment_source_view
+                } else {
+                    Some(environment_map.view)
+                },
+                source_sampler: if mip_level == 0 {
+                    environment_source_sampler
+                } else {
+                    Some(environment_sampler)
+                },
                 output_view: environment_map.mip_array_views[mip_level as usize],
                 parameters,
                 size,
@@ -2748,7 +2765,7 @@ impl Renderer {
         // SAFETY: compute pool was sized for one set per dispatch.
         let sets = unsafe { device.allocate_descriptor_sets(&allocate_info) }?;
         let mut parameter_buffers = Vec::with_capacity(dispatches.len());
-        for (dispatch, set) in dispatches.iter().zip(&sets) {
+        for (index, (dispatch, set)) in dispatches.iter().zip(&sets).enumerate() {
             let bytes = float_bytes::<80>(&dispatch.parameters);
             let buffer = HostBuffer::new(
                 self.instance()?,
@@ -2767,7 +2784,11 @@ impl Renderer {
             let source_info = dispatch.source_view.map(|view| {
                 [vk::DescriptorImageInfo::default()
                     .image_view(view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+                    .image_layout(if index > 0 && index < ENVIRONMENT_MIPS as usize {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    })]
             });
             let sampler_info = dispatch
                 .source_sampler
@@ -2853,17 +2874,22 @@ impl Renderer {
                         6,
                     );
                 }
-                if index + 1 == ENVIRONMENT_MIPS as usize {
+                if index < ENVIRONMENT_MIPS as usize {
                     pipeline_barrier(
                         device,
                         command_buffer,
                         image_layout_barrier(
                             environment_map.image,
                             vk::ImageLayout::GENERAL,
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            if index + 1 == ENVIRONMENT_MIPS as usize {
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                            } else {
+                                vk::ImageLayout::GENERAL
+                            },
                             vk::PipelineStageFlags2::COMPUTE_SHADER,
                             vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                            vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            vk::PipelineStageFlags2::COMPUTE_SHADER
+                                | vk::PipelineStageFlags2::FRAGMENT_SHADER,
                             vk::AccessFlags2::SHADER_SAMPLED_READ,
                             color_mip_subresource_range(0, ENVIRONMENT_MIPS).layer_count(6),
                         ),

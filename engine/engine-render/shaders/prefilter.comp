@@ -51,9 +51,24 @@ void main() {
     vec2 uv = (vec2(invocation.xy) + vec2(0.5)) / float(size) * 2.0 - 1.0;
     vec3 normal = cube_direction(int(invocation.z), uv);
     float roughness = params.pass_params.y;
+    if (roughness < 0.0) {
+        // Average the four texels of the preceding radiance mip. Sampling
+        // texel centers avoids losing small bright sources at coarser levels.
+        vec3 average = vec3(0.0);
+        for (int y = 0; y < 2; ++y) {
+            for (int x = 0; x < 2; ++x) {
+                vec2 source_uv = (vec2(invocation.xy) * 2.0
+                    + vec2(float(x), float(y)) + vec2(0.5)) / (2.0 * float(size)) * 2.0 - 1.0;
+                average += textureLod(samplerCube(source_texture, source_sampler),
+                    cube_direction(int(invocation.z), source_uv), params.pass_params.w).rgb * 0.25;
+            }
+        }
+        imageStore(output_image, ivec3(invocation), vec4(clamp(average, vec3(0.0), vec3(65504.0)), 1.0));
+        return;
+    }
     if (roughness <= 0.001) {
         vec3 color = textureLod(samplerCube(source_texture, source_sampler), normal, 0.0).rgb;
-        imageStore(output_image, ivec3(invocation), vec4(color, 1.0));
+        imageStore(output_image, ivec3(invocation), vec4(clamp(color, vec3(0.0), vec3(65504.0)), 1.0));
         return;
     }
     vec3 view = normal;
@@ -81,5 +96,5 @@ void main() {
             weight += n_dot_l;
         }
     }
-    imageStore(output_image, ivec3(invocation), vec4(color / max(weight, 1e-5), 1.0));
+    imageStore(output_image, ivec3(invocation), vec4(clamp(color / max(weight, 1e-5), vec3(0.0), vec3(65504.0)), 1.0));
 }

@@ -32,5 +32,5 @@ void main() {
     float sun_dot = dot(direction, normalize(params.sun_direction_intensity.xyz));
     float sun = smoothstep(cos(sun_radius), cos(sun_radius * 0.8), sun_dot);
     color += params.sun_direction_intensity.w * sun;
-    imageStore(output_image, ivec3(invocation), vec4(color, 1.0));
+    imageStore(output_image, ivec3(invocation), vec4(clamp(color, vec3(0.0), vec3(65504.0)), 1.0));
 }
