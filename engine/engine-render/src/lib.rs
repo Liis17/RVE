@@ -247,7 +247,8 @@ impl Default for DirectionalLight {
 /// Camera matrices and world-space position for one rendered view.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameCamera {
-    /// World-to-view matrix, stored by columns.
+    /// World-to-view matrix, stored by columns. Clustering visible local lights
+    /// requires a rigid affine transform (rotation/reflection and translation).
     pub view: [[f32; 4]; 4],
     /// View-to-clip matrix, stored by columns; Vulkan depth is `[0, 1]`.
     pub projection: [[f32; 4]; 4],
@@ -7708,8 +7709,19 @@ fn prepare_frame(
     frame: &Frame<'_>,
     render_extent: vk::Extent2D,
 ) -> Result<PreparedFrame, RenderError> {
-    let (depth_range, cluster_bounds) = camera_cluster_bounds(frame.camera.projection)?;
     let lights = select_local_lights(frame.camera, frame.lights)?;
+    let (depth_range, cluster_bounds) = match camera_cluster_bounds(frame.camera.projection) {
+        Ok(bounds) => bounds,
+        // Unlit frames also support clip-space cameras, such as sandbox's triangle.
+        Err(_) if lights.is_empty() => (
+            clusters::DepthRange {
+                near: 1.0,
+                far: 2.0,
+            },
+            vec![ClusterBounds::default(); CLUSTER_COUNT],
+        ),
+        Err(error) => return Err(error),
+    };
     let uniforms = frame_uniform_bytes_with_count(frame, lights.len(), depth_range, render_extent)?;
     let light_bytes = local_light_bytes(&lights, frame.camera.view)?;
     Ok(PreparedFrame {
@@ -7925,6 +7937,22 @@ fn local_light_contribution(camera: [f32; 3], light: LocalLight) -> f64 {
 }
 
 fn local_light_bytes(lights: &[LocalLight], view: [[f32; 4]; 4]) -> Result<Vec<u8>, RenderError> {
+    if !lights.is_empty() {
+        // Cluster spheres and cones retain world-space radii and angles, so
+        // the camera transform must preserve distances and angles.
+        let rigid = (0..3).all(|a| {
+            (0..3).all(|b| {
+                let dot = (0..3).map(|row| view[a][row] * view[b][row]).sum::<f32>();
+                (dot - if a == b { 1.0 } else { 0.0 }).abs() <= 1e-4
+            })
+        }) && (0..3).all(|column| view[column][3] == 0.0)
+            && view[3][3] == 1.0;
+        if !rigid {
+            return Err(RenderError::InvalidConfig(
+                "camera view must be a rigid affine transform when clustering local lights",
+            ));
+        }
+    }
     let mut packed = Vec::with_capacity(lights.len().max(1));
     for light in lights {
         packed.push(match *light {
@@ -9376,6 +9404,51 @@ mod tests {
             cos_inner_angle,
             cos_outer_angle,
         }
+    }
+
+    #[test]
+    fn triangle_clip_space_camera_without_local_lights_can_prepare_a_frame() {
+        for (width, height) in [(1600.0_f32, 900.0_f32), (900.0, 1600.0)] {
+            // sandbox::scene::triangle_view_projection scales the wider axis.
+            let aspect = width / height;
+            let mut projection = IDENTITY_MATRIX;
+            projection[0][0] = if aspect >= 1.0 { 1.0 / aspect } else { 1.0 };
+            projection[1][1] = if aspect < 1.0 { aspect } else { 1.0 };
+            let frame = Frame {
+                clear_color: [0.0; 4],
+                camera: FrameCamera {
+                    view: IDENTITY_MATRIX,
+                    projection,
+                    position: [0.0; 3],
+                },
+                environment: None,
+                shadow_cascades: &[],
+                light: DirectionalLight::default(),
+                lights: &[],
+                draws: &[],
+                overlay: &[],
+                view: ViewSettings::default(),
+            };
+            assert!(frame_uniform_bytes(&frame).is_ok());
+        }
+    }
+
+    #[test]
+    fn scaled_camera_view_is_rejected_before_cluster_sphere_packing() {
+        let mut view = IDENTITY_MATRIX;
+        view[0][0] = 2.0;
+        view[1][1] = 2.0;
+        view[2][2] = 2.0;
+        for light in [
+            point([0.0, 0.0, -3.0], [1.0; 3], 1.0),
+            spot([0.0, 0.0, -3.0], [0.0, 0.0, -1.0], 1.0, 0.8, 0.5),
+        ] {
+            assert!(matches!(
+                local_light_bytes(&[light], view),
+                Err(RenderError::InvalidConfig(_))
+            ));
+        }
+        assert!(local_light_bytes(&[], view).is_ok());
     }
 
     #[test]
