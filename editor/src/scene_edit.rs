@@ -227,6 +227,7 @@ impl EditorScene {
             transform: SceneTransform::default(),
             camera: None,
             mesh_renderer: None,
+            lod_group: None,
             directional_light: None,
             lite_scripts: Vec::new(),
             heavy_scripts: Vec::new(),

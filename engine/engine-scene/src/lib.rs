@@ -7,8 +7,9 @@ pub mod transform;
 pub mod world;
 
 pub use document::{
-    CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, MaterialOverride,
-    MeshRenderer, ParamValue, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
+    CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, LodGroup, LodLevel,
+    MAX_LOD_LEVELS, MaterialOverride, MeshRenderer, ParamValue, SceneAsset, SceneDocument,
+    SceneError, SceneObject, SceneTransform,
 };
 pub use world::{
     LightState, LocalTransform, MeshInstance, ObjectHandle, SceneFrame, SceneWarning, World,
