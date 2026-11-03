@@ -1,6 +1,7 @@
 //! Vulkan-рендерер, форматы изображений и материалы сцены.
 
 use ash::{Entry, vk};
+use culling::{Frustum, LocalBounds};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use std::collections::HashSet;
 use std::error::Error;
@@ -13,6 +14,7 @@ use ui::{
     validate_viewport_size,
 };
 
+mod culling;
 mod ui;
 
 pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
@@ -607,6 +609,7 @@ impl Renderer {
         indices: &[u32],
     ) -> Result<MeshId, RenderError> {
         validate_mesh(vertices.len(), indices)?;
+        let bounds = LocalBounds::from_vertices(vertices);
         let vertex_buffer = HostBuffer::new(
             self.instance()?,
             self.device()?,
@@ -625,6 +628,7 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
+            bounds,
         }));
         Ok(MeshId(self.meshes.len() - 1))
     }
@@ -966,6 +970,7 @@ impl Renderer {
             frame_set,
             meshes: &self.meshes,
             draws: frame.draws,
+            light_view_projection: frame.shadow_view_projection,
             enabled: frame.shadow_view_projection.is_some(),
         };
         let shadow_image = self
@@ -983,6 +988,7 @@ impl Renderer {
             meshes: &self.meshes,
             materials: &self.materials,
             draws: frame.draws,
+            view_projection: frame.view_projection,
             clear_color: frame.clear_color,
             timestamps,
             view: frame.view,
@@ -1223,6 +1229,7 @@ impl Renderer {
                             frame_set: *frame_set,
                             meshes: &self.meshes,
                             draws: frame.draws,
+                            light_view_projection: frame.shadow_view_projection,
                             enabled: frame.shadow_view_projection.is_some(),
                         },
                         ScenePass {
@@ -1232,6 +1239,7 @@ impl Renderer {
                             meshes: &self.meshes,
                             materials: &self.materials,
                             draws: frame.draws,
+                            view_projection: frame.view_projection,
                             clear_color: frame.clear_color,
                             timestamps: slot_timestamps.filter(|_| index == 0),
                             view: frame.view,
@@ -4144,6 +4152,7 @@ struct ScenePass<'a> {
     meshes: &'a [Option<MeshBuffers>],
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
+    view_projection: [[f32; 4]; 4],
     clear_color: [f32; 4],
     timestamps: Option<vk::QueryPool>,
     view: ViewSettings,
@@ -4156,6 +4165,7 @@ struct ShadowPass<'a> {
     frame_set: vk::DescriptorSet,
     meshes: &'a [Option<MeshBuffers>],
     draws: &'a [DrawCommand],
+    light_view_projection: Option<[[f32; 4]; 4]>,
     enabled: bool,
 }
 
@@ -4211,15 +4221,22 @@ fn record_draws(
             &[],
         );
     }
+    let frustum = Frustum::from_view_projection(scene.view_projection);
     for draw in scene.draws {
         // Индексы проверены validate_draws до начала кадра.
-        let (Some(mesh), Some(material)) = (
-            scene.meshes[draw.mesh.0].as_ref(),
-            scene.materials[draw
-                .material
-                .map_or(DEFAULT_MATERIAL, |material| material.0)]
-            .as_ref(),
-        ) else {
+        let Some(mesh) = scene.meshes[draw.mesh.0].as_ref() else {
+            continue;
+        };
+        if mesh
+            .bounds
+            .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
+        {
+            continue;
+        }
+        let Some(material) = scene.materials[draw
+            .material
+            .map_or(DEFAULT_MATERIAL, |material| material.0)]
+        .as_ref() else {
             continue;
         };
         let push_constants = push_constant_bytes(&draw.model);
@@ -4292,10 +4309,19 @@ fn record_shadow_draws(
             &[],
         );
     }
+    let frustum = shadow
+        .light_view_projection
+        .map(Frustum::from_view_projection);
     for draw in shadow_casters(shadow.draws) {
         let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
             continue;
         };
+        if frustum.is_some_and(|frustum| {
+            mesh.bounds
+                .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
+        }) {
+            continue;
+        }
         let push_constants = push_constant_bytes(&draw.model);
         // SAFETY: draw ids were checked before recording; the buffers and frame set stay alive.
         unsafe {
@@ -5117,6 +5143,7 @@ struct MeshBuffers {
     vertex_buffer: HostBuffer,
     index_buffer: HostBuffer,
     index_count: u32,
+    bounds: Option<LocalBounds>,
 }
 
 /// Буфер в host-visible памяти; данные копируются один раз при создании.

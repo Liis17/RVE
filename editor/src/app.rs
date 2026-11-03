@@ -469,60 +469,63 @@ fn render_scene_frame(
         .filter(|_| !playing)
         .map(|_| state.camera.distance);
     let pending_frame = state.pending_frame.take();
-    let Some(parts) = state.frame_parts() else {
-        return render_ui_only(&mut gpu.renderer, ui, &[]);
+    let (scene_frame, game_camera, game_settings, has_light, frame_target) = {
+        let Some(parts) = state.frame_parts() else {
+            return render_ui_only(&mut gpu.renderer, ui, &[]);
+        };
+        gpu.scene.sync_assets(
+            &mut gpu.renderer,
+            parts.project,
+            parts.world,
+            parts.models,
+            parts.log,
+        )?;
+        let (scene_frame, warnings) = parts.world.build_frame();
+        for warning in warnings {
+            parts.log.push(
+                LogLevel::Warn,
+                format!(
+                    "{}: {}: {}",
+                    warning.source, warning.object_id, warning.message
+                ),
+            );
+        }
+        let game_camera_handle = game_camera_id
+            .and_then(|id| parts.world.handle(&id))
+            .filter(|handle| parts.world.camera_of(*handle).is_some())
+            .unwrap_or_else(|| parts.world.active_camera());
+        let game_camera = parts
+            .world
+            .camera_of(game_camera_handle)
+            .unwrap_or(scene_frame.camera);
+        let game_settings = parts
+            .world
+            .camera_settings(game_camera_handle)
+            .copied()
+            .unwrap_or_default();
+        let has_light = parts
+            .world
+            .objects()
+            .iter()
+            .any(|object| object.directional_light.is_some());
+        let frame_target = pending_frame.and_then(|id| {
+            let object = parts.world.object_by_id(&id)?;
+            let model = parts
+                .models
+                .get(object.mesh_renderer.as_ref()?.model.as_str())?;
+            Some(bounding_sphere(
+                parts.world.world_matrix(object.handle)?,
+                model.bounds()?,
+            ))
+        });
+        (
+            scene_frame,
+            game_camera,
+            game_settings,
+            has_light,
+            frame_target,
+        )
     };
-    gpu.scene.sync_assets(
-        &mut gpu.renderer,
-        parts.project,
-        parts.world,
-        parts.models,
-        parts.log,
-    )?;
-    let (scene_frame, warnings) = parts.world.build_frame();
-    for warning in warnings {
-        parts.log.push(
-            LogLevel::Warn,
-            format!(
-                "{}: {}: {}",
-                warning.source, warning.object_id, warning.message
-            ),
-        );
-    }
-    gpu.scene.build_draws(
-        &mut gpu.renderer,
-        parts.world,
-        &scene_frame,
-        grid_camera_distance,
-    )?;
-    let game_camera_handle = game_camera_id
-        .and_then(|id| parts.world.handle(&id))
-        .filter(|handle| parts.world.camera_of(*handle).is_some())
-        .unwrap_or_else(|| parts.world.active_camera());
-    let game_camera = parts
-        .world
-        .camera_of(game_camera_handle)
-        .unwrap_or(scene_frame.camera);
-    let game_settings = parts
-        .world
-        .camera_settings(game_camera_handle)
-        .copied()
-        .unwrap_or_default();
-    let has_light = parts
-        .world
-        .objects()
-        .iter()
-        .any(|object| object.directional_light.is_some());
-    let frame_target = pending_frame.and_then(|id| {
-        let object = parts.world.object_by_id(&id)?;
-        let model = parts
-            .models
-            .get(object.mesh_renderer.as_ref()?.model.as_str())?;
-        Some(bounding_sphere(
-            parts.world.world_matrix(object.handle)?,
-            model.bounds()?,
-        ))
-    });
     if let Some((center, radius)) = frame_target
         && state.camera.needs_framing(center, radius)
     {
@@ -538,7 +541,17 @@ fn render_scene_frame(
     } else {
         CameraSettings::default()
     };
-
+    let Some(parts) = state.frame_parts() else {
+        return render_ui_only(&mut gpu.renderer, ui, &[]);
+    };
+    gpu.scene.build_draws(
+        &mut gpu.renderer,
+        parts.world,
+        &scene_frame,
+        scene_camera.position,
+        game_camera.position,
+        grid_camera_distance,
+    )?;
     if let Some([width, height]) = scene_size {
         gpu.renderer
             .resize_viewport(gpu.scene.viewport, width, height)?;

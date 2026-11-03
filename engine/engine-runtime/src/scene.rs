@@ -1,5 +1,6 @@
 use crate::pipeline::GpuSceneTable;
 use engine_assets::{Assets, Model, ModelMaterial, TextureData};
+use engine_files::VirtualPath;
 use engine_render::{
     Material, MaterialId, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
 };
@@ -10,8 +11,7 @@ use std::hash::Hash;
 
 pub(crate) struct ObjectModel {
     pub object: ObjectHandle,
-    pub model_path: String,
-    pub replacement_texture: Option<String>,
+    pub levels: Vec<(String, Option<String>)>,
     pub material: Option<MaterialOverride>,
 }
 
@@ -96,17 +96,41 @@ fn prepare_scene_with_model_loader(
 
     for object in world.objects() {
         if let Some(mesh) = &object.mesh_renderer {
-            let model_path = mesh.model.as_str().to_owned();
-            if !models.contains_key(&model_path) {
-                let model =
-                    load_model(&model_path).map_err(|error| format!("{scene_path}: {error}"))?;
-                models.insert(model_path.clone(), model);
+            let mut levels = vec![(
+                mesh.model.as_str().to_owned(),
+                mesh.texture.as_ref().map(|path| path.as_str().to_owned()),
+            )];
+            if let Some(group) = &object.lod_group {
+                for level in &group.levels {
+                    let model_path = VirtualPath::parse(&level.model)
+                        .map_err(|error| format!("{scene_path}: {error}"))?
+                        .as_str()
+                        .to_owned();
+                    let texture_path = level
+                        .texture
+                        .as_deref()
+                        .or_else(|| mesh.texture.as_ref().map(|path| path.as_str()));
+                    let replacement_texture = texture_path
+                        .map(|path| {
+                            VirtualPath::parse(path)
+                                .map(|path| path.as_str().to_owned())
+                                .map_err(|error| format!("{scene_path}: {error}"))
+                        })
+                        .transpose()?;
+                    levels.push((model_path, replacement_texture));
+                }
             }
-            let replacement_texture = mesh.texture.as_ref().map(|path| path.as_str().to_owned());
             let material = mesh.material.clone();
-            let scene_texture_paths = replacement_texture
+            for (model_path, _) in &levels {
+                if !models.contains_key(model_path) {
+                    let model =
+                        load_model(model_path).map_err(|error| format!("{scene_path}: {error}"))?;
+                    models.insert(model_path.clone(), model);
+                }
+            }
+            let scene_texture_paths = levels
                 .iter()
-                .cloned()
+                .filter_map(|(_, texture)| texture.clone())
                 .chain(material.iter().flat_map(|material| {
                     [
                         material.metallic_roughness_texture.as_ref(),
@@ -127,8 +151,7 @@ fn prepare_scene_with_model_loader(
             }
             objects.push(ObjectModel {
                 object: object.handle,
-                model_path,
-                replacement_texture,
+                levels,
                 material,
             });
         }
@@ -287,13 +310,16 @@ pub(crate) fn upload_scene(
 
     let mut table = GpuSceneTable::default();
     for object in &assets.objects {
-        let model_meshes = gpu_models.get(&object.model_path).ok_or({
-            RenderError::InvalidState("CPU-модель отсутствует в таблице GPU-ресурсов")
-        })?;
-        if object.material.is_none() && object.replacement_texture.is_none() {
-            table.by_object.insert(object.object, model_meshes.clone());
-        } else {
-            let model = assets.models.get(&object.model_path).ok_or({
+        let mut levels = Vec::with_capacity(object.levels.len());
+        for (model_path, replacement_texture) in &object.levels {
+            let model_meshes = gpu_models.get(model_path).ok_or({
+                RenderError::InvalidState("CPU-модель отсутствует в таблице GPU-ресурсов")
+            })?;
+            if object.material.is_none() && replacement_texture.is_none() {
+                levels.push(model_meshes.clone());
+                continue;
+            }
+            let model = assets.models.get(model_path).ok_or({
                 RenderError::InvalidState(
                     "CPU-модель отсутствует в таблице подготовленных ресурсов",
                 )
@@ -302,21 +328,22 @@ pub(crate) fn upload_scene(
             for (source_mesh, (mesh_id, _)) in model.meshes.iter().zip(model_meshes) {
                 let resolved = resolve_material(
                     &source_mesh.material,
-                    object.replacement_texture.as_deref(),
+                    replacement_texture.as_deref(),
                     object.material.as_ref(),
                 );
                 let material_id = upload_resolved_material(
                     renderer,
                     &resolved,
-                    &object.model_path,
+                    model_path,
                     model,
                     &assets.textures,
                     &mut texture_cache,
                 )?;
                 draws.push((*mesh_id, material_id));
             }
-            table.by_object.insert(object.object, draws);
+            levels.push(draws);
         }
+        table.by_object.insert(object.object, levels);
     }
     Ok(table)
 }
@@ -678,6 +705,47 @@ id = "camera"
         assert_eq!(
             prepared.sources.get("scripts/main.lua").unwrap(),
             "return {}\n"
+        );
+    }
+
+    #[test]
+    fn lod_models_load_once_and_keep_document_level_order() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath=\"models/base.fbx\"\n[[assets]]\npath=\"models/lod.fbx\"\n{CAMERA_SCENE}\n[[objects]]\nid=\"first\"\n[objects.mesh_renderer]\nmodel=\"models/base.fbx\"\n[objects.lod_group]\ncull_distance=50.0\n[[objects.lod_group.levels]]\nmodel=\"models/lod.fbx\"\ndistance=10.0\n[[objects]]\nid=\"second\"\n[objects.mesh_renderer]\nmodel=\"models/lod.fbx\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", &scene_text).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let mut loaded_paths = Vec::new();
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            |path| {
+                loaded_paths.push(path.to_owned());
+                Ok(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(loaded_paths, ["models/base.fbx", "models/lod.fbx"]);
+        assert_eq!(prepared.render_assets.models.len(), 2);
+        assert_eq!(
+            prepared.render_assets.objects[0].levels,
+            [
+                ("models/base.fbx".to_owned(), None),
+                ("models/lod.fbx".to_owned(), None),
+            ]
+        );
+        assert_eq!(
+            prepared.render_assets.objects[1].levels,
+            [("models/lod.fbx".to_owned(), None)]
         );
     }
 
