@@ -102,9 +102,13 @@ def main():
 
         sdk_dir = temp_root / "sdk"
         run_logged(
-            [cargo, "run", "-p", "rve-build", "--locked", "--", "sdk", "--output", str(sdk_dir)],
+            [cargo, "run", "-p", "rve-build", "--locked", "--", "sdk", "--output", str(sdk_dir), "--no-rust-toolchain"],
             build_dir,
         )
+        if sys.platform == "darwin":
+            sdk_dir = sdk_dir / "RVE Editor.app/Contents/MacOS"
+        if not (sdk_dir / f"rve-editor{executable_suffix}").is_file():
+            raise RuntimeError("SDK editor is missing")
         game_sdk = temp_root / "game-sdk"
         copy_demo_game(root / "examples/demo-game", game_sdk)
         rewrite_sdk_path(game_sdk / "HeavyScripts/Cargo.toml", sdk_dir / "rve-sdk")

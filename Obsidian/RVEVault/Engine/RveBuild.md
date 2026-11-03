@@ -94,15 +94,17 @@ Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to d
 ошибка TOML, несовпадение ABI или платформы завершают команду операционной ошибкой.
 SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходникам checkout.
 
-`rve-build sdk --output <dir>` доступна только в checkout-режиме. Она собирает
-distribution `rve-player` в `build/player` и dev `rve-player-dev` в `build/player-dev`,
-затем атомарно публикует новый каталог без замены существующего. Каталог содержит
-`rve-build[.exe]`, `rve-player[.exe]`, `rve-player-dev[.exe]`, `rve-sdk.toml` и
-`rve-sdk/Cargo.toml` с деревом `rve-sdk/src/**`; `target/` не
-копируется. `rve-build` копирует собственный запущенный executable. При debug-сборке
-команда предупреждает об этом; для распространяемого SDK рекомендуется запускать
-`cargo run --release -p rve-build -- sdk --output <dir>`. Клиентский crate указывает
-на `<sdk>/rve-sdk` как path-зависимость (см. [[Engine/RveSdk]]).
+`rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain)
+[--vulkan-sdk <dir>]` доступна только в checkout. Выбор toolchain обязателен;
+каталог должен содержать `bin/cargo` и `bin/rustc` (на Windows `.exe`). Дерево
+копируется в `toolchain/`. Отказ от toolchain предназначен для CI.
+
+Команда собирает release editor, build и оба player; distribution player без
+console. Артефакты берутся из Cargo JSON. Кэши изолированы в `build/sdk-player`
+и `build/sdk-tools`; на Windows сборка задаёт `-C target-feature=+crt-static`.
+SDK содержит четыре executable, маркер и гостевой `rve-sdk/Cargo.toml`, `src/**`.
+На macOS они находятся в `RVE Editor.app/Contents/MacOS`, Vulkan loader/MoltenVK
+и ICD — в `Contents/Resources/Engine`. Публикация атомарная без замены output.
 
 Если `project.rveproject` содержит `heavy_scripts`, каталог обязан содержать
 `Cargo.toml` с lib-target `crate-type = ["cdylib"]`. Сборщик читает Cargo metadata,

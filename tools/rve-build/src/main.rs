@@ -39,7 +39,11 @@ fn main() {
                 error.exit_code()
             }
         },
-        Ok(CommandLine::Sdk { output }) => match sdk::build_sdk(&output) {
+        Ok(CommandLine::Sdk {
+            output,
+            rust_toolchain,
+            vulkan_sdk,
+        }) => match sdk::build_sdk(&output, rust_toolchain.as_deref(), vulkan_sdk.as_deref()) {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("rve-build: {error}");

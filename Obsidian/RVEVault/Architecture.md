@@ -163,3 +163,11 @@ Sandbox, runtime и редактор создают меши с локально
 - Матрицы считаются крейтом glam по выбору пользователя. Публичный API renderer принимает матрицу как `[[f32; 4]; 4]` и не зависит от glam.
 - Ресурсы лежат в `assets` рабочего каталога (`build/assets`) и адресуются путями вида `/model/cube.fbx` — так попросил пользователь. Поддерживаются FBX для моделей, PNG для текстур и Radiance RGBE `.hdr` для environment.
 - `engine-assets` возвращает данные CPU в собственных типах и не зависит от renderer; перевод в `engine_render::Vertex` выполняет приложение.
+
+## Дистрибутив редактора
+
+`rve-build sdk` публикует редактор, сборщик, distribution/dev player,
+`rve-sdk.toml`, гостевой `rve-sdk/` и выбранный `toolchain/`. На Windows
+они лежат в корне; на macOS — в `RVE Editor.app/Contents/MacOS`, а Vulkan
+библиотеки в `Contents/Resources/Engine`. Исходники движка не включаются.
+Контракт сборки и выбор toolchain описаны в [[Engine/RveBuild]].

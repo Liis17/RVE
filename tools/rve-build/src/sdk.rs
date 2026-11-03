@@ -100,6 +100,14 @@ fn player_filename(flavor: player::PlayerFlavor) -> &'static str {
     }
 }
 
+fn editor_filename() -> &'static str {
+    if cfg!(windows) {
+        "rve-editor.exe"
+    } else {
+        "rve-editor"
+    }
+}
+
 fn rve_build_filename() -> &'static str {
     if cfg!(windows) {
         "rve-build.exe"
@@ -112,7 +120,14 @@ pub(crate) fn current_target() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
 
-pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
+pub(crate) fn build_sdk(
+    output: &Path,
+    rust_toolchain: Option<&Path>,
+    vulkan_sdk: Option<&Path>,
+) -> Result<(), BuildError> {
+    if let Some(toolchain) = rust_toolchain {
+        validate_toolchain(toolchain)?;
+    }
     let output = player::absolute_output_path(output)?;
     player::ensure_output_missing(&output)?;
 
@@ -121,10 +136,14 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
     let location = locate_player_in(
         &executable_dir,
         player::PlayerFlavor::Distribution,
-        player::build_checkout_player,
+        |flavor| {
+            player::build_sdk_binary("rve-player", flavor == player::PlayerFlavor::Distribution)
+        },
     )?;
     let rve_player = checkout_player_for_sdk(location)?;
-    let rve_player_dev = player::build_checkout_player(player::PlayerFlavor::Dev)?;
+    let rve_player_dev = player::build_sdk_binary("rve-player", false)?;
+    let rve_editor = player::build_sdk_binary("rve-editor", false)?;
+    let rve_build = player::build_sdk_binary("rve-build", false)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -148,9 +167,36 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
 
     let staging = TempDir::create(&output_parent, "rve-build-sdk")?;
     let root = player::repo_root()?;
+    #[cfg(target_os = "macos")]
+    let binary_dir = {
+        let contents = staging.path().join("RVE Editor.app/Contents");
+        player::create_dir_all(&contents.join("MacOS"))?;
+        let plist = platform::info_plist(
+            "rve-editor",
+            "RVE Editor",
+            "editor",
+            env!("CARGO_PKG_VERSION"),
+        );
+        fs::write(contents.join("Info.plist"), plist)
+            .map_err(|e| BuildError::operational(e.to_string()))?;
+        let engine = contents.join("Resources/Engine");
+        player::create_dir_all(&engine)?;
+        platform::copy_macos_vulkan_files(
+            &platform::find_macos_vulkan_files(vulkan_sdk)?,
+            &engine,
+        )?;
+        contents.join("MacOS")
+    };
+    #[cfg(not(target_os = "macos"))]
+    let binary_dir = {
+        let _ = vulkan_sdk;
+        staging.path().to_owned()
+    };
     assemble_sdk_layout(
-        staging.path(),
+        &binary_dir,
         &SdkSources {
+            rve_editor: &rve_editor,
+            rust_toolchain,
             rve_build: &rve_build,
             rve_player: &rve_player,
             rve_player_dev: &rve_player_dev,
@@ -160,12 +206,6 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
             target: &current_target(),
         },
     )?;
-
-    if cfg!(debug_assertions) {
-        eprintln!(
-            "предупреждение: SDK содержит текущую debug-сборку rve-build; для распространяемого SDK запустите `cargo run --release -p rve-build -- sdk --output <dir>`"
-        );
-    }
 
     match platform::publish_directory_no_replace(staging.path(), &output) {
         Ok(()) => Ok(()),
@@ -189,6 +229,8 @@ fn checkout_player_for_sdk(location: PlayerLocation) -> Result<PathBuf, BuildErr
 }
 
 struct SdkSources<'a> {
+    rve_editor: &'a Path,
+    rust_toolchain: Option<&'a Path>,
     rve_build: &'a Path,
     rve_player: &'a Path,
     rve_player_dev: &'a Path,
@@ -199,6 +241,11 @@ struct SdkSources<'a> {
 }
 
 fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), BuildError> {
+    if let Some(toolchain) = sources.rust_toolchain {
+        validate_toolchain(toolchain)?;
+        copy_directory(toolchain, &staging.join("toolchain"))?;
+    }
+    player::copy_file(sources.rve_editor, &staging.join(editor_filename()))?;
     player::copy_file(sources.rve_build, &staging.join(rve_build_filename()))?;
     player::copy_file(
         sources.rve_player,
@@ -224,6 +271,21 @@ fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), B
     fs::write(staging.join(SDK_MARKER), marker).map_err(|error| {
         BuildError::operational(format!("не удалось записать SDK-маркер: {error}"))
     })
+}
+
+fn validate_toolchain(root: &Path) -> Result<(), BuildError> {
+    for binary in ["cargo", "rustc"] {
+        let path = root
+            .join("bin")
+            .join(format!("{binary}{}", std::env::consts::EXE_SUFFIX));
+        if !path.is_file() {
+            return Err(BuildError::input(format!(
+                "toolchain missing {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<(), BuildError> {
@@ -451,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_layout_copies_only_the_cli_player_and_sdk_sources() {
+    fn sdk_layout_copies_editor_toolchain_players_and_guest_api() {
         let root = temp_dir("rve-sdk-layout");
         let source = root.path().join("source");
         let staging = root.path().join("staging");
@@ -475,6 +537,23 @@ mod tests {
         fs::write(sdk_source.join("target/ignored"), b"not packaged").unwrap();
         fs::create_dir(&staging).unwrap();
 
+        let toolchain = source.join("toolchain");
+        fs::create_dir_all(toolchain.join("bin")).unwrap();
+        assert!(super::validate_toolchain(&toolchain).is_err());
+        fs::write(
+            toolchain.join(format!("bin/cargo{}", std::env::consts::EXE_SUFFIX)),
+            b"cargo",
+        )
+        .unwrap();
+        assert!(super::validate_toolchain(&toolchain).is_err());
+        fs::write(
+            toolchain.join(format!("bin/rustc{}", std::env::consts::EXE_SUFFIX)),
+            b"rustc",
+        )
+        .unwrap();
+        super::validate_toolchain(&toolchain).unwrap();
+        let rve_editor = source.join("rve-editor");
+        fs::write(&rve_editor, b"editor binary").unwrap();
         let rve_build = source.join("rve-build");
         let rve_player = source.join("rve-player");
         let rve_player_dev = source.join("rve-player-dev");
@@ -482,6 +561,8 @@ mod tests {
         assemble_sdk_layout(
             &staging,
             &SdkSources {
+                rve_editor: &rve_editor,
+                rust_toolchain: Some(&toolchain),
                 rve_build: &rve_build,
                 rve_player: &rve_player,
                 rve_player_dev: &rve_player_dev,
@@ -512,6 +593,18 @@ mod tests {
         assert_eq!(
             fs::read(staging.join("rve-sdk/src/nested/api.rs")).unwrap(),
             b"pub fn nested() {}\n"
+        );
+        assert_eq!(
+            fs::read(staging.join(super::editor_filename())).unwrap(),
+            b"editor binary"
+        );
+        assert_eq!(
+            fs::read(staging.join(format!(
+                "toolchain/bin/rustc{}",
+                std::env::consts::EXE_SUFFIX
+            )))
+            .unwrap(),
+            b"rustc"
         );
         assert!(!staging.join("rve-sdk/target").exists());
         let marker = fs::read_to_string(staging.join("rve-sdk.toml")).unwrap();

@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir>\n  rve-build --help";
+pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build --help";
 
 pub(crate) enum CommandLine {
     Help,
@@ -16,6 +16,8 @@ pub(crate) enum CommandLine {
     },
     Sdk {
         output: PathBuf,
+        rust_toolchain: Option<PathBuf>,
+        vulkan_sdk: Option<PathBuf>,
     },
 }
 
@@ -39,6 +41,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandL
 
 fn parse_sdk(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, String> {
     let mut output = None;
+    let mut toolchain = None;
+    let mut selected = false;
+    let mut vulkan_sdk = None;
     while let Some(argument) = args.next() {
         if is_help(&argument) {
             return Ok(CommandLine::Help);
@@ -53,12 +58,38 @@ fn parse_sdk(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, St
                         "после --output требуется каталог".to_owned()
                     })?));
             }
+            Some("--rust-toolchain" | "--no-rust-toolchain") => {
+                if selected {
+                    return Err("выберите один флаг toolchain".to_owned());
+                }
+                selected = true;
+                if argument == "--rust-toolchain" {
+                    toolchain = Some(PathBuf::from(
+                        args.next().ok_or("ожидается каталог toolchain")?,
+                    ));
+                }
+            }
+            Some("--vulkan-sdk") => {
+                if vulkan_sdk.is_some() {
+                    return Err("повторный --vulkan-sdk".to_owned());
+                }
+                vulkan_sdk = Some(PathBuf::from(
+                    args.next().ok_or("ожидается каталог Vulkan SDK")?,
+                ));
+            }
             Some(value) => return Err(format!("неизвестный аргумент sdk: {value:?}")),
             None => return Err("аргумент sdk должен быть текстом UTF-8".to_owned()),
         }
     }
     let output = output.ok_or_else(|| "для sdk требуется --output <dir>".to_owned())?;
-    Ok(CommandLine::Sdk { output })
+    if !selected {
+        return Err("требуется --rust-toolchain <dir> или --no-rust-toolchain".to_owned());
+    }
+    Ok(CommandLine::Sdk {
+        output,
+        rust_toolchain: toolchain,
+        vulkan_sdk,
+    })
 }
 
 fn parse_build(mut args: impl Iterator<Item = OsString>) -> Result<CommandLine, String> {
@@ -178,9 +209,27 @@ mod tests {
                 if player_args == args(&["--frames", "120"])
         ));
         assert!(matches!(
-            parse(args(&["sdk", "--output", "sdk dir"])).unwrap(),
-            CommandLine::Sdk { output } if output == Path::new("sdk dir")
+            parse(args(&["sdk", "--output", "sdk dir", "--no-rust-toolchain"])).unwrap(),
+            CommandLine::Sdk { output, .. } if output == Path::new("sdk dir")
         ));
+    }
+
+    #[test]
+    fn sdk_requires_exactly_one_toolchain_choice() {
+        for flags in [
+            vec![],
+            vec!["--rust-toolchain"],
+            vec!["--rust-toolchain", "rust", "--no-rust-toolchain"],
+            vec!["--no-rust-toolchain", "--no-rust-toolchain"],
+        ] {
+            let mut values = vec!["sdk", "--output", "out"];
+            values.extend(flags);
+            assert!(parse(args(&values)).is_err());
+        }
+        assert!(
+            matches!(parse(args(&["sdk", "--output", "out", "--rust-toolchain", "rust", "--vulkan-sdk", "vk"])).unwrap(),
+            CommandLine::Sdk { rust_toolchain: Some(rust), vulkan_sdk: Some(vk), .. } if rust == Path::new("rust") && vk == Path::new("vk"))
+        );
     }
 
     #[test]

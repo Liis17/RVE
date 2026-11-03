@@ -75,7 +75,7 @@ exposure, tonemapping, anti-aliasing и render scale задаются файло
 ```sh
 cargo run -p rve-build -- run ../examples/demo-game -- --frames 120
 cargo run -p rve-build -- build ../examples/demo-game --output ../demo-out
-cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist
+cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist --rust-toolchain <toolchain-dir>
 ```
 
 `rve-build run` собирает игру и запускает dev-player с включённой developer console.
@@ -83,9 +83,14 @@ cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist
 каталоге, который должен отсутствовать до сборки. Для прямого запуска player CLI имеет вид
 `rve-player [--project <dir>] [--scripts <path>] [--frames N]`.
 
-Команда `rve-build sdk` собирает оба варианта player и создаёт переносимый каталог
-с `rve-build`, distribution player `rve-player`, dev player `rve-player-dev`,
-исходниками `rve-sdk` и маркером `rve-sdk.toml`. Игровой
+Команда `rve-build sdk` собирает release редактор, сборщик и оба варианта player
+и создаёт переносимый каталог с `rve-editor`, `rve-build`,
+distribution player `rve-player`, dev player `rve-player-dev`,
+гостевым API `rve-sdk`, выбранным `toolchain/` и маркером `rve-sdk.toml`.
+Обязателен `--rust-toolchain <dir>` либо явный `--no-rust-toolchain` для CI.
+На Windows SDK-бинарники собираются с `crt-static`; на macOS создаётся
+`RVE Editor.app` с Vulkan loader/MoltenVK (источник: `--vulkan-sdk`,
+`VULKAN_SDK` или Homebrew). Игровой
 crate подключает SDK через path `../rve-sdk-dist/rve-sdk` в `Cargo.toml`. Рядом с
 `rve-build` маркер включает SDK-режим: checkout движка не нужен, а совместимость
 проверяется по ABI и паре `ARCH-OS` текущей платформы. Без маркера используется

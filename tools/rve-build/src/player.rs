@@ -548,6 +548,56 @@ pub(crate) fn build_checkout_player(flavor: PlayerFlavor) -> Result<PathBuf, Bui
         .map_err(|error| BuildError::operational(format!("сборка rve-player: {error}")))
 }
 
+pub(crate) fn build_sdk_binary(
+    package: &str,
+    distribution_player: bool,
+) -> Result<PathBuf, BuildError> {
+    let root = repo_root()?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let cache = if distribution_player {
+        "sdk-player"
+    } else {
+        "sdk-tools"
+    };
+    let mut command = Command::new(cargo);
+    command
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            package,
+            "--message-format=json",
+        ])
+        .current_dir(root.join("build"))
+        .env("CARGO_TARGET_DIR", root.join("build").join(cache));
+    if distribution_player {
+        command.arg("--no-default-features");
+    }
+    if cfg!(windows) {
+        // An explicit target keeps crt-static off host proc-macro crates.
+        let environment = if cfg!(target_env = "gnu") {
+            "gnu"
+        } else {
+            "msvc"
+        };
+        command.args([
+            "--target",
+            &format!("{}-pc-windows-{environment}", std::env::consts::ARCH),
+        ]);
+        command
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", "-C target-feature=+crt-static");
+    }
+    let stdout = run_cargo(&mut command, "SDK build", CargoFailure::Operational)?;
+    let artifact =
+        parse_cargo_output(&stdout, package, "bin", None).map_err(BuildError::operational)?;
+    let executable = artifact
+        .executable
+        .ok_or_else(|| BuildError::operational("cargo did not report executable"))?;
+    normalize_build_path(&executable)
+}
+
 fn checkout_player_target_dir(root: &Path, flavor: PlayerFlavor) -> PathBuf {
     root.join("build").join(flavor.target_directory())
 }
