@@ -22,3 +22,6 @@ engine-script = { path = "../engine/engine-script" }
 engine-window = { path = "../engine/engine-window" }
 glam.workspace = true
 rfd.workspace = true
+
+[dev-dependencies]
+rve-sdk = { path = "../engine/rve-sdk" }

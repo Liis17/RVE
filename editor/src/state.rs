@@ -12,10 +12,15 @@ use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool};
 use engine_assets::Model;
 use engine_files::VirtualPath;
 use engine_scene::World;
-use engine_script::ScriptLibrary;
+use engine_script::{ParamSchema, ScriptInterruptHandle, ScriptLibrary};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+
+/// Сколько может выполняться chunk Lua при чтении схемы, прежде чем его прервут.
+const SCHEMA_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Действие, которое выполняется после построения UI: диалоги ОС блокируют кадр,
 /// а смена проекта или сцены затрагивает данные, заимствованные панелями.
@@ -101,6 +106,9 @@ pub struct EditorState {
     pub models: HashMap<String, Arc<Model>>,
     /// Идущая сборка релиза; одновременно — не больше одной.
     pub build: Option<BuildJob>,
+    /// Схемы `properties` lite-скриптов по пути; ошибка пишется в Console один раз.
+    /// Сбрасывается вместе с кэшами ресурсов.
+    pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
     edit_world: Option<(u64, World)>,
 }
 
@@ -132,6 +140,7 @@ impl EditorState {
             pending_frame: None,
             models: HashMap::new(),
             build: None,
+            lite_schemas: HashMap::new(),
             edit_world: None,
         }
     }
@@ -234,6 +243,29 @@ impl EditorState {
         }
     }
 
+    /// Схема `properties` lite-скрипта из кэша; при первом обращении файл читается из проекта.
+    pub fn lite_schema(&mut self, path: &str) -> Result<Option<ParamSchema>, String> {
+        if let Some(schema) = self.lite_schemas.get(path) {
+            return schema.clone();
+        }
+        let Some(project) = &self.project else {
+            return Ok(None);
+        };
+        let result = project
+            .read_text(path)
+            .and_then(|source| read_lite_schema(path, &source, SCHEMA_TIMEOUT));
+        if let Err(error) = &result {
+            self.log.error(error.clone());
+        }
+        self.lite_schemas.insert(path.to_owned(), result.clone());
+        result
+    }
+
+    /// Схема Rust-скрипта из загруженной библиотеки.
+    pub fn heavy_schema(&self, name: &str) -> Option<ParamSchema> {
+        self.library.as_ref()?.schema(name).cloned()
+    }
+
     /// Пути ресурсов заданного вида для выпадающих списков Inspector.
     pub fn assets_of_kind(&self, kind: AssetKind) -> Vec<String> {
         fn collect(entries: &[AssetEntry], kind: AssetKind, paths: &mut Vec<String>) {
@@ -249,6 +281,29 @@ impl EditorState {
         collect(&self.asset_tree, kind, &mut paths);
         paths
     }
+}
+
+/// Читает схему в отдельном Lua; chunk дольше `timeout` прерывается.
+fn read_lite_schema(
+    path: &str,
+    source: &str,
+    timeout: Duration,
+) -> Result<Option<ParamSchema>, String> {
+    let interrupt = ScriptInterruptHandle::new();
+    let (done, finished) = mpsc::channel::<()>();
+    let watchdog = {
+        let interrupt = interrupt.clone();
+        std::thread::spawn(move || {
+            if finished.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
+                interrupt.interrupt();
+            }
+        })
+    };
+    let result =
+        engine_script::lite_properties(path, source, &interrupt).map_err(|error| error.to_string());
+    drop(done);
+    let _ = watchdog.join();
+    result
 }
 
 #[cfg(test)]
@@ -314,5 +369,25 @@ mod tests {
         ];
         assert_eq!(state.assets_of_kind(AssetKind::Model), ["m/a.fbx", "b.fbx"]);
         assert_eq!(state.assets_of_kind(AssetKind::Script), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn lite_schemas_are_read_from_the_project_once_and_errors_logged_once() {
+        let mut state = EditorState::new(None);
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        state.project = Some(OpenProject::open(std::path::Path::new(dir)).unwrap());
+        let schema = state.lite_schema("scripts/rotate.lua").unwrap().unwrap();
+        assert!(schema.get("speed").is_some());
+        assert!(state.lite_schemas.contains_key("scripts/rotate.lua"));
+
+        assert!(state.lite_schema("scripts/missing.lua").is_err());
+        assert!(state.lite_schema("scripts/missing.lua").is_err());
+        assert_eq!(state.log.entries().count(), 1);
+    }
+
+    #[test]
+    fn hanging_schema_chunk_is_interrupted() {
+        let timeout = Duration::from_millis(20);
+        assert!(read_lite_schema("loop.lua", "while true do end", timeout).is_err());
     }
 }

@@ -11,6 +11,7 @@ use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
 use engine_assets::{Model, ModelMesh, ModelVertex};
 use engine_files::VirtualPath;
 use glam::Vec3;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -416,4 +417,212 @@ fn build_player_menu_item_queues_the_action() {
     click(&mut harness, "File");
     click(&mut harness, "Build Player…");
     assert_eq!(harness.state.actions, [crate::state::Action::BuildPlayer]);
+}
+
+/// Все надписи кадра, для поиска виджетов в тестах.
+fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Pos2)> {
+    fn visit(shape: &egui::Shape, out: &mut Vec<(String, Pos2)>) {
+        match shape {
+            egui::Shape::Text(shape) => out.push((
+                shape.galley.text().to_owned(),
+                shape.pos + shape.galley.rect.center().to_vec2(),
+            )),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| visit(shape, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in shapes {
+        visit(&clipped.shape, &mut out);
+    }
+    out
+}
+
+const SPEED_SCRIPT: &str = "scripts/rotate.lua";
+
+fn speed_schema() -> engine_scene::ParamSchema {
+    engine_scene::ParamSchema::new(vec![engine_scene::ParamSpec {
+        name: "speed".to_owned(),
+        kind: engine_scene::ParamKind::Float,
+        default: engine_scene::ParamValue::Float(30.0),
+        min: Some(0.0),
+        max: Some(360.0),
+        label: Some("Speed".to_owned()),
+    }])
+    .unwrap()
+}
+
+/// Камера с lite-скриптом выбрана; схема скрипта уже в кэше.
+fn harness_with_script(schema: Option<engine_scene::ParamSchema>) -> Harness {
+    let mut harness = Harness::new();
+    let path = VirtualPath::parse(SPEED_SCRIPT).unwrap();
+    let scene = harness.scene_mut();
+    scene.add_lite_script("camera", path).unwrap();
+    scene.select(Some("camera"));
+    harness
+        .state
+        .lite_schemas
+        .insert(SPEED_SCRIPT.to_owned(), Ok(schema));
+    harness
+}
+
+fn inspector_frame(harness: &mut Harness, events: Vec<Event>) -> Vec<(String, Pos2)> {
+    let input = harness.input(events);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| inspector::show(ui, state));
+    });
+    output.textures_delta.clear();
+    texts(&output.shapes)
+}
+
+fn script_params(harness: &Harness) -> BTreeMap<String, engine_scene::ParamValue> {
+    harness.scene().object("camera").unwrap().lite_scripts[0]
+        .params
+        .clone()
+}
+
+fn position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {
+    texts
+        .iter()
+        .find(|(found, _)| found == text)
+        .map(|(_, at)| *at)
+        .unwrap_or_else(|| {
+            panic!(
+                "{text:?} not in {:?}",
+                texts.iter().map(|t| &t.0).collect::<Vec<_>>()
+            )
+        })
+}
+
+fn inspector_click(harness: &mut Harness, at: Pos2) {
+    inspector_frame(harness, vec![Event::PointerMoved(at)]);
+    inspector_frame(harness, vec![button(at, PointerButton::Primary, true)]);
+    inspector_frame(harness, vec![button(at, PointerButton::Primary, false)]);
+    inspector_frame(harness, Vec::new());
+}
+
+#[test]
+fn schema_field_shows_the_default_and_writes_the_key_only_after_an_edit() {
+    let mut harness = harness_with_script(Some(speed_schema()));
+    inspector_frame(&mut harness, Vec::new());
+    let texts = inspector_frame(&mut harness, Vec::new());
+    position_of(&texts, "Speed");
+    let value = position_of(&texts, "30.00");
+    assert!(script_params(&harness).is_empty());
+    assert!(texts.iter().all(|(text, _)| text != "Add"));
+
+    inspector_frame(&mut harness, vec![Event::PointerMoved(value)]);
+    inspector_frame(
+        &mut harness,
+        vec![button(value, PointerButton::Primary, true)],
+    );
+    for step in 1..=4 {
+        inspector_frame(
+            &mut harness,
+            vec![Event::PointerMoved(value + vec2(10.0 * step as f32, 0.0))],
+        );
+    }
+    inspector_frame(
+        &mut harness,
+        vec![button(
+            value + vec2(40.0, 0.0),
+            PointerButton::Primary,
+            false,
+        )],
+    );
+    let params = script_params(&harness);
+    let Some(engine_scene::ParamValue::Float(speed)) = params.get("speed") else {
+        panic!("{params:?}");
+    };
+    assert!(*speed > 30.0 && *speed <= 360.0, "{speed}");
+}
+
+#[test]
+fn reset_removes_the_key_and_returns_the_default() {
+    let mut harness = harness_with_script(Some(speed_schema()));
+    harness
+        .scene_mut()
+        .edit_object("camera", None, |object| {
+            object.lite_scripts[0]
+                .params
+                .insert("speed".into(), engine_scene::ParamValue::Float(90.0));
+            Ok(())
+        })
+        .unwrap();
+    inspector_frame(&mut harness, Vec::new());
+    let texts = inspector_frame(&mut harness, Vec::new());
+    position_of(&texts, "90.00");
+    inspector_click(&mut harness, position_of(&texts, "↺"));
+    assert!(script_params(&harness).is_empty());
+    assert!(harness.scene_mut().undo());
+    assert_eq!(script_params(&harness).len(), 1);
+}
+
+#[test]
+fn undeclared_keys_are_marked_and_can_be_removed() {
+    let mut harness = harness_with_script(Some(speed_schema()));
+    harness
+        .scene_mut()
+        .edit_object("camera", None, |object| {
+            object.lite_scripts[0]
+                .params
+                .insert("spin".into(), engine_scene::ParamValue::Int(1));
+            Ok(())
+        })
+        .unwrap();
+    inspector_frame(&mut harness, Vec::new());
+    let texts = inspector_frame(&mut harness, Vec::new());
+    let marker = position_of(&texts, "⚠ spin");
+    let remove = texts
+        .iter()
+        .filter(|(text, at)| text == "x" && (at.y - marker.y).abs() < 4.0)
+        .map(|(_, at)| *at)
+        .next()
+        .expect("remove button on the marked row");
+    inspector_click(&mut harness, remove);
+    assert!(script_params(&harness).is_empty());
+}
+
+#[test]
+fn without_a_schema_the_free_form_editor_stays() {
+    let mut harness = harness_with_script(None);
+    inspector_frame(&mut harness, Vec::new());
+    let texts = inspector_frame(&mut harness, Vec::new());
+    position_of(&texts, "Add");
+    assert!(texts.iter().all(|(text, _)| text != "Speed"));
+}
+
+fn typed_library() -> engine_script::ScriptLibrary {
+    struct Empty;
+    impl rve_sdk::Script for Empty {}
+    fn factory(_: &rve_sdk::Params) -> Result<Box<dyn rve_sdk::Script>, String> {
+        Ok(Box::new(Empty))
+    }
+    let module = rve_sdk::script_module! {
+        "Bobber" => factory { speed: f32 = 1.4 (0.0..=10.0) "Bob speed" },
+    };
+    // SAFETY: the SDK macro returns an immutable process-lifetime table.
+    unsafe { engine_script::ScriptLibrary::from_module(module) }.unwrap()
+}
+
+#[test]
+fn rust_script_parameters_use_the_library_schema() {
+    let mut harness = Harness::new();
+    harness.state.library = Some(typed_library());
+    let scene = harness.scene_mut();
+    scene
+        .edit_object("camera", None, |object| {
+            object.heavy_scripts.push(engine_scene::HeavyScript {
+                name: "Bobber".to_owned(),
+                params: BTreeMap::new(),
+            });
+            Ok(())
+        })
+        .unwrap();
+    scene.select(Some("camera"));
+    inspector_frame(&mut harness, Vec::new());
+    let texts = inspector_frame(&mut harness, Vec::new());
+    position_of(&texts, "Bob speed");
+    position_of(&texts, "1.40");
 }

@@ -5,8 +5,8 @@ use crate::scene_edit::default_light;
 use crate::state::{AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::{
-    CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, ParamValue, SceneObject,
-    SceneTransform,
+    CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, ParamSchema, ParamSpec,
+    ParamValue, SceneObject, SceneTransform,
 };
 use std::collections::BTreeMap;
 
@@ -457,10 +457,21 @@ fn show_lite_script(
     let id = object.id.as_str();
     let script = &object.lite_scripts[index];
     let title = format!("Lua: {}", script.path.as_str());
+    let schema = state.lite_schema(script.path.as_str());
     let mut params = script.params.clone();
     let mut params_response = None;
-    let remove = component_header(ui, &title, (id, index), |ui| {
-        params_response = params_ui(ui, ("lite", id, index), &mut params);
+    let remove = component_header(ui, &title, (id, index), |ui| match &schema {
+        Ok(Some(schema)) => {
+            params_response = schema_params_ui(ui, ("lite", id, index), schema, &mut params);
+        }
+        Ok(None) => params_response = params_ui(ui, ("lite", id, index), &mut params),
+        Err(_) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "Ошибка схемы properties, см. Console",
+            );
+            params_response = params_ui(ui, ("lite", id, index), &mut params);
+        }
     });
     if let Some(response) = &params_response {
         let key = format!("lite-{index}");
@@ -487,10 +498,14 @@ fn show_heavy_script(
     let id = object.id.as_str();
     let script = &object.heavy_scripts[index];
     let title = format!("Rust: {}", script.name);
+    let schema = state.heavy_schema(&script.name);
     let mut params = script.params.clone();
     let mut params_response = None;
-    let remove = component_header(ui, &title, (id, index), |ui| {
-        params_response = params_ui(ui, ("heavy", id, index), &mut params);
+    let remove = component_header(ui, &title, (id, index), |ui| match &schema {
+        Some(schema) => {
+            params_response = schema_params_ui(ui, ("heavy", id, index), schema, &mut params);
+        }
+        None => params_response = params_ui(ui, ("heavy", id, index), &mut params),
     });
     if let Some(response) = &params_response {
         let key = format!("heavy-{index}");
@@ -658,6 +673,26 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                 }
             }
         });
+        let heavy_names: Option<Vec<String>> = state.library.as_ref().map(|library| {
+            library
+                .script_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        });
+        if let Some(names) = heavy_names {
+            ui.menu_button("Rust Script", |ui| {
+                if names.is_empty() {
+                    ui.label("Библиотека не регистрирует скрипты");
+                }
+                for name in names {
+                    if ui.button(&name).clicked() {
+                        add_heavy_script(state, id, name);
+                    }
+                }
+            });
+            return;
+        }
         ui.menu_button("Rust Script", |ui| {
             let name_id = ui.make_persistent_id("heavy_script_name");
             let mut name = ui
@@ -666,18 +701,118 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                 .unwrap_or_default();
             ui.text_edit_singleline(&mut name);
             if ui.button("Add").clicked() {
-                let script = std::mem::take(&mut name);
-                state.edit_scene(|scene| {
-                    scene.edit_object(id, None, |object| {
-                        object.heavy_scripts.push(HeavyScript {
-                            name: script,
-                            params: BTreeMap::new(),
-                        });
-                        Ok(())
-                    })
-                });
+                add_heavy_script(state, id, std::mem::take(&mut name));
             }
             ui.ctx().data_mut(|data| data.insert_temp(name_id, name));
         });
     });
+}
+
+fn add_heavy_script(state: &mut EditorState, id: &str, name: String) {
+    state.edit_scene(|scene| {
+        scene.edit_object(id, None, |object| {
+            object.heavy_scripts.push(HeavyScript {
+                name,
+                params: BTreeMap::new(),
+            });
+            Ok(())
+        })
+    });
+}
+
+/// Параметры по схеме скрипта: поля в порядке объявления с виджетом по типу. Ключ без
+/// значения в сцене показывает default и записывается только после правки; «↺» удаляет
+/// ключ и возвращает default. Необъявленные ключи помечены и удаляются кнопкой «x».
+fn schema_params_ui(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    schema: &ParamSchema,
+    params: &mut BTreeMap<String, ParamValue>,
+) -> Option<egui::Response> {
+    let mut combined: Option<egui::Response> = None;
+    let mut reset = None;
+    egui::Grid::new(("schema_params", salt))
+        .num_columns(3)
+        .show(ui, |ui| {
+            for spec in schema.specs() {
+                let stored = params.get(&spec.name).cloned();
+                let label = spec.label.as_deref().unwrap_or(&spec.name);
+                let label = match stored {
+                    Some(_) => egui::RichText::new(label),
+                    None => egui::RichText::new(label).weak(),
+                };
+                ui.label(label).on_hover_text(&spec.name);
+                let current = stored.as_ref().map(|value| spec.coerce(value));
+                let mut value = match &current {
+                    Some(Ok(value)) => value.clone(),
+                    Some(Err(_)) | None => spec.default.clone(),
+                };
+                let response = param_widget(ui, spec, &mut value);
+                if response.changed() {
+                    params.insert(spec.name.clone(), value);
+                }
+                merge_response(&mut combined, response);
+                ui.horizontal(|ui| {
+                    if stored.is_some() && ui.small_button("↺").on_hover_text("Default").clicked()
+                    {
+                        reset = Some(spec.name.clone());
+                    }
+                    if let Some(Err(error)) = &current {
+                        ui.colored_label(ui.visuals().error_fg_color, "⚠")
+                            .on_hover_text(error);
+                    }
+                });
+                ui.end_row();
+            }
+            for name in params.keys() {
+                if schema.get(name).is_some() {
+                    continue;
+                }
+                ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {name}"))
+                    .on_hover_text("Параметр не объявлен скриптом");
+                ui.label("не объявлен");
+                if ui.small_button("x").clicked() {
+                    reset = Some(name.clone());
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(name) = reset {
+        params.remove(&name);
+        let mut response = combined.unwrap_or_else(|| ui.label(""));
+        response.mark_changed();
+        return Some(response);
+    }
+    combined
+}
+
+fn param_widget(ui: &mut egui::Ui, spec: &ParamSpec, value: &mut ParamValue) -> egui::Response {
+    let min = spec.min.unwrap_or(f64::NEG_INFINITY);
+    let max = spec.max.unwrap_or(f64::INFINITY);
+    match value {
+        ParamValue::Bool(value) => ui.checkbox(value, ""),
+        // `as` насыщает бесконечные границы до i64::MIN/MAX.
+        ParamValue::Int(value) => {
+            ui.add(egui::DragValue::new(value).range(min as i64..=max as i64))
+        }
+        ParamValue::Float(value) => {
+            ui.add(egui::DragValue::new(value).speed(0.05).range(min..=max))
+        }
+        ParamValue::String(value) => ui.text_edit_singleline(value),
+        ParamValue::Array(values) => {
+            ui.horizontal(|ui| {
+                let mut combined: Option<egui::Response> = None;
+                for value in values.iter_mut() {
+                    if let ParamValue::Float(value) = value {
+                        merge_response(
+                            &mut combined,
+                            ui.add(egui::DragValue::new(value).speed(0.05)),
+                        );
+                    }
+                }
+                combined.unwrap_or_else(|| ui.label(""))
+            })
+            .inner
+        }
+    }
 }

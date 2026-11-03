@@ -2353,6 +2353,7 @@ dependencies = [
  "engine-window",
  "glam",
  "rfd",
+ "rve-sdk",
 ]
 
 [[package]]

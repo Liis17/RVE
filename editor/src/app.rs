@@ -81,6 +81,7 @@ impl EditorApp {
                 let start = project.settings.starting_scene().map(str::to_owned);
                 self.state.project = Some(project);
                 self.state.current_folder.clear();
+                self.load_library();
                 self.refresh_assets();
                 match start {
                     Some(path) => self.open_scene(&path),
@@ -100,6 +101,7 @@ impl EditorApp {
             Err(error) => self.state.log.error(error.to_string()),
         }
         self.state.previews.invalidate();
+        self.state.lite_schemas.clear();
         if let Some(gpu) = &mut self.gpu
             && let Err(error) = gpu
                 .scene
@@ -321,7 +323,7 @@ impl EditorApp {
     }
 
     fn start_play(&mut self) {
-        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
+        let (Some(_), Some(scene)) = (&self.state.project, &self.state.scene) else {
             return;
         };
         let needs_library = scene
@@ -330,21 +332,19 @@ impl EditorApp {
             .iter()
             .any(|object| !object.heavy_scripts.is_empty());
         if needs_library && self.state.library.is_none() {
-            let Some(path) = self.state.scripts_path.clone() else {
+            if self.state.scripts_path.is_none() {
                 self.state
                     .log
                     .error("В сцене есть Rust-скрипты: запустите редактор с --scripts <library>");
                 return;
-            };
-            // SAFETY: библиотека скриптов — нативный код проекта, явно указанный пользователем.
-            match unsafe { ScriptLibrary::load(&path) } {
-                Ok(library) => self.state.library = Some(library),
-                Err(error) => {
-                    self.state.log.error(format!("{}: {error}", path.display()));
-                    return;
-                }
+            }
+            if !self.load_library() {
+                return;
             }
         }
+        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
+            return;
+        };
         let result = PlaySession::start(scene.document(), self.state.library.as_ref(), |path| {
             project.read_text(path)
         });
@@ -355,6 +355,28 @@ impl EditorApp {
                 self.state.log.info("Play");
             }
             Err(error) => self.state.log.error(error),
+        }
+    }
+
+    /// Загружает `--scripts` один раз: схемы нужны Inspector, сама библиотека — Play.
+    /// Выгрузки нет, поэтому после пересборки cdylib редактор нужно перезапустить.
+    fn load_library(&mut self) -> bool {
+        if self.state.library.is_some() {
+            return true;
+        }
+        let Some(path) = self.state.scripts_path.clone() else {
+            return false;
+        };
+        // SAFETY: библиотека скриптов — нативный код проекта, явно указанный пользователем.
+        match unsafe { ScriptLibrary::load(&path) } {
+            Ok(library) => {
+                self.state.library = Some(library);
+                true
+            }
+            Err(error) => {
+                self.state.log.error(format!("{}: {error}", path.display()));
+                false
+            }
         }
     }
 
