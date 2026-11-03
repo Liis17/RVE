@@ -251,6 +251,7 @@ impl EditorScene {
                     object.mesh_renderer = Some(MeshRenderer {
                         model: path.clone(),
                         texture: None,
+                        material: None,
                     });
                 }
             }
@@ -371,7 +372,16 @@ impl EditorScene {
             if let Some(texture) = &texture {
                 ensure_asset(document, texture);
             }
-            find_object_mut(document, id)?.mesh_renderer = Some(MeshRenderer { model, texture });
+            let object = find_object_mut(document, id)?;
+            let material = object
+                .mesh_renderer
+                .as_ref()
+                .and_then(|mesh| mesh.material.clone());
+            object.mesh_renderer = Some(MeshRenderer {
+                model,
+                texture,
+                material,
+            });
             Ok(())
         })
     }
@@ -692,6 +702,43 @@ mod tests {
         assert_eq!(scene.document().assets.len(), 3);
         assert!(scene.set_mesh(&id, path("/t.png"), None).is_err());
         assert!(scene.add_lite_script(&id, path("/m.fbx")).is_err());
+    }
+
+    #[test]
+    fn assigning_a_new_mesh_preserves_its_material_override() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.set_mesh(&id, path("/first.fbx"), None).unwrap();
+        scene
+            .edit_object(&id, None, |object| {
+                object.mesh_renderer.as_mut().unwrap().material =
+                    Some(engine_scene::document::MaterialOverride {
+                        base_color: Some([0.3, 0.4, 0.5]),
+                        metallic: Some(1.0),
+                        roughness: Some(0.25),
+                        metallic_roughness_texture: None,
+                        normal_texture: None,
+                        normal_scale: Some(0.5),
+                    });
+                Ok(())
+            })
+            .unwrap();
+
+        scene.set_mesh(&id, path("/second.fbx"), None).unwrap();
+
+        let material = scene
+            .object(&id)
+            .unwrap()
+            .mesh_renderer
+            .as_ref()
+            .unwrap()
+            .material
+            .as_ref()
+            .unwrap();
+        assert_eq!(material.base_color, Some([0.3, 0.4, 0.5]));
+        assert_eq!(material.metallic, Some(1.0));
+        assert_eq!(material.roughness, Some(0.25));
+        assert_eq!(material.normal_scale, Some(0.5));
     }
 
     #[test]

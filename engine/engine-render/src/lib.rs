@@ -20,7 +20,8 @@ pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 const FRAMES_IN_FLIGHT: usize = 2;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
-const TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+const SRGB_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+const LINEAR_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 /// egui хранит значения в гамма-пространстве, поэтому они читаются без перевода; шейдер сам
 /// переводит результат для sRGB-swapchain, и смешивание в этом случае идёт в линейном пространстве.
 const UI_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -49,10 +50,13 @@ const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 /// Два timestamp на слот кадра: перед shadow pass и после scene pass.
 const TIMESTAMP_QUERY_COUNT: u32 = 2;
-/// Белая текстура 1x1 создаётся при инициализации и используется для `texture: None`.
-const WHITE_TEXTURE: usize = 0;
+const WHITE_SRGB_TEXTURE: usize = 0;
+const WHITE_LINEAR_TEXTURE: usize = 1;
+const FLAT_NORMAL_TEXTURE: usize = 2;
+const DEFAULT_MATERIAL: usize = 0;
 const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
-const FRAME_UNIFORMS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>() + 4 * size_of::<[f32; 4]>();
+const FRAME_UNIFORMS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>() + 5 * size_of::<[f32; 4]>();
+const MATERIAL_UNIFORMS_SIZE: usize = 2 * size_of::<[f32; 4]>();
 const IDENTITY_MATRIX: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -92,14 +96,51 @@ pub struct MeshId(usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextureId(usize);
 
+/// Идентификатор неизменяемого материала, созданного [`Renderer::create_material`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MaterialId(usize);
+
+/// Интерпретация RGBA8 texel-ов GPU-текстуры.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextureColorSpace {
+    Srgb,
+    Linear,
+}
+
+/// Неизменяемые параметры материала и необязательные текстуры.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Material {
+    pub base_color: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub base_color_texture: Option<TextureId>,
+    pub metallic_roughness_texture: Option<TextureId>,
+    pub normal_texture: Option<TextureId>,
+    pub normal_scale: f32,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            base_color: [1.0; 3],
+            metallic: 0.0,
+            roughness: 1.0,
+            base_color_texture: None,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: 1.0,
+        }
+    }
+}
+
 /// Команда рисования меша.
 ///
 /// `model` переводит пространство модели в мировое и задаётся по столбцам.
-/// Без текстуры меш рисуется белой текстурой, то есть цветом вершин.
+/// `None` выбирает встроенный белый dielectric материал.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawCommand {
     pub mesh: MeshId,
-    pub texture: Option<TextureId>,
+    pub material: Option<MaterialId>,
     pub model: [[f32; 4]; 4],
     /// Попадает ли меш в shadow map; на получение тени не влияет.
     pub casts_shadow: bool,
@@ -139,6 +180,7 @@ pub struct Frame<'a> {
     pub clear_color: [f32; 4],
     pub view_projection: [[f32; 4]; 4],
     pub shadow_view_projection: Option<[[f32; 4]; 4]>,
+    pub camera_position: [f32; 3],
     pub light: DirectionalLight,
     pub draws: &'a [DrawCommand],
     pub overlay: &'a [OverlayVertex],
@@ -193,6 +235,7 @@ pub enum RenderError {
     InvalidState(&'static str),
     InvalidMesh(&'static str),
     InvalidTexture(String),
+    InvalidMaterial(String),
 }
 
 impl fmt::Display for RenderError {
@@ -215,6 +258,7 @@ impl fmt::Display for RenderError {
             Self::InvalidState(message) => write!(f, "некорректное состояние рендерера: {message}"),
             Self::InvalidMesh(message) => write!(f, "некорректный меш: {message}"),
             Self::InvalidTexture(message) => write!(f, "некорректная текстура: {message}"),
+            Self::InvalidMaterial(message) => write!(f, "некорректный материал: {message}"),
         }
     }
 }
@@ -373,6 +417,7 @@ pub struct Renderer {
     pending_gpu_time: Option<Duration>,
     texture_sampler_anisotropy: Option<f32>,
     frame_set_layout: Option<vk::DescriptorSetLayout>,
+    material_set_layout: Option<vk::DescriptorSetLayout>,
     texture_set_layout: Option<vk::DescriptorSetLayout>,
     frame_descriptor_pool: Option<vk::DescriptorPool>,
     frame_uniforms: Vec<FrameUniforms>,
@@ -383,7 +428,9 @@ pub struct Renderer {
     /// Индекс — `MeshId`; слот удалённого меша остаётся пустым, id не используются повторно.
     meshes: Vec<Option<MeshBuffers>>,
     /// Индекс — `TextureId`; слот удалённой текстуры остаётся пустым.
-    textures: Vec<Option<Texture>>,
+    textures: Vec<Option<Arc<Texture>>>,
+    /// Индекс — `MaterialId`; удалённые материалы остаются пустыми и не переиспользуются.
+    materials: Vec<Option<GpuMaterial>>,
     ui_textures: Vec<Option<UiTexture>>,
     viewports: Vec<Option<Viewport>>,
     retired: RetireQueue<RetiredResource>,
@@ -437,6 +484,7 @@ impl Renderer {
             pending_gpu_time: None,
             texture_sampler_anisotropy: None,
             frame_set_layout: None,
+            material_set_layout: None,
             texture_set_layout: None,
             frame_descriptor_pool: None,
             frame_uniforms: Vec::new(),
@@ -446,6 +494,7 @@ impl Renderer {
             max_texture_size: 0,
             meshes: Vec::new(),
             textures: Vec::new(),
+            materials: Vec::new(),
             ui_textures: Vec::new(),
             viewports: Vec::new(),
             retired: RetireQueue::new(FRAMES_IN_FLIGHT),
@@ -529,17 +578,59 @@ impl Renderer {
         Ok(())
     }
 
-    /// Загружает sRGB-текстуру RGBA8 со строками сверху вниз и ждёт завершения копирования.
+    /// Загружает sRGB-текстуру RGBA8 со строками сверху вниз.
     pub fn create_texture(
         &mut self,
         width: u32,
         height: u32,
         rgba: &[u8],
     ) -> Result<TextureId, RenderError> {
+        self.create_texture_with_color_space(width, height, rgba, TextureColorSpace::Srgb)
+    }
+
+    /// Загружает RGBA8-текстуру в заданном цветовом пространстве.
+    pub fn create_texture_with_color_space(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        color_space: TextureColorSpace,
+    ) -> Result<TextureId, RenderError> {
         validate_texture(width, height, rgba.len(), self.max_texture_size)?;
-        let texture = self.upload_texture(width, height, rgba)?;
+        let texture = Arc::new(self.upload_texture(width, height, rgba, color_space)?);
         self.textures.push(Some(texture));
         Ok(TextureId(self.textures.len() - 1))
+    }
+
+    /// Создаёт неизменяемый материал, ссылающийся только на текстуры совместимого цветового пространства.
+    pub fn create_material(&mut self, material: &Material) -> Result<MaterialId, RenderError> {
+        let spaces = self
+            .textures
+            .iter()
+            .map(|texture| texture.as_ref().map(|texture| texture.color_space))
+            .collect::<Vec<_>>();
+        validate_material(material, &spaces)?;
+        let gpu_material = self.upload_material(material)?;
+        self.materials.push(Some(gpu_material));
+        Ok(MaterialId(self.materials.len() - 1))
+    }
+
+    /// Удаляет неизменяемый материал после завершения его кадровых обращений.
+    pub fn destroy_material(&mut self, material: MaterialId) -> Result<(), RenderError> {
+        if material.0 == DEFAULT_MATERIAL {
+            return Err(RenderError::InvalidMaterial(
+                "встроенный материал нельзя удалить".to_owned(),
+            ));
+        }
+        let resource = self
+            .materials
+            .get_mut(material.0)
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                RenderError::InvalidMaterial("MaterialId не принадлежит renderer".to_owned())
+            })?;
+        self.retired.retire(RetiredResource::Material(resource));
+        Ok(())
     }
 
     /// Удаляет текстуру; ресурсы освобождаются после завершения отправленных кадров.
@@ -547,7 +638,7 @@ impl Renderer {
         let unknown =
             || RenderError::InvalidTexture("TextureId не принадлежит renderer".to_owned());
         // Встроенная белая текстура не выдаётся наружу и нужна всем DrawCommand без текстуры.
-        if texture.0 == WHITE_TEXTURE {
+        if texture.0 <= FLAT_NORMAL_TEXTURE {
             return Err(unknown());
         }
         let resource = self
@@ -575,9 +666,18 @@ impl Renderer {
         let sampler = self
             .ui_sampler
             .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?;
-        let texture = self.upload_image(UI_TEXTURE_FORMAT, sampler, 1, width, height, rgba)?;
+        let image = self.upload_image(UI_TEXTURE_FORMAT, 1, width, height, rgba)?;
+        let (pool, set) = allocate_image_set(
+            self.device()?,
+            self.texture_set_layout()?,
+            image.view,
+            sampler,
+        )?;
         self.ui_textures.push(Some(UiTexture {
-            texture,
+            device: self.device()?.clone(),
+            pool,
+            set,
+            image,
             extent: vk::Extent2D { width, height },
         }));
         Ok(UiTextureId(self.ui_textures.len() - 1))
@@ -594,7 +694,7 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let target = self.ui_texture(texture)?;
         validate_texture_region(region, target.extent, rgba.len())?;
-        let image = target.texture.image.image;
+        let image = target.image.image;
         let device = self.device()?;
         let staging = HostBuffer::new(
             self.instance()?,
@@ -706,7 +806,7 @@ impl Renderer {
 
     /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
-        validate_draws(frame.draws, &self.meshes, &self.textures)?;
+        validate_draws(frame.draws, &self.meshes, &self.materials)?;
         validate_overlay(frame.overlay)?;
         let uniforms = frame_uniform_bytes(frame)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
@@ -805,7 +905,7 @@ impl Renderer {
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
             frame_set,
             meshes: &self.meshes,
-            textures: &self.textures,
+            materials: &self.materials,
             draws: frame.draws,
             clear_color: frame.clear_color,
             timestamps,
@@ -867,7 +967,7 @@ impl Renderer {
         validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
         let mut scene_uniforms = Vec::with_capacity(scenes.len());
         for (viewport, frame) in scenes {
-            validate_draws(frame.draws, &self.meshes, &self.textures)?;
+            validate_draws(frame.draws, &self.meshes, &self.materials)?;
             self.viewports
                 .get(viewport.0)
                 .and_then(Option::as_ref)
@@ -986,7 +1086,7 @@ impl Renderer {
         let mut draws = Vec::with_capacity(packed.draws.len());
         for draw in &packed.draws {
             let (set, image_is_linear) = match draw.image {
-                UiImage::Texture(texture) => (self.ui_texture(texture)?.texture.set, false),
+                UiImage::Texture(texture) => (self.ui_texture(texture)?.set, false),
                 UiImage::Viewport(viewport) => {
                     if !rendered.iter().any(|(drawn, _, _)| *drawn == viewport) {
                         continue;
@@ -1033,7 +1133,7 @@ impl Renderer {
                         pipeline_layout,
                         frame_set: *frame_set,
                         meshes: &self.meshes,
-                        textures: &self.textures,
+                        materials: &self.materials,
                         draws: frame.draws,
                         clear_color: frame.clear_color,
                         timestamps: slot_timestamps.filter(|_| index == 0),
@@ -1389,8 +1489,19 @@ impl Renderer {
         self.create_shadow_pipeline()?;
         self.create_overlay_pipeline()?;
         self.create_ui_pipeline()?;
-        let white = self.upload_texture(1, 1, &[255; 4])?;
-        self.textures.push(Some(white));
+        let white_srgb = Arc::new(self.upload_texture(1, 1, &[255; 4], TextureColorSpace::Srgb)?);
+        self.textures.push(Some(white_srgb));
+        let white_linear =
+            Arc::new(self.upload_texture(1, 1, &[255; 4], TextureColorSpace::Linear)?);
+        self.textures.push(Some(white_linear));
+        let flat_normal = Arc::new(self.upload_texture(
+            1,
+            1,
+            &[128, 128, 255, 255],
+            TextureColorSpace::Linear,
+        )?);
+        self.textures.push(Some(flat_normal));
+        self.create_material(&Material::default())?;
 
         if self.output_extent.width != 0 && self.output_extent.height != 0 {
             self.recreate_swapchain()?;
@@ -1441,6 +1552,39 @@ impl Renderer {
         // SAFETY: bindings match the shared frame uniform and sampled shadow map shaders.
         self.frame_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&frame_layout_info, None) }?);
+        let material_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let material_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&material_bindings);
+        // SAFETY: the bindings match the fragment material uniform, three maps and shared sampler.
+        self.material_set_layout =
+            Some(unsafe { device.create_descriptor_set_layout(&material_layout_info, None) }?);
+
         let texture_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -1455,7 +1599,7 @@ impl Renderer {
         ];
         let texture_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&texture_bindings);
-        // SAFETY: the bindings describe a fragment-stage sampled image and sampler.
+        // SAFETY: UI and viewport shaders use one sampled image and one sampler.
         self.texture_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&texture_layout_info, None) }?);
 
@@ -1536,24 +1680,28 @@ impl Renderer {
         Ok(())
     }
 
-    /// Копирует пиксели через staging-буфер в device-local image и создаёт её дескрипторы.
-    fn upload_texture(&self, width: u32, height: u32, rgba: &[u8]) -> Result<Texture, RenderError> {
-        let sampler = self
-            .sampler
-            .ok_or(RenderError::InvalidState("sampler отсутствует"))?;
+    /// Копирует пиксели через staging-буфер в device-local image.
+    fn upload_texture(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        color_space: TextureColorSpace,
+    ) -> Result<Texture, RenderError> {
         let mip_levels = mip_level_count(width, height);
-        self.upload_image(TEXTURE_FORMAT, sampler, mip_levels, width, height, rgba)
+        let format = texture_format(color_space);
+        let image = self.upload_image(format, mip_levels, width, height, rgba)?;
+        Ok(Texture { image, color_space })
     }
 
     fn upload_image(
         &self,
         format: vk::Format,
-        sampler: vk::Sampler,
         mip_levels: u32,
         width: u32,
         height: u32,
         rgba: &[u8],
-    ) -> Result<Texture, RenderError> {
+    ) -> Result<DeviceImage, RenderError> {
         let device = self.device()?;
         let extent = vk::Extent2D { width, height };
         let image = DeviceImage::new(
@@ -1636,19 +1784,114 @@ impl Renderer {
         })?;
         drop(staging);
 
-        let mut texture = Texture {
-            device: device.clone(),
-            pool: vk::DescriptorPool::null(),
-            set: vk::DescriptorSet::null(),
-            image,
-        };
-        (texture.pool, texture.set) = allocate_image_set(
+        Ok(image)
+    }
+
+    fn upload_material(&self, material: &Material) -> Result<GpuMaterial, RenderError> {
+        let device = self.device()?;
+        let uniform_buffer = HostBuffer::new(
+            self.instance()?,
             device,
-            self.texture_set_layout()?,
-            texture.image.view,
-            sampler,
+            self.physical_device,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &material_uniform_bytes(material),
         )?;
-        Ok(texture)
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(3),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        // SAFETY: the pool holds one material uniform, three images and one sampler.
+        let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+        let result = (|| {
+            let layouts = [self.material_set_layout()?];
+            let allocate_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            // SAFETY: the pool was sized for one material set of this layout.
+            let set = unsafe { device.allocate_descriptor_sets(&allocate_info) }?
+                .into_iter()
+                .next()
+                .ok_or(RenderError::InvalidState(
+                    "не создан material descriptor set",
+                ))?;
+
+            let texture_for = |texture: Option<TextureId>, fallback: usize| {
+                self.textures
+                    .get(texture.map_or(fallback, |texture| texture.0))
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .ok_or(RenderError::InvalidState("material texture отсутствует"))
+            };
+            let texture_refs = [
+                texture_for(material.base_color_texture, WHITE_SRGB_TEXTURE)?,
+                texture_for(material.metallic_roughness_texture, WHITE_LINEAR_TEXTURE)?,
+                texture_for(material.normal_texture, FLAT_NORMAL_TEXTURE)?,
+            ];
+            let image_infos: [vk::DescriptorImageInfo; 3] = std::array::from_fn(|index| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(texture_refs[index].image.view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            });
+            let sampler = self
+                .sampler
+                .ok_or(RenderError::InvalidState("sampler отсутствует"))?;
+            let sampler_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
+            let buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(uniform_buffer.buffer)
+                .offset(0)
+                .range(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&buffer_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&image_infos[0..1]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&image_infos[1..2]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&image_infos[2..3]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&sampler_info),
+            ];
+            // SAFETY: texture_refs keep every image alive until this material descriptor pool drops.
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            Ok(GpuMaterial {
+                device: device.clone(),
+                pool,
+                set,
+                _uniform_buffer: uniform_buffer,
+                _textures: texture_refs,
+            })
+        })();
+        if result.is_err() {
+            // SAFETY: allocation failed before the descriptor pool was published or used.
+            unsafe { device.destroy_descriptor_pool(pool, None) };
+        }
+        result
     }
 
     /// Записывает одноразовый command buffer, отправляет его и ждёт завершения.
@@ -1696,7 +1939,7 @@ impl Renderer {
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
             .size(PUSH_CONSTANTS_SIZE as u32)];
-        let set_layouts = [self.frame_set_layout()?, self.texture_set_layout()?];
+        let set_layouts = [self.frame_set_layout()?, self.material_set_layout()?];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&push_constant_ranges);
@@ -2147,9 +2390,15 @@ impl Renderer {
         ))
     }
 
+    fn material_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
+        self.material_set_layout.ok_or(RenderError::InvalidState(
+            "layout дескрипторов материала отсутствует",
+        ))
+    }
+
     fn texture_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
         self.texture_set_layout.ok_or(RenderError::InvalidState(
-            "layout дескрипторов текстуры отсутствует",
+            "layout дескрипторов UI-текстуры отсутствует",
         ))
     }
 }
@@ -2166,6 +2415,7 @@ impl Drop for Renderer {
         self.viewports.clear();
         self.ui_textures.clear();
         self.meshes.clear();
+        self.materials.clear();
         self.textures.clear();
         self.frame_uniforms.clear();
         if let Some(device) = self.device.as_ref() {
@@ -2174,7 +2424,7 @@ impl Drop for Renderer {
                 unsafe { device.destroy_descriptor_pool(pool, None) };
             }
             if let Some(sampler) = self.sampler.take() {
-                // SAFETY: every texture descriptor referencing the sampler was destroyed above.
+                // SAFETY: every material descriptor referencing the sampler was destroyed above.
                 unsafe { device.destroy_sampler(sampler, None) };
             }
             if let Some(sampler) = self.ui_sampler.take() {
@@ -2217,9 +2467,13 @@ impl Drop for Renderer {
                 // SAFETY: the only pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
-            for layout in [self.frame_set_layout.take(), self.texture_set_layout.take()]
-                .into_iter()
-                .flatten()
+            for layout in [
+                self.frame_set_layout.take(),
+                self.material_set_layout.take(),
+                self.texture_set_layout.take(),
+            ]
+            .into_iter()
+            .flatten()
             {
                 // SAFETY: the pipeline layout and all descriptor pools using it are gone.
                 unsafe { device.destroy_descriptor_set_layout(layout, None) };
@@ -2380,13 +2634,23 @@ fn inspect_device(
             .collect(),
     };
     let evaluation = evaluate_device(&facts, required_extensions);
+    let srgb_features = unsafe {
+        instance.get_physical_device_format_properties(physical_device, SRGB_TEXTURE_FORMAT)
+    }
+    .optimal_tiling_features;
+    let linear_features = unsafe {
+        instance.get_physical_device_format_properties(physical_device, LINEAR_TEXTURE_FORMAT)
+    }
+    .optimal_tiling_features;
+    let mut reasons = evaluation.reasons;
+    reasons.extend(texture_format_reasons(srgb_features, linear_features));
     let report = DeviceReport {
         name,
         vendor_id: properties.vendor_id,
         api_version: properties.api_version,
         discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
-        suitable: evaluation.reasons.is_empty(),
-        reasons: evaluation.reasons,
+        suitable: reasons.is_empty(),
+        reasons,
     };
 
     Ok(DeviceInspection {
@@ -2468,19 +2732,6 @@ fn choose_device(
                 "D32_SFLOAT не поддерживает depth attachment и выборку shadow map".to_owned(),
             );
         }
-        // SAFETY: format support is queried for this physical device.
-        let texture_properties = unsafe {
-            instance.get_physical_device_format_properties(physical_device, TEXTURE_FORMAT)
-        };
-        let missing_texture_features =
-            missing_texture_format_features(texture_properties.optimal_tiling_features);
-        if !missing_texture_features.is_empty() {
-            reasons.push(format!(
-                "R8G8B8A8_SRGB не поддерживает возможности: {}",
-                missing_texture_features.join(", ")
-            ));
-        }
-
         // SAFETY: the surface and physical device belong to the same live instance.
         let surface_capabilities = unsafe {
             surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
@@ -3077,14 +3328,25 @@ struct Viewport {
 }
 
 struct UiTexture {
-    texture: Texture,
+    device: ash::Device,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    image: DeviceImage,
     extent: vk::Extent2D,
+}
+
+impl Drop for UiTexture {
+    fn drop(&mut self) {
+        // SAFETY: retired UI textures are dropped only after their submitted frames complete.
+        unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
+    }
 }
 
 /// Ресурс, ожидающий завершения отправленных кадров; освобождается своим `Drop`.
 enum RetiredResource {
     Mesh(#[allow(dead_code)] MeshBuffers),
-    Texture(#[allow(dead_code)] Texture),
+    Texture(#[allow(dead_code)] Arc<Texture>),
+    Material(#[allow(dead_code)] GpuMaterial),
     UiTexture(#[allow(dead_code)] UiTexture),
     Viewport(#[allow(dead_code)] Viewport),
 }
@@ -3533,7 +3795,7 @@ struct ScenePass<'a> {
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
     meshes: &'a [Option<MeshBuffers>],
-    textures: &'a [Option<Texture>],
+    materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
     clear_color: [f32; 4],
     timestamps: Option<vk::QueryPool>,
@@ -3604,21 +3866,24 @@ fn record_draws(
     }
     for draw in scene.draws {
         // Индексы проверены validate_draws до начала кадра.
-        let (Some(mesh), Some(texture)) = (
-            &scene.meshes[draw.mesh.0],
-            &scene.textures[draw.texture.map_or(WHITE_TEXTURE, |texture| texture.0)],
+        let (Some(mesh), Some(material)) = (
+            scene.meshes[draw.mesh.0].as_ref(),
+            scene.materials[draw
+                .material
+                .map_or(DEFAULT_MATERIAL, |material| material.0)]
+            .as_ref(),
         ) else {
             continue;
         };
         let push_constants = push_constant_bytes(&draw.model);
-        // SAFETY: mesh buffers and textures stay alive until the device is idle and match the pipeline layout.
+        // SAFETY: mesh buffers and material descriptors stay alive until this frame's fence completes.
         unsafe {
             device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 scene.pipeline_layout,
                 1,
-                &[texture.set],
+                &[material.set],
                 &[],
             );
             device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer.buffer], &[0]);
@@ -4170,6 +4435,34 @@ fn missing_texture_format_features(supported: vk::FormatFeatureFlags) -> Vec<&'s
     .collect()
 }
 
+fn texture_format(color_space: TextureColorSpace) -> vk::Format {
+    match color_space {
+        TextureColorSpace::Srgb => SRGB_TEXTURE_FORMAT,
+        TextureColorSpace::Linear => LINEAR_TEXTURE_FORMAT,
+    }
+}
+
+fn texture_format_reasons(
+    srgb_features: vk::FormatFeatureFlags,
+    linear_features: vk::FormatFeatureFlags,
+) -> Vec<String> {
+    [
+        ("R8G8B8A8_SRGB", srgb_features),
+        ("R8G8B8A8_UNORM", linear_features),
+    ]
+    .into_iter()
+    .filter_map(|(format, features)| {
+        let missing = missing_texture_format_features(features);
+        (!missing.is_empty()).then(|| {
+            format!(
+                "{format} не поддерживает возможности: {}",
+                missing.join(", ")
+            )
+        })
+    })
+    .collect()
+}
+
 fn color_subresource_range() -> vk::ImageSubresourceRange {
     color_mip_subresource_range(0, 1)
 }
@@ -4232,18 +4525,25 @@ struct FrameUniforms {
     set: vk::DescriptorSet,
 }
 
-/// Текстура в device-local памяти с собственным пулом на один набор дескрипторов.
+/// Текстура в device-local памяти; материал выбирает её цветовое пространство.
 struct Texture {
+    image: DeviceImage,
+    color_space: TextureColorSpace,
+}
+
+/// Материал владеет uniform buffer и descriptor pool для собственного набора.
+struct GpuMaterial {
     device: ash::Device,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
-    image: DeviceImage,
+    _uniform_buffer: HostBuffer,
+    _textures: [Arc<Texture>; 3],
 }
 
-impl Drop for Texture {
+impl Drop for GpuMaterial {
     fn drop(&mut self) {
         if self.pool != vk::DescriptorPool::null() {
-            // SAFETY: the renderer waits for device idle before dropping textures; this frees the set.
+            // SAFETY: retirement waits for submitted frames; this frees the set before owned texture refs.
             unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
         }
     }
@@ -4380,7 +4680,7 @@ fn validate_mesh(vertex_count: usize, indices: &[u32]) -> Result<(), RenderError
 fn validate_draws<M, T>(
     draws: &[DrawCommand],
     meshes: &[Option<M>],
-    textures: &[Option<T>],
+    materials: &[Option<T>],
 ) -> Result<(), RenderError> {
     if draws
         .iter()
@@ -4388,15 +4688,81 @@ fn validate_draws<M, T>(
     {
         return Err(RenderError::InvalidMesh("MeshId не принадлежит renderer"));
     }
-    if draws.iter().any(|draw| {
-        draw.texture
-            .is_some_and(|texture| !textures.get(texture.0).is_some_and(Option::is_some))
-    }) {
-        return Err(RenderError::InvalidTexture(
-            "TextureId не принадлежит renderer".to_owned(),
-        ));
+    for draw in draws {
+        let material = draw
+            .material
+            .map_or(DEFAULT_MATERIAL, |material| material.0);
+        if !materials.get(material).is_some_and(Option::is_some) {
+            return Err(RenderError::InvalidMaterial(
+                "MaterialId не принадлежит renderer".to_owned(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn validate_material(
+    material: &Material,
+    texture_spaces: &[Option<TextureColorSpace>],
+) -> Result<(), RenderError> {
+    let valid_factor = |value: f32| value.is_finite() && (0.0..=1.0).contains(&value);
+    if !material.base_color.into_iter().all(valid_factor)
+        || !valid_factor(material.metallic)
+        || !valid_factor(material.roughness)
+        || !material.normal_scale.is_finite()
+    {
+        return Err(RenderError::InvalidMaterial(
+            "факторы должны быть конечными, base_color/metallic/roughness — в [0, 1]".to_owned(),
+        ));
+    }
+    let check_texture = |texture: Option<TextureId>, expected: TextureColorSpace, name: &str| {
+        let Some(texture) = texture else {
+            return Ok(());
+        };
+        let Some(Some(actual)) = texture_spaces.get(texture.0) else {
+            return Err(RenderError::InvalidMaterial(format!(
+                "TextureId для {name} не принадлежит renderer"
+            )));
+        };
+        if *actual != expected {
+            return Err(RenderError::InvalidMaterial(format!(
+                "{name} должен иметь цветовое пространство {expected:?}"
+            )));
+        }
+        Ok(())
+    };
+    check_texture(
+        material.base_color_texture,
+        TextureColorSpace::Srgb,
+        "base_color_texture",
+    )?;
+    check_texture(
+        material.metallic_roughness_texture,
+        TextureColorSpace::Linear,
+        "metallic_roughness_texture",
+    )?;
+    check_texture(
+        material.normal_texture,
+        TextureColorSpace::Linear,
+        "normal_texture",
+    )
+}
+
+fn material_uniform_bytes(material: &Material) -> [u8; MATERIAL_UNIFORMS_SIZE] {
+    float_bytes(&[
+        material.base_color[0],
+        material.base_color[1],
+        material.base_color[2],
+        1.0,
+        material.metallic,
+        material.roughness,
+        material.normal_scale,
+        if material.normal_texture.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+    ])
 }
 
 fn validate_texture(
@@ -4465,6 +4831,7 @@ fn index_bytes(indices: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
 }
 
+/// Байты `FrameUniforms` в порядке std140: две матрицы и пять `vec4`.
 /// Viewport рисуется в кадре один раз: его цель и uniform-буфер принадлежат одной сцене.
 fn validate_scene_viewports(
     viewports: impl Iterator<Item = ViewportId>,
@@ -4481,7 +4848,6 @@ fn validate_scene_viewports(
     Ok(())
 }
 
-/// Байты `FrameUniforms` в порядке std140: две матрицы и четыре `vec4`.
 fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
     let light = frame.light;
     let [x, y, z] = light.direction;
@@ -4515,6 +4881,12 @@ fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], R
         },
         1.0 / SHADOW_MAP_SIZE as f32,
         0.0,
+        0.0,
+    ]);
+    values[48..52].copy_from_slice(&[
+        frame.camera_position[0],
+        frame.camera_position[1],
+        frame.camera_position[2],
         0.0,
     ]);
     Ok(float_bytes(&values))
@@ -4563,6 +4935,82 @@ fn normal_matrix(model: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     }
     result[3][3] = 1.0;
     result
+}
+
+#[cfg(test)]
+fn derivative_tangent_basis(
+    dp1: [f32; 3],
+    dp2: [f32; 3],
+    duv1: [f32; 2],
+    duv2: [f32; 2],
+    normal: [f32; 3],
+) -> Option<([f32; 3], [f32; 3])> {
+    let determinant = duv1[0] * duv2[1] - duv1[1] * duv2[0];
+    if !determinant.is_finite()
+        || determinant.abs() <= 1e-8
+        || !dp1.into_iter().chain(dp2).all(f32::is_finite)
+    {
+        return None;
+    }
+    let normal = try_normalize3(normal).unwrap_or([0.0, 0.0, 1.0]);
+    let mut tangent = scale3(
+        sub3(scale3(dp1, duv2[1]), scale3(dp2, duv1[1])),
+        determinant.recip(),
+    );
+    let mut bitangent = scale3(
+        sub3(scale3(dp2, duv1[0]), scale3(dp1, duv2[0])),
+        -determinant.recip(),
+    );
+    tangent = sub3(tangent, scale3(normal, dot3(tangent, normal)));
+    bitangent = sub3(bitangent, scale3(normal, dot3(bitangent, normal)));
+    Some((try_normalize3(tangent)?, try_normalize3(bitangent)?))
+}
+
+#[cfg(test)]
+fn transform_tangent_normal(
+    tangent: [f32; 3],
+    bitangent: [f32; 3],
+    normal: [f32; 3],
+    tangent_normal: [f32; 3],
+) -> [f32; 3] {
+    let mapped = add3(
+        add3(
+            scale3(tangent, tangent_normal[0]),
+            scale3(bitangent, tangent_normal[1]),
+        ),
+        scale3(normal, tangent_normal[2]),
+    );
+    try_normalize3(mapped).unwrap_or(normal)
+}
+
+#[cfg(test)]
+fn try_normalize3(value: [f32; 3]) -> Option<[f32; 3]> {
+    let length_squared = dot3(value, value);
+    if !length_squared.is_finite() || length_squared <= 1e-20 {
+        None
+    } else {
+        Some(scale3(value, length_squared.sqrt().recip()))
+    }
+}
+
+#[cfg(test)]
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+#[cfg(test)]
+fn scale3(value: [f32; 3], scale: f32) -> [f32; 3] {
+    [value[0] * scale, value[1] * scale, value[2] * scale]
+}
+
+#[cfg(test)]
+fn sub3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
+}
+
+#[cfg(test)]
+fn add3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] + right[0], left[1] + right[1], left[2] + right[2]]
 }
 
 fn deduplicate_names(names: Vec<CString>) -> Vec<CString> {
@@ -4662,19 +5110,22 @@ fn select_composite_alpha(
 mod tests {
     use super::{
         AcquireAction, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
-        FRAME_UNIFORMS_SIZE, Frame, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, MeshId,
-        OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure,
-        RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER, TextureId, UI_FRAGMENT_SHADER,
+        FRAME_UNIFORMS_SIZE, Frame, MATERIAL_UNIFORMS_SIZE, MESH_FRAGMENT_SHADER,
+        MESH_VERTEX_SHADER, Material, MaterialId, MeshId, OVERLAY_FRAGMENT_SHADER,
+        OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure, RenderError, Renderer,
+        RendererConfig, SHADOW_VERTEX_SHADER, TextureColorSpace, TextureId, UI_FRAGMENT_SHADER,
         UI_VERTEX_SHADER, Vertex, best_device_index, check_extensions, classify_acquire_result,
-        classify_probe_instance_failure, deduplicate_names, evaluate_device, frame_uniform_bytes,
-        index_bytes, material_sampler_info, mip_extent, mip_level_count, missing_extensions,
+        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
+        evaluate_device, frame_uniform_bytes, index_bytes, material_sampler_info,
+        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
         missing_texture_format_features, normal_matrix, offscreen_previous_use,
         overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
         scene_viewport, select_composite_alpha, select_surface_extent, shadow_casters,
-        texture_mip_blit_region, texture_mip_destination_shader_barrier,
-        texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
-        timestamp_duration, validate_draws, validate_mesh, validate_overlay, validate_render_scale,
-        validate_texture, vertex_bytes,
+        texture_format, texture_format_reasons, texture_mip_blit_region,
+        texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
+        texture_mip_source_barrier, texture_upload_barrier, timestamp_duration,
+        transform_tangent_normal, validate_draws, validate_material, validate_mesh,
+        validate_overlay, validate_render_scale, validate_texture, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -4885,6 +5336,33 @@ mod tests {
     }
 
     #[test]
+    fn texture_formats_require_sampled_blit_and_transfer_support_in_both_spaces() {
+        let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::TRANSFER_DST
+            | vk::FormatFeatureFlags::BLIT_SRC
+            | vk::FormatFeatureFlags::BLIT_DST;
+        assert_eq!(
+            texture_format(TextureColorSpace::Srgb),
+            vk::Format::R8G8B8A8_SRGB
+        );
+        assert_eq!(
+            texture_format(TextureColorSpace::Linear),
+            vk::Format::R8G8B8A8_UNORM
+        );
+        assert!(texture_format_reasons(required, required).is_empty());
+        let srgb_missing =
+            texture_format_reasons(required & !vk::FormatFeatureFlags::BLIT_SRC, required);
+        assert_eq!(srgb_missing.len(), 1);
+        assert!(srgb_missing[0].contains("R8G8B8A8_SRGB"));
+        let linear_missing =
+            texture_format_reasons(required, required & !vk::FormatFeatureFlags::TRANSFER_DST);
+        assert_eq!(linear_missing.len(), 1);
+        assert!(linear_missing[0].contains("R8G8B8A8_UNORM"));
+    }
+
+    #[test]
     fn device_evaluation_accepts_all_shared_requirements() {
         let facts = DeviceFacts {
             api_version: vk::make_api_version(0, 1, 3, 0),
@@ -5088,6 +5566,98 @@ mod tests {
         }
     }
 
+    fn ggx_shader_has_analytic_peak(source: &str) -> bool {
+        let normalized = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let Some(function_start) = normalized.find("floatdistribution_ggx(") else {
+            return false;
+        };
+        let Some(body_offset) = normalized[function_start..].find('{') else {
+            return false;
+        };
+        let body_start = function_start + body_offset;
+        let Some(body_length) = normalized[body_start..].find('}') else {
+            return false;
+        };
+        let body = &normalized[body_start..=body_start + body_length];
+        [
+            "floatnormal_dot_half=clamp(normal_dot_half_input,0.0,1.0);",
+            "floatalpha_squared=alpha*alpha;",
+            "floatdenominator=(1.0-normal_dot_half*normal_dot_half)+alpha_squared*normal_dot_half*normal_dot_half;",
+            "denominator=max(denominator,alpha_squared);",
+            "returnalpha_squared/(PI*denominator*denominator);",
+        ]
+        .iter()
+        .all(|expression| body.contains(expression))
+            && !body.contains("max(PI*denominator*denominator,1e-7)")
+    }
+
+    #[test]
+    fn ggx_shader_preserves_the_analytic_low_roughness_peak() {
+        const PI: f32 = std::f32::consts::PI;
+        let shader = include_str!("../shaders/mesh.frag");
+        let shader_lf = shader.replace("\r\n", "\n");
+        assert!(ggx_shader_has_analytic_peak(shader));
+        assert!(ggx_shader_has_analytic_peak(&shader_lf));
+
+        let function_lf = "float distribution_ggx(float normal_dot_half_input, float alpha) {\n    float normal_dot_half = clamp(normal_dot_half_input, 0.0, 1.0);\n    float alpha_squared = alpha * alpha;\n    float denominator = (1.0 - normal_dot_half * normal_dot_half) + alpha_squared * normal_dot_half * normal_dot_half;\n    denominator = max(denominator, alpha_squared);\n    return alpha_squared / (PI * denominator * denominator);\n}";
+        let function_crlf = function_lf.replace('\n', "\r\n");
+        assert!(ggx_shader_has_analytic_peak(function_lf));
+        assert!(ggx_shader_has_analytic_peak(&function_crlf));
+
+        let shader_whitespace_variant = function_lf
+            .replace("float distribution_ggx(", "float \t distribution_ggx (")
+            .replace(
+                "normal_dot_half * normal_dot_half",
+                "normal_dot_half \t *\r\n normal_dot_half",
+            );
+        assert!(ggx_shader_has_analytic_peak(&shader_whitespace_variant));
+
+        let clipped_shader = "float distribution_ggx(float normal_dot_half_input, float alpha) {\n    float normal_dot_half = clamp(normal_dot_half_input, 0.0, 1.0);\n    float alpha_squared = alpha * alpha;\n    float denominator = (1.0 - normal_dot_half * normal_dot_half) + alpha_squared * normal_dot_half * normal_dot_half;\n    denominator = max(denominator, alpha_squared);\n    return alpha_squared / max(PI * denominator * denominator, 1e-7);\n}";
+        assert!(!ggx_shader_has_analytic_peak(clipped_shader));
+
+        let distribution = |normal_dot_half: f32, roughness: f32| {
+            let normal_dot_half = normal_dot_half.clamp(0.0, 1.0);
+            let alpha = roughness * roughness;
+            let alpha_squared = alpha * alpha;
+            let denominator = ((1.0 - normal_dot_half * normal_dot_half)
+                + alpha_squared * normal_dot_half * normal_dot_half)
+                .max(alpha_squared);
+            alpha_squared / (PI * denominator * denominator)
+        };
+        let roughnesses = [0.045, 0.1, 0.25, 1.0];
+        let mut peaks = Vec::with_capacity(roughnesses.len());
+        for roughness in roughnesses {
+            let alpha = roughness * roughness;
+            let alpha_squared = alpha * alpha;
+            let expected_peak = 1.0 / (PI * alpha_squared);
+            let peak = distribution(1.0, roughness);
+            assert!(
+                (peak / expected_peak - 1.0).abs() < 2e-5,
+                "{roughness}: {peak}"
+            );
+            assert!(distribution(0.0, roughness).is_finite());
+            assert!(distribution(-0.5, roughness).is_finite());
+            assert!(distribution(1.5, roughness).is_finite());
+            peaks.push(peak);
+        }
+
+        assert!(peaks[0] > peaks[1] && peaks[1] > peaks[2] && peaks[2] > peaks[3]);
+        let low_roughness_shoulder = distribution(0.99, roughnesses[0]) / peaks[0];
+        let next_shoulder = distribution(0.99, roughnesses[1]) / peaks[1];
+        assert!(low_roughness_shoulder < next_shoulder);
+        assert_eq!(
+            distribution(-0.5, roughnesses[0]),
+            distribution(0.0, roughnesses[0])
+        );
+        assert_eq!(
+            distribution(1.5, roughnesses[0]),
+            distribution(1.0, roughnesses[0])
+        );
+    }
+
     #[test]
     fn mesh_validation_accepts_triangle_lists_inside_vertex_range() {
         assert!(validate_mesh(3, &[0, 1, 2]).is_ok());
@@ -5154,7 +5724,7 @@ mod tests {
     fn shadow_pass_skips_draws_that_do_not_cast_shadows() {
         let draw = |mesh, casts_shadow| DrawCommand {
             mesh: MeshId(mesh),
-            texture: None,
+            material: None,
             model: IDENTITY,
             casts_shadow,
         };
@@ -5164,10 +5734,10 @@ mod tests {
     }
 
     #[test]
-    fn draw_validation_rejects_unknown_meshes_and_textures() {
-        let draw = |mesh, texture: Option<usize>| DrawCommand {
+    fn draw_validation_rejects_unknown_meshes_and_materials() {
+        let draw = |mesh, material: Option<usize>| DrawCommand {
             mesh: MeshId(mesh),
-            texture: texture.map(TextureId),
+            material: material.map(MaterialId),
             model: IDENTITY,
             casts_shadow: true,
         };
@@ -5180,27 +5750,207 @@ mod tests {
         ));
         assert!(matches!(
             validate_draws(&[draw(0, Some(2))], &slots(1), &slots(2)),
-            Err(RenderError::InvalidTexture(_))
+            Err(RenderError::InvalidMaterial(_))
+        ));
+        assert!(matches!(
+            validate_draws(&[draw(0, None)], &slots(1), &slots(0)),
+            Err(RenderError::InvalidMaterial(_))
         ));
     }
 
     #[test]
-    fn draw_validation_rejects_destroyed_meshes_and_textures() {
-        let draw = |mesh, texture: Option<usize>| DrawCommand {
+    fn material_validation_checks_factors_texture_ids_and_color_spaces() {
+        let spaces = [
+            Some(TextureColorSpace::Srgb),
+            Some(TextureColorSpace::Linear),
+        ];
+        assert!(validate_material(&Material::default(), &spaces).is_ok());
+        assert!(
+            validate_material(
+                &Material {
+                    base_color: [0.0, 1.0, 0.5],
+                    metallic: 1.0,
+                    roughness: 0.0,
+                    normal_scale: -3.0,
+                    ..Material::default()
+                },
+                &spaces
+            )
+            .is_ok()
+        );
+        for material in [
+            Material {
+                base_color: [f32::NAN, 0.0, 0.0],
+                ..Material::default()
+            },
+            Material {
+                base_color: [1.01, 0.0, 0.0],
+                ..Material::default()
+            },
+            Material {
+                metallic: f32::INFINITY,
+                ..Material::default()
+            },
+            Material {
+                roughness: -0.01,
+                ..Material::default()
+            },
+            Material {
+                normal_scale: f32::NAN,
+                ..Material::default()
+            },
+        ] {
+            assert!(matches!(
+                validate_material(&material, &spaces),
+                Err(RenderError::InvalidMaterial(_))
+            ));
+        }
+        for material in [
+            Material {
+                base_color_texture: Some(TextureId(1)),
+                ..Material::default()
+            },
+            Material {
+                metallic_roughness_texture: Some(TextureId(0)),
+                ..Material::default()
+            },
+            Material {
+                normal_texture: Some(TextureId(0)),
+                ..Material::default()
+            },
+            Material {
+                normal_texture: Some(TextureId(2)),
+                ..Material::default()
+            },
+        ] {
+            assert!(matches!(
+                validate_material(&material, &spaces),
+                Err(RenderError::InvalidMaterial(_))
+            ));
+        }
+        assert!(
+            validate_material(
+                &Material {
+                    base_color_texture: Some(TextureId(0)),
+                    metallic_roughness_texture: Some(TextureId(1)),
+                    normal_texture: Some(TextureId(1)),
+                    ..Material::default()
+                },
+                &spaces
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn material_uniforms_pack_base_color_and_parameters_into_two_vec4s() {
+        let material = Material {
+            base_color: [0.2, 0.4, 0.8],
+            metallic: 0.3,
+            roughness: 0.7,
+            normal_texture: Some(TextureId(2)),
+            normal_scale: 1.5,
+            ..Material::default()
+        };
+        assert_eq!(MATERIAL_UNIFORMS_SIZE, 32);
+        assert_eq!(
+            floats(&material_uniform_bytes(&material)),
+            [0.2, 0.4, 0.8, 1.0, 0.3, 0.7, 1.5, 1.0]
+        );
+        assert_eq!(
+            &floats(&material_uniform_bytes(&Material::default()))[4..8],
+            &[0.0, 1.0, 1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn derivative_tangent_basis_maps_v_down_texels_and_preserves_mirrored_orientation() {
+        let normal = [0.0, 0.0, 1.0];
+        let basis = derivative_tangent_basis(
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            normal,
+        )
+        .unwrap();
+        assert_close(basis.0, [1.0, 0.0, 0.0]);
+        assert_close(basis.1, [0.0, 1.0, 0.0]);
+        let texel = [0.5, 1.0, 0.5];
+        let tangent_normal = [
+            texel[0] * 2.0 - 1.0,
+            texel[1] * 2.0 - 1.0,
+            texel[2] * 2.0 - 1.0,
+        ];
+        assert_close(
+            transform_tangent_normal(basis.0, basis.1, normal, tangent_normal),
+            [0.0, 1.0, 0.0],
+        );
+
+        let mirrored = derivative_tangent_basis(
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [-1.0, 0.0],
+            [0.0, 1.0],
+            normal,
+        )
+        .unwrap();
+        assert_close(mirrored.0, [-1.0, 0.0, 0.0]);
+        assert_close(mirrored.1, [0.0, 1.0, 0.0]);
+        assert_close(
+            transform_tangent_normal(mirrored.0, mirrored.1, normal, [1.0, 0.0, 0.0]),
+            [-1.0, 0.0, 0.0],
+        );
+        assert_close(
+            transform_tangent_normal(mirrored.0, mirrored.1, normal, [0.0, 1.0, 0.0]),
+            [0.0, 1.0, 0.0],
+        );
+        let degenerate = derivative_tangent_basis(
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 0.0],
+            normal,
+        )
+        .unwrap_or(([0.0; 3], [0.0; 3]));
+        assert_close(
+            transform_tangent_normal(degenerate.0, degenerate.1, normal, [0.0, 0.0, 1.0]),
+            normal,
+        );
+        assert!(
+            derivative_tangent_basis(
+                [1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [1.0, 0.0],
+                [2.0, 0.0],
+                normal,
+            )
+            .is_none()
+        );
+        assert!(
+            derivative_tangent_basis([0.0; 3], [0.0; 3], [1.0, 0.0], [0.0, 1.0], normal,).is_none()
+        );
+    }
+
+    #[test]
+    fn draw_validation_rejects_destroyed_meshes_and_materials() {
+        let draw = |mesh, material: Option<usize>| DrawCommand {
             mesh: MeshId(mesh),
-            texture: texture.map(TextureId),
+            material: material.map(MaterialId),
             model: IDENTITY,
             casts_shadow: true,
         };
-        let alive = vec![Some(()), Some(())];
-        let destroyed = vec![Some(()), None];
+        let alive_meshes = vec![Some(()), Some(())];
+        let alive_materials = vec![Some(()), Some(())];
+        let destroyed_mesh = vec![Some(()), None];
+        let destroyed_material = vec![Some(()), None];
         assert!(matches!(
-            validate_draws(&[draw(1, None)], &destroyed, &alive),
+            validate_draws(&[draw(1, None)], &destroyed_mesh, &alive_materials),
             Err(RenderError::InvalidMesh(_))
         ));
         assert!(matches!(
-            validate_draws(&[draw(0, Some(1))], &alive, &destroyed),
-            Err(RenderError::InvalidTexture(_))
+            validate_draws(&[draw(0, Some(1))], &alive_meshes, &destroyed_material),
+            Err(RenderError::InvalidMaterial(_))
         ));
     }
 
@@ -5349,12 +6099,13 @@ mod tests {
             clear_color: [0.0; 4],
             view_projection: matrix(1.0),
             shadow_view_projection: Some(matrix(17.0)),
+            camera_position: [10.0, 11.0, 12.0],
             light,
             draws: &[],
             overlay: &[],
         };
         let values = floats(&frame_uniform_bytes(&frame).unwrap());
-        assert_eq!(FRAME_UNIFORMS_SIZE, 192);
+        assert_eq!(FRAME_UNIFORMS_SIZE, 208);
         assert_eq!(
             &values[0..16],
             &(1..=16).map(|x| x as f32).collect::<Vec<_>>()
@@ -5367,6 +6118,7 @@ mod tests {
         assert_eq!(&values[36..40], &[4.0, 5.0, 6.0, 0.0]);
         assert_eq!(&values[40..44], &[7.0, 8.0, 9.0, 0.0]);
         assert_eq!(&values[44..48], &[1.0, 1.0 / 2048.0, 0.0, 0.0]);
+        assert_eq!(&values[48..52], &[10.0, 11.0, 12.0, 0.0]);
 
         let no_shadows = Frame {
             shadow_view_projection: None,
@@ -5388,6 +6140,7 @@ mod tests {
                         clear_color: [0.0; 4],
                         view_projection: IDENTITY,
                         shadow_view_projection: None,
+                        camera_position: [0.0; 3],
                         light,
                         draws: &[],
                         overlay: &[],
@@ -5404,6 +6157,7 @@ mod tests {
             clear_color: [0.0; 4],
             view_projection: IDENTITY,
             shadow_view_projection: Some(invalid),
+            camera_position: [0.0; 3],
             light: DirectionalLight::default(),
             draws: &[],
             overlay: &[],

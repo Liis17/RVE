@@ -1,14 +1,18 @@
 use crate::pipeline::GpuSceneTable;
-use engine_assets::{Assets, Model, TextureData};
-use engine_render::{RenderError, Renderer, Vertex};
+use engine_assets::{Assets, Model, ModelMaterial, TextureData};
+use engine_render::{
+    Material, MaterialId, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
+};
 use engine_resources::ResourceHandle;
-use engine_scene::{ObjectHandle, SceneDocument, World};
+use engine_scene::{MaterialOverride, ObjectHandle, SceneDocument, World};
 use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 
 pub(crate) struct ObjectModel {
     pub object: ObjectHandle,
     pub model_path: String,
     pub replacement_texture: Option<String>,
+    pub material: Option<MaterialOverride>,
 }
 
 pub(crate) struct PreparedRenderAssets {
@@ -68,18 +72,33 @@ fn prepare_scene_with_model_loader(
                 models.insert(model_path.clone(), model);
             }
             let replacement_texture = mesh.texture.as_ref().map(|path| path.as_str().to_owned());
-            if let Some(path) = &replacement_texture
-                && !textures.contains_key(path)
-            {
-                let texture = assets
-                    .load_texture(path)
-                    .map_err(|error| format!("{scene_path}: {error}"))?;
-                textures.insert(path.clone(), texture);
+            let material = mesh.material.clone();
+            let scene_texture_paths = replacement_texture
+                .iter()
+                .cloned()
+                .chain(material.iter().flat_map(|material| {
+                    [
+                        material.metallic_roughness_texture.as_ref(),
+                        material.normal_texture.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|path| path.as_str().to_owned())
+                }))
+                .collect::<Vec<_>>();
+            for path in scene_texture_paths {
+                if let std::collections::hash_map::Entry::Vacant(entry) = textures.entry(path) {
+                    let texture = assets
+                        .load_texture(entry.key())
+                        .map_err(|error| format!("{scene_path}: {error}"))?;
+                    entry.insert(texture);
+                }
             }
             objects.push(ObjectModel {
                 object: object.handle,
                 model_path,
                 replacement_texture,
+                material,
             });
         }
         for script in &object.lite_scripts {
@@ -104,8 +123,91 @@ fn prepare_scene_with_model_loader(
     })
 }
 
-fn select_texture<T: Copy>(replacement: Option<T>, model_texture: Option<T>) -> Option<T> {
-    replacement.or(model_texture)
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MaterialTextureSource {
+    Model(usize),
+    Scene(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ResolvedMaterial {
+    base_color: [f32; 3],
+    metallic: f32,
+    roughness: f32,
+    base_color_texture: Option<MaterialTextureSource>,
+    metallic_roughness_texture: Option<MaterialTextureSource>,
+    normal_texture: Option<MaterialTextureSource>,
+    normal_scale: f32,
+}
+
+struct GpuTextureCache<T> {
+    model: HashMap<(String, usize, TextureColorSpace), T>,
+    scene: HashMap<(String, TextureColorSpace), T>,
+}
+
+impl<T> Default for GpuTextureCache<T> {
+    fn default() -> Self {
+        Self {
+            model: HashMap::new(),
+            scene: HashMap::new(),
+        }
+    }
+}
+
+fn get_or_insert_texture<K, T>(
+    cache: &mut HashMap<K, T>,
+    key: K,
+    create: impl FnOnce() -> Result<T, RenderError>,
+) -> Result<T, RenderError>
+where
+    K: Eq + Hash,
+    T: Copy,
+{
+    if let Some(&texture) = cache.get(&key) {
+        return Ok(texture);
+    }
+    let texture = create()?;
+    cache.insert(key, texture);
+    Ok(texture)
+}
+
+fn resolve_material(
+    model: &ModelMaterial,
+    replacement_texture: Option<&str>,
+    override_material: Option<&MaterialOverride>,
+) -> ResolvedMaterial {
+    let override_texture = |path: Option<&engine_files::VirtualPath>| {
+        path.map(|path| MaterialTextureSource::Scene(path.as_str().to_owned()))
+    };
+    ResolvedMaterial {
+        base_color: override_material
+            .and_then(|material| material.base_color)
+            .unwrap_or(model.base_color),
+        metallic: override_material
+            .and_then(|material| material.metallic)
+            .unwrap_or(model.metallic),
+        roughness: override_material
+            .and_then(|material| material.roughness)
+            .unwrap_or(model.roughness),
+        base_color_texture: replacement_texture
+            .map(|path| MaterialTextureSource::Scene(path.to_owned()))
+            .or_else(|| model.base_color_texture.map(MaterialTextureSource::Model)),
+        metallic_roughness_texture: override_texture(
+            override_material.and_then(|material| material.metallic_roughness_texture.as_ref()),
+        )
+        .or_else(|| {
+            model
+                .metallic_roughness_texture
+                .map(MaterialTextureSource::Model)
+        }),
+        normal_texture: override_texture(
+            override_material.and_then(|material| material.normal_texture.as_ref()),
+        )
+        .or_else(|| model.normal_texture.map(MaterialTextureSource::Model)),
+        normal_scale: override_material
+            .and_then(|material| material.normal_scale)
+            .unwrap_or(model.normal_scale),
+    }
 }
 
 fn read_utf8(resources: &ResourceHandle, path: &str) -> Result<String, String> {
@@ -121,12 +223,8 @@ pub(crate) fn upload_scene(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
 ) -> Result<GpuSceneTable, RenderError> {
-    let mut gpu_models: HashMap<
-        String,
-        Vec<(engine_render::MeshId, Option<engine_render::TextureId>)>,
-    > = HashMap::new();
-    let mut model_textures = HashMap::new();
-    let mut replacement_textures = HashMap::new();
+    let mut gpu_models: HashMap<String, Vec<(engine_render::MeshId, MaterialId)>> = HashMap::new();
+    let mut texture_cache = GpuTextureCache::<TextureId>::default();
 
     for (path, model) in &assets.models {
         let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
@@ -142,28 +240,16 @@ pub(crate) fn upload_scene(
                 })
                 .collect::<Vec<_>>();
             let mesh_id = renderer.create_mesh(&vertices, &mesh.indices)?;
-            let texture_id = match mesh.texture {
-                Some(index) => {
-                    if let Some(texture_id) = model_textures.get(&(path.clone(), index)) {
-                        Some(*texture_id)
-                    } else {
-                        let texture = model.textures.get(index).ok_or_else(|| {
-                            RenderError::InvalidTexture(format!(
-                                "модель {path:?} ссылается на отсутствующую текстуру {index}"
-                            ))
-                        })?;
-                        let texture_id = renderer.create_texture(
-                            texture.width,
-                            texture.height,
-                            &texture.rgba,
-                        )?;
-                        model_textures.insert((path.clone(), index), texture_id);
-                        Some(texture_id)
-                    }
-                }
-                None => None,
-            };
-            gpu_meshes.push((mesh_id, texture_id));
+            let resolved = resolve_material(&mesh.material, None, None);
+            let material_id = upload_resolved_material(
+                renderer,
+                &resolved,
+                path,
+                model,
+                &assets.textures,
+                &mut texture_cache,
+            )?;
+            gpu_meshes.push((mesh_id, material_id));
         }
         gpu_models.insert(path.clone(), gpu_meshes);
     }
@@ -173,36 +259,141 @@ pub(crate) fn upload_scene(
         let model_meshes = gpu_models.get(&object.model_path).ok_or({
             RenderError::InvalidState("CPU-модель отсутствует в таблице GPU-ресурсов")
         })?;
-        let replacement = if let Some(path) = &object.replacement_texture {
-            if let Some(texture_id) = replacement_textures.get(path) {
-                Some(*texture_id)
-            } else {
-                let texture = assets.textures.get(path).ok_or({
-                    RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
-                })?;
-                let texture_id =
-                    renderer.create_texture(texture.width, texture.height, &texture.rgba)?;
-                replacement_textures.insert(path.clone(), texture_id);
-                Some(texture_id)
-            }
+        if object.material.is_none() && object.replacement_texture.is_none() {
+            table.by_object.insert(object.object, model_meshes.clone());
         } else {
-            None
-        };
-        let draws = model_meshes
-            .iter()
-            .map(|(mesh, texture)| (*mesh, select_texture(replacement, *texture)))
-            .collect();
-        table.by_object.insert(object.object, draws);
+            let model = assets.models.get(&object.model_path).ok_or({
+                RenderError::InvalidState(
+                    "CPU-модель отсутствует в таблице подготовленных ресурсов",
+                )
+            })?;
+            let mut draws = Vec::with_capacity(model_meshes.len());
+            for (source_mesh, (mesh_id, _)) in model.meshes.iter().zip(model_meshes) {
+                let resolved = resolve_material(
+                    &source_mesh.material,
+                    object.replacement_texture.as_deref(),
+                    object.material.as_ref(),
+                );
+                let material_id = upload_resolved_material(
+                    renderer,
+                    &resolved,
+                    &object.model_path,
+                    model,
+                    &assets.textures,
+                    &mut texture_cache,
+                )?;
+                draws.push((*mesh_id, material_id));
+            }
+            table.by_object.insert(object.object, draws);
+        }
     }
     Ok(table)
 }
 
+fn upload_resolved_material(
+    renderer: &mut Renderer,
+    resolved: &ResolvedMaterial,
+    model_path: &str,
+    model: &Model,
+    scene_texture_data: &HashMap<String, TextureData>,
+    texture_cache: &mut GpuTextureCache<TextureId>,
+) -> Result<MaterialId, RenderError> {
+    let base_color_texture = upload_material_texture(
+        renderer,
+        resolved.base_color_texture.as_ref(),
+        TextureColorSpace::Srgb,
+        model_path,
+        model,
+        scene_texture_data,
+        texture_cache,
+    )?;
+    let metallic_roughness_texture = upload_material_texture(
+        renderer,
+        resolved.metallic_roughness_texture.as_ref(),
+        TextureColorSpace::Linear,
+        model_path,
+        model,
+        scene_texture_data,
+        texture_cache,
+    )?;
+    let normal_texture = upload_material_texture(
+        renderer,
+        resolved.normal_texture.as_ref(),
+        TextureColorSpace::Linear,
+        model_path,
+        model,
+        scene_texture_data,
+        texture_cache,
+    )?;
+    renderer.create_material(&Material {
+        base_color: resolved.base_color,
+        metallic: resolved.metallic,
+        roughness: resolved.roughness,
+        base_color_texture,
+        metallic_roughness_texture,
+        normal_texture,
+        normal_scale: resolved.normal_scale,
+    })
+}
+
+fn upload_material_texture(
+    renderer: &mut Renderer,
+    source: Option<&MaterialTextureSource>,
+    color_space: TextureColorSpace,
+    model_path: &str,
+    model: &Model,
+    scene_texture_data: &HashMap<String, TextureData>,
+    texture_cache: &mut GpuTextureCache<TextureId>,
+) -> Result<Option<TextureId>, RenderError> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let texture_id = match source {
+        MaterialTextureSource::Model(index) => {
+            let key = (model_path.to_owned(), *index, color_space);
+            let texture = model.textures.get(*index).ok_or_else(|| {
+                RenderError::InvalidTexture(format!(
+                    "модель {model_path:?} ссылается на отсутствующую текстуру {index}"
+                ))
+            })?;
+            get_or_insert_texture(&mut texture_cache.model, key, || {
+                renderer.create_texture_with_color_space(
+                    texture.width,
+                    texture.height,
+                    &texture.rgba,
+                    color_space,
+                )
+            })?
+        }
+        MaterialTextureSource::Scene(path) => {
+            let key = (path.clone(), color_space);
+            let texture = scene_texture_data.get(path).ok_or({
+                RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
+            })?;
+            get_or_insert_texture(&mut texture_cache.scene, key, || {
+                renderer.create_texture_with_color_space(
+                    texture.width,
+                    texture.height,
+                    &texture.rgba,
+                    color_space,
+                )
+            })?
+        }
+    };
+    Ok(Some(texture_id))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{load_scene, prepare_scene_with_model_loader, select_texture};
-    use engine_assets::{Assets, Model};
+    use super::{
+        GpuTextureCache, MaterialTextureSource, get_or_insert_texture, load_scene,
+        prepare_scene_with_model_loader, resolve_material,
+    };
+    use engine_assets::{Assets, Model, ModelMaterial};
+    use engine_files::VirtualPath;
+    use engine_render::TextureColorSpace;
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
-    use engine_scene::{SceneDocument, World};
+    use engine_scene::{MaterialOverride, SceneDocument, World};
     use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -379,9 +570,119 @@ far = 100.0
     }
 
     #[test]
-    fn component_texture_replaces_model_texture_or_falls_back_to_mesh_texture() {
-        assert_eq!(select_texture(Some(1), Some(2)), Some(1));
-        assert_eq!(select_texture(None, Some(2)), Some(2));
-        assert_eq!(select_texture::<u8>(None, None), None);
+    fn material_resolution_keeps_fbx_defaults_and_applies_only_specified_overrides() {
+        let model = ModelMaterial {
+            base_color: [0.2, 0.4, 0.6],
+            metallic: 0.7,
+            roughness: 0.3,
+            base_color_texture: Some(0),
+            metallic_roughness_texture: Some(1),
+            normal_texture: Some(2),
+            normal_scale: 0.8,
+        };
+        let unchanged = resolve_material(&model, None, None);
+        assert_eq!(unchanged.base_color, model.base_color);
+        assert_eq!(unchanged.metallic, model.metallic);
+        assert_eq!(unchanged.roughness, model.roughness);
+        assert_eq!(
+            unchanged.base_color_texture,
+            Some(MaterialTextureSource::Model(0))
+        );
+        assert_eq!(
+            unchanged.metallic_roughness_texture,
+            Some(MaterialTextureSource::Model(1))
+        );
+        assert_eq!(
+            unchanged.normal_texture,
+            Some(MaterialTextureSource::Model(2))
+        );
+        assert_eq!(unchanged.normal_scale, 0.8);
+
+        let override_material = MaterialOverride {
+            base_color: Some([0.9, 0.8, 0.7]),
+            metallic: Some(1.0),
+            roughness: None,
+            metallic_roughness_texture: Some(VirtualPath::parse("/textures/mr.png").unwrap()),
+            normal_texture: Some(VirtualPath::parse("/textures/normal.png").unwrap()),
+            normal_scale: Some(0.5),
+        };
+        let replacement = resolve_material(
+            &model,
+            Some("textures/replacement.png"),
+            Some(&override_material),
+        );
+        assert_eq!(replacement.base_color, [0.9, 0.8, 0.7]);
+        assert_eq!(replacement.metallic, 1.0);
+        assert_eq!(replacement.roughness, model.roughness);
+        assert_eq!(
+            replacement.base_color_texture,
+            Some(MaterialTextureSource::Scene(
+                "textures/replacement.png".to_owned()
+            ))
+        );
+        assert_eq!(
+            replacement.metallic_roughness_texture,
+            Some(MaterialTextureSource::Scene("textures/mr.png".to_owned()))
+        );
+        assert_eq!(
+            replacement.normal_texture,
+            Some(MaterialTextureSource::Scene(
+                "textures/normal.png".to_owned()
+            ))
+        );
+        assert_eq!(replacement.normal_scale, 0.5);
+    }
+
+    #[test]
+    fn gpu_texture_cache_reuses_uploads_per_source_and_color_space() {
+        let mut cache = GpuTextureCache::<u32>::default();
+        let uploads = Cell::new(0_u32);
+
+        let model_srgb_key = ("models/a.fbx".to_owned(), 0, TextureColorSpace::Srgb);
+        let model_srgb = get_or_insert_texture(&mut cache.model, model_srgb_key.clone(), || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let model_srgb_reused = get_or_insert_texture(&mut cache.model, model_srgb_key, || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let model_linear = get_or_insert_texture(
+            &mut cache.model,
+            ("models/a.fbx".to_owned(), 0, TextureColorSpace::Linear),
+            || {
+                uploads.set(uploads.get() + 1);
+                Ok(uploads.get())
+            },
+        )
+        .unwrap();
+        assert_eq!(model_srgb, model_srgb_reused);
+        assert_ne!(model_srgb, model_linear);
+
+        let scene_srgb_key = ("textures/shared.png".to_owned(), TextureColorSpace::Srgb);
+        let scene_srgb = get_or_insert_texture(&mut cache.scene, scene_srgb_key.clone(), || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let scene_srgb_reused = get_or_insert_texture(&mut cache.scene, scene_srgb_key, || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let scene_linear = get_or_insert_texture(
+            &mut cache.scene,
+            ("textures/shared.png".to_owned(), TextureColorSpace::Linear),
+            || {
+                uploads.set(uploads.get() + 1);
+                Ok(uploads.get())
+            },
+        )
+        .unwrap();
+        assert_eq!(scene_srgb, scene_srgb_reused);
+        assert_ne!(scene_srgb, scene_linear);
+        assert_eq!(uploads.get(), 4);
     }
 }

@@ -9,9 +9,9 @@ RVE — игровой движок на Rust с рендерингом чере
 - Rust stable.
 - Windows: видеодрайвер с поддержкой Vulkan 1.3.
 - macOS: Vulkan loader и MoltenVK. Для Homebrew: `brew install vulkan-loader molten-vk`.
-- Для `R8G8B8A8_SRGB` GPU должен поддерживать в optimal tiling `SAMPLED_IMAGE`,
-  `SAMPLED_IMAGE_FILTER_LINEAR`, `TRANSFER_SRC`, `TRANSFER_DST`, `BLIT_SRC` и
-  `BLIT_DST`; иначе renderer отклонит его.
+- Для `R8G8B8A8_SRGB` и `R8G8B8A8_UNORM` GPU должен поддерживать в optimal tiling
+  `SAMPLED_IMAGE`, `SAMPLED_IMAGE_FILTER_LINEAR`, `TRANSFER_SRC`, `TRANSFER_DST`,
+  `BLIT_SRC` и `BLIT_DST`; иначе renderer отклонит его.
 
 Для обычной сборки Rust-кода Vulkan SDK не требуется.
 
@@ -41,13 +41,14 @@ Sandbox показывает вращающийся куб над плоскос
 
 ```sh
 cargo run -p sandbox -- --scene triangle
+cargo run -p sandbox -- --scene materials --frames 300
 cargo run -p sandbox -- --model /models/cube.fbx --texture /textures/cube.png
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
 ```
 
 Ресурсы sandbox размещаются в `build/assets`. Например, путь
 `/models/cube.fbx` указывает на `build/assets/models/cube.fbx`. Поддерживаются
-сцены `triangle`, `cube` и `shadows`, модели FBX, текстуры PNG, ограничение
+сцены `triangle`, `cube`, `shadows` и `materials`, модели FBX, текстуры PNG, ограничение
 числа кадров, изменение размера окна и отладочный оверлей.
 
 Настройки окна sandbox необязательны. Чтобы изменить их, скопируй шаблон

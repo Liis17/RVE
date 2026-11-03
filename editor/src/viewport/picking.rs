@@ -104,7 +104,7 @@ mod tests {
             meshes: vec![ModelMesh {
                 vertices: vec![vertex(A), vertex(B), vertex(C)],
                 indices: vec![0, 1, 2],
-                texture: None,
+                material: Default::default(),
             }],
             textures: Vec::new(),
         }

@@ -14,6 +14,7 @@ pub enum Scene {
     Cube,
     #[default]
     Shadows,
+    Materials,
 }
 
 const SHADOWS_CAMERA: OrbitCamera = OrbitCamera {
@@ -21,6 +22,16 @@ const SHADOWS_CAMERA: OrbitCamera = OrbitCamera {
     radius: 4.2,
     height: 1.5,
     angular_speed: std::f32::consts::TAU / 20.0,
+    fov_narrow: std::f32::consts::FRAC_PI_4,
+    near: 0.1,
+    far: 100.0,
+};
+
+const MATERIALS_CAMERA: OrbitCamera = OrbitCamera {
+    target: Vec3::new(0.0, -0.3, 0.0),
+    radius: 7.4,
+    height: 3.1,
+    angular_speed: std::f32::consts::TAU / 40.0,
     fov_narrow: std::f32::consts::FRAC_PI_4,
     near: 0.1,
     far: 100.0,
@@ -36,6 +47,8 @@ pub(super) const SHADOWS_LIGHT_CENTER: Vec3 = Vec3::ZERO;
 /// Сфера охватывает углы плоскости (радиус √3 ≈ 1.73) и вращающийся куб.
 /// Для `--model` этого достаточно: `fit` вписывает модель в единичный куб.
 pub(super) const SHADOWS_LIGHT_RADIUS: f32 = 1.8;
+const MATERIALS_LIGHT_CENTER: Vec3 = Vec3::new(0.0, -0.6, 0.0);
+const MATERIALS_LIGHT_RADIUS: f32 = 5.9;
 pub(super) const SHADOWS_LIGHT_COLOR: [f32; 3] = [1.0; 3];
 pub(super) const SHADOWS_AMBIENT: [f32; 3] = [0.15; 3];
 
@@ -45,6 +58,7 @@ impl Scene {
             "triangle" => Some(Self::Triangle),
             "cube" => Some(Self::Cube),
             "shadows" => Some(Self::Shadows),
+            "materials" => Some(Self::Materials),
             _ => None,
         }
     }
@@ -53,6 +67,7 @@ impl Scene {
         match self {
             Self::Triangle => (TRIANGLE_VERTICES.to_vec(), TRIANGLE_INDICES.to_vec()),
             Self::Cube | Self::Shadows => cube_mesh(),
+            Self::Materials => uv_sphere_mesh(Vec3::ZERO, 1.0),
         }
     }
 
@@ -61,6 +76,7 @@ impl Scene {
         match self {
             Self::Triangle => None,
             Self::Cube | Self::Shadows => Some(checker_texture()),
+            Self::Materials => None,
         }
     }
 
@@ -71,6 +87,17 @@ impl Scene {
             Self::Shadows => SHADOWS_CAMERA
                 .camera_at(elapsed)
                 .view_projection(width, height),
+            Self::Materials => MATERIALS_CAMERA
+                .camera_at(elapsed)
+                .view_projection(width, height),
+        }
+    }
+
+    pub fn camera_position(self, elapsed: f32) -> [f32; 3] {
+        match self {
+            Self::Triangle | Self::Cube => [0.0, 0.0, 3.0],
+            Self::Shadows => SHADOWS_CAMERA.camera_at(elapsed).position.to_array(),
+            Self::Materials => MATERIALS_CAMERA.camera_at(elapsed).position.to_array(),
         }
     }
 
@@ -79,6 +106,7 @@ impl Scene {
             Self::Triangle => Mat4::from_rotation_z(elapsed),
             Self::Cube => cube_model(elapsed),
             Self::Shadows => Mat4::from_rotation_z(elapsed),
+            Self::Materials => Mat4::IDENTITY,
         }
     }
 }
@@ -93,6 +121,135 @@ pub fn shadows_light_view_projection(elapsed: f32) -> Mat4 {
         SHADOWS_LIGHT_CENTER,
         SHADOWS_LIGHT_RADIUS,
     )
+}
+
+pub fn materials_light_view_projection(elapsed: f32) -> Mat4 {
+    shadow_view_projection(
+        shadows_light_direction(elapsed),
+        MATERIALS_LIGHT_CENTER,
+        MATERIALS_LIGHT_RADIUS,
+    )
+}
+
+/// Ten UV spheres form dielectric and metallic rows with the same roughness sweep.
+pub fn material_sphere_meshes() -> Vec<(f32, f32, Vec<Vertex>, Vec<u32>)> {
+    const ROUGHNESS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+    const SPACING: f32 = 1.1;
+    const RADIUS: f32 = 0.38;
+    const HEIGHT: f32 = -0.62;
+    const ROW_Z: [f32; 2] = [0.65, -0.65];
+    let mut spheres = Vec::with_capacity(ROUGHNESS.len() * 2);
+    for (row_z, metallic) in ROW_Z.into_iter().zip([0.0, 1.0]) {
+        for (column, roughness) in ROUGHNESS.into_iter().enumerate() {
+            let x = (column as f32 - (ROUGHNESS.len() - 1) as f32 * 0.5) * SPACING;
+            let center = Vec3::new(x, HEIGHT, row_z);
+            let (vertices, indices) = uv_sphere_mesh(center, RADIUS);
+            spheres.push((metallic, roughness, vertices, indices));
+        }
+    }
+    spheres
+}
+
+fn uv_sphere_mesh(center: Vec3, radius: f32) -> (Vec<Vertex>, Vec<u32>) {
+    const LONGITUDES: u32 = 32;
+    const LATITUDES: u32 = 24;
+    let mut vertices = Vec::with_capacity(((LONGITUDES + 1) * (LATITUDES + 1)) as usize);
+    let mut indices = Vec::with_capacity((LONGITUDES * LATITUDES * 6) as usize);
+    for latitude in 0..=LATITUDES {
+        let v = latitude as f32 / LATITUDES as f32;
+        let theta = std::f32::consts::PI * v;
+        for longitude in 0..=LONGITUDES {
+            let u = longitude as f32 / LONGITUDES as f32;
+            let phi = std::f32::consts::TAU * u;
+            let normal = Vec3::new(
+                theta.sin() * phi.cos(),
+                theta.cos(),
+                theta.sin() * phi.sin(),
+            );
+            vertices.push(Vertex {
+                position: (center + normal * radius).to_array(),
+                normal: normal.to_array(),
+                uv: [u, v],
+                color: [1.0; 3],
+            });
+        }
+    }
+    let stride = LONGITUDES + 1;
+    for latitude in 0..LATITUDES {
+        for longitude in 0..LONGITUDES {
+            let top_left = latitude * stride + longitude;
+            let top_right = top_left + 1;
+            let bottom_left = top_left + stride;
+            let bottom_right = bottom_left + 1;
+            indices.extend([
+                top_left,
+                top_right,
+                bottom_right,
+                top_left,
+                bottom_right,
+                bottom_left,
+            ]);
+        }
+    }
+    (vertices, indices)
+}
+
+/// Square floor beneath the material rows; UVs tile the procedural normal map.
+pub fn materials_plane_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    const HALF_EXTENT: f32 = 4.0;
+    const UV_TILES: f32 = 4.0;
+    let positions = [
+        [-HALF_EXTENT, -1.0, -HALF_EXTENT],
+        [-HALF_EXTENT, -1.0, HALF_EXTENT],
+        [HALF_EXTENT, -1.0, HALF_EXTENT],
+        [HALF_EXTENT, -1.0, -HALF_EXTENT],
+    ];
+    let vertices = positions
+        .into_iter()
+        .zip([
+            [0.0, 0.0],
+            [0.0, UV_TILES],
+            [UV_TILES, UV_TILES],
+            [UV_TILES, 0.0],
+        ])
+        .map(|(position, uv)| Vertex {
+            position,
+            normal: [0.0, 1.0, 0.0],
+            uv,
+            color: [0.78, 0.78, 0.78],
+        })
+        .collect();
+    (vertices, vec![0, 1, 2, 0, 2, 3])
+}
+
+/// Procedural periodic height field encoded as a tangent-space RGBA8 normal map.
+pub fn sinusoidal_normal_texture() -> TextureData {
+    const SIZE: u32 = 128;
+    const PERIODS: f32 = 4.0;
+    const AMPLITUDE: f32 = 0.025;
+    let frequency = std::f32::consts::TAU * PERIODS;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        let v = y as f32 / SIZE as f32;
+        for x in 0..SIZE {
+            let u = x as f32 / SIZE as f32;
+            let (u_wave, v_wave) = (frequency * u, frequency * v);
+            let du = AMPLITUDE * frequency * u_wave.cos() * v_wave.sin();
+            let dv = AMPLITUDE * frequency * u_wave.sin() * v_wave.cos();
+            let normal = Vec3::new(-du, -dv, 1.0).normalize();
+            rgba.extend(
+                normal
+                    .to_array()
+                    .map(|component| ((component * 0.5 + 0.5) * 255.0).round() as u8),
+            );
+            rgba.push(255);
+        }
+    }
+    TextureData {
+        width: SIZE,
+        height: SIZE,
+        rgba,
+    }
 }
 
 /// Квадратная плоскость 2×2 на высоте −1, с обходом CCW со стороны +Y.
@@ -233,8 +390,8 @@ fn aspect_ratio(width: u32, height: u32) -> f32 {
 mod tests {
     use super::{
         Scene, TRIANGLE_INDICES, TRIANGLE_VERTICES, checker_texture, cube_mesh, cube_model,
-        cube_view_projection, plane_mesh, shadows_light_direction, shadows_light_view_projection,
-        triangle_view_projection,
+        cube_view_projection, material_sphere_meshes, plane_mesh, shadows_light_direction,
+        shadows_light_view_projection, sinusoidal_normal_texture, triangle_view_projection,
     };
     use glam::{Mat4, Vec3, Vec4};
 
@@ -291,6 +448,7 @@ mod tests {
         assert_eq!(Scene::parse("triangle"), Some(Scene::Triangle));
         assert_eq!(Scene::parse("cube"), Some(Scene::Cube));
         assert_eq!(Scene::parse("shadows"), Some(Scene::Shadows));
+        assert_eq!(Scene::parse("materials"), Some(Scene::Materials));
         assert_eq!(Scene::parse("Cube"), None);
         assert_eq!(Scene::parse(""), None);
         assert_eq!(Scene::default(), Scene::Shadows);
@@ -300,6 +458,63 @@ mod tests {
         assert!(Scene::Triangle.texture().is_none());
         assert!(Scene::Cube.texture().is_some());
         assert!(Scene::Shadows.texture().is_some());
+        assert!(Scene::Materials.texture().is_none());
+    }
+
+    #[test]
+    fn material_sphere_rows_have_unit_normals_valid_indices_and_full_roughness_sweeps() {
+        let spheres = material_sphere_meshes();
+        assert_eq!(spheres.len(), 10);
+        for (index, (metallic, roughness, vertices, indices)) in spheres.iter().enumerate() {
+            assert_eq!(*metallic, if index < 5 { 0.0 } else { 1.0 });
+            assert_eq!(*roughness, [0.0, 0.25, 0.5, 0.75, 1.0][index % 5]);
+            assert!(indices.len().is_multiple_of(3));
+            assert!(indices.iter().all(|&i| (i as usize) < vertices.len()));
+            assert!(vertices.iter().all(|vertex| {
+                let normal = Vec3::from(vertex.normal);
+                normal.is_finite() && (normal.length() - 1.0).abs() < 1e-5
+            }));
+        }
+    }
+
+    #[test]
+    fn material_sphere_rows_stay_inside_the_orbit_camera_view() {
+        let spheres = material_sphere_meshes();
+        for (width, height) in [(1280, 720), (720, 1280), (1000, 1000)] {
+            for step in 0..40 {
+                let elapsed = step as f32;
+                let view_projection = Scene::Materials.view_projection(elapsed, width, height);
+                for vertex in spheres.iter().flat_map(|(_, _, vertices, _)| vertices) {
+                    let point = clip(view_projection, vertex.position);
+                    let ndc = point.truncate() / point.w;
+                    assert!(point.w > 0.0, "{width}x{height} t={elapsed}: {point:?}");
+                    assert!(
+                        ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0,
+                        "{width}x{height} t={elapsed}: {ndc:?}"
+                    );
+                    assert!(
+                        (0.0..=1.0).contains(&ndc.z),
+                        "{width}x{height} t={elapsed}: {ndc:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn procedural_sinusoidal_normal_map_decodes_to_unit_vectors() {
+        let texture = sinusoidal_normal_texture();
+        assert_eq!((texture.width, texture.height), (128, 128));
+        assert_eq!(texture.rgba.len(), 128 * 128 * 4);
+        for pixel in texture.rgba.as_chunks::<4>().0 {
+            let normal = Vec3::new(
+                f32::from(pixel[0]) / 255.0 * 2.0 - 1.0,
+                f32::from(pixel[1]) / 255.0 * 2.0 - 1.0,
+                f32::from(pixel[2]) / 255.0 * 2.0 - 1.0,
+            );
+            assert!((normal.length() - 1.0).abs() < 0.01, "{normal:?}");
+            assert_eq!(pixel[3], 255);
+        }
     }
 
     #[test]
