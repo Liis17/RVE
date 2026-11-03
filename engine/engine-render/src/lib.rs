@@ -5566,25 +5566,57 @@ mod tests {
         }
     }
 
-    fn shader_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
-        let function_start = source.find(signature).expect("shader function exists");
-        let body_start = function_start + source[function_start..].find('{').unwrap();
-        let body_end = body_start + source[body_start..].find('}').unwrap();
-        &source[body_start..=body_end]
+    fn ggx_shader_has_analytic_peak(source: &str) -> bool {
+        let normalized = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let Some(function_start) = normalized.find("floatdistribution_ggx(") else {
+            return false;
+        };
+        let Some(body_offset) = normalized[function_start..].find('{') else {
+            return false;
+        };
+        let body_start = function_start + body_offset;
+        let Some(body_length) = normalized[body_start..].find('}') else {
+            return false;
+        };
+        let body = &normalized[body_start..=body_start + body_length];
+        [
+            "floatnormal_dot_half=clamp(normal_dot_half_input,0.0,1.0);",
+            "floatalpha_squared=alpha*alpha;",
+            "floatdenominator=(1.0-normal_dot_half*normal_dot_half)+alpha_squared*normal_dot_half*normal_dot_half;",
+            "denominator=max(denominator,alpha_squared);",
+            "returnalpha_squared/(PI*denominator*denominator);",
+        ]
+        .iter()
+        .all(|expression| body.contains(expression))
+            && !body.contains("max(PI*denominator*denominator,1e-7)")
     }
 
     #[test]
     fn ggx_shader_preserves_the_analytic_low_roughness_peak() {
         const PI: f32 = std::f32::consts::PI;
         let shader = include_str!("../shaders/mesh.frag");
-        let body = shader_function_body(shader, "float distribution_ggx(");
-        assert!(body.contains("clamp(normal_dot_half_input, 0.0, 1.0)"));
-        assert!(body.contains(
-            "(1.0 - normal_dot_half * normal_dot_half)\n        + alpha_squared * normal_dot_half * normal_dot_half"
-        ));
-        assert!(body.contains("max(denominator, alpha_squared)"));
-        assert!(body.contains("alpha_squared / (PI * denominator * denominator)"));
-        assert!(!body.contains("1e-7"));
+        let shader_lf = shader.replace("\r\n", "\n");
+        assert!(ggx_shader_has_analytic_peak(shader));
+        assert!(ggx_shader_has_analytic_peak(&shader_lf));
+
+        let function_lf = "float distribution_ggx(float normal_dot_half_input, float alpha) {\n    float normal_dot_half = clamp(normal_dot_half_input, 0.0, 1.0);\n    float alpha_squared = alpha * alpha;\n    float denominator = (1.0 - normal_dot_half * normal_dot_half) + alpha_squared * normal_dot_half * normal_dot_half;\n    denominator = max(denominator, alpha_squared);\n    return alpha_squared / (PI * denominator * denominator);\n}";
+        let function_crlf = function_lf.replace('\n', "\r\n");
+        assert!(ggx_shader_has_analytic_peak(function_lf));
+        assert!(ggx_shader_has_analytic_peak(&function_crlf));
+
+        let shader_whitespace_variant = function_lf
+            .replace("float distribution_ggx(", "float \t distribution_ggx (")
+            .replace(
+                "normal_dot_half * normal_dot_half",
+                "normal_dot_half \t *\r\n normal_dot_half",
+            );
+        assert!(ggx_shader_has_analytic_peak(&shader_whitespace_variant));
+
+        let clipped_shader = "float distribution_ggx(float normal_dot_half_input, float alpha) {\n    float normal_dot_half = clamp(normal_dot_half_input, 0.0, 1.0);\n    float alpha_squared = alpha * alpha;\n    float denominator = (1.0 - normal_dot_half * normal_dot_half) + alpha_squared * normal_dot_half * normal_dot_half;\n    denominator = max(denominator, alpha_squared);\n    return alpha_squared / max(PI * denominator * denominator, 1e-7);\n}";
+        assert!(!ggx_shader_has_analytic_peak(clipped_shader));
 
         let distribution = |normal_dot_half: f32, roughness: f32| {
             let normal_dot_half = normal_dot_half.clamp(0.0, 1.0);
