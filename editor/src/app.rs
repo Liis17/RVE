@@ -1,12 +1,13 @@
 //! Приложение редактора: окно, цикл кадра egui + renderer и выполнение действий.
 
+use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
 use crate::play::PlaySession;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
 use crate::settings::{SettingsStore, UserSettings};
-use crate::state::{Action, EditorState, UnsavedPrompt};
+use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt};
 use crate::ui;
 use crate::ui::scene_view::bounding_sphere;
 use crate::ui_render::{ConvertedMesh, UiBridge};
@@ -38,6 +39,9 @@ pub struct EditorApp {
     egui_state: Option<egui_winit::State>,
     bridge: UiBridge,
     repaint_at: Option<Instant>,
+    /// Ревизия сцены в последней копии автосохранения и время записи.
+    autosaved_revision: Option<u64>,
+    last_autosave: Instant,
     exit: bool,
     pub exit_code: u8,
     window_title: String,
@@ -72,6 +76,8 @@ impl EditorApp {
             egui_state: None,
             bridge: UiBridge::default(),
             repaint_at: None,
+            autosaved_revision: None,
+            last_autosave: Instant::now(),
             exit: false,
             exit_code: 0,
             window_title: String::new(),
@@ -150,8 +156,98 @@ impl EditorApp {
 
     fn new_scene(&mut self) {
         match EditorScene::new_untitled() {
-            Ok(scene) => self.set_scene(scene),
+            Ok(scene) => {
+                self.set_scene(scene);
+                self.offer_recovery();
+            }
             Err(error) => self.state.log.error(error),
+        }
+    }
+
+    fn autosave_store(&self) -> Option<AutosaveStore> {
+        Some(AutosaveStore::for_project(
+            &self.state.project.as_ref()?.root,
+        ))
+    }
+
+    /// Предлагает восстановить автосохранение открытой сцены, если оно осталось.
+    fn offer_recovery(&mut self) {
+        let scene = self
+            .state
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.path().cloned());
+        if let Some(contents) = self
+            .autosave_store()
+            .and_then(|store| store.read(scene.as_ref()))
+        {
+            self.state.recovery_prompt = Some(RecoveryPrompt { scene, contents });
+        }
+    }
+
+    fn remove_autosave(&mut self, scene: Option<&VirtualPath>) {
+        if let Some(store) = self.autosave_store()
+            && let Err(error) = store.remove(scene)
+        {
+            self.state.log.push(LogLevel::Warn, error);
+        }
+    }
+
+    /// Записывает копию изменённой сцены не чаще `AUTOSAVE_INTERVAL`.
+    fn autosave_tick(&mut self) {
+        let Some(scene) = &self.state.scene else {
+            return;
+        };
+        let revision = scene.revision();
+        if self.state.is_playing()
+            || !autosave_due(
+                scene.is_dirty(),
+                revision,
+                self.autosaved_revision,
+                self.last_autosave.elapsed(),
+            )
+        {
+            return;
+        }
+        let Some(store) = self.autosave_store() else {
+            return;
+        };
+        self.last_autosave = Instant::now();
+        self.autosaved_revision = Some(revision);
+        let result = scene
+            .document()
+            .to_toml()
+            .map_err(|error| error.to_string())
+            .and_then(|text| store.write(scene.path(), &text));
+        if let Err(error) = result {
+            self.state
+                .log
+                .push(LogLevel::Warn, format!("автосохранение: {error}"));
+        }
+    }
+
+    /// Срок следующего автосохранения, если в сцене есть незаписанные изменения.
+    fn autosave_deadline(&self) -> Option<Instant> {
+        let scene = self.state.scene.as_ref()?;
+        let waiting = scene.is_dirty()
+            && !self.state.is_playing()
+            && self.autosaved_revision != Some(scene.revision());
+        waiting.then(|| self.last_autosave + AUTOSAVE_INTERVAL)
+    }
+
+    fn restore_autosave(&mut self) {
+        let Some(prompt) = self.state.recovery_prompt.take() else {
+            return;
+        };
+        match EditorScene::recover(prompt.scene, &prompt.contents) {
+            Ok(scene) => {
+                self.set_scene(scene);
+                self.state.log.info("Восстановлено автосохранение");
+            }
+            Err(error) => self
+                .state
+                .log
+                .error(format!("автосохранение не восстановлено: {error}")),
         }
     }
 
@@ -166,7 +262,10 @@ impl EditorApp {
                 EditorScene::parse(path, &contents)
             });
         match result {
-            Ok(scene) => self.set_scene(scene),
+            Ok(scene) => {
+                self.set_scene(scene);
+                self.offer_recovery();
+            }
             Err(error) => self.state.log.error(error),
         }
     }
@@ -174,6 +273,9 @@ impl EditorApp {
     fn set_scene(&mut self, scene: EditorScene) {
         self.state.scene = Some(scene);
         self.state.scene_replaced();
+        self.state.recovery_prompt = None;
+        self.autosaved_revision = None;
+        self.last_autosave = Instant::now();
     }
 
     /// Спрашивает о несохранённых изменениях перед действием, отбрасывающим сцену.
@@ -236,7 +338,7 @@ impl EditorApp {
             .scene
             .as_ref()
             .and_then(|scene| scene.path().cloned());
-        let target = match existing {
+        let target = match existing.clone() {
             Some(path) if !choose_path => path,
             _ => {
                 let Some(root) = self.assets_root() else {
@@ -270,6 +372,9 @@ impl EditorApp {
                     .log
                     .info(format!("Сохранено {}", target.as_str()));
                 self.refresh_tree_only();
+                // Копии прежнего и нового пути устарели: на диске теперь актуальная сцена.
+                self.remove_autosave(existing.as_ref());
+                self.remove_autosave(Some(&target));
                 true
             }
             Err(error) => {
@@ -368,7 +473,22 @@ impl EditorApp {
                 }
                 Action::ImportFiles(files) => self.import(&files),
                 Action::RefreshAssets => self.refresh_assets(),
-                Action::Discard(then) => self.run_confirmed(*then),
+                Action::Discard(then) => {
+                    // Отказ от изменений делает копию ненужной.
+                    let scene = self
+                        .state
+                        .scene
+                        .as_ref()
+                        .and_then(|scene| scene.path().cloned());
+                    self.remove_autosave(scene.as_ref());
+                    self.run_confirmed(*then);
+                }
+                Action::RestoreAutosave => self.restore_autosave(),
+                Action::DiscardAutosave => {
+                    if let Some(prompt) = self.state.recovery_prompt.take() {
+                        self.remove_autosave(prompt.scene.as_ref());
+                    }
+                }
                 Action::SaveThen(then) => {
                     if self.save(false) {
                         self.run_confirmed(*then);
@@ -715,6 +835,8 @@ impl WindowHandler for EditorApp {
     }
 
     fn update(&mut self, window: &Window) -> bool {
+        // Здесь, а не в кадре: при простое окно просыпается к сроку без перерисовки.
+        self.autosave_tick();
         let background_pending = self.background_pending();
         if let Some(deadline) = self.repaint_at
             && Instant::now() >= deadline
@@ -731,10 +853,10 @@ impl WindowHandler for EditorApp {
         let preview = self
             .background_pending()
             .then(|| Instant::now() + PREVIEW_POLL);
-        match (self.repaint_at, preview) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [self.repaint_at, preview, self.autosave_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     fn close_requested(&mut self) -> bool {

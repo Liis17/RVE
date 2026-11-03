@@ -143,6 +143,17 @@ impl EditorScene {
         Ok(Self::from_document(document, Some(path)))
     }
 
+    /// Сцена из автосохранения: путь прежний, а изменения считаются несохранёнными.
+    pub fn recover(path: Option<VirtualPath>, contents: &str) -> Result<Self, String> {
+        let label = path
+            .as_ref()
+            .map_or("untitled.rvescene", |path| path.as_str());
+        let document = SceneDocument::parse(label, contents).map_err(|error| error.to_string())?;
+        let mut scene = Self::from_document(document, path);
+        scene.dirty = true;
+        Ok(scene)
+    }
+
     fn from_document(document: SceneDocument, path: Option<VirtualPath>) -> Self {
         Self {
             document,

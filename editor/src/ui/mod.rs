@@ -34,7 +34,35 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     }
 
     show_unsaved_prompt(ui.ctx(), state);
+    show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
+}
+
+fn show_recovery_prompt(ctx: &egui::Context, state: &mut EditorState) {
+    let Some(prompt) = &state.recovery_prompt else {
+        return;
+    };
+    let name = prompt
+        .scene
+        .as_ref()
+        .map_or("untitled", |path| path.as_str())
+        .to_owned();
+    egui::Modal::new(egui::Id::new("recover_autosave")).show(ctx, |ui| {
+        ui.set_max_width(380.0);
+        ui.heading("Autosave found");
+        ui.label(format!(
+            "Найдены несохранённые изменения {name} от прошлого сеанса. Восстановить их?"
+        ));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Restore").clicked() {
+                state.action(Action::RestoreAutosave);
+            }
+            if ui.button("Discard").clicked() {
+                state.action(Action::DiscardAutosave);
+            }
+        });
+    });
 }
 
 fn show_status_bar(ui: &mut egui::Ui, state: &EditorState) {
