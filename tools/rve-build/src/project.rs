@@ -5,7 +5,7 @@ use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
-use engine_scene::{ParamSchema, ParamValue, SceneDocument};
+use engine_scene::{ParamSchema, ParamValue, SceneDocument, SceneError, expand};
 use engine_script::{ScriptInterruptHandle, lite_properties};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -136,6 +136,11 @@ fn prepare_with_resources(
         })?;
         let document = SceneDocument::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
+        // Зависимости, скрипты и параметры берутся из раскрытого документа: префабы
+        // приносят свои `[[assets]]` и объекты.
+        let expansion = expand(&document, &mut |prefab| load_prefab(&handle, prefab))
+            .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
+        let document = expansion.document;
         validate_lite_params(&document, &path, &handle, &mut lite_schemas)?;
         heavy_scripts.extend(document.objects.iter().flat_map(|object| {
             object.heavy_scripts.iter().map(|script| HeavyScriptUse {
@@ -153,6 +158,12 @@ fn prepare_with_resources(
             stem,
         });
 
+        // Файлы префабов объявлены в `[[assets]]` использующих их документов и попадают
+        // в архивы по тем же правилам; здесь они учитываются и без такой записи.
+        for prefab in expansion.prefabs {
+            require_asset_file(&assets_dir, &prefab)?;
+            usages.entry(prefab).or_default().scenes.insert(scene_index);
+        }
         for asset in document.assets {
             let asset_path = asset.path;
             let usage = usages.entry(asset_path.clone()).or_default();
@@ -718,5 +729,125 @@ mod lite_params_tests {
         let error = prepare_project(root.path()).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("rotate.lua"), "{error}");
+    }
+}
+
+/// Префаб читается из `Assets` через тот же `ResourceHandle`, что и сцены.
+fn load_prefab(handle: &ResourceHandle, path: &VirtualPath) -> Result<SceneDocument, SceneError> {
+    let label = format!("/{path}");
+    let error = |message: String| SceneError {
+        source: label.clone(),
+        object_id: None,
+        message,
+    };
+    let bytes = handle
+        .read_all(label.as_str())
+        .and_then(|request| request.wait())
+        .map_err(|resource| error(resource.to_string()))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|utf8| error(format!("файл должен быть UTF-8: {utf8}")))?;
+    SceneDocument::parse_prefab(label.clone(), &text)
+}
+
+#[cfg(test)]
+mod prefab_tests {
+    use super::prepare_project;
+    use crate::temporary::TempDir;
+    use engine_files::VirtualPath;
+    use std::fs;
+    use std::path::Path;
+
+    const CAMERA: &str =
+        "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n";
+
+    fn write(root: &Path, path: &str, text: &str) {
+        let path = root.join("Assets").join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn project(root: &Path) {
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/scenes/main.rvescene\"\n[[scenes]]\npath = \"/scenes/second.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        // Общий префаб с вложенным; второй используется только main.
+        write(
+            root,
+            "prefabs/lamp.rveprefab",
+            "[[assets]]\npath = \"/prefabs/bulb.rveprefab\"\n[[assets]]\npath = \"/scripts/rotate.lua\"\n[[objects]]\nid = \"post\"\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\n[[instances]]\nid = \"bulb\"\nparent = \"post\"\nprefab = \"/prefabs/bulb.rveprefab\"\n",
+        );
+        write(
+            root,
+            "prefabs/bulb.rveprefab",
+            "[[objects]]\nid = \"glass\"\n",
+        );
+        write(
+            root,
+            "prefabs/sign.rveprefab",
+            "[[objects]]\nid = \"board\"\n",
+        );
+        write(
+            root,
+            "scripts/rotate.lua",
+            "return { properties = { speed = { type = \"float\", default = 1 } } }\n",
+        );
+        let lamp = "[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n";
+        write(
+            root,
+            "scenes/main.rvescene",
+            &format!(
+                "[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[assets]]\npath = \"/prefabs/sign.rveprefab\"\n{CAMERA}{lamp}[[instances]]\nid = \"sign\"\nprefab = \"/prefabs/sign.rveprefab\"\n"
+            ),
+        );
+        write(
+            root,
+            "scenes/second.rvescene",
+            &format!("[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n{CAMERA}{lamp}"),
+        );
+    }
+
+    fn path(value: &str) -> VirtualPath {
+        VirtualPath::parse(value).unwrap()
+    }
+
+    #[test]
+    fn prefabs_and_their_resources_are_packed_by_scene_membership() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-prefab").unwrap();
+        project(root.path());
+        let build = prepare_project(root.path()).unwrap();
+        let archive = |value: &str| build.assignments[&path(value)].as_str();
+        assert_eq!(archive("/prefabs/lamp.rveprefab"), "shared");
+        assert_eq!(archive("/prefabs/bulb.rveprefab"), "shared");
+        assert_eq!(archive("/scripts/rotate.lua"), "shared");
+        assert_eq!(archive("/prefabs/sign.rveprefab"), "scene-main");
+        assert!(build.files.contains_key(&path("/prefabs/bulb.rveprefab")));
+    }
+
+    #[test]
+    fn script_params_inside_prefabs_are_checked() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-prefab").unwrap();
+        project(root.path());
+        let lamp = "[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"post\"\nlite_params = [{ path = \"/scripts/rotate.lua\", params = { spin = 1 } }]\n";
+        write(
+            root.path(),
+            "scenes/second.rvescene",
+            &format!("[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n{CAMERA}{lamp}"),
+        );
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("lamp"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_prefab_is_a_project_error() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-prefab").unwrap();
+        project(root.path());
+        fs::remove_file(root.path().join("Assets/prefabs/bulb.rveprefab")).unwrap();
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("bulb.rveprefab"), "{error}");
     }
 }
