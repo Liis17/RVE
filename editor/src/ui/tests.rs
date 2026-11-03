@@ -415,6 +415,27 @@ fn showing_the_inspector_keeps_hdr_light_colors_and_material_overrides_unchanged
 }
 
 #[test]
+fn status_bar_summarises_the_scene_and_play_frame_rate() {
+    let mut harness = Harness::new();
+    assert_eq!(scene_status(&harness.state, 0.02), "untitled  |  2 objects");
+    harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    let document = harness.scene().document().clone();
+    harness.state.play =
+        Some(crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap());
+    assert_eq!(
+        scene_status(&harness.state, 0.02),
+        "untitled  |  * unsaved  |  3 objects  |  50 FPS"
+    );
+    harness.state.play.as_mut().unwrap().set_paused(true);
+    assert!(scene_status(&harness.state, 0.02).ends_with("Paused"));
+    harness.state.scene = None;
+    assert_eq!(scene_status(&harness.state, 0.02), "");
+}
+
+#[test]
 fn ctrl_shift_z_redoes_instead_of_undoing() {
     let mut harness = Harness::new();
     let id = harness

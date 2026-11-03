@@ -38,15 +38,45 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
 }
 
 fn show_status_bar(ui: &mut egui::Ui, state: &EditorState) {
+    let frame_seconds = ui.input(|input| input.stable_dt);
     egui::Panel::bottom("status_bar").show(ui, |ui| {
         ui.horizontal(|ui| {
-            let latest = state.log.entries().next_back();
-            match latest {
-                Some(entry) => ui.label(console::entry_text(entry)),
-                None => ui.label(""),
-            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(scene_status(state, frame_seconds));
+                ui.separator();
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if let Some(entry) = state.log.entries().next_back() {
+                        ui.add(egui::Label::new(console::entry_text(entry)).truncate());
+                    }
+                });
+            });
         });
     });
+}
+
+/// Сводка справа в строке состояния: сцена, признак правок, число объектов и FPS в Play.
+fn scene_status(state: &EditorState, frame_seconds: f32) -> String {
+    let Some(scene) = &state.scene else {
+        return String::new();
+    };
+    let mut parts = vec![
+        scene
+            .path()
+            .map_or("untitled", |path| path.as_str())
+            .to_owned(),
+    ];
+    if scene.is_dirty() {
+        parts.push("* unsaved".to_owned());
+    }
+    parts.push(format!("{} objects", scene.document().objects.len()));
+    if let Some(play) = &state.play {
+        if play.is_paused() {
+            parts.push("Paused".to_owned());
+        } else if frame_seconds > 0.0 {
+            parts.push(format!("{:.0} FPS", 1.0 / frame_seconds));
+        }
+    }
+    parts.join("  |  ")
 }
 
 fn show_welcome(ui: &mut egui::Ui, state: &mut EditorState) {
