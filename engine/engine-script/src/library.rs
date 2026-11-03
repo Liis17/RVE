@@ -1,5 +1,11 @@
+use crate::abi_host::read_message_value;
 use crate::abi_string::{AbiStringError, read_abi_str};
-use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveModule, RveScriptDesc};
+use engine_scene::{ParamKind, ParamSchema, ParamSpec};
+use rve_sdk::abi::{
+    RVE_PARAM_BOOL, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
+    RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule, RveParamDesc,
+    RveScriptDesc,
+};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -8,7 +14,7 @@ use std::path::Path;
 
 /// A script library that has been validated and deliberately kept loaded for process lifetime.
 pub struct ScriptLibrary {
-    scripts: HashMap<String, &'static RveScriptDesc>,
+    scripts: HashMap<String, (&'static RveScriptDesc, Option<ParamSchema>)>,
 }
 
 /// Failure while opening or validating an ABI script module.
@@ -25,6 +31,7 @@ pub enum ScriptLibraryError {
     InvalidScriptName { index: usize, name: String },
     DuplicateScriptName(String),
     ScriptCountOverflow,
+    InvalidParams { script: String, message: String },
 }
 
 impl fmt::Display for ScriptLibraryError {
@@ -65,6 +72,12 @@ impl fmt::Display for ScriptLibraryError {
                 write!(f, "script module contains duplicate name {name:?}")
             }
             Self::ScriptCountOverflow => f.write_str("script table size overflows address space"),
+            Self::InvalidParams { script, message } => {
+                write!(
+                    f,
+                    "script {script:?} declares invalid parameters: {message}"
+                )
+            }
         }
     }
 }
@@ -164,7 +177,14 @@ impl ScriptLibrary {
                 });
             }
             let name = name.to_owned();
-            if scripts.insert(name.clone(), descriptor).is_some() {
+            // SAFETY: the caller guarantees the parameter table of every descriptor.
+            let schema = unsafe { read_schema(descriptor) }.map_err(|message| {
+                ScriptLibraryError::InvalidParams {
+                    script: name.clone(),
+                    message,
+                }
+            })?;
+            if scripts.insert(name.clone(), (descriptor, schema)).is_some() {
                 return Err(ScriptLibraryError::DuplicateScriptName(name));
             }
         }
@@ -172,7 +192,22 @@ impl ScriptLibrary {
     }
 
     pub(crate) fn script(&self, name: &str) -> Option<&'static RveScriptDesc> {
-        self.scripts.get(name).copied()
+        self.scripts.get(name).map(|(descriptor, _)| *descriptor)
+    }
+
+    /// Registered script names in ascending order.
+    pub fn script_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self.scripts.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Parameter schema of a registered script; `None` for an unknown name or a script that
+    /// declares no parameters.
+    pub fn schema(&self, name: &str) -> Option<&ParamSchema> {
+        self.scripts
+            .get(name)
+            .and_then(|(_, schema)| schema.as_ref())
     }
 
     /// Returns whether this library registers a script with the given scene name.
@@ -186,4 +221,67 @@ pub(crate) fn valid_heavy_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Reads and validates the parameter table of one descriptor. An empty table declares no schema.
+///
+/// # Safety
+/// For a nonzero `param_count`, `params` must point to that many initialized process-lifetime
+/// descriptors whose strings and default values are readable.
+unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>, String> {
+    let count = descriptor.param_count;
+    if count == 0 {
+        return Ok(None);
+    }
+    if descriptor.params.is_null() {
+        return Err("null parameter table".to_owned());
+    }
+    if count > isize::MAX as usize / mem::size_of::<RveParamDesc>() {
+        return Err("parameter table size overflows address space".to_owned());
+    }
+    // SAFETY: guaranteed by this function's contract and checked above.
+    let params = unsafe { std::slice::from_raw_parts(descriptor.params, count) };
+    let mut specs = Vec::with_capacity(count);
+    for (index, param) in params.iter().enumerate() {
+        // SAFETY: the caller guarantees readable process-lifetime strings.
+        let name = unsafe { read_abi_str(param.name) }
+            .map_err(|error| format!("parameter {index} has an invalid name: {error:?}"))?
+            .to_owned();
+        let kind = match param.kind {
+            RVE_PARAM_BOOL => ParamKind::Bool,
+            RVE_PARAM_INT => ParamKind::Int,
+            RVE_PARAM_FLOAT => ParamKind::Float,
+            RVE_PARAM_STRING => ParamKind::String,
+            RVE_PARAM_VEC3 => ParamKind::Vec3,
+            kind => return Err(format!("parameter {name:?} has unknown kind {kind}")),
+        };
+        if param.flags & !(RVE_PARAM_HAS_MIN | RVE_PARAM_HAS_MAX) != 0 {
+            return Err(format!(
+                "parameter {name:?} has unknown flags {:#x}",
+                param.flags
+            ));
+        }
+        // SAFETY: the caller guarantees a readable default value.
+        let (default, _) = unsafe { read_message_value(&param.default) }
+            .map_err(|error| format!("parameter {name:?} has an invalid default: {error}"))?;
+        // SAFETY: the caller guarantees readable process-lifetime strings.
+        let label = match unsafe { read_abi_str(param.label) } {
+            Ok("") | Err(AbiStringError::Null) => None,
+            Ok(label) => Some(label.to_owned()),
+            Err(error) => {
+                return Err(format!(
+                    "parameter {name:?} has an invalid label: {error:?}"
+                ));
+            }
+        };
+        specs.push(ParamSpec {
+            min: (param.flags & RVE_PARAM_HAS_MIN != 0).then_some(param.min),
+            max: (param.flags & RVE_PARAM_HAS_MAX != 0).then_some(param.max),
+            name,
+            kind,
+            default,
+            label,
+        });
+    }
+    ParamSchema::new(specs).map(Some)
 }

@@ -23,6 +23,8 @@ dev-режиме. Инструмент является внешним crate wor
 `engine_script::lite_properties` и проверяет `params` объекта через
 `ParamSchema::resolve` (см. [[Engine/EngineScript]]). Ошибка схемы или параметра —
 ошибка проекта с кодом 2: сцена, id объекта и путь скрипта указываются в сообщении.
+После сборки cdylib так же проверяются `params` heavy-скриптов по
+`ScriptLibrary::schema`, вместе с проверкой имён.
 
 `build_project_archives` сериализует `ProjectSettings::to_toml` и
 `ArchiveSetRegistry::to_toml` во временный каталог, передаёт generated files вместе

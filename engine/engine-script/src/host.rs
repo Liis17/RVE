@@ -265,6 +265,14 @@ impl ScriptHost {
                             message: "object handle cannot be represented by the script ABI"
                                 .to_owned(),
                         })?;
+                    let schema = library.and_then(|library| library.schema(&script.name));
+                    let params = resolve_params(schema, &script.params).map_err(|message| {
+                        ScriptLoadError::Heavy {
+                            object_id: object.id.clone(),
+                            name: script.name.clone(),
+                            message,
+                        }
+                    })?;
                     let source = event_source(scene_name, &object.id, &script.name);
                     host.transaction.begin(
                         world,
@@ -276,7 +284,7 @@ impl ScriptHost {
                     );
                     let result = AbiScriptInstance::create(
                         descriptor,
-                        &script.params,
+                        &params,
                         AbiScriptCall {
                             self_object,
                             transaction: &mut host.transaction,

@@ -5,7 +5,7 @@ use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
-use engine_scene::{ParamSchema, SceneDocument};
+use engine_scene::{ParamSchema, ParamValue, SceneDocument};
 use engine_script::{ScriptInterruptHandle, lite_properties};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -21,7 +21,16 @@ pub(crate) struct ProjectBuild {
     pub(crate) archives: Vec<String>,
     #[cfg(windows)]
     pub(crate) icon: Option<VirtualPath>,
-    pub(crate) heavy_scripts: Vec<(String, String)>,
+    pub(crate) heavy_scripts: Vec<HeavyScriptUse>,
+}
+
+/// Heavy-скрипт объекта включённой сцены.
+#[derive(Clone, Debug)]
+pub(crate) struct HeavyScriptUse {
+    pub(crate) scene: String,
+    pub(crate) object: String,
+    pub(crate) name: String,
+    pub(crate) params: BTreeMap<String, ParamValue>,
 }
 
 #[derive(Default)]
@@ -129,10 +138,12 @@ fn prepare_with_resources(
             .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
         validate_lite_params(&document, &path, &handle, &mut lite_schemas)?;
         heavy_scripts.extend(document.objects.iter().flat_map(|object| {
-            object
-                .heavy_scripts
-                .iter()
-                .map(|script| (path.to_string(), script.name.clone()))
+            object.heavy_scripts.iter().map(|script| HeavyScriptUse {
+                scene: path.to_string(),
+                object: object.id.clone(),
+                name: script.name.clone(),
+                params: script.params.clone(),
+            })
         }));
 
         base_paths.insert(path.clone());
@@ -264,13 +275,14 @@ fn validate_lite_params(
 
 fn validate_heavy_scripts_configured(
     settings: &ProjectSettings,
-    heavy_scripts: &[(String, String)],
+    heavy_scripts: &[HeavyScriptUse],
 ) -> Result<(), BuildError> {
     if settings.heavy_scripts.is_none()
-        && let Some((scene, name)) = heavy_scripts.first()
+        && let Some(script) = heavy_scripts.first()
     {
         return Err(BuildError::input(format!(
-            "сцена /{scene} ссылается на heavy-скрипт {name:?}, но в project.rveproject не задан heavy_scripts"
+            "сцена /{} ссылается на heavy-скрипт {:?}, но в project.rveproject не задан heavy_scripts",
+            script.scene, script.name
         )));
     }
     Ok(())
@@ -496,7 +508,10 @@ fn extension_is(path: &str, extension: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetUsage, EnabledScene, assign_archives, validate_heavy_scripts_configured};
+    use super::{
+        AssetUsage, EnabledScene, HeavyScriptUse, assign_archives,
+        validate_heavy_scripts_configured,
+    };
     use engine_files::VirtualPath;
     use engine_project::ProjectSettings;
     use std::collections::{BTreeMap, BTreeSet};
@@ -513,7 +528,12 @@ mod tests {
         .unwrap();
         let error = validate_heavy_scripts_configured(
             &settings,
-            &[("/scenes/main.rvescene".to_owned(), "Bobber".to_owned())],
+            &[HeavyScriptUse {
+                scene: "/scenes/main.rvescene".to_owned(),
+                object: "mesh".to_owned(),
+                name: "Bobber".to_owned(),
+                params: BTreeMap::new(),
+            }],
         )
         .unwrap_err();
         assert_eq!(error.exit_code(), 2);
