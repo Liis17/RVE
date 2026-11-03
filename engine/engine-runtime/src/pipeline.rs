@@ -1,8 +1,8 @@
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId,
-    Renderer, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
+    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, FrameStatus,
+    MaterialId, MeshId, Renderer, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_scene::camera::Camera;
 use engine_scene::light::shadow_view_projection;
@@ -32,7 +32,7 @@ pub(crate) struct FrameSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
-    pub by_object: HashMap<ObjectHandle, Vec<(MeshId, Option<TextureId>)>>,
+    pub by_object: HashMap<ObjectHandle, Vec<(MeshId, MaterialId)>>,
 }
 
 #[derive(Debug)]
@@ -214,6 +214,7 @@ impl RenderBackend for VulkanBackend {
                 .view_projection(width, height)
                 .to_cols_array_2d(),
             shadow_view_projection: shadow,
+            camera_position: snapshot.camera.position.to_array(),
             light,
             draws: &snapshot.draws,
             overlay: &[],
@@ -479,9 +480,9 @@ fn make_snapshot(scene: engine_scene::SceneFrame, gpu_scene: &GpuSceneTable) -> 
     let mut draws = Vec::new();
     for instance in scene.meshes {
         if let Some(meshes) = gpu_scene.by_object.get(&instance.object) {
-            draws.extend(meshes.iter().map(|(mesh, texture)| DrawCommand {
+            draws.extend(meshes.iter().map(|(mesh, material)| DrawCommand {
                 mesh: *mesh,
-                texture: *texture,
+                material: Some(*material),
                 model: instance.model.to_cols_array_2d(),
                 casts_shadow: true,
             }));

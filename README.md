@@ -9,10 +9,12 @@ RVE — игровой движок на Rust с рендерингом чере
 - Rust stable.
 - Windows: видеодрайвер с поддержкой Vulkan 1.3.
 - macOS: Vulkan loader и MoltenVK. Для Homebrew: `brew install vulkan-loader molten-vk`.
-- HDR `R16G16B16A16_SFLOAT` и LDR `R8G8B8A8_SRGB` post targets требуют optimal
+- HDR `R16G16B16A16_SFLOAT` и LDR post target `R8G8B8A8_SRGB` требуют optimal
   tiling `COLOR_ATTACHMENT`, `SAMPLED_IMAGE` и `SAMPLED_IMAGE_FILTER_LINEAR`; surface
-  требует color attachment и blending. Material textures `R8G8B8A8_SRGB`
-  дополнительно требуют `TRANSFER_SRC`, `TRANSFER_DST`, `BLIT_SRC` и `BLIT_DST`.
+  и его format должны поддерживать color attachment, а surface format — blending.
+- Форматы текстур `R8G8B8A8_SRGB` и `R8G8B8A8_UNORM` требуют `SAMPLED_IMAGE`,
+  `SAMPLED_IMAGE_FILTER_LINEAR`, `TRANSFER_SRC`, `TRANSFER_DST`, `BLIT_SRC` и
+  `BLIT_DST` для полной mip-цепочки.
 
 Для обычной сборки Rust-кода Vulkan SDK не требуется.
 
@@ -42,6 +44,7 @@ Sandbox показывает вращающийся куб над плоскос
 
 ```sh
 cargo run -p sandbox -- --scene triangle
+cargo run -p sandbox -- --scene materials --frames 300
 cargo run -p sandbox -- --model /models/cube.fbx --texture /textures/cube.png
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
 cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
@@ -49,10 +52,10 @@ cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
 
 Ресурсы sandbox размещаются в `build/assets`. Например, путь
 `/models/cube.fbx` указывает на `build/assets/models/cube.fbx`. Поддерживаются
-сцены `triangle`, `cube` и `shadows`, модели FBX, текстуры PNG, ограничение
+сцены `triangle`, `cube`, `shadows` и `materials`, модели FBX, текстуры PNG, ограничение
 числа кадров, изменение размера окна и отладочный оверлей. Настройки проекции,
-экспозиции и тонмаппинга задаются файлом `.camerasettings`; явный `--render-scale`
-перекрывает масштаб из него.
+exposure, tonemapping, anti-aliasing и render scale задаются файлом
+`.camerasettings`; явный `--render-scale` перекрывает масштаб из него.
 
 Настройки окна sandbox необязательны. Чтобы изменить их, скопируй шаблон
 `bootstrap.rves.example` в `build/bootstrap.rves`.

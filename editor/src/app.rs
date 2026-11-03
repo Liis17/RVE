@@ -550,6 +550,7 @@ fn render_scene_frame(
     let scene_view = scene_size.map(|[width, height]| {
         gpu.scene.frame(
             scene_camera.view_projection(width, height),
+            scene_camera.position,
             scene_settings,
             &scene_frame.light,
             has_light,
@@ -559,6 +560,7 @@ fn render_scene_frame(
     let game_view = game_size.map(|[width, height]| {
         gpu.scene.frame(
             game_camera.view_projection(width, height),
+            game_camera.position,
             game_settings,
             &scene_frame.light,
             has_light,

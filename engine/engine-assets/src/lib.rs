@@ -17,7 +17,8 @@ pub const ASSETS_DIR: &str = "assets";
 /// Предел памяти декодера PNG; хватает на текстуру 8192x8192 RGBA с запасом.
 const PNG_DECODE_LIMIT: usize = 512 * 1024 * 1024;
 
-/// Пиксели RGBA8 в sRGB по строкам сверху вниз.
+/// Пиксели RGBA8 по строкам сверху вниз. Цветовое пространство задаёт использующий материал:
+/// base-color карты являются sRGB, metallic-roughness и normal карты — linear.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextureData {
     pub width: u32,
@@ -40,8 +41,36 @@ pub struct ModelVertex {
 pub struct ModelMesh {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
-    /// Индекс в [`Model::textures`].
-    pub texture: Option<usize>,
+    pub material: ModelMaterial,
+}
+
+/// Линейные факторы и индексы текстур материала модели.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelMaterial {
+    pub base_color: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+    /// Индекс в [`Model::textures`] для sRGB base-color.
+    pub base_color_texture: Option<usize>,
+    /// Индекс в [`Model::textures`] для линейной metallic-roughness карты.
+    pub metallic_roughness_texture: Option<usize>,
+    /// Индекс в [`Model::textures`] для линейной tangent-space normal карты.
+    pub normal_texture: Option<usize>,
+    pub normal_scale: f32,
+}
+
+impl Default for ModelMaterial {
+    fn default() -> Self {
+        Self {
+            base_color: [1.0; 3],
+            metallic: 0.0,
+            roughness: 1.0,
+            base_color_texture: None,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: 1.0,
+        }
+    }
 }
 
 /// Модель, собранная из всех мешей файла в мировом пространстве сцены.
@@ -198,7 +227,7 @@ impl Assets {
         decode_png(&bytes).map_err(|message| AssetError::Decode { path, message })
     }
 
-    /// Загружает FBX-модель с её PNG-текстурами.
+    /// Загружает FBX-модель с её PNG-текстурами материалов.
     ///
     /// Внешняя текстура ищется по пути, записанному в FBX относительно файла модели,
     /// а затем по имени файла рядом с моделью. Встроенные в FBX PNG тоже поддерживаются.
@@ -241,25 +270,25 @@ impl Assets {
                 if part.num_triangles == 0 {
                     continue;
                 }
-                let Some(texture) = materials
-                    .get(part.index as usize)
-                    .and_then(|material| diffuse_texture(material))
-                else {
+                let Some(material) = materials.get(part.index as usize) else {
                     continue;
                 };
-                if !seen_textures.insert(texture.element.element_id) || !texture.content.is_empty()
-                {
-                    continue;
-                }
-                let dependency = resolve_external_texture(
-                    &virtual_path,
-                    &path,
-                    texture,
-                    self,
-                    |asset_path, _| Ok(asset_path.to_owned()),
-                )?;
-                if !dependencies.contains(&dependency) {
-                    dependencies.push(dependency);
+                for texture in material_textures(material).into_iter().flatten() {
+                    if !seen_textures.insert(texture.element.element_id)
+                        || !texture.content.is_empty()
+                    {
+                        continue;
+                    }
+                    let dependency = resolve_external_texture(
+                        &virtual_path,
+                        &path,
+                        texture,
+                        self,
+                        |asset_path, _| Ok(asset_path.to_owned()),
+                    )?;
+                    if !dependencies.contains(&dependency) {
+                        dependencies.push(dependency);
+                    }
                 }
             }
         }
@@ -467,7 +496,8 @@ fn load_fbx(
         meshes: Vec::new(),
         textures: Vec::new(),
     };
-    let mut loaded_textures = HashMap::new();
+    let mut loaded_textures = HashMap::<u32, usize>::new();
+    let mut loaded_metallic_roughness = HashMap::<(Option<u32>, Option<u32>), usize>::new();
     let mut triangle = Vec::new();
     for node in scene.nodes.iter() {
         let Some(mesh) = node.mesh.as_ref() else {
@@ -511,29 +541,24 @@ fn load_fbx(
             if vertices.is_empty() {
                 continue;
             }
-            let texture = match materials
-                .get(part.index as usize)
-                .and_then(|material| diffuse_texture(material))
-            {
-                Some(texture) => Some(match loaded_textures.get(&texture.element.element_id) {
-                    Some(&index) => index,
-                    None => {
-                        model
-                            .textures
-                            .push(load_fbx_texture(virtual_path, path, texture, assets)?);
-                        let index = model.textures.len() - 1;
-                        loaded_textures.insert(texture.element.element_id, index);
-                        index
-                    }
-                }),
-                None => None,
+            let material = match materials.get(part.index as usize) {
+                Some(material) => load_model_material(
+                    material,
+                    virtual_path,
+                    path,
+                    assets,
+                    &mut model,
+                    &mut loaded_textures,
+                    &mut loaded_metallic_roughness,
+                )?,
+                None => ModelMaterial::default(),
             };
             let vertex_count = u32::try_from(vertices.len())
                 .map_err(|_| decode_error("в меше больше u32::MAX вершин".to_owned()))?;
             model.meshes.push(ModelMesh {
                 vertices,
                 indices: (0..vertex_count).collect(),
-                texture,
+                material,
             });
         }
     }
@@ -549,6 +574,284 @@ fn diffuse_texture(material: &ufbx::Material) -> Option<&ufbx::Texture> {
         .into_iter()
         .filter_map(|map| map.texture.as_deref())
         .find(|texture| texture.type_ == ufbx::TextureType::File)
+}
+
+fn material_textures(material: &ufbx::Material) -> [Option<&ufbx::Texture>; 4] {
+    let pbr = supports_metallic_roughness(material.shader_type);
+    [
+        diffuse_texture(material),
+        file_texture(&material.pbr.normal_map).or_else(|| file_texture(&material.fbx.normal_map)),
+        pbr.then(|| file_texture(&material.pbr.roughness)).flatten(),
+        pbr.then(|| file_texture(&material.pbr.metalness)).flatten(),
+    ]
+}
+
+fn file_texture(map: &ufbx::MaterialMap) -> Option<&ufbx::Texture> {
+    map.texture
+        .as_deref()
+        .filter(|texture| texture.type_ == ufbx::TextureType::File)
+}
+
+fn supports_metallic_roughness(shader_type: ufbx::ShaderType) -> bool {
+    matches!(
+        shader_type,
+        ufbx::ShaderType::OslStandardSurface
+            | ufbx::ShaderType::ArnoldStandardSurface
+            | ufbx::ShaderType::E3DsMaxPhysicalMaterial
+            | ufbx::ShaderType::E3DsMaxPbrMetalRough
+            | ufbx::ShaderType::E3DsMaxPbrSpecGloss
+            | ufbx::ShaderType::GltfMaterial
+            | ufbx::ShaderType::OpenpbrMaterial
+            | ufbx::ShaderType::ShaderfxGraph
+    )
+}
+
+fn load_model_material(
+    material: &ufbx::Material,
+    model_virtual_path: &str,
+    model_path: &Path,
+    assets: &Assets,
+    model: &mut Model,
+    loaded_textures: &mut HashMap<u32, usize>,
+    loaded_metallic_roughness: &mut HashMap<(Option<u32>, Option<u32>), usize>,
+) -> Result<ModelMaterial, AssetError> {
+    let [base_color, normal, roughness, metalness] = material_textures(material);
+    let base_color_texture = base_color
+        .map(|texture| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+        })
+        .transpose()?;
+    let normal_texture = normal
+        .map(|texture| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+        })
+        .transpose()?;
+    let metallic_roughness_texture = load_metallic_roughness_texture(
+        model_virtual_path,
+        model_path,
+        (roughness, metalness),
+        assets,
+        model,
+        loaded_textures,
+        loaded_metallic_roughness,
+    )?;
+    let has_metallic_roughness = supports_metallic_roughness(material.shader_type);
+    let base_color_factor = if base_color_texture.is_some() {
+        [1.0; 3]
+    } else if material.pbr.base_color.has_value {
+        map_vec3(&material.pbr.base_color)
+    } else if material.fbx.diffuse_color.has_value {
+        let factor = if material.fbx.diffuse_factor.has_value {
+            map_scalar(&material.fbx.diffuse_factor)
+        } else {
+            1.0
+        };
+        map_vec3(&material.fbx.diffuse_color).map(|value| value * factor)
+    } else {
+        [1.0; 3]
+    };
+    Ok(ModelMaterial {
+        base_color: base_color_factor,
+        metallic: if !has_metallic_roughness {
+            0.0
+        } else if metalness.is_some() {
+            1.0
+        } else if material.pbr.metalness.has_value {
+            map_scalar(&material.pbr.metalness)
+        } else {
+            0.0
+        },
+        roughness: if has_metallic_roughness
+            && roughness.is_none()
+            && material.pbr.roughness.has_value
+        {
+            map_scalar(&material.pbr.roughness)
+        } else {
+            1.0
+        },
+        base_color_texture,
+        metallic_roughness_texture,
+        normal_texture,
+        normal_scale: 1.0,
+    })
+}
+
+fn map_scalar(map: &ufbx::MaterialMap) -> f32 {
+    map.value_vec4.x as f32
+}
+
+fn map_vec3(map: &ufbx::MaterialMap) -> [f32; 3] {
+    [
+        map.value_vec4.x as f32,
+        map.value_vec4.y as f32,
+        map.value_vec4.z as f32,
+    ]
+}
+
+fn load_model_texture(
+    model_virtual_path: &str,
+    model_path: &Path,
+    texture: &ufbx::Texture,
+    assets: &Assets,
+    model: &mut Model,
+    loaded_textures: &mut HashMap<u32, usize>,
+) -> Result<usize, AssetError> {
+    let element_id = texture.element.element_id;
+    if let Some(&index) = loaded_textures.get(&element_id) {
+        return Ok(index);
+    }
+    model.textures.push(load_fbx_texture(
+        model_virtual_path,
+        model_path,
+        texture,
+        assets,
+    )?);
+    let index = model.textures.len() - 1;
+    loaded_textures.insert(element_id, index);
+    Ok(index)
+}
+
+fn load_metallic_roughness_texture(
+    model_virtual_path: &str,
+    model_path: &Path,
+    maps: (Option<&ufbx::Texture>, Option<&ufbx::Texture>),
+    assets: &Assets,
+    model: &mut Model,
+    loaded_textures: &mut HashMap<u32, usize>,
+    loaded_packed: &mut HashMap<(Option<u32>, Option<u32>), usize>,
+) -> Result<Option<usize>, AssetError> {
+    let (roughness, metalness) = maps;
+    let ids = (
+        roughness.map(|texture| texture.element.element_id),
+        metalness.map(|texture| texture.element.element_id),
+    );
+    if roughness.is_none() && metalness.is_none() {
+        return Ok(None);
+    }
+    if let (Some(roughness), Some(_)) = (roughness, metalness)
+        && ids.0 == ids.1
+    {
+        return load_model_texture(
+            model_virtual_path,
+            model_path,
+            roughness,
+            assets,
+            model,
+            loaded_textures,
+        )
+        .map(Some);
+    }
+    pack_metallic_roughness_texture(
+        model_virtual_path,
+        model_path,
+        maps,
+        assets,
+        model,
+        loaded_textures,
+        loaded_packed,
+    )
+    .map(Some)
+}
+
+fn pack_metallic_roughness_texture(
+    model_virtual_path: &str,
+    model_path: &Path,
+    maps: (Option<&ufbx::Texture>, Option<&ufbx::Texture>),
+    assets: &Assets,
+    model: &mut Model,
+    loaded_textures: &mut HashMap<u32, usize>,
+    loaded_packed: &mut HashMap<(Option<u32>, Option<u32>), usize>,
+) -> Result<usize, AssetError> {
+    let (roughness, metalness) = maps;
+    let ids = (
+        roughness.map(|texture| texture.element.element_id),
+        metalness.map(|texture| texture.element.element_id),
+    );
+    if let Some(&index) = loaded_packed.get(&ids) {
+        return Ok(index);
+    }
+    let roughness_index = roughness
+        .map(|texture| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+        })
+        .transpose()?;
+    let metalness_index = metalness
+        .map(|texture| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+        })
+        .transpose()?;
+    let packed = pack_metallic_roughness(
+        roughness_index.map(|index| &model.textures[index]),
+        metalness_index.map(|index| &model.textures[index]),
+    )
+    .map_err(|message| AssetError::Decode {
+        path: model_path.to_owned(),
+        message,
+    })?;
+    model.textures.push(packed);
+    let index = model.textures.len() - 1;
+    loaded_packed.insert(ids, index);
+    Ok(index)
+}
+
+fn pack_metallic_roughness(
+    roughness: Option<&TextureData>,
+    metalness: Option<&TextureData>,
+) -> Result<TextureData, String> {
+    let source = roughness
+        .or(metalness)
+        .expect("at least one map is present");
+    if roughness
+        .is_some_and(|texture| (texture.width, texture.height) != (source.width, source.height))
+        || metalness
+            .is_some_and(|texture| (texture.width, texture.height) != (source.width, source.height))
+    {
+        return Err("roughness и metallic карты имеют разные размеры".to_owned());
+    }
+    let mut rgba = Vec::with_capacity(source.rgba.len());
+    let roughness = roughness.map(|texture| texture.rgba.as_slice());
+    let metalness = metalness.map(|texture| texture.rgba.as_slice());
+    for pixel in 0..(source.width as usize * source.height as usize) {
+        rgba.extend_from_slice(&[
+            0,
+            roughness.map_or(255, |rgba| rgba[pixel * 4]),
+            metalness.map_or(255, |rgba| rgba[pixel * 4]),
+            255,
+        ]);
+    }
+    Ok(TextureData {
+        width: source.width,
+        height: source.height,
+        rgba,
+    })
 }
 
 fn load_fbx_scene(
@@ -755,8 +1058,9 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetError, Assets, Model, ModelMesh, ModelVertex, decode_png,
-        is_missing_texture_candidate, map_resource_error, texture_candidates,
+        AssetError, Assets, Model, ModelMaterial, ModelMesh, ModelVertex, TextureData, decode_png,
+        is_missing_texture_candidate, map_resource_error, pack_metallic_roughness,
+        supports_metallic_roughness, texture_candidates,
     };
     use engine_files::VirtualPath;
     use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
@@ -951,6 +1255,43 @@ mod tests {
         )
     }
 
+    fn arnold_quad_fbx(
+        properties: &str,
+        texture_connections: &[(&str, &str)],
+        duplicate_mesh: bool,
+    ) -> String {
+        let mut fbx = quad_fbx(None).replace(
+            "ShadingModel: \"lambert\"",
+            &format!("ShadingModel: \"lambert\"\n\t\tProperties70: {{\n{properties}\n\t\t}}"),
+        );
+        let mut extra_objects = String::from(
+            "\tImplementation: 5000, \"Implementation::ArnoldStandardSurface\", \"Implementation\" {\n\t\tProperties70: {\n\t\t\tP: \"RenderAPI\", \"KString\", \"\", \"U\", \"ARNOLD_SHADER_ID\"\n\t\t}\n\t}\n",
+        );
+        let mut extra_connections = String::from("\tC: \"OO\",3000,5000\n");
+        for (index, &(property, filename)) in texture_connections.iter().enumerate() {
+            let id = 4000 + index as u32;
+            extra_objects.push_str(&format!(
+                "\tTexture: {id}, \"Texture::{property}\", \"\" {{\n\t\tType: \"TextureVideoClip\"\n\t\tFileName: \"{filename}\"\n\t\tRelativeFilename: \"{filename}\"\n\t}}\n"
+            ));
+            extra_connections.push_str(&format!("\tC: \"OP\",{id},3000,\"{property}\"\n"));
+        }
+        if duplicate_mesh {
+            extra_objects.push_str(
+                "\tModel: 2001, \"Model::QuadCopy\", \"Mesh\" {\n\t\tVersion: 232\n\t}\n",
+            );
+            extra_connections
+                .push_str("\tC: \"OO\",1000,2001\n\tC: \"OO\",2001,0\n\tC: \"OO\",3000,2001\n");
+        }
+        fbx = fbx.replace(
+            "\n}\nConnections:  {\n",
+            &format!("\n{extra_objects}}}\nConnections:  {{\n"),
+        );
+        fbx.replace(
+            "\tC: \"OO\",3000,2000\n",
+            &format!("\tC: \"OO\",3000,2000\n{extra_connections}"),
+        )
+    }
+
     #[test]
     fn asset_paths_resolve_inside_the_assets_directory() {
         let assets = Assets::new("assets");
@@ -1123,7 +1464,7 @@ mod tests {
         assert_eq!(model.meshes.len(), 1);
         assert!(model.textures.is_empty());
         let mesh = &model.meshes[0];
-        assert_eq!(mesh.texture, None);
+        assert_eq!(mesh.material.base_color_texture, None);
         assert_eq!(mesh.indices, [0, 1, 2, 3, 4, 5]);
         assert_eq!(mesh.vertices.len(), 6);
         for vertex in &mesh.vertices {
@@ -1165,7 +1506,11 @@ mod tests {
             let expected = assets.load_model(model).unwrap();
             let actual = resource_assets.load_model(model).unwrap();
             assert_eq!(actual, expected);
-            assert_eq!(actual.meshes[0].texture, Some(0), "{actual:?}");
+            assert_eq!(
+                actual.meshes[0].material.base_color_texture,
+                Some(0),
+                "{actual:?}"
+            );
             assert_eq!(actual.textures.len(), 1);
             assert_eq!(actual.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
         }
@@ -1323,7 +1668,7 @@ mod tests {
 
         let (_system, assets) = packed.resource_assets();
         let model = assets.load_model("/model/quad.fbx").unwrap();
-        assert_eq!(model.meshes[0].texture, Some(0));
+        assert_eq!(model.meshes[0].material.base_color_texture, Some(0));
         assert_eq!(model.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
@@ -1459,7 +1804,7 @@ mod tests {
         let (_system, assets) = temp.resource_assets();
         let model = assets.load_model("/model/embedded.fbx").unwrap();
         assert_eq!(model, expected);
-        assert_eq!(model.meshes[0].texture, Some(0));
+        assert_eq!(model.meshes[0].material.base_color_texture, Some(0));
         assert_eq!(model.textures[0].rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
@@ -1537,6 +1882,322 @@ mod tests {
     }
 
     #[test]
+    fn arnold_pbr_factors_are_read_from_ufbx_material_maps_without_gamma_conversion() {
+        let temp = TempAssets::new("pbr-factors");
+        let fbx = arnold_quad_fbx(
+            "\t\t\tP: \"baseColor\", \"Color\", \"\", \"A\", 0.2, 0.4, 0.8\n\t\t\tP: \"metalness\", \"Number\", \"\", \"A\", 0.65\n\t\t\tP: \"specularRoughness\", \"Number\", \"\", \"A\", 0.35",
+            &[],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+
+        let model = temp.assets().load_model("/model/pbr.fbx").unwrap();
+        let material = &model.meshes[0].material;
+        assert_eq!(material.base_color, [0.2, 0.4, 0.8]);
+        assert_eq!(material.metallic, 0.65);
+        assert_eq!(material.roughness, 0.35);
+        assert_eq!(material.normal_scale, 1.0);
+        assert!(material.base_color_texture.is_none());
+        assert!(material.metallic_roughness_texture.is_none());
+        assert!(material.normal_texture.is_none());
+        assert!(model.textures.is_empty());
+    }
+
+    #[test]
+    fn pbr_base_and_normal_maps_load_with_white_base_factor_and_default_normal_scale() {
+        let temp = TempAssets::new("pbr-base-normal-maps");
+        let fbx = arnold_quad_fbx(
+            "",
+            &[("baseColor", "base.png"), ("normalCamera", "normal.png")],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/base.png", &rgba_png());
+        temp.write(
+            "model/normal.png",
+            &encode_png(
+                1,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[128, 128, 255, 255],
+            ),
+        );
+
+        let model = temp.assets().load_model("/model/pbr.fbx").unwrap();
+        let material = &model.meshes[0].material;
+        assert_eq!(material.base_color, [1.0; 3]);
+        assert_eq!(material.base_color_texture, Some(0));
+        assert_eq!(material.normal_texture, Some(1));
+        assert_eq!(material.normal_scale, 1.0);
+        assert_eq!(model.textures.len(), 2);
+    }
+
+    #[test]
+    fn classic_phong_reflection_and_shininess_never_become_metallic_roughness() {
+        let temp = TempAssets::new("classic-phong-pbr-regression");
+        let fbx = quad_fbx(None).replace(
+            "ShadingModel: \"lambert\"",
+            "ShadingModel: \"Phong\"\n\t\tProperties70: {\n\t\t\tP: \"ReflectionFactor\", \"Number\", \"\", \"A\", 1\n\t\t\tP: \"ShininessExponent\", \"Number\", \"\", \"A\", 20\n\t\t}",
+        );
+        temp.write("model/phong.fbx", fbx.as_bytes());
+
+        let model = temp.assets().load_model("/model/phong.fbx").unwrap();
+        let material = &model.meshes[0].material;
+        assert_eq!(material.metallic, 0.0);
+        assert_eq!(material.roughness, 1.0);
+        assert!(material.metallic_roughness_texture.is_none());
+    }
+
+    #[test]
+    fn separate_metallic_roughness_maps_pack_red_channels_and_reuse_the_packed_pair() {
+        let temp = TempAssets::new("pbr-packed-maps");
+        let fbx = arnold_quad_fbx(
+            "\t\t\tP: \"metalness\", \"Number\", \"\", \"A\", 0.2\n\t\t\tP: \"specularRoughness\", \"Number\", \"\", \"A\", 0.3",
+            &[
+                ("specularRoughness", "rough.png"),
+                ("metalness", "metal.png"),
+            ],
+            true,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write(
+            "model/rough.png",
+            &encode_png(
+                2,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[64, 8, 9, 255, 192, 10, 11, 255],
+            ),
+        );
+        temp.write(
+            "model/metal.png",
+            &encode_png(
+                2,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[16, 18, 19, 255, 32, 20, 21, 255],
+            ),
+        );
+
+        let model = temp.assets().load_model("/model/pbr.fbx").unwrap();
+        assert_eq!(model.meshes.len(), 2);
+        let first = &model.meshes[0].material;
+        let second = &model.meshes[1].material;
+        assert_eq!(first.metallic, 1.0);
+        assert_eq!(first.roughness, 1.0);
+        assert_eq!(
+            first.metallic_roughness_texture,
+            second.metallic_roughness_texture
+        );
+        assert_eq!(model.textures.len(), 3);
+        let packed = &model.textures[first.metallic_roughness_texture.unwrap()];
+        assert_eq!((packed.width, packed.height), (2, 1));
+        assert_eq!(packed.rgba, [0, 64, 16, 255, 0, 192, 32, 255]);
+    }
+
+    #[test]
+    fn one_shared_metallic_roughness_texture_keeps_gltf_g_and_b_channels() {
+        let temp = TempAssets::new("pbr-shared-map");
+        let mut fbx = arnold_quad_fbx("", &[("specularRoughness", "packed.png")], false);
+        fbx = fbx.replace(
+            "\tC: \"OP\",4000,3000,\"specularRoughness\"\n",
+            "\tC: \"OP\",4000,3000,\"specularRoughness\"\n\tC: \"OP\",4000,3000,\"metalness\"\n",
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write(
+            "model/packed.png",
+            &encode_png(
+                1,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[9, 64, 192, 255],
+            ),
+        );
+
+        let model = temp.assets().load_model("/model/pbr.fbx").unwrap();
+        assert_eq!(model.textures.len(), 1);
+        let material = &model.meshes[0].material;
+        assert_eq!(material.metallic, 1.0);
+        assert_eq!(material.roughness, 1.0);
+        assert_eq!(material.metallic_roughness_texture, Some(0));
+        assert_eq!(model.textures[0].rgba, [9, 64, 192, 255]);
+    }
+
+    #[test]
+    fn metallic_roughness_maps_require_matching_dimensions() {
+        let temp = TempAssets::new("pbr-size-mismatch");
+        let fbx = arnold_quad_fbx(
+            "",
+            &[
+                ("specularRoughness", "rough.png"),
+                ("metalness", "metal.png"),
+            ],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/rough.png", &rgba_png());
+        temp.write(
+            "model/metal.png",
+            &encode_png(
+                1,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[1, 2, 3, 255],
+            ),
+        );
+
+        assert!(matches!(
+            temp.assets().load_model("/model/pbr.fbx"),
+            Err(AssetError::Decode { message, .. })
+                if message.contains("roughness и metallic карты имеют разные размеры")
+        ));
+    }
+
+    #[test]
+    fn a_single_metallic_roughness_map_packs_its_red_channel_and_defaults_the_missing_channel() {
+        let roughness = TextureData {
+            width: 1,
+            height: 1,
+            rgba: vec![64, 10, 20, 255],
+        };
+        let metalness = TextureData {
+            width: 1,
+            height: 1,
+            rgba: vec![16, 30, 40, 255],
+        };
+        assert_eq!(
+            pack_metallic_roughness(Some(&roughness), None)
+                .unwrap()
+                .rgba,
+            [0, 64, 255, 255]
+        );
+        assert_eq!(
+            pack_metallic_roughness(None, Some(&metalness))
+                .unwrap()
+                .rgba,
+            [0, 255, 16, 255]
+        );
+    }
+
+    #[test]
+    fn metallic_roughness_is_enabled_only_for_supported_shader_types() {
+        for shader_type in [
+            ufbx::ShaderType::OslStandardSurface,
+            ufbx::ShaderType::ArnoldStandardSurface,
+            ufbx::ShaderType::E3DsMaxPhysicalMaterial,
+            ufbx::ShaderType::E3DsMaxPbrMetalRough,
+            ufbx::ShaderType::E3DsMaxPbrSpecGloss,
+            ufbx::ShaderType::GltfMaterial,
+            ufbx::ShaderType::OpenpbrMaterial,
+            ufbx::ShaderType::ShaderfxGraph,
+        ] {
+            assert!(supports_metallic_roughness(shader_type), "{shader_type:?}");
+        }
+        for shader_type in [
+            ufbx::ShaderType::Unknown,
+            ufbx::ShaderType::FbxLambert,
+            ufbx::ShaderType::FbxPhong,
+            ufbx::ShaderType::BlenderPhong,
+            ufbx::ShaderType::WavefrontMtl,
+        ] {
+            assert!(!supports_metallic_roughness(shader_type), "{shader_type:?}");
+        }
+    }
+
+    #[test]
+    fn pbr_dependencies_follow_base_normal_roughness_metalness_usage_without_decoding() {
+        let temp = TempAssets::new("pbr-dependencies");
+        let fbx = arnold_quad_fbx(
+            "",
+            &[
+                ("baseColor", "base.png"),
+                ("normalCamera", "normal.png"),
+                ("specularRoughness", "rough.png"),
+                ("metalness", "metal.png"),
+            ],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        for name in ["base.png", "normal.png", "rough.png", "metal.png"] {
+            temp.write(&format!("model/{name}"), b"not decoded as PNG");
+        }
+
+        assert_eq!(
+            temp.assets().model_dependencies("/model/pbr.fbx").unwrap(),
+            [
+                "/model/base.png",
+                "/model/normal.png",
+                "/model/rough.png",
+                "/model/metal.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn pbr_missing_external_texture_preserves_missing_texture_error() {
+        let temp = TempAssets::new("pbr-missing-texture");
+        let fbx = arnold_quad_fbx("", &[("specularRoughness", "lost.png")], false);
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+
+        let dependencies_error = temp
+            .assets()
+            .model_dependencies("/model/pbr.fbx")
+            .unwrap_err();
+        let model_error = temp.assets().load_model("/model/pbr.fbx").unwrap_err();
+        let missing = |error: AssetError| match error {
+            AssetError::MissingTexture {
+                texture,
+                tried,
+                model,
+            } => (texture, tried, model),
+            other => panic!("expected MissingTexture, got {other:?}"),
+        };
+        let dependency_missing = missing(dependencies_error);
+        assert_eq!(dependency_missing, missing(model_error));
+        assert_eq!(dependency_missing.0, "lost.png");
+    }
+
+    #[test]
+    fn classic_phong_reflection_texture_is_not_a_model_dependency() {
+        let temp = TempAssets::new("classic-phong-reflection-dependency");
+        let fbx = quad_fbx(None)
+            .replace(
+                "ShadingModel: \"lambert\"",
+                "ShadingModel: \"Phong\"\n\t\tProperties70: {\n\t\t\tP: \"ReflectionFactor\", \"Number\", \"\", \"A\", 1\n\t\t\tP: \"ShininessExponent\", \"Number\", \"\", \"A\", 20\n\t\t}",
+            )
+            .replace(
+                "Objects:  {\n",
+                "Objects:  {\n\tTexture: 4000, \"Texture::Reflection\", \"\" {\n\t\tType: \"TextureVideoClip\"\n\t\tFileName: \"lost.png\"\n\t\tRelativeFilename: \"lost.png\"\n\t}\n",
+            )
+            .replace(
+                "\tC: \"OO\",3000,2000\n",
+                "\tC: \"OO\",3000,2000\n\tC: \"OP\",4000,3000,\"ReflectionFactor\"\n",
+            );
+        temp.write("model/phong.fbx", fbx.as_bytes());
+
+        assert!(
+            temp.assets()
+                .model_dependencies("/model/phong.fbx")
+                .unwrap()
+                .is_empty()
+        );
+        let model = temp.assets().load_model("/model/phong.fbx").unwrap();
+        assert_eq!(model.meshes[0].material.metallic, 0.0);
+        assert_eq!(model.meshes[0].material.roughness, 1.0);
+        assert!(
+            model.meshes[0]
+                .material
+                .metallic_roughness_texture
+                .is_none()
+        );
+    }
+
+    #[test]
     fn bounds_cover_all_meshes_and_are_absent_for_empty_models() {
         let vertex = |position| ModelVertex {
             position,
@@ -1546,7 +2207,7 @@ mod tests {
         let mesh = |positions: [[f32; 3]; 3]| ModelMesh {
             vertices: positions.map(vertex).to_vec(),
             indices: vec![0, 1, 2],
-            texture: None,
+            material: ModelMaterial::default(),
         };
         let model = Model {
             meshes: vec![
