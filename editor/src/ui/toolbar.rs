@@ -237,6 +237,16 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
     });
 }
 
+/// Поле шага привязки; шаг всегда положительный.
+fn snap_step<'a>(value: &'a mut f32, prefix: &str, suffix: &str) -> egui::DragValue<'a> {
+    egui::DragValue::new(value)
+        .speed(0.01)
+        .range(0.001..=f32::MAX)
+        .max_decimals(3)
+        .prefix(prefix)
+        .suffix(suffix)
+}
+
 fn show_tools(ui: &mut egui::Ui, state: &mut EditorState) {
     for (tool, label, tip) in [
         (GizmoTool::Move, "Move", "Перемещение (W)"),
@@ -249,6 +259,13 @@ fn show_tools(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.separator();
     ui.selectable_value(&mut state.space, GizmoSpace::Global, "Global");
     ui.selectable_value(&mut state.space, GizmoSpace::Local, "Local");
+    ui.separator();
+    let snap = &mut state.snap;
+    ui.toggle_value(&mut snap.enabled, "Snap")
+        .on_hover_text("Привязка к шагу; без неё действует при удержании Ctrl");
+    ui.add(snap_step(&mut snap.move_step, "Move ", ""));
+    ui.add(snap_step(&mut snap.rotate_step_deg, "Rotate ", "°"));
+    ui.add(snap_step(&mut snap.scale_step, "Scale ", ""));
     ui.separator();
     let playing = state.is_playing();
     if ui.selectable_label(playing, "Play").clicked() {

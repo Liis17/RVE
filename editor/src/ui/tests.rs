@@ -278,6 +278,25 @@ fn dragging_the_move_handle_moves_along_the_axis_as_one_undo_step() {
 }
 
 #[test]
+fn enabled_snapping_moves_the_object_in_whole_steps() {
+    let (mut harness, id) = harness_with_cube();
+    harness.state.snap.enabled = true;
+    harness.state.snap.move_step = 0.5;
+    harness.scene_mut().select(Some(id.as_str()));
+    harness.panel(Vec::new(), scene_view::show);
+    let grab = y_handle_grab(&harness);
+    harness.drag(
+        grab,
+        grab - vec2(0.0, 90.0),
+        PointerButton::Primary,
+        scene_view::show,
+    );
+    let y = harness.scene().object(&id).unwrap().transform.position[1];
+    assert!(y >= 0.5, "{y}");
+    assert!((y / 0.5 - (y / 0.5).round()).abs() < 1e-4, "{y}");
+}
+
+#[test]
 fn dragging_the_scale_handle_changes_only_that_axis() {
     let (mut harness, id) = harness_with_cube();
     harness.state.tool = GizmoTool::Scale;

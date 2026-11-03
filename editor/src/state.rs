@@ -7,7 +7,7 @@ use crate::previews::PreviewCache;
 use crate::project::OpenProject;
 use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::EditorCamera;
-use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool};
+use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use engine_assets::Model;
 use engine_files::VirtualPath;
 use engine_scene::World;
@@ -74,6 +74,7 @@ pub struct EditorState {
     pub log: ConsoleLog,
     pub tool: GizmoTool,
     pub space: GizmoSpace,
+    pub snap: SnapSettings,
     pub camera: EditorCamera,
     pub gizmo_drag: Option<GizmoDrag>,
     pub play: Option<PlaySession>,
@@ -109,6 +110,7 @@ impl EditorState {
             log: ConsoleLog::default(),
             tool: GizmoTool::Move,
             space: GizmoSpace::Global,
+            snap: SnapSettings::default(),
             camera: EditorCamera::default(),
             gizmo_drag: None,
             play: None,
