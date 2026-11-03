@@ -288,6 +288,8 @@ fn handle_gizmo(
 
     // Завершение или продолжение активного перетаскивания.
     if let Some(drag) = state.gizmo_drag.clone() {
+        let snapping = state.snap.enabled || ui.input(|input| input.modifiers.command);
+        let step = snapping.then(|| state.snap.step(drag.tool));
         if !ui.input(|input| input.pointer.primary_down()) {
             state.gizmo_drag = None;
             if let Some(scene) = &mut state.scene {
@@ -295,7 +297,7 @@ fn handle_gizmo(
             }
         } else if let Some(pointer) = pointer
             && let Some(ray) = pointer_ray(view_projection, rect, pointer)
-            && let Some(transform) = drag.update(ray)
+            && let Some(transform) = drag.update(ray, step)
         {
             let key = format!("{selection}/gizmo");
             state.edit_scene(|scene| scene.set_transform(&selection, transform, Some(&key)));

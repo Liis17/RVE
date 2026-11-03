@@ -21,6 +21,47 @@ pub enum GizmoSpace {
     Global,
 }
 
+/// Шаги привязки гизмо. Перемещение и поворот привязываются к шагу относительно начала
+/// перетаскивания, масштаб — к кратным шага значениям.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnapSettings {
+    /// Привязка включена постоянно; без этого её включает удержание Ctrl/Cmd.
+    pub enabled: bool,
+    pub move_step: f32,
+    pub rotate_step_deg: f32,
+    pub scale_step: f32,
+}
+
+impl Default for SnapSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            move_step: 0.5,
+            rotate_step_deg: 15.0,
+            scale_step: 0.1,
+        }
+    }
+}
+
+impl SnapSettings {
+    /// Шаг инструмента в единицах `GizmoDrag::update`: метры, радианы или доли масштаба.
+    pub fn step(&self, tool: GizmoTool) -> f32 {
+        match tool {
+            GizmoTool::Move => self.move_step,
+            GizmoTool::Rotate => self.rotate_step_deg.to_radians(),
+            GizmoTool::Scale => self.scale_step,
+        }
+    }
+}
+
+/// Округляет значение до кратного шага; неположительный шаг привязку отключает.
+fn snap(value: f32, step: Option<f32>) -> f32 {
+    match step {
+        Some(step) if step > 0.0 => (value / step).round() * step,
+        _ => value,
+    }
+}
+
 /// Мировое положение и единичные оси гизмо объекта.
 pub fn gizmo_axes(world: Mat4, tool: GizmoTool, space: GizmoSpace) -> (Vec3, [Vec3; 3]) {
     let (_, rotation, translation) = world.to_scale_rotation_translation();
@@ -125,12 +166,13 @@ impl GizmoDrag {
         })
     }
 
-    /// Новая локальная трансформация для текущего луча курсора.
-    pub fn update(&self, ray: Ray) -> Option<SceneTransform> {
+    /// Новая локальная трансформация для текущего луча курсора; `step` — шаг привязки
+    /// из `SnapSettings::step`.
+    pub fn update(&self, ray: Ray, step: Option<f32>) -> Option<SceneTransform> {
         match self.tool {
             GizmoTool::Move => {
                 let t = closest_axis_parameter(ray, self.origin, self.axis)?;
-                let delta = self.axis * (t - self.start_parameter);
+                let delta = self.axis * snap(t - self.start_parameter, step);
                 Some(translate(self.start, self.parent_world, delta))
             }
             GizmoTool::Rotate => {
@@ -138,13 +180,24 @@ impl GizmoDrag {
                 Some(rotate(
                     self.start,
                     self.parent_world,
-                    Quat::from_axis_angle(self.axis, angle),
+                    Quat::from_axis_angle(self.axis, snap(angle, step)),
                 ))
             }
             GizmoTool::Scale => {
                 let t = closest_axis_parameter(ray, self.origin, self.axis)?;
                 let factor = 1.0 + (t - self.start_parameter) / self.handle_length.max(1e-4);
-                Some(scale(self.start, self.axis_index, factor))
+                let mut result = scale(self.start, self.axis_index, factor);
+                if let Some(step) = step.filter(|step| *step > 0.0) {
+                    let value = &mut result.scale[self.axis_index];
+                    // Привязка не должна обнулять масштаб: минимум — один шаг того же знака.
+                    let snapped = snap(*value, Some(step));
+                    *value = if snapped.abs() < step * 0.5 {
+                        step.copysign(self.start.scale[self.axis_index])
+                    } else {
+                        snapped
+                    };
+                }
+                Some(result)
             }
         }
     }
@@ -325,15 +378,18 @@ mod tests {
     #[test]
     fn move_drag_follows_the_cursor_relative_to_the_grab_point() {
         let drag = drag(GizmoTool::Move, Vec3::X, ray_at(1.0));
-        let moved = drag.update(ray_at(4.0)).unwrap();
+        let moved = drag.update(ray_at(4.0), None).unwrap();
         assert!((moved.position[0] - 3.0).abs() < 1e-4);
-        assert_eq!(drag.update(ray_at(1.0)).unwrap().position, [0.0, 0.0, 0.0]);
+        assert_eq!(
+            drag.update(ray_at(1.0), None).unwrap().position,
+            [0.0, 0.0, 0.0]
+        );
     }
 
     #[test]
     fn scale_drag_converts_handle_lengths_to_a_factor() {
         let drag = drag(GizmoTool::Scale, Vec3::X, ray_at(1.0));
-        let scaled = drag.update(ray_at(3.0)).unwrap();
+        let scaled = drag.update(ray_at(3.0), None).unwrap();
         assert!((scaled.scale[0] - 2.0).abs() < 1e-4);
     }
 
@@ -348,8 +404,80 @@ mod tests {
             direction: Vec3::NEG_Z,
         };
         let drag = drag(GizmoTool::Rotate, Vec3::Z, grab);
-        let result = drag.update(turned).unwrap();
+        let result = drag.update(turned, None).unwrap();
         assert!((result.rotation[2] - 90.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn snapped_move_advances_in_whole_steps_from_the_grab_point() {
+        let snap = SnapSettings::default();
+        let drag = drag(GizmoTool::Move, Vec3::X, ray_at(1.1));
+        let step = Some(snap.step(GizmoTool::Move));
+        let moved = drag.update(ray_at(1.1 + 1.3), step).unwrap();
+        assert!(
+            (moved.position[0] - 1.5).abs() < 1e-4,
+            "{:?}",
+            moved.position
+        );
+        let back = drag.update(ray_at(1.1 - 0.2), step).unwrap();
+        assert_eq!(back.position[0], 0.0);
+    }
+
+    #[test]
+    fn snapped_rotation_turns_by_whole_steps_in_local_and_global_space() {
+        let snap = SnapSettings::default();
+        let grab = Ray {
+            origin: Vec3::new(1.0, 0.0, 10.0),
+            direction: Vec3::NEG_Z,
+        };
+        // 40° от точки захвата превращаются в 45° при шаге 15°.
+        let angle = 40_f32.to_radians();
+        let turned = Ray {
+            origin: Vec3::new(angle.cos(), angle.sin(), 10.0),
+            direction: Vec3::NEG_Z,
+        };
+        let step = Some(snap.step(GizmoTool::Rotate));
+        let global = drag(GizmoTool::Rotate, Vec3::Z, grab);
+        let result = global.update(turned, step).unwrap();
+        assert!(
+            (result.rotation[2] - 45.0).abs() < 1e-2,
+            "{:?}",
+            result.rotation
+        );
+
+        // Local: ось гизмо — повёрнутая ось объекта, шаг считается вокруг неё же.
+        let start = SceneTransform {
+            rotation: [0.0, 0.0, 10.0],
+            ..SceneTransform::default()
+        };
+        let local = GizmoDrag::begin(
+            GizmoTool::Rotate,
+            2,
+            grab,
+            Vec3::ZERO,
+            Vec3::Z,
+            2.0,
+            start,
+            Mat4::IDENTITY,
+        )
+        .unwrap();
+        let result = local.update(turned, step).unwrap();
+        assert!(
+            (result.rotation[2] - 55.0).abs() < 1e-2,
+            "{:?}",
+            result.rotation
+        );
+    }
+
+    #[test]
+    fn snapped_scale_lands_on_multiples_of_the_step_and_never_reaches_zero() {
+        let step = Some(SnapSettings::default().step(GizmoTool::Scale));
+        let drag = drag(GizmoTool::Scale, Vec3::X, ray_at(1.0));
+        let scaled = drag.update(ray_at(3.13), step).unwrap();
+        assert!((scaled.scale[0] - 2.1).abs() < 1e-4, "{:?}", scaled.scale);
+        let tiny = drag.update(ray_at(-0.95), step).unwrap();
+        assert!((tiny.scale[0] - 0.1).abs() < 1e-4, "{:?}", tiny.scale);
+        assert_eq!(snap(0.37, Some(0.0)), 0.37);
     }
 
     #[test]
