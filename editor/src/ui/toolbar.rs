@@ -71,7 +71,9 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
         rename_selection(state);
     }
     // Esc в модальном окне закрывает его, а не снимает выделение.
-    let modal_open = state.unsaved_prompt.is_some() || state.project_dialog.is_some();
+    let modal_open = state.unsaved_prompt.is_some()
+        || state.project_dialog.is_some()
+        || state.recovery_prompt.is_some();
     if pressed(Key::Escape)
         && !modal_open
         && !state.is_playing()

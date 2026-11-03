@@ -40,6 +40,18 @@ pub enum Action {
     SaveThen(Box<Action>),
     /// Выполнить действие, отбросив несохранённые изменения.
     Discard(Box<Action>),
+    /// Открыть сцену из найденного автосохранения.
+    RestoreAutosave,
+    /// Удалить найденное автосохранение.
+    DiscardAutosave,
+}
+
+/// Найденное при открытии сцены автосохранение.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryPrompt {
+    /// Сцена копии; `None` — несохранённая новая сцена.
+    pub scene: Option<VirtualPath>,
+    pub contents: String,
 }
 
 /// Подтверждение действия при несохранённых изменениях сцены.
@@ -88,6 +100,7 @@ pub struct EditorState {
     pub library: Option<ScriptLibrary>,
     pub actions: Vec<Action>,
     pub unsaved_prompt: Option<UnsavedPrompt>,
+    pub recovery_prompt: Option<RecoveryPrompt>,
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
@@ -130,6 +143,7 @@ impl EditorState {
             library: None,
             actions: Vec::new(),
             unsaved_prompt: None,
+            recovery_prompt: None,
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_dialog: None,

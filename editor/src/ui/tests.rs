@@ -519,6 +519,43 @@ fn start_screen_opens_an_existing_recent_project_and_skips_missing_ones() {
 }
 
 #[test]
+fn recovery_prompt_offers_restore_and_blocks_escape() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.state.recovery_prompt = Some(crate::state::RecoveryPrompt {
+        scene: None,
+        contents: String::new(),
+    });
+    harness.press(egui::Key::Escape, Modifiers::NONE);
+    assert_eq!(harness.scene().selection(), Some("camera"));
+
+    let mut dock = default_layout();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness.ctx.run_ui(input, |ui| show(ui, state, &mut dock));
+        output.textures_delta.clear();
+    };
+    frame(&mut harness, Vec::new());
+    // Кнопки окна находятся просмотром середины экрана; Restore стоит левее Discard.
+    'search: for y in (330..440).step_by(6) {
+        for x in (480..800).step_by(16) {
+            let at = pos2(x as f32, y as f32);
+            frame(&mut harness, vec![Event::PointerMoved(at)]);
+            frame(&mut harness, vec![button(at, PointerButton::Primary, true)]);
+            frame(
+                &mut harness,
+                vec![button(at, PointerButton::Primary, false)],
+            );
+            if !harness.state.actions.is_empty() {
+                break 'search;
+            }
+        }
+    }
+    assert_eq!(harness.state.actions, [Action::RestoreAutosave]);
+}
+
+#[test]
 fn status_bar_summarises_the_scene_and_play_frame_rate() {
     let mut harness = Harness::new();
     assert_eq!(scene_status(&harness.state, 0.02), "untitled  |  2 objects");
