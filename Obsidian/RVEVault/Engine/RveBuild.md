@@ -19,6 +19,11 @@ dev-режиме. Инструмент является внешним crate wor
 иметь расширение `.png` и успешно загружаться через `Assets::load_texture`.
 Неиспользуемые файлы каталога Assets не копируются.
 
+Для каждого lite-скрипта включённой сцены сборщик получает схему `properties` через
+`engine_script::lite_properties` и проверяет `params` объекта через
+`ParamSchema::resolve` (см. [[Engine/EngineScript]]). Ошибка схемы или параметра —
+ошибка проекта с кодом 2: сцена, id объекта и путь скрипта указываются в сообщении.
+
 `build_project_archives` сериализует `ProjectSettings::to_toml` и
 `ArchiveSetRegistry::to_toml` во временный каталог, передаёт generated files вместе
 с проверенными исходными файлами как `BuildFileInput` в `build_archive_set`. Архивы

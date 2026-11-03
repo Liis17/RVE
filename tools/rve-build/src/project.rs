@@ -3,9 +3,10 @@ use engine_assets::{AssetError, Assets};
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{
-    ResourceConfig, ResourceError, ResourceErrorKind, ResourceSystem, SourceMode,
+    ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
-use engine_scene::SceneDocument;
+use engine_scene::{ParamSchema, SceneDocument};
+use engine_script::{ScriptInterruptHandle, lite_properties};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -106,6 +107,7 @@ fn prepare_with_resources(
     let mut heavy_scripts = Vec::new();
     let mut usages = BTreeMap::<VirtualPath, AssetUsage>::new();
     let mut base_paths = BTreeSet::<VirtualPath>::new();
+    let mut lite_schemas = BTreeMap::new();
 
     for scene in settings.scenes.iter().filter(|scene| scene.enabled) {
         let path = VirtualPath::parse(&scene.path)
@@ -125,6 +127,7 @@ fn prepare_with_resources(
         })?;
         let document = SceneDocument::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
+        validate_lite_params(&document, &path, &handle, &mut lite_schemas)?;
         heavy_scripts.extend(document.objects.iter().flat_map(|object| {
             object
                 .heavy_scripts
@@ -221,6 +224,42 @@ fn prepare_with_resources(
         icon,
         heavy_scripts,
     })
+}
+
+/// Проверяет `params` lite-скриптов сцены по схеме `properties` их классов; схемы
+/// кэшируются по пути скрипта для всех сцен.
+fn validate_lite_params(
+    document: &SceneDocument,
+    scene: &VirtualPath,
+    handle: &ResourceHandle,
+    schemas: &mut BTreeMap<VirtualPath, Option<ParamSchema>>,
+) -> Result<(), BuildError> {
+    for object in &document.objects {
+        for script in &object.lite_scripts {
+            if !schemas.contains_key(&script.path) {
+                let label = format!("/{}", script.path);
+                let bytes = handle
+                    .read_all(label.as_str())
+                    .and_then(|request| request.wait())
+                    .map_err(|error| resource_error(&format!("скрипт {label}"), error))?;
+                let source = String::from_utf8(bytes).map_err(|error| {
+                    BuildError::input(format!("скрипт {label} должен быть UTF-8: {error}"))
+                })?;
+                let schema = lite_properties(&label, &source, &ScriptInterruptHandle::new())
+                    .map_err(|error| BuildError::input(error.to_string()))?;
+                schemas.insert(script.path.clone(), schema);
+            }
+            if let Some(schema) = &schemas[&script.path] {
+                schema.resolve(&script.params).map_err(|error| {
+                    BuildError::input(format!(
+                        "сцена /{scene}, объект {:?}, скрипт /{}: {error}",
+                        object.id, script.path
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_heavy_scripts_configured(
@@ -601,5 +640,63 @@ mod tests {
         let error = assign_archives(&[scene], &usages, &BTreeSet::new(), None).unwrap_err();
         assert!(error.to_string().contains("scene-bad scene"));
         assert!(error.to_string().contains("имени сцены"));
+    }
+}
+
+#[cfg(test)]
+mod lite_params_tests {
+    use super::prepare_project;
+    use crate::temporary::TempDir;
+    use std::fs;
+    use std::path::Path;
+
+    const SCRIPT: &str =
+        "return { properties = { speed = { type = \"float\", default = 30, min = 0 } } }\n";
+
+    fn project(root: &Path, params: &str) {
+        let assets = root.join("Assets");
+        fs::create_dir_all(assets.join("scripts")).unwrap();
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        fs::write(assets.join("scripts/rotate.lua"), SCRIPT).unwrap();
+        fs::write(
+            assets.join("main.rvescene"),
+            format!(
+                "[[assets]]\npath = \"/scripts/rotate.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\nparams = {params}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lite_params_are_checked_against_the_script_schema() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-params").unwrap();
+        project(root.path(), "{ speed = 90 }");
+        prepare_project(root.path()).unwrap();
+        for params in ["{ speed = -1.0 }", "{ speed = \"fast\" }", "{ spin = 1 }"] {
+            project(root.path(), params);
+            let error = prepare_project(root.path()).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{params}: {error}");
+            assert!(error.to_string().contains("\"camera\""), "{error}");
+            assert!(error.to_string().contains("/scripts/rotate.lua"), "{error}");
+        }
+    }
+
+    #[test]
+    fn malformed_properties_are_a_project_error() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-params").unwrap();
+        project(root.path(), "{}");
+        fs::write(
+            root.path().join("Assets/scripts/rotate.lua"),
+            "return { properties = { speed = { type = \"double\" } } }\n",
+        )
+        .unwrap();
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("rotate.lua"), "{error}");
     }
 }

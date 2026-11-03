@@ -3,6 +3,7 @@
 pub mod camera;
 pub mod document;
 pub mod light;
+pub mod params;
 pub mod transform;
 pub mod world;
 
@@ -11,6 +12,7 @@ pub use document::{
     MAX_LOD_LEVELS, MaterialOverride, MeshRenderer, ParamValue, SceneAsset, SceneDocument,
     SceneError, SceneObject, SceneTransform,
 };
+pub use params::{ParamKind, ParamSchema, ParamSpec};
 pub use world::{
     LightState, LocalTransform, MeshInstance, ObjectHandle, SceneFrame, SceneWarning, World,
     WorldObject,
