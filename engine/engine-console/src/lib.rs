@@ -371,6 +371,10 @@ impl CommandHistory {
         self.entries.get(index + 1).map(String::as_str)
     }
 
+    pub fn reset_navigation(&mut self) {
+        self.cursor = None;
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -573,6 +577,19 @@ mod tests {
         assert_eq!(history.following(), Some("cmd104"));
         assert_eq!(history.following(), Some(""));
         assert_eq!(history.following(), None);
+    }
+
+    #[test]
+    fn edited_input_can_restart_history_from_the_newest_entry() {
+        let mut history = CommandHistory::default();
+        history.push("first");
+        history.push("second");
+        assert_eq!(history.previous(), Some("second"));
+        assert_eq!(history.previous(), Some("first"));
+
+        history.reset_navigation();
+
+        assert_eq!(history.previous(), Some("second"));
     }
 
     #[test]

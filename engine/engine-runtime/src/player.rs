@@ -175,6 +175,18 @@ struct PlayerWindow<'a> {
     seen_catalog_generation: Option<u64>,
 }
 
+#[cfg(feature = "dev-console")]
+fn new_egui_state(window: &Window) -> EguiWinitState {
+    EguiWinitState::new(
+        Context::default(),
+        ViewportId::ROOT,
+        window,
+        Some(window.scale_factor() as f32),
+        window.theme(),
+        None,
+    )
+}
+
 impl PlayerWindow<'_> {
     fn fail_init(&mut self, message: impl Into<String>) -> bool {
         self.status.record_failure(message);
@@ -214,7 +226,7 @@ impl PlayerWindow<'_> {
     }
 
     #[cfg(feature = "dev-console")]
-    fn set_console_open(&mut self, open: bool) {
+    fn set_console_open(&mut self, open: bool, window: &Window) {
         if self.console_open == open {
             return;
         }
@@ -223,9 +235,13 @@ impl PlayerWindow<'_> {
         self.console_repaint_at = None;
         lock_input(&self.input).console_open(open, self.window_focused);
         if open {
+            if self.egui_state.is_none() {
+                self.egui_state = Some(new_egui_state(window));
+            }
             self.console_needs_redraw = true;
         } else {
             self.console_needs_redraw = false;
+            self.egui_state = None;
             self.publish_console_ui(ConsoleUiFrame::default());
         }
     }
@@ -303,7 +319,7 @@ impl PlayerWindow<'_> {
                 .show(&context, screen_rect, &lines, &catalog);
         });
         if console_output.toggled {
-            self.set_console_open(self.console_overlay.is_open());
+            self.set_console_open(self.console_overlay.is_open(), window);
         }
         let egui::FullOutput {
             platform_output,
@@ -564,7 +580,7 @@ impl WindowHandler for PlayerWindow<'_> {
             && event.physical_key == PhysicalKey::Code(KeyCode::Backquote)
         {
             if event.state == ElementState::Pressed && !event.repeat {
-                self.set_console_open(!self.console_open);
+                self.set_console_open(!self.console_open, window);
             }
             return;
         }
@@ -590,15 +606,7 @@ impl WindowHandler for PlayerWindow<'_> {
     fn init(&mut self, window: Arc<Window>) -> bool {
         #[cfg(feature = "dev-console")]
         {
-            let context = Context::default();
-            self.egui_state = Some(EguiWinitState::new(
-                context,
-                ViewportId::ROOT,
-                window.as_ref(),
-                Some(window.scale_factor() as f32),
-                window.theme(),
-                None,
-            ));
+            self.egui_state = Some(new_egui_state(window.as_ref()));
             self.window_focused = window.has_focus();
             lock_input(&self.input).console_open(false, self.window_focused);
         }
