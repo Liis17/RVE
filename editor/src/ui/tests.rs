@@ -103,12 +103,33 @@ fn button(pos: Pos2, button: PointerButton, pressed: bool) -> Event {
 }
 
 fn key(key: egui::Key) -> Event {
+    key_with(key, Modifiers::NONE)
+}
+
+fn key_with(key: egui::Key, modifiers: Modifiers) -> Event {
     Event::Key {
         key,
         physical_key: None,
         pressed: true,
         repeat: false,
-        modifiers: Modifiers::NONE,
+        modifiers,
+    }
+}
+
+impl Harness {
+    /// Кадр только с обработкой горячих клавиш; модификаторы держатся весь кадр.
+    fn shortcuts(&mut self, mut events: Vec<Event>, modifiers: Modifiers) {
+        events.insert(0, Event::ModifiersChanged(modifiers));
+        let input = self.input(events);
+        let state = &mut self.state;
+        let mut output = self.ctx.run_ui(input, |ui| {
+            toolbar::handle_shortcuts(ui.ctx(), state);
+        });
+        output.textures_delta.clear();
+    }
+
+    fn press(&mut self, key: egui::Key, modifiers: Modifiers) {
+        self.shortcuts(vec![key_with(key, modifiers)], modifiers);
     }
 }
 
@@ -332,6 +353,66 @@ fn tool_shortcuts_apply_unless_a_text_field_has_focus() {
     });
     output.textures_delta.clear();
     assert_eq!(harness.state.tool, GizmoTool::Rotate);
+}
+
+#[test]
+fn ctrl_shift_z_redoes_instead_of_undoing() {
+    let mut harness = Harness::new();
+    let id = harness
+        .scene_mut()
+        .create_object(&NewObject::Empty, None)
+        .unwrap();
+    harness.press(egui::Key::Z, Modifiers::COMMAND);
+    assert!(harness.scene().object(&id).is_none());
+    harness.press(egui::Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+    assert!(harness.scene().object(&id).is_some());
+    assert!(!harness.scene().can_redo());
+}
+
+#[test]
+fn ctrl_d_duplicates_the_selection() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.press(egui::Key::D, Modifiers::COMMAND);
+    let scene = harness.scene();
+    assert_eq!(scene.document().objects.len(), 3);
+    let copy = scene.selection().unwrap();
+    assert_ne!(copy, "camera");
+    assert!(scene.object(copy).unwrap().camera.is_some());
+}
+
+#[test]
+fn f2_starts_renaming_and_escape_clears_the_selection() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    assert_eq!(
+        harness.state.hierarchy_rename,
+        Some(("camera".to_owned(), "Camera".to_owned()))
+    );
+    harness.state.hierarchy_rename = None;
+    harness.press(egui::Key::Escape, Modifiers::NONE);
+    assert_eq!(harness.scene().selection(), None);
+}
+
+#[test]
+fn escape_keeps_the_selection_while_a_dialog_is_open_or_playing() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.state.project_dialog = Some(project_panel::ProjectDialog::NewFolder {
+        name: String::new(),
+    });
+    harness.press(egui::Key::Escape, Modifiers::NONE);
+    assert_eq!(harness.scene().selection(), Some("camera"));
+
+    harness.state.project_dialog = None;
+    let document = harness.scene().document().clone();
+    harness.state.play =
+        Some(crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap());
+    harness.press(egui::Key::Escape, Modifiers::NONE);
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    assert_eq!(harness.scene().selection(), Some("camera"));
+    assert_eq!(harness.state.hierarchy_rename, None);
 }
 
 #[test]
