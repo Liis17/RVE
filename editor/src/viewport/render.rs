@@ -7,7 +7,7 @@ use engine_render::{
     DirectionalLight, DrawCommand, Frame, Material, MaterialId, MeshId, RenderError, Renderer,
     TextureColorSpace, TextureId, Vertex, ViewportId,
 };
-use engine_scene::document::MaterialOverride;
+use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
 use engine_scene::light::shadow_view_projection;
 use engine_scene::world::ObjectHandle;
 use engine_scene::{LightState, SceneFrame, World};
@@ -31,11 +31,10 @@ pub struct SceneRenderer {
     pub game_viewport: ViewportId,
     models: HashMap<String, Option<GpuModel>>,
     textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
-    object_materials: HashMap<(ObjectHandle, usize), (Material, MaterialId)>,
+    object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     grid: Option<MeshId>,
-    /// Команды кадра; сетка, если есть, идёт последней после `scene_draws` команд мира.
-    draws: Vec<DrawCommand>,
-    scene_draws: usize,
+    scene_draws: Vec<DrawCommand>,
+    game_draws: Vec<DrawCommand>,
 }
 
 impl SceneRenderer {
@@ -47,8 +46,8 @@ impl SceneRenderer {
             textures: HashMap::new(),
             object_materials: HashMap::new(),
             grid: None,
-            draws: Vec::new(),
-            scene_draws: 0,
+            scene_draws: Vec::new(),
+            game_draws: Vec::new(),
         })
     }
 
@@ -90,149 +89,136 @@ impl SceneRenderer {
             let Some(mesh) = &object.mesh_renderer else {
                 continue;
             };
-            let model_path = mesh.model.as_str();
-            if !self.models.contains_key(model_path) {
-                let gpu = match project.assets.load_model(model_path) {
-                    Ok(model) => {
-                        let model = Arc::new(model);
-                        let gpu = upload_model(renderer, &model)?;
-                        cpu_models.insert(model_path.to_owned(), model);
-                        Some(gpu)
-                    }
-                    Err(error) => {
-                        log.error(format!("{model_path}: {error}"));
-                        None
-                    }
-                };
-                self.models.insert(model_path.to_owned(), gpu);
-            }
-            let override_material = mesh.material.as_ref();
-            for (path, color_space) in [
-                mesh.texture
-                    .as_ref()
-                    .map(|path| (path.as_str(), TextureColorSpace::Srgb)),
-                override_material
-                    .and_then(|material| material.metallic_roughness_texture.as_ref())
-                    .map(|path| (path.as_str(), TextureColorSpace::Linear)),
-                override_material
-                    .and_then(|material| material.normal_texture.as_ref())
-                    .map(|path| (path.as_str(), TextureColorSpace::Linear)),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let key = (path.to_owned(), color_space);
-                if self.textures.contains_key(&key) {
+            let levels = object
+                .lod_group
+                .as_ref()
+                .map_or(1, |group| group.levels.len() + 1);
+            for level in 0..levels {
+                let Some(model_path) = lod_model_path(mesh, object.lod_group.as_ref(), level)
+                else {
                     continue;
-                }
-                let gpu = match project.assets.load_texture(path) {
-                    Ok(data) => Some(renderer.create_texture_with_color_space(
-                        data.width,
-                        data.height,
-                        &data.rgba,
-                        color_space,
-                    )?),
-                    Err(error) => {
-                        log.error(format!("{path}: {error}"));
-                        None
-                    }
                 };
-                self.textures.insert(key, gpu);
+                if !self.models.contains_key(model_path) {
+                    let gpu = match cpu_models.get(model_path).cloned() {
+                        Some(model) => Some(upload_model(renderer, &model)?),
+                        None => match project.assets.load_model(model_path) {
+                            Ok(model) => {
+                                let model = Arc::new(model);
+                                let gpu = upload_model(renderer, &model)?;
+                                cpu_models.insert(model_path.to_owned(), model);
+                                Some(gpu)
+                            }
+                            Err(error) => {
+                                log.error(format!("{model_path}: {error}"));
+                                None
+                            }
+                        },
+                    };
+                    self.models.insert(model_path.to_owned(), gpu);
+                }
+            }
+            for level in 0..levels {
+                if let Some(path) = lod_texture_path(mesh, object.lod_group.as_ref(), level) {
+                    self.sync_texture(renderer, project, log, path, TextureColorSpace::Srgb)?;
+                }
+            }
+            if let Some(override_material) = &mesh.material {
+                for (path, color_space) in [
+                    override_material
+                        .metallic_roughness_texture
+                        .as_ref()
+                        .map(|path| (path.as_str(), TextureColorSpace::Linear)),
+                    override_material
+                        .normal_texture
+                        .as_ref()
+                        .map(|path| (path.as_str(), TextureColorSpace::Linear)),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    self.sync_texture(renderer, project, log, path, color_space)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Строит команды отрисовки кадра мира; `grid_camera_distance` добавляет сетку.
+    fn sync_texture(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        log: &mut ConsoleLog,
+        path: &str,
+        color_space: TextureColorSpace,
+    ) -> Result<(), RenderError> {
+        let key = (path.to_owned(), color_space);
+        if self.textures.contains_key(&key) {
+            return Ok(());
+        }
+        let gpu = match project.assets.load_texture(path) {
+            Ok(data) => Some(renderer.create_texture_with_color_space(
+                data.width,
+                data.height,
+                &data.rgba,
+                color_space,
+            )?),
+            Err(error) => {
+                log.error(format!("{path}: {error}"));
+                None
+            }
+        };
+        self.textures.insert(key, gpu);
+        Ok(())
+    }
+
+    /// Строит отдельные draw lists для Scene и Game; сетка добавляется только в Scene.
     pub fn build_draws(
         &mut self,
         renderer: &mut Renderer,
         world: &World,
         frame: &SceneFrame,
+        scene_eye: Vec3,
+        game_eye: Vec3,
         grid_camera_distance: Option<f32>,
     ) -> Result<(), RenderError> {
-        self.draws.clear();
-        let mut used_object_materials = HashSet::new();
-        for instance in &frame.meshes {
-            let Some(object) = world.object(instance.object) else {
-                continue;
+        self.scene_draws.clear();
+        self.game_draws.clear();
+        let used_object_materials = {
+            let mut resources = DrawResources {
+                models: &self.models,
+                textures: &self.textures,
+                object_materials: &mut self.object_materials,
+                used_object_materials: HashSet::new(),
             };
-            let Some(mesh) = &object.mesh_renderer else {
-                continue;
-            };
-            let Some(Some(model)) = self.models.get(mesh.model.as_str()) else {
-                continue;
-            };
-            let replacement = mesh.texture.as_ref().and_then(|path| {
-                self.textures
-                    .get(&(path.as_str().to_owned(), TextureColorSpace::Srgb))
-                    .copied()
-                    .flatten()
-            });
-            for (mesh_index, (mesh_id, base_material, base_material_id)) in
-                model.meshes.iter().enumerate()
-            {
-                let override_material = mesh.material.as_ref();
-                let mr_texture = override_material
-                    .and_then(|material| material.metallic_roughness_texture.as_ref())
-                    .and_then(|path| {
-                        self.textures
-                            .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
-                            .copied()
-                            .flatten()
-                    });
-                let normal_texture = override_material
-                    .and_then(|material| material.normal_texture.as_ref())
-                    .and_then(|path| {
-                        self.textures
-                            .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
-                            .copied()
-                            .flatten()
-                    });
-                let resolved = resolve_material(
-                    *base_material,
-                    replacement,
-                    override_material,
-                    mr_texture,
-                    normal_texture,
-                );
-                let material_id = if resolved == *base_material {
-                    *base_material_id
-                } else {
-                    let key = (instance.object, mesh_index);
-                    used_object_materials.insert(key);
-                    match self.object_materials.get(&key) {
-                        Some((cached, id)) if *cached == resolved => *id,
-                        previous => {
-                            let id = renderer.create_material(&resolved)?;
-                            if let Some((_, old_id)) = previous {
-                                renderer.destroy_material(*old_id)?;
-                            }
-                            self.object_materials.insert(key, (resolved, id));
-                            id
-                        }
-                    }
-                };
-                self.draws.push(DrawCommand {
-                    mesh: *mesh_id,
-                    material: Some(material_id),
-                    model: instance.model.to_cols_array_2d(),
-                    casts_shadow: true,
-                });
-            }
-        }
+            append_world_draws(
+                renderer,
+                world,
+                frame,
+                scene_eye,
+                &mut resources,
+                &mut self.scene_draws,
+            )?;
+            append_world_draws(
+                renderer,
+                world,
+                frame,
+                game_eye,
+                &mut resources,
+                &mut self.game_draws,
+            )?;
+            resources.used_object_materials
+        };
         let stale = self
             .object_materials
             .keys()
-            .filter(|key| !used_object_materials.contains(key))
-            .copied()
+            .filter(|key| !used_object_materials.contains(*key))
+            .cloned()
             .collect::<Vec<_>>();
         for key in stale {
             if let Some((_, material)) = self.object_materials.remove(&key) {
                 renderer.destroy_material(material)?;
             }
         }
-        self.scene_draws = self.draws.len();
         if let Some(distance) = grid_camera_distance {
             let grid = match self.grid {
                 Some(grid) => grid,
@@ -243,7 +229,7 @@ impl SceneRenderer {
                     grid
                 }
             };
-            self.draws.push(DrawCommand {
+            self.scene_draws.push(DrawCommand {
                 mesh: grid,
                 material: None,
                 model: Mat4::from_scale(Vec3::splat(grid_scale(distance))).to_cols_array_2d(),
@@ -253,7 +239,7 @@ impl SceneRenderer {
         Ok(())
     }
 
-    /// Собирает `Frame` для заданной матрицы камеры; `with_grid` включает сетку редактора.
+    /// Собирает `Frame` для заданной матрицы камеры; `with_grid` выбирает Scene draw list.
     pub fn frame(
         &self,
         view_projection: Mat4,
@@ -270,13 +256,149 @@ impl SceneRenderer {
             camera_position: camera_position.to_array(),
             light,
             draws: if with_grid {
-                &self.draws
+                &self.scene_draws
             } else {
-                &self.draws[..self.scene_draws]
+                &self.game_draws
             },
             overlay: &[],
         }
     }
+}
+
+fn lod_model_path<'a>(
+    mesh: &'a MeshRenderer,
+    group: Option<&'a LodGroup>,
+    level: usize,
+) -> Option<&'a str> {
+    if level == 0 {
+        return Some(mesh.model.as_str());
+    }
+    let model = group?.levels.get(level - 1)?.model.as_str();
+    Some(model.strip_prefix('/').unwrap_or(model))
+}
+
+fn lod_texture_path<'a>(
+    mesh: &'a MeshRenderer,
+    group: Option<&'a LodGroup>,
+    level: usize,
+) -> Option<&'a str> {
+    let texture = if level == 0 {
+        mesh.texture.as_ref().map(|path| path.as_str())
+    } else {
+        group?
+            .levels
+            .get(level - 1)?
+            .texture
+            .as_deref()
+            .or_else(|| mesh.texture.as_ref().map(|path| path.as_str()))
+    }?;
+    Some(texture.strip_prefix('/').unwrap_or(texture))
+}
+
+struct DrawResources<'a> {
+    models: &'a HashMap<String, Option<GpuModel>>,
+    textures: &'a HashMap<(String, TextureColorSpace), Option<TextureId>>,
+    object_materials: &'a mut HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
+    used_object_materials: HashSet<(ObjectHandle, String, usize, usize)>,
+}
+
+// Both viewports can reference the same model with different LOD textures in one frame.
+fn object_material_key(
+    object: ObjectHandle,
+    model_path: &str,
+    level: usize,
+    mesh_index: usize,
+) -> (ObjectHandle, String, usize, usize) {
+    (object, model_path.to_owned(), level, mesh_index)
+}
+
+fn append_world_draws(
+    renderer: &mut Renderer,
+    world: &World,
+    frame: &SceneFrame,
+    eye: Vec3,
+    resources: &mut DrawResources<'_>,
+    draws: &mut Vec<DrawCommand>,
+) -> Result<(), RenderError> {
+    for instance in &frame.meshes {
+        let Some(object) = world.object(instance.object) else {
+            continue;
+        };
+        let Some(mesh) = &object.mesh_renderer else {
+            continue;
+        };
+        let Some(level) = world.lod_level(instance.object, eye) else {
+            continue;
+        };
+        let Some(model_path) = lod_model_path(mesh, object.lod_group.as_ref(), level) else {
+            continue;
+        };
+        let Some(Some(model)) = resources.models.get(model_path) else {
+            continue;
+        };
+        let replacement =
+            lod_texture_path(mesh, object.lod_group.as_ref(), level).and_then(|path| {
+                resources
+                    .textures
+                    .get(&(path.to_owned(), TextureColorSpace::Srgb))
+                    .copied()
+                    .flatten()
+            });
+        for (mesh_index, (mesh_id, base_material, base_material_id)) in
+            model.meshes.iter().enumerate()
+        {
+            let override_material = mesh.material.as_ref();
+            let mr_texture = override_material
+                .and_then(|material| material.metallic_roughness_texture.as_ref())
+                .and_then(|path| {
+                    resources
+                        .textures
+                        .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
+                        .copied()
+                        .flatten()
+                });
+            let normal_texture = override_material
+                .and_then(|material| material.normal_texture.as_ref())
+                .and_then(|path| {
+                    resources
+                        .textures
+                        .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
+                        .copied()
+                        .flatten()
+                });
+            let resolved = resolve_material(
+                *base_material,
+                replacement,
+                override_material,
+                mr_texture,
+                normal_texture,
+            );
+            let material_id = if resolved == *base_material {
+                *base_material_id
+            } else {
+                let key = object_material_key(instance.object, model_path, level, mesh_index);
+                resources.used_object_materials.insert(key.clone());
+                match resources.object_materials.get(&key) {
+                    Some((cached, id)) if *cached == resolved => *id,
+                    previous => {
+                        let id = renderer.create_material(&resolved)?;
+                        if let Some((_, old_id)) = previous {
+                            renderer.destroy_material(*old_id)?;
+                        }
+                        resources.object_materials.insert(key, (resolved, id));
+                        id
+                    }
+                }
+            };
+            draws.push(DrawCommand {
+                mesh: *mesh_id,
+                material: Some(material_id),
+                model: instance.model.to_cols_array_2d(),
+                casts_shadow: true,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, RenderError> {
@@ -486,6 +608,34 @@ fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_files::VirtualPath;
+    use engine_scene::LodLevel;
+
+    #[test]
+    fn lod_materials_for_two_viewports_do_not_replace_each_other() {
+        let document = engine_scene::SceneDocument::parse(
+            "test",
+            r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+fov_deg = 60.0
+near = 0.1
+far = 100.0
+"#,
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let object = world.handle("camera").unwrap();
+        let scene_key = object_material_key(object, "shared.fbx", 1, 0);
+        let game_key = object_material_key(object, "shared.fbx", 2, 0);
+        let mut cache = HashMap::new();
+        cache.insert(scene_key.clone(), "scene texture material");
+        cache.insert(game_key.clone(), "game texture material");
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache[&scene_key], "scene texture material");
+        assert_eq!(cache[&game_key], "game texture material");
+    }
 
     #[test]
     fn grid_is_flat_indexed_quads_with_two_lines_per_row() {
@@ -507,6 +657,54 @@ mod tests {
         assert_eq!(grid_scale(25.0), 10.0);
         assert!((grid_scale(0.2) - 0.1).abs() < 1e-5);
         assert!(grid_scale(0.0) > 0.0);
+    }
+
+    #[test]
+    fn lod_paths_keep_model_order_and_resolve_texture_inheritance() {
+        let mesh = MeshRenderer {
+            model: VirtualPath::parse("/models/base.fbx").unwrap(),
+            texture: Some(VirtualPath::parse("/textures/base.png").unwrap()),
+            material: None,
+        };
+        let group = LodGroup {
+            levels: vec![
+                LodLevel {
+                    model: "/models/lod1.fbx".to_owned(),
+                    texture: Some("/textures/lod.png".to_owned()),
+                    distance: 10.0,
+                },
+                LodLevel {
+                    model: "/models/lod2.fbx".to_owned(),
+                    texture: None,
+                    distance: 20.0,
+                },
+            ],
+            cull_distance: None,
+        };
+        assert_eq!(
+            lod_model_path(&mesh, Some(&group), 0),
+            Some("models/base.fbx")
+        );
+        assert_eq!(
+            lod_model_path(&mesh, Some(&group), 1),
+            Some("models/lod1.fbx")
+        );
+        assert_eq!(
+            lod_model_path(&mesh, Some(&group), 2),
+            Some("models/lod2.fbx")
+        );
+        assert_eq!(
+            lod_texture_path(&mesh, Some(&group), 0),
+            Some("textures/base.png")
+        );
+        assert_eq!(
+            lod_texture_path(&mesh, Some(&group), 1),
+            Some("textures/lod.png")
+        );
+        assert_eq!(
+            lod_texture_path(&mesh, Some(&group), 2),
+            Some("textures/base.png")
+        );
     }
 
     #[test]

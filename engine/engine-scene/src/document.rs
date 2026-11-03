@@ -152,6 +152,57 @@ impl SceneDocument {
                     validate_material_override(source, object, &asset_paths, material)?;
                 }
             }
+            if let Some(group) = &object.lod_group {
+                if object.mesh_renderer.is_none() {
+                    return Err(SceneError::new(
+                        source,
+                        Some(&object.id),
+                        "lod_group требует mesh_renderer",
+                    ));
+                }
+                if group.levels.is_empty() || group.levels.len() > MAX_LOD_LEVELS {
+                    return Err(SceneError::new(
+                        source,
+                        Some(&object.id),
+                        format!("lod_group должен содержать от 1 до {MAX_LOD_LEVELS} уровней"),
+                    ));
+                }
+                let mut previous_distance = 0.0;
+                for (index, level) in group.levels.iter().enumerate() {
+                    if !level.distance.is_finite()
+                        || level.distance <= 0.0
+                        || level.distance <= previous_distance
+                    {
+                        return Err(SceneError::new(
+                            source,
+                            Some(&object.id),
+                            format!(
+                                "lod_group.levels[{index}].distance должен быть конечным, положительным и строго возрастать"
+                            ),
+                        ));
+                    }
+                    previous_distance = level.distance;
+                    let model =
+                        parse_lod_path(source, object, &level.model, "lod_group.levels.model")?;
+                    require_asset_path(source, object, &asset_paths, &model, "модель LOD")?;
+                    require_extension(source, object, &model, "fbx", "модель LOD")?;
+                    if let Some(texture) = &level.texture {
+                        let texture =
+                            parse_lod_path(source, object, texture, "lod_group.levels.texture")?;
+                        require_asset_path(source, object, &asset_paths, &texture, "текстура LOD")?;
+                        require_extension(source, object, &texture, "png", "текстура LOD")?;
+                    }
+                }
+                if let Some(cull_distance) = group.cull_distance
+                    && (!cull_distance.is_finite() || cull_distance <= previous_distance)
+                {
+                    return Err(SceneError::new(
+                        source,
+                        Some(&object.id),
+                        "lod_group.cull_distance должен быть конечным и больше последнего distance",
+                    ));
+                }
+            }
             for script in &object.lite_scripts {
                 require_asset_path(source, object, &asset_paths, &script.path, "lite-скрипт")?;
                 require_extension(source, object, &script.path, "lua", "lite-скрипт")?;
@@ -245,6 +296,8 @@ pub struct SceneObject {
     pub camera: Option<CameraComponent>,
     #[serde(default)]
     pub mesh_renderer: Option<MeshRenderer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lod_group: Option<LodGroup>,
     #[serde(default)]
     pub directional_light: Option<DirectionalLightComponent>,
     #[serde(default)]
@@ -304,6 +357,43 @@ pub struct MeshRenderer {
     pub texture: Option<VirtualPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<MaterialOverride>,
+}
+
+pub const MAX_LOD_LEVELS: usize = 6;
+
+/// Дополнительные уровни модели, выбираемые по расстоянию до объекта.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LodGroup {
+    #[serde(default)]
+    pub levels: Vec<LodLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cull_distance: Option<f32>,
+}
+
+impl LodGroup {
+    /// Возвращает индекс уровня: 0 — `mesh_renderer`, 1.. — записи `levels`.
+    pub fn level_for_distance(&self, distance: f32) -> Option<usize> {
+        if self.cull_distance.is_some_and(|limit| distance >= limit) {
+            return None;
+        }
+        Some(
+            self.levels
+                .iter()
+                .take_while(|level| distance >= level.distance)
+                .count(),
+        )
+    }
+}
+
+/// Модель замены и её порог расстояния; `texture = None` наследует текстуру.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LodLevel {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture: Option<String>,
+    pub distance: f32,
 }
 
 /// Необязательные замены факторов и текстур FBX-материала.
@@ -619,6 +709,27 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                 );
             }
         }
+        if let Some(group) = object.get("lod_group").and_then(toml::Value::as_table)
+            && let Some(levels) = group.get("levels").and_then(toml::Value::as_array)
+        {
+            for level in levels {
+                if let Some(level) = level.as_table() {
+                    paths.extend(["model", "texture"].into_iter().filter_map(|key| {
+                        level.get(key).and_then(toml::Value::as_str).map(|path| {
+                            (
+                                object_id,
+                                if key == "model" {
+                                    "lod_group.levels.model"
+                                } else {
+                                    "lod_group.levels.texture"
+                                },
+                                path,
+                            )
+                        })
+                    }));
+                }
+            }
+        }
         if let Some(scripts) = object.get("lite_scripts").and_then(toml::Value::as_array) {
             paths.extend(scripts.iter().filter_map(|script| {
                 script
@@ -664,6 +775,22 @@ fn require_asset_path(
             format!("{kind} /{} отсутствует в [[assets]]", path.as_str()),
         ))
     }
+}
+
+fn parse_lod_path(
+    source: &str,
+    object: &SceneObject,
+    value: &str,
+    field: &str,
+) -> Result<VirtualPath, SceneError> {
+    VirtualPath::parse(value).map_err(|_| {
+        let path = value.strip_prefix('/').unwrap_or(value);
+        SceneError::new(
+            source,
+            Some(&object.id),
+            format!("{field} /{path}: некорректный virtual path"),
+        )
+    })
 }
 
 fn validate_material_override(
@@ -911,7 +1038,7 @@ mod option_virtual_path_serde {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParamValue, SceneDocument};
+    use super::{LodGroup, LodLevel, MAX_LOD_LEVELS, ParamValue, SceneDocument};
 
     const VALID: &str = r#"
 [[objects]]
@@ -946,6 +1073,45 @@ far = 100.0
         assert!(error.to_string().contains(contains), "{error}");
     }
 
+    fn lod_assets() -> String {
+        let mut assets = String::from("[[assets]]\npath=\"/models/base.fbx\"\n");
+        for index in 0..MAX_LOD_LEVELS {
+            assets.push_str(&format!("[[assets]]\npath=\"/models/lod{index}.fbx\"\n"));
+        }
+        assets.push_str(
+            "[[assets]]\npath=\"/textures/base.png\"\n[[assets]]\npath=\"/textures/lod.png\"\n",
+        );
+        assets
+    }
+
+    fn lod_group(distances: &[&str], cull_distance: Option<&str>) -> String {
+        let mut group = String::from("[objects.lod_group]\n");
+        if let Some(distance) = cull_distance {
+            group.push_str(&format!("cull_distance={distance}\n"));
+        }
+        for (index, distance) in distances.iter().enumerate() {
+            group.push_str(&format!(
+                "\n[[objects.lod_group.levels]]\nmodel=\"/models/lod{index}.fbx\"\ndistance={distance}\n"
+            ));
+        }
+        group
+    }
+
+    fn lod_scene(group: &str, mesh_renderer: bool) -> String {
+        let renderer = if mesh_renderer {
+            "[objects.mesh_renderer]\nmodel=\"/models/base.fbx\"\ntexture=\"/textures/base.png\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "{}\n{}\n[[objects]]\nid=\"mesh\"\n{}{}",
+            lod_assets(),
+            VALID,
+            renderer,
+            group
+        )
+    }
+
     #[test]
     fn valid_document_applies_defaults_and_round_trips() {
         let document = parse(VALID).unwrap();
@@ -957,6 +1123,138 @@ far = 100.0
         assert_eq!(camera.transform.scale, [1.0; 3]);
         let serialized = document.to_toml().unwrap();
         assert!(parse(&serialized).is_ok(), "{serialized}");
+    }
+
+    #[test]
+    fn lod_group_round_trips_and_absent_groups_keep_legacy_defaults() {
+        let input = lod_scene(&lod_group(&["10.0", "20.0"], Some("40.0")), true);
+        let document = parse(&input).unwrap();
+        let group = document.objects[1].lod_group.as_ref().unwrap();
+        assert_eq!(group.levels.len(), 2);
+        assert_eq!(group.levels[0].model, "/models/lod0.fbx");
+        assert_eq!(group.levels[0].texture, None);
+        assert_eq!(group.cull_distance, Some(40.0));
+
+        let serialized = document.to_toml().unwrap();
+        let round_trip = parse(&serialized).unwrap();
+        assert_eq!(
+            round_trip.objects[1].lod_group.as_ref().unwrap().levels[1].distance,
+            20.0
+        );
+        assert!(parse(VALID).unwrap().objects[0].lod_group.is_none());
+    }
+
+    #[test]
+    fn lod_group_selects_next_level_at_thresholds_and_culls_at_limit() {
+        let group = LodGroup {
+            levels: vec![
+                LodLevel {
+                    model: "/models/lod0.fbx".to_owned(),
+                    texture: None,
+                    distance: 10.0,
+                },
+                LodLevel {
+                    model: "/models/lod1.fbx".to_owned(),
+                    texture: None,
+                    distance: 20.0,
+                },
+            ],
+            cull_distance: Some(30.0),
+        };
+        assert_eq!(group.level_for_distance(0.0), Some(0));
+        assert_eq!(group.level_for_distance(9.99), Some(0));
+        assert_eq!(group.level_for_distance(10.0), Some(1));
+        assert_eq!(group.level_for_distance(20.0), Some(2));
+        assert_eq!(group.level_for_distance(29.99), Some(2));
+        assert_eq!(group.level_for_distance(30.0), None);
+    }
+
+    #[test]
+    fn lod_group_requires_a_mesh_and_one_to_six_levels() {
+        error(
+            &lod_scene(&lod_group(&["10.0"], None), false),
+            "lod_group требует mesh_renderer",
+        );
+        error(&lod_scene(&lod_group(&[], None), true), "от 1 до 6 уровней");
+        let seven = ["1.0", "2.0", "3.0", "4.0", "5.0", "6.0", "7.0"];
+        error(
+            &lod_scene(&lod_group(&seven, None), true),
+            "от 1 до 6 уровней",
+        );
+    }
+
+    #[test]
+    fn lod_distances_must_be_finite_positive_and_strictly_ascending() {
+        for distances in [
+            vec!["0.0"],
+            vec!["-1.0"],
+            vec!["nan"],
+            vec!["inf"],
+            vec!["10.0", "10.0"],
+            vec!["20.0", "10.0"],
+        ] {
+            error(
+                &lod_scene(&lod_group(&distances, None), true),
+                "distance должен быть конечным, положительным и строго возрастать",
+            );
+        }
+        for cull_distance in ["10.0", "5.0", "nan", "inf"] {
+            error(
+                &lod_scene(&lod_group(&["10.0"], Some(cull_distance)), true),
+                "cull_distance должен быть конечным и больше последнего distance",
+            );
+        }
+    }
+
+    #[test]
+    fn lod_assets_require_declared_fbx_and_png_paths_and_reject_unknown_fields() {
+        let group = lod_group(&["10.0"], None);
+        let undeclared = group.replace("/models/lod0.fbx", "/models/missing.fbx");
+        error(
+            &lod_scene(&undeclared, true),
+            "модель LOD /models/missing.fbx отсутствует в [[assets]]",
+        );
+
+        let wrong_model = group.replace("/models/lod0.fbx", "/models/lod0.obj");
+        let wrong_model = format!("[[assets]]\npath=\"/models/lod0.obj\"\n{wrong_model}");
+        error(&lod_scene(&wrong_model, true), "расширение .fbx");
+
+        let wrong_texture = group.replace(
+            "distance=10.0",
+            "distance=10.0\ntexture=\"/textures/lod.jpg\"",
+        );
+        let wrong_texture = format!("[[assets]]\npath=\"/textures/lod.jpg\"\n{wrong_texture}");
+        error(&lod_scene(&wrong_texture, true), "расширение .png");
+
+        let undeclared_texture = group.replace(
+            "distance=10.0",
+            "distance=10.0\ntexture=\"/textures/missing.png\"",
+        );
+        error(
+            &lod_scene(&undeclared_texture, true),
+            "текстура LOD /textures/missing.png отсутствует в [[assets]]",
+        );
+
+        error(
+            &lod_scene(
+                &group.replace("[objects.lod_group]", "[objects.lod_group]\nextra=true"),
+                true,
+            ),
+            "unknown field",
+        );
+        error(
+            &lod_scene(
+                &group.replace("distance=10.0", "distance=10.0\nextra=true"),
+                true,
+            ),
+            "unknown field",
+        );
+
+        let invalid_path = group.replace("/models/lod0.fbx", "/models/../lod0.fbx");
+        error(
+            &lod_scene(&invalid_path, true),
+            "lod_group.levels.model /models/../lod0.fbx: некорректный virtual path",
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use engine_files::VirtualPath;
 use engine_scene::{
-    CameraComponent, DirectionalLightComponent, MeshRenderer, SceneAsset, SceneDocument,
+    CameraComponent, DirectionalLightComponent, LodGroup, MeshRenderer, SceneAsset, SceneDocument,
     SceneObject, SceneTransform,
 };
 use std::collections::HashSet;
@@ -227,6 +227,7 @@ impl EditorScene {
             transform: SceneTransform::default(),
             camera: None,
             mesh_renderer: None,
+            lod_group: None,
             directional_light: None,
             lite_scripts: Vec::new(),
             heavy_scripts: Vec::new(),
@@ -386,6 +387,33 @@ impl EditorScene {
         })
     }
 
+    /// Назначает уровни LOD и добавляет их ресурсы в список сцены.
+    pub fn set_lod_group(&mut self, id: &str, group: Option<LodGroup>) -> Result<(), String> {
+        self.edit(None, |document| {
+            if let Some(group) = &group {
+                for level in &group.levels {
+                    let model = parse_lod_path(id, &level.model, "lod_group.levels.model")?;
+                    ensure_asset(document, &model);
+                    if let Some(texture) = &level.texture {
+                        let texture = parse_lod_path(id, texture, "lod_group.levels.texture")?;
+                        ensure_asset(document, &texture);
+                    }
+                }
+            }
+            find_object_mut(document, id)?.lod_group = group;
+            Ok(())
+        })
+    }
+
+    /// Удаляет mesh renderer и его обязательную LOD Group в одной правке.
+    pub fn remove_mesh_renderer(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.mesh_renderer = None;
+            object.lod_group = None;
+            Ok(())
+        })
+    }
+
     /// Добавляет Lua-скрипт объекту и его путь в список ресурсов сцены.
     pub fn add_lite_script(&mut self, id: &str, path: VirtualPath) -> Result<(), String> {
         self.edit(None, |document| {
@@ -461,6 +489,13 @@ fn ensure_asset(document: &mut SceneDocument, path: &VirtualPath) {
     }
 }
 
+fn parse_lod_path(id: &str, value: &str, field: &str) -> Result<VirtualPath, String> {
+    VirtualPath::parse(value).map_err(|_| {
+        let path = value.strip_prefix('/').unwrap_or(value);
+        format!("объект {id:?}: {field} /{path}: некорректный virtual path")
+    })
+}
+
 /// Идентификаторы объекта и всех его потомков.
 fn subtree_ids(document: &SceneDocument, id: &str) -> Result<HashSet<String>, String> {
     if !document.objects.iter().any(|object| object.id == id) {
@@ -516,6 +551,7 @@ fn unique_id(document: &SceneDocument, base: &str, reserved: &HashSet<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_scene::LodLevel;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn scene() -> EditorScene {
@@ -702,6 +738,124 @@ mod tests {
         assert_eq!(scene.document().assets.len(), 3);
         assert!(scene.set_mesh(&id, path("/t.png"), None).is_err());
         assert!(scene.add_lite_script(&id, path("/m.fbx")).is_err());
+    }
+
+    #[test]
+    fn lod_group_registers_assets_and_supports_undo_redo() {
+        let mut scene = scene();
+        let id = scene
+            .create_object(&NewObject::Mesh(path("/models/base.fbx"), [0.0; 3]), None)
+            .unwrap();
+        let group = LodGroup {
+            levels: vec![LodLevel {
+                model: "/models/lod.fbx".to_owned(),
+                texture: Some("/textures/lod.png".to_owned()),
+                distance: 10.0,
+            }],
+            cull_distance: Some(20.0),
+        };
+        scene.set_lod_group(&id, Some(group)).unwrap();
+
+        let assets = scene
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(assets.contains(&"models/lod.fbx"));
+        assert!(assets.contains(&"textures/lod.png"));
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .lod_group
+                .as_ref()
+                .unwrap()
+                .levels
+                .len(),
+            1
+        );
+        assert!(scene.undo());
+        assert!(scene.object(&id).unwrap().lod_group.is_none());
+        assert!(scene.redo());
+        assert!(scene.object(&id).unwrap().lod_group.is_some());
+    }
+
+    #[test]
+    fn invalid_lod_level_count_and_order_roll_back_with_validation_messages() {
+        let mut scene = scene();
+        let id = scene
+            .create_object(&NewObject::Mesh(path("/base.fbx"), [0.0; 3]), None)
+            .unwrap();
+        let before = scene.document().to_toml().unwrap();
+        let seven = LodGroup {
+            levels: (0..7)
+                .map(|index| LodLevel {
+                    model: format!("/lod{index}.fbx"),
+                    texture: None,
+                    distance: (index + 1) as f32 * 10.0,
+                })
+                .collect(),
+            cull_distance: None,
+        };
+        let error = scene.set_lod_group(&id, Some(seven)).unwrap_err();
+        assert!(error.contains("от 1 до 6 уровней"), "{error}");
+        assert_eq!(scene.document().to_toml().unwrap(), before);
+
+        let unordered = LodGroup {
+            levels: vec![
+                LodLevel {
+                    model: "/lod1.fbx".to_owned(),
+                    texture: None,
+                    distance: 20.0,
+                },
+                LodLevel {
+                    model: "/lod2.fbx".to_owned(),
+                    texture: None,
+                    distance: 10.0,
+                },
+            ],
+            cull_distance: None,
+        };
+        let error = scene.set_lod_group(&id, Some(unordered)).unwrap_err();
+        assert!(
+            error.contains("distance должен быть конечным, положительным и строго возрастать"),
+            "{error}"
+        );
+        assert_eq!(scene.document().to_toml().unwrap(), before);
+    }
+
+    #[test]
+    fn removing_mesh_renderer_also_removes_lod_group_and_history_restores_both() {
+        let mut scene = scene();
+        let id = scene
+            .create_object(&NewObject::Mesh(path("/base.fbx"), [0.0; 3]), None)
+            .unwrap();
+        scene
+            .set_lod_group(
+                &id,
+                Some(LodGroup {
+                    levels: vec![LodLevel {
+                        model: "/lod.fbx".to_owned(),
+                        texture: None,
+                        distance: 10.0,
+                    }],
+                    cull_distance: None,
+                }),
+            )
+            .unwrap();
+        scene.remove_mesh_renderer(&id).unwrap();
+        let object = scene.object(&id).unwrap();
+        assert!(object.mesh_renderer.is_none());
+        assert!(object.lod_group.is_none());
+        assert!(scene.undo());
+        let object = scene.object(&id).unwrap();
+        assert!(object.mesh_renderer.is_some());
+        assert!(object.lod_group.is_some());
+        assert!(scene.redo());
+        let object = scene.object(&id).unwrap();
+        assert!(object.mesh_renderer.is_none());
+        assert!(object.lod_group.is_none());
     }
 
     #[test]

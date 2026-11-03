@@ -2,8 +2,8 @@
 
 use crate::camera::Camera;
 use crate::document::{
-    CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, SceneDocument, SceneError,
-    SceneObject, camera_from_matrix, light_direction_from_matrix,
+    CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, LodGroup, SceneDocument,
+    SceneError, SceneObject, camera_from_matrix, light_direction_from_matrix,
 };
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -70,6 +70,7 @@ pub struct WorldObject {
     pub parent: Option<ObjectHandle>,
     pub transform: LocalTransform,
     pub mesh_renderer: Option<crate::document::MeshRenderer>,
+    pub lod_group: Option<LodGroup>,
     pub camera: Option<CameraComponent>,
     pub directional_light: Option<DirectionalLightComponent>,
     pub lite_scripts: Vec<LiteScript>,
@@ -219,6 +220,16 @@ impl World {
         self.world_matrices.get(handle.0).copied()
     }
 
+    /// Выбирает уровень по расстоянию до мировой позиции объекта.
+    pub fn lod_level(&self, handle: ObjectHandle, eye: Vec3) -> Option<usize> {
+        let object = self.object(handle)?;
+        let Some(group) = &object.lod_group else {
+            return Some(0);
+        };
+        let position = self.world_matrices.get(handle.0)?.w_axis.truncate();
+        group.level_for_distance(eye.distance(position))
+    }
+
     /// Камера объекта по текущим мировым матрицам; `None`, если камеры нет или базис невалиден.
     pub fn camera_of(&self, handle: ObjectHandle) -> Option<Camera> {
         let settings = self.object(handle)?.camera?;
@@ -328,6 +339,7 @@ fn world_object(
         parent,
         transform: object.transform.into(),
         mesh_renderer: object.mesh_renderer.clone(),
+        lod_group: object.lod_group.clone(),
         camera: object.camera,
         directional_light: object.directional_light,
         lite_scripts: object.lite_scripts.clone(),
@@ -547,6 +559,19 @@ rotation=[0.0,90.0,0.0]
         assert_eq!(frame.meshes.len(), 1);
         assert_eq!(frame.meshes[0].object.index(), 1);
         assert_eq!(frame.meshes[0].model, Mat4::from_scale(Vec3::ZERO));
+    }
+
+    #[test]
+    fn lod_level_uses_parented_world_origin_and_unconfigured_objects_use_level_zero() {
+        let scene = format!(
+            "[[assets]]\npath=\"/base.fbx\"\n[[assets]]\npath=\"/lod.fbx\"\n{CAMERA_SCENE}\n[[objects]]\nid=\"root\"\n[objects.transform]\nposition=[10.0,0.0,0.0]\n[[objects]]\nid=\"mesh\"\nparent=\"root\"\n[objects.transform]\nposition=[0.0,0.0,5.0]\n[objects.mesh_renderer]\nmodel=\"/base.fbx\"\n[objects.lod_group]\n[[objects.lod_group.levels]]\nmodel=\"/lod.fbx\"\ndistance=11.0\n"
+        );
+        let world = World::from_document(&parse(&scene)).unwrap();
+        let mesh = world.handle("mesh").unwrap();
+        let camera = world.handle("camera").unwrap();
+        assert_eq!(world.lod_level(mesh, Vec3::ZERO), Some(1));
+        assert_eq!(world.lod_level(mesh, Vec3::new(10.0, 0.0, 4.0)), Some(0));
+        assert_eq!(world.lod_level(camera, Vec3::ZERO), Some(0));
     }
 
     #[test]

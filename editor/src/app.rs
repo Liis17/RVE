@@ -454,6 +454,7 @@ fn render_scene_frame(
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     }
     let playing = state.is_playing();
+    let editor_camera = state.camera.camera();
     let game_camera_id = state.game_camera.clone();
     // Сетка нужна только панели Scene вне Play-режима.
     let grid_camera_distance = scene_size
@@ -480,12 +481,6 @@ fn render_scene_frame(
             ),
         );
     }
-    gpu.scene.build_draws(
-        &mut gpu.renderer,
-        parts.world,
-        &scene_frame,
-        grid_camera_distance,
-    )?;
     let game_camera = game_camera_id
         .and_then(|id| parts.world.handle(&id))
         .and_then(|handle| parts.world.camera_of(handle))
@@ -495,6 +490,19 @@ fn render_scene_frame(
         .objects()
         .iter()
         .any(|object| object.directional_light.is_some());
+    let scene_camera = if playing {
+        scene_frame.camera
+    } else {
+        editor_camera
+    };
+    gpu.scene.build_draws(
+        &mut gpu.renderer,
+        parts.world,
+        &scene_frame,
+        scene_camera.position,
+        game_camera.position,
+        grid_camera_distance,
+    )?;
     let frame_target = pending_frame.and_then(|id| {
         let object = parts.world.object_by_id(&id)?;
         let model = parts
@@ -510,12 +518,6 @@ fn render_scene_frame(
     {
         state.camera.focus(center, radius);
     }
-    let scene_camera = if playing {
-        scene_frame.camera
-    } else {
-        state.camera.camera()
-    };
-
     if let Some([width, height]) = scene_size {
         gpu.renderer
             .resize_viewport(gpu.scene.viewport, width, height)?;
