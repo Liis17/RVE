@@ -91,6 +91,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         return;
     };
     draw_markers(ui, &markers, view_projection, rect);
+    draw_selection_bounds(ui, state, &markers, view_projection, rect);
     let gizmo_taken = handle_gizmo(ui, state, &response, view_projection, rect);
     if !gizmo_taken
         && response.clicked()
@@ -218,6 +219,68 @@ fn draw_markers(ui: &egui::Ui, markers: &[Marker], view_projection: Mat4, rect: 
                 egui::FontId::proportional(9.0),
                 Color32::WHITE,
             );
+        }
+    }
+}
+
+/// Пары вершин рёбер параллелепипеда из `box_corners`.
+const BOX_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 3),
+    (3, 2),
+    (2, 0),
+    (4, 5),
+    (5, 7),
+    (7, 6),
+    (6, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+];
+
+/// Мировые вершины границ модели; бит 0 индекса выбирает X, бит 1 — Y, бит 2 — Z.
+fn box_corners(matrix: Mat4, (min, max): ([f32; 3], [f32; 3])) -> [Vec3; 8] {
+    std::array::from_fn(|index| {
+        let pick = |axis: usize| {
+            if index & (1 << axis) == 0 {
+                min[axis]
+            } else {
+                max[axis]
+            }
+        };
+        matrix.transform_point3(Vec3::new(pick(0), pick(1), pick(2)))
+    })
+}
+
+/// Рамка границ модели выделенного объекта. Рёбра с вершиной за камерой пропускаются.
+fn draw_selection_bounds(
+    ui: &egui::Ui,
+    state: &EditorState,
+    markers: &[Marker],
+    view_projection: Mat4,
+    rect: Rect,
+) {
+    let Some(selection) = state.scene.as_ref().and_then(|scene| scene.selection()) else {
+        return;
+    };
+    let painter = ui.painter_at(rect);
+    let stroke = Stroke::new(1.5, ACTIVE_COLOR);
+    for marker in markers.iter().filter(|marker| marker.id == selection) {
+        let Some(bounds) = marker
+            .model
+            .as_ref()
+            .and_then(|model| state.models.get(model))
+            .and_then(|model| model.bounds())
+        else {
+            continue;
+        };
+        let corners = box_corners(marker.world, bounds)
+            .map(|corner| to_screen(view_projection, rect, corner));
+        for (a, b) in BOX_EDGES {
+            if let (Some(a), Some(b)) = (corners[a], corners[b]) {
+                painter.line_segment([a, b], stroke);
+            }
         }
     }
 }
@@ -550,6 +613,27 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn box_corners_follow_the_world_matrix_and_edges_join_neighbours() {
+        let matrix = Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 1.0, 1.0),
+            glam::Quat::IDENTITY,
+            Vec3::new(10.0, 0.0, 0.0),
+        );
+        let corners = box_corners(matrix, ([-1.0, 0.0, -1.0], [1.0, 2.0, 1.0]));
+        assert_eq!(corners[0], Vec3::new(8.0, 0.0, -1.0));
+        assert_eq!(corners[7], Vec3::new(12.0, 2.0, 1.0));
+        // Каждое ребро меняет ровно одну координату, и все 12 рёбер различны.
+        for (a, b) in BOX_EDGES {
+            assert_eq!((a ^ b).count_ones(), 1, "{a}-{b}");
+        }
+        let unique = BOX_EDGES
+            .iter()
+            .map(|&(a, b)| (a.min(b), a.max(b)))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), 12);
     }
 
     #[test]
