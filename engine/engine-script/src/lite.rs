@@ -30,10 +30,15 @@ pub(crate) type ActiveCall = Rc<Cell<*mut ScriptTransaction>>;
 pub(crate) type ActiveOwner = Rc<Cell<Option<usize>>>;
 pub(crate) type CommandGeneration = Rc<Cell<u64>>;
 
+pub(crate) enum RegisteredCommandCallback {
+    Lua(RegistryKey),
+    Abi,
+}
+
 pub(crate) struct RegisteredLuaCommand {
     pub(crate) owner: usize,
     pub(crate) spec: CommandSpec,
-    pub(crate) callback: RegistryKey,
+    pub(crate) callback: RegisteredCommandCallback,
 }
 
 pub(crate) type LuaCommands = Rc<RefCell<std::collections::BTreeMap<String, RegisteredLuaCommand>>>;
@@ -540,7 +545,7 @@ fn register_command_function(
                 RegisteredLuaCommand {
                     owner,
                     spec,
-                    callback,
+                    callback: RegisteredCommandCallback::Lua(callback),
                 },
             );
             generation.set(generation.get().wrapping_add(1));
@@ -572,7 +577,9 @@ fn unregister_command_function(
             commands.remove(&name).expect("command exists after lookup")
         };
         generation.set(generation.get().wrapping_add(1));
-        lua.remove_registry_value(command.callback)?;
+        if let RegisteredCommandCallback::Lua(callback) = command.callback {
+            lua.remove_registry_value(callback)?;
+        }
         Ok(())
     })
 }

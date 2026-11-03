@@ -2,7 +2,7 @@ use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
 use crate::library::ScriptLibrary;
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LuaCommands,
-    LuaInstance,
+    LuaInstance, RegisteredCommandCallback,
 };
 use crate::transaction::{
     MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction,
@@ -143,6 +143,7 @@ pub struct ScriptHost {
     started: bool,
     destroyed: bool,
     input: ScriptInput,
+    current_time: ScriptTime,
 }
 
 #[derive(Clone, Copy)]
@@ -151,6 +152,11 @@ enum Phase {
     Update(f32),
     Message,
     Destroy,
+}
+
+enum CommandCallback {
+    Lua(Function),
+    Abi,
 }
 
 impl ScriptHost {
@@ -221,6 +227,7 @@ impl ScriptHost {
             started: false,
             destroyed: false,
             input: ScriptInput::default(),
+            current_time: ScriptTime::default(),
         };
         let mut classes: HashMap<String, (Table, Option<ParamSchema>)> = HashMap::new();
 
@@ -309,6 +316,7 @@ impl ScriptHost {
                         }
                     })?;
                     let source = event_source(scene_name, &object.id, &script.name);
+                    let owner = host.instances.len();
                     host.transaction.begin(
                         world,
                         object.handle,
@@ -325,6 +333,10 @@ impl ScriptHost {
                             transaction: &mut host.transaction,
                             events: &host.events,
                             source: &source,
+                            commands: &host.commands,
+                            commands_generation: &host.commands_generation,
+                            command_owner: owner,
+                            commands_allowed: false,
                         },
                     );
                     host.transaction.discard();
@@ -422,7 +434,7 @@ impl ScriptHost {
         self.commands_generation.get()
     }
 
-    /// Executes a registered Lua command inside the owning script's world transaction.
+    /// Executes a registered script command inside the owning script's world transaction.
     pub fn execute_command(
         &mut self,
         world: &mut World,
@@ -434,10 +446,14 @@ impl ScriptHost {
             let Some(command) = commands.get(&name) else {
                 return Err(CommandError::Unknown(name));
             };
-            let callback = self
-                .lua
-                .registry_value::<Function>(&command.callback)
-                .map_err(|error| CommandError::Failed(error.to_string()))?;
+            let callback = match &command.callback {
+                RegisteredCommandCallback::Lua(key) => CommandCallback::Lua(
+                    self.lua
+                        .registry_value::<Function>(key)
+                        .map_err(|error| CommandError::Failed(error.to_string()))?,
+                ),
+                RegisteredCommandCallback::Abi => CommandCallback::Abi,
+            };
             (command.owner, callback)
         };
         let Some(instance) = self.instances.get(owner) else {
@@ -448,20 +464,33 @@ impl ScriptHost {
         if !instance.enabled || self.destroyed {
             return Err(CommandError::Unknown(name));
         }
-        if self.interrupt.is_interrupted() {
+        if matches!(&callback, CommandCallback::Abi)
+            && !matches!(&instance.kind, ScriptKind::Heavy(HeavyInstance::Abi(_)))
+        {
+            return Err(CommandError::Failed(
+                "command callback does not match its script owner".to_owned(),
+            ));
+        }
+        let is_lua = matches!(&callback, CommandCallback::Lua(_));
+        if is_lua && self.interrupt.is_interrupted() {
             self.disable_lite_instances();
             return Err(CommandError::Failed("scripts interrupted".to_owned()));
         }
         let handle = instance.handle;
         let source = instance.source.clone();
-        let args = self
-            .lua
-            .create_table_with_capacity(command.args.len(), 0)
-            .map_err(|error| CommandError::Failed(error.to_string()))?;
-        for (index, value) in command.args.iter().enumerate() {
-            args.raw_set(index + 1, value.as_str())
+        let args = if is_lua {
+            let args = self
+                .lua
+                .create_table_with_capacity(command.args.len(), 0)
                 .map_err(|error| CommandError::Failed(error.to_string()))?;
-        }
+            for (index, value) in command.args.iter().enumerate() {
+                args.raw_set(index + 1, value.as_str())
+                    .map_err(|error| CommandError::Failed(error.to_string()))?;
+            }
+            Some(args)
+        } else {
+            None
+        };
 
         world.recalculate_world_matrices();
         *self.active_source.borrow_mut() = source.clone();
@@ -474,25 +503,62 @@ impl ScriptHost {
             (self.queued_messages.len(), self.queued_bytes),
         );
         let transaction_ptr = &mut self.transaction as *mut ScriptTransaction;
-        let result = {
+        let result: Result<Option<String>, (String, bool)> = {
             let _guard = ActiveCallGuard::new(
                 &self.active_call,
                 transaction_ptr,
                 &self.active_owner,
                 Some(owner),
             );
-            callback.call::<Value>(args)
+            match callback {
+                CommandCallback::Lua(callback) => callback
+                    .call::<Value>(args.expect("Lua command arguments exist"))
+                    .map(|result| match result {
+                        Value::String(message) => Some(message.to_string_lossy()),
+                        _ => None,
+                    })
+                    .map_err(|error| (error.to_string(), false)),
+                CommandCallback::Abi => {
+                    let ScriptKind::Heavy(HeavyInstance::Abi(script)) =
+                        &mut self.instances[owner].kind
+                    else {
+                        unreachable!("ABI command owner was checked above")
+                    };
+                    let Some(self_object) = abi_object_handle(handle) else {
+                        self.transaction.discard();
+                        return Err(CommandError::Failed(
+                            "object handle cannot be represented by the script ABI".to_owned(),
+                        ));
+                    };
+                    let call = AbiScriptCall {
+                        self_object,
+                        // SAFETY: this is the only transaction borrow for the synchronous ABI call.
+                        transaction: unsafe { &mut *transaction_ptr },
+                        events: &self.events,
+                        source: &source,
+                        commands: &self.commands,
+                        commands_generation: &self.commands_generation,
+                        command_owner: owner,
+                        commands_allowed: true,
+                    };
+                    script
+                        .invoke_command(self.current_time, &name, &command.args, call)
+                        .map(|()| None)
+                }
+            }
         };
-        if self.interrupt.is_interrupted() {
+        if is_lua && self.interrupt.is_interrupted() {
             self.transaction.discard();
             self.disable_lite_instances();
             return Err(CommandError::Failed("Lua execution interrupted".to_owned()));
         }
         let result = match result {
             Ok(result) => result,
-            Err(error) => {
+            Err((message, panicked)) => {
                 self.transaction.discard();
-                let message = error.to_string();
+                if panicked {
+                    self.disable_instance(owner);
+                }
                 self.events.borrow_mut().push(ScriptEvent {
                     level: ScriptEventLevel::Error,
                     source,
@@ -514,17 +580,18 @@ impl ScriptHost {
             });
             return Err(CommandError::Failed(message));
         }
-        if let Value::String(message) = result {
+        if let Some(message) = result {
             self.events.borrow_mut().push(ScriptEvent {
                 level: ScriptEventLevel::Info,
                 source,
-                message: message.to_string_lossy(),
+                message,
             });
         }
         Ok(())
     }
 
     fn run_phase(&mut self, world: &mut World, phase: Phase, time: ScriptTime) {
+        self.current_time = time;
         world.recalculate_world_matrices();
         if matches!(phase, Phase::Update(_)) {
             self.deliver_messages(world, time);
@@ -648,6 +715,8 @@ impl ScriptHost {
             queued_bytes,
             lua,
             interrupt,
+            commands,
+            commands_generation,
             ..
         } = self;
         let instance = &mut instances[index];
@@ -708,6 +777,10 @@ impl ScriptHost {
                     transaction: unsafe { &mut *transaction_ptr },
                     events,
                     source: &instance.source,
+                    commands,
+                    commands_generation,
+                    command_owner: index,
+                    commands_allowed: true,
                 };
                 match phase {
                     Phase::Message => match message {
@@ -805,14 +878,16 @@ impl ScriptHost {
         self.remove_command_keys(removed);
     }
 
-    fn remove_command_keys(&mut self, removed: Vec<mlua::RegistryKey>) {
+    fn remove_command_keys(&mut self, removed: Vec<RegisteredCommandCallback>) {
         if removed.is_empty() {
             return;
         }
         self.commands_generation
             .set(self.commands_generation.get().wrapping_add(1));
-        for key in removed {
-            let _ = self.lua.remove_registry_value(key);
+        for callback in removed {
+            if let RegisteredCommandCallback::Lua(key) = callback {
+                let _ = self.lua.remove_registry_value(key);
+            }
         }
     }
 }

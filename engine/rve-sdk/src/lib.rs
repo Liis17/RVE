@@ -331,6 +331,8 @@ pub trait Script: 'static {
     fn on_message(&mut self, _ctx: &mut Context<'_>, _sender: &str, _name: &str, _value: &Value) {}
     /// Called when the script host is destroyed after this instance has started.
     fn on_destroy(&mut self, _ctx: &mut Context<'_>) {}
+    /// Called when a registered developer-console command is submitted.
+    fn on_command(&mut self, _ctx: &mut Context<'_>, _name: &str, _args: &[&str]) {}
 }
 
 /// Call-scoped access to the host and this script's object.
@@ -342,7 +344,21 @@ pub struct Context<'a> {
     initial_transform: Transform,
     /// Mutable local transform of this script's object.
     pub transform: Transform,
+    /// Console logging and command registration for this script instance.
+    pub console: Console<'a>,
     _not_send_or_sync: PhantomData<*const ()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsoleLevel {
+    Log,
+    Warning,
+    Error,
+}
+
+/// Call-scoped console API exposed to a script.
+pub struct Console<'a> {
+    host: &'a RveHost,
 }
 
 /// Read-only snapshot of keyboard, mouse, and wheel input for the current script callback.
@@ -370,6 +386,7 @@ impl<'a> Context<'a> {
             host,
             initial_transform,
             transform: initial_transform,
+            console: Console { host },
             _not_send_or_sync: PhantomData,
         })
     }
@@ -490,6 +507,54 @@ impl<'a> Context<'a> {
         }
         // SAFETY: the host keeps returned strings alive through the current guest callback.
         unsafe { value.to_str().ok().map(str::to_owned) }
+    }
+}
+
+impl Console<'_> {
+    pub fn write(&self, message: impl AsRef<str>, level: ConsoleLevel) {
+        let level = match level {
+            ConsoleLevel::Log => abi::RVE_LOG_INFO,
+            ConsoleLevel::Warning => abi::RVE_LOG_WARN,
+            ConsoleLevel::Error => abi::RVE_LOG_ERROR,
+        };
+        // SAFETY: the string is borrowed only for the host call.
+        unsafe { (self.host.log)(self.host.ctx, level, RveStr::from_str_ref(message.as_ref())) }
+    }
+
+    pub fn register(&self, name: &str, description: Option<&str>) -> Result<(), String> {
+        let callback = self
+            .host
+            .register_command
+            .ok_or_else(|| "console commands are unavailable in this script ABI".to_owned())?;
+        // SAFETY: both strings are borrowed only during the host callback.
+        let status = unsafe {
+            callback(
+                self.host.ctx,
+                RveStr::from_str_ref(name),
+                description.map_or_else(RveStr::empty, RveStr::from_str_ref),
+            )
+        };
+        if status == abi::RveStatus::Ok as u32 {
+            Ok(())
+        } else {
+            Err(format!("host rejected console command {name:?} ({status})"))
+        }
+    }
+
+    pub fn unregister(&self, name: &str) -> Result<(), String> {
+        let callback = self
+            .host
+            .unregister_command
+            .ok_or_else(|| "console commands are unavailable in this script ABI".to_owned())?;
+        // SAFETY: the name is borrowed only during the host callback.
+        let status = unsafe { callback(self.host.ctx, RveStr::from_str_ref(name)) };
+        if status == abi::RveStatus::Ok as u32 {
+            Ok(())
+        } else {
+            Err(format!(
+                "host rejected console command removal {name:?} ({status})"
+            ))
+        }
     }
 }
 
@@ -706,8 +771,9 @@ impl<'a> BorrowedAbiValue<'a> {
 pub mod __private {
     use super::{Context, Params, Script, ValueError};
     use crate::abi::{
-        RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RveCreateFn, RveDropFn, RveHost, RveMessageFn,
-        RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUpdateFn, RveValue,
+        RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
+        RveMessageFn, RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUpdateFn,
+        RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
@@ -725,6 +791,7 @@ pub mod __private {
         message: RveMessageFn,
         destroy: RveStartFn,
         drop: RveDropFn,
+        command: RveCommandFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -737,6 +804,7 @@ pub mod __private {
             drop,
             params: params.as_ptr(),
             param_count: params.len(),
+            command: Some(command),
         }
     }
 
@@ -839,6 +907,41 @@ pub mod __private {
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
             let mut context = Context::new(unsafe { &*host })?;
             instance.0.on_message(&mut context, sender, name, &value);
+            context.commit()
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn command(
+        instance: *mut c_void,
+        host: *const RveHost,
+        name: RveStr,
+        args: *const RveStr,
+        arg_count: usize,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() || (arg_count > 0 && args.is_null()) {
+            return report(host, "null command callback argument", RveStatus::Error);
+        }
+        if arg_count > isize::MAX as usize / std::mem::size_of::<RveStr>() {
+            return report(host, "command argument count overflow", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: name and args are borrowed for this callback by the ABI host.
+            let name = unsafe { name.to_str() }.map_err(|error| error.to_string())?;
+            let args = if arg_count == 0 {
+                &[]
+            } else {
+                // SAFETY: the ABI host provides `arg_count` valid borrowed strings.
+                unsafe { std::slice::from_raw_parts(args, arg_count) }
+            };
+            let args = args
+                .iter()
+                .map(|arg| unsafe { arg.to_str() }.map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            // SAFETY: instance and host are valid for the duration of this callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new(unsafe { &*host })?;
+            instance.0.on_command(&mut context, name, &args);
             context.commit()
         }));
         status_from_result(host, result)
@@ -1091,6 +1194,16 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: host ABI owns the instance and call-scoped message pointers.
             unsafe { $crate::__private::message(instance, host, sender, name, value) }
         }
+        unsafe extern "C" fn __rve_command(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            name: $crate::abi::RveStr,
+            args: *const $crate::abi::RveStr,
+            arg_count: usize,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped command argument pointers.
+            unsafe { $crate::__private::command(instance, host, name, args, arg_count) }
+        }
         unsafe extern "C" fn __rve_destroy(
             instance: *mut ::std::ffi::c_void,
             host: *const $crate::abi::RveHost,
@@ -1112,6 +1225,7 @@ macro_rules! __rve_script_descriptor {
             __rve_message,
             __rve_destroy,
             __rve_drop_instance,
+            __rve_command,
             $crate::__rve_params!(@munch [] $($params)*),
         )
     }};

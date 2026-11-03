@@ -6,7 +6,7 @@ use rve_sdk::abi::{
     RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule, RveParamDesc,
     RveScriptDesc,
 };
-use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1};
+use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -151,10 +151,10 @@ impl ScriptLibrary {
         let scripts_ptr = unsafe { std::ptr::addr_of!((*module).scripts).read() };
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
-        let descriptor_size = if header.abi_version >= 3 {
-            std::mem::size_of::<RveScriptDesc>()
-        } else {
-            std::mem::size_of::<RveScriptDescV1>()
+        let descriptor_size = match header.abi_version {
+            4.. => std::mem::size_of::<RveScriptDesc>(),
+            3 => std::mem::size_of::<RveScriptDescV3>(),
+            _ => std::mem::size_of::<RveScriptDescV1>(),
         };
         if count > isize::MAX as usize / descriptor_size {
             return Err(ScriptLibraryError::ScriptCountOverflow);
@@ -169,16 +169,35 @@ impl ScriptLibrary {
         }
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v3 = (header.abi_version >= 3)
+        let descriptors_v4 = (header.abi_version >= 4)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
+        // SAFETY: version 3 has the parameter fields but no appended command callback.
+        let descriptors_v3 = (header.abi_version == 3).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV3>(), count)
+        });
         // SAFETY: versions 1 and 2 share the original descriptor layout.
         let descriptors_v1 = (header.abi_version < 3).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV1>(), count)
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v3 {
+            let descriptor = if let Some(descriptors) = descriptors_v4 {
                 &descriptors[index]
+            } else if let Some(descriptors) = descriptors_v3 {
+                let descriptor = &descriptors[index];
+                // ABI v3 has no command pointer; normalize the stable prefix and schema.
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: None,
+                }))
             } else {
                 let descriptor = &descriptors_v1.expect("legacy descriptor table")[index];
                 // Older ABI versions have no parameter fields. Normalize their stable callback
@@ -193,6 +212,7 @@ impl ScriptLibrary {
                     drop: descriptor.drop,
                     params: std::ptr::null(),
                     param_count: 0,
+                    command: None,
                 }))
             };
             // SAFETY: the caller guarantees process-lifetime storage for every non-null name.
@@ -208,7 +228,7 @@ impl ScriptLibrary {
             }
             let name = name.to_owned();
             let schema = if header.abi_version >= 3 {
-                // SAFETY: the caller guarantees the parameter table of every v3 descriptor.
+                // SAFETY: the caller guarantees the parameter table of every v3/v4 descriptor.
                 unsafe { read_schema(descriptor) }.map_err(|message| {
                     ScriptLibraryError::InvalidParams {
                         script: name.clone(),
