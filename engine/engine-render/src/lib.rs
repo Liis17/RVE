@@ -54,6 +54,7 @@ const OUTPUT_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
+const PIPELINE_CACHE_HEADER_SIZE: usize = size_of::<vk::PipelineCacheHeaderVersionOne>();
 /// Два timestamp на слот кадра: перед shadow pass и после scene pass.
 const TIMESTAMP_QUERY_COUNT: u32 = 2;
 const WHITE_SRGB_TEXTURE: usize = 0;
@@ -292,12 +293,55 @@ fn select_present_mode(
     }
 }
 
+#[derive(Clone, Copy)]
+struct PipelineCacheIdentity {
+    vendor_id: u32,
+    device_id: u32,
+    pipeline_cache_uuid: [u8; vk::UUID_SIZE],
+}
+
+fn validate_pipeline_cache(
+    data: &[u8],
+    expected: PipelineCacheIdentity,
+) -> Result<(), &'static str> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if data.len() < PIPELINE_CACHE_HEADER_SIZE {
+        return Err("pipeline cache header is truncated");
+    }
+
+    let header_size = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
+    if header_size != PIPELINE_CACHE_HEADER_SIZE {
+        return Err("pipeline cache header size is invalid");
+    }
+    if data.len() < header_size {
+        return Err("pipeline cache header is truncated");
+    }
+    let header_version = i32::from_ne_bytes(data[4..8].try_into().unwrap());
+    if header_version != vk::PipelineCacheHeaderVersion::ONE.as_raw() {
+        return Err("pipeline cache header version is unsupported");
+    }
+    let vendor_id = u32::from_ne_bytes(data[8..12].try_into().unwrap());
+    let device_id = u32::from_ne_bytes(data[12..16].try_into().unwrap());
+    let uuid = &data[16..PIPELINE_CACHE_HEADER_SIZE];
+    if vendor_id != expected.vendor_id
+        || device_id != expected.device_id
+        || uuid != expected.pipeline_cache_uuid
+    {
+        return Err("pipeline cache belongs to another physical device");
+    }
+    Ok(())
+}
+
 /// Настройки Vulkan-рендерера.
 #[derive(Default)]
 pub struct RendererConfig {
     pub extra_instance_extensions: Vec<&'static CStr>,
     pub extra_device_extensions: Vec<&'static CStr>,
     pub present_mode: PresentMode,
+    /// Vulkan pipeline cache bytes validated against the selected physical device.
+    pub pipeline_cache: Vec<u8>,
 }
 
 /// Возможности выбранного физического устройства.
@@ -498,6 +542,7 @@ pub struct Renderer {
     queue: vk::Queue,
     queue_family_index: u32,
     command_pool: Option<vk::CommandPool>,
+    pipeline_cache: Option<vk::PipelineCache>,
     pipeline_layout: Option<vk::PipelineLayout>,
     pipeline: Option<vk::Pipeline>,
     shadow_pipeline: Option<vk::Pipeline>,
@@ -575,6 +620,7 @@ impl Renderer {
             queue: vk::Queue::null(),
             queue_family_index: 0,
             command_pool: None,
+            pipeline_cache: None,
             pipeline_layout: None,
             pipeline: None,
             shadow_pipeline: None,
@@ -638,6 +684,15 @@ impl Renderer {
     /// Returns the present mode used by the current swapchain.
     pub fn present_mode(&self) -> PresentMode {
         self.present_mode
+    }
+
+    /// Returns the pipeline cache data produced by this renderer.
+    pub fn pipeline_cache_data(&self) -> Result<Vec<u8>, RenderError> {
+        let cache = self
+            .pipeline_cache
+            .ok_or(RenderError::InvalidState("pipeline cache отсутствует"))?;
+        // SAFETY: renderer creation and pipeline creation have completed on its owning thread.
+        unsafe { self.device()?.get_pipeline_cache_data(cache) }.map_err(RenderError::from)
     }
 
     /// Забирает GPU-время shadow и scene pass последнего завершённого кадра.
@@ -1662,11 +1717,26 @@ impl Renderer {
         self.command_pool =
             Some(unsafe { self.device()?.create_command_pool(&command_pool_info, None) }?);
         // SAFETY: physical_device was selected from this live instance.
-        let limits = unsafe {
+        let properties = unsafe {
             self.instance()?
                 .get_physical_device_properties(self.physical_device)
-        }
-        .limits;
+        };
+        validate_pipeline_cache(
+            &self.config.pipeline_cache,
+            PipelineCacheIdentity {
+                vendor_id: properties.vendor_id,
+                device_id: properties.device_id,
+                pipeline_cache_uuid: properties.pipeline_cache_uuid,
+            },
+        )
+        .map_err(RenderError::InvalidConfig)?;
+        let cache_info =
+            vk::PipelineCacheCreateInfo::default().initial_data(&self.config.pipeline_cache);
+        // SAFETY: supplied cache data passed the Vulkan version-one device identity checks.
+        self.pipeline_cache =
+            Some(unsafe { self.device()?.create_pipeline_cache(&cache_info, None) }?);
+        self.config.pipeline_cache = Vec::new();
+        let limits = properties.limits;
         self.max_texture_size = limits.max_image_dimension2_d;
         self.create_frame_resources()?;
         self.create_shadow_resources()?;
@@ -2256,7 +2326,7 @@ impl Renderer {
             .push_next(&mut rendering_info)];
         // SAFETY: shader modules, layout and dynamic-rendering formats are valid for this device.
         let pipelines = unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         }
         .map_err(|(_, error)| RenderError::Vulkan(error))?;
         self.pipeline = pipelines.into_iter().next();
@@ -2323,7 +2393,7 @@ impl Renderer {
             .push_next(&mut rendering_info)];
         // SAFETY: shader, shared layout, depth format and dynamic-rendering state are valid.
         let mut pipelines = match unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         } {
             Ok(pipelines) => pipelines,
             Err((pipelines, error)) => {
@@ -2343,6 +2413,7 @@ impl Renderer {
 
     fn create_post_pipelines(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
+        let cache = self.pipeline_cache()?;
         let set_layouts = [self.texture_set_layout()?];
         let push_constant_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
@@ -2356,18 +2427,21 @@ impl Renderer {
         self.post_pipeline_layout = Some(layout);
         self.tonemap_pipeline = Some(create_post_pipeline(
             &device,
+            cache,
             layout,
             LDR_FORMAT,
             TONEMAP_FRAGMENT_SHADER,
         )?);
         self.output_pipeline = Some(create_post_pipeline(
             &device,
+            cache,
             layout,
             self.surface_format.format,
             OUTPUT_FRAGMENT_SHADER,
         )?);
         self.viewport_output_pipeline = Some(create_post_pipeline(
             &device,
+            cache,
             layout,
             LDR_FORMAT,
             OUTPUT_FRAGMENT_SHADER,
@@ -2461,7 +2535,7 @@ impl Renderer {
             .push_next(&mut rendering_info)];
         // SAFETY: shader modules, layout and the surface color format are valid for this device.
         let pipelines = unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         }
         .map_err(|(_, error)| RenderError::Vulkan(error))?;
         self.overlay_pipeline = pipelines.into_iter().next();
@@ -2572,7 +2646,7 @@ impl Renderer {
             .push_next(&mut rendering_info)];
         // SAFETY: shader modules, layout and the surface color format are valid for this device.
         let pipelines = unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         }
         .map_err(|(_, error)| RenderError::Vulkan(error))?;
         self.ui_pipeline = pipelines.into_iter().next();
@@ -2640,6 +2714,11 @@ impl Renderer {
         self.device
             .as_ref()
             .ok_or(RenderError::InvalidState("device отсутствует"))
+    }
+
+    fn pipeline_cache(&self) -> Result<vk::PipelineCache, RenderError> {
+        self.pipeline_cache
+            .ok_or(RenderError::InvalidState("pipeline cache отсутствует"))
     }
 
     fn swapchain_loader(&self) -> Result<&ash::khr::swapchain::Device, RenderError> {
@@ -2769,6 +2848,10 @@ impl Drop for Renderer {
             {
                 // SAFETY: the pipeline layout and all descriptor pools using it are gone.
                 unsafe { device.destroy_descriptor_set_layout(layout, None) };
+            }
+            if let Some(cache) = self.pipeline_cache.take() {
+                // SAFETY: every pipeline created from the cache was destroyed above.
+                unsafe { device.destroy_pipeline_cache(cache, None) };
             }
         }
         if let (Some(device), Some(command_pool)) = (self.device.as_ref(), self.command_pool.take())
@@ -5118,6 +5201,7 @@ impl Drop for ShaderModule {
 
 fn create_post_pipeline(
     device: &ash::Device,
+    cache: vk::PipelineCache,
     layout: vk::PipelineLayout,
     color_format: vk::Format,
     fragment_shader: &[u8],
@@ -5169,18 +5253,17 @@ fn create_post_pipeline(
         .layout(layout)
         .push_next(&mut rendering_info)];
     // SAFETY: the modules, layout and dynamic-rendering format belong to this device.
-    let mut pipelines = match unsafe {
-        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
-    } {
-        Ok(pipelines) => pipelines,
-        Err((pipelines, error)) => {
-            for pipeline in pipelines {
-                // SAFETY: partial pipeline handles were returned by this device.
-                unsafe { device.destroy_pipeline(pipeline, None) };
+    let mut pipelines =
+        match unsafe { device.create_graphics_pipelines(cache, &pipeline_info, None) } {
+            Ok(pipelines) => pipelines,
+            Err((pipelines, error)) => {
+                for pipeline in pipelines {
+                    // SAFETY: partial pipeline handles were returned by this device.
+                    unsafe { device.destroy_pipeline(pipeline, None) };
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-    };
+        };
     pipelines
         .pop()
         .ok_or(RenderError::InvalidState("post pipeline не создан"))
@@ -5797,22 +5880,22 @@ mod tests {
         FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT, MATERIAL_UNIFORMS_SIZE,
         MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId, OFFSCREEN_FORMAT,
         OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex,
-        PresentMode, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
-        SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace,
-        TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings,
-        best_device_index, check_extensions, classify_acquire_result,
-        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
-        evaluate_device, frame_uniform_bytes, index_bytes, inverse_extent, material_sampler_info,
-        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
-        missing_post_format_features, missing_texture_format_features, normal_matrix,
-        offscreen_previous_use, overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy,
-        scaled_extent, scene_viewport, select_composite_alpha, select_present_mode,
-        select_surface_extent, shadow_casters, texture_format, texture_format_reasons,
-        texture_mip_blit_region, texture_mip_destination_shader_barrier,
+        PIPELINE_CACHE_HEADER_SIZE, PipelineCacheIdentity, PresentMode, ProbeInstanceFailure,
+        RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE,
+        TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER,
+        UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index, check_extensions,
+        classify_acquire_result, classify_probe_instance_failure, deduplicate_names,
+        derivative_tangent_basis, evaluate_device, frame_uniform_bytes, index_bytes,
+        inverse_extent, material_sampler_info, material_uniform_bytes, mip_extent, mip_level_count,
+        missing_extensions, missing_post_format_features, missing_texture_format_features,
+        normal_matrix, offscreen_previous_use, overlay_vertex_bytes, push_constant_bytes,
+        sampler_anisotropy, scaled_extent, scene_viewport, select_composite_alpha,
+        select_present_mode, select_surface_extent, shadow_casters, texture_format,
+        texture_format_reasons, texture_mip_blit_region, texture_mip_destination_shader_barrier,
         texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
         timestamp_duration, transform_tangent_normal, validate_draws, validate_material,
-        validate_mesh, validate_overlay, validate_render_scale, validate_texture,
-        validate_view_settings, vertex_bytes,
+        validate_mesh, validate_overlay, validate_pipeline_cache, validate_render_scale,
+        validate_texture, validate_view_settings, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -5854,6 +5937,42 @@ mod tests {
             select_present_mode(PresentMode::Immediate, &[]),
             vk::PresentModeKHR::FIFO
         );
+    }
+
+    #[test]
+    fn pipeline_cache_header_rejects_truncated_foreign_and_unsupported_data() {
+        let identity = PipelineCacheIdentity {
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+            pipeline_cache_uuid: [0xabu8; vk::UUID_SIZE],
+        };
+        let mut cache = Vec::new();
+        cache.extend_from_slice(&(PIPELINE_CACHE_HEADER_SIZE as u32).to_ne_bytes());
+        cache.extend_from_slice(&vk::PipelineCacheHeaderVersion::ONE.as_raw().to_ne_bytes());
+        cache.extend_from_slice(&identity.vendor_id.to_ne_bytes());
+        cache.extend_from_slice(&identity.device_id.to_ne_bytes());
+        cache.extend_from_slice(&identity.pipeline_cache_uuid);
+        cache.extend_from_slice(b"driver data");
+
+        assert!(validate_pipeline_cache(&[], identity).is_ok());
+        assert!(validate_pipeline_cache(&cache, identity).is_ok());
+        assert!(
+            validate_pipeline_cache(&cache[..PIPELINE_CACHE_HEADER_SIZE - 1], identity).is_err()
+        );
+
+        let mut wrong_size = cache.clone();
+        wrong_size[0..4].copy_from_slice(&0_u32.to_ne_bytes());
+        assert!(validate_pipeline_cache(&wrong_size, identity).is_err());
+
+        let mut wrong_version = cache.clone();
+        wrong_version[4..8].copy_from_slice(&2_i32.to_ne_bytes());
+        assert!(validate_pipeline_cache(&wrong_version, identity).is_err());
+
+        for offset in [8, 12, 16] {
+            let mut foreign = cache.clone();
+            foreign[offset] ^= 1;
+            assert!(validate_pipeline_cache(&foreign, identity).is_err());
+        }
     }
 
     #[test]

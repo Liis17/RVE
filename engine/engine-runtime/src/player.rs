@@ -11,6 +11,7 @@ use engine_render::{PresentMode, Renderer, RendererConfig};
 use engine_script::ScriptInterruptHandle;
 use engine_window::{Key, MouseButton, Window, WindowConfig, WindowHandler, WindowProxy, run};
 use flume::{Receiver, Sender};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +26,8 @@ impl ExitRequester for WindowExit {
 pub(crate) struct PlayerConfig {
     pub window: WindowConfig,
     pub present_mode: Option<BootstrapPresentMode>,
+    pub pipeline_cache_path: Option<PathBuf>,
+    pub pipeline_cache: Vec<u8>,
     pub frame_limit: Option<u64>,
     pub render_assets: PreparedRenderAssets,
     pub activation: PendingActivation,
@@ -42,6 +45,8 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     let PlayerConfig {
         window,
         present_mode,
+        pipeline_cache_path,
+        pipeline_cache,
         frame_limit,
         render_assets,
         activation,
@@ -57,6 +62,8 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     let mut handler = PlayerWindow {
         frame_limit,
         present_mode,
+        pipeline_cache_path,
+        pipeline_cache,
         render_assets,
         modules,
         activation,
@@ -87,6 +94,8 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
 struct PlayerWindow<'a> {
     frame_limit: Option<u64>,
     present_mode: Option<BootstrapPresentMode>,
+    pipeline_cache_path: Option<PathBuf>,
+    pipeline_cache: Vec<u8>,
     render_assets: PreparedRenderAssets,
     modules: &'a mut ModuleHost,
     activation: PendingActivation,
@@ -242,6 +251,7 @@ impl WindowHandler for PlayerWindow<'_> {
                         BootstrapPresentMode::Immediate => PresentMode::Immediate,
                     })
                     .unwrap_or_default(),
+                pipeline_cache: self.pipeline_cache.clone(),
                 ..RendererConfig::default()
             },
         ) {
@@ -263,7 +273,10 @@ impl WindowHandler for PlayerWindow<'_> {
         if let Err(error) = start_render(
             self.modules,
             RenderThreadConfig {
-                backend: Box::new(VulkanBackend::new(renderer)),
+                backend: Box::new(VulkanBackend::new(
+                    renderer,
+                    self.pipeline_cache_path.clone(),
+                )),
                 width: size.width,
                 height: size.height,
                 frame_limit: self.frame_limit,

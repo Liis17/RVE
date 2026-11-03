@@ -263,6 +263,8 @@ fn run_from_args(
         return fail(code, message);
     }
 
+    let pipeline_cache_path = engine_platform::pipeline_cache_path(&project.name);
+    let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
     let title = bootstrap.window_title.unwrap_or(project.name);
     let default_window = WindowConfig::default();
     let config = WindowConfig {
@@ -276,6 +278,8 @@ fn run_from_args(
         player::PlayerConfig {
             window: config,
             present_mode: bootstrap.present_mode,
+            pipeline_cache_path,
+            pipeline_cache,
             frame_limit: args.frames,
             render_assets,
             activation,

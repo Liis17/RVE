@@ -2365,6 +2365,7 @@ dependencies = [
  "egui_dock",
  "engine-assets",
  "engine-files",
+ "engine-platform",
  "engine-project",
  "engine-render",
  "engine-resources",

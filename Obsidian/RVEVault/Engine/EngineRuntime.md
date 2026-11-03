@@ -100,5 +100,6 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 - Использует [[Engine/EngineFiles]] для нормализации Windows filesystem path в `Layout`.
 - Использует [[Engine/EngineScene]] для `SceneDocument`, `World`, камеры и света; [[Engine/EngineScript]] остаётся на scripts thread и не становится `Send`.
 - Передаёт окно через [[Engine/EngineWindow]], общую Vulkan-работу через [[Engine/EngineRender]] и платформенную подготовку, диалог и singleton API через [[Engine/EnginePlatform]].
+- Pipeline cache приложения использует sanitized `ProjectSettings.name` под пользовательским каталогом кэша; renderer получает bytes до создания и сохраняет данные до Drop в render thread.
 - Renderer создаётся на главном потоке в `init`, затем передаётся render thread. Менять зависимости и поведение upstream-крейтов для runtime не требуется.
 - Пустые `engine-audio`, `engine-physics`, `engine-network`, `engine-neural` запускаются как отдельные управляемые потоки; доменной работы пока не выполняют.

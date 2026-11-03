@@ -36,6 +36,7 @@ Parent: [[Index]]
 | Окно | Размер из `bootstrap.rves` проекта, иначе 1600×900; заголовок содержит проект, сцену и признак несохранённых правок |
 | Раскладка проекта | Как dev-запуск player: `project.rveproject`, `bootstrap.rves`, `Assets/`; ресурсы читаются в `SourceMode::Loose`, поэтому новые файлы видны сразу. Камеры читают общие `.camerasettings` по объявленным scene asset paths |
 | Настройки пользователя | `rve-editor/settings.json` в каталоге настроек ОС (`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` или `~/.config`): до 10 недавних проектов и раскладка egui_dock. Пишется при открытии проекта и выходе; повреждённое поле или раскладка с повторяющимися панелями заменяются значением по умолчанию с предупреждением в Console |
+| Pipeline cache | `RendererConfig` всегда запрашивает FIFO; pipeline cache хранится отдельно в каталоге пользователя ОС для `rve-editor`, загружается до создания renderer и атомарно сохраняется после оконного цикла ([[Engine/EnginePlatform]], [[Engine/EngineRender]]) |
 | Автосохранение | `<проект>/.rve/editor/autosave/<сцена>.autosave`, где `~` и `/` пути экранированы как `~7E` и `~2F`, а новая сцена — `~untitled`. Каталог вне `Assets/`, поэтому копии не попадают в ресурсы и сборку |
 | Буфер обмена | Ctrl/Cmd+C кладёт в буфер ОС JSON с ключом `rve_editor_objects` (выделенные поддеревья `SceneObject`); вставка чужого текста игнорируется |
 
