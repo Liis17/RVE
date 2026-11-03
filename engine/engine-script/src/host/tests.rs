@@ -2115,3 +2115,140 @@ return Script
 }
 
 mod abi;
+
+#[test]
+fn lite_schema_defaults_reach_the_script_and_scene_values_are_coerced() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/schema.lua"
+[[objects.lite_scripts]]
+path = "/schema.lua"
+params = { speed = 90 }
+"#,
+    );
+    let source = r#"
+local Schema = {}
+Schema.properties = {
+  speed = { type = "float", default = 30, min = 0, max = 360 },
+  label = { type = "string", default = "spinner" },
+}
+function Schema:on_start()
+  rve.log(math.type(self.params.speed) .. ":" .. self.params.speed .. ":" .. self.params.label)
+end
+return Schema
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("schema.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let messages = event_messages(&mut host);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "float:90.0:spinner"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn lite_params_that_violate_the_schema_fail_loading() {
+    let source = r#"
+local Schema = { properties = { speed = { type = "float", min = 0 } } }
+return Schema
+"#;
+    for params in [
+        "{ speed = \"fast\" }",
+        "{ speed = -1.0 }",
+        "{ unknown = 1 }",
+    ] {
+        let world = one_camera(&format!(
+            "[[assets]]\npath = \"/schema.lua\"\n[[objects.lite_scripts]]\npath = \"/schema.lua\"\nparams = {params}\n"
+        ));
+        let error = ScriptHost::load(&world, "scene", &sources(&[("schema.lua", source)]), None)
+            .err()
+            .unwrap();
+        match error {
+            ScriptLoadError::Lite { path, message } => {
+                assert_eq!(path, "schema.lua");
+                assert!(message.contains("\"camera\""), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn lite_properties_reads_both_forms_without_creating_instances() {
+    let interrupt = ScriptInterruptHandle::new();
+    let named = r#"
+return { properties = {
+  speed = { type = "float", default = 30, min = 0, max = 360, label = "Speed" },
+  axis = { type = "vec3", default = { 0, 1, 0 } },
+} }
+"#;
+    let schema = crate::lite_properties("named.lua", named, &interrupt)
+        .unwrap()
+        .unwrap();
+    let names: Vec<_> = schema
+        .specs()
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect();
+    assert_eq!(names, ["axis", "speed"]);
+    let speed = schema.get("speed").unwrap();
+    assert_eq!(speed.label.as_deref(), Some("Speed"));
+    assert_eq!((speed.min, speed.max), (Some(0.0), Some(360.0)));
+
+    let listed = r#"
+return { properties = {
+  { name = "speed", type = "float" },
+  { name = "enabled", type = "bool", default = true },
+} }
+"#;
+    let schema = crate::lite_properties("listed.lua", listed, &interrupt)
+        .unwrap()
+        .unwrap();
+    let names: Vec<_> = schema
+        .specs()
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect();
+    assert_eq!(names, ["speed", "enabled"]);
+
+    assert_eq!(
+        crate::lite_properties("plain.lua", "return {}", &interrupt).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn malformed_properties_are_compile_errors_with_the_script_path() {
+    let interrupt = ScriptInterruptHandle::new();
+    for properties in [
+        "42",
+        "{ speed = 1 }",
+        "{ speed = { type = \"double\" } }",
+        "{ speed = { type = \"float\", default = \"x\" } }",
+        "{ speed = { type = \"float\", min = \"0\" } }",
+        "{ speed = { type = \"bool\", max = 1 } }",
+        "{ speed = { type = \"float\", unit = \"m\" } }",
+        "{ speed = { type = \"float\", name = \"speed\" } }",
+        "{ { type = \"float\" } }",
+        "{ { name = \"a\", type = \"int\" }, b = { type = \"int\" } }",
+        "{ [1] = { name = \"a\", type = \"int\" }, [3] = { name = \"b\", type = \"int\" } }",
+        "{ { name = \"a\", type = \"int\" }, { name = \"a\", type = \"int\" } }",
+    ] {
+        let source = format!("return {{ properties = {properties} }}");
+        match crate::lite_properties("bad.lua", &source, &interrupt) {
+            Err(ScriptLoadError::Lite { path, .. }) => assert_eq!(path, "bad.lua"),
+            other => panic!("{properties}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn lite_properties_honours_the_interrupt() {
+    let interrupt = ScriptInterruptHandle::new();
+    interrupt.interrupt();
+    assert!(crate::lite_properties("loop.lua", "while true do end", &interrupt).is_err());
+}

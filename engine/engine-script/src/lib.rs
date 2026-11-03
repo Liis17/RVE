@@ -8,8 +8,8 @@ mod lite;
 mod transaction;
 mod types;
 
-pub use engine_scene::ParamValue;
-pub use host::{ScriptHost, ScriptInterruptHandle, ScriptLoadError};
+pub use engine_scene::{ParamKind, ParamSchema, ParamSpec, ParamValue};
+pub use host::{ScriptHost, ScriptInterruptHandle, ScriptLoadError, lite_properties};
 pub use library::{ScriptLibrary, ScriptLibraryError};
 pub use rve_sdk::{Key, MouseButton};
 pub use types::{

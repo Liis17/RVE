@@ -20,6 +20,7 @@ pub struct AssetEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetKind {
     Scene,
+    Prefab,
     CameraSettings,
     Model,
     Texture,
@@ -36,6 +37,7 @@ impl AssetKind {
             .map(|(_, extension)| extension.to_ascii_lowercase());
         match extension.as_deref() {
             Some("rvescene") => Self::Scene,
+            Some("rveprefab") => Self::Prefab,
             Some("camerasettings") => Self::CameraSettings,
             Some("fbx") => Self::Model,
             Some("png") => Self::Texture,

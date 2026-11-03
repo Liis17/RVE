@@ -706,8 +706,8 @@ impl<'a> BorrowedAbiValue<'a> {
 pub mod __private {
     use super::{Context, Params, Script, ValueError};
     use crate::abi::{
-        RveCreateFn, RveDropFn, RveHost, RveMessageFn, RveParams, RveStartFn, RveStatus, RveStr,
-        RveUpdateFn,
+        RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RveCreateFn, RveDropFn, RveHost, RveMessageFn,
+        RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
@@ -715,6 +715,8 @@ pub mod __private {
 
     struct GuestInstance(Box<dyn Script>);
 
+    // Mirrors the fields of `RveScriptDesc`, which the macro fills in one call.
+    #[allow(clippy::too_many_arguments)]
     pub const fn descriptor(
         name: &'static str,
         create: RveCreateFn,
@@ -723,6 +725,7 @@ pub mod __private {
         message: RveMessageFn,
         destroy: RveStartFn,
         drop: RveDropFn,
+        params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
             name: RveStr::from_static(name),
@@ -732,6 +735,46 @@ pub mod __private {
             message,
             destroy,
             drop,
+            params: params.as_ptr(),
+            param_count: params.len(),
+        }
+    }
+
+    /// One parameter descriptor for [`crate::script_module!`] tables.
+    pub const fn param(
+        name: &'static str,
+        kind: u32,
+        default: RveValue,
+        min: Option<f64>,
+        max: Option<f64>,
+        label: Option<&'static str>,
+    ) -> RveParamDesc {
+        let mut flags = 0;
+        let min = match min {
+            Some(min) => {
+                flags |= RVE_PARAM_HAS_MIN;
+                min
+            }
+            None => 0.0,
+        };
+        let max = match max {
+            Some(max) => {
+                flags |= RVE_PARAM_HAS_MAX;
+                max
+            }
+            None => 0.0,
+        };
+        RveParamDesc {
+            name: RveStr::from_static(name),
+            kind,
+            default,
+            min,
+            max,
+            flags,
+            label: match label {
+                Some(label) => RveStr::from_static(label),
+                None => RveStr::empty(),
+            },
         }
     }
 
@@ -869,12 +912,14 @@ pub mod __private {
 }
 
 /// Builds a process-lifetime module table without exporting a global symbol.
+///
+/// Each script may declare its parameters in an optional block, see [`export_scripts!`].
 #[macro_export]
 macro_rules! script_module {
-    ($($name:literal => $factory:path),+ $(,)?) => {{
+    ($($name:literal => $factory:path $({ $($params:tt)* })?),+ $(,)?) => {{
         const SCRIPT_COUNT: usize = <[()]>::len(&[$($crate::script_module!(@unit $name)),+]);
         static SCRIPTS: [$crate::abi::RveScriptDesc; SCRIPT_COUNT] = [
-            $($crate::__rve_script_descriptor!($name, $factory)),+
+            $($crate::__rve_script_descriptor!($name, $factory, [$($($params)*)?])),+
         ];
         static MODULE: $crate::abi::RveModule = $crate::abi::RveModule::new(&SCRIPTS);
         &MODULE
@@ -883,21 +928,136 @@ macro_rules! script_module {
 }
 
 /// Defines the required `rve_script_module` C ABI export for a game library.
+///
+/// A script may declare typed parameters. The host fills missing ones with their defaults and
+/// rejects wrong types, out-of-range numbers and undeclared keys before calling the factory:
+///
+/// ```ignore
+/// rve_sdk::export_scripts! {
+///     "Bobber" => create_bobber {
+///         amplitude: f32 = 0.15,
+///         speed: f32 = 1.4 (0.0..=10.0) "Speed",
+///         axis: [f32; 3] = [0.0, 1.0, 0.0],
+///     }
+/// }
+/// ```
+///
+/// Supported types are `bool`, `i64`, `f32`/`f64` (float), `&str` and `[f32; 3]`. Defaults are
+/// literals; numeric types accept an inclusive `(min..=max)` range, and every parameter accepts a
+/// trailing label literal for editors. A script without a block declares no schema and receives
+/// scene parameters unchecked.
 #[macro_export]
 macro_rules! export_scripts {
-    ($($name:literal => $factory:path),+ $(,)?) => {
+    ($($name:literal => $factory:path $({ $($params:tt)* })?),+ $(,)?) => {
         #[unsafe(no_mangle)]
         #[doc = "Returns this game's static RVE script module table."]
         pub extern "C" fn rve_script_module() -> *const $crate::abi::RveModule {
-            $crate::script_module!($($name => $factory),+)
+            $crate::script_module!($($name => $factory $({ $($params)* })?),+)
         }
+    };
+}
+
+/// Parses a parameter block into a process-lifetime `&[RveParamDesc]`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rve_params {
+    (@munch [$($acc:expr,)*]) => {{
+        static PARAMS: &[$crate::abi::RveParamDesc] = &[$($acc),*];
+        PARAMS
+    }};
+    (@munch [$($acc:expr,)*] $param:ident : bool = $default:literal
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_BOOL,
+            $crate::abi::RveValue::boolean($default),
+            None,
+            None,
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : i64 = $default:literal
+        $(($min:literal ..= $max:literal))? $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_INT,
+            $crate::abi::RveValue::integer($default),
+            $crate::__rve_bound!($($min)?),
+            $crate::__rve_bound!($($max)?),
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : f32 $($tail:tt)*) => {
+        $crate::__rve_params!(@munch [$($acc,)*] $param : f64 $($tail)*)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : f64 = $default:literal
+        $(($min:literal ..= $max:literal))? $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_FLOAT,
+            $crate::abi::RveValue::float($default as f64),
+            $crate::__rve_bound!($($min)?),
+            $crate::__rve_bound!($($max)?),
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : &str = $default:literal
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_STRING,
+            $crate::abi::RveValue::static_string($default),
+            None,
+            None,
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+    (@munch [$($acc:expr,)*] $param:ident : [f32; 3] = [$x:literal, $y:literal, $z:literal]
+        $($label:literal)? $(, $($rest:tt)*)?) => {
+        $crate::__rve_params!(@munch [$($acc,)* $crate::__private::param(
+            stringify!($param),
+            $crate::abi::RVE_PARAM_VEC3,
+            {
+                static VALUES: [$crate::abi::RveValue; 3] = [
+                    $crate::abi::RveValue::float($x as f64),
+                    $crate::abi::RveValue::float($y as f64),
+                    $crate::abi::RveValue::float($z as f64),
+                ];
+                $crate::abi::RveValue::array(&VALUES)
+            },
+            None,
+            None,
+            $crate::__rve_label!($($label)?),
+        ),] $($($rest)*)?)
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rve_bound {
+    () => {
+        None
+    };
+    ($value:literal) => {
+        Some($value as f64)
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rve_label {
+    () => {
+        None
+    };
+    ($label:literal) => {
+        Some($label)
     };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __rve_script_descriptor {
-    ($name:literal, $factory:path) => {{
+    ($name:literal, $factory:path, [$($params:tt)*]) => {{
         unsafe extern "C" fn __rve_create(
             host: *const $crate::abi::RveHost,
             params: *const $crate::abi::RveParams,
@@ -952,6 +1112,7 @@ macro_rules! __rve_script_descriptor {
             __rve_message,
             __rve_destroy,
             __rve_drop_instance,
+            $crate::__rve_params!(@munch [] $($params)*),
         )
     }};
 }

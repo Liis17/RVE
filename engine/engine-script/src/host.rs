@@ -4,8 +4,10 @@ use crate::lite::{self, ActiveCall, ActiveSource, EventQueue, LuaInstance};
 use crate::transaction::{
     MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction,
 };
-use crate::types::{ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTime, ScriptTransform};
-use engine_scene::{LocalTransform, ObjectHandle, World};
+use crate::types::{
+    ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
+};
+use engine_scene::{LocalTransform, ObjectHandle, ParamSchema, World};
 use mlua::{Error as LuaError, Lua, Table};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -187,7 +189,7 @@ impl ScriptHost {
             destroyed: false,
             input: ScriptInput::default(),
         };
-        let mut classes: HashMap<String, Table> = HashMap::new();
+        let mut classes: HashMap<String, (Table, Option<ParamSchema>)> = HashMap::new();
 
         for object in world.objects() {
             let transform = script_transform(object.transform);
@@ -199,7 +201,7 @@ impl ScriptHost {
                         message: "source was not provided".to_owned(),
                     });
                 };
-                let class = if let Some(class) = classes.get(path) {
+                let (class, schema) = if let Some(class) = classes.get(path) {
                     class.clone()
                 } else {
                     let source_label = event_source(scene_name, &object.id, path);
@@ -226,12 +228,19 @@ impl ScriptHost {
                     classes.insert(path.to_owned(), class.clone());
                     class
                 };
+                let params =
+                    resolve_params(schema.as_ref(), &script.params).map_err(|message| {
+                        ScriptLoadError::Lite {
+                            path: path.to_owned(),
+                            message: format!("object {:?}: {message}", object.id),
+                        }
+                    })?;
                 let instance = LuaInstance::new(
                     &host.lua,
                     class,
                     &object.id,
                     &object.name,
-                    &script.params,
+                    &params,
                     transform,
                 )
                 .map_err(|error| ScriptLoadError::Lite {
@@ -256,6 +265,14 @@ impl ScriptHost {
                             message: "object handle cannot be represented by the script ABI"
                                 .to_owned(),
                         })?;
+                    let schema = library.and_then(|library| library.schema(&script.name));
+                    let params = resolve_params(schema, &script.params).map_err(|message| {
+                        ScriptLoadError::Heavy {
+                            object_id: object.id.clone(),
+                            name: script.name.clone(),
+                            message,
+                        }
+                    })?;
                     let source = event_source(scene_name, &object.id, &script.name);
                     host.transaction.begin(
                         world,
@@ -267,7 +284,7 @@ impl ScriptHost {
                     );
                     let result = AbiScriptInstance::create(
                         descriptor,
-                        &script.params,
+                        &params,
                         AbiScriptCall {
                             self_object,
                             transaction: &mut host.transaction,
@@ -624,6 +641,34 @@ fn abi_object_handle(handle: ObjectHandle) -> Option<u64> {
     u64::try_from(handle.index())
         .ok()
         .and_then(|index| index.checked_add(1))
+}
+
+/// Значения параметров экземпляра: по схеме скрипта, если она объявлена, иначе как в сцене.
+fn resolve_params(
+    schema: Option<&ParamSchema>,
+    params: &ScriptParams,
+) -> Result<ScriptParams, String> {
+    match schema {
+        Some(schema) => schema.resolve(params),
+        None => Ok(params.clone()),
+    }
+}
+
+/// Схема параметров lite-скрипта из поля класса `properties`; `None` — схема не объявлена.
+///
+/// Chunk выполняется в отдельном Lua с теми же ограничениями памяти и прерыванием, что и при
+/// загрузке сцены, но без API движка: `rve.find` и подобные на верхнем уровне дают ошибку.
+pub fn lite_properties(
+    label: &str,
+    source: &str,
+    interrupt: &ScriptInterruptHandle,
+) -> Result<Option<ParamSchema>, ScriptLoadError> {
+    lite::properties(label, source, interrupt.interrupted.clone()).map_err(|message| {
+        ScriptLoadError::Lite {
+            path: label.to_owned(),
+            message,
+        }
+    })
 }
 
 fn script_transform(transform: LocalTransform) -> ScriptTransform {

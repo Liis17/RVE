@@ -5,7 +5,8 @@ use engine_render::{
     Material, MaterialId, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
-use engine_scene::{CameraSettings, MaterialOverride, ObjectHandle, SceneDocument, World};
+use engine_scene::CameraSettings;
+use engine_scene::{MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
@@ -36,8 +37,25 @@ pub(crate) fn load_scene(
     let contents = read_utf8(resources, scene_path)?;
     let document =
         SceneDocument::parse(scene_path, &contents).map_err(|error| error.to_string())?;
-    let world = World::from_document(&document).map_err(|error| error.to_string())?;
+    let expansion = expand(&document, &mut |path| load_prefab(resources, path))
+        .map_err(|error| error.to_string())?;
+    let world = World::from_document(&expansion.document).map_err(|error| error.to_string())?;
     prepare_scene(resources, assets, scene_path, world)
+}
+
+/// Префаб читается через тот же `ResourceHandle`, что и сцена, поэтому dev и release
+/// загружают его одинаково.
+fn load_prefab(
+    resources: &ResourceHandle,
+    path: &VirtualPath,
+) -> Result<SceneDocument, SceneError> {
+    let label = format!("/{}", path.as_str());
+    let text = read_utf8(resources, &label).map_err(|message| SceneError {
+        source: label.clone(),
+        object_id: None,
+        message,
+    })?;
+    SceneDocument::parse_prefab(label, &text)
 }
 
 fn prepare_scene(
@@ -582,6 +600,53 @@ id = "camera"
         .err()
         .unwrap();
         assert!(error.contains("исходник должен быть UTF-8"));
+    }
+
+    #[test]
+    fn load_scene_expands_prefab_instances_through_the_resource_handle() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"/prefabs/spinner.rveprefab\"\n{CAMERA_SCENE}\n[[instances]]\nid = \"spinner1\"\nprefab = \"/prefabs/spinner.rveprefab\"\n[[instances.overrides]]\ntarget = \"blade\"\nlite_params = [{{ path = \"/scripts/spin.lua\", params = {{ speed = 2 }} }}]\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        project.write(
+            "prefabs/spinner.rveprefab",
+            b"[[assets]]\npath = \"/scripts/spin.lua\"\n[[objects]]\nid = \"hub\"\n[[objects]]\nid = \"blade\"\nparent = \"hub\"\n[[objects.lite_scripts]]\npath = \"/scripts/spin.lua\"\n",
+        );
+        project.write("scripts/spin.lua", b"return {}\n");
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let blade = prepared.world.handle("spinner1.blade").unwrap();
+        let object = prepared.world.object(blade).unwrap();
+        assert_eq!(
+            object.lite_scripts[0].params["speed"],
+            engine_scene::ParamValue::Int(2)
+        );
+        assert!(prepared.world.handle("spinner1").is_some());
+        assert!(prepared.sources.contains_key("scripts/spin.lua"));
+    }
+
+    #[test]
+    fn load_scene_reports_a_missing_prefab() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"/prefabs/gone.rveprefab\"\n{CAMERA_SCENE}\n[[instances]]\nid = \"x\"\nprefab = \"/prefabs/gone.rveprefab\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("gone.rveprefab"), "{error}");
     }
 
     #[test]

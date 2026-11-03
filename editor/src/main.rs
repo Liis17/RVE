@@ -3,6 +3,7 @@
 mod app;
 mod assets_fs;
 mod autosave;
+mod build;
 mod cli;
 mod console;
 mod input;

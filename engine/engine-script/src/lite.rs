@@ -5,7 +5,10 @@ use crate::transaction::{
 use crate::types::{
     ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
-use engine_scene::{AntiAliasing, CameraSettings, ObjectHandle, ParamValue, Tonemapper};
+use engine_scene::{
+    AntiAliasing, CameraSettings, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue,
+    Tonemapper,
+};
 use mlua::chunk::ChunkMode;
 use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, StdLib,
@@ -150,7 +153,7 @@ pub(crate) fn compile_class(
     base_environment: &Table,
     path: &str,
     source: &str,
-) -> Result<Table, String> {
+) -> Result<(Table, Option<ParamSchema>), String> {
     let environment =
         script_environment(lua, base_environment).map_err(|error| error.to_string())?;
     let value = lua
@@ -173,7 +176,159 @@ pub(crate) fn compile_class(
             _ => return Err(format!("class field {callback:?} must be a function")),
         }
     }
-    Ok(class)
+    let schema = class_properties(&class)?;
+    Ok((class, schema))
+}
+
+/// Схема из поля класса `properties`: таблица `name = { type = ... }` (поля по имени)
+/// или массив `{ { name = ..., type = ... }, ... }` (порядок массива).
+fn class_properties(class: &Table) -> Result<Option<ParamSchema>, String> {
+    let properties = match class
+        .get::<Value>("properties")
+        .map_err(|error| error.to_string())?
+    {
+        Value::Nil => return Ok(None),
+        Value::Table(properties) => properties,
+        _ => return Err("class field \"properties\" must be a table".to_owned()),
+    };
+    let mut named = Vec::new();
+    let mut listed = Vec::new();
+    properties
+        .for_each::<Value, Value>(|key, value| {
+            let Value::Table(entry) = value else {
+                return Err(LuaError::runtime("each property must be a table"));
+            };
+            match key {
+                Value::String(name) => {
+                    let name = name
+                        .to_str()
+                        .map_err(|_| LuaError::runtime("property names must be UTF-8"))?
+                        .to_owned();
+                    named.push((name, entry));
+                }
+                key => match sequence_index(key) {
+                    Some(index) => listed.push((index, entry)),
+                    None => {
+                        return Err(LuaError::runtime(
+                            "properties keys must be names or array indices",
+                        ));
+                    }
+                },
+            }
+            Ok(())
+        })
+        .map_err(|error| format!("properties: {error}"))?;
+    if !named.is_empty() && !listed.is_empty() {
+        return Err("properties must be either a name table or an array, not both".to_owned());
+    }
+    let mut specs = Vec::with_capacity(named.len() + listed.len());
+    if listed.is_empty() {
+        named.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (name, entry) in named {
+            if !matches!(entry.get::<Value>("name"), Ok(Value::Nil)) {
+                return Err(format!(
+                    "properties.{name}: field \"name\" is only used in the array form"
+                ));
+            }
+            specs.push(property_spec(name, &entry)?);
+        }
+    } else {
+        listed.sort_by_key(|(index, _)| *index);
+        if listed
+            .iter()
+            .enumerate()
+            .any(|(offset, (index, _))| *index != offset + 1)
+        {
+            return Err("properties array must have consecutive indices 1..n".to_owned());
+        }
+        for (index, entry) in listed {
+            let name = match entry.get::<Value>("name") {
+                Ok(Value::String(name)) => name
+                    .to_str()
+                    .map_err(|_| format!("properties[{index}]: name must be UTF-8"))?
+                    .to_owned(),
+                _ => return Err(format!("properties[{index}]: name must be a string")),
+            };
+            specs.push(property_spec(name, &entry)?);
+        }
+    }
+    ParamSchema::new(specs)
+        .map(Some)
+        .map_err(|error| format!("properties: {error}"))
+}
+
+fn property_spec(name: String, entry: &Table) -> Result<ParamSpec, String> {
+    let context = |message: &str| format!("properties.{name}: {message}");
+    entry
+        .for_each::<Value, Value>(|key, _| match key {
+            Value::String(key)
+                if matches!(
+                    key.as_bytes().as_ref(),
+                    b"name" | b"type" | b"default" | b"min" | b"max" | b"label"
+                ) =>
+            {
+                Ok(())
+            }
+            _ => Err(LuaError::runtime(
+                "unknown field; expected type, default, min, max or label",
+            )),
+        })
+        .map_err(|error| context(&error.to_string()))?;
+    let kind = match entry.get::<Value>("type") {
+        Ok(Value::String(kind)) => kind
+            .to_str()
+            .ok()
+            .and_then(|kind| ParamKind::parse(&kind))
+            .ok_or_else(|| context("type must be bool, int, float, string or vec3"))?,
+        _ => return Err(context("type must be a string")),
+    };
+    let default = match entry.get::<Value>("default") {
+        Ok(Value::Nil) => kind.zero(),
+        Ok(value) => lua_param_value(value).map_err(|error| context(&error.to_string()))?,
+        Err(error) => return Err(context(&error.to_string())),
+    };
+    let bound = |field: &str| match entry.get::<Value>(field) {
+        Ok(Value::Nil) => Ok(None),
+        Ok(Value::Integer(value)) => Ok(Some(value as f64)),
+        Ok(Value::Number(value)) => Ok(Some(value)),
+        _ => Err(context(&format!("{field} must be a number"))),
+    };
+    let label = match entry.get::<Value>("label") {
+        Ok(Value::Nil) => None,
+        Ok(Value::String(label)) => Some(
+            label
+                .to_str()
+                .map_err(|_| context("label must be UTF-8"))?
+                .to_owned(),
+        ),
+        _ => return Err(context("label must be a string")),
+    };
+    Ok(ParamSpec {
+        min: bound("min")?,
+        max: bound("max")?,
+        name,
+        kind,
+        default,
+        label,
+    })
+}
+
+/// Схема параметров lite-скрипта без создания экземпляров: chunk выполняется в отдельном
+/// Lua с теми же ограничениями, что и при загрузке сцены. API движка (`rve.find` и др.)
+/// на верхнем уровне chunk недоступен, как и при загрузке.
+pub(crate) fn properties(
+    label: &str,
+    source: &str,
+    interrupted: Arc<AtomicBool>,
+) -> Result<Option<ParamSchema>, String> {
+    let state = create_lua(
+        Rc::new(RefCell::new(Vec::new())),
+        Rc::new(RefCell::new(label.to_owned())),
+        Rc::new(Cell::new(std::ptr::null_mut())),
+        interrupted,
+    )
+    .map_err(|error| error.to_string())?;
+    compile_class(&state.lua, &state.base_environment, label, source).map(|(_, schema)| schema)
 }
 
 pub(crate) struct LuaInstance {
@@ -865,7 +1020,6 @@ fn lua_message_name(value: LuaString) -> mlua::Result<String> {
         .map_err(|_| LuaError::runtime("message names must contain valid UTF-8"))
 }
 
-#[cfg(test)]
 fn lua_param_value(value: Value) -> mlua::Result<ParamValue> {
     lua_param_value_with_size(value).map(|(value, _)| value)
 }

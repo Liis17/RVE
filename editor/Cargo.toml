@@ -24,3 +24,12 @@ glam.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+rve-sdk = { path = "../engine/rve-sdk" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

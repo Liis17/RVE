@@ -3,10 +3,30 @@
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, DirectionalLightComponent, LodGroup, MeshRenderer, SceneAsset, SceneDocument,
-    SceneObject, SceneTransform,
+    CameraComponent, DirectionalLightComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin,
+    PrefabInstance, PrefabOverride, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform,
 };
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+mod prefabs;
+
+pub use prefabs::OverrideField;
+
+/// Загрузчик префабов проекта по virtual path; документ разобран как `.rveprefab`.
+pub type PrefabLoader = Rc<dyn Fn(&VirtualPath) -> Result<SceneDocument, SceneError>>;
+
+/// Загрузчик для сцены вне проекта: префабов нет.
+pub fn no_prefabs() -> PrefabLoader {
+    Rc::new(|path| {
+        Err(SceneError {
+            source: format!("/{}", path.as_str()),
+            object_id: None,
+            message: "префабы доступны только в открытом проекте".to_owned(),
+        })
+    })
+}
 use std::fs;
 use std::path::Path;
 
@@ -40,6 +60,8 @@ pub enum NewObject {
     DirectionalLight,
     /// Модель и локальная позиция нового объекта.
     Mesh(VirtualPath, [f32; 3]),
+    /// Экземпляр префаба и локальная позиция его корня.
+    Prefab(VirtualPath, [f32; 3]),
 }
 
 /// Вид компонента для меню Reset/Copy/Paste в Inspector.
@@ -117,7 +139,11 @@ impl Component {
 
 /// Открытая сцена с выделением и историей правок.
 pub struct EditorScene {
+    /// Авторский документ: его правят команды и он сохраняется в файл.
     document: SceneDocument,
+    /// Раскрытый документ для показа, мира и Play; пересчитывается после каждой правки.
+    expansion: Expansion,
+    loader: PrefabLoader,
     /// Virtual path файла сцены; `None` — сцена ещё не сохранялась.
     path: Option<VirtualPath>,
     dirty: bool,
@@ -135,29 +161,49 @@ impl EditorScene {
     pub fn new_untitled() -> Result<Self, String> {
         let document =
             SceneDocument::parse("untitled.rvescene", NEW_SCENE).map_err(|e| e.to_string())?;
-        Ok(Self::from_document(document, None))
+        Self::from_document(document, None, no_prefabs())
     }
 
-    pub fn parse(path: VirtualPath, contents: &str) -> Result<Self, String> {
-        let document =
-            SceneDocument::parse(path.as_str(), contents).map_err(|error| error.to_string())?;
-        Ok(Self::from_document(document, Some(path)))
+    /// Разбирает сцену или, для пути `.rveprefab`, префаб.
+    pub fn parse(path: VirtualPath, contents: &str, loader: PrefabLoader) -> Result<Self, String> {
+        let document = parse_document(&path, contents).map_err(|error| error.to_string())?;
+        Self::from_document(document, Some(path), loader)
     }
 
     /// Сцена из автосохранения: путь прежний, а изменения считаются несохранёнными.
     pub fn recover(path: Option<VirtualPath>, contents: &str) -> Result<Self, String> {
+        Self::recover_with_loader(path, contents, no_prefabs())
+    }
+
+    /// Восстанавливает автосохранение проекта с тем же загрузчиком префабов.
+    pub fn recover_with_loader(
+        path: Option<VirtualPath>,
+        contents: &str,
+        loader: PrefabLoader,
+    ) -> Result<Self, String> {
         let label = path
             .as_ref()
             .map_or("untitled.rvescene", |path| path.as_str());
-        let document = SceneDocument::parse(label, contents).map_err(|error| error.to_string())?;
-        let mut scene = Self::from_document(document, path);
+        let document = match path.as_ref() {
+            Some(path) => parse_document(path, contents),
+            None => SceneDocument::parse(label, contents),
+        }
+        .map_err(|error| error.to_string())?;
+        let mut scene = Self::from_document(document, path, loader)?;
         scene.dirty = true;
         Ok(scene)
     }
 
-    fn from_document(document: SceneDocument, path: Option<VirtualPath>) -> Self {
-        Self {
+    fn from_document(
+        document: SceneDocument,
+        path: Option<VirtualPath>,
+        loader: PrefabLoader,
+    ) -> Result<Self, String> {
+        let expansion = expand_document(&document, path.as_ref(), &loader)?;
+        Ok(Self {
             document,
+            expansion,
+            loader,
             path,
             dirty: false,
             selection: Vec::new(),
@@ -165,11 +211,55 @@ impl EditorScene {
             redo: Vec::new(),
             coalesce: None,
             revision: 0,
-        }
+        })
     }
 
     pub fn document(&self) -> &SceneDocument {
         &self.document
+    }
+
+    /// Раскрытый документ: объекты экземпляров с id через точку. Его показывают панели.
+    pub fn view(&self) -> &SceneDocument {
+        &self.expansion.document
+    }
+
+    /// Происхождение объекта экземпляра; `None` — собственный объект документа.
+    pub fn origin(&self, id: &str) -> Option<&ObjectOrigin> {
+        self.expansion.origins.get(id)
+    }
+
+    /// Авторский экземпляр префаба по id.
+    pub fn instance(&self, id: &str) -> Option<&PrefabInstance> {
+        self.document
+            .instances
+            .iter()
+            .find(|instance| instance.id == id)
+    }
+
+    /// Объект, входящий в экземпляр, но не его корень: его нельзя удалить или перенести.
+    pub fn is_prefab_part(&self, id: &str) -> bool {
+        self.origin(id).is_some() && self.instance(id).is_none()
+    }
+
+    /// Подменяет загрузчик префабов и раскрывает документ заново.
+    pub fn set_prefab_loader(&mut self, loader: PrefabLoader) -> Result<(), String> {
+        self.loader = loader;
+        self.reload_prefabs()
+    }
+
+    /// Раскрывает документ заново, например после изменения файлов префабов.
+    pub fn reload_prefabs(&mut self) -> Result<(), String> {
+        self.expansion = expand_document(&self.document, self.path.as_ref(), &self.loader)?;
+        self.revision += 1;
+        let visible = self
+            .expansion
+            .document
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        self.selection.retain(|id| visible.contains(id.as_str()));
+        Ok(())
     }
 
     pub fn path(&self) -> Option<&VirtualPath> {
@@ -202,8 +292,9 @@ impl EditorScene {
         self.object(self.selection()?)
     }
 
+    /// Объект раскрытого документа, в том числе объект экземпляра.
     pub fn object(&self, id: &str) -> Option<&SceneObject> {
-        self.document.objects.iter().find(|object| object.id == id)
+        self.view().objects.iter().find(|object| object.id == id)
     }
 
     /// Заменяет выделение одним объектом или очищает его.
@@ -291,9 +382,19 @@ impl EditorScene {
         self.coalesce = None;
         self.dirty = true;
         self.revision += 1;
-        let document = &self.document;
-        self.selection
-            .retain(|id| document.objects.iter().any(|object| &object.id == id));
+        // Документ из истории уже раскрывался; ошибка возможна, только если файлы префабов
+        // изменились, и тогда остаётся прежнее раскрытие.
+        if let Ok(expansion) = expand_document(&self.document, self.path.as_ref(), &self.loader) {
+            self.expansion = expansion;
+        }
+        let visible = self
+            .expansion
+            .document
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        self.selection.retain(|id| visible.contains(id.as_str()));
     }
 
     /// Завершает непрерывную правку: следующее изменение создаст новую запись истории.
@@ -320,6 +421,8 @@ impl EditorScene {
         let mut next = self.document.clone();
         change(&mut next)?;
         next.validate().map_err(|error| error.to_string())?;
+        let expansion = expand_document(&next, self.path.as_ref(), &self.loader)?;
+        self.expansion = expansion;
         let continues = coalesce.is_some() && coalesce == self.coalesce.as_deref();
         if !continues {
             self.undo.push(std::mem::replace(&mut self.document, next));
@@ -337,13 +440,21 @@ impl EditorScene {
     }
 
     /// Изменяет один объект; подходит для всех правок полей в Inspector.
+    ///
+    /// У корня экземпляра `name`, `transform` и `parent` пишутся в сам экземпляр.
     pub fn edit_object(
         &mut self,
         id: &str,
         coalesce: Option<&str>,
         change: impl FnOnce(&mut SceneObject) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.edit(coalesce, |document| change(find_object_mut(document, id)?))
+        if self.document.objects.iter().any(|object| object.id == id) {
+            return self.edit(coalesce, |document| change(find_object_mut(document, id)?));
+        }
+        if self.origin(id).is_some() {
+            return self.edit_prefab_object(id, coalesce, change);
+        }
+        Err(format!("объект {id:?} не найден"))
     }
 
     pub fn create_object(
@@ -351,17 +462,15 @@ impl EditorScene {
         kind: &NewObject,
         parent: Option<&str>,
     ) -> Result<String, String> {
+        if let NewObject::Prefab(path, position) = kind {
+            return self.instantiate(path, parent, *position);
+        }
         let (base, name) = match kind {
             NewObject::Empty => ("object".to_owned(), "Empty".to_owned()),
             NewObject::Camera => ("camera".to_owned(), "Camera".to_owned()),
             NewObject::DirectionalLight => ("light".to_owned(), "Directional Light".to_owned()),
-            NewObject::Mesh(path, _) => {
-                let stem = path
-                    .as_str()
-                    .rsplit('/')
-                    .next()
-                    .and_then(|file| file.split('.').next())
-                    .unwrap_or("mesh");
+            NewObject::Mesh(path, _) | NewObject::Prefab(path, _) => {
+                let stem = file_stem(path);
                 (stem.to_owned(), stem.to_owned())
             }
         };
@@ -380,7 +489,7 @@ impl EditorScene {
         };
         self.edit(None, |document| {
             match kind {
-                NewObject::Empty => {}
+                NewObject::Empty | NewObject::Prefab(..) => {}
                 NewObject::Camera => {
                     if !document
                         .objects
@@ -416,7 +525,8 @@ impl EditorScene {
         Ok(id)
     }
 
-    /// Удаляет объект вместе с потомками; единственную камеру удалить нельзя.
+    /// Удаляет объект или экземпляр вместе с потомками; единственную камеру удалить нельзя.
+    /// Часть экземпляра удалить нельзя: удаляется весь экземпляр или делается Unpack.
     pub fn delete_object(&mut self, id: &str) -> Result<(), String> {
         self.delete_objects(&[id.to_owned()])
     }
@@ -425,12 +535,19 @@ impl EditorScene {
     pub fn delete_objects(&mut self, ids: &[String]) -> Result<(), String> {
         let mut removed = HashSet::new();
         for id in ids {
-            removed.extend(subtree_ids(&self.document, id)?);
+            self.require_own(id)?;
+            removed.extend(subtree_ids(self.view(), id)?);
+        }
+        if removed.is_empty() {
+            return Ok(());
         }
         self.edit(None, |document| {
             document
                 .objects
                 .retain(|object| !removed.contains(&object.id));
+            document
+                .instances
+                .retain(|instance| !removed.contains(&instance.id));
             if document
                 .objects
                 .iter()
@@ -461,28 +578,148 @@ impl EditorScene {
         self.delete_objects(&roots)
     }
 
-    /// Копирует объект с потомками; вложенные ссылки `parent` указывают на новые копии.
+    /// Копирует объект или экземпляр с потомками и выделяет копии.
     pub fn duplicate_object(&mut self, id: &str) -> Result<String, String> {
-        let copies = self.insert_copies(self.subtrees(&[id.to_owned()])?)?;
-        Ok(copies
+        self.duplicate_roots(&[id.to_owned()])?
             .into_iter()
             .next()
-            .expect("копируется хотя бы один объект"))
+            .ok_or_else(|| format!("объект {id:?} не найден"))
     }
 
     /// Копирует выделенные поддеревья одной записью истории и выделяет копии.
     pub fn duplicate_selection(&mut self) -> Result<Vec<String>, String> {
         let roots = self.selection_roots();
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.insert_copies(self.subtrees(&roots)?)
+        self.duplicate_roots(&roots)
     }
 
-    /// Объекты поддеревьев `roots` в порядке документа: исходник для дублирования и копирования.
+    fn duplicate_roots(&mut self, roots: &[String]) -> Result<Vec<String>, String> {
+        let mut subtree = HashSet::new();
+        for root in roots {
+            self.require_own(root)?;
+            subtree.extend(subtree_ids(self.view(), root)?);
+        }
+        if subtree.is_empty() {
+            return Ok(Vec::new());
+        }
+        let source_ids = self
+            .document
+            .objects
+            .iter()
+            .map(|object| &object.id)
+            .chain(self.document.instances.iter().map(|instance| &instance.id))
+            .filter(|id| subtree.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reserved = HashSet::new();
+        let mut renamed = HashMap::new();
+        for source in &source_ids {
+            let copy_id = unique_id(&self.document, source, &reserved);
+            reserved.insert(copy_id.clone());
+            renamed.insert(source.clone(), copy_id);
+        }
+        let copies = roots
+            .iter()
+            .filter_map(|root| renamed.get(root).cloned())
+            .collect::<Vec<_>>();
+        let prefab_cameras = self
+            .view()
+            .objects
+            .iter()
+            .filter_map(|object| {
+                let origin = self.origin(&object.id)?;
+                if !renamed.contains_key(&origin.instance) {
+                    return None;
+                }
+                Some((
+                    origin.instance.clone(),
+                    origin.target.clone(),
+                    object.camera.clone()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let remap =
+            |parent: Option<String>| parent.map(|parent| rename_reference(&renamed, parent));
+        self.edit(None, |document| {
+            let objects = document
+                .objects
+                .iter()
+                .filter(|object| renamed.contains_key(&object.id))
+                .cloned()
+                .map(|mut object| {
+                    object.parent = remap(object.parent);
+                    object.id = renamed[&object.id].clone();
+                    if let Some(camera) = &mut object.camera {
+                        camera.active = false;
+                    }
+                    object
+                })
+                .collect::<Vec<_>>();
+            let instances = document
+                .instances
+                .iter()
+                .filter(|instance| renamed.contains_key(&instance.id))
+                .cloned()
+                .map(|mut instance| {
+                    instance.parent = remap(instance.parent);
+                    instance.id = renamed[&instance.id].clone();
+                    instance
+                })
+                .collect::<Vec<_>>();
+            document.objects.extend(objects);
+            document.instances.extend(instances);
+            for (source_instance, target, mut camera) in prefab_cameras {
+                camera.active = false;
+                if let Some(settings) = &camera.settings {
+                    ensure_asset(document, settings);
+                }
+                let instance_id = &renamed[&source_instance];
+                let instance = document
+                    .instances
+                    .iter_mut()
+                    .find(|instance| &instance.id == instance_id)
+                    .ok_or_else(|| format!("экземпляр {instance_id:?} не найден"))?;
+                if let Some(change) = instance
+                    .overrides
+                    .iter_mut()
+                    .find(|change| change.target == target)
+                {
+                    change.camera = Some(camera);
+                } else {
+                    instance.overrides.push(PrefabOverride {
+                        target,
+                        camera: Some(camera),
+                        ..PrefabOverride::default()
+                    });
+                }
+            }
+            if document
+                .objects
+                .iter()
+                .filter(|object| object.camera.is_some())
+                .count()
+                > 1
+                && !document
+                    .objects
+                    .iter()
+                    .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                && let Some(object) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                object.camera.as_mut().unwrap().active = true;
+            }
+            Ok(())
+        })?;
+        self.selection = copies.clone();
+        Ok(copies)
+    }
+
+    /// Объекты обычных поддеревьев в порядке документа для системного буфера обмена.
     pub fn subtrees(&self, roots: &[String]) -> Result<Vec<SceneObject>, String> {
         let mut ids = HashSet::new();
         for root in roots {
+            self.require_own(root)?;
             ids.extend(subtree_ids(&self.document, root)?);
         }
         Ok(self
@@ -494,11 +731,7 @@ impl EditorScene {
             .collect())
     }
 
-    /// Добавляет копии объектов одной записью истории и выделяет копии корней.
-    ///
-    /// Копии получают свободные id, а ссылки `parent` внутри набора указывают на копии.
-    /// Корень остаётся под прежним родителем, если тот есть в сцене, иначе становится корневым.
-    /// Ресурсы компонентов добавляются в список сцены, поэтому набор можно вставить в другую сцену.
+    /// Вставляет объекты из системного буфера одной записью истории.
     pub fn insert_copies(&mut self, objects: Vec<SceneObject>) -> Result<Vec<String>, String> {
         let mut reserved = HashSet::new();
         let mut renamed = HashMap::new();
@@ -613,81 +846,163 @@ impl EditorScene {
 
     /// Назначает активную камеру; снятие единственного active оставляет одну камеру implicit.
     pub fn set_camera_active(&mut self, id: &str, active: bool) -> Result<(), String> {
-        self.edit(None, |document| {
-            if find_object(document, id)?.camera.is_none() {
-                return Err(format!("объект {id:?} не имеет камеры"));
-            }
-            if active {
-                for object in &mut document.objects {
-                    if let Some(camera) = &mut object.camera {
-                        camera.active = object.id == id;
-                    }
-                }
-            } else {
-                find_object_mut(document, id)?
+        let mut cameras = self
+            .view()
+            .objects
+            .iter()
+            .filter_map(|object| {
+                object
                     .camera
-                    .as_mut()
-                    .unwrap()
-                    .active = false;
-                let camera_count = document
-                    .objects
-                    .iter()
-                    .filter(|object| object.camera.is_some())
-                    .count();
-                if camera_count > 1
-                    && !document
-                        .objects
-                        .iter()
-                        .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
-                    && let Some(replacement) = document
-                        .objects
+                    .clone()
+                    .map(|camera| (object.id.clone(), camera))
+            })
+            .collect::<Vec<_>>();
+        let Some(selected_index) = cameras.iter().position(|(camera_id, _)| camera_id == id) else {
+            return Err(format!("объект {id:?} не имеет камеры"));
+        };
+        if active {
+            for (camera_id, camera) in &mut cameras {
+                camera.active = camera_id == id;
+            }
+        } else {
+            cameras[selected_index].1.active = false;
+            if cameras.len() > 1
+                && !cameras.iter().any(|(_, camera)| camera.active)
+                && let Some((_, (_, replacement))) = cameras
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(index, _)| *index != selected_index)
+            {
+                replacement.active = true;
+            }
+        }
+        let updates = cameras
+            .into_iter()
+            .map(|(camera_id, camera)| {
+                let origin = self.origin(&camera_id).cloned();
+                (camera_id, origin, camera)
+            })
+            .collect::<Vec<_>>();
+        self.edit(None, |document| {
+            for (camera_id, origin, camera) in updates {
+                if let Some(origin) = origin {
+                    if let Some(settings) = &camera.settings {
+                        ensure_asset(document, settings);
+                    }
+                    let instance = document
+                        .instances
                         .iter_mut()
-                        .find(|object| object.id != id && object.camera.is_some())
-                {
-                    replacement.camera.as_mut().unwrap().active = true;
+                        .find(|instance| instance.id == origin.instance)
+                        .ok_or_else(|| format!("экземпляр {:?} не найден", origin.instance))?;
+                    if let Some(change) = instance
+                        .overrides
+                        .iter_mut()
+                        .find(|change| change.target == origin.target)
+                    {
+                        change.camera = Some(camera);
+                    } else {
+                        instance.overrides.push(PrefabOverride {
+                            target: origin.target,
+                            camera: Some(camera),
+                            ..PrefabOverride::default()
+                        });
+                    }
+                } else {
+                    find_object_mut(document, &camera_id)?.camera = Some(camera);
                 }
             }
             Ok(())
         })
     }
 
-    /// Меняет идентификатор объекта и все ссылки потомков на него.
+    /// Меняет идентификатор объекта или экземпляра и все ссылки на него, в том числе на
+    /// объекты внутри экземпляра (`door1.handle`).
     pub fn change_id(&mut self, id: &str, new_id: &str) -> Result<(), String> {
         if id == new_id {
             return Ok(());
         }
+        self.require_own(id)?;
+        let renamed = std::collections::HashMap::from([(id.to_owned(), new_id.to_owned())]);
         self.edit(None, |document| {
-            find_object_mut(document, id)?.id = new_id.to_owned();
-            for object in &mut document.objects {
-                if object.parent.as_deref() == Some(id) {
-                    object.parent = Some(new_id.to_owned());
-                }
+            if let Some(object) = document.objects.iter_mut().find(|object| object.id == id) {
+                object.id = new_id.to_owned();
+            } else if let Some(instance) = document
+                .instances
+                .iter_mut()
+                .find(|instance| instance.id == id)
+            {
+                instance.id = new_id.to_owned();
+            }
+            let parents = document
+                .objects
+                .iter_mut()
+                .map(|object| &mut object.parent)
+                .chain(
+                    document
+                        .instances
+                        .iter_mut()
+                        .map(|instance| &mut instance.parent),
+                );
+            for parent in parents {
+                *parent = parent
+                    .take()
+                    .map(|parent| rename_reference(&renamed, parent));
             }
             Ok(())
         })?;
         for selected in &mut self.selection {
-            if selected == id {
-                *selected = new_id.to_owned();
-            }
+            *selected = rename_reference(&renamed, std::mem::take(selected));
         }
         Ok(())
     }
 
-    /// Меняет родителя с сохранением локальной трансформации.
+    /// Меняет родителя с сохранением локальной трансформации. Объектам внутри экземпляра
+    /// родителя менять нельзя.
     pub fn set_parent(&mut self, id: &str, parent: Option<&str>) -> Result<(), String> {
+        self.require_own(id)?;
         if let Some(parent) = parent
-            && subtree_ids(&self.document, id)?.contains(parent)
+            && subtree_ids(self.view(), id)?.contains(parent)
         {
             return Err(format!(
                 "объект {id:?} нельзя вложить в себя или своего потомка {parent:?}"
             ));
         }
-        self.edit_object(id, None, |object| {
-            object.parent = parent.map(str::to_owned);
+        self.edit(None, |document| {
+            let parent = parent.map(str::to_owned);
+            if let Some(object) = document.objects.iter_mut().find(|object| object.id == id) {
+                object.parent = parent;
+            } else if let Some(instance) = document
+                .instances
+                .iter_mut()
+                .find(|instance| instance.id == id)
+            {
+                instance.parent = parent;
+            }
             Ok(())
         })
     }
 
+    /// Объект — собственный объект документа или корень экземпляра.
+    fn require_own(&self, id: &str) -> Result<(), String> {
+        if self.is_prefab_part(id) {
+            return Err(format!(
+                "объект {id:?} — часть префаба: правьте префаб (Open Prefab) или сделайте Unpack"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn set_transform(
+        &mut self,
+        id: &str,
+        transform: SceneTransform,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        self.edit_object(id, coalesce, |object| {
+            object.transform = transform;
+            Ok(())
+        })
+    }
     /// Назначает модель и текстуру объекта; их пути добавляются в список ресурсов сцены.
     pub fn set_mesh(
         &mut self,
@@ -695,6 +1010,18 @@ impl EditorScene {
         model: VirtualPath,
         texture: Option<VirtualPath>,
     ) -> Result<(), String> {
+        if self.origin(id).is_some() {
+            // Модель объекта экземпляра меняется override; ресурсы добавит сама правка.
+            return self.edit_object(id, None, |object| {
+                let mesh = object
+                    .mesh_renderer
+                    .as_mut()
+                    .ok_or("Mesh Renderer объекта префаба добавляется только в самом префабе")?;
+                mesh.model = model;
+                mesh.texture = texture;
+                Ok(())
+            });
+        }
         self.edit(None, |document| {
             ensure_asset(document, &model);
             if let Some(texture) = &texture {
@@ -727,6 +1054,16 @@ impl EditorScene {
                 .ends_with(".camerasettings")
         {
             return Err(format!("{}: ожидается ресурс .camerasettings", path));
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                let camera = object
+                    .camera
+                    .as_mut()
+                    .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+                camera.settings = settings;
+                Ok(())
+            });
         }
         self.edit(None, |document| {
             if let Some(path) = &settings {
@@ -791,6 +1128,12 @@ impl EditorScene {
 
     /// Задаёт значение компонента целиком; его ресурсы добавляются в список сцены.
     pub fn set_component(&mut self, id: &str, component: Component) -> Result<(), String> {
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                component.apply(object);
+                Ok(())
+            });
+        }
         self.edit(None, |document| {
             let object = find_object_mut(document, id)?;
             component.apply(object);
@@ -826,15 +1169,90 @@ impl EditorScene {
     ///
     /// Результат сначала разбирается заново, поэтому файл на диске всегда остаётся читаемым.
     pub fn save(&mut self, file: &Path, path: VirtualPath) -> Result<(), String> {
+        if is_prefab_path(&path) != self.document.is_prefab() {
+            return Err(format!(
+                "/{}: сцена сохраняется в .rvescene, префаб — в .rveprefab",
+                path.as_str()
+            ));
+        }
         let contents = self.document.to_toml().map_err(|error| error.to_string())?;
-        let reparsed = SceneDocument::parse(path.as_str(), &contents)
+        let reparsed = parse_document(&path, &contents)
             .map_err(|error| format!("сериализованная сцена не прошла проверку: {error}"))?;
+        // Префаб, включающий сам себя под новым путём, отклоняется до записи.
+        expand_document(&reparsed, Some(&path), &self.loader)?;
         write_atomic(file, contents.as_bytes())?;
         self.document = reparsed;
         self.path = Some(path);
         self.dirty = false;
         Ok(())
     }
+}
+
+fn is_prefab_path(path: &VirtualPath) -> bool {
+    std::path::Path::new(path.as_str())
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rveprefab"))
+}
+
+/// Разбирает файл по расширению: `.rveprefab` — префаб, иначе сцена.
+fn parse_document(path: &VirtualPath, contents: &str) -> Result<SceneDocument, SceneError> {
+    if is_prefab_path(path) {
+        SceneDocument::parse_prefab(path.as_str(), contents)
+    } else {
+        SceneDocument::parse(path.as_str(), contents)
+    }
+}
+
+/// Раскрывает документ. Если это префаб с путём `own`, ссылка на этот путь получает сам
+/// документ, а не файл с диска: так цикл через несохранённую правку обнаруживается сразу.
+fn expand_document(
+    document: &SceneDocument,
+    own: Option<&VirtualPath>,
+    loader: &PrefabLoader,
+) -> Result<Expansion, String> {
+    expand_document_with(document, own, loader, None)
+}
+
+/// Как [`expand_document`]; `skip_overrides` — экземпляр, чьи overrides не применяются.
+fn expand_document_with(
+    document: &SceneDocument,
+    own: Option<&VirtualPath>,
+    loader: &PrefabLoader,
+    skip_overrides: Option<&str>,
+) -> Result<Expansion, String> {
+    let own = own.filter(|_| document.is_prefab());
+    let mut load = |path: &VirtualPath| match own {
+        Some(own) if own == path => Ok(document.clone()),
+        _ => loader(path),
+    };
+    match skip_overrides {
+        Some(instance) => engine_scene::expand_without_overrides(document, instance, &mut load),
+        None => engine_scene::expand(document, &mut load),
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn file_stem(path: &VirtualPath) -> &str {
+    path.as_str()
+        .rsplit('/')
+        .next()
+        .and_then(|file| file.split('.').next())
+        .unwrap_or("object")
+}
+
+/// Ссылка на переименованный объект: сам id или объект внутри переименованного
+/// экземпляра (`old.child` → `new.child`).
+fn rename_reference(renamed: &std::collections::HashMap<String, String>, id: String) -> String {
+    if let Some(new) = renamed.get(&id) {
+        return new.clone();
+    }
+    if let Some((head, rest)) = id.split_once('.')
+        && let Some(new) = renamed.get(head)
+    {
+        return format!("{new}.{rest}");
+    }
+    id
 }
 
 /// Светлая настройка по умолчанию для нового directional light.
@@ -903,6 +1321,13 @@ fn register_object_assets(
     }
     for script in &object.lite_scripts {
         ensure_asset(document, &script.path);
+    }
+    if let Some(settings) = object
+        .camera
+        .as_ref()
+        .and_then(|camera| camera.settings.as_ref())
+    {
+        ensure_asset(document, settings);
     }
     Ok(())
 }
@@ -1001,7 +1426,12 @@ fn unique_id(document: &SceneDocument, base: &str, reserved: &HashSet<String>) -
         sanitized.push_str("object");
     }
     let taken = |candidate: &str| {
-        reserved.contains(candidate) || document.objects.iter().any(|object| object.id == candidate)
+        reserved.contains(candidate)
+            || document.objects.iter().any(|object| object.id == candidate)
+            || document
+                .instances
+                .iter()
+                .any(|instance| instance.id == candidate)
     };
     sanitized.truncate(MAX_ID_LENGTH);
     if !taken(&sanitized) {
@@ -1918,8 +2348,12 @@ mod tests {
         assert_eq!(scene.path().unwrap().as_str(), "a.rvescene");
         assert_eq!(scene.document().source_label(), "a.rvescene");
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
-        let reopened =
-            EditorScene::parse(path("/a.rvescene"), &fs::read_to_string(&file).unwrap()).unwrap();
+        let reopened = EditorScene::parse(
+            path("/a.rvescene"),
+            &fs::read_to_string(&file).unwrap(),
+            no_prefabs(),
+        )
+        .unwrap();
         assert_eq!(reopened.document().objects.len(), 3);
     }
 
@@ -1943,14 +2377,27 @@ mod tests {
         let directory = TempDir::new();
         let file = directory.0.join("main.rvescene");
         let label = path("/scenes/main.rvescene");
-        let original =
-            EditorScene::parse(label.clone(), &fs::read_to_string(source).unwrap()).unwrap();
+        let project = crate::project::OpenProject::open(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/demo-game"
+        )))
+        .unwrap();
+        let original = EditorScene::parse(
+            label.clone(),
+            &fs::read_to_string(source).unwrap(),
+            project.prefab_loader(),
+        )
+        .unwrap();
         let expected = original.document().to_toml().unwrap();
         let mut scene = original;
         scene.save(&file, label.clone()).unwrap();
         let saved = fs::read_to_string(&file).unwrap();
         assert_eq!(saved, expected);
-        let reopened = EditorScene::parse(label, &saved).unwrap();
+        let reopened = EditorScene::parse(label, &saved, project.prefab_loader()).unwrap();
+        assert_eq!(
+            reopened.object("orbit.moon").unwrap().name.as_deref(),
+            Some("Moon")
+        );
         let cube = reopened.object("shared-cube").unwrap();
         assert_eq!(cube.lite_scripts.len(), 1);
         assert_eq!(cube.heavy_scripts[0].name, "Bobber");

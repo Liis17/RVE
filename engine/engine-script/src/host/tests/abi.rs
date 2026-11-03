@@ -8,7 +8,8 @@ use crate::transaction::{
 use engine_scene::World;
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost,
-    RveModule, RveParams, RveScriptDesc, RveStatus, RveStr, RveTransform, RveValue,
+    RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveStatus, RveStr, RveTransform,
+    RveValue,
 };
 use rve_sdk::{AntiAliasing, CameraSettings, Key, MouseButton, Params, Script, Tonemapper, Value};
 use std::collections::BTreeMap;
@@ -407,33 +408,40 @@ fn version_mismatch_does_not_read_the_module_table() {
 }
 
 #[test]
-fn abi_v1_header_uses_the_existing_script_table_and_host_prefix() {
+fn legacy_abi_v1_and_v2_descriptors_are_rejected() {
+    for version in [1, 2] {
+        let module = legacy_probe_module(version);
+        // SAFETY: the leaked module is immutable; rejection reads only its header.
+        assert!(matches!(
+            unsafe { crate::ScriptLibrary::from_module(module) },
+            Err(crate::ScriptLibraryError::AbiVersion { found, .. }) if found == version
+        ));
+    }
+}
+fn legacy_probe_module(version: u32) -> &'static RveModule {
     let current = sdk_module();
-    let module = RveModule {
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let probe = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
+        .iter()
+        .find(|script| unsafe { script.name.to_str() }.ok() == Some("Probe"))
+        .expect("Probe descriptor exists");
+    let scripts = Box::leak(Box::new([RveScriptDescV1 {
+        name: probe.name,
+        create: probe.create,
+        start: probe.start,
+        update: probe.update,
+        message: probe.message,
+        destroy: probe.destroy,
+        drop: probe.drop,
+    }]));
+    Box::leak(Box::new(RveModule {
         header: RveHeader {
-            abi_version: RVE_SCRIPT_ABI_MIN_VERSION,
+            abi_version: version,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
-        scripts: current.scripts,
-        script_count: current.script_count,
-    };
-    // SAFETY: the legacy header has the unchanged v1 script table and static descriptors.
-    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(&module)) }
-        .expect("ABI v1 module is supported");
-    let mut world = scripted_world("Probe", r#"{ label = "abi-v1" }"#);
-    let mut host = load_host(&world, &library);
-    host.start(
-        &mut world,
-        ScriptTime {
-            elapsed: 3.5,
-            frame: 17,
-        },
-    );
-    assert!(
-        message_list(&mut host)
-            .iter()
-            .any(|message| message == "start:abi-v1")
-    );
+        scripts: scripts.as_ptr().cast(),
+        script_count: scripts.len(),
+    }))
 }
 
 #[test]
@@ -676,6 +684,8 @@ fn null_module() -> &'static RveModule {
         message: no_op_message,
         destroy: no_op,
         drop: no_op_drop,
+        params: std::ptr::null(),
+        param_count: 0,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -693,6 +703,8 @@ fn null_name_module() -> &'static RveModule {
         message: no_op_message,
         destroy: no_op,
         drop: no_op_drop,
+        params: std::ptr::null(),
+        param_count: 0,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -711,6 +723,8 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         message: no_op_message,
         destroy: no_op,
         drop: no_op_drop,
+        params: std::ptr::null(),
+        param_count: 0,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1109,6 +1123,8 @@ fn error_message_module() -> &'static RveModule {
             message: no_op_message,
             destroy: no_op,
             drop: free_byte,
+            params: std::ptr::null(),
+            param_count: 0,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -1118,6 +1134,8 @@ fn error_message_module() -> &'static RveModule {
             message: count_error_message,
             destroy: no_op,
             drop: free_byte,
+            params: std::ptr::null(),
+            param_count: 0,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -1143,6 +1161,8 @@ fn set_local_during_create_module() -> &'static RveModule {
         message: count_create_message,
         destroy: no_op,
         drop: free_byte,
+        params: std::ptr::null(),
+        param_count: 0,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1157,6 +1177,8 @@ fn poisoned_create_module() -> &'static RveModule {
         message: no_op_message,
         destroy: no_op,
         drop: poisoned_drop,
+        params: std::ptr::null(),
+        param_count: 0,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1581,4 +1603,192 @@ fn panic_in_guest_drop_emits_an_error_event() {
         event.level == crate::ScriptEventLevel::Error && event.message == "ABI script drop panicked"
     }));
     assert_eq!(PROBE_DROPS.load(Ordering::SeqCst), 1);
+}
+
+struct EchoParams(Params);
+
+impl Script for EchoParams {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        let mut entries: Vec<_> = self
+            .0
+            .iter()
+            .map(|(key, value)| format!("{key}={value:?}"))
+            .collect();
+        entries.sort();
+        ctx.log_info(entries.join(";"));
+    }
+}
+
+fn echo_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(EchoParams(params.clone())))
+}
+
+fn typed_module() -> &'static RveModule {
+    rve_sdk::script_module! {
+        "Typed" => echo_factory {
+            speed: f32 = 1.5 (0.0..=10.0) "Speed",
+            enabled: bool = true,
+        },
+        "Untyped" => echo_factory,
+    }
+}
+
+fn typed_library() -> crate::ScriptLibrary {
+    // SAFETY: the SDK macro returns an immutable process-lifetime table.
+    unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(typed_module())) }.unwrap()
+}
+
+#[test]
+fn library_exposes_script_names_and_declared_schemas() {
+    let library = typed_library();
+    assert_eq!(library.script_names(), ["Typed", "Untyped"]);
+    let schema = library.schema("Typed").unwrap();
+    let names: Vec<_> = schema
+        .specs()
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect();
+    assert_eq!(names, ["speed", "enabled"]);
+    let speed = schema.get("speed").unwrap();
+    assert_eq!(speed.kind, engine_scene::ParamKind::Float);
+    assert_eq!((speed.min, speed.max), (Some(0.0), Some(10.0)));
+    assert_eq!(speed.label.as_deref(), Some("Speed"));
+    assert!(library.schema("Untyped").is_none());
+    assert!(library.schema("Missing").is_none());
+}
+
+#[test]
+fn heavy_defaults_are_filled_and_scene_values_coerced_before_create() {
+    let _lock = test_lock();
+    let library = typed_library();
+    let mut world = scripted_world("Typed", "{ speed = 3 }");
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "enabled=Bool(true);speed=Float(3.0)")
+    );
+
+    let mut world = scripted_world("Untyped", "{ anything = 3 }");
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "anything=Int(3)")
+    );
+}
+
+#[test]
+fn heavy_params_that_violate_the_schema_fail_loading() {
+    let library = typed_library();
+    for params in ["{ speed = 11.0 }", "{ enabled = 1 }", "{ unknown = 1 }"] {
+        let world = scripted_world("Typed", params);
+        let error = load(&world, &library).err().unwrap();
+        assert!(
+            matches!(&error, ScriptLoadError::Heavy { object_id, name, .. }
+                if object_id == "camera" && name == "Typed"),
+            "{params}: {error}"
+        );
+    }
+}
+
+fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModule {
+    // The leaked descriptor table lives for the test process, as the ABI requires.
+    let scripts: &'static [RveScriptDesc] = Box::leak(Box::new([RveScriptDesc {
+        name: RveStr::from_static("Broken"),
+        create: null_create,
+        start: no_op,
+        update: no_op_update,
+        message: no_op_message,
+        destroy: no_op,
+        drop: no_op_drop,
+        params: params.as_ptr(),
+        param_count: params.len(),
+    }]));
+    RveModule::new(scripts)
+}
+
+#[test]
+fn malformed_parameter_tables_are_rejected() {
+    use rve_sdk::abi::{
+        RVE_PARAM_BOOL, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MIN, RveParamDesc, RveValue,
+    };
+    fn desc(name: RveStr, kind: u32, default: RveValue, flags: u32) -> RveParamDesc {
+        RveParamDesc {
+            name,
+            kind,
+            default,
+            min: 5.0,
+            max: 0.0,
+            flags,
+            label: RveStr::empty(),
+        }
+    }
+    static BAD_UTF8: [u8; 1] = [0xff];
+    let bad_utf8 = RveStr {
+        ptr: BAD_UTF8.as_ptr(),
+        len: 1,
+    };
+    let speed = RveStr::from_static("speed");
+    let cases: Vec<Vec<RveParamDesc>> = vec![
+        vec![desc(speed, RVE_PARAM_FLOAT, RveValue::boolean(true), 0)],
+        vec![
+            desc(speed, RVE_PARAM_FLOAT, RveValue::float(1.0), 0),
+            desc(speed, RVE_PARAM_FLOAT, RveValue::float(2.0), 0),
+        ],
+        vec![desc(bad_utf8, RVE_PARAM_BOOL, RveValue::boolean(true), 0)],
+        vec![desc(speed, 99, RveValue::float(1.0), 0)],
+        vec![desc(speed, RVE_PARAM_FLOAT, RveValue::float(1.0), 0x80)],
+        vec![desc(
+            speed,
+            RVE_PARAM_FLOAT,
+            RveValue::float(1.0),
+            RVE_PARAM_HAS_MIN,
+        )],
+        vec![desc(
+            RveStr::from_static("1bad"),
+            RVE_PARAM_FLOAT,
+            RveValue::float(1.0),
+            0,
+        )],
+    ];
+    for case in cases {
+        let params: &'static [RveParamDesc] = Box::leak(case.into_boxed_slice());
+        let module: &'static RveModule = Box::leak(Box::new(module_with_params(params)));
+        // SAFETY: the leaked tables live for the process and their strings are static.
+        let result = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) };
+        assert!(
+            matches!(
+                &result,
+                Err(crate::ScriptLibraryError::InvalidParams { script, .. }) if script == "Broken"
+            ),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    let null_table: &'static RveModule = Box::leak(Box::new({
+        let mut module = module_with_params(&[]);
+        let scripts: &'static mut [RveScriptDesc] = Box::leak(Box::new([RveScriptDesc {
+            name: RveStr::from_static("Broken"),
+            create: null_create,
+            start: no_op,
+            update: no_op_update,
+            message: no_op_message,
+            destroy: no_op,
+            drop: no_op_drop,
+            params: std::ptr::null(),
+            param_count: 1,
+        }]));
+        module.scripts = scripts.as_ptr();
+        module
+    }));
+    // SAFETY: the null table with a nonzero count is rejected before it is read.
+    let result = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(null_table)) };
+    assert!(matches!(
+        result,
+        Err(crate::ScriptLibraryError::InvalidParams { .. })
+    ));
 }

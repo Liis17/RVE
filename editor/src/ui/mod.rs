@@ -34,6 +34,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     }
 
     show_unsaved_prompt(ui.ctx(), state);
+    show_apply_prompt(ui.ctx(), state);
     show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
     state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
@@ -122,6 +123,30 @@ fn show_welcome(ui: &mut egui::Ui, state: &mut EditorState) {
             ui.add_space(4.0);
             recent_projects(ui, state);
         }
+    });
+}
+
+/// Подтверждение переноса overrides в файл префаба: он меняется для всех сцен.
+fn show_apply_prompt(ctx: &egui::Context, state: &mut EditorState) {
+    let Some(id) = state.apply_prompt.clone() else {
+        return;
+    };
+    egui::Modal::new(egui::Id::new("apply_to_prefab")).show(ctx, |ui| {
+        ui.set_max_width(360.0);
+        ui.heading("Apply to Prefab");
+        ui.label(format!(
+            "Перенести overrides {id:?} в файл префаба? Изменение увидят все экземпляры, undo сцены его не отменит."
+        ));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Apply").clicked() {
+                state.apply_prompt = None;
+                state.action(Action::ApplyToPrefab(id.clone()));
+            }
+            if ui.button("Cancel").clicked() {
+                state.apply_prompt = None;
+            }
+        });
     });
 }
 

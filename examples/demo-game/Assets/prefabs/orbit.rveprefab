@@ -1,0 +1,20 @@
+[[assets]]
+path = "/prefabs/satellite.rveprefab"
+
+[[assets]]
+path = "/scripts/rotate.lua"
+
+[[objects]]
+id = "pivot"
+name = "Orbit"
+[[objects.lite_scripts]]
+path = "/scripts/rotate.lua"
+params = { speed = 45.0 }
+
+[[instances]]
+id = "moon"
+parent = "pivot"
+prefab = "/prefabs/satellite.rveprefab"
+[instances.transform]
+position = [1.7, 0.0, 0.0]
+scale = [0.25, 0.25, 0.25]

@@ -3,9 +3,9 @@
 use std::ffi::c_void;
 
 /// Oldest script ABI version accepted by the host.
-pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 1;
-/// Current stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 2;
+pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
+/// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 3;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -387,6 +387,16 @@ impl RveValue {
         }
     }
 
+    /// Creates a process-lifetime string value usable in constant tables.
+    pub const fn static_string(value: &'static str) -> Self {
+        Self {
+            tag: RVE_VALUE_STR,
+            data: RveValueData {
+                string: RveStr::from_static(value),
+            },
+        }
+    }
+
     /// Creates a borrowed string value.
     pub fn string(value: &str) -> Self {
         Self {
@@ -633,7 +643,29 @@ pub type RveDestroyFn = RveStartFn;
 /// Guest instance destructor callback.
 pub type RveDropFn = unsafe extern "C" fn(instance: *mut c_void) -> RveStatus;
 
+/// Script descriptor layout used by ABI versions 1 and 2.
+#[repr(C)]
+pub struct RveScriptDescV1 {
+    /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
+    pub name: RveStr,
+    /// Creates one guest instance.
+    pub create: RveCreateFn,
+    /// Runs the instance's start callback.
+    pub start: RveStartFn,
+    /// Runs the instance's update callback.
+    pub update: RveUpdateFn,
+    /// Runs the instance's message callback.
+    pub message: RveMessageFn,
+    /// Runs the instance's destroy callback.
+    pub destroy: RveDestroyFn,
+    /// Releases one successfully created instance.
+    pub drop: RveDropFn,
+}
+
 /// One exported guest script implementation.
+///
+/// The parameter fields were appended in ABI version 3. Versions 1 and 2 use
+/// [`RveScriptDescV1`] and are normalized by the host before use.
 #[repr(C)]
 pub struct RveScriptDesc {
     /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
@@ -650,6 +682,46 @@ pub struct RveScriptDesc {
     pub destroy: RveDestroyFn,
     /// Releases one successfully created instance.
     pub drop: RveDropFn,
+    /// Declared parameters in declaration order; null only when `param_count` is zero.
+    pub params: *const RveParamDesc,
+    /// Number of parameter descriptors. Zero means the script declares no schema.
+    pub param_count: usize,
+}
+
+/// Parameter kind: boolean.
+pub const RVE_PARAM_BOOL: u32 = 0;
+/// Parameter kind: signed 64-bit integer.
+pub const RVE_PARAM_INT: u32 = 1;
+/// Parameter kind: 64-bit floating-point number.
+pub const RVE_PARAM_FLOAT: u32 = 2;
+/// Parameter kind: UTF-8 string.
+pub const RVE_PARAM_STRING: u32 = 3;
+/// Parameter kind: array of three floating-point numbers.
+pub const RVE_PARAM_VEC3: u32 = 4;
+
+/// [`RveParamDesc::flags`] bit: `min` is set.
+pub const RVE_PARAM_HAS_MIN: u32 = 1;
+/// [`RveParamDesc::flags`] bit: `max` is set.
+pub const RVE_PARAM_HAS_MAX: u32 = 2;
+
+/// One declared script parameter. All pointers refer to process-lifetime data.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveParamDesc {
+    /// Parameter name in the `[A-Za-z_][A-Za-z0-9_]*` format, at most 64 bytes.
+    pub name: RveStr,
+    /// One of the `RVE_PARAM_*` kinds.
+    pub kind: u32,
+    /// Default value; it must match `kind` and the declared range.
+    pub default: RveValue,
+    /// Inclusive lower bound, read only with [`RVE_PARAM_HAS_MIN`].
+    pub min: f64,
+    /// Inclusive upper bound, read only with [`RVE_PARAM_HAS_MAX`].
+    pub max: f64,
+    /// `RVE_PARAM_HAS_*` bits; other bits must be zero.
+    pub flags: u32,
+    /// Optional UTF-8 label for editors; empty means none.
+    pub label: RveStr,
 }
 
 /// Static script table returned from `rve_script_module`.
@@ -684,6 +756,8 @@ unsafe impl Sync for RveArray {}
 unsafe impl Sync for RveValueData {}
 unsafe impl Sync for RveValue {}
 unsafe impl Sync for RveParamEntry {}
+unsafe impl Sync for RveParamDesc {}
+unsafe impl Sync for RveScriptDescV1 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 

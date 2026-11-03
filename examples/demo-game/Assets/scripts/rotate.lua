@@ -1,5 +1,9 @@
 local Rotate = {}
 
+Rotate.properties = {
+  speed = { type = "float", default = 30, min = -720, max = 720, label = "Speed (deg/s)" },
+}
+
 function Rotate:on_start()
   rve.log_info("Rotate started; broadcasting demo_ready")
   rve.broadcast("demo_ready", "Lua start callback")
@@ -12,7 +16,7 @@ function Rotate:on_update(dt)
   local rotation = self.transform.rotation
   self.transform.rotation = {
     x = rotation.x,
-    y = rotation.y + (self.params.speed or 30.0) * dt,
+    y = rotation.y + self.params.speed * dt,
     z = rotation.z
   }
 end

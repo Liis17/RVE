@@ -820,3 +820,114 @@ fn malformed_borrowed_values_and_duplicate_keys_are_rejected() {
         "duplicate parameter key \"same\""
     );
 }
+
+mod with_params {
+    use crate::{Params, Script};
+
+    struct Empty;
+    impl Script for Empty {}
+
+    fn factory(_: &Params) -> Result<Box<dyn Script>, String> {
+        Ok(Box::new(Empty))
+    }
+
+    pub(super) fn module() -> &'static crate::abi::RveModule {
+        crate::script_module! {
+            "Typed" => factory {
+                enabled: bool = true "Enabled",
+                count: i64 = 3 (0..=10),
+                amplitude: f32 = 0.15,
+                speed: f64 = -1.5 (-10.0..=10.0) "Speed",
+                title: &str = "hello",
+                axis: [f32; 3] = [0.0, 1, -0.5],
+            },
+            "Plain" => factory,
+        }
+    }
+}
+
+#[test]
+fn script_module_macro_exports_typed_parameter_tables() {
+    use crate::abi::{
+        RVE_PARAM_BOOL, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
+        RVE_PARAM_STRING, RVE_PARAM_VEC3, RveParamDesc,
+    };
+    let module = with_params::module();
+    let plain = descriptor(module, "Plain");
+    assert_eq!(plain.param_count, 0);
+
+    let typed = descriptor(module, "Typed");
+    // SAFETY: the macro builds a process-lifetime table of `param_count` descriptors.
+    let params: &[RveParamDesc] =
+        unsafe { std::slice::from_raw_parts(typed.params, typed.param_count) };
+    let text = |value: RveStr| unsafe { value.to_str() }.unwrap().to_owned();
+    let summary: Vec<_> = params
+        .iter()
+        .map(|param| (text(param.name), param.kind, param.flags, text(param.label)))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("enabled".into(), RVE_PARAM_BOOL, 0, "Enabled".into()),
+            (
+                "count".into(),
+                RVE_PARAM_INT,
+                RVE_PARAM_HAS_MIN | RVE_PARAM_HAS_MAX,
+                String::new()
+            ),
+            ("amplitude".into(), RVE_PARAM_FLOAT, 0, String::new()),
+            (
+                "speed".into(),
+                RVE_PARAM_FLOAT,
+                RVE_PARAM_HAS_MIN | RVE_PARAM_HAS_MAX,
+                "Speed".into()
+            ),
+            ("title".into(), RVE_PARAM_STRING, 0, String::new()),
+            ("axis".into(), RVE_PARAM_VEC3, 0, String::new()),
+        ]
+    );
+    // SAFETY: defaults are static values built by the macro.
+    let defaults: Vec<_> = params
+        .iter()
+        .map(|param| unsafe { param.default.into_owned() }.unwrap())
+        .collect();
+    assert_eq!(
+        defaults,
+        [
+            Value::Bool(true),
+            Value::Int(3),
+            Value::Float(0.15),
+            Value::Float(-1.5),
+            Value::String("hello".into()),
+            Value::Array(vec![
+                Value::Float(0.0),
+                Value::Float(1.0),
+                Value::Float(-0.5)
+            ]),
+        ]
+    );
+    assert_eq!((params[1].min, params[1].max), (0.0, 10.0));
+    assert_eq!((params[3].min, params[3].max), (-10.0, 10.0));
+}
+
+#[test]
+fn param_descriptor_layout_is_c_compatible() {
+    use crate::abi::RveParamDesc;
+    use std::mem::{align_of, offset_of, size_of};
+    let pointer = size_of::<usize>();
+    assert_eq!(offset_of!(RveParamDesc, name), 0);
+    assert_eq!(offset_of!(RveParamDesc, kind), 2 * pointer);
+    assert_eq!(
+        offset_of!(RveParamDesc, default) % align_of::<RveValue>(),
+        0
+    );
+    assert_eq!(
+        align_of::<RveParamDesc>(),
+        align_of::<RveValue>().max(align_of::<f64>())
+    );
+    assert_eq!(size_of::<RveParamDesc>() % align_of::<RveParamDesc>(), 0);
+    assert_eq!(
+        offset_of!(RveScriptDesc, param_count),
+        offset_of!(RveScriptDesc, params) + pointer
+    );
+}

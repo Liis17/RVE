@@ -1,5 +1,12 @@
+use crate::abi_host::read_message_value;
 use crate::abi_string::{AbiStringError, read_abi_str};
-use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveModule, RveScriptDesc};
+use engine_scene::{ParamKind, ParamSchema, ParamSpec};
+use rve_sdk::abi::{
+    RVE_PARAM_BOOL, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
+    RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule, RveParamDesc,
+    RveScriptDesc,
+};
+use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -8,7 +15,7 @@ use std::path::Path;
 
 /// A script library that has been validated and deliberately kept loaded for process lifetime.
 pub struct ScriptLibrary {
-    scripts: HashMap<String, &'static RveScriptDesc>,
+    scripts: HashMap<String, (&'static RveScriptDesc, Option<ParamSchema>)>,
 }
 
 /// Failure while opening or validating an ABI script module.
@@ -25,6 +32,7 @@ pub enum ScriptLibraryError {
     InvalidScriptName { index: usize, name: String },
     DuplicateScriptName(String),
     ScriptCountOverflow,
+    InvalidParams { script: String, message: String },
 }
 
 impl fmt::Display for ScriptLibraryError {
@@ -65,6 +73,12 @@ impl fmt::Display for ScriptLibraryError {
                 write!(f, "script module contains duplicate name {name:?}")
             }
             Self::ScriptCountOverflow => f.write_str("script table size overflows address space"),
+            Self::InvalidParams { script, message } => {
+                write!(
+                    f,
+                    "script {script:?} declares invalid parameters: {message}"
+                )
+            }
         }
     }
 }
@@ -137,7 +151,12 @@ impl ScriptLibrary {
         let scripts_ptr = unsafe { std::ptr::addr_of!((*module).scripts).read() };
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
-        if count > isize::MAX as usize / std::mem::size_of::<RveScriptDesc>() {
+        let descriptor_size = if header.abi_version >= 3 {
+            std::mem::size_of::<RveScriptDesc>()
+        } else {
+            std::mem::size_of::<RveScriptDescV1>()
+        };
+        if count > isize::MAX as usize / descriptor_size {
             return Err(ScriptLibraryError::ScriptCountOverflow);
         }
         if count > 0 && scripts_ptr.is_null() {
@@ -148,11 +167,34 @@ impl ScriptLibrary {
                 scripts: HashMap::new(),
             });
         }
-        // SAFETY: guaranteed by this method's caller contract and checked non-null/count above.
-        let descriptors: &'static [RveScriptDesc] =
-            unsafe { std::slice::from_raw_parts(scripts_ptr, count) };
+        // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
+        // matching immutable table remains readable for process lifetime.
+        let descriptors_v3 = (header.abi_version >= 3)
+            .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
+        // SAFETY: versions 1 and 2 share the original descriptor layout.
+        let descriptors_v1 = (header.abi_version < 3).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV1>(), count)
+        });
         let mut scripts = HashMap::with_capacity(count);
-        for (index, descriptor) in descriptors.iter().enumerate() {
+        for index in 0..count {
+            let descriptor = if let Some(descriptors) = descriptors_v3 {
+                &descriptors[index]
+            } else {
+                let descriptor = &descriptors_v1.expect("legacy descriptor table")[index];
+                // Older ABI versions have no parameter fields. Normalize their stable callback
+                // prefix so instances can keep using the same descriptor representation.
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: std::ptr::null(),
+                    param_count: 0,
+                }))
+            };
             // SAFETY: the caller guarantees process-lifetime storage for every non-null name.
             let name = unsafe { read_abi_str(descriptor.name) }.map_err(|error| match error {
                 AbiStringError::Null => ScriptLibraryError::NullScriptName { index },
@@ -165,7 +207,18 @@ impl ScriptLibrary {
                 });
             }
             let name = name.to_owned();
-            if scripts.insert(name.clone(), descriptor).is_some() {
+            let schema = if header.abi_version >= 3 {
+                // SAFETY: the caller guarantees the parameter table of every v3 descriptor.
+                unsafe { read_schema(descriptor) }.map_err(|message| {
+                    ScriptLibraryError::InvalidParams {
+                        script: name.clone(),
+                        message,
+                    }
+                })?
+            } else {
+                None
+            };
+            if scripts.insert(name.clone(), (descriptor, schema)).is_some() {
                 return Err(ScriptLibraryError::DuplicateScriptName(name));
             }
         }
@@ -173,7 +226,22 @@ impl ScriptLibrary {
     }
 
     pub(crate) fn script(&self, name: &str) -> Option<&'static RveScriptDesc> {
-        self.scripts.get(name).copied()
+        self.scripts.get(name).map(|(descriptor, _)| *descriptor)
+    }
+
+    /// Registered script names in ascending order.
+    pub fn script_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self.scripts.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Parameter schema of a registered script; `None` for an unknown name or a script that
+    /// declares no parameters.
+    pub fn schema(&self, name: &str) -> Option<&ParamSchema> {
+        self.scripts
+            .get(name)
+            .and_then(|(_, schema)| schema.as_ref())
     }
 
     /// Returns whether this library registers a script with the given scene name.
@@ -187,4 +255,67 @@ pub(crate) fn valid_heavy_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Reads and validates the parameter table of one descriptor. An empty table declares no schema.
+///
+/// # Safety
+/// For a nonzero `param_count`, `params` must point to that many initialized process-lifetime
+/// descriptors whose strings and default values are readable.
+unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>, String> {
+    let count = descriptor.param_count;
+    if count == 0 {
+        return Ok(None);
+    }
+    if descriptor.params.is_null() {
+        return Err("null parameter table".to_owned());
+    }
+    if count > isize::MAX as usize / mem::size_of::<RveParamDesc>() {
+        return Err("parameter table size overflows address space".to_owned());
+    }
+    // SAFETY: guaranteed by this function's contract and checked above.
+    let params = unsafe { std::slice::from_raw_parts(descriptor.params, count) };
+    let mut specs = Vec::with_capacity(count);
+    for (index, param) in params.iter().enumerate() {
+        // SAFETY: the caller guarantees readable process-lifetime strings.
+        let name = unsafe { read_abi_str(param.name) }
+            .map_err(|error| format!("parameter {index} has an invalid name: {error:?}"))?
+            .to_owned();
+        let kind = match param.kind {
+            RVE_PARAM_BOOL => ParamKind::Bool,
+            RVE_PARAM_INT => ParamKind::Int,
+            RVE_PARAM_FLOAT => ParamKind::Float,
+            RVE_PARAM_STRING => ParamKind::String,
+            RVE_PARAM_VEC3 => ParamKind::Vec3,
+            kind => return Err(format!("parameter {name:?} has unknown kind {kind}")),
+        };
+        if param.flags & !(RVE_PARAM_HAS_MIN | RVE_PARAM_HAS_MAX) != 0 {
+            return Err(format!(
+                "parameter {name:?} has unknown flags {:#x}",
+                param.flags
+            ));
+        }
+        // SAFETY: the caller guarantees a readable default value.
+        let (default, _) = unsafe { read_message_value(&param.default) }
+            .map_err(|error| format!("parameter {name:?} has an invalid default: {error}"))?;
+        // SAFETY: the caller guarantees readable process-lifetime strings.
+        let label = match unsafe { read_abi_str(param.label) } {
+            Ok("") | Err(AbiStringError::Null) => None,
+            Ok(label) => Some(label.to_owned()),
+            Err(error) => {
+                return Err(format!(
+                    "parameter {name:?} has an invalid label: {error:?}"
+                ));
+            }
+        };
+        specs.push(ParamSpec {
+            min: (param.flags & RVE_PARAM_HAS_MIN != 0).then_some(param.min),
+            max: (param.flags & RVE_PARAM_HAS_MAX != 0).then_some(param.max),
+            name,
+            kind,
+            default,
+            label,
+        });
+    }
+    ParamSchema::new(specs).map(Some)
 }

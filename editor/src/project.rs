@@ -1,12 +1,16 @@
 //! Открытый проект: настройки, ресурсы в режиме loose и окно по `bootstrap.rves`.
 
 use crate::assets_fs::AssetsDir;
+use crate::scene_edit::PrefabLoader;
 use engine_assets::Assets;
+use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, ProjectSettings};
-use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
-use engine_scene::{CameraSettings, World};
-use std::collections::BTreeMap;
+use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem, SourceMode};
+use engine_scene::{CameraSettings, SceneDocument, SceneError, World};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Проект игры, открытый в редакторе по той же раскладке, что и dev-запуск player.
 pub struct OpenProject {
@@ -15,7 +19,41 @@ pub struct OpenProject {
     pub settings: ProjectSettings,
     pub assets_dir: AssetsDir,
     pub assets: Assets,
+    prefabs: Rc<PrefabCache>,
     resources: ResourceSystem,
+}
+
+/// Разобранные префабы проекта по пути; сбрасывается после Refresh и сохранения префаба.
+struct PrefabCache {
+    handle: ResourceHandle,
+    documents: RefCell<HashMap<VirtualPath, SceneDocument>>,
+}
+
+impl PrefabCache {
+    fn load(&self, path: &VirtualPath) -> Result<SceneDocument, SceneError> {
+        if let Some(document) = self.documents.borrow().get(path) {
+            return Ok(document.clone());
+        }
+        let label = format!("/{}", path.as_str());
+        let error = |message: String| SceneError {
+            source: label.clone(),
+            object_id: None,
+            message,
+        };
+        let bytes = self
+            .handle
+            .read_all(label.as_str())
+            .map_err(|resource| error(resource.to_string()))?
+            .wait()
+            .map_err(|resource| error(resource.to_string()))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|utf8| error(format!("файл должен быть UTF-8: {utf8}")))?;
+        let document = SceneDocument::parse_prefab(label.clone(), &text)?;
+        self.documents
+            .borrow_mut()
+            .insert(path.clone(), document.clone());
+        Ok(document)
+    }
 }
 
 impl OpenProject {
@@ -35,11 +73,16 @@ impl OpenProject {
         })
         .map_err(|error| format!("{}: {error}", root.display()))?;
         let assets = Assets::with_resources(resources.handle());
+        let prefabs = Rc::new(PrefabCache {
+            handle: resources.handle(),
+            documents: RefCell::default(),
+        });
         Ok(Self {
             root: dir,
             settings,
             assets_dir: AssetsDir::new(root),
             assets,
+            prefabs,
             resources,
         })
     }
@@ -54,6 +97,17 @@ impl OpenProject {
             .wait()
             .map_err(|error| format!("{path}: {error}"))?;
         String::from_utf8(bytes).map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))
+    }
+
+    /// Загрузчик префабов проекта для [`crate::scene_edit::EditorScene`].
+    pub fn prefab_loader(&self) -> PrefabLoader {
+        let cache = Rc::clone(&self.prefabs);
+        Rc::new(move |path| cache.load(path))
+    }
+
+    /// Забывает разобранные префабы: следующее раскрытие прочитает файлы заново.
+    pub fn clear_prefabs(&self) {
+        self.prefabs.documents.borrow_mut().clear();
     }
 
     /// Загружает общие `.camerasettings` файлы и назначает их камерам мира.
@@ -254,7 +308,11 @@ mod tests {
             let path = format!("{dir}/Assets/scenes/{scene}.rvescene");
             let text = std::fs::read_to_string(&path).unwrap();
             let document = SceneDocument::parse(path.as_str(), &text).unwrap();
-            let mut world = World::from_document(&document).unwrap();
+            let loader = project.prefab_loader();
+            let expanded = engine_scene::expand(&document, &mut |path| loader(path))
+                .unwrap()
+                .document;
+            let mut world = World::from_document(&expanded).unwrap();
             let (frame, _) = world.build_frame();
             assert!(frame.light.direction[1] < 0.0, "{path}");
             assert!(!frame.meshes.is_empty(), "{path}");
@@ -288,7 +346,11 @@ mod tests {
             let path = format!("scenes/{scene}.rvescene");
             let source = project.read_text(&path).unwrap();
             let document = SceneDocument::parse(&path, &source).unwrap();
-            let mut world = World::from_document(&document).unwrap();
+            let loader = project.prefab_loader();
+            let expanded = engine_scene::expand(&document, &mut |prefab| loader(prefab))
+                .unwrap()
+                .document;
+            let mut world = World::from_document(&expanded).unwrap();
             project.apply_camera_settings(&mut world).unwrap();
             let camera = world.camera_settings(world.active_camera()).unwrap();
             assert_eq!(camera.projection.fov_deg, expected_fov, "{path}");

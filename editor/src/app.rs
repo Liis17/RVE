@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
 /// Как часто проверять готовность фоновых превью и моделей.
 const PREVIEW_POLL: Duration = Duration::from_millis(30);
+/// Как часто забирать вывод идущей сборки.
+const BUILD_POLL: Duration = Duration::from_millis(50);
 
 pub struct EditorApp {
     state: EditorState,
@@ -106,6 +108,7 @@ impl EditorApp {
                 self.state.project = Some(project);
                 self.save_settings();
                 self.state.current_folder.clear();
+                self.load_library();
                 self.refresh_assets();
                 match start {
                     Some(path) => self.open_scene(&path),
@@ -144,6 +147,13 @@ impl EditorApp {
             Err(error) => self.state.log.error(error.to_string()),
         }
         self.state.previews.invalidate();
+        self.state.lite_schemas.clear();
+        project.clear_prefabs();
+        if let Some(scene) = &mut self.state.scene
+            && let Err(error) = scene.reload_prefabs()
+        {
+            self.state.log.error(error);
+        }
         // Модели, разбор которых начался до сброса, загружаются заново.
         self.state.model_loader.restart(project.assets.clone());
         if let Some(gpu) = &mut self.gpu
@@ -156,7 +166,14 @@ impl EditorApp {
     }
 
     fn new_scene(&mut self) {
-        match EditorScene::new_untitled() {
+        let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
+        let scene = EditorScene::new_untitled().and_then(|mut scene| {
+            if let Some(loader) = loader {
+                scene.set_prefab_loader(loader)?;
+            }
+            Ok(scene)
+        });
+        match scene {
             Ok(scene) => {
                 self.set_scene(scene);
                 self.offer_recovery();
@@ -245,7 +262,14 @@ impl EditorApp {
         let Some(prompt) = self.state.recovery_prompt.take() else {
             return;
         };
-        match EditorScene::recover(prompt.scene, &prompt.contents) {
+        let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
+        let recovered = match loader {
+            Some(loader) => {
+                EditorScene::recover_with_loader(prompt.scene, &prompt.contents, loader)
+            }
+            None => EditorScene::recover(prompt.scene, &prompt.contents),
+        };
+        match recovered {
             Ok(scene) => {
                 self.set_scene(scene);
                 self.state.log.info("Восстановлено автосохранение");
@@ -265,7 +289,7 @@ impl EditorApp {
             .map_err(|_| format!("{path}: некорректный путь сцены"))
             .and_then(|path| {
                 let contents = project.read_text(path.as_str())?;
-                EditorScene::parse(path, &contents)
+                EditorScene::parse(path, &contents, project.prefab_loader())
             });
         match result {
             Ok(scene) => {
@@ -312,8 +336,146 @@ impl EditorApp {
             }
             Action::OpenProjectAt(dir) => self.open_project(&dir),
             Action::Exit => self.exit = true,
+            Action::BuildPlayer => self.start_build(),
+            Action::CreatePrefab(id) => self.create_prefab(&id),
             _ => {}
         }
+    }
+
+    /// Запускает `rve-build` в выбранный каталог `<папка>/<id проекта>`; сцена уже
+    /// сохранена, потому что сборщик читает её с диска.
+    fn start_build(&mut self) {
+        if self.state.build.is_some() {
+            self.state.log.error("Сборка уже идёт");
+            return;
+        }
+        let Some(project) = &self.state.project else {
+            return;
+        };
+        let (project_dir, id) = (project.root.clone(), project.settings.id.clone());
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_owned));
+        let tool = match crate::build::locate_build_tool(
+            exe_dir.as_deref(),
+            &crate::build::checkout_workspace(),
+            std::env::var_os("CARGO"),
+        ) {
+            Ok(tool) => tool,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let output = match std::path::absolute(folder.join(id)) {
+            Ok(output) => output,
+            Err(error) => {
+                self.state
+                    .log
+                    .error(format!("{}: {error}", folder.display()));
+                return;
+            }
+        };
+        if output.exists() {
+            self.state.log.error(format!(
+                "{}: каталог уже существует, выберите другую папку",
+                output.display()
+            ));
+            return;
+        }
+        let command = tool.command(&project_dir, &output);
+        match crate::build::BuildJob::spawn(command, output.clone()) {
+            Ok(job) => {
+                self.state
+                    .log
+                    .info(format!("Build Player: {}", output.display()));
+                self.state.build = Some(job);
+            }
+            Err(error) => self.state.log.error(format!("rve-build: {error}")),
+        }
+    }
+
+    /// Сохраняет поддерево объекта в `Assets/prefabs/<id>.rveprefab` и заменяет его
+    /// экземпляром. Запись файла не входит в undo: undo вернёт поддерево, файл останется.
+    fn create_prefab(&mut self, id: &str) {
+        let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
+            return;
+        };
+        let result = VirtualPath::parse(&format!("prefabs/{id}.rveprefab"))
+            .map_err(|_| format!("{id}: некорректное имя префаба"))
+            .and_then(|path| {
+                let file = project
+                    .assets_dir
+                    .resolve(path.as_str())
+                    .map_err(|error| error.to_string())?;
+                if file.exists() {
+                    return Err(format!("/{}: файл уже существует", path.as_str()));
+                }
+                let prefab = scene.prefab_from_subtree(id, &format!("/{}", path.as_str()))?;
+                let text = prefab.to_toml().map_err(|error| error.to_string())?;
+                if let Some(parent) = file.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|error| format!("{}: {error}", parent.display()))?;
+                }
+                crate::scene_edit::write_atomic(&file, text.as_bytes())?;
+                project.clear_prefabs();
+                scene.replace_with_instance(id, &path)?;
+                Ok(path)
+            });
+        match result {
+            Ok(path) => {
+                self.state
+                    .log
+                    .info(format!("Создан префаб /{}", path.as_str()));
+                self.refresh_tree_only();
+            }
+            Err(error) => self.state.log.error(error),
+        }
+    }
+
+    /// Переносит overrides объекта экземпляра в файл префаба и убирает их из сцены.
+    /// Запись файла атомарна и не входит в undo сцены.
+    fn apply_to_prefab(&mut self, id: &str) {
+        let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
+            return;
+        };
+        let result = scene.prefab_with_override(id).and_then(|(path, prefab)| {
+            let file = project
+                .assets_dir
+                .resolve(path.as_str())
+                .map_err(|error| error.to_string())?;
+            let text = prefab.to_toml().map_err(|error| error.to_string())?;
+            crate::scene_edit::write_atomic(&file, text.as_bytes())?;
+            project.clear_prefabs();
+            scene.drop_override(id)?;
+            Ok(path)
+        });
+        match result {
+            Ok(path) => self
+                .state
+                .log
+                .info(format!("Overrides перенесены в /{}", path.as_str())),
+            Err(error) => self.state.log.error(error),
+        }
+    }
+
+    /// Переносит вывод сборки в Console; возвращает, появились ли строки.
+    fn poll_build(&mut self) -> bool {
+        let Some(job) = &mut self.state.build else {
+            return false;
+        };
+        let lines = job.poll();
+        if job.is_finished() {
+            self.state.build = None;
+        }
+        let any = !lines.is_empty();
+        for (level, line) in lines {
+            self.state.log.push(level, line);
+        }
+        any
     }
 
     fn assets_root(&self) -> Option<PathBuf> {
@@ -324,6 +486,7 @@ impl EditorApp {
         rfd::FileDialog::new()
             .set_directory(self.assets_root()?)
             .add_filter("RVE Scene", &["rvescene"])
+            .add_filter("RVE Prefab", &["rveprefab"])
             .pick_file()
     }
 
@@ -350,10 +513,20 @@ impl EditorApp {
                 let Some(root) = self.assets_root() else {
                     return false;
                 };
+                let prefab = self
+                    .state
+                    .scene
+                    .as_ref()
+                    .is_some_and(|scene| scene.document().is_prefab());
+                let kind = if prefab {
+                    ("RVE Prefab", "rveprefab", "prefab")
+                } else {
+                    ("RVE Scene", "rvescene", "scene")
+                };
                 let Some(file) = rfd::FileDialog::new()
                     .set_directory(root)
-                    .add_filter("RVE Scene", &["rvescene"])
-                    .set_file_name("scene.rvescene")
+                    .add_filter(kind.0, &[kind.1])
+                    .set_file_name(format!("{}.{}", kind.2, kind.1))
                     .save_file()
                 else {
                     return false;
@@ -377,6 +550,10 @@ impl EditorApp {
                 self.state
                     .log
                     .info(format!("Сохранено {}", target.as_str()));
+                // Сохранённый префаб видят следующие раскрытия.
+                if let Some(project) = &self.state.project {
+                    project.clear_prefabs();
+                }
                 self.refresh_tree_only();
                 // Копии прежнего и нового пути устарели: на диске теперь актуальная сцена.
                 self.remove_autosave(existing.as_ref());
@@ -399,36 +576,40 @@ impl EditorApp {
     }
 
     fn start_play(&mut self) {
-        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
+        let Some(scene) = &self.state.scene else {
             return;
         };
+        if scene.document().is_prefab() {
+            self.state
+                .log
+                .error("Play недоступен для префаба: откройте сцену");
+            return;
+        }
         let needs_library = scene
-            .document()
+            .view()
             .objects
             .iter()
             .any(|object| !object.heavy_scripts.is_empty());
         if needs_library && self.state.library.is_none() {
-            let Some(path) = self.state.scripts_path.clone() else {
+            if self.state.scripts_path.is_none() {
                 self.state
                     .log
                     .error("В сцене есть Rust-скрипты: запустите редактор с --scripts <library>");
                 return;
-            };
-            // SAFETY: библиотека скриптов — нативный код проекта, явно указанный пользователем.
-            match unsafe { ScriptLibrary::load(&path) } {
-                Ok(library) => self.state.library = Some(library),
-                Err(error) => {
-                    self.state.log.error(format!("{}: {error}", path.display()));
-                    return;
-                }
+            }
+            if !self.load_library() {
+                return;
             }
         }
+        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
+            return;
+        };
         let result = (|| {
             let mut world =
-                World::from_document(scene.document()).map_err(|error| error.to_string())?;
+                World::from_document(scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
             PlaySession::start_with_world(
-                scene.document(),
+                scene.view(),
                 world,
                 self.state.library.as_ref(),
                 |path| project.read_text(path),
@@ -441,6 +622,28 @@ impl EditorApp {
                 self.state.log.info("Play");
             }
             Err(error) => self.state.log.error(error),
+        }
+    }
+
+    /// Загружает `--scripts` один раз: схемы нужны Inspector, сама библиотека — Play.
+    /// Выгрузки нет, поэтому после пересборки cdylib редактор нужно перезапустить.
+    fn load_library(&mut self) -> bool {
+        if self.state.library.is_some() {
+            return true;
+        }
+        let Some(path) = self.state.scripts_path.clone() else {
+            return false;
+        };
+        // SAFETY: библиотека скриптов — нативный код проекта, явно указанный пользователем.
+        match unsafe { ScriptLibrary::load(&path) } {
+            Ok(library) => {
+                self.state.library = Some(library);
+                true
+            }
+            Err(error) => {
+                self.state.log.error(format!("{}: {error}", path.display()));
+                false
+            }
         }
     }
 
@@ -487,6 +690,13 @@ impl EditorApp {
                 }
                 Action::ImportFiles(files) => self.import(&files),
                 Action::RefreshAssets => self.refresh_assets(),
+                Action::BuildPlayer => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else {
+                        self.run_guarded(Action::BuildPlayer);
+                    }
+                }
                 Action::Discard(then) => {
                     // Отказ от изменений делает копию ненужной.
                     let scene = self
@@ -506,6 +716,20 @@ impl EditorApp {
                 Action::SaveThen(then) => {
                     if self.save(false) {
                         self.run_confirmed(*then);
+                    }
+                }
+                Action::ApplyToPrefab(id) => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else {
+                        self.apply_to_prefab(&id);
+                    }
+                }
+                Action::CreatePrefab(id) => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else {
+                        self.run_confirmed(Action::CreatePrefab(id));
                     }
                 }
                 action @ (Action::NewScene
@@ -878,13 +1102,15 @@ impl WindowHandler for EditorApp {
     fn update(&mut self, window: &Window) -> bool {
         // Здесь, а не в кадре: при простое окно просыпается к сроку без перерисовки.
         self.autosave_tick();
+        let previews_pending = self.state.previews.has_pending();
+        let build_output = self.poll_build();
         let background_pending = self.background_pending();
         if let Some(deadline) = self.repaint_at
             && Instant::now() >= deadline
         {
             self.repaint_at = None;
             window.request_redraw();
-        } else if background_pending {
+        } else if previews_pending || build_output || background_pending {
             window.request_redraw();
         }
         !self.exit
@@ -894,7 +1120,12 @@ impl WindowHandler for EditorApp {
         let preview = self
             .background_pending()
             .then(|| Instant::now() + PREVIEW_POLL);
-        [self.repaint_at, preview, self.autosave_deadline()]
+        let build = self
+            .state
+            .build
+            .is_some()
+            .then(|| Instant::now() + BUILD_POLL);
+        [self.repaint_at, preview, build, self.autosave_deadline()]
             .into_iter()
             .flatten()
             .min()
@@ -911,6 +1142,9 @@ impl WindowHandler for EditorApp {
 
     fn exiting(&mut self) {
         self.stop_play();
+        if let Some(job) = self.state.build.take() {
+            job.kill();
+        }
         self.save_settings();
         // Renderer удерживает окно и освобождается до него.
         self.gpu = None;

@@ -1,13 +1,13 @@
 //! Панель Inspector: поля и компоненты выбранного объекта.
 
 use crate::assets_fs::AssetKind;
-use crate::scene_edit::{Component, ComponentKind, default_light};
-use crate::state::{AssetDrag, EditorState};
+use crate::scene_edit::{Component, ComponentKind, OverrideField, default_light};
+use crate::state::{Action, AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, ParamValue, SceneObject,
-    SceneTransform,
+    CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, ParamSchema, ParamSpec,
+    ParamValue, SceneObject, SceneTransform,
 };
 use std::collections::BTreeMap;
 
@@ -71,10 +71,22 @@ fn commit(
 
 fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     let id = object.id.as_str();
+    show_prefab_bar(ui, state, id);
+    let name_mark = mark(state, id, OverrideField::Name);
+    let part = state
+        .scene
+        .as_ref()
+        .is_some_and(|scene| scene.is_prefab_part(id));
+    let mut name_reverted = false;
     egui::Grid::new("object_fields")
         .num_columns(2)
         .show(ui, |ui| {
-            ui.label("Name");
+            ui.horizontal(|ui| {
+                ui.label(marked_text("Name", name_mark.overridden));
+                if name_mark.overridden {
+                    name_reverted = ui.small_button("↺").on_hover_text("Revert").clicked();
+                }
+            });
             let mut name = object.name.clone().unwrap_or_default();
             let response = ui.text_edit_singleline(&mut name);
             commit(state, id, "name", &response, |object| {
@@ -88,7 +100,7 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
                 .ctx()
                 .data(|data| data.get_temp::<String>(editor_id))
                 .unwrap_or_else(|| id.to_owned());
-            let response = ui.text_edit_singleline(&mut text);
+            let response = ui.add_enabled(!part, egui::TextEdit::singleline(&mut text));
             if response.lost_focus() {
                 ui.ctx().data_mut(|data| data.remove::<String>(editor_id));
                 state.edit_scene(|scene| scene.change_id(id, &text));
@@ -97,6 +109,10 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
             }
             ui.end_row();
         });
+    if name_reverted {
+        revert(state, id, OverrideField::Name);
+        return;
+    }
 
     ui.separator();
     show_transform(ui, state, object);
@@ -119,7 +135,80 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
         show_heavy_script(ui, state, object, index);
     }
     ui.separator();
-    show_add_component(ui, state, object);
+    if !part {
+        show_add_component(ui, state, object);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Mark {
+    locked: bool,
+    overridden: bool,
+}
+
+const PREFAB_LOCKED: &str =
+    "Компоненты объекта префаба меняются в самом префабе: Open Prefab или Unpack";
+const OVERRIDE_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 170, 255);
+
+fn mark(state: &EditorState, id: &str, field: OverrideField) -> Mark {
+    let Some(scene) = &state.scene else {
+        return Mark::default();
+    };
+    Mark {
+        locked: scene.origin(id).is_some(),
+        overridden: scene.is_overridden(id, &field),
+    }
+}
+
+fn revert(state: &mut EditorState, id: &str, field: OverrideField) {
+    state.edit_scene(|scene| scene.revert_field(id, &field));
+}
+
+fn marked_text(text: &str, overridden: bool) -> egui::RichText {
+    if overridden {
+        egui::RichText::new(text).strong().color(OVERRIDE_COLOR)
+    } else {
+        egui::RichText::new(text)
+    }
+}
+
+fn show_prefab_bar(ui: &mut egui::Ui, state: &mut EditorState, id: &str) {
+    let Some(scene) = &state.scene else {
+        return;
+    };
+    let Some(origin) = scene.origin(id) else {
+        return;
+    };
+    let Some(prefab) = scene
+        .instance(&origin.instance)
+        .map(|instance| instance.prefab.as_str().to_owned())
+    else {
+        return;
+    };
+    let has_override = scene.object_override(id).is_some();
+    let root_fields = scene
+        .instance(id)
+        .is_some_and(|instance| instance.name.is_some());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(format!("Prefab /{prefab}")).color(OVERRIDE_COLOR));
+        if ui
+            .add_enabled(has_override, egui::Button::new("Apply to Prefab"))
+            .on_hover_text("Перенести overrides объекта в файл префаба")
+            .clicked()
+        {
+            state.apply_prompt = Some(id.to_owned());
+        }
+        if ui
+            .add_enabled(has_override || root_fields, egui::Button::new("Revert All"))
+            .clicked()
+        {
+            state.edit_scene(|scene| scene.revert_override(id));
+        }
+        if ui.button("Open Prefab").clicked() {
+            state.action(Action::OpenScene(Some(prefab.clone())));
+        }
+    });
+    ui.separator();
 }
 
 fn vec3_row(ui: &mut egui::Ui, label: &str, value: &mut [f32; 3], speed: f64) -> egui::Response {
@@ -196,19 +285,34 @@ fn commit_picker(
 
 fn show_transform(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     let id = object.id.as_str();
+    let field = OverrideField::Transform;
     let menu = component_menu(state, id, ComponentKind::Transform);
-    let action = component_header(ui, "Transform", id, Some(menu), false, |ui| {
-        egui::Grid::new("transform").num_columns(2).show(ui, |ui| {
-            let mut transform: SceneTransform = object.transform;
-            let position = vec3_row(ui, "Position", &mut transform.position, 0.05);
-            let rotation = vec3_row(ui, "Rotation", &mut transform.rotation, 0.5);
-            let scale = vec3_row(ui, "Scale", &mut transform.scale, 0.02);
-            let response = position | rotation | scale;
-            commit(state, id, "transform", &response, |object| {
-                object.transform = transform;
+    let action = component_header(
+        ui,
+        "Transform",
+        id,
+        mark(state, id, field.clone()),
+        Some(menu),
+        false,
+        |ui| {
+            egui::Grid::new("transform").num_columns(2).show(ui, |ui| {
+                let mut transform: SceneTransform = object.transform;
+                let position = vec3_row(ui, "Position", &mut transform.position, 0.05);
+                let rotation = vec3_row(ui, "Rotation", &mut transform.rotation, 0.5);
+                let scale = vec3_row(ui, "Scale", &mut transform.scale, 0.02);
+                let response = position | rotation | scale;
+                if response.changed() {
+                    let key = format!("{id}/transform");
+                    state.edit_scene(|scene| scene.set_transform(id, transform, Some(&key)));
+                }
+                finish_edit(state, &response);
             });
-        });
-    });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
     run_menu_action(state, id, ComponentKind::Transform, action);
 }
 
@@ -217,6 +321,7 @@ fn show_transform(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObje
 enum HeaderAction {
     None,
     Remove,
+    Revert,
     Reset,
     Copy,
     Paste,
@@ -231,12 +336,18 @@ struct ComponentMenu {
 
 fn component_menu(state: &EditorState, id: &str, kind: ComponentKind) -> ComponentMenu {
     let object = state.scene.as_ref().and_then(|scene| scene.object(id));
+    let locked_lod = kind == ComponentKind::LodGroup
+        && state
+            .scene
+            .as_ref()
+            .is_some_and(|scene| scene.is_prefab_part(id));
     ComponentMenu {
         reset: object.is_some_and(|object| Component::reset(object, kind).is_some()),
         paste: state
             .component_clipboard
             .as_ref()
-            .is_some_and(|copied| copied.kind() == kind),
+            .is_some_and(|copied| copied.kind() == kind)
+            && !locked_lod,
     }
 }
 
@@ -255,7 +366,7 @@ fn run_menu_action(state: &mut EditorState, id: &str, kind: ComponentKind, actio
             .component_clipboard
             .clone()
             .filter(|copied| copied.kind() == kind),
-        HeaderAction::None | HeaderAction::Remove => None,
+        HeaderAction::None | HeaderAction::Remove | HeaderAction::Revert => None,
     };
     if let Some(component) = component {
         state.edit_scene(|scene| scene.set_component(id, component));
@@ -267,6 +378,7 @@ fn component_header(
     ui: &mut egui::Ui,
     title: &str,
     salt: impl std::hash::Hash + std::fmt::Debug,
+    mark: Mark,
     menu: Option<ComponentMenu>,
     removable: bool,
     body: impl FnOnce(&mut egui::Ui),
@@ -275,7 +387,9 @@ fn component_header(
     let id = ui.make_persistent_id(("component", title, salt));
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
         .show_header(ui, |ui| {
-            let label = ui.add(egui::Label::new(title).sense(egui::Sense::click()));
+            let label = ui.add(
+                egui::Label::new(marked_text(title, mark.overridden)).sense(egui::Sense::click()),
+            );
             if let Some(menu) = menu {
                 label.context_menu(|ui| {
                     if ui
@@ -295,8 +409,17 @@ fn component_header(
                     }
                 });
             }
-            if removable && ui.small_button("Remove").clicked() {
-                action = HeaderAction::Remove;
+            if removable {
+                let remove = ui
+                    .add_enabled(!mark.locked, egui::Button::new("Remove").small())
+                    .on_disabled_hover_text(PREFAB_LOCKED)
+                    .clicked();
+                if remove {
+                    action = HeaderAction::Remove;
+                }
+            }
+            if mark.overridden && ui.small_button("Revert").clicked() {
+                action = HeaderAction::Revert;
             }
         })
         .body(body);
@@ -304,37 +427,50 @@ fn component_header(
 }
 
 fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &CameraComponent) {
+    let field = OverrideField::Camera;
     let menu = component_menu(state, id, ComponentKind::Camera);
-    let action = component_header(ui, "Camera", id, Some(menu), true, |ui| {
-        egui::Grid::new("camera").num_columns(2).show(ui, |ui| {
-            ui.label("Settings");
-            let mut options = vec!["Default".to_owned()];
-            options.extend(state.assets_of_kind(AssetKind::CameraSettings));
-            let current = camera
-                .settings
-                .as_ref()
-                .map(|path| path.as_str())
-                .unwrap_or("Default");
-            if let Some(chosen) = asset_picker(ui, "camera_settings", current, &options) {
-                let settings = if chosen == "Default" {
-                    Some(None)
-                } else {
-                    parse_path(state, &chosen).map(Some)
-                };
-                if let Some(settings) = settings {
-                    state.edit_scene(|scene| scene.set_camera_settings(id, settings));
+    let action = component_header(
+        ui,
+        "Camera",
+        id,
+        mark(state, id, field.clone()),
+        Some(menu),
+        true,
+        |ui| {
+            egui::Grid::new("camera").num_columns(2).show(ui, |ui| {
+                ui.label("Settings");
+                let mut options = vec!["Default".to_owned()];
+                options.extend(state.assets_of_kind(AssetKind::CameraSettings));
+                let current = camera
+                    .settings
+                    .as_ref()
+                    .map(|path| path.as_str())
+                    .unwrap_or("Default");
+                if let Some(chosen) = asset_picker(ui, "camera_settings", current, &options) {
+                    let settings = if chosen == "Default" {
+                        Some(None)
+                    } else {
+                        parse_path(state, &chosen).map(Some)
+                    };
+                    if let Some(settings) = settings {
+                        state.edit_scene(|scene| scene.set_camera_settings(id, settings));
+                    }
                 }
-            }
-            ui.end_row();
-            ui.label("Active");
-            let mut active = camera.active;
-            let response = ui.checkbox(&mut active, "");
-            if response.changed() {
-                state.edit_scene(|scene| scene.set_camera_active(id, active));
-            }
-            finish_edit(state, &response);
-        });
-    });
+                ui.end_row();
+                ui.label("Active");
+                let mut active = camera.active;
+                let response = ui.checkbox(&mut active, "");
+                if response.changed() {
+                    state.edit_scene(|scene| scene.set_camera_active(id, active));
+                }
+                finish_edit(state, &response);
+            });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
     if action == HeaderAction::Remove {
         state.edit_scene(|scene| scene.remove_camera(id));
     }
@@ -388,20 +524,29 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     textures.extend(state.assets_of_kind(AssetKind::Texture));
     let mut model_choice = None;
     let mut texture_choice = None;
+    let field = OverrideField::Mesh;
     let menu = component_menu(state, id, ComponentKind::MeshRenderer);
-    let action = component_header(ui, "Mesh Renderer", id, Some(menu), true, |ui| {
-        egui::Grid::new("mesh").num_columns(2).show(ui, |ui| {
-            ui.label("Model");
-            model_choice = asset_picker(ui, "mesh_model", mesh.model.as_str(), &models);
-            ui.end_row();
-            ui.label("Texture");
-            let current = mesh.texture.as_ref().map_or("", |texture| texture.as_str());
-            texture_choice = asset_picker(ui, "mesh_texture", current, &textures);
-            ui.end_row();
-        });
-        ui.separator();
-        show_material(ui, state, id, mesh.material.as_ref(), &textures);
-    });
+    let action = component_header(
+        ui,
+        "Mesh Renderer",
+        id,
+        mark(state, id, field.clone()),
+        Some(menu),
+        true,
+        |ui| {
+            egui::Grid::new("mesh").num_columns(2).show(ui, |ui| {
+                ui.label("Model");
+                model_choice = asset_picker(ui, "mesh_model", mesh.model.as_str(), &models);
+                ui.end_row();
+                ui.label("Texture");
+                let current = mesh.texture.as_ref().map_or("", |texture| texture.as_str());
+                texture_choice = asset_picker(ui, "mesh_texture", current, &textures);
+                ui.end_row();
+            });
+            ui.separator();
+            show_material(ui, state, id, mesh.material.as_ref(), &textures);
+        },
+    );
     if model_choice.is_some() || texture_choice.is_some() {
         let model_changed = model_choice.is_some();
         let model = model_choice.map_or(Some(mesh.model.clone()), |path| parse_path(state, &path));
@@ -416,6 +561,10 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
                 state.pending_frame = Some(id.to_owned());
             }
         }
+    }
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
     }
     if action == HeaderAction::Remove {
         state.edit_scene(|scene| scene.remove_mesh_renderer(id));
@@ -599,99 +748,120 @@ fn show_lod_group(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObje
     let mut asset_changed = false;
     let mut structure_changed = false;
     let mut response = None;
+    let locked = state
+        .scene
+        .as_ref()
+        .is_some_and(|scene| scene.is_prefab_part(id));
     let menu = component_menu(state, id, ComponentKind::LodGroup);
-    let action = component_header(ui, "LOD Group", id, Some(menu), true, |ui| {
-        let can_remove_level = group.levels.len() > 1;
-        let mut remove_level = None;
-        for (index, level) in group.levels.iter_mut().enumerate() {
-            ui.push_id(("lod_level", index), |ui| {
-                ui.label(format!("LOD {}", index + 1));
-                egui::Grid::new("lod_level_fields")
+    let action = component_header(
+        ui,
+        "LOD Group",
+        id,
+        Mark {
+            locked,
+            overridden: false,
+        },
+        Some(menu),
+        true,
+        |ui| {
+            ui.add_enabled_ui(!locked, |ui| {
+                let can_remove_level = group.levels.len() > 1;
+                let mut remove_level = None;
+                for (index, level) in group.levels.iter_mut().enumerate() {
+                    ui.push_id(("lod_level", index), |ui| {
+                        ui.label(format!("LOD {}", index + 1));
+                        egui::Grid::new("lod_level_fields")
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                ui.label("Model");
+                                let current = level.model.strip_prefix('/').unwrap_or(&level.model);
+                                if let Some(choice) =
+                                    asset_picker(ui, "lod_model", current, &models)
+                                    && choice != current
+                                    && let Some(path) = parse_path(state, &choice)
+                                {
+                                    level.model = path.as_str().to_owned();
+                                    asset_changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label("Texture");
+                                let current = level
+                                    .texture
+                                    .as_deref()
+                                    .map(|path| path.strip_prefix('/').unwrap_or(path))
+                                    .unwrap_or("");
+                                if let Some(choice) =
+                                    asset_picker(ui, "lod_texture", current, &textures)
+                                    && choice != current
+                                {
+                                    level.texture = if choice.is_empty() {
+                                        None
+                                    } else {
+                                        parse_path(state, &choice)
+                                            .map(|path| path.as_str().to_owned())
+                                    };
+                                    asset_changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label("Distance");
+                                let distance =
+                                    ui.add(egui::DragValue::new(&mut level.distance).speed(0.1));
+                                merge_response(&mut response, distance);
+                                ui.end_row();
+                            });
+                        let remove =
+                            ui.add_enabled(can_remove_level, egui::Button::new("Remove Level"));
+                        if remove.clicked() {
+                            remove_level = Some(index);
+                        }
+                        ui.separator();
+                    });
+                }
+                if let Some(index) = remove_level {
+                    group.levels.remove(index);
+                    structure_changed = true;
+                }
+
+                let add = ui.add_enabled(
+                    group.levels.len() < MAX_LOD_LEVELS,
+                    egui::Button::new("Add Level"),
+                );
+                if add.clicked() {
+                    let distance = group.levels.last().unwrap().distance * 2.0;
+                    group.levels.push(LodLevel {
+                        model: base_model.clone(),
+                        texture: None,
+                        distance,
+                    });
+                    structure_changed = true;
+                }
+
+                ui.separator();
+                let last_distance = group.levels.last().unwrap().distance;
+                let mut cull_enabled = group.cull_distance.is_some();
+                egui::Grid::new("lod_cull_fields")
                     .num_columns(2)
                     .show(ui, |ui| {
-                        ui.label("Model");
-                        let current = level.model.strip_prefix('/').unwrap_or(&level.model);
-                        if let Some(choice) = asset_picker(ui, "lod_model", current, &models)
-                            && choice != current
-                            && let Some(path) = parse_path(state, &choice)
-                        {
-                            level.model = path.as_str().to_owned();
-                            asset_changed = true;
+                        ui.label("Cull Distance");
+                        let cull = ui.checkbox(&mut cull_enabled, "");
+                        if cull.changed() {
+                            group.cull_distance = cull_enabled.then_some(last_distance * 2.0);
                         }
+                        merge_response(&mut response, cull);
                         ui.end_row();
-
-                        ui.label("Texture");
-                        let current = level
-                            .texture
-                            .as_deref()
-                            .map(|path| path.strip_prefix('/').unwrap_or(path))
-                            .unwrap_or("");
-                        if let Some(choice) = asset_picker(ui, "lod_texture", current, &textures)
-                            && choice != current
-                        {
-                            level.texture = if choice.is_empty() {
-                                None
-                            } else {
-                                parse_path(state, &choice).map(|path| path.as_str().to_owned())
-                            };
-                            asset_changed = true;
+                        if let Some(mut distance) = group.cull_distance {
+                            ui.label("Distance");
+                            let value = ui.add(egui::DragValue::new(&mut distance).speed(0.1));
+                            group.cull_distance = Some(distance);
+                            merge_response(&mut response, value);
+                            ui.end_row();
                         }
-                        ui.end_row();
-
-                        ui.label("Distance");
-                        let distance = ui.add(egui::DragValue::new(&mut level.distance).speed(0.1));
-                        merge_response(&mut response, distance);
-                        ui.end_row();
                     });
-                let remove = ui.add_enabled(can_remove_level, egui::Button::new("Remove Level"));
-                if remove.clicked() {
-                    remove_level = Some(index);
-                }
-                ui.separator();
             });
-        }
-        if let Some(index) = remove_level {
-            group.levels.remove(index);
-            structure_changed = true;
-        }
-
-        let add = ui.add_enabled(
-            group.levels.len() < MAX_LOD_LEVELS,
-            egui::Button::new("Add Level"),
-        );
-        if add.clicked() {
-            let distance = group.levels.last().unwrap().distance * 2.0;
-            group.levels.push(LodLevel {
-                model: base_model.clone(),
-                texture: None,
-                distance,
-            });
-            structure_changed = true;
-        }
-
-        ui.separator();
-        let last_distance = group.levels.last().unwrap().distance;
-        let mut cull_enabled = group.cull_distance.is_some();
-        egui::Grid::new("lod_cull_fields")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("Cull Distance");
-                let cull = ui.checkbox(&mut cull_enabled, "");
-                if cull.changed() {
-                    group.cull_distance = cull_enabled.then_some(last_distance * 2.0);
-                }
-                merge_response(&mut response, cull);
-                ui.end_row();
-                if let Some(mut distance) = group.cull_distance {
-                    ui.label("Distance");
-                    let value = ui.add(egui::DragValue::new(&mut distance).speed(0.1));
-                    group.cull_distance = Some(distance);
-                    merge_response(&mut response, value);
-                    ui.end_row();
-                }
-            });
-    });
-
+        },
+    );
     if action == HeaderAction::Remove {
         state.edit_scene(|scene| scene.set_lod_group(id, None));
         return;
@@ -721,33 +891,46 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
         return;
     };
     let id = object.id.as_str();
+    let field = OverrideField::Light;
     let menu = component_menu(state, id, ComponentKind::DirectionalLight);
-    let action = component_header(ui, "Directional Light", id, Some(menu), true, |ui| {
-        egui::Grid::new("light").num_columns(2).show(ui, |ui| {
-            let mut value = light;
-            let (color_picked, color) = color_row(ui, "Color", &mut value.color);
-            let (ambient_picked, ambient) = color_row(ui, "Ambient", &mut value.ambient);
-            ui.label("Shadows");
-            let shadows = ui.checkbox(&mut value.shadows, "");
-            ui.end_row();
-            let center = vec3_row(ui, "Shadow Center", &mut value.shadow_center, 0.05);
-            ui.label("Shadow Radius");
-            let mut radius = value.shadow_radius.unwrap_or(0.0);
-            let radius_response = ui.add(egui::DragValue::new(&mut radius).speed(0.1));
-            value.shadow_radius = (radius > 0.0).then_some(radius);
-            ui.end_row();
-            let response = color | ambient | shadows | center | radius_response;
-            let picked = color_picked || ambient_picked;
-            commit_picker(state, ui, id, "light", picked, |object| {
-                object.directional_light = Some(value);
-            });
-            if !picked {
-                commit(state, id, "light", &response, |object| {
+    let action = component_header(
+        ui,
+        "Directional Light",
+        id,
+        mark(state, id, field.clone()),
+        Some(menu),
+        true,
+        |ui| {
+            egui::Grid::new("light").num_columns(2).show(ui, |ui| {
+                let mut value = light;
+                let (color_picked, color) = color_row(ui, "Color", &mut value.color);
+                let (ambient_picked, ambient) = color_row(ui, "Ambient", &mut value.ambient);
+                ui.label("Shadows");
+                let shadows = ui.checkbox(&mut value.shadows, "");
+                ui.end_row();
+                let center = vec3_row(ui, "Shadow Center", &mut value.shadow_center, 0.05);
+                ui.label("Shadow Radius");
+                let mut radius = value.shadow_radius.unwrap_or(0.0);
+                let radius_response = ui.add(egui::DragValue::new(&mut radius).speed(0.1));
+                value.shadow_radius = (radius > 0.0).then_some(radius);
+                ui.end_row();
+                let response = color | ambient | shadows | center | radius_response;
+                let picked = color_picked || ambient_picked;
+                commit_picker(state, ui, id, "light", picked, |object| {
                     object.directional_light = Some(value);
                 });
-            }
-        });
-    });
+                if !picked {
+                    commit(state, id, "light", &response, |object| {
+                        object.directional_light = Some(value);
+                    });
+                }
+            });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
     if action == HeaderAction::Remove {
         state.edit_scene(|scene| {
             scene.edit_object(id, None, |object| {
@@ -768,16 +951,51 @@ fn show_lite_script(
     let id = object.id.as_str();
     let script = &object.lite_scripts[index];
     let title = format!("Lua: {}", script.path.as_str());
+    let schema = state.lite_schema(script.path.as_str());
+    let field = OverrideField::LiteParams(script.path.clone());
     let mut params = script.params.clone();
     let mut params_response = None;
-    let action = component_header(ui, &title, (id, index), None, true, |ui| {
-        params_response = params_ui(ui, ("lite", id, index), &mut params);
-    });
+    let mut reset = None;
+    let action = component_header(
+        ui,
+        &title,
+        (id, index),
+        mark(state, id, field.clone()),
+        None,
+        true,
+        |ui| match &schema {
+            Ok(Some(schema)) => {
+                params_response =
+                    schema_params_ui(ui, ("lite", id, index), schema, &mut params, &mut reset);
+            }
+            Ok(None) => params_response = params_ui(ui, ("lite", id, index), &mut params),
+            Err(_) => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    "Ошибка схемы properties, см. Console",
+                );
+                params_response = params_ui(ui, ("lite", id, index), &mut params);
+            }
+        },
+    );
+    if let Some((name, default)) = reset {
+        let base_has_param = default.is_some()
+            && prefab_base_object(state, id).is_some_and(|base| {
+                base.lite_scripts.get(index).is_some_and(|base_script| {
+                    base_script.path == script.path && base_script.params.contains_key(&name)
+                })
+            });
+        reset_schema_param(&mut params, &name, default, base_has_param);
+    }
     if let Some(response) = &params_response {
         let key = format!("lite-{index}");
         commit(state, id, &key, response, |object| {
             object.lite_scripts[index].params = params;
         });
+    }
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
     }
     if action == HeaderAction::Remove {
         state.edit_scene(|scene| {
@@ -798,16 +1016,44 @@ fn show_heavy_script(
     let id = object.id.as_str();
     let script = &object.heavy_scripts[index];
     let title = format!("Rust: {}", script.name);
+    let schema = state.heavy_schema(&script.name);
+    let field = OverrideField::HeavyParams(script.name.clone());
     let mut params = script.params.clone();
     let mut params_response = None;
-    let action = component_header(ui, &title, (id, index), None, true, |ui| {
-        params_response = params_ui(ui, ("heavy", id, index), &mut params);
-    });
+    let mut reset = None;
+    let action = component_header(
+        ui,
+        &title,
+        (id, index),
+        mark(state, id, field.clone()),
+        None,
+        true,
+        |ui| match &schema {
+            Some(schema) => {
+                params_response =
+                    schema_params_ui(ui, ("heavy", id, index), schema, &mut params, &mut reset);
+            }
+            None => params_response = params_ui(ui, ("heavy", id, index), &mut params),
+        },
+    );
+    if let Some((name, default)) = reset {
+        let base_has_param = default.is_some()
+            && prefab_base_object(state, id).is_some_and(|base| {
+                base.heavy_scripts.get(index).is_some_and(|base_script| {
+                    base_script.name == script.name && base_script.params.contains_key(&name)
+                })
+            });
+        reset_schema_param(&mut params, &name, default, base_has_param);
+    }
     if let Some(response) = &params_response {
         let key = format!("heavy-{index}");
         commit(state, id, &key, response, |object| {
             object.heavy_scripts[index].params = params;
         });
+    }
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
     }
     if action == HeaderAction::Remove {
         state.edit_scene(|scene| {
@@ -898,6 +1144,151 @@ fn params_ui(
         return Some(response);
     }
     combined
+}
+
+fn schema_params_ui(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    schema: &ParamSchema,
+    params: &mut BTreeMap<String, ParamValue>,
+    reset: &mut Option<(String, Option<ParamValue>)>,
+) -> Option<egui::Response> {
+    let mut combined: Option<egui::Response> = None;
+    egui::Grid::new(("schema_params", salt))
+        .num_columns(3)
+        .show(ui, |ui| {
+            for spec in schema.specs() {
+                let stored = params.get(&spec.name).cloned();
+                let label = spec.label.as_deref().unwrap_or(&spec.name);
+                let label = match stored {
+                    Some(_) => egui::RichText::new(label),
+                    None => egui::RichText::new(label).weak(),
+                };
+                ui.label(label).on_hover_text(&spec.name);
+                let current = stored.as_ref().map(|value| spec.coerce(value));
+                let mut value = match &current {
+                    Some(Ok(value)) => value.clone(),
+                    Some(Err(_)) | None => spec.default.clone(),
+                };
+                let response = param_widget(ui, spec, &mut value);
+                if response.changed() {
+                    params.insert(spec.name.clone(), value);
+                }
+                merge_response(&mut combined, response);
+                ui.horizontal(|ui| {
+                    if stored.is_some() && ui.small_button("↺").on_hover_text("Default").clicked()
+                    {
+                        *reset = Some((spec.name.clone(), Some(spec.default.clone())));
+                    }
+                    if let Some(Err(error)) = &current {
+                        ui.colored_label(ui.visuals().error_fg_color, "⚠")
+                            .on_hover_text(error);
+                    }
+                });
+                ui.end_row();
+            }
+            for name in params.keys() {
+                if schema.get(name).is_some() {
+                    continue;
+                }
+                ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {name}"))
+                    .on_hover_text("Параметр не объявлен скриптом");
+                ui.label("не объявлен");
+                if ui.small_button("x").clicked() {
+                    *reset = Some((name.clone(), None));
+                }
+                ui.end_row();
+            }
+        });
+    if reset.is_some() {
+        let mut response = combined.unwrap_or_else(|| ui.label(""));
+        response.mark_changed();
+        return Some(response);
+    }
+    combined
+}
+
+fn prefab_base_object(state: &EditorState, id: &str) -> Option<SceneObject> {
+    let scene = state.scene.as_ref()?;
+    let origin = scene.origin(id)?;
+    scene.base_object(&origin.instance, id).ok()
+}
+
+fn reset_schema_param(
+    params: &mut BTreeMap<String, ParamValue>,
+    name: &str,
+    default: Option<ParamValue>,
+    base_has_param: bool,
+) {
+    if base_has_param && let Some(default) = default {
+        params.insert(name.to_owned(), default);
+    } else {
+        params.remove(name);
+    }
+}
+
+fn integer_bounds(min: f64, max: f64) -> Option<std::ops::RangeInclusive<i64>> {
+    const I64_LOWER: f64 = -9_223_372_036_854_775_808.0;
+    const I64_UPPER: f64 = 9_223_372_036_854_775_808.0;
+
+    let lower = if min == f64::NEG_INFINITY {
+        i64::MIN
+    } else {
+        let min = min.ceil();
+        if !min.is_finite() || min >= I64_UPPER {
+            return None;
+        }
+        if min <= I64_LOWER {
+            i64::MIN
+        } else {
+            min as i64
+        }
+    };
+    let upper = if max == f64::INFINITY {
+        i64::MAX
+    } else {
+        let max = max.floor();
+        if !max.is_finite() || max < I64_LOWER {
+            return None;
+        }
+        if max >= I64_UPPER {
+            i64::MAX
+        } else {
+            max as i64
+        }
+    };
+    (lower <= upper).then_some(lower..=upper)
+}
+
+fn param_widget(ui: &mut egui::Ui, spec: &ParamSpec, value: &mut ParamValue) -> egui::Response {
+    let min = spec.min.unwrap_or(f64::NEG_INFINITY);
+    let max = spec.max.unwrap_or(f64::INFINITY);
+    match value {
+        ParamValue::Bool(value) => ui.checkbox(value, ""),
+        ParamValue::Int(value) => match integer_bounds(min, max) {
+            Some(bounds) => ui.add(egui::DragValue::new(value).range(bounds)),
+            None => ui.label("нет целых значений в диапазоне"),
+        },
+        ParamValue::Float(value) => {
+            ui.add(egui::DragValue::new(value).speed(0.05).range(min..=max))
+        }
+        ParamValue::String(value) => ui.text_edit_singleline(value),
+        ParamValue::Array(values) => {
+            ui.horizontal(|ui| {
+                let mut combined: Option<egui::Response> = None;
+                for value in values.iter_mut() {
+                    if let ParamValue::Float(value) = value {
+                        merge_response(
+                            &mut combined,
+                            ui.add(egui::DragValue::new(value).speed(0.05)),
+                        );
+                    }
+                }
+                combined.unwrap_or_else(|| ui.label(""))
+            })
+            .inner
+        }
+    }
 }
 
 fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
@@ -1059,5 +1450,33 @@ mod tests {
         assert!(camera(&state, &other).settings.is_none());
         assert!(state.scene.as_mut().unwrap().undo());
         assert!(camera(&state, &other).settings.is_some());
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::{integer_bounds, reset_schema_param};
+    use engine_scene::ParamValue;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn integer_bounds_round_fractional_limits_inward_and_handle_empty_ranges() {
+        assert_eq!(integer_bounds(1.2, 2.2), Some(2..=2));
+        assert_eq!(integer_bounds(-2.2, -1.2), Some(-2..=-2));
+        assert_eq!(integer_bounds(1.2, 1.8), None);
+        assert_eq!(
+            integer_bounds(f64::NEG_INFINITY, f64::INFINITY),
+            Some(i64::MIN..=i64::MAX)
+        );
+    }
+
+    #[test]
+    fn reset_keeps_schema_default_when_base_prefab_has_the_key() {
+        let mut params = BTreeMap::from([("speed".to_owned(), ParamValue::Int(12))]);
+        reset_schema_param(&mut params, "speed", Some(ParamValue::Int(30)), true);
+        assert_eq!(params["speed"], ParamValue::Int(30));
+
+        reset_schema_param(&mut params, "speed", Some(ParamValue::Int(30)), false);
+        assert!(!params.contains_key("speed"));
     }
 }

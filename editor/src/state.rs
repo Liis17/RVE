@@ -1,6 +1,7 @@
 //! Состояние редактора, общее для панелей и обработчиков действий; не зависит от GPU.
 
 use crate::assets_fs::{AssetEntry, AssetKind};
+use crate::build::BuildJob;
 use crate::console::ConsoleLog;
 use crate::play::PlaySession;
 use crate::previews::PreviewCache;
@@ -12,10 +13,15 @@ use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
 use engine_files::VirtualPath;
 use engine_scene::World;
-use engine_script::ScriptLibrary;
+use engine_script::{ParamSchema, ScriptInterruptHandle, ScriptLibrary};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+
+/// Сколько может выполняться chunk Lua при чтении схемы, прежде чем его прервут.
+const SCHEMA_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Действие, которое выполняется после построения UI: диалоги ОС блокируют кадр,
 /// а смена проекта или сцены затрагивает данные, заимствованные панелями.
@@ -36,6 +42,12 @@ pub enum Action {
     ImportFiles(Vec<PathBuf>),
     /// Файловая структура изменилась: сбросить кэши ресурсов и прочитать дерево заново.
     RefreshAssets,
+    /// Выбрать каталог и собрать релиз проекта через `rve-build`; сцена сохраняется заранее.
+    BuildPlayer,
+    /// Сохранить поддерево объекта в новый префаб и заменить его экземпляром.
+    CreatePrefab(String),
+    /// Перенести overrides объекта экземпляра в файл префаба.
+    ApplyToPrefab(String),
     /// Сохранить сцену и при успехе выполнить действие.
     SaveThen(Box<Action>),
     /// Выполнить действие, отбросив несохранённые изменения.
@@ -124,6 +136,13 @@ pub struct EditorState {
     pub pending_frame: Option<String>,
     /// CPU-модели, загруженные для отрисовки: по ним работают picking и фокус камеры.
     pub models: HashMap<String, Arc<Model>>,
+    /// Объект, чьи overrides ждут подтверждения переноса в префаб.
+    pub apply_prompt: Option<String>,
+    /// Идущая сборка релиза; одновременно — не больше одной.
+    pub build: Option<BuildJob>,
+    /// Схемы `properties` lite-скриптов по пути; ошибка пишется в Console один раз.
+    /// Сбрасывается вместе с кэшами ресурсов.
+    pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
     /// Фоновый разбор FBX для `models`.
     pub model_loader: ModelLoader,
     edit_world: Option<(u64, World)>,
@@ -163,6 +182,9 @@ impl EditorState {
             game_camera: None,
             pending_frame: None,
             models: HashMap::new(),
+            build: None,
+            apply_prompt: None,
+            lite_schemas: HashMap::new(),
             model_loader: ModelLoader::default(),
             edit_world: None,
         }
@@ -193,7 +215,7 @@ impl EditorState {
             .as_ref()
             .is_none_or(|(built, _)| *built != revision);
         if stale {
-            match World::from_document(scene.document()) {
+            match world_for_view(scene.view()) {
                 Ok(mut world) => {
                     if let Some(project) = &self.project
                         && let Err(error) = project.apply_camera_settings(&mut world)
@@ -258,20 +280,50 @@ impl EditorState {
         self.edit_scene(|scene| scene.create_object(kind, parent));
     }
 
-    /// Создаёт объект из перетащенного ресурса, если это модель; `position` — локальная позиция.
+    /// Создаёт объект из перетащенного ресурса: модель или экземпляр префаба;
+    /// `position` — локальная позиция.
     pub fn create_from_asset(&mut self, path: &str, parent: Option<&str>, position: [f32; 3]) {
-        if AssetKind::of(path) != AssetKind::Model {
-            self.log
-                .error(format!("{path}: на сцену можно перетащить только .fbx"));
+        let asset_kind = AssetKind::of(path);
+        if !matches!(asset_kind, AssetKind::Model | AssetKind::Prefab) {
+            self.log.error(format!(
+                "{path}: на сцену можно перетащить только .fbx или .rveprefab"
+            ));
             return;
         }
         match VirtualPath::parse(path) {
             Ok(path) => {
-                let kind = NewObject::Mesh(path, position);
+                let kind = if asset_kind == AssetKind::Prefab {
+                    NewObject::Prefab(path, position)
+                } else {
+                    NewObject::Mesh(path, position)
+                };
                 self.pending_frame = self.edit_scene(|scene| scene.create_object(&kind, parent));
             }
             Err(_) => self.log.error(format!("{path}: некорректный путь ресурса")),
         }
+    }
+
+    /// Схема `properties` lite-скрипта из кэша; при первом обращении файл читается из проекта.
+    pub fn lite_schema(&mut self, path: &str) -> Result<Option<ParamSchema>, String> {
+        if let Some(schema) = self.lite_schemas.get(path) {
+            return schema.clone();
+        }
+        let Some(project) = &self.project else {
+            return Ok(None);
+        };
+        let result = project
+            .read_text(path)
+            .and_then(|source| read_lite_schema(path, &source, SCHEMA_TIMEOUT));
+        if let Err(error) = &result {
+            self.log.error(error.clone());
+        }
+        self.lite_schemas.insert(path.to_owned(), result.clone());
+        result
+    }
+
+    /// Схема Rust-скрипта из загруженной библиотеки.
+    pub fn heavy_schema(&self, name: &str) -> Option<ParamSchema> {
+        self.library.as_ref()?.schema(name).cloned()
     }
 
     /// Пути ресурсов заданного вида для выпадающих списков Inspector.
@@ -291,11 +343,64 @@ impl EditorState {
     }
 }
 
+/// Мир для показа раскрытого документа. Префабу без камеры добавляется скрытая камера
+/// под корнем: `World` требует камеру, а вид Scene всё равно использует камеру редактора.
+fn world_for_view(view: &engine_scene::SceneDocument) -> Result<World, engine_scene::SceneError> {
+    if !view.is_prefab() || view.objects.iter().any(|object| object.camera.is_some()) {
+        return World::from_document(view);
+    }
+    let mut view = view.clone();
+    let root = view
+        .objects
+        .iter()
+        .find(|object| object.parent.is_none())
+        .map(|object| object.id.clone());
+    view.objects.push(engine_scene::SceneObject {
+        id: EDITOR_CAMERA_ID.to_owned(),
+        name: None,
+        parent: root,
+        transform: engine_scene::SceneTransform::default(),
+        camera: Some(engine_scene::CameraComponent::default()),
+        mesh_renderer: None,
+        lod_group: None,
+        directional_light: None,
+        lite_scripts: Vec::new(),
+        heavy_scripts: Vec::new(),
+    });
+    World::from_document(&view)
+}
+
+/// Id скрытой камеры префаба в мире вида; документ его не содержит.
+const EDITOR_CAMERA_ID: &str = "__editor_camera";
+
+/// Читает схему в отдельном Lua; chunk дольше `timeout` прерывается.
+fn read_lite_schema(
+    path: &str,
+    source: &str,
+    timeout: Duration,
+) -> Result<Option<ParamSchema>, String> {
+    let interrupt = ScriptInterruptHandle::new();
+    let (done, finished) = mpsc::channel::<()>();
+    let watchdog = {
+        let interrupt = interrupt.clone();
+        std::thread::spawn(move || {
+            if finished.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
+                interrupt.interrupt();
+            }
+        })
+    };
+    let result =
+        engine_script::lite_properties(path, source, &interrupt).map_err(|error| error.to_string());
+    drop(done);
+    let _ = watchdog.join();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::project::OpenProject;
-    use crate::scene_edit::EditorScene;
+    use crate::scene_edit::{EditorScene, no_prefabs};
     use engine_scene::CameraSettings;
     use std::fs;
     use std::path::PathBuf;
@@ -355,8 +460,14 @@ settings = "/cameras/problem.camerasettings"
 "#;
         let mut state = EditorState::new(None);
         state.project = Some(OpenProject::open(project_dir).unwrap());
-        state.scene =
-            Some(EditorScene::parse(VirtualPath::parse("main.rvescene").unwrap(), SCENE).unwrap());
+        state.scene = Some(
+            EditorScene::parse(
+                VirtualPath::parse("main.rvescene").unwrap(),
+                SCENE,
+                no_prefabs(),
+            )
+            .unwrap(),
+        );
         state
     }
 
@@ -465,5 +576,25 @@ settings = "/cameras/problem.camerasettings"
         ];
         assert_eq!(state.assets_of_kind(AssetKind::Model), ["m/a.fbx", "b.fbx"]);
         assert_eq!(state.assets_of_kind(AssetKind::Script), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn lite_schemas_are_read_from_the_project_once_and_errors_logged_once() {
+        let mut state = EditorState::new(None);
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        state.project = Some(OpenProject::open(std::path::Path::new(dir)).unwrap());
+        let schema = state.lite_schema("scripts/rotate.lua").unwrap().unwrap();
+        assert!(schema.get("speed").is_some());
+        assert!(state.lite_schemas.contains_key("scripts/rotate.lua"));
+
+        assert!(state.lite_schema("scripts/missing.lua").is_err());
+        assert!(state.lite_schema("scripts/missing.lua").is_err());
+        assert_eq!(state.log.entries().count(), 1);
+    }
+
+    #[test]
+    fn hanging_schema_chunk_is_interrupted() {
+        let timeout = Duration::from_millis(20);
+        assert!(read_lite_schema("loop.lua", "while true do end", timeout).is_err());
     }
 }

@@ -205,6 +205,16 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
             state.action(Action::SaveAs);
         }
         ui.separator();
+        if ui
+            .add_enabled(
+                editing && state.build.is_none(),
+                egui::Button::new("Build Player…"),
+            )
+            .clicked()
+        {
+            state.action(Action::BuildPlayer);
+        }
+        ui.separator();
         if ui.button("Exit").clicked() {
             state.action(Action::Exit);
         }

@@ -640,7 +640,9 @@ fn host_input_vector(
     })
 }
 
-unsafe fn read_message_value(value: *const RveValue) -> Result<(ParamValue, usize), String> {
+pub(crate) unsafe fn read_message_value(
+    value: *const RveValue,
+) -> Result<(ParamValue, usize), String> {
     if value.is_null() {
         return Err("null message value".to_owned());
     }

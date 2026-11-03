@@ -3,7 +3,7 @@ use crate::error::BuildError;
 #[cfg(windows)]
 use crate::ico::png_to_ico;
 use crate::platform;
-use crate::project::{ProjectBuild, prepare_project};
+use crate::project::{HeavyScriptUse, ProjectBuild, prepare_project};
 use crate::sdk::{self, PlayerLocation};
 use crate::temporary::TempDir;
 use engine_files::{VirtualPath, strip_windows_verbatim_prefix};
@@ -213,7 +213,7 @@ fn build_game_scripts(
             library_path.display()
         ))
     })?;
-    validate_heavy_script_names(&library, &project.heavy_scripts)?;
+    validate_heavy_scripts(&library, &project.heavy_scripts)?;
     drop(library);
     Ok(Some(library_path))
 }
@@ -226,15 +226,25 @@ fn select_library_file<'a>(filenames: &'a [PathBuf], extension: &str) -> Option<
     })
 }
 
-fn validate_heavy_script_names(
+/// Имена heavy-скриптов сцен есть в библиотеке, а их `params` проходят схему скрипта.
+fn validate_heavy_scripts(
     library: &ScriptLibrary,
-    heavy_scripts: &[(String, String)],
+    heavy_scripts: &[HeavyScriptUse],
 ) -> Result<(), BuildError> {
-    for (scene, name) in heavy_scripts {
-        if !library.contains_script(name) {
+    for script in heavy_scripts {
+        if !library.contains_script(&script.name) {
             return Err(BuildError::input(format!(
-                "сцена /{scene} ссылается на heavy-скрипт {name:?}, которого нет в библиотеке"
+                "сцена /{} ссылается на heavy-скрипт {:?}, которого нет в библиотеке",
+                script.scene, script.name
             )));
+        }
+        if let Some(schema) = library.schema(&script.name) {
+            schema.resolve(&script.params).map_err(|error| {
+                BuildError::input(format!(
+                    "сцена /{}, объект {:?}, heavy-скрипт {:?}: {error}",
+                    script.scene, script.object, script.name
+                ))
+            })?;
         }
     }
     Ok(())
@@ -771,10 +781,10 @@ mod tests {
     use super::{
         CargoArtifact, CargoFailure, build_distribution, heavy_scripts_manifest,
         parse_cargo_output, parse_cdylib_target, player_file_name, select_library_file,
-        validate_heavy_script_names, validate_staged_archives,
+        validate_heavy_scripts, validate_staged_archives,
     };
     use crate::error::BuildError;
-    use crate::project::ProjectBuild;
+    use crate::project::{HeavyScriptUse, ProjectBuild};
     use crate::temporary::TempDir;
     use engine_files::strip_windows_verbatim_prefix;
     use engine_project::ProjectSettings;
@@ -794,7 +804,7 @@ mod tests {
 
     fn test_library() -> ScriptLibrary {
         let module = rve_sdk::script_module! {
-            "Bobber" => test_factory,
+            "Bobber" => test_factory { speed: f32 = 1.4 (0.0..=10.0) },
             "Spinner" => test_factory,
         };
         // SAFETY: script_module! stores the descriptors and names in static storage.
@@ -941,25 +951,52 @@ mod tests {
     fn validates_all_scene_heavy_script_names_against_the_library() {
         let library = test_library();
         let scripts = [
-            ("scenes/main.rvescene".to_owned(), "Bobber".to_owned()),
-            ("scenes/side.rvescene".to_owned(), "Spinner".to_owned()),
+            heavy("scenes/main.rvescene", "Bobber", "{ speed = 2 }"),
+            heavy("scenes/side.rvescene", "Spinner", "{ anything = true }"),
         ];
 
-        assert!(validate_heavy_script_names(&library, &scripts).is_ok());
+        assert!(validate_heavy_scripts(&library, &scripts).is_ok());
     }
 
     #[test]
     fn missing_scene_heavy_script_is_a_project_error_with_scene_and_name() {
         let library = test_library();
-        let error = validate_heavy_script_names(
-            &library,
-            &[("scenes/main.rvescene".to_owned(), "Missing".to_owned())],
-        )
-        .unwrap_err();
+        let error =
+            validate_heavy_scripts(&library, &[heavy("scenes/main.rvescene", "Missing", "{}")])
+                .unwrap_err();
 
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("scenes/main.rvescene"));
         assert!(error.to_string().contains("Missing"));
+    }
+
+    fn heavy(scene: &str, name: &str, params: &str) -> HeavyScriptUse {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            params: BTreeMap<String, engine_scene::ParamValue>,
+        }
+        let wrapper: Wrapper = toml::from_str(&format!("params = {params}")).unwrap();
+        HeavyScriptUse {
+            scene: scene.to_owned(),
+            object: "mesh".to_owned(),
+            name: name.to_owned(),
+            params: wrapper.params,
+        }
+    }
+
+    #[test]
+    fn heavy_params_that_violate_the_library_schema_are_project_errors() {
+        let library = test_library();
+        for params in ["{ speed = 11.0 }", "{ speed = \"fast\" }", "{ spin = 1 }"] {
+            let error = validate_heavy_scripts(
+                &library,
+                &[heavy("scenes/main.rvescene", "Bobber", params)],
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{params}: {error}");
+            assert!(error.to_string().contains("\"mesh\""), "{error}");
+            assert!(error.to_string().contains("Bobber"), "{error}");
+        }
     }
 
     #[test]

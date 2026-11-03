@@ -1,6 +1,7 @@
 //! TOML-документы сцен и их проверенная схема, независимая от renderer.
 
 use crate::CameraSettings;
+use crate::prefab::PrefabInstance;
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -48,28 +49,83 @@ pub struct SceneDocument {
     pub assets: Vec<SceneAsset>,
     #[serde(default)]
     pub objects: Vec<SceneObject>,
+    /// Экземпляры префабов; см. [`crate::prefab`]. Пустой список не сериализуется,
+    /// поэтому сцены без префабов сохраняются как прежде.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<PrefabInstance>,
     #[serde(skip)]
-    source_label: String,
+    pub(crate) source_label: String,
+    #[serde(skip)]
+    pub(crate) kind: DocumentKind,
+    /// Результат [`crate::prefab::expand`]: id объектов могут содержать точки.
+    #[serde(skip)]
+    pub(crate) expanded: bool,
+}
+
+/// Вид документа: сцена или префаб `.rveprefab`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DocumentKind {
+    #[default]
+    Scene,
+    Prefab,
 }
 
 impl SceneDocument {
     /// Разбирает TOML и проверяет идентификаторы, ссылки, числа и мировые базисы.
     pub fn parse(source_label: impl Into<String>, input: &str) -> Result<Self, SceneError> {
-        let source_label = source_label.into();
+        Self::parse_kind(source_label.into(), input, DocumentKind::Scene)
+    }
+
+    /// Разбирает префаб `.rveprefab`: схема та же, что у сцены, но ровно один корень
+    /// (объект или экземпляр) и камера не обязательна.
+    pub fn parse_prefab(source_label: impl Into<String>, input: &str) -> Result<Self, SceneError> {
+        Self::parse_kind(source_label.into(), input, DocumentKind::Prefab)
+    }
+
+    fn parse_kind(
+        source_label: String,
+        input: &str,
+        kind: DocumentKind,
+    ) -> Result<Self, SceneError> {
         let value: toml::Value = toml::from_str(input)
             .map_err(|error| SceneError::new(&source_label, None, error.to_string()))?;
         validate_raw_virtual_paths(&value, &source_label)?;
         let mut document: Self = toml::from_str(input)
             .map_err(|error| SceneError::new(&source_label, None, error.to_string()))?;
         document.source_label = source_label;
+        document.kind = kind;
         document.validate()?;
         Ok(document)
     }
 
     /// Сериализует документ в форматированный TOML.
     pub fn to_toml(&self) -> Result<String, SceneError> {
+        if self.expanded {
+            return Err(SceneError::new(
+                &self.source_label,
+                None,
+                "раскрытый документ префабов не сохраняется; сохраняйте авторский документ",
+            ));
+        }
         toml::to_string_pretty(self)
             .map_err(|error| SceneError::new(&self.source_label, None, error.to_string()))
+    }
+
+    /// Документ разобран как префаб `.rveprefab`.
+    pub fn is_prefab(&self) -> bool {
+        self.kind == DocumentKind::Prefab
+    }
+
+    /// Документ получен из [`crate::prefab::expand`] и не содержит экземпляров.
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Тот же документ как префаб; editor создаёт так `.rveprefab` из поддерева сцены.
+    pub fn into_prefab(mut self, source_label: impl Into<String>) -> Self {
+        self.kind = DocumentKind::Prefab;
+        self.source_label = source_label.into();
+        self
     }
 
     /// Метка источника, переданная в [`SceneDocument::parse`].
@@ -78,6 +134,10 @@ impl SceneDocument {
     }
 
     /// Проверяет идентификаторы, ссылки, числа и мировые базисы уже изменённого документа.
+    ///
+    /// Документ с `instances` проверяется только локально: формат, ресурсы и overrides.
+    /// Существование родителей, циклы, камеры, свет и базисы зависят от содержимого
+    /// префабов и проверяются на результате [`crate::prefab::expand`].
     pub fn validate(&self) -> Result<(), SceneError> {
         let source = &self.source_label;
         let mut asset_paths = HashSet::with_capacity(self.assets.len());
@@ -105,7 +165,15 @@ impl SceneDocument {
 
         let mut object_indices = HashMap::with_capacity(self.objects.len());
         for (index, object) in self.objects.iter().enumerate() {
-            if !valid_ascii_name(&object.id, true) {
+            if self.expanded {
+                if !crate::prefab::valid_expanded_id(&object.id) {
+                    return Err(SceneError::new(
+                        source,
+                        Some(&object.id),
+                        "раскрытый id должен состоять из сегментов [A-Za-z0-9_-]{1,64} через точку и быть не длиннее 255 байт",
+                    ));
+                }
+            } else if !valid_ascii_name(&object.id, true) {
                 return Err(SceneError::new(
                     source,
                     Some(&object.id),
@@ -120,12 +188,33 @@ impl SceneDocument {
                 ));
             }
         }
+        crate::prefab::validate_instances(self, &asset_paths, &object_indices)?;
+        let local_only = !self.instances.is_empty();
+        if self.kind == DocumentKind::Prefab {
+            let roots = self
+                .objects
+                .iter()
+                .map(|object| &object.parent)
+                .chain(self.instances.iter().map(|instance| &instance.parent))
+                .filter(|parent| parent.is_none())
+                .count();
+            if roots != 1 {
+                return Err(SceneError::new(
+                    source,
+                    None,
+                    format!(
+                        "префаб должен иметь ровно один корневой объект или экземпляр, найдено {roots}"
+                    ),
+                ));
+            }
+        }
 
         let mut camera_count = 0;
         let mut active_camera_count = 0;
         let mut light_count = 0;
         for object in &self.objects {
             if let Some(parent) = &object.parent
+                && !local_only
                 && !object_indices.contains_key(parent.as_str())
             {
                 return Err(SceneError::new(
@@ -139,10 +228,16 @@ impl SceneDocument {
                 camera_count += 1;
                 active_camera_count += usize::from(camera.active);
                 if let Some(settings) = &camera.settings {
-                    require_asset_path(source, object, &asset_paths, settings, "настройки камеры")?;
+                    require_asset_path(
+                        source,
+                        &object.id,
+                        &asset_paths,
+                        settings,
+                        "настройки камеры",
+                    )?;
                     require_extension(
                         source,
-                        object,
+                        &object.id,
                         settings,
                         "camerasettings",
                         "настройки камеры",
@@ -154,14 +249,14 @@ impl SceneDocument {
                 validate_light(source, object, light)?;
             }
             if let Some(mesh) = &object.mesh_renderer {
-                require_asset_path(source, object, &asset_paths, &mesh.model, "модель")?;
-                require_extension(source, object, &mesh.model, "fbx", "модель")?;
+                require_asset_path(source, &object.id, &asset_paths, &mesh.model, "модель")?;
+                require_extension(source, &object.id, &mesh.model, "fbx", "модель")?;
                 if let Some(texture) = &mesh.texture {
-                    require_asset_path(source, object, &asset_paths, texture, "текстура")?;
-                    require_extension(source, object, texture, "png", "текстура")?;
+                    require_asset_path(source, &object.id, &asset_paths, texture, "текстура")?;
+                    require_extension(source, &object.id, texture, "png", "текстура")?;
                 }
                 if let Some(material) = &mesh.material {
-                    validate_material_override(source, object, &asset_paths, material)?;
+                    validate_material_override(source, &object.id, &asset_paths, material)?;
                 }
             }
             if let Some(group) = &object.lod_group {
@@ -195,14 +290,24 @@ impl SceneDocument {
                     }
                     previous_distance = level.distance;
                     let model =
-                        parse_lod_path(source, object, &level.model, "lod_group.levels.model")?;
-                    require_asset_path(source, object, &asset_paths, &model, "модель LOD")?;
-                    require_extension(source, object, &model, "fbx", "модель LOD")?;
+                        parse_lod_path(source, &object.id, &level.model, "lod_group.levels.model")?;
+                    require_asset_path(source, &object.id, &asset_paths, &model, "модель LOD")?;
+                    require_extension(source, &object.id, &model, "fbx", "модель LOD")?;
                     if let Some(texture) = &level.texture {
-                        let texture =
-                            parse_lod_path(source, object, texture, "lod_group.levels.texture")?;
-                        require_asset_path(source, object, &asset_paths, &texture, "текстура LOD")?;
-                        require_extension(source, object, &texture, "png", "текстура LOD")?;
+                        let texture = parse_lod_path(
+                            source,
+                            &object.id,
+                            texture,
+                            "lod_group.levels.texture",
+                        )?;
+                        require_asset_path(
+                            source,
+                            &object.id,
+                            &asset_paths,
+                            &texture,
+                            "текстура LOD",
+                        )?;
+                        require_extension(source, &object.id, &texture, "png", "текстура LOD")?;
                     }
                 }
                 if let Some(cull_distance) = group.cull_distance
@@ -216,8 +321,14 @@ impl SceneDocument {
                 }
             }
             for script in &object.lite_scripts {
-                require_asset_path(source, object, &asset_paths, &script.path, "lite-скрипт")?;
-                require_extension(source, object, &script.path, "lua", "lite-скрипт")?;
+                require_asset_path(
+                    source,
+                    &object.id,
+                    &asset_paths,
+                    &script.path,
+                    "lite-скрипт",
+                )?;
+                require_extension(source, &object.id, &script.path, "lua", "lite-скрипт")?;
                 validate_params(source, object, &script.params)?;
             }
             for script in &object.heavy_scripts {
@@ -235,7 +346,7 @@ impl SceneDocument {
             }
         }
 
-        if camera_count == 0 {
+        if camera_count == 0 && self.kind == DocumentKind::Scene && !local_only {
             return Err(SceneError::new(
                 source,
                 None,
@@ -264,6 +375,9 @@ impl SceneDocument {
                     "в сцене допускается не более одного directional_light, найдено {light_count}"
                 ),
             ));
+        }
+        if local_only {
+            return Ok(());
         }
 
         let world_matrices = validated_world_matrices(self, &object_indices)?;
@@ -298,7 +412,7 @@ impl SceneDocument {
 }
 
 /// Ресурс, объявленный для включения в архив сцены.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneAsset {
     #[serde(with = "virtual_path_serde")]
@@ -308,7 +422,7 @@ pub struct SceneAsset {
 }
 
 /// Объект сцены в порядке документа.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneObject {
     pub id: String,
@@ -339,7 +453,7 @@ impl SceneObject {
 }
 
 /// Локальная трансформация документа; углы вращения хранятся в градусах.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneTransform {
     #[serde(default = "zero3")]
@@ -361,7 +475,7 @@ impl Default for SceneTransform {
 }
 
 /// Ссылка на настройки камеры и выбор активной камеры сцены.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraComponent {
     #[serde(default, with = "option_virtual_path_serde")]
@@ -370,7 +484,7 @@ pub struct CameraComponent {
 }
 
 /// Экземпляр FBX, необязательная замена base-color PNG и override материала.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshRenderer {
     #[serde(with = "virtual_path_serde")]
@@ -423,7 +537,7 @@ pub struct LodLevel {
 }
 
 /// Необязательные замены факторов и текстур FBX-материала.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterialOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,7 +563,7 @@ pub struct MaterialOverride {
 }
 
 /// Цвет направленного света, ambient и необязательная проекция теней.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectionalLightComponent {
     #[serde(default = "one3")]
@@ -566,7 +680,7 @@ impl<'de> Deserialize<'de> for ParamValue {
 }
 
 /// Файл скрипта для lightweight runtime.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiteScript {
     #[serde(with = "virtual_path_serde")]
@@ -576,7 +690,7 @@ pub struct LiteScript {
 }
 
 /// Фабрика скрипта, зарегистрированная игровым крейтом.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeavyScript {
     pub name: String,
@@ -684,6 +798,20 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                 .map(|path| (None, "assets.path", path))
         }));
     }
+    if let Some(instances) = value.get("instances").and_then(toml::Value::as_array) {
+        paths.extend(instances.iter().filter_map(|instance| {
+            instance
+                .get("prefab")
+                .and_then(toml::Value::as_str)
+                .map(|path| {
+                    (
+                        instance.get("id").and_then(toml::Value::as_str),
+                        "prefab",
+                        path,
+                    )
+                })
+        }));
+    }
     let Some(objects) = value.get("objects").and_then(toml::Value::as_array) else {
         return validate_raw_paths(paths, source);
     };
@@ -767,9 +895,9 @@ fn validate_raw_paths(
     Ok(())
 }
 
-fn require_asset_path(
+pub(crate) fn require_asset_path(
     source: &str,
-    object: &SceneObject,
+    object_id: &str,
     assets: &HashSet<VirtualPath>,
     path: &VirtualPath,
     kind: &str,
@@ -779,7 +907,7 @@ fn require_asset_path(
     } else {
         Err(SceneError::new(
             source,
-            Some(&object.id),
+            Some(object_id),
             format!("{kind} /{} отсутствует в [[assets]]", path.as_str()),
         ))
     }
@@ -787,7 +915,7 @@ fn require_asset_path(
 
 fn parse_lod_path(
     source: &str,
-    object: &SceneObject,
+    object_id: &str,
     value: &str,
     field: &str,
 ) -> Result<VirtualPath, SceneError> {
@@ -795,22 +923,22 @@ fn parse_lod_path(
         let path = value.strip_prefix('/').unwrap_or(value);
         SceneError::new(
             source,
-            Some(&object.id),
+            Some(object_id),
             format!("{field} /{path}: некорректный virtual path"),
         )
     })
 }
 
-fn validate_material_override(
+pub(crate) fn validate_material_override(
     source: &str,
-    object: &SceneObject,
+    object_id: &str,
     assets: &HashSet<VirtualPath>,
     material: &MaterialOverride,
 ) -> Result<(), SceneError> {
     let invalid_factor = |field: &str| {
         SceneError::new(
             source,
-            Some(&object.id),
+            Some(object_id),
             format!("{field} должен быть конечным и находиться в диапазоне [0, 1]"),
         )
     };
@@ -839,7 +967,7 @@ fn validate_material_override(
     {
         return Err(SceneError::new(
             source,
-            Some(&object.id),
+            Some(object_id),
             "material.normal_scale должен быть конечным",
         ));
     }
@@ -851,16 +979,16 @@ fn validate_material_override(
         (material.normal_texture.as_ref(), "normal текстура"),
     ] {
         if let Some(path) = path {
-            require_asset_path(source, object, assets, path, kind)?;
-            require_extension(source, object, path, "png", kind)?;
+            require_asset_path(source, object_id, assets, path, kind)?;
+            require_extension(source, object_id, path, "png", kind)?;
         }
     }
     Ok(())
 }
 
-fn require_extension(
+pub(crate) fn require_extension(
     source: &str,
-    object: &SceneObject,
+    object_id: &str,
     path: &VirtualPath,
     extension: &str,
     kind: &str,
@@ -874,7 +1002,7 @@ fn require_extension(
     } else {
         Err(SceneError::new(
             source,
-            Some(&object.id),
+            Some(object_id),
             format!(
                 "{kind} /{} должен иметь расширение .{extension}",
                 path.as_str()
@@ -883,7 +1011,7 @@ fn require_extension(
     }
 }
 
-fn valid_ascii_name(value: &str, hyphen: bool) -> bool {
+pub(crate) fn valid_ascii_name(value: &str, hyphen: bool) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -982,7 +1110,7 @@ pub(crate) fn light_direction_from_matrix(matrix: glam::Mat4) -> Option<[f32; 3]
     }
 }
 
-mod virtual_path_serde {
+pub(crate) mod virtual_path_serde {
     use engine_files::VirtualPath;
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -1011,7 +1139,7 @@ mod virtual_path_serde {
     }
 }
 
-mod option_virtual_path_serde {
+pub(crate) mod option_virtual_path_serde {
     use engine_files::VirtualPath;
     use serde::{Deserialize, Deserializer, Serializer};
 

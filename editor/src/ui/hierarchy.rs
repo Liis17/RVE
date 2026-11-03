@@ -1,10 +1,22 @@
 //! Панель Hierarchy: дерево объектов сцены.
 
 use crate::scene_edit::{EditorScene, NewObject};
-use crate::state::{AssetDrag, EditorState};
+use crate::state::{Action, AssetDrag, EditorState};
 use crate::ui::scene_view;
 use engine_scene::SceneObject;
 use std::collections::{HashMap, HashSet};
+
+/// Цвет экземпляров префабов и их объектов.
+const PREFAB_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 170, 255);
+
+/// Подпись строки: имя или последний сегмент id, чтобы объекты экземпляра без имени
+/// показывались как в префабе (`handle`, а не `door1.handle`).
+fn row_name(object: &SceneObject) -> &str {
+    match &object.name {
+        Some(name) => name,
+        None => object.id.rsplit('.').next().unwrap_or(&object.id),
+    }
+}
 
 /// Перетаскиваемый объект иерархии.
 #[derive(Clone, Debug)]
@@ -22,6 +34,9 @@ enum Command {
     BeginRename(String, String),
     CommitRename(String, String),
     CancelRename,
+    CreatePrefab(String),
+    Unpack(String),
+    OpenPrefab(String),
 }
 
 /// Дети каждого объекта в порядке документа; ключ `None` — корневые объекты.
@@ -79,10 +94,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     let mut commands = Vec::new();
     let rename = state.hierarchy_rename.clone();
     let query = state.hierarchy_filter.trim();
-    let visible = (!query.is_empty()).then(|| filter_visible(&scene.document().objects, query));
+    let visible = (!query.is_empty()).then(|| filter_visible(&scene.view().objects, query));
     egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
         ui.add_enabled_ui(editable, |ui| {
-            let children = children_map(&scene.document().objects);
+            let children = children_map(&scene.view().objects);
             let tree = TreeContext {
                 scene,
                 children: &children,
@@ -195,10 +210,22 @@ impl TreeContext<'_> {
             return;
         }
         let selected = self.scene.is_selected(&object.id);
-        let response = ui.add(
-            egui::Button::selectable(selected, object.display_name())
-                .sense(egui::Sense::click_and_drag()),
-        );
+        let instance = self.scene.instance(&object.id);
+        let part = self.scene.is_prefab_part(&object.id);
+        // Корень экземпляра помечен значком, объекты префаба — цветом, как в Unity.
+        let mut text = egui::RichText::new(match instance {
+            Some(_) => format!("📦 {}", row_name(object)),
+            None => row_name(object).to_owned(),
+        });
+        if instance.is_some() || part {
+            text = text.color(PREFAB_COLOR);
+        }
+        let response =
+            ui.add(egui::Button::selectable(selected, text).sense(egui::Sense::click_and_drag()));
+        let response = match instance {
+            Some(instance) => response.on_hover_text(format!("/{}", instance.prefab.as_str())),
+            None => response,
+        };
         if response.clicked() {
             let modifiers = ui.input(|input| input.modifiers);
             commands.push(Command::Select(object.id.clone(), modifiers));
@@ -209,7 +236,10 @@ impl TreeContext<'_> {
                 object.display_name().to_owned(),
             ));
         }
-        response.dnd_set_drag_payload(ObjectDrag(object.id.clone()));
+        // Объекты внутри экземпляра не перетаскиваются: менять им родителя нельзя.
+        if !part {
+            response.dnd_set_drag_payload(ObjectDrag(object.id.clone()));
+        }
         if let Some(dragged) = response.dnd_release_payload::<ObjectDrag>()
             && dragged.0 != object.id
         {
@@ -234,11 +264,25 @@ impl TreeContext<'_> {
             if ui.button("Create Child").clicked() {
                 commands.push(Command::CreateChild(object.id.clone()));
             }
-            if ui.button("Duplicate").clicked() {
-                commands.push(Command::Duplicate(object.id.clone()));
+            if !part {
+                if ui.button("Duplicate").clicked() {
+                    commands.push(Command::Duplicate(object.id.clone()));
+                }
+                if ui.button("Delete").clicked() {
+                    commands.push(Command::Delete(object.id.clone()));
+                }
             }
-            if ui.button("Delete").clicked() {
-                commands.push(Command::Delete(object.id.clone()));
+            ui.separator();
+            if instance.is_none() && !part && ui.button("Create Prefab").clicked() {
+                commands.push(Command::CreatePrefab(object.id.clone()));
+            }
+            if let Some(instance) = instance {
+                if ui.button("Unpack").clicked() {
+                    commands.push(Command::Unpack(object.id.clone()));
+                }
+                if ui.button("Open Prefab").clicked() {
+                    commands.push(Command::OpenPrefab(instance.prefab.as_str().to_owned()));
+                }
             }
         });
     }
@@ -284,6 +328,11 @@ fn apply(state: &mut EditorState, command: Command) {
             });
         }
         Command::CancelRename => state.hierarchy_rename = None,
+        Command::CreatePrefab(id) => state.action(Action::CreatePrefab(id)),
+        Command::Unpack(id) => {
+            state.edit_scene(|scene| scene.unpack(&id));
+        }
+        Command::OpenPrefab(path) => state.action(Action::OpenScene(Some(path))),
     }
 }
 
@@ -301,7 +350,7 @@ mod tests {
         let second = scene
             .create_object(&NewObject::Empty, Some(&parent))
             .unwrap();
-        let map = children_map(&scene.document().objects);
+        let map = children_map(&scene.view().objects);
         assert_eq!(map[&None].len(), 3);
         let children = map[&Some(parent.as_str())]
             .iter()

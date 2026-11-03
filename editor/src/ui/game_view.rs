@@ -34,11 +34,20 @@ fn resolve_camera<'a>(
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
+    if state
+        .scene
+        .as_ref()
+        .is_some_and(|scene| scene.document().is_prefab())
+    {
+        state.game_view.visible = false;
+        ui.label("Game недоступен для префаба");
+        return;
+    }
     let Some(scene) = state.scene.as_ref() else {
         ui.label("Сцена не открыта");
         return;
     };
-    let cameras = scene_cameras(scene.document());
+    let cameras = scene_cameras(scene.view());
     let Some((current_id, current_name, _)) =
         resolve_camera(&cameras, state.game_camera.as_deref()).cloned()
     else {

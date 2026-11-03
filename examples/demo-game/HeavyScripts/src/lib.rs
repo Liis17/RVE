@@ -24,27 +24,25 @@ impl Script for Bobber {
     }
 }
 
-fn number(params: &Params, name: &str, default: f32) -> Result<f32, String> {
-    let value = match params.get(name) {
-        None => default,
-        Some(Value::Int(value)) => *value as f32,
+/// The host has already checked parameters against the schema below and filled defaults.
+fn float(params: &Params, name: &str) -> f32 {
+    match params.get(name) {
         Some(Value::Float(value)) => *value as f32,
-        Some(_) => return Err(format!("{name} must be a number")),
-    };
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(format!("{name} must be finite"))
+        _ => 0.0,
     }
 }
 
 fn create_bobber(params: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(Bobber {
         base_y: 0.0,
-        amplitude: number(params, "amplitude", 0.15)?,
-        speed: number(params, "speed", 1.4)?,
+        amplitude: float(params, "amplitude"),
+        speed: float(params, "speed"),
     }))
 }
 
-rve_sdk::export_scripts! { "Bobber" => create_bobber }
-
+rve_sdk::export_scripts! {
+    "Bobber" => create_bobber {
+        amplitude: f32 = 0.15 (0.0..=10.0) "Amplitude",
+        speed: f32 = 1.4 (0.0..=20.0) "Speed",
+    }
+}

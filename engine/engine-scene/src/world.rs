@@ -140,7 +140,25 @@ pub struct World {
 impl World {
     /// Создаёт runtime-мир из разобранного и проверенного документа сцены.
     pub fn from_document(document: &SceneDocument) -> Result<Self, SceneError> {
+        if !document.instances.is_empty() {
+            return Err(SceneError::new(
+                document.source_label(),
+                None,
+                "документ содержит экземпляры префабов; раскройте его через prefab::expand",
+            ));
+        }
         document.validate()?;
+        if document
+            .objects
+            .iter()
+            .all(|object| object.camera.is_none())
+        {
+            return Err(SceneError::new(
+                document.source_label(),
+                None,
+                "для World нужна хотя бы одна камера",
+            ));
+        }
         let indices_by_id = document
             .objects
             .iter()
