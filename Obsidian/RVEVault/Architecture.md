@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует PBR metallic-roughness меши с tangent-space normal maps, направленным светом, depth buffer и PCF shadow map в HDR offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает и проверяет документы `.rvescene`, строит runtime-граф `World` и выдаёт мировые матрицы, камеру, свет и меши для кадра. `engine-script` запускает Lua и Rust-скрипты из ABI-библиотеки. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений пока представлены пустыми потоками-заглушками; редактор также остаётся без реализации.
+RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки, а `rve-editor` — графический редактор сцен на egui. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует PBR metallic-roughness меши с tangent-space normal maps, направленным светом, depth buffer и PCF shadow map в HDR offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает и проверяет документы `.rvescene`, строит runtime-граф `World` и выдаёт мировые матрицы, камеры, свет и меши для кадра. `engine-script` запускает Lua и Rust-скрипты из ABI-библиотеки. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений пока представлены пустыми потоками-заглушками.
 
 ## Стек
 
@@ -22,6 +22,8 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 | flume 0.11.1 | Bounded очереди ресурсов и снимков кадров, каналы управления потоками runtime | `engine/engine-resources/Cargo.toml`, `engine/engine-runtime/Cargo.toml` |
 | sysinfo 0.39.6 (только фича `system`) | Проверка RAM и логических CPU в runtime, метрики `--debug-overlay` | `engine/engine-runtime/Cargo.toml`, `engine/sandbox/src/debug_overlay.rs` |
 | font8x8 0.3.1 | Bitmap-шрифт 8×8 оверлея | `engine/sandbox/src/debug_overlay.rs` |
+| egui 0.36.2, egui-winit 0.36.2, egui_dock 0.21.1 | Интерфейс редактора, ввод из winit и встраиваемые панели | `editor/src` |
+| rfd 0.17.2 | Системные диалоги выбора файлов и папок редактора | `editor/src/app.rs` |
 | ufbx 0.11.5 | Загрузка FBX; C-библиотека собирается через `cc` | `engine/engine-assets/src/lib.rs` |
 | png 0.18.1 | Декодирование PNG | `engine/engine-assets/src/lib.rs` |
 | mlua 0.12.2 (`lua54`, `vendored`) | Lua host для lite-скриптов без системной Lua | `engine/engine-script/Cargo.toml` |
@@ -56,10 +58,11 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/RveBuild]] — сборка релиза из проекта, раскладка архивов и генерация player crate.
 - [[Engine/Sandbox]] — приложение, соединяющее core, window, render, assets и scene.
 
-`engine-audio`, `engine-physics`, `engine-network` и `engine-neural` — пустые модули-заглушки: каждый предоставляет `new()` и `run(stop)`, который ждёт сигнал остановки. Их доменные runtime и полная документация появятся позже. `engine-editor` пока остаётся скелетом без реализации.
+`engine-audio`, `engine-physics`, `engine-network` и `engine-neural` — пустые модули-заглушки: каждый предоставляет `new()` и `run(stop)`, который ждёт сигнал остановки. Их доменные runtime и полная документация появятся позже.
 
 ## Направления зависимостей
 
+- `rve-editor` зависит от `engine-assets`, `engine-files`, `engine-project`, `engine-render`, `engine-resources`, `engine-scene`, `engine-script`, `engine-window`, egui, egui-winit, egui_dock, rfd и glam. От него ничего не зависит.
 - `sandbox` зависит от `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
 - `rve-player` зависит от `engine-runtime`; runtime соединяет `engine-project`, `engine-files`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `engine-script` и пустые доменные модули. `engine-files` снимает Windows verbatim-префикс в `Layout`; flume обслуживает управляющие каналы и ограниченную очередь снимков, sysinfo сверяет RAM и CPU с требованиями проекта.
 - `rve-build` использует `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak`, `engine-files` и `engine-script`: проверяет включённые сцены и ресурсы, собирает Rust-скрипты как `cdylib`, проверяет их ABI и имена, затем собирает готовый `rve-player` из checkout в `build/player`. Платформенный конвейер macOS дополнительно собирает Vulkan loader и MoltenVK в релиз; подробности — в [[Engine/RveBuild]].
@@ -72,9 +75,9 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - `engine-window` зависит от winit.
 - `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit и glam; naga — его build-зависимость.
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
-- `engine-core`, `engine-audio`, `engine-physics`, `engine-network`, `engine-neural` и `engine-editor` не имеют внешних зависимостей.
+- `engine-core`, `engine-audio`, `engine-physics`, `engine-network` и `engine-neural` не имеют внешних зависимостей.
 
-Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-project/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-script/Cargo.toml`, `engine/engine-script/src`, `engine/engine-script/src/library.rs`, `engine/rve-sdk/Cargo.toml`, `engine/engine-assets/Cargo.toml`, `engine/engine-runtime/Cargo.toml`, `engine/rve-player/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-network/Cargo.toml`, `engine/engine-neural/Cargo.toml`, `engine/engine-editor/Cargo.toml`, `engine/sandbox/Cargo.toml`.
+Источники: `Cargo.toml`, `engine/engine-core/Cargo.toml`, `engine/engine-project/Cargo.toml`, `engine/engine-window/Cargo.toml`, `engine/engine-platform/Cargo.toml`, `engine/engine-platform-windows/Cargo.toml`, `engine/engine-platform-macos/Cargo.toml`, `engine/engine-render/Cargo.toml`, `engine/engine-files/Cargo.toml`, `engine/engine-pak/Cargo.toml`, `engine/engine-resources/Cargo.toml`, `engine/engine-scene/Cargo.toml`, `engine/engine-script/Cargo.toml`, `engine/engine-script/src`, `engine/engine-script/src/library.rs`, `engine/rve-sdk/Cargo.toml`, `engine/engine-assets/Cargo.toml`, `engine/engine-runtime/Cargo.toml`, `engine/rve-player/Cargo.toml`, `engine/engine-physics/Cargo.toml`, `engine/engine-audio/Cargo.toml`, `engine/engine-network/Cargo.toml`, `engine/engine-neural/Cargo.toml`, `engine/sandbox/Cargo.toml`, `editor/Cargo.toml`.
 
 ## Файловые источники и RVEPAK
 
@@ -127,6 +130,10 @@ startup-потоке, внешние текстуры читаются чере�
 При инициализации sandbox/runtime загружает текстуры через `Renderer::create_texture_with_color_space` (staging-копия mip 0, линейная генерация полной mip-цепочки и ожидание fence), меши через `Renderer::create_mesh` и immutable materials через `Renderer::create_material`. Base color использует sRGB, normal и metallic-roughness maps — linear UNORM. Renderer сначала записывает depth-only shadow pass, затем mesh shader строит normal из derivative TBN и считает Cook-Torrance GGX direct light, Schlick Fresnel и ambient EnvBRDFApprox без IBL; direct light получает PCF shadow. Результат рисуется в существующем HDR offscreen-target без tonemapping. Позиция камеры передаётся через per-frame uniform для specular view vector. После scene pass изображение линейно blit-ится в swapchain; при непустом `Frame::overlay` renderer рисует оверлей в разрешении окна и вызывает present. Время shadow и scene pass измеряется timestamp queries и доступно через `Renderer::take_gpu_frame_time`; замер может немного занижать время, если начало shadow pass перекрывается с хвостом предыдущего кадра. При resize swapchain и per-frame targets пересоздаются; нулевой размер пропускает кадр. `render_scale` задаёт отдельное render resolution.
 
 Источники: `engine/engine-render/src/lib.rs`, `engine/engine-platform-windows/src/lib.rs`, `engine/engine-platform-macos/src/lib.rs`, `engine/sandbox/src/main.rs`.
+
+### Кадр редактора
+
+`rve-editor` рисует весь кадр через `Renderer::render_frame_with_ui`: shadow и scene pass идут в viewport target размером панели Scene, затем UI pass рисует примитивы egui прямо в swapchain image, а панель Scene показывает viewport как текстуру без копий на CPU. Подробности — в [[Engine/RveEditor]] и [[Engine/EngineRender]].
 
 ## Ограничения и инварианты
 

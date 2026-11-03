@@ -409,6 +409,7 @@ impl WindowHandler for Sandbox {
                 } else {
                     model
                 },
+                casts_shadow: true,
             })
             .collect::<Vec<_>>();
         let gpu_time = renderer.take_gpu_frame_time();

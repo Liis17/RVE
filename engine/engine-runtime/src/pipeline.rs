@@ -465,6 +465,7 @@ fn make_snapshot(scene: engine_scene::SceneFrame, gpu_scene: &GpuSceneTable) -> 
                 mesh: *mesh,
                 material: Some(*material),
                 model: instance.model.to_cols_array_2d(),
+                casts_shadow: true,
             }));
         }
     }
