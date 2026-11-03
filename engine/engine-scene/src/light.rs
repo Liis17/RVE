@@ -98,9 +98,9 @@ pub fn cascade_view_projections(
 
     let narrow_slope = (camera.fov_narrow * 0.5).tan();
     let (width_slope, height_slope) = if aspect >= 1.0 {
-        (narrow_slope, narrow_slope / aspect)
-    } else {
         (narrow_slope * aspect, narrow_slope)
+    } else {
+        (narrow_slope, narrow_slope / aspect)
     };
     if !width_slope.is_finite() || !height_slope.is_finite() {
         return Vec::new();
@@ -180,7 +180,15 @@ fn light_view_projection(
     };
     let light_right = direction.cross(reference_up).normalize();
     let light_up = light_right.cross(direction).normalize();
-    let texel_size = 2.0 * radius / resolution as f32;
+    // Snapping moves each coordinate by at most extent / resolution. Reserve
+    // that margin using the final texel size: extent >= radius + extent / resolution.
+    // A single texel cannot satisfy this bound, so leave its center unsnapped.
+    let extent = if resolution > 1 {
+        radius / (1.0 - 1.0 / resolution as f32)
+    } else {
+        radius
+    };
+    let texel_size = 2.0 * extent / resolution as f32;
     if !center.is_finite()
         || !light_right.is_finite()
         || !light_up.is_finite()
@@ -192,9 +200,13 @@ fn light_view_projection(
 
     let center_right = center.dot(light_right);
     let center_up = center.dot(light_up);
-    let snapped_center = center
-        + light_right * ((center_right / texel_size).round() * texel_size - center_right)
-        + light_up * ((center_up / texel_size).round() * texel_size - center_up);
+    let snapped_center = if resolution > 1 {
+        center
+            + light_right * ((center_right / texel_size).round() * texel_size - center_right)
+            + light_up * ((center_up / texel_size).round() * texel_size - center_up)
+    } else {
+        center
+    };
 
     // Keep the entire receiver sphere in depth and allow casters up to the effective
     // shadow distance toward the light, opposite the ray direction.
@@ -203,10 +215,10 @@ fn light_view_projection(
     let eye = snapped_center - direction * (depth_margin + near);
     let view = look_at_mat4(eye, snapped_center, reference_up);
     let projection = directx::orthographic(
-        -radius,
-        radius,
-        -radius,
-        radius,
+        -extent,
+        extent,
+        -extent,
+        extent,
         near,
         depth_margin + 2.0 * radius + near,
     );
@@ -242,28 +254,25 @@ mod tests {
         clip.truncate() / clip.w
     }
 
-    fn slice_corners(camera: Camera, aspect: f32, near: f32, far: f32) -> [Vec3; 8] {
-        let forward = (camera.target - camera.position).normalize();
-        let right = forward.cross(camera.up).normalize();
-        let up = right.cross(forward).normalize();
-        let narrow_slope = (camera.fov_narrow * 0.5).tan();
-        let (width_slope, height_slope) = if aspect >= 1.0 {
-            (narrow_slope, narrow_slope / aspect)
-        } else {
-            (narrow_slope * aspect, narrow_slope)
-        };
+    fn slice_corners(
+        mut camera: Camera,
+        width: u32,
+        height: u32,
+        near: f32,
+        far: f32,
+    ) -> [Vec3; 8] {
+        camera.near = near;
+        camera.far = far;
+        let inverse = camera.view_projection(width, height).inverse();
         let mut corners = [Vec3::ZERO; 8];
-        for (plane, distance) in [near, far].into_iter().enumerate() {
-            let center = camera.position + forward * distance;
-            let width = width_slope * distance;
-            let height = height_slope * distance;
-            let base = plane * 4;
-            corners[base..base + 4].copy_from_slice(&[
-                center - right * width - up * height,
-                center + right * width - up * height,
-                center - right * width + up * height,
-                center + right * width + up * height,
-            ]);
+        let mut index = 0;
+        for z in [0.0, 1.0] {
+            for y in [-1.0, 1.0] {
+                for x in [-1.0, 1.0] {
+                    corners[index] = inverse.project_point3(Vec3::new(x, y, z));
+                    index += 1;
+                }
+            }
         }
         corners
     }
@@ -322,11 +331,61 @@ mod tests {
         );
         assert_eq!(matrices.len(), 3);
         for (matrix, interval) in matrices.iter().zip(splits.windows(2)) {
-            for corner in slice_corners(camera, aspect, interval[0], interval[1]) {
+            for corner in slice_corners(camera, 1200, 900, interval[0], interval[1]) {
                 let projected = ndc(*matrix, corner);
                 assert!(projected.x.abs() <= 1.0 + 1e-5, "{projected:?}");
                 assert!(projected.y.abs() <= 1.0 + 1e-5, "{projected:?}");
                 assert!((0.0..=1.0).contains(&projected.z), "{projected:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cascades_cover_actual_landscape_and_portrait_projection_corners() {
+        let camera = Camera {
+            position: Vec3::ZERO,
+            target: Vec3::NEG_Z,
+            ..camera()
+        };
+        for (width, height) in [(1600, 900), (900, 1600)] {
+            let matrices = cascade_view_projections(
+                camera,
+                width as f32 / height as f32,
+                Vec3::NEG_Z,
+                settings(1, 100.0),
+                2048,
+            );
+            for corner in slice_corners(camera, width, height, camera.near, camera.far) {
+                let projected = ndc(matrices[0], corner);
+                assert!(projected.x.abs() <= 1.0 + 1e-5, "{projected:?}");
+                assert!(projected.y.abs() <= 1.0 + 1e-5, "{projected:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn snapped_cascades_keep_boundary_corners_inside_at_all_resolutions() {
+        let position = Vec3::new(-0.0304498, -0.0304498, 0.0152097);
+        let camera = Camera {
+            position,
+            target: position - Vec3::Z,
+            fov_narrow: std::f32::consts::FRAC_PI_2,
+            ..camera()
+        };
+        let direction = Vec3::new(-0.5964703, 0.7452898, 0.2979369);
+        for resolution in [2048, 16, 2, 1] {
+            let matrices =
+                cascade_view_projections(camera, 1.0, direction, settings(1, 100.0), resolution);
+            for corner in slice_corners(camera, 1000, 1000, camera.near, camera.far) {
+                let projected = ndc(matrices[0], corner);
+                assert!(
+                    projected.x.abs() <= 1.0 + 1e-5,
+                    "{resolution}: {projected:?}"
+                );
+                assert!(
+                    projected.y.abs() <= 1.0 + 1e-5,
+                    "{resolution}: {projected:?}"
+                );
             }
         }
     }
@@ -361,13 +420,7 @@ mod tests {
         };
         let settings = settings(4, 80.0);
         let base = cascade_view_projections(camera, 16.0 / 9.0, direction, settings, 2048);
-        let splits = practical_splits(camera.near, settings.distance, settings.cascades);
-        let narrow_slope = (camera.fov_narrow * 0.5).tan();
-        let radius = ((splits[1] * narrow_slope).powi(2)
-            + (splits[1] * narrow_slope / (16.0 / 9.0)).powi(2)
-            + ((splits[1] - splits[0]) * 0.5).powi(2))
-        .sqrt();
-        let texel_size = 2.0 * radius / 2048.0;
+        let texel_size = 2.0 / (base[0].x_axis.x.abs() * 2048.0);
         camera.position += Vec3::X * (0.2 * texel_size);
         camera.target += Vec3::X * (0.2 * texel_size);
         let moved = cascade_view_projections(camera, 16.0 / 9.0, direction, settings, 2048);
