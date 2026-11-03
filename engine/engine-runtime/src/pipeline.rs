@@ -31,7 +31,7 @@ pub(crate) struct FrameSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
-    pub by_object: HashMap<ObjectHandle, Vec<(MeshId, MaterialId)>>,
+    pub by_object: HashMap<ObjectHandle, Vec<Vec<(MeshId, MaterialId)>>>,
 }
 
 #[derive(Debug)]
@@ -404,7 +404,7 @@ fn scripts_thread(
                 warning.source, warning.object_id, warning.message
             );
         }
-        let snapshot = Arc::new(make_snapshot(scene_frame, &gpu_scene));
+        let snapshot = Arc::new(make_snapshot(scene_frame, &world, &gpu_scene));
         match send_snapshot(&frame_tx, &control_rx, snapshot, &mut background) {
             SendOutcome::Sent => {}
             SendOutcome::Background => {
@@ -457,23 +457,41 @@ fn load_script_library(
         .map_err(|error| error.to_string())
 }
 
-fn make_snapshot(scene: engine_scene::SceneFrame, gpu_scene: &GpuSceneTable) -> FrameSnapshot {
+fn make_snapshot(
+    scene: engine_scene::SceneFrame,
+    world: &World,
+    gpu_scene: &GpuSceneTable,
+) -> FrameSnapshot {
     let mut draws = Vec::new();
+    let camera_position = scene.camera.position;
     for instance in scene.meshes {
-        if let Some(meshes) = gpu_scene.by_object.get(&instance.object) {
-            draws.extend(meshes.iter().map(|(mesh, material)| DrawCommand {
-                mesh: *mesh,
-                material: Some(*material),
-                model: instance.model.to_cols_array_2d(),
-                casts_shadow: true,
-            }));
-        }
+        let Some(levels) = gpu_scene.by_object.get(&instance.object) else {
+            continue;
+        };
+        let Some(meshes) = selected_level(world, instance.object, camera_position, levels) else {
+            continue;
+        };
+        draws.extend(meshes.iter().map(|(mesh, material)| DrawCommand {
+            mesh: *mesh,
+            material: Some(*material),
+            model: instance.model.to_cols_array_2d(),
+            casts_shadow: true,
+        }));
     }
     FrameSnapshot {
         camera: scene.camera,
         light: scene.light,
         draws,
     }
+}
+
+fn selected_level<'a, T>(
+    world: &World,
+    object: ObjectHandle,
+    eye: Vec3,
+    levels: &'a [T],
+) -> Option<&'a T> {
+    levels.get(world.lod_level(object, eye)?)
 }
 
 fn print_script_events(events: Vec<ScriptEvent>) {
@@ -725,8 +743,8 @@ mod tests {
     use super::{
         Clock, ExitRequester, FrameSnapshot, GpuSceneTable, RenderBackend, RenderControl,
         RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
-        ScriptThreadConfig, render_loop, render_snapshot, render_thread, send_snapshot,
-        sync_input_background, wait_background_tick,
+        ScriptThreadConfig, render_loop, render_snapshot, render_thread, selected_level,
+        send_snapshot, sync_input_background, wait_background_tick,
     };
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
@@ -745,6 +763,53 @@ mod tests {
 
     fn test_input() -> Arc<Mutex<InputAccumulator>> {
         Arc::new(Mutex::new(InputAccumulator::default()))
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FakeMeshId(usize);
+
+    #[test]
+    fn snapshot_level_selection_uses_distance_and_skips_culled_objects() {
+        let input = r#"
+[[assets]]
+path="/models/base.fbx"
+[[assets]]
+path="/models/lod.fbx"
+[[objects]]
+id="camera"
+[objects.camera]
+fov_deg=60.0
+near=0.1
+far=100.0
+[[objects]]
+id="mesh"
+[objects.transform]
+position=[0.0,0.0,-5.0]
+[objects.mesh_renderer]
+model="/models/base.fbx"
+[objects.lod_group]
+cull_distance=8.0
+[[objects.lod_group.levels]]
+model="/models/lod.fbx"
+distance=2.0
+"#;
+        let document = SceneDocument::parse("snapshot.rvescene", input).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let object = world.handle("mesh").unwrap();
+        let level_meshes = [vec![FakeMeshId(1)], vec![FakeMeshId(2)]];
+
+        assert_eq!(
+            selected_level(&world, object, Vec3::ZERO, &level_meshes),
+            Some(&level_meshes[1])
+        );
+        assert_eq!(
+            selected_level(&world, object, Vec3::new(0.0, 0.0, -4.5), &level_meshes),
+            Some(&level_meshes[0])
+        );
+        assert_eq!(
+            selected_level(&world, object, Vec3::new(0.0, 0.0, 3.0), &level_meshes),
+            None
+        );
     }
 
     #[derive(Default)]
