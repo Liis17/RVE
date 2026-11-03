@@ -31,7 +31,7 @@ pub struct SceneRenderer {
     pub game_viewport: ViewportId,
     models: HashMap<String, Option<GpuModel>>,
     textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
-    object_materials: HashMap<(ObjectHandle, String, usize), (Material, MaterialId)>,
+    object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     grid: Option<MeshId>,
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
@@ -298,8 +298,18 @@ fn lod_texture_path<'a>(
 struct DrawResources<'a> {
     models: &'a HashMap<String, Option<GpuModel>>,
     textures: &'a HashMap<(String, TextureColorSpace), Option<TextureId>>,
-    object_materials: &'a mut HashMap<(ObjectHandle, String, usize), (Material, MaterialId)>,
-    used_object_materials: HashSet<(ObjectHandle, String, usize)>,
+    object_materials: &'a mut HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
+    used_object_materials: HashSet<(ObjectHandle, String, usize, usize)>,
+}
+
+// Both viewports can reference the same model with different LOD textures in one frame.
+fn object_material_key(
+    object: ObjectHandle,
+    model_path: &str,
+    level: usize,
+    mesh_index: usize,
+) -> (ObjectHandle, String, usize, usize) {
+    (object, model_path.to_owned(), level, mesh_index)
 }
 
 fn append_world_draws(
@@ -366,7 +376,7 @@ fn append_world_draws(
             let material_id = if resolved == *base_material {
                 *base_material_id
             } else {
-                let key = (instance.object, model_path.to_owned(), mesh_index);
+                let key = object_material_key(instance.object, model_path, level, mesh_index);
                 resources.used_object_materials.insert(key.clone());
                 match resources.object_materials.get(&key) {
                     Some((cached, id)) if *cached == resolved => *id,
@@ -600,6 +610,32 @@ mod tests {
     use super::*;
     use engine_files::VirtualPath;
     use engine_scene::LodLevel;
+
+    #[test]
+    fn lod_materials_for_two_viewports_do_not_replace_each_other() {
+        let document = engine_scene::SceneDocument::parse(
+            "test",
+            r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+fov_deg = 60.0
+near = 0.1
+far = 100.0
+"#,
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let object = world.handle("camera").unwrap();
+        let scene_key = object_material_key(object, "shared.fbx", 1, 0);
+        let game_key = object_material_key(object, "shared.fbx", 2, 0);
+        let mut cache = HashMap::new();
+        cache.insert(scene_key.clone(), "scene texture material");
+        cache.insert(game_key.clone(), "game texture material");
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache[&scene_key], "scene texture material");
+        assert_eq!(cache[&game_key], "game texture material");
+    }
 
     #[test]
     fn grid_is_flat_indexed_quads_with_two_lines_per_row() {
