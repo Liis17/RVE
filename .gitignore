@@ -28,3 +28,4 @@ rustc-ice-*.txt
 
 # LLVM coverage profile data written by instrumented binaries
 default.profraw
+/release/
