@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials|clustered] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -135,11 +135,12 @@ where
                     return Err("флаг --scene указан повторно".to_owned());
                 }
                 let value = args.next().ok_or_else(|| {
-                    "после --scene требуется triangle, cube, shadows или materials".to_owned()
+                    "после --scene требуется triangle, cube, shadows, materials или clustered"
+                        .to_owned()
                 })?;
                 scene = Some(Scene::parse(&value).ok_or_else(|| {
                     format!(
-                        "неизвестная сцена: {value}; доступны triangle, cube, shadows и materials"
+                        "неизвестная сцена: {value}; доступны triangle, cube, shadows, materials и clustered"
                     )
                 })?);
             }
@@ -1018,9 +1019,9 @@ mod tests {
         let options = parse_args(["--model", "/model/cube.fbx"]).unwrap();
         assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
         assert_eq!(options.texture, None);
-        for scene in ["shadows", "cube", "materials"] {
+        for scene in ["shadows", "cube", "materials", "clustered"] {
             let options = parse_args(["--scene", scene, "--model", "/model/cube.fbx"])
-                .expect("cube, shadow and material scenes may load a model");
+                .expect("non-triangle scenes may load a model");
             assert_eq!(options.scene, Scene::parse(scene).unwrap());
             assert_eq!(options.model.as_deref(), Some("/model/cube.fbx"));
         }

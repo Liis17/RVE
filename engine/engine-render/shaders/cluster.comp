@@ -1,0 +1,102 @@
+#version 450
+
+layout(local_size_x = CLUSTER_COMPUTE_LOCAL_SIZE) in;
+
+layout(set = 0, binding = 0) uniform FrameUniforms {
+    mat4 view_projection;
+    mat4 inverse_view_projection;
+    mat4 shadow_view_projections[4];
+    vec4 light_direction;
+    vec4 light_color;
+    vec4 ambient_color;
+    vec4 shadow_params;
+    vec4 camera_position;
+    mat4 environment_rotation;
+    vec4 environment_params;
+    vec4 local_light_params;
+    mat4 view;
+    vec4 cluster_params;
+} frame;
+
+struct LocalLightData {
+    vec4 position_range;
+    vec4 direction_type;
+    vec4 color_intensity;
+    vec4 cone_params;
+    vec4 view_position_range;
+    vec4 view_direction;
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer LocalLightBuffer {
+    LocalLightData lights[];
+} local_light_buffer;
+
+struct ClusterBounds {
+    vec4 minimum;
+    vec4 maximum;
+};
+
+struct ClusterRecord {
+    uint count;
+    uint indices[MAX_CLUSTER_LIGHTS];
+};
+
+layout(set = 0, binding = 4, std430) buffer ClusterBuffer {
+    ClusterRecord clusters[];
+} cluster_buffer;
+
+layout(set = 0, binding = 5, std430) readonly buffer ClusterBoundsBuffer {
+    ClusterBounds bounds[];
+} cluster_bounds_buffer;
+
+bool intersects_sphere_aabb(vec3 center, float radius, vec3 minimum, vec3 maximum) {
+    vec3 closest = clamp(center, minimum, maximum);
+    vec3 delta = center - closest;
+    return dot(delta, delta) <= radius * radius;
+}
+
+bool intersects_light(LocalLightData light, ClusterBounds bounds) {
+    vec3 minimum = bounds.minimum.xyz;
+    vec3 maximum = bounds.maximum.xyz;
+    if (light.direction_type.w < 0.5) {
+        return intersects_sphere_aabb(
+            light.view_position_range.xyz,
+            light.view_position_range.w,
+            minimum,
+            maximum
+        );
+    }
+
+    vec3 direction = normalize(light.view_direction.xyz);
+    float range = light.view_position_range.w;
+    float outer_cosine = clamp(light.cone_params.y, 0.0, 1.0);
+    // This sphere encloses the full finite spherical sector, including a 90-degree hemisphere.
+    vec3 center = light.view_position_range.xyz + direction * (range * 0.5);
+    float radius = range * sqrt(max(1.25 - outer_cosine, 0.0));
+    return intersects_sphere_aabb(center, radius, minimum, maximum);
+}
+
+void main() {
+    uint cluster_index = gl_GlobalInvocationID.x;
+    const uint cluster_count = CLUSTER_GRID_X * CLUSTER_GRID_Y * CLUSTER_GRID_Z;
+    if (cluster_index >= cluster_count) {
+        return;
+    }
+
+    ClusterBounds bounds = cluster_bounds_buffer.bounds[cluster_index];
+    uint light_count = min(
+        uint(frame.local_light_params.x + 0.5),
+        uint(MAX_RENDERED_LIGHTS)
+    );
+    uint selected_count = 0;
+    for (uint light_index = 0; light_index < light_count; ++light_index) {
+        if (!intersects_light(local_light_buffer.lights[light_index], bounds)) {
+            continue;
+        }
+        if (selected_count < MAX_CLUSTER_LIGHTS) {
+            cluster_buffer.clusters[cluster_index].indices[selected_count] = light_index;
+            ++selected_count;
+        }
+    }
+    cluster_buffer.clusters[cluster_index].count = selected_count;
+}

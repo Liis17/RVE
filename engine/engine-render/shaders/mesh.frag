@@ -20,6 +20,8 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 environment_rotation;
     vec4 environment_params;
     vec4 local_light_params;
+    mat4 view;
+    vec4 cluster_params;
 } frame;
 
 layout(set = 0, binding = 1) uniform texture2DArray shadow_map;
@@ -30,11 +32,22 @@ struct LocalLightData {
     vec4 direction_type;
     vec4 color_intensity;
     vec4 cone_params;
+    vec4 view_position_range;
+    vec4 view_direction;
 };
 
 layout(set = 0, binding = 3, std430) readonly buffer LocalLightBuffer {
     LocalLightData lights[];
 } local_light_buffer;
+
+struct ClusterRecord {
+    uint count;
+    uint indices[MAX_CLUSTER_LIGHTS];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer ClusterBuffer {
+    ClusterRecord clusters[];
+} cluster_buffer;
 
 layout(set = 1, binding = 0) uniform MaterialUniforms {
     vec4 base_color;
@@ -251,12 +264,46 @@ void main() {
         alpha,
         normal_dot_view
     ) * frame.light_color.rgb * shadow;
-    int local_light_count = clamp(
-        int(frame.local_light_params.x + 0.5),
-        0,
-        MAX_FORWARD_LIGHTS
+    float view_depth = -(frame.view * vec4(in_world_position, 1.0)).z;
+    float near_depth = frame.cluster_params.x;
+    float far_depth = frame.cluster_params.y;
+    int slice_z;
+    if (view_depth <= near_depth) {
+        slice_z = 0;
+    } else if (view_depth >= far_depth) {
+        slice_z = CLUSTER_GRID_Z - 1;
+    } else {
+        float normalized_depth = log(view_depth / near_depth) / log(far_depth / near_depth);
+        slice_z = clamp(int(floor(normalized_depth * float(CLUSTER_GRID_Z))), 0, CLUSTER_GRID_Z - 1);
+        float slice_start = near_depth
+            * pow(far_depth / near_depth, float(slice_z) / float(CLUSTER_GRID_Z));
+        if (slice_z > 0 && view_depth < slice_start) {
+            --slice_z;
+        }
+        if (slice_z + 1 < CLUSTER_GRID_Z) {
+            float slice_end = near_depth
+                * pow(far_depth / near_depth, float(slice_z + 1) / float(CLUSTER_GRID_Z));
+            if (view_depth >= slice_end) {
+                ++slice_z;
+            }
+        }
+    }
+    ivec2 tile = ivec2(floor(
+        gl_FragCoord.xy / frame.cluster_params.zw * vec2(CLUSTER_GRID_X, CLUSTER_GRID_Y)
+    ));
+    tile = clamp(tile, ivec2(0), ivec2(CLUSTER_GRID_X - 1, CLUSTER_GRID_Y - 1));
+    uint cluster_index = uint(
+        (slice_z * CLUSTER_GRID_Y + tile.y) * CLUSTER_GRID_X + tile.x
     );
-    for (int light_index = 0; light_index < local_light_count; ++light_index) {
+    uint local_light_count = min(
+        cluster_buffer.clusters[cluster_index].count,
+        uint(MAX_CLUSTER_LIGHTS)
+    );
+    for (uint light_offset = 0; light_offset < local_light_count; ++light_offset) {
+        uint light_index = cluster_buffer.clusters[cluster_index].indices[light_offset];
+        if (light_index >= uint(frame.local_light_params.x + 0.5)) {
+            continue;
+        }
         LocalLightData local_light = local_light_buffer.lights[light_index];
         vec3 light_delta = local_light.position_range.xyz - in_world_position;
         float distance_squared = dot(light_delta, light_delta);

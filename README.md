@@ -45,6 +45,7 @@ Sandbox показывает вращающийся куб над плоскос
 ```sh
 cargo run -p sandbox -- --scene triangle
 cargo run -p sandbox -- --scene materials --frames 300
+cargo run -p sandbox -- --scene clustered --frames 300 --resize-test --debug-overlay
 cargo run -p sandbox -- --model /models/cube.fbx --texture /textures/cube.png
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
 cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
@@ -52,7 +53,7 @@ cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
 
 Ресурсы sandbox размещаются в `build/assets`. Например, путь
 `/models/cube.fbx` указывает на `build/assets/models/cube.fbx`. Поддерживаются
-сцены `triangle`, `cube`, `shadows` и `materials`, модели FBX, текстуры PNG, ограничение
+сцены `triangle`, `cube`, `shadows`, `materials` и `clustered`, модели FBX, текстуры PNG, ограничение
 числа кадров, изменение размера окна и отладочный оверлей. Настройки проекции,
 exposure, tonemapping, anti-aliasing и render scale задаются файлом
 `.camerasettings`; явный `--render-scale` перекрывает масштаб из него. Сцены
@@ -167,7 +168,7 @@ tonemapper = "aces"
 
 В `DrawCommand` поле `texture` заменено на `material: Option<MaterialId>`. Создавай `Material` через `Renderer::create_material`; карты base color, metallic-roughness и normal можно загружать с нужным пространством цвета через `Renderer::create_texture_with_color_space`. Полный текущий контракт описан в [заметке renderer](Obsidian/RVEVault/Engine/EngineRender.md).
 
-`Frame` дополнен `lights: &[LocalLight]`; для кадров без локальных источников передавай `&[]`. Renderer выбирает из них до 32 видимых point/spot lights. Поле `shadows` компонентов сцены пока сохраняется для совместимости с будущей реализацией локальных теней.
+`Frame` дополнен `lights: &[LocalLight]`; для кадров без локальных источников передавай `&[]`. Renderer отбирает до 1024 видимых point/spot lights и строит сетку 16×9×24 кластеров; каждый кластер хранит до 128 индексов, лишние источники в нём детерминированно отбрасываются. Сцена `clustered` показывает стресс-набор из 160 локальных источников. Поле `shadows` компонентов сцены пока сохраняется для будущей реализации локальных теней.
 
 ## Архивы ресурсов
 

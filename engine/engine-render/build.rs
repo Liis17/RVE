@@ -7,7 +7,12 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-const MAX_FORWARD_LIGHTS: usize = 32;
+const CLUSTER_GRID_X: u32 = 16;
+const CLUSTER_GRID_Y: u32 = 9;
+const CLUSTER_GRID_Z: u32 = 24;
+const MAX_CLUSTER_LIGHTS: usize = 128;
+const MAX_RENDERED_LIGHTS: usize = 1024;
+const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = 64;
 
 type ShaderBuild = (
     &'static str,
@@ -35,6 +40,12 @@ const SHADERS: &[ShaderBuild] = &[
         naga::ShaderStage::Compute,
         &[],
         "prefilter.comp.spv",
+    ),
+    (
+        "cluster.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "cluster.comp.spv",
     ),
     ("mesh.vert", naga::ShaderStage::Vertex, &[], "mesh.vert.spv"),
     (
@@ -115,9 +126,18 @@ const SHADERS: &[ShaderBuild] = &[
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo задаёт OUT_DIR"));
+    let cluster_count = CLUSTER_GRID_X * CLUSTER_GRID_Y * CLUSTER_GRID_Z;
     fs::write(
         out_dir.join("render_constants.rs"),
-        format!("pub const MAX_FORWARD_LIGHTS: usize = {MAX_FORWARD_LIGHTS};\n"),
+        format!(
+            "pub const CLUSTER_GRID_X: usize = {CLUSTER_GRID_X};\n\
+             pub const CLUSTER_GRID_Y: usize = {CLUSTER_GRID_Y};\n\
+             pub const CLUSTER_GRID_Z: usize = {CLUSTER_GRID_Z};\n\
+             pub const MAX_CLUSTER_LIGHTS: usize = {MAX_CLUSTER_LIGHTS};\n\
+             pub const MAX_RENDERED_LIGHTS: usize = {MAX_RENDERED_LIGHTS};\n\
+             pub const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = {CLUSTER_COMPUTE_LOCAL_SIZE};\n\
+             pub const CLUSTER_COUNT: usize = {cluster_count};\n"
+        ),
     )
     .expect("не удалось записать constants renderer");
     let mut frontend = glsl::Frontend::default();
@@ -132,10 +152,25 @@ fn main() {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
         );
-        if name == "mesh.frag" {
+        if name == "mesh.frag" || name == "cluster.comp" {
+            shader_options.defines.extend([
+                ("CLUSTER_GRID_X".to_owned(), CLUSTER_GRID_X.to_string()),
+                ("CLUSTER_GRID_Y".to_owned(), CLUSTER_GRID_Y.to_string()),
+                ("CLUSTER_GRID_Z".to_owned(), CLUSTER_GRID_Z.to_string()),
+                (
+                    "MAX_CLUSTER_LIGHTS".to_owned(),
+                    MAX_CLUSTER_LIGHTS.to_string(),
+                ),
+            ]);
+        }
+        if name == "cluster.comp" {
             shader_options.defines.insert(
-                "MAX_FORWARD_LIGHTS".to_owned(),
-                MAX_FORWARD_LIGHTS.to_string(),
+                "MAX_RENDERED_LIGHTS".to_owned(),
+                MAX_RENDERED_LIGHTS.to_string(),
+            );
+            shader_options.defines.insert(
+                "CLUSTER_COMPUTE_LOCAL_SIZE".to_owned(),
+                CLUSTER_COMPUTE_LOCAL_SIZE.to_string(),
             );
         }
         let module = frontend

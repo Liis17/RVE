@@ -16,6 +16,7 @@ pub enum Scene {
     #[default]
     Shadows,
     Materials,
+    Clustered,
 }
 
 const SHADOWS_CAMERA: OrbitCamera = OrbitCamera {
@@ -54,6 +55,7 @@ impl Scene {
             "cube" => Some(Self::Cube),
             "shadows" => Some(Self::Shadows),
             "materials" => Some(Self::Materials),
+            "clustered" => Some(Self::Clustered),
             _ => None,
         }
     }
@@ -61,7 +63,7 @@ impl Scene {
     pub fn mesh(self) -> (Vec<Vertex>, Vec<u32>) {
         match self {
             Self::Triangle => (TRIANGLE_VERTICES.to_vec(), TRIANGLE_INDICES.to_vec()),
-            Self::Cube | Self::Shadows => cube_mesh(),
+            Self::Cube | Self::Shadows | Self::Clustered => cube_mesh(),
             Self::Materials => uv_sphere_mesh(Vec3::ZERO, 1.0),
         }
     }
@@ -70,7 +72,7 @@ impl Scene {
     pub fn texture(self) -> Option<TextureData> {
         match self {
             Self::Triangle => None,
-            Self::Cube | Self::Shadows => Some(checker_texture()),
+            Self::Cube | Self::Shadows | Self::Clustered => Some(checker_texture()),
             Self::Materials => None,
         }
     }
@@ -85,7 +87,7 @@ impl Scene {
         match self {
             Self::Triangle => triangle_view_projection(width, height),
             Self::Cube => cube_view_projection(width, height),
-            Self::Shadows | Self::Materials => self
+            Self::Shadows | Self::Materials | Self::Clustered => self
                 .camera_at(elapsed, settings)
                 .expect("lit sandbox scenes have a camera")
                 .view_projection(width, height),
@@ -104,7 +106,7 @@ impl Scene {
                 }
                 .camera_at(elapsed),
             ),
-            Self::Materials => Some(MATERIALS_CAMERA.camera_at(elapsed)),
+            Self::Materials | Self::Clustered => Some(MATERIALS_CAMERA.camera_at(elapsed)),
         }
     }
 
@@ -117,7 +119,7 @@ impl Scene {
         match self {
             Self::Triangle => Mat4::from_rotation_z(elapsed),
             Self::Cube => cube_model(elapsed),
-            Self::Shadows => Mat4::from_rotation_z(elapsed),
+            Self::Shadows | Self::Clustered => Mat4::from_rotation_z(elapsed),
             Self::Materials => Mat4::IDENTITY,
         }
     }
@@ -445,16 +447,19 @@ mod tests {
         assert_eq!(Scene::parse("cube"), Some(Scene::Cube));
         assert_eq!(Scene::parse("shadows"), Some(Scene::Shadows));
         assert_eq!(Scene::parse("materials"), Some(Scene::Materials));
+        assert_eq!(Scene::parse("clustered"), Some(Scene::Clustered));
         assert_eq!(Scene::parse("Cube"), None);
         assert_eq!(Scene::parse(""), None);
         assert_eq!(Scene::default(), Scene::Shadows);
         assert_eq!(Scene::Triangle.mesh().0, TRIANGLE_VERTICES);
         assert_eq!(Scene::Cube.mesh(), cube_mesh());
         assert_eq!(Scene::Shadows.mesh(), cube_mesh());
+        assert_eq!(Scene::Clustered.mesh(), cube_mesh());
         assert!(Scene::Triangle.texture().is_none());
         assert!(Scene::Cube.texture().is_some());
         assert!(Scene::Shadows.texture().is_some());
         assert!(Scene::Materials.texture().is_none());
+        assert!(Scene::Clustered.texture().is_some());
     }
 
     #[test]

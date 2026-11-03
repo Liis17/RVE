@@ -202,6 +202,28 @@ impl Content {
     }
 
     pub fn local_lights(&self) -> Vec<LocalLight> {
+        if self.motion == Scene::Clustered {
+            let mut lights = (0..144)
+                .map(|index| LocalLight::Point {
+                    position: [0.0; 3],
+                    color_intensity: [
+                        1.8 + (index % 3) as f32 * 0.2,
+                        1.2 + (index % 5) as f32 * 0.1,
+                        0.8 + (index % 7) as f32 * 0.08,
+                    ],
+                    range: 8.0,
+                })
+                .collect::<Vec<_>>();
+            lights.extend((0..16).map(|_| LocalLight::Spot {
+                position: [0.0; 3],
+                direction: [0.0, -1.0, 0.0],
+                color_intensity: [0.5, 0.8, 1.2],
+                range: 8.0,
+                cos_inner_angle: 30.0_f32.to_radians().cos(),
+                cos_outer_angle: 0.0,
+            }));
+            return lights;
+        }
         if !matches!(self.motion, Scene::Shadows | Scene::Materials) {
             return Vec::new();
         }
@@ -266,6 +288,7 @@ mod tests {
     use engine_assets::{
         Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex, TextureData,
     };
+    use engine_render::LocalLight;
     use glam::Vec3;
 
     fn texture(value: u8) -> TextureData {
@@ -449,6 +472,32 @@ mod tests {
             Content::from_scene(Scene::Triangle)
                 .shadow_cascades(0.0, 1280, 720, CameraSettings::default())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn clustered_scene_provides_same_cluster_overflow_and_mixed_light_stress() {
+        let content = Content::from_scene(Scene::Clustered);
+        let lights = content.local_lights();
+        assert_eq!(lights.len(), 160);
+        assert_eq!(
+            lights
+                .iter()
+                .filter(|light| matches!(light, LocalLight::Point { .. }))
+                .count(),
+            144
+        );
+        assert_eq!(
+            lights
+                .iter()
+                .filter(|light| matches!(light, LocalLight::Spot { .. }))
+                .count(),
+            16
+        );
+        assert!(
+            content
+                .view_projection(0.0, 1280, 720, CameraSettings::default())
+                .is_finite()
         );
     }
 

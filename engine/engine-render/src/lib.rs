@@ -4,6 +4,7 @@ use ash::{Entry, vk};
 
 pub mod environment;
 
+use clusters::{ClusterBounds, DepthRange, GpuLocalLight, camera_cluster_bounds};
 use culling::{Frustum, LocalBounds, back_to_front_order};
 pub use environment::{EnvironmentId, EnvironmentSource, ProceduralSky};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
@@ -18,6 +19,7 @@ use ui::{
     validate_viewport_size,
 };
 
+mod clusters;
 mod culling;
 mod ui;
 
@@ -44,6 +46,7 @@ const NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON: &str =
     "нет graphics queue family с поддержкой compute";
 const NO_GRAPHICS_PRESENT_QUEUE_FAMILY_REASON: &str = "нет общей graphics + present queue family";
 const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
+const CLUSTER_COMPUTE_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cluster.comp.spv"));
 const MESH_OPAQUE_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.opaque.spv"));
 const MESH_MASK_FRAGMENT_SHADER: &[u8] =
@@ -74,7 +77,7 @@ const SKYBOX_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
-/// Два timestamp на слот кадра: перед shadow pass и после scene pass.
+/// Два timestamp на слот кадра: перед cluster compute и после tonemap pass.
 const TIMESTAMP_QUERY_COUNT: u32 = 2;
 const WHITE_SRGB_TEXTURE: usize = 0;
 const WHITE_LINEAR_TEXTURE: usize = 1;
@@ -82,9 +85,13 @@ const FLAT_NORMAL_TEXTURE: usize = 2;
 const DEFAULT_MATERIAL: usize = 0;
 const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
 const FRAME_UNIFORMS_SIZE: usize =
-    (3 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 7 * size_of::<[f32; 4]>();
+    (4 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 8 * size_of::<[f32; 4]>();
 const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
-const LOCAL_LIGHT_GPU_SIZE: usize = 4 * size_of::<[f32; 4]>();
+const LOCAL_LIGHT_GPU_SIZE: usize = 6 * size_of::<[f32; 4]>();
+const CLUSTER_BOUNDS_GPU_SIZE: usize = 2 * size_of::<[f32; 4]>();
+const CLUSTER_RECORD_GPU_SIZE: usize = size_of::<u32>() * (1 + MAX_CLUSTER_LIGHTS);
+const CLUSTER_BUFFER_SIZE: usize = CLUSTER_COUNT * CLUSTER_RECORD_GPU_SIZE;
+const CLUSTER_BOUNDS_BUFFER_SIZE: usize = CLUSTER_COUNT * CLUSTER_BOUNDS_GPU_SIZE;
 const IDENTITY_MATRIX: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -548,6 +555,8 @@ pub struct Renderer {
     blend_pipeline: Option<vk::Pipeline>,
     skybox_pipeline: Option<vk::Pipeline>,
     shadow_pipeline: Option<vk::Pipeline>,
+    cluster_pipeline: Option<vk::Pipeline>,
+    cluster_pipeline_layout: Option<vk::PipelineLayout>,
     post_pipeline_layout: Option<vk::PipelineLayout>,
     tonemap_pipeline: Option<vk::Pipeline>,
     output_pipeline: Option<vk::Pipeline>,
@@ -638,6 +647,8 @@ impl Renderer {
             blend_pipeline: None,
             skybox_pipeline: None,
             shadow_pipeline: None,
+            cluster_pipeline: None,
+            cluster_pipeline_layout: None,
             post_pipeline_layout: None,
             tonemap_pipeline: None,
             output_pipeline: None,
@@ -705,7 +716,7 @@ impl Renderer {
         &self.capabilities
     }
 
-    /// Забирает GPU-время shadow и scene pass последнего завершённого кадра.
+    /// Забирает GPU-время clustered compute, shadow, scene и tonemap последнего завершённого кадра.
     ///
     /// Каждое измерение возвращается один раз; `None` — нового измерения нет
     /// или очередь не поддерживает timestamp queries. Вывод в окно и оверлей
@@ -1031,7 +1042,12 @@ impl Renderer {
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         validate_overlay(frame.overlay)?;
-        let prepared = prepare_frame(frame)?;
+        let output_extent = self
+            .swapchain
+            .as_ref()
+            .map_or(self.output_extent, |swapchain| swapchain.extent);
+        let render_extent = scaled_extent(output_extent, frame.view.render_scale);
+        let prepared = prepare_frame(frame, render_extent)?;
         let (environment_set, skybox) = self.environment_set_for(frame.environment)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(FrameStatus::Skipped);
@@ -1079,13 +1095,12 @@ impl Renderer {
                 ))?;
         // Fence слота дождались, поэтому GPU больше не читает этот буфер.
         frame_uniforms.buffer.write(&prepared.uniforms)?;
-        let local_light_bytes = local_light_bytes(&prepared.lights);
         let replaced_light_buffer = frame_uniforms.local_lights.write_keep_old(
             &instance,
             &device,
             self.physical_device,
             vk::BufferUsageFlags::STORAGE_BUFFER,
-            &local_light_bytes,
+            &prepared.light_bytes,
         )?;
         if replaced_light_buffer.is_some() {
             let light_buffer = frame_uniforms
@@ -1101,8 +1116,10 @@ impl Renderer {
             );
         }
         drop(replaced_light_buffer);
+        frame_uniforms
+            .cluster_bounds
+            .write(cluster_bounds_bytes(&prepared.cluster_bounds))?;
         let frame_set = frame_uniforms.set;
-        let render_extent = scaled_extent(swapchain.extent, frame.view.render_scale);
         // Цели создаются при первом кадре: редактору они не нужны. Выделение идёт до acquire,
         // чтобы ошибка памяти не оставила захваченный image и сигнальный semaphore. При смене
         // масштаба заменяется только target текущего слота после ожидания его fence.
@@ -1171,6 +1188,12 @@ impl Renderer {
                 .pipeline_layout
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
             frame_set,
+            cluster_pipeline: self
+                .cluster_pipeline
+                .ok_or(RenderError::InvalidState("cluster pipeline отсутствует"))?,
+            cluster_pipeline_layout: self.cluster_pipeline_layout.ok_or(
+                RenderError::InvalidState("cluster pipeline layout отсутствует"),
+            )?,
             environment_set,
             skybox_pipeline: self
                 .skybox_pipeline
@@ -1261,7 +1284,14 @@ impl Renderer {
                 .get(viewport.0)
                 .and_then(Option::as_ref)
                 .ok_or_else(unknown_viewport)?;
-            prepared_scenes.push(prepare_frame(frame)?);
+            let extent = self.viewports[viewport.0]
+                .as_ref()
+                .ok_or_else(unknown_viewport)?
+                .extent;
+            prepared_scenes.push(prepare_frame(
+                frame,
+                scaled_extent(extent, frame.view.render_scale),
+            )?);
             scene_environment_sets.push(self.environment_set_for(frame.environment)?);
         }
         let packed = pack_ui(ui, self.output_extent)?;
@@ -1367,7 +1397,8 @@ impl Renderer {
                 &device,
                 physical_device,
                 &prepared.uniforms,
-                &prepared.lights,
+                &prepared.light_bytes,
+                &prepared.cluster_bounds,
             )?;
             rendered.push((
                 *viewport,
@@ -1432,6 +1463,14 @@ impl Renderer {
         let blend_pipeline = self
             .blend_pipeline
             .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?;
+        let cluster_pipeline = self
+            .cluster_pipeline
+            .ok_or(RenderError::InvalidState("cluster pipeline отсутствует"))?;
+        let cluster_pipeline_layout =
+            self.cluster_pipeline_layout
+                .ok_or(RenderError::InvalidState(
+                    "cluster pipeline layout отсутствует",
+                ))?;
         let slot_timestamps = self.frames[frame_slot].timestamps;
         let scene_passes = rendered
             .iter()
@@ -1465,6 +1504,8 @@ impl Renderer {
                             pipeline: scene_pipeline,
                             mask_pipeline,
                             blend_pipeline,
+                            cluster_pipeline,
+                            cluster_pipeline_layout,
                             skybox_pipeline: *skybox_pipeline,
                             pipeline_layout,
                             frame_set: *frame_set,
@@ -1860,6 +1901,7 @@ impl Renderer {
         self.create_frame_resources()?;
         self.create_shadow_resources()?;
         self.create_descriptor_resources()?;
+        self.create_cluster_pipeline()?;
         self.create_environment_resources()?;
         self.create_default_environment()?;
         self.create_mesh_pipeline()?;
@@ -1914,7 +1956,11 @@ impl Renderer {
                 .binding(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+                .stage_flags(
+                    vk::ShaderStageFlags::VERTEX
+                        | vk::ShaderStageFlags::FRAGMENT
+                        | vk::ShaderStageFlags::COMPUTE,
+                ),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
@@ -1929,7 +1975,17 @@ impl Renderer {
                 .binding(3)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let frame_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&frame_bindings);
@@ -2069,12 +2125,12 @@ impl Renderer {
                 .descriptor_count(self.frames.len() as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(self.frames.len() as u32),
+                .descriptor_count((self.frames.len() * 3) as u32),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(self.frames.len() as u32)
             .pool_sizes(&pool_sizes);
-        // SAFETY: the pool holds one frame uniform, two images, two samplers and a light SSBO per slot.
+        // SAFETY: each set uses one uniform, two images, two samplers and three storage buffers.
         let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
         self.frame_descriptor_pool = Some(pool);
         let layouts = vec![self.frame_set_layout()?; self.frames.len()];
@@ -2091,7 +2147,7 @@ impl Renderer {
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 &[0; FRAME_UNIFORMS_SIZE],
             )?;
-            let light_bytes = local_light_bytes(&[]);
+            let light_bytes = local_light_bytes(&[], IDENTITY_MATRIX)?;
             let light_buffer = HostBuffer::new(
                 self.instance()?,
                 &device,
@@ -2099,11 +2155,27 @@ impl Renderer {
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 &light_bytes,
             )?;
+            let cluster_buffer = HostBuffer::new(
+                self.instance()?,
+                &device,
+                self.physical_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                &vec![0; CLUSTER_BUFFER_SIZE],
+            )?;
+            let cluster_bounds = HostBuffer::new(
+                self.instance()?,
+                &device,
+                self.physical_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                &vec![0; CLUSTER_BOUNDS_BUFFER_SIZE],
+            )?;
             write_frame_set(
                 &device,
                 set,
                 &buffer,
                 &light_buffer,
+                &cluster_buffer,
+                &cluster_bounds,
                 shadow_view,
                 shadow_sampler,
             );
@@ -2114,6 +2186,8 @@ impl Renderer {
                     buffer: Some(light_buffer),
                     capacity: light_bytes.len(),
                 },
+                _cluster_buffer: cluster_buffer,
+                cluster_bounds,
             });
         }
 
@@ -2143,6 +2217,20 @@ impl Renderer {
             frame.tonemap_set = sets[0];
             frame.output_set = sets[1];
         }
+        Ok(())
+    }
+
+    fn create_cluster_pipeline(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let set_layouts = [self.frame_set_layout()?];
+        let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
+        self.cluster_pipeline_layout = Some(layout);
+        self.cluster_pipeline = Some(create_compute_pipeline(
+            &device,
+            layout,
+            CLUSTER_COMPUTE_SHADER,
+        )?);
         Ok(())
     }
 
@@ -3887,6 +3975,7 @@ impl Drop for Renderer {
                 self.procedural_sky_pipeline.take(),
                 self.irradiance_pipeline.take(),
                 self.prefilter_pipeline.take(),
+                self.cluster_pipeline.take(),
             ]
             .into_iter()
             .flatten()
@@ -3904,6 +3993,10 @@ impl Drop for Renderer {
             }
             if let Some(layout) = self.compute_pipeline_layout.take() {
                 // SAFETY: every compute pipeline using this layout was destroyed above.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+            if let Some(layout) = self.cluster_pipeline_layout.take() {
+                // SAFETY: the clustered compute pipeline was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
             if let Some(pipeline) = self.overlay_pipeline.take() {
@@ -4152,6 +4245,7 @@ fn inspect_device(
     }
     .optimal_tiling_features;
     let mut reasons = evaluation.reasons;
+    reasons.extend(cluster_device_limit_reasons(&properties.limits));
     reasons.extend(texture_format_reasons(srgb_features, linear_features));
     let report = DeviceReport {
         name,
@@ -4170,6 +4264,28 @@ fn inspect_device(
         queue_families,
         graphics_queue_family_indices: evaluation.graphics_queue_family_indices,
     })
+}
+
+fn cluster_device_limit_reasons(limits: &vk::PhysicalDeviceLimits) -> Vec<String> {
+    let workgroup_count = (CLUSTER_COUNT as u32).div_ceil(CLUSTER_COMPUTE_LOCAL_SIZE);
+    let mut reasons = Vec::new();
+    if limits.max_compute_work_group_invocations < CLUSTER_COMPUTE_LOCAL_SIZE
+        || limits.max_compute_work_group_size[0] < CLUSTER_COMPUTE_LOCAL_SIZE
+        || limits.max_compute_work_group_count[0] < workgroup_count
+    {
+        reasons.push("лимиты compute workgroup не поддерживают clustered lighting".to_owned());
+    }
+    if limits.max_storage_buffer_range < CLUSTER_BUFFER_SIZE as u32 {
+        reasons.push("maxStorageBufferRange меньше фиксированного cluster SSBO".to_owned());
+    }
+    if limits.max_per_stage_descriptor_storage_buffers < 3
+        || limits.max_descriptor_set_storage_buffers < 3
+    {
+        reasons.push(
+            "лимиты storage buffer descriptors не поддерживают clustered lighting".to_owned(),
+        );
+    }
+    reasons
 }
 
 fn best_device_index<T>(
@@ -4472,7 +4588,7 @@ struct FrameResources {
     overlay_buffer: GrowingBuffer,
     ui_vertices: GrowingBuffer,
     ui_indices: GrowingBuffer,
-    /// Пул из двух timestamp: перед shadow pass и после scene pass; `None`, если очередь их не поддерживает.
+    /// Timestamp до clustering и после tonemap; `None`, если очередь их не поддерживает.
     timestamps: Option<vk::QueryPool>,
     /// Timestamp записаны и отправлены, но ещё не прочитаны.
     timestamps_pending: bool,
@@ -4514,7 +4630,7 @@ impl FrameResources {
         Ok(frame)
     }
 
-    /// Читает GPU-время shadow и scene pass, записанное прошлой отправкой этого слота.
+    /// Читает clustered compute, shadow, scene и tonemap время прошлой отправки этого слота.
     ///
     /// Вызывается после ожидания fence слота.
     fn read_gpu_time(
@@ -4696,11 +4812,14 @@ impl FrameTarget {
 }
 
 /// Заполняет набор дескрипторов кадра: uniform, shadow map и локальные источники.
+#[allow(clippy::too_many_arguments)]
 fn write_frame_set(
     device: &ash::Device,
     set: vk::DescriptorSet,
     buffer: &HostBuffer,
     local_lights: &HostBuffer,
+    clusters: &HostBuffer,
+    cluster_bounds: &HostBuffer,
     shadow_view: vk::ImageView,
     shadow_sampler: vk::Sampler,
 ) {
@@ -4716,6 +4835,14 @@ fn write_frame_set(
         .buffer(local_lights.buffer)
         .offset(0)
         .range(LOCAL_LIGHT_GPU_SIZE as vk::DeviceSize)];
+    let cluster_info = [vk::DescriptorBufferInfo::default()
+        .buffer(clusters.buffer)
+        .offset(0)
+        .range(CLUSTER_BUFFER_SIZE as vk::DeviceSize)];
+    let cluster_bounds_info = [vk::DescriptorBufferInfo::default()
+        .buffer(cluster_bounds.buffer)
+        .offset(0)
+        .range(CLUSTER_BOUNDS_BUFFER_SIZE as vk::DeviceSize)];
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(set)
@@ -4737,6 +4864,16 @@ fn write_frame_set(
             .dst_binding(3)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&local_light_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&cluster_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(5)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&cluster_bounds_info),
     ];
     // SAFETY: all resources are alive and no command buffer uses the set yet.
     unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -4778,6 +4915,8 @@ struct ViewportFrameSet {
     set: vk::DescriptorSet,
     buffer: HostBuffer,
     local_lights: GrowingBuffer,
+    _cluster_buffer: HostBuffer,
+    cluster_bounds: HostBuffer,
 }
 
 impl ViewportFrameSet {
@@ -4794,13 +4933,27 @@ impl ViewportFrameSet {
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &[0; FRAME_UNIFORMS_SIZE],
         )?;
-        let light_bytes = local_light_bytes(&[]);
+        let light_bytes = local_light_bytes(&[], IDENTITY_MATRIX)?;
         let light_buffer = HostBuffer::new(
             instance,
             device,
             physical_device,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             &light_bytes,
+        )?;
+        let cluster_buffer = HostBuffer::new(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            &vec![0; CLUSTER_BUFFER_SIZE],
+        )?;
+        let cluster_bounds = HostBuffer::new(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            &vec![0; CLUSTER_BOUNDS_BUFFER_SIZE],
         )?;
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
@@ -4814,7 +4967,7 @@ impl ViewportFrameSet {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1),
+                .descriptor_count(3),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
@@ -4840,6 +4993,8 @@ impl ViewportFrameSet {
             set,
             &buffer,
             &light_buffer,
+            &cluster_buffer,
+            &cluster_bounds,
             resources.shadow_view,
             resources.shadow_sampler,
         );
@@ -4852,6 +5007,8 @@ impl ViewportFrameSet {
                 buffer: Some(light_buffer),
                 capacity: light_bytes.len(),
             },
+            _cluster_buffer: cluster_buffer,
+            cluster_bounds,
         })
     }
 
@@ -4862,16 +5019,16 @@ impl ViewportFrameSet {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         uniforms: &[u8],
-        lights: &[LocalLight],
+        light_bytes: &[u8],
+        cluster_bounds: &[ClusterBounds],
     ) -> Result<vk::DescriptorSet, RenderError> {
         self.buffer.write(uniforms)?;
-        let bytes = local_light_bytes(lights);
         let replaced = self.local_lights.write_keep_old(
             instance,
             device,
             physical_device,
             vk::BufferUsageFlags::STORAGE_BUFFER,
-            &bytes,
+            light_bytes,
         )?;
         if replaced.is_some() {
             let buffer = self
@@ -4884,6 +5041,8 @@ impl ViewportFrameSet {
             write_local_light_descriptor(device, self.set, buffer, self.local_lights.capacity);
         }
         drop(replaced);
+        self.cluster_bounds
+            .write(cluster_bounds_bytes(cluster_bounds))?;
         Ok(self.set)
     }
 }
@@ -5542,7 +5701,7 @@ fn begin_command_buffer(
     Ok(())
 }
 
-/// Записывает shadow и scene pass; цвет цели остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
+/// Записывает cluster, shadow и scene pass; цвет цели остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
 #[allow(clippy::too_many_arguments)]
 fn record_scene(
     device: &ash::Device,
@@ -5557,7 +5716,50 @@ fn record_scene(
     if let Some(pool) = scene.timestamps {
         // SAFETY: the slot fence was waited, so these queries are not in use; reset happens outside rendering.
         unsafe { device.cmd_reset_query_pool(command_buffer, pool, 0, TIMESTAMP_QUERY_COUNT) };
+        // GPU time starts before clustering and runs through tonemapping; it does not wait for the preceding frame.
+        // SAFETY: query zero was reset above and this timestamp precedes the compute dispatch.
+        unsafe {
+            device.cmd_write_timestamp2(
+                command_buffer,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                pool,
+                0,
+            );
+        }
     }
+    // Every invocation writes one fixed cluster record; zero-light frames also reset every count.
+    // SAFETY: the frame set binds live light, cluster-output, bounds, and frame-uniform buffers.
+    unsafe {
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            scene.cluster_pipeline,
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            scene.cluster_pipeline_layout,
+            0,
+            &[scene.frame_set],
+            &[],
+        );
+        device.cmd_dispatch(
+            command_buffer,
+            (CLUSTER_COUNT as u32).div_ceil(CLUSTER_COMPUTE_LOCAL_SIZE),
+            1,
+            1,
+        );
+    }
+    let cluster_barrier = vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ);
+    let memory_barriers = [cluster_barrier];
+    let dependency = vk::DependencyInfo::default().memory_barriers(&memory_barriers);
+    // SAFETY: the barrier publishes the just-written cluster SSBO to the fragment shader reads.
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
+
     let (previous_stage, previous_access) = offscreen_previous_use(target.layout);
     let scene_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(previous_stage)
@@ -5590,20 +5792,6 @@ fn record_scene(
         .image(target.depth.image)
         .subresource_range(depth_subresource_range());
     pipeline_barrier(device, command_buffer, depth_barrier);
-    if let Some(pool) = scene.timestamps {
-        // Начало измерения предшествует shadow pass. Оно не блокирует его от хвоста предыдущего
-        // кадра, поэтому время может быть немного занижено; ожидание ради точности сериализовало бы кадры.
-        // SAFETY: the query was reset above, outside rendering.
-        unsafe {
-            device.cmd_write_timestamp2(
-                command_buffer,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                pool,
-                0,
-            );
-        }
-    }
-
     if shadow.shadow_cascades.is_empty() {
         if *shadow_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
             let (source_stage, source_access) = shadow_layout_source(*shadow_layout);
@@ -5910,6 +6098,8 @@ struct ScenePass<'a> {
     pipeline: vk::Pipeline,
     mask_pipeline: vk::Pipeline,
     blend_pipeline: vk::Pipeline,
+    cluster_pipeline: vk::Pipeline,
+    cluster_pipeline_layout: vk::PipelineLayout,
     skybox_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
@@ -7138,6 +7328,8 @@ struct FrameUniforms {
     buffer: HostBuffer,
     set: vk::DescriptorSet,
     local_lights: GrowingBuffer,
+    _cluster_buffer: HostBuffer,
+    cluster_bounds: HostBuffer,
 }
 
 /// Текстура в device-local памяти; материал выбирает её цветовое пространство.
@@ -7489,7 +7681,7 @@ fn index_bytes(indices: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
 }
 
-/// Байты `FrameUniforms` в порядке std140: семь матриц и семь `vec4`.
+/// Байты `FrameUniforms` в порядке std140: восемь матриц и восемь `vec4`.
 /// Viewport рисуется в кадре один раз: его цель и uniform-буфер принадлежат одной сцене.
 fn validate_scene_viewports(
     viewports: impl Iterator<Item = ViewportId>,
@@ -7506,24 +7698,25 @@ fn validate_scene_viewports(
     Ok(())
 }
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Default)]
-struct GpuLocalLight {
-    position_range: [f32; 4],
-    direction_type: [f32; 4],
-    color_intensity: [f32; 4],
-    cone_params: [f32; 4],
-}
-
 struct PreparedFrame {
     uniforms: [u8; FRAME_UNIFORMS_SIZE],
-    lights: Vec<LocalLight>,
+    light_bytes: Vec<u8>,
+    cluster_bounds: Vec<ClusterBounds>,
 }
 
-fn prepare_frame(frame: &Frame<'_>) -> Result<PreparedFrame, RenderError> {
+fn prepare_frame(
+    frame: &Frame<'_>,
+    render_extent: vk::Extent2D,
+) -> Result<PreparedFrame, RenderError> {
+    let (depth_range, cluster_bounds) = camera_cluster_bounds(frame.camera.projection)?;
     let lights = select_local_lights(frame.camera, frame.lights)?;
-    let uniforms = frame_uniform_bytes_with_count(frame, lights.len())?;
-    Ok(PreparedFrame { uniforms, lights })
+    let uniforms = frame_uniform_bytes_with_count(frame, lights.len(), depth_range, render_extent)?;
+    let light_bytes = local_light_bytes(&lights, frame.camera.view)?;
+    Ok(PreparedFrame {
+        uniforms,
+        light_bytes,
+        cluster_bounds,
+    })
 }
 
 fn select_local_lights(
@@ -7544,7 +7737,7 @@ fn select_local_lights(
     }
     let view_projection = multiply_4x4(camera.projection, camera.view);
     let frustum = Frustum::from_view_projection(view_projection);
-    let mut visible = Vec::with_capacity(lights.len().min(MAX_FORWARD_LIGHTS));
+    let mut visible = Vec::with_capacity(lights.len().min(MAX_RENDERED_LIGHTS));
     for (index, light) in lights.iter().copied().enumerate() {
         let light = validate_local_light(light)?;
         if local_light_visible(frustum, light) {
@@ -7564,7 +7757,7 @@ fn select_local_lights(
     );
     Ok(visible
         .into_iter()
-        .take(MAX_FORWARD_LIGHTS)
+        .take(MAX_RENDERED_LIGHTS)
         .map(|(_, _, light)| light)
         .collect())
 }
@@ -7624,6 +7817,15 @@ fn validate_local_light(light: LocalLight) -> Result<LocalLight, RenderError> {
                     "spot light direction must be non-zero",
                 ));
             }
+            let normalize_angle_cosine = |value: f32| {
+                if (-f32::EPSILON..0.0).contains(&value) {
+                    0.0
+                } else {
+                    value
+                }
+            };
+            let cos_inner_angle = normalize_angle_cosine(cos_inner_angle);
+            let cos_outer_angle = normalize_angle_cosine(cos_outer_angle);
             if !cos_inner_angle.is_finite()
                 || !cos_outer_angle.is_finite()
                 || cos_inner_angle < 0.0
@@ -7722,7 +7924,7 @@ fn local_light_contribution(camera: [f32; 3], light: LocalLight) -> f64 {
     luminance * range_window * range_window * spot_weight / distance_squared.max(1e-4)
 }
 
-fn local_light_bytes(lights: &[LocalLight]) -> Vec<u8> {
+fn local_light_bytes(lights: &[LocalLight], view: [[f32; 4]; 4]) -> Result<Vec<u8>, RenderError> {
     let mut packed = Vec::with_capacity(lights.len().max(1));
     for light in lights {
         packed.push(match *light {
@@ -7730,17 +7932,27 @@ fn local_light_bytes(lights: &[LocalLight]) -> Vec<u8> {
                 position,
                 color_intensity,
                 range,
-            } => GpuLocalLight {
-                position_range: [position[0], position[1], position[2], range],
-                direction_type: [0.0; 4],
-                color_intensity: [
-                    color_intensity[0],
-                    color_intensity[1],
-                    color_intensity[2],
-                    0.0,
-                ],
-                cone_params: [0.0; 4],
-            },
+            } => {
+                let view_position = view_position(view, position)?;
+                GpuLocalLight {
+                    position_range: [position[0], position[1], position[2], range],
+                    direction_type: [0.0; 4],
+                    color_intensity: [
+                        color_intensity[0],
+                        color_intensity[1],
+                        color_intensity[2],
+                        0.0,
+                    ],
+                    cone_params: [0.0; 4],
+                    view_position_range: [
+                        view_position[0],
+                        view_position[1],
+                        view_position[2],
+                        range,
+                    ],
+                    view_direction: [0.0; 4],
+                }
+            }
             LocalLight::Spot {
                 position,
                 direction,
@@ -7748,36 +7960,108 @@ fn local_light_bytes(lights: &[LocalLight]) -> Vec<u8> {
                 range,
                 cos_inner_angle,
                 cos_outer_angle,
-            } => GpuLocalLight {
-                position_range: [position[0], position[1], position[2], range],
-                direction_type: [direction[0], direction[1], direction[2], 1.0],
-                color_intensity: [
-                    color_intensity[0],
-                    color_intensity[1],
-                    color_intensity[2],
-                    0.0,
-                ],
-                cone_params: [cos_inner_angle, cos_outer_angle, 0.0, 0.0],
-            },
+            } => {
+                let view_position = view_position(view, position)?;
+                let view_direction = view_direction(view, direction)?;
+                GpuLocalLight {
+                    position_range: [position[0], position[1], position[2], range],
+                    direction_type: [direction[0], direction[1], direction[2], 1.0],
+                    color_intensity: [
+                        color_intensity[0],
+                        color_intensity[1],
+                        color_intensity[2],
+                        0.0,
+                    ],
+                    cone_params: [cos_inner_angle, cos_outer_angle, 0.0, 0.0],
+                    view_position_range: [
+                        view_position[0],
+                        view_position[1],
+                        view_position[2],
+                        range,
+                    ],
+                    view_direction: [view_direction[0], view_direction[1], view_direction[2], 0.0],
+                }
+            }
         });
     }
     if packed.is_empty() {
         packed.push(GpuLocalLight::default());
     }
     // SAFETY: GpuLocalLight is repr(C), aligned, and contains only four initialized vec4 fields.
-    unsafe {
+    Ok(unsafe {
         std::slice::from_raw_parts(packed.as_ptr().cast(), size_of_val(packed.as_slice())).to_vec()
+    })
+}
+
+fn cluster_bounds_bytes(bounds: &[ClusterBounds]) -> &[u8] {
+    debug_assert_eq!(bounds.len(), CLUSTER_COUNT);
+    debug_assert_eq!(size_of::<ClusterBounds>(), CLUSTER_BOUNDS_GPU_SIZE);
+    // SAFETY: ClusterBounds is repr(C), aligned to 16 bytes, and contains only initialized vec4s.
+    unsafe { std::slice::from_raw_parts(bounds.as_ptr().cast(), size_of_val(bounds)) }
+}
+
+fn transform_4x4(matrix: [[f32; 4]; 4], vector: [f32; 4]) -> [f32; 4] {
+    std::array::from_fn(|row| {
+        (0..4)
+            .map(|column| f64::from(matrix[column][row]) * f64::from(vector[column]))
+            .sum::<f64>() as f32
+    })
+}
+
+fn view_position(view: [[f32; 4]; 4], position: [f32; 3]) -> Result<[f32; 3], RenderError> {
+    let transformed = transform_4x4(view, [position[0], position[1], position[2], 1.0]);
+    if !transformed.into_iter().all(f32::is_finite) || transformed[3].abs() <= f32::EPSILON {
+        return Err(RenderError::InvalidConfig(
+            "camera view transform produced an invalid local light position",
+        ));
     }
+    let result = std::array::from_fn(|axis| transformed[axis] / transformed[3]);
+    if !result.into_iter().all(f32::is_finite) {
+        return Err(RenderError::InvalidConfig(
+            "camera view transform produced an invalid local light position",
+        ));
+    }
+    Ok(result)
+}
+
+fn view_direction(view: [[f32; 4]; 4], direction: [f32; 3]) -> Result<[f32; 3], RenderError> {
+    let transformed = transform_4x4(view, [direction[0], direction[1], direction[2], 0.0]);
+    let length = transformed[..3]
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    if !length.is_finite() || length <= f64::EPSILON {
+        return Err(RenderError::InvalidConfig(
+            "camera view transform produced an invalid spot direction",
+        ));
+    }
+    let result = std::array::from_fn(|axis| (f64::from(transformed[axis]) / length) as f32);
+    if !result.into_iter().all(f32::is_finite) {
+        return Err(RenderError::InvalidConfig(
+            "camera view transform produced an invalid spot direction",
+        ));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
 fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
-    prepare_frame(frame).map(|prepared| prepared.uniforms)
+    prepare_frame(
+        frame,
+        vk::Extent2D {
+            width: 1,
+            height: 1,
+        },
+    )
+    .map(|prepared| prepared.uniforms)
 }
 
 fn frame_uniform_bytes_with_count(
     frame: &Frame<'_>,
     local_light_count: usize,
+    depth_range: DepthRange,
+    render_extent: vk::Extent2D,
 ) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
     validate_view_settings(frame.view)?;
     if !frame
@@ -7878,6 +8162,13 @@ fn frame_uniform_bytes_with_count(
     values[116..132].copy_from_slice(rotation.as_flattened());
     values[132..136].copy_from_slice(&[intensity, skybox, present, 0.0]);
     values[136..140].copy_from_slice(&[local_light_count as f32, 0.0, 0.0, 0.0]);
+    values[140..156].copy_from_slice(frame.camera.view.as_flattened());
+    values[156..160].copy_from_slice(&[
+        depth_range.near,
+        depth_range.far,
+        render_extent.width.max(1) as f32,
+        render_extent.height.max(1) as f32,
+    ]);
     Ok(float_bytes(&values))
 }
 
@@ -8169,21 +8460,25 @@ fn select_composite_alpha(
 mod tests {
     use super::culling::{Frustum, LocalBounds};
     use super::{
-        AcquireAction, AlphaMode, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight,
-        DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, FrameCamera,
-        GpuLocalLight, LDR_FORMAT, LocalLight, MATERIAL_UNIFORMS_SIZE, MAX_FORWARD_LIGHTS,
-        MESH_BLEND_FRAGMENT_SHADER, MESH_MASK_FRAGMENT_SHADER, MESH_OPAQUE_FRAGMENT_SHADER,
-        MESH_VERTEX_SHADER, Material, MaterialId, MeshId, NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON,
-        OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER,
-        OverlayVertex, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
-        SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER, SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER,
-        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
-        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
-        check_extensions, classify_acquire_result, classify_probe_instance_failure,
-        deduplicate_names, derivative_tangent_basis, evaluate_device, frame_uniform_bytes,
-        index_bytes, inverse_extent, local_light_bytes, local_light_contribution,
-        material_sampler_info, material_uniform_bytes, mip_extent, mip_level_count,
-        missing_extensions, missing_offscreen_format_features, missing_post_format_features,
+        AcquireAction, AlphaMode, AntiAliasing, CLUSTER_BOUNDS_BUFFER_SIZE,
+        CLUSTER_BOUNDS_GPU_SIZE, CLUSTER_BUFFER_SIZE, CLUSTER_COMPUTE_LOCAL_SIZE,
+        CLUSTER_COMPUTE_SHADER, CLUSTER_COUNT, CLUSTER_GRID_X, CLUSTER_GRID_Y, CLUSTER_GRID_Z,
+        CLUSTER_RECORD_GPU_SIZE, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
+        FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, FrameCamera, GpuLocalLight,
+        IDENTITY_MATRIX, LDR_FORMAT, LocalLight, MATERIAL_UNIFORMS_SIZE, MAX_CLUSTER_LIGHTS,
+        MAX_RENDERED_LIGHTS, MESH_BLEND_FRAGMENT_SHADER, MESH_MASK_FRAGMENT_SHADER,
+        MESH_OPAQUE_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId,
+        NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON, OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER,
+        OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure,
+        RenderError, Renderer, RendererConfig, SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER,
+        SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER,
+        TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex,
+        ViewSettings, best_device_index, check_extensions, classify_acquire_result,
+        classify_probe_instance_failure, cluster_device_limit_reasons, deduplicate_names,
+        derivative_tangent_basis, evaluate_device, frame_uniform_bytes, index_bytes,
+        inverse_extent, local_light_bytes, local_light_contribution, material_sampler_info,
+        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
+        missing_offscreen_format_features, missing_post_format_features,
         missing_texture_format_features, normal_matrix, offscreen_previous_use,
         overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
         scene_viewport, select_composite_alpha, select_local_lights, select_surface_extent,
@@ -8496,6 +8791,61 @@ mod tests {
         assert_eq!(evaluation.reasons.len(), 1);
         assert!(evaluation.reasons[0].contains("R16G16B16A16_SFLOAT"));
         assert!(evaluation.reasons[0].contains("COLOR_ATTACHMENT_BLEND"));
+    }
+
+    #[test]
+    fn cluster_buffers_and_dispatch_fit_the_checked_device_limits() {
+        assert_eq!(
+            (CLUSTER_GRID_X, CLUSTER_GRID_Y, CLUSTER_GRID_Z),
+            (16, 9, 24)
+        );
+        assert_eq!(CLUSTER_COUNT, 3_456);
+        assert_eq!(MAX_CLUSTER_LIGHTS, 128);
+        assert_eq!(CLUSTER_RECORD_GPU_SIZE, 516);
+        assert_eq!(CLUSTER_BUFFER_SIZE, 1_783_296);
+        assert_eq!(CLUSTER_BOUNDS_GPU_SIZE, 32);
+        assert_eq!(CLUSTER_BOUNDS_BUFFER_SIZE, 110_592);
+        assert_eq!(std::mem::size_of::<super::clusters::ClusterBounds>(), 32);
+        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 96);
+
+        let mut limits = vk::PhysicalDeviceLimits {
+            max_compute_work_group_invocations: CLUSTER_COMPUTE_LOCAL_SIZE,
+            max_compute_work_group_size: [CLUSTER_COMPUTE_LOCAL_SIZE, 1, 1],
+            max_compute_work_group_count: [54, 1, 1],
+            max_storage_buffer_range: CLUSTER_BUFFER_SIZE as u32,
+            max_per_stage_descriptor_storage_buffers: 3,
+            max_descriptor_set_storage_buffers: 3,
+            ..vk::PhysicalDeviceLimits::default()
+        };
+        assert!(cluster_device_limit_reasons(&limits).is_empty());
+
+        limits.max_compute_work_group_count[0] -= 1;
+        assert!(
+            cluster_device_limit_reasons(&limits)
+                .iter()
+                .any(|reason| reason.contains("workgroup"))
+        );
+        limits.max_compute_work_group_count[0] += 1;
+        limits.max_storage_buffer_range -= 1;
+        assert!(
+            cluster_device_limit_reasons(&limits)
+                .iter()
+                .any(|reason| reason.contains("maxStorageBufferRange"))
+        );
+        limits.max_storage_buffer_range += 1;
+        limits.max_per_stage_descriptor_storage_buffers -= 1;
+        assert!(
+            cluster_device_limit_reasons(&limits)
+                .iter()
+                .any(|reason| reason.contains("storage buffer descriptors"))
+        );
+        limits.max_per_stage_descriptor_storage_buffers += 1;
+        limits.max_descriptor_set_storage_buffers -= 1;
+        assert!(
+            cluster_device_limit_reasons(&limits)
+                .iter()
+                .any(|reason| reason.contains("storage buffer descriptors"))
+        );
     }
 
     #[test]
@@ -8818,6 +9168,7 @@ mod tests {
             FULLSCREEN_VERTEX_SHADER,
             TONEMAP_FRAGMENT_SHADER,
             OUTPUT_FRAGMENT_SHADER,
+            CLUSTER_COMPUTE_SHADER,
         ] {
             let words = ash::util::read_spv(&mut std::io::Cursor::new(shader)).unwrap();
             assert_eq!(words[0], 0x0723_0203);
@@ -9029,20 +9380,29 @@ mod tests {
 
     #[test]
     fn local_light_ssbo_uses_the_tested_std430_layout_and_valid_empty_binding() {
-        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 64);
+        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 96);
         assert_eq!(std::mem::align_of::<GpuLocalLight>(), 16);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, position_range), 0);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, direction_type), 16);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, color_intensity), 32);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, cone_params), 48);
-        assert_eq!(local_light_bytes(&[]).len(), 64);
-        assert_eq!(floats(&local_light_bytes(&[])), [0.0; 16]);
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, view_position_range), 64);
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, view_direction), 80);
+        assert_eq!(local_light_bytes(&[], IDENTITY_MATRIX).unwrap().len(), 96);
+        assert_eq!(
+            floats(&local_light_bytes(&[], IDENTITY_MATRIX).unwrap()),
+            [0.0; 24]
+        );
 
-        let packed = local_light_bytes(&[
-            point([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 7.0),
-            spot([8.0, 9.0, 10.0], [0.0, 0.0, -1.0], 11.0, 0.8, 0.5),
-        ]);
-        assert_eq!(packed.len(), 2 * 64);
+        let packed = local_light_bytes(
+            &[
+                point([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 7.0),
+                spot([8.0, 9.0, 10.0], [0.0, 0.0, -1.0], 11.0, 0.8, 0.5),
+            ],
+            IDENTITY_MATRIX,
+        )
+        .unwrap();
+        assert_eq!(packed.len(), 2 * 96);
         let values = floats(&packed);
         assert_eq!(
             &values[0..16],
@@ -9051,11 +9411,40 @@ mod tests {
             ]
         );
         assert_eq!(
-            &values[16..32],
+            &values[24..40],
             &[
                 8.0, 9.0, 10.0, 11.0, 0.0, 0.0, -1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.8, 0.5, 0.0, 0.0
             ]
         );
+        assert_eq!(&values[16..24], &[1.0, 2.0, 3.0, 7.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            &values[40..48],
+            &[8.0, 9.0, 10.0, 11.0, 0.0, 0.0, -1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn local_light_ssbo_preserves_world_shading_data_and_adds_view_space_culling_data() {
+        let view = [
+            [0.0, 1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [-4.0, 2.0, 1.0, 1.0],
+        ];
+        let bytes = local_light_bytes(
+            &[
+                point([1.0, 2.0, 3.0], [1.0; 3], 4.0),
+                spot([8.0, 9.0, 10.0], [1.0, 0.0, 0.0], 5.0, 0.8, 0.5),
+            ],
+            view,
+        )
+        .unwrap();
+        let values = floats(&bytes);
+        assert_eq!(&values[0..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&values[16..20], &[-6.0, 3.0, 4.0, 4.0]);
+        assert_eq!(&values[24..28], &[8.0, 9.0, 10.0, 5.0]);
+        assert_eq!(&values[40..44], &[-13.0, 10.0, 11.0, 5.0]);
+        assert_eq!(&values[44..48], &[0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -9113,6 +9502,13 @@ mod tests {
                 .len(),
             1
         );
+        let wide_cone_reaches_boundary = spot(outside_apex, [-1.0, 0.0, 0.0], 0.2, 0.0, 0.0);
+        assert_eq!(
+            select_local_lights(camera, &[wide_cone_reaches_boundary])
+                .unwrap()
+                .len(),
+            1
+        );
         let cone_points_away = spot(outside_apex, [1.0, 0.0, 0.0], 0.5, 0.99, 0.99);
         assert!(
             select_local_lights(camera, &[cone_points_away])
@@ -9128,6 +9524,22 @@ mod tests {
             0.0,
         );
         assert_eq!(select_local_lights(camera, &[wide_cone]).unwrap().len(), 1);
+        let rounded_90_degree_cone = spot(
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, -1.0],
+            3.0,
+            90.0_f32.to_radians().cos(),
+            90.0_f32.to_radians().cos(),
+        );
+        let selected = select_local_lights(camera, &[rounded_90_degree_cone]).unwrap();
+        assert!(matches!(
+            selected.as_slice(),
+            [LocalLight::Spot {
+                cos_inner_angle: 0.0,
+                cos_outer_angle: 0.0,
+                ..
+            }]
+        ));
         let narrow_cone = spot([0.0, 0.0, -2.0], [0.0, 0.0, 1.0], 4.0, 1.0, 0.5);
         assert_eq!(
             select_local_lights(camera, &[narrow_cone]).unwrap().len(),
@@ -9138,7 +9550,7 @@ mod tests {
     #[test]
     fn local_light_selection_validates_every_input_and_caps_by_contribution_stably() {
         let camera = camera([0.0; 3]);
-        let mut invalid_extra = vec![point([0.0, 0.0, -1.0], [1.0; 3], 2.0); MAX_FORWARD_LIGHTS];
+        let mut invalid_extra = vec![point([0.0, 0.0, -1.0], [1.0; 3], 2.0); MAX_RENDERED_LIGHTS];
         invalid_extra.push(point([0.0, 0.0, -1.0], [1.0; 3], f32::NAN));
         assert!(matches!(
             select_local_lights(camera, &invalid_extra),
@@ -9158,11 +9570,11 @@ mod tests {
             ));
         }
 
-        let tied = (0..MAX_FORWARD_LIGHTS + 8)
+        let tied = (0..MAX_RENDERED_LIGHTS + 8)
             .map(|index| point([0.0, 0.0, 0.0], [1.0; 3], (index + 1) as f32))
             .collect::<Vec<_>>();
         let selected = select_local_lights(camera, &tied).unwrap();
-        assert_eq!(selected.len(), MAX_FORWARD_LIGHTS);
+        assert_eq!(selected.len(), MAX_RENDERED_LIGHTS);
         for (index, light) in selected.iter().enumerate() {
             assert_eq!(*light, point([0.0, 0.0, 0.0], [1.0; 3], (index + 1) as f32));
         }
@@ -9667,7 +10079,7 @@ mod tests {
             clear_color: [0.0; 4],
             camera: FrameCamera {
                 view: IDENTITY,
-                projection: IDENTITY,
+                projection: perspective_projection(),
                 position: [10.0, 11.0, 12.0],
             },
             environment: None,
@@ -9679,9 +10091,15 @@ mod tests {
             view: ViewSettings::default(),
         };
         let values = floats(&frame_uniform_bytes(&frame).unwrap());
-        assert_eq!(FRAME_UNIFORMS_SIZE, 560);
-        assert_eq!(&values[0..16], IDENTITY.as_flattened());
-        assert_eq!(&values[16..32], IDENTITY.as_flattened());
+        assert_eq!(FRAME_UNIFORMS_SIZE, 640);
+        let view_projection = perspective_projection();
+        assert_eq!(&values[0..16], view_projection.as_flattened());
+        assert_eq!(
+            &values[16..32],
+            super::environment::inverse4x4(view_projection)
+                .unwrap()
+                .as_flattened()
+        );
         for (cascade, start) in [(0, 32), (1, 48), (2, 64), (3, 80)] {
             let expected = (1..=16)
                 .map(|offset| (cascade as f32 * 16.0) + 17.0 + offset as f32 - 1.0)
@@ -9695,6 +10113,10 @@ mod tests {
         assert_eq!(&values[108..112], &[1.0, 1.0 / 2048.0, 4.0, 0.0]);
         assert_eq!(&values[112..116], &[10.0, 11.0, 12.0, 0.0]);
         assert_eq!(&values[136..140], &[0.0; 4]);
+        assert_eq!(&values[140..156], IDENTITY.as_flattened());
+        assert!((values[156] - 0.1).abs() < 1e-5);
+        assert!((values[157] - 20.0).abs() < 1e-3);
+        assert_eq!(&values[158..160], &[1.0, 1.0]);
 
         let no_shadows = Frame {
             shadow_cascades: &[],

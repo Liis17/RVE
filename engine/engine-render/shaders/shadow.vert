@@ -16,6 +16,8 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 environment_rotation;
     vec4 environment_params;
     vec4 local_light_params;
+    mat4 view;
+    vec4 cluster_params;
 } frame;
 
 layout(push_constant) uniform PushConstants {
