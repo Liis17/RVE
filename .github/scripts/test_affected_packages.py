@@ -210,6 +210,18 @@ class PackageSelectionTests(unittest.TestCase):
         for name in ["rve-build", "engine-runtime", "rve-player", "engine-script", "rve-sdk"]:
             self.assertIn(f"contains(needs.changes.outputs.packages, '{name}')", demo_condition)
         self.assertIn("env.BUILD_DEMO_GAME == 'true'", workflow)
+        workflow_lines = workflow.splitlines()
+        feature_off_clippy = next(
+            index for index, line in enumerate(workflow_lines)
+            if "- name: Clippy player without developer console" in line
+        )
+        feature_off_clippy_step = "\n".join(workflow_lines[feature_off_clippy:feature_off_clippy + 4])
+        self.assertIn("contains(needs.changes.outputs.packages, 'rve-player')", feature_off_clippy_step)
+        self.assertIn("contains(needs.changes.outputs.packages, 'engine-runtime')", feature_off_clippy_step)
+        self.assertIn(
+            "cargo clippy -p rve-player --no-default-features --all-targets --locked -- -D warnings",
+            feature_off_clippy_step,
+        )
         self.assertTrue("rve-build" in build_changes)
         self.assertTrue("engine-runtime" in runtime_changes)
         self.assertEqual(self.select(["engine/rve-sdk/src/lib.rs"]),

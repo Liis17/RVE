@@ -5,14 +5,15 @@ use crate::transaction::{
 use crate::types::{
     ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
+use engine_console::CommandSpec;
 use engine_scene::{
     AntiAliasing, CameraSettings, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue,
     Tonemapper,
 };
 use mlua::chunk::ChunkMode;
 use mlua::{
-    Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, StdLib,
-    Table, UserData, UserDataFields, Value, VmState,
+    Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, RegistryKey,
+    StdLib, Table, UserData, UserDataFields, Value, VmState,
 };
 use rve_sdk::{Key, MouseButton};
 use std::cell::{Cell, RefCell};
@@ -26,6 +27,21 @@ const LUA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) type EventQueue = Rc<RefCell<Vec<ScriptEvent>>>;
 pub(crate) type ActiveSource = Rc<RefCell<String>>;
 pub(crate) type ActiveCall = Rc<Cell<*mut ScriptTransaction>>;
+pub(crate) type ActiveOwner = Rc<Cell<Option<usize>>>;
+pub(crate) type CommandGeneration = Rc<Cell<u64>>;
+
+pub(crate) enum RegisteredCommandCallback {
+    Lua(RegistryKey),
+    Abi,
+}
+
+pub(crate) struct RegisteredLuaCommand {
+    pub(crate) owner: usize,
+    pub(crate) spec: CommandSpec,
+    pub(crate) callback: RegisteredCommandCallback,
+}
+
+pub(crate) type LuaCommands = Rc<RefCell<std::collections::BTreeMap<String, RegisteredLuaCommand>>>;
 
 pub(crate) struct LuaState {
     pub(crate) lua: Lua,
@@ -37,6 +53,9 @@ pub(crate) fn create_lua(
     events: EventQueue,
     active_source: ActiveSource,
     active_call: ActiveCall,
+    active_owner: ActiveOwner,
+    commands: LuaCommands,
+    commands_generation: CommandGeneration,
     interrupted: Arc<AtomicBool>,
 ) -> mlua::Result<LuaState> {
     let lua = Lua::new_with(
@@ -126,12 +145,52 @@ pub(crate) fn create_lua(
         "log_error",
         log_function(
             &lua,
-            tostring,
-            events,
-            active_source,
+            tostring.clone(),
+            events.clone(),
+            active_source.clone(),
             ScriptEventLevel::Error,
         )?,
     )?;
+    let console = lua.create_table()?;
+    console.set(
+        "write",
+        lua.create_function({
+            let events = events.clone();
+            let active_source = active_source.clone();
+            move |_, (text, level): (String, Option<String>)| {
+                let level = match level.as_deref().unwrap_or("info") {
+                    "log" | "info" => ScriptEventLevel::Info,
+                    "warning" | "warn" => ScriptEventLevel::Warn,
+                    "error" => ScriptEventLevel::Error,
+                    other => {
+                        return Err(LuaError::runtime(format!(
+                            "unknown console level {other:?}"
+                        )));
+                    }
+                };
+                events.borrow_mut().push(ScriptEvent {
+                    level,
+                    source: active_source.borrow().clone(),
+                    message: text,
+                });
+                Ok(())
+            }
+        })?,
+    )?;
+    console.set(
+        "register",
+        register_command_function(
+            &lua,
+            active_owner.clone(),
+            commands.clone(),
+            commands_generation.clone(),
+        )?,
+    )?;
+    console.set(
+        "unregister",
+        unregister_command_function(&lua, active_owner, commands, commands_generation)?,
+    )?;
+    rve.set("console", console)?;
     rve.set("find", find_function(&lua, active_call.clone())?)?;
     rve.set(
         "active_camera",
@@ -325,6 +384,9 @@ pub(crate) fn properties(
         Rc::new(RefCell::new(Vec::new())),
         Rc::new(RefCell::new(label.to_owned())),
         Rc::new(Cell::new(std::ptr::null_mut())),
+        Rc::new(Cell::new(None)),
+        Rc::new(RefCell::new(std::collections::BTreeMap::new())),
+        Rc::new(Cell::new(0)),
         interrupted,
     )
     .map_err(|error| error.to_string())?;
@@ -453,6 +515,71 @@ fn log_function(
             source: active_source.borrow().clone(),
             message: parts.join(" "),
         });
+        Ok(())
+    })
+}
+
+fn register_command_function(
+    lua: &Lua,
+    active_owner: ActiveOwner,
+    commands: LuaCommands,
+    generation: CommandGeneration,
+) -> mlua::Result<Function> {
+    lua.create_function(
+        move |lua, (name, callback, description): (String, Function, Option<String>)| {
+            let owner = active_owner.get().ok_or_else(|| {
+                LuaError::runtime("rve.console.register is only available during script callbacks")
+            })?;
+            let spec = CommandSpec::new(name, description.unwrap_or_default())
+                .map_err(|error| LuaError::runtime(error.to_string()))?;
+            let duplicate = commands.borrow().contains_key(&spec.name);
+            if duplicate {
+                return Err(LuaError::runtime(format!(
+                    "console command {:?} is already registered",
+                    spec.name
+                )));
+            }
+            let callback = lua.create_registry_value(callback)?;
+            commands.borrow_mut().insert(
+                spec.name.clone(),
+                RegisteredLuaCommand {
+                    owner,
+                    spec,
+                    callback: RegisteredCommandCallback::Lua(callback),
+                },
+            );
+            generation.set(generation.get().wrapping_add(1));
+            Ok(())
+        },
+    )
+}
+
+fn unregister_command_function(
+    lua: &Lua,
+    active_owner: ActiveOwner,
+    commands: LuaCommands,
+    generation: CommandGeneration,
+) -> mlua::Result<Function> {
+    lua.create_function(move |lua, name: String| {
+        let owner = active_owner.get().ok_or_else(|| {
+            LuaError::runtime("rve.console.unregister is only available during script callbacks")
+        })?;
+        let command = {
+            let mut commands = commands.borrow_mut();
+            let command = commands
+                .get(&name)
+                .ok_or_else(|| LuaError::runtime(format!("unknown console command {name:?}")))?;
+            if command.owner != owner {
+                return Err(LuaError::runtime(format!(
+                    "script cannot unregister command {name:?} owned by another instance"
+                )));
+            }
+            commands.remove(&name).expect("command exists after lookup")
+        };
+        generation.set(generation.get().wrapping_add(1));
+        if let RegisteredCommandCallback::Lua(callback) = command.callback {
+            lua.remove_registry_value(callback)?;
+        }
         Ok(())
     })
 }

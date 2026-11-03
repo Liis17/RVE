@@ -76,17 +76,45 @@ cargo run -p rve-build -- build ../examples/demo-game --output ../demo-out
 cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist
 ```
 
-`rve-build run` собирает игру и запускает её через release-player. `rve-build build`
-создаёт релиз в указанном каталоге, который должен отсутствовать до сборки. Для
-прямого запуска player CLI имеет вид
+`rve-build run` собирает игру и запускает dev-player с включённой developer console.
+`rve-build build` собирает distribution-player без console и создаёт релиз в указанном
+каталоге, который должен отсутствовать до сборки. Для прямого запуска player CLI имеет вид
 `rve-player [--project <dir>] [--scripts <path>] [--frames N]`.
 
-Команда `rve-build sdk` собирает release `rve-player` и создаёт переносимый каталог
-с `rve-build`, player, исходниками `rve-sdk` и маркером `rve-sdk.toml`. Игровой
+Команда `rve-build sdk` собирает оба варианта player и создаёт переносимый каталог
+с `rve-build`, distribution player `rve-player`, dev player `rve-player-dev`,
+исходниками `rve-sdk` и маркером `rve-sdk.toml`. Игровой
 crate подключает SDK через path `../rve-sdk-dist/rve-sdk` в `Cargo.toml`. Рядом с
 `rve-build` маркер включает SDK-режим: checkout движка не нужен, а совместимость
 проверяется по ABI и паре `ARCH-OS` текущей платформы. Без маркера используется
-checkout-режим и release player собирается один раз в `build/player`.
+checkout-режим: distribution player собирается в `build/player`, dev-player — в
+`build/player-dev`.
+
+По умолчанию Cargo feature `dev-console` включена у `rve-player`, в том числе при
+`cargo build --release -p rve-player`. Для distribution-бинарника собирай с
+`--no-default-features`; `rve-build build` уже делает это автоматически.
+
+В player и редакторе физическая клавиша Backquote (клавиша `ё` в русской раскладке)
+открывает консоль. В редакторе клавиша действует, когда не открыто модальное окно.
+Консоль занимает верхние 45% окна, показывает log и историю команд; Enter отправляет,
+Tab дополняет, Up/Down выбирают подсказки или историю, Escape закрывает. Пока консоль
+открыта, игровой ввод блокируется. Встроенные команды — `help [prefix]` и `clear`;
+пользовательские команды Lua и Rust доступны в Play/runtime.
+
+Lua-скрипт пишет сообщение с уровнем по умолчанию `info` через
+`rve.console.write(text, level)`, где `level` — `info`/`log`, `warning`/`warn` или
+`error`. Внутри lifecycle callback скрипт регистрирует команду через
+`rve.console.register(name, callback, description)`; callback получает таблицу
+строковых аргументов и может вернуть строку для вывода в Info. Имя команды состоит
+из строчных латинских букв, цифр, `_` и `.`, начинается с буквы или `_`; `help` и
+`clear` зарезервированы. Команды принадлежат скриптовому экземпляру и удаляются вместе
+с ним.
+
+Rust SDK предоставляет `ctx.console.write(text, ConsoleLevel::{Log, Warning, Error})`,
+`ctx.console.register(name, description)` и `unregister(name)`. Реализуй
+`Script::on_command(ctx, name, args)` для обработки зарегистрированной команды.
+Подробности поведения console и ABI приведены в [EngineConsole](Obsidian/RVEVault/Engine/EngineConsole.md),
+[EngineScript](Obsidian/RVEVault/Engine/EngineScript.md) и [RveSdk](Obsidian/RVEVault/Engine/RveSdk.md).
 
 В dev-режиме `rve-player` загружает Rust-скрипты только при явном `--scripts`;
 release-плеер автоматически ищет библиотеку в `Engine/`, а этот параметр позволяет
@@ -118,6 +146,7 @@ cargo run -p rve-editor -- --project ../examples/demo-game --scripts <path-to-sc
 
 | Действие | Управление |
 |---|---|
+| Developer console | Backquote (клавиша `ё` в русской раскладке), Escape — закрыть |
 | Сохранить, отменить, повторить | Ctrl+S, Ctrl+Z, Ctrl+Y |
 | Инструменты Move, Rotate, Scale | W, E, R |
 | Фокус на выделенном, удаление | F, Delete |

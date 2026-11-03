@@ -50,6 +50,11 @@ impl InputAccumulator {
         }
     }
 
+    #[cfg(feature = "dev-console")]
+    pub(crate) fn console_open(&mut self, open: bool, window_focused: bool) {
+        self.focused(!open && window_focused);
+    }
+
     pub(crate) fn set_background(&mut self, background: bool) {
         if self.background == background {
             return;
@@ -387,5 +392,30 @@ mod tests {
         let frame = input.take_frame();
         assert!(!frame.key_released(Key::C));
         assert!(!frame.mouse_released(MouseButton::Middle));
+    }
+
+    #[test]
+    #[cfg(feature = "dev-console")]
+    fn opening_console_releases_held_input_and_blocks_until_closed() {
+        let mut input = InputAccumulator {
+            focused: true,
+            ..Default::default()
+        };
+        input.key(WindowKey::W, true);
+        input.mouse_button(WindowMouseButton::Left, true);
+        input.take_frame();
+
+        input.console_open(true, true);
+        input.key(WindowKey::W, false);
+        input.mouse_button(WindowMouseButton::Left, false);
+        let frame = input.take_frame();
+        assert!(!frame.key_down(Key::W));
+        assert!(frame.key_released(Key::W));
+        assert!(!frame.mouse_down(MouseButton::Left));
+        assert!(frame.mouse_released(MouseButton::Left));
+
+        input.console_open(false, true);
+        input.key(WindowKey::W, true);
+        assert!(input.take_frame().key_down(Key::W));
     }
 }

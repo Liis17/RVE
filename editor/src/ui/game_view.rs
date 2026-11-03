@@ -82,6 +82,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         (rect.width() * pixels_per_point).round() as u32,
         (rect.height() * pixels_per_point).round() as u32,
     ];
+    state.game_view.rect = Some(rect);
     if let Some(texture) = state.game_viewport_texture {
         ui.painter().image(
             texture,

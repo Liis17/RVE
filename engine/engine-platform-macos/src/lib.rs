@@ -30,7 +30,7 @@ pub fn user_cache_dir() -> Option<PathBuf> {
     user_cache_dir_with(|name| std::env::var_os(name))
 }
 
-fn user_cache_dir_with(mut get: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+fn user_cache_dir_with(mut get: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
     get("HOME")
         .filter(|path| !path.is_empty())
         .map(|home| PathBuf::from(home).join("Library").join("Caches"))

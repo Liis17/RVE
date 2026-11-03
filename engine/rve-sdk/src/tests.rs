@@ -1,10 +1,12 @@
 use crate::abi::{
-    RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY,
-    RVE_VALUE_STR, RveArray, RveCameraSettings, RveHeader, RveHost, RveModule, RveParamEntry,
-    RveParams, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
+    RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray,
+    RveCameraSettings, RveHeader, RveHost, RveModule, RveParamEntry, RveParams, RveScriptDesc,
+    RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use crate::{
-    AntiAliasing, CameraSettings, Context, Key, MouseButton, Params, Script, Tonemapper, Value,
+    AntiAliasing, CameraSettings, ConsoleLevel, Context, Key, MouseButton, Params, Script,
+    Tonemapper, Value,
 };
 use std::ffi::c_void;
 
@@ -62,6 +64,34 @@ impl Script for Probe {
     }
 }
 
+struct ConsoleProbe;
+
+impl Script for ConsoleProbe {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        ctx.console.write("sdk log", ConsoleLevel::Log);
+        ctx.console.write("sdk warning", ConsoleLevel::Warning);
+        ctx.console.write("sdk error", ConsoleLevel::Error);
+        ctx.console
+            .register("sdk.cmd", Some("SDK console command"))
+            .unwrap();
+    }
+
+    fn on_command(&mut self, ctx: &mut Context<'_>, name: &str, args: &[&str]) {
+        assert_eq!(name, "sdk.cmd");
+        assert_eq!(args, ["first", "second"]);
+        ctx.console.write("command warning", ConsoleLevel::Warning);
+        ctx.console.unregister(name).unwrap();
+    }
+}
+
+struct PanicCommand;
+
+impl Script for PanicCommand {
+    fn on_command(&mut self, _: &mut Context<'_>, _: &str, _: &[&str]) {
+        panic!("command panic");
+    }
+}
+
 impl Drop for Probe {
     fn drop(&mut self) {
         if self.panic_drop {
@@ -89,11 +119,26 @@ fn panic_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     panic!("factory panic")
 }
 
+fn console_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ConsoleProbe))
+}
+
+fn panic_command_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PanicCommand))
+}
+
 fn scripts() -> &'static RveModule {
     crate::script_module! {
         "Probe" => probe_factory,
         "Error" => error_factory,
         "Panic" => panic_factory,
+    }
+}
+
+fn command_scripts() -> &'static RveModule {
+    crate::script_module! {
+        "ConsoleProbe" => console_factory,
+        "PanicCommand" => panic_command_factory,
     }
 }
 
@@ -140,6 +185,9 @@ struct HostState {
     error: Option<String>,
     transform: RveTransform,
     logs: Vec<String>,
+    log_levels: Vec<u32>,
+    registered_commands: Vec<(String, String)>,
+    unregistered_commands: Vec<String>,
     matrix: [f32; 16],
     sent: Vec<(String, String, Value)>,
     broadcasts: Vec<(String, Value)>,
@@ -159,13 +207,32 @@ unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
     state.error = Some(unsafe { message.to_str() }.unwrap().to_owned());
 }
 
-unsafe extern "C" fn log(ctx: *mut c_void, _: u32, message: RveStr) {
+unsafe extern "C" fn log(ctx: *mut c_void, level: u32, message: RveStr) {
     // SAFETY: test host points to a live HostState and guest strings are valid during the call.
     let state = unsafe { &mut *ctx.cast::<HostState>() };
     // SAFETY: message references a live guest string for this callback.
     state
         .logs
         .push(unsafe { message.to_str() }.unwrap().to_owned());
+    state.log_levels.push(level);
+}
+
+unsafe extern "C" fn register_command(ctx: *mut c_void, name: RveStr, description: RveStr) -> u32 {
+    // SAFETY: the host context and string slices remain live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let name = unsafe { name.to_str() }.unwrap().to_owned();
+    let description = unsafe { description.to_str() }.unwrap().to_owned();
+    state.registered_commands.push((name, description));
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn unregister_command(ctx: *mut c_void, name: RveStr) -> u32 {
+    // SAFETY: the host context and string slice remain live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state
+        .unregistered_commands
+        .push(unsafe { name.to_str() }.unwrap().to_owned());
+    RveStatus::Ok as u32
 }
 
 unsafe extern "C" fn find_object(_: *mut c_void, id: RveStr) -> u64 {
@@ -368,6 +435,8 @@ fn host(state: &mut HostState) -> RveHost {
         set_camera_settings: Some(set_camera_settings),
         active_camera: Some(active_camera),
         set_active_camera: Some(set_active_camera),
+        register_command: Some(register_command),
+        unregister_command: Some(unregister_command),
     }
 }
 
@@ -415,6 +484,89 @@ fn script_module_macro_builds_abi_table_and_guest_callbacks() {
     assert_eq!(state.logs, ["guest log"]);
     // SAFETY: drop is called exactly once for this successful create.
     assert_eq!(unsafe { (script.drop)(instance) }, RveStatus::Ok);
+}
+
+#[test]
+fn console_api_logs_registers_commands_and_catches_command_panics() {
+    let module = command_scripts();
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let mut console_instance = std::ptr::null_mut();
+    let console_script = descriptor(module, "ConsoleProbe");
+    // SAFETY: descriptor and host are live for each synchronous callback.
+    unsafe {
+        assert_eq!(
+            (console_script.create)(&host, &params, &mut console_instance),
+            RveStatus::Ok
+        );
+        assert_eq!(
+            (console_script.start)(console_instance, &host),
+            RveStatus::Ok
+        );
+    }
+    assert_eq!(
+        state.log_levels,
+        [RVE_LOG_INFO, RVE_LOG_WARN, RVE_LOG_ERROR]
+    );
+    assert_eq!(
+        state.registered_commands,
+        [("sdk.cmd".to_owned(), "SDK console command".to_owned())]
+    );
+
+    let arguments = [RveStr::from_static("first"), RveStr::from_static("second")];
+    // SAFETY: command strings and instance remain live for the callback.
+    unsafe {
+        assert_eq!(
+            (console_script.command.unwrap())(
+                console_instance,
+                &host,
+                RveStr::from_static("sdk.cmd"),
+                arguments.as_ptr(),
+                arguments.len(),
+            ),
+            RveStatus::Ok
+        );
+        assert_eq!((console_script.drop)(console_instance), RveStatus::Ok);
+    }
+    assert_eq!(state.unregistered_commands, ["sdk.cmd"]);
+    assert_eq!(state.log_levels.last(), Some(&RVE_LOG_WARN));
+
+    let mut panic_instance = std::ptr::null_mut();
+    let panic_script = descriptor(module, "PanicCommand");
+    // SAFETY: descriptor and host are live for each synchronous callback.
+    unsafe {
+        assert_eq!(
+            (panic_script.create)(&host, &params, &mut panic_instance),
+            RveStatus::Ok
+        );
+        assert_eq!(
+            (panic_script.command.unwrap())(
+                panic_instance,
+                &host,
+                RveStr::from_static("panic"),
+                std::ptr::null(),
+                0,
+            ),
+            RveStatus::Panicked
+        );
+        assert_eq!((panic_script.drop)(panic_instance), RveStatus::Ok);
+    }
+    assert!(state.error.as_deref().unwrap().contains("command panic"));
+}
+
+#[test]
+fn console_command_registration_reports_unavailable_optional_host_callbacks() {
+    let mut state = HostState::default();
+    let mut host = host(&mut state);
+    host.register_command = None;
+    host.unregister_command = None;
+    let context = Context::new(&host).unwrap();
+    assert!(context.console.register("sdk.cmd", None).is_err());
+    assert!(context.console.unregister("sdk.cmd").is_err());
 }
 
 #[test]
@@ -912,7 +1064,7 @@ fn script_module_macro_exports_typed_parameter_tables() {
 
 #[test]
 fn param_descriptor_layout_is_c_compatible() {
-    use crate::abi::RveParamDesc;
+    use crate::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveParamDesc, RveScriptDescV3};
     use std::mem::{align_of, offset_of, size_of};
     let pointer = size_of::<usize>();
     assert_eq!(offset_of!(RveParamDesc, name), 0);
@@ -929,5 +1081,16 @@ fn param_descriptor_layout_is_c_compatible() {
     assert_eq!(
         offset_of!(RveScriptDesc, param_count),
         offset_of!(RveScriptDesc, params) + pointer
+    );
+    assert_eq!(
+        offset_of!(RveScriptDesc, command),
+        size_of::<RveScriptDescV3>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 4);
+    assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
+    assert_eq!(
+        offset_of!(RveHost, register_command),
+        offset_of!(RveHost, set_active_camera)
+            + size_of::<Option<crate::abi::RveSetActiveCameraFn>>()
     );
 }

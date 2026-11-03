@@ -108,6 +108,14 @@ impl<T: Copy> ManagedTextures<T> {
         Ok(())
     }
 
+    /// Releases all egui-managed textures before the rendering backend is destroyed.
+    pub fn clear(&mut self, backend: &mut impl UiTextures<Id = T>) -> Result<(), RenderError> {
+        for (_, texture) in self.textures.drain() {
+            backend.free(texture)?;
+        }
+        Ok(())
+    }
+
     fn get(&self, id: u64) -> Option<T> {
         self.textures.get(&id).copied()
     }
@@ -219,8 +227,10 @@ fn physical_vertices(vertices: &[Vertex], pixels_per_point: f32) -> Vec<UiVertex
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::console::ConsoleOverlay;
     use egui::epaint::{ImageDelta, Mesh, PaintCallback};
-    use egui::{Color32, ColorImage, TextureOptions, pos2};
+    use egui::{Color32, ColorImage, Context, RawInput, TextureOptions, pos2, vec2};
+    use engine_console::{CommandCatalog, ConsoleLevel, ConsoleLine};
     use std::sync::Arc;
 
     #[derive(Default)]
@@ -328,6 +338,104 @@ mod tests {
         textures.apply_frees(&delta, &mut backend).unwrap();
         delta.clear();
         assert_eq!(backend.freed, [1]);
+    }
+
+    #[test]
+    fn clear_releases_every_managed_texture() {
+        let mut backend = FakeBackend::default();
+        let mut textures = ManagedTextures::default();
+        apply(&mut textures, set_delta(7, None, 1, 1), &mut backend);
+        apply(&mut textures, set_delta(8, None, 2, 2), &mut backend);
+
+        textures.clear(&mut backend).unwrap();
+
+        let mut freed = backend.freed;
+        freed.sort_unstable();
+        assert_eq!(freed, [1, 2]);
+    }
+
+    #[test]
+    fn console_context_recreated_after_close_reuploads_font_atlas_before_glyph_patches() {
+        fn frame(
+            context: &Context,
+            overlay: &mut ConsoleOverlay,
+            lines: &[ConsoleLine],
+        ) -> egui::FullOutput {
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |_ui| {
+                    overlay.show(context, rect, lines, &CommandCatalog::default());
+                },
+            )
+        }
+
+        let first_line = ConsoleLine {
+            level: ConsoleLevel::Info,
+            source: "console".to_owned(),
+            text: "first".to_owned(),
+        };
+        let context = Context::default();
+        let mut overlay = ConsoleOverlay::default();
+        overlay.set_open(true);
+        let mut textures = ManagedTextures::default();
+        let mut backend = FakeBackend::default();
+
+        let mut first = frame(&context, &mut overlay, std::slice::from_ref(&first_line));
+        assert!(
+            first
+                .textures_delta
+                .set
+                .values()
+                .flatten()
+                .any(|delta| delta.pos.is_none())
+        );
+        textures
+            .apply_updates(&first.textures_delta, &mut backend)
+            .unwrap();
+        first.textures_delta.clear();
+
+        overlay.set_open(false);
+        textures.clear(&mut backend).unwrap();
+        assert_eq!(backend.freed.len(), backend.created.len());
+        drop(context);
+        overlay.set_open(true);
+        let context = Context::default();
+        let mut reopened = frame(&context, &mut overlay, std::slice::from_ref(&first_line));
+        assert!(
+            reopened
+                .textures_delta
+                .set
+                .values()
+                .flatten()
+                .any(|delta| delta.pos.is_none())
+        );
+        textures
+            .apply_updates(&reopened.textures_delta, &mut backend)
+            .unwrap();
+        reopened.textures_delta.clear();
+
+        let later_line = ConsoleLine {
+            level: ConsoleLevel::Info,
+            source: "console".to_owned(),
+            text: "новый ёж".to_owned(),
+        };
+        let mut later = frame(&context, &mut overlay, &[first_line, later_line]);
+        assert!(
+            later
+                .textures_delta
+                .set
+                .values()
+                .flatten()
+                .any(|delta| delta.pos.is_some())
+        );
+        textures
+            .apply_updates(&later.textures_delta, &mut backend)
+            .unwrap();
+        later.textures_delta.clear();
     }
 
     #[test]

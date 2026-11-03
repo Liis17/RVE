@@ -19,8 +19,10 @@ use egui_dock::{DockArea, DockState, Style};
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab>) {
     state.scene_view.visible = false;
     state.scene_view.hovered = false;
+    state.scene_view.rect = None;
     state.game_view.visible = false;
     state.game_view.hovered = false;
+    state.game_view.rect = None;
     toolbar::handle_shortcuts(ui.ctx(), state);
     toolbar::show(ui, state, dock);
     show_status_bar(ui, state);
