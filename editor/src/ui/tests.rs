@@ -356,6 +356,46 @@ fn tool_shortcuts_apply_unless_a_text_field_has_focus() {
 }
 
 #[test]
+fn showing_the_inspector_keeps_hdr_light_colors_and_material_overrides_unchanged() {
+    let mut harness = Harness::new();
+    let scene = harness.scene_mut();
+    scene
+        .edit_object("sun", None, |object| {
+            object.directional_light.as_mut().unwrap().color = [2.5, 1.5, 0.5];
+            Ok(())
+        })
+        .unwrap();
+    let model = VirtualPath::parse("/cube.fbx").unwrap();
+    let mesh = scene
+        .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+        .unwrap();
+    scene
+        .set_material(
+            &mesh,
+            Some(engine_scene::document::MaterialOverride {
+                base_color: Some([0.2, 0.4, 0.6]),
+                metallic: Some(0.5),
+                roughness: None,
+                metallic_roughness_texture: None,
+                normal_texture: None,
+                normal_scale: Some(2.0),
+            }),
+            None,
+        )
+        .unwrap();
+    let before = harness.scene().document().to_toml().unwrap();
+    let revision = harness.scene().revision();
+    for selected in ["sun", mesh.as_str()] {
+        harness.scene_mut().select(Some(selected));
+        for _ in 0..2 {
+            harness.panel(Vec::new(), inspector::show);
+        }
+    }
+    assert_eq!(harness.scene().revision(), revision);
+    assert_eq!(harness.scene().document().to_toml().unwrap(), before);
+}
+
+#[test]
 fn ctrl_shift_z_redoes_instead_of_undoing() {
     let mut harness = Harness::new();
     let id = harness
