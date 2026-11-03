@@ -2,6 +2,7 @@
 
 use crate::scene_edit::{EditorScene, NewObject};
 use crate::state::{AssetDrag, EditorState};
+use crate::ui::scene_view;
 use engine_scene::SceneObject;
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +12,8 @@ struct ObjectDrag(String);
 
 /// Изменения, собранные при обходе дерева и применяемые после него.
 enum Command {
-    Select(String),
+    /// Щелчок по строке с модификаторами; пустой id — щелчок мимо объектов.
+    Select(String, egui::Modifiers),
     SetParent(String, Option<String>),
     CreateFromAsset(String, Option<String>),
     CreateChild(String),
@@ -104,7 +106,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                 commands.push(Command::CreateFromAsset(asset.0.clone(), None));
             }
             if rest.clicked() {
-                commands.push(Command::Select(String::new()));
+                commands.push(Command::Select(
+                    String::new(),
+                    ui.input(|input| input.modifiers),
+                ));
             }
             rest.context_menu(|ui| {
                 if ui.button("Create Empty").clicked() {
@@ -189,13 +194,14 @@ impl TreeContext<'_> {
             }
             return;
         }
-        let selected = self.scene.selection() == Some(object.id.as_str());
+        let selected = self.scene.is_selected(&object.id);
         let response = ui.add(
             egui::Button::selectable(selected, object.display_name())
                 .sense(egui::Sense::click_and_drag()),
         );
         if response.clicked() {
-            commands.push(Command::Select(object.id.clone()));
+            let modifiers = ui.input(|input| input.modifiers);
+            commands.push(Command::Select(object.id.clone(), modifiers));
         }
         if response.double_clicked() {
             commands.push(Command::BeginRename(
@@ -240,9 +246,10 @@ impl TreeContext<'_> {
 
 fn apply(state: &mut EditorState, command: Command) {
     match command {
-        Command::Select(id) => {
+        Command::Select(id, modifiers) => {
             if let Some(scene) = &mut state.scene {
-                scene.select((!id.is_empty()).then_some(id.as_str()));
+                let id = (!id.is_empty()).then_some(id.as_str());
+                scene_view::apply_click_selection(scene, id, modifiers);
             }
         }
         Command::SetParent(id, parent) => {

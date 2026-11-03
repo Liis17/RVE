@@ -22,6 +22,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         return;
     };
     let enabled = !state.is_playing();
+    let selected = state
+        .scene
+        .as_ref()
+        .map_or(0, |scene| scene.selected_ids().len());
+    if selected > 1 {
+        ui.label(format!(
+            "Выделено объектов: {selected}; показан активный {}",
+            object.display_name()
+        ));
+        ui.separator();
+    }
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {

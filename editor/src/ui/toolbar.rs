@@ -92,25 +92,11 @@ pub fn redo(state: &mut EditorState) {
 }
 
 pub fn delete_selection(state: &mut EditorState) {
-    let selection = state
-        .scene
-        .as_ref()
-        .and_then(|scene| scene.selection())
-        .map(str::to_owned);
-    if let Some(id) = selection {
-        state.edit_scene(|scene| scene.delete_object(&id));
-    }
+    state.edit_scene(|scene| scene.delete_selection());
 }
 
 pub fn duplicate_selection(state: &mut EditorState) {
-    let selection = state
-        .scene
-        .as_ref()
-        .and_then(|scene| scene.selection())
-        .map(str::to_owned);
-    if let Some(id) = selection {
-        state.edit_scene(|scene| scene.duplicate_object(&id));
-    }
+    state.edit_scene(|scene| scene.duplicate_selection());
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab>) {
