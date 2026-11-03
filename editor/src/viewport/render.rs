@@ -7,11 +7,12 @@ use engine_assets::{Model, ModelAlphaMode};
 use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, Material, MaterialId,
-    MeshId, RenderError, Renderer, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
-    Vertex, ViewSettings, ViewportId,
+    MeshId, RenderError, Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
+use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
-use engine_scene::light::shadow_view_projection;
+use engine_scene::light::cascade_view_projections;
 use engine_scene::world::ObjectHandle;
 use engine_scene::{AntiAliasing, CameraSettings, LightState, SceneFrame, Tonemapper, World};
 use glam::{Mat4, Vec3};
@@ -259,16 +260,18 @@ impl SceneRenderer {
     }
 
     /// Собирает `Frame` для заданной матрицы камеры; `with_grid` выбирает Scene draw list.
-    pub fn frame(
-        &self,
+    #[allow(clippy::too_many_arguments)]
+    pub fn frame<'a>(
+        &'a self,
         view_projection: Mat4,
         camera_position: Vec3,
         settings: CameraSettings,
         light: &LightState,
         scene_has_light: bool,
+        shadow_cascades: &'a [[[f32; 4]; 4]],
         with_grid: bool,
-    ) -> Frame<'_> {
-        let (light, shadow) = frame_light(light, scene_has_light);
+    ) -> Frame<'a> {
+        let light = frame_light(light, scene_has_light);
         Frame {
             clear_color: [
                 settings.render.clear_color[0],
@@ -277,7 +280,7 @@ impl SceneRenderer {
                 1.0,
             ],
             view_projection: view_projection.to_cols_array_2d(),
-            shadow_view_projection: shadow,
+            shadow_cascades,
             camera_position: camera_position.to_array(),
             light,
             draws: if with_grid {
@@ -300,6 +303,31 @@ impl SceneRenderer {
                 },
             },
         }
+    }
+
+    pub fn shadow_cascades(
+        camera: Camera,
+        width: u32,
+        height: u32,
+        light: &LightState,
+        scene_has_light: bool,
+    ) -> Vec<[[f32; 4]; 4]> {
+        if !scene_has_light {
+            return Vec::new();
+        }
+        let Some(settings) = light.shadow else {
+            return Vec::new();
+        };
+        cascade_view_projections(
+            camera,
+            width.max(1) as f32 / height.max(1) as f32,
+            Vec3::from_array(light.direction),
+            settings,
+            SHADOW_MAP_RESOLUTION,
+        )
+        .into_iter()
+        .map(|matrix| matrix.to_cols_array_2d())
+        .collect()
     }
 }
 
@@ -652,24 +680,15 @@ fn resolve_material(
 
 /// Свет кадра. Сцена без directional light показывается светом renderer по умолчанию,
 /// иначе объекты редактора выглядели бы плоско залитыми.
-fn frame_light(
-    light: &LightState,
-    scene_has_light: bool,
-) -> (DirectionalLight, Option<[[f32; 4]; 4]>) {
+fn frame_light(light: &LightState, scene_has_light: bool) -> DirectionalLight {
     if !scene_has_light {
-        return (DirectionalLight::default(), None);
+        return DirectionalLight::default();
     }
-    let shadow = light.shadow.map(|(center, radius)| {
-        shadow_view_projection(Vec3::from_array(light.direction), center, radius).to_cols_array_2d()
-    });
-    (
-        DirectionalLight {
-            direction: light.direction,
-            color: light.color,
-            ambient: light.ambient,
-        },
-        shadow,
-    )
+    DirectionalLight {
+        direction: light.direction,
+        color: light.color,
+        ambient: light.ambient,
+    }
 }
 
 /// Шаг сетки — степень десяти по расстоянию камеры: линии сохраняют толщину на экране.
@@ -728,6 +747,17 @@ mod tests {
     use super::*;
     use engine_files::VirtualPath;
     use engine_scene::LodLevel;
+
+    fn camera() -> Camera {
+        Camera {
+            position: Vec3::new(0.0, 0.0, 5.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov_narrow: std::f32::consts::FRAC_PI_4,
+            near: 0.1,
+            far: 100.0,
+        }
+    }
 
     #[test]
     fn lod_materials_for_two_viewports_do_not_replace_each_other() {
@@ -825,9 +855,9 @@ id = "camera"
     #[test]
     fn scene_without_a_light_uses_the_renderer_default_and_no_shadows() {
         let state = LightState::default();
-        let (light, shadow) = frame_light(&state, false);
+        let light = frame_light(&state, false);
         assert_eq!(light.direction, DirectionalLight::default().direction);
-        assert_eq!(shadow, None);
+        assert!(SceneRenderer::shadow_cascades(camera(), 1280, 720, &state, false).is_empty());
     }
 
     #[test]
@@ -836,16 +866,44 @@ id = "camera"
             direction: [0.0, -1.0, 0.0],
             color: [0.5; 3],
             ambient: [0.1; 3],
-            shadow: Some((Vec3::ZERO, 10.0)),
+            shadow: Some(engine_scene::ShadowSettings {
+                distance: 40.0,
+                cascades: 2,
+            }),
         };
-        let (light, shadow) = frame_light(&state, true);
+        let light = frame_light(&state, true);
         assert_eq!(light.color, [0.5; 3]);
-        assert!(shadow.is_some());
+        assert_eq!(
+            SceneRenderer::shadow_cascades(camera(), 1280, 720, &state, true).len(),
+            2
+        );
         let without_shadow = LightState {
             shadow: None,
             ..state
         };
-        assert_eq!(frame_light(&without_shadow, true).1, None);
+        assert!(
+            SceneRenderer::shadow_cascades(camera(), 1280, 720, &without_shadow, true).is_empty()
+        );
+    }
+
+    #[test]
+    fn scene_and_game_viewports_build_camera_relative_shadow_cascades() {
+        let light = LightState {
+            shadow: Some(engine_scene::ShadowSettings {
+                distance: 60.0,
+                cascades: 3,
+            }),
+            ..LightState::default()
+        };
+        let first = camera();
+        let mut second = first;
+        second.position += Vec3::X * 12.0;
+        second.target += Vec3::X * 12.0;
+        let first_cascades = SceneRenderer::shadow_cascades(first, 1280, 720, &light, true);
+        let second_cascades = SceneRenderer::shadow_cascades(second, 1280, 720, &light, true);
+        assert_eq!(first_cascades.len(), 3);
+        assert_eq!(second_cascades.len(), 3);
+        assert_ne!(first_cascades[0], second_cascades[0]);
     }
 
     #[test]

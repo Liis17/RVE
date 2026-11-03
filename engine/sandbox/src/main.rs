@@ -492,6 +492,12 @@ impl WindowHandler for Sandbox {
             Some(overlay) => overlay.update(Instant::now(), gpu_time),
             None => &[],
         };
+        let shadow_cascades = self.content.shadow_cascades(
+            elapsed,
+            self.size.width,
+            self.size.height,
+            self.camera_settings,
+        );
         let frame = Frame {
             clear_color: [
                 self.camera_settings.render.clear_color[0],
@@ -508,10 +514,7 @@ impl WindowHandler for Sandbox {
                     self.camera_settings,
                 )
                 .to_cols_array_2d(),
-            shadow_view_projection: self
-                .content
-                .shadow_view_projection(elapsed)
-                .map(|matrix| matrix.to_cols_array_2d()),
+            shadow_cascades: &shadow_cascades,
             camera_position: self.content.motion.camera_position(elapsed),
             light: self.content.light(elapsed),
             draws: &draws,

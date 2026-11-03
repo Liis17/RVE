@@ -603,10 +603,10 @@ pub struct DirectionalLightComponent {
     pub ambient: [f32; 3],
     #[serde(default)]
     pub shadows: bool,
-    #[serde(default = "zero3")]
-    pub shadow_center: [f32; 3],
-    #[serde(default)]
-    pub shadow_radius: Option<f32>,
+    #[serde(default = "default_shadow_distance")]
+    pub shadow_distance: f32,
+    #[serde(default = "default_shadow_cascades")]
+    pub shadow_cascades: u8,
 }
 
 /// Скаляр или массив значений параметра скрипта.
@@ -773,24 +773,18 @@ fn validate_light(
             "directional_light.ambient должен содержать конечные компоненты >= 0",
         ));
     }
-    if !light.shadow_center.into_iter().all(f32::is_finite)
-        || light
-            .shadow_radius
-            .is_some_and(|radius| !radius.is_finite())
-    {
+    if !light.shadow_distance.is_finite() || light.shadow_distance <= 0.0 {
         return Err(SceneError::new(
             source,
             Some(&object.id),
-            "параметры тени должны быть конечными",
+            "directional_light.shadow_distance должен быть конечным и > 0",
         ));
     }
-    if light.shadow_radius.is_some_and(|radius| radius <= 0.0)
-        || (light.shadows && light.shadow_radius.is_none())
-    {
+    if !(1..=crate::light::MAX_SHADOW_CASCADES).contains(&light.shadow_cascades) {
         return Err(SceneError::new(
             source,
             Some(&object.id),
-            "shadow_radius должен быть > 0 и обязателен при shadows = true",
+            "directional_light.shadow_cascades должен быть в диапазоне 1..=4",
         ));
     }
     Ok(())
@@ -1099,6 +1093,14 @@ fn one3() -> [f32; 3] {
 
 fn default_ambient() -> [f32; 3] {
     [0.15; 3]
+}
+
+fn default_shadow_distance() -> f32 {
+    100.0
+}
+
+fn default_shadow_cascades() -> u8 {
+    crate::light::MAX_SHADOW_CASCADES
 }
 
 fn validated_world_matrices(
@@ -1793,10 +1795,6 @@ scale=[1.0,1.0,0.0]
             "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\ncolor=[nan,1.0,1.0]\n"
         );
         assert!(parse(&light_nan).is_err());
-        let shadow_center_nan = format!(
-            "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadow_center=[0.0,inf,0.0]\n"
-        );
-        assert!(parse(&shadow_center_nan).is_err());
         let param_inf = format!(
             "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{speed=inf}}\n[[assets]]\npath=\"/s.lua\"\n"
         );
@@ -1804,24 +1802,32 @@ scale=[1.0,1.0,0.0]
     }
 
     #[test]
-    fn light_defaults_shadow_requirements_and_nonnegative_colors_are_checked() {
-        let no_shadow_radius = format!(
-            "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadows=true\n"
-        );
-        assert!(parse(&no_shadow_radius).is_err());
-        for radius in ["0.0", "-1.0", "nan", "inf"] {
+    fn light_defaults_shadow_settings_and_nonnegative_colors_are_checked() {
+        for distance in ["0.0", "-1.0", "nan", "inf", "-inf"] {
             let input = format!(
-                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadows=true\nshadow_radius={radius}\n"
-            );
-            assert!(parse(&input).is_err(), "accepted radius {radius}");
-        }
-        for radius in ["0.0", "-1.0"] {
-            let input = format!(
-                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadows=false\nshadow_radius={radius}\n"
+                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadow_distance={distance}\n"
             );
             assert!(
                 parse(&input).is_err(),
-                "accepted shadow_radius {radius} without shadows"
+                "accepted shadow distance {distance}"
+            );
+        }
+        for cascades in ["0", "5"] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadow_cascades={cascades}\n"
+            );
+            assert!(
+                parse(&input).is_err(),
+                "accepted shadow cascades {cascades}"
+            );
+        }
+        for removed_field in ["shadow_center=[0.0,0.0,0.0]", "shadow_radius=5.0"] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\n{removed_field}\n"
+            );
+            assert!(
+                parse(&input).is_err(),
+                "accepted removed field {removed_field}"
             );
         }
         let negative_color = format!(
@@ -1836,7 +1842,14 @@ scale=[1.0,1.0,0.0]
         assert_eq!(light.color, [1.0; 3]);
         assert_eq!(light.ambient, [0.15; 3]);
         assert!(!light.shadows);
-        assert_eq!(light.shadow_center, [0.0; 3]);
+        assert_eq!(light.shadow_distance, 100.0);
+        assert_eq!(light.shadow_cascades, 4);
+
+        let shadow_enabled = parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\nshadows=true\n"
+        ))
+        .unwrap();
+        assert!(shadow_enabled.objects[1].directional_light.unwrap().shadows);
     }
 
     #[test]

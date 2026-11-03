@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn scene_shadow_orthographic_matrix_culls_outside_the_shadow_volume() {
-        // Matches shadow_view_projection(NEG_Z, ZERO, 1): a unit orthographic
+        // Matches a unit orthographic light frustum:
         // volume looking from +Z, with DirectX [0, 1] clip depth.
         let light_view_projection = [
             [1.0, 0.0, 0.0, 0.0],

@@ -9,6 +9,8 @@ pub mod prefab;
 pub mod transform;
 pub mod world;
 
+pub use light::ShadowSettings;
+
 pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,
     ProjectionSettings, Tonemapper,

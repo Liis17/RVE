@@ -3,14 +3,14 @@
 layout(location = 0) in vec3 in_normal;
 layout(location = 1) in vec2 in_uv;
 layout(location = 2) in vec3 in_color;
-layout(location = 3) in vec4 in_light_clip;
-layout(location = 4) in vec3 in_world_position;
+layout(location = 3) in vec4 in_shadow_clip[4];
+layout(location = 7) in vec3 in_world_position;
 
 layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view_projection;
-    mat4 light_view_projection;
+    mat4 shadow_view_projections[4];
     vec4 light_direction;
     vec4 light_color;
     vec4 ambient_color;
@@ -18,8 +18,8 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 camera_position;
 } frame;
 
-layout(set = 0, binding = 1) uniform texture2D shadow_map;
-layout(set = 0, binding = 2) uniform sampler shadow_sampler;
+layout(set = 0, binding = 1) uniform texture2DArray shadow_map;
+layout(set = 0, binding = 2) uniform samplerShadow shadow_sampler;
 
 layout(set = 1, binding = 0) uniform MaterialUniforms {
     vec4 base_color;
@@ -167,26 +167,32 @@ void main() {
 
     float geometric_light_dot = dot(geometric_normal, light);
     float shadow = 1.0;
-    if (frame.shadow_params.x > 0.5 && in_light_clip.w != 0.0) {
-        vec3 light_ndc = in_light_clip.xyz / in_light_clip.w;
-        vec2 shadow_uv = vec2(0.5 + 0.5 * light_ndc.x, 0.5 - 0.5 * light_ndc.y);
-        if (all(greaterThanEqual(shadow_uv, vec2(0.0)))
-            && all(lessThanEqual(shadow_uv, vec2(1.0)))
-            && light_ndc.z >= 0.0 && light_ndc.z <= 1.0) {
+    if (frame.shadow_params.x > 0.5) {
+        for (int cascade = 0; cascade < int(frame.shadow_params.z); ++cascade) {
+            vec4 light_clip = in_shadow_clip[cascade];
+            if (light_clip.w == 0.0) {
+                continue;
+            }
+            vec3 light_ndc = light_clip.xyz / light_clip.w;
+            vec2 shadow_uv = vec2(0.5 + 0.5 * light_ndc.x, 0.5 - 0.5 * light_ndc.y);
+            if (any(lessThan(shadow_uv, vec2(0.0)))
+                || any(greaterThan(shadow_uv, vec2(1.0)))
+                || light_ndc.z < 0.0 || light_ndc.z > 1.0) {
+                continue;
+            }
             float bias = max(0.005 * (1.0 - max(geometric_light_dot, 0.0)), 0.0005);
-            shadow = 0.0;
+            float cascade_shadow = 0.0;
             for (int y = -1; y <= 1; ++y) {
                 for (int x = -1; x <= 1; ++x) {
                     vec2 offset = vec2(float(x), float(y)) * frame.shadow_params.y;
-                    float shadow_depth = textureLod(
-                        sampler2D(shadow_map, shadow_sampler), shadow_uv + offset, 0.0
-                    ).r;
-                    if (light_ndc.z - bias <= shadow_depth) {
-                        shadow += 1.0;
-                    }
+                    cascade_shadow += texture(
+                        sampler2DArrayShadow(shadow_map, shadow_sampler),
+                        vec4(shadow_uv + offset, float(cascade), light_ndc.z - bias)
+                    );
                 }
             }
-            shadow /= 9.0;
+            shadow = cascade_shadow / 9.0;
+            break;
         }
     }
 

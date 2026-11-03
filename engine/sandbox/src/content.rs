@@ -1,13 +1,13 @@
 //! Содержимое кадра sandbox: демонстрационная сцена или модель из assets.
 
 use crate::scene::{
-    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, material_sphere_meshes,
-    materials_light_view_projection, materials_plane_mesh, plane_mesh, shadows_light_direction,
-    shadows_light_view_projection, sinusoidal_normal_texture,
+    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, material_sphere_meshes, materials_plane_mesh,
+    plane_mesh, shadows_light_direction, sinusoidal_normal_texture,
 };
 use engine_assets::{Model, ModelAlphaMode, ModelMaterial, TextureData};
-use engine_render::{DirectionalLight, Vertex};
-use engine_scene::CameraSettings;
+use engine_render::{DirectionalLight, SHADOW_MAP_RESOLUTION, Vertex};
+use engine_scene::light::cascade_view_projections;
+use engine_scene::{CameraSettings, ShadowSettings};
 use glam::{Mat4, Vec3};
 
 /// Меш с CPU-материалом и индексами его текстур в [`Content::textures`].
@@ -201,12 +201,30 @@ impl Content {
         }
     }
 
-    pub fn shadow_view_projection(&self, elapsed: f32) -> Option<Mat4> {
-        match self.motion {
-            Scene::Shadows => Some(shadows_light_view_projection(elapsed)),
-            Scene::Materials => Some(materials_light_view_projection(elapsed)),
-            Scene::Triangle | Scene::Cube => None,
-        }
+    pub fn shadow_cascades(
+        &self,
+        elapsed: f32,
+        width: u32,
+        height: u32,
+        settings: CameraSettings,
+    ) -> Vec<[[f32; 4]; 4]> {
+        let Some(camera) = self.motion.camera_at(elapsed, settings) else {
+            return Vec::new();
+        };
+        let shadow_settings = ShadowSettings {
+            distance: camera.far.min(100.0),
+            cascades: 4,
+        };
+        cascade_view_projections(
+            camera,
+            width.max(1) as f32 / height.max(1) as f32,
+            shadows_light_direction(elapsed),
+            shadow_settings,
+            SHADOW_MAP_RESOLUTION,
+        )
+        .into_iter()
+        .map(|matrix| matrix.to_cols_array_2d())
+        .collect()
     }
 }
 
@@ -369,7 +387,11 @@ mod tests {
                 content.light(1.5),
                 engine_render::DirectionalLight::default()
             );
-            assert!(content.shadow_view_projection(1.5).is_none());
+            assert!(
+                content
+                    .shadow_cascades(1.5, 800, 600, CameraSettings::default())
+                    .is_empty()
+            );
         }
     }
 
@@ -382,20 +404,28 @@ mod tests {
         assert_eq!(content.meshes[1].material.base_color_texture, None);
         assert_eq!(content.light(0.0).color, [1.0; 3]);
         assert_eq!(content.light(0.0).ambient, [0.15; 3]);
-        assert!(content.shadow_view_projection(0.0).is_some());
+        let cascades = content.shadow_cascades(0.0, 1280, 720, CameraSettings::default());
+        assert_eq!(cascades.len(), 4);
+        assert!(
+            cascades
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
         assert_eq!(
             Content::from_scene(Scene::Cube).light(0.0),
             engine_render::DirectionalLight::default()
         );
         assert!(
             Content::from_scene(Scene::Cube)
-                .shadow_view_projection(0.0)
-                .is_none()
+                .shadow_cascades(0.0, 1280, 720, CameraSettings::default())
+                .is_empty()
         );
         assert!(
             Content::from_scene(Scene::Triangle)
-                .shadow_view_projection(0.0)
-                .is_none()
+                .shadow_cascades(0.0, 1280, 720, CameraSettings::default())
+                .is_empty()
         );
     }
 
@@ -432,7 +462,12 @@ mod tests {
         assert_eq!(floor.material.normal_texture, Some(0));
         assert_eq!(floor.vertices[0].position, [-4.0, -1.0, -4.0]);
         assert_eq!(content.light(0.0).ambient, [0.15; 3]);
-        assert!(content.shadow_view_projection(0.0).is_some());
+        assert_eq!(
+            content
+                .shadow_cascades(0.0, 1280, 720, CameraSettings::default())
+                .len(),
+            4
+        );
     }
 
     #[test]

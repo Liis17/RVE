@@ -3,8 +3,8 @@
 use engine_assets::TextureData;
 use engine_render::Vertex;
 use engine_scene::CameraSettings;
-use engine_scene::camera::OrbitCamera;
-use engine_scene::light::{OrbitingSun, shadow_view_projection};
+use engine_scene::camera::{Camera, OrbitCamera};
+use engine_scene::light::OrbitingSun;
 use glam::camera::rh::proj::directx;
 use glam::{Mat4, Vec3};
 
@@ -44,12 +44,6 @@ const SHADOWS_SUN: OrbitingSun = OrbitingSun {
     angular_speed: -std::f32::consts::TAU / 12.0,
 };
 
-pub(super) const SHADOWS_LIGHT_CENTER: Vec3 = Vec3::ZERO;
-/// Сфера охватывает углы плоскости (радиус √3 ≈ 1.73) и вращающийся куб.
-/// Для `--model` этого достаточно: `fit` вписывает модель в единичный куб.
-pub(super) const SHADOWS_LIGHT_RADIUS: f32 = 1.8;
-const MATERIALS_LIGHT_CENTER: Vec3 = Vec3::new(0.0, -0.6, 0.0);
-const MATERIALS_LIGHT_RADIUS: f32 = 5.9;
 pub(super) const SHADOWS_LIGHT_COLOR: [f32; 3] = [1.0; 3];
 pub(super) const SHADOWS_AMBIENT: [f32; 3] = [0.15; 3];
 
@@ -91,26 +85,32 @@ impl Scene {
         match self {
             Self::Triangle => triangle_view_projection(width, height),
             Self::Cube => cube_view_projection(width, height),
-            Self::Shadows => OrbitCamera {
-                fov_narrow: settings.projection.fov_deg.to_radians(),
-                near: settings.projection.near,
-                far: settings.projection.far,
-                ..SHADOWS_CAMERA
-            }
-            .camera_at(elapsed)
-            .view_projection(width, height),
-            Self::Materials => MATERIALS_CAMERA
-                .camera_at(elapsed)
+            Self::Shadows | Self::Materials => self
+                .camera_at(elapsed, settings)
+                .expect("lit sandbox scenes have a camera")
                 .view_projection(width, height),
         }
     }
 
-    pub fn camera_position(self, elapsed: f32) -> [f32; 3] {
+    pub fn camera_at(self, elapsed: f32, settings: CameraSettings) -> Option<Camera> {
         match self {
-            Self::Triangle | Self::Cube => [0.0, 0.0, 3.0],
-            Self::Shadows => SHADOWS_CAMERA.camera_at(elapsed).position.to_array(),
-            Self::Materials => MATERIALS_CAMERA.camera_at(elapsed).position.to_array(),
+            Self::Triangle | Self::Cube => None,
+            Self::Shadows => Some(
+                OrbitCamera {
+                    fov_narrow: settings.projection.fov_deg.to_radians(),
+                    near: settings.projection.near,
+                    far: settings.projection.far,
+                    ..SHADOWS_CAMERA
+                }
+                .camera_at(elapsed),
+            ),
+            Self::Materials => Some(MATERIALS_CAMERA.camera_at(elapsed)),
         }
+    }
+
+    pub fn camera_position(self, elapsed: f32) -> [f32; 3] {
+        self.camera_at(elapsed, CameraSettings::default())
+            .map_or([0.0, 0.0, 3.0], |camera| camera.position.to_array())
     }
 
     pub fn model(self, elapsed: f32) -> Mat4 {
@@ -125,22 +125,6 @@ impl Scene {
 
 pub fn shadows_light_direction(elapsed: f32) -> Vec3 {
     SHADOWS_SUN.direction_at(elapsed)
-}
-
-pub fn shadows_light_view_projection(elapsed: f32) -> Mat4 {
-    shadow_view_projection(
-        shadows_light_direction(elapsed),
-        SHADOWS_LIGHT_CENTER,
-        SHADOWS_LIGHT_RADIUS,
-    )
-}
-
-pub fn materials_light_view_projection(elapsed: f32) -> Mat4 {
-    shadow_view_projection(
-        shadows_light_direction(elapsed),
-        MATERIALS_LIGHT_CENTER,
-        MATERIALS_LIGHT_RADIUS,
-    )
 }
 
 /// Ten UV spheres form dielectric and metallic rows with the same roughness sweep.
@@ -403,8 +387,7 @@ mod tests {
     use super::{
         CameraSettings, Scene, TRIANGLE_INDICES, TRIANGLE_VERTICES, checker_texture, cube_mesh,
         cube_model, cube_view_projection, material_sphere_meshes, plane_mesh,
-        shadows_light_direction, shadows_light_view_projection, sinusoidal_normal_texture,
-        triangle_view_projection,
+        shadows_light_direction, sinusoidal_normal_texture, triangle_view_projection,
     };
     use glam::{Mat4, Vec3, Vec4};
 
@@ -750,30 +733,18 @@ mod tests {
     }
 
     #[test]
-    fn shadow_map_covers_rotating_cube_and_plane_for_full_sun_orbit() {
-        let (cube_vertices, _) = cube_mesh();
-        let (plane_vertices, _) = plane_mesh();
+    fn lit_scene_cameras_are_finite_for_full_camera_and_sun_orbits() {
         for step in 0..=64 {
             let elapsed = step as f32 * 12.0 / 64.0;
-            let light_view_projection = shadows_light_view_projection(elapsed);
-            let model = Scene::Shadows.model(elapsed);
-
-            for (name, position) in cube_vertices
-                .iter()
-                .map(|vertex| ("cube", model.transform_point3(Vec3::from(vertex.position))))
-                .chain(
-                    plane_vertices
-                        .iter()
-                        .map(|vertex| ("plane", Vec3::from(vertex.position))),
-                )
-            {
-                let clip = light_view_projection * position.extend(1.0);
-                let ndc = clip.truncate() / clip.w;
-                assert!(
-                    ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z),
-                    "{name} t={elapsed}: {ndc:?}"
-                );
-            }
+            let shadows = Scene::Shadows
+                .camera_at(elapsed, CameraSettings::default())
+                .unwrap();
+            let materials = Scene::Materials
+                .camera_at(elapsed, CameraSettings::default())
+                .unwrap();
+            assert!(shadows.view_projection(1280, 720).is_finite());
+            assert!(materials.view_projection(1280, 720).is_finite());
+            assert!(shadows_light_direction(elapsed).is_finite());
         }
     }
 }

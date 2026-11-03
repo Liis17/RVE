@@ -28,7 +28,9 @@ const LINEAR_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 /// egui хранит значения в гамма-пространстве, поэтому они читаются без перевода; шейдер сам
 /// переводит результат для sRGB-swapchain, и смешивание в этом случае идёт в линейном пространстве.
 const UI_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-const SHADOW_MAP_SIZE: u32 = 2048;
+/// Resolution of each layer in the shared directional shadow map.
+pub const SHADOW_MAP_RESOLUTION: u32 = 2048;
+const SHADOW_CASCADE_COUNT: usize = 4;
 /// Максимальное ожидание swapchain image перед пропуском кадра.
 const ACQUIRE_TIMEOUT_NS: u64 = 100_000_000;
 const NO_GRAPHICS_QUEUE_FAMILY_REASON: &str = "нет graphics queue family";
@@ -64,7 +66,8 @@ const WHITE_LINEAR_TEXTURE: usize = 1;
 const FLAT_NORMAL_TEXTURE: usize = 2;
 const DEFAULT_MATERIAL: usize = 0;
 const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
-const FRAME_UNIFORMS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>() + 5 * size_of::<[f32; 4]>();
+const FRAME_UNIFORMS_SIZE: usize =
+    (1 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 5 * size_of::<[f32; 4]>();
 const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
 const IDENTITY_MATRIX: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
@@ -203,8 +206,8 @@ impl Default for DirectionalLight {
 ///
 /// `view_projection` переводит мировое пространство в clip space и задаётся по столбцам.
 /// Ось Y clip space направлена вверх, глубина после деления на `w` лежит в `[0, 1]`.
-/// `shadow_view_projection`, если задана, переводит мировое пространство в clip space света
-/// с той же конвенцией Y-up и глубиной `[0, 1]`; `None` отключает отбрасывание теней.
+/// `shadow_cascades` содержит от нуля до четырёх матриц clip space света с той же конвенцией
+/// Y-up и глубиной `[0, 1]`; пустой срез отключает тени. Матрицы должны быть конечными.
 /// `overlay` — треугольники (по три вершины), которые рисуются с альфа-смешиванием
 /// поверх итогового изображения без масштабирования `render_scale`; пустой срез
 /// отключает оверлей. `view` задаёт render scale, экспозицию, tonemapper и сглаживание.
@@ -212,7 +215,7 @@ impl Default for DirectionalLight {
 pub struct Frame<'a> {
     pub clear_color: [f32; 4],
     pub view_projection: [[f32; 4]; 4],
-    pub shadow_view_projection: Option<[[f32; 4]; 4]>,
+    pub shadow_cascades: &'a [[[f32; 4]; 4]],
     pub camera_position: [f32; 3],
     pub light: DirectionalLight,
     pub draws: &'a [DrawCommand],
@@ -512,6 +515,7 @@ pub struct Renderer {
     post_sampler: Option<vk::Sampler>,
     shadow_sampler: Option<vk::Sampler>,
     shadow_image: Option<DeviceImage>,
+    shadow_layout: vk::ImageLayout,
     max_texture_size: u32,
     /// Индекс — `MeshId`; слот удалённого меша остаётся пустым, id не используются повторно.
     meshes: Vec<Option<MeshBuffers>>,
@@ -586,6 +590,7 @@ impl Renderer {
             post_sampler: None,
             shadow_sampler: None,
             shadow_image: None,
+            shadow_layout: vk::ImageLayout::UNDEFINED,
             max_texture_size: 0,
             meshes: Vec::new(),
             textures: Vec::new(),
@@ -1002,8 +1007,7 @@ impl Renderer {
             meshes: &self.meshes,
             materials: &self.materials,
             draws: frame.draws,
-            light_view_projection: frame.shadow_view_projection,
-            enabled: frame.shadow_view_projection.is_some(),
+            shadow_cascades: frame.shadow_cascades,
         };
         let shadow_image = self
             .shadow_image
@@ -1052,11 +1056,13 @@ impl Renderer {
             .target
             .as_mut()
             .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
+        let mut shadow_layout = self.shadow_layout;
         record_frame(
             &device,
             command_buffer,
             target,
             shadow_image,
+            &mut shadow_layout,
             swapchain.images[image_index],
             swapchain.views[image_index],
             swapchain.extent,
@@ -1075,6 +1081,7 @@ impl Renderer {
             &scene,
             overlay.as_ref(),
         )?;
+        self.shadow_layout = shadow_layout;
 
         self.submit_and_present(
             image_index,
@@ -1275,8 +1282,7 @@ impl Renderer {
                             meshes: &self.meshes,
                             materials: &self.materials,
                             draws: frame.draws,
-                            light_view_projection: frame.shadow_view_projection,
-                            enabled: frame.shadow_view_projection.is_some(),
+                            shadow_cascades: frame.shadow_cascades,
                         },
                         ScenePass {
                             pipeline: scene_pipeline,
@@ -1328,6 +1334,7 @@ impl Renderer {
         };
 
         begin_command_buffer(&device, command_buffer)?;
+        let mut shadow_layout = self.shadow_layout;
         let tonemap_pipeline = self
             .tonemap_pipeline
             .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?;
@@ -1351,6 +1358,7 @@ impl Renderer {
                 command_buffer,
                 &mut target.scene,
                 shadow_image,
+                &mut shadow_layout,
                 target.render_extent,
                 shadow,
                 pass,
@@ -1392,6 +1400,7 @@ impl Renderer {
         );
         // SAFETY: command recording is complete before the command buffer is submitted.
         unsafe { device.end_command_buffer(command_buffer) }?;
+        self.shadow_layout = shadow_layout;
 
         self.submit_and_present(
             image_index,
@@ -1884,28 +1893,31 @@ impl Renderer {
 
     /// Создаёт единственную общую depth-карту и sampler для всех слотов кадров.
     fn create_shadow_resources(&mut self) -> Result<(), RenderError> {
-        let image = DeviceImage::new(
+        let image = DeviceImage::new_array(
             self.instance()?,
             self.device()?,
             self.physical_device,
             vk::Extent2D {
-                width: SHADOW_MAP_SIZE,
-                height: SHADOW_MAP_SIZE,
+                width: SHADOW_MAP_RESOLUTION,
+                height: SHADOW_MAP_RESOLUTION,
             },
             DEPTH_FORMAT,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-            depth_subresource_range(),
+            shadow_subresource_range(),
+            SHADOW_CASCADE_COUNT as u32,
         )?;
         self.shadow_image = Some(image);
         let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
             .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .compare_enable(true)
+            .compare_op(vk::CompareOp::LESS_OR_EQUAL)
             .max_lod(0.0);
-        // SAFETY: the sampler uses core nearest filtering and clamp-to-edge addressing.
+        // SAFETY: linear depth comparison is required during physical-device selection.
         self.shadow_sampler = Some(unsafe { self.device()?.create_sampler(&sampler_info, None) }?);
         Ok(())
     }
@@ -3139,13 +3151,14 @@ fn choose_device(
             instance.get_physical_device_format_properties(physical_device, DEPTH_FORMAT)
         };
         let depth_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
         if !depth_properties
             .optimal_tiling_features
             .contains(depth_features)
         {
             reasons.push(
-                "D32_SFLOAT не поддерживает depth attachment и выборку shadow map".to_owned(),
+                "D32_SFLOAT не поддерживает depth attachment, linear comparison sampling shadow map".to_owned(),
             );
         }
         // SAFETY: the surface and physical device belong to the same live instance.
@@ -4003,6 +4016,7 @@ struct DeviceImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    layer_views: Vec<vk::ImageView>,
 }
 
 impl DeviceImage {
@@ -4016,6 +4030,59 @@ impl DeviceImage {
         usage: vk::ImageUsageFlags,
         subresource_range: vk::ImageSubresourceRange,
     ) -> Result<Self, RenderError> {
+        Self::new_with_layers(
+            instance,
+            device,
+            physical_device,
+            extent,
+            format,
+            usage,
+            subresource_range,
+            1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_array(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        subresource_range: vk::ImageSubresourceRange,
+        array_layers: u32,
+    ) -> Result<Self, RenderError> {
+        Self::new_with_layers(
+            instance,
+            device,
+            physical_device,
+            extent,
+            format,
+            usage,
+            subresource_range,
+            array_layers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_layers(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        subresource_range: vk::ImageSubresourceRange,
+        array_layers: u32,
+    ) -> Result<Self, RenderError> {
+        if array_layers == 0 {
+            return Err(RenderError::InvalidConfig(
+                "image должен иметь хотя бы один слой",
+            ));
+        }
+        let mut subresource_range = subresource_range;
+        subresource_range.layer_count = array_layers;
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -4025,7 +4092,7 @@ impl DeviceImage {
                 depth: 1,
             })
             .mip_levels(subresource_range.level_count)
-            .array_layers(1)
+            .array_layers(array_layers)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
@@ -4038,6 +4105,7 @@ impl DeviceImage {
             image,
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
+            layer_views: Vec::new(),
         };
         // SAFETY: image was created by this device and remains alive.
         let requirements = unsafe { device.get_image_memory_requirements(target.image) };
@@ -4059,18 +4127,40 @@ impl DeviceImage {
         unsafe { device.bind_image_memory(target.image, target.memory, 0) }?;
         let view_info = vk::ImageViewCreateInfo::default()
             .image(target.image)
-            .view_type(vk::ImageViewType::TYPE_2D)
+            .view_type(if array_layers == 1 {
+                vk::ImageViewType::TYPE_2D
+            } else {
+                vk::ImageViewType::TYPE_2D_ARRAY
+            })
             .format(format)
             .components(vk::ComponentMapping::default())
             .subresource_range(subresource_range);
         // SAFETY: image view range matches the image's concrete mip and array-layer counts.
         target.view = unsafe { device.create_image_view(&view_info, None) }?;
+        if array_layers > 1 {
+            for layer in 0..array_layers {
+                let layer_view_info = vk::ImageViewCreateInfo::default()
+                    .image(target.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .components(vk::ComponentMapping::default())
+                    .subresource_range(subresource_range.base_array_layer(layer).layer_count(1));
+                // SAFETY: the per-layer view addresses one valid layer of the array image.
+                target
+                    .layer_views
+                    .push(unsafe { device.create_image_view(&layer_view_info, None) }?);
+            }
+        }
         Ok(target)
     }
 }
 
 impl Drop for DeviceImage {
     fn drop(&mut self) {
+        for view in self.layer_views.drain(..) {
+            // SAFETY: each layer view is an owned child of the image and is destroyed first.
+            unsafe { self.device.destroy_image_view(view, None) };
+        }
         if self.view != vk::ImageView::null() {
             // SAFETY: view is an owned child of image and is destroyed before its image.
             unsafe { self.device.destroy_image_view(self.view, None) };
@@ -4092,6 +4182,7 @@ fn record_frame(
     command_buffer: vk::CommandBuffer,
     target: &mut FrameTarget,
     shadow_image: &DeviceImage,
+    shadow_layout: &mut vk::ImageLayout,
     output_image: vk::Image,
     output_view: vk::ImageView,
     output_extent: vk::Extent2D,
@@ -4112,6 +4203,7 @@ fn record_frame(
         command_buffer,
         &mut target.scene,
         shadow_image,
+        shadow_layout,
         target.render_extent,
         shadow,
         scene,
@@ -4162,11 +4254,13 @@ fn begin_command_buffer(
 }
 
 /// Записывает shadow и scene pass; цвет цели остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
+#[allow(clippy::too_many_arguments)]
 fn record_scene(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     target: &mut OffscreenTarget,
     shadow_image: &DeviceImage,
+    shadow_layout: &mut vk::ImageLayout,
     render_extent: vk::Extent2D,
     shadow: &ShadowPass<'_>,
     scene: &ScenePass<'_>,
@@ -4221,68 +4315,98 @@ fn record_scene(
         }
     }
 
-    let shadow_to_depth = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-        .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-        .dst_stage_mask(
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-        )
-        .dst_access_mask(
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        )
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(shadow_image.image)
-        .subresource_range(depth_subresource_range());
-    pipeline_barrier(device, command_buffer, shadow_to_depth);
-    let shadow_depth_attachment = vk::RenderingAttachmentInfo::default()
-        .image_view(shadow_image.view)
-        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .clear_value(vk::ClearValue {
-            depth_stencil: vk::ClearDepthStencilValue {
-                depth: 1.0,
-                stencil: 0,
-            },
-        });
-    let shadow_rendering_info = vk::RenderingInfo::default()
-        .render_area(vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D {
-                width: SHADOW_MAP_SIZE,
-                height: SHADOW_MAP_SIZE,
-            },
-        })
-        .layer_count(1)
-        .depth_attachment(&shadow_depth_attachment);
-    // SAFETY: the depth-only view covers the fixed shadow-map render area.
-    unsafe { device.cmd_begin_rendering(command_buffer, &shadow_rendering_info) };
-    if shadow.enabled {
-        record_shadow_draws(device, command_buffer, SHADOW_MAP_SIZE, shadow);
-    }
-    // SAFETY: this matches the preceding depth-only cmd_begin_rendering call.
-    unsafe { device.cmd_end_rendering(command_buffer) };
+    if shadow.shadow_cascades.is_empty() {
+        if *shadow_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            let (source_stage, source_access) = shadow_layout_source(*shadow_layout);
+            let shadow_to_sample = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(source_stage)
+                .src_access_mask(source_access)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .old_layout(*shadow_layout)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(shadow_image.image)
+                .subresource_range(shadow_subresource_range());
+            pipeline_barrier(device, command_buffer, shadow_to_sample);
+            *shadow_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        }
+    } else {
+        let (source_stage, source_access) = shadow_layout_source(*shadow_layout);
+        let shadow_to_depth = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(source_stage)
+            .src_access_mask(source_access)
+            .dst_stage_mask(
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .dst_access_mask(
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .old_layout(*shadow_layout)
+            .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(shadow_image.image)
+            .subresource_range(shadow_subresource_range());
+        pipeline_barrier(device, command_buffer, shadow_to_depth);
+        *shadow_layout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
 
-    let shadow_to_sample = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-        )
-        .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-        .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(shadow_image.image)
-        .subresource_range(depth_subresource_range());
-    pipeline_barrier(device, command_buffer, shadow_to_sample);
+        for (cascade, matrix) in shadow.shadow_cascades.iter().enumerate() {
+            let shadow_depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(shadow_image.layer_views[cascade])
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                });
+            let shadow_rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: SHADOW_MAP_RESOLUTION,
+                        height: SHADOW_MAP_RESOLUTION,
+                    },
+                })
+                .layer_count(1)
+                .depth_attachment(&shadow_depth_attachment);
+            // SAFETY: this depth-only view covers one fixed-size array layer.
+            unsafe { device.cmd_begin_rendering(command_buffer, &shadow_rendering_info) };
+            record_shadow_draws(
+                device,
+                command_buffer,
+                SHADOW_MAP_RESOLUTION,
+                cascade as u32,
+                *matrix,
+                shadow,
+            );
+            // SAFETY: this matches the preceding depth-only cmd_begin_rendering call.
+            unsafe { device.cmd_end_rendering(command_buffer) };
+        }
+
+        let shadow_to_sample = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(shadow_image.image)
+            .subresource_range(shadow_subresource_range());
+        pipeline_barrier(device, command_buffer, shadow_to_sample);
+        *shadow_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    }
 
     let color_attachment = [vk::RenderingAttachmentInfo::default()
         .image_view(target.color.view)
@@ -4423,8 +4547,7 @@ struct ShadowPass<'a> {
     meshes: &'a [Option<MeshBuffers>],
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
-    light_view_projection: Option<[[f32; 4]; 4]>,
-    enabled: bool,
+    shadow_cascades: &'a [[[f32; 4]; 4]],
 }
 
 /// Рисование UI в swapchain image; `draws` хранит вызов, его набор и признак линейного изображения.
@@ -4584,10 +4707,21 @@ fn shadow_casters(
         .filter(move |draw| draw.casts_shadow && !matches!(alpha_mode(draw), AlphaMode::Blend))
 }
 
+fn shadow_caster_is_outside(
+    draw: &DrawCommand,
+    bounds: Option<LocalBounds>,
+    frustum: Option<Frustum>,
+) -> bool {
+    frustum
+        .is_some_and(|frustum| bounds.is_some_and(|bounds| !frustum.intersects(draw.model, bounds)))
+}
+
 fn record_shadow_draws(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     extent: u32,
+    cascade_index: u32,
+    light_view_projection: [[f32; 4]; 4],
     shadow: &ShadowPass<'_>,
 ) {
     if shadow.draws.is_empty() {
@@ -4620,9 +4754,7 @@ fn record_shadow_draws(
             &[],
         );
     }
-    let frustum = shadow
-        .light_view_projection
-        .map(Frustum::from_view_projection);
+    let frustum = Some(Frustum::from_view_projection(light_view_projection));
     for draw in shadow_casters(shadow.draws, |draw| {
         material_for_draw(shadow.materials, draw)
             .map_or(AlphaMode::Opaque, |material| material.alpha_mode)
@@ -4633,10 +4765,7 @@ fn record_shadow_draws(
         let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
             continue;
         };
-        if frustum.is_some_and(|frustum| {
-            mesh.bounds
-                .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
-        }) {
+        if shadow_caster_is_outside(draw, mesh.bounds, frustum) {
             continue;
         }
         let push_constants = push_constant_bytes(&draw.model);
@@ -4664,7 +4793,7 @@ fn record_shadow_draws(
                 0,
                 &push_constants,
             );
-            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, cascade_index);
         }
     }
 }
@@ -5353,6 +5482,30 @@ fn depth_subresource_range() -> vk::ImageSubresourceRange {
         .layer_count(1)
 }
 
+fn shadow_subresource_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(SHADOW_CASCADE_COUNT as u32)
+}
+
+fn shadow_layout_source(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    match layout {
+        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        ),
+        _ => (
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        ),
+    }
+}
+
 fn color_subresource_layers() -> vk::ImageSubresourceLayers {
     vk::ImageSubresourceLayers::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -5812,7 +5965,7 @@ fn index_bytes(indices: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), size_of_val(indices)) }
 }
 
-/// Байты `FrameUniforms` в порядке std140: две матрицы и пять `vec4`.
+/// Байты `FrameUniforms` в порядке std140: пять матриц и пять `vec4`.
 /// Viewport рисуется в кадре один раз: его цель и uniform-буфер принадлежат одной сцене.
 fn validate_scene_viewports(
     viewports: impl Iterator<Item = ViewportId>,
@@ -5839,33 +5992,45 @@ fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], R
             "направление света должно быть конечным и ненулевым",
         ));
     }
+    if frame.shadow_cascades.len() > SHADOW_CASCADE_COUNT {
+        return Err(RenderError::InvalidConfig(
+            "число shadow cascades должно быть не больше четырёх",
+        ));
+    }
     if frame
-        .shadow_view_projection
-        .is_some_and(|matrix| !matrix.iter().flatten().all(|value| value.is_finite()))
+        .shadow_cascades
+        .iter()
+        .any(|matrix| !matrix.iter().flatten().all(|value| value.is_finite()))
     {
         return Err(RenderError::InvalidConfig(
-            "матрица shadow view projection должна быть конечной",
+            "матрицы shadow cascades должны быть конечными",
         ));
     }
 
-    let light_view_projection = frame.shadow_view_projection.unwrap_or(IDENTITY_MATRIX);
     let mut values = [0.0; FRAME_UNIFORMS_SIZE / size_of::<f32>()];
     values[..16].copy_from_slice(frame.view_projection.as_flattened());
-    values[16..32].copy_from_slice(light_view_projection.as_flattened());
-    values[32..36].copy_from_slice(&[x, y, z, 0.0]);
-    values[36..40].copy_from_slice(&[light.color[0], light.color[1], light.color[2], 0.0]);
-    values[40..44].copy_from_slice(&[light.ambient[0], light.ambient[1], light.ambient[2], 0.0]);
-    values[44..48].copy_from_slice(&[
-        if frame.shadow_view_projection.is_some() {
-            1.0
-        } else {
+    for cascade in 0..SHADOW_CASCADE_COUNT {
+        let start = 16 + cascade * 16;
+        let matrix = frame
+            .shadow_cascades
+            .get(cascade)
+            .unwrap_or(&IDENTITY_MATRIX);
+        values[start..start + 16].copy_from_slice(matrix.as_flattened());
+    }
+    values[80..84].copy_from_slice(&[x, y, z, 0.0]);
+    values[84..88].copy_from_slice(&[light.color[0], light.color[1], light.color[2], 0.0]);
+    values[88..92].copy_from_slice(&[light.ambient[0], light.ambient[1], light.ambient[2], 0.0]);
+    values[92..96].copy_from_slice(&[
+        if frame.shadow_cascades.is_empty() {
             0.0
+        } else {
+            1.0
         },
-        1.0 / SHADOW_MAP_SIZE as f32,
-        0.0,
+        1.0 / SHADOW_MAP_RESOLUTION as f32,
+        frame.shadow_cascades.len() as f32,
         0.0,
     ]);
-    values[48..52].copy_from_slice(&[
+    values[96..100].copy_from_slice(&[
         frame.camera_position[0],
         frame.camera_position[1],
         frame.camera_position[2],
@@ -6105,6 +6270,7 @@ fn select_composite_alpha(
 
 #[cfg(test)]
 mod tests {
+    use super::culling::{Frustum, LocalBounds};
     use super::{
         AcquireAction, AlphaMode, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight,
         DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT,
@@ -6112,16 +6278,17 @@ mod tests {
         MESH_OPAQUE_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId,
         OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER,
         OverlayVertex, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
-        SHADOW_FRAGMENT_SHADER, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER,
-        TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex,
-        ViewSettings, best_device_index, check_extensions, classify_acquire_result,
-        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
-        evaluate_device, frame_uniform_bytes, index_bytes, inverse_extent, material_sampler_info,
-        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
-        missing_offscreen_format_features, missing_post_format_features,
-        missing_texture_format_features, normal_matrix, offscreen_previous_use,
-        overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
-        scene_viewport, select_composite_alpha, select_surface_extent, shadow_casters,
+        SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER, SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER,
+        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
+        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
+        check_extensions, classify_acquire_result, classify_probe_instance_failure,
+        deduplicate_names, derivative_tangent_basis, evaluate_device, frame_uniform_bytes,
+        index_bytes, inverse_extent, material_sampler_info, material_uniform_bytes, mip_extent,
+        mip_level_count, missing_extensions, missing_offscreen_format_features,
+        missing_post_format_features, missing_texture_format_features, normal_matrix,
+        offscreen_previous_use, overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy,
+        scaled_extent, scene_viewport, select_composite_alpha, select_surface_extent,
+        shadow_caster_is_outside, shadow_casters, shadow_layout_source, shadow_subresource_range,
         texture_format, texture_format_reasons, texture_mip_blit_region,
         texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
         texture_mip_source_barrier, texture_upload_barrier, timestamp_duration,
@@ -6881,6 +7048,47 @@ mod tests {
     }
 
     #[test]
+    fn shadow_culling_uses_the_current_cascade_frustum() {
+        let draw = DrawCommand {
+            mesh: MeshId(0),
+            material: None,
+            model: IDENTITY,
+            casts_shadow: true,
+        };
+        let bounds = LocalBounds {
+            min: [-0.1, -0.1, 0.4],
+            max: [0.1, 0.1, 0.6],
+        };
+        let first = Frustum::from_view_projection(IDENTITY);
+        let mut second_matrix = IDENTITY;
+        second_matrix[3][0] = -10.0;
+        let second = Frustum::from_view_projection(second_matrix);
+
+        assert!(!shadow_caster_is_outside(&draw, Some(bounds), Some(first)));
+        assert!(shadow_caster_is_outside(&draw, Some(bounds), Some(second)));
+        assert!(!shadow_caster_is_outside(&draw, None, Some(second)));
+    }
+
+    #[test]
+    fn shadow_array_has_four_depth_layers_and_tracks_sample_layout_dependencies() {
+        let range = shadow_subresource_range();
+        assert_eq!(range.layer_count, SHADOW_CASCADE_COUNT as u32);
+        assert_eq!(range.aspect_mask, vk::ImageAspectFlags::DEPTH);
+        assert_eq!(
+            shadow_layout_source(vk::ImageLayout::UNDEFINED).0,
+            vk::PipelineStageFlags2::NONE
+        );
+        assert_eq!(
+            shadow_layout_source(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            )
+        );
+        assert_eq!(SHADOW_MAP_RESOLUTION, 2048);
+    }
+
+    #[test]
     fn draw_validation_rejects_unknown_meshes_and_materials() {
         let draw = |mesh, material: Option<usize>| DrawCommand {
             mesh: MeshId(mesh),
@@ -7256,7 +7464,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_uniforms_pack_matrices_and_light_at_std140_offsets() {
+    fn frame_uniforms_pack_cascade_matrices_and_light_at_std140_offsets() {
         let matrix = |start: f32| {
             std::array::from_fn(|column| {
                 std::array::from_fn(|row| start + (column * 4 + row) as f32)
@@ -7267,10 +7475,11 @@ mod tests {
             color: [4.0, 5.0, 6.0],
             ambient: [7.0, 8.0, 9.0],
         };
+        let cascades = [matrix(17.0), matrix(33.0), matrix(49.0), matrix(65.0)];
         let frame = Frame {
             clear_color: [0.0; 4],
             view_projection: matrix(1.0),
-            shadow_view_projection: Some(matrix(17.0)),
+            shadow_cascades: &cascades,
             camera_position: [10.0, 11.0, 12.0],
             light,
             draws: &[],
@@ -7278,7 +7487,7 @@ mod tests {
             view: ViewSettings::default(),
         };
         let values = floats(&frame_uniform_bytes(&frame).unwrap());
-        assert_eq!(FRAME_UNIFORMS_SIZE, 208);
+        assert_eq!(FRAME_UNIFORMS_SIZE, 400);
         assert_eq!(
             &values[0..16],
             &(1..=16).map(|x| x as f32).collect::<Vec<_>>()
@@ -7287,17 +7496,24 @@ mod tests {
             &values[16..32],
             &(17..=32).map(|x| x as f32).collect::<Vec<_>>()
         );
-        assert_eq!(&values[32..36], &[1.0, 2.0, 3.0, 0.0]);
-        assert_eq!(&values[36..40], &[4.0, 5.0, 6.0, 0.0]);
-        assert_eq!(&values[40..44], &[7.0, 8.0, 9.0, 0.0]);
-        assert_eq!(&values[44..48], &[1.0, 1.0 / 2048.0, 0.0, 0.0]);
-        assert_eq!(&values[48..52], &[10.0, 11.0, 12.0, 0.0]);
+        for (cascade, start) in [(1, 32), (2, 48), (3, 64)] {
+            let expected = (1..=16)
+                .map(|offset| start as f32 + offset as f32)
+                .collect::<Vec<_>>();
+            assert_eq!(&values[start..start + 16], expected.as_slice());
+            assert_eq!(cascades[cascade].as_flattened(), expected.as_slice());
+        }
+        assert_eq!(&values[80..84], &[1.0, 2.0, 3.0, 0.0]);
+        assert_eq!(&values[84..88], &[4.0, 5.0, 6.0, 0.0]);
+        assert_eq!(&values[88..92], &[7.0, 8.0, 9.0, 0.0]);
+        assert_eq!(&values[92..96], &[1.0, 1.0 / 2048.0, 4.0, 0.0]);
+        assert_eq!(&values[96..100], &[10.0, 11.0, 12.0, 0.0]);
 
         let no_shadows = Frame {
-            shadow_view_projection: None,
+            shadow_cascades: &[],
             ..frame
         };
-        assert_eq!(floats(&frame_uniform_bytes(&no_shadows).unwrap())[44], 0.0);
+        assert_eq!(floats(&frame_uniform_bytes(&no_shadows).unwrap())[92], 0.0);
     }
 
     #[test]
@@ -7312,7 +7528,7 @@ mod tests {
                     frame_uniform_bytes(&Frame {
                         clear_color: [0.0; 4],
                         view_projection: IDENTITY,
-                        shadow_view_projection: None,
+                        shadow_cascades: &[],
                         camera_position: [0.0; 3],
                         light,
                         draws: &[],
@@ -7327,10 +7543,30 @@ mod tests {
 
         let mut invalid = IDENTITY;
         invalid[2][1] = f32::NAN;
+        let invalid_cascades = [invalid];
         let frame = Frame {
             clear_color: [0.0; 4],
             view_projection: IDENTITY,
-            shadow_view_projection: Some(invalid),
+            shadow_cascades: &invalid_cascades,
+            camera_position: [0.0; 3],
+            light: DirectionalLight::default(),
+            draws: &[],
+            overlay: &[],
+            view: ViewSettings::default(),
+        };
+        assert!(matches!(
+            frame_uniform_bytes(&frame),
+            Err(RenderError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn frame_uniforms_reject_more_than_four_shadow_cascades() {
+        let too_many = [IDENTITY; 5];
+        let frame = Frame {
+            clear_color: [0.0; 4],
+            view_projection: IDENTITY,
+            shadow_cascades: &too_many,
             camera_position: [0.0; 3],
             light: DirectionalLight::default(),
             draws: &[],

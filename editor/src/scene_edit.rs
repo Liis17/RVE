@@ -49,7 +49,8 @@ name = "Directional Light"
 rotation = [50.0, 30.0, 0.0]
 [objects.directional_light]
 shadows = true
-shadow_radius = 20.0
+shadow_distance = 20.0
+shadow_cascades = 4
 "#;
 
 /// Вид объекта, создаваемого из меню или перетаскиванием ресурса.
@@ -1263,8 +1264,8 @@ pub fn default_light() -> DirectionalLightComponent {
         color: [1.0; 3],
         ambient: [0.18, 0.18, 0.2],
         shadows: true,
-        shadow_center: [0.0; 3],
-        shadow_radius: Some(20.0),
+        shadow_distance: 20.0,
+        shadow_cascades: 4,
     }
 }
 

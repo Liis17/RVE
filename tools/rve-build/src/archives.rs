@@ -194,7 +194,7 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         .unwrap();
         let scene_body = |extra_assets: &str, model: &str| {
             format!(
-                "[[assets]]\npath = \"/models/shared.fbx\"\n[[assets]]\npath = \"/scripts/rotate.lua\"\n[[assets]]\npath = \"/cameras/shared.camerasettings\"\n{extra_assets}\n[[objects]]\nid = \"camera\"\n[objects.camera]\nsettings = \"/cameras/shared.camerasettings\"\n\n[[objects]]\nid = \"light\"\n[objects.directional_light]\nshadows = true\nshadow_radius = 8.0\n[[objects]]\nid = \"mesh\"\n[objects.mesh_renderer]\nmodel = \"{model}\"\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\n"
+                "[[assets]]\npath = \"/models/shared.fbx\"\n[[assets]]\npath = \"/scripts/rotate.lua\"\n[[assets]]\npath = \"/cameras/shared.camerasettings\"\n{extra_assets}\n[[objects]]\nid = \"camera\"\n[objects.camera]\nsettings = \"/cameras/shared.camerasettings\"\n\n[[objects]]\nid = \"light\"\n[objects.directional_light]\nshadows = true\nshadow_distance = 80.0\nshadow_cascades = 4\n[[objects]]\nid = \"mesh\"\n[objects.mesh_renderer]\nmodel = \"{model}\"\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\n"
             )
         };
         fs::write(

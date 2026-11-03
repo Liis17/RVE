@@ -254,7 +254,11 @@ fn camera_and_light_overrides_replace_whole_components_and_heavy_params_merge() 
         "cameras/override.camerasettings"
     );
     let sun = object(&expanded, "rig.sun");
-    assert_eq!(sun.directional_light.unwrap().color, [1.0, 0.5, 0.5]);
+    let light = sun.directional_light.unwrap();
+    assert_eq!(light.color, [1.0, 0.5, 0.5]);
+    assert!(!light.shadows);
+    assert_eq!(light.shadow_distance, 100.0);
+    assert_eq!(light.shadow_cascades, 4);
     let params = &sun.heavy_scripts[0].params;
     assert_eq!(params["speed"], ParamValue::Float(2.0));
     assert_eq!(params["amplitude"], ParamValue::Float(0.5));

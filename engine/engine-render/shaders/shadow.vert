@@ -6,11 +6,12 @@ layout(location = 0) out vec2 out_uv;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 view_projection;
-    mat4 light_view_projection;
+    mat4 shadow_view_projections[4];
     vec4 light_direction;
     vec4 light_color;
     vec4 ambient_color;
     vec4 shadow_params;
+    vec4 camera_position;
 } frame;
 
 layout(push_constant) uniform PushConstants {
@@ -20,5 +21,6 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     out_uv = in_uv;
-    gl_Position = frame.light_view_projection * push_constants.model * vec4(in_position, 1.0);
+    gl_Position = frame.shadow_view_projections[gl_InstanceIndex]
+        * push_constants.model * vec4(in_position, 1.0);
 }

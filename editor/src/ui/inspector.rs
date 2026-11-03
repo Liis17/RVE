@@ -997,13 +997,26 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
                 ui.label("Shadows");
                 let shadows = ui.checkbox(&mut value.shadows, "");
                 ui.end_row();
-                let center = vec3_row(ui, "Shadow Center", &mut value.shadow_center, 0.05);
-                ui.label("Shadow Radius");
-                let mut radius = value.shadow_radius.unwrap_or(0.0);
-                let radius_response = ui.add(egui::DragValue::new(&mut radius).speed(0.1));
-                value.shadow_radius = (radius > 0.0).then_some(radius);
+                ui.label("Shadow Distance");
+                let mut distance = value.shadow_distance;
+                let distance_response = ui.add(
+                    egui::DragValue::new(&mut distance)
+                        .speed(0.1)
+                        .range(0.01..=f32::MAX),
+                );
+                value.shadow_distance = if distance.is_finite() {
+                    distance.max(0.01)
+                } else {
+                    100.0
+                };
                 ui.end_row();
-                let response = color | ambient | shadows | center | radius_response;
+                ui.label("Shadow Cascades");
+                let mut cascades = u32::from(value.shadow_cascades);
+                let cascades_response =
+                    ui.add(egui::DragValue::new(&mut cascades).speed(1.0).range(1..=4));
+                value.shadow_cascades = cascades as u8;
+                ui.end_row();
+                let response = color | ambient | shadows | distance_response | cascades_response;
                 let picked = color_picked || ambient_picked;
                 commit_picker(state, ui, id, "light", picked, |object| {
                     object.directional_light = Some(value);

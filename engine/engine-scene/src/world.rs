@@ -6,6 +6,7 @@ use crate::document::{
     CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, LodGroup, SceneDocument,
     SceneError, SceneObject, camera_from_matrix, light_direction_from_matrix,
 };
+use crate::light::ShadowSettings;
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -85,7 +86,7 @@ pub struct LightState {
     pub direction: [f32; 3],
     pub color: [f32; 3],
     pub ambient: [f32; 3],
-    pub shadow: Option<(Vec3, f32)>,
+    pub shadow: Option<ShadowSettings>,
 }
 
 impl Default for LightState {
@@ -503,11 +504,9 @@ fn light_state(settings: DirectionalLightComponent, direction: [f32; 3]) -> Ligh
         direction,
         color: settings.color,
         ambient: settings.ambient,
-        shadow: settings.shadows.then(|| {
-            (
-                Vec3::from_array(settings.shadow_center),
-                settings.shadow_radius.unwrap(),
-            )
+        shadow: settings.shadows.then_some(ShadowSettings {
+            distance: settings.shadow_distance,
+            cascades: settings.shadow_cascades,
         }),
     }
 }
@@ -515,7 +514,7 @@ fn light_state(settings: DirectionalLightComponent, direction: [f32; 3]) -> Ligh
 #[cfg(test)]
 mod tests {
     use super::{LocalTransform, ObjectHandle, World};
-    use crate::SceneDocument;
+    use crate::{SceneDocument, light::ShadowSettings};
     use glam::{Mat4, Quat, Vec3};
 
     const CAMERA_SCENE: &str = r#"
@@ -629,12 +628,18 @@ rotation=[0.0,90.0,0.0]
         assert_eq!(frame.light.shadow, None);
 
         let scene = format!(
-            "{CAMERA_SCENE}\n[[objects]]\nid=\"sun\"\n[objects.transform]\nrotation=[0.0,90.0,0.0]\n[objects.directional_light]\nshadows=true\nshadow_radius=5.0\n"
+            "{CAMERA_SCENE}\n[[objects]]\nid=\"sun\"\n[objects.transform]\nrotation=[0.0,90.0,0.0]\n[objects.directional_light]\nshadows=true\nshadow_distance=50.0\nshadow_cascades=2\n"
         );
         let mut world = World::from_document(&parse(&scene)).unwrap();
         let (frame, _) = world.build_frame();
         assert!(Vec3::from_array(frame.light.direction).abs_diff_eq(Vec3::NEG_X, 1e-5));
-        assert_eq!(frame.light.shadow, Some((Vec3::ZERO, 5.0)));
+        assert_eq!(
+            frame.light.shadow,
+            Some(ShadowSettings {
+                distance: 50.0,
+                cascades: 2,
+            })
+        );
     }
 
     #[test]

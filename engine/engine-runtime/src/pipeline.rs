@@ -2,10 +2,11 @@ use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, FrameStatus,
-    MaterialId, MeshId, Renderer, Tonemapper as RenderTonemapper, ViewSettings,
+    MaterialId, MeshId, Renderer, SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper,
+    ViewSettings,
 };
 use engine_scene::camera::Camera;
-use engine_scene::light::shadow_view_projection;
+use engine_scene::light::cascade_view_projections;
 use engine_scene::{AntiAliasing, CameraSettings, LightState, ObjectHandle, Tonemapper, World};
 use engine_script::{
     ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary, ScriptTime,
@@ -198,9 +199,17 @@ impl RenderBackend for VulkanBackend {
             color: snapshot.light.color,
             ambient: snapshot.light.ambient,
         };
-        let shadow = snapshot.light.shadow.map(|(center, radius)| {
-            shadow_view_projection(Vec3::from_array(snapshot.light.direction), center, radius)
-                .to_cols_array_2d()
+        let shadow_cascades = snapshot.light.shadow.map_or_else(Vec::new, |settings| {
+            cascade_view_projections(
+                snapshot.camera,
+                width.max(1) as f32 / height.max(1) as f32,
+                Vec3::from_array(snapshot.light.direction),
+                settings,
+                SHADOW_MAP_RESOLUTION,
+            )
+            .into_iter()
+            .map(|matrix| matrix.to_cols_array_2d())
+            .collect()
         });
         let frame = Frame {
             clear_color: [
@@ -213,7 +222,7 @@ impl RenderBackend for VulkanBackend {
                 .camera
                 .view_projection(width, height)
                 .to_cols_array_2d(),
-            shadow_view_projection: shadow,
+            shadow_cascades: &shadow_cascades,
             camera_position: snapshot.camera.position.to_array(),
             light,
             draws: &snapshot.draws,

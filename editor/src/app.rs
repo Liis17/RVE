@@ -954,6 +954,12 @@ fn render_scene_frame(
         game_camera.position,
         grid_camera_distance,
     )?;
+    let scene_shadow_cascades = scene_size.map_or_else(Vec::new, |[width, height]| {
+        SceneRenderer::shadow_cascades(scene_camera, width, height, &scene_frame.light, has_light)
+    });
+    let game_shadow_cascades = game_size.map_or_else(Vec::new, |[width, height]| {
+        SceneRenderer::shadow_cascades(game_camera, width, height, &scene_frame.light, has_light)
+    });
     if let Some([width, height]) = scene_size {
         gpu.renderer
             .resize_viewport(gpu.scene.viewport, width, height)?;
@@ -969,6 +975,7 @@ fn render_scene_frame(
             scene_settings,
             &scene_frame.light,
             has_light,
+            &scene_shadow_cascades,
             true,
         )
     });
@@ -979,6 +986,7 @@ fn render_scene_frame(
             game_settings,
             &scene_frame.light,
             has_light,
+            &game_shadow_cascades,
             false,
         )
     });
