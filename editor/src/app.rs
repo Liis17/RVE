@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 /// Цвет окна за панелями; всё окно закрыто UI, поэтому заметен только при первом кадре.
 const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
-/// Как часто проверять готовность фоновых превью.
+/// Как часто проверять готовность фоновых превью и моделей.
 const PREVIEW_POLL: Duration = Duration::from_millis(30);
 
 pub struct EditorApp {
@@ -110,6 +110,11 @@ impl EditorApp {
         }
     }
 
+    /// Превью или модели ещё готовятся в фоне: окно должно проснуться, чтобы показать их.
+    fn background_pending(&self) -> bool {
+        self.state.previews.has_pending() || self.state.model_loader.has_pending()
+    }
+
     /// Записывает недавние проекты и раскладку панелей; ошибка только пишется в Console.
     fn save_settings(&mut self) {
         let Some(store) = &self.settings else {
@@ -133,6 +138,8 @@ impl EditorApp {
             Err(error) => self.state.log.error(error.to_string()),
         }
         self.state.previews.invalidate();
+        // Модели, разбор которых начался до сброса, загружаются заново.
+        self.state.model_loader.restart(project.assets.clone());
         if let Some(gpu) = &mut self.gpu
             && let Err(error) = gpu
                 .scene
@@ -458,8 +465,10 @@ impl EditorApp {
         }
 
         // Камера могла сместиться к новой модели: гизмо и маркеры нужно перестроить.
+        // Пока модель загружается, кадр запросит готовность загрузки, а не этот флаг.
         let framing = self.state.pending_frame.is_some();
         let status = render_scene_frame(gpu, &mut self.state, &ui_primitives)?;
+        let framing = framing && self.state.pending_frame.is_none();
 
         self.bridge
             .managed
@@ -505,6 +514,8 @@ fn render_scene_frame(
         .filter(|_| !playing)
         .map(|_| state.camera.distance);
     let pending_frame = state.pending_frame.take();
+    // Модель ещё разбирается в фоне: наведение камеры ждёт её готовности.
+    let mut still_loading = None;
     let (scene_frame, game_camera, game_settings, has_light, frame_target) = {
         let Some(parts) = state.frame_parts() else {
             return render_ui_only(&mut gpu.renderer, ui, &[]);
@@ -514,6 +525,7 @@ fn render_scene_frame(
             parts.project,
             parts.world,
             parts.models,
+            parts.loader,
             parts.log,
         )?;
         let (scene_frame, warnings) = parts.world.build_frame();
@@ -546,9 +558,13 @@ fn render_scene_frame(
             .any(|object| object.directional_light.is_some());
         let frame_target = pending_frame.and_then(|id| {
             let object = parts.world.object_by_id(&id)?;
-            let model = parts
-                .models
-                .get(object.mesh_renderer.as_ref()?.model.as_str())?;
+            let path = object.mesh_renderer.as_ref()?.model.as_str();
+            let Some(model) = parts.models.get(path) else {
+                if parts.loader.is_pending(path) {
+                    still_loading = Some(id.clone());
+                }
+                return None;
+            };
             Some(bounding_sphere(
                 parts.world.world_matrix(object.handle)?,
                 model.bounds()?,
@@ -562,6 +578,7 @@ fn render_scene_frame(
             frame_target,
         )
     };
+    state.pending_frame = still_loading;
     if let Some((center, radius)) = frame_target
         && state.camera.needs_framing(center, radius)
     {
@@ -734,13 +751,13 @@ impl WindowHandler for EditorApp {
     }
 
     fn update(&mut self, window: &Window) -> bool {
-        let previews_pending = self.state.previews.has_pending();
+        let background_pending = self.background_pending();
         if let Some(deadline) = self.repaint_at
             && Instant::now() >= deadline
         {
             self.repaint_at = None;
             window.request_redraw();
-        } else if previews_pending {
+        } else if background_pending {
             window.request_redraw();
         }
         !self.exit
@@ -748,9 +765,7 @@ impl WindowHandler for EditorApp {
 
     fn next_wakeup(&mut self) -> Option<Instant> {
         let preview = self
-            .state
-            .previews
-            .has_pending()
+            .background_pending()
             .then(|| Instant::now() + PREVIEW_POLL);
         match (self.repaint_at, preview) {
             (Some(a), Some(b)) => Some(a.min(b)),

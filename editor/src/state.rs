@@ -8,6 +8,7 @@ use crate::project::OpenProject;
 use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::EditorCamera;
 use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
+use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
 use engine_files::VirtualPath;
 use engine_scene::World;
@@ -67,6 +68,7 @@ pub struct FrameParts<'a> {
     pub world: &'a mut World,
     pub project: &'a OpenProject,
     pub models: &'a mut HashMap<String, Arc<Model>>,
+    pub loader: &'a mut ModelLoader,
     pub log: &'a mut ConsoleLog,
 }
 
@@ -106,6 +108,8 @@ pub struct EditorState {
     pub pending_frame: Option<String>,
     /// CPU-модели, загруженные для отрисовки: по ним работают picking и фокус камеры.
     pub models: HashMap<String, Arc<Model>>,
+    /// Фоновый разбор FBX для `models`.
+    pub model_loader: ModelLoader,
     edit_world: Option<(u64, World)>,
 }
 
@@ -141,6 +145,7 @@ impl EditorState {
             game_camera: None,
             pending_frame: None,
             models: HashMap::new(),
+            model_loader: ModelLoader::default(),
             edit_world: None,
         }
     }
@@ -199,6 +204,7 @@ impl EditorState {
             world,
             project: self.project.as_ref()?,
             models: &mut self.models,
+            loader: &mut self.model_loader,
             log: &mut self.log,
         })
     }
