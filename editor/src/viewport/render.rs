@@ -5,7 +5,7 @@ use crate::project::OpenProject;
 use engine_assets::Model;
 use engine_render::{
     DirectionalLight, DrawCommand, Frame, MeshId, RenderError, Renderer, TextureId, Vertex,
-    ViewportId,
+    ViewSettings, ViewportId,
 };
 use engine_scene::light::shadow_view_projection;
 use engine_scene::{LightState, SceneFrame, World};
@@ -189,6 +189,7 @@ impl SceneRenderer {
                 &self.draws[..self.scene_draws]
             },
             overlay: &[],
+            view: ViewSettings::default(),
         }
     }
 }

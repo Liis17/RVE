@@ -1,7 +1,7 @@
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use engine_render::{
-    DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId, Renderer, TextureId,
+    DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId, Renderer, TextureId, ViewSettings,
 };
 use engine_scene::camera::Camera;
 use engine_scene::light::shadow_view_projection;
@@ -211,6 +211,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
+            view: ViewSettings::default(),
         };
         self.renderer
             .render_frame(&frame)

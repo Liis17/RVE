@@ -9,9 +9,10 @@ RVE — игровой движок на Rust с рендерингом чере
 - Rust stable.
 - Windows: видеодрайвер с поддержкой Vulkan 1.3.
 - macOS: Vulkan loader и MoltenVK. Для Homebrew: `brew install vulkan-loader molten-vk`.
-- Для `R8G8B8A8_SRGB` GPU должен поддерживать в optimal tiling `SAMPLED_IMAGE`,
-  `SAMPLED_IMAGE_FILTER_LINEAR`, `TRANSFER_SRC`, `TRANSFER_DST`, `BLIT_SRC` и
-  `BLIT_DST`; иначе renderer отклонит его.
+- HDR `R16G16B16A16_SFLOAT` и LDR `R8G8B8A8_SRGB` post targets требуют optimal
+  tiling `COLOR_ATTACHMENT`, `SAMPLED_IMAGE` и `SAMPLED_IMAGE_FILTER_LINEAR`; surface
+  требует color attachment и blending. Material textures `R8G8B8A8_SRGB`
+  дополнительно требуют `TRANSFER_SRC`, `TRANSFER_DST`, `BLIT_SRC` и `BLIT_DST`.
 
 Для обычной сборки Rust-кода Vulkan SDK не требуется.
 

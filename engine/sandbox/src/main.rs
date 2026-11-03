@@ -7,7 +7,9 @@ use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
 use engine_project::BootstrapConfig;
-use engine_render::{DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId};
+use engine_render::{
+    DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId, ViewSettings,
+};
 use engine_resources::{ResourceConfig, ResourceSystem};
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use scene::Scene;
@@ -298,10 +300,7 @@ impl WindowHandler for Sandbox {
         let size = window.inner_size();
         println!("Window: {}x{} (physical pixels)", size.width, size.height);
         self.size = size;
-        let config = RendererConfig {
-            render_scale: self.options.render_scale,
-            ..RendererConfig::default()
-        };
+        let config = RendererConfig::default();
         match Renderer::new(Arc::clone(&window), size.width, size.height, config) {
             Ok(mut renderer) => {
                 let capabilities = renderer.capabilities();
@@ -385,6 +384,10 @@ impl WindowHandler for Sandbox {
             light: self.content.light(elapsed),
             draws: &draws,
             overlay,
+            view: ViewSettings {
+                render_scale: self.options.render_scale,
+                ..ViewSettings::default()
+            },
         };
         match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {
