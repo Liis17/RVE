@@ -686,6 +686,25 @@ pub fn default_light() -> DirectionalLightComponent {
     }
 }
 
+/// Ключ JSON, по которому редактор узнаёт свои объекты в буфере обмена ОС.
+const CLIPBOARD_KEY: &str = "rve_editor_objects";
+
+/// Текст буфера обмена с объектами, например из `EditorScene::subtrees`.
+pub fn objects_to_clipboard(objects: &[SceneObject]) -> Result<String, String> {
+    serde_json::to_string_pretty(&serde_json::json!({ CLIPBOARD_KEY: objects }))
+        .map_err(|error| error.to_string())
+}
+
+/// Объекты из буфера обмена; `None` — в буфере не объекты редактора.
+pub fn objects_from_clipboard(text: &str) -> Option<Result<Vec<SceneObject>, String>> {
+    let mut value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let objects = value.get_mut(CLIPBOARD_KEY)?.take();
+    Some(
+        serde_json::from_value(objects)
+            .map_err(|error| format!("объекты в буфере обмена повреждены: {error}")),
+    )
+}
+
 /// Камера нового объекта или компонента.
 pub fn default_camera() -> CameraComponent {
     CameraComponent {
@@ -1489,6 +1508,79 @@ mod tests {
         assert_eq!(position(&scene, "sun")[0], 3.0);
         assert!(scene.undo());
         assert_eq!(position(&scene, &a)[0], 0.0);
+    }
+
+    #[test]
+    fn clipboard_objects_paste_into_another_scene_with_new_ids_and_assets() {
+        let mut source = scene();
+        let parent = source
+            .create_object(
+                &NewObject::Mesh(path("/models/a.fbx"), [1.0, 0.0, 0.0]),
+                None,
+            )
+            .unwrap();
+        source
+            .create_object(&NewObject::Empty, Some(&parent))
+            .unwrap();
+        source
+            .add_lite_script(&parent, path("/scripts/spin.lua"))
+            .unwrap();
+        let text =
+            objects_to_clipboard(&source.subtrees(std::slice::from_ref(&parent)).unwrap()).unwrap();
+
+        let mut target = scene();
+        let objects = objects_from_clipboard(&text).unwrap().unwrap();
+        let pasted = target.insert_copies(objects.clone()).unwrap();
+        assert_eq!(pasted, std::slice::from_ref(&parent));
+        let assets = target
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(assets, ["models/a.fbx", "scripts/spin.lua"]);
+        // Повторная вставка в ту же сцену получает свободные id и своего ребёнка.
+        let again = target.insert_copies(objects).unwrap();
+        assert_ne!(again, pasted);
+        assert_eq!(target.selected_ids(), again.as_slice());
+        let children = target
+            .document()
+            .objects
+            .iter()
+            .filter(|object| object.parent.as_ref() == Some(&again[0]))
+            .count();
+        assert_eq!(children, 1);
+        assert_eq!(target.document().objects.len(), 2 + 4);
+    }
+
+    #[test]
+    fn pasted_roots_keep_an_existing_parent_and_invalid_pastes_are_rejected() {
+        let mut scene = scene();
+        let parent = scene.create_object(&NewObject::Empty, None).unwrap();
+        let child = scene
+            .create_object(&NewObject::Empty, Some(&parent))
+            .unwrap();
+        let copies = scene
+            .insert_copies(scene.subtrees(&[child]).unwrap())
+            .unwrap();
+        assert_eq!(
+            scene.object(&copies[0]).unwrap().parent.as_ref(),
+            Some(&parent)
+        );
+
+        let light = scene.subtrees(&["sun".to_owned()]).unwrap();
+        let before = scene.document().objects.len();
+        let error = scene.insert_copies(light).unwrap_err();
+        assert!(error.contains("directional_light"), "{error}");
+        assert_eq!(scene.document().objects.len(), before);
+
+        assert!(objects_from_clipboard("plain text").is_none());
+        assert!(objects_from_clipboard("{\"other\": 1}").is_none());
+        assert!(
+            objects_from_clipboard("{\"rve_editor_objects\": 5}")
+                .unwrap()
+                .is_err()
+        );
     }
 
     struct TempDir(std::path::PathBuf);

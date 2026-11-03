@@ -1,7 +1,7 @@
 //! Верхнее меню, строка инструментов и горячие клавиши.
 
 use crate::layout::{Tab, default_layout, is_open};
-use crate::scene_edit::NewObject;
+use crate::scene_edit::{NewObject, objects_from_clipboard, objects_to_clipboard};
 use crate::state::{Action, EditorState};
 use crate::ui::scene_view;
 use crate::viewport::gizmo::{GizmoSpace, GizmoTool};
@@ -35,6 +35,21 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
     }
     if ctx.input_mut(|input| input.consume_shortcut(&DUPLICATE)) {
         duplicate_selection(state);
+    }
+    // egui-winit превращает Ctrl/Cmd+C и +V в события Copy и Paste без события клавиши.
+    let (copy, paste) = ctx.input(|input| {
+        let copy = input.events.contains(&egui::Event::Copy);
+        let paste = input.events.iter().find_map(|event| match event {
+            egui::Event::Paste(text) => Some(text.clone()),
+            _ => None,
+        });
+        (copy, paste)
+    });
+    if copy && let Some(text) = copy_selection(state) {
+        ctx.copy_text(text);
+    }
+    if let Some(text) = paste {
+        paste_objects(state, &text);
     }
     let pressed = |key| ctx.input(|input| input.key_pressed(key) && input.modifiers.is_none());
     if pressed(Key::W) {
@@ -89,6 +104,36 @@ pub fn undo(state: &mut EditorState) {
 pub fn redo(state: &mut EditorState) {
     state.edit_scene(|scene| Ok(scene.redo()));
     state.gizmo_drag = None;
+}
+
+/// Текст для буфера обмена ОС с выделенными поддеревьями; `None` — выделения нет.
+pub fn copy_selection(state: &mut EditorState) -> Option<String> {
+    let scene = state.scene.as_ref()?;
+    let roots = scene.selection_roots();
+    if roots.is_empty() {
+        return None;
+    }
+    match scene
+        .subtrees(&roots)
+        .and_then(|objects| objects_to_clipboard(&objects))
+    {
+        Ok(text) => Some(text),
+        Err(error) => {
+            state.log.error(error);
+            None
+        }
+    }
+}
+
+/// Вставляет объекты из буфера обмена; чужой текст игнорируется.
+pub fn paste_objects(state: &mut EditorState, text: &str) {
+    match objects_from_clipboard(text) {
+        None => {}
+        Some(Ok(objects)) => {
+            state.edit_scene(|scene| scene.insert_copies(objects));
+        }
+        Some(Err(error)) => state.log.error(error),
+    }
 }
 
 pub fn delete_selection(state: &mut EditorState) {
