@@ -249,11 +249,55 @@ impl AntiAliasing {
     }
 }
 
+/// Requested presentation behavior for the swapchain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresentMode {
+    /// V-sync; Vulkan guarantees this mode for a usable surface.
+    #[default]
+    Fifo,
+    /// Low-latency presentation that may replace queued frames.
+    Mailbox,
+    /// Immediate presentation without waiting for a vertical blank.
+    Immediate,
+}
+
+impl PresentMode {
+    fn vk(self) -> vk::PresentModeKHR {
+        match self {
+            Self::Fifo => vk::PresentModeKHR::FIFO,
+            Self::Mailbox => vk::PresentModeKHR::MAILBOX,
+            Self::Immediate => vk::PresentModeKHR::IMMEDIATE,
+        }
+    }
+
+    fn from_vk(mode: vk::PresentModeKHR) -> Self {
+        match mode {
+            vk::PresentModeKHR::FIFO => Self::Fifo,
+            vk::PresentModeKHR::MAILBOX => Self::Mailbox,
+            vk::PresentModeKHR::IMMEDIATE => Self::Immediate,
+            _ => Self::Fifo,
+        }
+    }
+}
+
+fn select_present_mode(
+    requested: PresentMode,
+    supported: &[vk::PresentModeKHR],
+) -> vk::PresentModeKHR {
+    let requested = requested.vk();
+    if supported.contains(&requested) {
+        requested
+    } else {
+        vk::PresentModeKHR::FIFO
+    }
+}
+
 /// Настройки Vulkan-рендерера.
 #[derive(Default)]
 pub struct RendererConfig {
     pub extra_instance_extensions: Vec<&'static CStr>,
     pub extra_device_extensions: Vec<&'static CStr>,
+    pub present_mode: PresentMode,
 }
 
 /// Возможности выбранного физического устройства.
@@ -497,6 +541,8 @@ pub struct Renderer {
     frame_slot: usize,
     swapchain: Option<SwapchainBundle>,
     surface_format: vk::SurfaceFormatKHR,
+    present_mode: PresentMode,
+    last_warned_present_mode: Option<PresentMode>,
     output_extent: vk::Extent2D,
     swapchain_dirty: bool,
     config: RendererConfig,
@@ -566,6 +612,8 @@ impl Renderer {
             frame_slot: 0,
             swapchain: None,
             surface_format: vk::SurfaceFormatKHR::default(),
+            present_mode: config.present_mode,
+            last_warned_present_mode: None,
             output_extent: vk::Extent2D { width, height },
             swapchain_dirty: true,
             config,
@@ -585,6 +633,11 @@ impl Renderer {
     /// Возвращает характеристики выбранного GPU.
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    /// Returns the present mode used by the current swapchain.
+    pub fn present_mode(&self) -> PresentMode {
+        self.present_mode
     }
 
     /// Забирает GPU-время shadow и scene pass последнего завершённого кадра.
@@ -2546,7 +2599,18 @@ impl Renderer {
             self.surface_format,
             self.output_extent,
             old_swapchain,
+            self.config.present_mode,
         )?;
+        self.present_mode = new_swapchain.present_mode;
+        if self.present_mode == self.config.present_mode {
+            self.last_warned_present_mode = None;
+        } else if self.last_warned_present_mode != Some(self.present_mode) {
+            eprintln!(
+                "requested present mode {:?} is unavailable; using {:?}",
+                self.config.present_mode, self.present_mode
+            );
+            self.last_warned_present_mode = Some(self.present_mode);
+        }
         self.swapchain = Some(new_swapchain);
         for frame in &mut self.frames {
             frame.target = None;
@@ -3091,6 +3155,7 @@ struct SwapchainBundle {
     views: Vec<vk::ImageView>,
     render_finished: Vec<vk::Semaphore>,
     extent: vk::Extent2D,
+    present_mode: PresentMode,
 }
 
 impl SwapchainBundle {
@@ -3105,6 +3170,7 @@ impl SwapchainBundle {
         surface_format: vk::SurfaceFormatKHR,
         requested_extent: vk::Extent2D,
         old_swapchain: vk::SwapchainKHR,
+        requested_present_mode: PresentMode,
     ) -> Result<Self, RenderError> {
         // SAFETY: device and surface are alive and associated with this instance.
         let capabilities = unsafe {
@@ -3127,6 +3193,11 @@ impl SwapchainBundle {
             .ok_or_else(|| {
                 RenderError::Unsupported("surface не поддерживает composite alpha".to_owned())
             })?;
+        // SAFETY: the physical device and surface belong to this live instance.
+        let present_modes = unsafe {
+            surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
+        }?;
+        let selected_present_mode = select_present_mode(requested_present_mode, &present_modes);
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
@@ -3138,7 +3209,7 @@ impl SwapchainBundle {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(composite_alpha)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(selected_present_mode)
             .clipped(true)
             .old_swapchain(old_swapchain);
         // SAFETY: all swapchain parameters were checked against the current surface capabilities.
@@ -3151,6 +3222,7 @@ impl SwapchainBundle {
             views: Vec::new(),
             render_finished: Vec::new(),
             extent,
+            present_mode: PresentMode::from_vk(selected_present_mode),
         };
         // SAFETY: the swapchain was just created by this loader and is still alive.
         bundle.images = unsafe { loader.get_swapchain_images(bundle.handle) }?;
@@ -5725,22 +5797,22 @@ mod tests {
         FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT, MATERIAL_UNIFORMS_SIZE,
         MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId, OFFSCREEN_FORMAT,
         OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex,
-        ProbeInstanceFailure, RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER,
-        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
-        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
-        check_extensions, classify_acquire_result, classify_probe_instance_failure,
-        deduplicate_names, derivative_tangent_basis, evaluate_device, frame_uniform_bytes,
-        index_bytes, inverse_extent, material_sampler_info, material_uniform_bytes, mip_extent,
-        mip_level_count, missing_extensions, missing_post_format_features,
-        missing_texture_format_features, normal_matrix, offscreen_previous_use,
-        overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
-        scene_viewport, select_composite_alpha, select_surface_extent, shadow_casters,
-        texture_format, texture_format_reasons, texture_mip_blit_region,
-        texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
-        texture_mip_source_barrier, texture_upload_barrier, timestamp_duration,
-        transform_tangent_normal, validate_draws, validate_material, validate_mesh,
-        validate_overlay, validate_render_scale, validate_texture, validate_view_settings,
-        vertex_bytes,
+        PresentMode, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
+        SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace,
+        TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings,
+        best_device_index, check_extensions, classify_acquire_result,
+        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
+        evaluate_device, frame_uniform_bytes, index_bytes, inverse_extent, material_sampler_info,
+        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
+        missing_post_format_features, missing_texture_format_features, normal_matrix,
+        offscreen_previous_use, overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy,
+        scaled_extent, scene_viewport, select_composite_alpha, select_present_mode,
+        select_surface_extent, shadow_casters, texture_format, texture_format_reasons,
+        texture_mip_blit_region, texture_mip_destination_shader_barrier,
+        texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
+        timestamp_duration, transform_tangent_normal, validate_draws, validate_material,
+        validate_mesh, validate_overlay, validate_render_scale, validate_texture,
+        validate_view_settings, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -5754,6 +5826,34 @@ mod tests {
     #[test]
     fn renderer_is_send() {
         assert_send::<Renderer>();
+    }
+
+    #[test]
+    fn present_mode_selection_uses_requested_mode_or_fifo_for_every_supported_set() {
+        let modes = [
+            (PresentMode::Fifo, vk::PresentModeKHR::FIFO),
+            (PresentMode::Mailbox, vk::PresentModeKHR::MAILBOX),
+            (PresentMode::Immediate, vk::PresentModeKHR::IMMEDIATE),
+        ];
+        for mask in 0..(1 << modes.len()) {
+            let supported = modes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, mode))| (mask & (1 << index) != 0).then_some(*mode))
+                .collect::<Vec<_>>();
+            for (requested, vulkan_mode) in modes {
+                let expected = if supported.contains(&vulkan_mode) {
+                    vulkan_mode
+                } else {
+                    vk::PresentModeKHR::FIFO
+                };
+                assert_eq!(select_present_mode(requested, &supported), expected);
+            }
+        }
+        assert_eq!(
+            select_present_mode(PresentMode::Immediate, &[]),
+            vk::PresentModeKHR::FIFO
+        );
     }
 
     #[test]

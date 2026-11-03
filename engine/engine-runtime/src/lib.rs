@@ -275,6 +275,7 @@ fn run_from_args(
     let code = player::run_window(
         player::PlayerConfig {
             window: config,
+            present_mode: bootstrap.present_mode,
             frame_limit: args.frames,
             render_assets,
             activation,

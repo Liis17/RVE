@@ -6,7 +6,8 @@ use crate::pipeline::{
     SCRIPTS_THREAD, ScriptControl, VulkanBackend, start_render,
 };
 use crate::scene::{PreparedRenderAssets, upload_scene};
-use engine_render::{Renderer, RendererConfig};
+use engine_project::BootstrapPresentMode;
+use engine_render::{PresentMode, Renderer, RendererConfig};
 use engine_script::ScriptInterruptHandle;
 use engine_window::{Key, MouseButton, Window, WindowConfig, WindowHandler, WindowProxy, run};
 use flume::{Receiver, Sender};
@@ -23,6 +24,7 @@ impl ExitRequester for WindowExit {
 
 pub(crate) struct PlayerConfig {
     pub window: WindowConfig,
+    pub present_mode: Option<BootstrapPresentMode>,
     pub frame_limit: Option<u64>,
     pub render_assets: PreparedRenderAssets,
     pub activation: PendingActivation,
@@ -39,6 +41,7 @@ pub(crate) struct PlayerConfig {
 pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     let PlayerConfig {
         window,
+        present_mode,
         frame_limit,
         render_assets,
         activation,
@@ -53,6 +56,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     } = config;
     let mut handler = PlayerWindow {
         frame_limit,
+        present_mode,
         render_assets,
         modules,
         activation,
@@ -82,6 +86,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
 
 struct PlayerWindow<'a> {
     frame_limit: Option<u64>,
+    present_mode: Option<BootstrapPresentMode>,
     render_assets: PreparedRenderAssets,
     modules: &'a mut ModuleHost,
     activation: PendingActivation,
@@ -228,7 +233,17 @@ impl WindowHandler for PlayerWindow<'_> {
             Arc::clone(&window),
             size.width,
             size.height,
-            RendererConfig::default(),
+            RendererConfig {
+                present_mode: self
+                    .present_mode
+                    .map(|mode| match mode {
+                        BootstrapPresentMode::Fifo => PresentMode::Fifo,
+                        BootstrapPresentMode::Mailbox => PresentMode::Mailbox,
+                        BootstrapPresentMode::Immediate => PresentMode::Immediate,
+                    })
+                    .unwrap_or_default(),
+                ..RendererConfig::default()
+            },
         ) {
             Ok(renderer) => renderer,
             Err(error) => return self.fail_init(format!("ошибка renderer: {error}")),
