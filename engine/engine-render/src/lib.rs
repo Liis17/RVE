@@ -831,13 +831,7 @@ impl Renderer {
             .and_then(Option::as_ref)
             .map(|buffers| buffers.upload_serial)
             .ok_or(RenderError::InvalidMesh("MeshId не принадлежит renderer"))?;
-        if self
-            .pending_upload
-            .as_ref()
-            .is_some_and(|batch| batch.serial == upload_serial)
-        {
-            self.flush_uploads()?;
-        }
+        self.flush_upload_serial(upload_serial)?;
         let buffers = self
             .meshes
             .get_mut(mesh.0)
@@ -848,7 +842,8 @@ impl Renderer {
         Ok(())
     }
 
-    /// Загружает sRGB-текстуру RGBA8 со строками сверху вниз.
+    /// Записывает sRGB RGBA8 загрузку со строками сверху вниз в upload batch.
+    /// Ошибка отправки batch может вернуться из следующего resource API или кадра.
     pub fn create_texture(
         &mut self,
         width: u32,
@@ -858,7 +853,8 @@ impl Renderer {
         self.create_texture_with_color_space(width, height, rgba, TextureColorSpace::Srgb)
     }
 
-    /// Загружает RGBA8-текстуру в заданном цветовом пространстве.
+    /// Записывает RGBA8-текстуру заданного цветового пространства в upload batch.
+    /// Ошибка отправки batch может вернуться из следующего resource API или кадра.
     pub fn create_texture_with_color_space(
         &mut self,
         width: u32,
@@ -903,7 +899,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Удаляет текстуру; ресурсы освобождаются после завершения отправленных кадров.
+    /// Отправляет её ожидающую загрузку при необходимости; image ждёт upload и кадров перед освобождением.
     pub fn destroy_texture(&mut self, texture: TextureId) -> Result<(), RenderError> {
         let unknown =
             || RenderError::InvalidTexture("TextureId не принадлежит renderer".to_owned());
@@ -911,12 +907,20 @@ impl Renderer {
         if texture.0 <= FLAT_NORMAL_TEXTURE {
             return Err(unknown());
         }
+        let upload_serial = self
+            .textures
+            .get(texture.0)
+            .and_then(Option::as_ref)
+            .map(|texture| texture.upload_serial)
+            .ok_or_else(unknown)?;
+        self.flush_upload_serial(upload_serial)?;
         let resource = self
             .textures
             .get_mut(texture.0)
             .and_then(Option::take)
             .ok_or_else(unknown)?;
-        self.retired.retire(RetiredResource::Texture(resource), 0);
+        self.retired
+            .retire(RetiredResource::Texture(resource), upload_serial);
         Ok(())
     }
 
@@ -925,7 +929,8 @@ impl Renderer {
         self.max_texture_size
     }
 
-    /// Загружает UI-текстуру RGBA8: предумноженный цвет в гамма-пространстве, строки сверху вниз.
+    /// Записывает UI-текстуру RGBA8 в upload batch: предумноженный цвет в гамма-пространстве, строки сверху вниз.
+    /// Ошибка отправки batch может вернуться из следующего resource API или кадра.
     pub fn create_ui_texture(
         &mut self,
         width: u32,
@@ -936,19 +941,25 @@ impl Renderer {
         let sampler = self
             .ui_sampler
             .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?;
-        let image = self.upload_image(UI_TEXTURE_FORMAT, 1, width, height, rgba)?;
-        let (pool, set) = allocate_image_set(
-            self.device()?,
-            self.texture_set_layout()?,
-            image.view,
-            sampler,
-        )?;
+        let device = self.device()?.clone();
+        let image_set_layout = self.texture_set_layout()?;
+        let (image, upload_serial) =
+            self.upload_image(UI_TEXTURE_FORMAT, 1, width, height, rgba)?;
+        let (pool, set) = match allocate_image_set(&device, image_set_layout, image.view, sampler) {
+            Ok(resources) => resources,
+            Err(error) => {
+                self.retired
+                    .retire(RetiredResource::Image(image), upload_serial);
+                return Err(error);
+            }
+        };
         self.ui_textures.push(Some(UiTexture {
-            device: self.device()?.clone(),
+            device,
             pool,
             set,
             image,
             extent: vk::Extent2D { width, height },
+            upload_serial,
         }));
         Ok(UiTextureId(self.ui_textures.len() - 1))
     }
@@ -964,7 +975,9 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let target = self.ui_texture(texture)?;
         validate_texture_region(region, target.extent, rgba.len())?;
+        let upload_serial = target.upload_serial;
         let image = target.image.image;
+        self.flush_upload_serial(upload_serial)?;
         let device = self.device()?;
         let staging = HostBuffer::new(
             self.instance()?,
@@ -1022,14 +1035,18 @@ impl Renderer {
                 .image(image)
                 .subresource_range(color_subresource_range());
             pipeline_barrier(device, command_buffer, to_shader);
-        })
+        })?;
+        self.poll_uploads()?;
+        Ok(())
     }
 
-    /// Удаляет UI-текстуру; ресурсы освобождаются после завершения отправленных кадров.
+    /// Отправляет её ожидающую загрузку при необходимости; image ждёт upload и кадров перед освобождением.
     pub fn free_ui_texture(&mut self, texture: UiTextureId) -> Result<(), RenderError> {
-        self.ui_texture(texture)?;
+        let upload_serial = self.ui_texture(texture)?.upload_serial;
+        self.flush_upload_serial(upload_serial)?;
         if let Some(resource) = self.ui_textures[texture.0].take() {
-            self.retired.retire(RetiredResource::UiTexture(resource), 0);
+            self.retired
+                .retire(RetiredResource::UiTexture(resource), upload_serial);
         }
         Ok(())
     }
@@ -2088,9 +2105,9 @@ impl Renderer {
         Ok(())
     }
 
-    /// Копирует пиксели через staging-буфер в device-local image.
+    /// Записывает пиксели через batch staging-буфер в device-local image.
     fn upload_texture(
-        &self,
+        &mut self,
         width: u32,
         height: u32,
         rgba: &[u8],
@@ -2098,101 +2115,77 @@ impl Renderer {
     ) -> Result<Texture, RenderError> {
         let mip_levels = mip_level_count(width, height);
         let format = texture_format(color_space);
-        let image = self.upload_image(format, mip_levels, width, height, rgba)?;
-        Ok(Texture { image, color_space })
+        let (image, upload_serial) = self.upload_image(format, mip_levels, width, height, rgba)?;
+        Ok(Texture {
+            image,
+            color_space,
+            upload_serial,
+        })
     }
 
     fn upload_image(
-        &self,
+        &mut self,
         format: vk::Format,
         mip_levels: u32,
         width: u32,
         height: u32,
         rgba: &[u8],
-    ) -> Result<DeviceImage, RenderError> {
-        let device = self.device()?;
-        let extent = vk::Extent2D { width, height };
+    ) -> Result<(DeviceImage, u64), RenderError> {
+        let instance = self.instance()?.clone();
+        let device = self.device()?.clone();
+        let layout = upload_data_layout(0, rgba.len(), self.upload_alignment).ok_or(
+            RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
+        )?;
+        let capacity = upload_batch_capacity(layout.1, self.upload_alignment).ok_or(
+            RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
+        )?;
+        let must_flush = self.pending_upload.as_ref().is_some_and(|batch| {
+            batch.oversized
+                || upload_data_layout(batch.cursor, rgba.len(), self.upload_alignment)
+                    .is_none_or(|(_, end)| end > batch.capacity)
+        });
+        if must_flush {
+            self.flush_uploads()?;
+        }
+        if self.pending_upload.is_none() {
+            let serial = self.next_upload_serial;
+            let next_serial = serial
+                .checked_add(1)
+                .ok_or(RenderError::InvalidState("upload serial исчерпан"))?;
+            self.pending_upload = Some(UploadBatch::new(
+                &instance,
+                &device,
+                self.physical_device,
+                self.queue_family_index,
+                capacity,
+                capacity > DEFAULT_UPLOAD_BATCH_CAPACITY,
+                serial,
+            )?);
+            self.next_upload_serial = next_serial;
+        }
         let image = DeviceImage::new(
-            self.instance()?,
-            device,
+            &instance,
+            &device,
             self.physical_device,
-            extent,
+            vk::Extent2D { width, height },
             format,
             vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST,
             color_mip_subresource_range(0, mip_levels),
         )?;
-        let staging = HostBuffer::new(
-            self.instance()?,
-            device,
-            self.physical_device,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            rgba,
+        let batch = self
+            .pending_upload
+            .as_mut()
+            .ok_or(RenderError::InvalidState("upload batch отсутствует"))?;
+        let layout = upload_data_layout(batch.cursor, rgba.len(), self.upload_alignment).ok_or(
+            RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
         )?;
-        self.submit_once(|command_buffer| {
-            let to_transfer = texture_upload_barrier(image.image, mip_levels);
-            pipeline_barrier(device, command_buffer, to_transfer);
-            let region = [vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .image_subresource(color_subresource_layers())
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })];
-            // SAFETY: the staging buffer holds width * height RGBA8 texels for this image.
-            unsafe {
-                device.cmd_copy_buffer_to_image(
-                    command_buffer,
-                    staging.buffer,
-                    image.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &region,
-                )
-            };
-            let mut source_extent = extent;
-            for mip_level in 1..mip_levels {
-                let source_range = color_mip_subresource_range(mip_level - 1, 1);
-                pipeline_barrier(
-                    device,
-                    command_buffer,
-                    texture_mip_source_barrier(image.image, source_range),
-                );
-
-                let destination_extent = mip_extent(width, height, mip_level);
-                let region = [texture_mip_blit_region(
-                    mip_level - 1,
-                    source_extent,
-                    destination_extent,
-                )];
-                // SAFETY: adjacent mip levels are distinct, in bounds, and use the same blit-capable format.
-                unsafe {
-                    device.cmd_blit_image(
-                        command_buffer,
-                        image.image,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        image.image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &region,
-                        vk::Filter::LINEAR,
-                    )
-                };
-                pipeline_barrier(
-                    device,
-                    command_buffer,
-                    texture_mip_shader_barrier(image.image, source_range),
-                );
-                source_extent = destination_extent;
-            }
-
-            let final_range = color_mip_subresource_range(mip_levels - 1, 1);
-            let to_shader = texture_mip_destination_shader_barrier(image.image, final_range);
-            pipeline_barrier(device, command_buffer, to_shader);
-        })?;
-        drop(staging);
-
-        Ok(image)
+        batch.staging.write_at(layout.0, rgba)?;
+        batch.record_image_upload(image.image, width, height, mip_levels, layout.0);
+        batch.cursor = layout.1;
+        let upload_serial = batch.serial;
+        Ok((image, upload_serial))
     }
 
     fn upload_material(&self, material: &Material) -> Result<GpuMaterial, RenderError> {
@@ -2373,6 +2366,17 @@ impl Renderer {
             "upload batch отсутствует после submit",
         ))?;
         self.in_flight_uploads.push(batch);
+        Ok(())
+    }
+
+    fn flush_upload_serial(&mut self, serial: u64) -> Result<(), RenderError> {
+        if self
+            .pending_upload
+            .as_ref()
+            .is_some_and(|batch| batch.serial == serial)
+        {
+            self.flush_uploads()?;
+        }
         Ok(())
     }
 
@@ -3975,11 +3979,12 @@ struct UiTexture {
     set: vk::DescriptorSet,
     image: DeviceImage,
     extent: vk::Extent2D,
+    upload_serial: u64,
 }
 
 impl Drop for UiTexture {
     fn drop(&mut self) {
-        // SAFETY: retired UI textures are dropped only after their submitted frames complete.
+        // SAFETY: retirement waits for frame use and the image's upload serial before freeing its descriptor pool.
         unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
     }
 }
@@ -3988,6 +3993,7 @@ impl Drop for UiTexture {
 enum RetiredResource {
     Mesh(#[allow(dead_code)] MeshBuffers),
     Texture(#[allow(dead_code)] Arc<Texture>),
+    Image(#[allow(dead_code)] DeviceImage),
     Material(#[allow(dead_code)] GpuMaterial),
     UiTexture(#[allow(dead_code)] UiTexture),
     Viewport(#[allow(dead_code)] Viewport),
@@ -5452,6 +5458,7 @@ struct FrameUniforms {
 struct Texture {
     image: DeviceImage,
     color_space: TextureColorSpace,
+    upload_serial: u64,
 }
 
 /// Материал владеет uniform buffer и descriptor pool для собственного набора.
@@ -5511,16 +5518,21 @@ fn align_upload_offset(cursor: usize, alignment: usize) -> Option<usize> {
     Some(offset)
 }
 
+fn upload_data_layout(cursor: usize, size: usize, alignment: usize) -> Option<(usize, usize)> {
+    let offset = align_upload_offset(cursor, alignment)?;
+    let end = offset.checked_add(size)?;
+    u64::try_from(end).ok()?;
+    Some((offset, end))
+}
+
 fn mesh_upload_layout(
     cursor: usize,
     vertex_size: usize,
     index_size: usize,
     alignment: usize,
 ) -> Option<MeshUploadLayout> {
-    let vertex_offset = align_upload_offset(cursor, alignment)?;
-    let index_offset = align_upload_offset(vertex_offset.checked_add(vertex_size)?, alignment)?;
-    let end = index_offset.checked_add(index_size)?;
-    u64::try_from(end).ok()?;
+    let (vertex_offset, vertex_end) = upload_data_layout(cursor, vertex_size, alignment)?;
+    let (index_offset, end) = upload_data_layout(vertex_end, index_size, alignment)?;
     Some(MeshUploadLayout {
         vertex_offset,
         index_offset,
@@ -5675,6 +5687,80 @@ impl UploadBatch {
             self.device
                 .cmd_pipeline_barrier2(self.command_buffer, &dependency)
         };
+    }
+
+    fn record_image_upload(
+        &self,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+        buffer_offset: usize,
+    ) {
+        pipeline_barrier(
+            &self.device,
+            self.command_buffer,
+            texture_upload_barrier(image, mip_levels),
+        );
+        let region = [vk::BufferImageCopy::default()
+            .buffer_offset(buffer_offset as vk::DeviceSize)
+            .image_subresource(color_subresource_layers())
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })];
+        // SAFETY: the aligned staging range contains exactly the base-level RGBA8 texels.
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                self.command_buffer,
+                self.staging.buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region,
+            )
+        };
+        let mut source_extent = vk::Extent2D { width, height };
+        for mip_level in 1..mip_levels {
+            let source_range = color_mip_subresource_range(mip_level - 1, 1);
+            pipeline_barrier(
+                &self.device,
+                self.command_buffer,
+                texture_mip_source_barrier(image, source_range),
+            );
+            let destination_extent = mip_extent(width, height, mip_level);
+            let region = [texture_mip_blit_region(
+                mip_level - 1,
+                source_extent,
+                destination_extent,
+            )];
+            // SAFETY: adjacent mip levels are distinct, in bounds, and use the same blit-capable format.
+            unsafe {
+                self.device.cmd_blit_image(
+                    self.command_buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                    vk::Filter::LINEAR,
+                )
+            };
+            pipeline_barrier(
+                &self.device,
+                self.command_buffer,
+                texture_mip_shader_barrier(image, source_range),
+            );
+            source_extent = destination_extent;
+        }
+        pipeline_barrier(
+            &self.device,
+            self.command_buffer,
+            texture_mip_destination_shader_barrier(
+                image,
+                color_mip_subresource_range(mip_levels - 1, 1),
+            ),
+        );
     }
 }
 
@@ -6002,9 +6088,7 @@ fn validate_texture(
             "{width}x{height} больше предела GPU {max_size}x{max_size}"
         )));
     }
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|texels| texels.checked_mul(4));
+    let expected = texture_staging_size(width, height);
     if expected != Some(byte_count) {
         return Err(RenderError::InvalidTexture(format!(
             "для RGBA8 {width}x{height} нужно {} байт, передано {byte_count}",
@@ -6012,6 +6096,12 @@ fn validate_texture(
         )));
     }
     Ok(())
+}
+
+fn texture_staging_size(width: u32, height: u32) -> Option<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|texels| texels.checked_mul(4))
 }
 
 fn validate_overlay(vertices: &[OverlayVertex]) -> Result<(), RenderError> {
@@ -6363,11 +6453,11 @@ mod tests {
         sampler_anisotropy, scaled_extent, scene_viewport, select_composite_alpha,
         select_present_mode, select_surface_extent, shadow_casters, texture_format,
         texture_format_reasons, texture_mip_blit_region, texture_mip_destination_shader_barrier,
-        texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
-        timestamp_duration, transform_tangent_normal, upload_batch_capacity,
-        upload_batch_flush_required, validate_draws, validate_material, validate_mesh,
-        validate_overlay, validate_pipeline_cache, validate_render_scale, validate_texture,
-        validate_view_settings, vertex_bytes,
+        texture_mip_shader_barrier, texture_mip_source_barrier, texture_staging_size,
+        texture_upload_barrier, timestamp_duration, transform_tangent_normal,
+        upload_batch_capacity, upload_batch_flush_required, upload_data_layout, validate_draws,
+        validate_material, validate_mesh, validate_overlay, validate_pipeline_cache,
+        validate_render_scale, validate_texture, validate_view_settings, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -7102,6 +7192,26 @@ mod tests {
             upload_batch_flush_required(oversized.end, 44, 12, 16, capacity),
             Some(true)
         );
+    }
+
+    #[test]
+    fn texture_upload_budget_contains_only_base_level_rgba8_source_data() {
+        let width = 4;
+        let height = 4;
+        let mip_levels = mip_level_count(width, height);
+        let base_level_bytes = texture_staging_size(width, height).unwrap();
+        let whole_chain_bytes = (0..mip_levels)
+            .map(|mip| {
+                let extent = mip_extent(width, height, mip);
+                extent.width as usize * extent.height as usize * 4
+            })
+            .sum::<usize>();
+        assert_eq!(base_level_bytes, 4 * 4 * 4);
+        assert_eq!(whole_chain_bytes, 84);
+        assert_eq!(base_level_bytes, 64);
+        assert!(whole_chain_bytes > base_level_bytes);
+        assert_eq!(upload_data_layout(0, base_level_bytes, 16), Some((16, 80)));
+        assert_eq!(texture_staging_size(u32::MAX, u32::MAX), None);
     }
 
     const IDENTITY: [[f32; 4]; 4] = [
