@@ -814,7 +814,9 @@ pub(crate) fn render_local_lights(states: &[LocalLightState]) -> Vec<LocalLight>
                 ..
             } => LocalLight::Point {
                 position,
-                color_intensity: color.map(|component| component * intensity),
+                color_intensity: color.map(|component| {
+                    (f64::from(component) * f64::from(intensity)).min(f64::from(f32::MAX)) as f32
+                }),
                 range,
             },
             LocalLightState::Spot {
@@ -829,7 +831,9 @@ pub(crate) fn render_local_lights(states: &[LocalLightState]) -> Vec<LocalLight>
             } => LocalLight::Spot {
                 position,
                 direction,
-                color_intensity: color.map(|component| component * intensity),
+                color_intensity: color.map(|component| {
+                    (f64::from(component) * f64::from(intensity)).min(f64::from(f32::MAX)) as f32
+                }),
                 range,
                 cos_inner_angle: inner_angle_deg.to_radians().cos().max(0.0),
                 cos_outer_angle: outer_angle_deg.to_radians().cos().max(0.0),
@@ -1178,6 +1182,44 @@ id = "camera"
         ));
     }
 
+    #[test]
+    fn scene_valid_local_light_factors_saturate_without_infinity() {
+        let document = engine_scene::SceneDocument::parse(
+            "lights.rvescene",
+            r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "point"
+[objects.point_light]
+color = [2e38, 1, 0]
+intensity = 2
+range = 10
+[[objects]]
+id = "spot"
+[objects.spot_light]
+color = [2e38, 1, 0]
+intensity = 2
+range = 10
+"#,
+        )
+        .unwrap();
+        let mut world = engine_scene::World::from_document(&document).unwrap();
+        let lights = render_local_lights(&world.build_frame().0.local_lights);
+        assert_eq!(lights.len(), 2);
+        for light in lights {
+            let color_intensity = match light {
+                LocalLight::Point {
+                    color_intensity, ..
+                }
+                | LocalLight::Spot {
+                    color_intensity, ..
+                } => color_intensity,
+            };
+            assert_eq!(color_intensity, [f32::MAX, 2.0, 0.0]);
+        }
+    }
     #[test]
     fn scene_and_game_viewports_build_camera_relative_shadow_cascades() {
         let light = LightState {
