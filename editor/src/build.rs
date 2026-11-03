@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Способ запустить `rve-build`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +38,12 @@ pub fn locate_build_tool(
         if binary.is_file() {
             return Ok(BuildTool::Binary(binary));
         }
+        if dir.join("rve-sdk.toml").is_file() {
+            return Err(format!(
+                "SDK editor is missing its neighboring rve-build{}; checkout fallback is disabled",
+                std::env::consts::EXE_SUFFIX
+            ));
+        }
     }
     if workspace.join("Cargo.toml").is_file() {
         return Ok(BuildTool::Cargo {
@@ -51,6 +58,17 @@ impl BuildTool {
     /// Команда `build <project> --output <output>`; пути должны быть абсолютными,
     /// потому что cargo запускается из корня workspace.
     pub fn command(&self, project: &Path, output: &Path) -> Command {
+        let mut command = self.command_for("build", project);
+        command.arg("--output").arg(output);
+        command
+    }
+
+    /// Команда `scripts <project>` для автоматической сборки скриптов редактором.
+    pub fn scripts_command(&self, project: &Path) -> Command {
+        self.command_for("scripts", project)
+    }
+
+    fn command_for(&self, subcommand: &str, project: &Path) -> Command {
         let mut command = match self {
             Self::Binary(binary) => Command::new(binary),
             Self::Cargo { cargo, workspace } => {
@@ -62,11 +80,7 @@ impl BuildTool {
                 command
             }
         };
-        command
-            .arg("build")
-            .arg(project)
-            .arg("--output")
-            .arg(output);
+        command.arg(subcommand).arg(project);
         command
     }
 }
@@ -103,8 +117,154 @@ pub fn finish_message(code: Option<i32>, output: &Path) -> (LogLevel, String) {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
 enum Message {
-    Line(LogLevel, String),
+    Line(Stream, LogLevel, String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobCompletion {
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub last_stdout_line: Option<String>,
+}
+
+/// A background `rve-build scripts` process.
+pub struct ScriptsJob {
+    job: BuildJob,
+}
+
+impl ScriptsJob {
+    pub fn spawn(command: Command, project: PathBuf) -> std::io::Result<Self> {
+        Ok(Self {
+            job: BuildJob::spawn_with_finish(command, project, finish_scripts_message)?,
+        })
+    }
+
+    pub fn poll(&mut self) -> Vec<(LogLevel, String)> {
+        self.job.poll()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.job.is_finished()
+    }
+
+    pub fn completion(&self) -> Option<&JobCompletion> {
+        self.job.completion()
+    }
+
+    pub fn kill(self) {
+        self.job.kill();
+    }
+}
+
+fn finish_scripts_message(code: Option<i32>, _project: &Path) -> (LogLevel, String) {
+    match code {
+        Some(0) => (LogLevel::Info, "Scripts build completed".to_owned()),
+        Some(code) => finish_message(Some(code), Path::new("scripts")),
+        None => finish_message(None, Path::new("scripts")),
+    }
+}
+
+pub fn scripts_library_from_completion(
+    completion: &JobCompletion,
+) -> Result<Option<PathBuf>, String> {
+    if !completion.success {
+        return Err(format!(
+            "scripts build failed{}",
+            completion
+                .exit_code
+                .map_or_else(String::new, |code| format!(" with exit code {code}"))
+        ));
+    }
+    let line = completion
+        .last_stdout_line
+        .as_deref()
+        .ok_or_else(|| "scripts build did not print its library path".to_owned())?;
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(line);
+    if !path.is_absolute() {
+        return Err(format!("scripts library path is not absolute: {line}"));
+    }
+    Ok(Some(path))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScriptFingerprint {
+    modified: SystemTime,
+    size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptGeneration {
+    pub path: PathBuf,
+    fingerprint: ScriptFingerprint,
+}
+
+pub fn copy_script_generation(
+    project: &Path,
+    source: &Path,
+    current: Option<&ScriptGeneration>,
+) -> std::io::Result<Option<ScriptGeneration>> {
+    let metadata = std::fs::metadata(source)?;
+    let fingerprint = ScriptFingerprint {
+        modified: metadata.modified()?,
+        size: metadata.len(),
+    };
+    if current.is_some_and(|generation| generation.fingerprint == fingerprint) {
+        return Ok(None);
+    }
+    let extension = source.extension().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "script library has no extension",
+        )
+    })?;
+    let elapsed = fingerprint
+        .modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let directory = project.join(".rve/editor/scripts");
+    std::fs::create_dir_all(&directory)?;
+    let name = format!("rve-scripts-{elapsed}-{}", fingerprint.size);
+    let destination = directory.join(format!("{name}.{}", extension.to_string_lossy()));
+    std::fs::copy(source, &destination)?;
+    Ok(Some(ScriptGeneration {
+        path: destination,
+        fingerprint,
+    }))
+}
+
+pub fn cleanup_script_generations(project: &Path) -> std::io::Result<()> {
+    let directory = project.join(".rve/editor/scripts");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if entry.file_type()?.is_file()
+            && name.starts_with("rve-scripts-")
+            && ["dll", "dylib", "so"]
+                .iter()
+                .any(|extension| name.ends_with(&format!(".{extension}")))
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -241,12 +401,23 @@ pub struct BuildJob {
     readers: Vec<JoinHandle<()>>,
     process_tree: Option<ProcessTree>,
     output: PathBuf,
+    finish: fn(Option<i32>, &Path) -> (LogLevel, String),
+    last_stdout_line: Option<String>,
+    completion: Option<JobCompletion>,
     finished: bool,
 }
 
 impl BuildJob {
     /// Запускает команду с перехваченными stdout и stderr; `output` попадает в итог.
-    pub fn spawn(mut command: Command, output: PathBuf) -> std::io::Result<Self> {
+    pub fn spawn(command: Command, output: PathBuf) -> std::io::Result<Self> {
+        Self::spawn_with_finish(command, output, finish_message)
+    }
+
+    fn spawn_with_finish(
+        mut command: Command,
+        output: PathBuf,
+        finish: fn(Option<i32>, &Path) -> (LogLevel, String),
+    ) -> std::io::Result<Self> {
         let mut process_tree = ProcessTree::prepare(&mut command)?;
         command
             .stdin(Stdio::null())
@@ -268,10 +439,17 @@ impl BuildJob {
         let (sender, receiver) = mpsc::channel();
         let mut readers = Vec::with_capacity(2);
         if let Some(stdout) = child.stdout.take() {
-            readers.push(spawn_reader(stdout, sender.clone(), |_| LogLevel::Info));
+            readers.push(spawn_reader(stdout, sender.clone(), Stream::Stdout, |_| {
+                LogLevel::Info
+            }));
         }
         if let Some(stderr) = child.stderr.take() {
-            readers.push(spawn_reader(stderr, sender, classify_stderr));
+            readers.push(spawn_reader(
+                stderr,
+                sender,
+                Stream::Stderr,
+                classify_stderr,
+            ));
         }
         Ok(Self {
             child,
@@ -279,6 +457,9 @@ impl BuildJob {
             readers,
             process_tree: Some(process_tree),
             output,
+            finish,
+            last_stdout_line: None,
+            completion: None,
             finished: false,
         })
     }
@@ -302,10 +483,15 @@ impl BuildJob {
         lines
     }
 
-    fn read_messages(&self, lines: &mut Vec<(LogLevel, String)>) {
+    fn read_messages(&mut self, lines: &mut Vec<(LogLevel, String)>) {
         loop {
             match self.receiver.try_recv() {
-                Ok(Message::Line(level, line)) => lines.push((level, line)),
+                Ok(Message::Line(stream, level, line)) => {
+                    if stream == Stream::Stdout {
+                        self.last_stdout_line = Some(line.clone());
+                    }
+                    lines.push((level, line));
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
@@ -323,14 +509,22 @@ impl BuildJob {
         self.join_readers();
         self.read_messages(lines);
         self.finished = true;
-        lines.push(finish_message(
-            status.and_then(|status| status.code()),
-            &self.output,
-        ));
+        let success = status.as_ref().is_some_and(ExitStatus::success);
+        let exit_code = status.and_then(|status| status.code());
+        self.completion = Some(JobCompletion {
+            success,
+            exit_code,
+            last_stdout_line: self.last_stdout_line.clone(),
+        });
+        lines.push((self.finish)(exit_code, &self.output));
     }
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    pub fn completion(&self) -> Option<&JobCompletion> {
+        self.completion.as_ref()
     }
 
     /// Останавливает процесс и его потомков, затем дожидается потоков вывода.
@@ -368,6 +562,7 @@ impl Drop for BuildJob {
 fn spawn_reader(
     stream: impl Read + Send + 'static,
     sender: Sender<Message>,
+    source: Stream,
     level: fn(&str) -> LogLevel,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -378,7 +573,10 @@ fn spawn_reader(
             let line = String::from_utf8_lossy(&buffer);
             let line = line.trim_end_matches(['\r', '\n']).to_owned();
             buffer.clear();
-            if sender.send(Message::Line(level(&line), line)).is_err() {
+            if sender
+                .send(Message::Line(source, level(&line), line))
+                .is_err()
+            {
                 return;
             }
         }
@@ -477,6 +675,25 @@ mod tests {
     }
 
     #[test]
+    fn sdk_marker_forbids_checkout_fallback_when_neighboring_tool_is_missing() {
+        let exe_dir = TempDir::new();
+        let workspace = TempDir::new();
+        fs::write(workspace.0.join("Cargo.toml"), "").unwrap();
+        fs::write(exe_dir.0.join("rve-sdk.toml"), "").unwrap();
+        let error = locate_build_tool(Some(&exe_dir.0), &workspace.0, None).unwrap_err();
+        assert!(error.contains("neighboring rve-build"), "{error}");
+
+        let binary = exe_dir
+            .0
+            .join(format!("rve-build{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&binary, "").unwrap();
+        assert_eq!(
+            locate_build_tool(Some(&exe_dir.0), &workspace.0, None).unwrap(),
+            BuildTool::Binary(binary)
+        );
+    }
+
+    #[test]
     fn cargo_command_runs_from_the_workspace_root() {
         let tool = BuildTool::Cargo {
             cargo: "cargo".into(),
@@ -501,6 +718,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scripts_command_uses_the_same_binary_or_cargo_runner() {
+        let tool = BuildTool::Cargo {
+            cargo: "cargo".into(),
+            workspace: PathBuf::from("ws"),
+        };
+        let command = tool.scripts_command(Path::new("/game"));
+        assert_eq!(command.get_current_dir(), Some(Path::new("ws")));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "run",
+                "-p",
+                "rve-build",
+                "--locked",
+                "--",
+                "scripts",
+                "/game"
+            ]
+        );
+    }
+
+    #[test]
+    fn scripts_output_accepts_an_absolute_path_and_empty_output() {
+        let path = std::env::current_exe().unwrap();
+        assert_eq!(
+            scripts_library_from_completion(&JobCompletion {
+                success: true,
+                exit_code: Some(0),
+                last_stdout_line: Some(path.display().to_string()),
+            })
+            .unwrap(),
+            Some(path)
+        );
+        assert_eq!(
+            scripts_library_from_completion(&JobCompletion {
+                success: true,
+                exit_code: Some(0),
+                last_stdout_line: Some(String::new()),
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            scripts_library_from_completion(&JobCompletion {
+                success: true,
+                exit_code: Some(0),
+                last_stdout_line: Some("relative.dll".to_owned()),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn script_generations_skip_unchanged_outputs_and_copy_changed_outputs() {
+        let project = TempDir::new();
+        let source = project.0.join("game.dll");
+        fs::write(&source, b"first").unwrap();
+        let first = copy_script_generation(&project.0, &source, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            first
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rve-scripts-")
+        );
+        assert!(
+            first
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".dll")
+        );
+        assert_eq!(
+            copy_script_generation(&project.0, &source, Some(&first)).unwrap(),
+            None
+        );
+
+        fs::write(&source, b"changed output").unwrap();
+        let second = copy_script_generation(&project.0, &source, Some(&first))
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(fs::read(second.path).unwrap(), b"changed output");
+    }
+
+    #[test]
+    fn generation_cleanup_removes_only_editor_generated_libraries() {
+        let project = TempDir::new();
+        let directory = project.0.join(".rve/editor/scripts");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("rve-scripts-old.dll"), "old").unwrap();
+        fs::write(directory.join("keep.dll"), "user").unwrap();
+        cleanup_script_generations(&project.0).unwrap();
+        assert!(!directory.join("rve-scripts-old.dll").exists());
+        assert!(directory.join("keep.dll").exists());
+    }
+
     /// Дочерний процесс для `job_reports_lines_in_order_and_the_exit_code`; без
     /// переменной окружения ничего не делает.
     #[test]
@@ -515,7 +834,7 @@ mod tests {
         std::process::exit(code.parse().unwrap());
     }
 
-    fn run_helper(code: i32) -> Vec<(LogLevel, String)> {
+    fn run_helper(code: i32) -> (Vec<(LogLevel, String)>, JobCompletion) {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -533,12 +852,12 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(job.poll().is_empty());
-        lines
+        (lines, job.completion().unwrap().clone())
     }
 
     #[test]
     fn job_reports_lines_in_order_and_the_exit_code() {
-        let lines = run_helper(2);
+        let (lines, completion) = run_helper(2);
         let markers: Vec<_> = lines
             .iter()
             .filter(|(_, line)| line.contains("marker-"))
@@ -570,10 +889,14 @@ mod tests {
             lines.last().unwrap(),
             &finish_message(Some(2), Path::new("out-dir"))
         );
+        assert!(!completion.success);
+        assert_eq!(completion.exit_code, Some(2));
+        assert_eq!(completion.last_stdout_line.as_deref(), Some("marker-out-2"));
 
-        let lines = run_helper(0);
+        let (lines, completion) = run_helper(0);
         assert_eq!(lines.last().unwrap().0, LogLevel::Info);
         assert!(lines.last().unwrap().1.contains("out-dir"));
+        assert!(completion.success);
     }
 
     #[test]

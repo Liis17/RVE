@@ -343,8 +343,10 @@ fn show_tools(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.add(snap_step(&mut snap.scale_step, "Scale ", ""));
     ui.separator();
     let playing = state.is_playing();
-    if ui.selectable_label(playing, "Play").clicked() {
-        state.action(if playing { Action::Stop } else { Action::Play });
+    let play_pending = state.pending_play;
+    let can_stop = playing || play_pending;
+    if ui.selectable_label(can_stop, "Play").clicked() {
+        state.action(if can_stop { Action::Stop } else { Action::Play });
     }
     let paused = state.play.as_ref().is_some_and(|play| play.is_paused());
     if ui
@@ -354,7 +356,10 @@ fn show_tools(ui: &mut egui::Ui, state: &mut EditorState) {
     {
         play.set_paused(!paused);
     }
-    if ui.add_enabled(playing, egui::Button::new("Stop")).clicked() {
+    if ui
+        .add_enabled(can_stop, egui::Button::new("Stop"))
+        .clicked()
+    {
         state.action(Action::Stop);
     }
 }

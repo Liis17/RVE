@@ -863,6 +863,33 @@ fn build_player_menu_item_queues_the_action() {
     assert_eq!(harness.state.actions, [crate::state::Action::BuildPlayer]);
 }
 
+#[test]
+fn stop_button_cancels_a_play_request_waiting_for_script_build() {
+    let mut harness = Harness::new();
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+    harness.state.project = Some(OpenProject::open(Path::new(dir)).unwrap());
+    harness.state.pending_play = true;
+    let mut dock = default_layout();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness
+            .ctx
+            .run_ui(input, |ui| toolbar::show(ui, state, &mut dock));
+        output.textures_delta.clear();
+        output.shapes
+    };
+    let shapes = frame(&mut harness, Vec::new());
+    let at = find_text(&shapes, "Stop").unwrap_or_else(|| panic!("Stop not shown"));
+    frame(&mut harness, vec![Event::PointerMoved(at)]);
+    frame(&mut harness, vec![button(at, PointerButton::Primary, true)]);
+    frame(
+        &mut harness,
+        vec![button(at, PointerButton::Primary, false)],
+    );
+    assert_eq!(harness.state.actions, [crate::state::Action::Stop]);
+}
+
 /// Все надписи кадра, для поиска виджетов в тестах.
 fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Pos2)> {
     fn visit(shape: &egui::Shape, out: &mut Vec<(String, Pos2)>) {

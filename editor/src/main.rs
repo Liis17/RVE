@@ -19,6 +19,8 @@ mod viewport;
 
 use engine_project::ProjectSettings;
 use engine_window::{RedrawMode, WindowConfig};
+#[cfg(any(target_os = "macos", test))]
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const DEFAULT_WINDOW_SIZE: (u32, u32) = (1600, 900);
@@ -64,6 +66,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    prepare_vulkan_environment();
     let mut editor = app::EditorApp::new(args.project, args.scripts);
     let run_result = engine_window::run(config, &mut editor);
     editor.save_pipeline_cache();
@@ -72,6 +75,38 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::from(editor.exit_code)
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_vulkan_environment() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_dir) = executable.parent() else {
+        return;
+    };
+    let root = editor_vulkan_root(exe_dir, true);
+    // SAFETY: called in main before EditorApp or the window creates any threads.
+    unsafe { engine_platform::prepare_vulkan_environment(&root) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prepare_vulkan_environment() {}
+
+#[cfg(any(target_os = "macos", test))]
+fn editor_vulkan_root(exe_dir: &Path, is_macos: bool) -> PathBuf {
+    if is_macos
+        && exe_dir.file_name().is_some_and(|name| name == "MacOS")
+        && let Some(contents) = exe_dir.parent()
+        && contents.file_name().is_some_and(|name| name == "Contents")
+        && let Some(bundle) = contents.parent()
+        && bundle
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+    {
+        return contents.join("Resources");
+    }
+    exe_dir.to_owned()
 }
 
 #[cfg(test)]
@@ -114,6 +149,28 @@ mod tests {
         assert_eq!(
             config.width,
             bootstrap.window_size_x.unwrap_or(DEFAULT_WINDOW_SIZE.0)
+        );
+    }
+
+    #[test]
+    fn mac_editor_bundle_uses_contents_resources_for_vulkan_files() {
+        assert_eq!(
+            editor_vulkan_root(
+                Path::new("/Applications/RVE Editor.app/Contents/MacOS"),
+                true
+            ),
+            PathBuf::from("/Applications/RVE Editor.app/Contents/Resources")
+        );
+        assert_eq!(
+            editor_vulkan_root(Path::new("/opt/rve"), true),
+            PathBuf::from("/opt/rve")
+        );
+        assert_eq!(
+            editor_vulkan_root(
+                Path::new("/Applications/RVE Editor.app/Contents/MacOS"),
+                false
+            ),
+            PathBuf::from("/Applications/RVE Editor.app/Contents/MacOS")
         );
     }
 
