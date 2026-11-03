@@ -112,6 +112,8 @@ pub(crate) fn build_distribution(
     if let Some(library) = &scripts_library {
         copy_file(library, &engine_dir.join(scripts_library_filename()))?;
     }
+    #[cfg(windows)]
+    copy_fsr_runtime(&project, &engine_dir)?;
     let assets_dir = resources_dir.join("Assets");
     build_project_archives(&project, &assets_dir)?;
     validate_staged_archives(&assets_dir)?;
@@ -693,6 +695,51 @@ pub(crate) fn copy_file(source: &Path, destination: &Path) -> Result<(), BuildEr
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+fn copy_fsr_runtime(project: &ProjectBuild, engine_dir: &Path) -> Result<(), BuildError> {
+    let Some(relative) = project.settings.runtime.fsr_library.as_deref() else {
+        return Ok(());
+    };
+    let root = fs::canonicalize(&project.project_dir).map_err(|error| {
+        BuildError::input(format!(
+            "не удалось открыть каталог проекта для FSR: {error}"
+        ))
+    })?;
+    let loader = fs::canonicalize(root.join(relative)).map_err(|error| {
+        BuildError::input(format!("FSR loader DLL не найден ({relative}): {error}"))
+    })?;
+    if !loader.starts_with(&root) || !loader.is_file() {
+        return Err(BuildError::input(format!(
+            "runtime.fsr_library должен указывать на файл внутри проекта: {relative}"
+        )));
+    }
+    let upscaler = fs::canonicalize(
+        loader
+            .parent()
+            .ok_or_else(|| BuildError::input("FSR loader DLL не содержит каталог"))?
+            .join("amd_fidelityfx_upscaler_vk.dll"),
+    )
+    .map_err(|error| {
+        BuildError::input(format!(
+            "FSR upscaler effect DLL не найден рядом с loader: {error}"
+        ))
+    })?;
+    if !upscaler.starts_with(&root) || !upscaler.is_file() {
+        return Err(BuildError::input(
+            "FSR upscaler effect DLL должен находиться внутри каталога проекта",
+        ));
+    }
+    let loader_name = loader
+        .file_name()
+        .ok_or_else(|| BuildError::input("FSR loader DLL не содержит имени файла"))?;
+    create_dir_all(engine_dir)?;
+    copy_file(&loader, &engine_dir.join(loader_name))?;
+    copy_file(
+        &upscaler,
+        &engine_dir.join("amd_fidelityfx_upscaler_vk.dll"),
+    )
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn write_file(path: &Path, contents: &[u8]) -> Result<(), BuildError> {
     match fs::read(path) {
@@ -810,8 +857,8 @@ pub(crate) fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
 mod tests {
     use super::{
         CargoArtifact, CargoFailure, PlayerFlavor, build_distribution, checkout_player_target_dir,
-        heavy_scripts_manifest, parse_cargo_output, parse_cdylib_target, player_file_name,
-        select_library_file, validate_heavy_scripts, validate_staged_archives,
+        copy_fsr_runtime, heavy_scripts_manifest, parse_cargo_output, parse_cdylib_target,
+        player_file_name, select_library_file, validate_heavy_scripts, validate_staged_archives,
     };
     use crate::error::BuildError;
     use crate::project::{HeavyScriptUse, ProjectBuild};
@@ -893,6 +940,49 @@ mod tests {
             icon: None,
             heavy_scripts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn copies_optional_fsr_loader_and_effect_to_engine_directory() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-fsr-package").unwrap();
+        let project_dir = root.path().join("project");
+        let vendor_dir = project_dir.join("vendor");
+        let engine_dir = root.path().join("output/Engine");
+        fs::create_dir_all(&vendor_dir).unwrap();
+        let loader = vendor_dir.join("amd_fidelityfx_loader_vk.dll");
+        let upscaler = vendor_dir.join("amd_fidelityfx_upscaler_vk.dll");
+        fs::write(&loader, b"loader").unwrap();
+        fs::write(&upscaler, b"upscaler").unwrap();
+        let mut project = sample_project(&project_dir, None);
+        project.settings.runtime.fsr_library =
+            Some("vendor/amd_fidelityfx_loader_vk.dll".to_owned());
+
+        copy_fsr_runtime(&project, &engine_dir).unwrap();
+
+        assert_eq!(
+            fs::read(engine_dir.join("amd_fidelityfx_loader_vk.dll")).unwrap(),
+            b"loader"
+        );
+        assert_eq!(
+            fs::read(engine_dir.join("amd_fidelityfx_upscaler_vk.dll")).unwrap(),
+            b"upscaler"
+        );
+    }
+
+    #[test]
+    fn configured_fsr_loader_requires_its_effect_dll() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-fsr-missing-effect").unwrap();
+        let project_dir = root.path().join("project");
+        let vendor_dir = project_dir.join("vendor");
+        fs::create_dir_all(&vendor_dir).unwrap();
+        fs::write(vendor_dir.join("loader.dll"), b"loader").unwrap();
+        let mut project = sample_project(&project_dir, None);
+        project.settings.runtime.fsr_library = Some("vendor/loader.dll".to_owned());
+
+        let error = copy_fsr_runtime(&project, &root.path().join("output/Engine")).unwrap_err();
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("upscaler effect DLL"));
     }
 
     #[test]

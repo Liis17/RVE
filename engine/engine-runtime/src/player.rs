@@ -15,7 +15,7 @@ use egui_winit::State as EguiWinitState;
 #[cfg(feature = "dev-console")]
 use engine_console::{CommandLine, ConsoleBuffer, ConsoleLevel, ConsoleLine, parse_command_line};
 use engine_project::BootstrapPresentMode;
-use engine_render::{DebugView, PresentMode, Renderer, RendererConfig};
+use engine_render::{DebugView, PresentMode, Renderer, RendererConfig, UpscalerConfig};
 use engine_script::ScriptInterruptHandle;
 #[cfg(feature = "dev-console")]
 use engine_ui::console::ConsoleOverlay;
@@ -43,6 +43,7 @@ pub(crate) struct PlayerConfig {
     pub window: WindowConfig,
     pub present_mode: Option<BootstrapPresentMode>,
     pub pipeline_cache_path: Option<PathBuf>,
+    pub fsr_library: Option<PathBuf>,
     pub pipeline_cache: Vec<u8>,
     pub frame_limit: Option<u64>,
     pub debug_view: DebugView,
@@ -69,6 +70,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         window,
         present_mode,
         pipeline_cache_path,
+        fsr_library,
         pipeline_cache,
         frame_limit,
         debug_view,
@@ -98,6 +100,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         f8_down: false,
         present_mode,
         pipeline_cache_path,
+        fsr_library,
         pipeline_cache,
         render_assets,
         modules,
@@ -154,6 +157,7 @@ struct PlayerWindow<'a> {
     frame_limit: Option<u64>,
     present_mode: Option<BootstrapPresentMode>,
     pipeline_cache_path: Option<PathBuf>,
+    fsr_library: Option<PathBuf>,
     pipeline_cache: Vec<u8>,
     render_assets: PreparedRenderAssets,
     modules: &'a mut ModuleHost,
@@ -651,6 +655,9 @@ impl WindowHandler for PlayerWindow<'_> {
                     })
                     .unwrap_or_default(),
                 pipeline_cache: self.pipeline_cache.clone(),
+                upscalers: UpscalerConfig {
+                    fsr_library: self.fsr_library.clone(),
+                },
                 ..RendererConfig::default()
             },
         ) {

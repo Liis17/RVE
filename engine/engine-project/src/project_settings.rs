@@ -46,12 +46,15 @@ pub struct ProjectRequirements {
 pub struct RuntimeSettings {
     #[serde(default = "default_background_tick_hz")]
     pub background_tick_hz: u32,
+    #[serde(default)]
+    pub fsr_library: Option<String>,
 }
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             background_tick_hz: default_background_tick_hz(),
+            fsr_library: None,
         }
     }
 }
@@ -141,6 +144,17 @@ impl ProjectSettings {
         if self.runtime.background_tick_hz == 0 {
             return Err("runtime.background_tick_hz должен быть больше нуля".to_owned());
         }
+        if let Some(path) = &self.runtime.fsr_library
+            && (!is_relative_project_path(path)
+                || !Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("dll")))
+        {
+            return Err(
+                "runtime.fsr_library должен быть относительным путём к DLL внутри каталога проекта"
+                    .to_owned(),
+            );
+        }
 
         Ok(())
     }
@@ -224,6 +238,7 @@ mod tests {
         assert_eq!(settings.requirements.min_cpu_threads, 0);
         assert_eq!(settings.runtime, RuntimeSettings::default());
         assert_eq!(settings.runtime.background_tick_hz, 30);
+        assert_eq!(settings.runtime.fsr_library, None);
         assert_eq!(settings.starting_scene(), Some("scenes/start.rvescene"));
     }
 
@@ -351,10 +366,46 @@ mod tests {
         let invalid = ProjectSettings {
             runtime: RuntimeSettings {
                 background_tick_hz: 0,
+                fsr_library: None,
             },
             ..settings
         };
         assert!(invalid.to_toml().is_err());
+    }
+
+    #[test]
+    fn validates_optional_fsr_loader_path() {
+        let settings = ProjectSettings::parse(&format!(
+            "{}\n[runtime]\nfsr_library = \"vendor/amd_fidelityfx_loader_vk.dll\"\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.runtime.fsr_library.as_deref(),
+            Some("vendor/amd_fidelityfx_loader_vk.dll")
+        );
+        assert_eq!(
+            ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap(),
+            settings
+        );
+
+        for path in [
+            "",
+            "../loader.dll",
+            "C:/vendor/loader.dll",
+            "vendor/loader.bin",
+        ] {
+            let contents = format!(
+                "{}\n[runtime]\nfsr_library = {path:?}\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            );
+            assert!(
+                ProjectSettings::parse(&contents)
+                    .unwrap_err()
+                    .contains("runtime.fsr_library"),
+                "{path:?}"
+            );
+        }
     }
 
     #[test]

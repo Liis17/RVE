@@ -136,6 +136,19 @@ release-плеер автоматически ищет библиотеку в `
 рядом в каталоге релиза. Подробности — в [описании сборщика](Obsidian/RVEVault/Engine/RveBuild.md)
 и [runtime-путей](Obsidian/RVEVault/Engine/EngineRuntime.md).
 
+Для FSR на Windows положи официальный `amd_fidelityfx_loader_vk.dll` и соседний
+`amd_fidelityfx_upscaler_vk.dll` в каталог проекта и укажи loader в
+`project.rveproject`:
+
+```toml
+[runtime]
+fsr_library = "vendor/amd_fidelityfx_loader_vk.dll"
+```
+
+`rve-build build` проверяет и копирует обе DLL в `Engine/`; в dev-запуске player
+читает их прямо из каталога проекта. Без доступного FSR SDK запрос `fsr` использует
+TAA и выводит одно предупреждение. На macOS доступен только TAA.
+
 ## Редактор
 
 `rve-editor` — редактор сцен: панели Scene, Game, Hierarchy, Inspector, Project и Console можно перетаскивать и собирать во вкладки.

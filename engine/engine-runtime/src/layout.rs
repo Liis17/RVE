@@ -106,6 +106,24 @@ impl Layout {
                 .cloned()
         })
     }
+
+    pub fn fsr_library_path(&self, configured_path: Option<&str>) -> Option<PathBuf> {
+        #[cfg(windows)]
+        {
+            let configured_path = configured_path?;
+            let root = self.bootstrap.parent()?;
+            if self.source_mode == SourceMode::Registry {
+                Some(root.join(Path::new(configured_path).file_name()?))
+            } else {
+                Some(root.join(configured_path))
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = configured_path;
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +195,22 @@ mod tests {
             layout.project_settings,
             ProjectSettingsLocation::File(Path::new("/tmp/demo/project.rveproject").into())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fsr_loader_path_uses_project_relative_path_in_dev_and_engine_name_in_release() {
+        let dev = Layout::dev(Path::new("C:/projects/demo"));
+        assert_eq!(
+            dev.fsr_library_path(Some("vendor/amd_fidelityfx_loader_vk.dll")),
+            Some(Path::new("C:/projects/demo/vendor/amd_fidelityfx_loader_vk.dll").into())
+        );
+        let release = Layout::release(Path::new("C:/games/demo"));
+        assert_eq!(
+            release.fsr_library_path(Some("vendor/amd_fidelityfx_loader_vk.dll")),
+            Some(Path::new("C:/games/demo/Engine/amd_fidelityfx_loader_vk.dll").into())
+        );
+        assert_eq!(release.fsr_library_path(None), None);
     }
 
     #[test]

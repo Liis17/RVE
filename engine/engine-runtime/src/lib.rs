@@ -152,6 +152,7 @@ fn run_from_args(
         Ok(project) => project,
         Err(error) => return fail(2, format!("ошибка проекта: {error}")),
     };
+    let fsr_library = layout.fsr_library_path(project.runtime.fsr_library.as_deref());
 
     if !bootstrap.allow_multiple_instances {
         let outcome = acquire_or_activate(
@@ -305,6 +306,7 @@ fn run_from_args(
             window: config,
             present_mode: bootstrap.present_mode,
             pipeline_cache_path,
+            fsr_library,
             pipeline_cache,
             frame_limit: args.frames,
             debug_view,

@@ -23,6 +23,12 @@ Parent: [[Index]]
 `Contents/Resources` того же бандла: Finder запускает «голый» исполняемый файл через
 Terminal, поэтому `rve-build` публикует macOS-релиз как `.app`.
 
+На Windows `runtime.fsr_library` задаёт путь к FSR loader DLL: dev-player читает его
+относительно каталога проекта, release-player ищет файл с тем же именем в `Engine/`.
+`rve-build build` помещает туда также соседний `amd_fidelityfx_upscaler_vk.dll`.
+Если loader, effect или поддержка Vulkan недоступны, запрос FSR переключается на TAA
+и выводит одно предупреждение. На macOS FSR недоступен.
+
 Параметр `--scripts <path>` задаёт ABI-библиотеку Rust-скриптов. В release layout,
 если параметр не задан, runtime выбирает `Engine/game_scripts.dll` на Windows или
 `Engine/libgame_scripts.dylib` на macOS, только если файл существует. В dev-режиме
