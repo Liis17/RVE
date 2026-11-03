@@ -4342,6 +4342,66 @@ mod tests {
         }
     }
 
+    fn shader_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let function_start = source.find(signature).expect("shader function exists");
+        let body_start = function_start + source[function_start..].find('{').unwrap();
+        let body_end = body_start + source[body_start..].find('}').unwrap();
+        &source[body_start..=body_end]
+    }
+
+    #[test]
+    fn ggx_shader_preserves_the_analytic_low_roughness_peak() {
+        const PI: f32 = std::f32::consts::PI;
+        let shader = include_str!("../shaders/mesh.frag");
+        let body = shader_function_body(shader, "float distribution_ggx(");
+        assert!(body.contains("clamp(normal_dot_half_input, 0.0, 1.0)"));
+        assert!(body.contains(
+            "(1.0 - normal_dot_half * normal_dot_half)\n        + alpha_squared * normal_dot_half * normal_dot_half"
+        ));
+        assert!(body.contains("max(denominator, alpha_squared)"));
+        assert!(body.contains("alpha_squared / (PI * denominator * denominator)"));
+        assert!(!body.contains("1e-7"));
+
+        let distribution = |normal_dot_half: f32, roughness: f32| {
+            let normal_dot_half = normal_dot_half.clamp(0.0, 1.0);
+            let alpha = roughness * roughness;
+            let alpha_squared = alpha * alpha;
+            let denominator = ((1.0 - normal_dot_half * normal_dot_half)
+                + alpha_squared * normal_dot_half * normal_dot_half)
+                .max(alpha_squared);
+            alpha_squared / (PI * denominator * denominator)
+        };
+        let roughnesses = [0.045, 0.1, 0.25, 1.0];
+        let mut peaks = Vec::with_capacity(roughnesses.len());
+        for roughness in roughnesses {
+            let alpha = roughness * roughness;
+            let alpha_squared = alpha * alpha;
+            let expected_peak = 1.0 / (PI * alpha_squared);
+            let peak = distribution(1.0, roughness);
+            assert!(
+                (peak / expected_peak - 1.0).abs() < 2e-5,
+                "{roughness}: {peak}"
+            );
+            assert!(distribution(0.0, roughness).is_finite());
+            assert!(distribution(-0.5, roughness).is_finite());
+            assert!(distribution(1.5, roughness).is_finite());
+            peaks.push(peak);
+        }
+
+        assert!(peaks[0] > peaks[1] && peaks[1] > peaks[2] && peaks[2] > peaks[3]);
+        let low_roughness_shoulder = distribution(0.99, roughnesses[0]) / peaks[0];
+        let next_shoulder = distribution(0.99, roughnesses[1]) / peaks[1];
+        assert!(low_roughness_shoulder < next_shoulder);
+        assert_eq!(
+            distribution(-0.5, roughnesses[0]),
+            distribution(0.0, roughnesses[0])
+        );
+        assert_eq!(
+            distribution(1.5, roughnesses[0]),
+            distribution(1.0, roughnesses[0])
+        );
+    }
+
     #[test]
     fn mesh_validation_accepts_triangle_lists_inside_vertex_range() {
         assert!(validate_mesh(3, &[0, 1, 2]).is_ok());

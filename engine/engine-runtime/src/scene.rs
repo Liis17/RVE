@@ -6,6 +6,7 @@ use engine_render::{
 use engine_resources::ResourceHandle;
 use engine_scene::{MaterialOverride, ObjectHandle, SceneDocument, World};
 use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 
 pub(crate) struct ObjectModel {
     pub object: ObjectHandle,
@@ -139,10 +140,35 @@ struct ResolvedMaterial {
     normal_scale: f32,
 }
 
-#[derive(Default)]
-struct GpuTextureCache {
-    model: HashMap<(String, usize, TextureColorSpace), TextureId>,
-    scene: HashMap<(String, TextureColorSpace), TextureId>,
+struct GpuTextureCache<T> {
+    model: HashMap<(String, usize, TextureColorSpace), T>,
+    scene: HashMap<(String, TextureColorSpace), T>,
+}
+
+impl<T> Default for GpuTextureCache<T> {
+    fn default() -> Self {
+        Self {
+            model: HashMap::new(),
+            scene: HashMap::new(),
+        }
+    }
+}
+
+fn get_or_insert_texture<K, T>(
+    cache: &mut HashMap<K, T>,
+    key: K,
+    create: impl FnOnce() -> Result<T, RenderError>,
+) -> Result<T, RenderError>
+where
+    K: Eq + Hash,
+    T: Copy,
+{
+    if let Some(&texture) = cache.get(&key) {
+        return Ok(texture);
+    }
+    let texture = create()?;
+    cache.insert(key, texture);
+    Ok(texture)
 }
 
 fn resolve_material(
@@ -198,7 +224,7 @@ pub(crate) fn upload_scene(
     assets: &PreparedRenderAssets,
 ) -> Result<GpuSceneTable, RenderError> {
     let mut gpu_models: HashMap<String, Vec<(engine_render::MeshId, MaterialId)>> = HashMap::new();
-    let mut texture_cache = GpuTextureCache::default();
+    let mut texture_cache = GpuTextureCache::<TextureId>::default();
 
     for (path, model) in &assets.models {
         let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
@@ -270,7 +296,7 @@ fn upload_resolved_material(
     model_path: &str,
     model: &Model,
     scene_texture_data: &HashMap<String, TextureData>,
-    texture_cache: &mut GpuTextureCache,
+    texture_cache: &mut GpuTextureCache<TextureId>,
 ) -> Result<MaterialId, RenderError> {
     let base_color_texture = upload_material_texture(
         renderer,
@@ -317,61 +343,51 @@ fn upload_material_texture(
     model_path: &str,
     model: &Model,
     scene_texture_data: &HashMap<String, TextureData>,
-    texture_cache: &mut GpuTextureCache,
+    texture_cache: &mut GpuTextureCache<TextureId>,
 ) -> Result<Option<TextureId>, RenderError> {
     let Some(source) = source else {
         return Ok(None);
     };
-    let (width, height, rgba, model_key, scene_key) = match source {
+    let texture_id = match source {
         MaterialTextureSource::Model(index) => {
             let key = (model_path.to_owned(), *index, color_space);
-            if let Some(&texture) = texture_cache.model.get(&key) {
-                return Ok(Some(texture));
-            }
             let texture = model.textures.get(*index).ok_or_else(|| {
                 RenderError::InvalidTexture(format!(
                     "модель {model_path:?} ссылается на отсутствующую текстуру {index}"
                 ))
             })?;
-            (
-                texture.width,
-                texture.height,
-                &texture.rgba,
-                Some(key),
-                None,
-            )
+            get_or_insert_texture(&mut texture_cache.model, key, || {
+                renderer.create_texture_with_color_space(
+                    texture.width,
+                    texture.height,
+                    &texture.rgba,
+                    color_space,
+                )
+            })?
         }
         MaterialTextureSource::Scene(path) => {
             let key = (path.clone(), color_space);
-            if let Some(&texture) = texture_cache.scene.get(&key) {
-                return Ok(Some(texture));
-            }
             let texture = scene_texture_data.get(path).ok_or({
                 RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
             })?;
-            (
-                texture.width,
-                texture.height,
-                &texture.rgba,
-                None,
-                Some(key),
-            )
+            get_or_insert_texture(&mut texture_cache.scene, key, || {
+                renderer.create_texture_with_color_space(
+                    texture.width,
+                    texture.height,
+                    &texture.rgba,
+                    color_space,
+                )
+            })?
         }
     };
-    let texture_id = renderer.create_texture_with_color_space(width, height, rgba, color_space)?;
-    if let Some(key) = model_key {
-        texture_cache.model.insert(key, texture_id);
-    }
-    if let Some(key) = scene_key {
-        texture_cache.scene.insert(key, texture_id);
-    }
     Ok(Some(texture_id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MaterialTextureSource, load_scene, prepare_scene_with_model_loader, resolve_material,
+        GpuTextureCache, MaterialTextureSource, get_or_insert_texture, load_scene,
+        prepare_scene_with_model_loader, resolve_material,
     };
     use engine_assets::{Assets, Model, ModelMaterial};
     use engine_files::VirtualPath;
@@ -379,7 +395,6 @@ mod tests {
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::{MaterialOverride, SceneDocument, World};
     use std::cell::Cell;
-    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -619,11 +634,55 @@ far = 100.0
     }
 
     #[test]
-    fn gpu_texture_cache_keys_keep_model_texture_roles_separate() {
-        let keys = HashSet::from([
-            ("models/a.fbx".to_owned(), 0, TextureColorSpace::Srgb),
+    fn gpu_texture_cache_reuses_uploads_per_source_and_color_space() {
+        let mut cache = GpuTextureCache::<u32>::default();
+        let uploads = Cell::new(0_u32);
+
+        let model_srgb_key = ("models/a.fbx".to_owned(), 0, TextureColorSpace::Srgb);
+        let model_srgb = get_or_insert_texture(&mut cache.model, model_srgb_key.clone(), || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let model_srgb_reused = get_or_insert_texture(&mut cache.model, model_srgb_key, || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let model_linear = get_or_insert_texture(
+            &mut cache.model,
             ("models/a.fbx".to_owned(), 0, TextureColorSpace::Linear),
-        ]);
-        assert_eq!(keys.len(), 2);
+            || {
+                uploads.set(uploads.get() + 1);
+                Ok(uploads.get())
+            },
+        )
+        .unwrap();
+        assert_eq!(model_srgb, model_srgb_reused);
+        assert_ne!(model_srgb, model_linear);
+
+        let scene_srgb_key = ("textures/shared.png".to_owned(), TextureColorSpace::Srgb);
+        let scene_srgb = get_or_insert_texture(&mut cache.scene, scene_srgb_key.clone(), || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let scene_srgb_reused = get_or_insert_texture(&mut cache.scene, scene_srgb_key, || {
+            uploads.set(uploads.get() + 1);
+            Ok(uploads.get())
+        })
+        .unwrap();
+        let scene_linear = get_or_insert_texture(
+            &mut cache.scene,
+            ("textures/shared.png".to_owned(), TextureColorSpace::Linear),
+            || {
+                uploads.set(uploads.get() + 1);
+                Ok(uploads.get())
+            },
+        )
+        .unwrap();
+        assert_eq!(scene_srgb, scene_srgb_reused);
+        assert_ne!(scene_srgb, scene_linear);
+        assert_eq!(uploads.get(), 4);
     }
 }

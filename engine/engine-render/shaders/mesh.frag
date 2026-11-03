@@ -40,10 +40,13 @@ vec3 safe_normalize(vec3 value, vec3 fallback) {
     return value * inversesqrt(length_squared);
 }
 
-float distribution_ggx(float normal_dot_half, float alpha) {
+float distribution_ggx(float normal_dot_half_input, float alpha) {
+    float normal_dot_half = clamp(normal_dot_half_input, 0.0, 1.0);
     float alpha_squared = alpha * alpha;
-    float denominator = normal_dot_half * normal_dot_half * (alpha_squared - 1.0) + 1.0;
-    return alpha_squared / max(PI * denominator * denominator, 1e-7);
+    float denominator = (1.0 - normal_dot_half * normal_dot_half)
+        + alpha_squared * normal_dot_half * normal_dot_half;
+    denominator = max(denominator, alpha_squared);
+    return alpha_squared / (PI * denominator * denominator);
 }
 
 float visibility_smith_ggx_correlated(float normal_dot_light, float normal_dot_view, float alpha) {
