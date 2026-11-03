@@ -17,6 +17,13 @@ const REDO_SHIFT: KeyboardShortcut =
 const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
 
 pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
+    // Модальное окно перекрывает указатель, но не клавиатуру: правки за ним запрещены.
+    if state.unsaved_prompt.is_some()
+        || state.project_dialog.is_some()
+        || state.recovery_prompt.is_some()
+    {
+        return;
+    }
     if ctx.input_mut(|input| input.consume_shortcut(&SAVE)) {
         state.action(Action::Save);
     }
@@ -30,7 +37,11 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
         redo(state);
     }
     // Одиночные клавиши не должны срабатывать при вводе текста и полёте камеры (ПКМ+WASD).
-    if ctx.egui_wants_keyboard_input() || ctx.input(|input| input.pointer.secondary_down()) {
+    // Esc снимает фокус поля ещё до этого кадра, поэтому учитывается и фокус прошлого кадра.
+    if ctx.egui_wants_keyboard_input()
+        || state.text_focused_last_frame
+        || ctx.input(|input| input.pointer.secondary_down())
+    {
         return;
     }
     if ctx.input_mut(|input| input.consume_shortcut(&DUPLICATE)) {
@@ -70,12 +81,7 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
     if pressed(Key::F2) {
         rename_selection(state);
     }
-    // Esc в модальном окне закрывает его, а не снимает выделение.
-    let modal_open = state.unsaved_prompt.is_some()
-        || state.project_dialog.is_some()
-        || state.recovery_prompt.is_some();
     if pressed(Key::Escape)
-        && !modal_open
         && !state.is_playing()
         && let Some(scene) = &mut state.scene
     {

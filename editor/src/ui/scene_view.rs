@@ -363,7 +363,12 @@ fn handle_gizmo(
             .collect::<Vec<_>>();
         Some((active, starts))
     }) else {
-        state.gizmo_drag = None;
+        // Выделение исчезло посреди перетаскивания: следующая правка — новая запись истории.
+        if state.gizmo_drag.take().is_some()
+            && let Some(scene) = &mut state.scene
+        {
+            scene.end_continuous_edit();
+        }
         return false;
     };
     let Some(world) = state.world_mut() else {

@@ -20,8 +20,9 @@ pub struct OpenProject {
 
 impl OpenProject {
     pub fn open(dir: &Path) -> Result<Self, String> {
-        let dir =
-            std::path::absolute(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        let dir = std::path::absolute(dir)
+            .map(|dir| without_dot_components(&dir))
+            .map_err(|error| format!("{}: {error}", dir.display()))?;
         let settings = ProjectSettings::load(dir.join("project.rveproject"))?;
         let root = dir.join("Assets");
         if !root.is_dir() {
@@ -101,6 +102,22 @@ impl OpenProject {
     }
 }
 
+/// Убирает `.` и `..` из абсолютного пути без обращения к диску: один проект,
+/// открытый по разным относительным путям, получает один путь в недавних проектах.
+fn without_dot_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
 impl Drop for OpenProject {
     fn drop(&mut self) {
         if let Err(error) = self.resources.shutdown() {
@@ -155,6 +172,24 @@ mod tests {
         fs::write(temp.0.join("Assets/new.lua"), "return {}").unwrap();
         assert_eq!(project.read_text("new.lua").unwrap(), "return {}");
         assert!(project.read_text("missing.lua").is_err());
+    }
+
+    #[test]
+    fn project_root_has_no_dot_components() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/./demo-game");
+        let project = OpenProject::open(Path::new(dir)).unwrap();
+        let expected = std::path::absolute(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/demo-game"
+        ))
+        .unwrap();
+        assert!(project.root.is_absolute());
+        assert!(project.root.components().all(|component| !matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )));
+        assert_eq!(project.root, without_dot_components(&expected));
+        assert!(project.root.ends_with("examples/demo-game"));
     }
 
     #[test]
