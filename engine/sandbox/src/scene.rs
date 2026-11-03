@@ -74,6 +74,13 @@ impl Scene {
         }
     }
 
+    pub fn camera_position(self, elapsed: f32) -> [f32; 3] {
+        match self {
+            Self::Triangle | Self::Cube => [0.0, 0.0, 3.0],
+            Self::Shadows => SHADOWS_CAMERA.camera_at(elapsed).position.to_array(),
+        }
+    }
+
     pub fn model(self, elapsed: f32) -> Mat4 {
         match self {
             Self::Triangle => Mat4::from_rotation_z(elapsed),

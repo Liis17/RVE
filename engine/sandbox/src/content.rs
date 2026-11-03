@@ -4,16 +4,16 @@ use crate::scene::{
     SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, plane_mesh, shadows_light_direction,
     shadows_light_view_projection,
 };
-use engine_assets::{Model, TextureData};
+use engine_assets::{Model, ModelMaterial, TextureData};
 use engine_render::{DirectionalLight, Vertex};
 use glam::{Mat4, Vec3};
 
-/// Меш с индексом текстуры в [`Content::textures`].
+/// Меш с CPU-материалом и индексами его текстур в [`Content::textures`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
-    pub texture: Option<usize>,
+    pub material: ModelMaterial,
     /// Окружение остаётся неподвижным и не наследует fit или движение объекта.
     pub environment: bool,
 }
@@ -36,7 +36,10 @@ impl Content {
         let mut meshes = vec![Mesh {
             vertices,
             indices,
-            texture: (!textures.is_empty()).then_some(0),
+            material: ModelMaterial {
+                base_color_texture: (!textures.is_empty()).then_some(0),
+                ..ModelMaterial::default()
+            },
             environment: false,
         }];
         if scene == Scene::Shadows {
@@ -44,7 +47,7 @@ impl Content {
             meshes.push(Mesh {
                 vertices,
                 indices,
-                texture: None,
+                material: ModelMaterial::default(),
                 environment: true,
             });
         }
@@ -77,7 +80,7 @@ impl Content {
                     })
                     .collect(),
                 indices: mesh.indices,
-                texture: mesh.material.base_color_texture,
+                material: mesh.material,
                 environment: false,
             })
             .collect::<Vec<_>>();
@@ -86,7 +89,7 @@ impl Content {
             meshes.push(Mesh {
                 vertices,
                 indices,
-                texture: None,
+                material: ModelMaterial::default(),
                 environment: true,
             });
         }
@@ -98,11 +101,12 @@ impl Content {
         }
     }
 
-    /// Заменяет текстуры всех мешей одной текстурой.
+    /// Заменяет base-color texture всех мешей одной текстурой.
     pub fn override_texture(&mut self, texture: TextureData) {
-        self.textures = vec![texture];
+        let replacement = self.textures.len();
+        self.textures.push(texture);
         for mesh in &mut self.meshes {
-            mesh.texture = Some(0);
+            mesh.material.base_color_texture = Some(replacement);
         }
     }
 
@@ -171,8 +175,13 @@ mod tests {
                     ],
                     indices: vec![0, 1, 2],
                     material: ModelMaterial {
+                        base_color: [0.2, 0.3, 0.4],
+                        metallic: 0.6,
+                        roughness: 0.25,
                         base_color_texture: Some(0),
-                        ..ModelMaterial::default()
+                        metallic_roughness_texture: Some(0),
+                        normal_texture: Some(0),
+                        normal_scale: 0.75,
                     },
                 },
                 ModelMesh {
@@ -196,12 +205,12 @@ mod tests {
             ),
             cube_mesh()
         );
-        assert_eq!(cube.meshes[0].texture, Some(0));
+        assert_eq!(cube.meshes[0].material.base_color_texture, Some(0));
         assert_eq!(cube.textures.len(), 1);
         assert_eq!(cube.motion, Scene::Cube);
 
         let triangle = Content::from_scene(Scene::Triangle);
-        assert_eq!(triangle.meshes[0].texture, None);
+        assert_eq!(triangle.meshes[0].material.base_color_texture, None);
         assert!(triangle.textures.is_empty());
         assert_eq!(triangle.motion, Scene::Triangle);
     }
@@ -210,8 +219,16 @@ mod tests {
     fn models_keep_meshes_textures_and_attributes_with_white_vertex_color() {
         let content = Content::from_model(model(), Scene::Cube);
         assert_eq!(content.meshes.len(), 2);
-        assert_eq!(content.meshes[0].texture, Some(0));
-        assert_eq!(content.meshes[1].texture, None);
+        assert_eq!(content.meshes[0].material.base_color_texture, Some(0));
+        assert_eq!(content.meshes[1].material.base_color_texture, None);
+        assert_eq!(content.meshes[0].material.metallic, 0.6);
+        assert_eq!(content.meshes[0].material.roughness, 0.25);
+        assert_eq!(
+            content.meshes[0].material.metallic_roughness_texture,
+            Some(0)
+        );
+        assert_eq!(content.meshes[0].material.normal_texture, Some(0));
+        assert_eq!(content.meshes[0].material.normal_scale, 0.75);
         assert_eq!(content.textures, [texture(7)]);
         assert_eq!(content.motion, Scene::Cube);
         let vertex = content.meshes[0].vertices[1];
@@ -242,12 +259,22 @@ mod tests {
     fn texture_override_applies_to_every_mesh() {
         let mut content = Content::from_model(model(), Scene::Cube);
         content.override_texture(texture(9));
-        assert_eq!(content.textures, [texture(9)]);
-        assert!(content.meshes.iter().all(|mesh| mesh.texture == Some(0)));
+        assert_eq!(content.textures, [texture(7), texture(9)]);
+        assert!(
+            content
+                .meshes
+                .iter()
+                .all(|mesh| mesh.material.base_color_texture == Some(1))
+        );
+        assert_eq!(
+            content.meshes[0].material.metallic_roughness_texture,
+            Some(0)
+        );
+        assert_eq!(content.meshes[0].material.normal_texture, Some(0));
 
         let mut triangle = Content::from_scene(Scene::Triangle);
         triangle.override_texture(texture(9));
-        assert_eq!(triangle.meshes[0].texture, Some(0));
+        assert_eq!(triangle.meshes[0].material.base_color_texture, Some(0));
     }
 
     #[test]
@@ -273,7 +300,7 @@ mod tests {
         assert_eq!(content.meshes.len(), 2);
         assert!(!content.meshes[0].environment);
         assert!(content.meshes[1].environment);
-        assert_eq!(content.meshes[1].texture, None);
+        assert_eq!(content.meshes[1].material.base_color_texture, None);
         assert_eq!(content.light(0.0).color, [1.0; 3]);
         assert_eq!(content.light(0.0).ambient, [0.15; 3]);
         assert!(content.shadow_view_projection(0.0).is_some());
@@ -301,7 +328,7 @@ mod tests {
         assert_eq!(shadows.meshes.len(), 3);
         assert!(shadows.meshes[..2].iter().all(|mesh| !mesh.environment));
         assert!(shadows.meshes[2].environment);
-        assert!(shadows.meshes[2].texture.is_none());
+        assert!(shadows.meshes[2].material.base_color_texture.is_none());
         assert_eq!(shadows.motion, Scene::Shadows);
         assert_eq!(shadows.model(0.0), Scene::Shadows.model(0.0) * shadows.fit);
         assert_eq!(cube.model(1.0), Scene::Cube.model(1.0) * cube.fit);
@@ -311,7 +338,13 @@ mod tests {
     fn texture_override_also_covers_shadow_environment() {
         let mut content = Content::from_scene(Scene::Shadows);
         content.override_texture(texture(11));
-        assert_eq!(content.textures, [texture(11)]);
-        assert!(content.meshes.iter().all(|mesh| mesh.texture == Some(0)));
+        assert_eq!(content.textures.len(), 2);
+        assert_eq!(content.textures[1], texture(11));
+        assert!(
+            content
+                .meshes
+                .iter()
+                .all(|mesh| mesh.material.base_color_texture == Some(1))
+        );
     }
 }

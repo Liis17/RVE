@@ -7,10 +7,14 @@ use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
 use engine_project::BootstrapConfig;
-use engine_render::{DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId};
+use engine_render::{
+    DrawCommand, Frame, FrameStatus, Material, MaterialId, MeshId, Renderer, RendererConfig,
+    TextureColorSpace, TextureId,
+};
 use engine_resources::{ResourceConfig, ResourceSystem};
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use scene::Scene;
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -165,7 +169,7 @@ struct ResizeTest {
 struct Sandbox {
     renderer: Option<Renderer>,
     content: Content,
-    meshes: Vec<(MeshId, Option<TextureId>, bool)>,
+    meshes: Vec<(MeshId, MaterialId, bool)>,
     size: PhysicalSize<u32>,
     time: Time,
     options: Options,
@@ -267,23 +271,62 @@ impl Sandbox {
     }
 
     fn upload_content(&mut self, renderer: &mut Renderer) -> Result<(), String> {
-        let mut textures = Vec::with_capacity(self.content.textures.len());
-        for texture in &self.content.textures {
-            textures.push(
-                renderer
-                    .create_texture(texture.width, texture.height, &texture.rgba)
-                    .map_err(|error| format!("ошибка создания текстуры: {error}"))?,
-            );
-        }
+        let mut texture_cache = HashMap::new();
         for mesh in &self.content.meshes {
             let id = renderer
                 .create_mesh(&mesh.vertices, &mesh.indices)
                 .map_err(|error| format!("ошибка создания меша: {error}"))?;
-            self.meshes.push((
-                id,
-                mesh.texture.map(|index| textures[index]),
-                mesh.environment,
-            ));
+            let base_color_texture = mesh
+                .material
+                .base_color_texture
+                .map(|index| {
+                    upload_content_texture(
+                        renderer,
+                        &self.content.textures,
+                        &mut texture_cache,
+                        index,
+                        TextureColorSpace::Srgb,
+                    )
+                })
+                .transpose()?;
+            let metallic_roughness_texture = mesh
+                .material
+                .metallic_roughness_texture
+                .map(|index| {
+                    upload_content_texture(
+                        renderer,
+                        &self.content.textures,
+                        &mut texture_cache,
+                        index,
+                        TextureColorSpace::Linear,
+                    )
+                })
+                .transpose()?;
+            let normal_texture = mesh
+                .material
+                .normal_texture
+                .map(|index| {
+                    upload_content_texture(
+                        renderer,
+                        &self.content.textures,
+                        &mut texture_cache,
+                        index,
+                        TextureColorSpace::Linear,
+                    )
+                })
+                .transpose()?;
+            let material_id = renderer
+                .create_material(&Material {
+                    base_color: mesh.material.base_color,
+                    metallic: mesh.material.metallic,
+                    roughness: mesh.material.roughness,
+                    base_color_texture,
+                    metallic_roughness_texture,
+                    normal_texture,
+                    normal_scale: mesh.material.normal_scale,
+                })
+                .map_err(|error| format!("ошибка создания материала: {error}"))?;
+            self.meshes.push((id, material_id, mesh.environment));
         }
         Ok(())
     }
@@ -356,9 +399,9 @@ impl WindowHandler for Sandbox {
         let draws = self
             .meshes
             .iter()
-            .map(|&(mesh, texture, environment)| DrawCommand {
+            .map(|&(mesh, material, environment)| DrawCommand {
                 mesh,
-                texture,
+                material: Some(material),
                 model: if environment {
                     glam::Mat4::IDENTITY.to_cols_array_2d()
                 } else {
@@ -381,6 +424,7 @@ impl WindowHandler for Sandbox {
                 .content
                 .shadow_view_projection(elapsed)
                 .map(|matrix| matrix.to_cols_array_2d()),
+            camera_position: self.content.motion.camera_position(elapsed),
             light: self.content.light(elapsed),
             draws: &draws,
             overlay,
@@ -431,6 +475,26 @@ impl WindowHandler for Sandbox {
     fn exiting(&mut self) {
         self.renderer.take();
     }
+}
+
+fn upload_content_texture(
+    renderer: &mut Renderer,
+    textures: &[engine_assets::TextureData],
+    cache: &mut HashMap<(usize, TextureColorSpace), TextureId>,
+    index: usize,
+    color_space: TextureColorSpace,
+) -> Result<TextureId, String> {
+    if let Some(&texture_id) = cache.get(&(index, color_space)) {
+        return Ok(texture_id);
+    }
+    let texture = textures
+        .get(index)
+        .ok_or_else(|| format!("материал ссылается на отсутствующую текстуру {index}"))?;
+    let texture_id = renderer
+        .create_texture_with_color_space(texture.width, texture.height, &texture.rgba, color_space)
+        .map_err(|error| format!("ошибка создания текстуры: {error}"))?;
+    cache.insert((index, color_space), texture_id);
+    Ok(texture_id)
 }
 
 fn main() -> ExitCode {
