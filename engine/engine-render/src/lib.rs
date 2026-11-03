@@ -20,6 +20,7 @@ mod ui;
 pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 
 const FRAMES_IN_FLIGHT: usize = 2;
+const DEFAULT_UPLOAD_BATCH_CAPACITY: usize = 64 * 1024 * 1024;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const LDR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -541,6 +542,11 @@ pub struct Renderer {
     physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
     queue_family_index: u32,
+    upload_alignment: usize,
+    next_upload_serial: u64,
+    completed_upload_serial: u64,
+    pending_upload: Option<UploadBatch>,
+    in_flight_uploads: Vec<UploadBatch>,
     command_pool: Option<vk::CommandPool>,
     pipeline_cache: Option<vk::PipelineCache>,
     pipeline_layout: Option<vk::PipelineLayout>,
@@ -619,6 +625,11 @@ impl Renderer {
             physical_device: vk::PhysicalDevice::null(),
             queue: vk::Queue::null(),
             queue_family_index: 0,
+            upload_alignment: 16,
+            next_upload_serial: 1,
+            completed_upload_serial: 0,
+            pending_upload: None,
+            in_flight_uploads: Vec::new(),
             command_pool: None,
             pipeline_cache: None,
             pipeline_layout: None,
@@ -710,45 +721,130 @@ impl Renderer {
         self.swapchain_dirty = true;
     }
 
-    /// Загружает треугольный меш в память GPU. Каждые три индекса образуют треугольник.
+    /// Записывает асинхронную загрузку треугольного меша в GPU. Каждые три индекса образуют треугольник.
+    /// Ошибка отправки пачки может вернуться из следующего `create_mesh`, `destroy_mesh` или кадра.
     pub fn create_mesh(
         &mut self,
         vertices: &[Vertex],
         indices: &[u32],
     ) -> Result<MeshId, RenderError> {
         validate_mesh(vertices.len(), indices)?;
+        let instance = self.instance()?.clone();
+        let device = self.device()?.clone();
         let bounds = LocalBounds::from_vertices(vertices);
-        let vertex_buffer = HostBuffer::new(
-            self.instance()?,
-            self.device()?,
-            self.physical_device,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            vertex_bytes(vertices),
+        let vertex_data = vertex_bytes(vertices);
+        let index_data = index_bytes(indices);
+        let layout = mesh_upload_layout(
+            0,
+            vertex_data.len(),
+            index_data.len(),
+            self.upload_alignment,
+        )
+        .ok_or(RenderError::InvalidMesh(
+            "размер меша переполняет диапазон буфера",
+        ))?;
+        let capacity = upload_batch_capacity(layout.end, self.upload_alignment).ok_or(
+            RenderError::InvalidMesh("размер меша переполняет диапазон буфера"),
         )?;
-        let index_buffer = HostBuffer::new(
-            self.instance()?,
-            self.device()?,
+        let must_flush = self.pending_upload.as_ref().is_some_and(|batch| {
+            batch.oversized
+                || upload_batch_flush_required(
+                    batch.cursor,
+                    vertex_data.len(),
+                    index_data.len(),
+                    self.upload_alignment,
+                    batch.capacity,
+                )
+                .unwrap_or(true)
+        });
+        if must_flush {
+            self.flush_uploads()?;
+        }
+        if self.pending_upload.is_none() {
+            self.pending_upload = Some(UploadBatch::new(
+                &instance,
+                &device,
+                self.physical_device,
+                self.queue_family_index,
+                capacity,
+                capacity > DEFAULT_UPLOAD_BATCH_CAPACITY,
+                self.next_upload_serial,
+            )?);
+            self.next_upload_serial = self
+                .next_upload_serial
+                .checked_add(1)
+                .ok_or(RenderError::InvalidState("upload serial исчерпан"))?;
+        }
+        let batch = self
+            .pending_upload
+            .as_mut()
+            .ok_or(RenderError::InvalidState("upload batch отсутствует"))?;
+        let layout = mesh_upload_layout(
+            batch.cursor,
+            vertex_data.len(),
+            index_data.len(),
+            self.upload_alignment,
+        )
+        .ok_or(RenderError::InvalidMesh(
+            "размер меша переполняет диапазон буфера",
+        ))?;
+        let vertex_buffer = DeviceBuffer::new(
+            &instance,
+            &device,
             self.physical_device,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            index_bytes(indices),
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vertex_data.len(),
         )?;
+        let index_buffer = DeviceBuffer::new(
+            &instance,
+            &device,
+            self.physical_device,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            index_data.len(),
+        )?;
+        batch.staging.write_at(layout.vertex_offset, vertex_data)?;
+        batch.staging.write_at(layout.index_offset, index_data)?;
+        batch.record_mesh_copies(
+            &vertex_buffer,
+            &index_buffer,
+            layout,
+            vertex_data.len(),
+            index_data.len(),
+        );
+        batch.cursor = layout.end;
+        let upload_serial = batch.serial;
         self.meshes.push(Some(MeshBuffers {
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
             bounds,
+            upload_serial,
         }));
         Ok(MeshId(self.meshes.len() - 1))
     }
 
-    /// Удаляет меш; буферы освобождаются после завершения отправленных кадров.
+    /// Отправляет его ожидающую загрузку при необходимости; буферы освобождаются после upload и кадров.
     pub fn destroy_mesh(&mut self, mesh: MeshId) -> Result<(), RenderError> {
+        let upload_serial = self
+            .meshes
+            .get(mesh.0)
+            .and_then(Option::as_ref)
+            .map(|buffers| buffers.upload_serial)
+            .ok_or(RenderError::InvalidMesh("MeshId не принадлежит renderer"))?;
+        if self
+            .pending_upload
+            .as_ref()
+            .is_some_and(|batch| batch.serial == upload_serial)
+        {
+            self.flush_uploads()?;
+        }
         let buffers = self
             .meshes
             .get_mut(mesh.0)
             .and_then(Option::take)
             .ok_or(RenderError::InvalidMesh("MeshId не принадлежит renderer"))?;
-        self.retired.retire(RetiredResource::Mesh(buffers));
+        self.retired
+            .retire(RetiredResource::Mesh(buffers), upload_serial);
         Ok(())
     }
 
@@ -803,7 +899,7 @@ impl Renderer {
             .ok_or_else(|| {
                 RenderError::InvalidMaterial("MaterialId не принадлежит renderer".to_owned())
             })?;
-        self.retired.retire(RetiredResource::Material(resource));
+        self.retired.retire(RetiredResource::Material(resource), 0);
         Ok(())
     }
 
@@ -820,7 +916,7 @@ impl Renderer {
             .get_mut(texture.0)
             .and_then(Option::take)
             .ok_or_else(unknown)?;
-        self.retired.retire(RetiredResource::Texture(resource));
+        self.retired.retire(RetiredResource::Texture(resource), 0);
         Ok(())
     }
 
@@ -933,7 +1029,7 @@ impl Renderer {
     pub fn free_ui_texture(&mut self, texture: UiTextureId) -> Result<(), RenderError> {
         self.ui_texture(texture)?;
         if let Some(resource) = self.ui_textures[texture.0].take() {
-            self.retired.retire(RetiredResource::UiTexture(resource));
+            self.retired.retire(RetiredResource::UiTexture(resource), 0);
         }
         Ok(())
     }
@@ -974,7 +1070,7 @@ impl Renderer {
             .get_mut(viewport.0)
             .and_then(Option::take)
             .ok_or_else(unknown_viewport)?;
-        self.retired.retire(RetiredResource::Viewport(resource));
+        self.retired.retire(RetiredResource::Viewport(resource), 0);
         Ok(())
     }
 
@@ -994,22 +1090,29 @@ impl Renderer {
         let instance = self.instance()?.clone();
         let device = self.device()?.clone();
         let swapchain_loader = self.swapchain_loader()?.clone();
+        let frame_slot = self.frame_slot;
+        let fence = self
+            .frames
+            .get(frame_slot)
+            .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?
+            .fence;
+        // SAFETY: this fence belongs to the frame slot and its prior submission is finished before reuse.
+        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        self.poll_uploads()?;
+        self.flush_uploads()?;
+        self.retired.slot_completed(frame_slot);
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
-        let frame_slot = self.frame_slot;
         let frame_resources = self
             .frames
             .get_mut(frame_slot)
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
-        let fence = frame_resources.fence;
         let image_available = frame_resources.image_available;
         let command_buffer = frame_resources.command_buffer;
         let swapchain_handle = swapchain.handle;
         let image_count = swapchain.images.len();
 
-        // SAFETY: fence принадлежит текущему слоту и предыдущая работа этого слота завершается перед повторным использованием.
-        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
         if let Some(gpu_time) = frame_resources.read_gpu_time(
             &device,
             self.timestamp_valid_bits,
@@ -1017,7 +1120,6 @@ impl Renderer {
         )? {
             self.pending_gpu_time = Some(gpu_time);
         }
-        self.retired.slot_completed(frame_slot);
         // Fence слота дождались, поэтому GPU больше не читает вершины оверлея этого слота.
         frame_resources.write_overlay(&instance, &device, self.physical_device, frame.overlay)?;
         let timestamps = frame_resources.timestamps;
@@ -1189,6 +1291,16 @@ impl Renderer {
         let device = self.device()?.clone();
         let swapchain_loader = self.swapchain_loader()?.clone();
         let frame_slot = self.frame_slot;
+        let fence = self
+            .frames
+            .get(frame_slot)
+            .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?
+            .fence;
+        // SAFETY: this fence belongs to the frame slot and its prior submission is finished before reuse.
+        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        self.poll_uploads()?;
+        self.flush_uploads()?;
+        self.retired.slot_completed(frame_slot);
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
@@ -1197,8 +1309,6 @@ impl Renderer {
             .get_mut(frame_slot)
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
         let command_buffer = frame_resources.command_buffer;
-        // SAFETY: fence принадлежит текущему слоту; его прошлая работа завершается перед повторным использованием.
-        unsafe { device.wait_for_fences(&[frame_resources.fence], true, u64::MAX) }?;
         if let Some(gpu_time) = frame_resources.read_gpu_time(
             &device,
             self.timestamp_valid_bits,
@@ -1206,7 +1316,6 @@ impl Renderer {
         )? {
             self.pending_gpu_time = Some(gpu_time);
         }
-        self.retired.slot_completed(frame_slot);
         // Fence слота дождались, поэтому GPU больше не читает буферы этого слота.
         frame_resources.ui_vertices.write(
             &instance,
@@ -1738,6 +1847,11 @@ impl Renderer {
         self.config.pipeline_cache = Vec::new();
         let limits = properties.limits;
         self.max_texture_size = limits.max_image_dimension2_d;
+        self.upload_alignment = usize::try_from(limits.optimal_buffer_copy_offset_alignment)
+            .map_err(|_| {
+                RenderError::Unsupported("слишком большое выравнивание buffer copy".to_owned())
+            })?
+            .max(1);
         self.create_frame_resources()?;
         self.create_shadow_resources()?;
         self.create_descriptor_resources()?;
@@ -2227,6 +2341,61 @@ impl Renderer {
         result
     }
 
+    fn flush_uploads(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let Some(batch) = self.pending_upload.as_mut() else {
+            return Ok(());
+        };
+        if batch.cursor == 0 {
+            self.pending_upload.take();
+            return Ok(());
+        }
+        if batch.recording {
+            // SAFETY: this batch's command buffer is recording on the renderer thread and has not been submitted.
+            unsafe { device.end_command_buffer(batch.command_buffer) }?;
+            batch.recording = false;
+        }
+        if batch.fence.is_none() {
+            // SAFETY: a default fence is unsignaled and belongs to this upload submission.
+            batch.fence =
+                Some(unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?);
+        }
+        let command_infos = [vk::CommandBufferSubmitInfo::default()
+            .command_buffer(batch.command_buffer)
+            .device_mask(0)];
+        let submit_info = [vk::SubmitInfo2::default().command_buffer_infos(&command_infos)];
+        let fence = batch.fence.ok_or(RenderError::InvalidState(
+            "upload fence отсутствует после создания",
+        ))?;
+        // SAFETY: the executable batch command buffer and unsignaled fence are owned by this renderer.
+        unsafe { device.queue_submit2(self.queue, &submit_info, fence) }?;
+        let batch = self.pending_upload.take().ok_or(RenderError::InvalidState(
+            "upload batch отсутствует после submit",
+        ))?;
+        self.in_flight_uploads.push(batch);
+        Ok(())
+    }
+
+    fn poll_uploads(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let mut index = 0;
+        while index < self.in_flight_uploads.len() {
+            let fence = self.in_flight_uploads[index]
+                .fence
+                .ok_or(RenderError::InvalidState("upload fence отсутствует"))?;
+            // SAFETY: each fence belongs to an upload submission on this device.
+            if unsafe { device.get_fence_status(fence) }? {
+                let batch = self.in_flight_uploads.remove(index);
+                self.completed_upload_serial = self.completed_upload_serial.max(batch.serial);
+                drop(batch);
+            } else {
+                index += 1;
+            }
+        }
+        self.retired.upload_completed(self.completed_upload_serial);
+        Ok(())
+    }
+
     fn create_mesh_pipeline(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
         let push_constant_ranges = [vk::PushConstantRange::default()
@@ -2657,8 +2826,10 @@ impl Renderer {
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(());
         }
+        self.flush_uploads()?;
         // SAFETY: recreation waits for work submitted by this device before replacing its frame targets.
         unsafe { self.device()?.device_wait_idle() }?;
+        self.poll_uploads()?;
         let old_swapchain = self
             .swapchain
             .as_ref()
@@ -2757,6 +2928,8 @@ impl Drop for Renderer {
             // SAFETY: teardown waits for renderer submissions before destroying owned Vulkan resources.
             let _ = unsafe { device.device_wait_idle() };
         }
+        self.pending_upload.take();
+        self.in_flight_uploads.clear();
         self.swapchain.take();
         self.frames.clear();
         self.retired.clear();
@@ -3811,7 +3984,7 @@ impl Drop for UiTexture {
     }
 }
 
-/// Ресурс, ожидающий завершения отправленных кадров; освобождается своим `Drop`.
+/// Ресурс, ожидающий кадры и связанный upload serial; освобождается своим `Drop`.
 enum RetiredResource {
     Mesh(#[allow(dead_code)] MeshBuffers),
     Texture(#[allow(dead_code)] Arc<Texture>),
@@ -5300,10 +5473,220 @@ impl Drop for GpuMaterial {
 }
 
 struct MeshBuffers {
-    vertex_buffer: HostBuffer,
-    index_buffer: HostBuffer,
+    vertex_buffer: DeviceBuffer,
+    index_buffer: DeviceBuffer,
     index_count: u32,
     bounds: Option<LocalBounds>,
+    upload_serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MeshUploadLayout {
+    vertex_offset: usize,
+    index_offset: usize,
+    end: usize,
+}
+
+fn upload_required_alignment(alignment: usize) -> Option<usize> {
+    let alignment = alignment.max(1);
+    let mut left = 16;
+    let mut right = alignment;
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    16usize.checked_div(left)?.checked_mul(alignment)
+}
+
+fn align_upload_offset(cursor: usize, alignment: usize) -> Option<usize> {
+    let alignment = upload_required_alignment(alignment)?;
+    let remainder = cursor % alignment;
+    let offset = if cursor < 16 && remainder == 0 {
+        alignment
+    } else if remainder == 0 {
+        cursor
+    } else {
+        cursor.checked_add(alignment - remainder)?
+    };
+    u64::try_from(offset).ok()?;
+    Some(offset)
+}
+
+fn mesh_upload_layout(
+    cursor: usize,
+    vertex_size: usize,
+    index_size: usize,
+    alignment: usize,
+) -> Option<MeshUploadLayout> {
+    let vertex_offset = align_upload_offset(cursor, alignment)?;
+    let index_offset = align_upload_offset(vertex_offset.checked_add(vertex_size)?, alignment)?;
+    let end = index_offset.checked_add(index_size)?;
+    u64::try_from(end).ok()?;
+    Some(MeshUploadLayout {
+        vertex_offset,
+        index_offset,
+        end,
+    })
+}
+
+fn upload_batch_capacity(required_size: usize, alignment: usize) -> Option<usize> {
+    Some(DEFAULT_UPLOAD_BATCH_CAPACITY.max(align_upload_offset(required_size, alignment)?))
+}
+
+fn upload_batch_flush_required(
+    cursor: usize,
+    vertex_size: usize,
+    index_size: usize,
+    alignment: usize,
+    capacity: usize,
+) -> Option<bool> {
+    Some(mesh_upload_layout(cursor, vertex_size, index_size, alignment)?.end > capacity)
+}
+
+/// Записываемая пачка копирований и её staging память.
+struct UploadBatch {
+    device: ash::Device,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    staging: HostBuffer,
+    capacity: usize,
+    cursor: usize,
+    serial: u64,
+    oversized: bool,
+    recording: bool,
+    fence: Option<vk::Fence>,
+}
+
+impl UploadBatch {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        queue_family_index: u32,
+        capacity: usize,
+        oversized: bool,
+        serial: u64,
+    ) -> Result<Self, RenderError> {
+        let staging = HostBuffer::new_empty(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            capacity,
+        )?;
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        // SAFETY: the upload pool uses this renderer's graphics queue family.
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }?;
+        let result = (|| {
+            let allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            // SAFETY: command pool belongs to this device and is not used elsewhere.
+            let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info) }?[0];
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: command buffer was just allocated and is in the initial state.
+            unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
+            Ok(command_buffer)
+        })();
+        let command_buffer = match result {
+            Ok(command_buffer) => command_buffer,
+            Err(error) => {
+                // SAFETY: failed initialization did not submit work from this pool.
+                unsafe { device.destroy_command_pool(command_pool, None) };
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            device: device.clone(),
+            command_pool,
+            command_buffer,
+            staging,
+            capacity,
+            cursor: 0,
+            serial,
+            oversized,
+            recording: true,
+            fence: None,
+        })
+    }
+
+    fn record_mesh_copies(
+        &self,
+        vertex_buffer: &DeviceBuffer,
+        index_buffer: &DeviceBuffer,
+        layout: MeshUploadLayout,
+        vertex_size: usize,
+        index_size: usize,
+    ) {
+        let vertex_regions = [vk::BufferCopy2::default()
+            .src_offset(layout.vertex_offset as vk::DeviceSize)
+            .dst_offset(0)
+            .size(vertex_size as vk::DeviceSize)];
+        let vertex_copy = vk::CopyBufferInfo2::default()
+            .src_buffer(self.staging.buffer)
+            .dst_buffer(vertex_buffer.buffer)
+            .regions(&vertex_regions);
+        // SAFETY: source and destination ranges were allocated for these exact byte counts.
+        unsafe {
+            self.device
+                .cmd_copy_buffer2(self.command_buffer, &vertex_copy)
+        };
+        let index_regions = [vk::BufferCopy2::default()
+            .src_offset(layout.index_offset as vk::DeviceSize)
+            .dst_offset(0)
+            .size(index_size as vk::DeviceSize)];
+        let index_copy = vk::CopyBufferInfo2::default()
+            .src_buffer(self.staging.buffer)
+            .dst_buffer(index_buffer.buffer)
+            .regions(&index_regions);
+        // SAFETY: source and destination ranges were allocated for these exact byte counts.
+        unsafe {
+            self.device
+                .cmd_copy_buffer2(self.command_buffer, &index_copy)
+        };
+        let barriers = [
+            vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT)
+                .dst_access_mask(vk::AccessFlags2::VERTEX_ATTRIBUTE_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(vertex_buffer.buffer)
+                .offset(0)
+                .size(vertex_size as vk::DeviceSize),
+            vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
+                .dst_access_mask(vk::AccessFlags2::INDEX_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(index_buffer.buffer)
+                .offset(0)
+                .size(index_size as vk::DeviceSize),
+        ];
+        let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+        // SAFETY: barriers make each copy visible to its subsequent vertex/index input access.
+        unsafe {
+            self.device
+                .cmd_pipeline_barrier2(self.command_buffer, &dependency)
+        };
+    }
+}
+
+impl Drop for UploadBatch {
+    fn drop(&mut self) {
+        if let Some(fence) = self.fence.take() {
+            // SAFETY: submitted batches are dropped only after their fence signals or device idle.
+            unsafe { self.device.destroy_fence(fence, None) };
+        }
+        // SAFETY: this batch is either not submitted or its fence has completed.
+        unsafe { self.device.destroy_command_pool(self.command_pool, None) };
+    }
 }
 
 /// Буфер в host-visible памяти; данные копируются один раз при создании.
@@ -5311,6 +5694,7 @@ struct HostBuffer {
     device: ash::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    size: usize,
 }
 
 impl HostBuffer {
@@ -5321,16 +5705,31 @@ impl HostBuffer {
         usage: vk::BufferUsageFlags,
         data: &[u8],
     ) -> Result<Self, RenderError> {
+        let buffer = Self::new_empty(instance, device, physical_device, usage, data.len())?;
+        buffer.write(data)?;
+        Ok(buffer)
+    }
+
+    fn new_empty(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        usage: vk::BufferUsageFlags,
+        size: usize,
+    ) -> Result<Self, RenderError> {
         let buffer_info = vk::BufferCreateInfo::default()
-            .size(data.len() as vk::DeviceSize)
+            .size(u64::try_from(size).map_err(|_| {
+                RenderError::InvalidConfig("размер Vulkan buffer превышает DeviceSize")
+            })?)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // SAFETY: the buffer has a non-zero size guaranteed by mesh validation.
+        // SAFETY: callers request a non-zero buffer size.
         let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
         let mut host_buffer = Self {
             device: device.clone(),
             buffer,
             memory: vk::DeviceMemory::null(),
+            size,
         };
         // SAFETY: buffer was created by this device and remains alive.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
@@ -5341,7 +5740,9 @@ impl HostBuffer {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
         .ok_or_else(|| {
-            RenderError::Unsupported("нет HOST_VISIBLE | HOST_COHERENT memory для меша".to_owned())
+            RenderError::Unsupported(
+                "нет HOST_VISIBLE | HOST_COHERENT memory для буфера".to_owned(),
+            )
         })?;
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
@@ -5350,17 +5751,6 @@ impl HostBuffer {
         host_buffer.memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
         // SAFETY: memory allocation satisfies the buffer's reported requirements.
         unsafe { device.bind_buffer_memory(buffer, host_buffer.memory, 0) }?;
-        // SAFETY: the coherent allocation is at least data.len() bytes and is not mapped elsewhere.
-        unsafe {
-            let mapped = device.map_memory(
-                host_buffer.memory,
-                0,
-                data.len() as vk::DeviceSize,
-                vk::MemoryMapFlags::empty(),
-            )?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
-            device.unmap_memory(host_buffer.memory);
-        }
         Ok(host_buffer)
     }
 }
@@ -5368,18 +5758,98 @@ impl HostBuffer {
 impl HostBuffer {
     /// Перезаписывает начало буфера; GPU не должен читать буфер во время записи.
     fn write(&self, data: &[u8]) -> Result<(), RenderError> {
-        // SAFETY: callers write at most the buffer size into coherent memory that is not in use by the GPU.
+        self.write_at(0, data)
+    }
+
+    fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), RenderError> {
+        if offset
+            .checked_add(data.len())
+            .is_none_or(|end| end > self.size)
+        {
+            return Err(RenderError::InvalidState(
+                "запись выходит за размер host buffer",
+            ));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: callers write within the coherent buffer while it is not in use by the GPU.
         unsafe {
             let mapped = self.device.map_memory(
                 self.memory,
                 0,
-                data.len() as vk::DeviceSize,
+                self.size as vk::DeviceSize,
                 vk::MemoryMapFlags::empty(),
             )?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                mapped.cast::<u8>().add(offset),
+                data.len(),
+            );
             self.device.unmap_memory(self.memory);
         }
         Ok(())
+    }
+}
+
+/// Буфер в DEVICE_LOCAL памяти для vertex и index input.
+struct DeviceBuffer {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl DeviceBuffer {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        usage: vk::BufferUsageFlags,
+        size: usize,
+    ) -> Result<Self, RenderError> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(u64::try_from(size).map_err(|_| {
+                RenderError::InvalidConfig("размер Vulkan buffer превышает DeviceSize")
+            })?)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: callers provide non-empty mesh data and a valid usage.
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
+        let mut device_buffer = Self {
+            device: device.clone(),
+            buffer,
+            memory: vk::DeviceMemory::null(),
+        };
+        // SAFETY: buffer belongs to this device and is alive.
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let memory_type = find_memory_type(
+            instance,
+            physical_device,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| {
+            RenderError::Unsupported("нет DEVICE_LOCAL memory для mesh buffer".to_owned())
+        })?;
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        // SAFETY: allocation size and memory type were returned for this buffer.
+        device_buffer.memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
+        // SAFETY: allocation satisfies this buffer's memory requirements.
+        unsafe { device.bind_buffer_memory(buffer, device_buffer.memory, 0) }?;
+        Ok(device_buffer)
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        // SAFETY: owning renderer waits for frame and upload serials before dropping mesh buffers.
+        unsafe { self.device.destroy_buffer(self.buffer, None) };
+        if self.memory != vk::DeviceMemory::null() {
+            // SAFETY: the buffer bound to this allocation was destroyed first.
+            unsafe { self.device.free_memory(self.memory, None) };
+        }
     }
 }
 
@@ -5876,26 +6346,28 @@ fn select_composite_alpha(
 #[cfg(test)]
 mod tests {
     use super::{
-        AcquireAction, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
-        FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT, MATERIAL_UNIFORMS_SIZE,
-        MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId, OFFSCREEN_FORMAT,
-        OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex,
-        PIPELINE_CACHE_HEADER_SIZE, PipelineCacheIdentity, PresentMode, ProbeInstanceFailure,
-        RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE,
-        TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER,
-        UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index, check_extensions,
-        classify_acquire_result, classify_probe_instance_failure, deduplicate_names,
-        derivative_tangent_basis, evaluate_device, frame_uniform_bytes, index_bytes,
-        inverse_extent, material_sampler_info, material_uniform_bytes, mip_extent, mip_level_count,
+        AcquireAction, AntiAliasing, DEFAULT_UPLOAD_BATCH_CAPACITY, DeviceFacts, DeviceReport,
+        DirectionalLight, DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame,
+        LDR_FORMAT, MATERIAL_UNIFORMS_SIZE, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material,
+        MaterialId, MeshId, OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER,
+        OVERLAY_VERTEX_SHADER, OverlayVertex, PIPELINE_CACHE_HEADER_SIZE, PipelineCacheIdentity,
+        PresentMode, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
+        SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace,
+        TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings,
+        align_upload_offset, best_device_index, check_extensions, classify_acquire_result,
+        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
+        evaluate_device, frame_uniform_bytes, index_bytes, inverse_extent, material_sampler_info,
+        material_uniform_bytes, mesh_upload_layout, mip_extent, mip_level_count,
         missing_extensions, missing_post_format_features, missing_texture_format_features,
         normal_matrix, offscreen_previous_use, overlay_vertex_bytes, push_constant_bytes,
         sampler_anisotropy, scaled_extent, scene_viewport, select_composite_alpha,
         select_present_mode, select_surface_extent, shadow_casters, texture_format,
         texture_format_reasons, texture_mip_blit_region, texture_mip_destination_shader_barrier,
         texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
-        timestamp_duration, transform_tangent_normal, validate_draws, validate_material,
-        validate_mesh, validate_overlay, validate_pipeline_cache, validate_render_scale,
-        validate_texture, validate_view_settings, vertex_bytes,
+        timestamp_duration, transform_tangent_normal, upload_batch_capacity,
+        upload_batch_flush_required, validate_draws, validate_material, validate_mesh,
+        validate_overlay, validate_pipeline_cache, validate_render_scale, validate_texture,
+        validate_view_settings, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -6593,6 +7065,43 @@ mod tests {
                 "{vertex_count} {indices:?}"
             );
         }
+    }
+
+    #[test]
+    fn upload_offsets_are_at_least_sixteen_and_multiple_of_device_alignment() {
+        let layout = mesh_upload_layout(0, 44, 12, 256).unwrap();
+        assert_eq!(layout.vertex_offset, 256);
+        assert_eq!(layout.index_offset, 512);
+        assert!(layout.vertex_offset >= 16 && layout.vertex_offset.is_multiple_of(256));
+        assert!(layout.index_offset >= 16 && layout.index_offset.is_multiple_of(256));
+
+        let non_power_of_two = align_upload_offset(0, 24).unwrap();
+        assert_eq!(non_power_of_two, 48);
+        assert!(non_power_of_two.is_multiple_of(24));
+    }
+
+    #[test]
+    fn upload_layout_rejects_offset_and_size_overflow() {
+        assert_eq!(align_upload_offset(usize::MAX, 256), None);
+        assert_eq!(mesh_upload_layout(0, usize::MAX, 4, 16), None);
+        assert_eq!(upload_batch_capacity(usize::MAX, 16), None);
+    }
+
+    #[test]
+    fn upload_batches_flush_on_capacity_and_isolate_oversized_meshes() {
+        assert_eq!(
+            upload_batch_flush_required(16, 44, 12, 16, 128),
+            Some(false)
+        );
+        assert_eq!(upload_batch_flush_required(80, 44, 12, 16, 128), Some(true));
+
+        let oversized = mesh_upload_layout(0, DEFAULT_UPLOAD_BATCH_CAPACITY + 1, 12, 16).unwrap();
+        let capacity = upload_batch_capacity(oversized.end, 16).unwrap();
+        assert!(capacity > DEFAULT_UPLOAD_BATCH_CAPACITY);
+        assert_eq!(
+            upload_batch_flush_required(oversized.end, 44, 12, 16, capacity),
+            Some(true)
+        );
     }
 
     const IDENTITY: [[f32; 4]; 4] = [
