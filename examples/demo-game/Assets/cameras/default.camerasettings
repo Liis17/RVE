@@ -1,0 +1,4 @@
+[projection]
+fov_deg = 55.0
+near = 0.1
+far = 100.0

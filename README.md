@@ -9,9 +9,12 @@ RVE — игровой движок на Rust с рендерингом чере
 - Rust stable.
 - Windows: видеодрайвер с поддержкой Vulkan 1.3.
 - macOS: Vulkan loader и MoltenVK. Для Homebrew: `brew install vulkan-loader molten-vk`.
-- Для `R8G8B8A8_SRGB` и `R8G8B8A8_UNORM` GPU должен поддерживать в optimal tiling
-  `SAMPLED_IMAGE`, `SAMPLED_IMAGE_FILTER_LINEAR`, `TRANSFER_SRC`, `TRANSFER_DST`,
-  `BLIT_SRC` и `BLIT_DST`; иначе renderer отклонит его.
+- HDR `R16G16B16A16_SFLOAT` и LDR post target `R8G8B8A8_SRGB` требуют optimal
+  tiling `COLOR_ATTACHMENT`, `SAMPLED_IMAGE` и `SAMPLED_IMAGE_FILTER_LINEAR`; surface
+  и его format должны поддерживать color attachment, а surface format — blending.
+- Форматы текстур `R8G8B8A8_SRGB` и `R8G8B8A8_UNORM` требуют `SAMPLED_IMAGE`,
+  `SAMPLED_IMAGE_FILTER_LINEAR`, `TRANSFER_SRC`, `TRANSFER_DST`, `BLIT_SRC` и
+  `BLIT_DST` для полной mip-цепочки.
 
 Для обычной сборки Rust-кода Vulkan SDK не требуется.
 
@@ -44,12 +47,15 @@ cargo run -p sandbox -- --scene triangle
 cargo run -p sandbox -- --scene materials --frames 300
 cargo run -p sandbox -- --model /models/cube.fbx --texture /textures/cube.png
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
+cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
 ```
 
 Ресурсы sandbox размещаются в `build/assets`. Например, путь
 `/models/cube.fbx` указывает на `build/assets/models/cube.fbx`. Поддерживаются
 сцены `triangle`, `cube`, `shadows` и `materials`, модели FBX, текстуры PNG, ограничение
-числа кадров, изменение размера окна и отладочный оверлей.
+числа кадров, изменение размера окна и отладочный оверлей. Настройки проекции,
+exposure, tonemapping, anti-aliasing и render scale задаются файлом
+`.camerasettings`; явный `--render-scale` перекрывает масштаб из него.
 
 Настройки окна sandbox необязательны. Чтобы изменить их, скопируй шаблон
 `bootstrap.rves.example` в `build/bootstrap.rves`.
@@ -124,6 +130,41 @@ cargo run -p rve-editor -- --project ../examples/demo-game --scripts <path-to-sc
 Play не меняет документ: Stop возвращает сцену к состоянию до запуска. Lua, зависший дольше 5 секунд, прерывается, но зависший Rust-скрипт прервать нельзя, и он остановит редактор.
 
 Ограничения: раскладка панелей не сохраняется, список файлов обновляется кнопкой Refresh, а переименование или удаление файла в Project не обновляет ссылки в сценах. При сохранении комментарии в файле сцены теряются.
+
+## Обновление проектов и renderer API
+
+Старые сцены с полями `fov_deg`, `near` и `far` внутри `[objects.camera]` больше не разбираются. Перенеси проекцию и настройки вывода в отдельный файл `.camerasettings`, добавь его в список assets и укажи путь в поле settings камеры:
+
+~~~toml
+[[assets]]
+path = "/cameras/main.camerasettings"
+
+[[objects]]
+id = "camera"
+[objects.camera]
+settings = "/cameras/main.camerasettings"
+~~~
+
+Файл настроек использует таблицы projection, render и color:
+
+~~~toml
+[projection]
+fov_deg = 60.0
+near = 0.1
+far = 1000.0
+
+[render]
+render_scale = 1.0
+anti_aliasing = "fxaa"
+
+[color]
+exposure_ev = 0.0
+tonemapper = "aces"
+~~~
+
+Код, использующий engine-render, тоже требует миграции. Поле `RendererConfig::render_scale` удалено: масштаб, exposure, tonemapper и anti-aliasing теперь передаются в `Frame` через `view: ViewSettings`, а позиция камеры — через `camera_position`.
+
+В `DrawCommand` поле `texture` заменено на `material: Option<MaterialId>`. Создавай `Material` через `Renderer::create_material`; карты base color, metallic-roughness и normal можно загружать с нужным пространством цвета через `Renderer::create_texture_with_color_space`. Полный текущий контракт описан в [заметке renderer](Obsidian/RVEVault/Engine/EngineRender.md).
 
 ## Архивы ресурсов
 

@@ -15,6 +15,7 @@ use engine_files::VirtualPath;
 use engine_render::{
     FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
 };
+use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
 use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
 use std::path::{Path, PathBuf};
@@ -270,9 +271,17 @@ impl EditorApp {
                 }
             }
         }
-        let result = PlaySession::start(scene.document(), self.state.library.as_ref(), |path| {
-            project.read_text(path)
-        });
+        let result = (|| {
+            let mut world =
+                World::from_document(scene.document()).map_err(|error| error.to_string())?;
+            project.apply_camera_settings(&mut world)?;
+            PlaySession::start_with_world(
+                scene.document(),
+                world,
+                self.state.library.as_ref(),
+                |path| project.read_text(path),
+            )
+        })();
         match result {
             Ok(session) => {
                 self.state.play = Some(session);
@@ -454,46 +463,86 @@ fn render_scene_frame(
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     }
     let playing = state.is_playing();
-    let editor_camera = state.camera.camera();
     let game_camera_id = state.game_camera.clone();
     // Сетка нужна только панели Scene вне Play-режима.
     let grid_camera_distance = scene_size
         .filter(|_| !playing)
         .map(|_| state.camera.distance);
     let pending_frame = state.pending_frame.take();
-    let Some(parts) = state.frame_parts() else {
-        return render_ui_only(&mut gpu.renderer, ui, &[]);
+    let (scene_frame, game_camera, game_settings, has_light, frame_target) = {
+        let Some(parts) = state.frame_parts() else {
+            return render_ui_only(&mut gpu.renderer, ui, &[]);
+        };
+        gpu.scene.sync_assets(
+            &mut gpu.renderer,
+            parts.project,
+            parts.world,
+            parts.models,
+            parts.log,
+        )?;
+        let (scene_frame, warnings) = parts.world.build_frame();
+        for warning in warnings {
+            parts.log.push(
+                LogLevel::Warn,
+                format!(
+                    "{}: {}: {}",
+                    warning.source, warning.object_id, warning.message
+                ),
+            );
+        }
+        let game_camera_handle = game_camera_id
+            .and_then(|id| parts.world.handle(&id))
+            .filter(|handle| parts.world.camera_of(*handle).is_some())
+            .unwrap_or_else(|| parts.world.active_camera());
+        let game_camera = parts
+            .world
+            .camera_of(game_camera_handle)
+            .unwrap_or(scene_frame.camera);
+        let game_settings = parts
+            .world
+            .camera_settings(game_camera_handle)
+            .copied()
+            .unwrap_or_default();
+        let has_light = parts
+            .world
+            .objects()
+            .iter()
+            .any(|object| object.directional_light.is_some());
+        let frame_target = pending_frame.and_then(|id| {
+            let object = parts.world.object_by_id(&id)?;
+            let model = parts
+                .models
+                .get(object.mesh_renderer.as_ref()?.model.as_str())?;
+            Some(bounding_sphere(
+                parts.world.world_matrix(object.handle)?,
+                model.bounds()?,
+            ))
+        });
+        (
+            scene_frame,
+            game_camera,
+            game_settings,
+            has_light,
+            frame_target,
+        )
     };
-    gpu.scene.sync_assets(
-        &mut gpu.renderer,
-        parts.project,
-        parts.world,
-        parts.models,
-        parts.log,
-    )?;
-    let (scene_frame, warnings) = parts.world.build_frame();
-    for warning in warnings {
-        parts.log.push(
-            LogLevel::Warn,
-            format!(
-                "{}: {}: {}",
-                warning.source, warning.object_id, warning.message
-            ),
-        );
+    if let Some((center, radius)) = frame_target
+        && state.camera.needs_framing(center, radius)
+    {
+        state.camera.focus(center, radius);
     }
-    let game_camera = game_camera_id
-        .and_then(|id| parts.world.handle(&id))
-        .and_then(|handle| parts.world.camera_of(handle))
-        .unwrap_or(scene_frame.camera);
-    let has_light = parts
-        .world
-        .objects()
-        .iter()
-        .any(|object| object.directional_light.is_some());
     let scene_camera = if playing {
         scene_frame.camera
     } else {
-        editor_camera
+        state.camera.camera()
+    };
+    let scene_settings = if playing {
+        scene_frame.view
+    } else {
+        CameraSettings::default()
+    };
+    let Some(parts) = state.frame_parts() else {
+        return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
     gpu.scene.build_draws(
         &mut gpu.renderer,
@@ -503,21 +552,6 @@ fn render_scene_frame(
         game_camera.position,
         grid_camera_distance,
     )?;
-    let frame_target = pending_frame.and_then(|id| {
-        let object = parts.world.object_by_id(&id)?;
-        let model = parts
-            .models
-            .get(object.mesh_renderer.as_ref()?.model.as_str())?;
-        Some(bounding_sphere(
-            parts.world.world_matrix(object.handle)?,
-            model.bounds()?,
-        ))
-    });
-    if let Some((center, radius)) = frame_target
-        && state.camera.needs_framing(center, radius)
-    {
-        state.camera.focus(center, radius);
-    }
     if let Some([width, height]) = scene_size {
         gpu.renderer
             .resize_viewport(gpu.scene.viewport, width, height)?;
@@ -530,6 +564,7 @@ fn render_scene_frame(
         gpu.scene.frame(
             scene_camera.view_projection(width, height),
             scene_camera.position,
+            scene_settings,
             &scene_frame.light,
             has_light,
             true,
@@ -539,6 +574,7 @@ fn render_scene_frame(
         gpu.scene.frame(
             game_camera.view_projection(width, height),
             game_camera.position,
+            game_settings,
             &scene_frame.light,
             has_light,
             false,

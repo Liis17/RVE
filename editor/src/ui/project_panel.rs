@@ -109,6 +109,7 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
     }
     match AssetKind::of(&entry.path) {
         AssetKind::Scene => "SCENE",
+        AssetKind::CameraSettings => "CAMERA",
         AssetKind::Model => "FBX",
         AssetKind::Texture => "PNG",
         AssetKind::Script => "LUA",

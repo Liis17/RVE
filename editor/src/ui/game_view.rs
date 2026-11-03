@@ -5,24 +5,31 @@ use crate::state::EditorState;
 use egui::{Color32, Rect, Sense};
 use engine_scene::SceneDocument;
 
-/// Камеры документа в его порядке: id и отображаемое имя.
-fn scene_cameras(document: &SceneDocument) -> Vec<(String, String)> {
+/// Камеры документа в его порядке: id, отображаемое имя и признак активной камеры.
+fn scene_cameras(document: &SceneDocument) -> Vec<(String, String, bool)> {
     document
         .objects
         .iter()
         .filter(|object| object.camera.is_some())
-        .map(|object| (object.id.clone(), object.display_name().to_owned()))
+        .map(|object| {
+            (
+                object.id.clone(),
+                object.display_name().to_owned(),
+                object.camera.as_ref().is_some_and(|camera| camera.active),
+            )
+        })
         .collect()
 }
 
-/// Выбранная камера, если она ещё есть в сцене, иначе первая: она же камера игры.
+/// Выбранная камера, затем активная камера документа, затем первая камера.
 fn resolve_camera<'a>(
-    cameras: &'a [(String, String)],
+    cameras: &'a [(String, String, bool)],
     selected: Option<&str>,
-) -> Option<&'a (String, String)> {
+) -> Option<&'a (String, String, bool)> {
     cameras
         .iter()
-        .find(|(id, _)| Some(id.as_str()) == selected)
+        .find(|(id, _, _)| Some(id.as_str()) == selected)
+        .or_else(|| cameras.iter().find(|(_, _, active)| *active))
         .or_else(|| cameras.first())
 }
 
@@ -32,7 +39,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         return;
     };
     let cameras = scene_cameras(scene.document());
-    let Some((current_id, current_name)) =
+    let Some((current_id, current_name, _)) =
         resolve_camera(&cameras, state.game_camera.as_deref()).cloned()
     else {
         return;
@@ -44,7 +51,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
             egui::ComboBox::from_id_salt("game_camera")
                 .selected_text(current_name.as_str())
                 .show_ui(ui, |ui| {
-                    for (id, name) in &cameras {
+                    for (id, name, _) in &cameras {
                         ui.selectable_value(&mut chosen, id.clone(), name);
                     }
                 });
@@ -94,12 +101,14 @@ mod tests {
     fn cameras_are_listed_in_document_order_with_their_names() {
         let cameras = scene_cameras(two_cameras().document());
         assert_eq!(cameras.len(), 2);
-        assert_eq!(cameras[0], ("camera".to_owned(), "Camera".to_owned()));
+        assert_eq!(cameras[0].0, "camera");
+        assert_eq!(cameras[0].1, "Camera");
+        assert!(cameras[0].2);
         assert_ne!(cameras[1].0, "camera");
     }
 
     #[test]
-    fn selection_falls_back_to_the_first_camera_when_it_is_gone() {
+    fn selection_falls_back_to_the_document_active_camera_when_it_is_gone() {
         let cameras = scene_cameras(two_cameras().document());
         let second = cameras[1].0.as_str();
         assert_eq!(

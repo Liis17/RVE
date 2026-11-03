@@ -1,6 +1,6 @@
 use crate::lite::EventQueue;
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
-use engine_scene::{LocalTransform, ObjectHandle, ParamValue, World};
+use engine_scene::{CameraSettings, LocalTransform, ObjectHandle, ParamValue, World};
 use std::collections::HashMap;
 
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
@@ -91,6 +91,8 @@ pub(crate) struct ScriptTransaction {
     writable: bool,
     source: String,
     pending_transforms: HashMap<ObjectHandle, LocalTransform>,
+    pending_camera_settings: HashMap<ObjectHandle, CameraSettings>,
+    pending_active_camera: Option<ObjectHandle>,
     pending_messages: Vec<PendingMessage>,
     pending_bytes: usize,
     queued_message_count: usize,
@@ -109,6 +111,8 @@ impl Default for ScriptTransaction {
             writable: false,
             source: String::new(),
             pending_transforms: HashMap::with_capacity(8),
+            pending_camera_settings: HashMap::with_capacity(2),
+            pending_active_camera: None,
             pending_messages: Vec::with_capacity(16),
             pending_bytes: 0,
             queued_message_count: 0,
@@ -138,6 +142,8 @@ impl ScriptTransaction {
         self.source.clear();
         self.source.push_str(source);
         self.pending_transforms.clear();
+        self.pending_camera_settings.clear();
+        self.pending_active_camera = None;
         self.pending_messages.clear();
         self.pending_bytes = 0;
         self.queued_message_count = queued_messages.0;
@@ -204,6 +210,48 @@ impl ScriptTransaction {
         true
     }
 
+    pub(crate) fn camera_settings(&self, handle: ObjectHandle) -> Option<CameraSettings> {
+        self.pending_camera_settings
+            .get(&handle)
+            .copied()
+            .or_else(|| self.world()?.camera_settings(handle).copied())
+    }
+
+    pub(crate) fn set_camera_settings(
+        &mut self,
+        handle: ObjectHandle,
+        settings: CameraSettings,
+    ) -> bool {
+        if !self.writable
+            || self
+                .world()
+                .and_then(|world| world.object(handle))
+                .is_none_or(|object| object.camera.is_none())
+        {
+            return false;
+        }
+        self.pending_camera_settings.insert(handle, settings);
+        true
+    }
+
+    pub(crate) fn active_camera(&self) -> Option<ObjectHandle> {
+        self.pending_active_camera
+            .or_else(|| self.world().map(World::active_camera))
+    }
+
+    pub(crate) fn set_active_camera(&mut self, handle: ObjectHandle) -> bool {
+        if !self.writable
+            || self
+                .world()
+                .and_then(|world| world.object(handle))
+                .is_none_or(|object| object.camera.is_none())
+        {
+            return false;
+        }
+        self.pending_active_camera = Some(handle);
+        true
+    }
+
     pub(crate) fn world_matrix(&self, handle: ObjectHandle) -> Option<[f32; 16]> {
         self.world()?
             .world_matrix(handle)
@@ -225,6 +273,20 @@ impl ScriptTransaction {
     pub(crate) fn set_local_from_abi(&mut self, handle: u64, transform: ScriptTransform) -> bool {
         self.object_from_abi_handle(handle)
             .is_some_and(|handle| self.set_local_transform(handle, transform))
+    }
+
+    pub(crate) fn set_camera_settings_from_abi(
+        &mut self,
+        handle: u64,
+        settings: CameraSettings,
+    ) -> bool {
+        self.object_from_abi_handle(handle)
+            .is_some_and(|handle| self.set_camera_settings(handle, settings))
+    }
+
+    pub(crate) fn set_active_camera_from_abi(&mut self, handle: u64) -> bool {
+        self.object_from_abi_handle(handle)
+            .is_some_and(|handle| self.set_active_camera(handle))
     }
 
     pub(crate) fn send(
@@ -325,6 +387,16 @@ impl ScriptTransaction {
             .pending_transforms
             .keys()
             .all(|handle| world.local_transform(*handle).is_some());
+        let camera_settings_target_valid = self.pending_camera_settings.keys().all(|handle| {
+            world
+                .object(*handle)
+                .is_some_and(|object| object.camera.is_some())
+        });
+        let active_camera_target_valid = self.pending_active_camera.is_none_or(|handle| {
+            world
+                .object(handle)
+                .is_some_and(|object| object.camera.is_some())
+        });
         if !transforms_are_finite {
             self.discard();
             return Err("script produced a non-finite transform".to_owned());
@@ -333,12 +405,38 @@ impl ScriptTransaction {
             self.discard();
             return Err("script wrote a transform for an unknown object".to_owned());
         }
+        if let Some(error) = self
+            .pending_camera_settings
+            .values()
+            .find_map(|settings| settings.validate().err())
+        {
+            self.discard();
+            return Err(format!("script produced invalid camera settings: {error}"));
+        }
+        if !camera_settings_target_valid {
+            self.discard();
+            return Err("script wrote camera settings for an object without a camera".to_owned());
+        }
+        if !active_camera_target_valid {
+            self.discard();
+            return Err("script selected an object without a camera as active".to_owned());
+        }
 
         for (handle, transform) in self.pending_transforms.drain() {
             // Handles and all transforms were validated before applying any write.
             world
                 .set_local_transform(handle, transform)
                 .expect("validated object handle remains present during commit");
+        }
+        for (handle, settings) in self.pending_camera_settings.drain() {
+            world
+                .set_camera_settings(handle, settings)
+                .expect("validated camera settings target remains present during commit");
+        }
+        if let Some(handle) = self.pending_active_camera.take() {
+            world
+                .set_active_camera(handle)
+                .expect("validated active camera target remains present during commit");
         }
 
         if !self.pending_messages.is_empty() || self.overflowed_messages != 0 {
@@ -372,6 +470,8 @@ impl ScriptTransaction {
 
     pub(crate) fn discard(&mut self) {
         self.pending_transforms.clear();
+        self.pending_camera_settings.clear();
+        self.pending_active_camera = None;
         self.pending_messages.clear();
         self.pending_bytes = 0;
         self.queued_message_count = 0;

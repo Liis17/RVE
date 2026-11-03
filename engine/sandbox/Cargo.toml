@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 engine-core = { path = "../engine-core" }
+engine-files = { path = "../engine-files" }
 engine-window = { path = "../engine-window" }
 engine-render = { path = "../engine-render" }
 engine-assets = { path = "../engine-assets" }
@@ -18,5 +19,4 @@ glam.workspace = true
 sysinfo.workspace = true
 
 [dev-dependencies]
-engine-files = { path = "../engine-files" }
 engine-pak = { path = "../engine-pak" }

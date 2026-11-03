@@ -109,21 +109,44 @@ pub struct PlaySession {
 impl PlaySession {
     /// Запускает сцену. Исходники Lua читаются через `read_source`; скрипты получают `on_start`
     /// при первом обновлении.
+    #[cfg(test)]
     pub fn start(
         document: &SceneDocument,
         library: Option<&ScriptLibrary>,
         read_source: impl FnMut(&str) -> Result<String, String>,
     ) -> Result<Self, String> {
-        Self::start_with_limit(document, library, read_source, SCRIPT_TIME_LIMIT)
+        let world = World::from_document(document).map_err(|error| error.to_string())?;
+        Self::start_with_world(document, world, library, read_source)
     }
 
+    /// Starts from a world whose referenced camera settings are already loaded.
+    pub fn start_with_world(
+        document: &SceneDocument,
+        world: World,
+        library: Option<&ScriptLibrary>,
+        read_source: impl FnMut(&str) -> Result<String, String>,
+    ) -> Result<Self, String> {
+        Self::start_with_world_limit(document, world, library, read_source, SCRIPT_TIME_LIMIT)
+    }
+
+    #[cfg(test)]
     fn start_with_limit(
         document: &SceneDocument,
+        library: Option<&ScriptLibrary>,
+        read_source: impl FnMut(&str) -> Result<String, String>,
+        time_limit: Duration,
+    ) -> Result<Self, String> {
+        let world = World::from_document(document).map_err(|error| error.to_string())?;
+        Self::start_with_world_limit(document, world, library, read_source, time_limit)
+    }
+
+    fn start_with_world_limit(
+        document: &SceneDocument,
+        world: World,
         library: Option<&ScriptLibrary>,
         mut read_source: impl FnMut(&str) -> Result<String, String>,
         time_limit: Duration,
     ) -> Result<Self, String> {
-        let world = World::from_document(document).map_err(|error| error.to_string())?;
         let mut sources = BTreeMap::new();
         for object in world.objects() {
             for script in &object.lite_scripts {
@@ -236,9 +259,6 @@ path = "/rotate.lua"
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 
 [[objects]]
 id = "spinner"

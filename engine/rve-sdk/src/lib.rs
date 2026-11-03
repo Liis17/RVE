@@ -7,8 +7,10 @@ pub mod abi;
 
 pub use abi::{Key, MouseButton};
 use abi::{
-    RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveHost, RveParams, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
+    RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT,
+    RVE_VALUE_STR, RveArray, RveCameraSettings, RveHost, RveParams, RveStr, RveTime, RveTransform,
+    RveValue, RveValueData,
 };
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -168,6 +170,157 @@ impl From<Transform> for RveTransform {
     }
 }
 
+/// Camera anti-aliasing mode supported by the renderer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AntiAliasing {
+    /// FXAA 3.11 quality output pass.
+    #[default]
+    Fxaa = RVE_ANTI_ALIASING_FXAA,
+    /// Bilinear output filtering.
+    None = RVE_ANTI_ALIASING_NONE,
+}
+
+impl AntiAliasing {
+    /// Converts a stable ABI code into a supported anti-aliasing mode.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            RVE_ANTI_ALIASING_FXAA => Some(Self::Fxaa),
+            RVE_ANTI_ALIASING_NONE => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable ABI code for this mode.
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+}
+
+/// HDR-to-display tone mapping operator.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Tonemapper {
+    /// ACES fitted curve.
+    #[default]
+    Aces = RVE_TONEMAPPER_ACES,
+    /// Khronos PBR Neutral curve.
+    Neutral = RVE_TONEMAPPER_NEUTRAL,
+    /// Clamp HDR values directly to the display range.
+    None = RVE_TONEMAPPER_NONE,
+}
+
+impl Tonemapper {
+    /// Converts a stable ABI code into a supported tonemapper.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            RVE_TONEMAPPER_ACES => Some(Self::Aces),
+            RVE_TONEMAPPER_NEUTRAL => Some(Self::Neutral),
+            RVE_TONEMAPPER_NONE => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable ABI code for this tonemapper.
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Flattened projection, render, and color settings for one scene camera.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraSettings {
+    /// Perspective field of view in degrees, measured on the narrow window side.
+    pub fov_deg: f32,
+    /// Near clip plane distance.
+    pub near: f32,
+    /// Far clip plane distance.
+    pub far: f32,
+    /// Render resolution scale in `(0, 1]`.
+    pub render_scale: f32,
+    /// Linear scene clear color.
+    pub clear_color: [f32; 3],
+    /// Manual exposure in EV.
+    pub exposure_ev: f32,
+    /// Spatial output filtering mode.
+    pub anti_aliasing: AntiAliasing,
+    /// HDR-to-display tone mapping operator.
+    pub tonemapper: Tonemapper,
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        Self {
+            fov_deg: 60.0,
+            near: 0.1,
+            far: 1000.0,
+            render_scale: 1.0,
+            clear_color: [0.1, 0.1, 0.12],
+            exposure_ev: 0.0,
+            anti_aliasing: AntiAliasing::Fxaa,
+            tonemapper: Tonemapper::Aces,
+        }
+    }
+}
+
+impl TryFrom<RveCameraSettings> for CameraSettings {
+    type Error = ();
+
+    fn try_from(value: RveCameraSettings) -> Result<Self, Self::Error> {
+        let settings = Self {
+            fov_deg: value.fov_deg,
+            near: value.near,
+            far: value.far,
+            render_scale: value.render_scale,
+            clear_color: value.clear_color,
+            exposure_ev: value.exposure_ev,
+            anti_aliasing: AntiAliasing::from_code(value.anti_aliasing).ok_or(())?,
+            tonemapper: Tonemapper::from_code(value.tonemapper).ok_or(())?,
+        };
+        if settings.is_valid() {
+            Ok(settings)
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl From<CameraSettings> for RveCameraSettings {
+    fn from(value: CameraSettings) -> Self {
+        Self {
+            fov_deg: value.fov_deg,
+            near: value.near,
+            far: value.far,
+            render_scale: value.render_scale,
+            clear_color: value.clear_color,
+            exposure_ev: value.exposure_ev,
+            anti_aliasing: value.anti_aliasing.code(),
+            tonemapper: value.tonemapper.code(),
+        }
+    }
+}
+
+impl CameraSettings {
+    fn is_valid(self) -> bool {
+        self.fov_deg.is_finite()
+            && self.fov_deg > 0.0
+            && self.fov_deg < 180.0
+            && self.near.is_finite()
+            && self.far.is_finite()
+            && self.near > 0.0
+            && self.far > self.near
+            && self.render_scale.is_finite()
+            && self.render_scale > 0.0
+            && self.render_scale <= 1.0
+            && self
+                .clear_color
+                .into_iter()
+                .all(|value| value.is_finite() && value >= 0.0)
+            && self.exposure_ev.is_finite()
+            && (-16.0..=16.0).contains(&self.exposure_ev)
+    }
+}
+
 /// Lifecycle implemented by a guest script.
 pub trait Script: 'static {
     /// Called once before the first update.
@@ -259,6 +412,15 @@ impl<'a> Context<'a> {
     pub fn find(&self, id: &str) -> Option<Object> {
         // SAFETY: the host pointer and borrowed id are valid for this callback.
         let handle = unsafe { (self.host.find_object)(self.host.ctx, RveStr::from_str_ref(id)) };
+        (handle != 0).then_some(Object { handle })
+    }
+
+    /// Returns the currently active scene camera, or `None` if this host lacks ABI v2 camera
+    /// callbacks.
+    pub fn active_camera(&self) -> Option<Object> {
+        let callback = self.host.active_camera?;
+        // SAFETY: host callback pointers and context are valid during this guest callback.
+        let handle = unsafe { callback(self.host.ctx) };
         (handle != 0).then_some(Object { handle })
     }
 
@@ -411,6 +573,38 @@ impl Object {
         let transform: RveTransform = transform.into();
         // SAFETY: the host pointer and transform are valid during this guest callback.
         unsafe { (ctx.host.set_local)(ctx.host.ctx, self.handle, &transform) }
+    }
+
+    /// Returns this object's camera settings, or `None` if it is not a camera or the host does
+    /// not provide ABI v2 camera callbacks.
+    pub fn camera_settings(&self, ctx: &Context<'_>) -> Option<CameraSettings> {
+        let callback = ctx.host.get_camera_settings?;
+        let mut settings = RveCameraSettings::default();
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut settings) } {
+            return None;
+        }
+        settings.try_into().ok()
+    }
+
+    /// Stages this object's camera settings. Returns false when the host lacks ABI v2 camera
+    /// callbacks, the object is not a camera, or the settings are invalid or read-only.
+    pub fn set_camera_settings(&self, ctx: &mut Context<'_>, settings: CameraSettings) -> bool {
+        let Some(callback) = ctx.host.set_camera_settings else {
+            return false;
+        };
+        let settings: RveCameraSettings = settings.into();
+        // SAFETY: host callback and settings are valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, &settings) }
+    }
+
+    /// Stages this object as the active scene camera.
+    pub fn activate_camera(&self, ctx: &mut Context<'_>) -> bool {
+        let Some(callback) = ctx.host.set_active_camera else {
+            return false;
+        };
+        // SAFETY: host callback is valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle) }
     }
 
     /// Returns this object's column-major world matrix snapshot.

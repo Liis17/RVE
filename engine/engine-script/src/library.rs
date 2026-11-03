@@ -1,5 +1,5 @@
 use crate::abi_string::{AbiStringError, read_abi_str};
-use rve_sdk::abi::{RVE_SCRIPT_ABI_VERSION, RveModule, RveScriptDesc};
+use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveModule, RveScriptDesc};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -17,7 +17,7 @@ pub enum ScriptLibraryError {
     Open(String),
     MissingEntryPoint(String),
     NullModule,
-    AbiVersion { expected: u32, found: u32 },
+    AbiVersion { min: u32, max: u32, found: u32 },
     InvalidHeaderSize { expected: usize, found: u32 },
     NullScripts,
     NullScriptName { index: usize },
@@ -38,10 +38,10 @@ impl fmt::Display for ScriptLibraryError {
                 )
             }
             Self::NullModule => f.write_str("script library returned a null module pointer"),
-            Self::AbiVersion { expected, found } => {
+            Self::AbiVersion { min, max, found } => {
                 write!(
                     f,
-                    "script ABI version {found} is unsupported; expected {expected}"
+                    "script ABI version {found} is unsupported; supported range is {min}..={max}"
                 )
             }
             Self::InvalidHeaderSize { expected, found } => {
@@ -117,9 +117,10 @@ impl ScriptLibrary {
         // Read only the header before validating its version and size. This avoids forming a
         // reference to the full module while the host does not yet know which layout it contains.
         let header = unsafe { std::ptr::addr_of!((*module).header).read() };
-        if header.abi_version != RVE_SCRIPT_ABI_VERSION {
+        if !(RVE_SCRIPT_ABI_MIN_VERSION..=RVE_SCRIPT_ABI_VERSION).contains(&header.abi_version) {
             return Err(ScriptLibraryError::AbiVersion {
-                expected: RVE_SCRIPT_ABI_VERSION,
+                min: RVE_SCRIPT_ABI_MIN_VERSION,
+                max: RVE_SCRIPT_ABI_VERSION,
                 found: header.abi_version,
             });
         }

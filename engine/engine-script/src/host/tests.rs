@@ -11,9 +11,7 @@ fn world(source: &str) -> World {
     let source = if source.contains("[objects.camera]") {
         source.to_owned()
     } else {
-        format!(
-            "{source}\n[[objects]]\nid = \"__test_camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n"
-        )
+        format!("{source}\n[[objects]]\nid = \"__test_camera\"\n[objects.camera]\n\n")
     };
     let document = SceneDocument::parse("test.rvescene", &source).unwrap();
     World::from_document(&document).unwrap()
@@ -26,12 +24,31 @@ fn one_camera(body: &str) -> World {
 id = "camera"
 name = "Camera object"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 {body}
 "#
     ))
+}
+
+fn two_cameras_with_lite_script() -> World {
+    world(
+        r#"
+[[assets]]
+path = "/camera.lua"
+[[objects]]
+id = "camera"
+name = "Primary"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/camera.lua"
+[[objects]]
+id = "second"
+name = "Secondary"
+[objects.camera]
+[[objects]]
+id = "plain"
+"#,
+    )
 }
 
 fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -356,9 +373,6 @@ path = "/b.lua"
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 [[objects.lite_scripts]]
 path = "/a.lua"
 params = { label = "camera-lite" }
@@ -1830,6 +1844,166 @@ fn lua_creation_phases_reject_object_writes_and_messages() {
             matches!(result, Err(ScriptLoadError::Lite { message, .. }) if message.contains("unavailable during script creation"))
         );
         assert_eq!(*world.local_transform(handle).unwrap(), before);
+    }
+}
+
+#[test]
+fn lua_camera_api_reads_pending_settings_and_switches_active_camera_atomically() {
+    let mut world = two_cameras_with_lite_script();
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  assert(rve.find("plain"):get_camera_settings() == nil)
+  local primary = rve.active_camera()
+  assert(primary and primary.id == "camera")
+  local before = primary:get_camera_settings()
+  assert(before.projection.fov_deg == 60)
+  assert(before.render.anti_aliasing == "fxaa")
+  assert(before.color.tonemapper == "aces")
+
+  primary:set_camera_settings({
+    projection = { fov_deg = 72 },
+    render = { clear_color = { 0.2, 0.3, 0.4 }, anti_aliasing = "none" },
+    color = { exposure_ev = 1.5, tonemapper = "neutral" },
+  })
+  local pending = primary:get_camera_settings()
+  assert(pending.projection.fov_deg == 72 and math.abs(pending.projection.near - 0.1) < 0.0001)
+  assert(math.abs(pending.render.clear_color[2] - 0.3) < 0.0001 and pending.render.render_scale == 1)
+  assert(pending.color.exposure_ev == 1.5 and pending.color.tonemapper == "neutral")
+
+  local secondary = rve.find("second")
+  secondary:activate_camera()
+  assert(rve.active_camera().id == "second")
+  secondary:set_camera_settings({ color = { exposure_ev = -2 } })
+  local secondary_settings = secondary:get_camera_settings()
+  assert(secondary_settings.color.exposure_ev == -2)
+  assert(secondary_settings.projection.fov_deg == 60)
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("camera.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(events.is_empty(), "unexpected script events: {events:?}");
+    let primary = world.handle("camera").unwrap();
+    let secondary = world.handle("second").unwrap();
+    assert_eq!(world.active_camera(), secondary);
+    let primary_settings = world.camera_settings(primary).unwrap();
+    assert_eq!(primary_settings.projection.fov_deg, 72.0);
+    assert_eq!(primary_settings.render.clear_color, [0.2, 0.3, 0.4]);
+    assert_eq!(primary_settings.color.exposure_ev, 1.5);
+    let secondary_settings = world.camera_settings(secondary).unwrap();
+    assert_eq!(secondary_settings.color.exposure_ev, -2.0);
+}
+
+#[test]
+fn lua_camera_settings_type_enum_and_non_camera_errors_disable_the_instance() {
+    for (label, body, expected) in [
+        (
+            "unknown",
+            r#"rve.find("camera"):set_camera_settings({ color = { boost = 1 } })"#,
+            "unknown color field",
+        ),
+        (
+            "type",
+            r#"rve.find("camera"):set_camera_settings({ projection = { fov_deg = "wide" } })"#,
+            "fov_deg must be a number",
+        ),
+        (
+            "enum",
+            r#"rve.find("camera"):set_camera_settings({ render = { anti_aliasing = "msaa" } })"#,
+            "anti_aliasing must be",
+        ),
+        (
+            "non-camera",
+            r#"rve.find("plain"):set_camera_settings({})"#,
+            "has no camera",
+        ),
+        (
+            "activate non-camera",
+            r#"rve.find("plain"):activate_camera()"#,
+            "has no camera",
+        ),
+    ] {
+        let mut world = two_cameras_with_lite_script();
+        let source =
+            format!("local Script = {{}}\nfunction Script:on_update() {body} end\nreturn Script");
+        let mut host = ScriptHost::load(
+            &world,
+            "scene",
+            &sources(&[("camera.lua", source.as_str())]),
+            None,
+        )
+        .unwrap();
+        host.update(&mut world, 0.1, ScriptTime::default());
+        assert!(
+            host.drain_events()
+                .iter()
+                .any(|event| event.level == ScriptEventLevel::Error
+                    && event.message.contains(expected)),
+            "{label} input did not produce {expected:?}"
+        );
+        assert_eq!(
+            world
+                .camera_settings(world.handle("camera").unwrap())
+                .unwrap()
+                .projection
+                .fov_deg,
+            60.0
+        );
+    }
+}
+
+#[test]
+fn invalid_lua_camera_settings_roll_back_settings_selection_and_transform() {
+    let mut world = two_cameras_with_lite_script();
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local own = rve.find("camera")
+  local transform = own:get_transform()
+  transform.position = { x = 9, y = 0, z = 0 }
+  own:set_transform(transform)
+  own:set_camera_settings({ color = { exposure_ev = 17 } })
+  rve.find("second"):activate_camera()
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("camera.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    let primary = world.handle("camera").unwrap();
+    assert_eq!(world.local_transform(primary).unwrap().position.x, 0.0);
+    assert_eq!(world.active_camera(), primary);
+    assert_eq!(
+        world.camera_settings(primary).unwrap().color.exposure_ev,
+        0.0
+    );
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("invalid camera settings")
+    }));
+}
+
+#[test]
+fn lua_camera_writes_are_rejected_during_creation() {
+    for source in [
+        r#"local camera = rve.find("camera"); camera:set_camera_settings({ color = { exposure_ev = 1 } }); return {}"#,
+        r#"local camera = rve.find("camera"); camera:activate_camera(); return {}"#,
+    ] {
+        let world = two_cameras_with_lite_script();
+        let handle = world.handle("camera").unwrap();
+        let result = ScriptHost::load(&world, "scene", &sources(&[("camera.lua", source)]), None);
+        assert!(
+            matches!(result, Err(ScriptLoadError::Lite { message, .. }) if message.contains("unavailable during script creation"))
+        );
+        assert_eq!(world.active_camera(), handle);
+        assert_eq!(
+            world.camera_settings(handle).unwrap().color.exposure_ev,
+            0.0
+        );
     }
 }
 

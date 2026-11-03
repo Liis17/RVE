@@ -2,6 +2,9 @@
 path = "/models/neko.fbx"
 
 [[assets]]
+path = "/cameras/neko.camerasettings"
+
+[[assets]]
 path = "/models/tx.png"
 
 [[assets]]
@@ -13,9 +16,7 @@ name = "Camera"
 [objects.transform]
 position = [0.0, 0.0, 5.8]
 [objects.camera]
-fov_deg = 45.0
-near = 0.01
-far = 100.0
+settings = "/cameras/neko.camerasettings"
 
 [[objects]]
 id = "light"

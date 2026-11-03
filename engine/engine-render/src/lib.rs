@@ -21,6 +21,7 @@ pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+const LDR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const SRGB_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const LINEAR_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -38,18 +39,21 @@ const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sh
 const OVERLAY_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.vert.spv"));
 const OVERLAY_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/overlay.frag.spv"));
-/// Swapchain принимает blit кадра и затем рисование оверлея.
-const SWAPCHAIN_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
-    vk::ImageUsageFlags::TRANSFER_DST.as_raw() | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
-);
+const SWAPCHAIN_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::COLOR_ATTACHMENT;
 const SURFACE_FORMAT_FEATURES: vk::FormatFeatureFlags = vk::FormatFeatureFlags::from_raw(
-    vk::FormatFeatureFlags::BLIT_DST.as_raw()
+    vk::FormatFeatureFlags::COLOR_ATTACHMENT.as_raw()
         | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND.as_raw(),
 );
 const UI_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.vert.spv"));
 const UI_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.frag.spv"));
+const FULLSCREEN_VERTEX_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
+const TONEMAP_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
+const OUTPUT_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/output.frag.spv"));
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
+const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 /// Два timestamp на слот кадра: перед shadow pass и после scene pass.
 const TIMESTAMP_QUERY_COUNT: u32 = 2;
 const WHITE_SRGB_TEXTURE: usize = 0;
@@ -176,7 +180,7 @@ impl Default for DirectionalLight {
 /// с той же конвенцией Y-up и глубиной `[0, 1]`; `None` отключает отбрасывание теней.
 /// `overlay` — треугольники (по три вершины), которые рисуются с альфа-смешиванием
 /// поверх итогового изображения без масштабирования `render_scale`; пустой срез
-/// отключает оверлей.
+/// отключает оверлей. `view` задаёт render scale, экспозицию, tonemapper и сглаживание.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
     pub clear_color: [f32; 4],
@@ -186,23 +190,70 @@ pub struct Frame<'a> {
     pub light: DirectionalLight,
     pub draws: &'a [DrawCommand],
     pub overlay: &'a [OverlayVertex],
+    pub view: ViewSettings,
 }
 
-/// Настройки Vulkan-рендерера.
-pub struct RendererConfig {
+/// Настройки масштабирования и обработки цвета одного вида.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewSettings {
     pub render_scale: f32,
-    pub extra_instance_extensions: Vec<&'static CStr>,
-    pub extra_device_extensions: Vec<&'static CStr>,
+    pub exposure_ev: f32,
+    pub tonemapper: Tonemapper,
+    pub anti_aliasing: AntiAliasing,
 }
 
-impl Default for RendererConfig {
+impl Default for ViewSettings {
     fn default() -> Self {
         Self {
             render_scale: 1.0,
-            extra_instance_extensions: Vec::new(),
-            extra_device_extensions: Vec::new(),
+            exposure_ev: 0.0,
+            tonemapper: Tonemapper::Aces,
+            anti_aliasing: AntiAliasing::Fxaa,
         }
     }
+}
+
+/// Оператор преобразования HDR-цвета в SDR.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tonemapper {
+    #[default]
+    Aces,
+    Neutral,
+    None,
+}
+
+impl Tonemapper {
+    const fn code(self) -> u32 {
+        match self {
+            Self::Aces => 0,
+            Self::Neutral => 1,
+            Self::None => 2,
+        }
+    }
+}
+
+/// Пространственная фильтрация перед выводом кадра.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AntiAliasing {
+    #[default]
+    Fxaa,
+    None,
+}
+
+impl AntiAliasing {
+    const fn code(self) -> u32 {
+        match self {
+            Self::Fxaa => 0,
+            Self::None => 1,
+        }
+    }
+}
+
+/// Настройки Vulkan-рендерера.
+#[derive(Default)]
+pub struct RendererConfig {
+    pub extra_instance_extensions: Vec<&'static CStr>,
+    pub extra_device_extensions: Vec<&'static CStr>,
 }
 
 /// Возможности выбранного физического устройства.
@@ -406,6 +457,10 @@ pub struct Renderer {
     pipeline_layout: Option<vk::PipelineLayout>,
     pipeline: Option<vk::Pipeline>,
     shadow_pipeline: Option<vk::Pipeline>,
+    post_pipeline_layout: Option<vk::PipelineLayout>,
+    tonemap_pipeline: Option<vk::Pipeline>,
+    output_pipeline: Option<vk::Pipeline>,
+    viewport_output_pipeline: Option<vk::Pipeline>,
     overlay_pipeline_layout: Option<vk::PipelineLayout>,
     overlay_pipeline: Option<vk::Pipeline>,
     ui_pipeline_layout: Option<vk::PipelineLayout>,
@@ -422,8 +477,10 @@ pub struct Renderer {
     material_set_layout: Option<vk::DescriptorSetLayout>,
     texture_set_layout: Option<vk::DescriptorSetLayout>,
     frame_descriptor_pool: Option<vk::DescriptorPool>,
+    post_descriptor_pool: Option<vk::DescriptorPool>,
     frame_uniforms: Vec<FrameUniforms>,
     sampler: Option<vk::Sampler>,
+    post_sampler: Option<vk::Sampler>,
     shadow_sampler: Option<vk::Sampler>,
     shadow_image: Option<DeviceImage>,
     max_texture_size: u32,
@@ -458,7 +515,6 @@ impl Renderer {
     where
         W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
     {
-        validate_render_scale(config.render_scale)?;
         let entry = engine_platform::load_vulkan()
             .map_err(|error| RenderError::Loader(error.to_string()))?;
         let window: Arc<dyn WindowHandleOwner> = window;
@@ -476,6 +532,10 @@ impl Renderer {
             pipeline_layout: None,
             pipeline: None,
             shadow_pipeline: None,
+            post_pipeline_layout: None,
+            tonemap_pipeline: None,
+            output_pipeline: None,
+            viewport_output_pipeline: None,
             overlay_pipeline_layout: None,
             overlay_pipeline: None,
             ui_pipeline_layout: None,
@@ -489,8 +549,10 @@ impl Renderer {
             material_set_layout: None,
             texture_set_layout: None,
             frame_descriptor_pool: None,
+            post_descriptor_pool: None,
             frame_uniforms: Vec::new(),
             sampler: None,
+            post_sampler: None,
             shadow_sampler: None,
             shadow_image: None,
             max_texture_size: 0,
@@ -860,18 +922,32 @@ impl Renderer {
         // Fence слота дождались, поэтому GPU больше не читает этот буфер.
         frame_uniforms.buffer.write(&uniforms)?;
         let frame_set = frame_uniforms.set;
-        let offscreen_extent = scaled_extent(swapchain.extent, self.config.render_scale);
+        let render_extent = scaled_extent(swapchain.extent, frame.view.render_scale);
         // Цели создаются при первом кадре: редактору они не нужны. Выделение идёт до acquire,
-        // чтобы ошибка памяти не оставила захваченный image и сигнальный semaphore.
-        let frame_resources = &mut self.frames[frame_slot];
-        if frame_resources.target.is_none() {
-            frame_resources.target = Some(OffscreenTarget::new(
-                &instance,
+        // чтобы ошибка памяти не оставила захваченный image и сигнальный semaphore. При смене
+        // масштаба заменяется только target текущего слота после ожидания его fence.
+        let post_sampler = self
+            .post_sampler
+            .ok_or(RenderError::InvalidState("post sampler отсутствует"))?;
+        let target_changed = frame_resources
+            .target
+            .as_ref()
+            .is_none_or(|target| target.render_extent != render_extent);
+        if target_changed {
+            let target = FrameTarget::new(&instance, &device, self.physical_device, render_extent)?;
+            write_image_set(
                 &device,
-                self.physical_device,
-                offscreen_extent,
-                vk::ImageUsageFlags::TRANSFER_SRC,
-            )?);
+                frame_resources.tonemap_set,
+                target.scene.color.view,
+                post_sampler,
+            );
+            write_image_set(
+                &device,
+                frame_resources.output_set,
+                target.ldr.view,
+                post_sampler,
+            );
+            frame_resources.target = Some(target);
         }
         let Some((image_index, acquire_suboptimal)) = acquire_image(
             &swapchain_loader,
@@ -915,6 +991,7 @@ impl Renderer {
             view_projection: frame.view_projection,
             clear_color: frame.clear_color,
             timestamps,
+            view: frame.view,
         };
         let frame_resources = &mut self.frames[frame_slot];
         let overlay =
@@ -929,7 +1006,6 @@ impl Renderer {
                     vertex_buffer: buffer.buffer,
                     // validate_overlay проверил, что число вершин помещается в u32.
                     vertex_count: frame.overlay.len() as u32,
-                    view: swapchain.views[image_index],
                 }),
                 _ => None,
             };
@@ -943,8 +1019,19 @@ impl Renderer {
             target,
             shadow_image,
             swapchain.images[image_index],
+            swapchain.views[image_index],
             swapchain.extent,
-            offscreen_extent,
+            frame.view,
+            frame_resources.tonemap_set,
+            frame_resources.output_set,
+            self.tonemap_pipeline
+                .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?,
+            self.output_pipeline
+                .ok_or(RenderError::InvalidState("output pipeline отсутствует"))?,
+            self.post_pipeline_layout.ok_or(RenderError::InvalidState(
+                "post pipeline layout отсутствует",
+            ))?,
+            is_srgb_format(self.surface_format.format),
             &shadow,
             &scene,
             overlay.as_ref(),
@@ -953,7 +1040,7 @@ impl Renderer {
         self.submit_and_present(
             image_index,
             acquire_suboptimal,
-            vk::PipelineStageFlags2::TRANSFER,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             timestamps.is_some(),
         )
     }
@@ -1036,6 +1123,9 @@ impl Renderer {
             image_sampler: self
                 .ui_sampler
                 .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?,
+            post_sampler: self
+                .post_sampler
+                .ok_or(RenderError::InvalidState("post sampler отсутствует"))?,
             frame_set_layout: self.frame_set_layout()?,
             shadow_view: self
                 .shadow_image
@@ -1056,26 +1146,29 @@ impl Renderer {
             if extent.width == 0 || extent.height == 0 {
                 continue;
             }
+            let render_extent = scaled_extent(extent, frame.view.render_scale);
             let slot_target = &mut entry.targets[frame_slot];
-            if slot_target
-                .as_ref()
-                .is_none_or(|target| target.extent != extent)
-            {
-                *slot_target = None;
+            if slot_target.as_ref().is_none_or(|target| {
+                target.extent != extent || target.render_extent != render_extent
+            }) {
                 *slot_target = Some(ViewportTarget::new(
                     &instance,
                     &device,
                     physical_device,
                     extent,
+                    render_extent,
                     &target_resources,
                 )?);
             }
-            let frame_set = slot_target
-                .as_ref()
-                .ok_or_else(unknown_viewport)?
-                .frame_set
-                .write(uniforms)?;
-            rendered.push((*viewport, *frame, frame_set));
+            let target = slot_target.as_ref().ok_or_else(unknown_viewport)?;
+            let frame_set = target.frame_set.write(uniforms)?;
+            rendered.push((
+                *viewport,
+                *frame,
+                frame_set,
+                target.tonemap_set,
+                target.output_set,
+            ));
         }
 
         let Some((image_index, acquire_suboptimal)) = acquire_image(
@@ -1094,7 +1187,10 @@ impl Renderer {
             let (set, image_is_linear) = match draw.image {
                 UiImage::Texture(texture) => (self.ui_texture(texture)?.set, false),
                 UiImage::Viewport(viewport) => {
-                    if !rendered.iter().any(|(drawn, _, _)| *drawn == viewport) {
+                    if !rendered
+                        .iter()
+                        .any(|(drawn, _, _, _, _)| *drawn == viewport)
+                    {
                         continue;
                     }
                     let target = self.viewports[viewport.0]
@@ -1123,31 +1219,36 @@ impl Renderer {
         let scene_passes = rendered
             .iter()
             .enumerate()
-            .map(|(index, (viewport, frame, frame_set))| {
-                (
-                    *viewport,
-                    ShadowPass {
-                        pipeline: shadow_pipeline,
-                        pipeline_layout,
-                        frame_set: *frame_set,
-                        meshes: &self.meshes,
-                        draws: frame.draws,
-                        light_view_projection: frame.shadow_view_projection,
-                        enabled: frame.shadow_view_projection.is_some(),
-                    },
-                    ScenePass {
-                        pipeline: scene_pipeline,
-                        pipeline_layout,
-                        frame_set: *frame_set,
-                        meshes: &self.meshes,
-                        materials: &self.materials,
-                        draws: frame.draws,
-                        view_projection: frame.view_projection,
-                        clear_color: frame.clear_color,
-                        timestamps: slot_timestamps.filter(|_| index == 0),
-                    },
-                )
-            })
+            .map(
+                |(index, (viewport, frame, frame_set, tonemap_set, output_set))| {
+                    (
+                        *viewport,
+                        ShadowPass {
+                            pipeline: shadow_pipeline,
+                            pipeline_layout,
+                            frame_set: *frame_set,
+                            meshes: &self.meshes,
+                            draws: frame.draws,
+                            light_view_projection: frame.shadow_view_projection,
+                            enabled: frame.shadow_view_projection.is_some(),
+                        },
+                        ScenePass {
+                            pipeline: scene_pipeline,
+                            pipeline_layout,
+                            frame_set: *frame_set,
+                            meshes: &self.meshes,
+                            materials: &self.materials,
+                            draws: frame.draws,
+                            view_projection: frame.view_projection,
+                            clear_color: frame.clear_color,
+                            timestamps: slot_timestamps.filter(|_| index == 0),
+                            view: frame.view,
+                        },
+                        *tonemap_set,
+                        *output_set,
+                    )
+                },
+            )
             .collect::<Vec<_>>();
         let timestamps = !scene_passes.is_empty() && slot_timestamps.is_some();
         let shadow_image = self
@@ -1178,36 +1279,60 @@ impl Renderer {
         };
 
         begin_command_buffer(&device, command_buffer)?;
-        for (viewport, shadow, pass) in &scene_passes {
+        let tonemap_pipeline = self
+            .tonemap_pipeline
+            .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?;
+        let viewport_output_pipeline =
+            self.viewport_output_pipeline
+                .ok_or(RenderError::InvalidState(
+                    "viewport output pipeline отсутствует",
+                ))?;
+        let post_pipeline_layout = self.post_pipeline_layout.ok_or(RenderError::InvalidState(
+            "post pipeline layout отсутствует",
+        ))?;
+        for (viewport, shadow, pass, tonemap_set, output_set) in &scene_passes {
             let Some(target) = self.viewports[viewport.0]
                 .as_mut()
                 .and_then(|entry| entry.targets[frame_slot].as_mut())
             else {
                 continue;
             };
-            let extent = target.extent;
             record_scene(
                 &device,
                 command_buffer,
-                &mut target.offscreen,
+                &mut target.scene,
                 shadow_image,
-                extent,
+                target.render_extent,
                 shadow,
                 pass,
             );
-            let to_sampled = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(target.offscreen.color.image)
-                .subresource_range(color_subresource_range());
-            pipeline_barrier(&device, command_buffer, to_sampled);
-            target.offscreen.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            record_tonemap_pass(
+                &device,
+                command_buffer,
+                &mut target.scene,
+                &target.ldr,
+                target.render_extent,
+                *tonemap_set,
+                tonemap_pipeline,
+                post_pipeline_layout,
+                pass.view,
+                pass.timestamps,
+            );
+            record_output_pass(
+                &device,
+                command_buffer,
+                target.output.image,
+                target.output.view,
+                target.render_extent,
+                target.extent,
+                *output_set,
+                viewport_output_pipeline,
+                post_pipeline_layout,
+                pass.view.anti_aliasing,
+                true,
+                None,
+                true,
+            );
         }
         record_ui(
             &device,
@@ -1495,6 +1620,7 @@ impl Renderer {
         self.create_descriptor_resources()?;
         self.create_mesh_pipeline()?;
         self.create_shadow_pipeline()?;
+        self.create_post_pipelines()?;
         self.create_overlay_pipeline()?;
         self.create_ui_pipeline()?;
         let white_srgb = Arc::new(self.upload_texture(1, 1, &[255; 4], TextureColorSpace::Srgb)?);
@@ -1614,6 +1740,16 @@ impl Renderer {
         let sampler_info = material_sampler_info(self.texture_sampler_anisotropy);
         // SAFETY: sampler anisotropy is enabled only when the selected device supports it.
         self.sampler = Some(unsafe { device.create_sampler(&sampler_info, None) }?);
+        let post_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(0.0);
+        // SAFETY: the post sampler uses core linear filtering and clamp-to-edge addressing.
+        self.post_sampler = Some(unsafe { device.create_sampler(&post_sampler_info, None) }?);
 
         let shadow_image = self
             .shadow_image
@@ -1656,6 +1792,33 @@ impl Renderer {
             )?;
             write_frame_set(&device, set, &buffer, shadow_view, shadow_sampler);
             self.frame_uniforms.push(FrameUniforms { buffer, set });
+        }
+
+        let post_set_count = (self.frames.len() * 2) as u32;
+        let post_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(post_set_count),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(post_set_count),
+        ];
+        let post_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(post_set_count)
+            .pool_sizes(&post_pool_sizes);
+        // SAFETY: each frame slot owns a tonemap and output image set.
+        let post_pool = unsafe { device.create_descriptor_pool(&post_pool_info, None) }?;
+        self.post_descriptor_pool = Some(post_pool);
+        let post_layouts = vec![self.texture_set_layout()?; post_set_count as usize];
+        let post_allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(post_pool)
+            .set_layouts(&post_layouts);
+        // SAFETY: the pool was sized for these image and sampler sets.
+        let post_sets = unsafe { device.allocate_descriptor_sets(&post_allocate_info) }?;
+        let (post_sets, _) = post_sets.as_chunks::<2>();
+        for (frame, sets) in self.frames.iter_mut().zip(post_sets) {
+            frame.tonemap_set = sets[0];
+            frame.output_set = sets[1];
         }
         Ok(())
     }
@@ -2125,6 +2288,40 @@ impl Renderer {
         Ok(())
     }
 
+    fn create_post_pipelines(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let set_layouts = [self.texture_set_layout()?];
+        let push_constant_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(POST_PUSH_CONSTANTS_SIZE as u32)];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant_ranges);
+        // SAFETY: the image/sampler set layout and 16-byte fragment range are valid.
+        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
+        self.post_pipeline_layout = Some(layout);
+        self.tonemap_pipeline = Some(create_post_pipeline(
+            &device,
+            layout,
+            LDR_FORMAT,
+            TONEMAP_FRAGMENT_SHADER,
+        )?);
+        self.output_pipeline = Some(create_post_pipeline(
+            &device,
+            layout,
+            self.surface_format.format,
+            OUTPUT_FRAGMENT_SHADER,
+        )?);
+        self.viewport_output_pipeline = Some(create_post_pipeline(
+            &device,
+            layout,
+            LDR_FORMAT,
+            OUTPUT_FRAGMENT_SHADER,
+        )?);
+        Ok(())
+    }
+
     /// Pipeline оверлея: 2D-треугольники с альфа-смешиванием прямо в swapchain image.
     fn create_overlay_pipeline(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
@@ -2431,12 +2628,20 @@ impl Drop for Renderer {
                 // SAFETY: the device is idle; destroying the pool frees its frame sets.
                 unsafe { device.destroy_descriptor_pool(pool, None) };
             }
+            if let Some(pool) = self.post_descriptor_pool.take() {
+                // SAFETY: frame targets are gone; destroying the pool frees their post sets.
+                unsafe { device.destroy_descriptor_pool(pool, None) };
+            }
             if let Some(sampler) = self.sampler.take() {
                 // SAFETY: every material descriptor referencing the sampler was destroyed above.
                 unsafe { device.destroy_sampler(sampler, None) };
             }
             if let Some(sampler) = self.ui_sampler.take() {
                 // SAFETY: every UI texture and viewport descriptor referencing the sampler is gone.
+                unsafe { device.destroy_sampler(sampler, None) };
+            }
+            if let Some(sampler) = self.post_sampler.take() {
+                // SAFETY: every post descriptor pool referencing this sampler was destroyed above.
                 unsafe { device.destroy_sampler(sampler, None) };
             }
             if let Some(sampler) = self.shadow_sampler.take() {
@@ -2455,8 +2660,23 @@ impl Drop for Renderer {
                 // SAFETY: the device is idle, so no command buffer uses this pipeline.
                 unsafe { device.destroy_pipeline(pipeline, None) };
             }
+            for pipeline in [
+                self.tonemap_pipeline.take(),
+                self.output_pipeline.take(),
+                self.viewport_output_pipeline.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                // SAFETY: the device is idle, so no command buffer uses these pipelines.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
             if let Some(layout) = self.pipeline_layout.take() {
                 // SAFETY: the only pipeline created with this layout was destroyed above.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+            if let Some(layout) = self.post_pipeline_layout.take() {
+                // SAFETY: all pipelines created with this layout were destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
             if let Some(pipeline) = self.overlay_pipeline.take() {
@@ -2718,13 +2938,24 @@ fn choose_device(
             instance.get_physical_device_format_properties(physical_device, OFFSCREEN_FORMAT)
         };
         let offscreen_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT
-            | vk::FormatFeatureFlags::BLIT_SRC
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
         if !offscreen_properties
             .optimal_tiling_features
             .contains(offscreen_features)
         {
-            reasons.push("R16G16B16A16_SFLOAT не поддерживает нужные offscreen usage".to_owned());
+            reasons.push("R16G16B16A16_SFLOAT не поддерживает HDR scene sampling".to_owned());
+        }
+        // SAFETY: format support is queried for this physical device.
+        let ldr_properties =
+            unsafe { instance.get_physical_device_format_properties(physical_device, LDR_FORMAT) };
+        let missing_ldr_features =
+            missing_post_format_features(ldr_properties.optimal_tiling_features);
+        if !missing_ldr_features.is_empty() {
+            reasons.push(format!(
+                "R8G8B8A8_SRGB не поддерживает возможности post target: {}",
+                missing_ldr_features.join(", ")
+            ));
         }
         // SAFETY: format support is queried for this physical device.
         let depth_properties = unsafe {
@@ -2748,7 +2979,7 @@ fn choose_device(
             .supported_usage_flags
             .contains(SWAPCHAIN_USAGE)
         {
-            reasons.push("surface не поддерживает TRANSFER_DST и COLOR_ATTACHMENT".to_owned());
+            reasons.push("surface не поддерживает COLOR_ATTACHMENT".to_owned());
         }
         // SAFETY: surface query only reads capabilities for the live device and surface.
         let surface_formats = unsafe {
@@ -2763,7 +2994,8 @@ fn choose_device(
         }
         let surface_format = choose_surface_format(instance, physical_device, &surface_formats);
         if surface_format.is_none() {
-            reasons.push("нет surface-формата с BLIT_DST и COLOR_ATTACHMENT_BLEND".to_owned());
+            reasons
+                .push("нет surface-формата с COLOR_ATTACHMENT и COLOR_ATTACHMENT_BLEND".to_owned());
         }
 
         let mut queue_family_index = None;
@@ -2880,7 +3112,7 @@ impl SwapchainBundle {
         }?;
         if !capabilities.supported_usage_flags.contains(SWAPCHAIN_USAGE) {
             return Err(RenderError::Unsupported(
-                "surface больше не поддерживает TRANSFER_DST и COLOR_ATTACHMENT".to_owned(),
+                "surface больше не поддерживает COLOR_ATTACHMENT".to_owned(),
             ));
         }
         let extent = select_surface_extent(capabilities, requested_extent);
@@ -2965,7 +3197,9 @@ struct FrameResources {
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     image_available: vk::Semaphore,
-    target: Option<OffscreenTarget>,
+    target: Option<FrameTarget>,
+    tonemap_set: vk::DescriptorSet,
+    output_set: vk::DescriptorSet,
     /// Вершины оверлея этого слота.
     overlay_buffer: GrowingBuffer,
     ui_vertices: GrowingBuffer,
@@ -2988,6 +3222,8 @@ impl FrameResources {
             fence: vk::Fence::null(),
             image_available: vk::Semaphore::null(),
             target: None,
+            tonemap_set: vk::DescriptorSet::null(),
+            output_set: vk::DescriptorSet::null(),
             overlay_buffer: GrowingBuffer::default(),
             ui_vertices: GrowingBuffer::default(),
             ui_indices: GrowingBuffer::default(),
@@ -3126,7 +3362,6 @@ impl OffscreenTarget {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         extent: vk::Extent2D,
-        output_usage: vk::ImageUsageFlags,
     ) -> Result<Self, RenderError> {
         Ok(Self {
             color: DeviceImage::new(
@@ -3135,7 +3370,7 @@ impl OffscreenTarget {
                 physical_device,
                 extent,
                 OFFSCREEN_FORMAT,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | output_usage,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 color_subresource_range(),
             )?,
             depth: DeviceImage::new(
@@ -3148,6 +3383,35 @@ impl OffscreenTarget {
                 depth_subresource_range(),
             )?,
             layout: vk::ImageLayout::UNDEFINED,
+        })
+    }
+}
+
+struct FrameTarget {
+    scene: OffscreenTarget,
+    ldr: DeviceImage,
+    render_extent: vk::Extent2D,
+}
+
+impl FrameTarget {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        render_extent: vk::Extent2D,
+    ) -> Result<Self, RenderError> {
+        Ok(Self {
+            scene: OffscreenTarget::new(instance, device, physical_device, render_extent)?,
+            ldr: DeviceImage::new(
+                instance,
+                device,
+                physical_device,
+                render_extent,
+                LDR_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                color_subresource_range(),
+            )?,
+            render_extent,
         })
     }
 }
@@ -3193,6 +3457,7 @@ fn write_frame_set(
 struct ViewportTargetResources {
     image_set_layout: vk::DescriptorSetLayout,
     image_sampler: vk::Sampler,
+    post_sampler: vk::Sampler,
     frame_set_layout: vk::DescriptorSetLayout,
     shadow_view: vk::ImageView,
     shadow_sampler: vk::Sampler,
@@ -3282,10 +3547,16 @@ impl Drop for ViewportFrameSet {
 /// Цель рендера сцены одного кадрового слота, которую UI читает как текстуру.
 struct ViewportTarget {
     device: ash::Device,
-    pool: vk::DescriptorPool,
+    ui_pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
+    post_pool: vk::DescriptorPool,
+    tonemap_set: vk::DescriptorSet,
+    output_set: vk::DescriptorSet,
     extent: vk::Extent2D,
-    offscreen: OffscreenTarget,
+    render_extent: vk::Extent2D,
+    scene: OffscreenTarget,
+    ldr: DeviceImage,
+    output: DeviceImage,
     frame_set: ViewportFrameSet,
 }
 
@@ -3295,28 +3566,60 @@ impl ViewportTarget {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         extent: vk::Extent2D,
+        render_extent: vk::Extent2D,
         resources: &ViewportTargetResources,
     ) -> Result<Self, RenderError> {
-        let offscreen = OffscreenTarget::new(
+        let scene = OffscreenTarget::new(instance, device, physical_device, render_extent)?;
+        let ldr = DeviceImage::new(
+            instance,
+            device,
+            physical_device,
+            render_extent,
+            LDR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            color_subresource_range(),
+        )?;
+        let output = DeviceImage::new(
             instance,
             device,
             physical_device,
             extent,
-            vk::ImageUsageFlags::SAMPLED,
+            LDR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            color_subresource_range(),
         )?;
         let frame_set = ViewportFrameSet::new(instance, device, physical_device, resources)?;
-        let (pool, set) = allocate_image_set(
+        let (post_pool, post_sets) = allocate_post_image_sets(
             device,
             resources.image_set_layout,
-            offscreen.color.view,
-            resources.image_sampler,
+            resources.post_sampler,
+            [scene.color.view, ldr.view],
         )?;
+        let (ui_pool, set) = match allocate_image_set(
+            device,
+            resources.image_set_layout,
+            output.view,
+            resources.image_sampler,
+        ) {
+            Ok(set) => set,
+            Err(error) => {
+                // SAFETY: no command buffer references the new target during construction.
+                unsafe { device.destroy_descriptor_pool(post_pool, None) };
+                return Err(error);
+            }
+        };
         Ok(Self {
             device: device.clone(),
-            pool,
+            ui_pool,
             set,
+            post_pool,
+            tonemap_set: post_sets[0],
+            output_set: post_sets[1],
             extent,
-            offscreen,
+            render_extent,
+            scene,
+            ldr,
+            output,
             frame_set,
         })
     }
@@ -3325,7 +3628,10 @@ impl ViewportTarget {
 impl Drop for ViewportTarget {
     fn drop(&mut self) {
         // SAFETY: the target is dropped only after fences of the submissions using it were waited.
-        unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
+        unsafe {
+            self.device.destroy_descriptor_pool(self.ui_pool, None);
+            self.device.destroy_descriptor_pool(self.post_pool, None);
+        };
     }
 }
 
@@ -3396,6 +3702,63 @@ fn allocate_image_set(
             return Err(RenderError::Vulkan(error));
         }
     };
+    write_image_set(device, set, view, sampler);
+    Ok((pool, set))
+}
+
+fn allocate_post_image_sets(
+    device: &ash::Device,
+    layout: vk::DescriptorSetLayout,
+    sampler: vk::Sampler,
+    views: [vk::ImageView; 2],
+) -> Result<(vk::DescriptorPool, [vk::DescriptorSet; 2]), RenderError> {
+    let pool_sizes = [
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(2),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::SAMPLER)
+            .descriptor_count(2),
+    ];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(2)
+        .pool_sizes(&pool_sizes);
+    // SAFETY: the pool holds one tonemap and one output descriptor set.
+    let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+    let layouts = [layout; 2];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool)
+        .set_layouts(&layouts);
+    // SAFETY: the pool was sized for two sets of this layout.
+    let sets = match unsafe { device.allocate_descriptor_sets(&allocate_info) } {
+        Ok(sets) => sets,
+        Err(error) => {
+            // SAFETY: no set was allocated from this new pool.
+            unsafe { device.destroy_descriptor_pool(pool, None) };
+            return Err(RenderError::Vulkan(error));
+        }
+    };
+    let sets: [vk::DescriptorSet; 2] = match sets.try_into() {
+        Ok(sets) => sets,
+        Err(_) => {
+            // SAFETY: no command buffer references the newly allocated sets.
+            unsafe { device.destroy_descriptor_pool(pool, None) };
+            return Err(RenderError::InvalidState(
+                "неверное число post descriptor sets",
+            ));
+        }
+    };
+    write_image_set(device, sets[0], views[0], sampler);
+    write_image_set(device, sets[1], views[1], sampler);
+    Ok((pool, sets))
+}
+
+fn write_image_set(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+) {
     let image_info = [vk::DescriptorImageInfo::default()
         .image_view(view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
@@ -3414,7 +3777,6 @@ fn allocate_image_set(
     ];
     // SAFETY: the set, image view and sampler are alive and the set is not in use.
     unsafe { device.update_descriptor_sets(&writes, &[]) };
-    Ok((pool, set))
 }
 
 /// Получает swapchain image; `None` означает, что кадр нужно пропустить.
@@ -3552,11 +3914,18 @@ impl Drop for DeviceImage {
 fn record_frame(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
-    target: &mut OffscreenTarget,
+    target: &mut FrameTarget,
     shadow_image: &DeviceImage,
     output_image: vk::Image,
+    output_view: vk::ImageView,
     output_extent: vk::Extent2D,
-    render_extent: vk::Extent2D,
+    view: ViewSettings,
+    tonemap_set: vk::DescriptorSet,
+    output_set: vk::DescriptorSet,
+    tonemap_pipeline: vk::Pipeline,
+    output_pipeline: vk::Pipeline,
+    post_pipeline_layout: vk::PipelineLayout,
+    output_is_srgb: bool,
     shadow: &ShadowPass<'_>,
     scene: &ScenePass<'_>,
     overlay: Option<&OverlayPass>,
@@ -3565,37 +3934,41 @@ fn record_frame(
     record_scene(
         device,
         command_buffer,
-        target,
+        &mut target.scene,
         shadow_image,
-        render_extent,
+        target.render_extent,
         shadow,
         scene,
     );
-
-    let source_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(target.color.image)
-        .subresource_range(color_subresource_range());
-    pipeline_barrier(device, command_buffer, source_barrier);
+    record_tonemap_pass(
+        device,
+        command_buffer,
+        &mut target.scene,
+        &target.ldr,
+        target.render_extent,
+        tonemap_set,
+        tonemap_pipeline,
+        post_pipeline_layout,
+        view,
+        scene.timestamps,
+    );
     record_output_pass(
         device,
         command_buffer,
-        target.color.image,
         output_image,
-        render_extent,
+        output_view,
+        target.render_extent,
         output_extent,
+        output_set,
+        output_pipeline,
+        post_pipeline_layout,
+        view.anti_aliasing,
+        output_is_srgb,
         overlay,
+        false,
     );
     // SAFETY: command recording is complete before the command buffer is submitted.
     unsafe { device.end_command_buffer(command_buffer) }?;
-    target.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
     Ok(())
 }
 
@@ -3610,21 +3983,6 @@ fn begin_command_buffer(
     // SAFETY: the command buffer was reset and belongs to the renderer's graphics command pool.
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
     Ok(())
-}
-
-/// Стадия и доступ последнего использования цвета offscreen-цели до следующего кадра.
-fn offscreen_previous_use(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
-    match layout {
-        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        ),
-        _ => (
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_READ,
-        ),
-    }
 }
 
 /// Записывает shadow и scene pass; цвет цели остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
@@ -3784,18 +4142,7 @@ fn record_scene(
     record_draws(device, command_buffer, render_extent, scene);
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
-    if let Some(pool) = scene.timestamps {
-        // Конец scene pass: blit и оверлей ждут swapchain image и в замер не входят.
-        // SAFETY: the query was reset at the start of this command buffer.
-        unsafe {
-            device.cmd_write_timestamp2(
-                command_buffer,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                pool,
-                1,
-            );
-        }
-    }
+    target.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
 }
 
 struct ScenePass<'a> {
@@ -3808,6 +4155,7 @@ struct ScenePass<'a> {
     view_projection: [[f32; 4]; 4],
     clear_color: [f32; 4],
     timestamps: Option<vk::QueryPool>,
+    view: ViewSettings,
 }
 
 /// Depth-only shadow pass. It shares the frame set and model transforms with the scene pass.
@@ -3839,7 +4187,6 @@ struct OverlayPass {
     pipeline_layout: vk::PipelineLayout,
     vertex_buffer: vk::Buffer,
     vertex_count: u32,
-    view: vk::ImageView,
 }
 
 fn record_draws(
@@ -4009,124 +4356,250 @@ fn scene_viewport(extent: vk::Extent2D) -> vk::Viewport {
     }
 }
 
-fn record_output_pass(
+#[allow(clippy::too_many_arguments)]
+fn record_tonemap_pass(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
-    source_image: vk::Image,
-    output_image: vk::Image,
-    render_extent: vk::Extent2D,
-    output_extent: vk::Extent2D,
-    overlay: Option<&OverlayPass>,
+    source: &mut OffscreenTarget,
+    output: &DeviceImage,
+    extent: vk::Extent2D,
+    set: vk::DescriptorSet,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    view: ViewSettings,
+    timestamps: Option<vk::QueryPool>,
 ) {
-    // TRANSFER связывает переход layout с ожиданием acquire на этой стадии.
+    let source_barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        .old_layout(source.layout)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(source.color.image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, source_barrier);
     let output_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
         .src_access_mask(vk::AccessFlags2::NONE)
-        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(output_image)
-        .subresource_range(color_subresource_range());
-    pipeline_barrier(device, command_buffer, output_barrier);
-
-    let region = [vk::ImageBlit2::default()
-        .src_subresource(color_subresource_layers())
-        .src_offsets([
-            vk::Offset3D { x: 0, y: 0, z: 0 },
-            vk::Offset3D {
-                x: render_extent.width as i32,
-                y: render_extent.height as i32,
-                z: 1,
-            },
-        ])
-        .dst_subresource(color_subresource_layers())
-        .dst_offsets([
-            vk::Offset3D { x: 0, y: 0, z: 0 },
-            vk::Offset3D {
-                x: output_extent.width as i32,
-                y: output_extent.height as i32,
-                z: 1,
-            },
-        ])];
-    let blit_info = vk::BlitImageInfo2::default()
-        .src_image(source_image)
-        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        .dst_image(output_image)
-        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .regions(&region)
-        .filter(vk::Filter::LINEAR);
-    // SAFETY: source/destination images support the requested blit formats and layouts.
-    unsafe { device.cmd_blit_image2(command_buffer, &blit_info) };
-
-    let (last_stage, last_access, last_layout) = match overlay {
-        Some(overlay) => {
-            record_overlay(device, command_buffer, output_image, output_extent, overlay);
-            (
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            )
-        }
-        None => (
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        ),
-    };
-    let present_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(last_stage)
-        .src_access_mask(last_access)
-        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-        .dst_access_mask(vk::AccessFlags2::NONE)
-        .old_layout(last_layout)
-        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(output_image)
-        .subresource_range(color_subresource_range());
-    pipeline_barrier(device, command_buffer, present_barrier);
-}
-
-/// Рисует оверлей поверх результата blit; image остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
-fn record_overlay(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    output_image: vk::Image,
-    output_extent: vk::Extent2D,
-    overlay: &OverlayPass,
-) {
-    let to_attachment = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
         .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(
-            vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        )
-        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .old_layout(vk::ImageLayout::UNDEFINED)
         .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(output_image)
+        .image(output.image)
         .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, output_barrier);
+
+    let attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(output.view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent,
+    };
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(area)
+        .layer_count(1)
+        .color_attachments(&attachment);
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: extent.width as f32,
+        height: extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let push_constants = float_bytes::<POST_PUSH_CONSTANTS_SIZE>(&[
+        view.exposure_ev,
+        view.tonemapper.code() as f32,
+        0.0,
+        0.0,
+    ]);
+    // SAFETY: source and destination views match the descriptor and attachment layouts.
+    unsafe {
+        device.cmd_begin_rendering(command_buffer, &rendering_info);
+        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_set_viewport(command_buffer, 0, &viewport);
+        device.cmd_set_scissor(command_buffer, 0, &[area]);
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline_layout,
+            0,
+            &[set],
+            &[],
+        );
+        device.cmd_push_constants(
+            command_buffer,
+            pipeline_layout,
+            vk::ShaderStageFlags::FRAGMENT,
+            0,
+            &push_constants,
+        );
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.cmd_end_rendering(command_buffer);
+    }
+    if let Some(pool) = timestamps {
+        // End GPU timing after tone mapping and before any swapchain-dependent output work.
+        // SAFETY: the query was reset by record_scene and this pass follows its scene rendering.
+        unsafe {
+            device.cmd_write_timestamp2(
+                command_buffer,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                pool,
+                1,
+            );
+        }
+    }
+    let sampled = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(output.image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, sampled);
+    source.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_output_pass(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    output_image: vk::Image,
+    output_view: vk::ImageView,
+    source_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
+    set: vk::DescriptorSet,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    anti_aliasing: AntiAliasing,
+    output_is_srgb: bool,
+    overlay: Option<&OverlayPass>,
+    sample_output: bool,
+) {
+    let to_attachment = output_attachment_barrier(output_image);
     pipeline_barrier(device, command_buffer, to_attachment);
 
     let area = vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
         extent: output_extent,
     };
-    // Результат blit сохраняется: оверлей смешивается поверх него.
-    let color_attachment = [vk::RenderingAttachmentInfo::default()
-        .image_view(overlay.view)
+    let attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(output_view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::LOAD)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
         .store_op(vk::AttachmentStoreOp::STORE)];
     let rendering_info = vk::RenderingInfo::default()
         .render_area(area)
         .layer_count(1)
-        .color_attachments(&color_attachment);
+        .color_attachments(&attachment);
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: output_extent.width as f32,
+        height: output_extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let [texel_width, texel_height] = inverse_extent(source_extent);
+    let push_constants = float_bytes::<POST_PUSH_CONSTANTS_SIZE>(&[
+        texel_width,
+        texel_height,
+        anti_aliasing.code() as f32,
+        f32::from(u8::from(output_is_srgb)),
+    ]);
+    // SAFETY: the output view uses the pipeline's color format and descriptor set samples LDR.
+    unsafe {
+        device.cmd_begin_rendering(command_buffer, &rendering_info);
+        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_set_viewport(command_buffer, 0, &viewport);
+        device.cmd_set_scissor(command_buffer, 0, &[area]);
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline_layout,
+            0,
+            &[set],
+            &[],
+        );
+        device.cmd_push_constants(
+            command_buffer,
+            pipeline_layout,
+            vk::ShaderStageFlags::FRAGMENT,
+            0,
+            &push_constants,
+        );
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+    }
+    if let Some(overlay) = overlay {
+        record_overlay(device, command_buffer, output_extent, overlay);
+    }
+    // SAFETY: this matches the output pass's dynamic rendering begin.
+    unsafe { device.cmd_end_rendering(command_buffer) };
+
+    let sampled_output = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(if sample_output {
+            vk::PipelineStageFlags2::FRAGMENT_SHADER
+        } else {
+            vk::PipelineStageFlags2::NONE
+        })
+        .dst_access_mask(if sample_output {
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+        } else {
+            vk::AccessFlags2::NONE
+        })
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(if sample_output {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        } else {
+            vk::ImageLayout::PRESENT_SRC_KHR
+        })
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(output_image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, sampled_output);
+}
+
+fn output_attachment_barrier(output_image: vk::Image) -> vk::ImageMemoryBarrier2<'static> {
+    // Keep the layout transition in the COLOR_ATTACHMENT_OUTPUT acquire-wait scope.
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(output_image)
+        .subresource_range(color_subresource_range())
+}
+
+/// Рисует оверлей внутри output pass, поверх уже отфильтрованного изображения.
+fn record_overlay(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    output_extent: vk::Extent2D,
+    overlay: &OverlayPass,
+) {
+    let area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: output_extent,
+    };
     let viewport = [vk::Viewport {
         x: 0.0,
         y: 0.0,
@@ -4137,10 +4610,8 @@ fn record_overlay(
     }];
     let push_constants =
         float_bytes::<OVERLAY_PUSH_CONSTANTS_SIZE>(&[viewport[0].width, viewport[0].height]);
-    // SAFETY: the view belongs to the output image, the pipeline matches the swapchain format,
-    // and the vertex buffer holds vertex_count overlay vertices written after the slot fence.
+    // SAFETY: output pass rendering is active and the vertex buffer was written after the slot fence.
     unsafe {
-        device.cmd_begin_rendering(command_buffer, &rendering_info);
         device.cmd_bind_pipeline(
             command_buffer,
             vk::PipelineBindPoint::GRAPHICS,
@@ -4157,7 +4628,6 @@ fn record_overlay(
             &push_constants,
         );
         device.cmd_draw(command_buffer, overlay.vertex_count, 1, 0, 0);
-        device.cmd_end_rendering(command_buffer);
     }
 }
 
@@ -4461,6 +4931,20 @@ fn missing_texture_format_features(supported: vk::FormatFeatureFlags) -> Vec<&'s
     .collect()
 }
 
+fn missing_post_format_features(supported: vk::FormatFeatureFlags) -> Vec<&'static str> {
+    [
+        (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
+        (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+        (
+            vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            "SAMPLED_IMAGE_FILTER_LINEAR",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(feature, name)| (!supported.contains(feature)).then_some(name))
+    .collect()
+}
+
 fn texture_format(color_space: TextureColorSpace) -> vk::Format {
     match color_space {
         TextureColorSpace::Srgb => SRGB_TEXTURE_FORMAT,
@@ -4487,6 +4971,21 @@ fn texture_format_reasons(
         })
     })
     .collect()
+}
+
+/// Возвращает источник доступа текущего layout цвета перед следующим проходом сцены.
+fn offscreen_previous_use(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    match layout {
+        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        ),
+        _ => (
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+        ),
+    }
 }
 
 fn color_subresource_range() -> vk::ImageSubresourceRange {
@@ -4543,6 +5042,76 @@ impl Drop for ShaderModule {
         // SAFETY: shader modules may be destroyed once pipeline creation has returned.
         unsafe { self.device.destroy_shader_module(self.handle, None) };
     }
+}
+
+fn create_post_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    color_format: vk::Format,
+    fragment_shader: &[u8],
+) -> Result<vk::Pipeline, RenderError> {
+    let vertex_module = ShaderModule::new(device, FULLSCREEN_VERTEX_SHADER)?;
+    let fragment_module = ShaderModule::new(device, fragment_shader)?;
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex_module.handle)
+            .name(c"main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment_module.handle)
+            .name(c"main"),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let color_blend =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let color_formats = [color_format];
+    let mut rendering_info =
+        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+    let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(layout)
+        .push_next(&mut rendering_info)];
+    // SAFETY: the modules, layout and dynamic-rendering format belong to this device.
+    let mut pipelines = match unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+    } {
+        Ok(pipelines) => pipelines,
+        Err((pipelines, error)) => {
+            for pipeline in pipelines {
+                // SAFETY: partial pipeline handles were returned by this device.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            return Err(error.into());
+        }
+    };
+    pipelines
+        .pop()
+        .ok_or(RenderError::InvalidState("post pipeline не создан"))
 }
 
 /// Uniform-буфер освещения и его набор дескрипторов для одного слота кадра.
@@ -4876,6 +5445,7 @@ fn validate_scene_viewports(
 }
 
 fn frame_uniform_bytes(frame: &Frame<'_>) -> Result<[u8; FRAME_UNIFORMS_SIZE], RenderError> {
+    validate_view_settings(frame.view)?;
     let light = frame.light;
     let [x, y, z] = light.direction;
     let length_squared = x * x + y * y + z * z;
@@ -5092,12 +5662,27 @@ fn validate_render_scale(scale: f32) -> Result<(), RenderError> {
     }
 }
 
+fn validate_view_settings(view: ViewSettings) -> Result<(), RenderError> {
+    validate_render_scale(view.render_scale)?;
+    if view.exposure_ev.is_finite() && (-16.0..=16.0).contains(&view.exposure_ev) {
+        Ok(())
+    } else {
+        Err(RenderError::InvalidConfig(
+            "exposure_ev должен быть конечным и находиться в [-16, 16]",
+        ))
+    }
+}
+
 fn scaled_extent(output: vk::Extent2D, scale: f32) -> vk::Extent2D {
     let scale = f64::from(scale);
     vk::Extent2D {
         width: ((f64::from(output.width) * scale).floor() as u32).max(1),
         height: ((f64::from(output.height) * scale).floor() as u32).max(1),
     }
+}
+
+fn inverse_extent(extent: vk::Extent2D) -> [f32; 2] {
+    [1.0 / extent.width as f32, 1.0 / extent.height as f32]
 }
 
 fn select_surface_extent(
@@ -5136,15 +5721,17 @@ fn select_composite_alpha(
 #[cfg(test)]
 mod tests {
     use super::{
-        AcquireAction, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
-        FRAME_UNIFORMS_SIZE, Frame, MATERIAL_UNIFORMS_SIZE, MESH_FRAGMENT_SHADER,
-        MESH_VERTEX_SHADER, Material, MaterialId, MeshId, OVERLAY_FRAGMENT_SHADER,
-        OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure, RenderError, Renderer,
-        RendererConfig, SHADOW_VERTEX_SHADER, TextureColorSpace, TextureId, UI_FRAGMENT_SHADER,
-        UI_VERTEX_SHADER, Vertex, best_device_index, check_extensions, classify_acquire_result,
-        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
-        evaluate_device, frame_uniform_bytes, index_bytes, material_sampler_info,
-        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
+        AcquireAction, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
+        FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT, MATERIAL_UNIFORMS_SIZE,
+        MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId, OFFSCREEN_FORMAT,
+        OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex,
+        ProbeInstanceFailure, RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER,
+        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
+        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
+        check_extensions, classify_acquire_result, classify_probe_instance_failure,
+        deduplicate_names, derivative_tangent_basis, evaluate_device, frame_uniform_bytes,
+        index_bytes, inverse_extent, material_sampler_info, material_uniform_bytes, mip_extent,
+        mip_level_count, missing_extensions, missing_post_format_features,
         missing_texture_format_features, normal_matrix, offscreen_previous_use,
         overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
         scene_viewport, select_composite_alpha, select_surface_extent, shadow_casters,
@@ -5152,7 +5739,8 @@ mod tests {
         texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
         texture_mip_source_barrier, texture_upload_barrier, timestamp_duration,
         transform_tangent_normal, validate_draws, validate_material, validate_mesh,
-        validate_overlay, validate_render_scale, validate_texture, vertex_bytes,
+        validate_overlay, validate_render_scale, validate_texture, validate_view_settings,
+        vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -5310,6 +5898,32 @@ mod tests {
     }
 
     #[test]
+    fn output_attachment_transition_is_ordered_at_color_output() {
+        let image = vk::Image::null();
+        let barrier = super::output_attachment_barrier(image);
+
+        assert_eq!(barrier.image, image);
+        assert_eq!(
+            barrier.src_stage_mask,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+        );
+        assert_eq!(barrier.src_access_mask, vk::AccessFlags2::NONE);
+        assert_eq!(
+            barrier.dst_stage_mask,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+        );
+        assert_eq!(
+            barrier.dst_access_mask,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+        );
+        assert_eq!(barrier.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(
+            barrier.new_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+    }
+
+    #[test]
     fn material_sampler_enables_mip_filtering_and_optional_anisotropy() {
         let cases = [
             (false, 16.0, None),
@@ -5363,6 +5977,32 @@ mod tests {
     }
 
     #[test]
+    fn post_format_requires_attachment_sampling_and_linear_filtering() {
+        let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        assert_eq!(LDR_FORMAT, vk::Format::R8G8B8A8_SRGB);
+        assert!(missing_post_format_features(required).is_empty());
+        for (feature, name) in [
+            (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
+            (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+            (
+                vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+                "SAMPLED_IMAGE_FILTER_LINEAR",
+            ),
+        ] {
+            assert_eq!(missing_post_format_features(required & !feature), [name]);
+        }
+    }
+
+    #[test]
+    fn postprocess_formats_and_swapchain_usage_match_the_passes() {
+        assert_eq!(OFFSCREEN_FORMAT, vk::Format::R16G16B16A16_SFLOAT);
+        assert_eq!(LDR_FORMAT, vk::Format::R8G8B8A8_SRGB);
+        assert_eq!(SWAPCHAIN_USAGE, vk::ImageUsageFlags::COLOR_ATTACHMENT);
+    }
+
+    #[test]
     fn texture_formats_require_sampled_blit_and_transfer_support_in_both_spaces() {
         let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
@@ -5387,6 +6027,28 @@ mod tests {
             texture_format_reasons(required, required & !vk::FormatFeatureFlags::TRANSFER_DST);
         assert_eq!(linear_missing.len(), 1);
         assert!(linear_missing[0].contains("R8G8B8A8_UNORM"));
+    }
+
+    #[test]
+    fn offscreen_barrier_source_follows_the_previous_use_of_the_target() {
+        assert_eq!(
+            offscreen_previous_use(vk::ImageLayout::UNDEFINED),
+            (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+        );
+        assert_eq!(
+            offscreen_previous_use(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            (
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ
+            )
+        );
+        assert_eq!(
+            offscreen_previous_use(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+            )
+        );
     }
 
     #[test]
@@ -5587,6 +6249,9 @@ mod tests {
             OVERLAY_FRAGMENT_SHADER,
             UI_VERTEX_SHADER,
             UI_FRAGMENT_SHADER,
+            FULLSCREEN_VERTEX_SHADER,
+            TONEMAP_FRAGMENT_SHADER,
+            OUTPUT_FRAGMENT_SHADER,
         ] {
             let words = ash::util::read_spv(&mut std::io::Cursor::new(shader)).unwrap();
             assert_eq!(words[0], 0x0723_0203);
@@ -5982,28 +6647,6 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_barrier_source_follows_the_previous_use_of_the_target() {
-        assert_eq!(
-            offscreen_previous_use(vk::ImageLayout::UNDEFINED),
-            (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
-        );
-        assert_eq!(
-            offscreen_previous_use(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
-            (
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_READ
-            )
-        );
-        assert_eq!(
-            offscreen_previous_use(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            (
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::SHADER_SAMPLED_READ
-            )
-        );
-    }
-
-    #[test]
     fn texture_validation_requires_rgba8_bytes_within_gpu_limits() {
         assert!(validate_texture(1, 1, 4, 16).is_ok());
         assert!(validate_texture(16, 2, 128, 16).is_ok());
@@ -6130,6 +6773,7 @@ mod tests {
             light,
             draws: &[],
             overlay: &[],
+            view: ViewSettings::default(),
         };
         let values = floats(&frame_uniform_bytes(&frame).unwrap());
         assert_eq!(FRAME_UNIFORMS_SIZE, 208);
@@ -6171,6 +6815,7 @@ mod tests {
                         light,
                         draws: &[],
                         overlay: &[],
+                        view: ViewSettings::default(),
                     }),
                     Err(RenderError::InvalidConfig(_))
                 ),
@@ -6188,6 +6833,7 @@ mod tests {
             light: DirectionalLight::default(),
             draws: &[],
             overlay: &[],
+            view: ViewSettings::default(),
         };
         assert!(matches!(
             frame_uniform_bytes(&frame),
@@ -6219,12 +6865,65 @@ mod tests {
     }
 
     #[test]
-    fn default_config_uses_native_resolution_without_extra_extensions() {
+    fn default_config_has_no_extra_extensions_and_view_defaults_to_full_quality() {
         let config = RendererConfig::default();
-        assert_eq!(config.render_scale, 1.0);
-        assert!(validate_render_scale(config.render_scale).is_ok());
         assert!(config.extra_instance_extensions.is_empty());
         assert!(config.extra_device_extensions.is_empty());
+        let view = ViewSettings::default();
+        assert_eq!(view.render_scale, 1.0);
+        assert_eq!(view.exposure_ev, 0.0);
+        assert_eq!(view.tonemapper, Tonemapper::Aces);
+        assert_eq!(view.anti_aliasing, AntiAliasing::Fxaa);
+        assert!(validate_view_settings(view).is_ok());
+    }
+
+    #[test]
+    fn postprocess_enum_codes_are_stable_for_the_shader_contract() {
+        assert_eq!(Tonemapper::Aces.code(), 0);
+        assert_eq!(Tonemapper::Neutral.code(), 1);
+        assert_eq!(Tonemapper::None.code(), 2);
+        assert_eq!(AntiAliasing::Fxaa.code(), 0);
+        assert_eq!(AntiAliasing::None.code(), 1);
+    }
+
+    #[test]
+    fn view_settings_validate_scale_and_exposure_ranges() {
+        for render_scale in [1.0, 0.5, f32::MIN_POSITIVE] {
+            assert!(
+                validate_view_settings(ViewSettings {
+                    render_scale,
+                    ..ViewSettings::default()
+                })
+                .is_ok()
+            );
+        }
+        for exposure_ev in [-16.0, 0.0, 16.0] {
+            assert!(
+                validate_view_settings(ViewSettings {
+                    exposure_ev,
+                    ..ViewSettings::default()
+                })
+                .is_ok()
+            );
+        }
+        for render_scale in [0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.01, -0.1] {
+            assert!(matches!(
+                validate_view_settings(ViewSettings {
+                    render_scale,
+                    ..ViewSettings::default()
+                }),
+                Err(RenderError::InvalidConfig(_))
+            ));
+        }
+        for exposure_ev in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -16.01, 16.01] {
+            assert!(matches!(
+                validate_view_settings(ViewSettings {
+                    exposure_ev,
+                    ..ViewSettings::default()
+                }),
+                Err(RenderError::InvalidConfig(_))
+            ));
+        }
     }
 
     #[test]
@@ -6395,6 +7094,17 @@ mod tests {
     }
 
     #[test]
+    fn output_pass_uses_reciprocal_source_extent_for_fxaa() {
+        assert_eq!(
+            inverse_extent(vk::Extent2D {
+                width: 1280,
+                height: 720,
+            }),
+            [1.0 / 1280.0, 1.0 / 720.0]
+        );
+    }
+
+    #[test]
     fn surface_extent_uses_fixed_extent_or_clamps_requested_size() {
         let capabilities = vk::SurfaceCapabilitiesKHR {
             current_extent: vk::Extent2D {
@@ -6506,5 +7216,163 @@ mod tests {
             timestamp_duration(u64::MAX, 4, 64, 1.0),
             Duration::from_nanos(5)
         );
+    }
+}
+
+// The renderer has no CPU GLSL interpreter; build.rs compiles the actual shader with Naga.
+// This small numeric oracle covers edge-coordinate behavior without a Vulkan device.
+#[cfg(test)]
+mod fxaa_reference_tests {
+    fn fxaa_edge_offset(
+        sample_luma: impl Fn(f32, f32) -> f32,
+        uv: [f32; 2],
+        pixel: [f32; 2],
+    ) -> (bool, [f32; 2], f32) {
+        let at = |x: f32, y: f32| sample_luma(uv[0] + x * pixel[0], uv[1] + y * pixel[1]);
+        let m = at(0.0, 0.0);
+        let n = at(0.0, -1.0);
+        let w = at(-1.0, 0.0);
+        let e = at(1.0, 0.0);
+        let s = at(0.0, 1.0);
+        let nw = at(-1.0, -1.0);
+        let ne = at(1.0, -1.0);
+        let sw = at(-1.0, 1.0);
+        let se = at(1.0, 1.0);
+
+        let horizontal_1 = -2.0 * m + n + s;
+        let vertical_1 = -2.0 * m + w + e;
+        let horizontal_2 = -2.0 * e + ne + se;
+        let vertical_2 = -2.0 * n + nw + ne;
+        let horizontal_3 = -2.0 * w + nw + sw;
+        let vertical_3 = -2.0 * s + sw + se;
+        let edge_horizontal = horizontal_3.abs() + 2.0 * horizontal_1.abs() + horizontal_2.abs();
+        let edge_vertical = vertical_3.abs() + 2.0 * vertical_1.abs() + vertical_2.abs();
+        let horizontal = edge_horizontal >= edge_vertical;
+
+        let (luma_a, luma_b) = if horizontal { (n, s) } else { (w, e) };
+        let gradient_a = (luma_a - m).abs();
+        let gradient_b = (luma_b - m).abs();
+        let use_a = gradient_a >= gradient_b;
+        let edge_luma = 0.5 * (m + if use_a { luma_a } else { luma_b });
+        let gradient = gradient_a.max(gradient_b);
+        let normal = if horizontal { [0.0, 1.0] } else { [1.0, 0.0] };
+        let along = if horizontal { [1.0, 0.0] } else { [0.0, 1.0] };
+        let side = if use_a { -0.5 } else { 0.5 };
+        let edge_start = [normal[0] * side, normal[1] * side];
+        let mut end_a = [edge_start[0] - along[0], edge_start[1] - along[1]];
+        let mut end_b = [edge_start[0] + along[0], edge_start[1] + along[1]];
+        let mut luma_end_a = at(end_a[0], end_a[1]);
+        let mut luma_end_b = at(end_b[0], end_b[1]);
+        let mut done_a = (luma_end_a - edge_luma).abs() >= gradient * 0.25;
+        let mut done_b = (luma_end_b - edge_luma).abs() >= gradient * 0.25;
+        const STEPS: [f32; 11] = [1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0];
+        for step in STEPS {
+            if !done_a {
+                end_a[0] -= along[0] * step;
+                end_a[1] -= along[1] * step;
+                luma_end_a = at(end_a[0], end_a[1]);
+                done_a = (luma_end_a - edge_luma).abs() >= gradient * 0.25;
+            }
+            if !done_b {
+                end_b[0] += along[0] * step;
+                end_b[1] += along[1] * step;
+                luma_end_b = at(end_b[0], end_b[1]);
+                done_b = (luma_end_b - edge_luma).abs() >= gradient * 0.25;
+            }
+        }
+
+        let (distance_a, distance_b) = if horizontal {
+            (end_a[0].abs(), end_b[0].abs())
+        } else {
+            (end_a[1].abs(), end_b[1].abs())
+        };
+        let nearest_luma = if distance_a < distance_b {
+            luma_end_a
+        } else {
+            luma_end_b
+        };
+        let good_span = (nearest_luma < edge_luma) != (m < edge_luma);
+        let edge_offset = if good_span {
+            0.5 - distance_a.min(distance_b) / (distance_a + distance_b)
+        } else {
+            0.0
+        };
+        let direction = if use_a { -1.0 } else { 1.0 };
+        (
+            horizontal,
+            [normal[0] * direction, normal[1] * direction],
+            edge_offset,
+        )
+    }
+
+    fn finite_step_luma(
+        position: [f32; 2],
+        horizontal: bool,
+        center_positive: bool,
+        bright_inside: bool,
+    ) -> f32 {
+        let texel = |x: i32, y: i32| {
+            let (across, along) = if horizontal { (y, x) } else { (x, y) };
+            let inside_side = if center_positive {
+                across >= 1
+            } else {
+                across <= 0
+            };
+            let inside = (-1..=3).contains(&along) && inside_side;
+            let high = if bright_inside { inside } else { !inside };
+            if high { 1.0 } else { 0.0 }
+        };
+        let x0 = position[0].floor() as i32;
+        let y0 = position[1].floor() as i32;
+        let tx = position[0] - x0 as f32;
+        let ty = position[1] - y0 as f32;
+        let top = texel(x0, y0) * (1.0 - tx) + texel(x0 + 1, y0) * tx;
+        let bottom = texel(x0, y0 + 1) * (1.0 - tx) + texel(x0 + 1, y0 + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
+
+    #[test]
+    fn finite_step_edges_have_oriented_offsets_for_both_polarities() {
+        for horizontal in [false, true] {
+            for bright_inside in [false, true] {
+                let center_positive = bright_inside;
+                let uv = if horizontal {
+                    [0.0, if center_positive { 1.0 } else { 0.0 }]
+                } else {
+                    [if center_positive { 1.0 } else { 0.0 }, 0.0]
+                };
+                let sample =
+                    |x, y| finite_step_luma([x, y], horizontal, center_positive, bright_inside);
+                let (detected_horizontal, direction, offset) =
+                    fxaa_edge_offset(sample, uv, [1.0, 1.0]);
+                let expected_sign = if center_positive { -1.0 } else { 1.0 };
+                let normal_axis = if horizontal { 1 } else { 0 };
+
+                assert_eq!(detected_horizontal, horizontal);
+                assert!(
+                    offset.is_finite() && offset > 0.0,
+                    "{horizontal}, {bright_inside}"
+                );
+                assert!(
+                    direction[normal_axis] * expected_sign > 0.0,
+                    "{horizontal}, {bright_inside}: {direction:?}"
+                );
+                assert_eq!(direction[1 - normal_axis], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn subpixel_filter_uses_weighted_twelve_sample_average_and_squared_smoothstep() {
+        let center: f32 = 0.5;
+        let cardinal_sum: f32 = 4.0;
+        let diagonal_sum: f32 = 0.0;
+        let range: f32 = 1.0;
+        let average = (2.0 * cardinal_sum + diagonal_sum) / 12.0;
+        let value = ((average - center).abs() / range).clamp(0.0, 1.0);
+        let smooth = value * value * (3.0 - 2.0 * value);
+        let offset = smooth * smooth * 0.75;
+
+        assert!((offset - 0.004_115_226).abs() < 1e-6);
     }
 }

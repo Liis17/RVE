@@ -1,5 +1,6 @@
 //! TOML-документы сцен и их проверенная схема, независимая от renderer.
 
+use crate::CameraSettings;
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -121,6 +122,7 @@ impl SceneDocument {
         }
 
         let mut camera_count = 0;
+        let mut active_camera_count = 0;
         let mut light_count = 0;
         for object in &self.objects {
             if let Some(parent) = &object.parent
@@ -135,7 +137,17 @@ impl SceneDocument {
             validate_transform(source, object)?;
             if let Some(camera) = &object.camera {
                 camera_count += 1;
-                validate_camera(source, object, camera)?;
+                active_camera_count += usize::from(camera.active);
+                if let Some(settings) = &camera.settings {
+                    require_asset_path(source, object, &asset_paths, settings, "настройки камеры")?;
+                    require_extension(
+                        source,
+                        object,
+                        settings,
+                        "camerasettings",
+                        "настройки камеры",
+                    )?;
+                }
             }
             if let Some(light) = &object.directional_light {
                 light_count += 1;
@@ -230,6 +242,20 @@ impl SceneDocument {
                 "сцена должна содержать хотя бы одну камеру",
             ));
         }
+        if active_camera_count > 1 {
+            return Err(SceneError::new(
+                source,
+                None,
+                "в сцене допускается не более одной активной камеры",
+            ));
+        }
+        if camera_count > 1 && active_camera_count == 0 {
+            return Err(SceneError::new(
+                source,
+                None,
+                "при нескольких камерах одна должна иметь active = true",
+            ));
+        }
         if light_count > 1 {
             return Err(SceneError::new(
                 source,
@@ -251,7 +277,7 @@ impl SceneDocument {
                 ));
             }
             if object.camera.is_some()
-                && camera_from_matrix(matrix, object.camera.unwrap()).is_none()
+                && camera_from_matrix(matrix, CameraSettings::default()).is_none()
             {
                 return Err(SceneError::new(
                     source,
@@ -334,13 +360,13 @@ impl Default for SceneTransform {
     }
 }
 
-/// Параметры проекции камеры. Поле зрения измеряется по узкой стороне.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Ссылка на настройки камеры и выбор активной камеры сцены.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct CameraComponent {
-    pub fov_deg: f32,
-    pub near: f32,
-    pub far: f32,
+    #[serde(default, with = "option_virtual_path_serde")]
+    pub settings: Option<VirtualPath>,
+    pub active: bool,
 }
 
 /// Экземпляр FBX, необязательная замена base-color PNG и override материала.
@@ -575,32 +601,6 @@ fn validate_transform(source: &str, object: &SceneObject) -> Result<(), SceneErr
     Ok(())
 }
 
-fn validate_camera(
-    source: &str,
-    object: &SceneObject,
-    camera: &CameraComponent,
-) -> Result<(), SceneError> {
-    if !camera.fov_deg.is_finite() || camera.fov_deg <= 0.0 || camera.fov_deg >= 180.0 {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "camera.fov_deg должен быть конечным и находиться между 0 и 180",
-        ));
-    }
-    if !camera.near.is_finite()
-        || !camera.far.is_finite()
-        || camera.near <= 0.0
-        || camera.far <= camera.near
-    {
-        return Err(SceneError::new(
-            source,
-            Some(&object.id),
-            "camera требует конечные параметры 0 < near < far",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_light(
     source: &str,
     object: &SceneObject,
@@ -708,6 +708,14 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                         }),
                 );
             }
+        }
+        if let Some(camera) = object.get("camera").and_then(toml::Value::as_table) {
+            paths.extend(
+                camera
+                    .get("settings")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| (object_id, "camera.settings", path)),
+            );
         }
         if let Some(group) = object.get("lod_group").and_then(toml::Value::as_table)
             && let Some(levels) = group.get("levels").and_then(toml::Value::as_array)
@@ -925,7 +933,7 @@ fn validated_world_matrices(
 
 pub(crate) fn camera_from_matrix(
     matrix: glam::Mat4,
-    settings: CameraComponent,
+    settings: CameraSettings,
 ) -> Option<crate::camera::Camera> {
     use glam::Vec3;
 
@@ -958,9 +966,9 @@ pub(crate) fn camera_from_matrix(
         position,
         target,
         up,
-        fov_narrow: settings.fov_deg.to_radians(),
-        near: settings.near,
-        far: settings.far,
+        fov_narrow: settings.projection.fov_deg.to_radians(),
+        near: settings.projection.near,
+        far: settings.projection.far,
     })
 }
 
@@ -1039,23 +1047,24 @@ mod option_virtual_path_serde {
 #[cfg(test)]
 mod tests {
     use super::{LodGroup, LodLevel, MAX_LOD_LEVELS, ParamValue, SceneDocument};
+    use engine_files::VirtualPath;
 
     const VALID: &str = r#"
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
+
 "#;
 
     #[test]
     fn validate_checks_a_document_changed_after_parsing() {
         let mut document = parse(VALID).unwrap();
         assert!(document.validate().is_ok());
-        document.objects[0].camera.as_mut().unwrap().near = -1.0;
+        document.objects[0].camera.as_mut().unwrap().settings =
+            Some(VirtualPath::parse("missing.camerasettings").unwrap());
         let error = document.validate().unwrap_err();
         assert_eq!(error.object_id.as_deref(), Some("camera"));
+        assert!(error.message.contains("[[assets]]"));
         document.objects.clear();
         assert!(document.validate().unwrap_err().message.contains("камер"));
     }
@@ -1123,6 +1132,17 @@ far = 100.0
         assert_eq!(camera.transform.scale, [1.0; 3]);
         let serialized = document.to_toml().unwrap();
         assert!(parse(&serialized).is_ok(), "{serialized}");
+    }
+
+    #[test]
+    fn integer_literals_are_accepted_for_transform_fields() {
+        let input = VALID.replace(
+            "[objects.camera]",
+            "[objects.transform]\nposition = [0, 1, 0]\n[objects.camera]",
+        );
+        let document = parse(&input).unwrap();
+        assert_eq!(document.objects[0].transform.position, [0.0, 1.0, 0.0]);
+        assert!(!document.objects[0].camera.as_ref().unwrap().active);
     }
 
     #[test]
@@ -1258,25 +1278,13 @@ far = 100.0
     }
 
     #[test]
-    fn integer_literals_are_accepted_for_vector_and_camera_float_fields() {
-        let input = VALID
-            .replace(
-                "[objects.camera]",
-                "[objects.transform]\nposition = [0, 1, 0]\n[objects.camera]",
-            )
-            .replace("fov_deg = 60.0", "fov_deg = 60");
-        let document = parse(&input).unwrap();
-        assert_eq!(document.objects[0].transform.position, [0.0, 1.0, 0.0]);
-        assert_eq!(document.objects[0].camera.unwrap().fov_deg, 60.0);
-    }
-
-    #[test]
     fn unknown_fields_are_denied_at_every_schema_level() {
         let cases = [
             format!("unexpected = true\n{VALID}"),
             VALID.replace("id = \"camera\"", "id = \"camera\"\nunexpected = true"),
             format!("{VALID}\nunexpected = true"),
             format!("{VALID}\n[objects.transform]\nunexpected = true"),
+            format!("{VALID}\n[objects.camera]\nunexpected = true"),
             format!("{VALID}\n[[assets]]\npath = \"/a.fbx\"\nunexpected = true"),
             format!("{VALID}\n[[objects.lite_scripts]]\npath = \"/s.lua\"\nunexpected = true"),
             format!("{VALID}\n[[objects.heavy_scripts]]\nname = \"Spin\"\nunexpected = true"),
@@ -1303,9 +1311,7 @@ far = 100.0
     fn parent_must_exist_and_hierarchy_must_be_acyclic() {
         let missing = VALID.replace("id = \"camera\"", "id = \"camera\"\nparent = \"lost\"");
         error(&missing, "родитель \"lost\" не существует");
-        let cycle =
-            "[[objects]]\nid = \"camera\"\nparent = \"loop\"\n[objects.camera]\nfov_deg=60.0\nnear=0.1\nfar=10.0\n[[objects]]\nid = \"loop\"\nparent = \"camera\"\n"
-                .to_owned();
+        let cycle = "[[objects]]\nid = \"camera\"\nparent = \"loop\"\n[objects.camera]\n[[objects]]\nid = \"loop\"\nparent = \"camera\"\n".to_owned();
         error(&cycle, "цикл");
     }
 
@@ -1318,9 +1324,7 @@ parent="rig"
 [objects.transform]
 rotation=[45.0,0.0,0.0]
 [objects.camera]
-fov_deg=60.0
-near=0.1
-far=10.0
+
 [[objects]]
 id="rig"
 [objects.transform]
@@ -1352,20 +1356,18 @@ scale=[1.0,1.0,0.0]
     }
 
     #[test]
-    fn scene_requires_a_camera_and_at_most_one_light() {
+    fn scene_requires_a_camera_and_selects_one_explicit_active_camera() {
         assert!(parse("[[objects]]\nid=\"empty\"\n").is_err());
-        let two_cameras = format!(
-            "{VALID}\n[[objects]]\nid=\"second\"\n[objects.camera]\nfov_deg=60.0\nnear=0.1\nfar=20.0\n"
+        let two_without_active = format!("{VALID}\n[[objects]]\nid=\"second\"\n[objects.camera]\n");
+        error(&two_without_active, "одна должна иметь active = true");
+        let two_with_active =
+            format!("{VALID}\n[[objects]]\nid=\"second\"\n[objects.camera]\nactive = true\n");
+        assert!(parse(&two_with_active).is_ok());
+        let two_active = format!(
+            "{}\n[[objects]]\nid=\"second\"\n[objects.camera]\nactive = true\n",
+            VALID.replace("[objects.camera]", "[objects.camera]\nactive = true")
         );
-        assert_eq!(
-            parse(&two_cameras)
-                .unwrap()
-                .objects
-                .iter()
-                .filter(|object| object.camera.is_some())
-                .count(),
-            2
-        );
+        error(&two_active, "не более одной активной камеры");
         let two_lights = format!(
             "{VALID}\n[[objects]]\nid=\"sun1\"\n[objects.directional_light]\n[[objects]]\nid=\"sun2\"\n[objects.directional_light]\n"
         );
@@ -1390,8 +1392,25 @@ scale=[1.0,1.0,0.0]
             "[[assets]]\npath=\"/scripts/a.txt\"\n{VALID}\n[[objects.lite_scripts]]\npath=\"/scripts/a.txt\"\n"
         );
         error(&wrong_script, "расширение .lua");
+        let missing_settings = VALID.replace(
+            "[objects.camera]",
+            "[objects.camera]\nsettings = \"/camera/default.camerasettings\"",
+        );
+        error(&missing_settings, "отсутствует в [[assets]]");
+        let wrong_settings_extension = format!(
+            "[[assets]]\npath=\"/camera/default.toml\"\n{}",
+            VALID.replace(
+                "[objects.camera]",
+                "[objects.camera]\nsettings=\"/camera/default.toml\"",
+            )
+        );
+        error(&wrong_settings_extension, "расширение .camerasettings");
         let good = format!(
-            "[[assets]]\npath=\"/models/A.FBX\"\n[[assets]]\npath=\"/textures/A.PNG\"\n[[assets]]\npath=\"/scripts/a.LUA\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/A.FBX\"\ntexture=\"/textures/A.PNG\"\n[[objects.lite_scripts]]\npath=\"/scripts/a.LUA\"\n"
+            "[[assets]]\npath=\"/models/A.FBX\"\n[[assets]]\npath=\"/textures/A.PNG\"\n[[assets]]\npath=\"/scripts/a.LUA\"\n[[assets]]\npath=\"/camera/Default.CAMERAsettings\"\n{}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/A.FBX\"\ntexture=\"/textures/A.PNG\"\n[[objects.lite_scripts]]\npath=\"/scripts/a.LUA\"\n",
+            VALID.replace(
+                "[objects.camera]",
+                "[objects.camera]\nsettings=\"/camera/Default.CAMERAsettings\"",
+            )
         );
         assert!(parse(&good).is_ok());
     }
@@ -1533,8 +1552,9 @@ scale=[1.0,1.0,0.0]
             );
             assert!(parse(&input).is_err(), "accepted transform {values}");
         }
-        let camera_nan = VALID.replace("fov_deg = 60.0", "fov_deg = nan");
-        assert!(parse(&camera_nan).is_err());
+        let old_camera_fields =
+            VALID.replace("[objects.camera]", "[objects.camera]\nfov_deg = 60.0");
+        error(&old_camera_fields, "unknown field `fov_deg`");
         let light_nan = format!(
             "{VALID}\n[[objects]]\nid=\"sun\"\n[objects.directional_light]\ncolor=[nan,1.0,1.0]\n"
         );
@@ -1547,26 +1567,6 @@ scale=[1.0,1.0,0.0]
             "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{speed=inf}}\n[[assets]]\npath=\"/s.lua\"\n"
         );
         assert!(parse(&param_inf).is_err());
-    }
-
-    #[test]
-    fn fov_and_clip_planes_are_validated() {
-        for fov in ["0.0", "180.0", "nan", "inf"] {
-            let input = VALID.replace("60.0", fov);
-            assert!(parse(&input).is_err(), "accepted fov {fov}");
-        }
-        for (near, far) in [
-            ("0.0", "100.0"),
-            ("2.0", "2.0"),
-            ("3.0", "2.0"),
-            ("nan", "10.0"),
-            ("0.1", "inf"),
-        ] {
-            let input = VALID
-                .replace("near = 0.1", &format!("near = {near}"))
-                .replace("far = 100.0", &format!("far = {far}"));
-            assert!(parse(&input).is_err(), "accepted near/far {near}/{far}");
-        }
     }
 
     #[test]
