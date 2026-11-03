@@ -86,6 +86,9 @@ pub struct EditorState {
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
+    /// Строки поиска панелей Hierarchy и Project.
+    pub hierarchy_filter: String,
+    pub project_filter: String,
     /// Компонент, скопированный в Inspector для вставки в объекты.
     pub component_clipboard: Option<Component>,
     pub previews: PreviewCache,
@@ -122,6 +125,8 @@ impl EditorState {
             current_folder: String::new(),
             project_dialog: None,
             hierarchy_rename: None,
+            hierarchy_filter: String::new(),
+            project_filter: String::new(),
             component_clipboard: None,
             previews: PreviewCache::default(),
             viewport_texture: None,

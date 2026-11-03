@@ -3,7 +3,7 @@
 use crate::scene_edit::{EditorScene, NewObject};
 use crate::state::{AssetDrag, EditorState};
 use engine_scene::SceneObject;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Перетаскиваемый объект иерархии.
 #[derive(Clone, Debug)]
@@ -34,14 +34,50 @@ fn children_map(objects: &[SceneObject]) -> HashMap<Option<&str>, Vec<&SceneObje
     children
 }
 
+/// Объекты, видимые при фильтре: совпадения по имени или id без учёта регистра и их предки.
+fn filter_visible(objects: &[SceneObject], query: &str) -> HashSet<String> {
+    let query = query.to_lowercase();
+    let parents = objects
+        .iter()
+        .map(|object| (object.id.as_str(), object.parent.as_deref()))
+        .collect::<HashMap<_, _>>();
+    let mut visible = HashSet::new();
+    for object in objects {
+        let matches = object.display_name().to_lowercase().contains(&query)
+            || object.id.to_lowercase().contains(&query);
+        if !matches {
+            continue;
+        }
+        let mut current = Some(object.id.as_str());
+        // Предки добавляются до первого уже видимого; цикл родителей схема не допускает.
+        while let Some(id) = current {
+            if !visible.insert(id.to_owned()) {
+                break;
+            }
+            current = parents.get(id).copied().flatten();
+        }
+    }
+    visible
+}
+
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
-    let Some(scene) = state.scene.as_ref() else {
+    if state.scene.is_none() {
         ui.label("Сцена не открыта");
+        return;
+    }
+    ui.add(
+        egui::TextEdit::singleline(&mut state.hierarchy_filter)
+            .hint_text("Search")
+            .desired_width(f32::INFINITY),
+    );
+    let Some(scene) = state.scene.as_ref() else {
         return;
     };
     let editable = !state.is_playing();
     let mut commands = Vec::new();
     let rename = state.hierarchy_rename.clone();
+    let query = state.hierarchy_filter.trim();
+    let visible = (!query.is_empty()).then(|| filter_visible(&scene.document().objects, query));
     egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
         ui.add_enabled_ui(editable, |ui| {
             let children = children_map(&scene.document().objects);
@@ -49,9 +85,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                 scene,
                 children: &children,
                 rename: rename.as_ref(),
+                visible: visible.as_ref(),
             };
             if let Some(roots) = children.get(&None) {
-                for object in roots {
+                for object in roots.iter().filter(|object| tree.is_visible(object)) {
                     tree.row(ui, object, &mut commands);
                 }
             }
@@ -85,14 +122,35 @@ struct TreeContext<'a> {
     scene: &'a EditorScene,
     children: &'a HashMap<Option<&'a str>, Vec<&'a SceneObject>>,
     rename: Option<&'a (String, String)>,
+    /// Видимые при фильтре объекты; `None` — фильтра нет.
+    visible: Option<&'a HashSet<String>>,
 }
 
 impl TreeContext<'_> {
+    fn is_visible(&self, object: &SceneObject) -> bool {
+        self.visible
+            .is_none_or(|visible| visible.contains(&object.id))
+    }
+
     fn row(&self, ui: &mut egui::Ui, object: &SceneObject, commands: &mut Vec<Command>) {
-        let children = self.children.get(&Some(object.id.as_str()));
+        let children = self
+            .children
+            .get(&Some(object.id.as_str()))
+            .map(|children| {
+                children
+                    .iter()
+                    .filter(|child| self.is_visible(child))
+                    .collect::<Vec<_>>()
+            });
         match children {
             Some(children) if !children.is_empty() => {
-                let id = ui.make_persistent_id(("hierarchy", &object.id));
+                // При фильтре узлы раскрыты, а свёрнутость обычного дерева не меняется.
+                let salt = if self.visible.is_some() {
+                    "hierarchy_filtered"
+                } else {
+                    "hierarchy"
+                };
+                let id = ui.make_persistent_id((salt, &object.id));
                 egui::collapsing_header::CollapsingState::load_with_default_open(
                     ui.ctx(),
                     id,
@@ -243,5 +301,29 @@ mod tests {
             .map(|object| object.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(children, [first, second]);
+    }
+
+    #[test]
+    fn filter_keeps_matches_and_their_ancestors_ignoring_case() {
+        let mut scene = EditorScene::new_untitled().unwrap();
+        let parent = scene.create_object(&NewObject::Empty, None).unwrap();
+        let child = scene
+            .create_object(&NewObject::Empty, Some(&parent))
+            .unwrap();
+        scene
+            .edit_object(&child, None, |object| {
+                object.name = Some("Wheel Front".to_owned());
+                Ok(())
+            })
+            .unwrap();
+        let objects = &scene.document().objects;
+        let visible = filter_visible(objects, "wheel");
+        assert_eq!(visible, HashSet::from([parent.clone(), child.clone()]));
+        // Совпадение по id тоже учитывается; соседние ветки не показываются.
+        assert_eq!(
+            filter_visible(objects, "SUN"),
+            HashSet::from(["sun".to_owned()])
+        );
+        assert!(filter_visible(objects, "missing").is_empty());
     }
 }
