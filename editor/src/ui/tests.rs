@@ -374,3 +374,46 @@ fn game_view_shows_the_image_and_takes_a_camera_from_the_scene() {
     harness.panel(Vec::new(), game_view::show);
     assert!(!harness.state.game_view.visible);
 }
+
+/// Центр первой надписи `text` среди фигур кадра.
+fn find_text(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<Pos2> {
+    fn visit(shape: &egui::Shape, text: &str) -> Option<Pos2> {
+        match shape {
+            egui::Shape::Text(shape) if shape.galley.text() == text => {
+                Some(shape.pos + shape.galley.rect.center().to_vec2())
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| visit(shape, text)),
+            _ => None,
+        }
+    }
+    shapes
+        .iter()
+        .find_map(|clipped| visit(&clipped.shape, text))
+}
+
+#[test]
+fn build_player_menu_item_queues_the_action() {
+    let mut harness = Harness::new();
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+    harness.state.project = Some(OpenProject::open(Path::new(dir)).unwrap());
+    let mut dock = default_layout();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness
+            .ctx
+            .run_ui(input, |ui| toolbar::show(ui, state, &mut dock));
+        output.textures_delta.clear();
+        output.shapes
+    };
+    let mut click = |harness: &mut Harness, text: &str| {
+        let shapes = frame(harness, Vec::new());
+        let at = find_text(&shapes, text).unwrap_or_else(|| panic!("{text} not shown"));
+        frame(harness, vec![Event::PointerMoved(at)]);
+        frame(harness, vec![button(at, PointerButton::Primary, true)]);
+        frame(harness, vec![button(at, PointerButton::Primary, false)]);
+    };
+    click(&mut harness, "File");
+    click(&mut harness, "Build Player…");
+    assert_eq!(harness.state.actions, [crate::state::Action::BuildPlayer]);
+}

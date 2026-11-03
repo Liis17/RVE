@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
 /// Как часто проверять готовность фоновых превью.
 const PREVIEW_POLL: Duration = Duration::from_millis(30);
+/// Как часто забирать вывод идущей сборки.
+const BUILD_POLL: Duration = Duration::from_millis(50);
 
 pub struct EditorApp {
     state: EditorState,
@@ -162,8 +164,81 @@ impl EditorApp {
                 }
             }
             Action::Exit => self.exit = true,
+            Action::BuildPlayer => self.start_build(),
             _ => {}
         }
+    }
+
+    /// Запускает `rve-build` в выбранный каталог `<папка>/<id проекта>`; сцена уже
+    /// сохранена, потому что сборщик читает её с диска.
+    fn start_build(&mut self) {
+        if self.state.build.is_some() {
+            self.state.log.error("Сборка уже идёт");
+            return;
+        }
+        let Some(project) = &self.state.project else {
+            return;
+        };
+        let (project_dir, id) = (project.dir.clone(), project.settings.id.clone());
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_owned));
+        let tool = match crate::build::locate_build_tool(
+            exe_dir.as_deref(),
+            &crate::build::checkout_workspace(),
+            std::env::var_os("CARGO"),
+        ) {
+            Ok(tool) => tool,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let output = match std::path::absolute(folder.join(id)) {
+            Ok(output) => output,
+            Err(error) => {
+                self.state
+                    .log
+                    .error(format!("{}: {error}", folder.display()));
+                return;
+            }
+        };
+        if output.exists() {
+            self.state.log.error(format!(
+                "{}: каталог уже существует, выберите другую папку",
+                output.display()
+            ));
+            return;
+        }
+        let command = tool.command(&project_dir, &output);
+        match crate::build::BuildJob::spawn(command, output.clone()) {
+            Ok(job) => {
+                self.state
+                    .log
+                    .info(format!("Build Player: {}", output.display()));
+                self.state.build = Some(job);
+            }
+            Err(error) => self.state.log.error(format!("rve-build: {error}")),
+        }
+    }
+
+    /// Переносит вывод сборки в Console; возвращает, появились ли строки.
+    fn poll_build(&mut self) -> bool {
+        let Some(job) = &mut self.state.build else {
+            return false;
+        };
+        let lines = job.poll();
+        if job.is_finished() {
+            self.state.build = None;
+        }
+        let any = !lines.is_empty();
+        for (level, line) in lines {
+            self.state.log.push(level, line);
+        }
+        any
     }
 
     fn assets_root(&self) -> Option<PathBuf> {
@@ -326,6 +401,13 @@ impl EditorApp {
                 }
                 Action::ImportFiles(files) => self.import(&files),
                 Action::RefreshAssets => self.refresh_assets(),
+                Action::BuildPlayer => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else {
+                        self.run_guarded(Action::BuildPlayer);
+                    }
+                }
                 Action::Discard(then) => self.run_confirmed(*then),
                 Action::SaveThen(then) => {
                     if self.save(false) {
@@ -663,12 +745,13 @@ impl WindowHandler for EditorApp {
 
     fn update(&mut self, window: &Window) -> bool {
         let previews_pending = self.state.previews.has_pending();
+        let build_output = self.poll_build();
         if let Some(deadline) = self.repaint_at
             && Instant::now() >= deadline
         {
             self.repaint_at = None;
             window.request_redraw();
-        } else if previews_pending {
+        } else if previews_pending || build_output {
             window.request_redraw();
         }
         !self.exit
@@ -680,10 +763,15 @@ impl WindowHandler for EditorApp {
             .previews
             .has_pending()
             .then(|| Instant::now() + PREVIEW_POLL);
-        match (self.repaint_at, preview) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let build = self
+            .state
+            .build
+            .is_some()
+            .then(|| Instant::now() + BUILD_POLL);
+        [self.repaint_at, preview, build]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     fn close_requested(&mut self) -> bool {
@@ -697,6 +785,9 @@ impl WindowHandler for EditorApp {
 
     fn exiting(&mut self) {
         self.stop_play();
+        if let Some(job) = self.state.build.take() {
+            job.kill();
+        }
         // Renderer удерживает окно и освобождается до него.
         self.gpu = None;
         self.egui_state = None;

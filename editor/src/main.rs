@@ -2,6 +2,7 @@
 
 mod app;
 mod assets_fs;
+mod build;
 mod cli;
 mod console;
 mod input;

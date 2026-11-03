@@ -4,10 +4,12 @@ use crate::assets_fs::AssetsDir;
 use engine_assets::Assets;
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Проект игры, открытый в редакторе по той же раскладке, что и dev-запуск player.
 pub struct OpenProject {
+    /// Абсолютный путь каталога проекта.
+    pub dir: PathBuf,
     pub settings: ProjectSettings,
     pub assets_dir: AssetsDir,
     pub assets: Assets,
@@ -31,6 +33,7 @@ impl OpenProject {
         .map_err(|error| format!("{}: {error}", root.display()))?;
         let assets = Assets::with_resources(resources.handle());
         Ok(Self {
+            dir,
             settings,
             assets_dir: AssetsDir::new(root),
             assets,

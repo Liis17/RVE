@@ -1,6 +1,7 @@
 //! Состояние редактора, общее для панелей и обработчиков действий; не зависит от GPU.
 
 use crate::assets_fs::{AssetEntry, AssetKind};
+use crate::build::BuildJob;
 use crate::console::ConsoleLog;
 use crate::play::PlaySession;
 use crate::previews::PreviewCache;
@@ -33,6 +34,8 @@ pub enum Action {
     ImportFiles(Vec<PathBuf>),
     /// Файловая структура изменилась: сбросить кэши ресурсов и прочитать дерево заново.
     RefreshAssets,
+    /// Выбрать каталог и собрать релиз проекта через `rve-build`; сцена сохраняется заранее.
+    BuildPlayer,
     /// Сохранить сцену и при успехе выполнить действие.
     SaveThen(Box<Action>),
     /// Выполнить действие, отбросив несохранённые изменения.
@@ -96,6 +99,8 @@ pub struct EditorState {
     pub pending_frame: Option<String>,
     /// CPU-модели, загруженные для отрисовки: по ним работают picking и фокус камеры.
     pub models: HashMap<String, Arc<Model>>,
+    /// Идущая сборка релиза; одновременно — не больше одной.
+    pub build: Option<BuildJob>,
     edit_world: Option<(u64, World)>,
 }
 
@@ -126,6 +131,7 @@ impl EditorState {
             game_camera: None,
             pending_frame: None,
             models: HashMap::new(),
+            build: None,
             edit_world: None,
         }
     }
