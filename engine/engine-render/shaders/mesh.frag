@@ -80,6 +80,13 @@ layout(set = 2, binding = 3) uniform textureCube prefiltered_map;
 layout(set = 2, binding = 4) uniform texture2D brdf_lut;
 layout(set = 2, binding = 5) uniform sampler brdf_sampler;
 
+layout(push_constant) uniform PushConstants {
+    mat4 model;
+    mat4 normal_from_model;
+    mat4 previous_model;
+    uvec4 params;
+} push_constants;
+
 const float PI = 3.14159265358979323846;
 
 vec3 safe_normalize(vec3 value, vec3 fallback) {
@@ -212,7 +219,32 @@ float local_shadow_visibility(LocalLightData light, vec3 geometric_normal, vec3 
     return visibility / 9.0;
 }
 
+vec3 lod_color(uint level) {
+    switch (level % 7u) {
+        case 0u: return vec3(0.95, 0.28, 0.2);
+        case 1u: return vec3(0.95, 0.58, 0.18);
+        case 2u: return vec3(0.86, 0.82, 0.18);
+        case 3u: return vec3(0.22, 0.78, 0.3);
+        case 4u: return vec3(0.16, 0.72, 0.9);
+        case 5u: return vec3(0.32, 0.38, 0.95);
+        default: return vec3(0.86, 0.26, 0.86);
+    }
+}
+
+vec3 cascade_color(int index) {
+    if (index == 0) return vec3(1.0, 0.25, 0.15);
+    if (index == 1) return vec3(0.2, 0.85, 0.3);
+    if (index == 2) return vec3(0.2, 0.4, 1.0);
+    return vec3(1.0, 0.82, 0.18);
+}
+
 void main() {
+    int debug_view = int(frame.render_params.w + 0.5);
+    if (debug_view == 3) {
+        out_color = vec4(1.0, 0.0, 0.0, 1.0);
+        out_velocity = vec2(0.0);
+        return;
+    }
     vec4 base_sample = texture(
         sampler2D(base_color_texture, material_sampler), in_uv, frame.render_params.z
     );
@@ -286,6 +318,12 @@ void main() {
         normal = -normal;
     }
 
+    if (debug_view == 2) {
+        out_color = vec4(normal * 0.5 + 0.5, output_alpha);
+        out_velocity = vec2(0.0);
+        return;
+    }
+
     vec3 base_color = base_sample.rgb * material.base_color.rgb * in_color;
     float metallic = clamp(material.parameters.x * metallic_roughness_sample.b, 0.0, 1.0);
     float roughness = clamp(material.parameters.y * metallic_roughness_sample.g, 0.0, 1.0);
@@ -298,7 +336,15 @@ void main() {
     vec3 diffuse_color = (1.0 - metallic) * base_color;
     vec3 directional_light = safe_normalize(-frame.light_direction.xyz, geometric_normal);
     float geometric_light_dot = dot(geometric_normal, directional_light);
+    if (debug_view == 4) {
+        vec3 color = lod_color(push_constants.params.x)
+            * (0.2 + 0.8 * max(dot(normal, directional_light), 0.0));
+        out_color = vec4(color, output_alpha);
+        out_velocity = vec2(0.0);
+        return;
+    }
     float shadow = 1.0;
+    int selected_cascade = -1;
     if (frame.shadow_params.x > 0.5) {
         for (int cascade = 0; cascade < int(frame.shadow_params.z); ++cascade) {
             vec4 light_clip = in_shadow_clip[cascade];
@@ -312,6 +358,7 @@ void main() {
                 || light_ndc.z < 0.0 || light_ndc.z > 1.0) {
                 continue;
             }
+            selected_cascade = cascade;
             float bias = max(0.005 * (1.0 - max(geometric_light_dot, 0.0)), 0.0005);
             float cascade_shadow = 0.0;
             for (int y = -1; y <= 1; ++y) {
@@ -429,7 +476,13 @@ void main() {
         environment_weight
     ) * mix(1.0, occlusion, material.alpha_parameters.w);
     vec3 emissive = material.emissive.rgb * emissive_sample;
-    out_color = vec4(ambient + direct + emissive, output_alpha);
+    vec3 lit_color = ambient + direct + emissive;
+    if (debug_view == 5) {
+        lit_color = selected_cascade < 0
+            ? vec3(1.0, 0.0, 1.0)
+            : lit_color * cascade_color(selected_cascade);
+    }
+    out_color = vec4(lit_color, output_alpha);
     vec2 current_ndc = in_current_clip.xy / in_current_clip.w;
     vec2 previous_ndc = in_previous_clip.xy / in_previous_clip.w;
     vec2 current_uv = vec2(current_ndc.x * 0.5 + 0.5, 0.5 - current_ndc.y * 0.5);

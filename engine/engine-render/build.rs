@@ -69,6 +69,12 @@ const SHADERS: &[ShaderBuild] = &[
         "mesh.frag.blend.spv",
     ),
     (
+        "wireframe.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "wireframe.frag.spv",
+    ),
+    (
         "shadow.vert",
         naga::ShaderStage::Vertex,
         &[],

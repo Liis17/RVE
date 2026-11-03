@@ -9,10 +9,10 @@ use engine_core::Time;
 use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, BootstrapPresentMode};
 use engine_render::{
-    AlphaMode, AntiAliasing as RenderAntiAliasing, DrawCommand, EnvironmentId, EnvironmentSource,
-    Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId, MeshId, ProceduralSky,
-    Renderer, RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
-    ViewSettings,
+    AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, EnvironmentId,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId,
+    MeshId, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
@@ -686,6 +686,7 @@ impl WindowHandler for Sandbox {
             local_light_shadows: &local_light_shadows,
             draws: &draws,
             overlay,
+            debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: self.camera_settings.render.render_scale,
                 exposure_ev: self.camera_settings.color.exposure_ev,

@@ -7,7 +7,7 @@ use crate::module_host::{ModuleHost, panic_message};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
+    AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, LocalLight,
     LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId, ProceduralSky, Renderer,
     SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
@@ -389,6 +389,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
+            debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 exposure_ev: snapshot.view.color.exposure_ev,
@@ -493,6 +494,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
+            debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 exposure_ev: snapshot.view.color.exposure_ev,
@@ -930,7 +932,9 @@ fn make_snapshot(
         let Some(levels) = gpu_scene.by_object.get(&instance.object) else {
             continue;
         };
-        let Some(meshes) = selected_level(world, instance.object, camera_position, levels) else {
+        let Some((lod_level, meshes)) =
+            selected_level(world, instance.object, camera_position, levels)
+        else {
             continue;
         };
         let model = instance.model.to_cols_array_2d();
@@ -941,7 +945,7 @@ fn make_snapshot(
                 material: Some(*material),
                 model,
                 previous_model,
-                lod_level: 0,
+                lod_level,
                 casts_shadow: true,
             });
             current_models.insert(instance.object, model);
@@ -1115,8 +1119,9 @@ fn selected_level<'a, T>(
     object: ObjectHandle,
     eye: Vec3,
     levels: &'a [T],
-) -> Option<&'a T> {
-    levels.get(world.lod_level(object, eye)?)
+) -> Option<(u8, &'a T)> {
+    let level = world.lod_level(object, eye)?;
+    Some((level.try_into().ok()?, levels.get(level)?))
 }
 
 fn print_script_events(events: Vec<ScriptEvent>) {
@@ -1654,11 +1659,11 @@ distance=2.0
 
         assert_eq!(
             selected_level(&world, object, Vec3::ZERO, &level_meshes),
-            Some(&level_meshes[1])
+            Some((1, &level_meshes[1]))
         );
         assert_eq!(
             selected_level(&world, object, Vec3::new(0.0, 0.0, -4.5), &level_meshes),
-            Some(&level_meshes[0])
+            Some((0, &level_meshes[0]))
         );
         assert_eq!(
             selected_level(&world, object, Vec3::new(0.0, 0.0, 3.0), &level_meshes),

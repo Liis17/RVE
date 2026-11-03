@@ -6,7 +6,7 @@ use crate::viewport::model_loader::ModelLoader;
 use engine_assets::{Model, ModelAlphaMode};
 use engine_render::AlphaMode;
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
+    AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, LocalLight, LocalLightShadow,
     LocalLightShadowMatrices, Material, MaterialId, MeshId, ProceduralSky, RenderError, Renderer,
     SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex,
@@ -414,6 +414,7 @@ impl SceneRenderer {
                 &self.game_draws
             },
             overlay: &[],
+            debug_view: DebugView::Lit,
             reset_history: self.motion_history.reset_pending,
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
@@ -667,7 +668,7 @@ fn append_world_draws(
                 material: Some(material_id),
                 model: instance.model.to_cols_array_2d(),
                 previous_model: motion_history.previous_model(instance.object),
-                lod_level: 0,
+                lod_level: u8::try_from(level).unwrap_or(u8::MAX),
                 casts_shadow: true,
             });
             motion_history.record_current(instance.object, instance.model.to_cols_array_2d());

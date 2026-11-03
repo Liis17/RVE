@@ -134,6 +134,8 @@ Sandbox, runtime и редактор создают меши с локально
 
 Источники: `engine/engine-render/src/lib.rs`, `engine/engine-platform-windows/src/lib.rs`, `engine/engine-platform-macos/src/lib.rs`, `engine/sandbox/src/main.rs`.
 
+`Frame::debug_view` выбирает стабильные режимы Lit, Wireframe, Normals, Overdraw, LodLevels и ShadowCascades. Не-Lit режимы отключают temporal jitter и resolve, а смена debug key сбрасывает history. Raw color modes обходят EV и tonemapping; Wireframe — отдельный `LINE` overlay с depth `LESS_OR_EQUAL`, без depth writes и с отрицательным bias, доступный только если выбранный GPU поддерживает `fillModeNonSolid`. Overdraw суммирует красный канал для растеризованных fragments без depth test/write и alpha discard, поэтому masked holes также считаются.
+
 ### Кадр редактора
 
 `rve-editor` готовит отдельные draw lists, camera matrices, environments, local shadow matrices и directional cascades для Scene и Game; каждая панель использует собственную камеру, размер viewport и LOD. Renderer независимо строит cluster lists и рисует compute, shadow, opaque, skybox, blend и post passes в viewport targets; затем UI pass рисует примитивы egui прямо в swapchain image, а панели показывают viewport как текстуры без копий на CPU. `engine-scene` задаёт LOD thresholds и cull distance от мировой позиции объекта; runtime и editor применяют их до отправки draws, а renderer независимо выполняет frustum culling по камере и каскадам. Подробности — в [[Engine/RveEditor]], [[Engine/EngineScene]] и [[Engine/EngineRender]].

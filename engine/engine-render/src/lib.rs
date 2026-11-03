@@ -57,6 +57,8 @@ const MESH_MASK_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.mask.spv"));
 const MESH_BLEND_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.blend.spv"));
+const WIREFRAME_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/wireframe.frag.spv"));
 const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 const LOCAL_SHADOW_VERTEX_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/shadow.local.vert.spv"));
@@ -325,6 +327,7 @@ pub struct Frame<'a> {
     pub local_light_shadows: &'a [LocalLightShadow],
     pub draws: &'a [DrawCommand],
     pub overlay: &'a [OverlayVertex],
+    pub debug_view: DebugView,
     pub view: ViewSettings,
     /// Discards temporal history for this view before rendering it.
     pub reset_history: bool,
@@ -378,6 +381,39 @@ pub enum AntiAliasing {
     Taa,
     Fsr,
     Dlss,
+}
+
+/// Alternate scene outputs used to inspect geometry and lighting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DebugView {
+    #[default]
+    Lit,
+    Wireframe,
+    Normals,
+    Overdraw,
+    LodLevels,
+    ShadowCascades,
+}
+
+impl DebugView {
+    /// Stable shader-facing value; zero is the normal lit renderer path.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Lit => 0,
+            Self::Wireframe => 1,
+            Self::Normals => 2,
+            Self::Overdraw => 3,
+            Self::LodLevels => 4,
+            Self::ShadowCascades => 5,
+        }
+    }
+
+    const fn has_linear_output(self) -> bool {
+        matches!(
+            self,
+            Self::Normals | Self::Overdraw | Self::LodLevels | Self::ShadowCascades
+        )
+    }
 }
 
 impl AntiAliasing {
@@ -520,6 +556,7 @@ pub struct Capabilities {
     pub api_version: u32,
     pub discrete: bool,
     pub tessellation_shader: bool,
+    pub wireframe: bool,
 }
 
 /// Результат проверки базовых Vulkan-требований для физического устройства.
@@ -723,6 +760,8 @@ pub struct Renderer {
     pipeline: Option<vk::Pipeline>,
     mask_pipeline: Option<vk::Pipeline>,
     blend_pipeline: Option<vk::Pipeline>,
+    overdraw_pipeline: Option<vk::Pipeline>,
+    wireframe_pipeline: Option<vk::Pipeline>,
     skybox_pipeline: Option<vk::Pipeline>,
     shadow_pipeline: Option<vk::Pipeline>,
     local_shadow_pipeline: Option<vk::Pipeline>,
@@ -830,6 +869,8 @@ impl Renderer {
             pipeline: None,
             mask_pipeline: None,
             blend_pipeline: None,
+            overdraw_pipeline: None,
+            wireframe_pipeline: None,
             skybox_pipeline: None,
             shadow_pipeline: None,
             local_shadow_pipeline: None,
@@ -898,6 +939,7 @@ impl Renderer {
                 api_version: 0,
                 discrete: false,
                 tessellation_shader: false,
+                wireframe: false,
             },
             window,
         };
@@ -1352,8 +1394,10 @@ impl Renderer {
 
     /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
+        validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         validate_overlay(frame.overlay)?;
+        let view = effective_view_settings(frame.view, frame.debug_view);
         self.miss_unlisted_viewports(&[]);
         let output_extent = self
             .swapchain
@@ -1361,7 +1405,12 @@ impl Renderer {
             .map_or(self.output_extent, |swapchain| swapchain.extent);
         let render_extent = scaled_extent(output_extent, frame.view.render_scale);
         let temporal_plan = self.screen_temporal.state.plan(
-            temporal_key(render_extent, output_extent, frame.view.anti_aliasing),
+            temporal_key(
+                render_extent,
+                output_extent,
+                view.anti_aliasing,
+                frame.debug_view.code(),
+            ),
             multiply_4x4(frame.camera.projection, frame.camera.view),
             frame.reset_history,
         );
@@ -1391,7 +1440,7 @@ impl Renderer {
         self.poll_uploads()?;
         self.flush_uploads()?;
         self.retired.slot_completed(frame_slot);
-        if frame.view.anti_aliasing.is_temporal() {
+        if view.anti_aliasing.is_temporal() {
             ensure_temporal_history(
                 &instance,
                 &device,
@@ -1490,7 +1539,7 @@ impl Renderer {
             .target
             .as_ref()
             .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
-        let tonemap_source = if frame.view.anti_aliasing.is_temporal() {
+        let tonemap_source = if view.anti_aliasing.is_temporal() {
             let history = self
                 .screen_temporal
                 .history
@@ -1564,6 +1613,10 @@ impl Renderer {
             blend_pipeline: self
                 .blend_pipeline
                 .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?,
+            overdraw_pipeline: self
+                .overdraw_pipeline
+                .ok_or(RenderError::InvalidState("overdraw pipeline отсутствует"))?,
+            wireframe_pipeline: self.wireframe_pipeline,
             pipeline_layout: self
                 .pipeline_layout
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
@@ -1590,8 +1643,9 @@ impl Renderer {
             temporal_plan,
             camera_position: frame.camera.position,
             clear_color: frame.clear_color,
+            debug_view: frame.debug_view,
             timestamps,
-            view: frame.view,
+            view,
         };
         let frame_resources = &mut self.frames[frame_slot];
         let overlay =
@@ -1615,7 +1669,7 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
         let mut shadow_layout = self.shadow_layout;
         let mut local_shadow_layout = self.local_shadow_layout;
-        let temporal_record = if frame.view.anti_aliasing.is_temporal() {
+        let temporal_record = if view.anti_aliasing.is_temporal() {
             let history = self
                 .screen_temporal
                 .history
@@ -1643,7 +1697,7 @@ impl Renderer {
             swapchain.images[image_index],
             swapchain.views[image_index],
             swapchain.extent,
-            frame.view,
+            view,
             frame_resources.tonemap_set,
             frame_resources.output_set,
             self.tonemap_pipeline
@@ -1668,8 +1722,7 @@ impl Renderer {
         let temporal_submissions = [TemporalSubmission {
             view: TemporalViewId::Screen,
             plan: temporal_plan,
-            layouts: frame
-                .view
+            layouts: view
                 .anti_aliasing
                 .is_temporal()
                 .then_some([vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; 2]),
@@ -1701,6 +1754,7 @@ impl Renderer {
         let mut prepared_scenes = Vec::with_capacity(scenes.len());
         let mut scene_environment_sets = Vec::with_capacity(scenes.len());
         for (viewport, frame) in scenes {
+            validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
             validate_draws(frame.draws, &self.meshes, &self.materials)?;
             self.viewports
                 .get(viewport.0)
@@ -1711,13 +1765,19 @@ impl Renderer {
                 .ok_or_else(unknown_viewport)?
                 .extent;
             let render_extent = scaled_extent(extent, frame.view.render_scale);
+            let view = effective_view_settings(frame.view, frame.debug_view);
             let plan = self.viewports[viewport.0]
                 .as_ref()
                 .ok_or_else(unknown_viewport)?
                 .temporal
                 .state
                 .plan(
-                    temporal_key(render_extent, extent, frame.view.anti_aliasing),
+                    temporal_key(
+                        render_extent,
+                        extent,
+                        view.anti_aliasing,
+                        frame.debug_view.code(),
+                    ),
                     multiply_4x4(frame.camera.projection, frame.camera.view),
                     frame.reset_history,
                 );
@@ -1758,7 +1818,12 @@ impl Renderer {
                 .as_ref()
                 .ok_or_else(unknown_viewport)?
                 .extent;
-            if extent.width > 0 && extent.height > 0 && frame.view.anti_aliasing.is_temporal() {
+            if extent.width > 0
+                && extent.height > 0
+                && effective_view_settings(frame.view, frame.debug_view)
+                    .anti_aliasing
+                    .is_temporal()
+            {
                 let entry = self.viewports[viewport.0]
                     .as_mut()
                     .ok_or_else(unknown_viewport)?;
@@ -1860,7 +1925,10 @@ impl Renderer {
                 )?);
             }
             let target = slot_target.as_mut().ok_or_else(unknown_viewport)?;
-            let tonemap_source = if frame.view.anti_aliasing.is_temporal() {
+            let tonemap_source = if effective_view_settings(frame.view, frame.debug_view)
+                .anti_aliasing
+                .is_temporal()
+            {
                 let history = entry
                     .temporal
                     .history
@@ -1965,6 +2033,10 @@ impl Renderer {
         let blend_pipeline = self
             .blend_pipeline
             .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?;
+        let overdraw_pipeline = self
+            .overdraw_pipeline
+            .ok_or(RenderError::InvalidState("overdraw pipeline отсутствует"))?;
+        let wireframe_pipeline = self.wireframe_pipeline;
         let cluster_pipeline = self
             .cluster_pipeline
             .ok_or(RenderError::InvalidState("cluster pipeline отсутствует"))?;
@@ -2010,6 +2082,8 @@ impl Renderer {
                             pipeline: scene_pipeline,
                             mask_pipeline,
                             blend_pipeline,
+                            overdraw_pipeline,
+                            wireframe_pipeline,
                             cluster_pipeline,
                             cluster_pipeline_layout,
                             skybox_pipeline: *skybox_pipeline,
@@ -2028,8 +2102,9 @@ impl Renderer {
                             temporal_plan: *plan,
                             camera_position: frame.camera.position,
                             clear_color: frame.clear_color,
+                            debug_view: frame.debug_view,
                             timestamps: slot_timestamps.filter(|_| index == 0),
-                            view: frame.view,
+                            view: effective_view_settings(frame.view, frame.debug_view),
                         },
                         *tonemap_set,
                         *output_set,
@@ -2149,6 +2224,7 @@ impl Renderer {
                 tonemap_pipeline,
                 post_pipeline_layout,
                 pass.view,
+                pass.debug_view,
                 pass.timestamps,
             );
             if !pass.view.anti_aliasing.is_temporal() {
@@ -2476,6 +2552,7 @@ impl Renderer {
             api_version: choice.api_version,
             discrete: choice.discrete,
             tessellation_shader: choice.tessellation_shader,
+            wireframe: choice.wireframe,
         };
 
         let queue_priority = [1.0_f32];
@@ -2488,6 +2565,7 @@ impl Renderer {
             .collect::<Vec<_>>();
         let features = vk::PhysicalDeviceFeatures::default()
             .tessellation_shader(self.capabilities.tessellation_shader)
+            .fill_mode_non_solid(self.capabilities.wireframe)
             .shader_storage_image_extended_formats(true)
             .sampler_anisotropy(self.texture_sampler_anisotropy.is_some());
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::default()
@@ -4019,7 +4097,7 @@ impl Renderer {
     fn create_mesh_pipeline(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
         let push_constant_ranges = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(PUSH_CONSTANTS_SIZE as u32)];
         let set_layouts = [
@@ -4040,6 +4118,7 @@ impl Renderer {
         let opaque_module = ShaderModule::new(&device, MESH_OPAQUE_FRAGMENT_SHADER)?;
         let mask_module = ShaderModule::new(&device, MESH_MASK_FRAGMENT_SHADER)?;
         let blend_module = ShaderModule::new(&device, MESH_BLEND_FRAGMENT_SHADER)?;
+        let wireframe_module = ShaderModule::new(&device, WIREFRAME_FRAGMENT_SHADER)?;
         let vertex_stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vertex_module.handle)
@@ -4063,6 +4142,13 @@ impl Renderer {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(blend_module.handle)
+                .name(c"main"),
+        ];
+        let wireframe_stages = [
+            vertex_stage,
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(wireframe_module.handle)
                 .name(c"main"),
         ];
         let vertex_bindings = [vk::VertexInputBindingDescription::default()
@@ -4115,6 +4201,14 @@ impl Renderer {
         ];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let wireframe_attachments = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::empty()),
+        ];
+        let wireframe_color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&wireframe_attachments);
         let transparent_attachments = [
             vk::PipelineColorBlendAttachmentState::default()
                 .blend_enable(true)
@@ -4130,6 +4224,18 @@ impl Renderer {
         ];
         let transparent_color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&transparent_attachments);
+        let overdraw_attachments = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .dst_color_blend_factor(vk::BlendFactor::ONE)
+                .color_blend_op(vk::BlendOp::ADD)
+                .color_write_mask(vk::ColorComponentFlags::R),
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::empty()),
+        ];
+        let overdraw_color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&overdraw_attachments);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
             .depth_write_enable(true)
@@ -4138,6 +4244,21 @@ impl Renderer {
             .depth_test_enable(true)
             .depth_write_enable(false)
             .depth_compare_op(vk::CompareOp::LESS);
+        let overdraw_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(false)
+            .depth_write_enable(false);
+        let wireframe_rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_bias_enable(true)
+            .depth_bias_constant_factor(-1.0)
+            .depth_bias_slope_factor(-1.0)
+            .polygon_mode(vk::PolygonMode::LINE)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let wireframe_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
@@ -4154,6 +4275,12 @@ impl Renderer {
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(DEPTH_FORMAT);
         let mut blend_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let mut overdraw_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let mut wireframe_rendering_info = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(DEPTH_FORMAT);
         let pipeline_layout = self
@@ -4196,6 +4323,18 @@ impl Renderer {
                 .dynamic_state(&dynamic_state)
                 .layout(pipeline_layout)
                 .push_next(&mut blend_rendering_info),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&opaque_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&overdraw_depth_stencil)
+                .color_blend_state(&overdraw_color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut overdraw_rendering_info),
         ];
         // SAFETY: shader modules, layout and dynamic-rendering formats are valid for this device.
         let mut pipelines = match unsafe {
@@ -4210,7 +4349,7 @@ impl Renderer {
                 return Err(RenderError::Vulkan(error));
             }
         };
-        if pipelines.len() != 3 {
+        if pipelines.len() != 4 {
             for pipeline in pipelines {
                 // SAFETY: these pipeline handles were returned by this device.
                 unsafe { device.destroy_pipeline(pipeline, None) };
@@ -4222,6 +4361,38 @@ impl Renderer {
         self.pipeline = Some(pipelines.remove(0));
         self.mask_pipeline = Some(pipelines.remove(0));
         self.blend_pipeline = Some(pipelines.remove(0));
+        self.overdraw_pipeline = Some(pipelines.remove(0));
+        if self.capabilities.wireframe {
+            let wireframe_info = [vk::GraphicsPipelineCreateInfo::default()
+                .stages(&wireframe_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&wireframe_rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&wireframe_depth_stencil)
+                .color_blend_state(&wireframe_color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut wireframe_rendering_info)];
+            // SAFETY: the optional LINE pipeline uses the same live layout and dynamic-rendering formats.
+            let mut wireframe_pipelines = match unsafe {
+                device.create_graphics_pipelines(self.pipeline_cache()?, &wireframe_info, None)
+            } {
+                Ok(pipelines) => pipelines,
+                Err((pipelines, error)) => {
+                    for pipeline in pipelines {
+                        // SAFETY: these partial pipeline handles were returned by this device.
+                        unsafe { device.destroy_pipeline(pipeline, None) };
+                    }
+                    return Err(RenderError::Vulkan(error));
+                }
+            };
+            self.wireframe_pipeline = wireframe_pipelines.pop();
+            if self.wireframe_pipeline.is_none() {
+                return Err(RenderError::InvalidState("wireframe pipeline не создан"));
+            }
+        }
         Ok(())
     }
 
@@ -4729,6 +4900,8 @@ impl Drop for Renderer {
                 self.pipeline.take(),
                 self.mask_pipeline.take(),
                 self.blend_pipeline.take(),
+                self.overdraw_pipeline.take(),
+                self.wireframe_pipeline.take(),
                 self.skybox_pipeline.take(),
             ]
             .into_iter()
@@ -4848,6 +5021,7 @@ struct DeviceChoice {
     api_version: u32,
     discrete: bool,
     tessellation_shader: bool,
+    wireframe: bool,
     texture_sampler_anisotropy: Option<f32>,
     timestamp_valid_bits: u32,
     timestamp_period: f32,
@@ -4875,6 +5049,7 @@ struct DeviceEvaluation {
 struct DeviceInspection {
     report: DeviceReport,
     tessellation_shader: bool,
+    wireframe: bool,
     texture_sampler_anisotropy: Option<f32>,
     timestamp_period: f32,
     queue_families: Vec<vk::QueueFamilyProperties>,
@@ -4984,12 +5159,18 @@ fn inspect_device(
         .into_owned();
 
     // SAFETY: device feature query uses a valid physical device and a properly initialized pNext chain.
-    let (tessellation_shader, storage_image_extended_formats, texture_sampler_anisotropy) = {
+    let (
+        tessellation_shader,
+        fill_mode_non_solid,
+        storage_image_extended_formats,
+        texture_sampler_anisotropy,
+    ) = {
         let mut features_2 = vk::PhysicalDeviceFeatures2::default();
         // SAFETY: querying core features uses a valid physical device and null pNext chain.
         unsafe { instance.get_physical_device_features2(physical_device, &mut features_2) };
         (
             features_2.features.tessellation_shader != vk::FALSE,
+            features_2.features.fill_mode_non_solid != vk::FALSE,
             features_2.features.shader_storage_image_extended_formats != vk::FALSE,
             sampler_anisotropy(
                 features_2.features.sampler_anisotropy != vk::FALSE,
@@ -5077,6 +5258,7 @@ fn inspect_device(
     Ok(DeviceInspection {
         report,
         tessellation_shader,
+        wireframe: fill_mode_non_solid,
         texture_sampler_anisotropy,
         timestamp_period: properties.limits.timestamp_period,
         queue_families,
@@ -5290,6 +5472,7 @@ fn choose_device(
             api_version: inspection.report.api_version,
             discrete: inspection.report.discrete,
             tessellation_shader: inspection.tessellation_shader,
+            wireframe: inspection.wireframe,
             texture_sampler_anisotropy: inspection.texture_sampler_anisotropy,
             timestamp_valid_bits,
             timestamp_period: inspection.timestamp_period,
@@ -6193,6 +6376,7 @@ fn temporal_key(
     render_extent: vk::Extent2D,
     output_extent: vk::Extent2D,
     anti_aliasing: AntiAliasing,
+    debug_view: u32,
 ) -> TemporalKey {
     TemporalKey {
         render_extent: TemporalExtent {
@@ -6204,8 +6388,31 @@ fn temporal_key(
             height: output_extent.height,
         },
         anti_aliasing,
-        debug_view: 0,
+        debug_view,
     }
+}
+
+fn effective_view_settings(mut view: ViewSettings, debug_view: DebugView) -> ViewSettings {
+    if debug_view != DebugView::Lit {
+        view.anti_aliasing = AntiAliasing::None;
+    }
+    if debug_view.has_linear_output() {
+        view.exposure_ev = 0.0;
+        view.tonemapper = Tonemapper::None;
+    }
+    view
+}
+
+fn validate_debug_view(
+    debug_view: DebugView,
+    wireframe_supported: bool,
+) -> Result<(), RenderError> {
+    if debug_view == DebugView::Wireframe && !wireframe_supported {
+        return Err(RenderError::InvalidConfig(
+            "wireframe debug view requires fillModeNonSolid support",
+        ));
+    }
+    Ok(())
 }
 
 struct UiTexture {
@@ -6821,6 +7028,7 @@ fn record_frame(
         tonemap_pipeline,
         post_pipeline_layout,
         view,
+        scene.debug_view,
         scene.timestamps,
     );
     if temporal.is_none() {
@@ -7067,6 +7275,11 @@ fn record_scene(
         shadow,
     );
 
+    let clear_color = if scene.debug_view == DebugView::Overdraw {
+        [0.0, 0.0, 0.0, 1.0]
+    } else {
+        scene.clear_color
+    };
     let color_attachment = [
         vk::RenderingAttachmentInfo::default()
             .image_view(target.color.view)
@@ -7075,7 +7288,7 @@ fn record_scene(
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: scene.clear_color,
+                    float32: clear_color,
                 },
             }),
         vk::RenderingAttachmentInfo::default()
@@ -7113,11 +7326,15 @@ fn record_scene(
         command_buffer,
         render_extent,
         scene,
-        DrawPass::OpaqueAndMask,
+        if scene.debug_view == DebugView::Overdraw {
+            DrawPass::Overdraw
+        } else {
+            DrawPass::OpaqueAndMask
+        },
     );
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
-    if scene.skybox {
+    if scene.skybox && scene.debug_view != DebugView::Overdraw {
         pipeline_barrier(
             device,
             command_buffer,
@@ -7192,7 +7409,7 @@ fn record_scene(
         // SAFETY: this matches the preceding dynamic-rendering begin call.
         unsafe { device.cmd_end_rendering(command_buffer) };
     }
-    if has_transparent_draws(scene) {
+    if scene.debug_view != DebugView::Overdraw && has_transparent_draws(scene) {
         let color_to_blend = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -7276,6 +7493,9 @@ fn record_scene(
         // SAFETY: this matches the preceding transparent cmd_begin_rendering call.
         unsafe { device.cmd_end_rendering(command_buffer) };
     }
+    if scene.debug_view == DebugView::Wireframe {
+        record_wireframe(device, command_buffer, target, render_extent, scene);
+    }
     pipeline_barrier(
         device,
         command_buffer,
@@ -7308,6 +7528,82 @@ fn record_scene(
     );
     target.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
     target.depth_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+}
+
+fn record_wireframe(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    target: &OffscreenTarget,
+    render_extent: vk::Extent2D,
+    scene: &ScenePass<'_>,
+) {
+    for image in [&target.color, &target.velocity] {
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                image.image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                color_subresource_range(),
+            ),
+        );
+    }
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            target.depth.image,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+            depth_subresource_range(),
+        ),
+    );
+    let color_attachments = [
+        vk::RenderingAttachmentInfo::default()
+            .image_view(target.color.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE),
+        vk::RenderingAttachmentInfo::default()
+            .image_view(target.velocity.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE),
+    ];
+    let depth_attachment = vk::RenderingAttachmentInfo::default()
+        .image_view(target.depth.view)
+        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE);
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: render_extent,
+        })
+        .layer_count(1)
+        .color_attachments(&color_attachments)
+        .depth_attachment(&depth_attachment);
+    // SAFETY: wireframe overlay attachments match the scene pass formats and remain in attachment layouts.
+    unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
+    record_draws(
+        device,
+        command_buffer,
+        render_extent,
+        scene,
+        DrawPass::Wireframe,
+    );
+    // SAFETY: this matches the preceding dynamic-rendering begin call.
+    unsafe { device.cmd_end_rendering(command_buffer) };
 }
 
 fn record_local_shadow_layers(
@@ -7441,12 +7737,16 @@ fn record_skybox(
 enum DrawPass {
     OpaqueAndMask,
     Blend,
+    Overdraw,
+    Wireframe,
 }
 
 struct ScenePass<'a> {
     pipeline: vk::Pipeline,
     mask_pipeline: vk::Pipeline,
     blend_pipeline: vk::Pipeline,
+    overdraw_pipeline: vk::Pipeline,
+    wireframe_pipeline: Option<vk::Pipeline>,
     cluster_pipeline: vk::Pipeline,
     cluster_pipeline_layout: vk::PipelineLayout,
     skybox_pipeline: vk::Pipeline,
@@ -7463,6 +7763,7 @@ struct ScenePass<'a> {
     camera_position: [f32; 3],
     clear_color: [f32; 4],
     timestamps: Option<vk::QueryPool>,
+    debug_view: DebugView,
     view: ViewSettings,
 }
 
@@ -7553,17 +7854,26 @@ fn record_draws(
         let Some(material) = material_for_draw(scene.materials, draw) else {
             continue;
         };
-        let pipeline_kind = match (pass, material.alpha_mode) {
-            (DrawPass::OpaqueAndMask, AlphaMode::Opaque) => DrawPipeline::Opaque,
-            (DrawPass::OpaqueAndMask, AlphaMode::Mask { .. }) => DrawPipeline::Mask,
-            (DrawPass::Blend, AlphaMode::Blend) => DrawPipeline::Blend,
-            _ => continue,
+        let pipeline_kind = match pass {
+            DrawPass::Overdraw => DrawPipeline::Overdraw,
+            DrawPass::Wireframe => DrawPipeline::Wireframe,
+            DrawPass::OpaqueAndMask => match material.alpha_mode {
+                AlphaMode::Opaque => DrawPipeline::Opaque,
+                AlphaMode::Mask { .. } => DrawPipeline::Mask,
+                AlphaMode::Blend => continue,
+            },
+            DrawPass::Blend => match material.alpha_mode {
+                AlphaMode::Blend => DrawPipeline::Blend,
+                AlphaMode::Opaque | AlphaMode::Mask { .. } => continue,
+            },
         };
         if bound_pipeline != Some(pipeline_kind) {
             let pipeline = match pipeline_kind {
                 DrawPipeline::Opaque => scene.pipeline,
                 DrawPipeline::Mask => scene.mask_pipeline,
                 DrawPipeline::Blend => scene.blend_pipeline,
+                DrawPipeline::Overdraw => scene.overdraw_pipeline,
+                DrawPipeline::Wireframe => scene.wireframe_pipeline.unwrap_or(scene.pipeline),
             };
             // SAFETY: the selected pipeline matches the active dynamic-rendering attachments.
             unsafe {
@@ -7616,7 +7926,7 @@ fn record_draws(
             device.cmd_push_constants(
                 command_buffer,
                 scene.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 &push_constants,
             );
@@ -7630,6 +7940,8 @@ enum DrawPipeline {
     Opaque,
     Mask,
     Blend,
+    Overdraw,
+    Wireframe,
 }
 
 fn material_for_draw<'a>(
@@ -7809,6 +8121,7 @@ fn record_tonemap_pass(
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     view: ViewSettings,
+    debug_view: DebugView,
     timestamps: Option<vk::QueryPool>,
 ) {
     if source_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
@@ -7868,7 +8181,7 @@ fn record_tonemap_pass(
     let push_constants = float_bytes::<POST_PUSH_CONSTANTS_SIZE>(&[
         view.exposure_ev,
         view.tonemapper.code() as f32,
-        0.0,
+        debug_view.code() as f32,
         0.0,
     ]);
     // SAFETY: source and destination views match the descriptor and attachment layouts.
@@ -10486,7 +10799,12 @@ fn frame_uniform_bytes_with_count(
     let [jitter_x, jitter_y, lod_bias] = temporal.map_or([0.0; 3], |plan| {
         [plan.jitter_ndc[0], plan.jitter_ndc[1], plan.lod_bias]
     });
-    values[176..180].copy_from_slice(&[jitter_x, jitter_y, lod_bias, 0.0]);
+    values[176..180].copy_from_slice(&[
+        jitter_x,
+        jitter_y,
+        lod_bias,
+        frame.debug_view.code() as f32,
+    ]);
     Ok(float_bytes(&values))
 }
 
@@ -10787,9 +11105,9 @@ mod tests {
         AcquireAction, AlphaMode, AntiAliasing, CLUSTER_BOUNDS_BUFFER_SIZE,
         CLUSTER_BOUNDS_GPU_SIZE, CLUSTER_BUFFER_SIZE, CLUSTER_COMPUTE_LOCAL_SIZE,
         CLUSTER_COMPUTE_SHADER, CLUSTER_COUNT, CLUSTER_GRID_X, CLUSTER_GRID_Y, CLUSTER_GRID_Z,
-        CLUSTER_RECORD_GPU_SIZE, DEFAULT_UPLOAD_BATCH_CAPACITY, DeviceFacts, DeviceReport,
-        DirectionalLight, DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame,
-        FrameCamera, GpuLocalLight, IDENTITY_MATRIX, LDR_FORMAT, LOCAL_LIGHT_GPU_SIZE,
+        CLUSTER_RECORD_GPU_SIZE, DEFAULT_UPLOAD_BATCH_CAPACITY, DebugView, DeviceFacts,
+        DeviceReport, DirectionalLight, DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER,
+        Frame, FrameCamera, GpuLocalLight, IDENTITY_MATRIX, LDR_FORMAT, LOCAL_LIGHT_GPU_SIZE,
         LOCAL_SHADOW_MAP_RESOLUTION, LOCAL_SHADOW_MATRIX_BUFFER_SIZE, LocalLight, LocalLightShadow,
         LocalLightShadowMatrices, MATERIAL_UNIFORMS_SIZE, MAX_CLUSTER_LIGHTS,
         MAX_LOCAL_SHADOW_LAYERS, MAX_RENDERED_LIGHTS, MESH_BLEND_FRAGMENT_SHADER,
@@ -10803,22 +11121,23 @@ mod tests {
         UI_VERTEX_SHADER, VELOCITY_FORMAT, Vertex, ViewSettings, align_upload_offset,
         best_device_index, check_extensions, classify_acquire_result,
         classify_probe_instance_failure, cluster_device_limit_reasons, deduplicate_names,
-        derivative_tangent_basis, draw_rasterization_state, evaluate_device, frame_uniform_bytes,
-        index_bytes, index_local_light_shadows, inverse_extent, local_light_bytes,
-        local_light_bytes_for_selected, local_light_contribution, local_shadow_matrix_bytes,
-        material_sampler_info, material_uniform_bytes, mesh_upload_layout, mip_extent,
-        mip_level_count, missing_extensions, missing_offscreen_format_features,
-        missing_post_format_features, missing_texture_format_features,
-        missing_velocity_format_features, normal_matrix, offscreen_previous_use,
-        overlay_vertex_bytes, point_shadow_face_index, push_constant_bytes, sampler_anisotropy,
-        scaled_extent, scene_viewport, select_composite_alpha, select_local_light_entries,
-        select_local_lights, select_local_shadow_slots, select_present_mode, select_surface_extent,
-        shadow_array_limits_suitable, shadow_caster_is_outside, shadow_casters,
-        shadow_layout_source, shadow_subresource_range, texture_format, texture_format_reasons,
-        texture_mip_blit_region, texture_mip_destination_shader_barrier,
-        texture_mip_shader_barrier, texture_mip_source_barrier, texture_staging_size,
-        texture_upload_barrier, timestamp_duration, transform_tangent_normal,
-        upload_batch_capacity, upload_batch_flush_required, upload_data_layout, validate_draws,
+        derivative_tangent_basis, draw_rasterization_state, effective_view_settings,
+        evaluate_device, frame_uniform_bytes, index_bytes, index_local_light_shadows,
+        inverse_extent, local_light_bytes, local_light_bytes_for_selected,
+        local_light_contribution, local_shadow_matrix_bytes, material_sampler_info,
+        material_uniform_bytes, mesh_upload_layout, mip_extent, mip_level_count,
+        missing_extensions, missing_offscreen_format_features, missing_post_format_features,
+        missing_texture_format_features, missing_velocity_format_features, normal_matrix,
+        offscreen_previous_use, overlay_vertex_bytes, point_shadow_face_index, push_constant_bytes,
+        sampler_anisotropy, scaled_extent, scene_viewport, select_composite_alpha,
+        select_local_light_entries, select_local_lights, select_local_shadow_slots,
+        select_present_mode, select_surface_extent, shadow_array_limits_suitable,
+        shadow_caster_is_outside, shadow_casters, shadow_layout_source, shadow_subresource_range,
+        texture_format, texture_format_reasons, texture_mip_blit_region,
+        texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
+        texture_mip_source_barrier, texture_staging_size, texture_upload_barrier,
+        timestamp_duration, transform_tangent_normal, upload_batch_capacity,
+        upload_batch_flush_required, upload_data_layout, validate_debug_view, validate_draws,
         validate_material, validate_mesh, validate_overlay, validate_pipeline_cache,
         validate_render_scale, validate_texture, validate_view_settings, vertex_bytes,
     };
@@ -10835,6 +11154,76 @@ mod tests {
     #[test]
     fn renderer_is_send() {
         assert_send::<Renderer>();
+    }
+
+    #[test]
+    fn debug_view_shader_codes_are_stable_and_distinct() {
+        assert_eq!(
+            [
+                DebugView::Lit.code(),
+                DebugView::Wireframe.code(),
+                DebugView::Normals.code(),
+                DebugView::Overdraw.code(),
+                DebugView::LodLevels.code(),
+                DebugView::ShadowCascades.code(),
+            ],
+            [0, 1, 2, 3, 4, 5]
+        );
+        let extent = vk::Extent2D {
+            width: 640,
+            height: 360,
+        };
+        assert_eq!(
+            super::temporal_key(extent, extent, AntiAliasing::Taa, DebugView::Lit.code())
+                .debug_view,
+            DebugView::Lit.code()
+        );
+        assert_eq!(
+            super::temporal_key(
+                extent,
+                extent,
+                AntiAliasing::None,
+                DebugView::ShadowCascades.code()
+            )
+            .debug_view,
+            DebugView::ShadowCascades.code()
+        );
+    }
+
+    #[test]
+    fn non_lit_debug_views_disable_aa_and_raw_views_bypass_tonemapping() {
+        let settings = ViewSettings {
+            render_scale: 0.5,
+            exposure_ev: 2.0,
+            tonemapper: Tonemapper::Aces,
+            anti_aliasing: AntiAliasing::Taa,
+        };
+        assert_eq!(effective_view_settings(settings, DebugView::Lit), settings);
+        let wireframe = effective_view_settings(settings, DebugView::Wireframe);
+        assert_eq!(wireframe.anti_aliasing, AntiAliasing::None);
+        assert_eq!(wireframe.exposure_ev, 2.0);
+        assert_eq!(wireframe.tonemapper, Tonemapper::Aces);
+        for debug_view in [
+            DebugView::Normals,
+            DebugView::Overdraw,
+            DebugView::LodLevels,
+            DebugView::ShadowCascades,
+        ] {
+            let view = effective_view_settings(settings, debug_view);
+            assert_eq!(view.anti_aliasing, AntiAliasing::None);
+            assert_eq!(view.exposure_ev, 0.0);
+            assert_eq!(view.tonemapper, Tonemapper::None);
+        }
+    }
+
+    #[test]
+    fn wireframe_view_requires_optional_device_feature() {
+        assert!(validate_debug_view(DebugView::Lit, false).is_ok());
+        assert!(validate_debug_view(DebugView::Wireframe, true).is_ok());
+        assert!(matches!(
+            validate_debug_view(DebugView::Wireframe, false),
+            Err(super::RenderError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -11984,6 +12373,7 @@ mod tests {
                 local_light_shadows: &[],
                 draws: &[],
                 overlay: &[],
+                debug_view: DebugView::Lit,
                 view: ViewSettings::default(),
                 reset_history: false,
             };
@@ -12978,6 +13368,7 @@ mod tests {
             local_light_shadows: &[],
             draws: &[],
             overlay: &[],
+            debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
         };
@@ -13010,6 +13401,12 @@ mod tests {
         assert_eq!(&values[158..160], &[1.0, 1.0]);
         assert_eq!(&values[160..176], view_projection.as_flattened());
         assert_eq!(&values[176..180], &[0.0; 4]);
+
+        let normals = Frame {
+            debug_view: DebugView::Normals,
+            ..frame
+        };
+        assert_eq!(floats(&frame_uniform_bytes(&normals).unwrap())[179], 2.0);
 
         let no_shadows = Frame {
             shadow_cascades: &[],
@@ -13053,6 +13450,7 @@ mod tests {
             local_light_shadows: &[],
             draws: &[],
             overlay: &[],
+            debug_view: DebugView::Lit,
             view: ViewSettings {
                 anti_aliasing: AntiAliasing::Taa,
                 ..ViewSettings::default()
@@ -13101,6 +13499,7 @@ mod tests {
                         local_light_shadows: &[],
                         draws: &[],
                         overlay: &[],
+                        debug_view: DebugView::Lit,
                         view: ViewSettings::default(),
                         reset_history: false,
                     }),
@@ -13127,6 +13526,7 @@ mod tests {
             local_light_shadows: &[],
             draws: &[],
             overlay: &[],
+            debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
         };
@@ -13153,6 +13553,7 @@ mod tests {
             local_light_shadows: &[],
             draws: &[],
             overlay: &[],
+            debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
         };
