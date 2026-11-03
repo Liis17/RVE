@@ -18,6 +18,19 @@ fn main() {
             println!("{}", cli::USAGE);
             0
         }
+        Ok(CommandLine::Scripts { project_dir }) => match player::scripts_project(&project_dir) {
+            Ok(path) => {
+                println!(
+                    "{}",
+                    path.map(|p| p.display().to_string()).unwrap_or_default()
+                );
+                0
+            }
+            Err(error) => {
+                eprintln!("rve-build: {error}");
+                error.exit_code()
+            }
+        },
         Ok(CommandLine::Build {
             project_dir,
             output,

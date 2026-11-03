@@ -182,6 +182,58 @@ fn scripts_library_filename() -> &'static str {
     "libgame_scripts.so"
 }
 
+pub(crate) fn scripts_project(project: &Path) -> Result<Option<PathBuf>, BuildError> {
+    build_game_scripts(&prepare_project(project)?, false)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_command_line_tools() -> Result<(), BuildError> {
+    let status = Command::new("xcode-select")
+        .arg("-p")
+        .status()
+        .map_err(|e| BuildError::operational(format!("xcode-select: {e}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    Command::new("xcode-select")
+        .arg("--install")
+        .status()
+        .map_err(|e| BuildError::operational(format!("xcode-select --install: {e}")))?;
+    Err(BuildError::operational(
+        "Установите Command Line Tools в открывшемся диалоге и повторите сборку",
+    ))
+}
+
+fn script_cargo_command(project: &Path, toolchain: Option<&Path>) -> Result<Command, BuildError> {
+    let Some(toolchain) = toolchain else {
+        return Ok(Command::new(
+            std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+        ));
+    };
+    let bin = toolchain.join("bin");
+    let mut command = Command::new(bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)));
+    let mut paths = vec![bin.clone()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    command
+        .env(
+            "RUSTC",
+            bin.join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .env("CARGO_HOME", project.join(".rve/cargo-home"))
+        .env(
+            "PATH",
+            std::env::join_paths(paths).map_err(|e| BuildError::operational(e.to_string()))?,
+        )
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    Ok(command)
+}
+
 fn build_game_scripts(
     project: &ProjectBuild,
     release: bool,
@@ -191,13 +243,26 @@ fn build_game_scripts(
     };
     let project_root = normalize_build_path(&project.project_dir)?;
     let scripts_dir = manifest_path.parent().unwrap_or(&project_root);
-    let target = cargo_cdylib_target(&manifest_path)?;
+    let exe = current_executable_path()?;
+    let exe_dir = executable_directory(&exe)?;
+    let sdk_root = if exe_dir.join("rve-sdk.toml").is_file() {
+        exe_dir
+    } else {
+        repo_root()?.join("engine")
+    };
+    sdk::sync_guest_sdk(
+        &sdk_root.join("rve-sdk"),
+        &project_root.join(".rve/sdk/rve-sdk"),
+    )?;
+    #[cfg(target_os = "macos")]
+    ensure_command_line_tools()?;
+    let toolchain = sdk_root.join("toolchain");
+    let bundled = toolchain.is_dir().then_some(toolchain.as_path());
+    let target = cargo_cdylib_target(&manifest_path, &project_root, bundled)?;
     let target_dir = normalize_build_path(&project_root.join(".rve/target"))?;
     create_dir_all(&target_dir)?;
 
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-
-    let mut command = Command::new(&cargo);
+    let mut command = script_cargo_command(&project_root, bundled)?;
     command
         .arg("build")
         .arg("--lib")
@@ -342,10 +407,13 @@ struct CdylibTarget {
     target_name: String,
 }
 
-fn cargo_cdylib_target(manifest_path: &Path) -> Result<CdylibTarget, BuildError> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+fn cargo_cdylib_target(
+    manifest_path: &Path,
+    project: &Path,
+    toolchain: Option<&Path>,
+) -> Result<CdylibTarget, BuildError> {
     let stdout = run_cargo(
-        Command::new(cargo)
+        script_cargo_command(project, toolchain)?
             .arg("metadata")
             .arg("--no-deps")
             .arg("--format-version")
@@ -889,6 +957,39 @@ mod tests {
         };
         // SAFETY: script_module! stores the descriptors and names in static storage.
         unsafe { ScriptLibrary::from_module(module) }.unwrap()
+    }
+
+    #[test]
+    fn bundled_command_uses_private_compiler_and_cargo_home() {
+        let project = Path::new("project");
+        let toolchain = Path::new("sdk/toolchain");
+        let command = super::script_cargo_command(project, Some(toolchain)).unwrap();
+        assert_eq!(
+            command.get_program(),
+            toolchain.join(format!("bin/cargo{}", std::env::consts::EXE_SUFFIX))
+        );
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env[std::ffi::OsStr::new("RUSTC")],
+            Some(
+                toolchain
+                    .join("bin")
+                    .join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
+                    .as_os_str()
+            )
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("CARGO_HOME")],
+            Some(project.join(".rve/cargo-home").as_os_str())
+        );
+        assert_eq!(env[std::ffi::OsStr::new("RUSTUP_TOOLCHAIN")], None);
+        assert_eq!(env[std::ffi::OsStr::new("RUSTFLAGS")], None);
+        assert_eq!(
+            std::env::split_paths(env[std::ffi::OsStr::new("PATH")].unwrap())
+                .next()
+                .unwrap(),
+            toolchain.join("bin")
+        );
     }
 
     #[test]

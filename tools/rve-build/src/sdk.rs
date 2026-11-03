@@ -288,6 +288,50 @@ fn validate_toolchain(root: &Path) -> Result<(), BuildError> {
     Ok(())
 }
 
+/// Copies only changed guest API files so Cargo keeps its incremental cache.
+pub(crate) fn sync_guest_sdk(source: &Path, destination: &Path) -> Result<(), BuildError> {
+    fn sync(source: &Path, destination: &Path) -> Result<(), BuildError> {
+        player::create_dir_all(destination)?;
+        for entry in fs::read_dir(source).map_err(|e| BuildError::operational(e.to_string()))? {
+            let entry = entry.map_err(|e| BuildError::operational(e.to_string()))?;
+            let target = destination.join(entry.file_name());
+            if entry.path().is_dir() {
+                sync(&entry.path(), &target)?;
+            } else {
+                let bytes =
+                    fs::read(entry.path()).map_err(|e| BuildError::operational(e.to_string()))?;
+                if fs::read(&target).ok().as_deref() != Some(bytes.as_slice()) {
+                    fs::write(&target, bytes)
+                        .map_err(|e| BuildError::operational(e.to_string()))?;
+                }
+            }
+        }
+        for entry in
+            fs::read_dir(destination).map_err(|e| BuildError::operational(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| BuildError::operational(e.to_string()))?;
+            if !source.join(entry.file_name()).exists() {
+                if entry.path().is_dir() {
+                    fs::remove_dir_all(entry.path())
+                } else {
+                    fs::remove_file(entry.path())
+                }
+                .map_err(|e| BuildError::operational(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+    player::create_dir_all(destination)?;
+    let manifest = source.join("Cargo.toml");
+    let bytes = fs::read(&manifest)
+        .map_err(|e| BuildError::operational(format!("{}: {e}", manifest.display())))?;
+    let target = destination.join("Cargo.toml");
+    if fs::read(&target).ok().as_deref() != Some(bytes.as_slice()) {
+        fs::write(target, bytes).map_err(|e| BuildError::operational(e.to_string()))?;
+    }
+    sync(&source.join("src"), &destination.join("src"))
+}
+
 fn copy_directory(source: &Path, destination: &Path) -> Result<(), BuildError> {
     player::create_dir_all(destination)?;
     let entries = fs::read_dir(source).map_err(|error| {
@@ -348,6 +392,26 @@ mod tests {
 
     fn temp_dir(prefix: &str) -> TempDir {
         TempDir::create(&std::env::temp_dir(), prefix).unwrap()
+    }
+
+    #[test]
+    fn guest_sync_preserves_unchanged_files_and_updates_and_removes_changed_sources() {
+        let temp = temp_dir("guest-sync");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("guest");
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("Cargo.toml"), "manifest").unwrap();
+        fs::write(source.join("src/lib.rs"), "first").unwrap();
+        super::sync_guest_sdk(&source, &destination).unwrap();
+        let file = destination.join("src/lib.rs");
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        super::sync_guest_sdk(&source, &destination).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+        fs::write(source.join("src/lib.rs"), "second").unwrap();
+        fs::write(destination.join("src/obsolete.rs"), "obsolete").unwrap();
+        super::sync_guest_sdk(&source, &destination).unwrap();
+        assert_eq!(fs::read_to_string(file).unwrap(), "second");
+        assert!(!destination.join("src/obsolete.rs").exists());
     }
 
     #[test]

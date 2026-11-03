@@ -114,6 +114,19 @@ SDK содержит четыре executable, маркер и гостевой `
 `compiler-artifact` по package id из metadata, имени target, kind `cdylib` и
 расширению текущей платформы. Cargo.lock скриптов остаётся в зоне проекта.
 
+`rve-build scripts <project-dir>` собирает debug cdylib с теми же проверками ABI,
+имён и параметров и выводит абсолютный путь последней строкой stdout. Без
+`heavy_scripts` выводит пустую строку и завершается успешно. Перед Cargo гостевой
+API из SDK либо checkout синхронизируется в `<project>/.rve/sdk/rve-sdk`;
+совпадающие файлы сохраняют mtime, удалённые исходники убираются.
+
+При наличии SDK `toolchain/` и metadata, и build запускают его Cargo с явным
+`RUSTC`, отдельным `CARGO_HOME=<project>/.rve/cargo-home` и toolchain/bin в начале
+PATH. Наследуемые Rust flags, rustup toolchain и compiler wrappers убираются.
+Без toolchain действует прежний CARGO/PATH. На macOS отсутствие CLT вызывает
+`xcode-select --install` и операционную ошибку с просьбой повторить сборку после
+установки.
+
 Собранную библиотеку сборщик загружает через `ScriptLibrary` и проверяет, что она
 регистрирует каждое имя heavy-скрипта из включённых сцен. Ссылка сцены на heavy без
 `heavy_scripts`, отсутствие cdylib или незарегистрированное имя — ошибка проекта с

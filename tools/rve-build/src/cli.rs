@@ -1,10 +1,13 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build --help";
+pub(crate) const USAGE: &str = "Usage:\n  rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]\n  rve-build run <project-dir> [-- <rve-player args...>]\n  rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain) [--vulkan-sdk <dir>]\n  rve-build scripts <project-dir>\n  rve-build --help";
 
 pub(crate) enum CommandLine {
     Help,
+    Scripts {
+        project_dir: PathBuf,
+    },
     Build {
         project_dir: PathBuf,
         output: PathBuf,
@@ -34,6 +37,18 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CommandL
         Some("build") => parse_build(args),
         Some("run") => parse_run(args),
         Some("sdk") => parse_sdk(args),
+        Some("scripts") => {
+            let project_dir = args.next().ok_or("для scripts требуется <project-dir>")?;
+            if is_help(&project_dir) {
+                return Ok(CommandLine::Help);
+            }
+            if args.next().is_some() {
+                return Err("лишние аргументы scripts".to_owned());
+            }
+            Ok(CommandLine::Scripts {
+                project_dir: project_dir.into(),
+            })
+        }
         Some(value) => Err(format!("неизвестная команда {value:?}")),
         None => Err("имя команды должно быть текстом UTF-8".to_owned()),
     }
@@ -172,6 +187,15 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn scripts_requires_one_project_path() {
+        assert!(
+            matches!(parse(args(&["scripts", "my project"])).unwrap(), CommandLine::Scripts { project_dir } if project_dir == Path::new("my project"))
+        );
+        assert!(parse(args(&["scripts"])).is_err());
+        assert!(parse(args(&["scripts", "game", "extra"])).is_err());
     }
 
     #[test]
