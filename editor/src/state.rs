@@ -24,6 +24,8 @@ pub enum Action {
     /// `None` — выбрать файл в диалоге.
     OpenScene(Option<String>),
     OpenProject,
+    /// Открыть проект из списка недавних.
+    OpenProjectAt(PathBuf),
     Save,
     SaveAs,
     Exit,
@@ -79,6 +81,8 @@ pub struct EditorState {
     pub gizmo_drag: Option<GizmoDrag>,
     pub play: Option<PlaySession>,
     pub scripts_path: Option<PathBuf>,
+    /// Недавние проекты из настроек пользователя, последний открытый — первым.
+    pub recent_projects: Vec<PathBuf>,
     pub library: Option<ScriptLibrary>,
     pub actions: Vec<Action>,
     pub unsaved_prompt: Option<UnsavedPrompt>,
@@ -118,6 +122,7 @@ impl EditorState {
             gizmo_drag: None,
             play: None,
             scripts_path,
+            recent_projects: Vec::new(),
             library: None,
             actions: Vec::new(),
             unsaved_prompt: None,

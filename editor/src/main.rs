@@ -10,6 +10,7 @@ mod play;
 mod previews;
 mod project;
 mod scene_edit;
+mod settings;
 mod state;
 mod ui;
 mod ui_render;

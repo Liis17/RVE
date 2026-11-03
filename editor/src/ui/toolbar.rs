@@ -1,6 +1,6 @@
 //! Верхнее меню, строка инструментов и горячие клавиши.
 
-use crate::layout::{Tab, is_open};
+use crate::layout::{Tab, default_layout, is_open};
 use crate::scene_edit::NewObject;
 use crate::state::{Action, EditorState};
 use crate::ui::scene_view;
@@ -144,6 +144,10 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
         {
             state.action(Action::OpenProject);
         }
+        ui.add_enabled_ui(
+            !state.is_playing() && !state.recent_projects.is_empty(),
+            |ui| ui.menu_button("Open Recent", |ui| super::recent_projects(ui, state)),
+        );
         if ui
             .add_enabled(editing, egui::Button::new("Open Scene…"))
             .clicked()
@@ -233,6 +237,10 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
             {
                 dock.push_to_first_leaf(tab);
             }
+        }
+        ui.separator();
+        if ui.button("Reset Layout").clicked() {
+            *dock = default_layout();
         }
     });
 }

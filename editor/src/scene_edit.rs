@@ -625,7 +625,7 @@ fn is_empty_material(material: &MaterialOverride) -> bool {
         && material.normal_scale.is_none()
 }
 
-fn write_atomic(file: &Path, contents: &[u8]) -> Result<(), String> {
+pub fn write_atomic(file: &Path, contents: &[u8]) -> Result<(), String> {
     let describe = |error: std::io::Error| format!("{}: {error}", file.display());
     let name = file
         .file_name()
