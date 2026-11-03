@@ -1,6 +1,7 @@
 //! Редактируемая сцена: команды над документом, undo/redo и сохранение.
 
 use engine_files::VirtualPath;
+use engine_scene::document::MaterialOverride;
 use engine_scene::{
     CameraComponent, DirectionalLightComponent, LodGroup, MeshRenderer, SceneAsset, SceneDocument,
     SceneObject, SceneTransform,
@@ -158,6 +159,14 @@ impl EditorScene {
     /// Завершает непрерывную правку: следующее изменение создаст новую запись истории.
     pub fn end_continuous_edit(&mut self) {
         self.coalesce = None;
+    }
+
+    /// Завершает непрерывную правку только с ключом `key`. Нужна виджетам вроде палитры цвета,
+    /// которые не сообщают об окончании перетаскивания.
+    pub fn end_continuous_edit_for(&mut self, key: &str) {
+        if self.coalesce.as_deref() == Some(key) {
+            self.coalesce = None;
+        }
     }
 
     /// Применяет правку к копии и принимает её только после проверки всего документа.
@@ -534,6 +543,36 @@ impl EditorScene {
         })
     }
 
+    /// Заменяет scene material override; текстуры добавляются в список ресурсов сцены.
+    /// Override без заданных полей удаляется.
+    pub fn set_material(
+        &mut self,
+        id: &str,
+        material: Option<MaterialOverride>,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        let material = material.filter(|material| !is_empty_material(material));
+        self.edit(coalesce, |document| {
+            if let Some(material) = &material {
+                for texture in [
+                    &material.metallic_roughness_texture,
+                    &material.normal_texture,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    ensure_asset(document, texture);
+                }
+            }
+            find_object_mut(document, id)?
+                .mesh_renderer
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?}: нет Mesh Renderer"))?
+                .material = material;
+            Ok(())
+        })
+    }
+
     /// Назначает уровни LOD и добавляет их ресурсы в список сцены.
     pub fn set_lod_group(&mut self, id: &str, group: Option<LodGroup>) -> Result<(), String> {
         self.edit(None, |document| {
@@ -599,6 +638,15 @@ pub fn default_light() -> DirectionalLightComponent {
         shadow_center: [0.0; 3],
         shadow_radius: Some(20.0),
     }
+}
+
+fn is_empty_material(material: &MaterialOverride) -> bool {
+    material.base_color.is_none()
+        && material.metallic.is_none()
+        && material.roughness.is_none()
+        && material.metallic_roughness_texture.is_none()
+        && material.normal_texture.is_none()
+        && material.normal_scale.is_none()
 }
 
 fn write_atomic(file: &Path, contents: &[u8]) -> Result<(), String> {
@@ -1185,6 +1233,80 @@ mod tests {
         assert_eq!(material.metallic, Some(1.0));
         assert_eq!(material.roughness, Some(0.25));
         assert_eq!(material.normal_scale, Some(0.5));
+    }
+
+    fn material(roughness: Option<f32>) -> MaterialOverride {
+        MaterialOverride {
+            base_color: None,
+            metallic: None,
+            roughness,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: None,
+        }
+    }
+
+    fn mesh_material(scene: &EditorScene, id: &str) -> Option<MaterialOverride> {
+        scene.object(id)?.mesh_renderer.as_ref()?.material.clone()
+    }
+
+    #[test]
+    fn material_override_registers_textures_and_empty_override_is_removed() {
+        let mut scene = scene();
+        let id = scene
+            .create_object(&NewObject::Mesh(path("/m.fbx"), [0.0; 3]), None)
+            .unwrap();
+        let mut textured = material(Some(0.3));
+        textured.normal_texture = Some(path("/textures/n.png"));
+        scene.set_material(&id, Some(textured), None).unwrap();
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path.as_str() == "textures/n.png")
+        );
+        assert_eq!(mesh_material(&scene, &id).unwrap().roughness, Some(0.3));
+        scene.set_material(&id, Some(material(None)), None).unwrap();
+        assert!(mesh_material(&scene, &id).is_none());
+        assert!(scene.undo());
+        assert!(mesh_material(&scene, &id).is_some());
+    }
+
+    #[test]
+    fn invalid_material_values_and_objects_without_mesh_are_rejected() {
+        let mut scene = scene();
+        let id = scene
+            .create_object(&NewObject::Mesh(path("/m.fbx"), [0.0; 3]), None)
+            .unwrap();
+        let error = scene
+            .set_material(&id, Some(material(Some(1.5))), None)
+            .unwrap_err();
+        assert!(error.contains("material.roughness"), "{error}");
+        assert!(mesh_material(&scene, &id).is_none());
+        let mut wrong = material(None);
+        wrong.normal_texture = Some(path("/n.jpg"));
+        assert!(scene.set_material(&id, Some(wrong), None).is_err());
+        assert!(
+            scene
+                .set_material("camera", Some(material(Some(0.5))), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ending_a_continuous_edit_by_key_leaves_other_keys_running() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.set_transform(&id, moved(1.0), Some("drag")).unwrap();
+        scene.end_continuous_edit_for("picker");
+        scene.set_transform(&id, moved(2.0), Some("drag")).unwrap();
+        scene.end_continuous_edit_for("drag");
+        scene.set_transform(&id, moved(3.0), Some("drag")).unwrap();
+        assert!(scene.undo());
+        assert_eq!(position(&scene, &id)[0], 2.0);
+        assert!(scene.undo());
+        assert_eq!(position(&scene, &id)[0], 0.0);
     }
 
     #[test]

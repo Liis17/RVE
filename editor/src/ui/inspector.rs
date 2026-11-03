@@ -4,6 +4,7 @@ use crate::assets_fs::AssetKind;
 use crate::scene_edit::default_light;
 use crate::state::{AssetDrag, EditorState};
 use engine_files::VirtualPath;
+use engine_scene::document::MaterialOverride;
 use engine_scene::{
     CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, ParamValue, SceneObject,
     SceneTransform,
@@ -127,6 +128,59 @@ fn vec3_row(ui: &mut egui::Ui, label: &str, value: &mut [f32; 3], speed: f64) ->
         .inner;
     ui.end_row();
     response
+}
+
+/// Строка цвета: палитра для выбора на глаз и поля для точных значений.
+/// Поля не ограничены сверху: свет допускает HDR-значения, которые палитра не показывает.
+/// Возвращает признак выбора в палитре и ответ полей.
+fn color_row(ui: &mut egui::Ui, label: &str, value: &mut [f32; 3]) -> (bool, egui::Response) {
+    ui.label(label);
+    let (picked, response) = ui
+        .horizontal(|ui| {
+            // Палитра получает копию: её преобразование цвета не должно трогать HDR-значения.
+            let mut shown = *value;
+            let picked = ui.color_edit_button_rgb(&mut shown).changed();
+            if picked {
+                *value = shown.map(|channel| channel.max(0.0));
+            }
+            let mut combined = None;
+            for channel in value.iter_mut() {
+                let field = egui::DragValue::new(channel)
+                    .speed(0.01)
+                    .range(0.0..=f32::MAX);
+                merge_response(&mut combined, ui.add(field));
+            }
+            (picked, combined.expect("цвет содержит три компонента"))
+        })
+        .inner;
+    ui.end_row();
+    (picked, response)
+}
+
+/// Применяет выбор в палитре. Палитра не сообщает об окончании перетаскивания, поэтому
+/// её правки объединяются в одну запись истории, пока нажата кнопка мыши.
+fn commit_picker(
+    state: &mut EditorState,
+    ui: &egui::Ui,
+    id: &str,
+    field: &str,
+    picked: bool,
+    change: impl FnOnce(&mut SceneObject),
+) {
+    let key = format!("{id}/{field}-picker");
+    if picked {
+        state.edit_scene(|scene| {
+            scene.edit_object(id, Some(&key), |object| {
+                change(object);
+                Ok(())
+            })
+        });
+    }
+    if !ui.input(|input| input.pointer.any_down())
+        && let Some(scene) = &mut state.scene
+    {
+        scene.end_continuous_edit_for(&key);
+    }
 }
 
 fn show_transform(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
@@ -258,6 +312,8 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
             texture_choice = asset_picker(ui, "mesh_texture", current, &textures);
             ui.end_row();
         });
+        ui.separator();
+        show_material(ui, state, id, mesh.material.as_ref(), &textures);
     });
     if model_choice.is_some() || texture_choice.is_some() {
         let model_changed = model_choice.is_some();
@@ -276,6 +332,156 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     }
     if remove {
         state.edit_scene(|scene| scene.remove_mesh_renderer(id));
+    }
+}
+
+/// Поле override: флажок включает замену значения FBX, без него поле не показывается.
+/// Возвращает `true`, если флажок переключён.
+fn optional_value<T: Copy>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<T>,
+    default: T,
+    field: impl FnOnce(&mut egui::Ui, &mut T) -> Option<egui::Response>,
+    response: &mut Option<egui::Response>,
+) -> bool {
+    ui.label(label);
+    let toggled = ui
+        .horizontal(|ui| {
+            let mut enabled = value.is_some();
+            let toggled = ui.checkbox(&mut enabled, "").changed();
+            if toggled {
+                *value = enabled.then_some(default);
+            }
+            if let Some(value) = value
+                && let Some(field) = field(ui, value)
+            {
+                merge_response(response, field);
+            }
+            toggled
+        })
+        .inner;
+    ui.end_row();
+    toggled
+}
+
+/// Scene material override: заданные поля заменяют значения материалов FBX.
+fn show_material(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    current: Option<&MaterialOverride>,
+    textures: &[String],
+) {
+    let mut material = current.cloned().unwrap_or(MaterialOverride {
+        base_color: None,
+        metallic: None,
+        roughness: None,
+        metallic_roughness_texture: None,
+        normal_texture: None,
+        normal_scale: None,
+    });
+    let mut toggled = false;
+    let mut picked = false;
+    let mut response = None;
+    let mut texture_choices = [None, None];
+    ui.label("Material Override");
+    egui::Grid::new("material").num_columns(2).show(ui, |ui| {
+        toggled |= optional_value(
+            ui,
+            "Base Color",
+            &mut material.base_color,
+            [1.0; 3],
+            |ui, color| {
+                let mut shown = *color;
+                if ui.color_edit_button_rgb(&mut shown).changed() {
+                    *color = shown.map(|channel| channel.clamp(0.0, 1.0));
+                    picked = true;
+                }
+                let mut combined = None;
+                for channel in color.iter_mut() {
+                    let field = egui::DragValue::new(channel).speed(0.01).range(0.0..=1.0);
+                    merge_response(&mut combined, ui.add(field));
+                }
+                combined
+            },
+            &mut response,
+        );
+        let factor =
+            |ui: &mut egui::Ui, value: &mut f32| Some(ui.add(egui::Slider::new(value, 0.0..=1.0)));
+        toggled |= optional_value(
+            ui,
+            "Metallic",
+            &mut material.metallic,
+            0.0,
+            factor,
+            &mut response,
+        );
+        toggled |= optional_value(
+            ui,
+            "Roughness",
+            &mut material.roughness,
+            0.5,
+            factor,
+            &mut response,
+        );
+        toggled |= optional_value(
+            ui,
+            "Normal Scale",
+            &mut material.normal_scale,
+            1.0,
+            |ui, value| Some(ui.add(egui::DragValue::new(value).speed(0.01))),
+            &mut response,
+        );
+        let maps = [
+            ("Metal/Rough Map", &material.metallic_roughness_texture),
+            ("Normal Map", &material.normal_texture),
+        ];
+        for (index, (label, path)) in maps.into_iter().enumerate() {
+            ui.label(label);
+            let current = path.as_ref().map_or("", |path| path.as_str());
+            texture_choices[index] =
+                asset_picker(ui, label, current, textures).filter(|choice| choice != current);
+            ui.end_row();
+        }
+    });
+
+    let mut discrete = toggled;
+    for (choice, slot) in texture_choices.into_iter().zip([
+        &mut material.metallic_roughness_texture,
+        &mut material.normal_texture,
+    ]) {
+        let Some(choice) = choice else {
+            continue;
+        };
+        if choice.is_empty() {
+            *slot = None;
+        } else if let Some(path) = parse_path(state, &choice) {
+            *slot = Some(path);
+        } else {
+            continue;
+        }
+        discrete = true;
+    }
+    let picker_key = format!("{id}/material-picker");
+    if discrete {
+        state.edit_scene(|scene| scene.set_material(id, Some(material), None));
+        if let Some(scene) = &mut state.scene {
+            scene.end_continuous_edit();
+        }
+    } else if picked {
+        state.edit_scene(|scene| scene.set_material(id, Some(material), Some(&picker_key)));
+    } else if let Some(response) = &response {
+        if response.changed() {
+            let key = format!("{id}/material");
+            state.edit_scene(|scene| scene.set_material(id, Some(material), Some(&key)));
+        }
+        finish_edit(state, response);
+    }
+    if !ui.input(|input| input.pointer.any_down())
+        && let Some(scene) = &mut state.scene
+    {
+        scene.end_continuous_edit_for(&picker_key);
     }
 }
 
@@ -425,8 +631,8 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
     let remove = component_header(ui, "Directional Light", id, |ui| {
         egui::Grid::new("light").num_columns(2).show(ui, |ui| {
             let mut value = light;
-            let color = vec3_row(ui, "Color", &mut value.color, 0.01);
-            let ambient = vec3_row(ui, "Ambient", &mut value.ambient, 0.01);
+            let (color_picked, color) = color_row(ui, "Color", &mut value.color);
+            let (ambient_picked, ambient) = color_row(ui, "Ambient", &mut value.ambient);
             ui.label("Shadows");
             let shadows = ui.checkbox(&mut value.shadows, "");
             ui.end_row();
@@ -437,9 +643,15 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
             value.shadow_radius = (radius > 0.0).then_some(radius);
             ui.end_row();
             let response = color | ambient | shadows | center | radius_response;
-            commit(state, id, "light", &response, |object| {
+            let picked = color_picked || ambient_picked;
+            commit_picker(state, ui, id, "light", picked, |object| {
                 object.directional_light = Some(value);
             });
+            if !picked {
+                commit(state, id, "light", &response, |object| {
+                    object.directional_light = Some(value);
+                });
+            }
         });
     });
     if remove {
