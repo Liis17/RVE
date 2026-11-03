@@ -554,6 +554,55 @@ fn ctrl_shift_z_redoes_instead_of_undoing() {
 }
 
 #[test]
+fn copy_puts_objects_on_the_os_clipboard_and_paste_inserts_them() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    let input = harness.input(vec![Event::Copy]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        toolbar::handle_shortcuts(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    let copied = output
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("Copy кладёт текст в буфер ОС");
+
+    harness.shortcuts(vec![Event::Paste(copied.clone())], Modifiers::NONE);
+    let scene = harness.scene();
+    assert_eq!(scene.document().objects.len(), 3);
+    let pasted = scene.selection().unwrap();
+    assert_ne!(pasted, "camera");
+    assert!(scene.object(pasted).unwrap().camera.is_some());
+
+    // Чужой текст и вставка в текстовое поле объектов не создают.
+    harness.shortcuts(vec![Event::Paste("hello".to_owned())], Modifiers::NONE);
+    assert_eq!(harness.scene().document().objects.len(), 3);
+    assert_eq!(harness.state.log.entries().count(), 0);
+    let text_id = egui::Id::new("focused_text");
+    let mut text = String::new();
+    let input = harness.input(Vec::new());
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+        ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
+    });
+    output.textures_delta.clear();
+    let input = harness.input(vec![Event::Paste(copied)]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+        toolbar::handle_shortcuts(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    assert_eq!(harness.scene().document().objects.len(), 3);
+}
+
+#[test]
 fn ctrl_d_duplicates_the_selection() {
     let mut harness = Harness::new();
     harness.scene_mut().select(Some("camera"));
