@@ -671,14 +671,6 @@ fn show_material(
             |ui, value| Some(ui.add(egui::DragValue::new(value).speed(0.01))),
             &mut response,
         );
-        toggled |= optional_value(
-            ui,
-            "Double Sided",
-            &mut material.double_sided,
-            false,
-            |ui, value| Some(ui.checkbox(value, "")),
-            &mut response,
-        );
         let maps = [
             ("Metal/Rough Map", &material.metallic_roughness_texture),
             ("Normal Map", &material.normal_texture),

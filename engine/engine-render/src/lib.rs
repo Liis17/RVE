@@ -337,6 +337,29 @@ fn validate_pipeline_cache(
     Ok(())
 }
 
+fn compatible_pipeline_cache(data: &[u8], expected: PipelineCacheIdentity) -> &[u8] {
+    match validate_pipeline_cache(data, expected) {
+        Ok(()) => data,
+        Err(reason) => {
+            eprintln!("ignoring pipeline cache: {reason}");
+            &[]
+        }
+    }
+}
+
+fn completed_upload_count<E>(
+    statuses: impl IntoIterator<Item = Result<bool, E>>,
+) -> Result<usize, E> {
+    let mut count = 0;
+    for status in statuses {
+        if !status? {
+            break;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Настройки Vulkan-рендерера.
 #[derive(Default)]
 pub struct RendererConfig {
@@ -763,6 +786,7 @@ impl Renderer {
             self.flush_uploads()?;
         }
         if self.pending_upload.is_none() {
+            self.poll_uploads()?;
             self.pending_upload = Some(UploadBatch::new(
                 &instance,
                 &device,
@@ -1855,17 +1879,15 @@ impl Renderer {
             self.instance()?
                 .get_physical_device_properties(self.physical_device)
         };
-        validate_pipeline_cache(
+        let cache_data = compatible_pipeline_cache(
             &self.config.pipeline_cache,
             PipelineCacheIdentity {
                 vendor_id: properties.vendor_id,
                 device_id: properties.device_id,
                 pipeline_cache_uuid: properties.pipeline_cache_uuid,
             },
-        )
-        .map_err(RenderError::InvalidConfig)?;
-        let cache_info =
-            vk::PipelineCacheCreateInfo::default().initial_data(&self.config.pipeline_cache);
+        );
+        let cache_info = vk::PipelineCacheCreateInfo::default().initial_data(cache_data);
         // SAFETY: supplied cache data passed the Vulkan version-one device identity checks.
         self.pipeline_cache =
             Some(unsafe { self.device()?.create_pipeline_cache(&cache_info, None) }?);
@@ -2156,6 +2178,7 @@ impl Renderer {
             self.flush_uploads()?;
         }
         if self.pending_upload.is_none() {
+            self.poll_uploads()?;
             let serial = self.next_upload_serial;
             let next_serial = serial
                 .checked_add(1)
@@ -2391,19 +2414,16 @@ impl Renderer {
 
     fn poll_uploads(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
-        let mut index = 0;
-        while index < self.in_flight_uploads.len() {
-            let fence = self.in_flight_uploads[index]
+        let completed = completed_upload_count(self.in_flight_uploads.iter().map(|batch| {
+            let fence = batch
                 .fence
                 .ok_or(RenderError::InvalidState("upload fence отсутствует"))?;
             // SAFETY: each fence belongs to an upload submission on this device.
-            if unsafe { device.get_fence_status(fence) }? {
-                let batch = self.in_flight_uploads.remove(index);
-                self.completed_upload_serial = self.completed_upload_serial.max(batch.serial);
-                drop(batch);
-            } else {
-                index += 1;
-            }
+            unsafe { device.get_fence_status(fence) }.map_err(RenderError::from)
+        }))?;
+        // Uploads share one queue: only the completed prefix can be reclaimed.
+        for batch in self.in_flight_uploads.drain(..completed) {
+            self.completed_upload_serial = self.completed_upload_serial.max(batch.serial);
         }
         self.retired.upload_completed(self.completed_upload_serial);
         Ok(())
@@ -6595,6 +6615,13 @@ mod tests {
 
         assert!(validate_pipeline_cache(&[], identity).is_ok());
         assert!(validate_pipeline_cache(&cache, identity).is_ok());
+        assert_eq!(super::compatible_pipeline_cache(&cache, identity), cache);
+        assert!(super::compatible_pipeline_cache(&cache[..12], identity).is_empty());
+        let foreign_identity = PipelineCacheIdentity {
+            vendor_id: identity.vendor_id + 1,
+            ..identity
+        };
+        assert!(super::compatible_pipeline_cache(&cache, foreign_identity).is_empty());
         assert!(
             validate_pipeline_cache(&cache[..PIPELINE_CACHE_HEADER_SIZE - 1], identity).is_err()
         );
@@ -7118,6 +7145,46 @@ mod tests {
             let words = ash::util::read_spv(&mut std::io::Cursor::new(shader)).unwrap();
             assert_eq!(words[0], 0x0723_0203);
         }
+    }
+
+    #[test]
+    fn completed_uploads_release_staging_without_a_frame() {
+        use std::rc::Rc;
+        let staging = Rc::new(());
+        let mut batches = vec![
+            Rc::clone(&staging),
+            Rc::clone(&staging),
+            Rc::clone(&staging),
+        ];
+        let completed =
+            super::completed_upload_count([Ok::<_, ()>(true), Ok(true), Ok(false)]).unwrap();
+        drop(batches.drain(..completed));
+        assert_eq!(Rc::strong_count(&staging), 2);
+        let completed = super::completed_upload_count([Ok::<_, ()>(true)]).unwrap();
+        drop(batches.drain(..completed));
+        assert_eq!(Rc::strong_count(&staging), 1);
+        assert_eq!(super::completed_upload_count([Ok(false), Err(())]), Ok(0));
+        assert_eq!(super::completed_upload_count([Ok(true), Err(())]), Err(()));
+    }
+
+    #[test]
+    fn back_face_reverses_the_complete_nonflat_mapped_normal() {
+        let geometric = [0.0, 0.0, 1.0];
+        let tangent_sample = [0.6, 0.0, 0.8];
+        let front =
+            transform_tangent_normal([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], geometric, tangent_sample);
+        let back = front.map(|component| -component);
+        assert!((back[0] + 0.6).abs() < 1e-6);
+        assert!((back[2] + 0.8).abs() < 1e-6);
+        // Tie the numeric reference to the shader's operation order: the full
+        // mapped normal and geometric fallback must both flip after TBN mapping.
+        let shader = include_str!("../shaders/mesh.frag");
+        let mapping = shader.find("vec3 normal = geometric_normal;").unwrap();
+        let flip = shader.find("if (!gl_FrontFacing)").unwrap();
+        assert!(flip > mapping);
+        let flip_block = shader[flip..].split('}').next().unwrap();
+        assert!(flip_block.contains("geometric_normal = -geometric_normal;"));
+        assert!(flip_block.contains("normal = -normal;"));
     }
 
     fn ggx_shader_has_analytic_peak(source: &str) -> bool {
