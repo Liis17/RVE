@@ -275,6 +275,20 @@ impl ScriptTransaction {
             .is_some_and(|handle| self.set_local_transform(handle, transform))
     }
 
+    pub(crate) fn set_camera_settings_from_abi(
+        &mut self,
+        handle: u64,
+        settings: CameraSettings,
+    ) -> bool {
+        self.object_from_abi_handle(handle)
+            .is_some_and(|handle| self.set_camera_settings(handle, settings))
+    }
+
+    pub(crate) fn set_active_camera_from_abi(&mut self, handle: u64) -> bool {
+        self.object_from_abi_handle(handle)
+            .is_some_and(|handle| self.set_active_camera(handle))
+    }
+
     pub(crate) fn send(
         &mut self,
         target_id: &str,

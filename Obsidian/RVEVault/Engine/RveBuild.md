@@ -63,8 +63,10 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 по полю `fresh` этого артефакта.
 
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
-`engine_version`, `abi_version` и `target`. `abi_version` должен совпадать с
-`RVE_SCRIPT_ABI_VERSION`; `target` должен совпадать с парой `ARCH-OS`, например
+`engine_version`, `abi_version` и `target`. Маркер распространяемого SDK должен
+указывать текущий `RVE_SCRIPT_ABI_VERSION`; player принимает heavy-script ABI версии
+`RVE_SCRIPT_ABI_MIN_VERSION..=RVE_SCRIPT_ABI_VERSION`, чтобы загружать v1-модули с
+неизменной таблицей скриптов. `target` должен совпадать с парой `ARCH-OS`, например
 `x86_64-windows` или `aarch64-macos`. `rve-build` запускает соседний
 `rve-player[.exe]` и сообщает `rve-player: prebuilt (SDK)`. Отсутствующий player,
 ошибка TOML, несовпадение ABI или платформы завершают команду операционной ошибкой.

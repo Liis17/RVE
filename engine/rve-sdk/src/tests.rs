@@ -1,9 +1,11 @@
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY,
-    RVE_VALUE_STR, RveArray, RveHeader, RveHost, RveModule, RveParamEntry, RveParams,
-    RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_VALUE_STR, RveArray, RveCameraSettings, RveHeader, RveHost, RveModule, RveParamEntry,
+    RveParams, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
-use crate::{Context, Key, MouseButton, Params, Script, Value};
+use crate::{
+    AntiAliasing, CameraSettings, Context, Key, MouseButton, Params, Script, Tonemapper, Value,
+};
 use std::ffi::c_void;
 
 struct Probe {
@@ -146,6 +148,8 @@ struct HostState {
     cursor: [f32; 2],
     mouse_delta: [f32; 2],
     wheel: [f32; 2],
+    camera_settings: RveCameraSettings,
+    active_camera: u64,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -296,6 +300,46 @@ unsafe extern "C" fn wheel_delta(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
     unsafe { input_vector(ctx, out, |state| state.wheel) }
 }
 
+unsafe extern "C" fn get_camera_settings(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut RveCameraSettings,
+) -> bool {
+    if object == 0 || out.is_null() {
+        return false;
+    }
+    // SAFETY: test host points to a live HostState and out is supplied by the ABI caller.
+    unsafe { *out = (&*ctx.cast::<HostState>()).camera_settings };
+    true
+}
+
+unsafe extern "C" fn set_camera_settings(
+    ctx: *mut c_void,
+    object: u64,
+    settings: *const RveCameraSettings,
+) -> bool {
+    if object == 0 || settings.is_null() {
+        return false;
+    }
+    // SAFETY: test host and settings pointer remain live through this callback.
+    unsafe { (&mut *ctx.cast::<HostState>()).camera_settings = *settings };
+    true
+}
+
+unsafe extern "C" fn active_camera(ctx: *mut c_void) -> u64 {
+    // SAFETY: test host points to a live HostState during the guest call.
+    unsafe { (&*ctx.cast::<HostState>()).active_camera }
+}
+
+unsafe extern "C" fn set_active_camera(ctx: *mut c_void, object: u64) -> bool {
+    if object == 0 {
+        return false;
+    }
+    // SAFETY: test host points to a live HostState during the guest call.
+    unsafe { (&mut *ctx.cast::<HostState>()).active_camera = object };
+    true
+}
+
 fn host(state: &mut HostState) -> RveHost {
     state.matrix = [2.0; 16];
     RveHost {
@@ -320,6 +364,10 @@ fn host(state: &mut HostState) -> RveHost {
         cursor_position,
         mouse_delta,
         wheel_delta,
+        get_camera_settings: Some(get_camera_settings),
+        set_camera_settings: Some(set_camera_settings),
+        active_camera: Some(active_camera),
+        set_active_camera: Some(set_active_camera),
     }
 }
 
@@ -416,6 +464,83 @@ fn guest_input_wrapper_reads_states_and_pointer_vectors() {
     assert_eq!(input.cursor(), [12.0, 34.0]);
     assert_eq!(input.mouse_delta(), [1.5, -2.0]);
     assert_eq!(input.wheel(), [0.0, 0.75]);
+}
+
+#[test]
+fn guest_camera_wrappers_read_write_and_switch_cameras() {
+    let mut state = HostState {
+        active_camera: 1,
+        ..HostState::default()
+    };
+    let host = host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let camera = context.find("camera").unwrap();
+    assert_eq!(context.active_camera(), Some(camera));
+    assert_eq!(
+        camera.camera_settings(&context),
+        Some(CameraSettings::default())
+    );
+
+    let settings = CameraSettings {
+        fov_deg: 72.0,
+        near: 0.25,
+        far: 250.0,
+        render_scale: 0.75,
+        clear_color: [0.2, 0.3, 0.4],
+        exposure_ev: 2.0,
+        anti_aliasing: AntiAliasing::None,
+        tonemapper: Tonemapper::Neutral,
+    };
+    assert!(camera.set_camera_settings(&mut context, settings));
+    assert_eq!(camera.camera_settings(&context), Some(settings));
+
+    let secondary = crate::Object { handle: 2 };
+    assert!(secondary.activate_camera(&mut context));
+    assert_eq!(context.active_camera(), Some(secondary));
+}
+
+#[test]
+fn guest_camera_wrappers_report_when_callbacks_are_unavailable() {
+    let mut state = HostState {
+        active_camera: 1,
+        ..HostState::default()
+    };
+    let mut host = host(&mut state);
+    host.get_camera_settings = None;
+    host.set_camera_settings = None;
+    host.active_camera = None;
+    host.set_active_camera = None;
+    let mut context = Context::new(&host).unwrap();
+    let camera = context.find("camera").unwrap();
+
+    assert_eq!(context.active_camera(), None);
+    assert_eq!(camera.camera_settings(&context), None);
+    assert!(!camera.set_camera_settings(&mut context, CameraSettings::default()));
+    assert!(!camera.activate_camera(&mut context));
+}
+
+#[test]
+fn camera_sdk_enum_codes_and_raw_settings_validation_are_stable() {
+    assert_eq!(AntiAliasing::Fxaa.code(), 0);
+    assert_eq!(AntiAliasing::None.code(), 1);
+    assert_eq!(AntiAliasing::from_code(0), Some(AntiAliasing::Fxaa));
+    assert_eq!(AntiAliasing::from_code(1), Some(AntiAliasing::None));
+    assert_eq!(AntiAliasing::from_code(2), None);
+    assert_eq!(Tonemapper::Aces.code(), 0);
+    assert_eq!(Tonemapper::Neutral.code(), 1);
+    assert_eq!(Tonemapper::None.code(), 2);
+    assert_eq!(Tonemapper::from_code(3), None);
+
+    let invalid_code = RveCameraSettings {
+        anti_aliasing: 99,
+        ..RveCameraSettings::default()
+    };
+    assert!(CameraSettings::try_from(invalid_code).is_err());
+    let invalid_range = RveCameraSettings {
+        exposure_ev: 16.1,
+        ..RveCameraSettings::default()
+    };
+    assert!(CameraSettings::try_from(invalid_range).is_err());
 }
 
 #[test]
