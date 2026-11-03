@@ -2,6 +2,7 @@
 
 use engine_assets::TextureData;
 use engine_render::Vertex;
+use engine_scene::CameraSettings;
 use engine_scene::camera::OrbitCamera;
 use engine_scene::light::{OrbitingSun, shadow_view_projection};
 use glam::camera::rh::proj::directx;
@@ -64,13 +65,24 @@ impl Scene {
         }
     }
 
-    pub fn view_projection(self, elapsed: f32, width: u32, height: u32) -> Mat4 {
+    pub fn view_projection(
+        self,
+        elapsed: f32,
+        width: u32,
+        height: u32,
+        settings: CameraSettings,
+    ) -> Mat4 {
         match self {
             Self::Triangle => triangle_view_projection(width, height),
             Self::Cube => cube_view_projection(width, height),
-            Self::Shadows => SHADOWS_CAMERA
-                .camera_at(elapsed)
-                .view_projection(width, height),
+            Self::Shadows => OrbitCamera {
+                fov_narrow: settings.projection.fov_deg.to_radians(),
+                near: settings.projection.near,
+                far: settings.projection.far,
+                ..SHADOWS_CAMERA
+            }
+            .camera_at(elapsed)
+            .view_projection(width, height),
         }
     }
 
@@ -232,9 +244,9 @@ fn aspect_ratio(width: u32, height: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Scene, TRIANGLE_INDICES, TRIANGLE_VERTICES, checker_texture, cube_mesh, cube_model,
-        cube_view_projection, plane_mesh, shadows_light_direction, shadows_light_view_projection,
-        triangle_view_projection,
+        CameraSettings, Scene, TRIANGLE_INDICES, TRIANGLE_VERTICES, checker_texture, cube_mesh,
+        cube_model, cube_view_projection, plane_mesh, shadows_light_direction,
+        shadows_light_view_projection, triangle_view_projection,
     };
     use glam::{Mat4, Vec3, Vec4};
 
@@ -429,7 +441,12 @@ mod tests {
             for step in 0..64 {
                 // Равномерные моменты проходят также через диагональные азимуты камеры.
                 let elapsed = step as f32 * 20.0 / 64.0;
-                let transform = Scene::Shadows.view_projection(elapsed, width, height);
+                let transform = Scene::Shadows.view_projection(
+                    elapsed,
+                    width,
+                    height,
+                    CameraSettings::default(),
+                );
                 let model = Scene::Shadows.model(elapsed);
                 for position in cube_vertices
                     .iter()
@@ -454,6 +471,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shadow_scene_uses_camera_asset_projection_settings() {
+        let defaults = CameraSettings::default();
+        let mut narrow = defaults;
+        narrow.projection.fov_deg = 30.0;
+        narrow.projection.near = 0.5;
+        narrow.projection.far = 500.0;
+        assert_ne!(
+            Scene::Shadows.view_projection(1.0, 1280, 720, defaults),
+            Scene::Shadows.view_projection(1.0, 1280, 720, narrow)
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@ use crate::assets_fs::AssetsDir;
 use engine_assets::Assets;
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
+use engine_scene::{CameraSettings, World};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Проект игры, открытый в редакторе по той же раскладке, что и dev-запуск player.
@@ -48,6 +50,41 @@ impl OpenProject {
             .wait()
             .map_err(|error| format!("{path}: {error}"))?;
         String::from_utf8(bytes).map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))
+    }
+
+    /// Загружает общие `.camerasettings` файлы и назначает их камерам мира.
+    pub fn apply_camera_settings(&self, world: &mut World) -> Result<(), String> {
+        let cameras = world
+            .objects()
+            .iter()
+            .filter_map(|object| {
+                Some((
+                    object.handle,
+                    object
+                        .camera
+                        .as_ref()?
+                        .settings
+                        .as_ref()?
+                        .as_str()
+                        .to_owned(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut settings_by_path = BTreeMap::new();
+        for (_, path) in &cameras {
+            if !settings_by_path.contains_key(path) {
+                let source = self.read_text(path)?;
+                let settings =
+                    CameraSettings::parse(path, &source).map_err(|error| error.to_string())?;
+                settings_by_path.insert(path.clone(), settings);
+            }
+        }
+        for (handle, path) in cameras {
+            world
+                .set_camera_settings(handle, settings_by_path[&path])
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Настройки окна проекта; отсутствующий файл не является ошибкой.
@@ -203,5 +240,44 @@ mod tests {
         let project = OpenProject::open(Path::new(dir)).unwrap();
         let start = project.settings.starting_scene().unwrap();
         assert!(project.read_text(start).unwrap().contains("[[objects]]"));
+    }
+
+    #[test]
+    fn all_demo_scenes_load_their_camera_settings_assets() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let project = OpenProject::open(Path::new(dir)).unwrap();
+        for (scene, expected_fov) in [("main", 55.0), ("second", 55.0), ("draft", 60.0)] {
+            let path = format!("scenes/{scene}.rvescene");
+            let source = project.read_text(&path).unwrap();
+            let document = SceneDocument::parse(&path, &source).unwrap();
+            let mut world = World::from_document(&document).unwrap();
+            project.apply_camera_settings(&mut world).unwrap();
+            let camera = world.camera_settings(world.active_camera()).unwrap();
+            assert_eq!(camera.projection.fov_deg, expected_fov, "{path}");
+            assert_eq!(camera.projection.near, 0.1, "{path}");
+            assert_eq!(camera.projection.far, 100.0, "{path}");
+        }
+    }
+
+    #[test]
+    fn camera_settings_asset_is_loaded_into_the_editor_world() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        fs::create_dir_all(temp.0.join("Assets/cameras")).unwrap();
+        fs::write(
+            temp.0.join("Assets/cameras/main.camerasettings"),
+            "[projection]\nfov_deg = 42.0\nnear = 0.25\nfar = 250.0\n",
+        )
+        .unwrap();
+        let source = "[[assets]]\npath = \"/cameras/main.camerasettings\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nsettings = \"/cameras/main.camerasettings\"\n";
+        let document = SceneDocument::parse("scene.rvescene", source).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let project = OpenProject::open(&temp.0).unwrap();
+        project.apply_camera_settings(&mut world).unwrap();
+        let camera = world.handle("camera").unwrap();
+        assert_eq!(
+            world.camera_settings(camera).unwrap().projection.fov_deg,
+            42.0
+        );
+        assert_eq!(world.camera_settings(camera).unwrap().projection.near, 0.25);
     }
 }

@@ -156,7 +156,15 @@ impl EditorState {
             .is_none_or(|(built, _)| *built != revision);
         if stale {
             match World::from_document(scene.document()) {
-                Ok(world) => self.edit_world = Some((revision, world)),
+                Ok(mut world) => {
+                    if let Some(project) = &self.project
+                        && let Err(error) = project.apply_camera_settings(&mut world)
+                    {
+                        self.log.error(error);
+                        return None;
+                    }
+                    self.edit_world = Some((revision, world));
+                }
                 Err(error) => {
                     self.log.error(error.to_string());
                     return None;

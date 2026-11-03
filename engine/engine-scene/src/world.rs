@@ -1,5 +1,6 @@
 //! Runtime-данные сцены и подготовка кадра без зависимости от renderer.
 
+use crate::CameraSettings;
 use crate::camera::Camera;
 use crate::document::{
     CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, SceneDocument, SceneError,
@@ -71,6 +72,7 @@ pub struct WorldObject {
     pub transform: LocalTransform,
     pub mesh_renderer: Option<crate::document::MeshRenderer>,
     pub camera: Option<CameraComponent>,
+    pub camera_settings: Option<CameraSettings>,
     pub directional_light: Option<DirectionalLightComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
@@ -107,6 +109,7 @@ pub struct MeshInstance {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneFrame {
     pub camera: Camera,
+    pub view: CameraSettings,
     pub light: LightState,
     pub meshes: Vec<MeshInstance>,
 }
@@ -127,7 +130,8 @@ pub struct World {
     indices_by_id: HashMap<String, ObjectHandle>,
     topological_order: Vec<ObjectHandle>,
     world_matrices: Vec<Mat4>,
-    last_valid_camera: Option<Camera>,
+    active_camera: ObjectHandle,
+    last_valid_camera: Option<(Camera, CameraSettings)>,
     last_valid_light: LightState,
     invalid_basis_reported: HashSet<ObjectHandle>,
 }
@@ -170,6 +174,18 @@ impl World {
             objects,
             indices_by_id,
             topological_order: order.into_iter().map(ObjectHandle).collect(),
+            active_camera: document
+                .objects
+                .iter()
+                .position(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                .or_else(|| {
+                    document
+                        .objects
+                        .iter()
+                        .position(|object| object.camera.is_some())
+                })
+                .map(ObjectHandle)
+                .expect("SceneDocument validation requires a camera"),
             last_valid_camera: None,
             last_valid_light: LightState::default(),
             invalid_basis_reported: HashSet::new(),
@@ -221,8 +237,69 @@ impl World {
 
     /// Камера объекта по текущим мировым матрицам; `None`, если камеры нет или базис невалиден.
     pub fn camera_of(&self, handle: ObjectHandle) -> Option<Camera> {
-        let settings = self.object(handle)?.camera?;
+        let object = self.object(handle)?;
+        object.camera.as_ref()?;
+        let settings = object.camera_settings.unwrap_or_default();
         camera_from_matrix(self.world_matrix(handle)?, settings)
+    }
+
+    /// Настройки камеры; `None`, если объект не содержит Camera component.
+    pub fn camera_settings(&self, handle: ObjectHandle) -> Option<&CameraSettings> {
+        self.object(handle)?.camera.as_ref()?;
+        self.object(handle)?.camera_settings.as_ref()
+    }
+
+    /// Проверяет и заменяет настройки существующей камеры.
+    pub fn set_camera_settings(
+        &mut self,
+        handle: ObjectHandle,
+        settings: CameraSettings,
+    ) -> Result<(), SceneError> {
+        settings.validate().map_err(|error| {
+            let object_id = self.object(handle).map(|object| object.id.as_str());
+            SceneError::new(&self.source_label, object_id, error.message)
+        })?;
+        let Some(object) = self.objects.get_mut(handle.0) else {
+            return Err(SceneError::new(
+                &self.source_label,
+                None,
+                format!("неизвестный handle объекта {}", handle.0),
+            ));
+        };
+        if object.camera.is_none() {
+            return Err(SceneError::new(
+                &self.source_label,
+                Some(&object.id),
+                "у объекта нет Camera component",
+            ));
+        }
+        object.camera_settings = Some(settings);
+        Ok(())
+    }
+
+    /// Возвращает handle камеры, активной при построении кадра.
+    pub fn active_camera(&self) -> ObjectHandle {
+        self.active_camera
+    }
+
+    /// Назначает активной существующую камеру.
+    pub fn set_active_camera(&mut self, handle: ObjectHandle) -> Result<(), SceneError> {
+        let Some(object) = self.object(handle) else {
+            return Err(SceneError::new(
+                &self.source_label,
+                None,
+                format!("неизвестный handle объекта {}", handle.0),
+            ));
+        };
+        if object.camera.is_none() {
+            return Err(SceneError::new(
+                &self.source_label,
+                Some(&object.id),
+                "у объекта нет Camera component",
+            ));
+        }
+        self.active_camera = handle;
+        Ok(())
     }
 
     /// Пересчитывает мировые матрицы в порядке от родителя к потомкам.
@@ -238,27 +315,23 @@ impl World {
 
     /// Строит кадр и возвращает первые предупреждения о невалидных базисах.
     /// Для камеры или света сохраняется последнее валидное динамическое состояние.
-    /// Камера кадра — первая в порядке документа; остальные на кадр не влияют.
+    /// Камера кадра задаётся `active_camera`; при невалидном базисе используется последнее валидное состояние.
     pub fn build_frame(&mut self) -> (SceneFrame, Vec<SceneWarning>) {
         self.recalculate_world_matrices();
         let mut warnings = Vec::new();
-        let mut camera = self.last_valid_camera;
+        let mut camera_state = self.last_valid_camera;
         let mut light = self.last_valid_light;
-        let main_camera = self
-            .objects
-            .iter()
-            .position(|object| object.camera.is_some());
 
         for index in 0..self.objects.len() {
             let matrix = self.world_matrices[index];
-            let camera_settings = self.objects[index]
-                .camera
-                .filter(|_| main_camera == Some(index));
+            let camera_settings = (self.active_camera.0 == index)
+                .then(|| self.objects[index].camera_settings.unwrap_or_default());
             let light_settings = self.objects[index].directional_light;
             if let Some(settings) = camera_settings {
                 if let Some(value) = camera_from_matrix(matrix, settings) {
-                    camera = Some(value);
-                    self.last_valid_camera = Some(value);
+                    let state = (value, settings);
+                    camera_state = Some(state);
+                    self.last_valid_camera = Some(state);
                 } else {
                     self.warn_invalid_basis(ObjectHandle(index), "камеры", &mut warnings);
                 }
@@ -279,7 +352,8 @@ impl World {
         }
 
         // from_document проверяет сцену и сразу фиксирует её первый валидный базис камеры.
-        let camera = camera.expect("World::from_document initializes the validated camera");
+        let (camera, view) =
+            camera_state.expect("World::from_document initializes the validated camera");
         let meshes = self
             .objects
             .iter()
@@ -293,6 +367,7 @@ impl World {
         (
             SceneFrame {
                 camera,
+                view,
                 light,
                 meshes,
             },
@@ -328,7 +403,8 @@ fn world_object(
         parent,
         transform: object.transform.into(),
         mesh_renderer: object.mesh_renderer.clone(),
-        camera: object.camera,
+        camera: object.camera.clone(),
+        camera_settings: object.camera.as_ref().map(|_| CameraSettings::default()),
         directional_light: object.directional_light,
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
@@ -416,9 +492,7 @@ mod tests {
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
+
 "#;
 
     fn parse(input: &str) -> SceneDocument {
@@ -476,9 +550,7 @@ parent="rig"
 [objects.transform]
 position=[0.0,0.0,2.0]
 [objects.camera]
-fov_deg=60.0
-near=0.1
-far=10.0
+
 [[objects]]
 id="rig"
 [objects.transform]
@@ -556,9 +628,7 @@ rotation=[0.0,90.0,0.0]
 id="camera"
 parent="rig"
 [objects.camera]
-fov_deg=60.0
-near=0.1
-far=10.0
+
 [[objects]]
 id="rig"
 [objects.transform]
@@ -595,7 +665,7 @@ scale=[0.0,0.0,0.0]
     }
 
     #[test]
-    fn first_camera_in_the_document_drives_the_frame_and_others_stay_readable() {
+    fn explicit_active_camera_drives_the_frame_and_camera_settings_are_per_camera() {
         let document = SceneDocument::parse(
             "cameras.rvescene",
             r#"
@@ -604,29 +674,38 @@ id="main"
 [objects.transform]
 position=[1.0,0.0,0.0]
 [objects.camera]
-fov_deg=60.0
-near=0.1
-far=10.0
+active=true
+
 [[objects]]
 id="second"
 [objects.transform]
 position=[2.0,0.0,0.0]
 [objects.camera]
-fov_deg=40.0
-near=0.1
-far=10.0
+
 "#,
         )
         .unwrap();
         let mut world = World::from_document(&document).unwrap();
+        let main = world.handle("main").unwrap();
+        let main_settings =
+            crate::CameraSettings::parse("main.camerasettings", "[color]\nexposure_ev = 2.0\n")
+                .unwrap();
+        world.set_camera_settings(main, main_settings).unwrap();
         assert_eq!(world.build_frame().0.camera.position.x, 1.0);
+        assert_eq!(world.build_frame().0.view.color.exposure_ev, 2.0);
         let second = world.handle("second").unwrap();
         assert_eq!(world.camera_of(second).unwrap().position.x, 2.0);
+        assert!(world.camera_settings(second).is_some());
+        world.set_active_camera(second).unwrap();
+        let (frame, _) = world.build_frame();
+        assert_eq!(frame.camera.position.x, 2.0);
+        assert_eq!(frame.view, crate::CameraSettings::default());
         let mut moved = *world.local_transform(second).unwrap();
         moved.position.x = 5.0;
         world.set_local_transform(second, moved).unwrap();
-        assert_eq!(world.build_frame().0.camera.position.x, 1.0);
+        assert_eq!(world.build_frame().0.camera.position.x, 5.0);
         assert_eq!(world.camera_of(second).unwrap().position.x, 5.0);
+        assert_eq!(world.active_camera(), second);
     }
 
     #[test]
@@ -651,6 +730,77 @@ far=10.0
         let (second, warnings) = world.build_frame();
         assert_eq!(second.camera, previous);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn switching_to_invalid_camera_keeps_the_last_valid_camera_and_view() {
+        let document = SceneDocument::parse(
+            "switch.rvescene",
+            r#"
+[[objects]]
+id="first"
+[objects.camera]
+active=true
+[[objects]]
+id="second"
+[objects.camera]
+"#,
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let first = world.handle("first").unwrap();
+        let second = world.handle("second").unwrap();
+        let settings =
+            crate::CameraSettings::parse("first.camerasettings", "[color]\nexposure_ev = 3.0\n")
+                .unwrap();
+        world.set_camera_settings(first, settings).unwrap();
+        let (valid, _) = world.build_frame();
+        world
+            .set_local_transform(
+                second,
+                LocalTransform {
+                    scale: Vec3::new(1.0, 0.0, 1.0),
+                    ..LocalTransform::default()
+                },
+            )
+            .unwrap();
+        world.set_active_camera(second).unwrap();
+        let (fallback, warnings) = world.build_frame();
+        assert_eq!(fallback.camera, valid.camera);
+        assert_eq!(fallback.view, settings);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].object_id, "second");
+    }
+
+    #[test]
+    fn camera_mutators_reject_non_cameras_and_unknown_handles() {
+        let scene = format!("{CAMERA_SCENE}\n[[objects]]\nid=\"mesh\"\n");
+        let mut world = World::from_document(&parse(&scene)).unwrap();
+        let mesh = world.handle("mesh").unwrap();
+        let camera = world.handle("camera").unwrap();
+        let defaults = crate::CameraSettings::default();
+        assert!(world.set_active_camera(mesh).is_err());
+        assert!(world.set_camera_settings(mesh, defaults).is_err());
+        assert!(world.set_active_camera(ObjectHandle(99)).is_err());
+        assert!(
+            world
+                .set_camera_settings(ObjectHandle(99), defaults)
+                .is_err()
+        );
+        assert!(
+            world
+                .set_camera_settings(
+                    camera,
+                    crate::CameraSettings {
+                        render: crate::CameraRenderSettings {
+                            render_scale: 0.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -692,9 +842,7 @@ position=[1.0,0.0,0.0]
 [[objects]]
 id="camera"
 [objects.camera]
-fov_deg=60.0
-near=0.1
-far=10.0
+
 [[objects]]
 id="parent"
 [objects.transform]

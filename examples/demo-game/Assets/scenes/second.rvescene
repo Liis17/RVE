@@ -2,6 +2,9 @@
 path = "/models/shared-cube.fbx"
 
 [[assets]]
+path = "/cameras/default.camerasettings"
+
+[[assets]]
 path = "/models/props-cube.fbx"
 archive = "props"
 
@@ -14,9 +17,7 @@ name = "Camera"
 [objects.transform]
 position = [0.0, 1.0, 8.0]
 [objects.camera]
-fov_deg = 55.0
-near = 0.1
-far = 100.0
+settings = "/cameras/default.camerasettings"
 
 [[objects]]
 id = "sun"

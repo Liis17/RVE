@@ -6,11 +6,14 @@ use content::Content;
 use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
+use engine_files::VirtualPath;
 use engine_project::BootstrapConfig;
 use engine_render::{
-    DrawCommand, Frame, FrameStatus, MeshId, Renderer, RendererConfig, TextureId, ViewSettings,
+    AntiAliasing as RenderAntiAliasing, DrawCommand, Frame, FrameStatus, MeshId, Renderer,
+    RendererConfig, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
 };
-use engine_resources::{ResourceConfig, ResourceSystem};
+use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
+use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use scene::Scene;
 use std::env;
@@ -19,13 +22,14 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--resize-test] [--scene triangle|cube|shadows] [--model /путь.fbx] [--texture /путь.png] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows] [--model /путь.fbx] [--texture /путь.png] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
 struct Options {
     frames: Option<u64>,
-    render_scale: f32,
+    render_scale: Option<f32>,
+    camera_settings: Option<String>,
     resize_test: bool,
     scene: Scene,
     /// Путь модели внутри `assets`, например `/model/cube.fbx`.
@@ -44,6 +48,7 @@ where
     let mut args = args.into_iter().map(Into::into);
     let mut frames = None;
     let mut render_scale = None;
+    let mut camera_settings = None;
     let mut resize_test = false;
     let mut scene = None;
     let mut model = None;
@@ -80,6 +85,26 @@ where
                     return Err("--render-scale должен быть конечным числом в (0, 1]".to_owned());
                 }
                 render_scale = Some(value);
+            }
+            "--camera-settings" => {
+                if camera_settings.is_some() {
+                    return Err("флаг --camera-settings указан повторно".to_owned());
+                }
+                let value = args.next().ok_or_else(|| {
+                    "после --camera-settings требуется путь к .camerasettings".to_owned()
+                })?;
+                let path = VirtualPath::parse(&value)
+                    .map_err(|error| format!("некорректный путь --camera-settings: {error}"))?;
+                let is_camera_settings = path
+                    .as_str()
+                    .rsplit('/')
+                    .next()
+                    .and_then(|name| name.rsplit_once('.'))
+                    .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("camerasettings"));
+                if !is_camera_settings {
+                    return Err("--camera-settings должен указывать на .camerasettings".to_owned());
+                }
+                camera_settings = Some(path.as_str().to_owned());
             }
             "--resize-test" => {
                 if resize_test {
@@ -133,13 +158,32 @@ where
     }
     Ok(Options {
         frames,
-        render_scale: render_scale.unwrap_or(1.0),
+        render_scale,
+        camera_settings,
         resize_test,
         scene: scene.unwrap_or_default(),
         model,
         texture,
         debug_overlay,
     })
+}
+
+fn load_camera_settings(
+    options: &Options,
+    resources: &ResourceHandle,
+) -> Result<CameraSettings, String> {
+    if let Some(path) = &options.camera_settings {
+        let bytes = resources
+            .read_all(path)
+            .map_err(|error| format!("{path}: {error}"))?
+            .wait()
+            .map_err(|error| format!("{path}: {error}"))?;
+        let source = String::from_utf8(bytes)
+            .map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))?;
+        CameraSettings::parse(path, &source).map_err(|error| error.to_string())
+    } else {
+        Ok(CameraSettings::default())
+    }
 }
 
 /// Загружает модель или демонстрационную сцену и заменяет текстуры, если задан `--texture`.
@@ -167,6 +211,7 @@ struct ResizeTest {
 struct Sandbox {
     renderer: Option<Renderer>,
     content: Content,
+    camera_settings: CameraSettings,
     meshes: Vec<(MeshId, Option<TextureId>, bool)>,
     size: PhysicalSize<u32>,
     time: Time,
@@ -178,10 +223,14 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    fn new(options: Options, content: Content) -> Self {
+    fn new(options: Options, content: Content, mut camera_settings: CameraSettings) -> Self {
+        if let Some(render_scale) = options.render_scale {
+            camera_settings.render.render_scale = render_scale;
+        }
         Self {
             renderer: None,
             content,
+            camera_settings,
             meshes: Vec::new(),
             size: PhysicalSize::new(0, 0),
             time: Time::new(),
@@ -341,12 +390,6 @@ impl WindowHandler for Sandbox {
             return true;
         }
         let elapsed = self.time.elapsed().as_secs_f32();
-        let color = [
-            0.5 + 0.5 * elapsed.sin(),
-            0.5 + 0.5 * (elapsed * 0.73).sin(),
-            0.5 + 0.5 * (elapsed * 0.41).sin(),
-            1.0,
-        ];
         let Some(renderer) = self.renderer.as_mut() else {
             self.failure = Some("рендерер отсутствует".to_owned());
             return false;
@@ -372,10 +415,20 @@ impl WindowHandler for Sandbox {
             None => &[],
         };
         let frame = Frame {
-            clear_color: color,
+            clear_color: [
+                self.camera_settings.render.clear_color[0],
+                self.camera_settings.render.clear_color[1],
+                self.camera_settings.render.clear_color[2],
+                1.0,
+            ],
             view_projection: self
                 .content
-                .view_projection(elapsed, self.size.width, self.size.height)
+                .view_projection(
+                    elapsed,
+                    self.size.width,
+                    self.size.height,
+                    self.camera_settings,
+                )
                 .to_cols_array_2d(),
             shadow_view_projection: self
                 .content
@@ -385,8 +438,17 @@ impl WindowHandler for Sandbox {
             draws: &draws,
             overlay,
             view: ViewSettings {
-                render_scale: self.options.render_scale,
-                ..ViewSettings::default()
+                render_scale: self.camera_settings.render.render_scale,
+                exposure_ev: self.camera_settings.color.exposure_ev,
+                tonemapper: match self.camera_settings.color.tonemapper {
+                    Tonemapper::Aces => RenderTonemapper::Aces,
+                    Tonemapper::Neutral => RenderTonemapper::Neutral,
+                    Tonemapper::None => RenderTonemapper::None,
+                },
+                anti_aliasing: match self.camera_settings.render.anti_aliasing {
+                    AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
+                    AntiAliasing::None => RenderAntiAliasing::None,
+                },
             },
         };
         match renderer.render_frame(&frame) {
@@ -500,7 +562,14 @@ fn main_after_vulkan_environment() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut app = Sandbox::new(options, content);
+    let camera_settings = match load_camera_settings(&options, &resources.handle()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("Ошибка настроек камеры: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut app = Sandbox::new(options, content, camera_settings);
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
     let mut exit_code = match (run_result, failure) {
@@ -527,7 +596,7 @@ fn main_after_vulkan_environment() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Content, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args,
+        CameraSettings, Content, Options, RESIZE_SIZE, RESTORE_SIZE, Sandbox, Scene, parse_args,
         with_executable_directory,
     };
     use engine_assets::Assets;
@@ -535,7 +604,7 @@ mod tests {
 
     fn sandbox(options: Options) -> Sandbox {
         let content = Content::from_scene(options.scene);
-        Sandbox::new(options, content)
+        Sandbox::new(options, content, CameraSettings::default())
     }
 
     #[test]
@@ -581,8 +650,17 @@ mod tests {
     fn scale_accepts_small_positive_values_and_native_resolution() {
         for scale in [f32::MIN_POSITIVE, 1.0] {
             let options = parse_args(["--render-scale".to_owned(), scale.to_string()]).unwrap();
-            assert_eq!(options.render_scale, scale);
+            assert_eq!(options.render_scale, Some(scale));
         }
+    }
+
+    #[test]
+    fn explicit_render_scale_overrides_the_camera_asset_scale() {
+        let options = parse_args(["--render-scale", "0.4"]).unwrap();
+        let mut settings = CameraSettings::default();
+        settings.render.render_scale = 0.75;
+        let sandbox = Sandbox::new(options, Content::from_scene(Scene::Cube), settings);
+        assert_eq!(sandbox.camera_settings.render.render_scale, 0.4);
     }
 
     #[test]
@@ -595,7 +673,7 @@ mod tests {
             parse_args(["--resize-test", "--render-scale", "1", "--frames", "120"]).unwrap();
         assert!(options.resize_test);
         assert_eq!(options.frames, Some(120));
-        assert_eq!(options.render_scale, 1.0);
+        assert_eq!(options.render_scale, Some(1.0));
     }
 
     #[test]
@@ -620,7 +698,8 @@ mod tests {
     fn resize_progress_requires_requested_and_matching_physical_sizes() {
         let mut sandbox = sandbox(Options {
             frames: None,
-            render_scale: 1.0,
+            render_scale: Some(1.0),
+            camera_settings: None,
             resize_test: true,
             scene: Scene::Cube,
             model: None,
@@ -676,6 +755,8 @@ mod tests {
             "120",
             "--render-scale",
             "0.5",
+            "--camera-settings",
+            "/camera/default.camerasettings",
             "--resize-test",
             "--scene",
             "triangle",
@@ -685,7 +766,11 @@ mod tests {
         ])
         .expect("valid arguments should parse");
         assert_eq!(options.frames, Some(120));
-        assert_eq!(options.render_scale, 0.5);
+        assert_eq!(options.render_scale, Some(0.5));
+        assert_eq!(
+            options.camera_settings.as_deref(),
+            Some("camera/default.camerasettings")
+        );
         assert!(options.resize_test);
         assert_eq!(options.scene, Scene::Triangle);
         assert_eq!(options.model, None);
@@ -722,6 +807,15 @@ mod tests {
             vec!["--render-scale", "0"],
             vec!["--render-scale", "2"],
             vec!["--render-scale", "0.5", "--render-scale", "0.25"],
+            vec!["--camera-settings"],
+            vec!["--camera-settings", "../camera.camerasettings"],
+            vec!["--camera-settings", "/camera/default.toml"],
+            vec![
+                "--camera-settings",
+                "/a.camerasettings",
+                "--camera-settings",
+                "/b.camerasettings",
+            ],
             vec!["--resize-test", "--resize-test"],
             vec!["--frames", "119", "--resize-test"],
             vec!["--scene"],
@@ -743,7 +837,8 @@ mod tests {
     fn defaults_to_unbounded_run_at_native_scale() {
         let options = parse_args(Vec::<String>::new()).expect("empty args are valid");
         assert_eq!(options.frames, None);
-        assert_eq!(options.render_scale, 1.0);
+        assert_eq!(options.render_scale, None);
+        assert_eq!(options.camera_settings, None);
         assert!(!options.resize_test);
         assert_eq!(options.scene, Scene::Shadows);
         assert_eq!(options.model, None);

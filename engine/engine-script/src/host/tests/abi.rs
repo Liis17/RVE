@@ -319,9 +319,6 @@ fn scripted_world(script_name: &str, params: &str) -> World {
 id = "camera"
 name = "Camera object"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 [[objects.heavy_scripts]]
 name = {script_name:?}
 params = {params}
@@ -610,9 +607,6 @@ fn partial_load_failure_drops_instances_already_created() {
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 [[objects.heavy_scripts]]
 name = "Probe"
 params = { label = "first" }
@@ -660,9 +654,6 @@ fn update_panic_disables_only_its_instance_and_drop_runs_after_destroy_panic() {
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 [[objects.heavy_scripts]]
 name = "Probe"
 params = { label = "bad", panic_update = true }

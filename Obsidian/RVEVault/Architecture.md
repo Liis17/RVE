@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение и границы
 
-RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки, а `rve-editor` — графический редактор сцен на egui. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает и проверяет документы сцен `.rvescene`, строит runtime-граф `World` и выдаёт мировые матрицы, камеру, свет и меши для кадра. `engine-script` запускает Lua и Rust-скрипты из ABI-библиотеки. Модели FBX и текстуры PNG читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений пока представлены пустыми потоками-заглушками.
+RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки, а `rve-editor` — графический редактор сцен на egui. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, рисует меши с текстурами, направленным светом, depth buffer и shadow map в offscreen-изображение и переносит его в swapchain. `engine-scene` разбирает `.rvescene` и `.camerasettings`, строит runtime-граф `World` и выдаёт активную камеру с настройками HDR вывода, свет и меши для кадра. `engine-script` запускает Lua и Rust-скрипты из ABI-библиотеки. Модели FBX, текстуры PNG и настройки камер читаются из loose assets или RVEPAK через `engine-resources`. Доменные runtime для физики, звука, сети и нейросетевых вычислений пока представлены пустыми потоками-заглушками.
 
 ## Стек
 
@@ -51,7 +51,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EngineResources]] — фоновый доступ к loose files и RVEPAK через ограниченный worker pool.
 - `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG в память CPU, без зависимости от renderer.
-- [[Engine/EngineScene]] — формат `.rvescene`, его проверка и runtime-граф `World` с камерами, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
+- [[Engine/EngineScene]] — форматы `.rvescene` и `.camerasettings`, их проверка и runtime-граф `World` с множеством камер, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
 - [[Engine/EngineScript]] — Lua host и загрузчик ABI-библиотеки Rust-скриптов; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
 - [[Engine/RveSdk]] — независимый SDK с C ABI и guest API для игровых `cdylib`.
 - [[Engine/EngineRuntime]] — потоки игры, порядок запуска, ограниченный конвейер кадров и завершение; библиотека запуска используется бинарником `rve-player`.

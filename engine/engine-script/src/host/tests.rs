@@ -11,9 +11,7 @@ fn world(source: &str) -> World {
     let source = if source.contains("[objects.camera]") {
         source.to_owned()
     } else {
-        format!(
-            "{source}\n[[objects]]\nid = \"__test_camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n"
-        )
+        format!("{source}\n[[objects]]\nid = \"__test_camera\"\n[objects.camera]\n\n")
     };
     let document = SceneDocument::parse("test.rvescene", &source).unwrap();
     World::from_document(&document).unwrap()
@@ -26,9 +24,6 @@ fn one_camera(body: &str) -> World {
 id = "camera"
 name = "Camera object"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 {body}
 "#
     ))
@@ -356,9 +351,6 @@ path = "/b.lua"
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 [[objects.lite_scripts]]
 path = "/a.lua"
 params = { label = "camera-lite" }

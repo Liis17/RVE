@@ -15,7 +15,9 @@ dev-режиме. Инструмент является внешним crate wor
 `ResourceSystem` в `SourceMode::Loose`, затем проверяет каждую включённую сцену с
 помощью `SceneDocument`. Выключенные сцены не открываются. В сборку попадают файлы
 включённых сцен, их `[[assets]]`, внешние PNG-зависимости FBX через
-`Assets::model_dependencies` и заданный `BootstrapConfig.app_icon`. Иконка должна
+`Assets::model_dependencies` и заданный `BootstrapConfig.app_icon`. Каждый объявленный
+asset `.camerasettings` проверяется как UTF-8/TOML с диапазонами настроек до сборки.
+Иконка должна
 иметь расширение `.png` и успешно загружаться через `Assets::load_texture`.
 Неиспользуемые файлы каталога Assets не копируются.
 

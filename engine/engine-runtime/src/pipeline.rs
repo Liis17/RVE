@@ -1,11 +1,12 @@
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use engine_render::{
-    DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId, Renderer, TextureId, ViewSettings,
+    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, FrameStatus, MeshId,
+    Renderer, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_scene::camera::Camera;
 use engine_scene::light::shadow_view_projection;
-use engine_scene::{LightState, ObjectHandle, World};
+use engine_scene::{AntiAliasing, CameraSettings, LightState, ObjectHandle, Tonemapper, World};
 use engine_script::{
     ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary, ScriptTime,
 };
@@ -18,13 +19,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-pub(crate) const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.12, 1.0];
 pub(crate) const SCRIPTS_THREAD: &str = "rve-scripts";
 pub(crate) const RENDER_THREAD: &str = "rve-render";
 
 #[derive(Debug)]
 pub(crate) struct FrameSnapshot {
     pub camera: Camera,
+    pub view: CameraSettings,
     pub light: LightState,
     pub draws: Vec<DrawCommand>,
 }
@@ -202,7 +203,12 @@ impl RenderBackend for VulkanBackend {
                 .to_cols_array_2d()
         });
         let frame = Frame {
-            clear_color: CLEAR_COLOR,
+            clear_color: [
+                snapshot.view.render.clear_color[0],
+                snapshot.view.render.clear_color[1],
+                snapshot.view.render.clear_color[2],
+                1.0,
+            ],
             view_projection: snapshot
                 .camera
                 .view_projection(width, height)
@@ -211,7 +217,19 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
-            view: ViewSettings::default(),
+            view: ViewSettings {
+                render_scale: snapshot.view.render.render_scale,
+                exposure_ev: snapshot.view.color.exposure_ev,
+                tonemapper: match snapshot.view.color.tonemapper {
+                    Tonemapper::Aces => RenderTonemapper::Aces,
+                    Tonemapper::Neutral => RenderTonemapper::Neutral,
+                    Tonemapper::None => RenderTonemapper::None,
+                },
+                anti_aliasing: match snapshot.view.render.anti_aliasing {
+                    AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
+                    AntiAliasing::None => RenderAntiAliasing::None,
+                },
+            },
         };
         self.renderer
             .render_frame(&frame)
@@ -471,6 +489,7 @@ fn make_snapshot(scene: engine_scene::SceneFrame, gpu_scene: &GpuSceneTable) -> 
     }
     FrameSnapshot {
         camera: scene.camera,
+        view: scene.view,
         light: scene.light,
         draws,
     }
@@ -725,13 +744,14 @@ mod tests {
     use super::{
         Clock, ExitRequester, FrameSnapshot, GpuSceneTable, RenderBackend, RenderControl,
         RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
-        ScriptThreadConfig, render_loop, render_snapshot, render_thread, send_snapshot,
-        sync_input_background, wait_background_tick,
+        ScriptThreadConfig, make_snapshot, render_loop, render_snapshot, render_thread,
+        send_snapshot, sync_input_background, wait_background_tick,
     };
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
     use engine_render::{DrawCommand, FrameStatus};
+    use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
     use engine_scene::{SceneDocument, World};
@@ -907,9 +927,32 @@ mod tests {
                 near: 0.1,
                 far: 100.0,
             },
+            view: CameraSettings::default(),
             light: LightState::default(),
             draws: Vec::<DrawCommand>::new(),
         }
+    }
+
+    #[test]
+    fn frame_snapshot_preserves_active_camera_view_settings() {
+        let document = engine_scene::SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = engine_scene::World::from_document(&document).unwrap();
+        let mut settings = CameraSettings::default();
+        settings.render.render_scale = 0.5;
+        settings.render.clear_color = [0.2, 0.3, 0.4];
+        settings.render.anti_aliasing = engine_scene::AntiAliasing::None;
+        settings.color.exposure_ev = 1.0;
+        settings.color.tonemapper = engine_scene::Tonemapper::Neutral;
+        world
+            .set_camera_settings(world.active_camera(), settings)
+            .unwrap();
+        let (frame, _) = world.build_frame();
+        let snapshot = make_snapshot(frame, &GpuSceneTable::default());
+        assert_eq!(snapshot.view, settings);
     }
 
     #[test]
@@ -1062,7 +1105,7 @@ mod tests {
     fn background_before_go_is_kept_and_ticks_without_sending_snapshots() {
         let document = SceneDocument::parse(
             "startup.rvescene",
-            "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects.heavy_scripts]]\nname = \"TickProbe\"\n",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\n[[objects.heavy_scripts]]\nname = \"TickProbe\"\n",
         )
         .unwrap();
         let world = World::from_document(&document).unwrap();
@@ -1136,7 +1179,7 @@ mod tests {
 
         let document = SceneDocument::parse(
             "startup.rvescene",
-            "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects.heavy_scripts]]\nname = \"InputProbe\"\n",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\n[[objects.heavy_scripts]]\nname = \"InputProbe\"\n",
         )
         .unwrap();
         let world = World::from_document(&document).unwrap();
@@ -1345,7 +1388,7 @@ mod tests {
     fn lua_load_error_is_reported_before_window_and_stops_modules() {
         let document = SceneDocument::parse(
             "startup.rvescene",
-            "[[assets]]\npath = \"scripts/bad.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects]]\nid = \"scripted\"\n[[objects.lite_scripts]]\npath = \"scripts/bad.lua\"\n",
+            "[[assets]]\npath = \"scripts/bad.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n\n[[objects]]\nid = \"scripted\"\n[[objects.lite_scripts]]\npath = \"scripts/bad.lua\"\n",
         ).unwrap();
         let world = World::from_document(&document).unwrap();
         let mut modules = ModuleHost::new();
@@ -1399,7 +1442,7 @@ mod tests {
     fn script_library_load_error_is_reported_before_ready() {
         let document = SceneDocument::parse(
             "startup.rvescene",
-            "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\n",
         )
         .unwrap();
         let world = World::from_document(&document).unwrap();
@@ -1444,7 +1487,7 @@ mod tests {
         DESTROY_CALLS.store(0, Ordering::SeqCst);
         let document = SceneDocument::parse(
             "startup.rvescene",
-            "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects.heavy_scripts]]\nname = \"DestroyProbe\"\n",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\n[[objects.heavy_scripts]]\nname = \"DestroyProbe\"\n",
         )
         .unwrap();
         let world = World::from_document(&document).unwrap();
@@ -1504,7 +1547,7 @@ mod tests {
 
         let document = SceneDocument::parse(
             "startup.rvescene",
-            "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\n",
         )
         .unwrap();
         let world = World::from_document(&document).unwrap();

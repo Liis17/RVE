@@ -20,9 +20,6 @@ name = "Camera"
 [objects.transform]
 position = [0.0, 1.0, 6.0]
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 1000.0
 
 [[objects]]
 id = "sun"
@@ -235,11 +232,18 @@ impl EditorScene {
             match kind {
                 NewObject::Empty => {}
                 NewObject::Camera => {
-                    object.camera = Some(CameraComponent {
-                        fov_deg: 60.0,
-                        near: 0.1,
-                        far: 1000.0,
-                    });
+                    if !document
+                        .objects
+                        .iter()
+                        .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                        && let Some(existing_camera) = document
+                            .objects
+                            .iter_mut()
+                            .find(|object| object.camera.is_some())
+                    {
+                        existing_camera.camera.as_mut().unwrap().active = true;
+                    }
+                    object.camera = Some(CameraComponent::default());
                 }
                 NewObject::DirectionalLight => {
                     object.transform.rotation = [50.0, 30.0, 0.0];
@@ -268,6 +272,21 @@ impl EditorScene {
             document
                 .objects
                 .retain(|object| !removed.contains(&object.id));
+            if document
+                .objects
+                .iter()
+                .any(|object| object.camera.is_some())
+                && !document
+                    .objects
+                    .iter()
+                    .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                && let Some(object) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                object.camera.as_mut().unwrap().active = true;
+            }
             Ok(())
         })?;
         if self
@@ -291,6 +310,21 @@ impl EditorScene {
             renamed.insert(source.clone(), copy_id);
         }
         self.edit(None, |document| {
+            if document
+                .objects
+                .iter()
+                .any(|object| object.camera.is_some())
+                && !document
+                    .objects
+                    .iter()
+                    .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                && let Some(object) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                object.camera.as_mut().unwrap().active = true;
+            }
             let copies = document
                 .objects
                 .iter()
@@ -301,6 +335,9 @@ impl EditorScene {
                         .parent
                         .map(|parent| renamed.get(&parent).cloned().unwrap_or(parent));
                     object.id = renamed[&object.id].clone();
+                    if let Some(camera) = &mut object.camera {
+                        camera.active = false;
+                    }
                     object
                 })
                 .collect::<Vec<_>>();
@@ -310,6 +347,89 @@ impl EditorScene {
         let copy = renamed[id].clone();
         self.selection = Some(copy.clone());
         Ok(copy)
+    }
+
+    /// Добавляет камеру, сохраняя единственную активную камеру документа.
+    pub fn add_camera(&mut self, id: &str) -> Result<(), String> {
+        self.edit(None, |document| {
+            if find_object(document, id)?.camera.is_some() {
+                return Err(format!("объект {id:?} уже имеет камеру"));
+            }
+            if !document
+                .objects
+                .iter()
+                .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                && let Some(existing) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                existing.camera.as_mut().unwrap().active = true;
+            }
+            find_object_mut(document, id)?.camera = Some(CameraComponent::default());
+            Ok(())
+        })
+    }
+
+    /// Удаляет камеру, назначая замену, если была удалена активная камера.
+    pub fn remove_camera(&mut self, id: &str) -> Result<(), String> {
+        self.edit(None, |document| {
+            let active = find_object(document, id)?
+                .camera
+                .as_ref()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?
+                .active;
+            find_object_mut(document, id)?.camera = None;
+            if active
+                && let Some(replacement) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                replacement.camera.as_mut().unwrap().active = true;
+            }
+            Ok(())
+        })
+    }
+
+    /// Назначает активную камеру; снятие единственного active оставляет одну камеру implicit.
+    pub fn set_camera_active(&mut self, id: &str, active: bool) -> Result<(), String> {
+        self.edit(None, |document| {
+            if find_object(document, id)?.camera.is_none() {
+                return Err(format!("объект {id:?} не имеет камеры"));
+            }
+            if active {
+                for object in &mut document.objects {
+                    if let Some(camera) = &mut object.camera {
+                        camera.active = object.id == id;
+                    }
+                }
+            } else {
+                find_object_mut(document, id)?
+                    .camera
+                    .as_mut()
+                    .unwrap()
+                    .active = false;
+                let camera_count = document
+                    .objects
+                    .iter()
+                    .filter(|object| object.camera.is_some())
+                    .count();
+                if camera_count > 1
+                    && !document
+                        .objects
+                        .iter()
+                        .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                    && let Some(replacement) = document
+                        .objects
+                        .iter_mut()
+                        .find(|object| object.id != id && object.camera.is_some())
+                {
+                    replacement.camera.as_mut().unwrap().active = true;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Меняет идентификатор объекта и все ссылки потомков на него.
@@ -376,6 +496,33 @@ impl EditorScene {
         })
     }
 
+    /// Назначает настройки камеры и добавляет их путь в список ресурсов сцены.
+    pub fn set_camera_settings(
+        &mut self,
+        id: &str,
+        settings: Option<VirtualPath>,
+    ) -> Result<(), String> {
+        if let Some(path) = &settings
+            && !path
+                .as_str()
+                .to_ascii_lowercase()
+                .ends_with(".camerasettings")
+        {
+            return Err(format!("{}: ожидается ресурс .camerasettings", path));
+        }
+        self.edit(None, |document| {
+            if let Some(path) = &settings {
+                ensure_asset(document, path);
+            }
+            let camera = find_object_mut(document, id)?
+                .camera
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+            camera.settings = settings;
+            Ok(())
+        })
+    }
+
     /// Добавляет Lua-скрипт объекту и его путь в список ресурсов сцены.
     pub fn add_lite_script(&mut self, id: &str, path: VirtualPath) -> Result<(), String> {
         self.edit(None, |document| {
@@ -438,6 +585,14 @@ fn find_object_mut<'a>(
     document
         .objects
         .iter_mut()
+        .find(|object| object.id == id)
+        .ok_or_else(|| format!("объект {id:?} не найден"))
+}
+
+fn find_object<'a>(document: &'a SceneDocument, id: &str) -> Result<&'a SceneObject, String> {
+    document
+        .objects
+        .iter()
         .find(|object| object.id == id)
         .ok_or_else(|| format!("объект {id:?} не найден"))
 }
@@ -634,7 +789,95 @@ mod tests {
         for id in [created, copy] {
             assert!(scene.object(&id).unwrap().camera.is_some());
         }
+        assert_eq!(
+            scene
+                .document()
+                .objects
+                .iter()
+                .filter(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                .count(),
+            1
+        );
+        scene.document().validate().unwrap();
         assert!(scene.duplicate_object("sun").is_err());
+    }
+
+    #[test]
+    fn removing_the_active_camera_selects_a_remaining_camera() {
+        let mut scene = scene();
+        let second = scene.create_object(&NewObject::Camera, None).unwrap();
+        scene.remove_camera("camera").unwrap();
+        assert!(
+            scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        scene.document().validate().unwrap();
+        assert!(scene.remove_camera(&second).is_err());
+    }
+
+    #[test]
+    fn camera_activation_switches_atomically_and_one_camera_can_be_implicit() {
+        let mut editor_scene = scene();
+        let second = editor_scene
+            .create_object(&NewObject::Camera, None)
+            .unwrap();
+        editor_scene.set_camera_active(&second, true).unwrap();
+        assert!(
+            !editor_scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        assert!(
+            editor_scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        editor_scene.set_camera_active(&second, false).unwrap();
+        assert!(
+            editor_scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        assert!(
+            !editor_scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        editor_scene.document().validate().unwrap();
+
+        let mut single = scene();
+        single.set_camera_active("camera", false).unwrap();
+        assert!(
+            !single
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        single.document().validate().unwrap();
     }
 
     #[test]
@@ -673,12 +916,30 @@ mod tests {
     #[test]
     fn component_edit_with_invalid_values_is_rolled_back() {
         let mut scene = scene();
+        let second = scene.create_object(&NewObject::Camera, None).unwrap();
         let result = scene.edit_object("camera", None, |object| {
-            object.camera.as_mut().unwrap().near = -1.0;
+            object.camera.as_mut().unwrap().active = false;
             Ok(())
         });
         assert!(result.is_err());
-        assert_eq!(scene.object("camera").unwrap().camera.unwrap().near, 0.1);
+        assert!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        assert!(
+            !scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
     }
 
     #[test]
@@ -692,6 +953,37 @@ mod tests {
         assert_eq!(scene.document().assets.len(), 3);
         assert!(scene.set_mesh(&id, path("/t.png"), None).is_err());
         assert!(scene.add_lite_script(&id, path("/m.fbx")).is_err());
+    }
+
+    #[test]
+    fn assigning_camera_settings_registers_a_valid_asset_path() {
+        let mut scene = scene();
+        let settings = path("/cameras/main.camerasettings");
+        scene
+            .set_camera_settings("camera", Some(settings.clone()))
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .settings,
+            Some(settings.clone())
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == settings)
+        );
+        assert!(
+            scene
+                .set_camera_settings("camera", Some(path("/cameras/main.toml")))
+                .is_err()
+        );
     }
 
     #[test]

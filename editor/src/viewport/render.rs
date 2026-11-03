@@ -4,18 +4,17 @@ use crate::console::ConsoleLog;
 use crate::project::OpenProject;
 use engine_assets::Model;
 use engine_render::{
-    DirectionalLight, DrawCommand, Frame, MeshId, RenderError, Renderer, TextureId, Vertex,
-    ViewSettings, ViewportId,
+    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, MeshId, RenderError,
+    Renderer, TextureId, Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_scene::light::shadow_view_projection;
-use engine_scene::{LightState, SceneFrame, World};
+use engine_scene::{AntiAliasing, CameraSettings, LightState, SceneFrame, Tonemapper, World};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const GRID_HALF_CELLS: i32 = 20;
 const GRID_LINE_WIDTH: f32 = 0.02;
-const CLEAR_COLOR: [f32; 4] = [0.025, 0.028, 0.035, 1.0];
 
 struct GpuModel {
     meshes: Vec<(MeshId, Option<TextureId>)>,
@@ -173,13 +172,19 @@ impl SceneRenderer {
     pub fn frame(
         &self,
         view_projection: Mat4,
+        settings: CameraSettings,
         light: &LightState,
         scene_has_light: bool,
         with_grid: bool,
     ) -> Frame<'_> {
         let (light, shadow) = frame_light(light, scene_has_light);
         Frame {
-            clear_color: CLEAR_COLOR,
+            clear_color: [
+                settings.render.clear_color[0],
+                settings.render.clear_color[1],
+                settings.render.clear_color[2],
+                1.0,
+            ],
             view_projection: view_projection.to_cols_array_2d(),
             shadow_view_projection: shadow,
             light,
@@ -189,7 +194,19 @@ impl SceneRenderer {
                 &self.draws[..self.scene_draws]
             },
             overlay: &[],
-            view: ViewSettings::default(),
+            view: ViewSettings {
+                render_scale: settings.render.render_scale,
+                exposure_ev: settings.color.exposure_ev,
+                tonemapper: match settings.color.tonemapper {
+                    Tonemapper::Aces => RenderTonemapper::Aces,
+                    Tonemapper::Neutral => RenderTonemapper::Neutral,
+                    Tonemapper::None => RenderTonemapper::None,
+                },
+                anti_aliasing: match settings.render.anti_aliasing {
+                    AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
+                    AntiAliasing::None => RenderAntiAliasing::None,
+                },
+            },
         }
     }
 }

@@ -44,12 +44,15 @@ Sandbox показывает вращающийся куб над плоскос
 cargo run -p sandbox -- --scene triangle
 cargo run -p sandbox -- --model /models/cube.fbx --texture /textures/cube.png
 cargo run -p sandbox -- --frames 120 --render-scale 0.5
+cargo run -p sandbox -- --camera-settings /cameras/default.camerasettings
 ```
 
 Ресурсы sandbox размещаются в `build/assets`. Например, путь
 `/models/cube.fbx` указывает на `build/assets/models/cube.fbx`. Поддерживаются
 сцены `triangle`, `cube` и `shadows`, модели FBX, текстуры PNG, ограничение
-числа кадров, изменение размера окна и отладочный оверлей.
+числа кадров, изменение размера окна и отладочный оверлей. Настройки проекции,
+экспозиции и тонмаппинга задаются файлом `.camerasettings`; явный `--render-scale`
+перекрывает масштаб из него.
 
 Настройки окна sandbox необязательны. Чтобы изменить их, скопируй шаблон
 `bootstrap.rves.example` в `build/bootstrap.rves`.

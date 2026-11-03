@@ -85,7 +85,7 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
 
     ui.separator();
     show_transform(ui, state, object);
-    if let Some(camera) = object.camera {
+    if let Some(camera) = &object.camera {
         show_camera(ui, state, id, camera);
     }
     if object.mesh_renderer.is_some() {
@@ -159,35 +159,39 @@ fn component_header(
     remove
 }
 
-fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: CameraComponent) {
+fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &CameraComponent) {
     let remove = component_header(ui, "Camera", id, |ui| {
         egui::Grid::new("camera").num_columns(2).show(ui, |ui| {
-            let mut value = camera;
-            ui.label("FOV");
-            let fov = ui.add(
-                egui::DragValue::new(&mut value.fov_deg)
-                    .speed(0.25)
-                    .suffix("°"),
-            );
+            ui.label("Settings");
+            let mut options = vec!["Default".to_owned()];
+            options.extend(state.assets_of_kind(AssetKind::CameraSettings));
+            let current = camera
+                .settings
+                .as_ref()
+                .map(|path| path.as_str())
+                .unwrap_or("Default");
+            if let Some(chosen) = asset_picker(ui, "camera_settings", current, &options) {
+                let settings = if chosen == "Default" {
+                    Some(None)
+                } else {
+                    parse_path(state, &chosen).map(Some)
+                };
+                if let Some(settings) = settings {
+                    state.edit_scene(|scene| scene.set_camera_settings(id, settings));
+                }
+            }
             ui.end_row();
-            ui.label("Near");
-            let near = ui.add(egui::DragValue::new(&mut value.near).speed(0.01));
-            ui.end_row();
-            ui.label("Far");
-            let far = ui.add(egui::DragValue::new(&mut value.far).speed(1.0));
-            ui.end_row();
-            commit(state, id, "camera", &(fov | near | far), |object| {
-                object.camera = Some(value);
-            });
+            ui.label("Active");
+            let mut active = camera.active;
+            let response = ui.checkbox(&mut active, "");
+            if response.changed() {
+                state.edit_scene(|scene| scene.set_camera_active(id, active));
+            }
+            finish_edit(state, &response);
         });
     });
     if remove {
-        state.edit_scene(|scene| {
-            scene.edit_object(id, None, |object| {
-                object.camera = None;
-                Ok(())
-            })
-        });
+        state.edit_scene(|scene| scene.remove_camera(id));
     }
 }
 
@@ -454,16 +458,7 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
     let id = object.id.as_str();
     ui.menu_button("Add Component", |ui| {
         if object.camera.is_none() && ui.button("Camera").clicked() {
-            state.edit_scene(|scene| {
-                scene.edit_object(id, None, |object| {
-                    object.camera = Some(CameraComponent {
-                        fov_deg: 60.0,
-                        near: 0.1,
-                        far: 1000.0,
-                    });
-                    Ok(())
-                })
-            });
+            state.edit_scene(|scene| scene.add_camera(id));
         }
         if object.mesh_renderer.is_none() {
             ui.menu_button("Mesh Renderer", |ui| {

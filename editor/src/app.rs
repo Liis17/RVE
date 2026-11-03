@@ -15,6 +15,7 @@ use engine_files::VirtualPath;
 use engine_render::{
     FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
 };
+use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
 use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
 use std::path::{Path, PathBuf};
@@ -270,9 +271,17 @@ impl EditorApp {
                 }
             }
         }
-        let result = PlaySession::start(scene.document(), self.state.library.as_ref(), |path| {
-            project.read_text(path)
-        });
+        let result = (|| {
+            let mut world =
+                World::from_document(scene.document()).map_err(|error| error.to_string())?;
+            project.apply_camera_settings(&mut world)?;
+            PlaySession::start_with_world(
+                scene.document(),
+                world,
+                self.state.library.as_ref(),
+                |path| project.read_text(path),
+            )
+        })();
         match result {
             Ok(session) => {
                 self.state.play = Some(session);
@@ -486,10 +495,19 @@ fn render_scene_frame(
         &scene_frame,
         grid_camera_distance,
     )?;
-    let game_camera = game_camera_id
+    let game_camera_handle = game_camera_id
         .and_then(|id| parts.world.handle(&id))
-        .and_then(|handle| parts.world.camera_of(handle))
+        .filter(|handle| parts.world.camera_of(*handle).is_some())
+        .unwrap_or_else(|| parts.world.active_camera());
+    let game_camera = parts
+        .world
+        .camera_of(game_camera_handle)
         .unwrap_or(scene_frame.camera);
+    let game_settings = parts
+        .world
+        .camera_settings(game_camera_handle)
+        .copied()
+        .unwrap_or_default();
     let has_light = parts
         .world
         .objects()
@@ -515,6 +533,11 @@ fn render_scene_frame(
     } else {
         state.camera.camera()
     };
+    let scene_settings = if playing {
+        scene_frame.view
+    } else {
+        CameraSettings::default()
+    };
 
     if let Some([width, height]) = scene_size {
         gpu.renderer
@@ -527,6 +550,7 @@ fn render_scene_frame(
     let scene_view = scene_size.map(|[width, height]| {
         gpu.scene.frame(
             scene_camera.view_projection(width, height),
+            scene_settings,
             &scene_frame.light,
             has_light,
             true,
@@ -535,6 +559,7 @@ fn render_scene_frame(
     let game_view = game_size.map(|[width, height]| {
         gpu.scene.frame(
             game_camera.view_projection(width, height),
+            game_settings,
             &scene_frame.light,
             has_light,
             false,
