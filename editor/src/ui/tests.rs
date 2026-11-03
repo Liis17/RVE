@@ -820,6 +820,25 @@ fn game_view_shows_the_image_and_takes_a_camera_from_the_scene() {
     assert!(!harness.state.game_view.visible);
 }
 
+#[test]
+fn scene_and_game_views_keep_independent_debug_modes() {
+    let mut harness = Harness::new();
+    harness.state.scene_view.debug_view = engine_render::DebugView::Normals;
+    harness.state.game_view.debug_view = engine_render::DebugView::ShadowCascades;
+
+    harness.panel(Vec::new(), scene_view::show);
+    harness.panel(Vec::new(), game_view::show);
+
+    assert_eq!(
+        harness.state.scene_view.debug_view,
+        engine_render::DebugView::Normals
+    );
+    assert_eq!(
+        harness.state.game_view.debug_view,
+        engine_render::DebugView::ShadowCascades
+    );
+}
+
 /// Центр первой надписи `text` среди фигур кадра.
 fn find_text(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<Pos2> {
     fn visit(shape: &egui::Shape, text: &str) -> Option<Pos2> {

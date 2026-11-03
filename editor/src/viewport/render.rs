@@ -388,6 +388,7 @@ impl SceneRenderer {
         environment_state: Option<&EnvironmentState>,
         shadow_cascades: &'a [[[f32; 4]; 4]],
         with_grid: bool,
+        debug_view: DebugView,
     ) -> Frame<'a> {
         let light = frame_light(light, scene_has_light);
         let environment = self.frame_environment(environment_state);
@@ -414,7 +415,7 @@ impl SceneRenderer {
                 &self.game_draws
             },
             overlay: &[],
-            debug_view: DebugView::Lit,
+            debug_view,
             reset_history: self.motion_history.reset_pending,
             view: ViewSettings {
                 render_scale: settings.render.render_scale,

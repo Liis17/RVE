@@ -1,14 +1,15 @@
+use engine_render::DebugView;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub(crate) const USAGE: &str =
-    "Использование: rve-player [--project <dir>] [--scripts <path>] [--frames N]";
+pub(crate) const USAGE: &str = "Использование: rve-player [--project <dir>] [--scripts <path>] [--frames N] [--debug-view lit|wireframe|normals|overdraw|lod|cascades]";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PlayerArgs {
     pub project: Option<PathBuf>,
     pub scripts: Option<PathBuf>,
     pub frames: Option<u64>,
+    pub debug_view: Option<DebugView>,
 }
 
 impl PlayerArgs {
@@ -57,9 +58,46 @@ impl PlayerArgs {
                     }
                     parsed.scripts = Some(PathBuf::from(value));
                 }
+                Some("--debug-view") => {
+                    if parsed.debug_view.is_some() {
+                        return Err("параметр --debug-view указан повторно".to_owned());
+                    }
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "укажите режим после --debug-view".to_owned())?;
+                    let view = match value.to_str() {
+                        Some("lit") => DebugView::Lit,
+                        Some("wireframe") => DebugView::Wireframe,
+                        Some("normals") => DebugView::Normals,
+                        Some("overdraw") => DebugView::Overdraw,
+                        Some("lod") => DebugView::LodLevels,
+                        Some("cascades") => DebugView::ShadowCascades,
+                        Some(_) => {
+                            return Err(
+                                "--debug-view должен быть lit, wireframe, normals, overdraw, lod или cascades".to_owned(),
+                            );
+                        }
+                        None => return Err("аргументы должны быть в UTF-8".to_owned()),
+                    };
+                    parsed.debug_view = Some(view);
+                }
                 Some(other) => return Err(format!("неизвестный аргумент {other:?}")),
                 None => return Err("аргументы должны быть в UTF-8".to_owned()),
             }
+        }
+        if parsed.debug_view.is_some() && parsed.project.is_none() {
+            return Err("--debug-view доступен только при запуске с --project".to_owned());
+        }
+        Ok(parsed)
+    }
+
+    pub fn parse_for_build(
+        args: impl IntoIterator<Item = OsString>,
+        dev_player: bool,
+    ) -> Result<Self, String> {
+        let parsed = Self::parse(args)?;
+        if parsed.debug_view.is_some() && !dev_player {
+            return Err("--debug-view доступен только в dev-player".to_owned());
         }
         Ok(parsed)
     }
@@ -68,6 +106,7 @@ impl PlayerArgs {
 #[cfg(test)]
 mod tests {
     use super::PlayerArgs;
+    use engine_render::DebugView;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -83,6 +122,7 @@ mod tests {
                 project: Some("my game".into()),
                 scripts: None,
                 frames: Some(120),
+                debug_view: None,
             }
         );
         assert_eq!(
@@ -91,6 +131,7 @@ mod tests {
                 project: Some("./game".into()),
                 scripts: None,
                 frames: Some(1),
+                debug_view: None,
             }
         );
         assert_eq!(
@@ -99,6 +140,26 @@ mod tests {
                 .scripts,
             Some(PathBuf::from("scripts/game.dll"))
         );
+        assert_eq!(
+            parse(&["--project", "game", "--debug-view", "cascades"])
+                .unwrap()
+                .debug_view,
+            Some(DebugView::ShadowCascades)
+        );
+        for (name, view) in [
+            ("lit", DebugView::Lit),
+            ("wireframe", DebugView::Wireframe),
+            ("normals", DebugView::Normals),
+            ("overdraw", DebugView::Overdraw),
+            ("lod", DebugView::LodLevels),
+        ] {
+            assert_eq!(
+                parse(&["--project", "game", "--debug-view", name])
+                    .unwrap()
+                    .debug_view,
+                Some(view)
+            );
+        }
     }
 
     #[test]
@@ -117,8 +178,28 @@ mod tests {
             vec!["--scripts", "scripts.dll", "--scripts", "other.dll"],
             vec!["--scripts"],
             vec!["--scripts", "--project", "game"],
+            vec!["--debug-view"],
+            vec!["--debug-view", "bad"],
+            vec!["--debug-view", "lit", "--debug-view", "normals"],
+            vec!["--debug-view", "lit"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }
+    }
+
+    #[test]
+    fn debug_view_is_rejected_by_release_builds() {
+        let args = ["--project", "game", "--debug-view", "normals"]
+            .into_iter()
+            .map(OsString::from);
+        assert!(PlayerArgs::parse_for_build(args, false).is_err());
+
+        let args = ["--project", "game", "--debug-view", "normals"]
+            .into_iter()
+            .map(OsString::from);
+        assert_eq!(
+            PlayerArgs::parse_for_build(args, true).unwrap().debug_view,
+            Some(DebugView::Normals)
+        );
     }
 }

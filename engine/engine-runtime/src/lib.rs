@@ -22,7 +22,7 @@ use engine_console::ConsoleBuffer;
 use engine_console::install_logger;
 use engine_platform::{Acquire, ActivationError, InstanceLock, activate_running_instance};
 use engine_project::{BootstrapConfig, ProjectSettings};
-use engine_render::probe_devices;
+use engine_render::{DebugView, probe_devices};
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_script::ScriptInterruptHandle;
 use engine_window::{RedrawMode, WindowConfig, WindowIcon};
@@ -43,7 +43,10 @@ use sysinfo::{CpuRefreshKind, System};
 
 /// Runs an RVE game using the release layout or a loose-file development project.
 pub fn run_player() -> ExitCode {
-    let args = match PlayerArgs::parse(std::env::args_os().skip(1)) {
+    let args = match PlayerArgs::parse_for_build(
+        std::env::args_os().skip(1),
+        cfg!(feature = "dev-console"),
+    ) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("Ошибка аргументов: {error}");
@@ -91,6 +94,7 @@ fn run_from_args(
     activation: PendingActivation,
     #[cfg(feature = "dev-console")] console_buffer: Arc<Mutex<ConsoleBuffer>>,
 ) -> ExitCode {
+    let debug_view = args.debug_view.unwrap_or(DebugView::Lit);
     #[cfg(feature = "dev-console")]
     let command_catalog = Arc::new(Mutex::new(CommandCatalogSnapshot::default()));
     #[cfg(feature = "dev-console")]
@@ -303,6 +307,7 @@ fn run_from_args(
             pipeline_cache_path,
             pipeline_cache,
             frame_limit: args.frames,
+            debug_view,
             render_assets,
             activation,
             script_tx,

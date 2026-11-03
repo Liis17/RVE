@@ -105,6 +105,8 @@ pub(crate) enum RenderControl {
     Resize(u32, u32),
     Occluded(bool),
     #[cfg(feature = "dev-console")]
+    DebugView(DebugView),
+    #[cfg(feature = "dev-console")]
     ConsoleUiChanged,
     Shutdown,
 }
@@ -176,6 +178,8 @@ impl Clock for MonotonicClock {
 
 pub(crate) trait RenderBackend: Send {
     fn resize(&mut self, width: u32, height: u32);
+    #[cfg(feature = "dev-console")]
+    fn set_debug_view(&mut self, _debug_view: DebugView) {}
     fn render(
         &mut self,
         snapshot: &FrameSnapshot,
@@ -256,6 +260,7 @@ pub(crate) enum ScriptStartupError {
 
 pub(crate) struct VulkanBackend {
     renderer: Renderer,
+    debug_view: DebugView,
     current_environment: Option<(EnvironmentCacheKey, EnvironmentId)>,
     pipeline_cache_path: Option<std::path::PathBuf>,
     #[cfg(feature = "dev-console")]
@@ -272,9 +277,14 @@ type PendingConsoleCommands = VecDeque<CommandLine>;
 type PendingConsoleCommands = ();
 
 impl VulkanBackend {
-    pub fn new(renderer: Renderer, pipeline_cache_path: Option<std::path::PathBuf>) -> Self {
+    pub fn new(
+        renderer: Renderer,
+        pipeline_cache_path: Option<std::path::PathBuf>,
+        debug_view: DebugView,
+    ) -> Self {
         Self {
             renderer,
+            debug_view,
             current_environment: None,
             pipeline_cache_path,
             #[cfg(feature = "dev-console")]
@@ -363,6 +373,11 @@ impl RenderBackend for VulkanBackend {
         self.renderer.resize(width, height);
     }
 
+    #[cfg(feature = "dev-console")]
+    fn set_debug_view(&mut self, debug_view: DebugView) {
+        self.debug_view = debug_view;
+    }
+
     fn render(
         &mut self,
         snapshot: &FrameSnapshot,
@@ -389,7 +404,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
-            debug_view: DebugView::Lit,
+            debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 exposure_ev: snapshot.view.color.exposure_ev,
@@ -494,7 +509,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
-            debug_view: DebugView::Lit,
+            debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 exposure_ev: snapshot.view.color.exposure_ev,
@@ -1361,12 +1376,17 @@ fn render_loop(
     let mut occluded = false;
     let mut paused = false;
     let mut presented = 0_u64;
+    #[cfg(feature = "dev-console")]
+    let mut debug_view_dirty = false;
     let mut latest_snapshot: Option<Arc<FrameSnapshot>> = None;
     #[cfg(feature = "dev-console")]
     let mut ui_frame = ConsoleUiFrame::default();
     #[cfg(feature = "dev-console")]
     let mut console_active = false;
     loop {
+        #[cfg(feature = "dev-console")]
+        let mut should_render = std::mem::take(&mut debug_view_dirty);
+        #[cfg(not(feature = "dev-console"))]
         let mut should_render = false;
         loop {
             match control_rx.try_recv() {
@@ -1385,6 +1405,11 @@ fn render_loop(
                     {
                         should_render = true;
                     }
+                }
+                #[cfg(feature = "dev-console")]
+                Ok(RenderControl::DebugView(value)) => {
+                    backend.set_debug_view(value);
+                    should_render = true;
                 }
                 #[cfg(feature = "dev-console")]
                 Ok(RenderControl::ConsoleUiChanged) => should_render = true,
@@ -1454,6 +1479,11 @@ fn render_loop(
                 backend.resize(width, height);
             }
             RenderSelection::Control(Ok(RenderControl::Occluded(value))) => occluded = value,
+            #[cfg(feature = "dev-console")]
+            RenderSelection::Control(Ok(RenderControl::DebugView(value))) => {
+                backend.set_debug_view(value);
+                debug_view_dirty = true;
+            }
             #[cfg(feature = "dev-console")]
             RenderSelection::Control(Ok(RenderControl::ConsoleUiChanged)) => {}
             RenderSelection::Control(Ok(RenderControl::Shutdown))

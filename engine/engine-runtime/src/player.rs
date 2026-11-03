@@ -15,7 +15,7 @@ use egui_winit::State as EguiWinitState;
 #[cfg(feature = "dev-console")]
 use engine_console::{CommandLine, ConsoleBuffer, ConsoleLevel, ConsoleLine, parse_command_line};
 use engine_project::BootstrapPresentMode;
-use engine_render::{PresentMode, Renderer, RendererConfig};
+use engine_render::{DebugView, PresentMode, Renderer, RendererConfig};
 use engine_script::ScriptInterruptHandle;
 #[cfg(feature = "dev-console")]
 use engine_ui::console::ConsoleOverlay;
@@ -45,6 +45,7 @@ pub(crate) struct PlayerConfig {
     pub pipeline_cache_path: Option<PathBuf>,
     pub pipeline_cache: Vec<u8>,
     pub frame_limit: Option<u64>,
+    pub debug_view: DebugView,
     pub render_assets: PreparedRenderAssets,
     pub activation: PendingActivation,
     pub script_tx: Sender<ScriptControl>,
@@ -70,6 +71,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         pipeline_cache_path,
         pipeline_cache,
         frame_limit,
+        debug_view,
         render_assets,
         activation,
         script_tx,
@@ -89,6 +91,11 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     } = config;
     let mut handler = PlayerWindow {
         frame_limit,
+        debug_view,
+        #[cfg(feature = "dev-console")]
+        wireframe_supported: false,
+        #[cfg(feature = "dev-console")]
+        f8_down: false,
         present_mode,
         pipeline_cache_path,
         pipeline_cache,
@@ -163,6 +170,11 @@ struct PlayerWindow<'a> {
     render_started: bool,
     cleaned: bool,
     input: Arc<Mutex<InputAccumulator>>,
+    debug_view: DebugView,
+    #[cfg(feature = "dev-console")]
+    wireframe_supported: bool,
+    #[cfg(feature = "dev-console")]
+    f8_down: bool,
     #[cfg(feature = "dev-console")]
     console_buffer: Arc<Mutex<ConsoleBuffer>>,
     #[cfg(feature = "dev-console")]
@@ -645,6 +657,10 @@ impl WindowHandler for PlayerWindow<'_> {
             Ok(renderer) => renderer,
             Err(error) => return self.fail_init(format!("ошибка renderer: {error}")),
         };
+        #[cfg(feature = "dev-console")]
+        {
+            self.wireframe_supported = renderer.capabilities().wireframe;
+        }
         let gpu_scene = match upload_scene(&mut renderer, &self.render_assets) {
             Ok(scene) => scene,
             Err(error) => return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}")),
@@ -657,7 +673,8 @@ impl WindowHandler for PlayerWindow<'_> {
         };
         let (render_stopped_tx, render_stopped_rx) = flume::bounded(1);
         self.render_stopped_rx = Some(render_stopped_rx);
-        let backend = VulkanBackend::new(renderer, self.pipeline_cache_path.clone());
+        let backend =
+            VulkanBackend::new(renderer, self.pipeline_cache_path.clone(), self.debug_view);
         #[cfg(feature = "dev-console")]
         let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(
@@ -728,6 +745,21 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn key(&mut self, key: Key, pressed: bool) {
         #[cfg(feature = "dev-console")]
+        if key == Key::F8 {
+            if pressed && !self.f8_down {
+                self.f8_down = true;
+                if !self.console_open && self.window_focused {
+                    self.debug_view = next_debug_view(self.debug_view, self.wireframe_supported);
+                    let _ = self
+                        .render_tx
+                        .send(RenderControl::DebugView(self.debug_view));
+                }
+            } else if !pressed {
+                self.f8_down = false;
+            }
+            return;
+        }
+        #[cfg(feature = "dev-console")]
         if self.console_open {
             return;
         }
@@ -770,6 +802,9 @@ impl WindowHandler for PlayerWindow<'_> {
         #[cfg(feature = "dev-console")]
         {
             self.window_focused = focused;
+            if !focused {
+                self.f8_down = false;
+            }
             lock_input(&self.input).console_open(self.console_open, self.window_focused);
         }
         #[cfg(not(feature = "dev-console"))]
@@ -778,6 +813,65 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn exiting(&mut self) {
         self.cleanup();
+    }
+}
+
+#[cfg(feature = "dev-console")]
+fn next_debug_view(current: DebugView, wireframe_supported: bool) -> DebugView {
+    let views = [
+        DebugView::Lit,
+        DebugView::Wireframe,
+        DebugView::Normals,
+        DebugView::Overdraw,
+        DebugView::LodLevels,
+        DebugView::ShadowCascades,
+    ];
+    let mut index = views.iter().position(|view| *view == current).unwrap_or(0);
+    for _ in 0..views.len() {
+        index = (index + 1) % views.len();
+        let candidate = views[index];
+        if candidate != DebugView::Wireframe || wireframe_supported {
+            return candidate;
+        }
+    }
+    DebugView::Lit
+}
+
+#[cfg(test)]
+#[cfg(feature = "dev-console")]
+mod debug_view_tests {
+    use super::next_debug_view;
+    use engine_render::DebugView;
+
+    #[test]
+    fn debug_view_cycle_skips_wireframe_when_the_device_lacks_support() {
+        assert_eq!(next_debug_view(DebugView::Lit, false), DebugView::Normals);
+        assert_eq!(
+            next_debug_view(DebugView::ShadowCascades, false),
+            DebugView::Lit
+        );
+    }
+
+    #[test]
+    fn debug_view_cycle_includes_wireframe_when_supported() {
+        assert_eq!(next_debug_view(DebugView::Lit, true), DebugView::Wireframe);
+        assert_eq!(
+            next_debug_view(DebugView::Wireframe, true),
+            DebugView::Normals
+        );
+        let cycle = [
+            DebugView::Wireframe,
+            DebugView::Normals,
+            DebugView::Overdraw,
+            DebugView::LodLevels,
+            DebugView::ShadowCascades,
+            DebugView::Lit,
+        ];
+        let mut current = DebugView::Lit;
+        for expected in cycle {
+            current = next_debug_view(current, true);
+            assert_eq!(current, expected);
+        }
     }
 }
 

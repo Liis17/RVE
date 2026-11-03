@@ -67,6 +67,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         } else {
             ui.label(current_name.as_str());
         }
+        ui.separator();
+        ui.label("View");
+        super::debug_view::picker(
+            ui,
+            "game_debug_view",
+            &mut state.game_view.debug_view,
+            state.wireframe_supported,
+        );
     });
     state.game_camera = Some(chosen);
 

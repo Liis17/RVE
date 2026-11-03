@@ -32,6 +32,12 @@ Terminal, поэтому `rve-build` публикует macOS-релиз как 
 кодом 2. Относительный путь `--scripts` разрешается от текущего рабочего каталога и
 приводится к абсолютному; существующие пути нормализуются по правилам платформы.
 
+`--debug-view lit|wireframe|normals|overdraw|lod|cascades` доступен только вместе с
+`--project`; неправильный режим и применение к release layout завершаются кодом 2.
+Dev-player с developer console циклически меняет поддерживаемые режимы клавишей F8;
+режим пропускается, если окно не в фокусе или консоль открыта. Wireframe включается в
+цикл только при поддержке `fillModeNonSolid`; F8 не передаёт клавишу скриптам.
+
 Заголовок окна берётся из bootstrap, затем из `ProjectSettings.name`. `AppIcon`
 загружается через `Assets::load_texture` до создания окна; ошибка загрузки относится
 к коду 2. Начальный размер окна берётся из bootstrap с defaults `WindowConfig`.
@@ -83,7 +89,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 | Файл | Ответственность |
 |---|---|
 | `engine/engine-runtime/src/lib.rs` | `run_player`, layout startup, resources, project lock, hardware check и lifecycle модулей |
-| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames` и usage |
+| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames`, dev-only `--debug-view` и usage |
 | `engine/engine-runtime/src/layout.rs` | release/dev пути и выбор ABI-библиотеки |
 | `engine/engine-runtime/src/activation.rs` | `PendingActivation` и single-instance handshake |
 | `engine/engine-runtime/src/hardware.rs` | чистое решение по device/RAM/CPU требованиям |
@@ -91,7 +97,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 | `engine/engine-runtime/src/scene.rs` | CPU-preload сцены и загрузка GPU-таблицы ресурсов |
 | `engine/engine-runtime/src/pipeline.rs` | snapshots, script/render loops, fakeable backend и status guard |
 | `engine/engine-runtime/src/input.rs` | `InputAccumulator`, переходы состояния и кадровые input snapshots |
-| `engine/engine-runtime/src/player.rs` | `WindowHandler`, renderer handoff и shutdown окна |
+| `engine/engine-runtime/src/player.rs` | `WindowHandler`, F8 debug-view control, renderer handoff и shutdown окна |
 | `engine/engine-runtime/src/console.rs` | UI snapshots, latest-only slot и интеграция console-команд с scripts thread |
 | `engine/rve-player/src/main.rs` | бинарный entry point |
 

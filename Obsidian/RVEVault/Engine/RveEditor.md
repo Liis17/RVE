@@ -14,19 +14,19 @@ Parent: [[Index]]
 | `editor/src/app.rs` | `EditorApp`, `render_scene_frame` | `WindowHandler`: цикл кадра и действия (`Action`), диалоги ОС, запуск Play |
 | `engine/engine-ui/src` | `UiBridge`, `ManagedTextures`, `UiTextures`, `ConsoleOverlay` | Общий egui bridge и console overlay для UI pass |
 | `editor/src/console.rs` | console toggle и преобразование команд в Play actions | Состояние и обработка editor console |
-| `editor/src/state.rs` | `EditorState`, `Action`, `FrameParts` | Состояние панелей без GPU |
+| `editor/src/state.rs` | `EditorState`, `SceneViewInfo`, `Action`, `FrameParts` | Раздельное debug-view состояние Scene/Game и состояние панелей без GPU |
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject` | Команды над документом, undo/redo, атомарное сохранение, раскрытие префабов |
 | `editor/src/scene_edit/prefabs.rs` | `OverrideField`, `object_override` | Instantiate, Create Prefab, Unpack, overrides и Apply to Prefab |
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject`, `Component` | Команды над документом, выделение, undo/redo, буфер обмена объектов, атомарное сохранение |
 | `editor/src/settings.rs` | `SettingsStore`, `UserSettings` | Настройки пользователя: недавние проекты и раскладка панелей |
 | `editor/src/autosave.rs` | `AutosaveStore` | Копии несохранённых сцен и их восстановление |
 | `editor/src/assets_fs.rs` | `AssetsDir` | Файловые операции в `Assets/` с проверкой путей |
-| `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose |
+| `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` |
 | `editor/src/previews.rs` | `PreviewCache` | Фоновое декодирование PNG/Radiance HDR, tone mapping HDR thumbnails и LRU-кэш UI-текстур |
 | `editor/src/build.rs` | `BuildJob`, `locate_build_tool` | File → Build Player: дочерний процесс `rve-build` и его вывод в Console |
 | `editor/src/play.rs` | `PlaySession`, `Watchdog` | Копия мира и скрипты на главном потоке, прерывание зависшего Lua |
 | `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
-| `editor/src/ui/` | `show`, `scene_view`, `game_view`, `hierarchy`, `inspector`, `project_panel`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
+| `editor/src/ui/` | `show`, `scene_view`, `game_view`, `debug_view`, `hierarchy`, `inspector`, `project_panel`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
 
 ## Публичные контракты
 
@@ -43,7 +43,7 @@ Parent: [[Index]]
 
 ## Поток кадра
 
-`EditorApp::frame` сначала выполняет накопленные действия, затем `draw_frame`: загрузка готовых превью, `egui::Context::run_ui`, обработка platform output, применение `TexturesDelta`, тесселяция, шаг Play, подготовка сцены и один вызов `Renderer::render_frame_with_ui`, после него — освобождение текстур egui. Размеры viewport берутся из прямоугольников панелей Scene и Game этого же кадра, поэтому изображение не отстаёт от раскладки. Scene и Game рисуются отдельными scene pass; скрытая панель свой pass не выполняет, поэтому вкладки в одной группе стоят как одна сцена.
+`EditorApp::frame` сначала выполняет накопленные действия, затем `draw_frame`: загрузка готовых превью, `egui::Context::run_ui`, обработка platform output, применение `TexturesDelta`, тесселяция, шаг Play, подготовка сцены и один вызов `Renderer::render_frame_with_ui`, после него — освобождение текстур egui. Размеры viewport берутся из прямоугольников панелей Scene и Game этого же кадра, поэтому изображение не отстаёт от раскладки. Scene и Game рисуются отдельными scene pass и хранят собственные `DebugView`; скрытая панель свой pass не выполняет, поэтому вкладки в одной группе стоят как одна сцена. Combo `View` скрывает Wireframe, если GPU не поддерживает `fillModeNonSolid`.
 
 Каждый viewport получает собственный список draws, `FrameCamera`, environment, локальные lights, local shadow requests/matrices и camera-relative directional shadow cascades. Runtime helpers из `engine-scene::light` строят матрицы из мирового состояния lights; renderer независимо распределяет 32 слоя с учётом camera distance для каждой панели. Scene использует камеру редактора вне Play и камеру сцены в Play; Game использует выбранную игровую камеру, поэтому проекция, cluster lists, environment transform, выбор локальных источников/теней и каскады считаются отдельно для каждой панели. Общий local shadow array перерисовывается последовательно перед каждым viewport opaque pass; матрицы лежат в per-frame viewport buffers. Сетка добавляется только к списку Scene. Обе панели используют общие кэши FBX/PNG/HDR и могут независимо выбрать разные LOD одного объекта.
 
@@ -61,7 +61,7 @@ Parent: [[Index]]
 
 Выделение — упорядоченный набор, последний объект активный: его показывает Inspector, по нему наводится камера (F). Ctrl/Cmd-щелчок в Scene и Hierarchy переключает объект, Shift-щелчок добавляет. Групповые удаление, дублирование, копирование и гизмо применяются к поддеревьям выделенных объектов без потомков уже выделенного предка и занимают одну запись истории; при ошибке валидации не меняется ни один объект. Вставка и дублирование дают копиям свободные id, переназначают `parent` внутри набора, оставляют корень под прежним родителем, если он есть в сцене, и добавляют ресурсы объектов в список сцены, поэтому объекты можно вставить в другую сцену.
 
-Схема сцены требует хотя бы одну камеру и не более одного directional light; Point/Spot Light допускаются множественно и независимо от directional. При нескольких камерах ровно одна должна быть активной; добавление, дублирование и удаление камер сохраняют это правило. Inspector задаёт camera settings asset и активность; старые поля FOV/near/far в компоненте больше не поддерживаются. Для directional light Inspector задаёт конечную положительную `shadow_distance` и число `shadow_cascades` от 1 до 4. Сохранение: `to_toml`, проверочный `parse`, запись во временный файл рядом и `rename`. Комментарии и форматирование исходного TOML не сохраняются.
+Схема сцены требует хотя бы одну камеру и не более одного directional light; Point/Spot Light допускаются множественно и независимо от directional. При нескольких камерах ровно одна должна быть активной; добавление, дублирование и удаление камер сохраняют это правило. Inspector задаёт camera settings asset и активность; AA picker меняет `render.anti_aliasing` выбранного `.camerasettings` и сразу сохраняет ресурс через `CameraSettings::to_toml`, обновляя все камеры текущего мира, которые его используют. Без назначенного ресурса AA недоступен. Старые поля FOV/near/far в компоненте больше не поддерживаются. Для directional light Inspector задаёт конечную положительную `shadow_distance` и число `shadow_cascades` от 1 до 4. Сохранение сцены: `to_toml`, проверочный `parse`, запись во временный файл рядом и `rename`. Комментарии и форматирование исходных TOML не сохраняются.
 
 Модель, брошенная на Scene, ложится на пол `y = 0` под курсором, а при промахе мимо пола — в цель камеры; брошенная в корень Hierarchy или созданная из меню появляется в цели камеры, дочерняя — в начале координат родителя. После загрузки новой модели камера наводится на неё только если объект почти не виден: занимает единицы пикселей или камера внутри него (`EditorCamera::needs_framing`). Модели FBX читаются в метрах по единице файла, поэтому файл без `UnitScaleFactor` считается сантиметровым.
 

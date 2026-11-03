@@ -81,7 +81,9 @@ cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist
 `rve-build run` собирает игру и запускает dev-player с включённой developer console.
 `rve-build build` собирает distribution-player без console и создаёт релиз в указанном
 каталоге, который должен отсутствовать до сборки. Для прямого запуска player CLI имеет вид
-`rve-player [--project <dir>] [--scripts <path>] [--frames N]`.
+`rve-player [--project <dir>] [--scripts <path>] [--frames N] [--debug-view lit|wireframe|normals|overdraw|lod|cascades]`.
+`--debug-view` принимает только dev-запуск с `--project`; в dev-player F8 циклически
+меняет поддерживаемые режимы, если окно в фокусе и developer console закрыта.
 
 Команда `rve-build sdk` собирает оба варианта player и создаёт переносимый каталог
 с `rve-build`, distribution player `rve-player`, dev player `rve-player-dev`,
@@ -145,6 +147,8 @@ cargo run -p rve-editor -- --project ../examples/demo-game --scripts <path-to-sc
 ~~~
 
 `--project` необязателен: без него открывается стартовый экран с выбором папки проекта. `--scripts` нужен для Play, если в сцене есть Rust-скрипты; без библиотеки Play не запустится и сообщит об этом в Console. Коды завершения: 0 — успех, 2 — неверные аргументы или настройки проекта, 1 — ошибка окна или Vulkan.
+Scene и Game имеют отдельный selector `View`; Inspector редактирует Anti-Aliasing у
+назначенного `.camerasettings` и сразу записывает этот ресурс.
 
 | Действие | Управление |
 |---|---|
