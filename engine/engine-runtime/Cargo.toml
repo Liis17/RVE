@@ -7,9 +7,15 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+dev-console = ["dep:egui", "dep:egui-winit", "dep:engine-ui", "dep:winit"]
+
 [dependencies]
 engine-console = { path = "../engine-console" }
+egui = { workspace = true, optional = true }
+egui-winit = { workspace = true, optional = true }
 engine-assets = { path = "../engine-assets" }
+engine-ui = { path = "../engine-ui", optional = true }
 engine-files = { path = "../engine-files" }
 engine-audio = { path = "../engine-audio" }
 engine-neural = { path = "../engine-neural" }
@@ -26,6 +32,7 @@ flume.workspace = true
 glam.workspace = true
 log.workspace = true
 sysinfo.workspace = true
+winit = { workspace = true, optional = true }
 
 [dev-dependencies]
 rve-sdk = { path = "../rve-sdk" }

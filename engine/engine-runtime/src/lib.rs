@@ -2,6 +2,8 @@
 
 mod activation;
 mod cli;
+#[cfg(feature = "dev-console")]
+mod console;
 mod hardware;
 mod input;
 mod layout;
@@ -12,7 +14,11 @@ mod scene;
 
 use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_or_activate};
 use cli::{PlayerArgs, USAGE};
+#[cfg(feature = "dev-console")]
+use console::{CommandCatalogSnapshot, ConsoleUiSlot};
 use engine_assets::{Assets, TextureData};
+#[cfg(feature = "dev-console")]
+use engine_console::ConsoleBuffer;
 use engine_console::install_logger;
 use engine_platform::{Acquire, ActivationError, InstanceLock, activate_running_instance};
 use engine_project::{BootstrapConfig, ProjectSettings};
@@ -45,6 +51,11 @@ pub fn run_player() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[cfg(feature = "dev-console")]
+    let console_buffer = Arc::new(Mutex::new(ConsoleBuffer::default()));
+    #[cfg(feature = "dev-console")]
+    let _ = install_logger(Some(Arc::clone(&console_buffer)));
+    #[cfg(not(feature = "dev-console"))]
     let _ = install_logger(None);
     let release_root = match executable_dir() {
         Ok(exe_dir) => release_root(&exe_dir),
@@ -59,6 +70,9 @@ pub fn run_player() -> ExitCode {
     // Vulkan configuration, and no runtime, resource, or activation thread exists yet.
     unsafe { engine_platform::prepare_vulkan_environment(&release_root) };
     let activation = PendingActivation::default();
+    #[cfg(feature = "dev-console")]
+    return run_from_args(release_root, args, activation, console_buffer);
+    #[cfg(not(feature = "dev-console"))]
     run_from_args(release_root, args, activation)
 }
 
@@ -75,7 +89,12 @@ fn run_from_args(
     release_root: PathBuf,
     args: PlayerArgs,
     activation: PendingActivation,
+    #[cfg(feature = "dev-console")] console_buffer: Arc<Mutex<ConsoleBuffer>>,
 ) -> ExitCode {
+    #[cfg(feature = "dev-console")]
+    let command_catalog = Arc::new(Mutex::new(CommandCatalogSnapshot::default()));
+    #[cfg(feature = "dev-console")]
+    let console_ui = Arc::new(ConsoleUiSlot::default());
     let layout = match args.project {
         Some(project) => {
             let project = match normalize_layout_path(&project) {
@@ -242,6 +261,8 @@ fn run_from_args(
             render_tx: render_tx.clone(),
             status: Arc::clone(&status),
             input: Arc::clone(&input),
+            #[cfg(feature = "dev-console")]
+            command_catalog: Arc::clone(&command_catalog),
         },
     ) {
         Ok(ready) => ready,
@@ -287,6 +308,12 @@ fn run_from_args(
             interrupt,
             status: Arc::clone(&status),
             input,
+            #[cfg(feature = "dev-console")]
+            console_buffer,
+            #[cfg(feature = "dev-console")]
+            command_catalog,
+            #[cfg(feature = "dev-console")]
+            console_ui,
         },
         &mut modules,
     );

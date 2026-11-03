@@ -1,4 +1,6 @@
 use crate::activation::PendingActivation;
+#[cfg(feature = "dev-console")]
+use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame, ConsoleUiSlot, snapshot_lines};
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::ModuleHost;
 use crate::pipeline::{
@@ -6,12 +8,26 @@ use crate::pipeline::{
     SCRIPTS_THREAD, ScriptControl, VulkanBackend, start_render,
 };
 use crate::scene::{PreparedRenderAssets, upload_scene};
+#[cfg(feature = "dev-console")]
+use egui::{Context, Rect, ViewportId};
+#[cfg(feature = "dev-console")]
+use egui_winit::State as EguiWinitState;
+#[cfg(feature = "dev-console")]
+use engine_console::{CommandLine, ConsoleBuffer, ConsoleLevel, ConsoleLine, parse_command_line};
 use engine_render::{Renderer, RendererConfig};
 use engine_script::ScriptInterruptHandle;
+#[cfg(feature = "dev-console")]
+use engine_ui::console::ConsoleOverlay;
 use engine_window::{Key, MouseButton, Window, WindowConfig, WindowHandler, WindowProxy, run};
 use flume::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(feature = "dev-console")]
+use std::time::Instant;
+#[cfg(feature = "dev-console")]
+use winit::event::{ElementState, WindowEvent};
+#[cfg(feature = "dev-console")]
+use winit::keyboard::{KeyCode, PhysicalKey};
 
 struct WindowExit(WindowProxy);
 
@@ -34,6 +50,12 @@ pub(crate) struct PlayerConfig {
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
     pub input: Arc<Mutex<InputAccumulator>>,
+    #[cfg(feature = "dev-console")]
+    pub console_buffer: Arc<Mutex<ConsoleBuffer>>,
+    #[cfg(feature = "dev-console")]
+    pub command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
+    #[cfg(feature = "dev-console")]
+    pub console_ui: Arc<ConsoleUiSlot>,
 }
 
 pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
@@ -50,6 +72,12 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         interrupt,
         status,
         input,
+        #[cfg(feature = "dev-console")]
+        console_buffer,
+        #[cfg(feature = "dev-console")]
+        command_catalog,
+        #[cfg(feature = "dev-console")]
+        console_ui,
     } = config;
     let mut handler = PlayerWindow {
         frame_limit,
@@ -68,6 +96,30 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         render_started: false,
         cleaned: false,
         input,
+        #[cfg(feature = "dev-console")]
+        console_buffer,
+        #[cfg(feature = "dev-console")]
+        command_catalog,
+        #[cfg(feature = "dev-console")]
+        console_ui,
+        #[cfg(feature = "dev-console")]
+        console_overlay: ConsoleOverlay::default(),
+        #[cfg(feature = "dev-console")]
+        console_open: false,
+        #[cfg(feature = "dev-console")]
+        egui_state: None,
+        #[cfg(feature = "dev-console")]
+        window_focused: false,
+        #[cfg(feature = "dev-console")]
+        window_occluded: false,
+        #[cfg(feature = "dev-console")]
+        console_needs_redraw: false,
+        #[cfg(feature = "dev-console")]
+        console_repaint_at: None,
+        #[cfg(feature = "dev-console")]
+        seen_console_generation: None,
+        #[cfg(feature = "dev-console")]
+        seen_catalog_generation: None,
     };
     let run_result = run(window, &mut handler);
     handler.cleanup();
@@ -97,6 +149,30 @@ struct PlayerWindow<'a> {
     render_started: bool,
     cleaned: bool,
     input: Arc<Mutex<InputAccumulator>>,
+    #[cfg(feature = "dev-console")]
+    console_buffer: Arc<Mutex<ConsoleBuffer>>,
+    #[cfg(feature = "dev-console")]
+    command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
+    #[cfg(feature = "dev-console")]
+    console_ui: Arc<ConsoleUiSlot>,
+    #[cfg(feature = "dev-console")]
+    console_overlay: ConsoleOverlay,
+    #[cfg(feature = "dev-console")]
+    console_open: bool,
+    #[cfg(feature = "dev-console")]
+    egui_state: Option<EguiWinitState>,
+    #[cfg(feature = "dev-console")]
+    window_focused: bool,
+    #[cfg(feature = "dev-console")]
+    window_occluded: bool,
+    #[cfg(feature = "dev-console")]
+    console_needs_redraw: bool,
+    #[cfg(feature = "dev-console")]
+    console_repaint_at: Option<Instant>,
+    #[cfg(feature = "dev-console")]
+    seen_console_generation: Option<u64>,
+    #[cfg(feature = "dev-console")]
+    seen_catalog_generation: Option<u64>,
 }
 
 impl PlayerWindow<'_> {
@@ -136,6 +212,266 @@ impl PlayerWindow<'_> {
             Duration::from_secs(2),
         );
     }
+
+    #[cfg(feature = "dev-console")]
+    fn set_console_open(&mut self, open: bool) {
+        if self.console_open == open {
+            return;
+        }
+        self.console_open = open;
+        self.console_overlay.set_open(open);
+        self.console_repaint_at = None;
+        lock_input(&self.input).console_open(open, self.window_focused);
+        if open {
+            self.console_needs_redraw = true;
+        } else {
+            self.console_needs_redraw = false;
+            self.publish_console_ui(ConsoleUiFrame::default());
+        }
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn publish_console_ui(&self, frame: ConsoleUiFrame) {
+        if self.console_ui.publish(frame) {
+            let _ = self.render_tx.send(RenderControl::ConsoleUiChanged);
+        }
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn update_console(&mut self, window: &Window) {
+        if !self.console_open {
+            return;
+        }
+        if self.window_occluded {
+            self.console_ui.discard_geometry_preserve_texture_delta();
+            return;
+        }
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            self.console_ui.discard_geometry_preserve_texture_delta();
+            return;
+        }
+
+        let console_generation = self
+            .console_buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation();
+        let catalog_generation = self
+            .command_catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation;
+        if self.seen_console_generation != Some(console_generation)
+            || self.seen_catalog_generation != Some(catalog_generation)
+        {
+            self.console_needs_redraw = true;
+        }
+        if self
+            .console_repaint_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.console_needs_redraw = true;
+        }
+        if !self.console_needs_redraw {
+            return;
+        }
+
+        let Some(state) = self.egui_state.as_mut() else {
+            return;
+        };
+        let context = state.egui_ctx().clone();
+        let raw_input = state.take_egui_input(window);
+        let screen_rect = raw_input.screen_rect.unwrap_or_else(|| {
+            let scale = egui_winit::pixels_per_point(&context, window);
+            Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size.width as f32 / scale, size.height as f32 / scale),
+            )
+        });
+        let lines = snapshot_lines(&self.console_buffer);
+        let catalog = self
+            .command_catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .catalog
+            .clone();
+        let mut console_output = Default::default();
+        let output = context.run_ui(raw_input, |_ui| {
+            console_output = self
+                .console_overlay
+                .show(&context, screen_rect, &lines, &catalog);
+        });
+        if console_output.toggled {
+            self.set_console_open(self.console_overlay.is_open());
+        }
+        let egui::FullOutput {
+            platform_output,
+            textures_delta,
+            shapes,
+            pixels_per_point,
+            viewport_output,
+        } = output;
+        let repaint_delay = viewport_output
+            .get(&ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay);
+        if let Some(delay) = repaint_delay {
+            self.console_repaint_at = Instant::now().checked_add(delay);
+        }
+        if let Some(state) = self.egui_state.as_mut() {
+            state.handle_platform_output(window, platform_output);
+        }
+
+        let open = self.console_open;
+        let frame = ConsoleUiFrame {
+            visible: open,
+            primitives: if open {
+                context.tessellate(shapes, pixels_per_point)
+            } else {
+                Vec::new()
+            },
+            textures_delta,
+            pixels_per_point,
+        };
+        self.console_needs_redraw = false;
+        self.seen_console_generation = Some(console_generation);
+        self.seen_catalog_generation = Some(catalog_generation);
+        self.publish_console_ui(frame);
+
+        if let Some(command) = console_output.submitted {
+            self.submit_console_command(command);
+            self.console_needs_redraw = true;
+            self.console_repaint_at = Some(Instant::now());
+        }
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn submit_console_command(&mut self, text: String) {
+        let command = match parse_command_line(&text) {
+            Ok(command) => command,
+            Err(error) => {
+                push_console_line(
+                    &self.console_buffer,
+                    ConsoleLevel::Info,
+                    "console",
+                    format!("> {text}"),
+                );
+                push_console_line(
+                    &self.console_buffer,
+                    ConsoleLevel::Error,
+                    "console",
+                    error.to_string(),
+                );
+                return;
+            }
+        };
+        if command.name == "clear" {
+            if let Err(error) = validate_builtin_args(&command, 0, "clear") {
+                push_console_line(
+                    &self.console_buffer,
+                    ConsoleLevel::Info,
+                    "console",
+                    format!("> {text}"),
+                );
+                push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
+                return;
+            }
+            self.console_buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            push_console_line(
+                &self.console_buffer,
+                ConsoleLevel::Info,
+                "console",
+                format!("> {text}"),
+            );
+            return;
+        }
+        push_console_line(
+            &self.console_buffer,
+            ConsoleLevel::Info,
+            "console",
+            format!("> {text}"),
+        );
+        match command.name.as_str() {
+            "help" => {
+                if let Err(error) = validate_builtin_args(&command, 1, "help [prefix]") {
+                    push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
+                    return;
+                }
+                let catalog = self
+                    .command_catalog
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .catalog
+                    .clone();
+                let matches = catalog.help(command.args.first().map_or("", String::as_str));
+                if matches.is_empty() {
+                    push_console_line(
+                        &self.console_buffer,
+                        ConsoleLevel::Info,
+                        "console",
+                        "no commands match the prefix",
+                    );
+                } else {
+                    for line in matches {
+                        push_console_line(
+                            &self.console_buffer,
+                            ConsoleLevel::Info,
+                            "console",
+                            line,
+                        );
+                    }
+                }
+            }
+            _ => {
+                if self
+                    .script_tx
+                    .send(ScriptControl::Console(command))
+                    .is_err()
+                {
+                    push_console_line(
+                        &self.console_buffer,
+                        ConsoleLevel::Error,
+                        "console",
+                        "script thread is not available",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "dev-console")]
+fn validate_builtin_args(
+    command: &CommandLine,
+    max_args: usize,
+    usage: &str,
+) -> Result<(), String> {
+    if command.args.len() <= max_args {
+        Ok(())
+    } else {
+        Err(format!("usage: {usage}"))
+    }
+}
+
+#[cfg(feature = "dev-console")]
+fn push_console_line(
+    buffer: &Arc<Mutex<ConsoleBuffer>>,
+    level: ConsoleLevel,
+    source: &str,
+    text: impl Into<String>,
+) {
+    let line = ConsoleLine {
+        level,
+        source: source.to_owned(),
+        text: text.into(),
+    };
+    buffer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(line);
 }
 
 trait RuntimeThreads {
@@ -222,7 +558,50 @@ impl WindowHandler for PlayerWindow<'_> {
         self.window_exit = Some(Arc::new(WindowExit(proxy)));
     }
 
+    #[cfg(feature = "dev-console")]
+    fn window_event(&mut self, window: &Window, event: &WindowEvent) {
+        if let WindowEvent::KeyboardInput { event, .. } = event
+            && event.physical_key == PhysicalKey::Code(KeyCode::Backquote)
+        {
+            if event.state == ElementState::Pressed && !event.repeat {
+                self.set_console_open(!self.console_open);
+            }
+            return;
+        }
+        if self.console_open
+            && self
+                .egui_state
+                .as_mut()
+                .is_some_and(|state| state.on_window_event(window, event).repaint)
+        {
+            self.console_needs_redraw = true;
+        }
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn next_wakeup(&mut self) -> Option<Instant> {
+        if self.console_open {
+            self.console_repaint_at
+        } else {
+            None
+        }
+    }
+
     fn init(&mut self, window: Arc<Window>) -> bool {
+        #[cfg(feature = "dev-console")]
+        {
+            let context = Context::default();
+            self.egui_state = Some(EguiWinitState::new(
+                context,
+                ViewportId::ROOT,
+                window.as_ref(),
+                Some(window.scale_factor() as f32),
+                window.theme(),
+                None,
+            ));
+            self.window_focused = window.has_focus();
+            lock_input(&self.input).console_open(false, self.window_focused);
+        }
         let size = window.inner_size();
         let mut renderer = match Renderer::new(
             Arc::clone(&window),
@@ -245,10 +624,13 @@ impl WindowHandler for PlayerWindow<'_> {
         };
         let (render_stopped_tx, render_stopped_rx) = flume::bounded(1);
         self.render_stopped_rx = Some(render_stopped_rx);
+        let backend = VulkanBackend::new(renderer);
+        #[cfg(feature = "dev-console")]
+        let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(
             self.modules,
             RenderThreadConfig {
-                backend: Box::new(VulkanBackend::new(renderer)),
+                backend: Box::new(backend),
                 width: size.width,
                 height: size.height,
                 frame_limit: self.frame_limit,
@@ -278,8 +660,18 @@ impl WindowHandler for PlayerWindow<'_> {
         true
     }
 
+    #[cfg(feature = "dev-console")]
+    fn update(&mut self, window: &Window) -> bool {
+        self.update_console(window);
+        true
+    }
+
     fn resized(&mut self, width: u32, height: u32) {
         let _ = self.render_tx.send(RenderControl::Resize(width, height));
+        #[cfg(feature = "dev-console")]
+        if width > 0 && height > 0 && self.console_open && !self.window_occluded {
+            self.console_needs_redraw = true;
+        }
     }
 
     fn close_requested(&mut self) -> bool {
@@ -290,29 +682,64 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn occluded(&mut self, occluded: bool) {
         let _ = self.render_tx.send(RenderControl::Occluded(occluded));
+        #[cfg(feature = "dev-console")]
+        {
+            self.window_occluded = occluded;
+            if occluded {
+                self.console_ui.discard_geometry_preserve_texture_delta();
+            } else if self.console_open {
+                self.console_needs_redraw = true;
+            }
+        }
     }
 
     fn key(&mut self, key: Key, pressed: bool) {
+        #[cfg(feature = "dev-console")]
+        if self.console_open {
+            return;
+        }
         lock_input(&self.input).key(key, pressed);
     }
 
     fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
+        #[cfg(feature = "dev-console")]
+        if self.console_open {
+            return;
+        }
         lock_input(&self.input).mouse_button(button, pressed);
     }
 
     fn cursor_moved(&mut self, x: f64, y: f64) {
+        #[cfg(feature = "dev-console")]
+        if self.console_open {
+            return;
+        }
         lock_input(&self.input).cursor_moved(x, y);
     }
 
     fn mouse_motion(&mut self, dx: f64, dy: f64) {
+        #[cfg(feature = "dev-console")]
+        if self.console_open {
+            return;
+        }
         lock_input(&self.input).mouse_motion(dx, dy);
     }
 
     fn mouse_wheel(&mut self, dx: f32, dy: f32) {
+        #[cfg(feature = "dev-console")]
+        if self.console_open {
+            return;
+        }
         lock_input(&self.input).mouse_wheel(dx, dy);
     }
 
     fn focused(&mut self, focused: bool) {
+        #[cfg(feature = "dev-console")]
+        {
+            self.window_focused = focused;
+            lock_input(&self.input).console_open(self.console_open, self.window_focused);
+        }
+        #[cfg(not(feature = "dev-console"))]
         lock_input(&self.input).focused(focused);
     }
 

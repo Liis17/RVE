@@ -747,6 +747,8 @@ dependencies = [
 name = "engine-runtime"
 version = "0.1.0"
 dependencies = [
+ "egui",
+ "egui-winit",
  "engine-assets",
  "engine-audio",
  "engine-console",
@@ -760,12 +762,14 @@ dependencies = [
  "engine-resources",
  "engine-scene",
  "engine-script",
+ "engine-ui",
  "engine-window",
  "flume",
  "glam",
  "log",
  "rve-sdk",
  "sysinfo",
+ "winit",
 ]
 
 [[package]]

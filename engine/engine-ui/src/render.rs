@@ -108,6 +108,14 @@ impl<T: Copy> ManagedTextures<T> {
         Ok(())
     }
 
+    /// Releases all egui-managed textures before the rendering backend is destroyed.
+    pub fn clear(&mut self, backend: &mut impl UiTextures<Id = T>) -> Result<(), RenderError> {
+        for (_, texture) in self.textures.drain() {
+            backend.free(texture)?;
+        }
+        Ok(())
+    }
+
     fn get(&self, id: u64) -> Option<T> {
         self.textures.get(&id).copied()
     }
@@ -328,6 +336,18 @@ mod tests {
         textures.apply_frees(&delta, &mut backend).unwrap();
         delta.clear();
         assert_eq!(backend.freed, [1]);
+    }
+
+    #[test]
+    fn clear_releases_every_managed_texture() {
+        let mut backend = FakeBackend::default();
+        let mut textures = ManagedTextures::default();
+        apply(&mut textures, set_delta(7, None, 1, 1), &mut backend);
+        apply(&mut textures, set_delta(8, None, 2, 2), &mut backend);
+
+        textures.clear(&mut backend).unwrap();
+
+        assert_eq!(backend.freed, [1, 2]);
     }
 
     #[test]

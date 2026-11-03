@@ -46,6 +46,10 @@ impl ConsoleOverlay {
         self.open
     }
 
+    pub fn set_open(&mut self, open: bool) {
+        self.open = open;
+    }
+
     /// Shows the console over the top 45 percent of `rect`.
     pub fn show(
         &mut self,
