@@ -647,6 +647,13 @@ name = "engine-audio"
 version = "0.1.0"
 
 [[package]]
+name = "engine-console"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "engine-core"
 version = "0.1.0"
 
