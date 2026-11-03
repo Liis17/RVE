@@ -755,7 +755,7 @@ mod tests {
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
     use engine_scene::{SceneDocument, World};
-    use engine_script::{Key, ScriptInterruptHandle};
+    use engine_script::{Key, ScriptHost, ScriptInterruptHandle, ScriptTime};
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
@@ -953,6 +953,44 @@ mod tests {
         let (frame, _) = world.build_frame();
         let snapshot = make_snapshot(frame, &GpuSceneTable::default());
         assert_eq!(snapshot.view, settings);
+    }
+
+    #[test]
+    fn lua_camera_exposure_update_is_visible_in_the_next_frame_snapshot() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/exposure.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/exposure.lua"
+[[objects]]
+id = "second"
+[objects.camera]
+"#,
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let script = r#"
+local Script = {}
+function Script:on_update()
+  rve.active_camera():set_camera_settings({ color = { exposure_ev = 2.5 } })
+end
+return Script
+"#;
+        let sources = BTreeMap::from([("exposure.lua".to_owned(), script.to_owned())]);
+        let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+        host.update(&mut world, 0.1, ScriptTime::default());
+
+        let (frame, warnings) = world.build_frame();
+        assert!(warnings.is_empty());
+        let snapshot = make_snapshot(frame, &GpuSceneTable::default());
+        assert_eq!(snapshot.view.color.exposure_ev, 2.5);
+        assert!(host.drain_events().is_empty());
     }
 
     #[test]
