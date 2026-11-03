@@ -4,7 +4,10 @@ use crate::assets_fs::AssetKind;
 use crate::scene_edit::default_light;
 use crate::state::{AssetDrag, EditorState};
 use engine_files::VirtualPath;
-use engine_scene::{CameraComponent, HeavyScript, ParamValue, SceneObject, SceneTransform};
+use engine_scene::{
+    CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, ParamValue, SceneObject,
+    SceneTransform,
+};
 use std::collections::BTreeMap;
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -90,6 +93,9 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     }
     if object.mesh_renderer.is_some() {
         show_mesh(ui, state, object);
+    }
+    if object.lod_group.is_some() {
+        show_lod_group(ui, state, object);
     }
     if object.directional_light.is_some() {
         show_light(ui, state, object);
@@ -265,12 +271,145 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
         }
     }
     if remove {
-        state.edit_scene(|scene| {
-            scene.edit_object(id, None, |object| {
-                object.mesh_renderer = None;
-                Ok(())
-            })
-        });
+        state.edit_scene(|scene| scene.remove_mesh_renderer(id));
+    }
+}
+
+fn merge_response(combined: &mut Option<egui::Response>, response: egui::Response) {
+    *combined = Some(match combined.take() {
+        Some(previous) => previous | response,
+        None => response,
+    });
+}
+
+fn show_lod_group(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
+    let Some(mut group) = object.lod_group.clone() else {
+        return;
+    };
+    let original = group.clone();
+    let id = object.id.as_str();
+    let base_model = object
+        .mesh_renderer
+        .as_ref()
+        .expect("LOD Group requires Mesh Renderer")
+        .model
+        .as_str()
+        .to_owned();
+    let models = state.assets_of_kind(AssetKind::Model);
+    let mut textures = vec![String::new()];
+    textures.extend(state.assets_of_kind(AssetKind::Texture));
+    let mut asset_changed = false;
+    let mut structure_changed = false;
+    let mut response = None;
+    let remove_component = component_header(ui, "LOD Group", id, |ui| {
+        let can_remove_level = group.levels.len() > 1;
+        let mut remove_level = None;
+        for (index, level) in group.levels.iter_mut().enumerate() {
+            ui.push_id(("lod_level", index), |ui| {
+                ui.label(format!("LOD {}", index + 1));
+                egui::Grid::new("lod_level_fields")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Model");
+                        let current = level.model.strip_prefix('/').unwrap_or(&level.model);
+                        if let Some(choice) = asset_picker(ui, "lod_model", current, &models)
+                            && choice != current
+                            && let Some(path) = parse_path(state, &choice)
+                        {
+                            level.model = path.as_str().to_owned();
+                            asset_changed = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Texture");
+                        let current = level
+                            .texture
+                            .as_deref()
+                            .map(|path| path.strip_prefix('/').unwrap_or(path))
+                            .unwrap_or("");
+                        if let Some(choice) = asset_picker(ui, "lod_texture", current, &textures)
+                            && choice != current
+                        {
+                            level.texture = if choice.is_empty() {
+                                None
+                            } else {
+                                parse_path(state, &choice).map(|path| path.as_str().to_owned())
+                            };
+                            asset_changed = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Distance");
+                        let distance = ui.add(egui::DragValue::new(&mut level.distance).speed(0.1));
+                        merge_response(&mut response, distance);
+                        ui.end_row();
+                    });
+                let remove = ui.add_enabled(can_remove_level, egui::Button::new("Remove Level"));
+                if remove.clicked() {
+                    remove_level = Some(index);
+                }
+                ui.separator();
+            });
+        }
+        if let Some(index) = remove_level {
+            group.levels.remove(index);
+            structure_changed = true;
+        }
+
+        let add = ui.add_enabled(
+            group.levels.len() < MAX_LOD_LEVELS,
+            egui::Button::new("Add Level"),
+        );
+        if add.clicked() {
+            let distance = group.levels.last().unwrap().distance * 2.0;
+            group.levels.push(LodLevel {
+                model: base_model.clone(),
+                texture: None,
+                distance,
+            });
+            structure_changed = true;
+        }
+
+        ui.separator();
+        let last_distance = group.levels.last().unwrap().distance;
+        let mut cull_enabled = group.cull_distance.is_some();
+        egui::Grid::new("lod_cull_fields")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Cull Distance");
+                let cull = ui.checkbox(&mut cull_enabled, "");
+                if cull.changed() {
+                    group.cull_distance = cull_enabled.then_some(last_distance * 2.0);
+                }
+                merge_response(&mut response, cull);
+                ui.end_row();
+                if let Some(mut distance) = group.cull_distance {
+                    ui.label("Distance");
+                    let value = ui.add(egui::DragValue::new(&mut distance).speed(0.1));
+                    group.cull_distance = Some(distance);
+                    merge_response(&mut response, value);
+                    ui.end_row();
+                }
+            });
+    });
+
+    if remove_component {
+        state.edit_scene(|scene| scene.set_lod_group(id, None));
+        return;
+    }
+    if group != original {
+        if asset_changed || structure_changed {
+            state.edit_scene(|scene| scene.set_lod_group(id, Some(group)));
+            if let Some(scene) = &mut state.scene {
+                scene.end_continuous_edit();
+            }
+        } else if let Some(response) = &response {
+            commit(state, id, "lod_group", response, |object| {
+                object.lod_group = Some(group);
+            });
+        }
+    } else if let Some(response) = &response {
+        finish_edit(state, response);
     }
 }
 
@@ -475,6 +614,29 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                             .is_some()
                     {
                         state.pending_frame = Some(id.to_owned());
+                    }
+                }
+            });
+        }
+        if object.mesh_renderer.is_some() && object.lod_group.is_none() {
+            ui.menu_button("LOD Group", |ui| {
+                for model in state.assets_of_kind(AssetKind::Model) {
+                    if ui.button(&model).clicked()
+                        && let Some(path) = parse_path(state, &model)
+                    {
+                        state.edit_scene(|scene| {
+                            scene.set_lod_group(
+                                id,
+                                Some(LodGroup {
+                                    levels: vec![LodLevel {
+                                        model: path.as_str().to_owned(),
+                                        texture: None,
+                                        distance: 10.0,
+                                    }],
+                                    cull_distance: None,
+                                }),
+                            )
+                        });
                     }
                 }
             });
