@@ -131,6 +131,41 @@ Play не меняет документ: Stop возвращает сцену к
 
 Ограничения: раскладка панелей не сохраняется, список файлов обновляется кнопкой Refresh, а переименование или удаление файла в Project не обновляет ссылки в сценах. При сохранении комментарии в файле сцены теряются.
 
+## Обновление проектов и renderer API
+
+Старые сцены с полями `fov_deg`, `near` и `far` внутри `[objects.camera]` больше не разбираются. Перенеси проекцию и настройки вывода в отдельный файл `.camerasettings`, добавь его в список assets и укажи путь в поле settings камеры:
+
+~~~toml
+[[assets]]
+path = "/cameras/main.camerasettings"
+
+[[objects]]
+id = "camera"
+[objects.camera]
+settings = "/cameras/main.camerasettings"
+~~~
+
+Файл настроек использует таблицы projection, render и color:
+
+~~~toml
+[projection]
+fov_deg = 60.0
+near = 0.1
+far = 1000.0
+
+[render]
+render_scale = 1.0
+anti_aliasing = "fxaa"
+
+[color]
+exposure_ev = 0.0
+tonemapper = "aces"
+~~~
+
+Код, использующий engine-render, тоже требует миграции. Поле `RendererConfig::render_scale` удалено: масштаб, exposure, tonemapper и anti-aliasing теперь передаются в `Frame` через `view: ViewSettings`, а позиция камеры — через `camera_position`.
+
+В `DrawCommand` поле `texture` заменено на `material: Option<MaterialId>`. Создавай `Material` через `Renderer::create_material`; карты base color, metallic-roughness и normal можно загружать с нужным пространством цвета через `Renderer::create_texture_with_color_space`. Полный текущий контракт описан в [заметке renderer](Obsidian/RVEVault/Engine/EngineRender.md).
+
 ## Архивы ресурсов
 
 Инструмент `rvepak` собирает, просматривает и проверяет наборы архивов по

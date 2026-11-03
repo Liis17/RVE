@@ -62,12 +62,18 @@ vec3 fxaa(vec2 uv) {
         return perceptual_rgb_at(uv);
     }
 
-    float edge_vertical = abs(0.25 * (luma_nw + luma_ne) - 0.5 * luma_n)
-        + abs(0.5 * (luma_w + luma_e) - luma_m)
-        + abs(0.25 * (luma_sw + luma_se) - 0.5 * luma_s);
-    float edge_horizontal = abs(0.25 * (luma_nw + luma_sw) - 0.5 * luma_w)
-        + abs(0.5 * (luma_n + luma_s) - luma_m)
-        + abs(0.25 * (luma_ne + luma_se) - 0.5 * luma_e);
+    float luma_ns = luma_n + luma_s;
+    float luma_we = luma_w + luma_e;
+    float edge_horizontal_1 = -2.0 * luma_m + luma_ns;
+    float edge_vertical_1 = -2.0 * luma_m + luma_we;
+    float edge_horizontal_2 = -2.0 * luma_e + luma_ne + luma_se;
+    float edge_vertical_2 = -2.0 * luma_n + luma_nw + luma_ne;
+    float edge_horizontal_3 = -2.0 * luma_w + luma_nw + luma_sw;
+    float edge_vertical_3 = -2.0 * luma_s + luma_sw + luma_se;
+    float edge_horizontal = abs(edge_horizontal_3) + 2.0 * abs(edge_horizontal_1)
+        + abs(edge_horizontal_2);
+    float edge_vertical = abs(edge_vertical_3) + 2.0 * abs(edge_vertical_1)
+        + abs(edge_vertical_2);
     bool horizontal = edge_horizontal >= edge_vertical;
     float luma_a = horizontal ? luma_n : luma_w;
     float luma_b = horizontal ? luma_s : luma_e;
@@ -86,9 +92,9 @@ vec3 fxaa(vec2 uv) {
     float end_luma_b = luma_at(end_b);
     bool done_a = abs(end_luma_a - edge_luma) >= gradient * 0.25;
     bool done_b = abs(end_luma_b - edge_luma) >= gradient * 0.25;
-    const float quality_steps[12] = float[12](1.0, 1.5, 2.0, 2.0, 2.0, 2.0,
-                                               2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
-    for (int i = 0; i < 12; i++) {
+    const float quality_steps[11] = float[11](1.0, 1.0, 1.0, 1.0, 1.5, 2.0,
+                                               2.0, 2.0, 2.0, 4.0, 8.0);
+    for (int i = 0; i < 11; i++) {
         if (done_a && done_b) {
             break;
         }
@@ -104,8 +110,8 @@ vec3 fxaa(vec2 uv) {
         }
     }
 
-    float distance_a = horizontal ? abs(uv.y - end_a.y) : abs(uv.x - end_a.x);
-    float distance_b = horizontal ? abs(end_b.y - uv.y) : abs(end_b.x - uv.x);
+    float distance_a = horizontal ? abs(uv.x - end_a.x) : abs(uv.y - end_a.y);
+    float distance_b = horizontal ? abs(end_b.x - uv.x) : abs(end_b.y - uv.y);
     float edge_offset = 0.5 - min(distance_a, distance_b) / max(distance_a + distance_b, 1e-6);
     float end_luma = distance_a < distance_b ? end_luma_a : end_luma_b;
     bool center_is_below = luma_m < edge_luma;
@@ -113,11 +119,13 @@ vec3 fxaa(vec2 uv) {
         edge_offset = 0.0;
     }
 
-    float average_luma = (luma_n + luma_w + luma_e + luma_s) * 0.25;
-    float subpixel = clamp(abs(average_luma - luma_m) / range - 0.25, 0.0, 0.75);
-    subpixel = subpixel * subpixel * (3.0 - 2.0 * subpixel) * 0.75;
+    float average_luma = (2.0 * (luma_ns + luma_we) + luma_nw + luma_ne
+        + luma_sw + luma_se) / 12.0;
+    float subpixel = clamp(abs(average_luma - luma_m) / range, 0.0, 1.0);
+    subpixel = subpixel * subpixel * (3.0 - 2.0 * subpixel);
+    subpixel = subpixel * subpixel * 0.75;
     float offset = max(edge_offset, subpixel);
-    return perceptual_rgb_at(uv + normal * offset);
+    return perceptual_rgb_at(uv + normal * offset * (use_a ? -1.0 : 1.0));
 }
 
 void main() {

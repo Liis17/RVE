@@ -161,7 +161,6 @@ impl EditorState {
                         && let Err(error) = project.apply_camera_settings(&mut world)
                     {
                         self.log.error(error);
-                        return None;
                     }
                     self.edit_world = Some((revision, world));
                 }
@@ -256,7 +255,71 @@ impl EditorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::OpenProject;
     use crate::scene_edit::EditorScene;
+    use engine_scene::CameraSettings;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TempProject(PathBuf);
+
+    impl TempProject {
+        fn new(problem_settings: Option<&str>) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rve-editor-state-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(path.join("Assets/cameras")).unwrap();
+            fs::write(
+                path.join("project.rveproject"),
+                "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/main.rvescene\"\n",
+            )
+            .unwrap();
+            fs::write(
+                path.join("Assets/cameras/valid.camerasettings"),
+                "[projection]\nfov_deg = 42.0\nnear = 0.25\nfar = 250.0\n",
+            )
+            .unwrap();
+            if let Some(settings) = problem_settings {
+                fs::write(path.join("Assets/cameras/problem.camerasettings"), settings).unwrap();
+            }
+            Self(path)
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn state_with_camera_assets(project_dir: &std::path::Path) -> EditorState {
+        const SCENE: &str = r#"
+[[assets]]
+path = "/cameras/valid.camerasettings"
+[[assets]]
+path = "/cameras/problem.camerasettings"
+
+[[objects]]
+id = "camera-a"
+[objects.camera]
+settings = "/cameras/valid.camerasettings"
+active = true
+
+[[objects]]
+id = "camera-b"
+[objects.camera]
+settings = "/cameras/problem.camerasettings"
+"#;
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(project_dir).unwrap());
+        state.scene =
+            Some(EditorScene::parse(VirtualPath::parse("main.rvescene").unwrap(), SCENE).unwrap());
+        state
+    }
 
     fn state_with_scene() -> EditorState {
         let mut state = EditorState::new(None);
@@ -270,6 +333,53 @@ mod tests {
         assert_eq!(state.world_mut().unwrap().objects().len(), 2);
         state.create_object(&NewObject::Empty, None);
         assert_eq!(state.world_mut().unwrap().objects().len(), 3);
+    }
+
+    #[test]
+    fn invalid_camera_asset_keeps_default_edit_world_and_logs_once_per_revision() {
+        for problem_settings in [None, Some("[projection]\nfov_deg = 190.0\n")] {
+            let temp = TempProject::new(problem_settings);
+            let mut state = state_with_camera_assets(&temp.0);
+
+            for frame in 0..4 {
+                let world = state
+                    .world_mut()
+                    .expect("camera asset errors keep the edit world");
+                assert_eq!(world.objects().len(), 2);
+                for object in world
+                    .objects()
+                    .iter()
+                    .filter(|object| object.camera.is_some())
+                {
+                    assert_eq!(
+                        world.camera_settings(object.handle),
+                        Some(&CameraSettings::default())
+                    );
+                }
+                assert!(world.camera_of(world.active_camera()).is_some());
+                if frame < 3 {
+                    state.log.info(format!("frame {frame}"));
+                }
+            }
+
+            let errors = state
+                .log
+                .entries()
+                .filter(|entry| entry.level == crate::console::LogLevel::Error)
+                .count();
+            assert_eq!(errors, 1);
+
+            state.create_object(&NewObject::Empty, None);
+            assert!(state.world_mut().is_some());
+            state.log.info("rebuilt scene");
+            assert!(state.world_mut().is_some());
+            let errors = state
+                .log
+                .entries()
+                .filter(|entry| entry.level == crate::console::LogLevel::Error)
+                .count();
+            assert_eq!(errors, 2);
+        }
     }
 
     #[test]
