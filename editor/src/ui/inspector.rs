@@ -1,7 +1,7 @@
 //! Панель Inspector: поля и компоненты выбранного объекта.
 
 use crate::assets_fs::AssetKind;
-use crate::scene_edit::default_light;
+use crate::scene_edit::{Component, ComponentKind, default_light};
 use crate::state::{AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
@@ -185,42 +185,116 @@ fn commit_picker(
 
 fn show_transform(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     let id = object.id.as_str();
-    egui::CollapsingHeader::new("Transform")
-        .default_open(true)
-        .show(ui, |ui| {
-            egui::Grid::new("transform").num_columns(2).show(ui, |ui| {
-                let mut transform: SceneTransform = object.transform;
-                let position = vec3_row(ui, "Position", &mut transform.position, 0.05);
-                let rotation = vec3_row(ui, "Rotation", &mut transform.rotation, 0.5);
-                let scale = vec3_row(ui, "Scale", &mut transform.scale, 0.02);
-                let response = position | rotation | scale;
-                commit(state, id, "transform", &response, |object| {
-                    object.transform = transform;
-                });
+    let menu = component_menu(state, id, ComponentKind::Transform);
+    let action = component_header(ui, "Transform", id, Some(menu), false, |ui| {
+        egui::Grid::new("transform").num_columns(2).show(ui, |ui| {
+            let mut transform: SceneTransform = object.transform;
+            let position = vec3_row(ui, "Position", &mut transform.position, 0.05);
+            let rotation = vec3_row(ui, "Rotation", &mut transform.rotation, 0.5);
+            let scale = vec3_row(ui, "Scale", &mut transform.scale, 0.02);
+            let response = position | rotation | scale;
+            commit(state, id, "transform", &response, |object| {
+                object.transform = transform;
             });
         });
+    });
+    run_menu_action(state, id, ComponentKind::Transform, action);
 }
 
-/// Заголовок компонента с кнопкой удаления; возвращает `true` при её нажатии.
+/// Действие из заголовка компонента.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeaderAction {
+    None,
+    Remove,
+    Reset,
+    Copy,
+    Paste,
+}
+
+/// Доступные пункты контекстного меню заголовка; Copy доступен всегда.
+#[derive(Clone, Copy, Debug)]
+struct ComponentMenu {
+    reset: bool,
+    paste: bool,
+}
+
+fn component_menu(state: &EditorState, id: &str, kind: ComponentKind) -> ComponentMenu {
+    let object = state.scene.as_ref().and_then(|scene| scene.object(id));
+    ComponentMenu {
+        reset: object.is_some_and(|object| Component::reset(object, kind).is_some()),
+        paste: state
+            .component_clipboard
+            .as_ref()
+            .is_some_and(|copied| copied.kind() == kind),
+    }
+}
+
+/// Выполняет Reset/Copy/Paste; Remove обрабатывает сам компонент.
+fn run_menu_action(state: &mut EditorState, id: &str, kind: ComponentKind, action: HeaderAction) {
+    let Some(object) = state.scene.as_ref().and_then(|scene| scene.object(id)) else {
+        return;
+    };
+    let component = match action {
+        HeaderAction::Copy => {
+            state.component_clipboard = Component::read(object, kind);
+            return;
+        }
+        HeaderAction::Reset => Component::reset(object, kind),
+        HeaderAction::Paste => state
+            .component_clipboard
+            .clone()
+            .filter(|copied| copied.kind() == kind),
+        HeaderAction::None | HeaderAction::Remove => None,
+    };
+    if let Some(component) = component {
+        state.edit_scene(|scene| scene.set_component(id, component));
+    }
+}
+
+/// Заголовок компонента: кнопка удаления и контекстное меню Reset/Copy/Paste по щелчку ПКМ.
 fn component_header(
     ui: &mut egui::Ui,
     title: &str,
     salt: impl std::hash::Hash + std::fmt::Debug,
+    menu: Option<ComponentMenu>,
+    removable: bool,
     body: impl FnOnce(&mut egui::Ui),
-) -> bool {
-    let mut remove = false;
+) -> HeaderAction {
+    let mut action = HeaderAction::None;
     let id = ui.make_persistent_id(("component", title, salt));
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
         .show_header(ui, |ui| {
-            ui.label(title);
-            remove = ui.small_button("Remove").clicked();
+            let label = ui.add(egui::Label::new(title).sense(egui::Sense::click()));
+            if let Some(menu) = menu {
+                label.context_menu(|ui| {
+                    if ui
+                        .add_enabled(menu.reset, egui::Button::new("Reset"))
+                        .clicked()
+                    {
+                        action = HeaderAction::Reset;
+                    }
+                    if ui.button("Copy").clicked() {
+                        action = HeaderAction::Copy;
+                    }
+                    if ui
+                        .add_enabled(menu.paste, egui::Button::new("Paste"))
+                        .clicked()
+                    {
+                        action = HeaderAction::Paste;
+                    }
+                });
+            }
+            if removable && ui.small_button("Remove").clicked() {
+                action = HeaderAction::Remove;
+            }
         })
         .body(body);
-    remove
+    action
 }
 
 fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: CameraComponent) {
-    let remove = component_header(ui, "Camera", id, |ui| {
+    let menu = component_menu(state, id, ComponentKind::Camera);
+    let action = component_header(ui, "Camera", id, Some(menu), true, |ui| {
         egui::Grid::new("camera").num_columns(2).show(ui, |ui| {
             let mut value = camera;
             ui.label("FOV");
@@ -241,7 +315,7 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: Cam
             });
         });
     });
-    if remove {
+    if action == HeaderAction::Remove {
         state.edit_scene(|scene| {
             scene.edit_object(id, None, |object| {
                 object.camera = None;
@@ -249,6 +323,7 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: Cam
             })
         });
     }
+    run_menu_action(state, id, ComponentKind::Camera, action);
 }
 
 /// Выбор ресурса из выпадающего списка или перетаскиванием из Project.
@@ -298,7 +373,8 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     textures.extend(state.assets_of_kind(AssetKind::Texture));
     let mut model_choice = None;
     let mut texture_choice = None;
-    let remove = component_header(ui, "Mesh Renderer", id, |ui| {
+    let menu = component_menu(state, id, ComponentKind::MeshRenderer);
+    let action = component_header(ui, "Mesh Renderer", id, Some(menu), true, |ui| {
         egui::Grid::new("mesh").num_columns(2).show(ui, |ui| {
             ui.label("Model");
             model_choice = asset_picker(ui, "mesh_model", mesh.model.as_str(), &models);
@@ -326,9 +402,10 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
             }
         }
     }
-    if remove {
+    if action == HeaderAction::Remove {
         state.edit_scene(|scene| scene.remove_mesh_renderer(id));
     }
+    run_menu_action(state, id, ComponentKind::MeshRenderer, action);
 }
 
 /// Поле override: флажок включает замену значения FBX, без него поле не показывается.
@@ -507,7 +584,8 @@ fn show_lod_group(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObje
     let mut asset_changed = false;
     let mut structure_changed = false;
     let mut response = None;
-    let remove_component = component_header(ui, "LOD Group", id, |ui| {
+    let menu = component_menu(state, id, ComponentKind::LodGroup);
+    let action = component_header(ui, "LOD Group", id, Some(menu), true, |ui| {
         let can_remove_level = group.levels.len() > 1;
         let mut remove_level = None;
         for (index, level) in group.levels.iter_mut().enumerate() {
@@ -599,8 +677,12 @@ fn show_lod_group(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObje
             });
     });
 
-    if remove_component {
+    if action == HeaderAction::Remove {
         state.edit_scene(|scene| scene.set_lod_group(id, None));
+        return;
+    }
+    if action != HeaderAction::None {
+        run_menu_action(state, id, ComponentKind::LodGroup, action);
         return;
     }
     if group != original {
@@ -624,7 +706,8 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
         return;
     };
     let id = object.id.as_str();
-    let remove = component_header(ui, "Directional Light", id, |ui| {
+    let menu = component_menu(state, id, ComponentKind::DirectionalLight);
+    let action = component_header(ui, "Directional Light", id, Some(menu), true, |ui| {
         egui::Grid::new("light").num_columns(2).show(ui, |ui| {
             let mut value = light;
             let (color_picked, color) = color_row(ui, "Color", &mut value.color);
@@ -650,7 +733,7 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
             }
         });
     });
-    if remove {
+    if action == HeaderAction::Remove {
         state.edit_scene(|scene| {
             scene.edit_object(id, None, |object| {
                 object.directional_light = None;
@@ -658,6 +741,7 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
             })
         });
     }
+    run_menu_action(state, id, ComponentKind::DirectionalLight, action);
 }
 
 fn show_lite_script(
@@ -671,7 +755,7 @@ fn show_lite_script(
     let title = format!("Lua: {}", script.path.as_str());
     let mut params = script.params.clone();
     let mut params_response = None;
-    let remove = component_header(ui, &title, (id, index), |ui| {
+    let action = component_header(ui, &title, (id, index), None, true, |ui| {
         params_response = params_ui(ui, ("lite", id, index), &mut params);
     });
     if let Some(response) = &params_response {
@@ -680,7 +764,7 @@ fn show_lite_script(
             object.lite_scripts[index].params = params;
         });
     }
-    if remove {
+    if action == HeaderAction::Remove {
         state.edit_scene(|scene| {
             scene.edit_object(id, None, |object| {
                 object.lite_scripts.remove(index);
@@ -701,7 +785,7 @@ fn show_heavy_script(
     let title = format!("Rust: {}", script.name);
     let mut params = script.params.clone();
     let mut params_response = None;
-    let remove = component_header(ui, &title, (id, index), |ui| {
+    let action = component_header(ui, &title, (id, index), None, true, |ui| {
         params_response = params_ui(ui, ("heavy", id, index), &mut params);
     });
     if let Some(response) = &params_response {
@@ -710,7 +794,7 @@ fn show_heavy_script(
             object.heavy_scripts[index].params = params;
         });
     }
-    if remove {
+    if action == HeaderAction::Remove {
         state.edit_scene(|scene| {
             scene.edit_object(id, None, |object| {
                 object.heavy_scripts.remove(index);
@@ -892,4 +976,74 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
             ui.ctx().data_mut(|data| data.insert_temp(name_id, name));
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene_edit::{EditorScene, NewObject};
+
+    fn state() -> EditorState {
+        let mut state = EditorState::new(None);
+        state.scene = Some(EditorScene::new_untitled().unwrap());
+        state
+    }
+
+    fn camera(state: &EditorState, id: &str) -> CameraComponent {
+        state
+            .scene
+            .as_ref()
+            .unwrap()
+            .object(id)
+            .unwrap()
+            .camera
+            .unwrap()
+    }
+
+    #[test]
+    fn copied_component_pastes_only_into_the_same_kind_and_reset_restores_defaults() {
+        let mut state = state();
+        state.edit_scene(|scene| {
+            scene.edit_object("camera", None, |object| {
+                object.camera.as_mut().unwrap().fov_deg = 30.0;
+                Ok(())
+            })
+        });
+        let other = state
+            .edit_scene(|scene| scene.create_object(&NewObject::Camera, None))
+            .unwrap();
+        assert!(!component_menu(&state, &other, ComponentKind::Camera).paste);
+        run_menu_action(
+            &mut state,
+            "camera",
+            ComponentKind::Camera,
+            HeaderAction::Copy,
+        );
+        assert!(component_menu(&state, &other, ComponentKind::Camera).paste);
+        assert!(!component_menu(&state, &other, ComponentKind::Transform).paste);
+
+        run_menu_action(
+            &mut state,
+            &other,
+            ComponentKind::Camera,
+            HeaderAction::Paste,
+        );
+        assert_eq!(camera(&state, &other).fov_deg, 30.0);
+        // Буфер другого вида не меняет компонент.
+        run_menu_action(
+            &mut state,
+            &other,
+            ComponentKind::Transform,
+            HeaderAction::Paste,
+        );
+        run_menu_action(
+            &mut state,
+            &other,
+            ComponentKind::Camera,
+            HeaderAction::Reset,
+        );
+        assert_eq!(camera(&state, &other).fov_deg, 60.0);
+        assert!(state.scene.as_mut().unwrap().undo());
+        assert_eq!(camera(&state, &other).fov_deg, 30.0);
+    }
 }

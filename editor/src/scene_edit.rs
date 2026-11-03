@@ -45,6 +45,75 @@ pub enum NewObject {
     Mesh(VirtualPath, [f32; 3]),
 }
 
+/// Вид компонента для меню Reset/Copy/Paste в Inspector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComponentKind {
+    Transform,
+    Camera,
+    MeshRenderer,
+    LodGroup,
+    DirectionalLight,
+}
+
+/// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
+#[derive(Clone, Debug)]
+pub enum Component {
+    Transform(SceneTransform),
+    Camera(CameraComponent),
+    MeshRenderer(MeshRenderer),
+    LodGroup(LodGroup),
+    DirectionalLight(DirectionalLightComponent),
+}
+
+impl Component {
+    pub fn kind(&self) -> ComponentKind {
+        match self {
+            Self::Transform(_) => ComponentKind::Transform,
+            Self::Camera(_) => ComponentKind::Camera,
+            Self::MeshRenderer(_) => ComponentKind::MeshRenderer,
+            Self::LodGroup(_) => ComponentKind::LodGroup,
+            Self::DirectionalLight(_) => ComponentKind::DirectionalLight,
+        }
+    }
+
+    /// Текущее значение компонента объекта; `None`, если компонента нет.
+    pub fn read(object: &SceneObject, kind: ComponentKind) -> Option<Self> {
+        Some(match kind {
+            ComponentKind::Transform => Self::Transform(object.transform),
+            ComponentKind::Camera => Self::Camera(object.camera?),
+            ComponentKind::MeshRenderer => Self::MeshRenderer(object.mesh_renderer.clone()?),
+            ComponentKind::LodGroup => Self::LodGroup(object.lod_group.clone()?),
+            ComponentKind::DirectionalLight => Self::DirectionalLight(object.directional_light?),
+        })
+    }
+
+    /// Значение по умолчанию для Reset. Mesh Renderer сохраняет модель, а LOD Group
+    /// сброса не имеет: её уровни — это выбор ресурсов, а не настройки.
+    pub fn reset(object: &SceneObject, kind: ComponentKind) -> Option<Self> {
+        Some(match kind {
+            ComponentKind::Transform => Self::Transform(SceneTransform::default()),
+            ComponentKind::Camera => Self::Camera(default_camera()),
+            ComponentKind::MeshRenderer => Self::MeshRenderer(MeshRenderer {
+                model: object.mesh_renderer.as_ref()?.model.clone(),
+                texture: None,
+                material: None,
+            }),
+            ComponentKind::LodGroup => return None,
+            ComponentKind::DirectionalLight => Self::DirectionalLight(default_light()),
+        })
+    }
+
+    fn apply(self, object: &mut SceneObject) {
+        match self {
+            Self::Transform(value) => object.transform = value,
+            Self::Camera(value) => object.camera = Some(value),
+            Self::MeshRenderer(value) => object.mesh_renderer = Some(value),
+            Self::LodGroup(value) => object.lod_group = Some(value),
+            Self::DirectionalLight(value) => object.directional_light = Some(value),
+        }
+    }
+}
+
 /// Открытая сцена с выделением и историей правок.
 pub struct EditorScene {
     document: SceneDocument,
@@ -444,6 +513,16 @@ impl EditorScene {
         })
     }
 
+    /// Задаёт значение компонента целиком; его ресурсы добавляются в список сцены.
+    pub fn set_component(&mut self, id: &str, component: Component) -> Result<(), String> {
+        self.edit(None, |document| {
+            let object = find_object_mut(document, id)?;
+            component.apply(object);
+            let object = object.clone();
+            register_object_assets(document, &object)
+        })
+    }
+
     /// Удаляет mesh renderer и его обязательную LOD Group в одной правке.
     pub fn remove_mesh_renderer(&mut self, id: &str) -> Result<(), String> {
         self.edit_object(id, None, |object| {
@@ -491,6 +570,50 @@ pub fn default_light() -> DirectionalLightComponent {
         shadow_center: [0.0; 3],
         shadow_radius: Some(20.0),
     }
+}
+
+/// Камера нового объекта или компонента.
+pub fn default_camera() -> CameraComponent {
+    CameraComponent {
+        fov_deg: 60.0,
+        near: 0.1,
+        far: 1000.0,
+    }
+}
+
+/// Добавляет в список ресурсов сцены все пути, на которые ссылаются компоненты объекта.
+fn register_object_assets(
+    document: &mut SceneDocument,
+    object: &SceneObject,
+) -> Result<(), String> {
+    if let Some(mesh) = &object.mesh_renderer {
+        ensure_asset(document, &mesh.model);
+        let material = mesh.material.as_ref();
+        for path in [
+            mesh.texture.as_ref(),
+            material.and_then(|material| material.metallic_roughness_texture.as_ref()),
+            material.and_then(|material| material.normal_texture.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure_asset(document, path);
+        }
+    }
+    if let Some(group) = &object.lod_group {
+        for level in &group.levels {
+            let model = parse_lod_path(&object.id, &level.model, "lod_group.levels.model")?;
+            ensure_asset(document, &model);
+            if let Some(texture) = &level.texture {
+                let texture = parse_lod_path(&object.id, texture, "lod_group.levels.texture")?;
+                ensure_asset(document, &texture);
+            }
+        }
+    }
+    for script in &object.lite_scripts {
+        ensure_asset(document, &script.path);
+    }
+    Ok(())
 }
 
 fn is_empty_material(material: &MaterialOverride) -> bool {
@@ -1000,6 +1123,55 @@ mod tests {
                 .set_material("camera", Some(material(Some(0.5))), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn pasted_components_register_assets_and_reset_keeps_the_mesh_model() {
+        let mut scene = scene();
+        let source = scene
+            .create_object(&NewObject::Mesh(path("/a.fbx"), [0.0; 3]), None)
+            .unwrap();
+        scene
+            .set_mesh(&source, path("/a.fbx"), Some(path("/t.png")))
+            .unwrap();
+        let copied =
+            Component::read(scene.object(&source).unwrap(), ComponentKind::MeshRenderer).unwrap();
+        // Вставка в другую сцену, где этих ресурсов ещё нет.
+        let mut target = EditorScene::new_untitled().unwrap();
+        let empty = target.create_object(&NewObject::Empty, None).unwrap();
+        target.set_component(&empty, copied).unwrap();
+        let assets = target
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(assets, ["a.fbx", "t.png"]);
+
+        let object = target.object(&empty).unwrap();
+        assert!(Component::reset(object, ComponentKind::LodGroup).is_none());
+        let reset = Component::reset(object, ComponentKind::MeshRenderer).unwrap();
+        target.set_component(&empty, reset).unwrap();
+        let mesh = target
+            .object(&empty)
+            .unwrap()
+            .mesh_renderer
+            .clone()
+            .unwrap();
+        assert_eq!(mesh.model.as_str(), "a.fbx");
+        assert!(mesh.texture.is_none());
+    }
+
+    #[test]
+    fn pasting_an_invalid_component_is_rolled_back() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let light = Component::DirectionalLight(default_light());
+        assert!(scene.set_component(&id, light).is_err());
+        assert!(scene.object(&id).unwrap().directional_light.is_none());
+        let transform = Component::Transform(moved(5.0));
+        scene.set_component(&id, transform).unwrap();
+        assert_eq!(position(&scene, &id)[0], 5.0);
     }
 
     #[test]
