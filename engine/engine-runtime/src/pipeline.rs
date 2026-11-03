@@ -47,6 +47,7 @@ pub(crate) const RENDER_THREAD: &str = "rve-render";
 pub(crate) struct FrameSnapshot {
     pub camera: Camera,
     pub view: CameraSettings,
+    pub reset_history: bool,
     pub light: LightState,
     pub local_lights: Vec<LocalLight>,
     pub local_light_shadows: Vec<LocalLightShadow>,
@@ -404,7 +405,7 @@ impl RenderBackend for VulkanBackend {
                     AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
-            reset_history: false,
+            reset_history: snapshot.reset_history,
         };
         self.renderer
             .render_frame(&frame)
@@ -508,7 +509,7 @@ impl RenderBackend for VulkanBackend {
                     AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
-            reset_history: false,
+            reset_history: snapshot.reset_history,
         };
         let vertices = [
             UiVertex {
@@ -717,6 +718,7 @@ fn scripts_thread(
     let now = clock.now();
     let mut next_background_tick =
         now.saturating_add(if background { interval } else { Duration::ZERO });
+    let mut motion_history = MotionHistory::default();
 
     loop {
         sync_input_background(&input, background, &mut applied_background);
@@ -813,7 +815,7 @@ fn scripts_thread(
                 warning.message
             );
         }
-        let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene) {
+        let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene, &mut motion_history) {
             Ok(snapshot) => Arc::new(snapshot),
             Err(error) => {
                 status.record_failure(error);
@@ -887,13 +889,43 @@ fn load_script_library(
         .map_err(|error| error.to_string())
 }
 
+#[derive(Default)]
+struct MotionHistory {
+    active_camera: Option<ObjectHandle>,
+    previous_models: HashMap<ObjectHandle, [[f32; 4]; 4]>,
+}
+
+impl MotionHistory {
+    fn prepare_camera(&mut self, active_camera: ObjectHandle) -> bool {
+        let changed = self
+            .active_camera
+            .is_some_and(|previous| previous != active_camera);
+        if changed {
+            self.previous_models.clear();
+        }
+        self.active_camera = Some(active_camera);
+        changed
+    }
+
+    fn previous_model(&self, object: ObjectHandle) -> Option<[[f32; 4]; 4]> {
+        self.previous_models.get(&object).copied()
+    }
+
+    fn commit(&mut self, models: HashMap<ObjectHandle, [[f32; 4]; 4]>) {
+        self.previous_models = models;
+    }
+}
+
 fn make_snapshot(
     scene: engine_scene::SceneFrame,
     world: &World,
     gpu_scene: &GpuSceneTable,
+    motion_history: &mut MotionHistory,
 ) -> Result<FrameSnapshot, String> {
     let mut draws = Vec::new();
     let camera_position = scene.camera.position;
+    let reset_history = motion_history.prepare_camera(world.active_camera());
+    let mut current_models = HashMap::new();
     for instance in scene.meshes {
         let Some(levels) = gpu_scene.by_object.get(&instance.object) else {
             continue;
@@ -901,20 +933,27 @@ fn make_snapshot(
         let Some(meshes) = selected_level(world, instance.object, camera_position, levels) else {
             continue;
         };
-        draws.extend(meshes.iter().map(|(mesh, material)| DrawCommand {
-            mesh: *mesh,
-            material: Some(*material),
-            model: instance.model.to_cols_array_2d(),
-            previous_model: None,
-            lod_level: 0,
-            casts_shadow: true,
-        }));
+        let model = instance.model.to_cols_array_2d();
+        let previous_model = motion_history.previous_model(instance.object);
+        for (mesh, material) in meshes {
+            draws.push(DrawCommand {
+                mesh: *mesh,
+                material: Some(*material),
+                model,
+                previous_model,
+                lod_level: 0,
+                casts_shadow: true,
+            });
+            current_models.insert(instance.object, model);
+        }
     }
     let environment = resolve_environment_snapshot(scene.environment.as_ref(), gpu_scene)?;
     let (local_lights, local_light_shadows) = render_local_lights(&scene.local_lights);
+    motion_history.commit(current_models);
     Ok(FrameSnapshot {
         camera: scene.camera,
         view: scene.view,
+        reset_history,
         light: scene.light,
         local_lights,
         local_light_shadows,
@@ -1473,8 +1512,8 @@ mod tests {
     use super::execute_console_commands;
     use super::{
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
-        GpuSceneTable, RenderBackend, RenderControl, RenderThreadConfig, RuntimeStatus,
-        SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig,
+        GpuSceneTable, MotionHistory, RenderBackend, RenderControl, RenderThreadConfig,
+        RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig,
         log_script_events_with, make_snapshot, procedural_environment_key, render_local_lights,
         render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
         sync_input_background, wait_background_tick,
@@ -1558,6 +1597,33 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeMeshId(usize);
+
+    #[test]
+    fn motion_history_tracks_only_current_objects_and_resets_on_camera_change() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"main\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"second\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let main = world.handle("main").unwrap();
+        let second = world.handle("second").unwrap();
+        let first_model = [[1.0; 4]; 4];
+        let next_model = [[2.0; 4]; 4];
+        let mut history = MotionHistory::default();
+
+        assert!(!history.prepare_camera(main));
+        assert_eq!(history.previous_model(main), None);
+        history.commit(HashMap::from([(main, first_model), (second, first_model)]));
+        assert_eq!(history.previous_model(main), Some(first_model));
+
+        history.commit(HashMap::from([(main, next_model)]));
+        assert_eq!(history.previous_model(main), Some(next_model));
+        assert_eq!(history.previous_model(second), None);
+
+        assert!(history.prepare_camera(second));
+        assert_eq!(history.previous_model(main), None);
+    }
 
     #[test]
     fn snapshot_level_selection_uses_distance_and_skips_culled_objects() {
@@ -1786,6 +1852,7 @@ distance=2.0
                 far: 100.0,
             },
             view: CameraSettings::default(),
+            reset_history: false,
             light: LightState::default(),
             local_lights: Vec::new(),
             local_light_shadows: Vec::new(),
@@ -1926,7 +1993,13 @@ range = 10
             .set_camera_settings(world.active_camera(), settings)
             .unwrap();
         let (frame, _) = world.build_frame();
-        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default()).unwrap();
+        let snapshot = make_snapshot(
+            frame,
+            &world,
+            &GpuSceneTable::default(),
+            &mut MotionHistory::default(),
+        )
+        .unwrap();
         assert_eq!(snapshot.view, settings);
     }
 
@@ -1940,7 +2013,15 @@ range = 10
         let mut world = World::from_document(&document).unwrap();
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty());
-        assert!(make_snapshot(frame.clone(), &world, &GpuSceneTable::default()).is_err());
+        assert!(
+            make_snapshot(
+                frame.clone(),
+                &world,
+                &GpuSceneTable::default(),
+                &mut MotionHistory::default(),
+            )
+            .is_err()
+        );
 
         let source = Arc::new(EnvironmentSource::Equirect {
             width: 2,
@@ -1951,7 +2032,7 @@ range = 10
             environments: HashMap::from([("environment/sky.hdr".to_owned(), source)]),
             ..GpuSceneTable::default()
         };
-        let snapshot = make_snapshot(frame, &world, &scene).unwrap();
+        let snapshot = make_snapshot(frame, &world, &scene, &mut MotionHistory::default()).unwrap();
         let environment = snapshot.environment.unwrap();
         assert_eq!(
             environment.key,
@@ -2024,7 +2105,13 @@ return Script
 
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty());
-        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default()).unwrap();
+        let snapshot = make_snapshot(
+            frame,
+            &world,
+            &GpuSceneTable::default(),
+            &mut MotionHistory::default(),
+        )
+        .unwrap();
         assert_eq!(snapshot.view.color.exposure_ev, 2.5);
         assert!(host.drain_events().is_empty());
     }

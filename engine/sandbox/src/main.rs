@@ -299,6 +299,7 @@ struct Sandbox {
     meshes: Vec<(MeshId, MaterialId, bool)>,
     size: PhysicalSize<u32>,
     time: Time,
+    previous_elapsed: Option<f32>,
     options: Options,
     presented_frames: u64,
     resize_test: ResizeTest,
@@ -331,6 +332,7 @@ impl Sandbox {
             meshes: Vec::new(),
             size: PhysicalSize::new(0, 0),
             time: Time::new(),
+            previous_elapsed: None,
             options,
             presented_frames: 0,
             resize_test: ResizeTest::default(),
@@ -599,6 +601,10 @@ impl WindowHandler for Sandbox {
             return false;
         };
         let model = self.content.model(elapsed).to_cols_array_2d();
+        let previous_model = self
+            .content
+            .model(self.previous_elapsed.unwrap_or(elapsed))
+            .to_cols_array_2d();
         let draws = self
             .meshes
             .iter()
@@ -610,7 +616,11 @@ impl WindowHandler for Sandbox {
                 } else {
                     model
                 },
-                previous_model: None,
+                previous_model: Some(if environment {
+                    glam::Mat4::IDENTITY.to_cols_array_2d()
+                } else {
+                    previous_model
+                }),
                 lod_level: 0,
                 casts_shadow: true,
             })
@@ -696,6 +706,7 @@ impl WindowHandler for Sandbox {
         };
         match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {
+                self.previous_elapsed = Some(elapsed);
                 self.presented_frames += 1;
                 if let Some(overlay) = self.debug_overlay.as_mut() {
                     overlay.frame_presented();
