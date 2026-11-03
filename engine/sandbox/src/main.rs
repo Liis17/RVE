@@ -384,6 +384,7 @@ impl Sandbox {
                     base_color: mesh.material.base_color,
                     metallic: mesh.material.metallic,
                     roughness: mesh.material.roughness,
+                    double_sided: mesh.material.double_sided,
                     base_color_texture,
                     metallic_roughness_texture,
                     normal_texture,

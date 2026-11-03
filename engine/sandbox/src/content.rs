@@ -52,7 +52,10 @@ impl Content {
             meshes.push(Mesh {
                 vertices,
                 indices,
-                material: ModelMaterial::default(),
+                material: ModelMaterial {
+                    double_sided: true,
+                    ..ModelMaterial::default()
+                },
                 environment: true,
             });
         }
@@ -93,6 +96,7 @@ impl Content {
                 roughness: 0.85,
                 normal_texture: Some(0),
                 normal_scale: 1.0,
+                double_sided: true,
                 ..ModelMaterial::default()
             },
             environment: true,
@@ -243,6 +247,7 @@ mod tests {
                         metallic_roughness_texture: Some(0),
                         normal_texture: Some(0),
                         normal_scale: 0.75,
+                        double_sided: true,
                     },
                 },
                 ModelMesh {
@@ -281,7 +286,9 @@ mod tests {
         let content = Content::from_model(model(), Scene::Cube);
         assert_eq!(content.meshes.len(), 2);
         assert_eq!(content.meshes[0].material.base_color_texture, Some(0));
+        assert!(content.meshes[0].material.double_sided);
         assert_eq!(content.meshes[1].material.base_color_texture, None);
+        assert!(!content.meshes[1].material.double_sided);
         assert_eq!(content.meshes[0].material.metallic, 0.6);
         assert_eq!(content.meshes[0].material.roughness, 0.25);
         assert_eq!(
@@ -409,6 +416,7 @@ mod tests {
         let floor = content.meshes.last().unwrap();
         assert!(floor.environment);
         assert_eq!(floor.material.normal_texture, Some(0));
+        assert!(floor.material.double_sided);
         assert_eq!(floor.vertices[0].position, [-4.0, -1.0, -4.0]);
         assert_eq!(content.light(0.0).ambient, [0.15; 3]);
         assert!(content.shadow_view_projection(0.0).is_some());

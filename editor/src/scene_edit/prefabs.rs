@@ -673,6 +673,7 @@ fn material_diff(
         )?,
         normal_texture: field(&from.normal_texture, &to.normal_texture)?,
         normal_scale: field(&from.normal_scale, &to.normal_scale)?,
+        double_sided: field(&from.double_sided, &to.double_sided)?,
     })
 }
 
@@ -688,6 +689,7 @@ fn merge_material(target: &mut MaterialOverride, change: &MaterialOverride) {
         target.normal_texture = change.normal_texture.clone();
     }
     target.normal_scale = change.normal_scale.or(target.normal_scale);
+    target.double_sided = change.double_sided.or(target.double_sided);
 }
 
 /// Поле объекта экземпляра, которое может быть переопределено.

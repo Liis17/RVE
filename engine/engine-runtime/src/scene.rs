@@ -206,6 +206,7 @@ struct ResolvedMaterial {
     base_color: [f32; 3],
     metallic: f32,
     roughness: f32,
+    double_sided: bool,
     base_color_texture: Option<MaterialTextureSource>,
     metallic_roughness_texture: Option<MaterialTextureSource>,
     normal_texture: Option<MaterialTextureSource>,
@@ -261,6 +262,9 @@ fn resolve_material(
         roughness: override_material
             .and_then(|material| material.roughness)
             .unwrap_or(model.roughness),
+        double_sided: override_material
+            .and_then(|material| material.double_sided)
+            .unwrap_or(model.double_sided),
         base_color_texture: replacement_texture
             .map(|path| MaterialTextureSource::Scene(path.to_owned()))
             .or_else(|| model.base_color_texture.map(MaterialTextureSource::Model)),
@@ -405,6 +409,7 @@ fn upload_resolved_material(
         base_color: resolved.base_color,
         metallic: resolved.metallic,
         roughness: resolved.roughness,
+        double_sided: resolved.double_sided,
         base_color_texture,
         metallic_roughness_texture,
         normal_texture,
@@ -824,11 +829,13 @@ id = "camera"
             metallic_roughness_texture: Some(1),
             normal_texture: Some(2),
             normal_scale: 0.8,
+            double_sided: true,
         };
         let unchanged = resolve_material(&model, None, None);
         assert_eq!(unchanged.base_color, model.base_color);
         assert_eq!(unchanged.metallic, model.metallic);
         assert_eq!(unchanged.roughness, model.roughness);
+        assert!(unchanged.double_sided);
         assert_eq!(
             unchanged.base_color_texture,
             Some(MaterialTextureSource::Model(0))
@@ -850,6 +857,7 @@ id = "camera"
             metallic_roughness_texture: Some(VirtualPath::parse("/textures/mr.png").unwrap()),
             normal_texture: Some(VirtualPath::parse("/textures/normal.png").unwrap()),
             normal_scale: Some(0.5),
+            double_sided: Some(false),
         };
         let replacement = resolve_material(
             &model,
@@ -859,6 +867,7 @@ id = "camera"
         assert_eq!(replacement.base_color, [0.9, 0.8, 0.7]);
         assert_eq!(replacement.metallic, 1.0);
         assert_eq!(replacement.roughness, model.roughness);
+        assert!(!replacement.double_sided);
         assert_eq!(
             replacement.base_color_texture,
             Some(MaterialTextureSource::Scene(

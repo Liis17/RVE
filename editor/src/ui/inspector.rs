@@ -617,6 +617,7 @@ fn show_material(
         metallic_roughness_texture: None,
         normal_texture: None,
         normal_scale: None,
+        double_sided: None,
     });
     let mut toggled = false;
     let mut picked = false;
@@ -668,6 +669,14 @@ fn show_material(
             &mut material.normal_scale,
             1.0,
             |ui, value| Some(ui.add(egui::DragValue::new(value).speed(0.01))),
+            &mut response,
+        );
+        toggled |= optional_value(
+            ui,
+            "Double Sided",
+            &mut material.double_sided,
+            false,
+            |ui, value| Some(ui.checkbox(value, "")),
             &mut response,
         );
         let maps = [

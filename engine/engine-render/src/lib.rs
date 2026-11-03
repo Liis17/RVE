@@ -115,12 +115,13 @@ pub enum TextureColorSpace {
     Linear,
 }
 
-/// Неизменяемые параметры материала и необязательные текстуры.
+/// Неизменяемые параметры материала, отсечение граней и необязательные текстуры.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
+    pub double_sided: bool,
     pub base_color_texture: Option<TextureId>,
     pub metallic_roughness_texture: Option<TextureId>,
     pub normal_texture: Option<TextureId>,
@@ -133,6 +134,7 @@ impl Default for Material {
             base_color: [1.0; 3],
             metallic: 0.0,
             roughness: 1.0,
+            double_sided: false,
             base_color_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
@@ -464,7 +466,7 @@ fn classify_probe_instance_failure(error: vk::Result) -> ProbeInstanceFailure {
 
 /// Проверяет доступные Vulkan-устройства без создания окна или surface.
 ///
-/// `suitable` учитывает Vulkan 1.3, dynamic rendering, synchronization2,
+/// `suitable` учитывает Vulkan 1.3, dynamic rendering, synchronization2, extended dynamic state,
 /// graphics queue и обязательные расширения устройства, включая swapchain.
 /// Возможность present и совместимость с конкретным surface проверяются
 /// отдельно в [`Renderer::new`]. Если loader недоступен, возвращается
@@ -1196,6 +1198,7 @@ impl Renderer {
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
             frame_set,
             meshes: &self.meshes,
+            materials: &self.materials,
             draws: frame.draws,
             light_view_projection: frame.shadow_view_projection,
             enabled: frame.shadow_view_projection.is_some(),
@@ -1462,6 +1465,7 @@ impl Renderer {
                             pipeline_layout,
                             frame_set: *frame_set,
                             meshes: &self.meshes,
+                            materials: &self.materials,
                             draws: frame.draws,
                             light_view_projection: frame.shadow_view_projection,
                             enabled: frame.shadow_view_projection.is_some(),
@@ -1817,11 +1821,15 @@ impl Renderer {
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
+        let mut extended_dynamic_state =
+            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
+                .extended_dynamic_state(true);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&extension_pointers)
             .enabled_features(&features)
-            .push_next(&mut features_13);
+            .push_next(&mut features_13)
+            .push_next(&mut extended_dynamic_state);
         // SAFETY: the selected physical device reported every requested feature and extension.
         let device = unsafe {
             self.instance()?
@@ -2284,6 +2292,7 @@ impl Renderer {
                 device: device.clone(),
                 pool,
                 set,
+                double_sided: material.double_sided,
                 _uniform_buffer: uniform_buffer,
                 _textures: texture_refs,
             })
@@ -2459,10 +2468,9 @@ impl Renderer {
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
-        // Отсечение граней выключено: видимость не зависит от порядка обхода вершин.
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
+            .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -2475,7 +2483,12 @@ impl Renderer {
             .depth_test_enable(true)
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+            vk::DynamicState::FRONT_FACE,
+        ];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let color_formats = [OFFSCREEN_FORMAT];
@@ -2536,7 +2549,7 @@ impl Renderer {
             .depth_bias_constant_factor(1.25)
             .depth_bias_slope_factor(1.75)
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
+            .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -2545,7 +2558,12 @@ impl Renderer {
             .depth_test_enable(true)
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+            vk::DynamicState::FRONT_FACE,
+        ];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut rendering_info =
@@ -3071,6 +3089,7 @@ struct DeviceFacts {
     api_version: u32,
     dynamic_rendering: bool,
     synchronization2: bool,
+    extended_dynamic_state: bool,
     supported_extensions: HashSet<String>,
     graphics_queue_families: Vec<bool>,
 }
@@ -3117,6 +3136,9 @@ fn evaluate_device(facts: &DeviceFacts, required_extensions: &[CString]) -> Devi
     if !facts.synchronization2 {
         reasons.push("не поддерживается synchronization2".to_owned());
     }
+    if !facts.extended_dynamic_state {
+        reasons.push("не поддерживается extendedDynamicState".to_owned());
+    }
     for extension in required_extensions {
         let name = extension.to_string_lossy();
         if !facts.supported_extensions.contains(name.as_ref()) {
@@ -3151,7 +3173,10 @@ fn inspect_device(
 
     // SAFETY: device feature query uses a valid physical device and a properly initialized pNext chain.
     let mut features_13 = vk::PhysicalDeviceVulkan13Features::default();
-    let mut features_2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features_13);
+    let mut extended_dynamic_state = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+    let mut features_2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut features_13)
+        .push_next(&mut extended_dynamic_state);
     unsafe { instance.get_physical_device_features2(physical_device, &mut features_2) };
     let tessellation_shader = features_2.features.tessellation_shader != vk::FALSE;
     let texture_sampler_anisotropy = sampler_anisotropy(
@@ -3177,6 +3202,7 @@ fn inspect_device(
         api_version: properties.api_version,
         dynamic_rendering: features_13.dynamic_rendering != vk::FALSE,
         synchronization2: features_13.synchronization2 != vk::FALSE,
+        extended_dynamic_state: extended_dynamic_state.extended_dynamic_state != vk::FALSE,
         supported_extensions,
         graphics_queue_families: queue_families
             .iter()
@@ -4498,6 +4524,7 @@ struct ShadowPass<'a> {
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
     meshes: &'a [Option<MeshBuffers>],
+    materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
     light_view_projection: Option<[[f32; 4]; 4]>,
     enabled: bool,
@@ -4556,6 +4583,7 @@ fn record_draws(
         );
     }
     let frustum = Frustum::from_view_projection(scene.view_projection);
+    let mut rasterization_state = None;
     for draw in scene.draws {
         // Индексы проверены validate_draws до начала кадра.
         let Some(mesh) = scene.meshes[draw.mesh.0].as_ref() else {
@@ -4573,6 +4601,15 @@ fn record_draws(
         .as_ref() else {
             continue;
         };
+        let next_rasterization_state = draw_rasterization_state(material.double_sided, &draw.model);
+        if rasterization_state != Some(next_rasterization_state) {
+            // SAFETY: the graphics pipeline declares both values as dynamic Vulkan 1.3 states.
+            unsafe {
+                device.cmd_set_cull_mode(command_buffer, next_rasterization_state.0);
+                device.cmd_set_front_face(command_buffer, next_rasterization_state.1);
+            }
+            rasterization_state = Some(next_rasterization_state);
+        }
         let push_constants = push_constant_bytes(&draw.model);
         // SAFETY: mesh buffers and material descriptors stay alive until this frame's fence completes.
         unsafe {
@@ -4646,6 +4683,7 @@ fn record_shadow_draws(
     let frustum = shadow
         .light_view_projection
         .map(Frustum::from_view_projection);
+    let mut rasterization_state = None;
     for draw in shadow_casters(shadow.draws) {
         let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
             continue;
@@ -4655,6 +4693,21 @@ fn record_shadow_draws(
                 .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
         }) {
             continue;
+        }
+        let Some(material) = shadow.materials[draw
+            .material
+            .map_or(DEFAULT_MATERIAL, |material| material.0)]
+        .as_ref() else {
+            continue;
+        };
+        let next_rasterization_state = draw_rasterization_state(material.double_sided, &draw.model);
+        if rasterization_state != Some(next_rasterization_state) {
+            // SAFETY: the shadow graphics pipeline declares both values as dynamic Vulkan 1.3 states.
+            unsafe {
+                device.cmd_set_cull_mode(command_buffer, next_rasterization_state.0);
+                device.cmd_set_front_face(command_buffer, next_rasterization_state.1);
+            }
+            rasterization_state = Some(next_rasterization_state);
         }
         let push_constants = push_constant_bytes(&draw.model);
         // SAFETY: draw ids were checked before recording; the buffers and frame set stay alive.
@@ -4676,6 +4729,28 @@ fn record_shadow_draws(
             device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
         }
     }
+}
+
+fn draw_rasterization_state(
+    double_sided: bool,
+    model: &[[f32; 4]; 4],
+) -> (vk::CullModeFlags, vk::FrontFace) {
+    let cull_mode = if double_sided {
+        vk::CullModeFlags::NONE
+    } else {
+        vk::CullModeFlags::BACK
+    };
+    let x = [model[0][0], model[0][1], model[0][2]];
+    let y = [model[1][0], model[1][1], model[1][2]];
+    let z = [model[2][0], model[2][1], model[2][2]];
+    let determinant = x[0] * (y[1] * z[2] - y[2] * z[1]) - x[1] * (y[0] * z[2] - y[2] * z[0])
+        + x[2] * (y[0] * z[1] - y[1] * z[0]);
+    let front_face = if determinant < 0.0 {
+        vk::FrontFace::CLOCKWISE
+    } else {
+        vk::FrontFace::COUNTER_CLOCKWISE
+    };
+    (cull_mode, front_face)
 }
 
 /// Viewport с отрицательной высотой направляет ось Y clip space вверх.
@@ -5466,6 +5541,7 @@ struct GpuMaterial {
     device: ash::Device,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
+    double_sided: bool,
     _uniform_buffer: HostBuffer,
     _textures: [Arc<Texture>; 3],
 }
@@ -6446,18 +6522,19 @@ mod tests {
         TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings,
         align_upload_offset, best_device_index, check_extensions, classify_acquire_result,
         classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
-        evaluate_device, frame_uniform_bytes, index_bytes, inverse_extent, material_sampler_info,
-        material_uniform_bytes, mesh_upload_layout, mip_extent, mip_level_count,
-        missing_extensions, missing_post_format_features, missing_texture_format_features,
-        normal_matrix, offscreen_previous_use, overlay_vertex_bytes, push_constant_bytes,
-        sampler_anisotropy, scaled_extent, scene_viewport, select_composite_alpha,
-        select_present_mode, select_surface_extent, shadow_casters, texture_format,
-        texture_format_reasons, texture_mip_blit_region, texture_mip_destination_shader_barrier,
-        texture_mip_shader_barrier, texture_mip_source_barrier, texture_staging_size,
-        texture_upload_barrier, timestamp_duration, transform_tangent_normal,
-        upload_batch_capacity, upload_batch_flush_required, upload_data_layout, validate_draws,
-        validate_material, validate_mesh, validate_overlay, validate_pipeline_cache,
-        validate_render_scale, validate_texture, validate_view_settings, vertex_bytes,
+        draw_rasterization_state, evaluate_device, frame_uniform_bytes, index_bytes,
+        inverse_extent, material_sampler_info, material_uniform_bytes, mesh_upload_layout,
+        mip_extent, mip_level_count, missing_extensions, missing_post_format_features,
+        missing_texture_format_features, normal_matrix, offscreen_previous_use,
+        overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
+        scene_viewport, select_composite_alpha, select_present_mode, select_surface_extent,
+        shadow_casters, texture_format, texture_format_reasons, texture_mip_blit_region,
+        texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
+        texture_mip_source_barrier, texture_staging_size, texture_upload_barrier,
+        timestamp_duration, transform_tangent_normal, upload_batch_capacity,
+        upload_batch_flush_required, upload_data_layout, validate_draws, validate_material,
+        validate_mesh, validate_overlay, validate_pipeline_cache, validate_render_scale,
+        validate_texture, validate_view_settings, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -6838,6 +6915,7 @@ mod tests {
             api_version: vk::make_api_version(0, 1, 3, 0),
             dynamic_rendering: true,
             synchronization2: true,
+            extended_dynamic_state: true,
             supported_extensions: HashSet::from([
                 "VK_KHR_swapchain".to_owned(),
                 "VK_KHR_portability_subset".to_owned(),
@@ -6861,6 +6939,7 @@ mod tests {
             api_version: vk::make_api_version(0, 2, 0, 0),
             dynamic_rendering: true,
             synchronization2: true,
+            extended_dynamic_state: true,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![true],
         };
@@ -6893,6 +6972,7 @@ mod tests {
             api_version: vk::make_api_version(0, 1, 2, 0),
             dynamic_rendering: false,
             synchronization2: false,
+            extended_dynamic_state: false,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![false, false],
         };
@@ -6909,6 +6989,7 @@ mod tests {
                 "Vulkan API ниже 1.3",
                 "не поддерживается dynamicRendering",
                 "не поддерживается synchronization2",
+                "не поддерживается extendedDynamicState",
                 "device extension недоступен: VK_KHR_swapchain",
                 "device extension недоступен: VK_KHR_portability_subset",
                 "нет graphics queue family",
@@ -7370,6 +7451,50 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rasterization_state_uses_material_sidedness_and_model_determinant() {
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mirrored_x = [
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mirrored_xy = [
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+
+        assert_eq!(
+            draw_rasterization_state(false, &identity),
+            (vk::CullModeFlags::BACK, vk::FrontFace::COUNTER_CLOCKWISE)
+        );
+        assert_eq!(
+            draw_rasterization_state(true, &identity),
+            (vk::CullModeFlags::NONE, vk::FrontFace::COUNTER_CLOCKWISE)
+        );
+        assert_eq!(
+            draw_rasterization_state(false, &mirrored_x),
+            (vk::CullModeFlags::BACK, vk::FrontFace::CLOCKWISE)
+        );
+        assert_eq!(
+            draw_rasterization_state(true, &mirrored_x),
+            (vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
+        );
+        assert_eq!(
+            draw_rasterization_state(false, &mirrored_xy),
+            (vk::CullModeFlags::BACK, vk::FrontFace::COUNTER_CLOCKWISE)
+        );
+        assert!(!Material::default().double_sided);
     }
 
     #[test]

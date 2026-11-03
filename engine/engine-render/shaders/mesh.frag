@@ -89,6 +89,7 @@ void main() {
     vec2 duv2 = dFdy(in_uv);
 
     vec3 geometric_normal = safe_normalize(in_normal, vec3(0.0, 0.0, 1.0));
+    if (!gl_FrontFacing) geometric_normal = -geometric_normal;
     vec3 tangent = vec3(0.0);
     vec3 bitangent = vec3(0.0);
     float determinant = duv1.x * duv2.y - duv1.y * duv2.x;
