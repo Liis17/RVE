@@ -415,6 +415,43 @@ fn showing_the_inspector_keeps_hdr_light_colors_and_material_overrides_unchanged
 }
 
 #[test]
+fn start_screen_opens_an_existing_recent_project_and_skips_missing_ones() {
+    let mut harness = Harness::new();
+    harness.state.scene = None;
+    let demo = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/demo-game"
+    ));
+    let missing = std::path::PathBuf::from("this/project/does/not/exist");
+    harness.state.recent_projects = vec![missing, demo.clone()];
+    harness.panel(Vec::new(), show_welcome);
+    // Строки списка находятся просмотром центра экрана сверху вниз.
+    for y in (240..720).step_by(4) {
+        harness.click(pos2(640.0, y as f32), show_welcome);
+        // Выше списка находится кнопка Open Project.
+        harness
+            .state
+            .actions
+            .retain(|action| *action != Action::OpenProject);
+        if !harness.state.actions.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(harness.state.actions, [Action::OpenProjectAt(demo.clone())]);
+
+    // Кнопка Remove Missing — последняя строка списка.
+    harness.state.actions.clear();
+    for y in (240..720).step_by(4).rev() {
+        harness.click(pos2(640.0, y as f32), show_welcome);
+        if harness.state.recent_projects.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(harness.state.recent_projects, [demo]);
+    assert!(harness.state.actions.is_empty());
+}
+
+#[test]
 fn status_bar_summarises_the_scene_and_play_frame_rate() {
     let mut harness = Harness::new();
     assert_eq!(scene_status(&harness.state, 0.02), "untitled  |  2 objects");

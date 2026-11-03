@@ -87,7 +87,36 @@ fn show_welcome(ui: &mut egui::Ui, state: &mut EditorState) {
         if ui.button("Open Project…").clicked() {
             state.action(Action::OpenProject);
         }
+        if !state.recent_projects.is_empty() {
+            ui.add_space(16.0);
+            ui.label("Recent Projects");
+            ui.add_space(4.0);
+            recent_projects(ui, state);
+        }
     });
+}
+
+/// Список недавних проектов. Отсутствующие проекты помечены и недоступны;
+/// Remove Missing убирает их из списка.
+pub(crate) fn recent_projects(ui: &mut egui::Ui, state: &mut EditorState) {
+    let is_project = |dir: &std::path::Path| dir.join("project.rveproject").is_file();
+    let mut any_missing = false;
+    for dir in &state.recent_projects {
+        let exists = is_project(dir);
+        any_missing |= !exists;
+        let label = if exists {
+            dir.display().to_string()
+        } else {
+            format!("{} (не найден)", dir.display())
+        };
+        if ui.add_enabled(exists, egui::Button::new(label)).clicked() {
+            state.actions.push(Action::OpenProjectAt(dir.clone()));
+            ui.close();
+        }
+    }
+    if any_missing && ui.button("Remove Missing").clicked() {
+        state.recent_projects.retain(|dir| is_project(dir));
+    }
 }
 
 fn show_unsaved_prompt(ctx: &egui::Context, state: &mut EditorState) {

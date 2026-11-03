@@ -1,10 +1,11 @@
 //! Приложение редактора: окно, цикл кадра egui + renderer и выполнение действий.
 
 use crate::console::LogLevel;
-use crate::layout::{Tab, default_layout};
+use crate::layout::Tab;
 use crate::play::PlaySession;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
+use crate::settings::{SettingsStore, UserSettings};
 use crate::state::{Action, EditorState, UnsavedPrompt};
 use crate::ui;
 use crate::ui::scene_view::bounding_sphere;
@@ -30,6 +31,8 @@ const PREVIEW_POLL: Duration = Duration::from_millis(30);
 pub struct EditorApp {
     state: EditorState,
     dock: DockState<Tab>,
+    /// Файл настроек пользователя; `None`, если каталог настроек ОС неизвестен.
+    settings: Option<SettingsStore>,
     initial_project: Option<PathBuf>,
     gpu: Option<GpuState>,
     egui_ctx: egui::Context,
@@ -49,9 +52,21 @@ struct GpuState {
 
 impl EditorApp {
     pub fn new(project: Option<PathBuf>, scripts: Option<PathBuf>) -> Self {
+        let mut state = EditorState::new(scripts);
+        let settings = SettingsStore::default_location();
+        let (user, problem) = settings
+            .as_ref()
+            .map(SettingsStore::load)
+            .unwrap_or_default();
+        if let Some(problem) = problem {
+            state.log.push(LogLevel::Warn, problem);
+        }
+        let dock = user.layout_or_default();
+        state.recent_projects = user.recent_projects;
         Self {
-            state: EditorState::new(scripts),
-            dock: default_layout(),
+            state,
+            dock,
+            settings,
             initial_project: project,
             gpu: None,
             egui_ctx: egui::Context::default(),
@@ -78,7 +93,12 @@ impl EditorApp {
                     .log
                     .info(format!("Открыт проект {}", project.settings.name));
                 let start = project.settings.starting_scene().map(str::to_owned);
+                UserSettings::remember_project(
+                    &mut self.state.recent_projects,
+                    project.root.clone(),
+                );
                 self.state.project = Some(project);
+                self.save_settings();
                 self.state.current_folder.clear();
                 self.refresh_assets();
                 match start {
@@ -87,6 +107,20 @@ impl EditorApp {
                 }
             }
             Err(error) => self.state.log.error(error),
+        }
+    }
+
+    /// Записывает недавние проекты и раскладку панелей; ошибка только пишется в Console.
+    fn save_settings(&mut self) {
+        let Some(store) = &self.settings else {
+            return;
+        };
+        let settings = UserSettings {
+            recent_projects: self.state.recent_projects.clone(),
+            layout: Some(self.dock.clone()),
+        };
+        if let Err(error) = store.save(&settings) {
+            self.state.log.push(LogLevel::Warn, error);
         }
     }
 
@@ -162,6 +196,7 @@ impl EditorApp {
                     self.open_project(&dir);
                 }
             }
+            Action::OpenProjectAt(dir) => self.open_project(&dir),
             Action::Exit => self.exit = true,
             _ => {}
         }
@@ -344,6 +379,7 @@ impl EditorApp {
                 action @ (Action::NewScene
                 | Action::OpenScene(_)
                 | Action::OpenProject
+                | Action::OpenProjectAt(_)
                 | Action::Exit) => {
                     if action == Action::Exit {
                         self.stop_play();
@@ -733,6 +769,7 @@ impl WindowHandler for EditorApp {
 
     fn exiting(&mut self) {
         self.stop_play();
+        self.save_settings();
         // Renderer удерживает окно и освобождается до него.
         self.gpu = None;
         self.egui_state = None;
