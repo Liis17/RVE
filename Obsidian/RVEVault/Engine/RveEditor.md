@@ -4,7 +4,7 @@ Parent: [[Index]]
 
 ## Назначение
 
-`rve-editor` (`editor/`) — нативное приложение в стиле Unity для правки сцен проекта: одно окно с меню и строкой инструментов и встраиваемыми панелями Scene, Game, Hierarchy, Inspector, Project и Console. Интерфейс строится на egui, панели — на egui_dock, отрисовка идёт через [[Engine/EngineRender]]. Вся логика редактора находится в этом крейте: `engine-render` не знает об egui и winit, [[Engine/EngineWindow]] только пробрасывает события.
+`rve-editor` (`editor/`) — нативное приложение в стиле Unity для правки сцен проекта: одно окно с меню и строкой инструментов и встраиваемыми панелями Scene, Game, Hierarchy, Inspector, Project и Console. Интерфейс строится на egui, панели — на egui_dock, отрисовка идёт через [[Engine/EngineRender]]. Общий UI bridge и developer console переиспользуются из `engine-ui`; `engine-render` не знает об egui и winit, [[Engine/EngineWindow]] только пробрасывает события.
 
 ## Источники
 
@@ -12,7 +12,8 @@ Parent: [[Index]]
 |---|---|---|
 | `editor/src/main.rs`, `editor/src/cli.rs` | `prepare`, `parse_args` | Проверка аргументов и настроек окна до создания окна, коды завершения |
 | `editor/src/app.rs` | `EditorApp`, `render_scene_frame` | `WindowHandler`: цикл кадра и действия (`Action`), диалоги ОС, запуск Play |
-| `editor/src/ui_render.rs` | `UiBridge`, `ManagedTextures`, `UiTextures` | Перевод вывода egui в UI pass: текстуры и физические пиксели |
+| `engine/engine-ui/src` | `UiBridge`, `ManagedTextures`, `UiTextures`, `ConsoleOverlay` | Общий egui bridge и console overlay для UI pass |
+| `editor/src/console.rs` | console toggle и преобразование команд в Play actions | Состояние и обработка editor console |
 | `editor/src/state.rs` | `EditorState`, `Action`, `FrameParts` | Состояние панелей без GPU |
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject` | Команды над документом, undo/redo, атомарное сохранение, раскрытие префабов |
 | `editor/src/scene_edit/prefabs.rs` | `OverrideField`, `object_override` | Instantiate, Create Prefab, Unpack, overrides и Apply to Prefab |
@@ -87,6 +88,14 @@ Inspector показывает `params` скрипта по его схеме ([
 Привязка (`SnapSettings`) включается кнопкой Snap или удержанием Ctrl/Cmd: перемещение и поворот идут целыми шагами от точки захвата, масштаб по оси округляется до кратного шага и не становится меньше одного шага.
 
 ## Play
+
+Developer console рисуется поверх Game прямоугольника после dock UI; существующая
+вкладка Console остаётся журналом `EditorState::log`, куда поступают script events.
+Backquote открывает overlay только без modal, а открытая консоль блокирует Play input и
+shortcuts W/E/R. `help` и `clear` работают всегда. Остальные команды выполняются только
+в Play через `PlaySession::execute_command`; вне Play editor сообщает `доступно только
+в Play`. Выполнение использует Play watchdog; Lua может быть прервана, Rust callback —
+нет. Полный контракт shared UI и logger см. в [[Engine/EngineConsole]].
 
 `PlaySession` создаёт `World` с проверенными `.camerasettings` и `ScriptHost` из документа и работает на главном потоке. Документ не меняется: Stop вызывает `on_destroy` и удаляет сессию, поэтому правки скриптов отбрасываются. Во время Play панели отключены, `EditorState::edit_scene` не выполняет правки, а панель Scene использует активную камеру сцены вместо камеры редактора. Ввод скриптов принимается над изображением Scene и Game. Выпадающий список Game меняет только preview панели; активную игровую камеру задаёт camera component сцены (`active = true`, либо единственная камера). Heavy-скрипты требуют `--scripts`; без библиотеки Play не запускается и пишет ошибку в Console.
 

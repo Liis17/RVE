@@ -71,6 +71,10 @@ jobs:
         run: |
           read -r -a packages <<< "$CARGO_PACKAGES"
           cargo clippy "${packages[@]}" --all-targets --locked -- -D warnings
+      - name: Clippy player without developer console
+        if: ${{ contains(needs.changes.outputs.packages, 'rve-player') || contains(needs.changes.outputs.packages, 'engine-runtime') }}
+        working-directory: build
+        run: cargo clippy -p rve-player --no-default-features --all-targets --locked -- -D warnings
       - name: Build affected packages
         working-directory: build
         run: |
