@@ -11,10 +11,17 @@ use egui_dock::DockState;
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
 const REDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+/// Привычный для macOS redo; проверяется раньше `UNDO`, который игнорирует лишний Shift.
+const REDO_SHIFT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
+const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
 
 pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
     if ctx.input_mut(|input| input.consume_shortcut(&SAVE)) {
         state.action(Action::Save);
+    }
+    if ctx.input_mut(|input| input.consume_shortcut(&REDO_SHIFT)) {
+        redo(state);
     }
     if ctx.input_mut(|input| input.consume_shortcut(&UNDO)) {
         undo(state);
@@ -25,6 +32,9 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
     // Одиночные клавиши не должны срабатывать при вводе текста и полёте камеры (ПКМ+WASD).
     if ctx.egui_wants_keyboard_input() || ctx.input(|input| input.pointer.secondary_down()) {
         return;
+    }
+    if ctx.input_mut(|input| input.consume_shortcut(&DUPLICATE)) {
+        duplicate_selection(state);
     }
     let pressed = |key| ctx.input(|input| input.key_pressed(key) && input.modifiers.is_none());
     if pressed(Key::W) {
@@ -41,6 +51,33 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
     }
     if pressed(Key::Delete) {
         delete_selection(state);
+    }
+    if pressed(Key::F2) {
+        rename_selection(state);
+    }
+    // Esc в модальном окне закрывает его, а не снимает выделение.
+    let modal_open = state.unsaved_prompt.is_some() || state.project_dialog.is_some();
+    if pressed(Key::Escape)
+        && !modal_open
+        && !state.is_playing()
+        && let Some(scene) = &mut state.scene
+    {
+        scene.select(None);
+    }
+}
+
+/// Начинает переименование выделенного объекта в Hierarchy.
+pub fn rename_selection(state: &mut EditorState) {
+    if state.is_playing() {
+        return;
+    }
+    let selected = state
+        .scene
+        .as_ref()
+        .and_then(|scene| scene.selected_object())
+        .map(|object| (object.id.clone(), object.display_name().to_owned()));
+    if let Some(rename) = selected {
+        state.hierarchy_rename = Some(rename);
     }
 }
 
@@ -149,11 +186,16 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
         {
             delete_selection(state);
         }
+        let duplicate =
+            egui::Button::new("Duplicate").shortcut_text(ui.ctx().format_shortcut(&DUPLICATE));
+        if ui.add_enabled(can_change, duplicate).clicked() {
+            duplicate_selection(state);
+        }
         if ui
-            .add_enabled(can_change, egui::Button::new("Duplicate"))
+            .add_enabled(can_change, egui::Button::new("Rename").shortcut_text("F2"))
             .clicked()
         {
-            duplicate_selection(state);
+            rename_selection(state);
         }
     });
     ui.menu_button("GameObject", |ui| {
