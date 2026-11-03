@@ -1,4 +1,4 @@
-use crate::Vertex;
+use crate::{DrawCommand, Vertex};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LocalBounds {
@@ -116,6 +116,67 @@ impl Frustum {
     }
 }
 
+/// Indices ordered back-to-front by distance to each transformed world AABB center.
+pub(crate) fn back_to_front_order(
+    draws: &[DrawCommand],
+    camera_position: [f32; 3],
+    mut bounds_for_draw: impl FnMut(&DrawCommand) -> Option<LocalBounds>,
+) -> Vec<usize> {
+    let mut distances = draws
+        .iter()
+        .enumerate()
+        .map(|(index, draw)| {
+            let distance = bounds_for_draw(draw)
+                .and_then(|bounds| world_aabb_center(draw.model, bounds))
+                .filter(|_| camera_position.into_iter().all(f32::is_finite))
+                .map_or(0.0, |center| {
+                    (0..3)
+                        .map(|axis| {
+                            let delta = center[axis] - camera_position[axis];
+                            delta * delta
+                        })
+                        .sum()
+                });
+            (index, distance)
+        })
+        .collect::<Vec<_>>();
+    distances.sort_by(
+        |(left_index, left_distance), (right_index, right_distance)| {
+            right_distance
+                .total_cmp(left_distance)
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
+    distances.into_iter().map(|(index, _)| index).collect()
+}
+
+fn world_aabb_center(model: [[f32; 4]; 4], bounds: LocalBounds) -> Option<[f32; 3]> {
+    if !bounds.is_valid() || !model.into_iter().flatten().all(f32::is_finite) {
+        return None;
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for x in [bounds.min[0], bounds.max[0]] {
+        for y in [bounds.min[1], bounds.max[1]] {
+            for z in [bounds.min[2], bounds.max[2]] {
+                let world = transform(model, [x, y, z, 1.0]);
+                if !world.into_iter().all(f32::is_finite) || world[3].abs() <= f32::EPSILON {
+                    return None;
+                }
+                for axis in 0..3 {
+                    let position = world[axis] / world[3];
+                    if !position.is_finite() {
+                        return None;
+                    }
+                    min[axis] = min[axis].min(position);
+                    max[axis] = max[axis].max(position);
+                }
+            }
+        }
+    }
+    Some(std::array::from_fn(|axis| (min[axis] + max[axis]) * 0.5))
+}
+
 fn transform(columns: [[f32; 4]; 4], vector: [f32; 4]) -> [f32; 4] {
     std::array::from_fn(|row| {
         columns[0][row] * vector[0]
@@ -131,8 +192,8 @@ fn dot(left: [f32; 4], right: [f32; 4]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frustum, LocalBounds};
-    use crate::Vertex;
+    use super::{Frustum, LocalBounds, back_to_front_order};
+    use crate::{DrawCommand, MeshId, Vertex};
 
     const IDENTITY: [[f32; 4]; 4] = [
         [1.0, 0.0, 0.0, 0.0],
@@ -170,6 +231,47 @@ mod tests {
         let mut model = IDENTITY;
         model[3] = [x, y, z, 1.0];
         model
+    }
+
+    fn draw(mesh: usize, model: [[f32; 4]; 4]) -> DrawCommand {
+        DrawCommand {
+            mesh: MeshId(mesh),
+            material: None,
+            model,
+            casts_shadow: true,
+        }
+    }
+
+    #[test]
+    fn transparent_order_is_back_to_front_and_equal_distances_keep_input_order() {
+        let draws = [
+            draw(0, translated(0.0, 0.0, 2.0)),
+            draw(1, translated(0.0, 0.0, -4.0)),
+            draw(2, translated(0.0, 0.0, 4.0)),
+        ];
+        let bounds = bounds([-0.5; 3], [0.5; 3]);
+        assert_eq!(
+            back_to_front_order(&draws, [0.0; 3], |_| Some(bounds)),
+            [1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn transparent_order_uses_world_aabb_centers_and_keeps_unknown_bounds_stable() {
+        let draws = [
+            draw(0, translated(0.0, 0.0, -5.0)),
+            draw(1, translated(0.0, 0.0, -2.0)),
+            draw(2, translated(0.0, 0.0, -2.0)),
+        ];
+        let bounds = [
+            Some(bounds([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])),
+            None,
+            None,
+        ];
+        assert_eq!(
+            back_to_front_order(&draws, [0.0; 3], |draw| bounds[draw.mesh.0]),
+            [0, 1, 2]
+        );
     }
 
     #[test]

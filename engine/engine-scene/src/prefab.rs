@@ -5,10 +5,10 @@
 //! остальные объекты — `<экземпляр>.<id в префабе>`, у вложенных — `a.b.c`.
 
 use crate::document::{
-    CameraComponent, DirectionalLightComponent, DocumentKind, MaterialOverride, ParamValue,
-    SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform, option_virtual_path_serde,
-    require_asset_path, require_extension, valid_ascii_name, validate_material_override,
-    virtual_path_serde,
+    CameraComponent, DirectionalLightComponent, DocumentKind, MaterialAlphaMode, MaterialOverride,
+    ParamValue, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
+    option_virtual_path_serde, require_asset_path, require_extension, valid_ascii_name,
+    validate_material_override, virtual_path_serde,
 };
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
@@ -273,14 +273,38 @@ fn merge_material(target: &mut MaterialOverride, change: &MaterialOverride) {
     if change.roughness.is_some() {
         target.roughness = change.roughness;
     }
+    if change.emissive.is_some() {
+        target.emissive = change.emissive;
+    }
+    if change.opacity.is_some() {
+        target.opacity = change.opacity;
+    }
+    if change.alpha_mode.is_some() {
+        target.alpha_mode = change.alpha_mode;
+        if change.alpha_mode != Some(MaterialAlphaMode::Mask) {
+            target.alpha_cutoff = None;
+        }
+    }
+    if change.alpha_cutoff.is_some() {
+        target.alpha_cutoff = change.alpha_cutoff;
+    }
     if change.metallic_roughness_texture.is_some() {
         target.metallic_roughness_texture = change.metallic_roughness_texture.clone();
     }
     if change.normal_texture.is_some() {
         target.normal_texture = change.normal_texture.clone();
     }
+    if change.emissive_texture.is_some() {
+        target.emissive_texture = change.emissive_texture.clone();
+    }
+    if change.occlusion_texture.is_some() {
+        target.occlusion_texture = change.occlusion_texture.clone();
+    }
     if change.normal_scale.is_some() {
         target.normal_scale = change.normal_scale;
+    }
+    if change.occlusion_strength.is_some() {
+        target.occlusion_strength = change.occlusion_strength;
     }
 }
 

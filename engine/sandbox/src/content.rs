@@ -5,7 +5,7 @@ use crate::scene::{
     materials_light_view_projection, materials_plane_mesh, plane_mesh, shadows_light_direction,
     shadows_light_view_projection, sinusoidal_normal_texture,
 };
-use engine_assets::{Model, ModelMaterial, TextureData};
+use engine_assets::{Model, ModelAlphaMode, ModelMaterial, TextureData};
 use engine_render::{DirectionalLight, Vertex};
 use engine_scene::CameraSettings;
 use glam::{Mat4, Vec3};
@@ -79,6 +79,21 @@ impl Content {
                     },
                     metallic,
                     roughness,
+                    emissive: if metallic == 0.0 && roughness == 0.0 {
+                        [0.8, 0.08, 0.015]
+                    } else {
+                        [0.0; 3]
+                    },
+                    opacity: if metallic == 1.0 && roughness == 1.0 {
+                        0.5
+                    } else {
+                        1.0
+                    },
+                    alpha_mode: if metallic == 1.0 && roughness == 1.0 {
+                        ModelAlphaMode::Blend
+                    } else {
+                        ModelAlphaMode::Opaque
+                    },
                     ..ModelMaterial::default()
                 },
                 environment: false,
@@ -209,7 +224,9 @@ fn fit_to_unit_cube(min: Vec3, max: Vec3) -> Mat4 {
 mod tests {
     use super::{CameraSettings, Content, fit_to_unit_cube};
     use crate::scene::{Scene, cube_mesh};
-    use engine_assets::{Model, ModelMaterial, ModelMesh, ModelVertex, TextureData};
+    use engine_assets::{
+        Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex, TextureData,
+    };
     use glam::Vec3;
 
     fn texture(value: u8) -> TextureData {
@@ -243,6 +260,7 @@ mod tests {
                         metallic_roughness_texture: Some(0),
                         normal_texture: Some(0),
                         normal_scale: 0.75,
+                        ..ModelMaterial::default()
                     },
                 },
                 ModelMesh {
@@ -406,6 +424,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0.0, 0.25, 0.5, 0.75, 1.0]
         );
+        assert_eq!(content.meshes[0].material.emissive, [0.8, 0.08, 0.015]);
+        assert_eq!(content.meshes[9].material.opacity, 0.5);
+        assert_eq!(content.meshes[9].material.alpha_mode, ModelAlphaMode::Blend);
         let floor = content.meshes.last().unwrap();
         assert!(floor.environment);
         assert_eq!(floor.material.normal_texture, Some(0));

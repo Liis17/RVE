@@ -6,8 +6,9 @@ use super::{
 };
 use engine_files::VirtualPath;
 use engine_scene::{
-    HeavyParamsOverride, LiteParamsOverride, MaterialOverride, MeshRendererOverride,
-    PrefabInstance, PrefabOverride, SceneDocument, SceneObject, SceneTransform, TransformOverride,
+    HeavyParamsOverride, LiteParamsOverride, MaterialAlphaMode, MaterialOverride,
+    MeshRendererOverride, PrefabInstance, PrefabOverride, SceneDocument, SceneObject,
+    SceneTransform, TransformOverride,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -425,6 +426,8 @@ fn material_paths(material: &MaterialOverride) -> impl Iterator<Item = VirtualPa
         .metallic_roughness_texture
         .iter()
         .chain(&material.normal_texture)
+        .chain(&material.emissive_texture)
+        .chain(&material.occlusion_texture)
         .cloned()
 }
 
@@ -663,16 +666,33 @@ fn material_diff(
             (_, to) => Ok(to.clone()),
         }
     }
+    let alpha_mode = field(&from.alpha_mode, &to.alpha_mode)?;
+    let alpha_cutoff = if to
+        .alpha_mode
+        .is_some_and(|mode| mode != MaterialAlphaMode::Mask)
+        && to.alpha_cutoff.is_none()
+    {
+        None
+    } else {
+        field(&from.alpha_cutoff, &to.alpha_cutoff)?
+    };
     Ok(MaterialOverride {
         base_color: field(&from.base_color, &to.base_color)?,
         metallic: field(&from.metallic, &to.metallic)?,
         roughness: field(&from.roughness, &to.roughness)?,
+        emissive: field(&from.emissive, &to.emissive)?,
+        opacity: field(&from.opacity, &to.opacity)?,
+        alpha_mode,
+        alpha_cutoff,
         metallic_roughness_texture: field(
             &from.metallic_roughness_texture,
             &to.metallic_roughness_texture,
         )?,
         normal_texture: field(&from.normal_texture, &to.normal_texture)?,
+        emissive_texture: field(&from.emissive_texture, &to.emissive_texture)?,
+        occlusion_texture: field(&from.occlusion_texture, &to.occlusion_texture)?,
         normal_scale: field(&from.normal_scale, &to.normal_scale)?,
+        occlusion_strength: field(&from.occlusion_strength, &to.occlusion_strength)?,
     })
 }
 
@@ -681,13 +701,29 @@ fn merge_material(target: &mut MaterialOverride, change: &MaterialOverride) {
     target.base_color = change.base_color.or(target.base_color);
     target.metallic = change.metallic.or(target.metallic);
     target.roughness = change.roughness.or(target.roughness);
+    target.emissive = change.emissive.or(target.emissive);
+    target.opacity = change.opacity.or(target.opacity);
+    if change.alpha_mode.is_some() {
+        target.alpha_mode = change.alpha_mode;
+        if change.alpha_mode != Some(MaterialAlphaMode::Mask) {
+            target.alpha_cutoff = None;
+        }
+    }
+    target.alpha_cutoff = change.alpha_cutoff.or(target.alpha_cutoff);
     if change.metallic_roughness_texture.is_some() {
         target.metallic_roughness_texture = change.metallic_roughness_texture.clone();
     }
     if change.normal_texture.is_some() {
         target.normal_texture = change.normal_texture.clone();
     }
+    if change.emissive_texture.is_some() {
+        target.emissive_texture = change.emissive_texture.clone();
+    }
+    if change.occlusion_texture.is_some() {
+        target.occlusion_texture = change.occlusion_texture.clone();
+    }
     target.normal_scale = change.normal_scale.or(target.normal_scale);
+    target.occlusion_strength = change.occlusion_strength.or(target.occlusion_strength);
 }
 
 /// Поле объекта экземпляра, которое может быть переопределено.
@@ -883,9 +919,12 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
 #[cfg(test)]
 mod tests {
     use super::super::{Component, EditorScene, NewObject, PrefabLoader};
-    use super::OverrideField;
+    use super::{OverrideField, material_diff, material_paths, merge_material};
     use engine_files::VirtualPath;
-    use engine_scene::{ParamValue, SceneDocument, SceneError, SceneTransform, World};
+    use engine_scene::{
+        MaterialAlphaMode, MaterialOverride, ParamValue, SceneDocument, SceneError, SceneTransform,
+        World,
+    };
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -950,6 +989,46 @@ mod tests {
             )
             .unwrap();
         (files, scene, id)
+    }
+
+    #[test]
+    fn material_diff_keeps_stage_one_fields_and_texture_dependencies() {
+        let before = MaterialOverride::default();
+        let after = MaterialOverride {
+            emissive: Some([2.0, 0.5, 1.0]),
+            opacity: Some(0.65),
+            alpha_mode: Some(MaterialAlphaMode::Mask),
+            alpha_cutoff: Some(0.4),
+            emissive_texture: Some(path("/textures/emissive.png")),
+            occlusion_texture: Some(path("/textures/occlusion.png")),
+            occlusion_strength: Some(0.7),
+            ..MaterialOverride::default()
+        };
+        let difference = material_diff(&before, &after).unwrap();
+        assert_eq!(difference, after);
+        assert_eq!(
+            material_paths(&difference)
+                .map(|path| path.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["textures/emissive.png", "textures/occlusion.png"]
+        );
+    }
+
+    #[test]
+    fn material_diff_clears_mask_cutoff_when_mode_changes() {
+        let before = MaterialOverride {
+            alpha_mode: Some(MaterialAlphaMode::Mask),
+            alpha_cutoff: Some(0.4),
+            ..MaterialOverride::default()
+        };
+        let after = MaterialOverride {
+            alpha_mode: Some(MaterialAlphaMode::Blend),
+            ..MaterialOverride::default()
+        };
+        let difference = material_diff(&before, &after).unwrap();
+        let mut merged = before;
+        merge_material(&mut merged, &difference);
+        assert_eq!(merged, after);
     }
 
     fn nested_door_scene() -> (Files, EditorScene) {

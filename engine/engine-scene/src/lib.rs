@@ -15,8 +15,8 @@ pub use camera_settings::{
 };
 pub use document::{
     CameraComponent, DirectionalLightComponent, HeavyScript, LiteScript, LodGroup, LodLevel,
-    MAX_LOD_LEVELS, MaterialOverride, MeshRenderer, ParamValue, SceneAsset, SceneDocument,
-    SceneError, SceneObject, SceneTransform,
+    MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue, SceneAsset,
+    SceneDocument, SceneError, SceneObject, SceneTransform,
 };
 pub use params::{ParamKind, ParamSchema, ParamSpec};
 pub use prefab::{

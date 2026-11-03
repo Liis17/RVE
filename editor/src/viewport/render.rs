@@ -3,7 +3,8 @@
 use crate::console::ConsoleLog;
 use crate::project::OpenProject;
 use crate::viewport::model_loader::ModelLoader;
-use engine_assets::Model;
+use engine_assets::{Model, ModelAlphaMode};
+use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, Material, MaterialId,
     MeshId, RenderError, Renderer, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
@@ -140,6 +141,14 @@ impl SceneRenderer {
                         .map(|path| (path.as_str(), TextureColorSpace::Linear)),
                     override_material
                         .normal_texture
+                        .as_ref()
+                        .map(|path| (path.as_str(), TextureColorSpace::Linear)),
+                    override_material
+                        .emissive_texture
+                        .as_ref()
+                        .map(|path| (path.as_str(), TextureColorSpace::Srgb)),
+                    override_material
+                        .occlusion_texture
                         .as_ref()
                         .map(|path| (path.as_str(), TextureColorSpace::Linear)),
                 ]
@@ -395,12 +404,32 @@ fn append_world_draws(
                         .copied()
                         .flatten()
                 });
+            let emissive_texture = override_material
+                .and_then(|material| material.emissive_texture.as_ref())
+                .and_then(|path| {
+                    resources
+                        .textures
+                        .get(&(path.as_str().to_owned(), TextureColorSpace::Srgb))
+                        .copied()
+                        .flatten()
+                });
+            let occlusion_texture = override_material
+                .and_then(|material| material.occlusion_texture.as_ref())
+                .and_then(|path| {
+                    resources
+                        .textures
+                        .get(&(path.as_str().to_owned(), TextureColorSpace::Linear))
+                        .copied()
+                        .flatten()
+                });
             let resolved = resolve_material(
                 *base_material,
                 replacement,
                 override_material,
                 mr_texture,
                 normal_texture,
+                emissive_texture,
+                occlusion_texture,
             );
             let material_id = if resolved == *base_material {
                 *base_material_id
@@ -453,6 +482,12 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                 base_color: base.base_color,
                 metallic: base.metallic,
                 roughness: base.roughness,
+                emissive: base.emissive,
+                opacity: base.opacity,
+                alpha_mode: match base.alpha_mode {
+                    ModelAlphaMode::Opaque => AlphaMode::Opaque,
+                    ModelAlphaMode::Blend => AlphaMode::Blend,
+                },
                 base_color_texture: model_texture(
                     renderer,
                     model,
@@ -477,7 +512,24 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     &mut textures_by_role,
                     &mut textures,
                 )?,
+                emissive_texture: model_texture(
+                    renderer,
+                    model,
+                    base.emissive_texture,
+                    TextureColorSpace::Srgb,
+                    &mut textures_by_role,
+                    &mut textures,
+                )?,
+                occlusion_texture: model_texture(
+                    renderer,
+                    model,
+                    base.occlusion_texture,
+                    TextureColorSpace::Linear,
+                    &mut textures_by_role,
+                    &mut textures,
+                )?,
                 normal_scale: base.normal_scale,
+                occlusion_strength: base.occlusion_strength,
             };
             let material_id = renderer.create_material(&material)?;
             materials.push(material_id);
@@ -545,6 +597,8 @@ fn resolve_material(
     override_material: Option<&MaterialOverride>,
     metallic_roughness_texture: Option<TextureId>,
     normal_texture: Option<TextureId>,
+    emissive_texture: Option<TextureId>,
+    occlusion_texture: Option<TextureId>,
 ) -> Material {
     if let Some(texture) = replacement_texture {
         base.base_color_texture = Some(texture);
@@ -559,14 +613,38 @@ fn resolve_material(
         if let Some(roughness) = override_material.roughness {
             base.roughness = roughness;
         }
+        if let Some(emissive) = override_material.emissive {
+            base.emissive = emissive;
+        }
+        if let Some(opacity) = override_material.opacity {
+            base.opacity = opacity;
+        }
+        if let Some(alpha_mode) = override_material.alpha_mode {
+            base.alpha_mode = match alpha_mode {
+                engine_scene::MaterialAlphaMode::Opaque => AlphaMode::Opaque,
+                engine_scene::MaterialAlphaMode::Mask => AlphaMode::Mask {
+                    cutoff: override_material.alpha_cutoff.unwrap_or(0.5),
+                },
+                engine_scene::MaterialAlphaMode::Blend => AlphaMode::Blend,
+            };
+        }
         if let Some(texture) = metallic_roughness_texture {
             base.metallic_roughness_texture = Some(texture);
         }
         if let Some(texture) = normal_texture {
             base.normal_texture = Some(texture);
         }
+        if let Some(texture) = emissive_texture {
+            base.emissive_texture = Some(texture);
+        }
+        if let Some(texture) = occlusion_texture {
+            base.occlusion_texture = Some(texture);
+        }
         if let Some(scale) = override_material.normal_scale {
             base.normal_scale = scale;
+        }
+        if let Some(strength) = override_material.occlusion_strength {
+            base.occlusion_strength = strength;
         }
     }
     base
@@ -783,17 +861,29 @@ id = "camera"
             base_color: Some([0.8, 0.7, 0.6]),
             metallic: Some(1.0),
             roughness: None,
+            emissive: Some([2.0, 1.0, 0.5]),
+            opacity: Some(0.4),
+            alpha_mode: Some(engine_scene::MaterialAlphaMode::Mask),
+            alpha_cutoff: Some(0.3),
             metallic_roughness_texture: None,
             normal_texture: None,
+            emissive_texture: None,
+            occlusion_texture: None,
             normal_scale: Some(0.5),
+            occlusion_strength: Some(0.25),
         };
 
-        let resolved = resolve_material(base, None, Some(&override_material), None, None);
+        let resolved =
+            resolve_material(base, None, Some(&override_material), None, None, None, None);
 
         assert_eq!(resolved.base_color, [0.8, 0.7, 0.6]);
         assert_eq!(resolved.metallic, 1.0);
         assert_eq!(resolved.roughness, 0.8);
+        assert_eq!(resolved.emissive, [2.0, 1.0, 0.5]);
+        assert_eq!(resolved.opacity, 0.4);
+        assert_eq!(resolved.alpha_mode, AlphaMode::Mask { cutoff: 0.3 });
         assert_eq!(resolved.normal_scale, 0.5);
+        assert_eq!(resolved.occlusion_strength, 0.25);
         assert_eq!(resolved.base_color_texture, None);
         assert_eq!(resolved.metallic_roughness_texture, None);
         assert_eq!(resolved.normal_texture, None);

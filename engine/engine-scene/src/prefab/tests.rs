@@ -162,7 +162,7 @@ mesh_renderer = { model = "/models/gold.fbx", texture = "/textures/gold.png" }
 lite_params = [{ path = "/scripts/rotate.lua", params = { speed = 90.0 } }]
 [[instances.overrides]]
 target = "frame"
-mesh_renderer = { material = { metallic = 0.9 } }
+mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opacity = 0.4, alpha_mode = "mask", alpha_cutoff = 0.25, occlusion_strength = 0.7 } }
 "#,
     ));
     let expanded = library.expand(&document).unwrap().document;
@@ -185,6 +185,33 @@ mesh_renderer = { material = { metallic = 0.9 } }
         .unwrap();
     assert_eq!(material.metallic, Some(0.9));
     assert_eq!(material.roughness, Some(0.4));
+    assert_eq!(material.emissive, Some([1.5, 0.2, 0.0]));
+    assert_eq!(material.opacity, Some(0.4));
+    assert_eq!(material.alpha_mode, Some(crate::MaterialAlphaMode::Mask));
+    assert_eq!(material.alpha_cutoff, Some(0.25));
+    assert_eq!(material.occlusion_strength, Some(0.7));
+}
+
+#[test]
+fn alpha_mode_override_removes_inherited_mask_cutoff() {
+    let alpha_door = DOOR.replace(
+        "roughness = 0.4",
+        "roughness = 0.4\nalpha_mode = \"mask\"\nalpha_cutoff = 0.4",
+    );
+    let library = Library::new(&[("prefabs/door.rveprefab", &alpha_door)]);
+    let document = scene(&door_scene(
+        "[[instances.overrides]]\ntarget = \"frame\"\nmesh_renderer = { material = { alpha_mode = \"blend\" } }\n",
+    ));
+    let expanded = library.expand(&document).unwrap().document;
+    let material = object(&expanded, "door1")
+        .mesh_renderer
+        .as_ref()
+        .unwrap()
+        .material
+        .as_ref()
+        .unwrap();
+    assert_eq!(material.alpha_mode, Some(crate::MaterialAlphaMode::Blend));
+    assert_eq!(material.alpha_cutoff, None);
 }
 
 #[test]

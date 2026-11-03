@@ -4,14 +4,14 @@ mod scene;
 
 use content::Content;
 use debug_overlay::DebugOverlay;
-use engine_assets::{ASSETS_DIR, AssetError, Assets};
+use engine_assets::{ASSETS_DIR, AssetError, Assets, ModelAlphaMode};
 use engine_core::Time;
 use engine_files::VirtualPath;
 use engine_project::BootstrapConfig;
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DrawCommand, Frame, FrameStatus, Material, MaterialId,
-    MeshId, Renderer, RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
-    ViewSettings,
+    AlphaMode, AntiAliasing as RenderAntiAliasing, DrawCommand, Frame, FrameStatus, Material,
+    MaterialId, MeshId, Renderer, RendererConfig, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
@@ -366,15 +366,50 @@ impl Sandbox {
                     )
                 })
                 .transpose()?;
+            let emissive_texture = mesh
+                .material
+                .emissive_texture
+                .map(|index| {
+                    upload_content_texture(
+                        renderer,
+                        &self.content.textures,
+                        &mut texture_cache,
+                        index,
+                        TextureColorSpace::Srgb,
+                    )
+                })
+                .transpose()?;
+            let occlusion_texture = mesh
+                .material
+                .occlusion_texture
+                .map(|index| {
+                    upload_content_texture(
+                        renderer,
+                        &self.content.textures,
+                        &mut texture_cache,
+                        index,
+                        TextureColorSpace::Linear,
+                    )
+                })
+                .transpose()?;
             let material_id = renderer
                 .create_material(&Material {
                     base_color: mesh.material.base_color,
                     metallic: mesh.material.metallic,
                     roughness: mesh.material.roughness,
+                    emissive: mesh.material.emissive,
+                    opacity: mesh.material.opacity,
+                    alpha_mode: match mesh.material.alpha_mode {
+                        ModelAlphaMode::Opaque => AlphaMode::Opaque,
+                        ModelAlphaMode::Blend => AlphaMode::Blend,
+                    },
                     base_color_texture,
                     metallic_roughness_texture,
                     normal_texture,
+                    emissive_texture,
+                    occlusion_texture,
                     normal_scale: mesh.material.normal_scale,
+                    occlusion_strength: mesh.material.occlusion_strength,
                 })
                 .map_err(|error| format!("ошибка создания материала: {error}"))?;
             self.meshes.push((id, material_id, mesh.environment));

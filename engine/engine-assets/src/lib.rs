@@ -44,19 +44,35 @@ pub struct ModelMesh {
     pub material: ModelMaterial,
 }
 
+/// Режим альфа-смешивания, извлечённый из FBX opacity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelAlphaMode {
+    #[default]
+    Opaque,
+    Blend,
+}
+
 /// Линейные факторы и индексы текстур материала модели.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelMaterial {
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
+    pub emissive: [f32; 3],
+    pub opacity: f32,
+    pub alpha_mode: ModelAlphaMode,
     /// Индекс в [`Model::textures`] для sRGB base-color.
     pub base_color_texture: Option<usize>,
     /// Индекс в [`Model::textures`] для линейной metallic-roughness карты.
     pub metallic_roughness_texture: Option<usize>,
     /// Индекс в [`Model::textures`] для линейной tangent-space normal карты.
     pub normal_texture: Option<usize>,
+    /// Индекс в [`Model::textures`] для sRGB emissive карты.
+    pub emissive_texture: Option<usize>,
+    /// Индекс в [`Model::textures`] для линейной ambient-occlusion карты.
+    pub occlusion_texture: Option<usize>,
     pub normal_scale: f32,
+    pub occlusion_strength: f32,
 }
 
 impl Default for ModelMaterial {
@@ -65,10 +81,16 @@ impl Default for ModelMaterial {
             base_color: [1.0; 3],
             metallic: 0.0,
             roughness: 1.0,
+            emissive: [0.0; 3],
+            opacity: 1.0,
+            alpha_mode: ModelAlphaMode::Opaque,
             base_color_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
+            emissive_texture: None,
+            occlusion_texture: None,
             normal_scale: 1.0,
+            occlusion_strength: 1.0,
         }
     }
 }
@@ -273,7 +295,12 @@ impl Assets {
                 let Some(material) = materials.get(part.index as usize) else {
                     continue;
                 };
-                for texture in material_textures(material).into_iter().flatten() {
+                let textures =
+                    material_textures(material).map_err(|message| AssetError::Decode {
+                        path: path.to_owned(),
+                        message: message.to_owned(),
+                    })?;
+                for texture in textures.all().into_iter().flatten() {
                     if !seen_textures.insert(texture.element.element_id)
                         || !texture.content.is_empty()
                     {
@@ -496,8 +523,7 @@ fn load_fbx(
         meshes: Vec::new(),
         textures: Vec::new(),
     };
-    let mut loaded_textures = HashMap::<u32, usize>::new();
-    let mut loaded_metallic_roughness = HashMap::<(Option<u32>, Option<u32>), usize>::new();
+    let mut texture_cache = ModelTextureCache::default();
     let mut triangle = Vec::new();
     for node in scene.nodes.iter() {
         let Some(mesh) = node.mesh.as_ref() else {
@@ -548,8 +574,7 @@ fn load_fbx(
                     path,
                     assets,
                     &mut model,
-                    &mut loaded_textures,
-                    &mut loaded_metallic_roughness,
+                    &mut texture_cache,
                 )?,
                 None => ModelMaterial::default(),
             };
@@ -576,14 +601,67 @@ fn diffuse_texture(material: &ufbx::Material) -> Option<&ufbx::Texture> {
         .find(|texture| texture.type_ == ufbx::TextureType::File)
 }
 
-fn material_textures(material: &ufbx::Material) -> [Option<&ufbx::Texture>; 4] {
+struct MaterialTextures<'a> {
+    base_color: Option<&'a ufbx::Texture>,
+    normal: Option<&'a ufbx::Texture>,
+    roughness: Option<&'a ufbx::Texture>,
+    metalness: Option<&'a ufbx::Texture>,
+    emissive: Option<&'a ufbx::Texture>,
+    occlusion: Option<&'a ufbx::Texture>,
+    opacity: Option<(&'a ufbx::Texture, bool)>,
+}
+
+#[derive(Default)]
+struct ModelTextureCache {
+    loaded_textures: HashMap<u32, usize>,
+    loaded_metallic_roughness: HashMap<(Option<u32>, Option<u32>), usize>,
+    loaded_base_color_opacity: HashMap<(Option<u32>, u32, bool), usize>,
+}
+
+impl MaterialTextures<'_> {
+    fn all(&self) -> [Option<&ufbx::Texture>; 7] {
+        [
+            self.base_color,
+            self.normal,
+            self.roughness,
+            self.metalness,
+            self.emissive,
+            self.occlusion,
+            self.opacity.map(|(texture, _)| texture),
+        ]
+    }
+}
+
+fn material_textures(material: &ufbx::Material) -> Result<MaterialTextures<'_>, &'static str> {
     let pbr = supports_metallic_roughness(material.shader_type);
-    [
-        diffuse_texture(material),
-        file_texture(&material.pbr.normal_map).or_else(|| file_texture(&material.fbx.normal_map)),
-        pbr.then(|| file_texture(&material.pbr.roughness)).flatten(),
-        pbr.then(|| file_texture(&material.pbr.metalness)).flatten(),
-    ]
+    let opacity_map = if material.pbr.opacity.texture.is_some() {
+        Some((&material.pbr.opacity, false))
+    } else if material.fbx.transparency_factor.texture.is_some() {
+        Some((&material.fbx.transparency_factor, true))
+    } else if material.fbx.transparency_color.texture.is_some() {
+        Some((&material.fbx.transparency_color, true))
+    } else {
+        None
+    }
+    .map(|(map, invert)| {
+        map.texture
+            .as_deref()
+            .filter(|texture| texture.type_ == ufbx::TextureType::File)
+            .map(|texture| (texture, invert))
+            .ok_or("opacity texture must be a file texture")
+    })
+    .transpose()?;
+    Ok(MaterialTextures {
+        base_color: diffuse_texture(material),
+        normal: file_texture(&material.pbr.normal_map)
+            .or_else(|| file_texture(&material.fbx.normal_map)),
+        roughness: pbr.then(|| file_texture(&material.pbr.roughness)).flatten(),
+        metalness: pbr.then(|| file_texture(&material.pbr.metalness)).flatten(),
+        emissive: file_texture(&material.pbr.emission_color)
+            .or_else(|| file_texture(&material.fbx.emission_color)),
+        occlusion: file_texture(&material.pbr.ambient_occlusion),
+        opacity: opacity_map,
+    })
 }
 
 fn file_texture(map: &ufbx::MaterialMap) -> Option<&ufbx::Texture> {
@@ -612,11 +690,19 @@ fn load_model_material(
     model_path: &Path,
     assets: &Assets,
     model: &mut Model,
-    loaded_textures: &mut HashMap<u32, usize>,
-    loaded_metallic_roughness: &mut HashMap<(Option<u32>, Option<u32>), usize>,
+    texture_cache: &mut ModelTextureCache,
 ) -> Result<ModelMaterial, AssetError> {
-    let [base_color, normal, roughness, metalness] = material_textures(material);
-    let base_color_texture = base_color
+    let ModelTextureCache {
+        loaded_textures,
+        loaded_metallic_roughness,
+        loaded_base_color_opacity,
+    } = texture_cache;
+    let textures = material_textures(material).map_err(|message| AssetError::Decode {
+        path: model_path.to_owned(),
+        message: message.to_owned(),
+    })?;
+    let base_color_source = textures
+        .base_color
         .map(|texture| {
             load_model_texture(
                 model_virtual_path,
@@ -628,7 +714,8 @@ fn load_model_material(
             )
         })
         .transpose()?;
-    let normal_texture = normal
+    let normal_texture = textures
+        .normal
         .map(|texture| {
             load_model_texture(
                 model_virtual_path,
@@ -643,14 +730,79 @@ fn load_model_material(
     let metallic_roughness_texture = load_metallic_roughness_texture(
         model_virtual_path,
         model_path,
-        (roughness, metalness),
+        (textures.roughness, textures.metalness),
         assets,
         model,
         loaded_textures,
         loaded_metallic_roughness,
     )?;
+    let opacity_texture = textures
+        .opacity
+        .map(|(texture, invert)| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+            .map(|index| (index, invert, texture.element.element_id))
+        })
+        .transpose()?;
+    let base_color_texture = if let Some((opacity_index, invert, opacity_id)) = opacity_texture {
+        let base_id = textures
+            .base_color
+            .map(|texture| texture.element.element_id);
+        let key = (base_id, opacity_id, invert);
+        if let Some(&index) = loaded_base_color_opacity.get(&key) {
+            Some(index)
+        } else {
+            let combined = combine_base_color_opacity(
+                base_color_source.map(|index| &model.textures[index]),
+                &model.textures[opacity_index],
+                invert,
+            )
+            .map_err(|message| AssetError::Decode {
+                path: model_path.to_owned(),
+                message,
+            })?;
+            model.textures.push(combined);
+            let index = model.textures.len() - 1;
+            loaded_base_color_opacity.insert(key, index);
+            Some(index)
+        }
+    } else {
+        base_color_source
+    };
+    let emissive_texture = textures
+        .emissive
+        .map(|texture| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+        })
+        .transpose()?;
+    let occlusion_texture = textures
+        .occlusion
+        .map(|texture| {
+            load_model_texture(
+                model_virtual_path,
+                model_path,
+                texture,
+                assets,
+                model,
+                loaded_textures,
+            )
+        })
+        .transpose()?;
     let has_metallic_roughness = supports_metallic_roughness(material.shader_type);
-    let base_color_factor = if base_color_texture.is_some() {
+    let base_color_factor = if base_color_source.is_some() {
         [1.0; 3]
     } else if material.pbr.base_color.has_value {
         map_vec3(&material.pbr.base_color)
@@ -664,11 +816,21 @@ fn load_model_material(
     } else {
         [1.0; 3]
     };
+    let emissive = emissive_factor(material);
+    let opacity = opacity_factor(material);
+    let has_transparent_base_alpha = base_color_texture.is_some_and(|index| {
+        model.textures[index]
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] < 255)
+    });
     Ok(ModelMaterial {
         base_color: base_color_factor,
         metallic: if !has_metallic_roughness {
             0.0
-        } else if metalness.is_some() {
+        } else if textures.metalness.is_some() {
             1.0
         } else if material.pbr.metalness.has_value {
             map_scalar(&material.pbr.metalness)
@@ -676,17 +838,31 @@ fn load_model_material(
             0.0
         },
         roughness: if has_metallic_roughness
-            && roughness.is_none()
+            && textures.roughness.is_none()
             && material.pbr.roughness.has_value
         {
             map_scalar(&material.pbr.roughness)
         } else {
             1.0
         },
+        emissive,
+        opacity,
+        alpha_mode: if opacity < 1.0 || opacity_texture.is_some() || has_transparent_base_alpha {
+            ModelAlphaMode::Blend
+        } else {
+            ModelAlphaMode::Opaque
+        },
         base_color_texture,
         metallic_roughness_texture,
         normal_texture,
+        emissive_texture,
+        occlusion_texture,
         normal_scale: 1.0,
+        occlusion_strength: if material.pbr.ambient_occlusion.has_value {
+            map_scalar(&material.pbr.ambient_occlusion)
+        } else {
+            1.0
+        },
     })
 }
 
@@ -700,6 +876,81 @@ fn map_vec3(map: &ufbx::MaterialMap) -> [f32; 3] {
         map.value_vec4.y as f32,
         map.value_vec4.z as f32,
     ]
+}
+
+fn emissive_factor(material: &ufbx::Material) -> [f32; 3] {
+    let (color, factor) = if material.pbr.emission_color.has_value
+        || material.pbr.emission_color.texture.is_some()
+        || material.pbr.emission_factor.has_value
+    {
+        (&material.pbr.emission_color, &material.pbr.emission_factor)
+    } else {
+        (&material.fbx.emission_color, &material.fbx.emission_factor)
+    };
+    if !color.has_value && color.texture.is_none() && !factor.has_value {
+        return [0.0; 3];
+    }
+    let color_factor = if color.has_value {
+        map_vec3(color)
+    } else {
+        [1.0; 3]
+    };
+    let scalar = if factor.has_value {
+        map_scalar(factor)
+    } else {
+        1.0
+    };
+    color_factor.map(|channel| channel * scalar)
+}
+
+fn opacity_factor(material: &ufbx::Material) -> f32 {
+    if material.pbr.opacity.has_value || material.pbr.opacity.texture.is_some() {
+        if material.pbr.opacity.has_value {
+            map_scalar(&material.pbr.opacity)
+        } else {
+            1.0
+        }
+    } else if material.fbx.transparency_factor.has_value
+        || material.fbx.transparency_factor.texture.is_some()
+    {
+        1.0 - map_scalar(&material.fbx.transparency_factor)
+    } else if material.fbx.transparency_color.has_value
+        || material.fbx.transparency_color.texture.is_some()
+    {
+        1.0 - map_scalar(&material.fbx.transparency_color)
+    } else {
+        1.0
+    }
+}
+
+fn combine_base_color_opacity(
+    base_color: Option<&TextureData>,
+    opacity: &TextureData,
+    invert_opacity: bool,
+) -> Result<TextureData, String> {
+    if base_color.is_some_and(|base| (base.width, base.height) != (opacity.width, opacity.height)) {
+        return Err("base color и opacity карты имеют разные размеры".to_owned());
+    }
+    let mut rgba =
+        base_color.map_or_else(|| vec![255; opacity.rgba.len()], |base| base.rgba.clone());
+    for (pixel, opacity_pixel) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(opacity.rgba.as_chunks::<4>().0.iter())
+    {
+        let opacity = if invert_opacity {
+            255 - opacity_pixel[0]
+        } else {
+            opacity_pixel[0]
+        };
+        pixel[3] = ((u16::from(pixel[3]) * u16::from(opacity) + 127) / 255) as u8;
+    }
+    Ok(TextureData {
+        width: opacity.width,
+        height: opacity.height,
+        rgba,
+    })
 }
 
 fn load_model_texture(
@@ -1058,9 +1309,9 @@ fn normalize([x, y, z]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetError, Assets, Model, ModelMaterial, ModelMesh, ModelVertex, TextureData, decode_png,
-        is_missing_texture_candidate, map_resource_error, pack_metallic_roughness,
-        supports_metallic_roughness, texture_candidates,
+        AssetError, Assets, Model, ModelAlphaMode, ModelMaterial, ModelMesh, ModelVertex,
+        TextureData, decode_png, is_missing_texture_candidate, map_resource_error,
+        pack_metallic_roughness, supports_metallic_roughness, texture_candidates,
     };
     use engine_files::VirtualPath;
     use engine_pak::{ArchiveId, ArchiveWriter, BlobId, WriterOptions};
@@ -1901,6 +2152,94 @@ mod tests {
         assert!(material.metallic_roughness_texture.is_none());
         assert!(material.normal_texture.is_none());
         assert!(model.textures.is_empty());
+    }
+
+    #[test]
+    fn pbr_emissive_and_opacity_maps_load_and_join_opacity_into_base_color_alpha() {
+        let temp = TempAssets::new("pbr-emissive-opacity");
+        let fbx = arnold_quad_fbx(
+            "\t\t\tP: \"emission\", \"Number\", \"\", \"A\", 2.5\n\t\t\tP: \"emissionColor\", \"Color\", \"\", \"A\", 0.2, 0.4, 0.8\n\t\t\tP: \"opacity\", \"Number\", \"\", \"A\", 0.6",
+            &[
+                ("emissionColor", "emissive.png"),
+                ("opacity", "opacity.png"),
+            ],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/emissive.png", &rgba_png());
+        temp.write(
+            "model/opacity.png",
+            &encode_png(
+                2,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[64, 0, 0, 255, 128, 0, 0, 255],
+            ),
+        );
+
+        let assets = temp.assets();
+        let model = assets.load_model("/model/pbr.fbx").unwrap();
+        let material = &model.meshes[0].material;
+        assert_eq!(material.emissive, [0.5, 1.0, 2.0]);
+        assert_eq!(material.opacity, 0.6);
+        assert_eq!(material.alpha_mode, ModelAlphaMode::Blend);
+        let base_color = &model.textures[material.base_color_texture.unwrap()];
+        assert_eq!(base_color.rgba, [255, 255, 255, 64, 255, 255, 255, 128]);
+        assert_eq!(
+            assets.model_dependencies("/model/pbr.fbx").unwrap(),
+            ["/model/emissive.png", "/model/opacity.png"]
+        );
+    }
+
+    #[test]
+    fn pbr_occlusion_map_uses_linear_red_channel_and_is_a_builder_dependency() {
+        let temp = TempAssets::new("pbr-occlusion");
+        let fbx = arnold_quad_fbx(
+            "\t\t\tP: \"3dsMax|ClassIDa\", \"int\", \"Integer\", \"\", -804315648\n\t\t\tP: \"3dsMax|ClassIDb\", \"int\", \"Integer\", \"\", -1099438848\n\t\t\tP: \"3dsMax|main|ao\", \"Number\", \"\", \"A\", 0.35",
+            &[("3dsMax|main|ao", "ao.png")],
+            false,
+        )
+        .replace("\tC: \"OO\",3000,5000\n", "")
+        .replace("ShadingModel: \"lambert\"", "ShadingModel: \"unknown\"");
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/ao.png", &rgba_png());
+
+        let assets = temp.assets();
+        let model = assets.load_model("/model/pbr.fbx").unwrap();
+        let material = &model.meshes[0].material;
+        assert_eq!(material.occlusion_strength, 0.35);
+        assert_eq!(material.occlusion_texture, Some(0));
+        assert_eq!(
+            assets.model_dependencies("/model/pbr.fbx").unwrap(),
+            ["/model/ao.png"]
+        );
+    }
+
+    #[test]
+    fn opacity_maps_with_incompatible_dimensions_fail_instead_of_being_ignored() {
+        let temp = TempAssets::new("pbr-opacity-size-mismatch");
+        let fbx = arnold_quad_fbx(
+            "",
+            &[("baseColor", "base.png"), ("opacity", "opacity.png")],
+            false,
+        );
+        temp.write("model/pbr.fbx", fbx.as_bytes());
+        temp.write("model/base.png", &rgba_png());
+        temp.write(
+            "model/opacity.png",
+            &encode_png(
+                1,
+                1,
+                png::ColorType::Rgba,
+                png::BitDepth::Eight,
+                &[128, 128, 128, 255],
+            ),
+        );
+
+        let error = temp.assets().load_model("/model/pbr.fbx").unwrap_err();
+        assert!(matches!(error, AssetError::Decode { .. }));
+        assert!(error.to_string().contains("разные размеры"));
     }
 
     #[test]

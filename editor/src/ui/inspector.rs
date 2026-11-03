@@ -6,8 +6,8 @@ use crate::state::{Action, AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, ParamSchema, ParamSpec,
-    ParamValue, SceneObject, SceneTransform,
+    CameraComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode,
+    ParamSchema, ParamSpec, ParamValue, SceneObject, SceneTransform,
 };
 use std::collections::BTreeMap;
 
@@ -614,14 +614,22 @@ fn show_material(
         base_color: None,
         metallic: None,
         roughness: None,
+        emissive: None,
+        opacity: None,
+        alpha_mode: None,
+        alpha_cutoff: None,
         metallic_roughness_texture: None,
         normal_texture: None,
+        emissive_texture: None,
+        occlusion_texture: None,
         normal_scale: None,
+        occlusion_strength: None,
     });
     let mut toggled = false;
     let mut picked = false;
+    let mut alpha_mode_picked = false;
     let mut response = None;
-    let mut texture_choices = [None, None];
+    let mut texture_choices = [None, None, None, None];
     ui.label("Material Override");
     egui::Grid::new("material").num_columns(2).show(ui, |ui| {
         toggled |= optional_value(
@@ -664,6 +672,83 @@ fn show_material(
         );
         toggled |= optional_value(
             ui,
+            "Emissive",
+            &mut material.emissive,
+            [0.0; 3],
+            |ui, color| {
+                let mut combined = None;
+                for channel in color.iter_mut() {
+                    let field = egui::DragValue::new(channel)
+                        .speed(0.1)
+                        .range(0.0..=f32::MAX);
+                    merge_response(&mut combined, ui.add(field));
+                }
+                combined
+            },
+            &mut response,
+        );
+        toggled |= optional_value(
+            ui,
+            "Opacity",
+            &mut material.opacity,
+            1.0,
+            factor,
+            &mut response,
+        );
+        toggled |= optional_value(
+            ui,
+            "Occlusion Strength",
+            &mut material.occlusion_strength,
+            1.0,
+            factor,
+            &mut response,
+        );
+        toggled |= optional_value(
+            ui,
+            "Alpha Mode",
+            &mut material.alpha_mode,
+            MaterialAlphaMode::Opaque,
+            |ui, mode| {
+                let label = match mode {
+                    MaterialAlphaMode::Opaque => "Opaque",
+                    MaterialAlphaMode::Mask => "Mask",
+                    MaterialAlphaMode::Blend => "Blend",
+                };
+                let response = egui::ComboBox::from_id_salt(format!("material_alpha_mode_{id}"))
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        alpha_mode_picked |= ui
+                            .selectable_value(mode, MaterialAlphaMode::Opaque, "Opaque")
+                            .changed();
+                        alpha_mode_picked |= ui
+                            .selectable_value(mode, MaterialAlphaMode::Mask, "Mask")
+                            .changed();
+                        alpha_mode_picked |= ui
+                            .selectable_value(mode, MaterialAlphaMode::Blend, "Blend")
+                            .changed();
+                    })
+                    .response;
+                Some(response)
+            },
+            &mut response,
+        );
+        if material.alpha_mode != Some(MaterialAlphaMode::Mask)
+            && material.alpha_cutoff.take().is_some()
+        {
+            toggled = true;
+        }
+        if material.alpha_mode == Some(MaterialAlphaMode::Mask) {
+            toggled |= optional_value(
+                ui,
+                "Alpha Cutoff",
+                &mut material.alpha_cutoff,
+                0.5,
+                factor,
+                &mut response,
+            );
+        }
+        toggled |= optional_value(
+            ui,
             "Normal Scale",
             &mut material.normal_scale,
             1.0,
@@ -673,6 +758,8 @@ fn show_material(
         let maps = [
             ("Metal/Rough Map", &material.metallic_roughness_texture),
             ("Normal Map", &material.normal_texture),
+            ("Emissive Map", &material.emissive_texture),
+            ("Occlusion Map", &material.occlusion_texture),
         ];
         for (index, (label, path)) in maps.into_iter().enumerate() {
             ui.label(label);
@@ -683,10 +770,12 @@ fn show_material(
         }
     });
 
-    let mut discrete = toggled;
+    let mut discrete = toggled || alpha_mode_picked;
     for (choice, slot) in texture_choices.into_iter().zip([
         &mut material.metallic_roughness_texture,
         &mut material.normal_texture,
+        &mut material.emissive_texture,
+        &mut material.occlusion_texture,
     ]) {
         let Some(choice) = choice else {
             continue;

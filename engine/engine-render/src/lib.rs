@@ -1,7 +1,7 @@
 //! Vulkan-рендерер, форматы изображений и материалы сцены.
 
 use ash::{Entry, vk};
-use culling::{Frustum, LocalBounds};
+use culling::{Frustum, LocalBounds, back_to_front_order};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use std::collections::HashSet;
 use std::error::Error;
@@ -34,16 +34,19 @@ const ACQUIRE_TIMEOUT_NS: u64 = 100_000_000;
 const NO_GRAPHICS_QUEUE_FAMILY_REASON: &str = "нет graphics queue family";
 const NO_GRAPHICS_PRESENT_QUEUE_FAMILY_REASON: &str = "нет общей graphics + present queue family";
 const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
-const MESH_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
+const MESH_OPAQUE_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.opaque.spv"));
+const MESH_MASK_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.mask.spv"));
+const MESH_BLEND_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.blend.spv"));
 const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
+const SHADOW_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
 const OVERLAY_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.vert.spv"));
 const OVERLAY_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/overlay.frag.spv"));
 const SWAPCHAIN_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::COLOR_ATTACHMENT;
-const SURFACE_FORMAT_FEATURES: vk::FormatFeatureFlags = vk::FormatFeatureFlags::from_raw(
-    vk::FormatFeatureFlags::COLOR_ATTACHMENT.as_raw()
-        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND.as_raw(),
-);
+const SURFACE_FORMAT_FEATURES: vk::FormatFeatureFlags = vk::FormatFeatureFlags::COLOR_ATTACHMENT;
 const UI_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.vert.spv"));
 const UI_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.frag.spv"));
 const FULLSCREEN_VERTEX_SHADER: &[u8] =
@@ -62,7 +65,7 @@ const FLAT_NORMAL_TEXTURE: usize = 2;
 const DEFAULT_MATERIAL: usize = 0;
 const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
 const FRAME_UNIFORMS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>() + 5 * size_of::<[f32; 4]>();
-const MATERIAL_UNIFORMS_SIZE: usize = 2 * size_of::<[f32; 4]>();
+const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
 const IDENTITY_MATRIX: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -113,16 +116,34 @@ pub enum TextureColorSpace {
     Linear,
 }
 
+/// Обработка альфа-канала материала.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum AlphaMode {
+    /// Всегда непрозрачный; альфа текстуры и `opacity` игнорируются.
+    #[default]
+    Opaque,
+    /// Пиксели ниже порога отбрасываются, остальные остаются непрозрачными.
+    Mask { cutoff: f32 },
+    /// Альфа смешивается с уже нарисованным цветом в порядке от дальнего к ближнему.
+    Blend,
+}
+
 /// Неизменяемые параметры материала и необязательные текстуры.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
+    pub emissive: [f32; 3],
+    pub opacity: f32,
+    pub alpha_mode: AlphaMode,
     pub base_color_texture: Option<TextureId>,
     pub metallic_roughness_texture: Option<TextureId>,
     pub normal_texture: Option<TextureId>,
+    pub emissive_texture: Option<TextureId>,
+    pub occlusion_texture: Option<TextureId>,
     pub normal_scale: f32,
+    pub occlusion_strength: f32,
 }
 
 impl Default for Material {
@@ -131,10 +152,16 @@ impl Default for Material {
             base_color: [1.0; 3],
             metallic: 0.0,
             roughness: 1.0,
+            emissive: [0.0; 3],
+            opacity: 1.0,
+            alpha_mode: AlphaMode::Opaque,
             base_color_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
+            emissive_texture: None,
+            occlusion_texture: None,
             normal_scale: 1.0,
+            occlusion_strength: 1.0,
         }
     }
 }
@@ -456,6 +483,8 @@ pub struct Renderer {
     command_pool: Option<vk::CommandPool>,
     pipeline_layout: Option<vk::PipelineLayout>,
     pipeline: Option<vk::Pipeline>,
+    mask_pipeline: Option<vk::Pipeline>,
+    blend_pipeline: Option<vk::Pipeline>,
     shadow_pipeline: Option<vk::Pipeline>,
     post_pipeline_layout: Option<vk::PipelineLayout>,
     tonemap_pipeline: Option<vk::Pipeline>,
@@ -531,6 +560,8 @@ impl Renderer {
             command_pool: None,
             pipeline_layout: None,
             pipeline: None,
+            mask_pipeline: None,
+            blend_pipeline: None,
             shadow_pipeline: None,
             post_pipeline_layout: None,
             tonemap_pipeline: None,
@@ -969,6 +1000,7 @@ impl Renderer {
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
             frame_set,
             meshes: &self.meshes,
+            materials: &self.materials,
             draws: frame.draws,
             light_view_projection: frame.shadow_view_projection,
             enabled: frame.shadow_view_projection.is_some(),
@@ -981,6 +1013,12 @@ impl Renderer {
             pipeline: self
                 .pipeline
                 .ok_or(RenderError::InvalidState("pipeline отсутствует"))?,
+            mask_pipeline: self
+                .mask_pipeline
+                .ok_or(RenderError::InvalidState("mask pipeline отсутствует"))?,
+            blend_pipeline: self
+                .blend_pipeline
+                .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?,
             pipeline_layout: self
                 .pipeline_layout
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
@@ -989,6 +1027,7 @@ impl Renderer {
             materials: &self.materials,
             draws: frame.draws,
             view_projection: frame.view_projection,
+            camera_position: frame.camera_position,
             clear_color: frame.clear_color,
             timestamps,
             view: frame.view,
@@ -1215,6 +1254,12 @@ impl Renderer {
         let scene_pipeline = self
             .pipeline
             .ok_or(RenderError::InvalidState("pipeline отсутствует"))?;
+        let mask_pipeline = self
+            .mask_pipeline
+            .ok_or(RenderError::InvalidState("mask pipeline отсутствует"))?;
+        let blend_pipeline = self
+            .blend_pipeline
+            .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?;
         let slot_timestamps = self.frames[frame_slot].timestamps;
         let scene_passes = rendered
             .iter()
@@ -1228,18 +1273,22 @@ impl Renderer {
                             pipeline_layout,
                             frame_set: *frame_set,
                             meshes: &self.meshes,
+                            materials: &self.materials,
                             draws: frame.draws,
                             light_view_projection: frame.shadow_view_projection,
                             enabled: frame.shadow_view_projection.is_some(),
                         },
                         ScenePass {
                             pipeline: scene_pipeline,
+                            mask_pipeline,
+                            blend_pipeline,
                             pipeline_layout,
                             frame_set: *frame_set,
                             meshes: &self.meshes,
                             materials: &self.materials,
                             draws: frame.draws,
                             view_projection: frame.view_projection,
+                            camera_position: frame.camera_position,
                             clear_color: frame.clear_color,
                             timestamps: slot_timestamps.filter(|_| index == 0),
                             view: frame.view,
@@ -1709,13 +1758,23 @@ impl Renderer {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let material_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&material_bindings);
-        // SAFETY: the bindings match the fragment material uniform, three maps and shared sampler.
+        // SAFETY: the bindings match the fragment material uniform, five maps and shared sampler.
         self.material_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&material_layout_info, None) }?);
 
@@ -1973,7 +2032,7 @@ impl Renderer {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(3),
+                .descriptor_count(5),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
@@ -1981,7 +2040,7 @@ impl Renderer {
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
             .pool_sizes(&pool_sizes);
-        // SAFETY: the pool holds one material uniform, three images and one sampler.
+        // SAFETY: the pool holds one material uniform, five images and one sampler.
         let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
         let result = (|| {
             let layouts = [self.material_set_layout()?];
@@ -2007,8 +2066,10 @@ impl Renderer {
                 texture_for(material.base_color_texture, WHITE_SRGB_TEXTURE)?,
                 texture_for(material.metallic_roughness_texture, WHITE_LINEAR_TEXTURE)?,
                 texture_for(material.normal_texture, FLAT_NORMAL_TEXTURE)?,
+                texture_for(material.emissive_texture, WHITE_SRGB_TEXTURE)?,
+                texture_for(material.occlusion_texture, WHITE_LINEAR_TEXTURE)?,
             ];
-            let image_infos: [vk::DescriptorImageInfo; 3] = std::array::from_fn(|index| {
+            let image_infos: [vk::DescriptorImageInfo; 5] = std::array::from_fn(|index| {
                 vk::DescriptorImageInfo::default()
                     .image_view(texture_refs[index].image.view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -2045,6 +2106,16 @@ impl Renderer {
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&image_infos[3..4]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(5)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&image_infos[4..5]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(6)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(&sampler_info),
             ];
@@ -2056,6 +2127,7 @@ impl Renderer {
                 set,
                 _uniform_buffer: uniform_buffer,
                 _textures: texture_refs,
+                alpha_mode: material.alpha_mode,
             })
         })();
         if result.is_err() {
@@ -2118,15 +2190,32 @@ impl Renderer {
         self.pipeline_layout = Some(unsafe { device.create_pipeline_layout(&layout_info, None) }?);
 
         let vertex_module = ShaderModule::new(&device, MESH_VERTEX_SHADER)?;
-        let fragment_module = ShaderModule::new(&device, MESH_FRAGMENT_SHADER)?;
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vertex_module.handle)
-                .name(c"main"),
+        let opaque_module = ShaderModule::new(&device, MESH_OPAQUE_FRAGMENT_SHADER)?;
+        let mask_module = ShaderModule::new(&device, MESH_MASK_FRAGMENT_SHADER)?;
+        let blend_module = ShaderModule::new(&device, MESH_BLEND_FRAGMENT_SHADER)?;
+        let vertex_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex_module.handle)
+            .name(c"main");
+        let opaque_stages = [
+            vertex_stage,
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fragment_module.handle)
+                .module(opaque_module.handle)
+                .name(c"main"),
+        ];
+        let mask_stages = [
+            vertex_stage,
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(mask_module.handle)
+                .name(c"main"),
+        ];
+        let blend_stages = [
+            vertex_stage,
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(blend_module.handle)
                 .name(c"main"),
         ];
         let vertex_bindings = [vk::VertexInputBindingDescription::default()
@@ -2175,38 +2264,105 @@ impl Renderer {
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let transparent_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B,
+            )];
+        let transparent_color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&transparent_attachments);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
             .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let transparent_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(false)
             .depth_compare_op(vk::CompareOp::LESS);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let color_formats = [OFFSCREEN_FORMAT];
-        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+        let mut opaque_rendering_info = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(DEPTH_FORMAT);
-        let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization)
-            .multisample_state(&multisample)
-            .depth_stencil_state(&depth_stencil)
-            .color_blend_state(&color_blend)
-            .dynamic_state(&dynamic_state)
-            .layout(
-                self.pipeline_layout
-                    .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
-            )
-            .push_next(&mut rendering_info)];
+        let mut mask_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let mut blend_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let pipeline_layout = self
+            .pipeline_layout
+            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+        let pipeline_info = [
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&opaque_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&depth_stencil)
+                .color_blend_state(&color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut opaque_rendering_info),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&mask_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&depth_stencil)
+                .color_blend_state(&color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut mask_rendering_info),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&blend_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&transparent_depth_stencil)
+                .color_blend_state(&transparent_color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut blend_rendering_info),
+        ];
         // SAFETY: shader modules, layout and dynamic-rendering formats are valid for this device.
-        let pipelines = unsafe {
+        let mut pipelines = match unsafe {
             device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+        } {
+            Ok(pipelines) => pipelines,
+            Err((pipelines, error)) => {
+                for pipeline in pipelines {
+                    // SAFETY: these partial pipeline handles were returned by this device.
+                    unsafe { device.destroy_pipeline(pipeline, None) };
+                }
+                return Err(RenderError::Vulkan(error));
+            }
+        };
+        if pipelines.len() != 3 {
+            for pipeline in pipelines {
+                // SAFETY: these pipeline handles were returned by this device.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            return Err(RenderError::InvalidState(
+                "mesh pipelines не созданы полностью",
+            ));
         }
-        .map_err(|(_, error)| RenderError::Vulkan(error))?;
-        self.pipeline = pipelines.into_iter().next();
+        self.pipeline = Some(pipelines.remove(0));
+        self.mask_pipeline = Some(pipelines.remove(0));
+        self.blend_pipeline = Some(pipelines.remove(0));
         Ok(())
     }
 
@@ -2214,19 +2370,33 @@ impl Renderer {
     fn create_shadow_pipeline(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
         let vertex_module = ShaderModule::new(&device, SHADOW_VERTEX_SHADER)?;
-        let stages = [vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vertex_module.handle)
-            .name(c"main")];
+        let fragment_module = ShaderModule::new(&device, SHADOW_FRAGMENT_SHADER)?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_module.handle)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_module.handle)
+                .name(c"main"),
+        ];
         let vertex_bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
             .stride(size_of::<Vertex>() as u32)
             .input_rate(vk::VertexInputRate::VERTEX)];
-        let vertex_attributes = [vk::VertexInputAttributeDescription::default()
-            .location(0)
-            .binding(0)
-            .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(std::mem::offset_of!(Vertex, position) as u32)];
+        let vertex_attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, position) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, uv) as u32),
+        ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
             .vertex_attribute_descriptions(&vertex_attributes);
@@ -2656,7 +2826,14 @@ impl Drop for Renderer {
                 // SAFETY: the device is idle, so no command buffer uses this pipeline.
                 unsafe { device.destroy_pipeline(pipeline, None) };
             }
-            if let Some(pipeline) = self.pipeline.take() {
+            for pipeline in [
+                self.pipeline.take(),
+                self.mask_pipeline.take(),
+                self.blend_pipeline.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 // SAFETY: the device is idle, so no command buffer uses this pipeline.
                 unsafe { device.destroy_pipeline(pipeline, None) };
             }
@@ -2749,6 +2926,7 @@ struct DeviceFacts {
     synchronization2: bool,
     supported_extensions: HashSet<String>,
     graphics_queue_families: Vec<bool>,
+    offscreen_format_features: vk::FormatFeatureFlags,
 }
 
 struct DeviceEvaluation {
@@ -2792,6 +2970,13 @@ fn evaluate_device(facts: &DeviceFacts, required_extensions: &[CString]) -> Devi
     }
     if !facts.synchronization2 {
         reasons.push("не поддерживается synchronization2".to_owned());
+    }
+    let missing_offscreen = missing_offscreen_format_features(facts.offscreen_format_features);
+    if !missing_offscreen.is_empty() {
+        reasons.push(format!(
+            "R16G16B16A16_SFLOAT не поддерживает HDR scene и blending: {}",
+            missing_offscreen.join(", ")
+        ));
     }
     for extension in required_extensions {
         let name = extension.to_string_lossy();
@@ -2849,6 +3034,10 @@ fn inspect_device(
     let queue_families =
         // SAFETY: queue-family properties are read from the live physical device.
         unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    let offscreen_format_features = unsafe {
+        instance.get_physical_device_format_properties(physical_device, OFFSCREEN_FORMAT)
+    }
+    .optimal_tiling_features;
     let facts = DeviceFacts {
         api_version: properties.api_version,
         dynamic_rendering: features_13.dynamic_rendering != vk::FALSE,
@@ -2860,6 +3049,7 @@ fn inspect_device(
                 family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
             })
             .collect(),
+        offscreen_format_features,
     };
     let evaluation = evaluate_device(&facts, required_extensions);
     let srgb_features = unsafe {
@@ -2933,19 +3123,6 @@ fn choose_device(
             continue;
         }
 
-        // SAFETY: properties and format support are queried for this physical device.
-        let offscreen_properties = unsafe {
-            instance.get_physical_device_format_properties(physical_device, OFFSCREEN_FORMAT)
-        };
-        let offscreen_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
-        if !offscreen_properties
-            .optimal_tiling_features
-            .contains(offscreen_features)
-        {
-            reasons.push("R16G16B16A16_SFLOAT не поддерживает HDR scene sampling".to_owned());
-        }
         // SAFETY: format support is queried for this physical device.
         let ldr_properties =
             unsafe { instance.get_physical_device_format_properties(physical_device, LDR_FORMAT) };
@@ -2994,8 +3171,7 @@ fn choose_device(
         }
         let surface_format = choose_surface_format(instance, physical_device, &surface_formats);
         if surface_format.is_none() {
-            reasons
-                .push("нет surface-формата с COLOR_ATTACHMENT и COLOR_ATTACHMENT_BLEND".to_owned());
+            reasons.push("нет surface-формата с COLOR_ATTACHMENT".to_owned());
         }
 
         let mut queue_family_index = None;
@@ -4122,7 +4298,7 @@ fn record_scene(
         .image_view(target.depth.view)
         .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
         .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: 1.0,
@@ -4139,20 +4315,98 @@ fn record_scene(
         .depth_attachment(&depth_attachment);
     // SAFETY: the dynamic-rendering attachment view covers the configured render extent.
     unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
-    record_draws(device, command_buffer, render_extent, scene);
+    record_draws(
+        device,
+        command_buffer,
+        render_extent,
+        scene,
+        DrawPass::OpaqueAndMask,
+    );
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
+    if has_transparent_draws(scene) {
+        let color_to_blend = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(target.color.image)
+            .subresource_range(color_subresource_range());
+        pipeline_barrier(device, command_buffer, color_to_blend);
+        let depth_to_blend = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_stage_mask(
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ)
+            .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(target.depth.image)
+            .subresource_range(depth_subresource_range());
+        pipeline_barrier(device, command_buffer, depth_to_blend);
+        let color_attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(target.color.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let depth_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(target.depth.view)
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE);
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: render_extent,
+            })
+            .layer_count(1)
+            .color_attachments(&color_attachment)
+            .depth_attachment(&depth_attachment);
+        // SAFETY: the color and depth attachments remain in their attachment layouts and were stored above.
+        unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
+        record_draws(
+            device,
+            command_buffer,
+            render_extent,
+            scene,
+            DrawPass::Blend,
+        );
+        // SAFETY: this matches the preceding transparent cmd_begin_rendering call.
+        unsafe { device.cmd_end_rendering(command_buffer) };
+    }
     target.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+}
+
+#[derive(Clone, Copy)]
+enum DrawPass {
+    OpaqueAndMask,
+    Blend,
 }
 
 struct ScenePass<'a> {
     pipeline: vk::Pipeline,
+    mask_pipeline: vk::Pipeline,
+    blend_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
     meshes: &'a [Option<MeshBuffers>],
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
     view_projection: [[f32; 4]; 4],
+    camera_position: [f32; 3],
     clear_color: [f32; 4],
     timestamps: Option<vk::QueryPool>,
     view: ViewSettings,
@@ -4164,6 +4418,7 @@ struct ShadowPass<'a> {
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
     meshes: &'a [Option<MeshBuffers>],
+    materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
     light_view_projection: Option<[[f32; 4]; 4]>,
     enabled: bool,
@@ -4194,6 +4449,7 @@ fn record_draws(
     command_buffer: vk::CommandBuffer,
     render_extent: vk::Extent2D,
     scene: &ScenePass<'_>,
+    pass: DrawPass,
 ) {
     if scene.draws.is_empty() {
         return;
@@ -4205,11 +4461,6 @@ fn record_draws(
     }];
     // SAFETY: recording happens inside dynamic rendering with a pipeline built for its formats.
     unsafe {
-        device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            scene.pipeline,
-        );
         device.cmd_set_viewport(command_buffer, 0, &viewport);
         device.cmd_set_scissor(command_buffer, 0, &scissor);
         device.cmd_bind_descriptor_sets(
@@ -4222,7 +4473,39 @@ fn record_draws(
         );
     }
     let frustum = Frustum::from_view_projection(scene.view_projection);
-    for draw in scene.draws {
+    let sorted = matches!(pass, DrawPass::Blend).then(|| {
+        back_to_front_order(scene.draws, scene.camera_position, |draw| {
+            scene.meshes.get(draw.mesh.0)?.as_ref()?.bounds
+        })
+    });
+    let draw_count = sorted.as_ref().map_or(scene.draws.len(), Vec::len);
+    let mut bound_pipeline = None;
+    for position in 0..draw_count {
+        let index = sorted
+            .as_ref()
+            .map_or(position, |indices| indices[position]);
+        let draw = &scene.draws[index];
+        let Some(material) = material_for_draw(scene.materials, draw) else {
+            continue;
+        };
+        let pipeline_kind = match (pass, material.alpha_mode) {
+            (DrawPass::OpaqueAndMask, AlphaMode::Opaque) => DrawPipeline::Opaque,
+            (DrawPass::OpaqueAndMask, AlphaMode::Mask { .. }) => DrawPipeline::Mask,
+            (DrawPass::Blend, AlphaMode::Blend) => DrawPipeline::Blend,
+            _ => continue,
+        };
+        if bound_pipeline != Some(pipeline_kind) {
+            let pipeline = match pipeline_kind {
+                DrawPipeline::Opaque => scene.pipeline,
+                DrawPipeline::Mask => scene.mask_pipeline,
+                DrawPipeline::Blend => scene.blend_pipeline,
+            };
+            // SAFETY: the selected pipeline matches the active dynamic-rendering attachments.
+            unsafe {
+                device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline)
+            };
+            bound_pipeline = Some(pipeline_kind);
+        }
         // Индексы проверены validate_draws до начала кадра.
         let Some(mesh) = scene.meshes[draw.mesh.0].as_ref() else {
             continue;
@@ -4233,12 +4516,6 @@ fn record_draws(
         {
             continue;
         }
-        let Some(material) = scene.materials[draw
-            .material
-            .map_or(DEFAULT_MATERIAL, |material| material.0)]
-        .as_ref() else {
-            continue;
-        };
         let push_constants = push_constant_bytes(&draw.model);
         // SAFETY: mesh buffers and material descriptors stay alive until this frame's fence completes.
         unsafe {
@@ -4269,8 +4546,39 @@ fn record_draws(
     }
 }
 
-fn shadow_casters(draws: &[DrawCommand]) -> impl Iterator<Item = &DrawCommand> {
-    draws.iter().filter(|draw| draw.casts_shadow)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrawPipeline {
+    Opaque,
+    Mask,
+    Blend,
+}
+
+fn material_for_draw<'a>(
+    materials: &'a [Option<GpuMaterial>],
+    draw: &DrawCommand,
+) -> Option<&'a GpuMaterial> {
+    materials
+        .get(
+            draw.material
+                .map_or(DEFAULT_MATERIAL, |material| material.0),
+        )
+        .and_then(Option::as_ref)
+}
+
+fn has_transparent_draws(scene: &ScenePass<'_>) -> bool {
+    scene.draws.iter().any(|draw| {
+        material_for_draw(scene.materials, draw)
+            .is_some_and(|material| matches!(material.alpha_mode, AlphaMode::Blend))
+    })
+}
+
+fn shadow_casters(
+    draws: &[DrawCommand],
+    mut alpha_mode: impl FnMut(&DrawCommand) -> AlphaMode,
+) -> impl Iterator<Item = &DrawCommand> {
+    draws
+        .iter()
+        .filter(move |draw| draw.casts_shadow && !matches!(alpha_mode(draw), AlphaMode::Blend))
 }
 
 fn record_shadow_draws(
@@ -4312,7 +4620,13 @@ fn record_shadow_draws(
     let frustum = shadow
         .light_view_projection
         .map(Frustum::from_view_projection);
-    for draw in shadow_casters(shadow.draws) {
+    for draw in shadow_casters(shadow.draws, |draw| {
+        material_for_draw(shadow.materials, draw)
+            .map_or(AlphaMode::Opaque, |material| material.alpha_mode)
+    }) {
+        let Some(material) = material_for_draw(shadow.materials, draw) else {
+            continue;
+        };
         let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
             continue;
         };
@@ -4323,8 +4637,16 @@ fn record_shadow_draws(
             continue;
         }
         let push_constants = push_constant_bytes(&draw.model);
-        // SAFETY: draw ids were checked before recording; the buffers and frame set stay alive.
+        // SAFETY: draw ids were checked before recording; material descriptors and buffers stay alive.
         unsafe {
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                shadow.pipeline_layout,
+                1,
+                &[material.set],
+                &[],
+            );
             device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer.buffer], &[0]);
             device.cmd_bind_index_buffer(
                 command_buffer,
@@ -4945,6 +5267,24 @@ fn missing_post_format_features(supported: vk::FormatFeatureFlags) -> Vec<&'stat
     .collect()
 }
 
+fn missing_offscreen_format_features(supported: vk::FormatFeatureFlags) -> Vec<&'static str> {
+    [
+        (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
+        (
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+            "COLOR_ATTACHMENT_BLEND",
+        ),
+        (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+        (
+            vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            "SAMPLED_IMAGE_FILTER_LINEAR",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(feature, name)| (!supported.contains(feature)).then_some(name))
+    .collect()
+}
+
 fn texture_format(color_space: TextureColorSpace) -> vk::Format {
     match color_space {
         TextureColorSpace::Srgb => SRGB_TEXTURE_FORMAT,
@@ -5132,7 +5472,8 @@ struct GpuMaterial {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     _uniform_buffer: HostBuffer,
-    _textures: [Arc<Texture>; 3],
+    _textures: [Arc<Texture>; 5],
+    alpha_mode: AlphaMode,
 }
 
 impl Drop for GpuMaterial {
@@ -5306,9 +5647,27 @@ fn validate_material(
         || !valid_factor(material.metallic)
         || !valid_factor(material.roughness)
         || !material.normal_scale.is_finite()
+        || !valid_factor(material.opacity)
+        || !valid_factor(material.occlusion_strength)
     {
         return Err(RenderError::InvalidMaterial(
-            "факторы должны быть конечными, base_color/metallic/roughness — в [0, 1]".to_owned(),
+            "факторы должны быть конечными; base_color/metallic/roughness/opacity/occlusion_strength — в [0, 1]".to_owned(),
+        ));
+    }
+    if !material
+        .emissive
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+    {
+        return Err(RenderError::InvalidMaterial(
+            "emissive должен содержать конечные компоненты >= 0".to_owned(),
+        ));
+    }
+    if let AlphaMode::Mask { cutoff } = material.alpha_mode
+        && !valid_factor(cutoff)
+    {
+        return Err(RenderError::InvalidMaterial(
+            "alpha cutoff должен быть конечным и находиться в диапазоне [0, 1]".to_owned(),
         ));
     }
     let check_texture = |texture: Option<TextureId>, expected: TextureColorSpace, name: &str| {
@@ -5341,10 +5700,25 @@ fn validate_material(
         material.normal_texture,
         TextureColorSpace::Linear,
         "normal_texture",
+    )?;
+    check_texture(
+        material.emissive_texture,
+        TextureColorSpace::Srgb,
+        "emissive_texture",
+    )?;
+    check_texture(
+        material.occlusion_texture,
+        TextureColorSpace::Linear,
+        "occlusion_texture",
     )
 }
 
 fn material_uniform_bytes(material: &Material) -> [u8; MATERIAL_UNIFORMS_SIZE] {
+    let (alpha_cutoff, alpha_mode) = match material.alpha_mode {
+        AlphaMode::Opaque => (0.0, 0.0),
+        AlphaMode::Mask { cutoff } => (cutoff, 1.0),
+        AlphaMode::Blend => (0.0, 2.0),
+    };
     float_bytes(&[
         material.base_color[0],
         material.base_color[1],
@@ -5358,6 +5732,14 @@ fn material_uniform_bytes(material: &Material) -> [u8; MATERIAL_UNIFORMS_SIZE] {
         } else {
             0.0
         },
+        material.emissive[0],
+        material.emissive[1],
+        material.emissive[2],
+        0.0,
+        material.opacity,
+        alpha_cutoff,
+        alpha_mode,
+        material.occlusion_strength,
     ])
 }
 
@@ -5721,17 +6103,19 @@ fn select_composite_alpha(
 #[cfg(test)]
 mod tests {
     use super::{
-        AcquireAction, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
-        FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT, MATERIAL_UNIFORMS_SIZE,
-        MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId, OFFSCREEN_FORMAT,
-        OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex,
-        ProbeInstanceFailure, RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER,
-        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
-        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
-        check_extensions, classify_acquire_result, classify_probe_instance_failure,
-        deduplicate_names, derivative_tangent_basis, evaluate_device, frame_uniform_bytes,
-        index_bytes, inverse_extent, material_sampler_info, material_uniform_bytes, mip_extent,
-        mip_level_count, missing_extensions, missing_post_format_features,
+        AcquireAction, AlphaMode, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight,
+        DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT,
+        MATERIAL_UNIFORMS_SIZE, MESH_BLEND_FRAGMENT_SHADER, MESH_MASK_FRAGMENT_SHADER,
+        MESH_OPAQUE_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId,
+        OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER,
+        OverlayVertex, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
+        SHADOW_FRAGMENT_SHADER, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER,
+        TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex,
+        ViewSettings, best_device_index, check_extensions, classify_acquire_result,
+        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
+        evaluate_device, frame_uniform_bytes, index_bytes, inverse_extent, material_sampler_info,
+        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
+        missing_offscreen_format_features, missing_post_format_features,
         missing_texture_format_features, normal_matrix, offscreen_previous_use,
         overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
         scene_viewport, select_composite_alpha, select_surface_extent, shadow_casters,
@@ -5996,6 +6380,51 @@ mod tests {
     }
 
     #[test]
+    fn hdr_scene_format_requires_blending_and_linear_sampling() {
+        let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        assert_eq!(OFFSCREEN_FORMAT, vk::Format::R16G16B16A16_SFLOAT);
+        assert!(missing_offscreen_format_features(required).is_empty());
+        for (feature, name) in [
+            (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
+            (
+                vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+                "COLOR_ATTACHMENT_BLEND",
+            ),
+            (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+            (
+                vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+                "SAMPLED_IMAGE_FILTER_LINEAR",
+            ),
+        ] {
+            assert_eq!(
+                missing_offscreen_format_features(required & !feature),
+                [name]
+            );
+        }
+    }
+
+    #[test]
+    fn device_report_explains_missing_hdr_blend_support() {
+        let facts = DeviceFacts {
+            api_version: vk::API_VERSION_1_3,
+            dynamic_rendering: true,
+            synchronization2: true,
+            supported_extensions: HashSet::new(),
+            graphics_queue_families: vec![true],
+            offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+        };
+        let evaluation = evaluate_device(&facts, &[]);
+        assert_eq!(evaluation.reasons.len(), 1);
+        assert!(evaluation.reasons[0].contains("R16G16B16A16_SFLOAT"));
+        assert!(evaluation.reasons[0].contains("COLOR_ATTACHMENT_BLEND"));
+    }
+
+    #[test]
     fn postprocess_formats_and_swapchain_usage_match_the_passes() {
         assert_eq!(OFFSCREEN_FORMAT, vk::Format::R16G16B16A16_SFLOAT);
         assert_eq!(LDR_FORMAT, vk::Format::R8G8B8A8_SRGB);
@@ -6062,6 +6491,10 @@ mod tests {
                 "VK_KHR_portability_subset".to_owned(),
             ]),
             graphics_queue_families: vec![false, true],
+            offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
         };
         let required = [
             CString::new("VK_KHR_swapchain").unwrap(),
@@ -6082,6 +6515,10 @@ mod tests {
             synchronization2: true,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![true],
+            offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
         };
 
         let evaluation = evaluate_device(&facts, &[]);
@@ -6114,6 +6551,10 @@ mod tests {
             synchronization2: false,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![false, false],
+            offscreen_format_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
         };
         let required = [
             CString::new("VK_KHR_swapchain").unwrap(),
@@ -6243,8 +6684,11 @@ mod tests {
     fn embedded_shaders_are_spirv_words() {
         for shader in [
             MESH_VERTEX_SHADER,
-            MESH_FRAGMENT_SHADER,
+            MESH_OPAQUE_FRAGMENT_SHADER,
+            MESH_MASK_FRAGMENT_SHADER,
+            MESH_BLEND_FRAGMENT_SHADER,
             SHADOW_VERTEX_SHADER,
+            SHADOW_FRAGMENT_SHADER,
             OVERLAY_VERTEX_SHADER,
             OVERLAY_FRAGMENT_SHADER,
             UI_VERTEX_SHADER,
@@ -6420,8 +6864,16 @@ mod tests {
             model: IDENTITY,
             casts_shadow,
         };
-        let draws = [draw(0, true), draw(1, false), draw(2, true)];
-        let casters: Vec<_> = shadow_casters(&draws).map(|draw| draw.mesh.0).collect();
+        let draws = [draw(0, true), draw(1, false), draw(2, true), draw(3, true)];
+        let modes = [
+            AlphaMode::Opaque,
+            AlphaMode::Opaque,
+            AlphaMode::Mask { cutoff: 0.4 },
+            AlphaMode::Blend,
+        ];
+        let casters: Vec<_> = shadow_casters(&draws, |draw| modes[draw.mesh.0])
+            .map(|draw| draw.mesh.0)
+            .collect();
         assert_eq!(casters, [0, 2]);
     }
 
@@ -6453,6 +6905,9 @@ mod tests {
     #[test]
     fn material_validation_checks_factors_texture_ids_and_color_spaces() {
         let spaces = [
+            Some(TextureColorSpace::Srgb),
+            Some(TextureColorSpace::Linear),
+            Some(TextureColorSpace::Linear),
             Some(TextureColorSpace::Srgb),
             Some(TextureColorSpace::Linear),
         ];
@@ -6491,6 +6946,26 @@ mod tests {
                 normal_scale: f32::NAN,
                 ..Material::default()
             },
+            Material {
+                opacity: -0.01,
+                ..Material::default()
+            },
+            Material {
+                occlusion_strength: f32::NAN,
+                ..Material::default()
+            },
+            Material {
+                emissive: [0.0, -0.1, 0.0],
+                ..Material::default()
+            },
+            Material {
+                emissive: [0.0, f32::INFINITY, 0.0],
+                ..Material::default()
+            },
+            Material {
+                alpha_mode: AlphaMode::Mask { cutoff: 1.01 },
+                ..Material::default()
+            },
         ] {
             assert!(matches!(
                 validate_material(&material, &spaces),
@@ -6511,7 +6986,19 @@ mod tests {
                 ..Material::default()
             },
             Material {
-                normal_texture: Some(TextureId(2)),
+                normal_texture: Some(TextureId(3)),
+                ..Material::default()
+            },
+            Material {
+                emissive_texture: Some(TextureId(1)),
+                ..Material::default()
+            },
+            Material {
+                occlusion_texture: Some(TextureId(0)),
+                ..Material::default()
+            },
+            Material {
+                occlusion_texture: Some(TextureId(5)),
                 ..Material::default()
             },
         ] {
@@ -6526,6 +7013,8 @@ mod tests {
                     base_color_texture: Some(TextureId(0)),
                     metallic_roughness_texture: Some(TextureId(1)),
                     normal_texture: Some(TextureId(1)),
+                    emissive_texture: Some(TextureId(3)),
+                    occlusion_texture: Some(TextureId(4)),
                     ..Material::default()
                 },
                 &spaces
@@ -6535,23 +7024,33 @@ mod tests {
     }
 
     #[test]
-    fn material_uniforms_pack_base_color_and_parameters_into_two_vec4s() {
+    fn material_uniforms_pack_four_std140_vec4s_with_declared_offsets() {
         let material = Material {
             base_color: [0.2, 0.4, 0.8],
             metallic: 0.3,
             roughness: 0.7,
             normal_texture: Some(TextureId(2)),
             normal_scale: 1.5,
+            emissive: [2.0, 3.0, 4.0],
+            opacity: 0.6,
+            alpha_mode: AlphaMode::Mask { cutoff: 0.25 },
+            occlusion_strength: 0.7,
             ..Material::default()
         };
-        assert_eq!(MATERIAL_UNIFORMS_SIZE, 32);
+        assert_eq!(MATERIAL_UNIFORMS_SIZE, 64);
         assert_eq!(
             floats(&material_uniform_bytes(&material)),
-            [0.2, 0.4, 0.8, 1.0, 0.3, 0.7, 1.5, 1.0]
+            [
+                0.2, 0.4, 0.8, 1.0, 0.3, 0.7, 1.5, 1.0, 2.0, 3.0, 4.0, 0.0, 0.6, 0.25, 1.0, 0.7
+            ]
         );
         assert_eq!(
             &floats(&material_uniform_bytes(&Material::default()))[4..8],
             &[0.0, 1.0, 1.0, 0.0]
+        );
+        assert_eq!(
+            &floats(&material_uniform_bytes(&Material::default()))[12..16],
+            &[1.0, 0.0, 0.0, 1.0]
         );
     }
 

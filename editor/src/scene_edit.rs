@@ -1092,6 +1092,8 @@ impl EditorScene {
                 for texture in [
                     &material.metallic_roughness_texture,
                     &material.normal_texture,
+                    &material.emissive_texture,
+                    &material.occlusion_texture,
                 ]
                 .into_iter()
                 .flatten()
@@ -1302,6 +1304,8 @@ fn register_object_assets(
             mesh.texture.as_ref(),
             material.and_then(|material| material.metallic_roughness_texture.as_ref()),
             material.and_then(|material| material.normal_texture.as_ref()),
+            material.and_then(|material| material.emissive_texture.as_ref()),
+            material.and_then(|material| material.occlusion_texture.as_ref()),
         ]
         .into_iter()
         .flatten()
@@ -1336,9 +1340,16 @@ fn is_empty_material(material: &MaterialOverride) -> bool {
     material.base_color.is_none()
         && material.metallic.is_none()
         && material.roughness.is_none()
+        && material.emissive.is_none()
+        && material.opacity.is_none()
+        && material.alpha_mode.is_none()
+        && material.alpha_cutoff.is_none()
         && material.metallic_roughness_texture.is_none()
         && material.normal_texture.is_none()
+        && material.emissive_texture.is_none()
+        && material.occlusion_texture.is_none()
         && material.normal_scale.is_none()
+        && material.occlusion_strength.is_none()
 }
 
 pub fn write_atomic(file: &Path, contents: &[u8]) -> Result<(), String> {
@@ -1910,6 +1921,7 @@ mod tests {
                         metallic_roughness_texture: None,
                         normal_texture: None,
                         normal_scale: Some(0.5),
+                        ..MaterialOverride::default()
                     });
                 Ok(())
             })
@@ -1940,6 +1952,7 @@ mod tests {
             metallic_roughness_texture: None,
             normal_texture: None,
             normal_scale: None,
+            ..MaterialOverride::default()
         }
     }
 
@@ -1955,15 +1968,29 @@ mod tests {
             .unwrap();
         let mut textured = material(Some(0.3));
         textured.normal_texture = Some(path("/textures/n.png"));
+        textured.emissive = Some([1.0, 0.25, 0.0]);
+        textured.emissive_texture = Some(path("/textures/emissive.png"));
+        textured.occlusion_texture = Some(path("/textures/occlusion.png"));
+        textured.occlusion_strength = Some(0.4);
         scene.set_material(&id, Some(textured), None).unwrap();
-        assert!(
-            scene
-                .document()
-                .assets
-                .iter()
-                .any(|asset| asset.path.as_str() == "textures/n.png")
-        );
+        let assets = scene
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(assets.contains(&"textures/n.png"));
+        assert!(assets.contains(&"textures/emissive.png"));
+        assert!(assets.contains(&"textures/occlusion.png"));
         assert_eq!(mesh_material(&scene, &id).unwrap().roughness, Some(0.3));
+        assert_eq!(
+            mesh_material(&scene, &id).unwrap().emissive,
+            Some([1.0, 0.25, 0.0])
+        );
+        assert_eq!(
+            mesh_material(&scene, &id).unwrap().occlusion_strength,
+            Some(0.4)
+        );
         scene.set_material(&id, Some(material(None)), None).unwrap();
         assert!(mesh_material(&scene, &id).is_none());
         assert!(scene.undo());

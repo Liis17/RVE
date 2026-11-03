@@ -536,6 +536,15 @@ pub struct LodLevel {
     pub distance: f32,
 }
 
+/// Режим обработки альфа-канала в переопределении материала.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialAlphaMode {
+    Opaque,
+    Mask,
+    Blend,
+}
+
 /// Необязательные замены факторов и текстур FBX-материала.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -546,6 +555,14 @@ pub struct MaterialOverride {
     pub metallic: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roughness: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emissive: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_mode: Option<MaterialAlphaMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_cutoff: Option<f32>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -558,8 +575,22 @@ pub struct MaterialOverride {
         with = "option_virtual_path_serde"
     )]
     pub normal_texture: Option<VirtualPath>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_virtual_path_serde"
+    )]
+    pub emissive_texture: Option<VirtualPath>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_virtual_path_serde"
+    )]
+    pub occlusion_texture: Option<VirtualPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normal_scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occlusion_strength: Option<f32>,
 }
 
 /// Цвет направленного света, ambient и необязательная проекция теней.
@@ -826,14 +857,19 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
             }));
             if let Some(material) = renderer.get("material").and_then(toml::Value::as_table) {
                 paths.extend(
-                    ["metallic_roughness_texture", "normal_texture"]
-                        .into_iter()
-                        .filter_map(|key| {
-                            material
-                                .get(key)
-                                .and_then(toml::Value::as_str)
-                                .map(|path| (object_id, key, path))
-                        }),
+                    [
+                        "metallic_roughness_texture",
+                        "normal_texture",
+                        "emissive_texture",
+                        "occlusion_texture",
+                    ]
+                    .into_iter()
+                    .filter_map(|key| {
+                        material
+                            .get(key)
+                            .and_then(toml::Value::as_str)
+                            .map(|path| (object_id, key, path))
+                    }),
                 );
             }
         }
@@ -961,6 +997,38 @@ pub(crate) fn validate_material_override(
     {
         return Err(invalid_factor("material.roughness"));
     }
+    if material.emissive.is_some_and(|color| {
+        color
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.0)
+    }) {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "material.emissive должен содержать конечные неотрицательные значения",
+        ));
+    }
+    for (field, value) in [
+        ("material.opacity", material.opacity),
+        ("material.occlusion_strength", material.occlusion_strength),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            return Err(invalid_factor(field));
+        }
+    }
+    if material
+        .alpha_cutoff
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(invalid_factor("material.alpha_cutoff"));
+    }
+    if material.alpha_cutoff.is_some() && material.alpha_mode != Some(MaterialAlphaMode::Mask) {
+        return Err(SceneError::new(
+            source,
+            Some(object_id),
+            "material.alpha_cutoff разрешён только при alpha_mode = \"mask\"",
+        ));
+    }
     if material
         .normal_scale
         .is_some_and(|value| !value.is_finite())
@@ -977,6 +1045,8 @@ pub(crate) fn validate_material_override(
             "metallic-roughness текстура",
         ),
         (material.normal_texture.as_ref(), "normal текстура"),
+        (material.emissive_texture.as_ref(), "emissive текстура"),
+        (material.occlusion_texture.as_ref(), "occlusion текстура"),
     ] {
         if let Some(path) = path {
             require_asset_path(source, object_id, assets, path, kind)?;
@@ -1174,7 +1244,7 @@ pub(crate) mod option_virtual_path_serde {
 
 #[cfg(test)]
 mod tests {
-    use super::{LodGroup, LodLevel, MAX_LOD_LEVELS, ParamValue, SceneDocument};
+    use super::{LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, ParamValue, SceneDocument};
     use engine_files::VirtualPath;
 
     const VALID: &str = r#"
@@ -1546,7 +1616,7 @@ scale=[1.0,1.0,0.0]
     #[test]
     fn material_override_round_trips_and_legacy_mesh_renderer_defaults() {
         let input = format!(
-            "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/textures/mr.png\"\n[[assets]]\npath=\"/textures/normal.png\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\nbase_color=[0.2,0.4,0.6]\nmetallic=0.7\nroughness=0.3\nmetallic_roughness_texture=\"/textures/mr.png\"\nnormal_texture=\"/textures/normal.png\"\nnormal_scale=0.5\n"
+            "[[assets]]\npath=\"/models/a.fbx\"\n[[assets]]\npath=\"/textures/mr.png\"\n[[assets]]\npath=\"/textures/normal.png\"\n[[assets]]\npath=\"/textures/emissive.png\"\n[[assets]]\npath=\"/textures/occlusion.png\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\nbase_color=[0.2,0.4,0.6]\nmetallic=0.7\nroughness=0.3\nemissive=[2.0,0.5,4.0]\nopacity=0.65\nalpha_mode=\"mask\"\nalpha_cutoff=0.35\nocclusion_strength=0.6\nmetallic_roughness_texture=\"/textures/mr.png\"\nnormal_texture=\"/textures/normal.png\"\nemissive_texture=\"/textures/emissive.png\"\nocclusion_texture=\"/textures/occlusion.png\"\nnormal_scale=0.5\n"
         );
         let document = parse(&input).unwrap();
         let material = document.objects[1]
@@ -1559,6 +1629,11 @@ scale=[1.0,1.0,0.0]
         assert_eq!(material.base_color, Some([0.2, 0.4, 0.6]));
         assert_eq!(material.metallic, Some(0.7));
         assert_eq!(material.roughness, Some(0.3));
+        assert_eq!(material.emissive, Some([2.0, 0.5, 4.0]));
+        assert_eq!(material.opacity, Some(0.65));
+        assert_eq!(material.alpha_mode, Some(MaterialAlphaMode::Mask));
+        assert_eq!(material.alpha_cutoff, Some(0.35));
+        assert_eq!(material.occlusion_strength, Some(0.6));
         assert_eq!(
             material
                 .metallic_roughness_texture
@@ -1570,6 +1645,14 @@ scale=[1.0,1.0,0.0]
         assert_eq!(
             material.normal_texture.as_ref().unwrap().as_str(),
             "textures/normal.png"
+        );
+        assert_eq!(
+            material.emissive_texture.as_ref().unwrap().as_str(),
+            "textures/emissive.png"
+        );
+        assert_eq!(
+            material.occlusion_texture.as_ref().unwrap().as_str(),
+            "textures/occlusion.png"
         );
         assert_eq!(material.normal_scale, Some(0.5));
 
@@ -1631,8 +1714,19 @@ scale=[1.0,1.0,0.0]
             "roughness=-0.01",
             "roughness=1.01",
             "roughness=inf",
+            "opacity=-0.01",
+            "opacity=1.01",
+            "opacity=nan",
+            "occlusion_strength=-0.01",
+            "occlusion_strength=1.01",
+            "emissive=[-0.1,0.0,0.0]",
+            "emissive=[0.0,nan,0.0]",
             "normal_scale=nan",
             "normal_scale=inf",
+            "alpha_mode=\"unknown\"",
+            "alpha_cutoff=-0.01",
+            "alpha_mode=\"blend\"\nalpha_cutoff=0.5",
+            "alpha_cutoff=0.5",
         ] {
             assert!(parse(&scene(values)).is_err(), "accepted {values}");
         }
@@ -1642,6 +1736,7 @@ scale=[1.0,1.0,0.0]
             ))
             .is_ok()
         );
+        assert!(parse(&scene("alpha_mode=\"mask\"\nalpha_cutoff=1.0")).is_ok());
     }
 
     #[test]
@@ -1661,6 +1756,17 @@ scale=[1.0,1.0,0.0]
             &scene(&wrong_extension, "normal_texture=\"/textures/normal.jpg\""),
             "расширение .png",
         );
+        for field in ["emissive_texture", "occlusion_texture"] {
+            error(
+                &scene(model, &format!("{field}=\"/textures/missing.png\"")),
+                "отсутствует в [[assets]]",
+            );
+            let wrong_extension = format!("{model}\n[[assets]]\npath=\"/textures/map.jpg\"");
+            error(
+                &scene(&wrong_extension, &format!("{field}=\"/textures/map.jpg\"")),
+                "расширение .png",
+            );
+        }
         let invalid_path = scene(model, "normal_texture=\"/textures/../normal.png\"");
         let error = parse(&invalid_path).unwrap_err();
         assert!(

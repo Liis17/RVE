@@ -24,11 +24,15 @@ layout(set = 0, binding = 2) uniform sampler shadow_sampler;
 layout(set = 1, binding = 0) uniform MaterialUniforms {
     vec4 base_color;
     vec4 parameters;
+    vec4 emissive;
+    vec4 alpha_parameters;
 } material;
 layout(set = 1, binding = 1) uniform texture2D base_color_texture;
 layout(set = 1, binding = 2) uniform texture2D metallic_roughness_texture;
 layout(set = 1, binding = 3) uniform texture2D normal_texture;
-layout(set = 1, binding = 4) uniform sampler material_sampler;
+layout(set = 1, binding = 4) uniform texture2D emissive_texture;
+layout(set = 1, binding = 5) uniform texture2D occlusion_texture;
+layout(set = 1, binding = 6) uniform sampler material_sampler;
 
 const float PI = 3.14159265358979323846;
 
@@ -78,10 +82,23 @@ vec3 env_brdf_approx(vec3 f0, float roughness, float normal_dot_view) {
 
 void main() {
     vec4 base_sample = texture(sampler2D(base_color_texture, material_sampler), in_uv);
+    float surface_alpha = base_sample.a * material.alpha_parameters.x;
+#ifdef ALPHA_MASK
+    if (surface_alpha < material.alpha_parameters.y) {
+        discard;
+    }
+    float output_alpha = 1.0;
+#elif defined(ALPHA_BLEND)
+    float output_alpha = surface_alpha;
+#else
+    float output_alpha = 1.0;
+#endif
     vec4 metallic_roughness_sample = texture(
         sampler2D(metallic_roughness_texture, material_sampler), in_uv
     );
     vec3 normal_sample = texture(sampler2D(normal_texture, material_sampler), in_uv).rgb;
+    vec3 emissive_sample = texture(sampler2D(emissive_texture, material_sampler), in_uv).rgb;
+    float occlusion = texture(sampler2D(occlusion_texture, material_sampler), in_uv).r;
 
     vec3 dp1 = dFdx(in_world_position);
     vec3 dp2 = dFdy(in_world_position);
@@ -176,6 +193,8 @@ void main() {
     vec3 direct = (diffuse + specular) * normal_dot_light
         * frame.light_color.rgb * shadow * PI;
     vec3 ambient = frame.ambient_color.rgb
-        * (diffuse_color + env_brdf_approx(f0, effective_roughness, normal_dot_view));
-    out_color = vec4(ambient + direct, 1.0);
+        * (diffuse_color + env_brdf_approx(f0, effective_roughness, normal_dot_view))
+        * mix(1.0, occlusion, material.alpha_parameters.w);
+    vec3 emissive = material.emissive.rgb * emissive_sample;
+    out_color = vec4(ambient + direct + emissive, output_alpha);
 }
