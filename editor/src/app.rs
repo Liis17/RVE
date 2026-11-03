@@ -10,7 +10,6 @@ use crate::settings::{SettingsStore, UserSettings};
 use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt};
 use crate::ui;
 use crate::ui::scene_view::bounding_sphere;
-use crate::ui_render::{ConvertedMesh, UiBridge};
 use crate::viewport::render::SceneRenderer;
 use egui_dock::DockState;
 use engine_console::{ConsoleBuffer, ConsoleLevel, install_logger};
@@ -20,6 +19,7 @@ use engine_render::{
 };
 use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
+use engine_ui::render::{ConvertedMesh, UiBridge};
 use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};

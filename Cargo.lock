@@ -790,6 +790,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "engine-console",
+ "engine-render",
+]
+
+[[package]]
 name = "engine-window"
 version = "0.1.0"
 dependencies = [
@@ -2382,6 +2391,7 @@ dependencies = [
  "engine-resources",
  "engine-scene",
  "engine-script",
+ "engine-ui",
  "engine-window",
  "glam",
  "libc",

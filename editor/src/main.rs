@@ -15,7 +15,6 @@ mod scene_edit;
 mod settings;
 mod state;
 mod ui;
-mod ui_render;
 mod viewport;
 
 use engine_project::ProjectSettings;

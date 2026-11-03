@@ -1,0 +1,10 @@
+[package]
+name = "engine-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui = { workspace = true, features = ["bytemuck"] }
+engine-console = { path = "../engine-console" }
+engine-render = { path = "../engine-render" }
