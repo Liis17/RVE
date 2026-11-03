@@ -2352,8 +2352,10 @@ dependencies = [
  "engine-script",
  "engine-window",
  "glam",
+ "libc",
  "rfd",
  "rve-sdk",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

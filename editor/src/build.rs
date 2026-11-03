@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
 
 /// Способ запустить `rve-build`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,14 +105,141 @@ pub fn finish_message(code: Option<i32>, output: &Path) -> (LogLevel, String) {
 
 enum Message {
     Line(LogLevel, String),
-    Eof,
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(unix)]
+struct ProcessTree {
+    process_group: Option<libc::pid_t>,
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ProcessTree;
+
+impl ProcessTree {
+    fn prepare(command: &mut Command) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let _ = command;
+            Self::new()
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+            Ok(Self {
+                process_group: None,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = command;
+            Ok(Self)
+        }
+    }
+
+    fn attach(&mut self, child: &Child) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+            let process = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            if unsafe { AssignProcessToJobObject(self.job, process) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(unix)]
+        {
+            self.process_group =
+                Some(libc::pid_t::try_from(child.id()).map_err(|_| {
+                    std::io::Error::other("child process id does not fit in pid_t")
+                })?);
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+        }
+        Ok(())
+    }
+
+    fn terminate(&self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+            if unsafe { TerminateJobObject(self.job, 1) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(unix)]
+        {
+            let Some(process_group) = self.process_group else {
+                return Ok(());
+            };
+            if unsafe { libc::kill(-process_group, libc::SIGKILL) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "process-tree cleanup is unsupported on this platform",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn new() -> std::io::Result<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let process_tree = Self { job };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                process_tree.job,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const std::ffi::c_void,
+                std::mem::size_of_val(&limits) as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(process_tree)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job) };
+        }
+    }
 }
 
 /// Запущенная сборка; строки и итог забираются `poll` из цикла кадра.
 pub struct BuildJob {
     child: Child,
     receiver: Receiver<Message>,
-    open_streams: usize,
+    readers: Vec<JoinHandle<()>>,
+    process_tree: Option<ProcessTree>,
     output: PathBuf,
     finished: bool,
 }
@@ -119,6 +247,7 @@ pub struct BuildJob {
 impl BuildJob {
     /// Запускает команду с перехваченными stdout и stderr; `output` попадает в итог.
     pub fn spawn(mut command: Command, output: PathBuf) -> std::io::Result<Self> {
+        let mut process_tree = ProcessTree::prepare(&mut command)?;
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -130,17 +259,25 @@ impl BuildJob {
             command.creation_flags(CREATE_NO_WINDOW);
         }
         let mut child = command.spawn()?;
+        if let Err(error) = process_tree.attach(&child) {
+            let _ = process_tree.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let (sender, receiver) = mpsc::channel();
+        let mut readers = Vec::with_capacity(2);
         if let Some(stdout) = child.stdout.take() {
-            spawn_reader(stdout, sender.clone(), |_| LogLevel::Info);
+            readers.push(spawn_reader(stdout, sender.clone(), |_| LogLevel::Info));
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_reader(stderr, sender, classify_stderr);
+            readers.push(spawn_reader(stderr, sender, classify_stderr));
         }
         Ok(Self {
             child,
             receiver,
-            open_streams: 2,
+            readers,
+            process_tree: Some(process_tree),
             output,
             finished: false,
         })
@@ -153,32 +290,38 @@ impl BuildJob {
         if self.finished {
             return lines;
         }
-        loop {
-            match self.receiver.try_recv() {
-                Ok(Message::Line(level, line)) => lines.push((level, line)),
-                Ok(Message::Eof) => self.open_streams -= 1,
-                Err(TryRecvError::Empty) => break,
-                // Читатель завершился без Eof только при панике; считаем потоки закрытыми.
-                Err(TryRecvError::Disconnected) => {
-                    self.open_streams = 0;
-                    break;
-                }
-            }
-        }
-        if self.open_streams == 0 {
-            match self.child.try_wait() {
-                Ok(Some(status)) => self.finish(Some(status), &mut lines),
-                Ok(None) => {}
-                Err(error) => {
-                    lines.push((LogLevel::Error, format!("rve-build: {error}")));
-                    self.finish(None, &mut lines);
-                }
+        self.read_messages(&mut lines);
+        match self.child.try_wait() {
+            Ok(Some(status)) => self.finish(Some(status), &mut lines),
+            Ok(None) => {}
+            Err(error) => {
+                lines.push((LogLevel::Error, format!("rve-build: {error}")));
+                self.finish(None, &mut lines);
             }
         }
         lines
     }
 
+    fn read_messages(&self, lines: &mut Vec<(LogLevel, String)>) {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(Message::Line(level, line)) => lines.push((level, line)),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
     fn finish(&mut self, status: Option<ExitStatus>, lines: &mut Vec<(LogLevel, String)>) {
+        if let Some(process_tree) = self.process_tree.take() {
+            let _ = process_tree.terminate();
+        }
+        if status.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        self.join_readers();
+        self.read_messages(lines);
         self.finished = true;
         lines.push(finish_message(
             status.and_then(|status| status.code()),
@@ -190,13 +333,35 @@ impl BuildJob {
         self.finished
     }
 
-    /// Останавливает процесс. Потоки-читатели не ожидаются: на Windows внук cargo
-    /// может пережить `kill` и держать каналы открытыми.
+    /// Останавливает процесс и его потомков, затем дожидается потоков вывода.
     pub fn kill(mut self) {
-        if !self.finished {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        if self.finished {
+            return;
         }
+        if let Some(process_tree) = &self.process_tree {
+            let _ = process_tree.terminate();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.process_tree.take();
+        self.join_readers();
+        self.finished = true;
+    }
+
+    fn join_readers(&mut self) {
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl Drop for BuildJob {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -204,7 +369,7 @@ fn spawn_reader(
     stream: impl Read + Send + 'static,
     sender: Sender<Message>,
     level: fn(&str) -> LogLevel,
-) {
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stream);
         let mut buffer = Vec::new();
@@ -217,8 +382,7 @@ fn spawn_reader(
                 return;
             }
         }
-        let _ = sender.send(Message::Eof);
-    });
+    })
 }
 
 #[cfg(test)]
@@ -226,8 +390,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     const HELPER: &str = "RVE_EDITOR_BUILD_HELPER_EXIT";
+    const TREE_MARKER: &str = "RVE_EDITOR_BUILD_TREE_MARKER";
 
     struct TempDir(PathBuf);
 
@@ -408,5 +574,115 @@ mod tests {
         let lines = run_helper(0);
         assert_eq!(lines.last().unwrap().0, LogLevel::Info);
         assert!(lines.last().unwrap().1.contains("out-dir"));
+    }
+
+    #[test]
+    fn process_tree_parent_process() {
+        let Ok(marker) = std::env::var(TREE_MARKER) else {
+            return;
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "build::tests::process_tree_descendant_process",
+                "--nocapture",
+                "-q",
+            ])
+            .env(TREE_MARKER, &marker)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        while !Path::new(&marker).exists() {
+            std::thread::yield_now();
+        }
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn process_tree_exit_parent_process() {
+        let Ok(marker) = std::env::var(TREE_MARKER) else {
+            return;
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "build::tests::process_tree_descendant_process",
+                "--nocapture",
+                "-q",
+            ])
+            .env(TREE_MARKER, &marker)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        while !Path::new(&marker).exists() {
+            std::thread::yield_now();
+        }
+        let _ = child.try_wait();
+    }
+
+    #[test]
+    fn process_tree_descendant_process() {
+        let Ok(marker) = std::env::var(TREE_MARKER) else {
+            return;
+        };
+        fs::write(marker, "running").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn kill_terminates_descendants_and_joins_output_readers() {
+        let dir = TempDir::new();
+        let marker = dir.0.join("descendant-started");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "build::tests::process_tree_parent_process",
+                "--nocapture",
+                "-q",
+            ])
+            .env(TREE_MARKER, &marker);
+        let mut job = BuildJob::spawn(command, PathBuf::from("out-dir")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            let _ = job.poll();
+            assert!(
+                !job.is_finished(),
+                "parent exited before starting its child"
+            );
+            std::thread::yield_now();
+        }
+        assert!(marker.exists(), "descendant did not start");
+
+        job.kill();
+    }
+
+    #[test]
+    fn parent_exit_terminates_descendants_and_joins_output_readers() {
+        let dir = TempDir::new();
+        let marker = dir.0.join("descendant-started");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "build::tests::process_tree_exit_parent_process",
+                "--nocapture",
+                "-q",
+            ])
+            .env(TREE_MARKER, &marker);
+        let mut job = BuildJob::spawn(command, PathBuf::from("out-dir")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !job.is_finished() && Instant::now() < deadline {
+            let _ = job.poll();
+            std::thread::yield_now();
+        }
+
+        assert!(marker.exists(), "descendant did not start");
+        assert!(job.is_finished(), "job did not finish after parent exit");
+        assert!(job.readers.is_empty(), "output readers were not joined");
     }
 }

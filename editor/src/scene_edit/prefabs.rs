@@ -176,11 +176,15 @@ impl EditorScene {
             let Some(inner) = nested.iter_mut().find(|inner| inner.id == head) else {
                 return Err(format!("override target {:?} не найден", change.target));
             };
+            let mut change = change.clone();
             let target = match rest {
                 Some(rest) => rest.to_owned(),
-                None => nested_root(&self.loader, &inner.prefab)?,
+                None => {
+                    let base = self.base_object(id, &format!("{id}.{head}"))?;
+                    promote_root_override(inner, &mut change, &base);
+                    nested_root(&self.loader, &inner.prefab)?
+                }
             };
-            let mut change = change.clone();
             change.target = target;
             match inner
                 .overrides
@@ -188,7 +192,8 @@ impl EditorScene {
                 .find(|existing| existing.target == change.target)
             {
                 Some(existing) => merge_override(existing, &change),
-                None => inner.overrides.push(change),
+                None if !is_empty(&change) => inner.overrides.push(change),
+                None => {}
             }
         }
         let remap =
@@ -205,8 +210,8 @@ impl EditorScene {
         let apply_root = |name: &mut Option<String>,
                           parent: &mut Option<String>,
                           transform: Option<&mut SceneTransform>| {
-            if instance.name.is_some() {
-                *name = instance.name.clone();
+            if let Some(value) = &instance.name {
+                *name = (!value.is_empty()).then(|| value.clone());
             }
             *parent = instance.parent.clone();
             if let (Some(target), Some(value)) = (transform, instance.transform) {
@@ -349,7 +354,7 @@ impl EditorScene {
     }
 
     /// Убирает override объекта экземпляра целиком: объект возвращается к префабу.
-    /// У корня сбрасываются также имя и трансформация экземпляра.
+    /// У корня сбрасывается имя, а трансформация размещения сохраняется.
     pub fn revert_override(&mut self, id: &str) -> Result<(), String> {
         let origin = self
             .origin(id)
@@ -366,7 +371,6 @@ impl EditorScene {
                 .retain(|change| change.target != origin.target);
             if origin.instance == id {
                 instance.name = None;
-                instance.transform = None;
             }
             Ok(())
         })
@@ -436,6 +440,23 @@ fn nested_root(loader: &super::PrefabLoader, path: &VirtualPath) -> Result<Strin
         .find(|object| object.parent.is_none())
         .map(|object| object.id.clone())
         .ok_or_else(|| format!("у префаба /{} нет корня", path.as_str()))
+}
+
+fn promote_root_override(
+    instance: &mut PrefabInstance,
+    change: &mut PrefabOverride,
+    base: &SceneObject,
+) {
+    if let Some(name) = change.name.take() {
+        instance.name = Some(name);
+    }
+    if let Some(transform) = change.transform.take() {
+        let mut value = base.transform;
+        value.position = transform.position.unwrap_or(value.position);
+        value.rotation = transform.rotation.unwrap_or(value.rotation);
+        value.scale = transform.scale.unwrap_or(value.scale);
+        instance.transform = Some(value);
+    }
 }
 
 /// Сливает `outer` поверх `base`: заданные поля внешнего override побеждают.
@@ -774,17 +795,23 @@ impl EditorScene {
             engine_scene::apply_override(object, &change)?;
         } else if let Some(inner) = prefab.instances.iter_mut().find(|inner| inner.id == head) {
             let mut change = change.clone();
-            change.target = match rest {
+            let target = match rest {
                 Some(rest) => rest.to_owned(),
-                None => nested_root(&self.loader, &inner.prefab)?,
+                None => {
+                    let base = self.base_object(&origin.instance, id)?;
+                    promote_root_override(inner, &mut change, &base);
+                    nested_root(&self.loader, &inner.prefab)?
+                }
             };
+            change.target = target;
             match inner
                 .overrides
                 .iter_mut()
                 .find(|existing| existing.target == change.target)
             {
                 Some(existing) => merge_override(existing, &change),
-                None => inner.overrides.push(change),
+                None if !is_empty(&change) => inner.overrides.push(change),
+                None => {}
             }
         } else {
             return Err(format!("override target {:?} не найден", change.target));
@@ -851,7 +878,7 @@ mod tests {
     use super::super::{EditorScene, NewObject, PrefabLoader};
     use super::OverrideField;
     use engine_files::VirtualPath;
-    use engine_scene::{SceneDocument, SceneError, SceneTransform, World};
+    use engine_scene::{ParamValue, SceneDocument, SceneError, SceneTransform, World};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -916,6 +943,33 @@ mod tests {
             )
             .unwrap();
         (files, scene, id)
+    }
+
+    fn nested_door_scene() -> (Files, EditorScene) {
+        let door = "[[assets]]\npath = \"/prefabs/lock.rveprefab\"\n[[objects]]\nid = \"frame\"\n[[instances]]\nid = \"lock\"\nparent = \"frame\"\nprefab = \"/prefabs/lock.rveprefab\"\nname = \"Nested\"\n[instances.transform]\nposition = [2.0, 0.0, 0.0]\nrotation = [0.0, 30.0, 0.0]\nscale = [2.0, 2.0, 2.0]\n";
+        let lock = "[[objects]]\nid = \"body\"\nname = \"Body\"\n[objects.transform]\nposition = [0.0, 4.0, 0.0]\n";
+        let files = Files::with(&[
+            ("prefabs/door.rveprefab", door),
+            ("prefabs/lock.rveprefab", lock),
+        ]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/door.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        (files, scene)
+    }
+
+    fn edit_nested_root(scene: &mut EditorScene) {
+        scene
+            .edit_object("door.lock", None, |object| {
+                object.name = Some("Applied".to_owned());
+                object.transform.position = [7.0, 3.0, 1.0];
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn world_position(scene: &EditorScene, id: &str) -> [f32; 3] {
@@ -1039,6 +1093,181 @@ mod tests {
             .unwrap();
         assert!(scene.object_override("door.handle").is_none());
         assert_eq!(scene.object("door.handle").unwrap().name, None);
+    }
+
+    #[test]
+    fn clearing_prefab_names_uses_the_explicit_empty_name_override() {
+        let prefab = "[[objects]]\nid = \"frame\"\nname = \"Door\"\n[[objects]]\nid = \"handle\"\nparent = \"frame\"\nname = \"Handle\"\n";
+        let files = Files::with(&[("prefabs/door.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/door.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("door.handle", None, |object| {
+                object.name = None;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            scene
+                .object_override("door.handle")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(scene.object("door.handle").unwrap().name, None);
+        let (_, applied) = scene.prefab_with_override("door.handle").unwrap();
+        assert_eq!(
+            applied
+                .objects
+                .iter()
+                .find(|object| object.id == "handle")
+                .unwrap()
+                .name,
+            None
+        );
+
+        scene
+            .edit_object("door", None, |object| {
+                object.name = None;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(scene.instance("door").unwrap().name.as_deref(), Some(""));
+        assert_eq!(scene.object("door").unwrap().name, None);
+
+        scene.unpack("door").unwrap();
+        assert_eq!(scene.object("door").unwrap().name, None);
+        assert_eq!(scene.object("door-handle").unwrap().name, None);
+    }
+
+    #[test]
+    fn schema_default_is_kept_as_an_override_when_prefab_defines_the_parameter() {
+        let prefab = "[[assets]]\npath = \"/scripts/params.lua\"\n[[objects]]\nid = \"frame\"\n[[objects.lite_scripts]]\npath = \"/scripts/params.lua\"\nparams = { speed = 12 }\n";
+        let files = Files::with(&[("prefabs/params.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/params.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("params", None, |object| {
+                object.lite_scripts[0]
+                    .params
+                    .insert("speed".to_owned(), ParamValue::Int(30));
+                Ok(())
+            })
+            .unwrap();
+
+        let change = scene.object_override("params").unwrap();
+        assert_eq!(change.lite_params[0].params["speed"], ParamValue::Int(30));
+        assert_eq!(
+            scene.object("params").unwrap().lite_scripts[0].params["speed"],
+            ParamValue::Int(30)
+        );
+    }
+
+    #[test]
+    fn revert_all_keeps_root_instance_placement_transform() {
+        let (_, mut scene, _) = door_scene();
+        scene
+            .set_mesh("door", path("/models/gold.fbx"), None)
+            .unwrap();
+        scene
+            .edit_object("door", None, |object| {
+                object.name = Some("Front door".to_owned());
+                Ok(())
+            })
+            .unwrap();
+
+        scene.revert_override("door").unwrap();
+
+        let instance = scene.instance("door").unwrap();
+        assert_eq!(instance.name, None);
+        assert_eq!(instance.transform.unwrap().position, [2.0, 0.0, 0.0]);
+        assert!(instance.overrides.is_empty());
+        assert_eq!(scene.object("door").unwrap().name, None);
+        assert_eq!(
+            scene
+                .object("door")
+                .unwrap()
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .model,
+            path("/models/door.fbx")
+        );
+    }
+
+    #[test]
+    fn applying_nested_root_name_and_transform_promotes_instance_fields() {
+        let (files, mut scene) = nested_door_scene();
+        edit_nested_root(&mut scene);
+
+        let (path, prefab) = scene.prefab_with_override("door.lock").unwrap();
+        let nested = prefab
+            .instances
+            .iter()
+            .find(|instance| instance.id == "lock")
+            .unwrap();
+        assert_eq!(nested.name.as_deref(), Some("Applied"));
+        assert_eq!(
+            nested.transform.unwrap(),
+            SceneTransform {
+                position: [7.0, 3.0, 1.0],
+                rotation: [0.0, 30.0, 0.0],
+                scale: [2.0, 2.0, 2.0],
+            }
+        );
+        assert!(nested.overrides.is_empty());
+
+        files.write(path.as_str(), &prefab.to_toml().unwrap());
+        scene.drop_override("door.lock").unwrap();
+        assert_eq!(
+            scene.object("door.lock").unwrap().name.as_deref(),
+            Some("Applied")
+        );
+        assert_eq!(
+            scene.object("door.lock").unwrap().transform.position,
+            [7.0, 3.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn unpack_promotes_nested_root_name_and_transform_to_instance_fields() {
+        let (_, mut scene) = nested_door_scene();
+        edit_nested_root(&mut scene);
+
+        scene.unpack("door").unwrap();
+
+        let nested = scene.instance("door-lock").unwrap();
+        assert_eq!(nested.name.as_deref(), Some("Applied"));
+        assert_eq!(
+            nested.transform.unwrap(),
+            SceneTransform {
+                position: [7.0, 3.0, 1.0],
+                rotation: [0.0, 30.0, 0.0],
+                scale: [2.0, 2.0, 2.0],
+            }
+        );
+        assert!(nested.overrides.is_empty());
+        assert_eq!(
+            scene.object("door-lock").unwrap().name.as_deref(),
+            Some("Applied")
+        );
+        assert_eq!(
+            scene.object("door-lock").unwrap().transform.position,
+            [7.0, 3.0, 1.0]
+        );
     }
 
     #[test]

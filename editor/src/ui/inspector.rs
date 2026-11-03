@@ -613,6 +613,7 @@ fn show_lite_script(
     let field = OverrideField::LiteParams(script.path.clone());
     let mut params = script.params.clone();
     let mut params_response = None;
+    let mut reset = None;
     let (remove, reverted) = component_header(
         ui,
         mark(state, id, field.clone()),
@@ -620,7 +621,8 @@ fn show_lite_script(
         (id, index),
         |ui| match &schema {
             Ok(Some(schema)) => {
-                params_response = schema_params_ui(ui, ("lite", id, index), schema, &mut params);
+                params_response =
+                    schema_params_ui(ui, ("lite", id, index), schema, &mut params, &mut reset);
             }
             Ok(None) => params_response = params_ui(ui, ("lite", id, index), &mut params),
             Err(_) => {
@@ -632,6 +634,15 @@ fn show_lite_script(
             }
         },
     );
+    if let Some((name, default)) = reset {
+        let base_has_param = default.is_some()
+            && prefab_base_object(state, id).is_some_and(|base| {
+                base.lite_scripts.get(index).is_some_and(|base_script| {
+                    base_script.path == script.path && base_script.params.contains_key(&name)
+                })
+            });
+        reset_schema_param(&mut params, &name, default, base_has_param);
+    }
     if let Some(response) = &params_response {
         let key = format!("lite-{index}");
         commit(state, id, &key, response, |object| {
@@ -665,6 +676,7 @@ fn show_heavy_script(
     let field = OverrideField::HeavyParams(script.name.clone());
     let mut params = script.params.clone();
     let mut params_response = None;
+    let mut reset = None;
     let (remove, reverted) = component_header(
         ui,
         mark(state, id, field.clone()),
@@ -672,11 +684,21 @@ fn show_heavy_script(
         (id, index),
         |ui| match &schema {
             Some(schema) => {
-                params_response = schema_params_ui(ui, ("heavy", id, index), schema, &mut params);
+                params_response =
+                    schema_params_ui(ui, ("heavy", id, index), schema, &mut params, &mut reset);
             }
             None => params_response = params_ui(ui, ("heavy", id, index), &mut params),
         },
     );
+    if let Some((name, default)) = reset {
+        let base_has_param = default.is_some()
+            && prefab_base_object(state, id).is_some_and(|base| {
+                base.heavy_scripts.get(index).is_some_and(|base_script| {
+                    base_script.name == script.name && base_script.params.contains_key(&name)
+                })
+            });
+        reset_schema_param(&mut params, &name, default, base_has_param);
+    }
     if let Some(response) = &params_response {
         let key = format!("heavy-{index}");
         commit(state, id, &key, response, |object| {
@@ -905,15 +927,15 @@ fn add_heavy_script(state: &mut EditorState, id: &str, name: String) {
 
 /// Параметры по схеме скрипта: поля в порядке объявления с виджетом по типу. Ключ без
 /// значения в сцене показывает default и записывается только после правки; «↺» удаляет
-/// ключ и возвращает default. Необъявленные ключи помечены и удаляются кнопкой «x».
+/// ключ или записывает default, если он должен перекрыть значение из prefab.
 fn schema_params_ui(
     ui: &mut egui::Ui,
     salt: impl std::hash::Hash + std::fmt::Debug,
     schema: &ParamSchema,
     params: &mut BTreeMap<String, ParamValue>,
+    reset: &mut Option<(String, Option<ParamValue>)>,
 ) -> Option<egui::Response> {
     let mut combined: Option<egui::Response> = None;
-    let mut reset = None;
     egui::Grid::new(("schema_params", salt))
         .num_columns(3)
         .show(ui, |ui| {
@@ -938,7 +960,7 @@ fn schema_params_ui(
                 ui.horizontal(|ui| {
                     if stored.is_some() && ui.small_button("↺").on_hover_text("Default").clicked()
                     {
-                        reset = Some(spec.name.clone());
+                        *reset = Some((spec.name.clone(), Some(spec.default.clone())));
                     }
                     if let Some(Err(error)) = &current {
                         ui.colored_label(ui.visuals().error_fg_color, "⚠")
@@ -955,13 +977,12 @@ fn schema_params_ui(
                     .on_hover_text("Параметр не объявлен скриптом");
                 ui.label("не объявлен");
                 if ui.small_button("x").clicked() {
-                    reset = Some(name.clone());
+                    *reset = Some((name.clone(), None));
                 }
                 ui.end_row();
             }
         });
-    if let Some(name) = reset {
-        params.remove(&name);
+    if reset.is_some() {
         let mut response = combined.unwrap_or_else(|| ui.label(""));
         response.mark_changed();
         return Some(response);
@@ -969,15 +990,67 @@ fn schema_params_ui(
     combined
 }
 
+fn prefab_base_object(state: &EditorState, id: &str) -> Option<SceneObject> {
+    let scene = state.scene.as_ref()?;
+    let origin = scene.origin(id)?;
+    scene.base_object(&origin.instance, id).ok()
+}
+
+fn reset_schema_param(
+    params: &mut BTreeMap<String, ParamValue>,
+    name: &str,
+    default: Option<ParamValue>,
+    base_has_param: bool,
+) {
+    if base_has_param && let Some(default) = default {
+        params.insert(name.to_owned(), default);
+    } else {
+        params.remove(name);
+    }
+}
+
+fn integer_bounds(min: f64, max: f64) -> Option<std::ops::RangeInclusive<i64>> {
+    const I64_LOWER: f64 = -9_223_372_036_854_775_808.0;
+    const I64_UPPER: f64 = 9_223_372_036_854_775_808.0;
+
+    let lower = if min == f64::NEG_INFINITY {
+        i64::MIN
+    } else {
+        let min = min.ceil();
+        if !min.is_finite() || min >= I64_UPPER {
+            return None;
+        }
+        if min <= I64_LOWER {
+            i64::MIN
+        } else {
+            min as i64
+        }
+    };
+    let upper = if max == f64::INFINITY {
+        i64::MAX
+    } else {
+        let max = max.floor();
+        if !max.is_finite() || max < I64_LOWER {
+            return None;
+        }
+        if max >= I64_UPPER {
+            i64::MAX
+        } else {
+            max as i64
+        }
+    };
+    (lower <= upper).then_some(lower..=upper)
+}
+
 fn param_widget(ui: &mut egui::Ui, spec: &ParamSpec, value: &mut ParamValue) -> egui::Response {
     let min = spec.min.unwrap_or(f64::NEG_INFINITY);
     let max = spec.max.unwrap_or(f64::INFINITY);
     match value {
         ParamValue::Bool(value) => ui.checkbox(value, ""),
-        // `as` насыщает бесконечные границы до i64::MIN/MAX.
-        ParamValue::Int(value) => {
-            ui.add(egui::DragValue::new(value).range(min as i64..=max as i64))
-        }
+        ParamValue::Int(value) => match integer_bounds(min, max) {
+            Some(bounds) => ui.add(egui::DragValue::new(value).range(bounds)),
+            None => ui.label("нет целых значений в диапазоне"),
+        },
         ParamValue::Float(value) => {
             ui.add(egui::DragValue::new(value).speed(0.05).range(min..=max))
         }
@@ -997,5 +1070,33 @@ fn param_widget(ui: &mut egui::Ui, spec: &ParamSpec, value: &mut ParamValue) -> 
             })
             .inner
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{integer_bounds, reset_schema_param};
+    use engine_scene::ParamValue;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn integer_bounds_round_fractional_limits_inward_and_handle_empty_ranges() {
+        assert_eq!(integer_bounds(1.2, 2.2), Some(2..=2));
+        assert_eq!(integer_bounds(-2.2, -1.2), Some(-2..=-2));
+        assert_eq!(integer_bounds(1.2, 1.8), None);
+        assert_eq!(
+            integer_bounds(f64::NEG_INFINITY, f64::INFINITY),
+            Some(i64::MIN..=i64::MAX)
+        );
+    }
+
+    #[test]
+    fn reset_keeps_schema_default_when_base_prefab_has_the_key() {
+        let mut params = BTreeMap::from([("speed".to_owned(), ParamValue::Int(12))]);
+        reset_schema_param(&mut params, "speed", Some(ParamValue::Int(30)), true);
+        assert_eq!(params["speed"], ParamValue::Int(30));
+
+        reset_schema_param(&mut params, "speed", Some(ParamValue::Int(30)), false);
+        assert!(!params.contains_key("speed"));
     }
 }

@@ -199,6 +199,21 @@ fn instance_fields_win_over_a_root_override() {
 }
 
 #[test]
+fn empty_instance_and_object_override_names_clear_inherited_names() {
+    let prefab = "[[objects]]\nid = \"root\"\nname = \"Root\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects]]\nid = \"handle\"\nparent = \"root\"\nname = \"Handle\"\n";
+    let library = Library::new(&[("prefabs/door.rveprefab", prefab)]);
+    let document = scene(
+        "[[assets]]\npath = \"/prefabs/door.rveprefab\"\n[[instances]]\nid = \"door\"\nprefab = \"/prefabs/door.rveprefab\"\nname = \"\"\n[[instances.overrides]]\ntarget = \"handle\"\nname = \"\"\n",
+    );
+    let serialized = document.to_toml().unwrap();
+    let reparsed = scene(&serialized);
+    let expanded = library.expand(&reparsed).unwrap().document;
+
+    assert_eq!(object(&expanded, "door").name, None);
+    assert_eq!(object(&expanded, "door.handle").name, None);
+}
+
+#[test]
 fn camera_and_light_overrides_replace_whole_components_and_heavy_params_merge() {
     let prefab = "[[objects]]\nid = \"rig\"\n[objects.camera]\nfov_deg = 50.0\nnear = 0.1\nfar = 10.0\n[[objects]]\nid = \"sun\"\nparent = \"rig\"\n[objects.directional_light]\nshadows = false\n[[objects.heavy_scripts]]\nname = \"Bobber\"\nparams = { speed = 1.0, amplitude = 0.5 }\n";
     let library = Library::new(&[("prefabs/rig.rveprefab", prefab)]);

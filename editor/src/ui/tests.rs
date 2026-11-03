@@ -560,6 +560,40 @@ fn reset_removes_the_key_and_returns_the_default() {
 }
 
 #[test]
+fn reset_uses_schema_default_when_prefab_base_has_the_parameter() {
+    let mut harness = Harness::new();
+    let prefab_path = VirtualPath::parse("/prefabs/params.rveprefab").unwrap();
+    let prefab = "[[assets]]\npath = \"/scripts/rotate.lua\"\n[[objects]]\nid = \"root\"\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\nparams = { speed = 90.0 }\n".to_owned();
+    harness
+        .scene_mut()
+        .set_prefab_loader(std::rc::Rc::new(move |path| {
+            engine_scene::SceneDocument::parse_prefab(format!("/{}", path.as_str()), &prefab)
+        }))
+        .unwrap();
+    harness
+        .scene_mut()
+        .create_object(&NewObject::Prefab(prefab_path, [0.0; 3]), None)
+        .unwrap();
+    harness
+        .state
+        .lite_schemas
+        .insert(SPEED_SCRIPT.to_owned(), Ok(Some(speed_schema())));
+
+    inspector_frame(&mut harness, Vec::new());
+    let texts = inspector_frame(&mut harness, Vec::new());
+    position_of(&texts, "90.00");
+    inspector_click(&mut harness, position_of(&texts, "↺"));
+
+    let params = &harness.scene().object("params").unwrap().lite_scripts[0].params;
+    assert_eq!(params["speed"], engine_scene::ParamValue::Float(30.0));
+    let change = harness.scene().object_override("params").unwrap();
+    assert_eq!(
+        change.lite_params[0].params["speed"],
+        engine_scene::ParamValue::Float(30.0)
+    );
+}
+
+#[test]
 fn undeclared_keys_are_marked_and_can_be_removed() {
     let mut harness = harness_with_script(Some(speed_schema()));
     harness

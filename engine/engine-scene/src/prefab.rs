@@ -190,7 +190,7 @@ fn expand_with(
 /// Применяет override к объекту. Ошибка — override поля компонента, которого нет.
 pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Result<(), String> {
     if let Some(name) = &change.name {
-        object.name = Some(name.clone());
+        object.name = (!name.is_empty()).then(|| name.clone());
     }
     if let Some(transform) = change.transform {
         let target = &mut object.transform;
@@ -413,7 +413,7 @@ impl Expander<'_, '_> {
                 if is_root {
                     object.parent = instance.parent.clone();
                     if let Some(name) = &instance.name {
-                        object.name = Some(name.clone());
+                        object.name = (!name.is_empty()).then(|| name.clone());
                     }
                     if let Some(transform) = instance.transform {
                         object.transform = transform;
