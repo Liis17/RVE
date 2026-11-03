@@ -640,6 +640,87 @@ fn copy_puts_objects_on_the_os_clipboard_and_paste_inserts_them() {
 }
 
 #[test]
+fn escape_that_closes_a_text_field_keeps_the_selection() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    let text_id = egui::Id::new("search");
+    let mut text = String::new();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>, focus: bool| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness.ctx.run_ui(input, |ui| {
+            toolbar::handle_shortcuts(ui.ctx(), state);
+            ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+            if focus {
+                ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
+            }
+            // Как в конце `ui::show`.
+            state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
+        });
+        output.textures_delta.clear();
+    };
+    frame(&mut harness, Vec::new(), true);
+    frame(&mut harness, Vec::new(), false);
+    // egui снимает фокус по Esc до построения UI этого кадра.
+    frame(&mut harness, vec![key(egui::Key::Escape)], false);
+    assert_eq!(harness.scene().selection(), Some("camera"));
+    // Следующий Esc вне поля снимает выделение.
+    frame(&mut harness, vec![key(egui::Key::Escape)], false);
+    assert_eq!(harness.scene().selection(), None);
+}
+
+#[test]
+fn shortcuts_do_not_edit_the_scene_behind_a_modal() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.state.recovery_prompt = Some(crate::state::RecoveryPrompt {
+        scene: None,
+        contents: String::new(),
+    });
+    harness.press(egui::Key::D, Modifiers::COMMAND);
+    harness.press(egui::Key::Delete, Modifiers::NONE);
+    assert_eq!(harness.scene().document().objects.len(), 2);
+    assert!(!harness.scene().is_dirty());
+}
+
+#[test]
+fn losing_the_selection_mid_drag_starts_a_new_history_entry() {
+    let (mut harness, id) = harness_with_cube();
+    harness.scene_mut().select(Some(id.as_str()));
+    harness.panel(Vec::new(), scene_view::show);
+    let grab = y_handle_grab(&harness);
+    harness.panel(vec![Event::PointerMoved(grab)], scene_view::show);
+    harness.panel(
+        vec![button(grab, PointerButton::Primary, true)],
+        scene_view::show,
+    );
+    for step in 1..=3 {
+        let at = grab - vec2(0.0, 20.0 * step as f32);
+        harness.panel(vec![Event::PointerMoved(at)], scene_view::show);
+    }
+    assert!(harness.state.gizmo_drag.is_some());
+    let dragged = harness.scene().object(&id).unwrap().transform;
+    harness.scene_mut().select(None);
+    harness.panel(Vec::new(), scene_view::show);
+    assert!(harness.state.gizmo_drag.is_none());
+
+    let key = format!("{id}/gizmo");
+    let moved = engine_scene::SceneTransform {
+        position: [9.0, 9.0, 9.0],
+        ..dragged
+    };
+    harness
+        .scene_mut()
+        .set_transforms(&[(id.clone(), moved)], Some(&key))
+        .unwrap();
+    assert!(harness.scene_mut().undo());
+    assert_eq!(
+        harness.scene().object(&id).unwrap().transform.position,
+        dragged.position
+    );
+}
+
+#[test]
 fn ctrl_d_duplicates_the_selection() {
     let mut harness = Harness::new();
     harness.scene_mut().select(Some("camera"));

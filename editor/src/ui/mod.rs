@@ -36,6 +36,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     show_unsaved_prompt(ui.ctx(), state);
     show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
+    state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
 }
 
 fn show_recovery_prompt(ctx: &egui::Context, state: &mut EditorState) {

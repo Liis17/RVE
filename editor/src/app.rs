@@ -199,7 +199,9 @@ impl EditorApp {
             return;
         };
         let revision = scene.revision();
+        // Пока решение о копии прошлого сеанса не принято, её нельзя перезаписать.
         if self.state.is_playing()
+            || self.state.recovery_prompt.is_some()
             || !autosave_due(
                 scene.is_dirty(),
                 revision,
@@ -212,17 +214,19 @@ impl EditorApp {
         let Some(store) = self.autosave_store() else {
             return;
         };
+        // Неудачная запись повторится через интервал, а не только после новой правки.
         self.last_autosave = Instant::now();
-        self.autosaved_revision = Some(revision);
         let result = scene
             .document()
             .to_toml()
             .map_err(|error| error.to_string())
             .and_then(|text| store.write(scene.path(), &text));
-        if let Err(error) = result {
-            self.state
+        match result {
+            Ok(()) => self.autosaved_revision = Some(revision),
+            Err(error) => self
+                .state
                 .log
-                .push(LogLevel::Warn, format!("автосохранение: {error}"));
+                .push(LogLevel::Warn, format!("автосохранение: {error}")),
         }
     }
 
@@ -231,6 +235,7 @@ impl EditorApp {
         let scene = self.state.scene.as_ref()?;
         let waiting = scene.is_dirty()
             && !self.state.is_playing()
+            && self.state.recovery_prompt.is_none()
             && self.autosaved_revision != Some(scene.revision());
         waiting.then(|| self.last_autosave + AUTOSAVE_INTERVAL)
     }

@@ -105,6 +105,9 @@ pub struct EditorState {
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
+    /// В прошлом кадре фокус был в текстовом поле: Esc этого кадра закрывает поле,
+    /// а не снимает выделение.
+    pub text_focused_last_frame: bool,
     /// Строки поиска панелей Hierarchy и Project.
     pub hierarchy_filter: String,
     pub project_filter: String,
@@ -148,6 +151,7 @@ impl EditorState {
             current_folder: String::new(),
             project_dialog: None,
             hierarchy_rename: None,
+            text_focused_last_frame: false,
             hierarchy_filter: String::new(),
             project_filter: String::new(),
             component_clipboard: None,

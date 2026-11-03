@@ -33,7 +33,10 @@ impl Worker {
             .name("rve-editor-models".to_owned())
             .spawn(move || {
                 for (generation, path) in request_rx {
-                    let model = load(&path);
+                    // Паника разбора не должна оставлять модель в очереди навсегда.
+                    let model =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&path)))
+                            .unwrap_or_else(|_| Err("паника при разборе модели".to_owned()));
                     if result_tx.send((generation, path, model)).is_err() {
                         break;
                     }
@@ -163,6 +166,24 @@ mod tests {
         assert!(done[0].1.is_ok());
         assert_eq!(done[1].0, "bad.fbx");
         assert_eq!(done[1].1.as_ref().unwrap_err(), "broken");
+    }
+
+    #[test]
+    fn a_panicking_parser_reports_an_error_and_the_queue_keeps_working() {
+        let mut loader = ModelLoader::default();
+        loader.restart_with(Arc::new(|path: &str| {
+            if path == "crash.fbx" {
+                panic!("broken parser");
+            }
+            Ok(empty_model())
+        }));
+        assert!(loader.request("crash.fbx"));
+        let done = loader.wait_finished();
+        assert_eq!(done[0].0, "crash.fbx");
+        assert!(done[0].1.as_ref().unwrap_err().contains("паника"));
+        assert!(!loader.has_pending());
+        assert!(loader.request("ok.fbx"));
+        assert!(loader.wait_finished()[0].1.is_ok());
     }
 
     #[test]
