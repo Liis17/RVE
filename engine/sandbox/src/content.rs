@@ -1,8 +1,9 @@
 //! Содержимое кадра sandbox: демонстрационная сцена или модель из assets.
 
 use crate::scene::{
-    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, plane_mesh, shadows_light_direction,
-    shadows_light_view_projection,
+    SHADOWS_AMBIENT, SHADOWS_LIGHT_COLOR, Scene, material_sphere_meshes,
+    materials_light_view_projection, materials_plane_mesh, plane_mesh, shadows_light_direction,
+    shadows_light_view_projection, sinusoidal_normal_texture,
 };
 use engine_assets::{Model, ModelMaterial, TextureData};
 use engine_render::{DirectionalLight, Vertex};
@@ -31,6 +32,9 @@ pub struct Content {
 
 impl Content {
     pub fn from_scene(scene: Scene) -> Self {
+        if scene == Scene::Materials {
+            return Self::material_showcase();
+        }
         let (vertices, indices) = scene.mesh();
         let textures = scene.texture().into_iter().collect::<Vec<_>>();
         let mut meshes = vec![Mesh {
@@ -55,6 +59,47 @@ impl Content {
             meshes,
             textures,
             motion: scene,
+            fit: Mat4::IDENTITY,
+        }
+    }
+
+    fn material_showcase() -> Self {
+        let textures = vec![sinusoidal_normal_texture()];
+        let mut meshes = material_sphere_meshes()
+            .into_iter()
+            .map(|(metallic, roughness, vertices, indices)| Mesh {
+                vertices,
+                indices,
+                material: ModelMaterial {
+                    base_color: if metallic == 0.0 {
+                        [0.68, 0.16, 0.045]
+                    } else {
+                        [0.82, 0.58, 0.24]
+                    },
+                    metallic,
+                    roughness,
+                    ..ModelMaterial::default()
+                },
+                environment: false,
+            })
+            .collect::<Vec<_>>();
+        let (vertices, indices) = materials_plane_mesh();
+        meshes.push(Mesh {
+            vertices,
+            indices,
+            material: ModelMaterial {
+                base_color: [0.54, 0.58, 0.63],
+                roughness: 0.85,
+                normal_texture: Some(0),
+                normal_scale: 1.0,
+                ..ModelMaterial::default()
+            },
+            environment: true,
+        });
+        Self {
+            meshes,
+            textures,
+            motion: Scene::Materials,
             fit: Mat4::IDENTITY,
         }
     }
@@ -84,8 +129,12 @@ impl Content {
                 environment: false,
             })
             .collect::<Vec<_>>();
-        if scene == Scene::Shadows {
-            let (vertices, indices) = plane_mesh();
+        if matches!(scene, Scene::Shadows | Scene::Materials) {
+            let (vertices, indices) = if scene == Scene::Materials {
+                materials_plane_mesh()
+            } else {
+                plane_mesh()
+            };
             meshes.push(Mesh {
                 vertices,
                 indices,
@@ -119,7 +168,7 @@ impl Content {
     }
 
     pub fn light(&self, elapsed: f32) -> DirectionalLight {
-        if self.motion != Scene::Shadows {
+        if !matches!(self.motion, Scene::Shadows | Scene::Materials) {
             return DirectionalLight::default();
         }
         DirectionalLight {
@@ -130,7 +179,11 @@ impl Content {
     }
 
     pub fn shadow_view_projection(&self, elapsed: f32) -> Option<Mat4> {
-        (self.motion == Scene::Shadows).then(|| shadows_light_view_projection(elapsed))
+        match self.motion {
+            Scene::Shadows => Some(shadows_light_view_projection(elapsed)),
+            Scene::Materials => Some(materials_light_view_projection(elapsed)),
+            Scene::Triangle | Scene::Cube => None,
+        }
     }
 }
 
@@ -318,6 +371,39 @@ mod tests {
                 .shadow_view_projection(0.0)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn materials_scene_has_dielectric_and_metal_roughness_rows_and_bumped_floor() {
+        let content = Content::from_scene(Scene::Materials);
+        assert_eq!(content.meshes.len(), 11);
+        assert_eq!(content.textures.len(), 1);
+        assert!(content.meshes[..5].iter().all(|mesh| {
+            mesh.material.metallic == 0.0 && mesh.material.normal_texture.is_none()
+        }));
+        assert!(content.meshes[5..10].iter().all(|mesh| {
+            mesh.material.metallic == 1.0 && mesh.material.normal_texture.is_none()
+        }));
+        assert_eq!(
+            content.meshes[..5]
+                .iter()
+                .map(|mesh| mesh.material.roughness)
+                .collect::<Vec<_>>(),
+            [0.0, 0.25, 0.5, 0.75, 1.0]
+        );
+        assert_eq!(
+            content.meshes[5..10]
+                .iter()
+                .map(|mesh| mesh.material.roughness)
+                .collect::<Vec<_>>(),
+            [0.0, 0.25, 0.5, 0.75, 1.0]
+        );
+        let floor = content.meshes.last().unwrap();
+        assert!(floor.environment);
+        assert_eq!(floor.material.normal_texture, Some(0));
+        assert_eq!(floor.vertices[0].position, [-4.0, -1.0, -4.0]);
+        assert_eq!(content.light(0.0).ambient, [0.15; 3]);
+        assert!(content.shadow_view_projection(0.0).is_some());
     }
 
     #[test]

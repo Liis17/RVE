@@ -33,6 +33,9 @@ name = "Shared Cube"
 position = [0.0, 0.0, 0.0]
 [objects.mesh_renderer]
 model = "/models/shared-cube.fbx"
+[objects.mesh_renderer.material]
+metallic = 0.55
+roughness = 0.32
 [[objects.lite_scripts]]
 path = "/scripts/rotate.lua"
 params = { speed = 30.0 }
