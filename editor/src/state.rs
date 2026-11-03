@@ -5,7 +5,7 @@ use crate::console::ConsoleLog;
 use crate::play::PlaySession;
 use crate::previews::PreviewCache;
 use crate::project::OpenProject;
-use crate::scene_edit::{EditorScene, NewObject};
+use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::EditorCamera;
 use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool};
 use engine_assets::Model;
@@ -85,6 +85,8 @@ pub struct EditorState {
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
+    /// Компонент, скопированный в Inspector для вставки в объекты.
+    pub component_clipboard: Option<Component>,
     pub previews: PreviewCache,
     pub viewport_texture: Option<egui::TextureId>,
     pub scene_view: SceneViewInfo,
@@ -118,6 +120,7 @@ impl EditorState {
             current_folder: String::new(),
             project_dialog: None,
             hierarchy_rename: None,
+            component_clipboard: None,
             previews: PreviewCache::default(),
             viewport_texture: None,
             scene_view: SceneViewInfo::default(),
