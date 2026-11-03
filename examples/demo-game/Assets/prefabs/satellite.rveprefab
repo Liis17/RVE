@@ -1,0 +1,16 @@
+[[assets]]
+path = "/models/shared-cube.fbx"
+
+[[assets]]
+path = "/scripts/rotate.lua"
+
+[[objects]]
+id = "body"
+name = "Satellite"
+[objects.transform]
+scale = [0.25, 0.25, 0.25]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[[objects.lite_scripts]]
+path = "/scripts/rotate.lua"
+params = { speed = 90.0 }

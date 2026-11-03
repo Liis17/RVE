@@ -626,3 +626,64 @@ fn rust_script_parameters_use_the_library_schema() {
     position_of(&texts, "Bob speed");
     position_of(&texts, "1.40");
 }
+
+fn hierarchy_frame(harness: &mut Harness, events: Vec<Event>) -> Vec<(String, Pos2)> {
+    let input = harness.input(events);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| hierarchy::show(ui, state));
+    });
+    output.textures_delta.clear();
+    texts(&output.shapes)
+}
+
+#[test]
+fn hierarchy_marks_prefab_instances_and_does_not_drag_their_objects() {
+    let mut harness = Harness::new();
+    let prefab = "[[objects]]\nid = \"frame\"\n[[objects]]\nid = \"handle\"\nparent = \"frame\"\n";
+    let loader: crate::scene_edit::PrefabLoader = std::rc::Rc::new(move |path| {
+        engine_scene::SceneDocument::parse_prefab(format!("/{}", path.as_str()), prefab)
+    });
+    let scene = harness.scene_mut();
+    scene.set_prefab_loader(loader).unwrap();
+    scene
+        .create_object(
+            &NewObject::Prefab(
+                VirtualPath::parse("/prefabs/door.rveprefab").unwrap(),
+                [0.0; 3],
+            ),
+            None,
+        )
+        .unwrap();
+    hierarchy_frame(&mut harness, Vec::new());
+    let texts = hierarchy_frame(&mut harness, Vec::new());
+    position_of(&texts, "📦 door");
+    let handle = position_of(&texts, "handle");
+    let camera = position_of(&texts, "Camera");
+    let revision = harness.scene().revision();
+
+    hierarchy_frame(&mut harness, vec![Event::PointerMoved(handle)]);
+    hierarchy_frame(
+        &mut harness,
+        vec![button(handle, PointerButton::Primary, true)],
+    );
+    for step in 1..=4 {
+        let at = handle + (camera - handle) * (step as f32 / 4.0);
+        hierarchy_frame(&mut harness, vec![Event::PointerMoved(at)]);
+    }
+    hierarchy_frame(
+        &mut harness,
+        vec![button(camera, PointerButton::Primary, false)],
+    );
+    hierarchy_frame(&mut harness, Vec::new());
+    assert_eq!(harness.scene().revision(), revision);
+    assert_eq!(
+        harness
+            .scene()
+            .object("door.handle")
+            .unwrap()
+            .parent
+            .as_deref(),
+        Some("door")
+    );
+}

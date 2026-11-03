@@ -23,7 +23,7 @@ pub const MAX_EXPANDED_ID_BYTES: usize = 255;
 pub const PREFAB_EXTENSION: &str = "rveprefab";
 
 /// Экземпляр префаба в сцене или другом префабе.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrefabInstance {
     /// Id корня раскрытого префаба; авторский формат `[A-Za-z0-9_-]{1,64}`.
@@ -44,7 +44,7 @@ pub struct PrefabInstance {
 
 /// Разреженная замена полей одного объекта префаба. Компоненты не добавляются и не
 /// удаляются: override поля отсутствующего компонента — ошибка.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrefabOverride {
     /// Id объекта в раскрытом префабе; у вложенных — через точку (`lock.bolt`).
@@ -78,7 +78,7 @@ pub struct TransformOverride {
 }
 
 /// Замена модели и текстуры; материал сливается по заданным полям.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshRendererOverride {
     #[serde(
@@ -98,7 +98,7 @@ pub struct MeshRendererOverride {
 }
 
 /// Слияние `params` lite-скриптов с этим путём по ключам.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiteParamsOverride {
     #[serde(with = "virtual_path_serde")]
@@ -107,7 +107,7 @@ pub struct LiteParamsOverride {
 }
 
 /// Слияние `params` heavy-скриптов с этим именем по ключам.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeavyParamsOverride {
     pub name: String,

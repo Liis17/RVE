@@ -41,6 +41,10 @@ pub enum Action {
     RefreshAssets,
     /// Выбрать каталог и собрать релиз проекта через `rve-build`; сцена сохраняется заранее.
     BuildPlayer,
+    /// Сохранить поддерево объекта в новый префаб и заменить его экземпляром.
+    CreatePrefab(String),
+    /// Перенести overrides объекта экземпляра в файл префаба.
+    ApplyToPrefab(String),
     /// Сохранить сцену и при успехе выполнить действие.
     SaveThen(Box<Action>),
     /// Выполнить действие, отбросив несохранённые изменения.
@@ -104,6 +108,8 @@ pub struct EditorState {
     pub pending_frame: Option<String>,
     /// CPU-модели, загруженные для отрисовки: по ним работают picking и фокус камеры.
     pub models: HashMap<String, Arc<Model>>,
+    /// Объект, чьи overrides ждут подтверждения переноса в префаб.
+    pub apply_prompt: Option<String>,
     /// Идущая сборка релиза; одновременно — не больше одной.
     pub build: Option<BuildJob>,
     /// Схемы `properties` lite-скриптов по пути; ошибка пишется в Console один раз.
@@ -140,6 +146,7 @@ impl EditorState {
             pending_frame: None,
             models: HashMap::new(),
             build: None,
+            apply_prompt: None,
             lite_schemas: HashMap::new(),
             edit_world: None,
         }
@@ -170,7 +177,7 @@ impl EditorState {
             .as_ref()
             .is_none_or(|(built, _)| *built != revision);
         if stale {
-            match World::from_document(scene.document()) {
+            match world_for_view(scene.view()) {
                 Ok(world) => self.edit_world = Some((revision, world)),
                 Err(error) => {
                     self.log.error(error.to_string());
@@ -227,16 +234,23 @@ impl EditorState {
         self.edit_scene(|scene| scene.create_object(kind, parent));
     }
 
-    /// Создаёт объект из перетащенного ресурса, если это модель; `position` — локальная позиция.
+    /// Создаёт объект из перетащенного ресурса: модель или экземпляр префаба;
+    /// `position` — локальная позиция.
     pub fn create_from_asset(&mut self, path: &str, parent: Option<&str>, position: [f32; 3]) {
-        if AssetKind::of(path) != AssetKind::Model {
-            self.log
-                .error(format!("{path}: на сцену можно перетащить только .fbx"));
+        let asset_kind = AssetKind::of(path);
+        if !matches!(asset_kind, AssetKind::Model | AssetKind::Prefab) {
+            self.log.error(format!(
+                "{path}: на сцену можно перетащить только .fbx или .rveprefab"
+            ));
             return;
         }
         match VirtualPath::parse(path) {
             Ok(path) => {
-                let kind = NewObject::Mesh(path, position);
+                let kind = if asset_kind == AssetKind::Prefab {
+                    NewObject::Prefab(path, position)
+                } else {
+                    NewObject::Mesh(path, position)
+                };
                 self.pending_frame = self.edit_scene(|scene| scene.create_object(&kind, parent));
             }
             Err(_) => self.log.error(format!("{path}: некорректный путь ресурса")),
@@ -282,6 +296,40 @@ impl EditorState {
         paths
     }
 }
+
+/// Мир для показа раскрытого документа. Префабу без камеры добавляется скрытая камера
+/// под корнем: `World` требует камеру, а вид Scene всё равно использует камеру редактора.
+fn world_for_view(view: &engine_scene::SceneDocument) -> Result<World, engine_scene::SceneError> {
+    if !view.is_prefab() || view.objects.iter().any(|object| object.camera.is_some()) {
+        return World::from_document(view);
+    }
+    let mut view = view.clone();
+    let root = view
+        .objects
+        .iter()
+        .find(|object| object.parent.is_none())
+        .map(|object| object.id.clone());
+    view.objects.push(engine_scene::SceneObject {
+        id: EDITOR_CAMERA_ID.to_owned(),
+        name: None,
+        parent: root,
+        transform: engine_scene::SceneTransform::default(),
+        camera: Some(engine_scene::CameraComponent {
+            fov_deg: 60.0,
+            near: 0.1,
+            far: 1000.0,
+        }),
+        mesh_renderer: None,
+        lod_group: None,
+        directional_light: None,
+        lite_scripts: Vec::new(),
+        heavy_scripts: Vec::new(),
+    });
+    World::from_document(&view)
+}
+
+/// Id скрытой камеры префаба в мире вида; документ его не содержит.
+const EDITOR_CAMERA_ID: &str = "__editor_camera";
 
 /// Читает схему в отдельном Lua; chunk дольше `timeout` прерывается.
 fn read_lite_schema(

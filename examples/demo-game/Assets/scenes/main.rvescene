@@ -4,6 +4,9 @@ path = "/models/shared-cube.fbx"
 [[assets]]
 path = "/scripts/rotate.lua"
 
+[[assets]]
+path = "/prefabs/orbit.rveprefab"
+
 [[objects]]
 id = "camera"
 name = "Camera"
@@ -42,3 +45,14 @@ params = { speed = 30.0 }
 [[objects.heavy_scripts]]
 name = "Bobber"
 params = { amplitude = 0.15, speed = 1.4 }
+
+[[instances]]
+id = "orbit"
+prefab = "/prefabs/orbit.rveprefab"
+[instances.transform]
+position = [0.0, 1.15, 0.0]
+
+[[instances.overrides]]
+target = "moon"
+name = "Moon"
+lite_params = [{ path = "/scripts/rotate.lua", params = { speed = -120.0 } }]

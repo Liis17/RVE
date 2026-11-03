@@ -380,7 +380,7 @@ impl SceneDocument {
 }
 
 /// Ресурс, объявленный для включения в архив сцены.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneAsset {
     #[serde(with = "virtual_path_serde")]
@@ -390,7 +390,7 @@ pub struct SceneAsset {
 }
 
 /// Объект сцены в порядке документа.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneObject {
     pub id: String,
@@ -421,7 +421,7 @@ impl SceneObject {
 }
 
 /// Локальная трансформация документа; углы вращения хранятся в градусах.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneTransform {
     #[serde(default = "zero3")]
@@ -443,7 +443,7 @@ impl Default for SceneTransform {
 }
 
 /// Параметры проекции камеры. Поле зрения измеряется по узкой стороне.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CameraComponent {
     pub fov_deg: f32,
@@ -452,7 +452,7 @@ pub struct CameraComponent {
 }
 
 /// Экземпляр FBX, необязательная замена base-color PNG и override материала.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshRenderer {
     #[serde(with = "virtual_path_serde")]
@@ -505,7 +505,7 @@ pub struct LodLevel {
 }
 
 /// Необязательные замены факторов и текстур FBX-материала.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterialOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -531,7 +531,7 @@ pub struct MaterialOverride {
 }
 
 /// Цвет направленного света, ambient и необязательная проекция теней.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectionalLightComponent {
     #[serde(default = "one3")]
@@ -648,7 +648,7 @@ impl<'de> Deserialize<'de> for ParamValue {
 }
 
 /// Файл скрипта для lightweight runtime.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiteScript {
     #[serde(with = "virtual_path_serde")]
@@ -658,7 +658,7 @@ pub struct LiteScript {
 }
 
 /// Фабрика скрипта, зарегистрированная игровым крейтом.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeavyScript {
     pub name: String,

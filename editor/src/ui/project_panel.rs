@@ -109,6 +109,7 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
     }
     match AssetKind::of(&entry.path) {
         AssetKind::Scene => "SCENE",
+        AssetKind::Prefab => "PREFAB",
         AssetKind::Model => "FBX",
         AssetKind::Texture => "PNG",
         AssetKind::Script => "LUA",
@@ -177,7 +178,10 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
     if response.double_clicked() {
         if entry.is_dir {
             state.current_folder = entry.path.clone();
-        } else if AssetKind::of(&entry.path) == AssetKind::Scene {
+        } else if matches!(
+            AssetKind::of(&entry.path),
+            AssetKind::Scene | AssetKind::Prefab
+        ) {
             state.action(Action::OpenScene(Some(entry.path.clone())));
         }
     }

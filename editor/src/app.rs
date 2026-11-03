@@ -102,6 +102,12 @@ impl EditorApp {
         }
         self.state.previews.invalidate();
         self.state.lite_schemas.clear();
+        project.clear_prefabs();
+        if let Some(scene) = &mut self.state.scene
+            && let Err(error) = scene.reload_prefabs()
+        {
+            self.state.log.error(error);
+        }
         if let Some(gpu) = &mut self.gpu
             && let Err(error) = gpu
                 .scene
@@ -112,7 +118,14 @@ impl EditorApp {
     }
 
     fn new_scene(&mut self) {
-        match EditorScene::new_untitled() {
+        let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
+        let scene = EditorScene::new_untitled().and_then(|mut scene| {
+            if let Some(loader) = loader {
+                scene.set_prefab_loader(loader)?;
+            }
+            Ok(scene)
+        });
+        match scene {
             Ok(scene) => self.set_scene(scene),
             Err(error) => self.state.log.error(error),
         }
@@ -126,7 +139,7 @@ impl EditorApp {
             .map_err(|_| format!("{path}: некорректный путь сцены"))
             .and_then(|path| {
                 let contents = project.read_text(path.as_str())?;
-                EditorScene::parse(path, &contents)
+                EditorScene::parse(path, &contents, project.prefab_loader())
             });
         match result {
             Ok(scene) => self.set_scene(scene),
@@ -167,6 +180,7 @@ impl EditorApp {
             }
             Action::Exit => self.exit = true,
             Action::BuildPlayer => self.start_build(),
+            Action::CreatePrefab(id) => self.create_prefab(&id),
             _ => {}
         }
     }
@@ -227,6 +241,70 @@ impl EditorApp {
         }
     }
 
+    /// Сохраняет поддерево объекта в `Assets/prefabs/<id>.rveprefab` и заменяет его
+    /// экземпляром. Запись файла не входит в undo: undo вернёт поддерево, файл останется.
+    fn create_prefab(&mut self, id: &str) {
+        let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
+            return;
+        };
+        let result = VirtualPath::parse(&format!("prefabs/{id}.rveprefab"))
+            .map_err(|_| format!("{id}: некорректное имя префаба"))
+            .and_then(|path| {
+                let file = project
+                    .assets_dir
+                    .resolve(path.as_str())
+                    .map_err(|error| error.to_string())?;
+                if file.exists() {
+                    return Err(format!("/{}: файл уже существует", path.as_str()));
+                }
+                let prefab = scene.prefab_from_subtree(id, &format!("/{}", path.as_str()))?;
+                let text = prefab.to_toml().map_err(|error| error.to_string())?;
+                if let Some(parent) = file.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|error| format!("{}: {error}", parent.display()))?;
+                }
+                crate::scene_edit::write_atomic(&file, text.as_bytes())?;
+                project.clear_prefabs();
+                scene.replace_with_instance(id, &path)?;
+                Ok(path)
+            });
+        match result {
+            Ok(path) => {
+                self.state
+                    .log
+                    .info(format!("Создан префаб /{}", path.as_str()));
+                self.refresh_tree_only();
+            }
+            Err(error) => self.state.log.error(error),
+        }
+    }
+
+    /// Переносит overrides объекта экземпляра в файл префаба и убирает их из сцены.
+    /// Запись файла атомарна и не входит в undo сцены.
+    fn apply_to_prefab(&mut self, id: &str) {
+        let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
+            return;
+        };
+        let result = scene.prefab_with_override(id).and_then(|(path, prefab)| {
+            let file = project
+                .assets_dir
+                .resolve(path.as_str())
+                .map_err(|error| error.to_string())?;
+            let text = prefab.to_toml().map_err(|error| error.to_string())?;
+            crate::scene_edit::write_atomic(&file, text.as_bytes())?;
+            project.clear_prefabs();
+            scene.drop_override(id)?;
+            Ok(path)
+        });
+        match result {
+            Ok(path) => self
+                .state
+                .log
+                .info(format!("Overrides перенесены в /{}", path.as_str())),
+            Err(error) => self.state.log.error(error),
+        }
+    }
+
     /// Переносит вывод сборки в Console; возвращает, появились ли строки.
     fn poll_build(&mut self) -> bool {
         let Some(job) = &mut self.state.build else {
@@ -251,6 +329,7 @@ impl EditorApp {
         rfd::FileDialog::new()
             .set_directory(self.assets_root()?)
             .add_filter("RVE Scene", &["rvescene"])
+            .add_filter("RVE Prefab", &["rveprefab"])
             .pick_file()
     }
 
@@ -277,10 +356,20 @@ impl EditorApp {
                 let Some(root) = self.assets_root() else {
                     return false;
                 };
+                let prefab = self
+                    .state
+                    .scene
+                    .as_ref()
+                    .is_some_and(|scene| scene.document().is_prefab());
+                let kind = if prefab {
+                    ("RVE Prefab", "rveprefab", "prefab")
+                } else {
+                    ("RVE Scene", "rvescene", "scene")
+                };
                 let Some(file) = rfd::FileDialog::new()
                     .set_directory(root)
-                    .add_filter("RVE Scene", &["rvescene"])
-                    .set_file_name("scene.rvescene")
+                    .add_filter(kind.0, &[kind.1])
+                    .set_file_name(format!("{}.{}", kind.2, kind.1))
                     .save_file()
                 else {
                     return false;
@@ -304,6 +393,10 @@ impl EditorApp {
                 self.state
                     .log
                     .info(format!("Сохранено {}", target.as_str()));
+                // Сохранённый префаб видят следующие раскрытия.
+                if let Some(project) = &self.state.project {
+                    project.clear_prefabs();
+                }
                 self.refresh_tree_only();
                 true
             }
@@ -327,7 +420,7 @@ impl EditorApp {
             return;
         };
         let needs_library = scene
-            .document()
+            .view()
             .objects
             .iter()
             .any(|object| !object.heavy_scripts.is_empty());
@@ -345,7 +438,13 @@ impl EditorApp {
         let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
             return;
         };
-        let result = PlaySession::start(scene.document(), self.state.library.as_ref(), |path| {
+        if scene.document().is_prefab() {
+            self.state
+                .log
+                .error("Play недоступен для префаба: откройте сцену");
+            return;
+        }
+        let result = PlaySession::start(scene.view(), self.state.library.as_ref(), |path| {
             project.read_text(path)
         });
         match result {
@@ -434,6 +533,20 @@ impl EditorApp {
                 Action::SaveThen(then) => {
                     if self.save(false) {
                         self.run_confirmed(*then);
+                    }
+                }
+                Action::ApplyToPrefab(id) => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else {
+                        self.apply_to_prefab(&id);
+                    }
+                }
+                Action::CreatePrefab(id) => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else {
+                        self.run_confirmed(Action::CreatePrefab(id));
                     }
                 }
                 action @ (Action::NewScene
