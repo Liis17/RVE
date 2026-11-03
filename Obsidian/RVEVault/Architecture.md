@@ -62,7 +62,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 
 ## Направления зависимостей
 
-- `rve-editor` зависит от `engine-assets`, `engine-files`, `engine-project`, `engine-render`, `engine-resources`, `engine-scene`, `engine-script`, `engine-window`, egui, egui-winit, egui_dock, rfd и glam. От него ничего не зависит.
+- `rve-editor` зависит от `engine-assets`, `engine-files`, `engine-project`, `engine-render`, `engine-resources`, `engine-scene`, `engine-script`, `engine-window`, egui, egui-winit, egui_dock (с feature `serde`), rfd, glam, serde и serde_json. От него ничего не зависит.
 - `sandbox` зависит от `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
 - `rve-player` зависит от `engine-runtime`; runtime соединяет `engine-project`, `engine-files`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `engine-script` и пустые доменные модули. `engine-files` снимает Windows verbatim-префикс в `Layout`; flume обслуживает управляющие каналы и ограниченную очередь снимков, sysinfo сверяет RAM и CPU с требованиями проекта.
 - `rve-build` использует `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak`, `engine-files` и `engine-script`: проверяет включённые сцены и ресурсы, собирает Rust-скрипты как `cdylib`, проверяет их ABI и имена, затем собирает готовый `rve-player` из checkout в `build/player`. Платформенный конвейер macOS дополнительно собирает Vulkan loader и MoltenVK в релиз; подробности — в [[Engine/RveBuild]].
