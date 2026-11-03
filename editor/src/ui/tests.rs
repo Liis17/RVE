@@ -176,7 +176,9 @@ fn harness_with_cube() -> (Harness, String) {
         .unwrap();
     let mut transform = scene.object(&id).unwrap().transform;
     transform.position = CUBE_POSITION.to_array();
-    scene.set_transform(&id, transform, None).unwrap();
+    scene
+        .set_transforms(&[(id.clone(), transform)], None)
+        .unwrap();
     scene.select(None);
     harness.state.models.insert("cube.fbx".to_owned(), cube());
     // Первый кадр определяет размер панели.
@@ -275,6 +277,71 @@ fn dragging_the_move_handle_moves_along_the_axis_as_one_undo_step() {
         scene.object(&id).unwrap().transform.position,
         CUBE_POSITION.to_array()
     );
+}
+
+impl Harness {
+    fn click_with(&mut self, at: Pos2, modifiers: Modifiers, panel: Panel) {
+        let changed = Event::ModifiersChanged(modifiers);
+        let press = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        self.panel(vec![changed.clone(), Event::PointerMoved(at)], panel);
+        self.panel(vec![changed.clone(), press(true)], panel);
+        self.panel(vec![changed.clone(), press(false)], panel);
+        self.panel(vec![Event::ModifiersChanged(Modifiers::NONE)], panel);
+    }
+}
+
+#[test]
+fn ctrl_click_builds_a_group_that_the_move_handle_drags_as_one_undo_step() {
+    let (mut harness, first) = harness_with_cube();
+    let second_position = Vec3::new(0.0, 0.0, 3.0);
+    let scene = harness.scene_mut();
+    let model = VirtualPath::parse("/cube.fbx").unwrap();
+    let second = scene
+        .create_object(&NewObject::Mesh(model, second_position.to_array()), None)
+        .unwrap();
+    scene.select(None);
+    harness.panel(Vec::new(), scene_view::show);
+
+    let first_center = harness.project(CUBE_POSITION);
+    let second_center = harness.project(second_position);
+    harness.click(first_center, scene_view::show);
+    harness.click_with(second_center, Modifiers::COMMAND, scene_view::show);
+    assert_eq!(
+        harness.scene().selected_ids(),
+        [first.clone(), second.clone()]
+    );
+    // Ctrl-щелчок по выделенному снимает только его.
+    harness.click_with(second_center, Modifiers::COMMAND, scene_view::show);
+    assert_eq!(harness.scene().selected_ids(), std::slice::from_ref(&first));
+    harness.click_with(second_center, Modifiers::SHIFT, scene_view::show);
+    assert_eq!(
+        harness.scene().selected_ids(),
+        [first.clone(), second.clone()]
+    );
+
+    // Гизмо стоит в среднем положении группы.
+    let center = (CUBE_POSITION + second_position) * 0.5;
+    let handle = center.distance(harness.state.camera.eye()) * 0.18;
+    let grab = harness.project(center + Vec3::Y * handle * 0.8);
+    harness.drag(
+        grab,
+        grab - vec2(0.0, 60.0),
+        PointerButton::Primary,
+        scene_view::show,
+    );
+    let y = |harness: &Harness, id: &str| harness.scene().object(id).unwrap().transform.position;
+    let (a, b) = (y(&harness, &first), y(&harness, &second));
+    assert!(a[1] > 0.1, "{a:?}");
+    assert!((a[1] - b[1]).abs() < 1e-5, "{a:?} {b:?}");
+    assert_eq!((a[0], b[2]), (CUBE_POSITION.x, second_position.z));
+    assert!(harness.scene_mut().undo());
+    assert_eq!(y(&harness, &first), CUBE_POSITION.to_array());
+    assert_eq!(y(&harness, &second), second_position.to_array());
 }
 
 #[test]
