@@ -21,6 +21,8 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
     if state.unsaved_prompt.is_some()
         || state.project_dialog.is_some()
         || state.recovery_prompt.is_some()
+        || state.apply_prompt.is_some()
+        || state.console_open
     {
         return;
     }

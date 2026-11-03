@@ -61,7 +61,7 @@ pub enum ModelAlphaMode {
     Blend,
 }
 
-/// Линейные факторы и индексы текстур материала модели.
+/// Линейные факторы, двусторонность и индексы текстур материала модели.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelMaterial {
     pub base_color: [f32; 3],
@@ -70,6 +70,7 @@ pub struct ModelMaterial {
     pub emissive: [f32; 3],
     pub opacity: f32,
     pub alpha_mode: ModelAlphaMode,
+    pub double_sided: bool,
     /// Индекс в [`Model::textures`] для sRGB base-color.
     pub base_color_texture: Option<usize>,
     /// Индекс в [`Model::textures`] для линейной metallic-roughness карты.
@@ -93,6 +94,7 @@ impl Default for ModelMaterial {
             emissive: [0.0; 3],
             opacity: 1.0,
             alpha_mode: ModelAlphaMode::Opaque,
+            double_sided: false,
             base_color_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
@@ -745,6 +747,7 @@ fn load_fbx(
         } else {
             &node.materials
         };
+        let mirrored = ufbx::matrix_determinant(&node.geometry_to_world) < 0.0;
         triangle.resize(mesh.max_face_triangles * 3, 0);
         for part in mesh.material_parts.iter() {
             let mut vertices = Vec::with_capacity(part.num_triangles * 3);
@@ -789,9 +792,10 @@ fn load_fbx(
             };
             let vertex_count = u32::try_from(vertices.len())
                 .map_err(|_| decode_error("в меше больше u32::MAX вершин".to_owned()))?;
+            let mut indices = sequential_triangle_indices(vertex_count, mirrored);
             model.meshes.push(ModelMesh {
                 vertices,
-                indices: (0..vertex_count).collect(),
+                indices: std::mem::take(&mut indices),
                 material,
             });
         }
@@ -800,6 +804,16 @@ fn load_fbx(
         return Err(decode_error("в модели нет треугольников".to_owned()));
     }
     Ok(model)
+}
+
+fn sequential_triangle_indices(vertex_count: u32, mirrored: bool) -> Vec<u32> {
+    let mut indices = (0..vertex_count).collect::<Vec<_>>();
+    if mirrored {
+        for triangle in indices.as_chunks_mut::<3>().0 {
+            triangle.swap(1, 2);
+        }
+    }
+    indices
 }
 
 /// Файловая текстура основного цвета: классический diffuse FBX или base color PBR.
@@ -1070,6 +1084,7 @@ fn load_model_material(
         } else {
             ModelAlphaMode::Opaque
         },
+        double_sided: material.features.double_sided.enabled,
         base_color_texture,
         metallic_roughness_texture,
         normal_texture,
@@ -2024,6 +2039,7 @@ mod tests {
         assert!(model.textures.is_empty());
         let mesh = &model.meshes[0];
         assert_eq!(mesh.material.base_color_texture, None);
+        assert!(!mesh.material.double_sided);
         assert_eq!(mesh.indices, [0, 1, 2, 3, 4, 5]);
         assert_eq!(mesh.vertices.len(), 6);
         for vertex in &mesh.vertices {
@@ -2043,6 +2059,41 @@ mod tests {
             model.bounds(),
             Some(([-0.01, -0.01, 0.0], [0.01, 0.01, 0.0]))
         );
+    }
+
+    #[test]
+    fn fbx_double_sided_material_and_mirrored_node_preserve_triangle_winding() {
+        let temp = TempAssets::new("double-sided-mirrored");
+        let fbx = quad_fbx(None)
+            .replace(
+                "P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,0,0",
+                "P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,0,0\n\t\t\tP: \"Lcl Scaling\", \"Lcl Scaling\", \"\", \"A\",-1,1,1",
+            )
+            .replace(
+                "ShadingModel: \"lambert\"",
+                "ShadingModel: \"gltf\"\n\t\tProperties70: {\n\t\t\tP: \"3dsMax|ClassIDa\", \"int\", \"Integer\", \"\",943849874\n\t\t\tP: \"3dsMax|ClassIDb\", \"int\", \"Integer\", \"\",1174294043\n\t\t\tP: \"3dsMax|main|DoubleSided\", \"bool\", \"Boolean\", \"\",1\n\t\t}",
+            );
+        temp.write("model/mirrored.fbx", fbx.as_bytes());
+
+        let model = temp.assets().load_model("/model/mirrored.fbx").unwrap();
+
+        let mesh = &model.meshes[0];
+        assert!(mesh.material.double_sided);
+        assert_eq!(mesh.indices, [0, 2, 1, 3, 5, 4]);
+        for triangle in mesh.indices.as_chunks::<3>().0 {
+            let a = mesh.vertices[triangle[0] as usize].position;
+            let b = mesh.vertices[triangle[1] as usize].position;
+            let c = mesh.vertices[triangle[2] as usize].position;
+            let normal = mesh.vertices[triangle[0] as usize].normal;
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let face = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            assert!(face[0] * normal[0] + face[1] * normal[1] + face[2] * normal[2] > 0.0);
+        }
     }
 
     #[test]

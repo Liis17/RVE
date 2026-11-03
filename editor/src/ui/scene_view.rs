@@ -109,6 +109,9 @@ pub(super) fn feed_play_pointer(
     rect: Rect,
     pixels_per_point: f32,
 ) {
+    if state.console_open {
+        return;
+    }
     let (pointer, delta, scroll) = ui.input(|input| {
         (
             input.pointer.latest_pos(),

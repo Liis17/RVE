@@ -1,11 +1,19 @@
+#[cfg(feature = "dev-console")]
+use crate::console::ConsoleUiSlot;
+#[cfg(feature = "dev-console")]
+use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
+#[cfg(feature = "dev-console")]
+use engine_console::CommandLine;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, LocalLight,
     LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId, ProceduralSky, Renderer,
     SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
 };
+#[cfg(feature = "dev-console")]
+use engine_render::{UiImage, UiPrimitive, UiVertex, ViewportId};
 use engine_scene::camera::Camera;
 use engine_scene::light::{
     cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
@@ -14,12 +22,18 @@ use engine_scene::{
     AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, ObjectHandle,
     Tonemapper, World,
 };
+#[cfg(feature = "dev-console")]
+use engine_script::CommandError;
 use engine_script::{
     ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary, ScriptTime,
 };
+#[cfg(feature = "dev-console")]
+use engine_ui::render::UiBridge;
 use flume::{Receiver, RecvTimeoutError, Selector, Sender, TryRecvError};
 use glam::{Mat3, Vec3};
 use std::collections::HashMap;
+#[cfg(feature = "dev-console")]
+use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -70,10 +84,18 @@ pub(crate) struct GpuSceneTable {
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
 }
 
+type FrameLighting = (
+    DirectionalLight,
+    Vec<[[f32; 4]; 4]>,
+    Option<FrameEnvironment>,
+);
+
 #[derive(Debug)]
 pub(crate) enum ScriptControl {
     Go(GpuSceneTable),
     Background(bool),
+    #[cfg(feature = "dev-console")]
+    Console(CommandLine),
     Shutdown,
 }
 
@@ -81,6 +103,8 @@ pub(crate) enum ScriptControl {
 pub(crate) enum RenderControl {
     Resize(u32, u32),
     Occluded(bool),
+    #[cfg(feature = "dev-console")]
+    ConsoleUiChanged,
     Shutdown,
 }
 
@@ -157,6 +181,26 @@ pub(crate) trait RenderBackend: Send {
         width: u32,
         height: u32,
     ) -> Result<FrameStatus, String>;
+    #[cfg(feature = "dev-console")]
+    fn take_console_ui(&mut self) -> Option<ConsoleUiFrame> {
+        None
+    }
+    #[cfg(feature = "dev-console")]
+    fn discard_console_geometry(&mut self) {}
+    #[cfg(feature = "dev-console")]
+    fn render_console(
+        &mut self,
+        snapshot: &FrameSnapshot,
+        width: u32,
+        height: u32,
+        _ui: &mut ConsoleUiFrame,
+    ) -> Result<FrameStatus, String> {
+        self.render(snapshot, width, height)
+    }
+    #[cfg(feature = "dev-console")]
+    fn close_console(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     fn wait_idle(&mut self) {}
 }
 
@@ -179,6 +223,8 @@ pub(crate) struct ScriptThreadConfig {
     pub render_tx: Sender<RenderControl>,
     pub status: Arc<RuntimeStatus>,
     pub input: Arc<Mutex<InputAccumulator>>,
+    #[cfg(feature = "dev-console")]
+    pub command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
 }
 
 pub(crate) struct ScriptThreadHandle {
@@ -210,28 +256,47 @@ pub(crate) enum ScriptStartupError {
 pub(crate) struct VulkanBackend {
     renderer: Renderer,
     current_environment: Option<(EnvironmentCacheKey, EnvironmentId)>,
+    pipeline_cache_path: Option<std::path::PathBuf>,
+    #[cfg(feature = "dev-console")]
+    console_ui: Option<Arc<ConsoleUiSlot>>,
+    #[cfg(feature = "dev-console")]
+    ui_bridge: UiBridge,
+    #[cfg(feature = "dev-console")]
+    console_viewport: Option<(ViewportId, u32, u32)>,
 }
 
+#[cfg(feature = "dev-console")]
+type PendingConsoleCommands = VecDeque<CommandLine>;
+#[cfg(not(feature = "dev-console"))]
+type PendingConsoleCommands = ();
+
 impl VulkanBackend {
-    pub fn new(renderer: Renderer) -> Self {
+    pub fn new(renderer: Renderer, pipeline_cache_path: Option<std::path::PathBuf>) -> Self {
         Self {
             renderer,
             current_environment: None,
+            pipeline_cache_path,
+            #[cfg(feature = "dev-console")]
+            console_ui: None,
+            #[cfg(feature = "dev-console")]
+            ui_bridge: UiBridge::default(),
+            #[cfg(feature = "dev-console")]
+            console_viewport: None,
         }
     }
-}
 
-impl RenderBackend for VulkanBackend {
-    fn resize(&mut self, width: u32, height: u32) {
-        self.renderer.resize(width, height);
+    #[cfg(feature = "dev-console")]
+    pub fn with_console(mut self, console_ui: Arc<ConsoleUiSlot>) -> Self {
+        self.console_ui = Some(console_ui);
+        self
     }
 
-    fn render(
+    fn frame_lighting(
         &mut self,
         snapshot: &FrameSnapshot,
         width: u32,
         height: u32,
-    ) -> Result<FrameStatus, String> {
+    ) -> Result<FrameLighting, String> {
         let light = DirectionalLight {
             direction: snapshot.light.direction,
             color: snapshot.light.color,
@@ -288,6 +353,22 @@ impl RenderBackend for VulkanBackend {
                 None
             }
         };
+        Ok((light, shadow_cascades, environment))
+    }
+}
+
+impl RenderBackend for VulkanBackend {
+    fn resize(&mut self, width: u32, height: u32) {
+        self.renderer.resize(width, height);
+    }
+
+    fn render(
+        &mut self,
+        snapshot: &FrameSnapshot,
+        width: u32,
+        height: u32,
+    ) -> Result<FrameStatus, String> {
+        let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let frame = Frame {
             clear_color: [
                 snapshot.view.render.clear_color[0],
@@ -324,6 +405,161 @@ impl RenderBackend for VulkanBackend {
         self.renderer
             .render_frame(&frame)
             .map_err(|error| error.to_string())
+    }
+
+    fn wait_idle(&mut self) {
+        match self.renderer.pipeline_cache_data() {
+            Ok(data) => {
+                engine_platform::save_pipeline_cache(self.pipeline_cache_path.as_deref(), &data)
+            }
+            Err(error) => eprintln!("failed to retrieve pipeline cache: {error}"),
+        }
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn take_console_ui(&mut self) -> Option<ConsoleUiFrame> {
+        self.console_ui.as_ref().and_then(|slot| slot.take())
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn discard_console_geometry(&mut self) {
+        if let Some(slot) = &self.console_ui {
+            slot.discard_geometry_preserve_texture_delta();
+        }
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn render_console(
+        &mut self,
+        snapshot: &FrameSnapshot,
+        width: u32,
+        height: u32,
+        ui: &mut ConsoleUiFrame,
+    ) -> Result<FrameStatus, String> {
+        if !ui.textures_delta.set.is_empty() {
+            if let Err(error) = self
+                .ui_bridge
+                .managed
+                .apply_updates(&ui.textures_delta, &mut self.renderer)
+            {
+                ui.textures_delta.clear();
+                return Err(error.to_string());
+            }
+            ui.textures_delta.set.clear();
+        }
+
+        let viewport = match self.console_viewport {
+            Some((viewport, old_width, old_height)) => {
+                if old_width != width || old_height != height {
+                    self.renderer
+                        .resize_viewport(viewport, width, height)
+                        .map_err(|error| error.to_string())?;
+                    self.console_viewport = Some((viewport, width, height));
+                }
+                viewport
+            }
+            None => {
+                let viewport = self
+                    .renderer
+                    .create_viewport(width, height)
+                    .map_err(|error| error.to_string())?;
+                self.console_viewport = Some((viewport, width, height));
+                viewport
+            }
+        };
+
+        let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
+        let scene = Frame {
+            clear_color: [
+                snapshot.view.render.clear_color[0],
+                snapshot.view.render.clear_color[1],
+                snapshot.view.render.clear_color[2],
+                1.0,
+            ],
+            camera: FrameCamera {
+                view: snapshot.camera.view().to_cols_array_2d(),
+                projection: snapshot.camera.projection(width, height).to_cols_array_2d(),
+                position: snapshot.camera.position.to_array(),
+            },
+            environment,
+            lights: &snapshot.local_lights,
+            local_light_shadows: &snapshot.local_light_shadows,
+            shadow_cascades: &shadow_cascades,
+            light,
+            draws: &snapshot.draws,
+            overlay: &[],
+            view: ViewSettings {
+                render_scale: snapshot.view.render.render_scale,
+                exposure_ev: snapshot.view.color.exposure_ev,
+                tonemapper: match snapshot.view.color.tonemapper {
+                    Tonemapper::Aces => RenderTonemapper::Aces,
+                    Tonemapper::Neutral => RenderTonemapper::Neutral,
+                    Tonemapper::None => RenderTonemapper::None,
+                },
+                anti_aliasing: match snapshot.view.render.anti_aliasing {
+                    AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
+                    AntiAliasing::None => RenderAntiAliasing::None,
+                },
+            },
+        };
+        let vertices = [
+            UiVertex {
+                position: [0.0, 0.0],
+                uv: [0.0, 0.0],
+                color: [255; 4],
+            },
+            UiVertex {
+                position: [width as f32, 0.0],
+                uv: [1.0, 0.0],
+                color: [255; 4],
+            },
+            UiVertex {
+                position: [width as f32, height as f32],
+                uv: [1.0, 1.0],
+                color: [255; 4],
+            },
+            UiVertex {
+                position: [0.0, height as f32],
+                uv: [0.0, 1.0],
+                color: [255; 4],
+            },
+        ];
+        let indices = [0, 1, 2, 0, 2, 3];
+        let converted = self.ui_bridge.convert(&ui.primitives, ui.pixels_per_point);
+        let mut primitives = Vec::with_capacity(converted.len() + 1);
+        primitives.push(UiPrimitive {
+            clip_rect: [0.0, 0.0, width as f32, height as f32],
+            image: UiImage::Viewport(viewport),
+            vertices: &vertices,
+            indices: &indices,
+        });
+        primitives.extend(converted.iter().map(|mesh| mesh.primitive()));
+        let status = self
+            .renderer
+            .render_frame_with_ui(&[(viewport, &scene)], &primitives, [0.0, 0.0, 0.0, 1.0])
+            .map_err(|error| error.to_string())?;
+        if status == FrameStatus::Presented && !ui.textures_delta.free.is_empty() {
+            self.ui_bridge
+                .managed
+                .apply_frees(&ui.textures_delta, &mut self.renderer)
+                .map_err(|error| error.to_string())?;
+            ui.textures_delta.free.clear();
+        }
+        Ok(status)
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn close_console(&mut self) -> Result<(), String> {
+        self.ui_bridge
+            .managed
+            .clear(&mut self.renderer)
+            .map_err(|error| error.to_string())?;
+        if let Some((viewport, _, _)) = self.console_viewport.take() {
+            self.renderer
+                .free_viewport(viewport)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -391,6 +627,8 @@ fn scripts_thread(
         render_tx,
         status,
         input,
+        #[cfg(feature = "dev-console")]
+        command_catalog,
         ..
     } = config;
     let library = match load_script_library(
@@ -429,6 +667,8 @@ fn scripts_thread(
 
     let mut background = false;
     let mut applied_background = false;
+    #[cfg(feature = "dev-console")]
+    let mut pending_console_commands = PendingConsoleCommands::default();
     let gpu_scene = loop {
         match control_rx.recv() {
             Ok(ScriptControl::Go(scene)) => break Some(scene),
@@ -437,6 +677,8 @@ fn scripts_thread(
                 background = value;
                 sync_input_background(&input, background, &mut applied_background);
             }
+            #[cfg(feature = "dev-console")]
+            Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
         }
     };
     let Some(gpu_scene) = gpu_scene else {
@@ -455,6 +697,14 @@ fn scripts_thread(
     };
     scripts.start(&mut world, start_time);
     print_script_events(scripts.drain_events());
+    #[cfg(feature = "dev-console")]
+    let mut published_catalog_generation = u64::MAX;
+    #[cfg(feature = "dev-console")]
+    publish_command_catalog(
+        &scripts,
+        &command_catalog,
+        &mut published_catalog_generation,
+    );
     let interval = Duration::from_secs_f64(1.0 / background_tick_hz.max(1) as f64);
     let now = clock.now();
     let mut next_background_tick =
@@ -468,6 +718,10 @@ fn scripts_thread(
                 clock.as_ref(),
                 &mut background,
                 next_background_tick,
+                #[cfg(feature = "dev-console")]
+                &mut pending_console_commands,
+                #[cfg(not(feature = "dev-console"))]
+                &mut (),
             ) {
                 break;
             }
@@ -476,16 +730,33 @@ fn scripts_thread(
             }
         }
         if !background {
-            match control_rx.try_recv() {
-                Ok(ScriptControl::Shutdown) | Err(TryRecvError::Disconnected) => break,
-                Ok(ScriptControl::Background(value)) => {
-                    background = value;
-                    if background {
-                        next_background_tick = clock.now().saturating_add(interval);
-                        continue;
+            let mut should_stop = false;
+            let mut entered_background = false;
+            loop {
+                match control_rx.try_recv() {
+                    Ok(ScriptControl::Shutdown) | Err(TryRecvError::Disconnected) => {
+                        should_stop = true;
+                        break;
                     }
+                    Ok(ScriptControl::Background(true)) => {
+                        background = true;
+                        next_background_tick = clock.now().saturating_add(interval);
+                        entered_background = true;
+                        break;
+                    }
+                    Ok(ScriptControl::Background(false)) | Ok(ScriptControl::Go(_)) => {}
+                    #[cfg(feature = "dev-console")]
+                    Ok(ScriptControl::Console(command)) => {
+                        pending_console_commands.push_back(command);
+                    }
+                    Err(TryRecvError::Empty) => break,
                 }
-                Ok(ScriptControl::Go(_)) | Err(TryRecvError::Empty) => {}
+            }
+            if should_stop {
+                break;
+            }
+            if entered_background {
+                continue;
             }
         }
 
@@ -497,10 +768,29 @@ fn scripts_thread(
             elapsed: now.as_secs_f64(),
             frame: frame_number,
         };
+        #[cfg(feature = "dev-console")]
+        {
+            for (name, error) in
+                execute_console_commands(&mut scripts, &mut world, &mut pending_console_commands)
+            {
+                log::error!(target: "console", "command {name} failed: {error}");
+            }
+            publish_command_catalog(
+                &scripts,
+                &command_catalog,
+                &mut published_catalog_generation,
+            );
+        }
         let input_frame = lock_input(&input).take_frame();
         scripts.set_input(input_frame);
         scripts.update(&mut world, dt, time);
         print_script_events(scripts.drain_events());
+        #[cfg(feature = "dev-console")]
+        publish_command_catalog(
+            &scripts,
+            &command_catalog,
+            &mut published_catalog_generation,
+        );
         if background {
             next_background_tick = now.saturating_add(interval);
             continue;
@@ -508,9 +798,11 @@ fn scripts_thread(
 
         let (scene_frame, warnings) = world.build_frame();
         for warning in warnings {
-            eprintln!(
+            log::warn!(
                 "[scene] {}: объект {}: {}",
-                warning.source, warning.object_id, warning.message
+                warning.source,
+                warning.object_id,
+                warning.message
             );
         }
         let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene) {
@@ -520,7 +812,16 @@ fn scripts_thread(
                 break;
             }
         };
-        match send_snapshot(&frame_tx, &control_rx, snapshot, &mut background) {
+        match send_snapshot(
+            &frame_tx,
+            &control_rx,
+            snapshot,
+            &mut background,
+            #[cfg(feature = "dev-console")]
+            &mut pending_console_commands,
+            #[cfg(not(feature = "dev-console"))]
+            &mut (),
+        ) {
             SendOutcome::Sent => {}
             SendOutcome::Background => {
                 next_background_tick = clock.now().saturating_add(interval);
@@ -538,6 +839,12 @@ fn scripts_thread(
         },
     );
     print_script_events(scripts.drain_events());
+    #[cfg(feature = "dev-console")]
+    publish_command_catalog(
+        &scripts,
+        &command_catalog,
+        &mut published_catalog_generation,
+    );
     let _ = render_tx.send(RenderControl::Shutdown);
 }
 
@@ -764,12 +1071,57 @@ fn selected_level<'a, T>(
 }
 
 fn print_script_events(events: Vec<ScriptEvent>) {
-    for event in events {
-        match event.level {
-            ScriptEventLevel::Info => println!("[script] {event}"),
-            ScriptEventLevel::Warn => eprintln!("[script warn] {event}"),
-            ScriptEventLevel::Error => eprintln!("[script] {event}"),
+    log_script_events_with(&events, log::logger());
+}
+
+#[cfg(feature = "dev-console")]
+fn publish_command_catalog(
+    scripts: &ScriptHost,
+    shared: &Mutex<CommandCatalogSnapshot>,
+    published_generation: &mut u64,
+) {
+    let generation = scripts.commands_generation();
+    if generation == *published_generation {
+        return;
+    }
+    let mut snapshot = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    snapshot.generation = generation;
+    snapshot.catalog = scripts.command_catalog();
+    *published_generation = generation;
+}
+
+#[cfg(feature = "dev-console")]
+fn execute_console_commands(
+    scripts: &mut ScriptHost,
+    world: &mut World,
+    pending: &mut PendingConsoleCommands,
+) -> Vec<(String, CommandError)> {
+    let mut errors = Vec::new();
+    while let Some(command) = pending.pop_front() {
+        if let Err(error) = scripts.execute_command(world, &command) {
+            errors.push((command.name, error));
         }
+        print_script_events(scripts.drain_events());
+    }
+    errors
+}
+
+fn log_script_events_with(events: &[ScriptEvent], logger: &dyn log::Log) {
+    for event in events {
+        let (level, text) = match event.level {
+            ScriptEventLevel::Info => (log::Level::Info, format!("[script] {event}")),
+            ScriptEventLevel::Warn => (log::Level::Warn, format!("[script warn] {event}")),
+            ScriptEventLevel::Error => (log::Level::Error, format!("[script] {event}")),
+        };
+        let args = format_args!("{text}");
+        let record = log::Record::builder()
+            .args(args)
+            .level(level)
+            .target(&event.source)
+            .build();
+        logger.log(&record);
     }
 }
 
@@ -790,6 +1142,8 @@ fn send_snapshot(
     control_rx: &Receiver<ScriptControl>,
     snapshot: Arc<FrameSnapshot>,
     background: &mut bool,
+    #[cfg(feature = "dev-console")] pending_console_commands: &mut PendingConsoleCommands,
+    #[cfg(not(feature = "dev-console"))] _: &mut PendingConsoleCommands,
 ) -> SendOutcome {
     loop {
         let selection = Selector::new()
@@ -808,6 +1162,10 @@ fn send_snapshot(
                     return SendOutcome::Background;
                 }
             }
+            #[cfg(feature = "dev-console")]
+            ScriptSelection::Control(Ok(ScriptControl::Console(command))) => {
+                pending_console_commands.push_back(command);
+            }
             ScriptSelection::Control(Ok(ScriptControl::Go(_))) => {}
         }
     }
@@ -818,6 +1176,8 @@ fn wait_background_tick(
     clock: &dyn Clock,
     background: &mut bool,
     deadline: Duration,
+    #[cfg(feature = "dev-console")] pending_console_commands: &mut PendingConsoleCommands,
+    #[cfg(not(feature = "dev-console"))] _: &mut PendingConsoleCommands,
 ) -> bool {
     while *background {
         let now = clock.now();
@@ -832,6 +1192,8 @@ fn wait_background_tick(
                     return true;
                 }
             }
+            #[cfg(feature = "dev-console")]
+            Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
             Ok(ScriptControl::Go(_)) | Err(RecvTimeoutError::Timeout) => {}
         }
     }
@@ -898,6 +1260,10 @@ fn render_thread(config: RenderThreadConfig) {
         interrupt.interrupt();
     }
     let _ = script_tx.send(ScriptControl::Shutdown);
+    #[cfg(feature = "dev-console")]
+    if let Err(error) = backend.close_console() {
+        status.record_failure(format!("ошибка освобождения UI консоли: {error}"));
+    }
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| backend.wait_idle())) {
         status.record_failure(format!(
             "ошибка ожидания renderer при завершении: {}",
@@ -941,23 +1307,86 @@ fn render_loop(
     let mut occluded = false;
     let mut paused = false;
     let mut presented = 0_u64;
+    let mut latest_snapshot: Option<Arc<FrameSnapshot>> = None;
+    #[cfg(feature = "dev-console")]
+    let mut ui_frame = ConsoleUiFrame::default();
+    #[cfg(feature = "dev-console")]
+    let mut console_active = false;
     loop {
+        let mut should_render = false;
         loop {
             match control_rx.try_recv() {
                 Ok(RenderControl::Resize(new_width, new_height)) => {
                     width = new_width;
                     height = new_height;
                     backend.resize(width, height);
+                    #[cfg(feature = "dev-console")]
+                    {
+                        should_render = true;
+                    }
                 }
-                Ok(RenderControl::Occluded(value)) => occluded = value,
+                Ok(RenderControl::Occluded(value)) => {
+                    occluded = value;
+                    #[cfg(feature = "dev-console")]
+                    {
+                        should_render = true;
+                    }
+                }
+                #[cfg(feature = "dev-console")]
+                Ok(RenderControl::ConsoleUiChanged) => should_render = true,
                 Ok(RenderControl::Shutdown) | Err(TryRecvError::Disconnected) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
             }
         }
+
+        #[cfg(feature = "dev-console")]
+        if let Some(frame) = backend.take_console_ui() {
+            ui_frame.replace_with(frame);
+            should_render = true;
+            if ui_frame.visible {
+                console_active = true;
+            } else if console_active {
+                ui_frame.textures_delta.clear();
+                backend.close_console()?;
+                console_active = false;
+            }
+        }
+
         let next_paused = occluded || width == 0 || height == 0;
         if next_paused != paused {
             paused = next_paused;
             let _ = script_tx.send(ScriptControl::Background(paused));
+            #[cfg(feature = "dev-console")]
+            {
+                should_render = true;
+            }
+        }
+        if paused {
+            #[cfg(feature = "dev-console")]
+            {
+                backend.discard_console_geometry();
+                ui_frame.primitives.clear();
+            }
+            should_render = false;
+        }
+
+        if should_render
+            && let Some(snapshot) = latest_snapshot.as_ref()
+            && let Some(frame_status) = render_snapshot(
+                backend,
+                Arc::clone(snapshot),
+                paused,
+                width,
+                height,
+                #[cfg(feature = "dev-console")]
+                &mut ui_frame,
+            )?
+            && frame_status == FrameStatus::Presented
+        {
+            presented = presented.saturating_add(1);
+            if frame_limit.is_some_and(|limit| presented >= limit) {
+                return Ok(());
+            }
         }
 
         match Selector::new()
@@ -971,22 +1400,30 @@ fn render_loop(
                 backend.resize(width, height);
             }
             RenderSelection::Control(Ok(RenderControl::Occluded(value))) => occluded = value,
+            #[cfg(feature = "dev-console")]
+            RenderSelection::Control(Ok(RenderControl::ConsoleUiChanged)) => {}
             RenderSelection::Control(Ok(RenderControl::Shutdown))
             | RenderSelection::Control(Err(_))
             | RenderSelection::Frame(Err(_)) => return Ok(()),
             RenderSelection::Frame(Ok(snapshot)) => {
-                let Some(frame_status) = render_snapshot(backend, snapshot, paused, width, height)?
+                latest_snapshot = Some(Arc::clone(&snapshot));
+                let Some(frame_status) = render_snapshot(
+                    backend,
+                    snapshot,
+                    paused,
+                    width,
+                    height,
+                    #[cfg(feature = "dev-console")]
+                    &mut ui_frame,
+                )?
                 else {
                     continue;
                 };
-                match frame_status {
-                    FrameStatus::Presented => {
-                        presented = presented.saturating_add(1);
-                        if frame_limit.is_some_and(|limit| presented >= limit) {
-                            return Ok(());
-                        }
+                if frame_status == FrameStatus::Presented {
+                    presented = presented.saturating_add(1);
+                    if frame_limit.is_some_and(|limit| presented >= limit) {
+                        return Ok(());
                     }
-                    FrameStatus::Skipped => {}
                 }
             }
         }
@@ -999,43 +1436,114 @@ fn render_snapshot(
     paused: bool,
     width: u32,
     height: u32,
+    #[cfg(feature = "dev-console")] ui_frame: &mut ConsoleUiFrame,
 ) -> Result<Option<FrameStatus>, String> {
     if paused {
         drop(snapshot);
         return Ok(None);
+    }
+    #[cfg(feature = "dev-console")]
+    if ui_frame.visible {
+        return backend
+            .render_console(&snapshot, width, height, ui_frame)
+            .map(Some);
     }
     backend.render(&snapshot, width, height).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dev-console")]
+    use super::CommandCatalogSnapshot;
+    #[cfg(feature = "dev-console")]
+    use super::ConsoleUiFrame;
+    #[cfg(feature = "dev-console")]
+    use super::ConsoleUiSlot;
+    #[cfg(feature = "dev-console")]
+    use super::execute_console_commands;
     use super::{
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
         GpuSceneTable, RenderBackend, RenderControl, RenderThreadConfig, RuntimeStatus,
-        SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig, make_snapshot,
-        procedural_environment_key, render_local_lights, render_loop, render_snapshot,
-        render_thread, selected_level, send_snapshot, sync_input_background, wait_background_tick,
+        SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig,
+        log_script_events_with, make_snapshot, procedural_environment_key, render_local_lights,
+        render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
+        sync_input_background, wait_background_tick,
     };
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
+    #[cfg(feature = "dev-console")]
+    use engine_console::CommandLine;
+    use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
     use engine_render::{DrawCommand, FrameStatus, LocalLight};
     use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
     use engine_scene::{LocalLightState, SceneDocument, World};
-    use engine_script::{Key, ScriptHost, ScriptInterruptHandle, ScriptTime};
+    use engine_script::{
+        Key, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
+    };
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
+    #[cfg(feature = "dev-console")]
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     fn test_input() -> Arc<Mutex<InputAccumulator>> {
         Arc::new(Mutex::new(InputAccumulator::default()))
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn test_command_catalog() -> Arc<Mutex<CommandCatalogSnapshot>> {
+        Arc::new(Mutex::new(CommandCatalogSnapshot::default()))
+    }
+
+    #[test]
+    fn script_events_keep_their_log_levels_and_prefixes() {
+        let sink = Arc::new(Mutex::new(ConsoleBuffer::with_capacity(4)));
+        let logger = ConsoleLogger::new(Some(sink.clone()));
+        log_script_events_with(
+            &[
+                ScriptEvent {
+                    level: ScriptEventLevel::Info,
+                    source: "scene/script".into(),
+                    message: "info".into(),
+                },
+                ScriptEvent {
+                    level: ScriptEventLevel::Warn,
+                    source: "scene/script".into(),
+                    message: "warn".into(),
+                },
+                ScriptEvent {
+                    level: ScriptEventLevel::Error,
+                    source: "scene/script".into(),
+                    message: "error".into(),
+                },
+            ],
+            &logger,
+        );
+        let lines = sink.lock().unwrap().snapshot();
+        assert_eq!(
+            lines.iter().map(|line| line.level).collect::<Vec<_>>(),
+            [ConsoleLevel::Info, ConsoleLevel::Warn, ConsoleLevel::Error]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "[script] scene/script: info",
+                "[script warn] scene/script: warn",
+                "[script] scene/script: error"
+            ]
+        );
+        assert_eq!(lines[0].source, "scene/script");
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1089,6 +1597,10 @@ distance=2.0
         fail: bool,
         panic: bool,
         panic_wait_idle: bool,
+        #[cfg(feature = "dev-console")]
+        console_slot: Option<Arc<ConsoleUiSlot>>,
+        #[cfg(feature = "dev-console")]
+        console_rendered: Option<mpsc::Sender<()>>,
     }
 
     impl RenderBackend for FakeBackend {
@@ -1114,6 +1626,27 @@ distance=2.0
 
         fn wait_idle(&mut self) {
             assert!(!self.panic_wait_idle, "fake wait_idle panic");
+        }
+
+        #[cfg(feature = "dev-console")]
+        fn take_console_ui(&mut self) -> Option<ConsoleUiFrame> {
+            self.console_slot.as_ref().and_then(|slot| slot.take())
+        }
+
+        #[cfg(feature = "dev-console")]
+        fn render_console(
+            &mut self,
+            snapshot: &FrameSnapshot,
+            width: u32,
+            height: u32,
+            ui: &mut ConsoleUiFrame,
+        ) -> Result<FrameStatus, String> {
+            assert!(ui.visible);
+            let status = self.render(snapshot, width, height)?;
+            if let Some(rendered) = &self.console_rendered {
+                let _ = rendered.send(());
+            }
+            Ok(status)
         }
     }
 
@@ -1486,6 +2019,117 @@ return Script
         assert!(host.drain_events().is_empty());
     }
 
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn queued_console_command_runs_before_update_and_publishes_catalog() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/console.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/console.lua"
+"#,
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let script = r#"
+local Script = {}
+function Script:on_start()
+  rve.console.register("arm", function()
+    Script.command_ran = true
+  end, "mark command as run")
+end
+function Script:on_update()
+  if not Script.checked then
+    Script.checked = true
+    if Script.command_ran then
+      rve.console.register("after_command", function() end, "command ran first")
+    else
+      rve.console.register("before_command", function() end, "update ran first")
+    end
+  end
+end
+return Script
+"#;
+        let sources = BTreeMap::from([("console.lua".to_owned(), script.to_owned())]);
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (render_tx, _render_rx) = flume::unbounded();
+        let catalog = test_command_catalog();
+        let mut modules = ModuleHost::new();
+        let thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "scene.rvescene".to_owned(),
+                sources,
+                scripts_library: None,
+                script_module: None,
+                interrupt: ScriptInterruptHandle::new(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 30,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::new(RuntimeStatus::default()),
+                input: test_input(),
+                command_catalog: Arc::clone(&catalog),
+            },
+        )
+        .unwrap();
+        thread.ready.recv().unwrap().unwrap();
+        script_tx
+            .send(ScriptControl::Console(CommandLine {
+                name: "arm".to_owned(),
+                args: Vec::new(),
+            }))
+            .unwrap();
+        script_tx
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+
+        let _frame = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let catalog = catalog.lock().unwrap();
+        assert!(catalog.generation > 0);
+        assert_eq!(
+            catalog.catalog.get("after_command").unwrap().description,
+            "command ran first"
+        );
+        assert!(catalog.catalog.get("before_command").is_none());
+        drop(catalog);
+
+        script_tx.send(ScriptControl::Shutdown).unwrap();
+        thread.stopped.recv_timeout(Duration::from_secs(1)).unwrap();
+        modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(modules.shutdown().is_empty());
+    }
+
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn unknown_console_command_is_reported_as_unknown() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let mut scripts = ScriptHost::load(&world, "scene", &BTreeMap::new(), None).unwrap();
+        let mut pending = VecDeque::from([CommandLine {
+            name: "missing".to_owned(),
+            args: Vec::new(),
+        }]);
+        let errors = execute_console_commands(&mut scripts, &mut world, &mut pending);
+        assert!(
+            matches!(errors.as_slice(), [(name, engine_script::CommandError::Unknown(error))] if name == "missing" && error == "missing")
+        );
+    }
+
     #[test]
     fn full_snapshot_queue_does_not_prevent_scripts_from_observing_shutdown() {
         let (frame_tx, frame_rx) = flume::bounded(1);
@@ -1497,6 +2141,7 @@ return Script
             &control_rx,
             Arc::new(empty_snapshot()),
             &mut false,
+            &mut Default::default(),
         );
         assert!(matches!(result, super::SendOutcome::Shutdown));
         assert_eq!(frame_rx.len(), 1);
@@ -1523,6 +2168,43 @@ return Script
         assert!(worker.join().unwrap().is_ok());
         drop(frame_tx);
         drop(script_rx);
+    }
+
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn latest_scene_is_redrawn_when_console_ui_changes() {
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (control_tx, control_rx) = flume::unbounded();
+        let (script_tx, _script_rx) = flume::unbounded();
+        let (rendered_tx, rendered_rx) = mpsc::channel();
+        let slot = Arc::new(ConsoleUiSlot::default());
+        let mut backend = FakeBackend {
+            console_slot: Some(Arc::clone(&slot)),
+            console_rendered: Some(rendered_tx),
+            ..FakeBackend::default()
+        };
+        let worker = std::thread::spawn(move || {
+            render_loop(
+                &mut backend,
+                640,
+                480,
+                None,
+                &frame_rx,
+                &control_rx,
+                &script_tx,
+            )
+        });
+
+        frame_tx.send(Arc::new(empty_snapshot())).unwrap();
+        let mut frame = ConsoleUiFrame::default();
+        frame.visible = true;
+        let notify = slot.publish(frame);
+        assert!(notify);
+        control_tx.send(RenderControl::ConsoleUiChanged).unwrap();
+        rendered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        control_tx.send(RenderControl::Shutdown).unwrap();
+        assert!(worker.join().unwrap().is_ok());
     }
 
     #[test]
@@ -1561,9 +2243,17 @@ return Script
     fn paused_snapshot_is_dropped_without_calling_the_renderer() {
         let mut backend = FakeBackend::default();
         assert!(
-            render_snapshot(&mut backend, Arc::new(empty_snapshot()), true, 0, 0)
-                .unwrap()
-                .is_none()
+            render_snapshot(
+                &mut backend,
+                Arc::new(empty_snapshot()),
+                true,
+                0,
+                0,
+                #[cfg(feature = "dev-console")]
+                &mut ConsoleUiFrame::default(),
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(backend.renders, 0);
     }
@@ -1584,6 +2274,7 @@ return Script
                     clock_for_wait.as_ref(),
                     &mut background,
                     deadline,
+                    &mut Default::default(),
                 );
                 if !ticked || !background {
                     break;
@@ -1663,6 +2354,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
             },
         )
         .unwrap();
@@ -1743,6 +2436,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: Arc::clone(&input),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
             },
         )
         .unwrap();
@@ -1827,7 +2522,8 @@ return Script
                 &frame_tx,
                 &control_rx,
                 Arc::new(empty_snapshot()),
-                &mut false
+                &mut false,
+                &mut Default::default()
             ),
             super::SendOutcome::Disconnected
         ));
@@ -1957,6 +2653,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
             },
         )
         .unwrap();
@@ -2001,6 +2699,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
             },
         )
         .unwrap();
@@ -2044,6 +2744,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
             },
         )
         .unwrap();
@@ -2104,6 +2806,8 @@ return Script
                 render_tx,
                 status: Arc::clone(&status),
                 input: test_input(),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
             },
         )
         .unwrap();

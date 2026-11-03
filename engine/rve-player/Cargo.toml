@@ -10,3 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 engine-runtime = { path = "../engine-runtime" }
+
+[features]
+default = ["dev-console"]
+dev-console = ["engine-runtime/dev-console"]

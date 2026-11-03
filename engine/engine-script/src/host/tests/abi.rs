@@ -5,13 +5,16 @@ use crate::transaction::{
     MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_STRING_BYTES,
     MAX_MESSAGES_PER_FRAME,
 };
+use crate::types::ScriptEventLevel;
 use engine_scene::World;
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost,
-    RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveStatus, RveStr, RveTransform,
-    RveValue,
+    RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveStatus, RveStr,
+    RveTransform, RveValue,
 };
-use rve_sdk::{AntiAliasing, CameraSettings, Key, MouseButton, Params, Script, Tonemapper, Value};
+use rve_sdk::{
+    AntiAliasing, CameraSettings, ConsoleLevel, Key, MouseButton, Params, Script, Tonemapper, Value,
+};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -44,6 +47,12 @@ struct CameraControl {
     panic_update: bool,
 }
 
+struct AbiConsoleCommand {
+    panic_update: bool,
+}
+
+struct AbiConsoleForeign;
+
 fn camera_control_factory(params: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(CameraControl {
         panic_update: matches!(params.get("panic_update"), Some(Value::Bool(true))),
@@ -70,6 +79,57 @@ impl Script for CameraControl {
         if self.panic_update {
             panic!("camera update panic");
         }
+    }
+}
+
+fn abi_console_command_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(AbiConsoleCommand {
+        panic_update: matches!(params.get("panic_update"), Some(Value::Bool(true))),
+    }))
+}
+
+fn abi_console_foreign_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(AbiConsoleForeign))
+}
+
+impl Script for AbiConsoleCommand {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.console.write("ABI info", ConsoleLevel::Log);
+        ctx.console.write("ABI warning", ConsoleLevel::Warning);
+        ctx.console.write("ABI error", ConsoleLevel::Error);
+        ctx.console
+            .register("abi.echo", Some("echo arguments"))
+            .unwrap();
+        assert!(ctx.console.register("abi.echo", None).is_err());
+        assert!(ctx.console.register("help", None).is_err());
+        assert!(ctx.console.register("Bad", None).is_err());
+    }
+
+    fn on_update(&mut self, _: &mut rve_sdk::Context<'_>, _: f32) {
+        if self.panic_update {
+            panic!("ABI update failure");
+        }
+    }
+
+    fn on_command(&mut self, ctx: &mut rve_sdk::Context<'_>, name: &str, args: &[&str]) {
+        assert_eq!(name, "abi.echo");
+        if args == ["panic"] {
+            ctx.transform.position[0] = 99.0;
+            panic!("ABI console command panic");
+        }
+        if args == ["unregister"] {
+            ctx.console.unregister(name).unwrap();
+            return;
+        }
+        ctx.transform.position[0] += args.len() as f32;
+        ctx.console
+            .write(format!("echo:{}", args.join(" ")), ConsoleLevel::Log);
+    }
+}
+
+impl Script for AbiConsoleForeign {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        assert!(ctx.console.unregister("abi.echo").is_err());
     }
 }
 
@@ -336,6 +396,8 @@ fn sdk_module() -> &'static RveModule {
         "Limits" => limit_message_factory,
         "InputProbe" => input_probe_factory,
         "CameraControl" => camera_control_factory,
+        "AbiConsoleCommand" => abi_console_command_factory,
+        "AbiConsoleForeign" => abi_console_foreign_factory,
     }
 }
 
@@ -408,6 +470,43 @@ fn version_mismatch_does_not_read_the_module_table() {
 }
 
 #[test]
+fn abi_v3_descriptor_loads_without_reading_a_command_tail() {
+    let module = v3_probe_module();
+    // SAFETY: the v3 module and its exact-sized descriptor table are leaked for the test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let descriptor = library.script("Probe").unwrap();
+    assert!(descriptor.command.is_none());
+}
+
+fn v3_probe_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let probe = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
+        .iter()
+        .find(|script| unsafe { script.name.to_str() }.ok() == Some("Probe"))
+        .expect("Probe descriptor exists");
+    let scripts = Box::leak(Box::new([RveScriptDescV3 {
+        name: probe.name,
+        create: probe.create,
+        start: probe.start,
+        update: probe.update,
+        message: probe.message,
+        destroy: probe.destroy,
+        drop: probe.drop,
+        params: probe.params,
+        param_count: probe.param_count,
+    }]));
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 3,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: scripts.as_ptr().cast(),
+        script_count: scripts.len(),
+    }))
+}
+
+#[test]
 fn legacy_abi_v1_and_v2_descriptors_are_rejected() {
     for version in [1, 2] {
         let module = legacy_probe_module(version);
@@ -442,6 +541,114 @@ fn legacy_probe_module(version: u32) -> &'static RveModule {
         scripts: scripts.as_ptr().cast(),
         script_count: scripts.len(),
     }))
+}
+
+#[test]
+fn abi_console_commands_execute_with_levels_and_owner_checks() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "owner"
+[[objects.heavy_scripts]]
+name = "AbiConsoleCommand"
+[[objects]]
+id = "foreign"
+[[objects.heavy_scripts]]
+name = "AbiConsoleForeign"
+"#,
+    );
+    let owner = world.handle("owner").unwrap();
+    let mut host = load_host(&world, &library());
+    host.start(&mut world, ScriptTime::default());
+
+    assert!(
+        host.commands()
+            .iter()
+            .any(|command| command.name == "abi.echo")
+    );
+    assert_eq!(host.commands_generation(), 1);
+    let start_events = host.drain_events();
+    assert_eq!(
+        start_events
+            .iter()
+            .map(|event| event.level)
+            .collect::<Vec<_>>(),
+        [
+            ScriptEventLevel::Info,
+            ScriptEventLevel::Warn,
+            ScriptEventLevel::Error
+        ]
+    );
+
+    let command = engine_console::parse_command_line("abi.echo first second").unwrap();
+    host.execute_command(&mut world, &command).unwrap();
+    assert_eq!(world.local_transform(owner).unwrap().position[0], 2.0);
+    let command_events = host.drain_events();
+    assert!(command_events.iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "echo:first second"
+    }));
+
+    let unregister = engine_console::parse_command_line("abi.echo unregister").unwrap();
+    host.execute_command(&mut world, &unregister).unwrap();
+    assert_eq!(host.commands_generation(), 2);
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.name == "abi.echo")
+    );
+    assert!(host.execute_command(&mut world, &unregister).is_err());
+}
+
+#[test]
+fn abi_console_command_panic_rolls_back_and_removes_owner_commands() {
+    let _lock = test_lock();
+    let mut world = scripted_world("AbiConsoleCommand", "{}");
+    let owner = world.handle("camera").unwrap();
+    let mut host = load_host(&world, &library());
+    host.start(&mut world, ScriptTime::default());
+    let command = engine_console::parse_command_line("abi.echo panic").unwrap();
+
+    assert!(host.execute_command(&mut world, &command).is_err());
+    assert_eq!(world.local_transform(owner).unwrap().position[0], 0.0);
+    assert_eq!(host.commands_generation(), 2);
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.name == "abi.echo")
+    );
+    assert!(host.execute_command(&mut world, &command).is_err());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event.message.contains("ABI console command panic")
+    }));
+}
+
+#[test]
+fn abi_console_commands_are_removed_when_an_instance_is_disabled() {
+    let _lock = test_lock();
+    let mut world = scripted_world("AbiConsoleCommand", "{ panic_update = true }");
+    let mut host = load_host(&world, &library());
+    host.start(&mut world, ScriptTime::default());
+    assert_eq!(host.commands_generation(), 1);
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    assert_eq!(host.commands_generation(), 2);
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.name == "abi.echo")
+    );
 }
 
 #[test]
@@ -686,6 +893,7 @@ fn null_module() -> &'static RveModule {
         drop: no_op_drop,
         params: std::ptr::null(),
         param_count: 0,
+        command: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -705,6 +913,7 @@ fn null_name_module() -> &'static RveModule {
         drop: no_op_drop,
         params: std::ptr::null(),
         param_count: 0,
+        command: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -725,6 +934,7 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         drop: no_op_drop,
         params: std::ptr::null(),
         param_count: 0,
+        command: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1125,6 +1335,7 @@ fn error_message_module() -> &'static RveModule {
             drop: free_byte,
             params: std::ptr::null(),
             param_count: 0,
+            command: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -1136,6 +1347,7 @@ fn error_message_module() -> &'static RveModule {
             drop: free_byte,
             params: std::ptr::null(),
             param_count: 0,
+            command: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -1163,6 +1375,7 @@ fn set_local_during_create_module() -> &'static RveModule {
         drop: free_byte,
         params: std::ptr::null(),
         param_count: 0,
+        command: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1179,6 +1392,7 @@ fn poisoned_create_module() -> &'static RveModule {
         drop: poisoned_drop,
         params: std::ptr::null(),
         param_count: 0,
+        command: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1706,6 +1920,7 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         drop: no_op_drop,
         params: params.as_ptr(),
         param_count: params.len(),
+        command: None,
     }]));
     RveModule::new(scripts)
 }
@@ -1781,6 +1996,7 @@ fn malformed_parameter_tables_are_rejected() {
             drop: no_op_drop,
             params: std::ptr::null(),
             param_count: 1,
+            command: None,
         }]));
         module.scripts = scripts.as_ptr();
         module

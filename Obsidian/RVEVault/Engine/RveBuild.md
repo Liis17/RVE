@@ -77,26 +77,28 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 `rve-build` не генерирует отдельный player crate. Режим определяется наличием
 `rve-sdk.toml` рядом с исполняемым файлом `rve-build`.
 
-Без маркера используется checkout-режим: `locate_player` собирает пакет `rve-player`
-командой `cargo build --release --locked -p rve-player` из корня репозитория и задаёт
-`CARGO_TARGET_DIR=<checkout>/build/player`. Путь к исполняемому файлу берётся из Cargo
-`compiler-artifact`; вывод сообщает `rve-player: rebuilt` или `rve-player: up to date`
-по полю `fresh` этого артефакта.
+Без маркера используется checkout-режим. Distribution flavor собирает пакет
+`rve-player` командой `cargo build --release --locked -p rve-player
+--no-default-features` и задаёт `CARGO_TARGET_DIR=<checkout>/build/player`; dev flavor
+собирает default features в `build/player-dev`. Путь к исполняемому файлу берётся из
+Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to date` по полю `fresh`
+этого артефакта.
 
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
 `engine_version`, `abi_version` и `target`. Маркер распространяемого SDK должен
 указывать текущий `RVE_SCRIPT_ABI_VERSION`; player принимает heavy-script ABI версии
-`RVE_SCRIPT_ABI_MIN_VERSION..=RVE_SCRIPT_ABI_VERSION`, чтобы загружать v1-модули с
-неизменной таблицей скриптов. `target` должен совпадать с парой `ARCH-OS`, например
-`x86_64-windows` или `aarch64-macos`. `rve-build` запускает соседний
-`rve-player[.exe]` и сообщает `rve-player: prebuilt (SDK)`. Отсутствующий player,
+`RVE_SCRIPT_ABI_MIN_VERSION..=RVE_SCRIPT_ABI_VERSION`, чтобы загружать v3-модули с
+таблицей скриптов предыдущей версии. `target` должен совпадать с парой `ARCH-OS`, например
+`x86_64-windows` или `aarch64-macos`. Команды `run` и `build` выбирают соответственно
+соседний `rve-player-dev[.exe]` и `rve-player[.exe]`. Отсутствующий player,
 ошибка TOML, несовпадение ABI или платформы завершают команду операционной ошибкой.
 SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходникам checkout.
 
 `rve-build sdk --output <dir>` доступна только в checkout-режиме. Она собирает
-release `rve-player` в `build/player`, затем атомарно публикует новый каталог без
-замены существующего. Каталог содержит `rve-build[.exe]`, `rve-player[.exe]`,
-`rve-sdk.toml` и `rve-sdk/Cargo.toml` с деревом `rve-sdk/src/**`; `target/` не
+distribution `rve-player` в `build/player` и dev `rve-player-dev` в `build/player-dev`,
+затем атомарно публикует новый каталог без замены существующего. Каталог содержит
+`rve-build[.exe]`, `rve-player[.exe]`, `rve-player-dev[.exe]`, `rve-sdk.toml` и
+`rve-sdk/Cargo.toml` с деревом `rve-sdk/src/**`; `target/` не
 копируется. `rve-build` копирует собственный запущенный executable. При debug-сборке
 команда предупреждает об этом; для распространяемого SDK рекомендуется запускать
 `cargo run --release -p rve-build -- sdk --output <dir>`. Клиентский crate указывает
@@ -115,15 +117,16 @@ release `rve-player` в `build/player`, затем атомарно публик
 `heavy_scripts`, отсутствие cdylib или незарегистрированное имя — ошибка проекта с
 кодом 2. ABI и модель гостевого crate описаны в [[Engine/RveSdk]].
 
-Команда `run` собирает скрипты в debug-профиле, берёт release `rve-player` из
-checkout `build/player` или соседнего каталога SDK и запускает его как `--project <absolute-project-dir> [--scripts
+Команда `run` собирает скрипты в debug-профиле, берёт dev `rve-player` с включённой
+developer console из checkout `build/player-dev` или `rve-player-dev[.exe]` из SDK и
+запускает его как `--project <absolute-project-dir> [--scripts
 <library>]`, затем передаёт пользовательские аргументы. Если скриптов нет, `--scripts`
-не добавляется. На Windows release-player — GUI executable и не открывает консоль;
-debug-сборку player можно запустить вручную командой `cargo run -p rve-player`;
-она сохраняет консоль для диагностики.
+не добавляется. На Windows player остаётся GUI executable без терминального окна;
+dev-вариант показывает developer console внутри окна. Cargo-команда
+`cargo run -p rve-player` использует default feature и включает её.
 
-Команда `build` собирает release cdylib и checkout release-player либо использует
-соседний prebuilt player из SDK, затем копирует
+Команда `build` собирает release cdylib и checkout distribution-player без developer
+console либо использует соседний distribution player из SDK, затем копирует
 исполняемый файл в релиз и библиотеку в `Engine/` под фиксированным именем
 `game_scripts.dll` (Windows) или `libgame_scripts.dylib` (macOS). Windows executable,
 `Engine/` и `Assets/` размещаются рядом; на macOS executable входит в

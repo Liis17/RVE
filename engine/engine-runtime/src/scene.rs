@@ -235,6 +235,7 @@ struct ResolvedMaterial {
     emissive: [f32; 3],
     opacity: f32,
     alpha_mode: AlphaMode,
+    double_sided: bool,
     base_color_texture: Option<MaterialTextureSource>,
     metallic_roughness_texture: Option<MaterialTextureSource>,
     normal_texture: Option<MaterialTextureSource>,
@@ -312,6 +313,9 @@ fn resolve_material(
                 ModelAlphaMode::Blend => AlphaMode::Blend,
             },
         },
+        double_sided: override_material
+            .and_then(|material| material.double_sided)
+            .unwrap_or(model.double_sided),
         base_color_texture: replacement_texture
             .map(|path| MaterialTextureSource::Scene(path.to_owned()))
             .or_else(|| model.base_color_texture.map(MaterialTextureSource::Model)),
@@ -491,6 +495,7 @@ fn upload_resolved_material(
         emissive: resolved.emissive,
         opacity: resolved.opacity,
         alpha_mode: resolved.alpha_mode,
+        double_sided: resolved.double_sided,
         base_color_texture,
         metallic_roughness_texture,
         normal_texture,
@@ -962,6 +967,7 @@ id = "camera"
             occlusion_texture: Some(4),
             normal_scale: 0.8,
             occlusion_strength: 0.6,
+            double_sided: true,
         };
         let unchanged = resolve_material(&model, None, None);
         assert_eq!(unchanged.base_color, model.base_color);
@@ -970,6 +976,7 @@ id = "camera"
         assert_eq!(unchanged.emissive, model.emissive);
         assert_eq!(unchanged.opacity, model.opacity);
         assert_eq!(unchanged.alpha_mode, AlphaMode::Blend);
+        assert!(unchanged.double_sided);
         assert_eq!(
             unchanged.base_color_texture,
             Some(MaterialTextureSource::Model(0))
@@ -1007,6 +1014,7 @@ id = "camera"
             occlusion_texture: Some(VirtualPath::parse("/textures/occlusion.png").unwrap()),
             normal_scale: Some(0.5),
             occlusion_strength: Some(0.2),
+            double_sided: Some(false),
         };
         let replacement = resolve_material(
             &model,
@@ -1019,6 +1027,7 @@ id = "camera"
         assert_eq!(replacement.emissive, [3.0, 2.0, 1.0]);
         assert_eq!(replacement.opacity, 0.4);
         assert_eq!(replacement.alpha_mode, AlphaMode::Mask { cutoff: 0.25 });
+        assert!(!replacement.double_sided);
         assert_eq!(
             replacement.base_color_texture,
             Some(MaterialTextureSource::Scene(

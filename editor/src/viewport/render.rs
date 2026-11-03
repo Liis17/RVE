@@ -45,6 +45,7 @@ pub struct SceneRenderer {
     current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
     object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     grid: Option<MeshId>,
+    grid_material: Option<MaterialId>,
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
 }
@@ -69,6 +70,7 @@ impl SceneRenderer {
             current_environment: None,
             object_materials: HashMap::new(),
             grid: None,
+            grid_material: None,
             scene_draws: Vec::new(),
             game_draws: Vec::new(),
         })
@@ -298,9 +300,20 @@ impl SceneRenderer {
                     grid
                 }
             };
+            let grid_material = match self.grid_material {
+                Some(material) => material,
+                None => {
+                    let material = renderer.create_material(&Material {
+                        double_sided: true,
+                        ..Material::default()
+                    })?;
+                    self.grid_material = Some(material);
+                    material
+                }
+            };
             self.scene_draws.push(DrawCommand {
                 mesh: grid,
-                material: None,
+                material: Some(grid_material),
                 model: Mat4::from_scale(Vec3::splat(grid_scale(distance))).to_cols_array_2d(),
                 casts_shadow: false,
             });
@@ -674,6 +687,7 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                 )?,
                 normal_scale: base.normal_scale,
                 occlusion_strength: base.occlusion_strength,
+                double_sided: base.double_sided,
             };
             let material_id = renderer.create_material(&material)?;
             materials.push(material_id);
@@ -789,6 +803,9 @@ fn resolve_material(
         }
         if let Some(strength) = override_material.occlusion_strength {
             base.occlusion_strength = strength;
+        }
+        if let Some(double_sided) = override_material.double_sided {
+            base.double_sided = double_sided;
         }
     }
     base
@@ -951,7 +968,7 @@ fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
             uv: [0.0, 0.0],
             color,
         }));
-        indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
+        indices.extend([first, first + 2, first + 1, first, first + 3, first + 2]);
     };
     for line in -GRID_HALF_CELLS..=GRID_HALF_CELLS {
         let offset = line as f32;
@@ -1071,6 +1088,13 @@ id = "camera"
                 .iter()
                 .all(|&index| (index as usize) < vertices.len())
         );
+        for triangle in indices.as_chunks::<3>().0 {
+            let a = Vec3::from_array(vertices[triangle[0] as usize].position);
+            let b = Vec3::from_array(vertices[triangle[1] as usize].position);
+            let c = Vec3::from_array(vertices[triangle[2] as usize].position);
+            let normal = Vec3::from_array(vertices[triangle[0] as usize].normal);
+            assert!((b - a).cross(c - a).dot(normal) > 0.0);
+        }
     }
 
     #[test]
@@ -1319,6 +1343,7 @@ range = 10
             occlusion_texture: None,
             normal_scale: Some(0.5),
             occlusion_strength: Some(0.25),
+            double_sided: Some(true),
         };
 
         let resolved =

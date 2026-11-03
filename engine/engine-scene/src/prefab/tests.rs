@@ -162,7 +162,7 @@ mesh_renderer = { model = "/models/gold.fbx", texture = "/textures/gold.png" }
 lite_params = [{ path = "/scripts/rotate.lua", params = { speed = 90.0 } }]
 [[instances.overrides]]
 target = "frame"
-mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opacity = 0.4, alpha_mode = "mask", alpha_cutoff = 0.25, occlusion_strength = 0.7 } }
+mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opacity = 0.4, alpha_mode = "mask", alpha_cutoff = 0.25, occlusion_strength = 0.7, double_sided = false } }
 "#,
     ));
     let expanded = library.expand(&document).unwrap().document;
@@ -190,6 +190,7 @@ mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opaci
     assert_eq!(material.alpha_mode, Some(crate::MaterialAlphaMode::Mask));
     assert_eq!(material.alpha_cutoff, Some(0.25));
     assert_eq!(material.occlusion_strength, Some(0.7));
+    assert_eq!(material.double_sided, Some(false));
 }
 
 #[test]

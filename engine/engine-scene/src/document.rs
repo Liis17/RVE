@@ -578,7 +578,7 @@ pub enum MaterialAlphaMode {
     Blend,
 }
 
-/// Необязательные замены факторов и текстур FBX-материала.
+/// Необязательные замены факторов, текстур и двусторонности FBX-материала.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterialOverride {
@@ -624,6 +624,8 @@ pub struct MaterialOverride {
     pub normal_scale: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occlusion_strength: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_sided: Option<bool>,
 }
 
 /// Цвет направленного света, ambient и необязательная проекция теней.
@@ -1614,6 +1616,7 @@ id = "camera"
 
         let serialized = document.to_toml().unwrap();
         let round_trip = parse(&serialized).unwrap();
+        assert!(!serialized.contains("double_sided"), "{serialized}");
         assert_eq!(
             round_trip.objects[1].lod_group.as_ref().unwrap().levels[1].distance,
             20.0
@@ -1914,6 +1917,7 @@ scale=[1.0,1.0,0.0]
             "textures/occlusion.png"
         );
         assert_eq!(material.normal_scale, Some(0.5));
+        assert_eq!(material.double_sided, None);
 
         let serialized = document.to_toml().unwrap();
         let round_trip = parse(&serialized).unwrap();
@@ -1929,6 +1933,39 @@ scale=[1.0,1.0,0.0]
             Some(0.7)
         );
         assert!(!serialized.contains("material = \""), "{serialized}");
+
+        let double_sided = parse(&format!(
+            "[[assets]]\npath=\"/models/a.fbx\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\ndouble_sided=true\n"
+        ))
+        .unwrap();
+        let double_sided_round_trip = parse(&double_sided.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            double_sided_round_trip.objects[1]
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .material
+                .as_ref()
+                .unwrap()
+                .double_sided,
+            Some(true)
+        );
+        let double_sided_false = parse(&format!(
+            "[[assets]]\npath=\"/models/a.fbx\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\ndouble_sided=false\n"
+        ))
+        .unwrap();
+        let double_sided_false_round_trip = parse(&double_sided_false.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            double_sided_false_round_trip.objects[1]
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .material
+                .as_ref()
+                .unwrap()
+                .double_sided,
+            Some(false)
+        );
 
         let partial = parse(&format!(
             "[[assets]]\npath=\"/models/a.fbx\"\n{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n[objects.mesh_renderer.material]\nroughness=0.4\n"

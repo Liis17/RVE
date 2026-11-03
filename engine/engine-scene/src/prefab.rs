@@ -334,6 +334,9 @@ fn merge_material(target: &mut MaterialOverride, change: &MaterialOverride) {
     if change.occlusion_strength.is_some() {
         target.occlusion_strength = change.occlusion_strength;
     }
+    if change.double_sided.is_some() {
+        target.double_sided = change.double_sided;
+    }
 }
 
 /// Раскрытый id: сегменты `[A-Za-z0-9_-]{1,64}` через точку, всего до 255 байт.

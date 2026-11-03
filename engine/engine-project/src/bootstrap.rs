@@ -2,6 +2,15 @@ use engine_files::VirtualPath;
 use std::fs;
 use std::path::Path;
 
+/// Present mode requested by a player or the sandbox at startup.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BootstrapPresentMode {
+    #[default]
+    Fifo,
+    Mailbox,
+    Immediate,
+}
+
 /// Startup settings read from a `bootstrap.rves` file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapConfig {
@@ -10,6 +19,7 @@ pub struct BootstrapConfig {
     pub window_title: Option<String>,
     pub allow_multiple_instances: bool,
     pub app_icon: Option<String>,
+    pub present_mode: Option<BootstrapPresentMode>,
 }
 
 impl Default for BootstrapConfig {
@@ -20,6 +30,7 @@ impl Default for BootstrapConfig {
             window_title: None,
             allow_multiple_instances: true,
             app_icon: None,
+            present_mode: None,
         }
     }
 }
@@ -46,7 +57,7 @@ impl BootstrapConfig {
 
     fn parse_with_path(contents: &str, path: &str) -> Result<Self, String> {
         let mut config = Self::default();
-        let mut seen = [false; 5];
+        let mut seen = [false; 6];
 
         for (line_index, raw_line) in contents.lines().enumerate() {
             let line_number = line_index + 1;
@@ -66,6 +77,7 @@ impl BootstrapConfig {
                 "WindowTitle" => 2,
                 "AllowMultipleInstances" => 3,
                 "AppIcon" => 4,
+                "PresentMode" => 5,
                 _ => return Err(error(&format!("неизвестный параметр {name}"))),
             };
             if seen[seen_index] {
@@ -116,6 +128,18 @@ impl BootstrapConfig {
                     }
                     config.app_icon = Some(value.to_owned());
                 }
+                "PresentMode" => {
+                    config.present_mode = Some(match raw_value.trim() {
+                        "Fifo" => BootstrapPresentMode::Fifo,
+                        "Mailbox" => BootstrapPresentMode::Mailbox,
+                        "Immediate" => BootstrapPresentMode::Immediate,
+                        _ => {
+                            return Err(error(
+                                "PresentMode должен быть Fifo, Mailbox или Immediate",
+                            ));
+                        }
+                    });
+                }
                 _ => unreachable!("known bootstrap field"),
             }
 
@@ -128,7 +152,7 @@ impl BootstrapConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::BootstrapConfig;
+    use super::{BootstrapConfig, BootstrapPresentMode};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,7 +167,7 @@ mod tests {
     #[test]
     fn parses_all_settings_and_preserves_text_after_the_first_equals() {
         let config = BootstrapConfig::parse(
-            " WindowSizeY = 900\r\nWindowTitle = My Game = Preview  \r\n\r\nWindowSizeX=1600\r\nAllowMultipleInstances=false\r\nAppIcon=/ui/game.png\r\n",
+            " WindowSizeY = 900\r\nWindowTitle = My Game = Preview  \r\n\r\nWindowSizeX=1600\r\nAllowMultipleInstances=false\r\nAppIcon=/ui/game.png\r\nPresentMode=Mailbox\r\n",
         )
         .unwrap();
 
@@ -152,6 +176,7 @@ mod tests {
         assert_eq!(config.window_title.as_deref(), Some("My Game = Preview"));
         assert!(!config.allow_multiple_instances);
         assert_eq!(config.app_icon.as_deref(), Some("/ui/game.png"));
+        assert_eq!(config.present_mode, Some(BootstrapPresentMode::Mailbox));
     }
 
     #[test]
@@ -162,6 +187,7 @@ mod tests {
         assert_eq!(config.window_title, None);
         assert!(config.allow_multiple_instances);
         assert_eq!(config.app_icon, None);
+        assert_eq!(config.present_mode, None);
 
         let partial = BootstrapConfig::parse("WindowSizeY=600").unwrap();
         assert_eq!(partial.window_size_x, None);
@@ -179,6 +205,11 @@ mod tests {
             ("WindowSizeX=800\nWindowSizeX=900", 2, "указан повторно"),
             ("WindowSizeY=600\nWindowSizeY=700", 2, "указан повторно"),
             ("WindowTitle=One\nWindowTitle=Two", 2, "указан повторно"),
+            (
+                "PresentMode=Fifo\nPresentMode=Mailbox",
+                2,
+                "указан повторно",
+            ),
             ("WindowSizeX 800", 1, "Имя=Значение"),
             ("WindowWidth=800", 1, "неизвестный параметр"),
             ("windowsizex=800", 1, "неизвестный параметр"),
@@ -206,6 +237,8 @@ mod tests {
         for (name, value) in [
             ("WindowTitle", "  "),
             ("AllowMultipleInstances", "TRUE"),
+            ("PresentMode", "fifo"),
+            ("PresentMode", "Vsync"),
             ("AppIcon", ""),
             ("AppIcon", "//icon.png"),
             ("AppIcon", "icon//game.png"),

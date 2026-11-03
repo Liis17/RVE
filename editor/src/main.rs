@@ -15,7 +15,6 @@ mod scene_edit;
 mod settings;
 mod state;
 mod ui;
-mod ui_render;
 mod viewport;
 
 use engine_project::ProjectSettings;
@@ -66,7 +65,9 @@ fn main() -> ExitCode {
         }
     };
     let mut editor = app::EditorApp::new(args.project, args.scripts);
-    if let Err(error) = engine_window::run(config, &mut editor) {
+    let run_result = engine_window::run(config, &mut editor);
+    editor.save_pipeline_cache();
+    if let Err(error) = run_result {
         eprintln!("{error}");
         return ExitCode::from(1);
     }

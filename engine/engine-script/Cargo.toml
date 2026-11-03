@@ -8,6 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+engine-console = { path = "../engine-console" }
 engine-scene = { path = "../engine-scene" }
 libloading.workspace = true
 mlua.workspace = true

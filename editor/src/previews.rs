@@ -1,8 +1,8 @@
 //! Превью PNG для панели Project: декодирование в фоне и LRU-кэш UI-текстур.
 
-use crate::ui_render::UiBridge;
 use engine_assets::{HdrImageData, TextureData, decode_hdr, decode_png};
 use engine_render::{RenderError, Renderer, UiTextureId};
+use engine_ui::render::UiBridge;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};

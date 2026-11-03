@@ -636,6 +636,7 @@ fn show_material(
         occlusion_texture: None,
         normal_scale: None,
         occlusion_strength: None,
+        double_sided: None,
     });
     let mut toggled = false;
     let mut picked = false;

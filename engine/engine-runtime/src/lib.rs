@@ -2,6 +2,8 @@
 
 mod activation;
 mod cli;
+#[cfg(feature = "dev-console")]
+mod console;
 mod hardware;
 mod input;
 mod layout;
@@ -12,7 +14,12 @@ mod scene;
 
 use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_or_activate};
 use cli::{PlayerArgs, USAGE};
+#[cfg(feature = "dev-console")]
+use console::{CommandCatalogSnapshot, ConsoleUiSlot};
 use engine_assets::{Assets, TextureData};
+#[cfg(feature = "dev-console")]
+use engine_console::ConsoleBuffer;
+use engine_console::install_logger;
 use engine_platform::{Acquire, ActivationError, InstanceLock, activate_running_instance};
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_render::probe_devices;
@@ -36,6 +43,20 @@ use sysinfo::{CpuRefreshKind, System};
 
 /// Runs an RVE game using the release layout or a loose-file development project.
 pub fn run_player() -> ExitCode {
+    let args = match PlayerArgs::parse(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("Ошибка аргументов: {error}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    #[cfg(feature = "dev-console")]
+    let console_buffer = Arc::new(Mutex::new(ConsoleBuffer::default()));
+    #[cfg(feature = "dev-console")]
+    let _ = install_logger(Some(Arc::clone(&console_buffer)));
+    #[cfg(not(feature = "dev-console"))]
+    let _ = install_logger(None);
     let release_root = match executable_dir() {
         Ok(exe_dir) => release_root(&exe_dir),
         Err(error) => {
@@ -49,15 +70,9 @@ pub fn run_player() -> ExitCode {
     // Vulkan configuration, and no runtime, resource, or activation thread exists yet.
     unsafe { engine_platform::prepare_vulkan_environment(&release_root) };
     let activation = PendingActivation::default();
-
-    let args = match PlayerArgs::parse(std::env::args_os().skip(1)) {
-        Ok(args) => args,
-        Err(error) => {
-            eprintln!("Ошибка аргументов: {error}");
-            eprintln!("{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
+    #[cfg(feature = "dev-console")]
+    return run_from_args(release_root, args, activation, console_buffer);
+    #[cfg(not(feature = "dev-console"))]
     run_from_args(release_root, args, activation)
 }
 
@@ -74,7 +89,12 @@ fn run_from_args(
     release_root: PathBuf,
     args: PlayerArgs,
     activation: PendingActivation,
+    #[cfg(feature = "dev-console")] console_buffer: Arc<Mutex<ConsoleBuffer>>,
 ) -> ExitCode {
+    #[cfg(feature = "dev-console")]
+    let command_catalog = Arc::new(Mutex::new(CommandCatalogSnapshot::default()));
+    #[cfg(feature = "dev-console")]
+    let console_ui = Arc::new(ConsoleUiSlot::default());
     let layout = match args.project {
         Some(project) => {
             let project = match normalize_layout_path(&project) {
@@ -150,14 +170,14 @@ fn run_from_args(
             InstanceOutcome::Continue(lock) => instance_lock = Some(lock),
             InstanceOutcome::Activated => {
                 if let Err(error) = resources.shutdown() {
-                    eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+                    log::error!("Ошибка завершения ресурсного сервиса: {error}");
                 }
                 drop(instance_lock.take());
                 return ExitCode::SUCCESS;
             }
             InstanceOutcome::Failure { code, message } => {
                 if let Err(error) = resources.shutdown() {
-                    eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+                    log::error!("Ошибка завершения ресурсного сервиса: {error}");
                 }
                 drop(instance_lock.take());
                 return fail(code, message);
@@ -179,10 +199,10 @@ fn run_from_args(
     );
     if !issues.is_empty() {
         let message = issues.join("\n");
-        eprintln!("{message}");
+        log::error!("{message}");
         engine_platform::show_error_dialog("RVE: системные требования", &message);
         if let Err(error) = resources.shutdown() {
-            eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+            log::error!("Ошибка завершения ресурсного сервиса: {error}");
         }
         drop(instance_lock.take());
         return ExitCode::from(3);
@@ -205,7 +225,7 @@ fn run_from_args(
     let mut modules = ModuleHost::new();
     if let Err(error) = start_empty_modules(&mut modules) {
         for error in modules.shutdown() {
-            eprintln!("Ошибка остановки модуля: {error}");
+            log::error!("Ошибка остановки модуля: {error}");
         }
         return fail(1, format!("не удалось запустить модуль: {error}"));
     }
@@ -241,28 +261,32 @@ fn run_from_args(
             render_tx: render_tx.clone(),
             status: Arc::clone(&status),
             input: Arc::clone(&input),
+            #[cfg(feature = "dev-console")]
+            command_catalog: Arc::clone(&command_catalog),
         },
     ) {
         Ok(ready) => ready,
         Err(error) => {
             let shutdown_errors = modules.shutdown();
             for error in shutdown_errors {
-                eprintln!("Ошибка остановки модуля: {error}");
+                log::error!("Ошибка остановки модуля: {error}");
             }
             return fail(1, format!("не удалось запустить поток скриптов: {error}"));
         }
     };
     if let Err((code, message)) = scripts_ready_result(script_thread.ready.recv()) {
         for error in modules.shutdown() {
-            eprintln!("Ошибка остановки модуля: {error}");
+            log::error!("Ошибка остановки модуля: {error}");
         }
         if let Err(error) = resources.shutdown() {
-            eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+            log::error!("Ошибка завершения ресурсного сервиса: {error}");
         }
         drop(instance_lock.take());
         return fail(code, message);
     }
 
+    let pipeline_cache_path = engine_platform::pipeline_cache_path(&project.name);
+    let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
     let title = bootstrap.window_title.unwrap_or(project.name);
     let default_window = WindowConfig::default();
     let config = WindowConfig {
@@ -275,6 +299,9 @@ fn run_from_args(
     let code = player::run_window(
         player::PlayerConfig {
             window: config,
+            present_mode: bootstrap.present_mode,
+            pipeline_cache_path,
+            pipeline_cache,
             frame_limit: args.frames,
             render_assets,
             activation,
@@ -286,16 +313,22 @@ fn run_from_args(
             interrupt,
             status: Arc::clone(&status),
             input,
+            #[cfg(feature = "dev-console")]
+            console_buffer,
+            #[cfg(feature = "dev-console")]
+            command_catalog,
+            #[cfg(feature = "dev-console")]
+            console_ui,
         },
         &mut modules,
     );
     let mut code = code;
     for error in modules.shutdown() {
-        eprintln!("Ошибка завершения модуля: {error}");
+        log::error!("Ошибка завершения модуля: {error}");
         code = 1;
     }
     if let Err(error) = resources.shutdown() {
-        eprintln!("Ошибка завершения ресурсного сервиса: {error}");
+        log::error!("Ошибка завершения ресурсного сервиса: {error}");
         if code == 0 {
             code = 1;
         }
@@ -405,7 +438,7 @@ fn start_empty_modules(modules: &mut ModuleHost) -> std::io::Result<()> {
 }
 
 fn fail(code: u8, message: impl AsRef<str>) -> ExitCode {
-    eprintln!("{}", message.as_ref());
+    log::error!("{}", message.as_ref());
     ExitCode::from(code)
 }
 

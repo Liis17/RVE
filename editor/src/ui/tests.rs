@@ -443,6 +443,16 @@ fn tool_shortcuts_apply_unless_a_text_field_has_focus() {
 }
 
 #[test]
+fn tool_shortcuts_are_blocked_while_the_console_is_open() {
+    let mut harness = Harness::new();
+    harness.state.console_open = true;
+    for key in [egui::Key::W, egui::Key::E, egui::Key::R] {
+        harness.press(key, Modifiers::NONE);
+        assert_eq!(harness.state.tool, GizmoTool::Move);
+    }
+}
+
+#[test]
 fn showing_the_inspector_keeps_hdr_light_colors_and_material_overrides_unchanged() {
     let mut harness = Harness::new();
     let scene = harness.scene_mut();
@@ -466,6 +476,7 @@ fn showing_the_inspector_keeps_hdr_light_colors_and_material_overrides_unchanged
                 metallic_roughness_texture: None,
                 normal_texture: None,
                 normal_scale: Some(2.0),
+                double_sided: None,
                 ..engine_scene::document::MaterialOverride::default()
             }),
             None,

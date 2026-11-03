@@ -720,6 +720,7 @@ fn material_diff(
         occlusion_texture: field(&from.occlusion_texture, &to.occlusion_texture)?,
         normal_scale: field(&from.normal_scale, &to.normal_scale)?,
         occlusion_strength: field(&from.occlusion_strength, &to.occlusion_strength)?,
+        double_sided: field(&from.double_sided, &to.double_sided)?,
     })
 }
 
@@ -751,6 +752,7 @@ fn merge_material(target: &mut MaterialOverride, change: &MaterialOverride) {
     }
     target.normal_scale = change.normal_scale.or(target.normal_scale);
     target.occlusion_strength = change.occlusion_strength.or(target.occlusion_strength);
+    target.double_sided = change.double_sided.or(target.double_sided);
 }
 
 /// Поле объекта экземпляра, которое может быть переопределено.

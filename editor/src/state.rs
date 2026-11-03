@@ -85,6 +85,8 @@ pub struct SceneViewInfo {
     pub hovered: bool,
     /// Размер изображения в физических пикселях.
     pub size: [u32; 2],
+    /// Прямоугольник изображения Game в координатах egui за текущий кадр.
+    pub rect: Option<egui::Rect>,
 }
 
 /// Раздельные заимствования состояния для подготовки кадра сцены.
@@ -120,6 +122,8 @@ pub struct EditorState {
     /// В прошлом кадре фокус был в текстовом поле: Esc этого кадра закрывает поле,
     /// а не снимает выделение.
     pub text_focused_last_frame: bool,
+    /// Developer console overlays Game and captures editor shortcuts while open.
+    pub console_open: bool,
     /// Строки поиска панелей Hierarchy и Project.
     pub hierarchy_filter: String,
     pub project_filter: String,
@@ -171,6 +175,7 @@ impl EditorState {
             project_dialog: None,
             hierarchy_rename: None,
             text_focused_last_frame: false,
+            console_open: false,
             hierarchy_filter: String::new(),
             project_filter: String::new(),
             component_clipboard: None,

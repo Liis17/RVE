@@ -3,5 +3,5 @@
 mod bootstrap;
 mod project_settings;
 
-pub use bootstrap::BootstrapConfig;
+pub use bootstrap::{BootstrapConfig, BootstrapPresentMode};
 pub use project_settings::{ProjectRequirements, ProjectScene, ProjectSettings, RuntimeSettings};

@@ -16,6 +16,34 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlayerFlavor {
+    Distribution,
+    Dev,
+}
+
+impl PlayerFlavor {
+    fn target_directory(self) -> &'static str {
+        match self {
+            Self::Distribution => "player",
+            Self::Dev => "player-dev",
+        }
+    }
+
+    fn cargo_arguments(self) -> Vec<&'static str> {
+        let mut arguments = vec!["build"];
+        if self == Self::Distribution {
+            arguments.push("--release");
+        }
+        arguments.extend(["--locked", "-p", "rve-player"]);
+        if self == Self::Distribution {
+            arguments.push("--no-default-features");
+        }
+        arguments.push("--message-format=json");
+        arguments
+    }
+}
+
 pub(crate) fn build_distribution(
     project_dir: &Path,
     output: &Path,
@@ -31,7 +59,7 @@ pub(crate) fn build_distribution(
     #[cfg(not(target_os = "macos"))]
     let _ = vulkan_sdk;
 
-    let executable = locate_player()?;
+    let executable = locate_player(PlayerFlavor::Distribution)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -123,7 +151,7 @@ pub(crate) fn build_distribution(
 pub(crate) fn run_project(project_dir: &Path, player_args: &[OsString]) -> Result<i32, BuildError> {
     let project = prepare_project(project_dir)?;
     let scripts_library = build_game_scripts(&project, false)?;
-    let executable = locate_player()?;
+    let executable = locate_player(PlayerFlavor::Dev)?;
     let project_dir = normalize_build_path(&project.project_dir)?;
     let mut command = Command::new(&executable);
     command.arg("--project").arg(project_dir);
@@ -445,10 +473,10 @@ fn parse_cargo_output(
         .ok_or_else(|| format!("cargo output не содержит target {target_name:?} с kind {kind:?}"))
 }
 
-fn locate_player() -> Result<PathBuf, BuildError> {
+fn locate_player(flavor: PlayerFlavor) -> Result<PathBuf, BuildError> {
     let executable = current_executable_path()?;
     let executable_dir = executable_directory(&executable)?;
-    match sdk::locate_player_in(&executable_dir, build_checkout_player)? {
+    match sdk::locate_player_in(&executable_dir, flavor, build_checkout_player)? {
         PlayerLocation::Checkout(executable) => Ok(executable),
         PlayerLocation::Sdk {
             executable,
@@ -488,21 +516,19 @@ pub(crate) fn executable_directory(executable: &Path) -> Result<PathBuf, BuildEr
     })
 }
 
-pub(crate) fn build_checkout_player() -> Result<PathBuf, BuildError> {
+pub(crate) fn build_checkout_player(flavor: PlayerFlavor) -> Result<PathBuf, BuildError> {
     let root = repo_root()?;
-    let target_dir = normalize_build_path(&root.join("build/player"))?;
+    let target_dir = normalize_build_path(&checkout_player_target_dir(&root, flavor))?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let stdout = run_cargo(
         Command::new(cargo)
-            .arg("build")
-            .arg("--release")
-            .arg("--locked")
-            .arg("-p")
-            .arg("rve-player")
-            .arg("--message-format=json")
+            .args(flavor.cargo_arguments())
             .current_dir(&root)
             .env("CARGO_TARGET_DIR", &target_dir),
-        "сборка rve-player",
+        match flavor {
+            PlayerFlavor::Distribution => "сборка distribution rve-player",
+            PlayerFlavor::Dev => "сборка dev rve-player",
+        },
         CargoFailure::Operational,
     )?;
     let artifact = parse_cargo_output(&stdout, "rve-player", "bin", None)
@@ -520,6 +546,10 @@ pub(crate) fn build_checkout_player() -> Result<PathBuf, BuildError> {
     );
     normalize_build_path(&executable)
         .map_err(|error| BuildError::operational(format!("сборка rve-player: {error}")))
+}
+
+fn checkout_player_target_dir(root: &Path, flavor: PlayerFlavor) -> PathBuf {
+    root.join("build").join(flavor.target_directory())
 }
 
 #[derive(Clone, Copy)]
@@ -779,9 +809,9 @@ pub(crate) fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CargoArtifact, CargoFailure, build_distribution, heavy_scripts_manifest,
-        parse_cargo_output, parse_cdylib_target, player_file_name, select_library_file,
-        validate_heavy_scripts, validate_staged_archives,
+        CargoArtifact, CargoFailure, PlayerFlavor, build_distribution, checkout_player_target_dir,
+        heavy_scripts_manifest, parse_cargo_output, parse_cdylib_target, player_file_name,
+        select_library_file, validate_heavy_scripts, validate_staged_archives,
     };
     use crate::error::BuildError;
     use crate::project::{HeavyScriptUse, ProjectBuild};
@@ -809,6 +839,41 @@ mod tests {
         };
         // SAFETY: script_module! stores the descriptors and names in static storage.
         unsafe { ScriptLibrary::from_module(module) }.unwrap()
+    }
+
+    #[test]
+    fn checkout_player_build_arguments_and_targets_follow_flavor() {
+        let root = Path::new("checkout");
+        assert_eq!(
+            PlayerFlavor::Distribution.cargo_arguments(),
+            [
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "rve-player",
+                "--no-default-features",
+                "--message-format=json",
+            ]
+        );
+        assert_eq!(
+            PlayerFlavor::Dev.cargo_arguments(),
+            [
+                "build",
+                "--locked",
+                "-p",
+                "rve-player",
+                "--message-format=json"
+            ]
+        );
+        assert_eq!(
+            checkout_player_target_dir(root, PlayerFlavor::Distribution),
+            root.join("build/player")
+        );
+        assert_eq!(
+            checkout_player_target_dir(root, PlayerFlavor::Dev),
+            root.join("build/player-dev")
+        );
     }
 
     fn sample_project(project_dir: &Path, heavy_scripts: Option<&str>) -> ProjectBuild {

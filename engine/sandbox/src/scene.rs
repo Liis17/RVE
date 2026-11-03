@@ -388,7 +388,7 @@ fn aspect_ratio(width: u32, height: u32) -> f32 {
 mod tests {
     use super::{
         CameraSettings, Scene, TRIANGLE_INDICES, TRIANGLE_VERTICES, checker_texture, cube_mesh,
-        cube_model, cube_view_projection, material_sphere_meshes, plane_mesh,
+        cube_model, cube_view_projection, material_sphere_meshes, materials_plane_mesh, plane_mesh,
         shadows_light_direction, sinusoidal_normal_texture, triangle_view_projection,
     };
     use glam::{Mat4, Vec3, Vec4};
@@ -532,7 +532,7 @@ mod tests {
                 .iter()
                 .all(|&index| (index as usize) < vertices.len())
         );
-        for triangle in indices.as_chunks::<3>().0 {
+        for &triangle in indices.as_chunks::<3>().0 {
             let corners = triangle.map(|index| vertices[index as usize]);
             let points = corners.map(|vertex| Vec3::from(vertex.position));
             let winding = (points[1] - points[0]).cross(points[2] - points[0]);
@@ -623,6 +623,22 @@ mod tests {
             vertices.iter().map(|vertex| vertex.uv).collect::<Vec<_>>(),
             [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]]
         );
+    }
+
+    #[test]
+    fn materials_plane_triangles_follow_their_upward_normals() {
+        let (vertices, indices) = materials_plane_mesh();
+        assert_eq!(indices, [0, 1, 2, 0, 2, 3]);
+        for triangle in indices.as_chunks::<3>().0 {
+            let points = triangle.map(|index| Vec3::from(vertices[index as usize].position));
+            let normal = Vec3::from(vertices[triangle[0] as usize].normal);
+            assert!(
+                (points[1] - points[0])
+                    .cross(points[2] - points[0])
+                    .dot(normal)
+                    > 0.0
+            );
+        }
     }
 
     #[test]
