@@ -214,6 +214,7 @@ pub(crate) enum ScriptStartupError {
 
 pub(crate) struct VulkanBackend {
     renderer: Renderer,
+    pipeline_cache_path: Option<std::path::PathBuf>,
     #[cfg(feature = "dev-console")]
     console_ui: Option<Arc<ConsoleUiSlot>>,
     #[cfg(feature = "dev-console")]
@@ -228,9 +229,10 @@ type PendingConsoleCommands = VecDeque<CommandLine>;
 type PendingConsoleCommands = ();
 
 impl VulkanBackend {
-    pub fn new(renderer: Renderer) -> Self {
+    pub fn new(renderer: Renderer, pipeline_cache_path: Option<std::path::PathBuf>) -> Self {
         Self {
             renderer,
+            pipeline_cache_path,
             #[cfg(feature = "dev-console")]
             console_ui: None,
             #[cfg(feature = "dev-console")]
@@ -300,6 +302,15 @@ impl RenderBackend for VulkanBackend {
         self.renderer
             .render_frame(&frame)
             .map_err(|error| error.to_string())
+    }
+
+    fn wait_idle(&mut self) {
+        match self.renderer.pipeline_cache_data() {
+            Ok(data) => {
+                engine_platform::save_pipeline_cache(self.pipeline_cache_path.as_deref(), &data)
+            }
+            Err(error) => eprintln!("failed to retrieve pipeline cache: {error}"),
+        }
     }
 
     #[cfg(feature = "dev-console")]

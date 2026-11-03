@@ -57,6 +57,8 @@ pub struct EditorApp {
     pub exit_code: u8,
     window_title: String,
     window: Option<Arc<Window>>,
+    pipeline_cache_path: Option<PathBuf>,
+    pipeline_cache: Vec<u8>,
 }
 
 struct GpuState {
@@ -68,6 +70,8 @@ impl EditorApp {
     pub fn new(project: Option<PathBuf>, scripts: Option<PathBuf>) -> Self {
         let engine_log = editor_log_buffer();
         let mut state = EditorState::new(scripts);
+        let pipeline_cache_path = engine_platform::pipeline_cache_path("rve-editor");
+        let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
         let settings = SettingsStore::default_location();
         let (user, problem) = settings
             .as_ref()
@@ -96,6 +100,20 @@ impl EditorApp {
             exit_code: 0,
             window_title: String::new(),
             window: None,
+            pipeline_cache_path,
+            pipeline_cache,
+        }
+    }
+
+    pub fn save_pipeline_cache(&self) {
+        let Some(renderer) = self.gpu.as_ref().map(|gpu| &gpu.renderer) else {
+            return;
+        };
+        match renderer.pipeline_cache_data() {
+            Ok(data) => {
+                engine_platform::save_pipeline_cache(self.pipeline_cache_path.as_deref(), &data)
+            }
+            Err(error) => eprintln!("failed to retrieve pipeline cache: {error}"),
         }
     }
 
@@ -1186,7 +1204,11 @@ impl WindowHandler for EditorApp {
             Arc::clone(&window),
             size.width,
             size.height,
-            RendererConfig::default(),
+            RendererConfig {
+                present_mode: engine_render::PresentMode::Fifo,
+                pipeline_cache: self.pipeline_cache.clone(),
+                ..RendererConfig::default()
+            },
         );
         let mut renderer = match renderer {
             Ok(renderer) => renderer,

@@ -476,6 +476,7 @@ fn showing_the_inspector_keeps_hdr_light_colors_and_material_overrides_unchanged
                 metallic_roughness_texture: None,
                 normal_texture: None,
                 normal_scale: Some(2.0),
+                double_sided: None,
             }),
             None,
         )

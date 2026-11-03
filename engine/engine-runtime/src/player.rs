@@ -14,12 +14,14 @@ use egui::{Context, Rect, ViewportId};
 use egui_winit::State as EguiWinitState;
 #[cfg(feature = "dev-console")]
 use engine_console::{CommandLine, ConsoleBuffer, ConsoleLevel, ConsoleLine, parse_command_line};
-use engine_render::{Renderer, RendererConfig};
+use engine_project::BootstrapPresentMode;
+use engine_render::{PresentMode, Renderer, RendererConfig};
 use engine_script::ScriptInterruptHandle;
 #[cfg(feature = "dev-console")]
 use engine_ui::console::ConsoleOverlay;
 use engine_window::{Key, MouseButton, Window, WindowConfig, WindowHandler, WindowProxy, run};
 use flume::{Receiver, Sender};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "dev-console")]
@@ -39,6 +41,9 @@ impl ExitRequester for WindowExit {
 
 pub(crate) struct PlayerConfig {
     pub window: WindowConfig,
+    pub present_mode: Option<BootstrapPresentMode>,
+    pub pipeline_cache_path: Option<PathBuf>,
+    pub pipeline_cache: Vec<u8>,
     pub frame_limit: Option<u64>,
     pub render_assets: PreparedRenderAssets,
     pub activation: PendingActivation,
@@ -61,6 +66,9 @@ pub(crate) struct PlayerConfig {
 pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     let PlayerConfig {
         window,
+        present_mode,
+        pipeline_cache_path,
+        pipeline_cache,
         frame_limit,
         render_assets,
         activation,
@@ -81,6 +89,9 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     } = config;
     let mut handler = PlayerWindow {
         frame_limit,
+        present_mode,
+        pipeline_cache_path,
+        pipeline_cache,
         render_assets,
         modules,
         activation,
@@ -134,6 +145,9 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
 
 struct PlayerWindow<'a> {
     frame_limit: Option<u64>,
+    present_mode: Option<BootstrapPresentMode>,
+    pipeline_cache_path: Option<PathBuf>,
+    pipeline_cache: Vec<u8>,
     render_assets: PreparedRenderAssets,
     modules: &'a mut ModuleHost,
     activation: PendingActivation,
@@ -615,7 +629,18 @@ impl WindowHandler for PlayerWindow<'_> {
             Arc::clone(&window),
             size.width,
             size.height,
-            RendererConfig::default(),
+            RendererConfig {
+                present_mode: self
+                    .present_mode
+                    .map(|mode| match mode {
+                        BootstrapPresentMode::Fifo => PresentMode::Fifo,
+                        BootstrapPresentMode::Mailbox => PresentMode::Mailbox,
+                        BootstrapPresentMode::Immediate => PresentMode::Immediate,
+                    })
+                    .unwrap_or_default(),
+                pipeline_cache: self.pipeline_cache.clone(),
+                ..RendererConfig::default()
+            },
         ) {
             Ok(renderer) => renderer,
             Err(error) => return self.fail_init(format!("ошибка renderer: {error}")),
@@ -632,7 +657,7 @@ impl WindowHandler for PlayerWindow<'_> {
         };
         let (render_stopped_tx, render_stopped_rx) = flume::bounded(1);
         self.render_stopped_rx = Some(render_stopped_rx);
-        let backend = VulkanBackend::new(renderer);
+        let backend = VulkanBackend::new(renderer, self.pipeline_cache_path.clone());
         #[cfg(feature = "dev-console")]
         let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(

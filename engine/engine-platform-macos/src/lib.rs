@@ -3,7 +3,7 @@
 
 use ash::{Entry, LoadingError, vk};
 use std::{
-    ffi::{CStr, OsStr},
+    ffi::{CStr, OsStr, OsString},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -24,6 +24,17 @@ pub const INSTANCE_FLAGS: vk::InstanceCreateFlags =
     vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
 /// Дополнительные к swapchain расширения устройства, необходимые платформе.
 pub const DEVICE_EXTENSIONS: &[&CStr] = &[ash::khr::portability_subset::NAME];
+
+/// Returns the user's cache directory.
+pub fn user_cache_dir() -> Option<PathBuf> {
+    user_cache_dir_with(|name| std::env::var_os(name))
+}
+
+fn user_cache_dir_with(mut get: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
+    get("HOME")
+        .filter(|path| !path.is_empty())
+        .map(|home| PathBuf::from(home).join("Library").join("Caches"))
+}
 
 static BUNDLED_VULKAN_LOADER: OnceLock<PathBuf> = OnceLock::new();
 
@@ -160,6 +171,15 @@ mod tests {
         assert!(INSTANCE_EXTENSIONS.contains(&c"VK_KHR_portability_enumeration"));
         assert!(INSTANCE_FLAGS.contains(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR));
         assert!(DEVICE_EXTENSIONS.contains(&c"VK_KHR_portability_subset"));
+    }
+
+    #[test]
+    fn cache_directory_uses_injected_home_environment() {
+        assert_eq!(
+            user_cache_dir_with(|name| { (name == "HOME").then(|| OsString::from("/Users/rve")) }),
+            Some(PathBuf::from("/Users/rve/Library/Caches"))
+        );
+        assert_eq!(user_cache_dir_with(|_| None), None);
     }
 
     #[test]

@@ -208,30 +208,44 @@ pub(crate) fn ui_vertex_bytes(vertices: &[UiVertex]) -> &[u8] {
 
 /// Ресурсы, которые ещё могут читать отправленные кадры.
 ///
-/// Запись освобождается, когда fence каждого кадрового слота дождались после её добавления:
-/// все отправки, видевшие ресурс, к этому моменту завершены.
+/// Запись освобождается после завершения каждого ожидающего кадрового слота и связанного upload serial.
 pub(crate) struct RetireQueue<T> {
     all_slots: u32,
-    entries: Vec<(u32, T)>,
+    completed_upload_serial: u64,
+    entries: Vec<(u32, u64, T)>,
 }
 
 impl<T> RetireQueue<T> {
     pub fn new(slot_count: usize) -> Self {
         Self {
             all_slots: (1_u32 << slot_count) - 1,
+            completed_upload_serial: 0,
             entries: Vec::new(),
         }
     }
 
-    pub fn retire(&mut self, resource: T) {
-        self.entries.push((self.all_slots, resource));
+    pub fn retire(&mut self, resource: T, upload_serial: u64) {
+        self.entries.push((self.all_slots, upload_serial, resource));
+        self.collect();
     }
 
-    /// Отмечает ожидание fence слота и уничтожает ресурсы, завершённые во всех слотах.
+    /// Отмечает завершённый frame slot и собирает ресурсы, которые больше ничего не ожидают.
     pub fn slot_completed(&mut self, slot: usize) {
-        self.entries.retain_mut(|(pending, _)| {
+        for (pending, _, _) in &mut self.entries {
             *pending &= !(1_u32 << slot);
-            *pending != 0
+        }
+        self.collect();
+    }
+
+    /// Отмечает завершённые GPU uploads и собирает ресурсы, не ожидающие кадры.
+    pub fn upload_completed(&mut self, serial: u64) {
+        self.completed_upload_serial = self.completed_upload_serial.max(serial);
+        self.collect();
+    }
+
+    fn collect(&mut self) {
+        self.entries.retain(|(pending, upload_serial, _)| {
+            *pending != 0 || *upload_serial > self.completed_upload_serial
         });
     }
 
@@ -368,7 +382,7 @@ mod tests {
     fn retired_resource_lives_until_every_slot_has_completed() {
         let resource = Rc::new(());
         let mut queue = RetireQueue::new(2);
-        queue.retire(Rc::clone(&resource));
+        queue.retire(Rc::clone(&resource), 0);
         queue.slot_completed(0);
         queue.slot_completed(0);
         assert_eq!(Rc::strong_count(&resource), 2);
@@ -380,8 +394,34 @@ mod tests {
     fn retired_resources_are_dropped_by_clear() {
         let resource = Rc::new(());
         let mut queue = RetireQueue::new(2);
-        queue.retire(Rc::clone(&resource));
+        queue.retire(Rc::clone(&resource), 0);
         queue.clear();
+        assert_eq!(Rc::strong_count(&resource), 1);
+    }
+
+    #[test]
+    fn retired_resource_waits_for_frame_slots_after_its_upload_finishes() {
+        let resource = Rc::new(());
+        let mut queue = RetireQueue::new(2);
+        queue.retire(Rc::clone(&resource), 7);
+        queue.upload_completed(7);
+        queue.slot_completed(0);
+        assert_eq!(Rc::strong_count(&resource), 2);
+        queue.slot_completed(1);
+        assert_eq!(Rc::strong_count(&resource), 1);
+    }
+
+    #[test]
+    fn retired_resource_keeps_waiting_for_upload_after_all_frame_slots() {
+        let resource = Rc::new(());
+        let mut queue = RetireQueue::new(2);
+        queue.retire(Rc::clone(&resource), 3);
+        queue.slot_completed(0);
+        queue.slot_completed(1);
+        assert_eq!(Rc::strong_count(&resource), 2);
+        queue.upload_completed(2);
+        assert_eq!(Rc::strong_count(&resource), 2);
+        queue.upload_completed(3);
         assert_eq!(Rc::strong_count(&resource), 1);
     }
 }

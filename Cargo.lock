@@ -2390,6 +2390,7 @@ dependencies = [
  "engine-assets",
  "engine-console",
  "engine-files",
+ "engine-platform",
  "engine-project",
  "engine-render",
  "engine-resources",

@@ -59,6 +59,8 @@ exposure, tonemapping, anti-aliasing и render scale задаются файло
 
 Настройки окна sandbox необязательны. Чтобы изменить их, скопируй шаблон
 `bootstrap.rves.example` в `build/bootstrap.rves`.
+Параметр `PresentMode` принимает `Fifo`, `Mailbox` или `Immediate`; неподдерживаемый
+режим swapchain автоматически заменяется на `Fifo`.
 
 ## Запуск и сборка игры
 

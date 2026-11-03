@@ -1910,6 +1910,7 @@ mod tests {
                         metallic_roughness_texture: None,
                         normal_texture: None,
                         normal_scale: Some(0.5),
+                        double_sided: None,
                     });
                 Ok(())
             })
@@ -1940,6 +1941,7 @@ mod tests {
             metallic_roughness_texture: None,
             normal_texture: None,
             normal_scale: None,
+            double_sided: None,
         }
     }
 

@@ -124,6 +124,11 @@ void main() {
         );
     }
 
+    if (!gl_FrontFacing) {
+        geometric_normal = -geometric_normal;
+        normal = -normal;
+    }
+
     vec3 base_color = base_sample.rgb * material.base_color.rgb * in_color;
     float metallic = clamp(material.parameters.x * metallic_roughness_sample.b, 0.0, 1.0);
     float roughness = clamp(material.parameters.y * metallic_roughness_sample.g, 0.0, 1.0);

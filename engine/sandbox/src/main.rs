@@ -7,7 +7,7 @@ use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets};
 use engine_core::Time;
 use engine_files::VirtualPath;
-use engine_project::BootstrapConfig;
+use engine_project::{BootstrapConfig, BootstrapPresentMode};
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DrawCommand, Frame, FrameStatus, Material, MaterialId,
     MeshId, Renderer, RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
@@ -216,6 +216,9 @@ struct Sandbox {
     renderer: Option<Renderer>,
     content: Content,
     camera_settings: CameraSettings,
+    present_mode: Option<BootstrapPresentMode>,
+    pipeline_cache_path: Option<PathBuf>,
+    pipeline_cache: Vec<u8>,
     meshes: Vec<(MeshId, MaterialId, bool)>,
     size: PhysicalSize<u32>,
     time: Time,
@@ -227,7 +230,14 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    fn new(options: Options, content: Content, mut camera_settings: CameraSettings) -> Self {
+    fn new(
+        options: Options,
+        content: Content,
+        mut camera_settings: CameraSettings,
+        present_mode: Option<BootstrapPresentMode>,
+        pipeline_cache_path: Option<PathBuf>,
+        pipeline_cache: Vec<u8>,
+    ) -> Self {
         if let Some(render_scale) = options.render_scale {
             camera_settings.render.render_scale = render_scale;
         }
@@ -235,6 +245,9 @@ impl Sandbox {
             renderer: None,
             content,
             camera_settings,
+            present_mode,
+            pipeline_cache_path,
+            pipeline_cache,
             meshes: Vec::new(),
             size: PhysicalSize::new(0, 0),
             time: Time::new(),
@@ -371,6 +384,7 @@ impl Sandbox {
                     base_color: mesh.material.base_color,
                     metallic: mesh.material.metallic,
                     roughness: mesh.material.roughness,
+                    double_sided: mesh.material.double_sided,
                     base_color_texture,
                     metallic_roughness_texture,
                     normal_texture,
@@ -385,6 +399,18 @@ impl Sandbox {
     fn take_failure(&mut self) -> Option<String> {
         self.failure.take()
     }
+
+    fn save_pipeline_cache(&self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        match renderer.pipeline_cache_data() {
+            Ok(data) => {
+                engine_platform::save_pipeline_cache(self.pipeline_cache_path.as_deref(), &data)
+            }
+            Err(error) => eprintln!("failed to retrieve pipeline cache: {error}"),
+        }
+    }
 }
 
 impl WindowHandler for Sandbox {
@@ -392,7 +418,18 @@ impl WindowHandler for Sandbox {
         let size = window.inner_size();
         println!("Window: {}x{} (physical pixels)", size.width, size.height);
         self.size = size;
-        let config = RendererConfig::default();
+        let config = RendererConfig {
+            present_mode: self
+                .present_mode
+                .map(|mode| match mode {
+                    BootstrapPresentMode::Fifo => engine_render::PresentMode::Fifo,
+                    BootstrapPresentMode::Mailbox => engine_render::PresentMode::Mailbox,
+                    BootstrapPresentMode::Immediate => engine_render::PresentMode::Immediate,
+                })
+                .unwrap_or_default(),
+            pipeline_cache: self.pipeline_cache.clone(),
+            ..RendererConfig::default()
+        };
         match Renderer::new(Arc::clone(&window), size.width, size.height, config) {
             Ok(mut renderer) => {
                 let capabilities = renderer.capabilities();
@@ -601,6 +638,7 @@ fn main_after_vulkan_environment() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let present_mode = bootstrap.present_mode;
     let default_window = WindowConfig::default();
     let config = WindowConfig {
         title: bootstrap.window_title.unwrap_or(default_window.title),
@@ -633,7 +671,16 @@ fn main_after_vulkan_environment() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut app = Sandbox::new(options, content, camera_settings);
+    let pipeline_cache_path = engine_platform::pipeline_cache_path("sandbox");
+    let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
+    let mut app = Sandbox::new(
+        options,
+        content,
+        camera_settings,
+        present_mode,
+        pipeline_cache_path,
+        pipeline_cache,
+    );
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
     let mut exit_code = match (run_result, failure) {
@@ -647,6 +694,7 @@ fn main_after_vulkan_environment() -> ExitCode {
         }
         (Ok(()), None) => 0,
     };
+    app.save_pipeline_cache();
     drop(app);
     if let Err(error) = resources.shutdown() {
         eprintln!("Ошибка завершения ресурсного сервиса: {error}");
@@ -668,7 +716,14 @@ mod tests {
 
     fn sandbox(options: Options) -> Sandbox {
         let content = Content::from_scene(options.scene);
-        Sandbox::new(options, content, CameraSettings::default())
+        Sandbox::new(
+            options,
+            content,
+            CameraSettings::default(),
+            None,
+            None,
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -723,7 +778,14 @@ mod tests {
         let options = parse_args(["--render-scale", "0.4"]).unwrap();
         let mut settings = CameraSettings::default();
         settings.render.render_scale = 0.75;
-        let sandbox = Sandbox::new(options, Content::from_scene(Scene::Cube), settings);
+        let sandbox = Sandbox::new(
+            options,
+            Content::from_scene(Scene::Cube),
+            settings,
+            None,
+            None,
+            Vec::new(),
+        );
         assert_eq!(sandbox.camera_settings.render.render_scale, 0.4);
     }
 

@@ -20,6 +20,7 @@ mod ui;
 pub use ui::{UiImage, UiPrimitive, UiTextureId, UiVertex, ViewportId};
 
 const FRAMES_IN_FLIGHT: usize = 2;
+const DEFAULT_UPLOAD_BATCH_CAPACITY: usize = 64 * 1024 * 1024;
 const OFFSCREEN_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const LDR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -54,6 +55,7 @@ const OUTPUT_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
+const PIPELINE_CACHE_HEADER_SIZE: usize = size_of::<vk::PipelineCacheHeaderVersionOne>();
 /// Два timestamp на слот кадра: перед shadow pass и после scene pass.
 const TIMESTAMP_QUERY_COUNT: u32 = 2;
 const WHITE_SRGB_TEXTURE: usize = 0;
@@ -113,12 +115,13 @@ pub enum TextureColorSpace {
     Linear,
 }
 
-/// Неизменяемые параметры материала и необязательные текстуры.
+/// Неизменяемые параметры материала, отсечение граней и необязательные текстуры.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
+    pub double_sided: bool,
     pub base_color_texture: Option<TextureId>,
     pub metallic_roughness_texture: Option<TextureId>,
     pub normal_texture: Option<TextureId>,
@@ -131,6 +134,7 @@ impl Default for Material {
             base_color: [1.0; 3],
             metallic: 0.0,
             roughness: 1.0,
+            double_sided: false,
             base_color_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
@@ -249,11 +253,121 @@ impl AntiAliasing {
     }
 }
 
+/// Requested presentation behavior for the swapchain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresentMode {
+    /// V-sync; Vulkan guarantees this mode for a usable surface.
+    #[default]
+    Fifo,
+    /// Low-latency presentation that may replace queued frames.
+    Mailbox,
+    /// Immediate presentation without waiting for a vertical blank.
+    Immediate,
+}
+
+impl PresentMode {
+    fn vk(self) -> vk::PresentModeKHR {
+        match self {
+            Self::Fifo => vk::PresentModeKHR::FIFO,
+            Self::Mailbox => vk::PresentModeKHR::MAILBOX,
+            Self::Immediate => vk::PresentModeKHR::IMMEDIATE,
+        }
+    }
+
+    fn from_vk(mode: vk::PresentModeKHR) -> Self {
+        match mode {
+            vk::PresentModeKHR::FIFO => Self::Fifo,
+            vk::PresentModeKHR::MAILBOX => Self::Mailbox,
+            vk::PresentModeKHR::IMMEDIATE => Self::Immediate,
+            _ => Self::Fifo,
+        }
+    }
+}
+
+fn select_present_mode(
+    requested: PresentMode,
+    supported: &[vk::PresentModeKHR],
+) -> vk::PresentModeKHR {
+    let requested = requested.vk();
+    if supported.contains(&requested) {
+        requested
+    } else {
+        vk::PresentModeKHR::FIFO
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PipelineCacheIdentity {
+    vendor_id: u32,
+    device_id: u32,
+    pipeline_cache_uuid: [u8; vk::UUID_SIZE],
+}
+
+fn validate_pipeline_cache(
+    data: &[u8],
+    expected: PipelineCacheIdentity,
+) -> Result<(), &'static str> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if data.len() < PIPELINE_CACHE_HEADER_SIZE {
+        return Err("pipeline cache header is truncated");
+    }
+
+    let header_size = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
+    if header_size != PIPELINE_CACHE_HEADER_SIZE {
+        return Err("pipeline cache header size is invalid");
+    }
+    if data.len() < header_size {
+        return Err("pipeline cache header is truncated");
+    }
+    let header_version = i32::from_ne_bytes(data[4..8].try_into().unwrap());
+    if header_version != vk::PipelineCacheHeaderVersion::ONE.as_raw() {
+        return Err("pipeline cache header version is unsupported");
+    }
+    let vendor_id = u32::from_ne_bytes(data[8..12].try_into().unwrap());
+    let device_id = u32::from_ne_bytes(data[12..16].try_into().unwrap());
+    let uuid = &data[16..PIPELINE_CACHE_HEADER_SIZE];
+    if vendor_id != expected.vendor_id
+        || device_id != expected.device_id
+        || uuid != expected.pipeline_cache_uuid
+    {
+        return Err("pipeline cache belongs to another physical device");
+    }
+    Ok(())
+}
+
+fn compatible_pipeline_cache(data: &[u8], expected: PipelineCacheIdentity) -> &[u8] {
+    match validate_pipeline_cache(data, expected) {
+        Ok(()) => data,
+        Err(reason) => {
+            eprintln!("ignoring pipeline cache: {reason}");
+            &[]
+        }
+    }
+}
+
+fn completed_upload_count<E>(
+    statuses: impl IntoIterator<Item = Result<bool, E>>,
+) -> Result<usize, E> {
+    let mut count = 0;
+    for status in statuses {
+        if !status? {
+            break;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Настройки Vulkan-рендерера.
 #[derive(Default)]
 pub struct RendererConfig {
     pub extra_instance_extensions: Vec<&'static CStr>,
     pub extra_device_extensions: Vec<&'static CStr>,
+    pub present_mode: PresentMode,
+    /// Vulkan pipeline cache bytes validated against the selected physical device.
+    pub pipeline_cache: Vec<u8>,
 }
 
 /// Возможности выбранного физического устройства.
@@ -375,7 +489,7 @@ fn classify_probe_instance_failure(error: vk::Result) -> ProbeInstanceFailure {
 
 /// Проверяет доступные Vulkan-устройства без создания окна или surface.
 ///
-/// `suitable` учитывает Vulkan 1.3, dynamic rendering, synchronization2,
+/// `suitable` учитывает Vulkan 1.3, dynamic rendering, synchronization2, extended dynamic state,
 /// graphics queue и обязательные расширения устройства, включая swapchain.
 /// Возможность present и совместимость с конкретным surface проверяются
 /// отдельно в [`Renderer::new`]. Если loader недоступен, возвращается
@@ -453,7 +567,13 @@ pub struct Renderer {
     physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
     queue_family_index: u32,
+    upload_alignment: usize,
+    next_upload_serial: u64,
+    completed_upload_serial: u64,
+    pending_upload: Option<UploadBatch>,
+    in_flight_uploads: Vec<UploadBatch>,
     command_pool: Option<vk::CommandPool>,
+    pipeline_cache: Option<vk::PipelineCache>,
     pipeline_layout: Option<vk::PipelineLayout>,
     pipeline: Option<vk::Pipeline>,
     shadow_pipeline: Option<vk::Pipeline>,
@@ -497,6 +617,8 @@ pub struct Renderer {
     frame_slot: usize,
     swapchain: Option<SwapchainBundle>,
     surface_format: vk::SurfaceFormatKHR,
+    present_mode: PresentMode,
+    last_warned_present_mode: Option<PresentMode>,
     output_extent: vk::Extent2D,
     swapchain_dirty: bool,
     config: RendererConfig,
@@ -528,7 +650,13 @@ impl Renderer {
             physical_device: vk::PhysicalDevice::null(),
             queue: vk::Queue::null(),
             queue_family_index: 0,
+            upload_alignment: 16,
+            next_upload_serial: 1,
+            completed_upload_serial: 0,
+            pending_upload: None,
+            in_flight_uploads: Vec::new(),
             command_pool: None,
+            pipeline_cache: None,
             pipeline_layout: None,
             pipeline: None,
             shadow_pipeline: None,
@@ -566,6 +694,8 @@ impl Renderer {
             frame_slot: 0,
             swapchain: None,
             surface_format: vk::SurfaceFormatKHR::default(),
+            present_mode: config.present_mode,
+            last_warned_present_mode: None,
             output_extent: vk::Extent2D { width, height },
             swapchain_dirty: true,
             config,
@@ -587,6 +717,20 @@ impl Renderer {
         &self.capabilities
     }
 
+    /// Returns the present mode used by the current swapchain.
+    pub fn present_mode(&self) -> PresentMode {
+        self.present_mode
+    }
+
+    /// Returns the pipeline cache data produced by this renderer.
+    pub fn pipeline_cache_data(&self) -> Result<Vec<u8>, RenderError> {
+        let cache = self
+            .pipeline_cache
+            .ok_or(RenderError::InvalidState("pipeline cache отсутствует"))?;
+        // SAFETY: renderer creation and pipeline creation have completed on its owning thread.
+        unsafe { self.device()?.get_pipeline_cache_data(cache) }.map_err(RenderError::from)
+    }
+
     /// Забирает GPU-время shadow и scene pass последнего завершённого кадра.
     ///
     /// Каждое измерение возвращается один раз; `None` — нового измерения нет
@@ -602,49 +746,130 @@ impl Renderer {
         self.swapchain_dirty = true;
     }
 
-    /// Загружает треугольный меш в память GPU. Каждые три индекса образуют треугольник.
+    /// Записывает асинхронную загрузку треугольного меша в GPU. Каждые три индекса образуют треугольник.
+    /// Ошибка отправки пачки может вернуться из следующего `create_mesh`, `destroy_mesh` или кадра.
     pub fn create_mesh(
         &mut self,
         vertices: &[Vertex],
         indices: &[u32],
     ) -> Result<MeshId, RenderError> {
         validate_mesh(vertices.len(), indices)?;
+        let instance = self.instance()?.clone();
+        let device = self.device()?.clone();
         let bounds = LocalBounds::from_vertices(vertices);
-        let vertex_buffer = HostBuffer::new(
-            self.instance()?,
-            self.device()?,
-            self.physical_device,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            vertex_bytes(vertices),
+        let vertex_data = vertex_bytes(vertices);
+        let index_data = index_bytes(indices);
+        let layout = mesh_upload_layout(
+            0,
+            vertex_data.len(),
+            index_data.len(),
+            self.upload_alignment,
+        )
+        .ok_or(RenderError::InvalidMesh(
+            "размер меша переполняет диапазон буфера",
+        ))?;
+        let capacity = upload_batch_capacity(layout.end, self.upload_alignment).ok_or(
+            RenderError::InvalidMesh("размер меша переполняет диапазон буфера"),
         )?;
-        let index_buffer = HostBuffer::new(
-            self.instance()?,
-            self.device()?,
+        let must_flush = self.pending_upload.as_ref().is_some_and(|batch| {
+            batch.oversized
+                || upload_batch_flush_required(
+                    batch.cursor,
+                    vertex_data.len(),
+                    index_data.len(),
+                    self.upload_alignment,
+                    batch.capacity,
+                )
+                .unwrap_or(true)
+        });
+        if must_flush {
+            self.flush_uploads()?;
+        }
+        if self.pending_upload.is_none() {
+            self.poll_uploads()?;
+            self.pending_upload = Some(UploadBatch::new(
+                &instance,
+                &device,
+                self.physical_device,
+                self.queue_family_index,
+                capacity,
+                capacity > DEFAULT_UPLOAD_BATCH_CAPACITY,
+                self.next_upload_serial,
+            )?);
+            self.next_upload_serial = self
+                .next_upload_serial
+                .checked_add(1)
+                .ok_or(RenderError::InvalidState("upload serial исчерпан"))?;
+        }
+        let batch = self
+            .pending_upload
+            .as_mut()
+            .ok_or(RenderError::InvalidState("upload batch отсутствует"))?;
+        let layout = mesh_upload_layout(
+            batch.cursor,
+            vertex_data.len(),
+            index_data.len(),
+            self.upload_alignment,
+        )
+        .ok_or(RenderError::InvalidMesh(
+            "размер меша переполняет диапазон буфера",
+        ))?;
+        let vertex_buffer = DeviceBuffer::new(
+            &instance,
+            &device,
             self.physical_device,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            index_bytes(indices),
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vertex_data.len(),
         )?;
+        let index_buffer = DeviceBuffer::new(
+            &instance,
+            &device,
+            self.physical_device,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            index_data.len(),
+        )?;
+        batch.staging.write_at(layout.vertex_offset, vertex_data)?;
+        batch.staging.write_at(layout.index_offset, index_data)?;
+        batch.record_mesh_copies(
+            &vertex_buffer,
+            &index_buffer,
+            layout,
+            vertex_data.len(),
+            index_data.len(),
+        );
+        batch.cursor = layout.end;
+        let upload_serial = batch.serial;
         self.meshes.push(Some(MeshBuffers {
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
             bounds,
+            upload_serial,
         }));
         Ok(MeshId(self.meshes.len() - 1))
     }
 
-    /// Удаляет меш; буферы освобождаются после завершения отправленных кадров.
+    /// Отправляет его ожидающую загрузку при необходимости; буферы освобождаются после upload и кадров.
     pub fn destroy_mesh(&mut self, mesh: MeshId) -> Result<(), RenderError> {
+        let upload_serial = self
+            .meshes
+            .get(mesh.0)
+            .and_then(Option::as_ref)
+            .map(|buffers| buffers.upload_serial)
+            .ok_or(RenderError::InvalidMesh("MeshId не принадлежит renderer"))?;
+        self.flush_upload_serial(upload_serial)?;
         let buffers = self
             .meshes
             .get_mut(mesh.0)
             .and_then(Option::take)
             .ok_or(RenderError::InvalidMesh("MeshId не принадлежит renderer"))?;
-        self.retired.retire(RetiredResource::Mesh(buffers));
+        self.retired
+            .retire(RetiredResource::Mesh(buffers), upload_serial);
         Ok(())
     }
 
-    /// Загружает sRGB-текстуру RGBA8 со строками сверху вниз.
+    /// Записывает sRGB RGBA8 загрузку со строками сверху вниз в upload batch.
+    /// Ошибка отправки batch может вернуться из следующего resource API или кадра.
     pub fn create_texture(
         &mut self,
         width: u32,
@@ -654,7 +879,8 @@ impl Renderer {
         self.create_texture_with_color_space(width, height, rgba, TextureColorSpace::Srgb)
     }
 
-    /// Загружает RGBA8-текстуру в заданном цветовом пространстве.
+    /// Записывает RGBA8-текстуру заданного цветового пространства в upload batch.
+    /// Ошибка отправки batch может вернуться из следующего resource API или кадра.
     pub fn create_texture_with_color_space(
         &mut self,
         width: u32,
@@ -695,11 +921,11 @@ impl Renderer {
             .ok_or_else(|| {
                 RenderError::InvalidMaterial("MaterialId не принадлежит renderer".to_owned())
             })?;
-        self.retired.retire(RetiredResource::Material(resource));
+        self.retired.retire(RetiredResource::Material(resource), 0);
         Ok(())
     }
 
-    /// Удаляет текстуру; ресурсы освобождаются после завершения отправленных кадров.
+    /// Отправляет её ожидающую загрузку при необходимости; image ждёт upload и кадров перед освобождением.
     pub fn destroy_texture(&mut self, texture: TextureId) -> Result<(), RenderError> {
         let unknown =
             || RenderError::InvalidTexture("TextureId не принадлежит renderer".to_owned());
@@ -707,12 +933,20 @@ impl Renderer {
         if texture.0 <= FLAT_NORMAL_TEXTURE {
             return Err(unknown());
         }
+        let upload_serial = self
+            .textures
+            .get(texture.0)
+            .and_then(Option::as_ref)
+            .map(|texture| texture.upload_serial)
+            .ok_or_else(unknown)?;
+        self.flush_upload_serial(upload_serial)?;
         let resource = self
             .textures
             .get_mut(texture.0)
             .and_then(Option::take)
             .ok_or_else(unknown)?;
-        self.retired.retire(RetiredResource::Texture(resource));
+        self.retired
+            .retire(RetiredResource::Texture(resource), upload_serial);
         Ok(())
     }
 
@@ -721,7 +955,8 @@ impl Renderer {
         self.max_texture_size
     }
 
-    /// Загружает UI-текстуру RGBA8: предумноженный цвет в гамма-пространстве, строки сверху вниз.
+    /// Записывает UI-текстуру RGBA8 в upload batch: предумноженный цвет в гамма-пространстве, строки сверху вниз.
+    /// Ошибка отправки batch может вернуться из следующего resource API или кадра.
     pub fn create_ui_texture(
         &mut self,
         width: u32,
@@ -732,19 +967,25 @@ impl Renderer {
         let sampler = self
             .ui_sampler
             .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?;
-        let image = self.upload_image(UI_TEXTURE_FORMAT, 1, width, height, rgba)?;
-        let (pool, set) = allocate_image_set(
-            self.device()?,
-            self.texture_set_layout()?,
-            image.view,
-            sampler,
-        )?;
+        let device = self.device()?.clone();
+        let image_set_layout = self.texture_set_layout()?;
+        let (image, upload_serial) =
+            self.upload_image(UI_TEXTURE_FORMAT, 1, width, height, rgba)?;
+        let (pool, set) = match allocate_image_set(&device, image_set_layout, image.view, sampler) {
+            Ok(resources) => resources,
+            Err(error) => {
+                self.retired
+                    .retire(RetiredResource::Image(image), upload_serial);
+                return Err(error);
+            }
+        };
         self.ui_textures.push(Some(UiTexture {
-            device: self.device()?.clone(),
+            device,
             pool,
             set,
             image,
             extent: vk::Extent2D { width, height },
+            upload_serial,
         }));
         Ok(UiTextureId(self.ui_textures.len() - 1))
     }
@@ -760,7 +1001,9 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let target = self.ui_texture(texture)?;
         validate_texture_region(region, target.extent, rgba.len())?;
+        let upload_serial = target.upload_serial;
         let image = target.image.image;
+        self.flush_upload_serial(upload_serial)?;
         let device = self.device()?;
         let staging = HostBuffer::new(
             self.instance()?,
@@ -818,14 +1061,18 @@ impl Renderer {
                 .image(image)
                 .subresource_range(color_subresource_range());
             pipeline_barrier(device, command_buffer, to_shader);
-        })
+        })?;
+        self.poll_uploads()?;
+        Ok(())
     }
 
-    /// Удаляет UI-текстуру; ресурсы освобождаются после завершения отправленных кадров.
+    /// Отправляет её ожидающую загрузку при необходимости; image ждёт upload и кадров перед освобождением.
     pub fn free_ui_texture(&mut self, texture: UiTextureId) -> Result<(), RenderError> {
-        self.ui_texture(texture)?;
+        let upload_serial = self.ui_texture(texture)?.upload_serial;
+        self.flush_upload_serial(upload_serial)?;
         if let Some(resource) = self.ui_textures[texture.0].take() {
-            self.retired.retire(RetiredResource::UiTexture(resource));
+            self.retired
+                .retire(RetiredResource::UiTexture(resource), upload_serial);
         }
         Ok(())
     }
@@ -866,7 +1113,7 @@ impl Renderer {
             .get_mut(viewport.0)
             .and_then(Option::take)
             .ok_or_else(unknown_viewport)?;
-        self.retired.retire(RetiredResource::Viewport(resource));
+        self.retired.retire(RetiredResource::Viewport(resource), 0);
         Ok(())
     }
 
@@ -886,22 +1133,29 @@ impl Renderer {
         let instance = self.instance()?.clone();
         let device = self.device()?.clone();
         let swapchain_loader = self.swapchain_loader()?.clone();
+        let frame_slot = self.frame_slot;
+        let fence = self
+            .frames
+            .get(frame_slot)
+            .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?
+            .fence;
+        // SAFETY: this fence belongs to the frame slot and its prior submission is finished before reuse.
+        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        self.poll_uploads()?;
+        self.flush_uploads()?;
+        self.retired.slot_completed(frame_slot);
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
-        let frame_slot = self.frame_slot;
         let frame_resources = self
             .frames
             .get_mut(frame_slot)
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
-        let fence = frame_resources.fence;
         let image_available = frame_resources.image_available;
         let command_buffer = frame_resources.command_buffer;
         let swapchain_handle = swapchain.handle;
         let image_count = swapchain.images.len();
 
-        // SAFETY: fence принадлежит текущему слоту и предыдущая работа этого слота завершается перед повторным использованием.
-        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
         if let Some(gpu_time) = frame_resources.read_gpu_time(
             &device,
             self.timestamp_valid_bits,
@@ -909,7 +1163,6 @@ impl Renderer {
         )? {
             self.pending_gpu_time = Some(gpu_time);
         }
-        self.retired.slot_completed(frame_slot);
         // Fence слота дождались, поэтому GPU больше не читает вершины оверлея этого слота.
         frame_resources.write_overlay(&instance, &device, self.physical_device, frame.overlay)?;
         let timestamps = frame_resources.timestamps;
@@ -969,6 +1222,7 @@ impl Renderer {
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
             frame_set,
             meshes: &self.meshes,
+            materials: &self.materials,
             draws: frame.draws,
             light_view_projection: frame.shadow_view_projection,
             enabled: frame.shadow_view_projection.is_some(),
@@ -1081,6 +1335,16 @@ impl Renderer {
         let device = self.device()?.clone();
         let swapchain_loader = self.swapchain_loader()?.clone();
         let frame_slot = self.frame_slot;
+        let fence = self
+            .frames
+            .get(frame_slot)
+            .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?
+            .fence;
+        // SAFETY: this fence belongs to the frame slot and its prior submission is finished before reuse.
+        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        self.poll_uploads()?;
+        self.flush_uploads()?;
+        self.retired.slot_completed(frame_slot);
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
@@ -1089,8 +1353,6 @@ impl Renderer {
             .get_mut(frame_slot)
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
         let command_buffer = frame_resources.command_buffer;
-        // SAFETY: fence принадлежит текущему слоту; его прошлая работа завершается перед повторным использованием.
-        unsafe { device.wait_for_fences(&[frame_resources.fence], true, u64::MAX) }?;
         if let Some(gpu_time) = frame_resources.read_gpu_time(
             &device,
             self.timestamp_valid_bits,
@@ -1098,7 +1360,6 @@ impl Renderer {
         )? {
             self.pending_gpu_time = Some(gpu_time);
         }
-        self.retired.slot_completed(frame_slot);
         // Fence слота дождались, поэтому GPU больше не читает буферы этого слота.
         frame_resources.ui_vertices.write(
             &instance,
@@ -1228,6 +1489,7 @@ impl Renderer {
                             pipeline_layout,
                             frame_set: *frame_set,
                             meshes: &self.meshes,
+                            materials: &self.materials,
                             draws: frame.draws,
                             light_view_projection: frame.shadow_view_projection,
                             enabled: frame.shadow_view_projection.is_some(),
@@ -1583,11 +1845,15 @@ impl Renderer {
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
+        let mut extended_dynamic_state =
+            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
+                .extended_dynamic_state(true);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&extension_pointers)
             .enabled_features(&features)
-            .push_next(&mut features_13);
+            .push_next(&mut features_13)
+            .push_next(&mut extended_dynamic_state);
         // SAFETY: the selected physical device reported every requested feature and extension.
         let device = unsafe {
             self.instance()?
@@ -1609,12 +1875,30 @@ impl Renderer {
         self.command_pool =
             Some(unsafe { self.device()?.create_command_pool(&command_pool_info, None) }?);
         // SAFETY: physical_device was selected from this live instance.
-        let limits = unsafe {
+        let properties = unsafe {
             self.instance()?
                 .get_physical_device_properties(self.physical_device)
-        }
-        .limits;
+        };
+        let cache_data = compatible_pipeline_cache(
+            &self.config.pipeline_cache,
+            PipelineCacheIdentity {
+                vendor_id: properties.vendor_id,
+                device_id: properties.device_id,
+                pipeline_cache_uuid: properties.pipeline_cache_uuid,
+            },
+        );
+        let cache_info = vk::PipelineCacheCreateInfo::default().initial_data(cache_data);
+        // SAFETY: supplied cache data passed the Vulkan version-one device identity checks.
+        self.pipeline_cache =
+            Some(unsafe { self.device()?.create_pipeline_cache(&cache_info, None) }?);
+        self.config.pipeline_cache = Vec::new();
+        let limits = properties.limits;
         self.max_texture_size = limits.max_image_dimension2_d;
+        self.upload_alignment = usize::try_from(limits.optimal_buffer_copy_offset_alignment)
+            .map_err(|_| {
+                RenderError::Unsupported("слишком большое выравнивание buffer copy".to_owned())
+            })?
+            .max(1);
         self.create_frame_resources()?;
         self.create_shadow_resources()?;
         self.create_descriptor_resources()?;
@@ -1851,9 +2135,9 @@ impl Renderer {
         Ok(())
     }
 
-    /// Копирует пиксели через staging-буфер в device-local image.
+    /// Записывает пиксели через batch staging-буфер в device-local image.
     fn upload_texture(
-        &self,
+        &mut self,
         width: u32,
         height: u32,
         rgba: &[u8],
@@ -1861,101 +2145,78 @@ impl Renderer {
     ) -> Result<Texture, RenderError> {
         let mip_levels = mip_level_count(width, height);
         let format = texture_format(color_space);
-        let image = self.upload_image(format, mip_levels, width, height, rgba)?;
-        Ok(Texture { image, color_space })
+        let (image, upload_serial) = self.upload_image(format, mip_levels, width, height, rgba)?;
+        Ok(Texture {
+            image,
+            color_space,
+            upload_serial,
+        })
     }
 
     fn upload_image(
-        &self,
+        &mut self,
         format: vk::Format,
         mip_levels: u32,
         width: u32,
         height: u32,
         rgba: &[u8],
-    ) -> Result<DeviceImage, RenderError> {
-        let device = self.device()?;
-        let extent = vk::Extent2D { width, height };
+    ) -> Result<(DeviceImage, u64), RenderError> {
+        let instance = self.instance()?.clone();
+        let device = self.device()?.clone();
+        let layout = upload_data_layout(0, rgba.len(), self.upload_alignment).ok_or(
+            RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
+        )?;
+        let capacity = upload_batch_capacity(layout.1, self.upload_alignment).ok_or(
+            RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
+        )?;
+        let must_flush = self.pending_upload.as_ref().is_some_and(|batch| {
+            batch.oversized
+                || upload_data_layout(batch.cursor, rgba.len(), self.upload_alignment)
+                    .is_none_or(|(_, end)| end > batch.capacity)
+        });
+        if must_flush {
+            self.flush_uploads()?;
+        }
+        if self.pending_upload.is_none() {
+            self.poll_uploads()?;
+            let serial = self.next_upload_serial;
+            let next_serial = serial
+                .checked_add(1)
+                .ok_or(RenderError::InvalidState("upload serial исчерпан"))?;
+            self.pending_upload = Some(UploadBatch::new(
+                &instance,
+                &device,
+                self.physical_device,
+                self.queue_family_index,
+                capacity,
+                capacity > DEFAULT_UPLOAD_BATCH_CAPACITY,
+                serial,
+            )?);
+            self.next_upload_serial = next_serial;
+        }
         let image = DeviceImage::new(
-            self.instance()?,
-            device,
+            &instance,
+            &device,
             self.physical_device,
-            extent,
+            vk::Extent2D { width, height },
             format,
             vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST,
             color_mip_subresource_range(0, mip_levels),
         )?;
-        let staging = HostBuffer::new(
-            self.instance()?,
-            device,
-            self.physical_device,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            rgba,
+        let batch = self
+            .pending_upload
+            .as_mut()
+            .ok_or(RenderError::InvalidState("upload batch отсутствует"))?;
+        let layout = upload_data_layout(batch.cursor, rgba.len(), self.upload_alignment).ok_or(
+            RenderError::InvalidTexture("размер данных текстуры переполняет DeviceSize".to_owned()),
         )?;
-        self.submit_once(|command_buffer| {
-            let to_transfer = texture_upload_barrier(image.image, mip_levels);
-            pipeline_barrier(device, command_buffer, to_transfer);
-            let region = [vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .image_subresource(color_subresource_layers())
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })];
-            // SAFETY: the staging buffer holds width * height RGBA8 texels for this image.
-            unsafe {
-                device.cmd_copy_buffer_to_image(
-                    command_buffer,
-                    staging.buffer,
-                    image.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &region,
-                )
-            };
-            let mut source_extent = extent;
-            for mip_level in 1..mip_levels {
-                let source_range = color_mip_subresource_range(mip_level - 1, 1);
-                pipeline_barrier(
-                    device,
-                    command_buffer,
-                    texture_mip_source_barrier(image.image, source_range),
-                );
-
-                let destination_extent = mip_extent(width, height, mip_level);
-                let region = [texture_mip_blit_region(
-                    mip_level - 1,
-                    source_extent,
-                    destination_extent,
-                )];
-                // SAFETY: adjacent mip levels are distinct, in bounds, and use the same blit-capable format.
-                unsafe {
-                    device.cmd_blit_image(
-                        command_buffer,
-                        image.image,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        image.image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &region,
-                        vk::Filter::LINEAR,
-                    )
-                };
-                pipeline_barrier(
-                    device,
-                    command_buffer,
-                    texture_mip_shader_barrier(image.image, source_range),
-                );
-                source_extent = destination_extent;
-            }
-
-            let final_range = color_mip_subresource_range(mip_levels - 1, 1);
-            let to_shader = texture_mip_destination_shader_barrier(image.image, final_range);
-            pipeline_barrier(device, command_buffer, to_shader);
-        })?;
-        drop(staging);
-
-        Ok(image)
+        batch.staging.write_at(layout.0, rgba)?;
+        batch.record_image_upload(image.image, width, height, mip_levels, layout.0);
+        batch.cursor = layout.1;
+        let upload_serial = batch.serial;
+        Ok((image, upload_serial))
     }
 
     fn upload_material(&self, material: &Material) -> Result<GpuMaterial, RenderError> {
@@ -2054,6 +2315,7 @@ impl Renderer {
                 device: device.clone(),
                 pool,
                 set,
+                double_sided: material.double_sided,
                 _uniform_buffer: uniform_buffer,
                 _textures: texture_refs,
             })
@@ -2102,6 +2364,69 @@ impl Renderer {
             unsafe { device.free_command_buffers(command_pool, &[command_buffer]) };
         }
         result
+    }
+
+    fn flush_uploads(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let Some(batch) = self.pending_upload.as_mut() else {
+            return Ok(());
+        };
+        if batch.cursor == 0 {
+            self.pending_upload.take();
+            return Ok(());
+        }
+        if batch.recording {
+            // SAFETY: this batch's command buffer is recording on the renderer thread and has not been submitted.
+            unsafe { device.end_command_buffer(batch.command_buffer) }?;
+            batch.recording = false;
+        }
+        if batch.fence.is_none() {
+            // SAFETY: a default fence is unsignaled and belongs to this upload submission.
+            batch.fence =
+                Some(unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?);
+        }
+        let command_infos = [vk::CommandBufferSubmitInfo::default()
+            .command_buffer(batch.command_buffer)
+            .device_mask(0)];
+        let submit_info = [vk::SubmitInfo2::default().command_buffer_infos(&command_infos)];
+        let fence = batch.fence.ok_or(RenderError::InvalidState(
+            "upload fence отсутствует после создания",
+        ))?;
+        // SAFETY: the executable batch command buffer and unsignaled fence are owned by this renderer.
+        unsafe { device.queue_submit2(self.queue, &submit_info, fence) }?;
+        let batch = self.pending_upload.take().ok_or(RenderError::InvalidState(
+            "upload batch отсутствует после submit",
+        ))?;
+        self.in_flight_uploads.push(batch);
+        Ok(())
+    }
+
+    fn flush_upload_serial(&mut self, serial: u64) -> Result<(), RenderError> {
+        if self
+            .pending_upload
+            .as_ref()
+            .is_some_and(|batch| batch.serial == serial)
+        {
+            self.flush_uploads()?;
+        }
+        Ok(())
+    }
+
+    fn poll_uploads(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let completed = completed_upload_count(self.in_flight_uploads.iter().map(|batch| {
+            let fence = batch
+                .fence
+                .ok_or(RenderError::InvalidState("upload fence отсутствует"))?;
+            // SAFETY: each fence belongs to an upload submission on this device.
+            unsafe { device.get_fence_status(fence) }.map_err(RenderError::from)
+        }))?;
+        // Uploads share one queue: only the completed prefix can be reclaimed.
+        for batch in self.in_flight_uploads.drain(..completed) {
+            self.completed_upload_serial = self.completed_upload_serial.max(batch.serial);
+        }
+        self.retired.upload_completed(self.completed_upload_serial);
+        Ok(())
     }
 
     fn create_mesh_pipeline(&mut self) -> Result<(), RenderError> {
@@ -2163,10 +2488,9 @@ impl Renderer {
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
-        // Отсечение граней выключено: видимость не зависит от порядка обхода вершин.
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
+            .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -2179,7 +2503,12 @@ impl Renderer {
             .depth_test_enable(true)
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+            vk::DynamicState::FRONT_FACE,
+        ];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let color_formats = [OFFSCREEN_FORMAT];
@@ -2203,7 +2532,7 @@ impl Renderer {
             .push_next(&mut rendering_info)];
         // SAFETY: shader modules, layout and dynamic-rendering formats are valid for this device.
         let pipelines = unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         }
         .map_err(|(_, error)| RenderError::Vulkan(error))?;
         self.pipeline = pipelines.into_iter().next();
@@ -2240,7 +2569,7 @@ impl Renderer {
             .depth_bias_constant_factor(1.25)
             .depth_bias_slope_factor(1.75)
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
+            .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -2249,7 +2578,12 @@ impl Renderer {
             .depth_test_enable(true)
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+            vk::DynamicState::FRONT_FACE,
+        ];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut rendering_info =
@@ -2270,7 +2604,7 @@ impl Renderer {
             .push_next(&mut rendering_info)];
         // SAFETY: shader, shared layout, depth format and dynamic-rendering state are valid.
         let mut pipelines = match unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         } {
             Ok(pipelines) => pipelines,
             Err((pipelines, error)) => {
@@ -2290,6 +2624,7 @@ impl Renderer {
 
     fn create_post_pipelines(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
+        let cache = self.pipeline_cache()?;
         let set_layouts = [self.texture_set_layout()?];
         let push_constant_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
@@ -2303,18 +2638,21 @@ impl Renderer {
         self.post_pipeline_layout = Some(layout);
         self.tonemap_pipeline = Some(create_post_pipeline(
             &device,
+            cache,
             layout,
             LDR_FORMAT,
             TONEMAP_FRAGMENT_SHADER,
         )?);
         self.output_pipeline = Some(create_post_pipeline(
             &device,
+            cache,
             layout,
             self.surface_format.format,
             OUTPUT_FRAGMENT_SHADER,
         )?);
         self.viewport_output_pipeline = Some(create_post_pipeline(
             &device,
+            cache,
             layout,
             LDR_FORMAT,
             OUTPUT_FRAGMENT_SHADER,
@@ -2408,7 +2746,7 @@ impl Renderer {
             .push_next(&mut rendering_info)];
         // SAFETY: shader modules, layout and the surface color format are valid for this device.
         let pipelines = unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         }
         .map_err(|(_, error)| RenderError::Vulkan(error))?;
         self.overlay_pipeline = pipelines.into_iter().next();
@@ -2519,7 +2857,7 @@ impl Renderer {
             .push_next(&mut rendering_info)];
         // SAFETY: shader modules, layout and the surface color format are valid for this device.
         let pipelines = unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         }
         .map_err(|(_, error)| RenderError::Vulkan(error))?;
         self.ui_pipeline = pipelines.into_iter().next();
@@ -2530,8 +2868,10 @@ impl Renderer {
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             return Ok(());
         }
+        self.flush_uploads()?;
         // SAFETY: recreation waits for work submitted by this device before replacing its frame targets.
         unsafe { self.device()?.device_wait_idle() }?;
+        self.poll_uploads()?;
         let old_swapchain = self
             .swapchain
             .as_ref()
@@ -2546,7 +2886,18 @@ impl Renderer {
             self.surface_format,
             self.output_extent,
             old_swapchain,
+            self.config.present_mode,
         )?;
+        self.present_mode = new_swapchain.present_mode;
+        if self.present_mode == self.config.present_mode {
+            self.last_warned_present_mode = None;
+        } else if self.last_warned_present_mode != Some(self.present_mode) {
+            eprintln!(
+                "requested present mode {:?} is unavailable; using {:?}",
+                self.config.present_mode, self.present_mode
+            );
+            self.last_warned_present_mode = Some(self.present_mode);
+        }
         self.swapchain = Some(new_swapchain);
         for frame in &mut self.frames {
             frame.target = None;
@@ -2576,6 +2927,11 @@ impl Renderer {
         self.device
             .as_ref()
             .ok_or(RenderError::InvalidState("device отсутствует"))
+    }
+
+    fn pipeline_cache(&self) -> Result<vk::PipelineCache, RenderError> {
+        self.pipeline_cache
+            .ok_or(RenderError::InvalidState("pipeline cache отсутствует"))
     }
 
     fn swapchain_loader(&self) -> Result<&ash::khr::swapchain::Device, RenderError> {
@@ -2614,6 +2970,8 @@ impl Drop for Renderer {
             // SAFETY: teardown waits for renderer submissions before destroying owned Vulkan resources.
             let _ = unsafe { device.device_wait_idle() };
         }
+        self.pending_upload.take();
+        self.in_flight_uploads.clear();
         self.swapchain.take();
         self.frames.clear();
         self.retired.clear();
@@ -2706,6 +3064,10 @@ impl Drop for Renderer {
                 // SAFETY: the pipeline layout and all descriptor pools using it are gone.
                 unsafe { device.destroy_descriptor_set_layout(layout, None) };
             }
+            if let Some(cache) = self.pipeline_cache.take() {
+                // SAFETY: every pipeline created from the cache was destroyed above.
+                unsafe { device.destroy_pipeline_cache(cache, None) };
+            }
         }
         if let (Some(device), Some(command_pool)) = (self.device.as_ref(), self.command_pool.take())
         {
@@ -2747,6 +3109,7 @@ struct DeviceFacts {
     api_version: u32,
     dynamic_rendering: bool,
     synchronization2: bool,
+    extended_dynamic_state: bool,
     supported_extensions: HashSet<String>,
     graphics_queue_families: Vec<bool>,
 }
@@ -2793,6 +3156,9 @@ fn evaluate_device(facts: &DeviceFacts, required_extensions: &[CString]) -> Devi
     if !facts.synchronization2 {
         reasons.push("не поддерживается synchronization2".to_owned());
     }
+    if !facts.extended_dynamic_state {
+        reasons.push("не поддерживается extendedDynamicState".to_owned());
+    }
     for extension in required_extensions {
         let name = extension.to_string_lossy();
         if !facts.supported_extensions.contains(name.as_ref()) {
@@ -2827,7 +3193,10 @@ fn inspect_device(
 
     // SAFETY: device feature query uses a valid physical device and a properly initialized pNext chain.
     let mut features_13 = vk::PhysicalDeviceVulkan13Features::default();
-    let mut features_2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features_13);
+    let mut extended_dynamic_state = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+    let mut features_2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut features_13)
+        .push_next(&mut extended_dynamic_state);
     unsafe { instance.get_physical_device_features2(physical_device, &mut features_2) };
     let tessellation_shader = features_2.features.tessellation_shader != vk::FALSE;
     let texture_sampler_anisotropy = sampler_anisotropy(
@@ -2853,6 +3222,7 @@ fn inspect_device(
         api_version: properties.api_version,
         dynamic_rendering: features_13.dynamic_rendering != vk::FALSE,
         synchronization2: features_13.synchronization2 != vk::FALSE,
+        extended_dynamic_state: extended_dynamic_state.extended_dynamic_state != vk::FALSE,
         supported_extensions,
         graphics_queue_families: queue_families
             .iter()
@@ -3091,6 +3461,7 @@ struct SwapchainBundle {
     views: Vec<vk::ImageView>,
     render_finished: Vec<vk::Semaphore>,
     extent: vk::Extent2D,
+    present_mode: PresentMode,
 }
 
 impl SwapchainBundle {
@@ -3105,6 +3476,7 @@ impl SwapchainBundle {
         surface_format: vk::SurfaceFormatKHR,
         requested_extent: vk::Extent2D,
         old_swapchain: vk::SwapchainKHR,
+        requested_present_mode: PresentMode,
     ) -> Result<Self, RenderError> {
         // SAFETY: device and surface are alive and associated with this instance.
         let capabilities = unsafe {
@@ -3127,6 +3499,11 @@ impl SwapchainBundle {
             .ok_or_else(|| {
                 RenderError::Unsupported("surface не поддерживает composite alpha".to_owned())
             })?;
+        // SAFETY: the physical device and surface belong to this live instance.
+        let present_modes = unsafe {
+            surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
+        }?;
+        let selected_present_mode = select_present_mode(requested_present_mode, &present_modes);
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
@@ -3138,7 +3515,7 @@ impl SwapchainBundle {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(composite_alpha)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(selected_present_mode)
             .clipped(true)
             .old_swapchain(old_swapchain);
         // SAFETY: all swapchain parameters were checked against the current surface capabilities.
@@ -3151,6 +3528,7 @@ impl SwapchainBundle {
             views: Vec::new(),
             render_finished: Vec::new(),
             extent,
+            present_mode: PresentMode::from_vk(selected_present_mode),
         };
         // SAFETY: the swapchain was just created by this loader and is still alive.
         bundle.images = unsafe { loader.get_swapchain_images(bundle.handle) }?;
@@ -3647,19 +4025,21 @@ struct UiTexture {
     set: vk::DescriptorSet,
     image: DeviceImage,
     extent: vk::Extent2D,
+    upload_serial: u64,
 }
 
 impl Drop for UiTexture {
     fn drop(&mut self) {
-        // SAFETY: retired UI textures are dropped only after their submitted frames complete.
+        // SAFETY: retirement waits for frame use and the image's upload serial before freeing its descriptor pool.
         unsafe { self.device.destroy_descriptor_pool(self.pool, None) };
     }
 }
 
-/// Ресурс, ожидающий завершения отправленных кадров; освобождается своим `Drop`.
+/// Ресурс, ожидающий кадры и связанный upload serial; освобождается своим `Drop`.
 enum RetiredResource {
     Mesh(#[allow(dead_code)] MeshBuffers),
     Texture(#[allow(dead_code)] Arc<Texture>),
+    Image(#[allow(dead_code)] DeviceImage),
     Material(#[allow(dead_code)] GpuMaterial),
     UiTexture(#[allow(dead_code)] UiTexture),
     Viewport(#[allow(dead_code)] Viewport),
@@ -4164,6 +4544,7 @@ struct ShadowPass<'a> {
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
     meshes: &'a [Option<MeshBuffers>],
+    materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
     light_view_projection: Option<[[f32; 4]; 4]>,
     enabled: bool,
@@ -4222,6 +4603,7 @@ fn record_draws(
         );
     }
     let frustum = Frustum::from_view_projection(scene.view_projection);
+    let mut rasterization_state = None;
     for draw in scene.draws {
         // Индексы проверены validate_draws до начала кадра.
         let Some(mesh) = scene.meshes[draw.mesh.0].as_ref() else {
@@ -4239,6 +4621,15 @@ fn record_draws(
         .as_ref() else {
             continue;
         };
+        let next_rasterization_state = draw_rasterization_state(material.double_sided, &draw.model);
+        if rasterization_state != Some(next_rasterization_state) {
+            // SAFETY: the graphics pipeline declares both values as dynamic Vulkan 1.3 states.
+            unsafe {
+                device.cmd_set_cull_mode(command_buffer, next_rasterization_state.0);
+                device.cmd_set_front_face(command_buffer, next_rasterization_state.1);
+            }
+            rasterization_state = Some(next_rasterization_state);
+        }
         let push_constants = push_constant_bytes(&draw.model);
         // SAFETY: mesh buffers and material descriptors stay alive until this frame's fence completes.
         unsafe {
@@ -4312,6 +4703,7 @@ fn record_shadow_draws(
     let frustum = shadow
         .light_view_projection
         .map(Frustum::from_view_projection);
+    let mut rasterization_state = None;
     for draw in shadow_casters(shadow.draws) {
         let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
             continue;
@@ -4321,6 +4713,21 @@ fn record_shadow_draws(
                 .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
         }) {
             continue;
+        }
+        let Some(material) = shadow.materials[draw
+            .material
+            .map_or(DEFAULT_MATERIAL, |material| material.0)]
+        .as_ref() else {
+            continue;
+        };
+        let next_rasterization_state = draw_rasterization_state(material.double_sided, &draw.model);
+        if rasterization_state != Some(next_rasterization_state) {
+            // SAFETY: the shadow graphics pipeline declares both values as dynamic Vulkan 1.3 states.
+            unsafe {
+                device.cmd_set_cull_mode(command_buffer, next_rasterization_state.0);
+                device.cmd_set_front_face(command_buffer, next_rasterization_state.1);
+            }
+            rasterization_state = Some(next_rasterization_state);
         }
         let push_constants = push_constant_bytes(&draw.model);
         // SAFETY: draw ids were checked before recording; the buffers and frame set stay alive.
@@ -4342,6 +4749,28 @@ fn record_shadow_draws(
             device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
         }
     }
+}
+
+fn draw_rasterization_state(
+    double_sided: bool,
+    model: &[[f32; 4]; 4],
+) -> (vk::CullModeFlags, vk::FrontFace) {
+    let cull_mode = if double_sided {
+        vk::CullModeFlags::NONE
+    } else {
+        vk::CullModeFlags::BACK
+    };
+    let x = [model[0][0], model[0][1], model[0][2]];
+    let y = [model[1][0], model[1][1], model[1][2]];
+    let z = [model[2][0], model[2][1], model[2][2]];
+    let determinant = x[0] * (y[1] * z[2] - y[2] * z[1]) - x[1] * (y[0] * z[2] - y[2] * z[0])
+        + x[2] * (y[0] * z[1] - y[1] * z[0]);
+    let front_face = if determinant < 0.0 {
+        vk::FrontFace::CLOCKWISE
+    } else {
+        vk::FrontFace::COUNTER_CLOCKWISE
+    };
+    (cull_mode, front_face)
 }
 
 /// Viewport с отрицательной высотой направляет ось Y clip space вверх.
@@ -5046,6 +5475,7 @@ impl Drop for ShaderModule {
 
 fn create_post_pipeline(
     device: &ash::Device,
+    cache: vk::PipelineCache,
     layout: vk::PipelineLayout,
     color_format: vk::Format,
     fragment_shader: &[u8],
@@ -5097,18 +5527,17 @@ fn create_post_pipeline(
         .layout(layout)
         .push_next(&mut rendering_info)];
     // SAFETY: the modules, layout and dynamic-rendering format belong to this device.
-    let mut pipelines = match unsafe {
-        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
-    } {
-        Ok(pipelines) => pipelines,
-        Err((pipelines, error)) => {
-            for pipeline in pipelines {
-                // SAFETY: partial pipeline handles were returned by this device.
-                unsafe { device.destroy_pipeline(pipeline, None) };
+    let mut pipelines =
+        match unsafe { device.create_graphics_pipelines(cache, &pipeline_info, None) } {
+            Ok(pipelines) => pipelines,
+            Err((pipelines, error)) => {
+                for pipeline in pipelines {
+                    // SAFETY: partial pipeline handles were returned by this device.
+                    unsafe { device.destroy_pipeline(pipeline, None) };
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-    };
+        };
     pipelines
         .pop()
         .ok_or(RenderError::InvalidState("post pipeline не создан"))
@@ -5124,6 +5553,7 @@ struct FrameUniforms {
 struct Texture {
     image: DeviceImage,
     color_space: TextureColorSpace,
+    upload_serial: u64,
 }
 
 /// Материал владеет uniform buffer и descriptor pool для собственного набора.
@@ -5131,6 +5561,7 @@ struct GpuMaterial {
     device: ash::Device,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
+    double_sided: bool,
     _uniform_buffer: HostBuffer,
     _textures: [Arc<Texture>; 3],
 }
@@ -5145,10 +5576,299 @@ impl Drop for GpuMaterial {
 }
 
 struct MeshBuffers {
-    vertex_buffer: HostBuffer,
-    index_buffer: HostBuffer,
+    vertex_buffer: DeviceBuffer,
+    index_buffer: DeviceBuffer,
     index_count: u32,
     bounds: Option<LocalBounds>,
+    upload_serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MeshUploadLayout {
+    vertex_offset: usize,
+    index_offset: usize,
+    end: usize,
+}
+
+fn upload_required_alignment(alignment: usize) -> Option<usize> {
+    let alignment = alignment.max(1);
+    let mut left = 16;
+    let mut right = alignment;
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    16usize.checked_div(left)?.checked_mul(alignment)
+}
+
+fn align_upload_offset(cursor: usize, alignment: usize) -> Option<usize> {
+    let alignment = upload_required_alignment(alignment)?;
+    let remainder = cursor % alignment;
+    let offset = if cursor < 16 && remainder == 0 {
+        alignment
+    } else if remainder == 0 {
+        cursor
+    } else {
+        cursor.checked_add(alignment - remainder)?
+    };
+    u64::try_from(offset).ok()?;
+    Some(offset)
+}
+
+fn upload_data_layout(cursor: usize, size: usize, alignment: usize) -> Option<(usize, usize)> {
+    let offset = align_upload_offset(cursor, alignment)?;
+    let end = offset.checked_add(size)?;
+    u64::try_from(end).ok()?;
+    Some((offset, end))
+}
+
+fn mesh_upload_layout(
+    cursor: usize,
+    vertex_size: usize,
+    index_size: usize,
+    alignment: usize,
+) -> Option<MeshUploadLayout> {
+    let (vertex_offset, vertex_end) = upload_data_layout(cursor, vertex_size, alignment)?;
+    let (index_offset, end) = upload_data_layout(vertex_end, index_size, alignment)?;
+    Some(MeshUploadLayout {
+        vertex_offset,
+        index_offset,
+        end,
+    })
+}
+
+fn upload_batch_capacity(required_size: usize, alignment: usize) -> Option<usize> {
+    Some(DEFAULT_UPLOAD_BATCH_CAPACITY.max(align_upload_offset(required_size, alignment)?))
+}
+
+fn upload_batch_flush_required(
+    cursor: usize,
+    vertex_size: usize,
+    index_size: usize,
+    alignment: usize,
+    capacity: usize,
+) -> Option<bool> {
+    Some(mesh_upload_layout(cursor, vertex_size, index_size, alignment)?.end > capacity)
+}
+
+/// Записываемая пачка копирований и её staging память.
+struct UploadBatch {
+    device: ash::Device,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    staging: HostBuffer,
+    capacity: usize,
+    cursor: usize,
+    serial: u64,
+    oversized: bool,
+    recording: bool,
+    fence: Option<vk::Fence>,
+}
+
+impl UploadBatch {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        queue_family_index: u32,
+        capacity: usize,
+        oversized: bool,
+        serial: u64,
+    ) -> Result<Self, RenderError> {
+        let staging = HostBuffer::new_empty(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            capacity,
+        )?;
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        // SAFETY: the upload pool uses this renderer's graphics queue family.
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }?;
+        let result = (|| {
+            let allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            // SAFETY: command pool belongs to this device and is not used elsewhere.
+            let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info) }?[0];
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: command buffer was just allocated and is in the initial state.
+            unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
+            Ok(command_buffer)
+        })();
+        let command_buffer = match result {
+            Ok(command_buffer) => command_buffer,
+            Err(error) => {
+                // SAFETY: failed initialization did not submit work from this pool.
+                unsafe { device.destroy_command_pool(command_pool, None) };
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            device: device.clone(),
+            command_pool,
+            command_buffer,
+            staging,
+            capacity,
+            cursor: 0,
+            serial,
+            oversized,
+            recording: true,
+            fence: None,
+        })
+    }
+
+    fn record_mesh_copies(
+        &self,
+        vertex_buffer: &DeviceBuffer,
+        index_buffer: &DeviceBuffer,
+        layout: MeshUploadLayout,
+        vertex_size: usize,
+        index_size: usize,
+    ) {
+        let vertex_regions = [vk::BufferCopy2::default()
+            .src_offset(layout.vertex_offset as vk::DeviceSize)
+            .dst_offset(0)
+            .size(vertex_size as vk::DeviceSize)];
+        let vertex_copy = vk::CopyBufferInfo2::default()
+            .src_buffer(self.staging.buffer)
+            .dst_buffer(vertex_buffer.buffer)
+            .regions(&vertex_regions);
+        // SAFETY: source and destination ranges were allocated for these exact byte counts.
+        unsafe {
+            self.device
+                .cmd_copy_buffer2(self.command_buffer, &vertex_copy)
+        };
+        let index_regions = [vk::BufferCopy2::default()
+            .src_offset(layout.index_offset as vk::DeviceSize)
+            .dst_offset(0)
+            .size(index_size as vk::DeviceSize)];
+        let index_copy = vk::CopyBufferInfo2::default()
+            .src_buffer(self.staging.buffer)
+            .dst_buffer(index_buffer.buffer)
+            .regions(&index_regions);
+        // SAFETY: source and destination ranges were allocated for these exact byte counts.
+        unsafe {
+            self.device
+                .cmd_copy_buffer2(self.command_buffer, &index_copy)
+        };
+        let barriers = [
+            vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT)
+                .dst_access_mask(vk::AccessFlags2::VERTEX_ATTRIBUTE_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(vertex_buffer.buffer)
+                .offset(0)
+                .size(vertex_size as vk::DeviceSize),
+            vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
+                .dst_access_mask(vk::AccessFlags2::INDEX_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(index_buffer.buffer)
+                .offset(0)
+                .size(index_size as vk::DeviceSize),
+        ];
+        let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+        // SAFETY: barriers make each copy visible to its subsequent vertex/index input access.
+        unsafe {
+            self.device
+                .cmd_pipeline_barrier2(self.command_buffer, &dependency)
+        };
+    }
+
+    fn record_image_upload(
+        &self,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+        buffer_offset: usize,
+    ) {
+        pipeline_barrier(
+            &self.device,
+            self.command_buffer,
+            texture_upload_barrier(image, mip_levels),
+        );
+        let region = [vk::BufferImageCopy::default()
+            .buffer_offset(buffer_offset as vk::DeviceSize)
+            .image_subresource(color_subresource_layers())
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })];
+        // SAFETY: the aligned staging range contains exactly the base-level RGBA8 texels.
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                self.command_buffer,
+                self.staging.buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region,
+            )
+        };
+        let mut source_extent = vk::Extent2D { width, height };
+        for mip_level in 1..mip_levels {
+            let source_range = color_mip_subresource_range(mip_level - 1, 1);
+            pipeline_barrier(
+                &self.device,
+                self.command_buffer,
+                texture_mip_source_barrier(image, source_range),
+            );
+            let destination_extent = mip_extent(width, height, mip_level);
+            let region = [texture_mip_blit_region(
+                mip_level - 1,
+                source_extent,
+                destination_extent,
+            )];
+            // SAFETY: adjacent mip levels are distinct, in bounds, and use the same blit-capable format.
+            unsafe {
+                self.device.cmd_blit_image(
+                    self.command_buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                    vk::Filter::LINEAR,
+                )
+            };
+            pipeline_barrier(
+                &self.device,
+                self.command_buffer,
+                texture_mip_shader_barrier(image, source_range),
+            );
+            source_extent = destination_extent;
+        }
+        pipeline_barrier(
+            &self.device,
+            self.command_buffer,
+            texture_mip_destination_shader_barrier(
+                image,
+                color_mip_subresource_range(mip_levels - 1, 1),
+            ),
+        );
+    }
+}
+
+impl Drop for UploadBatch {
+    fn drop(&mut self) {
+        if let Some(fence) = self.fence.take() {
+            // SAFETY: submitted batches are dropped only after their fence signals or device idle.
+            unsafe { self.device.destroy_fence(fence, None) };
+        }
+        // SAFETY: this batch is either not submitted or its fence has completed.
+        unsafe { self.device.destroy_command_pool(self.command_pool, None) };
+    }
 }
 
 /// Буфер в host-visible памяти; данные копируются один раз при создании.
@@ -5156,6 +5876,7 @@ struct HostBuffer {
     device: ash::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    size: usize,
 }
 
 impl HostBuffer {
@@ -5166,16 +5887,31 @@ impl HostBuffer {
         usage: vk::BufferUsageFlags,
         data: &[u8],
     ) -> Result<Self, RenderError> {
+        let buffer = Self::new_empty(instance, device, physical_device, usage, data.len())?;
+        buffer.write(data)?;
+        Ok(buffer)
+    }
+
+    fn new_empty(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        usage: vk::BufferUsageFlags,
+        size: usize,
+    ) -> Result<Self, RenderError> {
         let buffer_info = vk::BufferCreateInfo::default()
-            .size(data.len() as vk::DeviceSize)
+            .size(u64::try_from(size).map_err(|_| {
+                RenderError::InvalidConfig("размер Vulkan buffer превышает DeviceSize")
+            })?)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // SAFETY: the buffer has a non-zero size guaranteed by mesh validation.
+        // SAFETY: callers request a non-zero buffer size.
         let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
         let mut host_buffer = Self {
             device: device.clone(),
             buffer,
             memory: vk::DeviceMemory::null(),
+            size,
         };
         // SAFETY: buffer was created by this device and remains alive.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
@@ -5186,7 +5922,9 @@ impl HostBuffer {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
         .ok_or_else(|| {
-            RenderError::Unsupported("нет HOST_VISIBLE | HOST_COHERENT memory для меша".to_owned())
+            RenderError::Unsupported(
+                "нет HOST_VISIBLE | HOST_COHERENT memory для буфера".to_owned(),
+            )
         })?;
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
@@ -5195,17 +5933,6 @@ impl HostBuffer {
         host_buffer.memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
         // SAFETY: memory allocation satisfies the buffer's reported requirements.
         unsafe { device.bind_buffer_memory(buffer, host_buffer.memory, 0) }?;
-        // SAFETY: the coherent allocation is at least data.len() bytes and is not mapped elsewhere.
-        unsafe {
-            let mapped = device.map_memory(
-                host_buffer.memory,
-                0,
-                data.len() as vk::DeviceSize,
-                vk::MemoryMapFlags::empty(),
-            )?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
-            device.unmap_memory(host_buffer.memory);
-        }
         Ok(host_buffer)
     }
 }
@@ -5213,18 +5940,98 @@ impl HostBuffer {
 impl HostBuffer {
     /// Перезаписывает начало буфера; GPU не должен читать буфер во время записи.
     fn write(&self, data: &[u8]) -> Result<(), RenderError> {
-        // SAFETY: callers write at most the buffer size into coherent memory that is not in use by the GPU.
+        self.write_at(0, data)
+    }
+
+    fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), RenderError> {
+        if offset
+            .checked_add(data.len())
+            .is_none_or(|end| end > self.size)
+        {
+            return Err(RenderError::InvalidState(
+                "запись выходит за размер host buffer",
+            ));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: callers write within the coherent buffer while it is not in use by the GPU.
         unsafe {
             let mapped = self.device.map_memory(
                 self.memory,
                 0,
-                data.len() as vk::DeviceSize,
+                self.size as vk::DeviceSize,
                 vk::MemoryMapFlags::empty(),
             )?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                mapped.cast::<u8>().add(offset),
+                data.len(),
+            );
             self.device.unmap_memory(self.memory);
         }
         Ok(())
+    }
+}
+
+/// Буфер в DEVICE_LOCAL памяти для vertex и index input.
+struct DeviceBuffer {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl DeviceBuffer {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        usage: vk::BufferUsageFlags,
+        size: usize,
+    ) -> Result<Self, RenderError> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(u64::try_from(size).map_err(|_| {
+                RenderError::InvalidConfig("размер Vulkan buffer превышает DeviceSize")
+            })?)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: callers provide non-empty mesh data and a valid usage.
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
+        let mut device_buffer = Self {
+            device: device.clone(),
+            buffer,
+            memory: vk::DeviceMemory::null(),
+        };
+        // SAFETY: buffer belongs to this device and is alive.
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let memory_type = find_memory_type(
+            instance,
+            physical_device,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| {
+            RenderError::Unsupported("нет DEVICE_LOCAL memory для mesh buffer".to_owned())
+        })?;
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        // SAFETY: allocation size and memory type were returned for this buffer.
+        device_buffer.memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
+        // SAFETY: allocation satisfies this buffer's memory requirements.
+        unsafe { device.bind_buffer_memory(buffer, device_buffer.memory, 0) }?;
+        Ok(device_buffer)
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        // SAFETY: owning renderer waits for frame and upload serials before dropping mesh buffers.
+        unsafe { self.device.destroy_buffer(self.buffer, None) };
+        if self.memory != vk::DeviceMemory::null() {
+            // SAFETY: the buffer bound to this allocation was destroyed first.
+            unsafe { self.device.free_memory(self.memory, None) };
+        }
     }
 }
 
@@ -5377,9 +6184,7 @@ fn validate_texture(
             "{width}x{height} больше предела GPU {max_size}x{max_size}"
         )));
     }
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|texels| texels.checked_mul(4));
+    let expected = texture_staging_size(width, height);
     if expected != Some(byte_count) {
         return Err(RenderError::InvalidTexture(format!(
             "для RGBA8 {width}x{height} нужно {} байт, передано {byte_count}",
@@ -5387,6 +6192,12 @@ fn validate_texture(
         )));
     }
     Ok(())
+}
+
+fn texture_staging_size(width: u32, height: u32) -> Option<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|texels| texels.checked_mul(4))
 }
 
 fn validate_overlay(vertices: &[OverlayVertex]) -> Result<(), RenderError> {
@@ -5721,26 +6532,29 @@ fn select_composite_alpha(
 #[cfg(test)]
 mod tests {
     use super::{
-        AcquireAction, AntiAliasing, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
-        FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, LDR_FORMAT, MATERIAL_UNIFORMS_SIZE,
-        MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId, OFFSCREEN_FORMAT,
-        OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex,
-        ProbeInstanceFailure, RenderError, Renderer, RendererConfig, SHADOW_VERTEX_SHADER,
-        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
-        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
-        check_extensions, classify_acquire_result, classify_probe_instance_failure,
-        deduplicate_names, derivative_tangent_basis, evaluate_device, frame_uniform_bytes,
-        index_bytes, inverse_extent, material_sampler_info, material_uniform_bytes, mip_extent,
-        mip_level_count, missing_extensions, missing_post_format_features,
+        AcquireAction, AntiAliasing, DEFAULT_UPLOAD_BATCH_CAPACITY, DeviceFacts, DeviceReport,
+        DirectionalLight, DrawCommand, FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame,
+        LDR_FORMAT, MATERIAL_UNIFORMS_SIZE, MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material,
+        MaterialId, MeshId, OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER,
+        OVERLAY_VERTEX_SHADER, OverlayVertex, PIPELINE_CACHE_HEADER_SIZE, PipelineCacheIdentity,
+        PresentMode, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
+        SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace,
+        TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings,
+        align_upload_offset, best_device_index, check_extensions, classify_acquire_result,
+        classify_probe_instance_failure, deduplicate_names, derivative_tangent_basis,
+        draw_rasterization_state, evaluate_device, frame_uniform_bytes, index_bytes,
+        inverse_extent, material_sampler_info, material_uniform_bytes, mesh_upload_layout,
+        mip_extent, mip_level_count, missing_extensions, missing_post_format_features,
         missing_texture_format_features, normal_matrix, offscreen_previous_use,
         overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
-        scene_viewport, select_composite_alpha, select_surface_extent, shadow_casters,
-        texture_format, texture_format_reasons, texture_mip_blit_region,
+        scene_viewport, select_composite_alpha, select_present_mode, select_surface_extent,
+        shadow_casters, texture_format, texture_format_reasons, texture_mip_blit_region,
         texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
-        texture_mip_source_barrier, texture_upload_barrier, timestamp_duration,
-        transform_tangent_normal, validate_draws, validate_material, validate_mesh,
-        validate_overlay, validate_render_scale, validate_texture, validate_view_settings,
-        vertex_bytes,
+        texture_mip_source_barrier, texture_staging_size, texture_upload_barrier,
+        timestamp_duration, transform_tangent_normal, upload_batch_capacity,
+        upload_batch_flush_required, upload_data_layout, validate_draws, validate_material,
+        validate_mesh, validate_overlay, validate_pipeline_cache, validate_render_scale,
+        validate_texture, validate_view_settings, vertex_bytes,
     };
     use ash::vk;
     use std::time::Duration;
@@ -5754,6 +6568,77 @@ mod tests {
     #[test]
     fn renderer_is_send() {
         assert_send::<Renderer>();
+    }
+
+    #[test]
+    fn present_mode_selection_uses_requested_mode_or_fifo_for_every_supported_set() {
+        let modes = [
+            (PresentMode::Fifo, vk::PresentModeKHR::FIFO),
+            (PresentMode::Mailbox, vk::PresentModeKHR::MAILBOX),
+            (PresentMode::Immediate, vk::PresentModeKHR::IMMEDIATE),
+        ];
+        for mask in 0..(1 << modes.len()) {
+            let supported = modes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, mode))| (mask & (1 << index) != 0).then_some(*mode))
+                .collect::<Vec<_>>();
+            for (requested, vulkan_mode) in modes {
+                let expected = if supported.contains(&vulkan_mode) {
+                    vulkan_mode
+                } else {
+                    vk::PresentModeKHR::FIFO
+                };
+                assert_eq!(select_present_mode(requested, &supported), expected);
+            }
+        }
+        assert_eq!(
+            select_present_mode(PresentMode::Immediate, &[]),
+            vk::PresentModeKHR::FIFO
+        );
+    }
+
+    #[test]
+    fn pipeline_cache_header_rejects_truncated_foreign_and_unsupported_data() {
+        let identity = PipelineCacheIdentity {
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+            pipeline_cache_uuid: [0xabu8; vk::UUID_SIZE],
+        };
+        let mut cache = Vec::new();
+        cache.extend_from_slice(&(PIPELINE_CACHE_HEADER_SIZE as u32).to_ne_bytes());
+        cache.extend_from_slice(&vk::PipelineCacheHeaderVersion::ONE.as_raw().to_ne_bytes());
+        cache.extend_from_slice(&identity.vendor_id.to_ne_bytes());
+        cache.extend_from_slice(&identity.device_id.to_ne_bytes());
+        cache.extend_from_slice(&identity.pipeline_cache_uuid);
+        cache.extend_from_slice(b"driver data");
+
+        assert!(validate_pipeline_cache(&[], identity).is_ok());
+        assert!(validate_pipeline_cache(&cache, identity).is_ok());
+        assert_eq!(super::compatible_pipeline_cache(&cache, identity), cache);
+        assert!(super::compatible_pipeline_cache(&cache[..12], identity).is_empty());
+        let foreign_identity = PipelineCacheIdentity {
+            vendor_id: identity.vendor_id + 1,
+            ..identity
+        };
+        assert!(super::compatible_pipeline_cache(&cache, foreign_identity).is_empty());
+        assert!(
+            validate_pipeline_cache(&cache[..PIPELINE_CACHE_HEADER_SIZE - 1], identity).is_err()
+        );
+
+        let mut wrong_size = cache.clone();
+        wrong_size[0..4].copy_from_slice(&0_u32.to_ne_bytes());
+        assert!(validate_pipeline_cache(&wrong_size, identity).is_err());
+
+        let mut wrong_version = cache.clone();
+        wrong_version[4..8].copy_from_slice(&2_i32.to_ne_bytes());
+        assert!(validate_pipeline_cache(&wrong_version, identity).is_err());
+
+        for offset in [8, 12, 16] {
+            let mut foreign = cache.clone();
+            foreign[offset] ^= 1;
+            assert!(validate_pipeline_cache(&foreign, identity).is_err());
+        }
     }
 
     #[test]
@@ -6057,6 +6942,7 @@ mod tests {
             api_version: vk::make_api_version(0, 1, 3, 0),
             dynamic_rendering: true,
             synchronization2: true,
+            extended_dynamic_state: true,
             supported_extensions: HashSet::from([
                 "VK_KHR_swapchain".to_owned(),
                 "VK_KHR_portability_subset".to_owned(),
@@ -6080,6 +6966,7 @@ mod tests {
             api_version: vk::make_api_version(0, 2, 0, 0),
             dynamic_rendering: true,
             synchronization2: true,
+            extended_dynamic_state: true,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![true],
         };
@@ -6112,6 +6999,7 @@ mod tests {
             api_version: vk::make_api_version(0, 1, 2, 0),
             dynamic_rendering: false,
             synchronization2: false,
+            extended_dynamic_state: false,
             supported_extensions: HashSet::new(),
             graphics_queue_families: vec![false, false],
         };
@@ -6128,6 +7016,7 @@ mod tests {
                 "Vulkan API ниже 1.3",
                 "не поддерживается dynamicRendering",
                 "не поддерживается synchronization2",
+                "не поддерживается extendedDynamicState",
                 "device extension недоступен: VK_KHR_swapchain",
                 "device extension недоступен: VK_KHR_portability_subset",
                 "нет graphics queue family",
@@ -6258,6 +7147,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completed_uploads_release_staging_without_a_frame() {
+        use std::rc::Rc;
+        let staging = Rc::new(());
+        let mut batches = vec![
+            Rc::clone(&staging),
+            Rc::clone(&staging),
+            Rc::clone(&staging),
+        ];
+        let completed =
+            super::completed_upload_count([Ok::<_, ()>(true), Ok(true), Ok(false)]).unwrap();
+        drop(batches.drain(..completed));
+        assert_eq!(Rc::strong_count(&staging), 2);
+        let completed = super::completed_upload_count([Ok::<_, ()>(true)]).unwrap();
+        drop(batches.drain(..completed));
+        assert_eq!(Rc::strong_count(&staging), 1);
+        assert_eq!(super::completed_upload_count([Ok(false), Err(())]), Ok(0));
+        assert_eq!(super::completed_upload_count([Ok(true), Err(())]), Err(()));
+    }
+
+    #[test]
+    fn back_face_reverses_the_complete_nonflat_mapped_normal() {
+        let geometric = [0.0, 0.0, 1.0];
+        let tangent_sample = [0.6, 0.0, 0.8];
+        let front =
+            transform_tangent_normal([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], geometric, tangent_sample);
+        let back = front.map(|component| -component);
+        assert!((back[0] + 0.6).abs() < 1e-6);
+        assert!((back[2] + 0.8).abs() < 1e-6);
+        // Tie the numeric reference to the shader's operation order: the full
+        // mapped normal and geometric fallback must both flip after TBN mapping.
+        let shader = include_str!("../shaders/mesh.frag");
+        let mapping = shader.find("vec3 normal = geometric_normal;").unwrap();
+        let flip = shader.find("if (!gl_FrontFacing)").unwrap();
+        assert!(flip > mapping);
+        let flip_block = shader[flip..].split('}').next().unwrap();
+        assert!(flip_block.contains("geometric_normal = -geometric_normal;"));
+        assert!(flip_block.contains("normal = -normal;"));
+    }
+
     fn ggx_shader_has_analytic_peak(source: &str) -> bool {
         let normalized = source
             .chars()
@@ -6374,6 +7303,63 @@ mod tests {
                 "{vertex_count} {indices:?}"
             );
         }
+    }
+
+    #[test]
+    fn upload_offsets_are_at_least_sixteen_and_multiple_of_device_alignment() {
+        let layout = mesh_upload_layout(0, 44, 12, 256).unwrap();
+        assert_eq!(layout.vertex_offset, 256);
+        assert_eq!(layout.index_offset, 512);
+        assert!(layout.vertex_offset >= 16 && layout.vertex_offset.is_multiple_of(256));
+        assert!(layout.index_offset >= 16 && layout.index_offset.is_multiple_of(256));
+
+        let non_power_of_two = align_upload_offset(0, 24).unwrap();
+        assert_eq!(non_power_of_two, 48);
+        assert!(non_power_of_two.is_multiple_of(24));
+    }
+
+    #[test]
+    fn upload_layout_rejects_offset_and_size_overflow() {
+        assert_eq!(align_upload_offset(usize::MAX, 256), None);
+        assert_eq!(mesh_upload_layout(0, usize::MAX, 4, 16), None);
+        assert_eq!(upload_batch_capacity(usize::MAX, 16), None);
+    }
+
+    #[test]
+    fn upload_batches_flush_on_capacity_and_isolate_oversized_meshes() {
+        assert_eq!(
+            upload_batch_flush_required(16, 44, 12, 16, 128),
+            Some(false)
+        );
+        assert_eq!(upload_batch_flush_required(80, 44, 12, 16, 128), Some(true));
+
+        let oversized = mesh_upload_layout(0, DEFAULT_UPLOAD_BATCH_CAPACITY + 1, 12, 16).unwrap();
+        let capacity = upload_batch_capacity(oversized.end, 16).unwrap();
+        assert!(capacity > DEFAULT_UPLOAD_BATCH_CAPACITY);
+        assert_eq!(
+            upload_batch_flush_required(oversized.end, 44, 12, 16, capacity),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn texture_upload_budget_contains_only_base_level_rgba8_source_data() {
+        let width = 4;
+        let height = 4;
+        let mip_levels = mip_level_count(width, height);
+        let base_level_bytes = texture_staging_size(width, height).unwrap();
+        let whole_chain_bytes = (0..mip_levels)
+            .map(|mip| {
+                let extent = mip_extent(width, height, mip);
+                extent.width as usize * extent.height as usize * 4
+            })
+            .sum::<usize>();
+        assert_eq!(base_level_bytes, 4 * 4 * 4);
+        assert_eq!(whole_chain_bytes, 84);
+        assert_eq!(base_level_bytes, 64);
+        assert!(whole_chain_bytes > base_level_bytes);
+        assert_eq!(upload_data_layout(0, base_level_bytes, 16), Some((16, 80)));
+        assert_eq!(texture_staging_size(u32::MAX, u32::MAX), None);
     }
 
     const IDENTITY: [[f32; 4]; 4] = [
@@ -6532,6 +7518,50 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rasterization_state_uses_material_sidedness_and_model_determinant() {
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mirrored_x = [
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mirrored_xy = [
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+
+        assert_eq!(
+            draw_rasterization_state(false, &identity),
+            (vk::CullModeFlags::BACK, vk::FrontFace::COUNTER_CLOCKWISE)
+        );
+        assert_eq!(
+            draw_rasterization_state(true, &identity),
+            (vk::CullModeFlags::NONE, vk::FrontFace::COUNTER_CLOCKWISE)
+        );
+        assert_eq!(
+            draw_rasterization_state(false, &mirrored_x),
+            (vk::CullModeFlags::BACK, vk::FrontFace::CLOCKWISE)
+        );
+        assert_eq!(
+            draw_rasterization_state(true, &mirrored_x),
+            (vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
+        );
+        assert_eq!(
+            draw_rasterization_state(false, &mirrored_xy),
+            (vk::CullModeFlags::BACK, vk::FrontFace::COUNTER_CLOCKWISE)
+        );
+        assert!(!Material::default().double_sided);
     }
 
     #[test]
