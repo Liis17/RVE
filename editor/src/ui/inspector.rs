@@ -1011,10 +1011,10 @@ mod tests {
     fn copied_component_pastes_only_into_the_same_kind_and_reset_restores_defaults() {
         let mut state = state();
         state.edit_scene(|scene| {
-            scene.edit_object("camera", None, |object| {
-                object.camera.as_mut().unwrap().active = true;
-                Ok(())
-            })
+            scene.set_camera_settings(
+                "camera",
+                Some(engine_files::VirtualPath::parse("/cameras/a.camerasettings").unwrap()),
+            )
         });
         let other = state
             .edit_scene(|scene| scene.create_object(&NewObject::Camera, None))
@@ -1035,7 +1035,14 @@ mod tests {
             ComponentKind::Camera,
             HeaderAction::Paste,
         );
-        assert_eq!(camera(&state, &other).active, true);
+        assert_eq!(
+            camera(&state, &other)
+                .settings
+                .as_ref()
+                .map(|path| path.as_str()),
+            Some("cameras/a.camerasettings")
+        );
+        assert!(!camera(&state, &other).active);
         // Буфер другого вида не меняет компонент.
         run_menu_action(
             &mut state,
@@ -1049,8 +1056,8 @@ mod tests {
             ComponentKind::Camera,
             HeaderAction::Reset,
         );
-        assert_eq!(camera(&state, &other).active, false);
+        assert!(camera(&state, &other).settings.is_none());
         assert!(state.scene.as_mut().unwrap().undo());
-        assert_eq!(camera(&state, &other).active, true);
+        assert!(camera(&state, &other).settings.is_some());
     }
 }

@@ -103,7 +103,11 @@ impl Component {
     fn apply(self, object: &mut SceneObject) {
         match self {
             Self::Transform(value) => object.transform = value,
-            Self::Camera(value) => object.camera = Some(value),
+            Self::Camera(value) => {
+                // Активность — состояние сцены, а не свойство компонента: вставка её не меняет.
+                let active = object.camera.as_ref().is_some_and(|camera| camera.active);
+                object.camera = Some(CameraComponent { active, ..value });
+            }
             Self::MeshRenderer(value) => object.mesh_renderer = Some(value),
             Self::LodGroup(value) => object.lod_group = Some(value),
             Self::DirectionalLight(value) => object.directional_light = Some(value),
