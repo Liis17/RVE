@@ -177,7 +177,9 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
 
     fn create_demo_like_project(root: &Path) {
         let assets = root.join("Assets");
-        for path in ["scenes", "models", "textures", "icons", "scripts"] {
+        for path in [
+            "scenes", "models", "textures", "icons", "scripts", "cameras",
+        ] {
             fs::create_dir_all(assets.join(path)).unwrap();
         }
         fs::write(
@@ -192,7 +194,7 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         .unwrap();
         let scene_body = |extra_assets: &str, model: &str| {
             format!(
-                "[[assets]]\npath = \"/models/shared.fbx\"\n[[assets]]\npath = \"/scripts/rotate.lua\"\n{extra_assets}\n[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects]]\nid = \"light\"\n[objects.directional_light]\nshadows = true\nshadow_radius = 8.0\n[[objects]]\nid = \"mesh\"\n[objects.mesh_renderer]\nmodel = \"{model}\"\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\n"
+                "[[assets]]\npath = \"/models/shared.fbx\"\n[[assets]]\npath = \"/scripts/rotate.lua\"\n[[assets]]\npath = \"/cameras/shared.camerasettings\"\n{extra_assets}\n[[objects]]\nid = \"camera\"\n[objects.camera]\nsettings = \"/cameras/shared.camerasettings\"\n\n[[objects]]\nid = \"light\"\n[objects.directional_light]\nshadows = true\nshadow_radius = 8.0\n[[objects]]\nid = \"mesh\"\n[objects.mesh_renderer]\nmodel = \"{model}\"\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\n"
             )
         };
         fs::write(
@@ -223,6 +225,11 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         write_fixture_fbx(&assets.join("models/props.fbx"), None);
         write_fixture_fbx(&assets.join("models/draft.fbx"), None);
         fs::write(assets.join("scripts/rotate.lua"), "return {}\n").unwrap();
+        fs::write(
+            assets.join("cameras/shared.camerasettings"),
+            "[projection]\nfov_deg = 55.0\n",
+        )
+        .unwrap();
         write_png(
             &assets.join("textures/shared.png"),
             2,
@@ -306,5 +313,22 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_camera_settings_during_project_preparation() {
+        let project_root =
+            TempDir::create(&std::env::temp_dir(), "rve-build-camera-settings").unwrap();
+        create_demo_like_project(project_root.path());
+        fs::write(
+            project_root
+                .path()
+                .join("Assets/cameras/shared.camerasettings"),
+            "[projection]\nfov_deg = 180.0\n",
+        )
+        .unwrap();
+        let error = prepare_project(project_root.path()).unwrap_err();
+        assert!(error.to_string().contains("/cameras/shared.camerasettings"));
+        assert!(error.to_string().contains("0 и 180"));
     }
 }

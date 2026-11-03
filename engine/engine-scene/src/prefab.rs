@@ -216,12 +216,12 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             merge_material(merged, material);
         }
     }
-    if let Some(camera) = change.camera {
+    if let Some(camera) = &change.camera {
         let target = object
             .camera
             .as_mut()
             .ok_or("override camera: у объекта нет camera")?;
-        *target = camera;
+        *target = camera.clone();
     }
     if let Some(light) = change.directional_light {
         let target = object
@@ -345,6 +345,20 @@ pub(crate) fn validate_instances(
                 if let Some(material) = &mesh.material {
                     validate_material_override(source, id, assets, material)?;
                 }
+            }
+            if let Some(settings) = change
+                .camera
+                .as_ref()
+                .and_then(|camera| camera.settings.as_ref())
+            {
+                require_asset_path(source, id, assets, settings, "настройки камеры override")?;
+                require_extension(
+                    source,
+                    id,
+                    settings,
+                    "camerasettings",
+                    "настройки камеры override",
+                )?;
             }
         }
     }

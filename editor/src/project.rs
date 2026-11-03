@@ -6,16 +6,16 @@ use engine_assets::Assets;
 use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem, SourceMode};
-use engine_scene::{SceneDocument, SceneError};
+use engine_scene::{CameraSettings, SceneDocument, SceneError, World};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// Проект игры, открытый в редакторе по той же раскладке, что и dev-запуск player.
 pub struct OpenProject {
     /// Абсолютный путь каталога проекта.
-    pub dir: PathBuf,
+    pub root: PathBuf,
     pub settings: ProjectSettings,
     pub assets_dir: AssetsDir,
     pub assets: Assets,
@@ -58,8 +58,9 @@ impl PrefabCache {
 
 impl OpenProject {
     pub fn open(dir: &Path) -> Result<Self, String> {
-        let dir =
-            std::path::absolute(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        let dir = std::path::absolute(dir)
+            .map(|dir| without_dot_components(&dir))
+            .map_err(|error| format!("{}: {error}", dir.display()))?;
         let settings = ProjectSettings::load(dir.join("project.rveproject"))?;
         let root = dir.join("Assets");
         if !root.is_dir() {
@@ -77,7 +78,7 @@ impl OpenProject {
             documents: RefCell::default(),
         });
         Ok(Self {
-            dir,
+            root: dir,
             settings,
             assets_dir: AssetsDir::new(root),
             assets,
@@ -109,6 +110,41 @@ impl OpenProject {
         self.prefabs.documents.borrow_mut().clear();
     }
 
+    /// Загружает общие `.camerasettings` файлы и назначает их камерам мира.
+    pub fn apply_camera_settings(&self, world: &mut World) -> Result<(), String> {
+        let cameras = world
+            .objects()
+            .iter()
+            .filter_map(|object| {
+                Some((
+                    object.handle,
+                    object
+                        .camera
+                        .as_ref()?
+                        .settings
+                        .as_ref()?
+                        .as_str()
+                        .to_owned(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut settings_by_path = BTreeMap::new();
+        for (_, path) in &cameras {
+            if !settings_by_path.contains_key(path) {
+                let source = self.read_text(path)?;
+                let settings =
+                    CameraSettings::parse(path, &source).map_err(|error| error.to_string())?;
+                settings_by_path.insert(path.clone(), settings);
+            }
+        }
+        for (handle, path) in cameras {
+            world
+                .set_camera_settings(handle, settings_by_path[&path])
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Настройки окна проекта; отсутствующий файл не является ошибкой.
     pub fn bootstrap(dir: &Path) -> Result<BootstrapConfig, String> {
         let path = dir.join("bootstrap.rves");
@@ -118,6 +154,22 @@ impl OpenProject {
             Ok(BootstrapConfig::default())
         }
     }
+}
+
+/// Убирает `.` и `..` из абсолютного пути без обращения к диску: один проект,
+/// открытый по разным относительным путям, получает один путь в недавних проектах.
+fn without_dot_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }
 
 impl Drop for OpenProject {
@@ -174,6 +226,24 @@ mod tests {
         fs::write(temp.0.join("Assets/new.lua"), "return {}").unwrap();
         assert_eq!(project.read_text("new.lua").unwrap(), "return {}");
         assert!(project.read_text("missing.lua").is_err());
+    }
+
+    #[test]
+    fn project_root_has_no_dot_components() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/./demo-game");
+        let project = OpenProject::open(Path::new(dir)).unwrap();
+        let expected = std::path::absolute(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/demo-game"
+        ))
+        .unwrap();
+        assert!(project.root.is_absolute());
+        assert!(project.root.components().all(|component| !matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )));
+        assert_eq!(project.root, without_dot_components(&expected));
+        assert!(project.root.ends_with("examples/demo-game"));
     }
 
     #[test]
@@ -266,5 +336,48 @@ mod tests {
         let project = OpenProject::open(Path::new(dir)).unwrap();
         let start = project.settings.starting_scene().unwrap();
         assert!(project.read_text(start).unwrap().contains("[[objects]]"));
+    }
+
+    #[test]
+    fn all_demo_scenes_load_their_camera_settings_assets() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let project = OpenProject::open(Path::new(dir)).unwrap();
+        for (scene, expected_fov) in [("main", 55.0), ("second", 55.0), ("draft", 60.0)] {
+            let path = format!("scenes/{scene}.rvescene");
+            let source = project.read_text(&path).unwrap();
+            let document = SceneDocument::parse(&path, &source).unwrap();
+            let loader = project.prefab_loader();
+            let expanded = engine_scene::expand(&document, &mut |prefab| loader(prefab))
+                .unwrap()
+                .document;
+            let mut world = World::from_document(&expanded).unwrap();
+            project.apply_camera_settings(&mut world).unwrap();
+            let camera = world.camera_settings(world.active_camera()).unwrap();
+            assert_eq!(camera.projection.fov_deg, expected_fov, "{path}");
+            assert_eq!(camera.projection.near, 0.1, "{path}");
+            assert_eq!(camera.projection.far, 100.0, "{path}");
+        }
+    }
+
+    #[test]
+    fn camera_settings_asset_is_loaded_into_the_editor_world() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        fs::create_dir_all(temp.0.join("Assets/cameras")).unwrap();
+        fs::write(
+            temp.0.join("Assets/cameras/main.camerasettings"),
+            "[projection]\nfov_deg = 42.0\nnear = 0.25\nfar = 250.0\n",
+        )
+        .unwrap();
+        let source = "[[assets]]\npath = \"/cameras/main.camerasettings\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nsettings = \"/cameras/main.camerasettings\"\n";
+        let document = SceneDocument::parse("scene.rvescene", source).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let project = OpenProject::open(&temp.0).unwrap();
+        project.apply_camera_settings(&mut world).unwrap();
+        let camera = world.handle("camera").unwrap();
+        assert_eq!(
+            world.camera_settings(camera).unwrap().projection.fov_deg,
+            42.0
+        );
+        assert_eq!(world.camera_settings(camera).unwrap().projection.near, 0.25);
     }
 }

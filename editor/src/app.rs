@@ -1,11 +1,13 @@
 //! Приложение редактора: окно, цикл кадра egui + renderer и выполнение действий.
 
+use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
-use crate::layout::{Tab, default_layout};
+use crate::layout::Tab;
 use crate::play::PlaySession;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
-use crate::state::{Action, EditorState, UnsavedPrompt};
+use crate::settings::{SettingsStore, UserSettings};
+use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt};
 use crate::ui;
 use crate::ui::scene_view::bounding_sphere;
 use crate::ui_render::{ConvertedMesh, UiBridge};
@@ -15,6 +17,7 @@ use engine_files::VirtualPath;
 use engine_render::{
     FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
 };
+use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
 use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
 use std::path::{Path, PathBuf};
@@ -23,7 +26,7 @@ use std::time::{Duration, Instant};
 
 /// Цвет окна за панелями; всё окно закрыто UI, поэтому заметен только при первом кадре.
 const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
-/// Как часто проверять готовность фоновых превью.
+/// Как часто проверять готовность фоновых превью и моделей.
 const PREVIEW_POLL: Duration = Duration::from_millis(30);
 /// Как часто забирать вывод идущей сборки.
 const BUILD_POLL: Duration = Duration::from_millis(50);
@@ -31,12 +34,17 @@ const BUILD_POLL: Duration = Duration::from_millis(50);
 pub struct EditorApp {
     state: EditorState,
     dock: DockState<Tab>,
+    /// Файл настроек пользователя; `None`, если каталог настроек ОС неизвестен.
+    settings: Option<SettingsStore>,
     initial_project: Option<PathBuf>,
     gpu: Option<GpuState>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     bridge: UiBridge,
     repaint_at: Option<Instant>,
+    /// Ревизия сцены в последней копии автосохранения и время записи.
+    autosaved_revision: Option<u64>,
+    last_autosave: Instant,
     exit: bool,
     pub exit_code: u8,
     window_title: String,
@@ -50,15 +58,29 @@ struct GpuState {
 
 impl EditorApp {
     pub fn new(project: Option<PathBuf>, scripts: Option<PathBuf>) -> Self {
+        let mut state = EditorState::new(scripts);
+        let settings = SettingsStore::default_location();
+        let (user, problem) = settings
+            .as_ref()
+            .map(SettingsStore::load)
+            .unwrap_or_default();
+        if let Some(problem) = problem {
+            state.log.push(LogLevel::Warn, problem);
+        }
+        let dock = user.layout_or_default();
+        state.recent_projects = user.recent_projects;
         Self {
-            state: EditorState::new(scripts),
-            dock: default_layout(),
+            state,
+            dock,
+            settings,
             initial_project: project,
             gpu: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
             bridge: UiBridge::default(),
             repaint_at: None,
+            autosaved_revision: None,
+            last_autosave: Instant::now(),
             exit: false,
             exit_code: 0,
             window_title: String::new(),
@@ -79,7 +101,12 @@ impl EditorApp {
                     .log
                     .info(format!("Открыт проект {}", project.settings.name));
                 let start = project.settings.starting_scene().map(str::to_owned);
+                UserSettings::remember_project(
+                    &mut self.state.recent_projects,
+                    project.root.clone(),
+                );
                 self.state.project = Some(project);
+                self.save_settings();
                 self.state.current_folder.clear();
                 self.load_library();
                 self.refresh_assets();
@@ -89,6 +116,25 @@ impl EditorApp {
                 }
             }
             Err(error) => self.state.log.error(error),
+        }
+    }
+
+    /// Превью или модели ещё готовятся в фоне: окно должно проснуться, чтобы показать их.
+    fn background_pending(&self) -> bool {
+        self.state.previews.has_pending() || self.state.model_loader.has_pending()
+    }
+
+    /// Записывает недавние проекты и раскладку панелей; ошибка только пишется в Console.
+    fn save_settings(&mut self) {
+        let Some(store) = &self.settings else {
+            return;
+        };
+        let settings = UserSettings {
+            recent_projects: self.state.recent_projects.clone(),
+            layout: Some(self.dock.clone()),
+        };
+        if let Err(error) = store.save(&settings) {
+            self.state.log.push(LogLevel::Warn, error);
         }
     }
 
@@ -108,6 +154,8 @@ impl EditorApp {
         {
             self.state.log.error(error);
         }
+        // Модели, разбор которых начался до сброса, загружаются заново.
+        self.state.model_loader.restart(project.assets.clone());
         if let Some(gpu) = &mut self.gpu
             && let Err(error) = gpu
                 .scene
@@ -126,8 +174,110 @@ impl EditorApp {
             Ok(scene)
         });
         match scene {
-            Ok(scene) => self.set_scene(scene),
+            Ok(scene) => {
+                self.set_scene(scene);
+                self.offer_recovery();
+            }
             Err(error) => self.state.log.error(error),
+        }
+    }
+
+    fn autosave_store(&self) -> Option<AutosaveStore> {
+        Some(AutosaveStore::for_project(
+            &self.state.project.as_ref()?.root,
+        ))
+    }
+
+    /// Предлагает восстановить автосохранение открытой сцены, если оно осталось.
+    fn offer_recovery(&mut self) {
+        let scene = self
+            .state
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.path().cloned());
+        if let Some(contents) = self
+            .autosave_store()
+            .and_then(|store| store.read(scene.as_ref()))
+        {
+            self.state.recovery_prompt = Some(RecoveryPrompt { scene, contents });
+        }
+    }
+
+    fn remove_autosave(&mut self, scene: Option<&VirtualPath>) {
+        if let Some(store) = self.autosave_store()
+            && let Err(error) = store.remove(scene)
+        {
+            self.state.log.push(LogLevel::Warn, error);
+        }
+    }
+
+    /// Записывает копию изменённой сцены не чаще `AUTOSAVE_INTERVAL`.
+    fn autosave_tick(&mut self) {
+        let Some(scene) = &self.state.scene else {
+            return;
+        };
+        let revision = scene.revision();
+        // Пока решение о копии прошлого сеанса не принято, её нельзя перезаписать.
+        if self.state.is_playing()
+            || self.state.recovery_prompt.is_some()
+            || !autosave_due(
+                scene.is_dirty(),
+                revision,
+                self.autosaved_revision,
+                self.last_autosave.elapsed(),
+            )
+        {
+            return;
+        }
+        let Some(store) = self.autosave_store() else {
+            return;
+        };
+        // Неудачная запись повторится через интервал, а не только после новой правки.
+        self.last_autosave = Instant::now();
+        let result = scene
+            .document()
+            .to_toml()
+            .map_err(|error| error.to_string())
+            .and_then(|text| store.write(scene.path(), &text));
+        match result {
+            Ok(()) => self.autosaved_revision = Some(revision),
+            Err(error) => self
+                .state
+                .log
+                .push(LogLevel::Warn, format!("автосохранение: {error}")),
+        }
+    }
+
+    /// Срок следующего автосохранения, если в сцене есть незаписанные изменения.
+    fn autosave_deadline(&self) -> Option<Instant> {
+        let scene = self.state.scene.as_ref()?;
+        let waiting = scene.is_dirty()
+            && !self.state.is_playing()
+            && self.state.recovery_prompt.is_none()
+            && self.autosaved_revision != Some(scene.revision());
+        waiting.then(|| self.last_autosave + AUTOSAVE_INTERVAL)
+    }
+
+    fn restore_autosave(&mut self) {
+        let Some(prompt) = self.state.recovery_prompt.take() else {
+            return;
+        };
+        let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
+        let recovered = match loader {
+            Some(loader) => {
+                EditorScene::recover_with_loader(prompt.scene, &prompt.contents, loader)
+            }
+            None => EditorScene::recover(prompt.scene, &prompt.contents),
+        };
+        match recovered {
+            Ok(scene) => {
+                self.set_scene(scene);
+                self.state.log.info("Восстановлено автосохранение");
+            }
+            Err(error) => self
+                .state
+                .log
+                .error(format!("автосохранение не восстановлено: {error}")),
         }
     }
 
@@ -142,7 +292,10 @@ impl EditorApp {
                 EditorScene::parse(path, &contents, project.prefab_loader())
             });
         match result {
-            Ok(scene) => self.set_scene(scene),
+            Ok(scene) => {
+                self.set_scene(scene);
+                self.offer_recovery();
+            }
             Err(error) => self.state.log.error(error),
         }
     }
@@ -150,6 +303,9 @@ impl EditorApp {
     fn set_scene(&mut self, scene: EditorScene) {
         self.state.scene = Some(scene);
         self.state.scene_replaced();
+        self.state.recovery_prompt = None;
+        self.autosaved_revision = None;
+        self.last_autosave = Instant::now();
     }
 
     /// Спрашивает о несохранённых изменениях перед действием, отбрасывающим сцену.
@@ -178,6 +334,7 @@ impl EditorApp {
                     self.open_project(&dir);
                 }
             }
+            Action::OpenProjectAt(dir) => self.open_project(&dir),
             Action::Exit => self.exit = true,
             Action::BuildPlayer => self.start_build(),
             Action::CreatePrefab(id) => self.create_prefab(&id),
@@ -195,7 +352,7 @@ impl EditorApp {
         let Some(project) = &self.state.project else {
             return;
         };
-        let (project_dir, id) = (project.dir.clone(), project.settings.id.clone());
+        let (project_dir, id) = (project.root.clone(), project.settings.id.clone());
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(Path::to_owned));
@@ -350,7 +507,7 @@ impl EditorApp {
             .scene
             .as_ref()
             .and_then(|scene| scene.path().cloned());
-        let target = match existing {
+        let target = match existing.clone() {
             Some(path) if !choose_path => path,
             _ => {
                 let Some(root) = self.assets_root() else {
@@ -398,6 +555,9 @@ impl EditorApp {
                     project.clear_prefabs();
                 }
                 self.refresh_tree_only();
+                // Копии прежнего и нового пути устарели: на диске теперь актуальная сцена.
+                self.remove_autosave(existing.as_ref());
+                self.remove_autosave(Some(&target));
                 true
             }
             Err(error) => {
@@ -416,9 +576,15 @@ impl EditorApp {
     }
 
     fn start_play(&mut self) {
-        let (Some(_), Some(scene)) = (&self.state.project, &self.state.scene) else {
+        let Some(scene) = &self.state.scene else {
             return;
         };
+        if scene.document().is_prefab() {
+            self.state
+                .log
+                .error("Play недоступен для префаба: откройте сцену");
+            return;
+        }
         let needs_library = scene
             .view()
             .objects
@@ -438,15 +604,17 @@ impl EditorApp {
         let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
             return;
         };
-        if scene.document().is_prefab() {
-            self.state
-                .log
-                .error("Play недоступен для префаба: откройте сцену");
-            return;
-        }
-        let result = PlaySession::start(scene.view(), self.state.library.as_ref(), |path| {
-            project.read_text(path)
-        });
+        let result = (|| {
+            let mut world =
+                World::from_document(scene.view()).map_err(|error| error.to_string())?;
+            project.apply_camera_settings(&mut world)?;
+            PlaySession::start_with_world(
+                scene.view(),
+                world,
+                self.state.library.as_ref(),
+                |path| project.read_text(path),
+            )
+        })();
         match result {
             Ok(session) => {
                 self.state.play = Some(session);
@@ -529,7 +697,22 @@ impl EditorApp {
                         self.run_guarded(Action::BuildPlayer);
                     }
                 }
-                Action::Discard(then) => self.run_confirmed(*then),
+                Action::Discard(then) => {
+                    // Отказ от изменений делает копию ненужной.
+                    let scene = self
+                        .state
+                        .scene
+                        .as_ref()
+                        .and_then(|scene| scene.path().cloned());
+                    self.remove_autosave(scene.as_ref());
+                    self.run_confirmed(*then);
+                }
+                Action::RestoreAutosave => self.restore_autosave(),
+                Action::DiscardAutosave => {
+                    if let Some(prompt) = self.state.recovery_prompt.take() {
+                        self.remove_autosave(prompt.scene.as_ref());
+                    }
+                }
                 Action::SaveThen(then) => {
                     if self.save(false) {
                         self.run_confirmed(*then);
@@ -552,6 +735,7 @@ impl EditorApp {
                 action @ (Action::NewScene
                 | Action::OpenScene(_)
                 | Action::OpenProject
+                | Action::OpenProjectAt(_)
                 | Action::Exit) => {
                     if action == Action::Exit {
                         self.stop_play();
@@ -630,8 +814,10 @@ impl EditorApp {
         }
 
         // Камера могла сместиться к новой модели: гизмо и маркеры нужно перестроить.
+        // Пока модель загружается, кадр запросит готовность загрузки, а не этот флаг.
         let framing = self.state.pending_frame.is_some();
         let status = render_scene_frame(gpu, &mut self.state, &ui_primitives)?;
+        let framing = framing && self.state.pending_frame.is_none();
 
         self.bridge
             .managed
@@ -671,46 +857,94 @@ fn render_scene_frame(
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     }
     let playing = state.is_playing();
-    let editor_camera = state.camera.camera();
     let game_camera_id = state.game_camera.clone();
     // Сетка нужна только панели Scene вне Play-режима.
     let grid_camera_distance = scene_size
         .filter(|_| !playing)
         .map(|_| state.camera.distance);
     let pending_frame = state.pending_frame.take();
-    let Some(parts) = state.frame_parts() else {
-        return render_ui_only(&mut gpu.renderer, ui, &[]);
+    // Модель ещё разбирается в фоне: наведение камеры ждёт её готовности.
+    let mut still_loading = None;
+    let (scene_frame, game_camera, game_settings, has_light, frame_target) = {
+        let Some(parts) = state.frame_parts() else {
+            return render_ui_only(&mut gpu.renderer, ui, &[]);
+        };
+        gpu.scene.sync_assets(
+            &mut gpu.renderer,
+            parts.project,
+            parts.world,
+            parts.models,
+            parts.loader,
+            parts.log,
+        )?;
+        let (scene_frame, warnings) = parts.world.build_frame();
+        for warning in warnings {
+            parts.log.push(
+                LogLevel::Warn,
+                format!(
+                    "{}: {}: {}",
+                    warning.source, warning.object_id, warning.message
+                ),
+            );
+        }
+        let game_camera_handle = game_camera_id
+            .and_then(|id| parts.world.handle(&id))
+            .filter(|handle| parts.world.camera_of(*handle).is_some())
+            .unwrap_or_else(|| parts.world.active_camera());
+        let game_camera = parts
+            .world
+            .camera_of(game_camera_handle)
+            .unwrap_or(scene_frame.camera);
+        let game_settings = parts
+            .world
+            .camera_settings(game_camera_handle)
+            .copied()
+            .unwrap_or_default();
+        let has_light = parts
+            .world
+            .objects()
+            .iter()
+            .any(|object| object.directional_light.is_some());
+        let frame_target = pending_frame.and_then(|id| {
+            let object = parts.world.object_by_id(&id)?;
+            let path = object.mesh_renderer.as_ref()?.model.as_str();
+            let Some(model) = parts.models.get(path) else {
+                if parts.loader.is_pending(path) {
+                    still_loading = Some(id.clone());
+                }
+                return None;
+            };
+            Some(bounding_sphere(
+                parts.world.world_matrix(object.handle)?,
+                model.bounds()?,
+            ))
+        });
+        (
+            scene_frame,
+            game_camera,
+            game_settings,
+            has_light,
+            frame_target,
+        )
     };
-    gpu.scene.sync_assets(
-        &mut gpu.renderer,
-        parts.project,
-        parts.world,
-        parts.models,
-        parts.log,
-    )?;
-    let (scene_frame, warnings) = parts.world.build_frame();
-    for warning in warnings {
-        parts.log.push(
-            LogLevel::Warn,
-            format!(
-                "{}: {}: {}",
-                warning.source, warning.object_id, warning.message
-            ),
-        );
+    state.pending_frame = still_loading;
+    if let Some((center, radius)) = frame_target
+        && state.camera.needs_framing(center, radius)
+    {
+        state.camera.focus(center, radius);
     }
-    let game_camera = game_camera_id
-        .and_then(|id| parts.world.handle(&id))
-        .and_then(|handle| parts.world.camera_of(handle))
-        .unwrap_or(scene_frame.camera);
-    let has_light = parts
-        .world
-        .objects()
-        .iter()
-        .any(|object| object.directional_light.is_some());
     let scene_camera = if playing {
         scene_frame.camera
     } else {
-        editor_camera
+        state.camera.camera()
+    };
+    let scene_settings = if playing {
+        scene_frame.view
+    } else {
+        CameraSettings::default()
+    };
+    let Some(parts) = state.frame_parts() else {
+        return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
     gpu.scene.build_draws(
         &mut gpu.renderer,
@@ -720,21 +954,6 @@ fn render_scene_frame(
         game_camera.position,
         grid_camera_distance,
     )?;
-    let frame_target = pending_frame.and_then(|id| {
-        let object = parts.world.object_by_id(&id)?;
-        let model = parts
-            .models
-            .get(object.mesh_renderer.as_ref()?.model.as_str())?;
-        Some(bounding_sphere(
-            parts.world.world_matrix(object.handle)?,
-            model.bounds()?,
-        ))
-    });
-    if let Some((center, radius)) = frame_target
-        && state.camera.needs_framing(center, radius)
-    {
-        state.camera.focus(center, radius);
-    }
     if let Some([width, height]) = scene_size {
         gpu.renderer
             .resize_viewport(gpu.scene.viewport, width, height)?;
@@ -747,6 +966,7 @@ fn render_scene_frame(
         gpu.scene.frame(
             scene_camera.view_projection(width, height),
             scene_camera.position,
+            scene_settings,
             &scene_frame.light,
             has_light,
             true,
@@ -756,6 +976,7 @@ fn render_scene_frame(
         gpu.scene.frame(
             game_camera.view_projection(width, height),
             game_camera.position,
+            game_settings,
             &scene_frame.light,
             has_light,
             false,
@@ -879,14 +1100,17 @@ impl WindowHandler for EditorApp {
     }
 
     fn update(&mut self, window: &Window) -> bool {
+        // Здесь, а не в кадре: при простое окно просыпается к сроку без перерисовки.
+        self.autosave_tick();
         let previews_pending = self.state.previews.has_pending();
         let build_output = self.poll_build();
+        let background_pending = self.background_pending();
         if let Some(deadline) = self.repaint_at
             && Instant::now() >= deadline
         {
             self.repaint_at = None;
             window.request_redraw();
-        } else if previews_pending || build_output {
+        } else if previews_pending || build_output || background_pending {
             window.request_redraw();
         }
         !self.exit
@@ -894,16 +1118,14 @@ impl WindowHandler for EditorApp {
 
     fn next_wakeup(&mut self) -> Option<Instant> {
         let preview = self
-            .state
-            .previews
-            .has_pending()
+            .background_pending()
             .then(|| Instant::now() + PREVIEW_POLL);
         let build = self
             .state
             .build
             .is_some()
             .then(|| Instant::now() + BUILD_POLL);
-        [self.repaint_at, preview, build]
+        [self.repaint_at, preview, build, self.autosave_deadline()]
             .into_iter()
             .flatten()
             .min()
@@ -923,6 +1145,7 @@ impl WindowHandler for EditorApp {
         if let Some(job) = self.state.build.take() {
             job.kill();
         }
+        self.save_settings();
         // Renderer удерживает окно и освобождается до него.
         self.gpu = None;
         self.egui_state = None;

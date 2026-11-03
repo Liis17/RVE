@@ -6,9 +6,10 @@ use crate::console::ConsoleLog;
 use crate::play::PlaySession;
 use crate::previews::PreviewCache;
 use crate::project::OpenProject;
-use crate::scene_edit::{EditorScene, NewObject};
+use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::EditorCamera;
-use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool};
+use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
+use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
 use engine_files::VirtualPath;
 use engine_scene::World;
@@ -30,6 +31,8 @@ pub enum Action {
     /// `None` — выбрать файл в диалоге.
     OpenScene(Option<String>),
     OpenProject,
+    /// Открыть проект из списка недавних.
+    OpenProjectAt(PathBuf),
     Save,
     SaveAs,
     Exit,
@@ -49,6 +52,18 @@ pub enum Action {
     SaveThen(Box<Action>),
     /// Выполнить действие, отбросив несохранённые изменения.
     Discard(Box<Action>),
+    /// Открыть сцену из найденного автосохранения.
+    RestoreAutosave,
+    /// Удалить найденное автосохранение.
+    DiscardAutosave,
+}
+
+/// Найденное при открытии сцены автосохранение.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryPrompt {
+    /// Сцена копии; `None` — несохранённая новая сцена.
+    pub scene: Option<VirtualPath>,
+    pub contents: String,
 }
 
 /// Подтверждение действия при несохранённых изменениях сцены.
@@ -77,6 +92,7 @@ pub struct FrameParts<'a> {
     pub world: &'a mut World,
     pub project: &'a OpenProject,
     pub models: &'a mut HashMap<String, Arc<Model>>,
+    pub loader: &'a mut ModelLoader,
     pub log: &'a mut ConsoleLog,
 }
 
@@ -86,17 +102,29 @@ pub struct EditorState {
     pub log: ConsoleLog,
     pub tool: GizmoTool,
     pub space: GizmoSpace,
+    pub snap: SnapSettings,
     pub camera: EditorCamera,
     pub gizmo_drag: Option<GizmoDrag>,
     pub play: Option<PlaySession>,
     pub scripts_path: Option<PathBuf>,
+    /// Недавние проекты из настроек пользователя, последний открытый — первым.
+    pub recent_projects: Vec<PathBuf>,
     pub library: Option<ScriptLibrary>,
     pub actions: Vec<Action>,
     pub unsaved_prompt: Option<UnsavedPrompt>,
+    pub recovery_prompt: Option<RecoveryPrompt>,
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
+    /// В прошлом кадре фокус был в текстовом поле: Esc этого кадра закрывает поле,
+    /// а не снимает выделение.
+    pub text_focused_last_frame: bool,
+    /// Строки поиска панелей Hierarchy и Project.
+    pub hierarchy_filter: String,
+    pub project_filter: String,
+    /// Компонент, скопированный в Inspector для вставки в объекты.
+    pub component_clipboard: Option<Component>,
     pub previews: PreviewCache,
     pub viewport_texture: Option<egui::TextureId>,
     pub scene_view: SceneViewInfo,
@@ -115,6 +143,8 @@ pub struct EditorState {
     /// Схемы `properties` lite-скриптов по пути; ошибка пишется в Console один раз.
     /// Сбрасывается вместе с кэшами ресурсов.
     pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
+    /// Фоновый разбор FBX для `models`.
+    pub model_loader: ModelLoader,
     edit_world: Option<(u64, World)>,
 }
 
@@ -126,17 +156,24 @@ impl EditorState {
             log: ConsoleLog::default(),
             tool: GizmoTool::Move,
             space: GizmoSpace::Global,
+            snap: SnapSettings::default(),
             camera: EditorCamera::default(),
             gizmo_drag: None,
             play: None,
             scripts_path,
+            recent_projects: Vec::new(),
             library: None,
             actions: Vec::new(),
             unsaved_prompt: None,
+            recovery_prompt: None,
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_dialog: None,
             hierarchy_rename: None,
+            text_focused_last_frame: false,
+            hierarchy_filter: String::new(),
+            project_filter: String::new(),
+            component_clipboard: None,
             previews: PreviewCache::default(),
             viewport_texture: None,
             scene_view: SceneViewInfo::default(),
@@ -148,6 +185,7 @@ impl EditorState {
             build: None,
             apply_prompt: None,
             lite_schemas: HashMap::new(),
+            model_loader: ModelLoader::default(),
             edit_world: None,
         }
     }
@@ -178,7 +216,14 @@ impl EditorState {
             .is_none_or(|(built, _)| *built != revision);
         if stale {
             match world_for_view(scene.view()) {
-                Ok(world) => self.edit_world = Some((revision, world)),
+                Ok(mut world) => {
+                    if let Some(project) = &self.project
+                        && let Err(error) = project.apply_camera_settings(&mut world)
+                    {
+                        self.log.error(error);
+                    }
+                    self.edit_world = Some((revision, world));
+                }
                 Err(error) => {
                     self.log.error(error.to_string());
                     return None;
@@ -199,6 +244,7 @@ impl EditorState {
             world,
             project: self.project.as_ref()?,
             models: &mut self.models,
+            loader: &mut self.model_loader,
             log: &mut self.log,
         })
     }
@@ -314,11 +360,7 @@ fn world_for_view(view: &engine_scene::SceneDocument) -> Result<World, engine_sc
         name: None,
         parent: root,
         transform: engine_scene::SceneTransform::default(),
-        camera: Some(engine_scene::CameraComponent {
-            fov_deg: 60.0,
-            near: 0.1,
-            far: 1000.0,
-        }),
+        camera: Some(engine_scene::CameraComponent::default()),
         mesh_renderer: None,
         lod_group: None,
         directional_light: None,
@@ -357,7 +399,77 @@ fn read_lite_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene_edit::EditorScene;
+    use crate::project::OpenProject;
+    use crate::scene_edit::{EditorScene, no_prefabs};
+    use engine_scene::CameraSettings;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TempProject(PathBuf);
+
+    impl TempProject {
+        fn new(problem_settings: Option<&str>) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rve-editor-state-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(path.join("Assets/cameras")).unwrap();
+            fs::write(
+                path.join("project.rveproject"),
+                "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/main.rvescene\"\n",
+            )
+            .unwrap();
+            fs::write(
+                path.join("Assets/cameras/valid.camerasettings"),
+                "[projection]\nfov_deg = 42.0\nnear = 0.25\nfar = 250.0\n",
+            )
+            .unwrap();
+            if let Some(settings) = problem_settings {
+                fs::write(path.join("Assets/cameras/problem.camerasettings"), settings).unwrap();
+            }
+            Self(path)
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn state_with_camera_assets(project_dir: &std::path::Path) -> EditorState {
+        const SCENE: &str = r#"
+[[assets]]
+path = "/cameras/valid.camerasettings"
+[[assets]]
+path = "/cameras/problem.camerasettings"
+
+[[objects]]
+id = "camera-a"
+[objects.camera]
+settings = "/cameras/valid.camerasettings"
+active = true
+
+[[objects]]
+id = "camera-b"
+[objects.camera]
+settings = "/cameras/problem.camerasettings"
+"#;
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(project_dir).unwrap());
+        state.scene = Some(
+            EditorScene::parse(
+                VirtualPath::parse("main.rvescene").unwrap(),
+                SCENE,
+                no_prefabs(),
+            )
+            .unwrap(),
+        );
+        state
+    }
 
     fn state_with_scene() -> EditorState {
         let mut state = EditorState::new(None);
@@ -371,6 +483,53 @@ mod tests {
         assert_eq!(state.world_mut().unwrap().objects().len(), 2);
         state.create_object(&NewObject::Empty, None);
         assert_eq!(state.world_mut().unwrap().objects().len(), 3);
+    }
+
+    #[test]
+    fn invalid_camera_asset_keeps_default_edit_world_and_logs_once_per_revision() {
+        for problem_settings in [None, Some("[projection]\nfov_deg = 190.0\n")] {
+            let temp = TempProject::new(problem_settings);
+            let mut state = state_with_camera_assets(&temp.0);
+
+            for frame in 0..4 {
+                let world = state
+                    .world_mut()
+                    .expect("camera asset errors keep the edit world");
+                assert_eq!(world.objects().len(), 2);
+                for object in world
+                    .objects()
+                    .iter()
+                    .filter(|object| object.camera.is_some())
+                {
+                    assert_eq!(
+                        world.camera_settings(object.handle),
+                        Some(&CameraSettings::default())
+                    );
+                }
+                assert!(world.camera_of(world.active_camera()).is_some());
+                if frame < 3 {
+                    state.log.info(format!("frame {frame}"));
+                }
+            }
+
+            let errors = state
+                .log
+                .entries()
+                .filter(|entry| entry.level == crate::console::LogLevel::Error)
+                .count();
+            assert_eq!(errors, 1);
+
+            state.create_object(&NewObject::Empty, None);
+            assert!(state.world_mut().is_some());
+            state.log.info("rebuilt scene");
+            assert!(state.world_mut().is_some());
+            let errors = state
+                .log
+                .entries()
+                .filter(|entry| entry.level == crate::console::LogLevel::Error)
+                .count();
+            assert_eq!(errors, 2);
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ use engine_render::{
     Material, MaterialId, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
+use engine_scene::CameraSettings;
 use engine_scene::{MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
@@ -72,9 +73,40 @@ fn prepare_scene_with_model_loader(
     resources: &ResourceHandle,
     assets: &Assets,
     scene_path: &str,
-    world: World,
+    mut world: World,
     mut load_model: impl FnMut(&str) -> Result<Model, String>,
 ) -> Result<PreparedScene, String> {
+    let camera_settings = world
+        .objects()
+        .iter()
+        .filter_map(|object| {
+            Some((
+                object.handle,
+                object
+                    .camera
+                    .as_ref()?
+                    .settings
+                    .as_ref()?
+                    .as_str()
+                    .to_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut loaded_settings = HashMap::<String, CameraSettings>::new();
+    for (_, path) in &camera_settings {
+        if !loaded_settings.contains_key(path) {
+            let source = read_utf8(resources, path)?;
+            let settings =
+                CameraSettings::parse(path, &source).map_err(|error| error.to_string())?;
+            loaded_settings.insert(path.clone(), settings);
+        }
+    }
+    for (handle, path) in camera_settings {
+        world
+            .set_camera_settings(handle, loaded_settings[&path])
+            .map_err(|error| error.to_string())?;
+    }
+
     let mut models = HashMap::new();
     let mut textures = HashMap::new();
     let mut objects = Vec::new();
@@ -504,10 +536,18 @@ mod tests {
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 "#;
+
+    fn camera_settings_scene(two_cameras: bool) -> String {
+        let second = if two_cameras {
+            "\n[[objects]]\nid = \"second\"\n[objects.camera]\nsettings = \"/cameras/shared.camerasettings\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "[[assets]]\npath = \"/cameras/shared.camerasettings\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = {two_cameras}\nsettings = \"/cameras/shared.camerasettings\"\n{second}"
+        )
+    }
 
     fn scene_with_lite_script() -> String {
         format!(
@@ -622,6 +662,79 @@ far = 100.0
         .err()
         .unwrap();
         assert!(error.contains("scene.rvescene"));
+    }
+
+    #[test]
+    fn load_scene_rejects_a_missing_camera_settings_asset() {
+        let project = TempProject::new();
+        let source = camera_settings_scene(false);
+        project.write("scene.rvescene", source.as_bytes());
+        let resources = LooseResources::new(project.root());
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("cameras/shared.camerasettings"));
+    }
+
+    #[test]
+    fn load_scene_rejects_camera_settings_that_are_not_utf8_or_valid_toml() {
+        let project = TempProject::new();
+        let source = camera_settings_scene(false);
+        project.write("scene.rvescene", source.as_bytes());
+        project.write("cameras/shared.camerasettings", &[0xff, 0xfe]);
+        let resources = LooseResources::new(project.root());
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("cameras/shared.camerasettings"));
+        assert!(error.contains("UTF-8"));
+        let project = TempProject::new();
+        project.write("scene.rvescene", source.as_bytes());
+        project.write("cameras/shared.camerasettings", b"[projection\nfov = 45");
+        let resources = LooseResources::new(project.root());
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("cameras/shared.camerasettings"));
+    }
+
+    #[test]
+    fn cameras_sharing_a_settings_asset_receive_the_same_validated_settings() {
+        let project = TempProject::new();
+        let source = camera_settings_scene(true);
+        project.write("scene.rvescene", source.as_bytes());
+        project.write(
+            "cameras/shared.camerasettings",
+            b"[projection]\nfov_deg = 42.0\nnear = 0.2\nfar = 250.0\n",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        for id in ["camera", "second"] {
+            let world = &prepared.world;
+            let handle = world.handle(id).unwrap();
+            assert_eq!(
+                world.camera_settings(handle).unwrap().projection.fov_deg,
+                42.0
+            );
+            assert_eq!(world.camera_settings(handle).unwrap().projection.near, 0.2);
+        }
     }
 
     #[test]

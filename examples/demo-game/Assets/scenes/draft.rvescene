@@ -1,12 +1,13 @@
 [[assets]]
 path = "/models/draft-cube.fbx"
 
+[[assets]]
+path = "/cameras/draft.camerasettings"
+
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
+settings = "/cameras/draft.camerasettings"
 
 [[objects]]
 id = "draft-cube"

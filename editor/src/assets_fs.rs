@@ -21,6 +21,7 @@ pub struct AssetEntry {
 pub enum AssetKind {
     Scene,
     Prefab,
+    CameraSettings,
     Model,
     Texture,
     Script,
@@ -37,6 +38,7 @@ impl AssetKind {
         match extension.as_deref() {
             Some("rvescene") => Self::Scene,
             Some("rveprefab") => Self::Prefab,
+            Some("camerasettings") => Self::CameraSettings,
             Some("fbx") => Self::Model,
             Some("png") => Self::Texture,
             Some("lua") => Self::Script,
@@ -295,6 +297,10 @@ mod tests {
         assert_eq!(AssetKind::of("a.b/c"), AssetKind::Other);
         assert_eq!(AssetKind::of("m.fbx"), AssetKind::Model);
         assert_eq!(AssetKind::of("s.rvescene"), AssetKind::Scene);
+        assert_eq!(
+            AssetKind::of("camera.CAMERASETTINGS"),
+            AssetKind::CameraSettings
+        );
         assert_eq!(AssetKind::of("s.lua"), AssetKind::Script);
     }
 

@@ -2,7 +2,7 @@
 
 use crate::state::{AssetDrag, EditorState};
 use crate::viewport::camera::{Ray, ground_point, project_point, screen_ray};
-use crate::viewport::gizmo::{GizmoDrag, GizmoTool, gizmo_axes};
+use crate::viewport::gizmo::{DragTarget, GizmoDrag, GizmoTool, gizmo_axes};
 use crate::viewport::picking::{nearest_hit, ray_model};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use glam::{Mat4, Vec3};
@@ -91,12 +91,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         return;
     };
     draw_markers(ui, &markers, view_projection, rect);
+    draw_selection_bounds(ui, state, &markers, view_projection, rect);
     let gizmo_taken = handle_gizmo(ui, state, &response, view_projection, rect);
     if !gizmo_taken
         && response.clicked()
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        pick(state, &markers, view_projection, rect, pointer);
+        let modifiers = ui.input(|input| input.modifiers);
+        pick(state, &markers, view_projection, rect, pointer, modifiers);
     }
 }
 
@@ -222,12 +224,78 @@ fn draw_markers(ui: &egui::Ui, markers: &[Marker], view_projection: Mat4, rect: 
     }
 }
 
+/// Пары вершин рёбер параллелепипеда из `box_corners`.
+const BOX_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 3),
+    (3, 2),
+    (2, 0),
+    (4, 5),
+    (5, 7),
+    (7, 6),
+    (6, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+];
+
+/// Мировые вершины границ модели; бит 0 индекса выбирает X, бит 1 — Y, бит 2 — Z.
+fn box_corners(matrix: Mat4, (min, max): ([f32; 3], [f32; 3])) -> [Vec3; 8] {
+    std::array::from_fn(|index| {
+        let pick = |axis: usize| {
+            if index & (1 << axis) == 0 {
+                min[axis]
+            } else {
+                max[axis]
+            }
+        };
+        matrix.transform_point3(Vec3::new(pick(0), pick(1), pick(2)))
+    })
+}
+
+/// Рамки границ моделей выделенных объектов. Рёбра с вершиной за камерой пропускаются.
+fn draw_selection_bounds(
+    ui: &egui::Ui,
+    state: &EditorState,
+    markers: &[Marker],
+    view_projection: Mat4,
+    rect: Rect,
+) {
+    let Some(scene) = &state.scene else {
+        return;
+    };
+    let painter = ui.painter_at(rect);
+    let stroke = Stroke::new(1.5, ACTIVE_COLOR);
+    for marker in markers
+        .iter()
+        .filter(|marker| scene.is_selected(&marker.id))
+    {
+        let Some(bounds) = marker
+            .model
+            .as_ref()
+            .and_then(|model| state.models.get(model))
+            .and_then(|model| model.bounds())
+        else {
+            continue;
+        };
+        let corners = box_corners(marker.world, bounds)
+            .map(|corner| to_screen(view_projection, rect, corner));
+        for (a, b) in BOX_EDGES {
+            if let (Some(a), Some(b)) = (corners[a], corners[b]) {
+                painter.line_segment([a, b], stroke);
+            }
+        }
+    }
+}
+
 fn pick(
     state: &mut EditorState,
     markers: &[Marker],
     view_projection: Mat4,
     rect: Rect,
     pointer: Pos2,
+    modifiers: egui::Modifiers,
 ) {
     // Маркеры камеры и света не имеют геометрии и имеют приоритет: они рисуются поверх сцены.
     let marker = markers
@@ -246,11 +314,38 @@ fn pick(
         }))
     });
     if let Some(scene) = &mut state.scene {
-        scene.select(selected.as_deref());
+        apply_click_selection(scene, selected.as_deref(), modifiers);
     }
 }
 
-/// Рисует гизмо выделенного объекта и обрабатывает перетаскивание ручек.
+/// Щелчок по объекту: Ctrl/Cmd переключает его в выделении, Shift добавляет,
+/// без модификаторов выделение заменяется. Щелчок мимо объектов с модификатором ничего не снимает.
+pub(super) fn apply_click_selection(
+    scene: &mut crate::scene_edit::EditorScene,
+    id: Option<&str>,
+    modifiers: egui::Modifiers,
+) {
+    match id {
+        Some(id) if modifiers.command => scene.toggle_selection(id),
+        Some(id) if modifiers.shift => scene.add_to_selection(id),
+        _ if modifiers.command || modifiers.shift => {}
+        id => scene.select(id),
+    }
+}
+
+/// Мировая матрица объекта и его родителя.
+fn world_matrices(world: &engine_scene::World, id: &str) -> Option<(Mat4, Mat4)> {
+    let object = world.object_by_id(id)?;
+    let matrix = world.world_matrix(object.handle)?;
+    let parent = object
+        .parent
+        .and_then(|parent| world.world_matrix(parent))
+        .unwrap_or(Mat4::IDENTITY);
+    Some((matrix, parent))
+}
+
+/// Рисует гизмо выделения и обрабатывает перетаскивание ручек.
+/// Оси берутся у активного объекта, центр группы — среднее положение выделенных поддеревьев.
 /// Возвращает `true`, если указатель занят гизмо и щелчок не должен менять выделение.
 fn handle_gizmo(
     ui: &egui::Ui,
@@ -259,35 +354,58 @@ fn handle_gizmo(
     view_projection: Mat4,
     rect: Rect,
 ) -> bool {
-    let Some(selection) = state
-        .scene
-        .as_ref()
-        .and_then(|scene| scene.selection())
-        .map(str::to_owned)
-    else {
-        state.gizmo_drag = None;
+    let Some((selection, starts)) = state.scene.as_ref().and_then(|scene| {
+        let active = scene.selection()?.to_owned();
+        let starts = scene
+            .selection_roots()
+            .into_iter()
+            .filter_map(|id| Some((scene.object(&id)?.transform, id)))
+            .collect::<Vec<_>>();
+        Some((active, starts))
+    }) else {
+        // Выделение исчезло посреди перетаскивания: следующая правка — новая запись истории.
+        if state.gizmo_drag.take().is_some()
+            && let Some(scene) = &mut state.scene
+        {
+            scene.end_continuous_edit();
+        }
         return false;
     };
     let Some(world) = state.world_mut() else {
         return false;
     };
-    let Some(object) = world.object_by_id(&selection).cloned() else {
+    let Some((active_world, _)) = world_matrices(world, &selection) else {
         return false;
     };
-    let Some(object_world) = world.world_matrix(object.handle) else {
+    let targets = starts
+        .into_iter()
+        .filter_map(|(start, id)| {
+            let (matrix, parent_world) = world_matrices(world, &id)?;
+            Some(DragTarget {
+                id,
+                start,
+                parent_world,
+                world_position: matrix.w_axis.truncate(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
         return false;
-    };
-    let parent_world = object
-        .parent
-        .and_then(|parent| world.world_matrix(parent))
-        .unwrap_or(Mat4::IDENTITY);
-    let (origin, axes) = gizmo_axes(object_world, state.tool, state.space);
+    }
+    let (_, axes) = gizmo_axes(active_world, state.tool, state.space);
+    let origin = targets
+        .iter()
+        .map(|target| target.world_position)
+        .sum::<Vec3>()
+        / targets.len() as f32;
     let eye = state.camera.eye();
     let handle = origin.distance(eye) * HANDLE_SCREEN_FRACTION;
     let pointer = ui.input(|input| input.pointer.latest_pos());
 
     // Завершение или продолжение активного перетаскивания.
     if let Some(drag) = state.gizmo_drag.clone() {
+        let snapping = state.snap.enabled || ui.input(|input| input.modifiers.command);
+        let step = snapping.then(|| state.snap.step(drag.tool));
         if !ui.input(|input| input.pointer.primary_down()) {
             state.gizmo_drag = None;
             if let Some(scene) = &mut state.scene {
@@ -295,10 +413,10 @@ fn handle_gizmo(
             }
         } else if let Some(pointer) = pointer
             && let Some(ray) = pointer_ray(view_projection, rect, pointer)
-            && let Some(transform) = drag.update(ray)
+            && let Some(transforms) = drag.update(ray, step)
         {
             let key = format!("{selection}/gizmo");
-            state.edit_scene(|scene| scene.set_transform(&selection, transform, Some(&key)));
+            state.edit_scene(|scene| scene.set_transforms(&transforms, Some(&key)));
         }
     }
 
@@ -340,20 +458,14 @@ fn handle_gizmo(
         && let Some(axis_index) = hovered
         && let Some(pointer) = press_origin
         && let Some(ray) = pointer_ray(view_projection, rect, pointer)
-        && let Some(document_object) = state
-            .scene
-            .as_ref()
-            .and_then(|scene| scene.object(&selection))
     {
         state.gizmo_drag = GizmoDrag::begin(
             state.tool,
             axis_index,
             ray,
-            origin,
-            axes[axis_index],
+            (origin, axes[axis_index]),
             handle,
-            document_object.transform,
-            parent_world,
+            targets,
         );
     }
     state.gizmo_drag.is_some() || hovered.is_some()
@@ -548,6 +660,27 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn box_corners_follow_the_world_matrix_and_edges_join_neighbours() {
+        let matrix = Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 1.0, 1.0),
+            glam::Quat::IDENTITY,
+            Vec3::new(10.0, 0.0, 0.0),
+        );
+        let corners = box_corners(matrix, ([-1.0, 0.0, -1.0], [1.0, 2.0, 1.0]));
+        assert_eq!(corners[0], Vec3::new(8.0, 0.0, -1.0));
+        assert_eq!(corners[7], Vec3::new(12.0, 2.0, 1.0));
+        // Каждое ребро меняет ровно одну координату, и все 12 рёбер различны.
+        for (a, b) in BOX_EDGES {
+            assert_eq!((a ^ b).count_ones(), 1, "{a}-{b}");
+        }
+        let unique = BOX_EDGES
+            .iter()
+            .map(|&(a, b)| (a.min(b), a.max(b)))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), 12);
     }
 
     #[test]

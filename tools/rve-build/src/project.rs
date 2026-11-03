@@ -5,6 +5,7 @@ use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
+use engine_scene::CameraSettings;
 use engine_scene::{ParamSchema, ParamValue, SceneDocument, SceneError, expand};
 use engine_script::{ScriptInterruptHandle, lite_properties};
 use std::collections::{BTreeMap, BTreeSet};
@@ -180,6 +181,22 @@ fn prepare_with_resources(
                 .and_then(|request| request.wait())
                 .map_err(|error| resource_error(&format!("ресурс /{asset_path}"), error))?;
             require_asset_file(&assets_dir, &asset_path)?;
+
+            if extension_is(asset_path.as_str(), "camerasettings") {
+                let bytes = handle
+                    .read_all(format!("/{asset_path}"))
+                    .and_then(|request| request.wait())
+                    .map_err(|error| {
+                        resource_error(&format!("настройки камеры /{asset_path}"), error)
+                    })?;
+                let source = String::from_utf8(bytes).map_err(|error| {
+                    BuildError::input(format!(
+                        "настройки камеры /{asset_path} должны быть UTF-8: {error}"
+                    ))
+                })?;
+                CameraSettings::parse(format!("/{asset_path}"), &source)
+                    .map_err(|error| BuildError::input(error.to_string()))?;
+            }
 
             if extension_is(asset_path.as_str(), "fbx") {
                 let dependencies = assets
@@ -731,7 +748,7 @@ mod lite_params_tests {
         fs::write(
             assets.join("main.rvescene"),
             format!(
-                "[[assets]]\npath = \"/scripts/rotate.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\nparams = {params}\n"
+                "[[assets]]\npath = \"/scripts/rotate.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects.lite_scripts]]\npath = \"/scripts/rotate.lua\"\nparams = {params}\n"
             ),
         )
         .unwrap();
@@ -805,8 +822,7 @@ mod prefab_tests {
     use std::fs;
     use std::path::Path;
 
-    const CAMERA: &str =
-        "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n";
+    const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
 
     fn write(root: &Path, path: &str, text: &str) {
         let path = root.join("Assets").join(path);

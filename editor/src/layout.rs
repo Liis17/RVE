@@ -5,7 +5,7 @@ use crate::ui;
 use egui_dock::{DockState, NodeIndex, TabViewer};
 
 /// Панель редактора; каждая существует в одном экземпляре.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
     Scene,
     Game,

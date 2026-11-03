@@ -1,11 +1,13 @@
 //! Редактируемая сцена: команды над документом, undo/redo и сохранение.
 
 use engine_files::VirtualPath;
+use engine_scene::document::MaterialOverride;
 use engine_scene::{
     CameraComponent, DirectionalLightComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin,
-    PrefabInstance, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
+    PrefabInstance, PrefabOverride, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 mod prefabs;
@@ -39,9 +41,6 @@ name = "Camera"
 [objects.transform]
 position = [0.0, 1.0, 6.0]
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 1000.0
 
 [[objects]]
 id = "sun"
@@ -65,6 +64,79 @@ pub enum NewObject {
     Prefab(VirtualPath, [f32; 3]),
 }
 
+/// Вид компонента для меню Reset/Copy/Paste в Inspector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComponentKind {
+    Transform,
+    Camera,
+    MeshRenderer,
+    LodGroup,
+    DirectionalLight,
+}
+
+/// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
+#[derive(Clone, Debug)]
+pub enum Component {
+    Transform(SceneTransform),
+    Camera(CameraComponent),
+    MeshRenderer(MeshRenderer),
+    LodGroup(LodGroup),
+    DirectionalLight(DirectionalLightComponent),
+}
+
+impl Component {
+    pub fn kind(&self) -> ComponentKind {
+        match self {
+            Self::Transform(_) => ComponentKind::Transform,
+            Self::Camera(_) => ComponentKind::Camera,
+            Self::MeshRenderer(_) => ComponentKind::MeshRenderer,
+            Self::LodGroup(_) => ComponentKind::LodGroup,
+            Self::DirectionalLight(_) => ComponentKind::DirectionalLight,
+        }
+    }
+
+    /// Текущее значение компонента объекта; `None`, если компонента нет.
+    pub fn read(object: &SceneObject, kind: ComponentKind) -> Option<Self> {
+        Some(match kind {
+            ComponentKind::Transform => Self::Transform(object.transform),
+            ComponentKind::Camera => Self::Camera(object.camera.clone()?),
+            ComponentKind::MeshRenderer => Self::MeshRenderer(object.mesh_renderer.clone()?),
+            ComponentKind::LodGroup => Self::LodGroup(object.lod_group.clone()?),
+            ComponentKind::DirectionalLight => Self::DirectionalLight(object.directional_light?),
+        })
+    }
+
+    /// Значение по умолчанию для Reset. Mesh Renderer сохраняет модель, а LOD Group
+    /// сброса не имеет: её уровни — это выбор ресурсов, а не настройки.
+    pub fn reset(object: &SceneObject, kind: ComponentKind) -> Option<Self> {
+        Some(match kind {
+            ComponentKind::Transform => Self::Transform(SceneTransform::default()),
+            ComponentKind::Camera => Self::Camera(default_camera()),
+            ComponentKind::MeshRenderer => Self::MeshRenderer(MeshRenderer {
+                model: object.mesh_renderer.as_ref()?.model.clone(),
+                texture: None,
+                material: None,
+            }),
+            ComponentKind::LodGroup => return None,
+            ComponentKind::DirectionalLight => Self::DirectionalLight(default_light()),
+        })
+    }
+
+    fn apply(self, object: &mut SceneObject) {
+        match self {
+            Self::Transform(value) => object.transform = value,
+            Self::Camera(value) => {
+                // Активность — состояние сцены, а не свойство компонента: вставка её не меняет.
+                let active = object.camera.as_ref().is_some_and(|camera| camera.active);
+                object.camera = Some(CameraComponent { active, ..value });
+            }
+            Self::MeshRenderer(value) => object.mesh_renderer = Some(value),
+            Self::LodGroup(value) => object.lod_group = Some(value),
+            Self::DirectionalLight(value) => object.directional_light = Some(value),
+        }
+    }
+}
+
 /// Открытая сцена с выделением и историей правок.
 pub struct EditorScene {
     /// Авторский документ: его правят команды и он сохраняется в файл.
@@ -75,7 +147,8 @@ pub struct EditorScene {
     /// Virtual path файла сцены; `None` — сцена ещё не сохранялась.
     path: Option<VirtualPath>,
     dirty: bool,
-    selection: Option<String>,
+    /// Выделенные объекты в порядке выбора; последний — активный, его показывает Inspector.
+    selection: Vec<String>,
     undo: Vec<SceneDocument>,
     redo: Vec<SceneDocument>,
     /// Ключ незавершённой непрерывной правки, например перетаскивания значения.
@@ -97,6 +170,30 @@ impl EditorScene {
         Self::from_document(document, Some(path), loader)
     }
 
+    /// Сцена из автосохранения: путь прежний, а изменения считаются несохранёнными.
+    pub fn recover(path: Option<VirtualPath>, contents: &str) -> Result<Self, String> {
+        Self::recover_with_loader(path, contents, no_prefabs())
+    }
+
+    /// Восстанавливает автосохранение проекта с тем же загрузчиком префабов.
+    pub fn recover_with_loader(
+        path: Option<VirtualPath>,
+        contents: &str,
+        loader: PrefabLoader,
+    ) -> Result<Self, String> {
+        let label = path
+            .as_ref()
+            .map_or("untitled.rvescene", |path| path.as_str());
+        let document = match path.as_ref() {
+            Some(path) => parse_document(path, contents),
+            None => SceneDocument::parse(label, contents),
+        }
+        .map_err(|error| error.to_string())?;
+        let mut scene = Self::from_document(document, path, loader)?;
+        scene.dirty = true;
+        Ok(scene)
+    }
+
     fn from_document(
         document: SceneDocument,
         path: Option<VirtualPath>,
@@ -109,7 +206,7 @@ impl EditorScene {
             loader,
             path,
             dirty: false,
-            selection: None,
+            selection: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             coalesce: None,
@@ -154,13 +251,14 @@ impl EditorScene {
     pub fn reload_prefabs(&mut self) -> Result<(), String> {
         self.expansion = expand_document(&self.document, self.path.as_ref(), &self.loader)?;
         self.revision += 1;
-        if self
-            .selection
-            .as_deref()
-            .is_some_and(|id| self.object(id).is_none())
-        {
-            self.selection = None;
-        }
+        let visible = self
+            .expansion
+            .document
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        self.selection.retain(|id| visible.contains(id.as_str()));
         Ok(())
     }
 
@@ -176,12 +274,22 @@ impl EditorScene {
         self.revision
     }
 
+    /// Активный объект выделения.
     pub fn selection(&self) -> Option<&str> {
-        self.selection.as_deref()
+        self.selection.last().map(String::as_str)
+    }
+
+    /// Все выделенные объекты, активный — последним.
+    pub fn selected_ids(&self) -> &[String] {
+        &self.selection
+    }
+
+    pub fn is_selected(&self, id: &str) -> bool {
+        self.selection.iter().any(|selected| selected == id)
     }
 
     pub fn selected_object(&self) -> Option<&SceneObject> {
-        self.object(self.selection.as_deref()?)
+        self.object(self.selection()?)
     }
 
     /// Объект раскрытого документа, в том числе объект экземпляра.
@@ -189,8 +297,57 @@ impl EditorScene {
         self.view().objects.iter().find(|object| object.id == id)
     }
 
+    /// Заменяет выделение одним объектом или очищает его.
     pub fn select(&mut self, id: Option<&str>) {
-        self.selection = id.filter(|id| self.object(id).is_some()).map(str::to_owned);
+        self.selection = id
+            .filter(|id| self.object(id).is_some())
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+    }
+
+    /// Добавляет объект к выделению и делает его активным.
+    pub fn add_to_selection(&mut self, id: &str) {
+        if self.object(id).is_some() {
+            self.selection.retain(|selected| selected != id);
+            self.selection.push(id.to_owned());
+        }
+    }
+
+    /// Снимает выделение с объекта или добавляет его, если он не выделен.
+    pub fn toggle_selection(&mut self, id: &str) {
+        if self.is_selected(id) {
+            self.selection.retain(|selected| selected != id);
+        } else {
+            self.add_to_selection(id);
+        }
+    }
+
+    /// Выделенные объекты без тех, чей предок тоже выделен, в порядке документа:
+    /// групповые команды применяются к поддеревьям один раз.
+    pub fn selection_roots(&self) -> Vec<String> {
+        let parents = self
+            .document
+            .objects
+            .iter()
+            .map(|object| (object.id.as_str(), object.parent.as_deref()))
+            .collect::<HashMap<_, _>>();
+        let has_selected_ancestor = |id: &str| {
+            let mut current = parents.get(id).copied().flatten();
+            while let Some(parent) = current {
+                if self.is_selected(parent) {
+                    return true;
+                }
+                current = parents.get(parent).copied().flatten();
+            }
+            false
+        };
+        self.document
+            .objects
+            .iter()
+            .filter(|object| self.is_selected(&object.id) && !has_selected_ancestor(&object.id))
+            .map(|object| object.id.clone())
+            .collect()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -230,18 +387,27 @@ impl EditorScene {
         if let Ok(expansion) = expand_document(&self.document, self.path.as_ref(), &self.loader) {
             self.expansion = expansion;
         }
-        if self
-            .selection
-            .as_deref()
-            .is_some_and(|id| self.object(id).is_none())
-        {
-            self.selection = None;
-        }
+        let visible = self
+            .expansion
+            .document
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        self.selection.retain(|id| visible.contains(id.as_str()));
     }
 
     /// Завершает непрерывную правку: следующее изменение создаст новую запись истории.
     pub fn end_continuous_edit(&mut self) {
         self.coalesce = None;
+    }
+
+    /// Завершает непрерывную правку только с ключом `key`. Нужна виджетам вроде палитры цвета,
+    /// которые не сообщают об окончании перетаскивания.
+    pub fn end_continuous_edit_for(&mut self, key: &str) {
+        if self.coalesce.as_deref() == Some(key) {
+            self.coalesce = None;
+        }
     }
 
     /// Применяет правку к копии и принимает её только после проверки всего документа.
@@ -325,11 +491,18 @@ impl EditorScene {
             match kind {
                 NewObject::Empty | NewObject::Prefab(..) => {}
                 NewObject::Camera => {
-                    object.camera = Some(CameraComponent {
-                        fov_deg: 60.0,
-                        near: 0.1,
-                        far: 1000.0,
-                    });
+                    if !document
+                        .objects
+                        .iter()
+                        .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                        && let Some(existing_camera) = document
+                            .objects
+                            .iter_mut()
+                            .find(|object| object.camera.is_some())
+                    {
+                        existing_camera.camera.as_mut().unwrap().active = true;
+                    }
+                    object.camera = Some(CameraComponent::default());
                 }
                 NewObject::DirectionalLight => {
                     object.transform.rotation = [50.0, 30.0, 0.0];
@@ -348,15 +521,26 @@ impl EditorScene {
             document.objects.push(object);
             Ok(())
         })?;
-        self.selection = Some(id.clone());
+        self.selection = vec![id.clone()];
         Ok(id)
     }
 
     /// Удаляет объект или экземпляр вместе с потомками; единственную камеру удалить нельзя.
     /// Часть экземпляра удалить нельзя: удаляется весь экземпляр или делается Unpack.
     pub fn delete_object(&mut self, id: &str) -> Result<(), String> {
-        self.require_own(id)?;
-        let removed = subtree_ids(self.view(), id)?;
+        self.delete_objects(&[id.to_owned()])
+    }
+
+    /// Удаляет объекты с потомками одной записью истории.
+    pub fn delete_objects(&mut self, ids: &[String]) -> Result<(), String> {
+        let mut removed = HashSet::new();
+        for id in ids {
+            self.require_own(id)?;
+            removed.extend(subtree_ids(self.view(), id)?);
+        }
+        if removed.is_empty() {
+            return Ok(());
+        }
         self.edit(None, |document| {
             document
                 .objects
@@ -364,23 +548,59 @@ impl EditorScene {
             document
                 .instances
                 .retain(|instance| !removed.contains(&instance.id));
+            if document
+                .objects
+                .iter()
+                .any(|object| object.camera.is_some())
+                && !document
+                    .objects
+                    .iter()
+                    .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                && let Some(object) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                object.camera.as_mut().unwrap().active = true;
+            }
             Ok(())
         })?;
-        if self
-            .selection
-            .as_ref()
-            .is_some_and(|selection| removed.contains(selection))
-        {
-            self.selection = None;
-        }
+        self.selection.retain(|id| !removed.contains(id));
         Ok(())
     }
 
-    /// Копирует объект или экземпляр с потомками; ссылки `parent` внутри копии, в том числе
-    /// на объекты скопированных экземпляров, указывают на новые копии.
+    /// Удаляет выделенные объекты; потомок выделенного предка удаляется вместе с ним.
+    pub fn delete_selection(&mut self) -> Result<(), String> {
+        let roots = self.selection_roots();
+        if roots.is_empty() {
+            return Ok(());
+        }
+        self.delete_objects(&roots)
+    }
+
+    /// Копирует объект или экземпляр с потомками и выделяет копии.
     pub fn duplicate_object(&mut self, id: &str) -> Result<String, String> {
-        self.require_own(id)?;
-        let subtree = subtree_ids(self.view(), id)?;
+        self.duplicate_roots(&[id.to_owned()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("объект {id:?} не найден"))
+    }
+
+    /// Копирует выделенные поддеревья одной записью истории и выделяет копии.
+    pub fn duplicate_selection(&mut self) -> Result<Vec<String>, String> {
+        let roots = self.selection_roots();
+        self.duplicate_roots(&roots)
+    }
+
+    fn duplicate_roots(&mut self, roots: &[String]) -> Result<Vec<String>, String> {
+        let mut subtree = HashSet::new();
+        for root in roots {
+            self.require_own(root)?;
+            subtree.extend(subtree_ids(self.view(), root)?);
+        }
+        if subtree.is_empty() {
+            return Ok(Vec::new());
+        }
         let source_ids = self
             .document
             .objects
@@ -391,12 +611,32 @@ impl EditorScene {
             .cloned()
             .collect::<Vec<_>>();
         let mut reserved = HashSet::new();
-        let mut renamed = std::collections::HashMap::new();
+        let mut renamed = HashMap::new();
         for source in &source_ids {
             let copy_id = unique_id(&self.document, source, &reserved);
             reserved.insert(copy_id.clone());
             renamed.insert(source.clone(), copy_id);
         }
+        let copies = roots
+            .iter()
+            .filter_map(|root| renamed.get(root).cloned())
+            .collect::<Vec<_>>();
+        let prefab_cameras = self
+            .view()
+            .objects
+            .iter()
+            .filter_map(|object| {
+                let origin = self.origin(&object.id)?;
+                if !renamed.contains_key(&origin.instance) {
+                    return None;
+                }
+                Some((
+                    origin.instance.clone(),
+                    origin.target.clone(),
+                    object.camera.clone()?,
+                ))
+            })
+            .collect::<Vec<_>>();
         let remap =
             |parent: Option<String>| parent.map(|parent| rename_reference(&renamed, parent));
         self.edit(None, |document| {
@@ -408,6 +648,9 @@ impl EditorScene {
                 .map(|mut object| {
                     object.parent = remap(object.parent);
                     object.id = renamed[&object.id].clone();
+                    if let Some(camera) = &mut object.camera {
+                        camera.active = false;
+                    }
                     object
                 })
                 .collect::<Vec<_>>();
@@ -424,11 +667,252 @@ impl EditorScene {
                 .collect::<Vec<_>>();
             document.objects.extend(objects);
             document.instances.extend(instances);
+            for (source_instance, target, mut camera) in prefab_cameras {
+                camera.active = false;
+                if let Some(settings) = &camera.settings {
+                    ensure_asset(document, settings);
+                }
+                let instance_id = &renamed[&source_instance];
+                let instance = document
+                    .instances
+                    .iter_mut()
+                    .find(|instance| &instance.id == instance_id)
+                    .ok_or_else(|| format!("экземпляр {instance_id:?} не найден"))?;
+                if let Some(change) = instance
+                    .overrides
+                    .iter_mut()
+                    .find(|change| change.target == target)
+                {
+                    change.camera = Some(camera);
+                } else {
+                    instance.overrides.push(PrefabOverride {
+                        target,
+                        camera: Some(camera),
+                        ..PrefabOverride::default()
+                    });
+                }
+            }
+            if document
+                .objects
+                .iter()
+                .filter(|object| object.camera.is_some())
+                .count()
+                > 1
+                && !document
+                    .objects
+                    .iter()
+                    .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                && let Some(object) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                object.camera.as_mut().unwrap().active = true;
+            }
             Ok(())
         })?;
-        let copy = renamed[id].clone();
-        self.selection = Some(copy.clone());
-        Ok(copy)
+        self.selection = copies.clone();
+        Ok(copies)
+    }
+
+    /// Объекты обычных поддеревьев в порядке документа для системного буфера обмена.
+    pub fn subtrees(&self, roots: &[String]) -> Result<Vec<SceneObject>, String> {
+        let mut ids = HashSet::new();
+        for root in roots {
+            self.require_own(root)?;
+            ids.extend(subtree_ids(&self.document, root)?);
+        }
+        Ok(self
+            .document
+            .objects
+            .iter()
+            .filter(|object| ids.contains(&object.id))
+            .cloned()
+            .collect())
+    }
+
+    /// Вставляет объекты из системного буфера одной записью истории.
+    pub fn insert_copies(&mut self, objects: Vec<SceneObject>) -> Result<Vec<String>, String> {
+        let mut reserved = HashSet::new();
+        let mut renamed = HashMap::new();
+        for object in &objects {
+            let copy_id = unique_id(&self.document, &object.id, &reserved);
+            reserved.insert(copy_id.clone());
+            renamed.insert(object.id.clone(), copy_id);
+        }
+        let roots = objects
+            .iter()
+            .filter(|object| {
+                object
+                    .parent
+                    .as_ref()
+                    .is_none_or(|parent| !renamed.contains_key(parent))
+            })
+            .map(|object| renamed[&object.id].clone())
+            .collect::<Vec<_>>();
+        self.edit(None, |document| {
+            if document
+                .objects
+                .iter()
+                .any(|object| object.camera.is_some())
+                && !document
+                    .objects
+                    .iter()
+                    .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                && let Some(object) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                object.camera.as_mut().unwrap().active = true;
+            }
+            for mut object in objects {
+                object.parent = match object.parent {
+                    Some(parent) if renamed.contains_key(&parent) => Some(renamed[&parent].clone()),
+                    Some(parent) if document.objects.iter().any(|known| known.id == parent) => {
+                        Some(parent)
+                    }
+                    _ => None,
+                };
+                object.id = renamed[&object.id].clone();
+                if let Some(camera) = &mut object.camera {
+                    camera.active = false;
+                }
+                register_object_assets(document, &object)?;
+                document.objects.push(object);
+            }
+            Ok(())
+        })?;
+        self.selection = roots.clone();
+        Ok(roots)
+    }
+
+    /// Меняет трансформации нескольких объектов одной правкой: при ошибке не меняется ни одна.
+    pub fn set_transforms(
+        &mut self,
+        transforms: &[(String, SceneTransform)],
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        self.edit(coalesce, |document| {
+            for (id, transform) in transforms {
+                find_object_mut(document, id)?.transform = *transform;
+            }
+            Ok(())
+        })
+    }
+
+    /// Добавляет камеру, сохраняя единственную активную камеру документа.
+    pub fn add_camera(&mut self, id: &str) -> Result<(), String> {
+        self.edit(None, |document| {
+            if find_object(document, id)?.camera.is_some() {
+                return Err(format!("объект {id:?} уже имеет камеру"));
+            }
+            if !document
+                .objects
+                .iter()
+                .any(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                && let Some(existing) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                existing.camera.as_mut().unwrap().active = true;
+            }
+            find_object_mut(document, id)?.camera = Some(CameraComponent::default());
+            Ok(())
+        })
+    }
+
+    /// Удаляет камеру, назначая замену, если была удалена активная камера.
+    pub fn remove_camera(&mut self, id: &str) -> Result<(), String> {
+        self.edit(None, |document| {
+            let active = find_object(document, id)?
+                .camera
+                .as_ref()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?
+                .active;
+            find_object_mut(document, id)?.camera = None;
+            if active
+                && let Some(replacement) = document
+                    .objects
+                    .iter_mut()
+                    .find(|object| object.camera.is_some())
+            {
+                replacement.camera.as_mut().unwrap().active = true;
+            }
+            Ok(())
+        })
+    }
+
+    /// Назначает активную камеру; снятие единственного active оставляет одну камеру implicit.
+    pub fn set_camera_active(&mut self, id: &str, active: bool) -> Result<(), String> {
+        let mut cameras = self
+            .view()
+            .objects
+            .iter()
+            .filter_map(|object| {
+                object
+                    .camera
+                    .clone()
+                    .map(|camera| (object.id.clone(), camera))
+            })
+            .collect::<Vec<_>>();
+        let Some(selected_index) = cameras.iter().position(|(camera_id, _)| camera_id == id) else {
+            return Err(format!("объект {id:?} не имеет камеры"));
+        };
+        if active {
+            for (camera_id, camera) in &mut cameras {
+                camera.active = camera_id == id;
+            }
+        } else {
+            cameras[selected_index].1.active = false;
+            if cameras.len() > 1
+                && !cameras.iter().any(|(_, camera)| camera.active)
+                && let Some((_, (_, replacement))) = cameras
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(index, _)| *index != selected_index)
+            {
+                replacement.active = true;
+            }
+        }
+        let updates = cameras
+            .into_iter()
+            .map(|(camera_id, camera)| {
+                let origin = self.origin(&camera_id).cloned();
+                (camera_id, origin, camera)
+            })
+            .collect::<Vec<_>>();
+        self.edit(None, |document| {
+            for (camera_id, origin, camera) in updates {
+                if let Some(origin) = origin {
+                    if let Some(settings) = &camera.settings {
+                        ensure_asset(document, settings);
+                    }
+                    let instance = document
+                        .instances
+                        .iter_mut()
+                        .find(|instance| instance.id == origin.instance)
+                        .ok_or_else(|| format!("экземпляр {:?} не найден", origin.instance))?;
+                    if let Some(change) = instance
+                        .overrides
+                        .iter_mut()
+                        .find(|change| change.target == origin.target)
+                    {
+                        change.camera = Some(camera);
+                    } else {
+                        instance.overrides.push(PrefabOverride {
+                            target: origin.target,
+                            camera: Some(camera),
+                            ..PrefabOverride::default()
+                        });
+                    }
+                } else {
+                    find_object_mut(document, &camera_id)?.camera = Some(camera);
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Меняет идентификатор объекта или экземпляра и все ссылки на него, в том числе на
@@ -466,8 +950,8 @@ impl EditorScene {
             }
             Ok(())
         })?;
-        if let Some(selection) = self.selection.take() {
-            self.selection = Some(rename_reference(&renamed, selection));
+        for selected in &mut self.selection {
+            *selected = rename_reference(&renamed, std::mem::take(selected));
         }
         Ok(())
     }
@@ -519,7 +1003,6 @@ impl EditorScene {
             Ok(())
         })
     }
-
     /// Назначает модель и текстуру объекта; их пути добавляются в список ресурсов сцены.
     pub fn set_mesh(
         &mut self,
@@ -558,6 +1041,73 @@ impl EditorScene {
         })
     }
 
+    /// Назначает настройки камеры и добавляет их путь в список ресурсов сцены.
+    pub fn set_camera_settings(
+        &mut self,
+        id: &str,
+        settings: Option<VirtualPath>,
+    ) -> Result<(), String> {
+        if let Some(path) = &settings
+            && !path
+                .as_str()
+                .to_ascii_lowercase()
+                .ends_with(".camerasettings")
+        {
+            return Err(format!("{}: ожидается ресурс .camerasettings", path));
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                let camera = object
+                    .camera
+                    .as_mut()
+                    .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+                camera.settings = settings;
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            if let Some(path) = &settings {
+                ensure_asset(document, path);
+            }
+            let camera = find_object_mut(document, id)?
+                .camera
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+            camera.settings = settings;
+            Ok(())
+        })
+    }
+
+    /// Заменяет scene material override; текстуры добавляются в список ресурсов сцены.
+    /// Override без заданных полей удаляется.
+    pub fn set_material(
+        &mut self,
+        id: &str,
+        material: Option<MaterialOverride>,
+        coalesce: Option<&str>,
+    ) -> Result<(), String> {
+        let material = material.filter(|material| !is_empty_material(material));
+        self.edit(coalesce, |document| {
+            if let Some(material) = &material {
+                for texture in [
+                    &material.metallic_roughness_texture,
+                    &material.normal_texture,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    ensure_asset(document, texture);
+                }
+            }
+            find_object_mut(document, id)?
+                .mesh_renderer
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?}: нет Mesh Renderer"))?
+                .material = material;
+            Ok(())
+        })
+    }
+
     /// Назначает уровни LOD и добавляет их ресурсы в список сцены.
     pub fn set_lod_group(&mut self, id: &str, group: Option<LodGroup>) -> Result<(), String> {
         self.edit(None, |document| {
@@ -573,6 +1123,22 @@ impl EditorScene {
             }
             find_object_mut(document, id)?.lod_group = group;
             Ok(())
+        })
+    }
+
+    /// Задаёт значение компонента целиком; его ресурсы добавляются в список сцены.
+    pub fn set_component(&mut self, id: &str, component: Component) -> Result<(), String> {
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                component.apply(object);
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            let object = find_object_mut(document, id)?;
+            component.apply(object);
+            let object = object.clone();
+            register_object_assets(document, &object)
         })
     }
 
@@ -700,7 +1266,82 @@ pub fn default_light() -> DirectionalLightComponent {
     }
 }
 
-pub(crate) fn write_atomic(file: &Path, contents: &[u8]) -> Result<(), String> {
+/// Ключ JSON, по которому редактор узнаёт свои объекты в буфере обмена ОС.
+const CLIPBOARD_KEY: &str = "rve_editor_objects";
+
+/// Текст буфера обмена с объектами, например из `EditorScene::subtrees`.
+pub fn objects_to_clipboard(objects: &[SceneObject]) -> Result<String, String> {
+    serde_json::to_string_pretty(&serde_json::json!({ CLIPBOARD_KEY: objects }))
+        .map_err(|error| error.to_string())
+}
+
+/// Объекты из буфера обмена; `None` — в буфере не объекты редактора.
+pub fn objects_from_clipboard(text: &str) -> Option<Result<Vec<SceneObject>, String>> {
+    let mut value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let objects = value.get_mut(CLIPBOARD_KEY)?.take();
+    Some(
+        serde_json::from_value(objects)
+            .map_err(|error| format!("объекты в буфере обмена повреждены: {error}")),
+    )
+}
+
+/// Камера нового объекта или компонента.
+pub fn default_camera() -> CameraComponent {
+    CameraComponent::default()
+}
+
+/// Добавляет в список ресурсов сцены все пути, на которые ссылаются компоненты объекта.
+fn register_object_assets(
+    document: &mut SceneDocument,
+    object: &SceneObject,
+) -> Result<(), String> {
+    if let Some(mesh) = &object.mesh_renderer {
+        ensure_asset(document, &mesh.model);
+        let material = mesh.material.as_ref();
+        for path in [
+            mesh.texture.as_ref(),
+            material.and_then(|material| material.metallic_roughness_texture.as_ref()),
+            material.and_then(|material| material.normal_texture.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure_asset(document, path);
+        }
+    }
+    if let Some(group) = &object.lod_group {
+        for level in &group.levels {
+            let model = parse_lod_path(&object.id, &level.model, "lod_group.levels.model")?;
+            ensure_asset(document, &model);
+            if let Some(texture) = &level.texture {
+                let texture = parse_lod_path(&object.id, texture, "lod_group.levels.texture")?;
+                ensure_asset(document, &texture);
+            }
+        }
+    }
+    for script in &object.lite_scripts {
+        ensure_asset(document, &script.path);
+    }
+    if let Some(settings) = object
+        .camera
+        .as_ref()
+        .and_then(|camera| camera.settings.as_ref())
+    {
+        ensure_asset(document, settings);
+    }
+    Ok(())
+}
+
+fn is_empty_material(material: &MaterialOverride) -> bool {
+    material.base_color.is_none()
+        && material.metallic.is_none()
+        && material.roughness.is_none()
+        && material.metallic_roughness_texture.is_none()
+        && material.normal_texture.is_none()
+        && material.normal_scale.is_none()
+}
+
+pub fn write_atomic(file: &Path, contents: &[u8]) -> Result<(), String> {
     let describe = |error: std::io::Error| format!("{}: {error}", file.display());
     let name = file
         .file_name()
@@ -722,6 +1363,14 @@ fn find_object_mut<'a>(
     document
         .objects
         .iter_mut()
+        .find(|object| object.id == id)
+        .ok_or_else(|| format!("объект {id:?} не найден"))
+}
+
+fn find_object<'a>(document: &'a SceneDocument, id: &str) -> Result<&'a SceneObject, String> {
+    document
+        .objects
+        .iter()
         .find(|object| object.id == id)
         .ok_or_else(|| format!("объект {id:?} не найден"))
 }
@@ -931,7 +1580,95 @@ mod tests {
         for id in [created, copy] {
             assert!(scene.object(&id).unwrap().camera.is_some());
         }
+        assert_eq!(
+            scene
+                .document()
+                .objects
+                .iter()
+                .filter(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+                .count(),
+            1
+        );
+        scene.document().validate().unwrap();
         assert!(scene.duplicate_object("sun").is_err());
+    }
+
+    #[test]
+    fn removing_the_active_camera_selects_a_remaining_camera() {
+        let mut scene = scene();
+        let second = scene.create_object(&NewObject::Camera, None).unwrap();
+        scene.remove_camera("camera").unwrap();
+        assert!(
+            scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        scene.document().validate().unwrap();
+        assert!(scene.remove_camera(&second).is_err());
+    }
+
+    #[test]
+    fn camera_activation_switches_atomically_and_one_camera_can_be_implicit() {
+        let mut editor_scene = scene();
+        let second = editor_scene
+            .create_object(&NewObject::Camera, None)
+            .unwrap();
+        editor_scene.set_camera_active(&second, true).unwrap();
+        assert!(
+            !editor_scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        assert!(
+            editor_scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        editor_scene.set_camera_active(&second, false).unwrap();
+        assert!(
+            editor_scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        assert!(
+            !editor_scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        editor_scene.document().validate().unwrap();
+
+        let mut single = scene();
+        single.set_camera_active("camera", false).unwrap();
+        assert!(
+            !single
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        single.document().validate().unwrap();
     }
 
     #[test]
@@ -970,12 +1707,30 @@ mod tests {
     #[test]
     fn component_edit_with_invalid_values_is_rolled_back() {
         let mut scene = scene();
+        let second = scene.create_object(&NewObject::Camera, None).unwrap();
         let result = scene.edit_object("camera", None, |object| {
-            object.camera.as_mut().unwrap().near = -1.0;
+            object.camera.as_mut().unwrap().active = false;
             Ok(())
         });
         assert!(result.is_err());
-        assert_eq!(scene.object("camera").unwrap().camera.unwrap().near, 0.1);
+        assert!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        assert!(
+            !scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
     }
 
     #[test]
@@ -989,6 +1744,37 @@ mod tests {
         assert_eq!(scene.document().assets.len(), 3);
         assert!(scene.set_mesh(&id, path("/t.png"), None).is_err());
         assert!(scene.add_lite_script(&id, path("/m.fbx")).is_err());
+    }
+
+    #[test]
+    fn assigning_camera_settings_registers_a_valid_asset_path() {
+        let mut scene = scene();
+        let settings = path("/cameras/main.camerasettings");
+        scene
+            .set_camera_settings("camera", Some(settings.clone()))
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .settings,
+            Some(settings.clone())
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == settings)
+        );
+        assert!(
+            scene
+                .set_camera_settings("camera", Some(path("/cameras/main.toml")))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1146,6 +1932,135 @@ mod tests {
         assert_eq!(material.normal_scale, Some(0.5));
     }
 
+    fn material(roughness: Option<f32>) -> MaterialOverride {
+        MaterialOverride {
+            base_color: None,
+            metallic: None,
+            roughness,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: None,
+        }
+    }
+
+    fn mesh_material(scene: &EditorScene, id: &str) -> Option<MaterialOverride> {
+        scene.object(id)?.mesh_renderer.as_ref()?.material.clone()
+    }
+
+    #[test]
+    fn material_override_registers_textures_and_empty_override_is_removed() {
+        let mut scene = scene();
+        let id = scene
+            .create_object(&NewObject::Mesh(path("/m.fbx"), [0.0; 3]), None)
+            .unwrap();
+        let mut textured = material(Some(0.3));
+        textured.normal_texture = Some(path("/textures/n.png"));
+        scene.set_material(&id, Some(textured), None).unwrap();
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path.as_str() == "textures/n.png")
+        );
+        assert_eq!(mesh_material(&scene, &id).unwrap().roughness, Some(0.3));
+        scene.set_material(&id, Some(material(None)), None).unwrap();
+        assert!(mesh_material(&scene, &id).is_none());
+        assert!(scene.undo());
+        assert!(mesh_material(&scene, &id).is_some());
+    }
+
+    #[test]
+    fn invalid_material_values_and_objects_without_mesh_are_rejected() {
+        let mut scene = scene();
+        let id = scene
+            .create_object(&NewObject::Mesh(path("/m.fbx"), [0.0; 3]), None)
+            .unwrap();
+        let error = scene
+            .set_material(&id, Some(material(Some(1.5))), None)
+            .unwrap_err();
+        assert!(error.contains("material.roughness"), "{error}");
+        assert!(mesh_material(&scene, &id).is_none());
+        let mut wrong = material(None);
+        wrong.normal_texture = Some(path("/n.jpg"));
+        assert!(scene.set_material(&id, Some(wrong), None).is_err());
+        assert!(
+            scene
+                .set_material("camera", Some(material(Some(0.5))), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pasted_components_register_assets_and_reset_keeps_the_mesh_model() {
+        let mut scene = scene();
+        let source = scene
+            .create_object(&NewObject::Mesh(path("/a.fbx"), [0.0; 3]), None)
+            .unwrap();
+        scene
+            .set_mesh(&source, path("/a.fbx"), Some(path("/t.png")))
+            .unwrap();
+        let copied =
+            Component::read(scene.object(&source).unwrap(), ComponentKind::MeshRenderer).unwrap();
+        // Вставка в другую сцену, где этих ресурсов ещё нет.
+        let mut target = EditorScene::new_untitled().unwrap();
+        let empty = target.create_object(&NewObject::Empty, None).unwrap();
+        target.set_component(&empty, copied).unwrap();
+        let assets = target
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(assets, ["a.fbx", "t.png"]);
+
+        let object = target.object(&empty).unwrap();
+        assert!(Component::reset(object, ComponentKind::LodGroup).is_none());
+        let reset = Component::reset(object, ComponentKind::MeshRenderer).unwrap();
+        target.set_component(&empty, reset).unwrap();
+        let mesh = target
+            .object(&empty)
+            .unwrap()
+            .mesh_renderer
+            .clone()
+            .unwrap();
+        assert_eq!(mesh.model.as_str(), "a.fbx");
+        assert!(mesh.texture.is_none());
+    }
+
+    #[test]
+    fn pasting_an_invalid_component_is_rolled_back() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let light = Component::DirectionalLight(default_light());
+        assert!(scene.set_component(&id, light).is_err());
+        assert!(scene.object(&id).unwrap().directional_light.is_none());
+        let transform = Component::Transform(moved(5.0));
+        scene.set_component(&id, transform).unwrap();
+        assert_eq!(position(&scene, &id)[0], 5.0);
+    }
+
+    #[test]
+    fn ending_a_continuous_edit_by_key_leaves_other_keys_running() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene
+            .set_transforms(&[(id.clone(), moved(1.0))], Some("drag"))
+            .unwrap();
+        scene.end_continuous_edit_for("picker");
+        scene
+            .set_transforms(&[(id.clone(), moved(2.0))], Some("drag"))
+            .unwrap();
+        scene.end_continuous_edit_for("drag");
+        scene
+            .set_transforms(&[(id.clone(), moved(3.0))], Some("drag"))
+            .unwrap();
+        assert!(scene.undo());
+        assert_eq!(position(&scene, &id)[0], 2.0);
+        assert!(scene.undo());
+        assert_eq!(position(&scene, &id)[0], 0.0);
+    }
+
     #[test]
     fn undo_and_redo_restore_documents_and_new_edit_clears_redo() {
         let mut scene = scene();
@@ -1166,11 +2081,15 @@ mod tests {
         let mut scene = scene();
         let id = scene.create_object(&NewObject::Empty, None).unwrap();
         for x in [1.0, 2.0, 3.0] {
-            scene.set_transform(&id, moved(x), Some("drag")).unwrap();
+            scene
+                .set_transforms(&[(id.clone(), moved(x))], Some("drag"))
+                .unwrap();
         }
         assert_eq!(position(&scene, &id)[0], 3.0);
         scene.end_continuous_edit();
-        scene.set_transform(&id, moved(4.0), Some("drag")).unwrap();
+        scene
+            .set_transforms(&[(id.clone(), moved(4.0))], Some("drag"))
+            .unwrap();
         assert!(scene.undo());
         assert_eq!(position(&scene, &id)[0], 3.0);
         assert!(scene.undo());
@@ -1182,7 +2101,9 @@ mod tests {
         let mut scene = scene();
         let id = scene.create_object(&NewObject::Empty, None).unwrap();
         for step in 0..(MAX_UNDO_DEPTH + 10) {
-            scene.set_transform(&id, moved(step as f32), None).unwrap();
+            scene
+                .set_transforms(&[(id.clone(), moved(step as f32))], None)
+                .unwrap();
         }
         let mut undone = 0;
         while scene.undo() {
@@ -1202,6 +2123,197 @@ mod tests {
         assert_eq!(second.len(), MAX_ID_LENGTH);
         assert_ne!(first, second);
         assert_eq!(unique_id(&document, "", &HashSet::new()), "object");
+    }
+
+    #[test]
+    fn selection_toggles_adds_and_keeps_the_last_object_active() {
+        let mut scene = scene();
+        scene.select(Some("camera"));
+        scene.add_to_selection("sun");
+        assert_eq!(scene.selected_ids(), ["camera", "sun"]);
+        assert_eq!(scene.selection(), Some("sun"));
+        // Повторное добавление делает объект активным, а не дублирует его.
+        scene.add_to_selection("camera");
+        assert_eq!(scene.selected_ids(), ["sun", "camera"]);
+        scene.toggle_selection("camera");
+        assert_eq!(scene.selected_ids(), ["sun"]);
+        scene.toggle_selection("missing");
+        assert_eq!(scene.selected_ids(), ["sun"]);
+        scene.select(None);
+        assert!(scene.selected_ids().is_empty());
+    }
+
+    #[test]
+    fn group_delete_skips_descendants_of_selected_parents_and_is_one_undo_step() {
+        let mut scene = scene();
+        let parent = scene.create_object(&NewObject::Empty, None).unwrap();
+        let child = scene
+            .create_object(&NewObject::Empty, Some(&parent))
+            .unwrap();
+        let other = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.select(Some(&child));
+        scene.add_to_selection(&parent);
+        scene.add_to_selection(&other);
+        assert_eq!(scene.selection_roots(), [parent.clone(), other.clone()]);
+        scene.delete_selection().unwrap();
+        assert_eq!(scene.document().objects.len(), 2);
+        assert!(scene.selected_ids().is_empty());
+        assert!(scene.undo());
+        for id in [&parent, &child, &other] {
+            assert!(scene.object(id).is_some());
+        }
+    }
+
+    #[test]
+    fn failed_group_delete_changes_nothing() {
+        let mut scene = scene();
+        let empty = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.add_to_selection("camera");
+        assert!(scene.delete_selection().is_err());
+        assert!(scene.object(&empty).is_some());
+        assert_eq!(scene.selected_ids(), [empty, "camera".to_owned()]);
+    }
+
+    #[test]
+    fn group_duplicate_copies_each_subtree_once_and_selects_the_copies() {
+        let mut scene = scene();
+        let parent = scene.create_object(&NewObject::Empty, None).unwrap();
+        let child = scene
+            .create_object(&NewObject::Empty, Some(&parent))
+            .unwrap();
+        scene.select(Some(&parent));
+        scene.add_to_selection(&child);
+        scene.add_to_selection("camera");
+        let copies = scene.duplicate_selection().unwrap();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(scene.selected_ids(), copies.as_slice());
+        // Родитель, его ребёнок и камера — по одной копии.
+        assert_eq!(scene.document().objects.len(), 4 + 3);
+        // Копии корней идут в порядке документа: камера раньше нового родителя.
+        let parent_copy = copies
+            .iter()
+            .find(|id| scene.object(id).unwrap().camera.is_none())
+            .unwrap();
+        let copied_child = scene
+            .document()
+            .objects
+            .iter()
+            .filter(|object| object.parent.as_ref() == Some(parent_copy))
+            .count();
+        assert_eq!(copied_child, 1);
+        assert!(scene.undo());
+        assert_eq!(scene.document().objects.len(), 4);
+    }
+
+    #[test]
+    fn selection_follows_id_changes_and_undo() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.add_to_selection("camera");
+        scene.change_id(&id, "renamed").unwrap();
+        assert_eq!(scene.selected_ids(), ["renamed", "camera"]);
+        // Отмена переименования убирает из выделения id, которого больше нет.
+        assert!(scene.undo());
+        assert_eq!(scene.selected_ids(), ["camera"]);
+    }
+
+    #[test]
+    fn group_transform_edit_is_atomic() {
+        let mut scene = scene();
+        let a = scene.create_object(&NewObject::Empty, None).unwrap();
+        let invalid = SceneTransform {
+            position: [f32::NAN, 0.0, 0.0],
+            ..SceneTransform::default()
+        };
+        let result = scene.set_transforms(
+            &[(a.clone(), moved(1.0)), ("camera".to_owned(), invalid)],
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(position(&scene, &a)[0], 0.0);
+        scene
+            .set_transforms(
+                &[(a.clone(), moved(2.0)), ("sun".to_owned(), moved(3.0))],
+                None,
+            )
+            .unwrap();
+        assert_eq!(position(&scene, &a)[0], 2.0);
+        assert_eq!(position(&scene, "sun")[0], 3.0);
+        assert!(scene.undo());
+        assert_eq!(position(&scene, &a)[0], 0.0);
+    }
+
+    #[test]
+    fn clipboard_objects_paste_into_another_scene_with_new_ids_and_assets() {
+        let mut source = scene();
+        let parent = source
+            .create_object(
+                &NewObject::Mesh(path("/models/a.fbx"), [1.0, 0.0, 0.0]),
+                None,
+            )
+            .unwrap();
+        source
+            .create_object(&NewObject::Empty, Some(&parent))
+            .unwrap();
+        source
+            .add_lite_script(&parent, path("/scripts/spin.lua"))
+            .unwrap();
+        let text =
+            objects_to_clipboard(&source.subtrees(std::slice::from_ref(&parent)).unwrap()).unwrap();
+
+        let mut target = scene();
+        let objects = objects_from_clipboard(&text).unwrap().unwrap();
+        let pasted = target.insert_copies(objects.clone()).unwrap();
+        assert_eq!(pasted, std::slice::from_ref(&parent));
+        let assets = target
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(assets, ["models/a.fbx", "scripts/spin.lua"]);
+        // Повторная вставка в ту же сцену получает свободные id и своего ребёнка.
+        let again = target.insert_copies(objects).unwrap();
+        assert_ne!(again, pasted);
+        assert_eq!(target.selected_ids(), again.as_slice());
+        let children = target
+            .document()
+            .objects
+            .iter()
+            .filter(|object| object.parent.as_ref() == Some(&again[0]))
+            .count();
+        assert_eq!(children, 1);
+        assert_eq!(target.document().objects.len(), 2 + 4);
+    }
+
+    #[test]
+    fn pasted_roots_keep_an_existing_parent_and_invalid_pastes_are_rejected() {
+        let mut scene = scene();
+        let parent = scene.create_object(&NewObject::Empty, None).unwrap();
+        let child = scene
+            .create_object(&NewObject::Empty, Some(&parent))
+            .unwrap();
+        let copies = scene
+            .insert_copies(scene.subtrees(&[child]).unwrap())
+            .unwrap();
+        assert_eq!(
+            scene.object(&copies[0]).unwrap().parent.as_ref(),
+            Some(&parent)
+        );
+
+        let light = scene.subtrees(&["sun".to_owned()]).unwrap();
+        let before = scene.document().objects.len();
+        let error = scene.insert_copies(light).unwrap_err();
+        assert!(error.contains("directional_light"), "{error}");
+        assert_eq!(scene.document().objects.len(), before);
+
+        assert!(objects_from_clipboard("plain text").is_none());
+        assert!(objects_from_clipboard("{\"other\": 1}").is_none());
+        assert!(
+            objects_from_clipboard("{\"rve_editor_objects\": 5}")
+                .unwrap()
+                .is_err()
+        );
     }
 
     struct TempDir(std::path::PathBuf);

@@ -5,7 +5,10 @@ use crate::transaction::{
 use crate::types::{
     ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
-use engine_scene::{ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue};
+use engine_scene::{
+    AntiAliasing, CameraSettings, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue,
+    Tonemapper,
+};
 use mlua::chunk::ChunkMode;
 use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, StdLib,
@@ -130,6 +133,10 @@ pub(crate) fn create_lua(
         )?,
     )?;
     rve.set("find", find_function(&lua, active_call.clone())?)?;
+    rve.set(
+        "active_camera",
+        active_camera_function(&lua, active_call.clone())?,
+    )?;
     rve.set("send", send_function(&lua, active_call.clone())?)?;
     rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
     rve.set("input", input_table(&lua, active_call)?)?;
@@ -489,6 +496,30 @@ fn find_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
     })
 }
 
+fn active_camera_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |lua, _arguments: MultiValue| {
+        let active = with_active_call(&active_call, |transaction| {
+            Ok(transaction.active_camera().and_then(|handle| {
+                Some((
+                    handle,
+                    transaction.object_id(handle)?.to_owned(),
+                    transaction.object_name(handle)?.to_owned(),
+                ))
+            }))
+        })?;
+        let Some((handle, id, name)) = active else {
+            return Ok(Option::<Table>::None);
+        };
+        Ok(Some(object_table(
+            lua,
+            handle,
+            id,
+            name,
+            active_call.clone(),
+        )?))
+    })
+}
+
 fn object_table(
     lua: &Lua,
     handle: ObjectHandle,
@@ -549,6 +580,90 @@ fn object_table(
         })?,
     )?;
 
+    let camera_settings_active = active_call.clone();
+    object.set(
+        "get_camera_settings",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            let settings = with_active_call(&camera_settings_active, |transaction| {
+                Ok(transaction.camera_settings(handle))
+            })?;
+            settings
+                .map(|settings| camera_settings_table(lua, settings))
+                .transpose()
+        })?,
+    )?;
+
+    let set_camera_settings_active = active_call.clone();
+    object.set(
+        "set_camera_settings",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let mut arguments = arguments.into_iter();
+            let settings_table = match arguments.next() {
+                Some(Value::Table(_)) => arguments.next(),
+                value => value,
+            };
+            let Some(Value::Table(settings_table)) = settings_table else {
+                return Err(LuaError::runtime(
+                    "object.set_camera_settings expects a partial settings table",
+                ));
+            };
+            if arguments.next().is_some() {
+                return Err(LuaError::runtime(
+                    "object.set_camera_settings expects one settings table",
+                ));
+            }
+            let (writable, mut settings) =
+                with_active_call(&set_camera_settings_active, |transaction| {
+                    Ok((transaction.writable(), transaction.camera_settings(handle)))
+                })?;
+            let Some(mut settings) = settings.take() else {
+                return Err(LuaError::runtime(
+                    "object.set_camera_settings target object has no camera",
+                ));
+            };
+            if !writable {
+                return Err(LuaError::runtime(
+                    "object.set_camera_settings is unavailable during script creation",
+                ));
+            }
+            apply_camera_settings_table(&settings_table, &mut settings)?;
+            let accepted = with_active_call(&set_camera_settings_active, |transaction| {
+                Ok(transaction.set_camera_settings(handle, settings))
+            })?;
+            if accepted {
+                Ok(())
+            } else {
+                Err(LuaError::runtime(
+                    "object.set_camera_settings target object no longer exists",
+                ))
+            }
+        })?,
+    )?;
+
+    let activate_camera_active = active_call.clone();
+    object.set(
+        "activate_camera",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            let (writable, accepted) = with_active_call(&activate_camera_active, |transaction| {
+                Ok((
+                    transaction.writable(),
+                    transaction.set_active_camera(handle),
+                ))
+            })?;
+            if accepted {
+                Ok(())
+            } else if writable {
+                Err(LuaError::runtime(
+                    "object.activate_camera target object has no camera",
+                ))
+            } else {
+                Err(LuaError::runtime(
+                    "object.activate_camera is unavailable during script creation",
+                ))
+            }
+        })?,
+    )?;
+
     let matrix_active = active_call;
     object.set(
         "world_matrix",
@@ -560,6 +675,176 @@ fn object_table(
         })?,
     )?;
     Ok(object)
+}
+
+fn camera_settings_table(lua: &Lua, settings: CameraSettings) -> mlua::Result<Table> {
+    let result = lua.create_table()?;
+    let projection = lua.create_table()?;
+    projection.set("fov_deg", settings.projection.fov_deg as f64)?;
+    projection.set("near", settings.projection.near as f64)?;
+    projection.set("far", settings.projection.far as f64)?;
+    result.set("projection", projection)?;
+
+    let render = lua.create_table()?;
+    render.set("render_scale", settings.render.render_scale as f64)?;
+    let clear_color = lua.create_table_with_capacity(3, 0)?;
+    for (index, value) in settings.render.clear_color.into_iter().enumerate() {
+        clear_color.raw_set(index + 1, value as f64)?;
+    }
+    render.set("clear_color", clear_color)?;
+    render.set(
+        "anti_aliasing",
+        match settings.render.anti_aliasing {
+            AntiAliasing::Fxaa => "fxaa",
+            AntiAliasing::None => "none",
+        },
+    )?;
+    result.set("render", render)?;
+
+    let color = lua.create_table()?;
+    color.set("exposure_ev", settings.color.exposure_ev as f64)?;
+    color.set(
+        "tonemapper",
+        match settings.color.tonemapper {
+            Tonemapper::Aces => "aces",
+            Tonemapper::Neutral => "neutral",
+            Tonemapper::None => "none",
+        },
+    )?;
+    result.set("color", color)?;
+    Ok(result)
+}
+
+fn apply_camera_settings_table(table: &Table, settings: &mut CameraSettings) -> mlua::Result<()> {
+    ensure_known_fields(table, &["projection", "render", "color"], "camera settings")?;
+    if let Value::Table(projection) = table.get::<Value>("projection")? {
+        ensure_known_fields(&projection, &["fov_deg", "near", "far"], "projection")?;
+        set_optional_number(&projection, "fov_deg", &mut settings.projection.fov_deg)?;
+        set_optional_number(&projection, "near", &mut settings.projection.near)?;
+        set_optional_number(&projection, "far", &mut settings.projection.far)?;
+    } else if !matches!(table.get::<Value>("projection")?, Value::Nil) {
+        return Err(LuaError::runtime(
+            "camera settings.projection must be a table",
+        ));
+    }
+    if let Value::Table(render) = table.get::<Value>("render")? {
+        ensure_known_fields(
+            &render,
+            &["render_scale", "clear_color", "anti_aliasing"],
+            "render",
+        )?;
+        set_optional_number(&render, "render_scale", &mut settings.render.render_scale)?;
+        if let Value::Table(clear_color) = render.get::<Value>("clear_color")? {
+            settings.render.clear_color = read_number_array3(&clear_color, "render.clear_color")?;
+        } else if !matches!(render.get::<Value>("clear_color")?, Value::Nil) {
+            return Err(LuaError::runtime(
+                "render.clear_color must be an array of three numbers",
+            ));
+        }
+        if let Value::String(value) = render.get::<Value>("anti_aliasing")? {
+            settings.render.anti_aliasing = match value.to_str()?.as_ref() {
+                "fxaa" => AntiAliasing::Fxaa,
+                "none" => AntiAliasing::None,
+                _ => {
+                    return Err(LuaError::runtime(
+                        "render.anti_aliasing must be \"fxaa\" or \"none\"",
+                    ));
+                }
+            };
+        } else if !matches!(render.get::<Value>("anti_aliasing")?, Value::Nil) {
+            return Err(LuaError::runtime("render.anti_aliasing must be a string"));
+        }
+    } else if !matches!(table.get::<Value>("render")?, Value::Nil) {
+        return Err(LuaError::runtime("camera settings.render must be a table"));
+    }
+    if let Value::Table(color) = table.get::<Value>("color")? {
+        ensure_known_fields(&color, &["exposure_ev", "tonemapper"], "color")?;
+        set_optional_number(&color, "exposure_ev", &mut settings.color.exposure_ev)?;
+        if let Value::String(value) = color.get::<Value>("tonemapper")? {
+            settings.color.tonemapper = match value.to_str()?.as_ref() {
+                "aces" => Tonemapper::Aces,
+                "neutral" => Tonemapper::Neutral,
+                "none" => Tonemapper::None,
+                _ => {
+                    return Err(LuaError::runtime(
+                        "color.tonemapper must be \"aces\", \"neutral\", or \"none\"",
+                    ));
+                }
+            };
+        } else if !matches!(color.get::<Value>("tonemapper")?, Value::Nil) {
+            return Err(LuaError::runtime("color.tonemapper must be a string"));
+        }
+    } else if !matches!(table.get::<Value>("color")?, Value::Nil) {
+        return Err(LuaError::runtime("camera settings.color must be a table"));
+    }
+    Ok(())
+}
+
+fn ensure_known_fields(table: &Table, allowed: &[&str], context: &str) -> mlua::Result<()> {
+    for pair in table.clone().pairs::<String, Value>() {
+        let (key, _) =
+            pair.map_err(|_| LuaError::runtime(format!("{context} keys must be strings")))?;
+        if !allowed.contains(&key.as_str()) {
+            return Err(LuaError::runtime(format!(
+                "unknown {context} field {key:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn set_optional_number(table: &Table, key: &str, destination: &mut f32) -> mlua::Result<()> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(()),
+        Value::Integer(value) => {
+            *destination = value as f32;
+            Ok(())
+        }
+        Value::Number(value) => {
+            *destination = value as f32;
+            Ok(())
+        }
+        _ => Err(LuaError::runtime(format!("{key} must be a number"))),
+    }
+}
+
+fn read_number_array3(table: &Table, field: &str) -> mlua::Result<[f32; 3]> {
+    let mut values = [None; 3];
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let Value::Integer(index) = key else {
+            return Err(LuaError::runtime(format!(
+                "{field} must use indices 1, 2, and 3"
+            )));
+        };
+        if !(1..=3).contains(&index) {
+            return Err(LuaError::runtime(format!(
+                "{field} must use indices 1, 2, and 3"
+            )));
+        }
+        let index = (index - 1) as usize;
+        if values[index].is_some() {
+            return Err(LuaError::runtime(format!(
+                "{field} contains duplicate indices"
+            )));
+        }
+        let value = match value {
+            Value::Integer(value) => value as f64,
+            Value::Number(value) => value,
+            _ => {
+                return Err(LuaError::runtime(format!(
+                    "{field} entries must be numbers"
+                )));
+            }
+        };
+        values[index] = Some(value as f32);
+    }
+    let [Some(x), Some(y), Some(z)] = values else {
+        return Err(LuaError::runtime(format!(
+            "{field} must have exactly three numbers"
+        )));
+    };
+    Ok([x, y, z])
 }
 
 fn matrix_table(lua: &Lua, matrix: [f32; 16]) -> mlua::Result<Table> {

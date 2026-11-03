@@ -5,11 +5,16 @@ use crate::transaction::{
     ScriptTransaction,
 };
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
-use engine_scene::ParamValue;
+use engine_scene::{
+    AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, ParamValue,
+    ProjectionSettings, Tonemapper,
+};
 use rve_sdk::abi::{
-    RVE_LOG_ERROR, RVE_LOG_INFO, RVE_LOG_WARN, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
-    RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveHost, RveParamEntry, RveParams, RveScriptDesc,
-    RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_LOG_ERROR, RVE_LOG_INFO, RVE_LOG_WARN,
+    RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY,
+    RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveCameraSettings,
+    RveHost, RveParamEntry, RveParams, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform,
+    RveValue, RveValueData,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -71,6 +76,10 @@ impl<'a> AbiCallContext<'a> {
             cursor_position: host_cursor_position,
             mouse_delta: host_mouse_delta,
             wheel_delta: host_wheel_delta,
+            get_camera_settings: Some(host_get_camera_settings),
+            set_camera_settings: Some(host_set_camera_settings),
+            active_camera: Some(host_active_camera),
+            set_active_camera: Some(host_set_active_camera),
         }
     }
 
@@ -376,6 +385,114 @@ unsafe extern "C" fn host_world_matrix(ctx: *mut c_void, object: u64, out: *mut 
         unsafe { *out = matrix };
         true
     })
+}
+
+unsafe extern "C" fn host_get_camera_settings(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut RveCameraSettings,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(settings) = context.transaction.camera_settings(handle) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the guest's writable stack slot.
+        unsafe { *out = camera_settings_to_abi(settings) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_set_camera_settings(
+    ctx: *mut c_void,
+    object: u64,
+    settings: *const RveCameraSettings,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if !context.transaction.writable() || settings.is_null() {
+            return false;
+        }
+        // SAFETY: settings was checked non-null and is valid for this callback.
+        let Some(settings) = camera_settings_from_abi(unsafe { *settings }) else {
+            return false;
+        };
+        context
+            .transaction
+            .set_camera_settings_from_abi(object, settings)
+    })
+}
+
+unsafe extern "C" fn host_active_camera(ctx: *mut c_void) -> u64 {
+    guarded(ctx, 0, |context| {
+        context
+            .transaction
+            .active_camera()
+            .and_then(|handle| context.transaction.abi_handle(handle))
+            .unwrap_or(0)
+    })
+}
+
+unsafe extern "C" fn host_set_active_camera(ctx: *mut c_void, object: u64) -> bool {
+    guarded(ctx, false, |context| {
+        context.transaction.set_active_camera_from_abi(object)
+    })
+}
+
+fn camera_settings_to_abi(settings: CameraSettings) -> RveCameraSettings {
+    RveCameraSettings {
+        fov_deg: settings.projection.fov_deg,
+        near: settings.projection.near,
+        far: settings.projection.far,
+        render_scale: settings.render.render_scale,
+        clear_color: settings.render.clear_color,
+        exposure_ev: settings.color.exposure_ev,
+        anti_aliasing: match settings.render.anti_aliasing {
+            AntiAliasing::Fxaa => RVE_ANTI_ALIASING_FXAA,
+            AntiAliasing::None => RVE_ANTI_ALIASING_NONE,
+        },
+        tonemapper: match settings.color.tonemapper {
+            Tonemapper::Aces => RVE_TONEMAPPER_ACES,
+            Tonemapper::Neutral => RVE_TONEMAPPER_NEUTRAL,
+            Tonemapper::None => RVE_TONEMAPPER_NONE,
+        },
+    }
+}
+
+fn camera_settings_from_abi(value: RveCameraSettings) -> Option<CameraSettings> {
+    let anti_aliasing = match value.anti_aliasing {
+        RVE_ANTI_ALIASING_FXAA => AntiAliasing::Fxaa,
+        RVE_ANTI_ALIASING_NONE => AntiAliasing::None,
+        _ => return None,
+    };
+    let tonemapper = match value.tonemapper {
+        RVE_TONEMAPPER_ACES => Tonemapper::Aces,
+        RVE_TONEMAPPER_NEUTRAL => Tonemapper::Neutral,
+        RVE_TONEMAPPER_NONE => Tonemapper::None,
+        _ => return None,
+    };
+    let settings = CameraSettings {
+        projection: ProjectionSettings {
+            fov_deg: value.fov_deg,
+            near: value.near,
+            far: value.far,
+        },
+        render: CameraRenderSettings {
+            render_scale: value.render_scale,
+            clear_color: value.clear_color,
+            anti_aliasing,
+        },
+        color: CameraColorSettings {
+            exposure_ev: value.exposure_ev,
+            tonemapper,
+        },
+    };
+    settings.validate().ok()?;
+    Some(settings)
 }
 
 unsafe extern "C" fn host_send(
@@ -685,6 +802,9 @@ impl OwnedAbiParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ScriptInput;
+    use engine_scene::{SceneDocument, World};
+    use rve_sdk::abi::RveCameraSettings;
 
     #[test]
     fn warning_logs_keep_the_warn_level() {
@@ -727,5 +847,110 @@ mod tests {
         assert_eq!(cursor, [0.0; 2]);
         assert_eq!(mouse_delta, [0.0; 2]);
         assert_eq!(wheel, [0.0; 2]);
+    }
+
+    #[test]
+    fn camera_callbacks_validate_handles_settings_and_creation_writes() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let camera = world.active_camera();
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        transaction.begin(
+            &world,
+            camera,
+            "scene/camera/Probe",
+            true,
+            ScriptInput::default(),
+            (0, 0),
+        );
+        {
+            let mut context =
+                AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+            let host = context.host(ScriptTime::default());
+            let mut actual = RveCameraSettings::default();
+            // SAFETY: the host context and output slots remain live through the calls.
+            unsafe {
+                assert!((host.get_camera_settings.unwrap())(
+                    host.ctx,
+                    1,
+                    &mut actual
+                ));
+                assert_eq!(host.active_camera.unwrap()(host.ctx), 1);
+            }
+            assert_eq!(actual, RveCameraSettings::default());
+
+            let updated = RveCameraSettings {
+                exposure_ev: 2.0,
+                ..RveCameraSettings::default()
+            };
+            // SAFETY: the host context and settings pointer remain live through the call.
+            unsafe {
+                assert!((host.set_camera_settings.unwrap())(host.ctx, 1, &updated));
+                actual = RveCameraSettings::default();
+                assert!((host.get_camera_settings.unwrap())(
+                    host.ctx,
+                    1,
+                    &mut actual
+                ));
+            }
+            assert_eq!(actual.exposure_ev, 2.0);
+
+            let invalid_enum = RveCameraSettings {
+                tonemapper: u32::MAX,
+                ..updated
+            };
+            let invalid_data = RveCameraSettings {
+                exposure_ev: 17.0,
+                ..updated
+            };
+            // SAFETY: pointers are valid for each synchronous callback.
+            unsafe {
+                assert!(!(host.set_camera_settings.unwrap())(
+                    host.ctx,
+                    1,
+                    &invalid_enum
+                ));
+                assert!(!(host.set_camera_settings.unwrap())(
+                    host.ctx,
+                    1,
+                    &invalid_data
+                ));
+                assert!(!(host.set_camera_settings.unwrap())(
+                    host.ctx,
+                    1,
+                    std::ptr::null()
+                ));
+                assert!(!(host.get_camera_settings.unwrap())(
+                    host.ctx,
+                    1,
+                    std::ptr::null_mut()
+                ));
+                assert!(!(host.set_active_camera.unwrap())(host.ctx, 0));
+                assert!(!(host.set_active_camera.unwrap())(host.ctx, 2));
+            }
+            assert!(transaction.writable());
+        }
+
+        transaction.begin(
+            &world,
+            camera,
+            "scene/camera/Probe",
+            false,
+            ScriptInput::default(),
+            (0, 0),
+        );
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
+        let host = context.host(ScriptTime::default());
+        let settings = RveCameraSettings::default();
+        // SAFETY: the host context and settings pointer remain live through the call.
+        unsafe {
+            assert!(!(host.set_camera_settings.unwrap())(host.ctx, 1, &settings));
+            assert!(!(host.set_active_camera.unwrap())(host.ctx, 1));
+        }
     }
 }

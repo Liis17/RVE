@@ -2,22 +2,23 @@
 
 use crate::console::ConsoleLog;
 use crate::project::OpenProject;
+use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
 use engine_render::{
-    DirectionalLight, DrawCommand, Frame, Material, MaterialId, MeshId, RenderError, Renderer,
-    TextureColorSpace, TextureId, Vertex, ViewportId,
+    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, Frame, Material, MaterialId,
+    MeshId, RenderError, Renderer, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
+    Vertex, ViewSettings, ViewportId,
 };
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
 use engine_scene::light::shadow_view_projection;
 use engine_scene::world::ObjectHandle;
-use engine_scene::{LightState, SceneFrame, World};
+use engine_scene::{AntiAliasing, CameraSettings, LightState, SceneFrame, Tonemapper, World};
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const GRID_HALF_CELLS: i32 = 20;
 const GRID_LINE_WIDTH: f32 = 0.02;
-const CLEAR_COLOR: [f32; 4] = [0.025, 0.028, 0.035, 1.0];
 
 struct GpuModel {
     meshes: Vec<(MeshId, Material, MaterialId)>,
@@ -58,13 +59,7 @@ impl SceneRenderer {
         cpu_models: &mut HashMap<String, Arc<Model>>,
     ) -> Result<(), RenderError> {
         for model in self.models.drain().filter_map(|(_, model)| model) {
-            for (mesh, _, material) in model.meshes {
-                renderer.destroy_mesh(mesh)?;
-                renderer.destroy_material(material)?;
-            }
-            for texture in model.textures {
-                renderer.destroy_texture(texture)?;
-            }
+            destroy_model(renderer, model)?;
         }
         for (_, (_, material)) in self.object_materials.drain() {
             renderer.destroy_material(material)?;
@@ -76,15 +71,34 @@ impl SceneRenderer {
         Ok(())
     }
 
-    /// Загружает ресурсы объектов мира, которых ещё нет в кэше.
+    /// Загружает ресурсы объектов мира, которых ещё нет в кэше. Модели разбираются в фоне:
+    /// до готовности объект не рисуется, а готовые модели загружаются в GPU в этом вызове.
     pub fn sync_assets(
         &mut self,
         renderer: &mut Renderer,
         project: &OpenProject,
         world: &World,
         cpu_models: &mut HashMap<String, Arc<Model>>,
+        loader: &mut ModelLoader,
         log: &mut ConsoleLog,
     ) -> Result<(), RenderError> {
+        for (path, loaded) in loader.finished() {
+            let gpu = match loaded {
+                Ok(model) => {
+                    let model = Arc::new(model);
+                    let gpu = upload_model(renderer, &model)?;
+                    cpu_models.insert(path.clone(), model);
+                    Some(gpu)
+                }
+                Err(error) => {
+                    log.error(format!("{path}: {error}"));
+                    None
+                }
+            };
+            if let Some(Some(previous)) = self.models.insert(path, gpu) {
+                destroy_model(renderer, previous)?;
+            }
+        }
         for object in world.objects() {
             let Some(mesh) = &object.mesh_renderer else {
                 continue;
@@ -99,22 +113,18 @@ impl SceneRenderer {
                     continue;
                 };
                 if !self.models.contains_key(model_path) {
-                    let gpu = match cpu_models.get(model_path).cloned() {
-                        Some(model) => Some(upload_model(renderer, &model)?),
-                        None => match project.assets.load_model(model_path) {
-                            Ok(model) => {
-                                let model = Arc::new(model);
-                                let gpu = upload_model(renderer, &model)?;
-                                cpu_models.insert(model_path.to_owned(), model);
-                                Some(gpu)
+                    match cpu_models.get(model_path).cloned() {
+                        Some(model) => {
+                            let gpu = upload_model(renderer, &model)?;
+                            self.models.insert(model_path.to_owned(), Some(gpu));
+                        }
+                        None => {
+                            if !loader.request(model_path) {
+                                log.error(format!("{model_path}: фоновая загрузка недоступна"));
+                                self.models.insert(model_path.to_owned(), None);
                             }
-                            Err(error) => {
-                                log.error(format!("{model_path}: {error}"));
-                                None
-                            }
-                        },
-                    };
-                    self.models.insert(model_path.to_owned(), gpu);
+                        }
+                    }
                 }
             }
             for level in 0..levels {
@@ -244,13 +254,19 @@ impl SceneRenderer {
         &self,
         view_projection: Mat4,
         camera_position: Vec3,
+        settings: CameraSettings,
         light: &LightState,
         scene_has_light: bool,
         with_grid: bool,
     ) -> Frame<'_> {
         let (light, shadow) = frame_light(light, scene_has_light);
         Frame {
-            clear_color: CLEAR_COLOR,
+            clear_color: [
+                settings.render.clear_color[0],
+                settings.render.clear_color[1],
+                settings.render.clear_color[2],
+                1.0,
+            ],
             view_projection: view_projection.to_cols_array_2d(),
             shadow_view_projection: shadow,
             camera_position: camera_position.to_array(),
@@ -261,6 +277,19 @@ impl SceneRenderer {
                 &self.game_draws
             },
             overlay: &[],
+            view: ViewSettings {
+                render_scale: settings.render.render_scale,
+                exposure_ev: settings.color.exposure_ev,
+                tonemapper: match settings.color.tonemapper {
+                    Tonemapper::Aces => RenderTonemapper::Aces,
+                    Tonemapper::Neutral => RenderTonemapper::Neutral,
+                    Tonemapper::None => RenderTonemapper::None,
+                },
+                anti_aliasing: match settings.render.anti_aliasing {
+                    AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
+                    AntiAliasing::None => RenderAntiAliasing::None,
+                },
+            },
         }
     }
 }
@@ -397,6 +426,17 @@ fn append_world_draws(
                 casts_shadow: true,
             });
         }
+    }
+    Ok(())
+}
+
+fn destroy_model(renderer: &mut Renderer, model: GpuModel) -> Result<(), RenderError> {
+    for (mesh, _, material) in model.meshes {
+        renderer.destroy_mesh(mesh)?;
+        renderer.destroy_material(material)?;
+    }
+    for texture in model.textures {
+        renderer.destroy_texture(texture)?;
     }
     Ok(())
 }
@@ -619,9 +659,6 @@ mod tests {
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 "#,
         )
         .unwrap();

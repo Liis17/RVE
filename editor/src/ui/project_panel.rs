@@ -27,6 +27,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
             state.action(Action::ImportDialog);
         }
         ui.separator();
+        ui.add(
+            egui::TextEdit::singleline(&mut state.project_filter)
+                .hint_text("Search")
+                .desired_width(160.0),
+        );
+        ui.separator();
         let folder = if state.current_folder.is_empty() {
             "Assets".to_owned()
         } else {
@@ -53,7 +59,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
             .auto_shrink(false)
             .show(ui, |ui| {
                 let tree = std::mem::take(&mut state.asset_tree);
-                let entries = find_folder(&tree, &state.current_folder).unwrap_or(&tree);
+                let query = state.project_filter.trim().to_owned();
+                // Поиск идёт по всему Assets, а не только по открытой папке.
+                let entries = if query.is_empty() {
+                    find_folder(&tree, &state.current_folder)
+                        .unwrap_or(&tree)
+                        .iter()
+                        .collect()
+                } else {
+                    search_entries(&tree, &query)
+                };
                 ui.horizontal_wrapped(|ui| {
                     for entry in entries {
                         tile(ui, state, entry);
@@ -103,6 +118,21 @@ pub fn find_folder<'a>(tree: &'a [AssetEntry], path: &str) -> Option<&'a [AssetE
     Some(entries)
 }
 
+/// Файлы и папки всего дерева, имя которых содержит `query` без учёта регистра.
+fn search_entries<'a>(tree: &'a [AssetEntry], query: &str) -> Vec<&'a AssetEntry> {
+    fn collect<'a>(entries: &'a [AssetEntry], query: &str, found: &mut Vec<&'a AssetEntry>) {
+        for entry in entries {
+            if entry.name.to_lowercase().contains(query) {
+                found.push(entry);
+            }
+            collect(&entry.children, query, found);
+        }
+    }
+    let mut found = Vec::new();
+    collect(tree, &query.to_lowercase(), &mut found);
+    found
+}
+
 fn kind_label(entry: &AssetEntry) -> &'static str {
     if entry.is_dir {
         return "DIR";
@@ -110,6 +140,7 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
     match AssetKind::of(&entry.path) {
         AssetKind::Scene => "SCENE",
         AssetKind::Prefab => "PREFAB",
+        AssetKind::CameraSettings => "CAMERA",
         AssetKind::Model => "FBX",
         AssetKind::Texture => "PNG",
         AssetKind::Script => "LUA",
@@ -303,5 +334,34 @@ mod tests {
         assert_eq!(find_folder(&tree, "").unwrap().len(), 1);
         assert_eq!(find_folder(&tree, "a/b").unwrap()[0].name, "c");
         assert!(find_folder(&tree, "a/x").is_none());
+    }
+
+    #[test]
+    fn search_finds_nested_files_and_folders_ignoring_case() {
+        let file = |name: &str, path: &str| AssetEntry {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            is_dir: false,
+            children: Vec::new(),
+        };
+        let tree = vec![
+            folder(
+                "Models",
+                "Models",
+                vec![folder(
+                    "Cars",
+                    "Models/Cars",
+                    vec![file("Car.fbx", "Models/Cars/Car.fbx")],
+                )],
+            ),
+            file("car.png", "car.png"),
+            file("tree.fbx", "tree.fbx"),
+        ];
+        let paths = search_entries(&tree, "CAR")
+            .into_iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["Models/Cars", "Models/Cars/Car.fbx", "car.png"]);
+        assert!(search_entries(&tree, "missing").is_empty());
     }
 }

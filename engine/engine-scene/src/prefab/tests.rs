@@ -1,8 +1,7 @@
 use super::*;
 use crate::World;
 
-const CAMERA: &str =
-    "[[objects]]\nid = \"camera\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n";
+const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
 
 /// Набор префабов в памяти; загрузчик разбирает их как `.rveprefab`.
 struct Library(BTreeMap<String, String>);
@@ -200,7 +199,7 @@ fn instance_fields_win_over_a_root_override() {
 
 #[test]
 fn empty_instance_and_object_override_names_clear_inherited_names() {
-    let prefab = "[[objects]]\nid = \"root\"\nname = \"Root\"\n[objects.camera]\nfov_deg = 60.0\nnear = 0.1\nfar = 100.0\n[[objects]]\nid = \"handle\"\nparent = \"root\"\nname = \"Handle\"\n";
+    let prefab = "[[objects]]\nid = \"root\"\nname = \"Root\"\n[objects.camera]\n[[objects]]\nid = \"handle\"\nparent = \"root\"\nname = \"Handle\"\n";
     let library = Library::new(&[("prefabs/door.rveprefab", prefab)]);
     let document = scene(
         "[[assets]]\npath = \"/prefabs/door.rveprefab\"\n[[instances]]\nid = \"door\"\nprefab = \"/prefabs/door.rveprefab\"\nname = \"\"\n[[instances.overrides]]\ntarget = \"handle\"\nname = \"\"\n",
@@ -215,25 +214,35 @@ fn empty_instance_and_object_override_names_clear_inherited_names() {
 
 #[test]
 fn camera_and_light_overrides_replace_whole_components_and_heavy_params_merge() {
-    let prefab = "[[objects]]\nid = \"rig\"\n[objects.camera]\nfov_deg = 50.0\nnear = 0.1\nfar = 10.0\n[[objects]]\nid = \"sun\"\nparent = \"rig\"\n[objects.directional_light]\nshadows = false\n[[objects.heavy_scripts]]\nname = \"Bobber\"\nparams = { speed = 1.0, amplitude = 0.5 }\n";
+    let prefab = "[[assets]]\npath = \"/cameras/default.camerasettings\"\n[[objects]]\nid = \"rig\"\n[objects.camera]\nsettings = \"/cameras/default.camerasettings\"\nactive = true\n[[objects]]\nid = \"sun\"\nparent = \"rig\"\n[objects.directional_light]\nshadows = false\n[[objects.heavy_scripts]]\nname = \"Bobber\"\nparams = { speed = 1.0, amplitude = 0.5 }\n";
     let library = Library::new(&[("prefabs/rig.rveprefab", prefab)]);
     let document = scene(
-        "[[assets]]\npath = \"/prefabs/rig.rveprefab\"\n[[instances]]\nid = \"rig\"\nprefab = \"/prefabs/rig.rveprefab\"\n[[instances.overrides]]\ntarget = \"rig\"\ncamera = { fov_deg = 70.0, near = 0.5, far = 50.0 }\n[[instances.overrides]]\ntarget = \"sun\"\ndirectional_light = { color = [1.0, 0.5, 0.5] }\nheavy_params = [{ name = \"Bobber\", params = { speed = 2.0 } }]\n",
+        "[[assets]]\npath = \"/prefabs/rig.rveprefab\"\n[[assets]]\npath = \"/cameras/override.camerasettings\"\n[[instances]]\nid = \"rig\"\nprefab = \"/prefabs/rig.rveprefab\"\n[[instances.overrides]]\ntarget = \"rig\"\ncamera = { active = false, settings = \"/cameras/override.camerasettings\" }\n[[instances.overrides]]\ntarget = \"sun\"\ndirectional_light = { color = [1.0, 0.5, 0.5] }\nheavy_params = [{ name = \"Bobber\", params = { speed = 2.0 } }]\n",
     );
     let expanded = library.expand(&document).unwrap().document;
-    let camera = object(&expanded, "rig").camera.unwrap();
-    assert_eq!((camera.fov_deg, camera.near, camera.far), (70.0, 0.5, 50.0));
+    let camera = object(&expanded, "rig").camera.as_ref().unwrap();
+    assert!(!camera.active);
+    assert_eq!(
+        camera.settings.as_ref().unwrap().as_str(),
+        "cameras/override.camerasettings"
+    );
     let sun = object(&expanded, "rig.sun");
     assert_eq!(sun.directional_light.unwrap().color, [1.0, 0.5, 0.5]);
     let params = &sun.heavy_scripts[0].params;
     assert_eq!(params["speed"], ParamValue::Float(2.0));
     assert_eq!(params["amplitude"], ParamValue::Float(0.5));
+
+    let missing_camera_settings = SceneDocument::parse(
+        "scene.rvescene",
+        "[[assets]]\npath = \"/prefabs/rig.rveprefab\"\n[[instances]]\nid = \"rig\"\nprefab = \"/prefabs/rig.rveprefab\"\n[[instances.overrides]]\ntarget = \"rig\"\ncamera = { settings = \"/cameras/missing.camerasettings\" }\n",
+    )
+    .unwrap_err();
+    assert!(missing_camera_settings.message.contains("camerasettings"));
 }
 
 #[test]
 fn camera_only_in_a_prefab_satisfies_the_scene() {
-    let prefab =
-        "[[objects]]\nid = \"eye\"\n[objects.camera]\nfov_deg = 50.0\nnear = 0.1\nfar = 10.0\n";
+    let prefab = "[[objects]]\nid = \"eye\"\n[objects.camera]\n";
     let library = Library::new(&[("prefabs/eye.rveprefab", prefab)]);
     let document = scene(
         "[[assets]]\npath = \"/prefabs/eye.rveprefab\"\n[[instances]]\nid = \"player\"\nprefab = \"/prefabs/eye.rveprefab\"\n",
@@ -360,7 +369,7 @@ fn unknown_targets_and_missing_components_are_errors() {
             .contains("knob")
     );
     let no_camera = scene(&door_scene(
-        "[[instances.overrides]]\ntarget = \"handle\"\ncamera = { fov_deg = 60.0, near = 0.1, far = 10.0 }\n",
+        "[[instances.overrides]]\ntarget = \"handle\"\ncamera = { active = true }\n",
     ));
     assert!(
         library

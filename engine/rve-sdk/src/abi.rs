@@ -2,8 +2,21 @@
 
 use std::ffi::c_void;
 
+/// Oldest script ABI version accepted by the host.
+pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 1;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 2;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 3;
+
+/// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
+pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
+/// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
+pub const RVE_ANTI_ALIASING_NONE: u32 = 1;
+/// Camera tonemapper code for [`RveCameraSettings::tonemapper`].
+pub const RVE_TONEMAPPER_ACES: u32 = 0;
+/// Camera tonemapper code for [`RveCameraSettings::tonemapper`].
+pub const RVE_TONEMAPPER_NEUTRAL: u32 = 1;
+/// Camera tonemapper code for [`RveCameraSettings::tonemapper`].
+pub const RVE_TONEMAPPER_NONE: u32 = 2;
 
 /// Input state bit: the key or button is currently held.
 pub const RVE_INPUT_DOWN: u32 = 1;
@@ -472,6 +485,45 @@ impl Default for RveTransform {
     }
 }
 
+/// Complete projection, render, and color settings for one scene camera.
+///
+/// Enum values use the stable `RVE_ANTI_ALIASING_*` and `RVE_TONEMAPPER_*` codes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RveCameraSettings {
+    /// Perspective field of view in degrees, measured on the narrow window side.
+    pub fov_deg: f32,
+    /// Near clip plane distance.
+    pub near: f32,
+    /// Far clip plane distance.
+    pub far: f32,
+    /// Render resolution scale in `(0, 1]`.
+    pub render_scale: f32,
+    /// Linear scene clear color.
+    pub clear_color: [f32; 3],
+    /// Manual exposure in EV.
+    pub exposure_ev: f32,
+    /// Stable anti-aliasing code.
+    pub anti_aliasing: u32,
+    /// Stable tonemapper code.
+    pub tonemapper: u32,
+}
+
+impl Default for RveCameraSettings {
+    fn default() -> Self {
+        Self {
+            fov_deg: 60.0,
+            near: 0.1,
+            far: 1000.0,
+            render_scale: 1.0,
+            clear_color: [0.1, 0.1, 0.12],
+            exposure_ev: 0.0,
+            anti_aliasing: RVE_ANTI_ALIASING_FXAA,
+            tonemapper: RVE_TONEMAPPER_ACES,
+        }
+    }
+}
+
 /// Host callback that copies a guest error string for the duration of the call.
 pub type RveSetErrorFn = unsafe extern "C" fn(ctx: *mut c_void, message: RveStr);
 /// Host callback that appends a guest log event.
@@ -506,6 +558,16 @@ pub type RveKeyStateFn = unsafe extern "C" fn(ctx: *mut c_void, key: u32) -> u32
 pub type RveMouseButtonStateFn = unsafe extern "C" fn(ctx: *mut c_void, button: u32) -> u32;
 /// Copies one input vector into a guest-provided output slot.
 pub type RveInputVectorFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut [f32; 2]) -> bool;
+/// Reads one object's camera settings into a guest-owned output slot.
+pub type RveGetCameraSettingsFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RveCameraSettings) -> bool;
+/// Stages one object's camera settings.
+pub type RveSetCameraSettingsFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, settings: *const RveCameraSettings) -> bool;
+/// Returns the active camera handle, or zero when unavailable.
+pub type RveActiveCameraFn = unsafe extern "C" fn(ctx: *mut c_void) -> u64;
+/// Stages the active camera selection.
+pub type RveSetActiveCameraFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> bool;
 
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
@@ -546,6 +608,14 @@ pub struct RveHost {
     pub mouse_delta: RveInputVectorFn,
     /// Wheel-delta callback.
     pub wheel_delta: RveInputVectorFn,
+    /// Camera-settings callbacks are appended in ABI v2; `None` marks an unavailable callback.
+    pub get_camera_settings: Option<RveGetCameraSettingsFn>,
+    /// Stages one object's camera settings; present in ABI v2.
+    pub set_camera_settings: Option<RveSetCameraSettingsFn>,
+    /// Returns the active camera; present in ABI v2.
+    pub active_camera: Option<RveActiveCameraFn>,
+    /// Stages the active camera selection; present in ABI v2.
+    pub set_active_camera: Option<RveSetActiveCameraFn>,
 }
 
 /// Guest factory callback.
@@ -573,7 +643,29 @@ pub type RveDestroyFn = RveStartFn;
 /// Guest instance destructor callback.
 pub type RveDropFn = unsafe extern "C" fn(instance: *mut c_void) -> RveStatus;
 
+/// Script descriptor layout used by ABI versions 1 and 2.
+#[repr(C)]
+pub struct RveScriptDescV1 {
+    /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
+    pub name: RveStr,
+    /// Creates one guest instance.
+    pub create: RveCreateFn,
+    /// Runs the instance's start callback.
+    pub start: RveStartFn,
+    /// Runs the instance's update callback.
+    pub update: RveUpdateFn,
+    /// Runs the instance's message callback.
+    pub message: RveMessageFn,
+    /// Runs the instance's destroy callback.
+    pub destroy: RveDestroyFn,
+    /// Releases one successfully created instance.
+    pub drop: RveDropFn,
+}
+
 /// One exported guest script implementation.
+///
+/// The parameter fields were appended in ABI version 3. Versions 1 and 2 use
+/// [`RveScriptDescV1`] and are normalized by the host before use.
 #[repr(C)]
 pub struct RveScriptDesc {
     /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
@@ -665,12 +757,17 @@ unsafe impl Sync for RveValueData {}
 unsafe impl Sync for RveValue {}
 unsafe impl Sync for RveParamEntry {}
 unsafe impl Sync for RveParamDesc {}
+unsafe impl Sync for RveScriptDescV1 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Key, MouseButton};
+    use super::{
+        Key, MouseButton, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_TONEMAPPER_ACES,
+        RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn,
+        RveHost,
+    };
 
     #[test]
     fn key_codes_and_names_are_stable() {
@@ -733,5 +830,33 @@ mod tests {
             Some(MouseButton::Forward)
         );
         assert_eq!(MouseButton::from_name("UnknownButton"), None);
+    }
+
+    #[test]
+    fn camera_settings_codes_and_c_layout_are_stable_and_appended_to_host() {
+        assert_eq!(RVE_ANTI_ALIASING_FXAA, 0);
+        assert_eq!(RVE_ANTI_ALIASING_NONE, 1);
+        assert_eq!(RVE_TONEMAPPER_ACES, 0);
+        assert_eq!(RVE_TONEMAPPER_NEUTRAL, 1);
+        assert_eq!(RVE_TONEMAPPER_NONE, 2);
+        assert_eq!(std::mem::size_of::<RveCameraSettings>(), 40);
+        assert_eq!(std::mem::align_of::<RveCameraSettings>(), 4);
+        assert_eq!(std::mem::offset_of!(RveCameraSettings, fov_deg), 0);
+        assert_eq!(std::mem::offset_of!(RveCameraSettings, near), 4);
+        assert_eq!(std::mem::offset_of!(RveCameraSettings, far), 8);
+        assert_eq!(std::mem::offset_of!(RveCameraSettings, render_scale), 12);
+        assert_eq!(std::mem::offset_of!(RveCameraSettings, clear_color), 16);
+        assert_eq!(std::mem::offset_of!(RveCameraSettings, exposure_ev), 28);
+        assert_eq!(std::mem::offset_of!(RveCameraSettings, anti_aliasing), 32);
+        assert_eq!(std::mem::offset_of!(RveCameraSettings, tonemapper), 36);
+        assert_eq!(
+            std::mem::offset_of!(RveHost, get_camera_settings),
+            std::mem::offset_of!(RveHost, wheel_delta)
+                + std::mem::size_of::<super::RveInputVectorFn>()
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<RveGetCameraSettingsFn>>(),
+            std::mem::size_of::<RveGetCameraSettingsFn>()
+        );
     }
 }

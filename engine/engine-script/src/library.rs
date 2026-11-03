@@ -6,6 +6,7 @@ use rve_sdk::abi::{
     RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule, RveParamDesc,
     RveScriptDesc,
 };
+use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -23,7 +24,7 @@ pub enum ScriptLibraryError {
     Open(String),
     MissingEntryPoint(String),
     NullModule,
-    AbiVersion { expected: u32, found: u32 },
+    AbiVersion { min: u32, max: u32, found: u32 },
     InvalidHeaderSize { expected: usize, found: u32 },
     NullScripts,
     NullScriptName { index: usize },
@@ -45,10 +46,10 @@ impl fmt::Display for ScriptLibraryError {
                 )
             }
             Self::NullModule => f.write_str("script library returned a null module pointer"),
-            Self::AbiVersion { expected, found } => {
+            Self::AbiVersion { min, max, found } => {
                 write!(
                     f,
-                    "script ABI version {found} is unsupported; expected {expected}"
+                    "script ABI version {found} is unsupported; supported range is {min}..={max}"
                 )
             }
             Self::InvalidHeaderSize { expected, found } => {
@@ -130,9 +131,10 @@ impl ScriptLibrary {
         // Read only the header before validating its version and size. This avoids forming a
         // reference to the full module while the host does not yet know which layout it contains.
         let header = unsafe { std::ptr::addr_of!((*module).header).read() };
-        if header.abi_version != RVE_SCRIPT_ABI_VERSION {
+        if !(RVE_SCRIPT_ABI_MIN_VERSION..=RVE_SCRIPT_ABI_VERSION).contains(&header.abi_version) {
             return Err(ScriptLibraryError::AbiVersion {
-                expected: RVE_SCRIPT_ABI_VERSION,
+                min: RVE_SCRIPT_ABI_MIN_VERSION,
+                max: RVE_SCRIPT_ABI_VERSION,
                 found: header.abi_version,
             });
         }
@@ -149,7 +151,12 @@ impl ScriptLibrary {
         let scripts_ptr = unsafe { std::ptr::addr_of!((*module).scripts).read() };
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
-        if count > isize::MAX as usize / std::mem::size_of::<RveScriptDesc>() {
+        let descriptor_size = if header.abi_version >= 3 {
+            std::mem::size_of::<RveScriptDesc>()
+        } else {
+            std::mem::size_of::<RveScriptDescV1>()
+        };
+        if count > isize::MAX as usize / descriptor_size {
             return Err(ScriptLibraryError::ScriptCountOverflow);
         }
         if count > 0 && scripts_ptr.is_null() {
@@ -160,11 +167,34 @@ impl ScriptLibrary {
                 scripts: HashMap::new(),
             });
         }
-        // SAFETY: guaranteed by this method's caller contract and checked non-null/count above.
-        let descriptors: &'static [RveScriptDesc] =
-            unsafe { std::slice::from_raw_parts(scripts_ptr, count) };
+        // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
+        // matching immutable table remains readable for process lifetime.
+        let descriptors_v3 = (header.abi_version >= 3)
+            .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
+        // SAFETY: versions 1 and 2 share the original descriptor layout.
+        let descriptors_v1 = (header.abi_version < 3).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV1>(), count)
+        });
         let mut scripts = HashMap::with_capacity(count);
-        for (index, descriptor) in descriptors.iter().enumerate() {
+        for index in 0..count {
+            let descriptor = if let Some(descriptors) = descriptors_v3 {
+                &descriptors[index]
+            } else {
+                let descriptor = &descriptors_v1.expect("legacy descriptor table")[index];
+                // Older ABI versions have no parameter fields. Normalize their stable callback
+                // prefix so instances can keep using the same descriptor representation.
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: std::ptr::null(),
+                    param_count: 0,
+                }))
+            };
             // SAFETY: the caller guarantees process-lifetime storage for every non-null name.
             let name = unsafe { read_abi_str(descriptor.name) }.map_err(|error| match error {
                 AbiStringError::Null => ScriptLibraryError::NullScriptName { index },
@@ -177,13 +207,17 @@ impl ScriptLibrary {
                 });
             }
             let name = name.to_owned();
-            // SAFETY: the caller guarantees the parameter table of every descriptor.
-            let schema = unsafe { read_schema(descriptor) }.map_err(|message| {
-                ScriptLibraryError::InvalidParams {
-                    script: name.clone(),
-                    message,
-                }
-            })?;
+            let schema = if header.abi_version >= 3 {
+                // SAFETY: the caller guarantees the parameter table of every v3 descriptor.
+                unsafe { read_schema(descriptor) }.map_err(|message| {
+                    ScriptLibraryError::InvalidParams {
+                        script: name.clone(),
+                        message,
+                    }
+                })?
+            } else {
+                None
+            };
             if scripts.insert(name.clone(), (descriptor, schema)).is_some() {
                 return Err(ScriptLibraryError::DuplicateScriptName(name));
             }

@@ -36,7 +36,7 @@ impl EditorScene {
             document.instances.push(instance);
             Ok(())
         })?;
-        self.selection = Some(id.clone());
+        self.selection = vec![id.clone()];
         Ok(id)
     }
 
@@ -117,7 +117,7 @@ impl EditorScene {
             });
             Ok(())
         })?;
-        self.selection = Some(id.to_owned());
+        self.selection = vec![id.to_owned()];
         Ok(())
     }
 
@@ -261,7 +261,7 @@ impl EditorScene {
             document.instances.extend(nested);
             Ok(())
         })?;
-        self.selection = Some(id.to_owned());
+        self.selection = vec![id.to_owned()];
         Ok(())
     }
 
@@ -492,7 +492,7 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
         }
     }
     if outer.camera.is_some() {
-        base.camera = outer.camera;
+        base.camera = outer.camera.clone();
     }
     if outer.directional_light.is_some() {
         base.directional_light = outer.directional_light;
@@ -585,9 +585,9 @@ pub(crate) fn object_override(
     if edited.lod_group != base.lod_group {
         return Err("LOD Group объекта префаба меняется только в самом префабе".to_owned());
     }
-    match (base.camera, edited.camera) {
+    match (base.camera.as_ref(), edited.camera.as_ref()) {
         (None, None) => {}
-        (Some(from), Some(to)) => change.camera = (to != from).then_some(to),
+        (Some(from), Some(to)) => change.camera = (to != from).then(|| to.clone()),
         _ => return Err(COMPONENTS.to_owned()),
     }
     match (base.directional_light, edited.directional_light) {
@@ -870,12 +870,19 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
             paths.extend(material_paths(material));
         }
     }
+    if let Some(settings) = change
+        .camera
+        .as_ref()
+        .and_then(|camera| camera.settings.clone())
+    {
+        paths.push(settings);
+    }
     paths
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{EditorScene, NewObject, PrefabLoader};
+    use super::super::{Component, EditorScene, NewObject, PrefabLoader};
     use super::OverrideField;
     use engine_files::VirtualPath;
     use engine_scene::{ParamValue, SceneDocument, SceneError, SceneTransform, World};
@@ -999,6 +1006,93 @@ mod tests {
         assert!(scene.object("door.handle").is_none());
         assert!(scene.redo());
         assert!(scene.object("door.handle").is_some());
+    }
+
+    #[test]
+    fn camera_settings_and_active_camera_edits_write_prefab_overrides() {
+        let camera_prefab = "[[assets]]\npath = \"/cameras/default.camerasettings\"\n[[objects]]\nid = \"eye\"\n[objects.camera]\nsettings = \"/cameras/default.camerasettings\"\n";
+        let files = Files::with(&[("prefabs/camera.rveprefab", camera_prefab)]);
+        let mut scene = scene_with(&files);
+        scene.set_camera_active("camera", true).unwrap();
+        let first = scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/camera.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        let second = scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/camera.rveprefab"), [1.0, 0.0, 0.0]),
+                None,
+            )
+            .unwrap();
+        let initial_settings = path("/cameras/custom.camerasettings");
+        scene
+            .set_camera_settings(&first, Some(initial_settings))
+            .unwrap();
+        let settings = path("/cameras/copied.camerasettings");
+        let mut camera = scene.object(&first).unwrap().camera.clone().unwrap();
+        camera.settings = Some(settings.clone());
+        scene
+            .set_component(&first, Component::Camera(camera))
+            .unwrap();
+        scene.set_camera_active(&second, true).unwrap();
+
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == settings)
+        );
+        assert_eq!(
+            scene
+                .object(&first)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .settings,
+            Some(settings)
+        );
+        assert!(
+            !scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        assert!(
+            !scene
+                .object(&first)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        assert!(
+            scene
+                .object(&second)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        let duplicate = scene.duplicate_object(&second).unwrap();
+        assert!(
+            !scene
+                .object(&duplicate)
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .active
+        );
+        World::from_document(scene.view()).unwrap();
     }
 
     #[test]
@@ -1275,9 +1369,8 @@ mod tests {
         let (_, mut scene, _) = door_scene();
         let added = scene.edit_object("door.handle", None, |object| {
             object.camera = Some(engine_scene::CameraComponent {
-                fov_deg: 60.0,
-                near: 0.1,
-                far: 10.0,
+                settings: None,
+                active: false,
             });
             Ok(())
         });

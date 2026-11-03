@@ -7,6 +7,7 @@ use crate::scene::{
 };
 use engine_assets::{Model, ModelMaterial, TextureData};
 use engine_render::{DirectionalLight, Vertex};
+use engine_scene::CameraSettings;
 use glam::{Mat4, Vec3};
 
 /// Меш с CPU-материалом и индексами его текстур в [`Content::textures`].
@@ -163,8 +164,15 @@ impl Content {
         self.motion.model(elapsed) * self.fit
     }
 
-    pub fn view_projection(&self, elapsed: f32, width: u32, height: u32) -> Mat4 {
-        self.motion.view_projection(elapsed, width, height)
+    pub fn view_projection(
+        &self,
+        elapsed: f32,
+        width: u32,
+        height: u32,
+        settings: CameraSettings,
+    ) -> Mat4 {
+        self.motion
+            .view_projection(elapsed, width, height, settings)
     }
 
     pub fn light(&self, elapsed: f32) -> DirectionalLight {
@@ -199,7 +207,7 @@ fn fit_to_unit_cube(min: Vec3, max: Vec3) -> Mat4 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Content, fit_to_unit_cube};
+    use super::{CameraSettings, Content, fit_to_unit_cube};
     use crate::scene::{Scene, cube_mesh};
     use engine_assets::{Model, ModelMaterial, ModelMesh, ModelVertex, TextureData};
     use glam::Vec3;
@@ -336,8 +344,8 @@ mod tests {
             let content = Content::from_scene(scene);
             assert_eq!(content.model(1.5), scene.model(1.5));
             assert_eq!(
-                content.view_projection(1.5, 800, 600),
-                scene.view_projection(1.5, 800, 600)
+                content.view_projection(1.5, 800, 600, CameraSettings::default()),
+                scene.view_projection(1.5, 800, 600, CameraSettings::default())
             );
             assert_eq!(
                 content.light(1.5),

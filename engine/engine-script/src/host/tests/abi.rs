@@ -7,10 +7,11 @@ use crate::transaction::{
 };
 use engine_scene::World;
 use rve_sdk::abi::{
-    RVE_LOG_INFO, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost, RveModule, RveParams, RveScriptDesc,
-    RveStatus, RveStr, RveTransform, RveValue,
+    RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost,
+    RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveStatus, RveStr, RveTransform,
+    RveValue,
 };
-use rve_sdk::{Key, MouseButton, Params, Script, Value};
+use rve_sdk::{AntiAliasing, CameraSettings, Key, MouseButton, Params, Script, Tonemapper, Value};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -38,6 +39,39 @@ struct Probe {
 }
 
 struct InputProbe;
+
+struct CameraControl {
+    panic_update: bool,
+}
+
+fn camera_control_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(CameraControl {
+        panic_update: matches!(params.get("panic_update"), Some(Value::Bool(true))),
+    }))
+}
+
+impl Script for CameraControl {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let camera = ctx.active_camera().expect("active camera exists");
+        let mut settings = camera.camera_settings(ctx).expect("camera settings exist");
+        assert_eq!(settings, CameraSettings::default());
+        settings.fov_deg = 75.0;
+        settings.render_scale = 0.5;
+        settings.clear_color = [0.2, 0.3, 0.4];
+        settings.exposure_ev = 2.0;
+        settings.anti_aliasing = AntiAliasing::None;
+        settings.tonemapper = Tonemapper::Neutral;
+        assert!(camera.set_camera_settings(ctx, settings));
+        assert_eq!(camera.camera_settings(ctx), Some(settings));
+
+        let second = ctx.find("second").expect("second camera exists");
+        assert!(second.activate_camera(ctx));
+        assert_eq!(ctx.active_camera(), Some(second));
+        if self.panic_update {
+            panic!("camera update panic");
+        }
+    }
+}
 
 fn input_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(InputProbe))
@@ -301,6 +335,7 @@ fn sdk_module() -> &'static RveModule {
         "Message" => message_factory,
         "Limits" => limit_message_factory,
         "InputProbe" => input_probe_factory,
+        "CameraControl" => camera_control_factory,
     }
 }
 
@@ -319,9 +354,6 @@ fn scripted_world(script_name: &str, params: &str) -> World {
 id = "camera"
 name = "Camera object"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 [[objects.heavy_scripts]]
 name = {script_name:?}
 params = {params}
@@ -353,23 +385,156 @@ fn message_list(host: &mut ScriptHost) -> Vec<String> {
 
 #[test]
 fn version_mismatch_does_not_read_the_module_table() {
-    static MODULE: RveModule = RveModule {
+    for version in [0, RVE_SCRIPT_ABI_VERSION + 1] {
+        let module = RveModule {
+            header: RveHeader {
+                abi_version: version,
+                header_size: std::mem::size_of::<RveHeader>() as u32,
+            },
+            scripts: std::ptr::null(),
+            script_count: 1,
+        };
+        // SAFETY: the header is valid; unsupported versions are rejected without table reads.
+        let result = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(&module)) };
+        assert!(matches!(
+            result,
+            Err(crate::ScriptLibraryError::AbiVersion {
+                min: RVE_SCRIPT_ABI_MIN_VERSION,
+                max: RVE_SCRIPT_ABI_VERSION,
+                found,
+            }) if found == version
+        ));
+    }
+}
+
+#[test]
+fn legacy_abi_v1_and_v2_descriptors_load_without_parameter_fields() {
+    for version in [1, 2] {
+        let module = legacy_probe_module(version);
+        // SAFETY: the leaked module and v1-layout descriptor remain immutable for this test.
+        let library = unsafe { crate::ScriptLibrary::from_module(module) }
+            .expect("legacy module is supported");
+        assert!(library.schema("Probe").is_none());
+
+        let mut world = scripted_world("Probe", &format!(r#"{{ label = "abi-v{version}" }}"#));
+        let mut host = load_host(&world, &library);
+        host.start(
+            &mut world,
+            ScriptTime {
+                elapsed: 3.5,
+                frame: 17,
+            },
+        );
+        assert!(
+            message_list(&mut host)
+                .iter()
+                .any(|message| message == &format!("start:abi-v{version}"))
+        );
+    }
+}
+
+fn legacy_probe_module(version: u32) -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let probe = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
+        .iter()
+        .find(|script| unsafe { script.name.to_str() }.ok() == Some("Probe"))
+        .expect("Probe descriptor exists");
+    let scripts = Box::leak(Box::new([RveScriptDescV1 {
+        name: probe.name,
+        create: probe.create,
+        start: probe.start,
+        update: probe.update,
+        message: probe.message,
+        destroy: probe.destroy,
+        drop: probe.drop,
+    }]));
+    Box::leak(Box::new(RveModule {
         header: RveHeader {
-            abi_version: RVE_SCRIPT_ABI_VERSION + 1,
+            abi_version: version,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
-        scripts: std::ptr::null(),
-        script_count: 1,
-    };
-    // SAFETY: the header is valid; on a version mismatch the remaining fields are not read.
-    let result = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(&MODULE)) };
-    assert!(matches!(
-        result,
-        Err(crate::ScriptLibraryError::AbiVersion {
-            expected: RVE_SCRIPT_ABI_VERSION,
-            found: value,
-        }) if value == RVE_SCRIPT_ABI_VERSION + 1
-    ));
+        scripts: scripts.as_ptr().cast(),
+        script_count: scripts.len(),
+    }))
+}
+
+#[test]
+fn abi_camera_sdk_reads_writes_settings_and_switches_the_active_camera() {
+    let _lock = test_lock();
+    let library = library();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.heavy_scripts]]
+name = "CameraControl"
+[[objects]]
+id = "second"
+[objects.camera]
+"#,
+    );
+    let camera = world.handle("camera").unwrap();
+    let second = world.handle("second").unwrap();
+    let mut host = load_host(&world, &library);
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert_eq!(world.active_camera(), second);
+    assert_eq!(
+        world.camera_settings(camera).unwrap(),
+        &engine_scene::CameraSettings {
+            projection: engine_scene::ProjectionSettings {
+                fov_deg: 75.0,
+                ..Default::default()
+            },
+            render: engine_scene::CameraRenderSettings {
+                render_scale: 0.5,
+                clear_color: [0.2, 0.3, 0.4],
+                anti_aliasing: engine_scene::AntiAliasing::None,
+            },
+            color: engine_scene::CameraColorSettings {
+                exposure_ev: 2.0,
+                tonemapper: engine_scene::Tonemapper::Neutral,
+            },
+        }
+    );
+    assert!(host.drain_events().is_empty());
+}
+
+#[test]
+fn abi_camera_settings_and_active_camera_writes_roll_back_on_guest_panic() {
+    let _lock = test_lock();
+    let library = library();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.heavy_scripts]]
+name = "CameraControl"
+params = { panic_update = true }
+[[objects]]
+id = "second"
+[objects.camera]
+"#,
+    );
+    let camera = world.handle("camera").unwrap();
+    let mut host = load_host(&world, &library);
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert_eq!(world.active_camera(), camera);
+    assert_eq!(
+        world.camera_settings(camera).unwrap(),
+        &engine_scene::CameraSettings::default()
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message.contains("camera update panic"))
+    );
 }
 
 #[test]
@@ -616,9 +781,6 @@ fn partial_load_failure_drops_instances_already_created() {
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 [[objects.heavy_scripts]]
 name = "Probe"
 params = { label = "first" }
@@ -666,9 +828,6 @@ fn update_panic_disables_only_its_instance_and_drop_runs_after_destroy_panic() {
 [[objects]]
 id = "camera"
 [objects.camera]
-fov_deg = 60.0
-near = 0.1
-far = 100.0
 [[objects.heavy_scripts]]
 name = "Probe"
 params = { label = "bad", panic_update = true }
@@ -1548,27 +1707,6 @@ fn heavy_params_that_violate_the_schema_fail_loading() {
             "{params}: {error}"
         );
     }
-}
-
-#[test]
-fn version_one_modules_are_rejected() {
-    static MODULE: RveModule = RveModule {
-        header: RveHeader {
-            abi_version: 1,
-            header_size: std::mem::size_of::<RveHeader>() as u32,
-        },
-        scripts: std::ptr::null(),
-        script_count: 0,
-    };
-    // SAFETY: the header is valid; on a version mismatch the remaining fields are not read.
-    let result = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(&MODULE)) };
-    assert!(matches!(
-        result,
-        Err(crate::ScriptLibraryError::AbiVersion {
-            expected: 2,
-            found: 1
-        })
-    ));
 }
 
 fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModule {
