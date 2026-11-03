@@ -54,6 +54,8 @@ const MESH_MASK_FRAGMENT_SHADER: &[u8] =
 const MESH_BLEND_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.blend.spv"));
 const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
+const LOCAL_SHADOW_VERTEX_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/shadow.local.vert.spv"));
 const SHADOW_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
 const OVERLAY_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.vert.spv"));
 const OVERLAY_FRAGMENT_SHADER: &[u8] =
@@ -87,7 +89,8 @@ const PUSH_CONSTANTS_SIZE: usize = 2 * size_of::<[[f32; 4]; 4]>();
 const FRAME_UNIFORMS_SIZE: usize =
     (4 + SHADOW_CASCADE_COUNT) * size_of::<[[f32; 4]; 4]>() + 8 * size_of::<[f32; 4]>();
 const MATERIAL_UNIFORMS_SIZE: usize = 4 * size_of::<[f32; 4]>();
-const LOCAL_LIGHT_GPU_SIZE: usize = 6 * size_of::<[f32; 4]>();
+const LOCAL_LIGHT_GPU_SIZE: usize = 7 * size_of::<[f32; 4]>();
+const LOCAL_SHADOW_MATRIX_BUFFER_SIZE: usize = MAX_LOCAL_SHADOW_LAYERS * size_of::<[[f32; 4]; 4]>();
 const CLUSTER_BOUNDS_GPU_SIZE: usize = 2 * size_of::<[f32; 4]>();
 const CLUSTER_RECORD_GPU_SIZE: usize = size_of::<u32>() * (1 + MAX_CLUSTER_LIGHTS);
 const CLUSTER_BUFFER_SIZE: usize = CLUSTER_COUNT * CLUSTER_RECORD_GPU_SIZE;
@@ -233,6 +236,28 @@ pub enum LocalLight {
     },
 }
 
+/// CPU-generated matrices associated with a point or spot light. The renderer
+/// validates the light index and matrix type before applying its per-frame
+/// shadow-layer budget.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // The fixed six-face point matrix set is copied as frame data.
+pub enum LocalLightShadowMatrices {
+    Point {
+        /// +X, -X, +Y, -Y, +Z, -Z face order.
+        matrices: [[[f32; 4]; 4]; 6],
+    },
+    Spot {
+        matrix: [[f32; 4]; 4],
+    },
+}
+
+/// Shadow matrices for one entry in [`Frame::lights`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LocalLightShadow {
+    pub light_index: usize,
+    pub matrices: LocalLightShadowMatrices,
+}
+
 impl Default for DirectionalLight {
     /// Свет сверху слева со стороны камеры, смотрящей вдоль -Z.
     fn default() -> Self {
@@ -282,6 +307,9 @@ pub struct Frame<'a> {
     pub shadow_cascades: &'a [[[f32; 4]; 4]],
     pub light: DirectionalLight,
     pub lights: &'a [LocalLight],
+    /// Sparse point and spot shadow requests. Each entry refers to the same
+    /// index in `lights`; omitted entries render that light without a shadow.
+    pub local_light_shadows: &'a [LocalLightShadow],
     pub draws: &'a [DrawCommand],
     pub overlay: &'a [OverlayVertex],
     pub view: ViewSettings,
@@ -556,6 +584,7 @@ pub struct Renderer {
     blend_pipeline: Option<vk::Pipeline>,
     skybox_pipeline: Option<vk::Pipeline>,
     shadow_pipeline: Option<vk::Pipeline>,
+    local_shadow_pipeline: Option<vk::Pipeline>,
     cluster_pipeline: Option<vk::Pipeline>,
     cluster_pipeline_layout: Option<vk::PipelineLayout>,
     post_pipeline_layout: Option<vk::PipelineLayout>,
@@ -596,6 +625,8 @@ pub struct Renderer {
     environments: Vec<Option<GpuEnvironment>>,
     shadow_image: Option<DeviceImage>,
     shadow_layout: vk::ImageLayout,
+    local_shadow_image: Option<DeviceImage>,
+    local_shadow_layout: vk::ImageLayout,
     max_texture_size: u32,
     /// Индекс — `MeshId`; слот удалённого меша остаётся пустым, id не используются повторно.
     meshes: Vec<Option<MeshBuffers>>,
@@ -648,6 +679,7 @@ impl Renderer {
             blend_pipeline: None,
             skybox_pipeline: None,
             shadow_pipeline: None,
+            local_shadow_pipeline: None,
             cluster_pipeline: None,
             cluster_pipeline_layout: None,
             post_pipeline_layout: None,
@@ -685,6 +717,8 @@ impl Renderer {
             environments: Vec::new(),
             shadow_image: None,
             shadow_layout: vk::ImageLayout::UNDEFINED,
+            local_shadow_image: None,
+            local_shadow_layout: vk::ImageLayout::UNDEFINED,
             max_texture_size: 0,
             meshes: Vec::new(),
             textures: Vec::new(),
@@ -1096,6 +1130,9 @@ impl Renderer {
                 ))?;
         // Fence слота дождались, поэтому GPU больше не читает этот буфер.
         frame_uniforms.buffer.write(&prepared.uniforms)?;
+        frame_uniforms
+            .local_shadow_matrices
+            .write(&local_shadow_matrix_bytes(&prepared.local_shadow_matrices)?)?;
         let replaced_light_buffer = frame_uniforms.local_lights.write_keep_old(
             &instance,
             &device,
@@ -1162,6 +1199,9 @@ impl Renderer {
             pipeline: self
                 .shadow_pipeline
                 .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?,
+            local_pipeline: self.local_shadow_pipeline.ok_or(RenderError::InvalidState(
+                "local shadow pipeline отсутствует",
+            ))?,
             pipeline_layout: self
                 .pipeline_layout
                 .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
@@ -1170,11 +1210,16 @@ impl Renderer {
             materials: &self.materials,
             draws: frame.draws,
             shadow_cascades: frame.shadow_cascades,
+            local_shadow_matrices: &prepared.local_shadow_matrices,
         };
         let shadow_image = self
             .shadow_image
             .as_ref()
             .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
+        let local_shadow_image = self
+            .local_shadow_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("local shadow map отсутствует"))?;
         let scene = ScenePass {
             pipeline: self
                 .pipeline
@@ -1230,12 +1275,15 @@ impl Renderer {
             .as_mut()
             .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
         let mut shadow_layout = self.shadow_layout;
+        let mut local_shadow_layout = self.local_shadow_layout;
         record_frame(
             &device,
             command_buffer,
             target,
             shadow_image,
             &mut shadow_layout,
+            local_shadow_image,
+            &mut local_shadow_layout,
             swapchain.images[image_index],
             swapchain.views[image_index],
             swapchain.extent,
@@ -1255,6 +1303,7 @@ impl Renderer {
             overlay.as_ref(),
         )?;
         self.shadow_layout = shadow_layout;
+        self.local_shadow_layout = local_shadow_layout;
 
         self.submit_and_present(
             image_index,
@@ -1360,6 +1409,11 @@ impl Renderer {
                 .as_ref()
                 .ok_or(RenderError::InvalidState("shadow map отсутствует"))?
                 .view,
+            local_shadow_view: self
+                .local_shadow_image
+                .as_ref()
+                .ok_or(RenderError::InvalidState("local shadow map отсутствует"))?
+                .view,
             shadow_sampler: self
                 .shadow_sampler
                 .ok_or(RenderError::InvalidState("shadow sampler отсутствует"))?,
@@ -1399,6 +1453,7 @@ impl Renderer {
                 physical_device,
                 &prepared.uniforms,
                 &prepared.light_bytes,
+                &local_shadow_matrix_bytes(&prepared.local_shadow_matrices)?,
                 &prepared.cluster_bounds,
             )?;
             rendered.push((
@@ -1411,6 +1466,7 @@ impl Renderer {
                 *skybox,
                 target.tonemap_set,
                 target.output_set,
+                prepared.local_shadow_matrices.as_slice(),
             ));
         }
 
@@ -1432,7 +1488,7 @@ impl Renderer {
                 UiImage::Viewport(viewport) => {
                     if !rendered
                         .iter()
-                        .any(|(drawn, _, _, _, _, _, _, _)| *drawn == viewport)
+                        .any(|(drawn, _, _, _, _, _, _, _, _)| *drawn == viewport)
                     {
                         continue;
                     }
@@ -1455,6 +1511,9 @@ impl Renderer {
         let shadow_pipeline = self
             .shadow_pipeline
             .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?;
+        let local_shadow_pipeline = self.local_shadow_pipeline.ok_or(RenderError::InvalidState(
+            "local shadow pipeline отсутствует",
+        ))?;
         let scene_pipeline = self
             .pipeline
             .ok_or(RenderError::InvalidState("pipeline отсутствует"))?;
@@ -1488,18 +1547,21 @@ impl Renderer {
                         skybox,
                         tonemap_set,
                         output_set,
+                        local_shadow_matrices,
                     ),
                 )| {
                     (
                         *viewport,
                         ShadowPass {
                             pipeline: shadow_pipeline,
+                            local_pipeline: local_shadow_pipeline,
                             pipeline_layout,
                             frame_set: *frame_set,
                             meshes: &self.meshes,
                             materials: &self.materials,
                             draws: frame.draws,
                             shadow_cascades: frame.shadow_cascades,
+                            local_shadow_matrices,
                         },
                         ScenePass {
                             pipeline: scene_pipeline,
@@ -1535,6 +1597,10 @@ impl Renderer {
             .shadow_image
             .as_ref()
             .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
+        let local_shadow_image = self
+            .local_shadow_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("local shadow map отсутствует"))?;
         let ui_pass = UiPass {
             pipeline: self
                 .ui_pipeline
@@ -1560,6 +1626,7 @@ impl Renderer {
 
         begin_command_buffer(&device, command_buffer)?;
         let mut shadow_layout = self.shadow_layout;
+        let mut local_shadow_layout = self.local_shadow_layout;
         let tonemap_pipeline = self
             .tonemap_pipeline
             .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?;
@@ -1584,6 +1651,8 @@ impl Renderer {
                 &mut target.scene,
                 shadow_image,
                 &mut shadow_layout,
+                local_shadow_image,
+                &mut local_shadow_layout,
                 target.render_extent,
                 shadow,
                 pass,
@@ -1626,6 +1695,7 @@ impl Renderer {
         // SAFETY: command recording is complete before the command buffer is submitted.
         unsafe { device.end_command_buffer(command_buffer) }?;
         self.shadow_layout = shadow_layout;
+        self.local_shadow_layout = local_shadow_layout;
 
         self.submit_and_present(
             image_index,
@@ -1908,6 +1978,7 @@ impl Renderer {
         self.create_mesh_pipeline()?;
         self.create_skybox_pipeline()?;
         self.create_shadow_pipeline()?;
+        self.create_local_shadow_pipeline()?;
         self.create_post_pipelines()?;
         self.create_overlay_pipeline()?;
         self.create_ui_pipeline()?;
@@ -1987,10 +2058,20 @@ impl Renderer {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let frame_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&frame_bindings);
-        // SAFETY: bindings match the shared frame uniform and sampled shadow map shaders.
+        // SAFETY: bindings match frame, clustered-light, and local-shadow shaders.
         self.frame_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&frame_layout_info, None) }?);
         let material_bindings = [
@@ -2111,6 +2192,11 @@ impl Renderer {
             .as_ref()
             .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
         let shadow_view = shadow_image.view;
+        let local_shadow_view = self
+            .local_shadow_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("local shadow map отсутствует"))?
+            .view;
         let shadow_sampler = self
             .shadow_sampler
             .ok_or(RenderError::InvalidState("shadow sampler отсутствует"))?;
@@ -2120,18 +2206,18 @@ impl Renderer {
                 .descriptor_count(self.frames.len() as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(self.frames.len() as u32),
+                .descriptor_count((self.frames.len() * 2) as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(self.frames.len() as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count((self.frames.len() * 3) as u32),
+                .descriptor_count((self.frames.len() * 4) as u32),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(self.frames.len() as u32)
             .pool_sizes(&pool_sizes);
-        // SAFETY: each set uses one uniform, two images, two samplers and three storage buffers.
+        // SAFETY: each set uses one uniform, two images, one sampler, and four storage buffers.
         let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
         self.frame_descriptor_pool = Some(pool);
         let layouts = vec![self.frame_set_layout()?; self.frames.len()];
@@ -2156,6 +2242,13 @@ impl Renderer {
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 &light_bytes,
             )?;
+            let local_shadow_matrix_buffer = HostBuffer::new(
+                self.instance()?,
+                &device,
+                self.physical_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                &local_shadow_matrix_bytes(&[])?,
+            )?;
             let cluster_buffer = HostBuffer::new(
                 self.instance()?,
                 &device,
@@ -2175,9 +2268,11 @@ impl Renderer {
                 set,
                 &buffer,
                 &light_buffer,
+                &local_shadow_matrix_buffer,
                 &cluster_buffer,
                 &cluster_bounds,
                 shadow_view,
+                local_shadow_view,
                 shadow_sampler,
             );
             self.frame_uniforms.push(FrameUniforms {
@@ -2187,6 +2282,7 @@ impl Renderer {
                     buffer: Some(light_buffer),
                     capacity: light_bytes.len(),
                 },
+                local_shadow_matrices: local_shadow_matrix_buffer,
                 _cluster_buffer: cluster_buffer,
                 cluster_bounds,
             });
@@ -2353,7 +2449,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Создаёт единственную общую depth-карту и sampler для всех слотов кадров.
+    /// Создаёт directional и local depth-массивы и sampler сравнения для всех слотов кадров.
     fn create_shadow_resources(&mut self) -> Result<(), RenderError> {
         let image = DeviceImage::new_array(
             self.instance()?,
@@ -2369,6 +2465,20 @@ impl Renderer {
             SHADOW_CASCADE_COUNT as u32,
         )?;
         self.shadow_image = Some(image);
+        let local_image = DeviceImage::new_array(
+            self.instance()?,
+            self.device()?,
+            self.physical_device,
+            vk::Extent2D {
+                width: LOCAL_SHADOW_MAP_RESOLUTION,
+                height: LOCAL_SHADOW_MAP_RESOLUTION,
+            },
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            local_shadow_subresource_range(),
+            MAX_LOCAL_SHADOW_LAYERS as u32,
+        )?;
+        self.local_shadow_image = Some(local_image);
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -3457,92 +3567,27 @@ impl Renderer {
     /// Pipeline для depth-only shadow pass с фиксированным depth bias.
     fn create_shadow_pipeline(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
-        let vertex_module = ShaderModule::new(&device, SHADOW_VERTEX_SHADER)?;
-        let fragment_module = ShaderModule::new(&device, SHADOW_FRAGMENT_SHADER)?;
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vertex_module.handle)
-                .name(c"main"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fragment_module.handle)
-                .name(c"main"),
-        ];
-        let vertex_bindings = [vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(size_of::<Vertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)];
-        let vertex_attributes = [
-            vk::VertexInputAttributeDescription::default()
-                .location(0)
-                .binding(0)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(std::mem::offset_of!(Vertex, position) as u32),
-            vk::VertexInputAttributeDescription::default()
-                .location(1)
-                .binding(0)
-                .format(vk::Format::R32G32_SFLOAT)
-                .offset(std::mem::offset_of!(Vertex, uv) as u32),
-        ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&vertex_bindings)
-            .vertex_attribute_descriptions(&vertex_attributes);
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-            .depth_bias_enable(true)
-            .depth_bias_constant_factor(1.25)
-            .depth_bias_slope_factor(1.75)
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-            .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state =
-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let mut rendering_info =
-            vk::PipelineRenderingCreateInfo::default().depth_attachment_format(DEPTH_FORMAT);
-        let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization)
-            .multisample_state(&multisample)
-            .depth_stencil_state(&depth_stencil)
-            .dynamic_state(&dynamic_state)
-            .layout(
-                self.pipeline_layout
-                    .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
-            )
-            .push_next(&mut rendering_info)];
-        // SAFETY: shader, shared layout, depth format and dynamic-rendering state are valid.
-        let mut pipelines = match unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
-        } {
-            Ok(pipelines) => pipelines,
-            Err((pipelines, error)) => {
-                for pipeline in pipelines {
-                    // SAFETY: these partial pipeline handles were returned by this device.
-                    unsafe { device.destroy_pipeline(pipeline, None) };
-                }
-                return Err(RenderError::Vulkan(error));
-            }
-        };
-        self.shadow_pipeline = pipelines.pop();
-        if self.shadow_pipeline.is_none() {
-            return Err(RenderError::InvalidState("shadow pipeline не создан"));
-        }
+        let layout = self
+            .pipeline_layout
+            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+        self.shadow_pipeline = Some(create_shadow_graphics_pipeline(
+            &device,
+            layout,
+            SHADOW_VERTEX_SHADER,
+        )?);
+        Ok(())
+    }
+
+    fn create_local_shadow_pipeline(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let layout = self
+            .pipeline_layout
+            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+        self.local_shadow_pipeline = Some(create_shadow_graphics_pipeline(
+            &device,
+            layout,
+            LOCAL_SHADOW_VERTEX_SHADER,
+        )?);
         Ok(())
     }
 
@@ -3944,7 +3989,15 @@ impl Drop for Renderer {
                 // SAFETY: the frame descriptor pool is gone and the device is idle.
                 drop(image);
             }
+            if let Some(image) = self.local_shadow_image.take() {
+                // SAFETY: the frame descriptor pool is gone and the device is idle.
+                drop(image);
+            }
             if let Some(pipeline) = self.shadow_pipeline.take() {
+                // SAFETY: the device is idle, so no command buffer uses this pipeline.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            if let Some(pipeline) = self.local_shadow_pipeline.take() {
                 // SAFETY: the device is idle, so no command buffer uses this pipeline.
                 unsafe { device.destroy_pipeline(pipeline, None) };
             }
@@ -4248,6 +4301,7 @@ fn inspect_device(
     let mut reasons = evaluation.reasons;
     reasons.extend(cluster_device_limit_reasons(&properties.limits));
     reasons.extend(texture_format_reasons(srgb_features, linear_features));
+    reasons.extend(shadow_image_device_reasons(instance, physical_device));
     let report = DeviceReport {
         name,
         vendor_id: properties.vendor_id,
@@ -4280,13 +4334,63 @@ fn cluster_device_limit_reasons(limits: &vk::PhysicalDeviceLimits) -> Vec<String
         reasons.push("maxStorageBufferRange меньше фиксированного cluster SSBO".to_owned());
     }
     if limits.max_per_stage_descriptor_storage_buffers < 3
-        || limits.max_descriptor_set_storage_buffers < 3
+        || limits.max_descriptor_set_storage_buffers < 4
     {
         reasons.push(
-            "лимиты storage buffer descriptors не поддерживают clustered lighting".to_owned(),
+            "лимиты storage buffer descriptors не поддерживают clustered/local shadow lighting"
+                .to_owned(),
         );
     }
     reasons
+}
+
+fn shadow_image_device_reasons(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Vec<String> {
+    // SAFETY: format support is queried for this physical device.
+    let format_properties =
+        unsafe { instance.get_physical_device_format_properties(physical_device, DEPTH_FORMAT) };
+    let required_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+    let mut reasons = Vec::new();
+    if !format_properties
+        .optimal_tiling_features
+        .contains(required_features)
+    {
+        reasons.push(
+            "D32_SFLOAT не поддерживает depth attachment и linear comparison sampling shadow maps"
+                .to_owned(),
+        );
+    }
+    // SAFETY: image-format properties are queried for the fixed depth/sample usage.
+    match unsafe {
+        instance.get_physical_device_image_format_properties(
+            physical_device,
+            DEPTH_FORMAT,
+            vk::ImageType::TYPE_2D,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageCreateFlags::empty(),
+        )
+    } {
+        Ok(properties) if shadow_array_limits_suitable(&properties) => {}
+        Ok(_) => reasons.push(format!(
+            "D32_SFLOAT image limits do not support the {}-layer {}x{} local/directional shadow arrays",
+            MAX_LOCAL_SHADOW_LAYERS, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION
+        )),
+        Err(error) => reasons.push(format!(
+            "D32_SFLOAT image usage does not support shadow arrays: {error}"
+        )),
+    }
+    reasons
+}
+
+fn shadow_array_limits_suitable(properties: &vk::ImageFormatProperties) -> bool {
+    properties.max_array_layers >= MAX_LOCAL_SHADOW_LAYERS as u32
+        && properties.max_extent.width >= SHADOW_MAP_RESOLUTION
+        && properties.max_extent.height >= SHADOW_MAP_RESOLUTION
 }
 
 fn best_device_index<T>(
@@ -4341,21 +4445,6 @@ fn choose_device(
                 "R8G8B8A8_SRGB не поддерживает возможности post target: {}",
                 missing_ldr_features.join(", ")
             ));
-        }
-        // SAFETY: format support is queried for this physical device.
-        let depth_properties = unsafe {
-            instance.get_physical_device_format_properties(physical_device, DEPTH_FORMAT)
-        };
-        let depth_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
-        if !depth_properties
-            .optimal_tiling_features
-            .contains(depth_features)
-        {
-            reasons.push(
-                "D32_SFLOAT не поддерживает depth attachment, linear comparison sampling shadow map".to_owned(),
-            );
         }
         // SAFETY: the surface and physical device belong to the same live instance.
         let surface_capabilities = unsafe {
@@ -4819,9 +4908,11 @@ fn write_frame_set(
     set: vk::DescriptorSet,
     buffer: &HostBuffer,
     local_lights: &HostBuffer,
+    local_shadow_matrices: &HostBuffer,
     clusters: &HostBuffer,
     cluster_bounds: &HostBuffer,
     shadow_view: vk::ImageView,
+    local_shadow_view: vk::ImageView,
     shadow_sampler: vk::Sampler,
 ) {
     let buffer_info = [vk::DescriptorBufferInfo::default()
@@ -4836,6 +4927,10 @@ fn write_frame_set(
         .buffer(local_lights.buffer)
         .offset(0)
         .range(LOCAL_LIGHT_GPU_SIZE as vk::DeviceSize)];
+    let local_shadow_matrix_info = [vk::DescriptorBufferInfo::default()
+        .buffer(local_shadow_matrices.buffer)
+        .offset(0)
+        .range(LOCAL_SHADOW_MATRIX_BUFFER_SIZE as vk::DeviceSize)];
     let cluster_info = [vk::DescriptorBufferInfo::default()
         .buffer(clusters.buffer)
         .offset(0)
@@ -4844,6 +4939,9 @@ fn write_frame_set(
         .buffer(cluster_bounds.buffer)
         .offset(0)
         .range(CLUSTER_BOUNDS_BUFFER_SIZE as vk::DeviceSize)];
+    let local_shadow_image_info = [vk::DescriptorImageInfo::default()
+        .image_view(local_shadow_view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(set)
@@ -4875,6 +4973,16 @@ fn write_frame_set(
             .dst_binding(5)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&cluster_bounds_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(6)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&local_shadow_matrix_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(7)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&local_shadow_image_info),
     ];
     // SAFETY: all resources are alive and no command buffer uses the set yet.
     unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -4906,6 +5014,7 @@ struct ViewportTargetResources {
     post_sampler: vk::Sampler,
     frame_set_layout: vk::DescriptorSetLayout,
     shadow_view: vk::ImageView,
+    local_shadow_view: vk::ImageView,
     shadow_sampler: vk::Sampler,
 }
 
@@ -4916,6 +5025,7 @@ struct ViewportFrameSet {
     set: vk::DescriptorSet,
     buffer: HostBuffer,
     local_lights: GrowingBuffer,
+    local_shadow_matrices: HostBuffer,
     _cluster_buffer: HostBuffer,
     cluster_bounds: HostBuffer,
 }
@@ -4942,6 +5052,13 @@ impl ViewportFrameSet {
             vk::BufferUsageFlags::STORAGE_BUFFER,
             &light_bytes,
         )?;
+        let local_shadow_matrix_buffer = HostBuffer::new(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            &local_shadow_matrix_bytes(&[])?,
+        )?;
         let cluster_buffer = HostBuffer::new(
             instance,
             device,
@@ -4962,13 +5079,13 @@ impl ViewportFrameSet {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1),
+                .descriptor_count(2),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(3),
+                .descriptor_count(4),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
@@ -4994,9 +5111,11 @@ impl ViewportFrameSet {
             set,
             &buffer,
             &light_buffer,
+            &local_shadow_matrix_buffer,
             &cluster_buffer,
             &cluster_bounds,
             resources.shadow_view,
+            resources.local_shadow_view,
             resources.shadow_sampler,
         );
         Ok(Self {
@@ -5008,12 +5127,14 @@ impl ViewportFrameSet {
                 buffer: Some(light_buffer),
                 capacity: light_bytes.len(),
             },
+            local_shadow_matrices: local_shadow_matrix_buffer,
             _cluster_buffer: cluster_buffer,
             cluster_bounds,
         })
     }
 
     /// Записывает frame uniform и локальные lights после ожидания fence viewport-слота.
+    #[allow(clippy::too_many_arguments)] // Mirrors the frame buffers uploaded to this viewport set.
     fn write(
         &mut self,
         instance: &ash::Instance,
@@ -5021,9 +5142,12 @@ impl ViewportFrameSet {
         physical_device: vk::PhysicalDevice,
         uniforms: &[u8],
         light_bytes: &[u8],
+        local_shadow_matrix_bytes: &[u8; LOCAL_SHADOW_MATRIX_BUFFER_SIZE],
         cluster_bounds: &[ClusterBounds],
     ) -> Result<vk::DescriptorSet, RenderError> {
         self.buffer.write(uniforms)?;
+        self.local_shadow_matrices
+            .write(local_shadow_matrix_bytes)?;
         let replaced = self.local_lights.write_keep_old(
             instance,
             device,
@@ -5632,6 +5756,8 @@ fn record_frame(
     target: &mut FrameTarget,
     shadow_image: &DeviceImage,
     shadow_layout: &mut vk::ImageLayout,
+    local_shadow_image: &DeviceImage,
+    local_shadow_layout: &mut vk::ImageLayout,
     output_image: vk::Image,
     output_view: vk::ImageView,
     output_extent: vk::Extent2D,
@@ -5653,6 +5779,8 @@ fn record_frame(
         &mut target.scene,
         shadow_image,
         shadow_layout,
+        local_shadow_image,
+        local_shadow_layout,
         target.render_extent,
         shadow,
         scene,
@@ -5710,6 +5838,8 @@ fn record_scene(
     target: &mut OffscreenTarget,
     shadow_image: &DeviceImage,
     shadow_layout: &mut vk::ImageLayout,
+    local_shadow_image: &DeviceImage,
+    local_shadow_layout: &mut vk::ImageLayout,
     render_extent: vk::Extent2D,
     shadow: &ShadowPass<'_>,
     scene: &ScenePass<'_>,
@@ -5862,6 +5992,7 @@ fn record_scene(
                 SHADOW_MAP_RESOLUTION,
                 cascade as u32,
                 *matrix,
+                shadow.pipeline,
                 shadow,
             );
             // SAFETY: this matches the preceding depth-only cmd_begin_rendering call.
@@ -5885,6 +6016,14 @@ fn record_scene(
         pipeline_barrier(device, command_buffer, shadow_to_sample);
         *shadow_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
+
+    record_local_shadow_layers(
+        device,
+        command_buffer,
+        local_shadow_image,
+        local_shadow_layout,
+        shadow,
+    );
 
     let color_attachment = [vk::RenderingAttachmentInfo::default()
         .image_view(target.color.view)
@@ -6049,6 +6188,93 @@ fn record_scene(
     target.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
 }
 
+fn record_local_shadow_layers(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: &DeviceImage,
+    layout: &mut vk::ImageLayout,
+    shadow: &ShadowPass<'_>,
+) {
+    let (source_stage, source_access) = shadow_layout_source(*layout);
+    let to_depth = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(source_stage)
+        .src_access_mask(source_access)
+        .dst_stage_mask(
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
+        .old_layout(*layout)
+        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image)
+        .subresource_range(local_shadow_subresource_range());
+    pipeline_barrier(device, command_buffer, to_depth);
+    *layout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+
+    let extent = vk::Extent2D {
+        width: LOCAL_SHADOW_MAP_RESOLUTION,
+        height: LOCAL_SHADOW_MAP_RESOLUTION,
+    };
+    for layer in 0..MAX_LOCAL_SHADOW_LAYERS {
+        let depth_attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(image.layer_views[layer])
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            })];
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(render_area)
+            .layer_count(1)
+            .depth_attachment(&depth_attachment[0]);
+        // SAFETY: the single-layer view is cleared each scene pass, including unassigned layers.
+        unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
+        if let Some(matrix) = shadow.local_shadow_matrices.get(layer) {
+            record_shadow_draws(
+                device,
+                command_buffer,
+                LOCAL_SHADOW_MAP_RESOLUTION,
+                layer as u32,
+                *matrix,
+                shadow.local_pipeline,
+                shadow,
+            );
+        }
+        // SAFETY: this closes the depth-only rendering instance opened above.
+        unsafe { device.cmd_end_rendering(command_buffer) };
+    }
+
+    let to_sample = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+        )
+        .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image)
+        .subresource_range(local_shadow_subresource_range());
+    pipeline_barrier(device, command_buffer, to_sample);
+    *layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+}
+
 fn record_skybox(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -6119,12 +6345,14 @@ struct ScenePass<'a> {
 /// Depth-only shadow pass. It shares the frame set and model transforms with the scene pass.
 struct ShadowPass<'a> {
     pipeline: vk::Pipeline,
+    local_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     frame_set: vk::DescriptorSet,
     meshes: &'a [Option<MeshBuffers>],
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
     shadow_cascades: &'a [[[f32; 4]; 4]],
+    local_shadow_matrices: &'a [[[f32; 4]; 4]],
 }
 
 /// Рисование UI в swapchain image; `draws` хранит вызов, его набор и признак линейного изображения.
@@ -6307,6 +6535,7 @@ fn record_shadow_draws(
     extent: u32,
     cascade_index: u32,
     light_view_projection: [[f32; 4]; 4],
+    pipeline: vk::Pipeline,
     shadow: &ShadowPass<'_>,
 ) {
     if shadow.draws.is_empty() {
@@ -6323,11 +6552,7 @@ fn record_shadow_draws(
     }];
     // SAFETY: recording happens inside depth-only dynamic rendering with the shadow pipeline.
     unsafe {
-        device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            shadow.pipeline,
-        );
+        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
         device.cmd_set_viewport(command_buffer, 0, &viewport);
         device.cmd_set_scissor(command_buffer, 0, &scissor);
         device.cmd_bind_descriptor_sets(
@@ -7101,6 +7326,15 @@ fn shadow_subresource_range() -> vk::ImageSubresourceRange {
         .layer_count(SHADOW_CASCADE_COUNT as u32)
 }
 
+fn local_shadow_subresource_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(MAX_LOCAL_SHADOW_LAYERS as u32)
+}
+
 fn shadow_layout_source(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
     match layout {
         vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
@@ -7179,6 +7413,95 @@ fn create_compute_pipeline(
     pipelines
         .pop()
         .ok_or(RenderError::InvalidState("compute pipeline не создан"))
+}
+
+fn create_shadow_graphics_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    vertex_shader: &[u8],
+) -> Result<vk::Pipeline, RenderError> {
+    let vertex_module = ShaderModule::new(device, vertex_shader)?;
+    let fragment_module = ShaderModule::new(device, SHADOW_FRAGMENT_SHADER)?;
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex_module.handle)
+            .name(c"main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment_module.handle)
+            .name(c"main"),
+    ];
+    let vertex_bindings = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(size_of::<Vertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+    let vertex_attributes = [
+        vk::VertexInputAttributeDescription::default()
+            .location(0)
+            .binding(0)
+            .format(vk::Format::R32G32B32_SFLOAT)
+            .offset(std::mem::offset_of!(Vertex, position) as u32),
+        vk::VertexInputAttributeDescription::default()
+            .location(1)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(std::mem::offset_of!(Vertex, uv) as u32),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&vertex_bindings)
+        .vertex_attribute_descriptions(&vertex_attributes);
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .depth_bias_enable(true)
+        .depth_bias_constant_factor(1.25)
+        .depth_bias_slope_factor(1.75)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let mut rendering_info =
+        vk::PipelineRenderingCreateInfo::default().depth_attachment_format(DEPTH_FORMAT);
+    let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
+        .dynamic_state(&dynamic_state)
+        .layout(layout)
+        .push_next(&mut rendering_info)];
+    // SAFETY: shader, shared layout, depth format and dynamic-rendering state are valid.
+    let mut pipelines = match unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+    } {
+        Ok(pipelines) => pipelines,
+        Err((pipelines, error)) => {
+            for pipeline in pipelines {
+                // SAFETY: these partial pipeline handles were returned by this device.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            return Err(RenderError::Vulkan(error));
+        }
+    };
+    pipelines
+        .pop()
+        .ok_or(RenderError::InvalidState("shadow pipeline не создан"))
 }
 
 fn create_skybox_graphics_pipeline(
@@ -7329,6 +7652,7 @@ struct FrameUniforms {
     buffer: HostBuffer,
     set: vk::DescriptorSet,
     local_lights: GrowingBuffer,
+    local_shadow_matrices: HostBuffer,
     _cluster_buffer: HostBuffer,
     cluster_bounds: HostBuffer,
 }
@@ -7702,14 +8026,39 @@ fn validate_scene_viewports(
 struct PreparedFrame {
     uniforms: [u8; FRAME_UNIFORMS_SIZE],
     light_bytes: Vec<u8>,
+    local_shadow_matrices: Vec<[[f32; 4]; 4]>,
     cluster_bounds: Vec<ClusterBounds>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SelectedLocalLight {
+    source_index: usize,
+    light: LocalLight,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalShadowKind {
+    Point,
+    Spot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalShadowSlot {
+    layer_base: u32,
+    kind: LocalShadowKind,
+}
+
+struct LocalShadowPlan {
+    assignments: Vec<Option<LocalShadowSlot>>,
+    matrices: Vec<[[f32; 4]; 4]>,
 }
 
 fn prepare_frame(
     frame: &Frame<'_>,
     render_extent: vk::Extent2D,
 ) -> Result<PreparedFrame, RenderError> {
-    let lights = select_local_lights(frame.camera, frame.lights)?;
+    let shadow_requests = index_local_light_shadows(frame.lights, frame.local_light_shadows)?;
+    let lights = select_local_light_entries(frame.camera, frame.lights)?;
     let (depth_range, cluster_bounds) = match camera_cluster_bounds(frame.camera.projection) {
         Ok(bounds) => bounds,
         // Unlit frames also support clip-space cameras, such as sandbox's triangle.
@@ -7722,19 +8071,33 @@ fn prepare_frame(
         ),
         Err(error) => return Err(error),
     };
+    let shadow_plan = select_local_shadow_slots(&lights, &shadow_requests, frame.camera.position);
     let uniforms = frame_uniform_bytes_with_count(frame, lights.len(), depth_range, render_extent)?;
-    let light_bytes = local_light_bytes(&lights, frame.camera.view)?;
+    let light_bytes =
+        local_light_bytes_for_selected(&lights, &shadow_plan.assignments, frame.camera.view)?;
     Ok(PreparedFrame {
         uniforms,
         light_bytes,
+        local_shadow_matrices: shadow_plan.matrices,
         cluster_bounds,
     })
 }
 
+#[cfg(test)]
 fn select_local_lights(
     camera: FrameCamera,
     lights: &[LocalLight],
 ) -> Result<Vec<LocalLight>, RenderError> {
+    Ok(select_local_light_entries(camera, lights)?
+        .into_iter()
+        .map(|selected| selected.light)
+        .collect())
+}
+
+fn select_local_light_entries(
+    camera: FrameCamera,
+    lights: &[LocalLight],
+) -> Result<Vec<SelectedLocalLight>, RenderError> {
     if !camera.position.into_iter().all(f32::is_finite)
         || !camera.view.iter().flatten().all(|value| value.is_finite())
         || !camera
@@ -7770,8 +8133,119 @@ fn select_local_lights(
     Ok(visible
         .into_iter()
         .take(MAX_RENDERED_LIGHTS)
-        .map(|(_, _, light)| light)
+        .map(|(source_index, _, light)| SelectedLocalLight {
+            source_index,
+            light,
+        })
         .collect())
+}
+
+fn index_local_light_shadows<'a>(
+    lights: &[LocalLight],
+    shadows: &'a [LocalLightShadow],
+) -> Result<Vec<Option<&'a LocalLightShadow>>, RenderError> {
+    let mut indexed = vec![None; lights.len()];
+    for shadow in shadows {
+        let Some(light) = lights.get(shadow.light_index) else {
+            return Err(RenderError::InvalidConfig(
+                "local light shadow index must refer to an input light",
+            ));
+        };
+        if indexed[shadow.light_index].is_some() {
+            return Err(RenderError::InvalidConfig(
+                "local light shadow indices must be unique",
+            ));
+        }
+        let (matches_light, matrices_finite) = match (light, shadow.matrices) {
+            (LocalLight::Point { .. }, LocalLightShadowMatrices::Point { matrices }) => (
+                true,
+                matrices
+                    .iter()
+                    .all(|matrix| matrix.iter().flatten().all(|value| value.is_finite())),
+            ),
+            (LocalLight::Spot { .. }, LocalLightShadowMatrices::Spot { matrix }) => {
+                (true, matrix.iter().flatten().all(|value| value.is_finite()))
+            }
+            _ => (false, false),
+        };
+        if !matches_light || !matrices_finite {
+            return Err(RenderError::InvalidConfig(
+                "local light shadow matrices must be finite and match the light type",
+            ));
+        }
+        indexed[shadow.light_index] = Some(shadow);
+    }
+    Ok(indexed)
+}
+
+fn select_local_shadow_slots(
+    lights: &[SelectedLocalLight],
+    requests: &[Option<&LocalLightShadow>],
+    camera_position: [f32; 3],
+) -> LocalShadowPlan {
+    let mut candidates = lights
+        .iter()
+        .enumerate()
+        .filter_map(|(selected_index, selected)| {
+            let shadow = requests.get(selected.source_index).copied().flatten()?;
+            let (kind, matrix_count) = match shadow.matrices {
+                LocalLightShadowMatrices::Point { .. } => (LocalShadowKind::Point, 6),
+                LocalLightShadowMatrices::Spot { .. } => (LocalShadowKind::Spot, 1),
+            };
+            Some((
+                selected_index,
+                selected.source_index,
+                local_light_camera_distance_squared(selected.light, camera_position),
+                kind,
+                matrix_count,
+                shadow.matrices,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.2
+            .total_cmp(&right.2)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    let mut assignments = vec![None; lights.len()];
+    let mut matrices = Vec::with_capacity(MAX_LOCAL_SHADOW_LAYERS);
+    for (selected_index, _, _, kind, matrix_count, source) in candidates {
+        if matrices.len() + matrix_count > MAX_LOCAL_SHADOW_LAYERS {
+            continue;
+        }
+        let layer_base = matrices.len() as u32;
+        match source {
+            LocalLightShadowMatrices::Point { matrices: faces } => matrices.extend(faces),
+            LocalLightShadowMatrices::Spot { matrix } => matrices.push(matrix),
+        }
+        assignments[selected_index] = Some(LocalShadowSlot { layer_base, kind });
+    }
+    LocalShadowPlan {
+        assignments,
+        matrices,
+    }
+}
+
+fn local_light_camera_distance_squared(light: LocalLight, camera: [f32; 3]) -> f64 {
+    let position = match light {
+        LocalLight::Point { position, .. } | LocalLight::Spot { position, .. } => position,
+    };
+    (0..3)
+        .map(|axis| (f64::from(position[axis]) - f64::from(camera[axis])).powi(2))
+        .sum()
+}
+
+#[cfg(test)]
+fn point_shadow_face_index(direction: [f32; 3]) -> u32 {
+    let magnitude = direction.map(f32::abs);
+    if magnitude[0] >= magnitude[1] && magnitude[0] >= magnitude[2] {
+        return u32::from(direction[0] < 0.0);
+    }
+    if magnitude[1] >= magnitude[2] {
+        return if direction[1] >= 0.0 { 2 } else { 3 };
+    }
+    if direction[2] >= 0.0 { 4 } else { 5 }
 }
 
 fn validate_local_light(light: LocalLight) -> Result<LocalLight, RenderError> {
@@ -7937,6 +8411,23 @@ fn local_light_contribution(camera: [f32; 3], light: LocalLight) -> f64 {
 }
 
 fn local_light_bytes(lights: &[LocalLight], view: [[f32; 4]; 4]) -> Result<Vec<u8>, RenderError> {
+    let selected = lights
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(source_index, light)| SelectedLocalLight {
+            source_index,
+            light,
+        })
+        .collect::<Vec<_>>();
+    local_light_bytes_for_selected(&selected, &[], view)
+}
+
+fn local_light_bytes_for_selected(
+    lights: &[SelectedLocalLight],
+    assignments: &[Option<LocalShadowSlot>],
+    view: [[f32; 4]; 4],
+) -> Result<Vec<u8>, RenderError> {
     if !lights.is_empty() {
         // Cluster spheres and cones retain world-space radii and angles, so
         // the camera transform must preserve distances and angles.
@@ -7954,8 +8445,24 @@ fn local_light_bytes(lights: &[LocalLight], view: [[f32; 4]; 4]) -> Result<Vec<u
         }
     }
     let mut packed = Vec::with_capacity(lights.len().max(1));
-    for light in lights {
-        packed.push(match *light {
+    for (selected_index, selected) in lights.iter().enumerate() {
+        let shadow_params =
+            assignments
+                .get(selected_index)
+                .copied()
+                .flatten()
+                .map_or([0; 4], |slot| {
+                    [
+                        slot.layer_base,
+                        match slot.kind {
+                            LocalShadowKind::Point => 1,
+                            LocalShadowKind::Spot => 2,
+                        },
+                        1,
+                        0,
+                    ]
+                });
+        packed.push(match selected.light {
             LocalLight::Point {
                 position,
                 color_intensity,
@@ -7979,6 +8486,7 @@ fn local_light_bytes(lights: &[LocalLight], view: [[f32; 4]; 4]) -> Result<Vec<u
                         range,
                     ],
                     view_direction: [0.0; 4],
+                    shadow_params,
                 }
             }
             LocalLight::Spot {
@@ -8008,6 +8516,7 @@ fn local_light_bytes(lights: &[LocalLight], view: [[f32; 4]; 4]) -> Result<Vec<u
                         range,
                     ],
                     view_direction: [view_direction[0], view_direction[1], view_direction[2], 0.0],
+                    shadow_params,
                 }
             }
         });
@@ -8015,10 +8524,34 @@ fn local_light_bytes(lights: &[LocalLight], view: [[f32; 4]; 4]) -> Result<Vec<u
     if packed.is_empty() {
         packed.push(GpuLocalLight::default());
     }
-    // SAFETY: GpuLocalLight is repr(C), aligned, and contains only four initialized vec4 fields.
+    // SAFETY: GpuLocalLight is repr(C), aligned, and contains initialized vec4/uvec4 fields.
     Ok(unsafe {
         std::slice::from_raw_parts(packed.as_ptr().cast(), size_of_val(packed.as_slice())).to_vec()
     })
+}
+
+fn local_shadow_matrix_bytes(
+    matrices: &[[[f32; 4]; 4]],
+) -> Result<[u8; LOCAL_SHADOW_MATRIX_BUFFER_SIZE], RenderError> {
+    if matrices.len() > MAX_LOCAL_SHADOW_LAYERS
+        || matrices
+            .iter()
+            .any(|matrix| !matrix.iter().flatten().all(|value| value.is_finite()))
+    {
+        return Err(RenderError::InvalidConfig(
+            "local shadow matrices must be finite and fit the shared layer array",
+        ));
+    }
+    let mut bytes = [0; LOCAL_SHADOW_MATRIX_BUFFER_SIZE];
+    for layer in 0..MAX_LOCAL_SHADOW_LAYERS {
+        let matrix = matrices.get(layer).unwrap_or(&IDENTITY_MATRIX);
+        let matrix_bytes = unsafe {
+            std::slice::from_raw_parts(matrix.as_ptr().cast::<u8>(), size_of::<[[f32; 4]; 4]>())
+        };
+        let start = layer * size_of::<[[f32; 4]; 4]>();
+        bytes[start..start + matrix_bytes.len()].copy_from_slice(matrix_bytes);
+    }
+    Ok(bytes)
 }
 
 fn cluster_bounds_bytes(bounds: &[ClusterBounds]) -> &[u8] {
@@ -8493,31 +9026,35 @@ mod tests {
         CLUSTER_COMPUTE_SHADER, CLUSTER_COUNT, CLUSTER_GRID_X, CLUSTER_GRID_Y, CLUSTER_GRID_Z,
         CLUSTER_RECORD_GPU_SIZE, DeviceFacts, DeviceReport, DirectionalLight, DrawCommand,
         FRAME_UNIFORMS_SIZE, FULLSCREEN_VERTEX_SHADER, Frame, FrameCamera, GpuLocalLight,
-        IDENTITY_MATRIX, LDR_FORMAT, LocalLight, MATERIAL_UNIFORMS_SIZE, MAX_CLUSTER_LIGHTS,
-        MAX_RENDERED_LIGHTS, MESH_BLEND_FRAGMENT_SHADER, MESH_MASK_FRAGMENT_SHADER,
-        MESH_OPAQUE_FRAGMENT_SHADER, MESH_VERTEX_SHADER, Material, MaterialId, MeshId,
-        NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON, OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER,
-        OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER, OverlayVertex, ProbeInstanceFailure,
-        RenderError, Renderer, RendererConfig, SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER,
-        SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER, SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER,
-        TextureColorSpace, TextureId, Tonemapper, UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex,
-        ViewSettings, best_device_index, check_extensions, classify_acquire_result,
-        classify_probe_instance_failure, cluster_device_limit_reasons, deduplicate_names,
-        derivative_tangent_basis, evaluate_device, frame_uniform_bytes, index_bytes,
-        inverse_extent, local_light_bytes, local_light_contribution, material_sampler_info,
-        material_uniform_bytes, mip_extent, mip_level_count, missing_extensions,
-        missing_offscreen_format_features, missing_post_format_features,
-        missing_texture_format_features, normal_matrix, offscreen_previous_use,
-        overlay_vertex_bytes, push_constant_bytes, sampler_anisotropy, scaled_extent,
-        scene_viewport, select_composite_alpha, select_local_lights, select_surface_extent,
-        shadow_caster_is_outside, shadow_casters, shadow_layout_source, shadow_subresource_range,
-        texture_format, texture_format_reasons, texture_mip_blit_region,
-        texture_mip_destination_shader_barrier, texture_mip_shader_barrier,
-        texture_mip_source_barrier, texture_upload_barrier, timestamp_duration,
-        transform_tangent_normal, validate_draws, validate_material, validate_mesh,
-        validate_overlay, validate_render_scale, validate_texture, validate_view_settings,
-        vertex_bytes,
+        IDENTITY_MATRIX, LDR_FORMAT, LOCAL_LIGHT_GPU_SIZE, LOCAL_SHADOW_MAP_RESOLUTION,
+        LOCAL_SHADOW_MATRIX_BUFFER_SIZE, LocalLight, LocalLightShadow, LocalLightShadowMatrices,
+        MATERIAL_UNIFORMS_SIZE, MAX_CLUSTER_LIGHTS, MAX_LOCAL_SHADOW_LAYERS, MAX_RENDERED_LIGHTS,
+        MESH_BLEND_FRAGMENT_SHADER, MESH_MASK_FRAGMENT_SHADER, MESH_OPAQUE_FRAGMENT_SHADER,
+        MESH_VERTEX_SHADER, Material, MaterialId, MeshId, NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON,
+        OFFSCREEN_FORMAT, OUTPUT_FRAGMENT_SHADER, OVERLAY_FRAGMENT_SHADER, OVERLAY_VERTEX_SHADER,
+        OverlayVertex, ProbeInstanceFailure, RenderError, Renderer, RendererConfig,
+        SHADOW_CASCADE_COUNT, SHADOW_FRAGMENT_SHADER, SHADOW_MAP_RESOLUTION, SHADOW_VERTEX_SHADER,
+        SWAPCHAIN_USAGE, TONEMAP_FRAGMENT_SHADER, TextureColorSpace, TextureId, Tonemapper,
+        UI_FRAGMENT_SHADER, UI_VERTEX_SHADER, Vertex, ViewSettings, best_device_index,
+        check_extensions, classify_acquire_result, classify_probe_instance_failure,
+        cluster_device_limit_reasons, deduplicate_names, derivative_tangent_basis, evaluate_device,
+        frame_uniform_bytes, index_bytes, index_local_light_shadows, inverse_extent,
+        local_light_bytes, local_light_bytes_for_selected, local_light_contribution,
+        local_shadow_matrix_bytes, material_sampler_info, material_uniform_bytes, mip_extent,
+        mip_level_count, missing_extensions, missing_offscreen_format_features,
+        missing_post_format_features, missing_texture_format_features, normal_matrix,
+        offscreen_previous_use, overlay_vertex_bytes, point_shadow_face_index, push_constant_bytes,
+        sampler_anisotropy, scaled_extent, scene_viewport, select_composite_alpha,
+        select_local_light_entries, select_local_lights, select_local_shadow_slots,
+        select_surface_extent, shadow_array_limits_suitable, shadow_caster_is_outside,
+        shadow_casters, shadow_layout_source, shadow_subresource_range, texture_format,
+        texture_format_reasons, texture_mip_blit_region, texture_mip_destination_shader_barrier,
+        texture_mip_shader_barrier, texture_mip_source_barrier, texture_upload_barrier,
+        timestamp_duration, transform_tangent_normal, validate_draws, validate_material,
+        validate_mesh, validate_overlay, validate_render_scale, validate_texture,
+        validate_view_settings, vertex_bytes,
     };
+    use super::{LocalShadowKind, SelectedLocalLight};
     use ash::vk;
     use std::time::Duration;
     use std::{
@@ -8834,7 +9371,7 @@ mod tests {
         assert_eq!(CLUSTER_BOUNDS_GPU_SIZE, 32);
         assert_eq!(CLUSTER_BOUNDS_BUFFER_SIZE, 110_592);
         assert_eq!(std::mem::size_of::<super::clusters::ClusterBounds>(), 32);
-        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 96);
+        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 112);
 
         let mut limits = vk::PhysicalDeviceLimits {
             max_compute_work_group_invocations: CLUSTER_COMPUTE_LOCAL_SIZE,
@@ -8842,7 +9379,7 @@ mod tests {
             max_compute_work_group_count: [54, 1, 1],
             max_storage_buffer_range: CLUSTER_BUFFER_SIZE as u32,
             max_per_stage_descriptor_storage_buffers: 3,
-            max_descriptor_set_storage_buffers: 3,
+            max_descriptor_set_storage_buffers: 4,
             ..vk::PhysicalDeviceLimits::default()
         };
         assert!(cluster_device_limit_reasons(&limits).is_empty());
@@ -8874,6 +9411,25 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("storage buffer descriptors"))
         );
+    }
+
+    #[test]
+    fn shadow_array_device_limits_require_layer_count_and_directional_extent() {
+        let mut properties = vk::ImageFormatProperties {
+            max_extent: vk::Extent3D {
+                width: SHADOW_MAP_RESOLUTION,
+                height: SHADOW_MAP_RESOLUTION,
+                depth: 1,
+            },
+            max_array_layers: MAX_LOCAL_SHADOW_LAYERS as u32,
+            ..vk::ImageFormatProperties::default()
+        };
+        assert!(shadow_array_limits_suitable(&properties));
+        properties.max_array_layers -= 1;
+        assert!(!shadow_array_limits_suitable(&properties));
+        properties.max_array_layers += 1;
+        properties.max_extent.width -= 1;
+        assert!(!shadow_array_limits_suitable(&properties));
     }
 
     #[test]
@@ -9425,6 +9981,7 @@ mod tests {
                 shadow_cascades: &[],
                 light: DirectionalLight::default(),
                 lights: &[],
+                local_light_shadows: &[],
                 draws: &[],
                 overlay: &[],
                 view: ViewSettings::default(),
@@ -9453,7 +10010,7 @@ mod tests {
 
     #[test]
     fn local_light_ssbo_uses_the_tested_std430_layout_and_valid_empty_binding() {
-        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 96);
+        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 112);
         assert_eq!(std::mem::align_of::<GpuLocalLight>(), 16);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, position_range), 0);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, direction_type), 16);
@@ -9461,10 +10018,11 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GpuLocalLight, cone_params), 48);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, view_position_range), 64);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, view_direction), 80);
-        assert_eq!(local_light_bytes(&[], IDENTITY_MATRIX).unwrap().len(), 96);
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, shadow_params), 96);
+        assert_eq!(local_light_bytes(&[], IDENTITY_MATRIX).unwrap().len(), 112);
         assert_eq!(
             floats(&local_light_bytes(&[], IDENTITY_MATRIX).unwrap()),
-            [0.0; 24]
+            [0.0; 28]
         );
 
         let packed = local_light_bytes(
@@ -9475,7 +10033,7 @@ mod tests {
             IDENTITY_MATRIX,
         )
         .unwrap();
-        assert_eq!(packed.len(), 2 * 96);
+        assert_eq!(packed.len(), 2 * 112);
         let values = floats(&packed);
         assert_eq!(
             &values[0..16],
@@ -9484,16 +10042,213 @@ mod tests {
             ]
         );
         assert_eq!(
-            &values[24..40],
+            &values[28..44],
             &[
                 8.0, 9.0, 10.0, 11.0, 0.0, 0.0, -1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.8, 0.5, 0.0, 0.0
             ]
         );
         assert_eq!(&values[16..24], &[1.0, 2.0, 3.0, 7.0, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(
-            &values[40..48],
+            &values[44..52],
             &[8.0, 9.0, 10.0, 11.0, 0.0, 0.0, -1.0, 0.0]
         );
+    }
+
+    #[test]
+    fn local_shadow_slot_budget_is_distance_ordered_and_stably_maps_point_faces_and_spots() {
+        let lights = (0..6)
+            .map(|index| {
+                let distance = match index {
+                    0 | 1 => 1.0,
+                    other => other as f32,
+                };
+                point([distance, 0.0, 0.0], [1.0; 3], 10.0)
+            })
+            .chain((6..9).map(|index| {
+                let distance = if index < 8 { 5.5 } else { 6.0 };
+                spot([distance, 0.0, 0.0], [0.0, 0.0, -1.0], 10.0, 0.8, 0.5)
+            }))
+            .collect::<Vec<_>>();
+        let marker = |value: f32| [[value; 4]; 4];
+        let mut requests = (0..6)
+            .map(|index| LocalLightShadow {
+                light_index: index,
+                matrices: LocalLightShadowMatrices::Point {
+                    matrices: std::array::from_fn(|face| {
+                        marker(100.0 + index as f32 * 10.0 + face as f32)
+                    }),
+                },
+            })
+            .collect::<Vec<_>>();
+        requests.extend((6..9).map(|index| LocalLightShadow {
+            light_index: index,
+            matrices: LocalLightShadowMatrices::Spot {
+                matrix: marker(200.0 + index as f32),
+            },
+        }));
+        let indexed = index_local_light_shadows(&lights, &requests).unwrap();
+        let selected = lights
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(source_index, light)| SelectedLocalLight {
+                source_index,
+                light,
+            })
+            .collect::<Vec<_>>();
+        let plan = select_local_shadow_slots(&selected, &indexed, [0.0; 3]);
+
+        for (source_index, layer_base) in [(0, 0), (1, 6), (2, 12), (3, 18), (4, 24)] {
+            let slot = plan.assignments[source_index].unwrap();
+            assert_eq!(slot.layer_base, layer_base);
+            assert_eq!(slot.kind, LocalShadowKind::Point);
+        }
+        assert!(plan.assignments[5].is_none());
+        for (source_index, layer_base) in [(6, 30), (7, 31)] {
+            let slot = plan.assignments[source_index].unwrap();
+            assert_eq!(slot.layer_base, layer_base);
+            assert_eq!(slot.kind, LocalShadowKind::Spot);
+        }
+        assert!(plan.assignments[8].is_none());
+        assert_eq!(plan.matrices.len(), MAX_LOCAL_SHADOW_LAYERS);
+        assert_eq!(plan.matrices[0][0][0], 100.0);
+        assert_eq!(plan.matrices[6][0][0], 110.0);
+        assert_eq!(plan.matrices[30][0][0], 206.0);
+        assert_eq!(plan.matrices[31][0][0], 207.0);
+    }
+
+    #[test]
+    fn local_shadow_flags_follow_light_indices_after_contribution_sort_and_cap() {
+        let lights = (0..=MAX_RENDERED_LIGHTS)
+            .map(|index| point([0.0, 0.0, -2.0], [index as f32 + 1.0; 3], 8.0))
+            .collect::<Vec<_>>();
+        let requests = [0, MAX_RENDERED_LIGHTS].map(|light_index| LocalLightShadow {
+            light_index,
+            matrices: LocalLightShadowMatrices::Point {
+                matrices: [IDENTITY; 6],
+            },
+        });
+        let indexed = index_local_light_shadows(&lights, &requests).unwrap();
+        let selected = select_local_light_entries(camera([0.0; 3]), &lights).unwrap();
+        assert_eq!(selected.len(), MAX_RENDERED_LIGHTS);
+        assert_eq!(selected[0].source_index, MAX_RENDERED_LIGHTS);
+        assert_eq!(selected[MAX_RENDERED_LIGHTS - 1].source_index, 1);
+
+        let plan = select_local_shadow_slots(&selected, &indexed, [0.0; 3]);
+        assert_eq!(plan.assignments[0].unwrap().layer_base, 0);
+        assert!(plan.assignments.iter().skip(1).all(Option::is_none));
+        assert_eq!(plan.matrices.len(), 6);
+        let bytes = local_light_bytes_for_selected(&selected, &plan.assignments, IDENTITY).unwrap();
+        let first_shadow_params = std::array::from_fn(|index| {
+            u32::from_ne_bytes(bytes[96 + index * 4..100 + index * 4].try_into().unwrap())
+        });
+        assert_eq!(first_shadow_params, [0, 1, 1, 0]);
+        let last_offset = (MAX_RENDERED_LIGHTS - 1) * LOCAL_LIGHT_GPU_SIZE + 96;
+        let last_shadow_params = std::array::from_fn(|index| {
+            let start = last_offset + index * 4;
+            u32::from_ne_bytes(bytes[start..start + 4].try_into().unwrap())
+        });
+        assert_eq!(last_shadow_params, [0; 4]);
+    }
+
+    #[test]
+    fn local_shadow_request_indices_reject_duplicates_type_mismatches_and_nonfinite_matrices() {
+        let lights = [point([0.0; 3], [1.0; 3], 2.0)];
+        let point_shadow = LocalLightShadow {
+            light_index: 0,
+            matrices: LocalLightShadowMatrices::Point {
+                matrices: [IDENTITY; 6],
+            },
+        };
+        assert!(index_local_light_shadows(&lights, &[point_shadow]).is_ok());
+        assert!(index_local_light_shadows(&lights, &[point_shadow, point_shadow]).is_err());
+        assert!(
+            index_local_light_shadows(
+                &lights,
+                &[LocalLightShadow {
+                    light_index: 1,
+                    ..point_shadow
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            index_local_light_shadows(
+                &lights,
+                &[LocalLightShadow {
+                    matrices: LocalLightShadowMatrices::Spot { matrix: IDENTITY },
+                    ..point_shadow
+                }]
+            )
+            .is_err()
+        );
+        let mut invalid = IDENTITY;
+        invalid[0][0] = f32::NAN;
+        assert!(
+            index_local_light_shadows(
+                &lights,
+                &[LocalLightShadow {
+                    matrices: LocalLightShadowMatrices::Point {
+                        matrices: [invalid; 6],
+                    },
+                    ..point_shadow
+                }]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_shadow_matrix_storage_keeps_64_byte_layer_stride_and_finite_padding() {
+        assert_eq!(LOCAL_SHADOW_MAP_RESOLUTION, 1024);
+        assert_eq!(LOCAL_SHADOW_MATRIX_BUFFER_SIZE, 32 * 64);
+        let first = [[2.0; 4]; 4];
+        let second = [[3.0; 4]; 4];
+        let bytes = local_shadow_matrix_bytes(&[first, second]).unwrap();
+        let values = floats(&bytes);
+        assert_eq!(&values[..16], &[2.0; 16]);
+        assert_eq!(&values[16..32], &[3.0; 16]);
+        assert_eq!(&values[32..48], IDENTITY.as_flattened());
+        assert!(local_shadow_matrix_bytes(&vec![IDENTITY; MAX_LOCAL_SHADOW_LAYERS + 1]).is_err());
+        let mut invalid = IDENTITY;
+        invalid[3][0] = f32::INFINITY;
+        assert!(local_shadow_matrix_bytes(&[invalid]).is_err());
+    }
+
+    #[test]
+    fn point_shadow_face_selection_matches_shader_axis_and_tie_order() {
+        for (direction, expected) in [
+            ([1.0, 0.0, 0.0], 0),
+            ([-1.0, 0.0, 0.0], 1),
+            ([0.0, 1.0, 0.0], 2),
+            ([0.0, -1.0, 0.0], 3),
+            ([0.0, 0.0, 1.0], 4),
+            ([0.0, 0.0, -1.0], 5),
+            ([1.0, 1.0, 0.0], 0),
+            ([0.0, 1.0, 1.0], 2),
+            ([1.0, 0.0, 1.0], 0),
+        ] {
+            assert_eq!(point_shadow_face_index(direction), expected);
+        }
+        let shader = include_str!("../shaders/mesh.frag");
+        assert!(shader.contains("magnitude.x >= magnitude.y && magnitude.x >= magnitude.z"));
+        assert!(shader.contains("if (magnitude.y >= magnitude.z)"));
+    }
+
+    #[test]
+    fn local_shadow_matrix_and_light_layouts_match_all_shader_stages() {
+        let fragment = include_str!("../shaders/mesh.frag");
+        let compute = include_str!("../shaders/cluster.comp");
+        let local_vertex = include_str!("../shaders/shadow.vert");
+        for shader in [fragment, compute] {
+            assert!(shader.contains("uvec4 shadow_params;"));
+        }
+        assert!(fragment.contains("layout(set = 0, binding = 6, std430)"));
+        assert!(fragment.contains("layout(set = 0, binding = 7) uniform texture2DArray"));
+        assert!(local_vertex.contains("layout(set = 0, binding = 6, std430)"));
+        assert!(local_vertex.contains("mat4 matrices[MAX_LOCAL_SHADOW_LAYERS]"));
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, shadow_params), 96);
+        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 112);
     }
 
     #[test]
@@ -9515,9 +10270,9 @@ mod tests {
         let values = floats(&bytes);
         assert_eq!(&values[0..4], &[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(&values[16..20], &[-6.0, 3.0, 4.0, 4.0]);
-        assert_eq!(&values[24..28], &[8.0, 9.0, 10.0, 5.0]);
-        assert_eq!(&values[40..44], &[-13.0, 10.0, 11.0, 5.0]);
-        assert_eq!(&values[44..48], &[0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(&values[28..32], &[8.0, 9.0, 10.0, 5.0]);
+        assert_eq!(&values[44..48], &[-13.0, 10.0, 11.0, 5.0]);
+        assert_eq!(&values[48..52], &[0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -10159,6 +10914,7 @@ mod tests {
             shadow_cascades: &cascades,
             light,
             lights: &[],
+            local_light_shadows: &[],
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),
@@ -10218,6 +10974,7 @@ mod tests {
                         shadow_cascades: &[],
                         light,
                         lights: &[],
+                        local_light_shadows: &[],
                         draws: &[],
                         overlay: &[],
                         view: ViewSettings::default(),
@@ -10242,6 +10999,7 @@ mod tests {
             shadow_cascades: &invalid_cascades,
             light: DirectionalLight::default(),
             lights: &[],
+            local_light_shadows: &[],
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),
@@ -10266,6 +11024,7 @@ mod tests {
             shadow_cascades: &too_many,
             light: DirectionalLight::default(),
             lights: &[],
+            local_light_shadows: &[],
             draws: &[],
             overlay: &[],
             view: ViewSettings::default(),

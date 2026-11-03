@@ -2,12 +2,14 @@ use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, LocalLight, MaterialId,
-    MeshId, ProceduralSky, Renderer, SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper,
-    ViewSettings,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, LocalLight,
+    LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId, ProceduralSky, Renderer,
+    SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_scene::camera::Camera;
-use engine_scene::light::cascade_view_projections;
+use engine_scene::light::{
+    cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
+};
 use engine_scene::{
     AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, ObjectHandle,
     Tonemapper, World,
@@ -33,6 +35,7 @@ pub(crate) struct FrameSnapshot {
     pub view: CameraSettings,
     pub light: LightState,
     pub local_lights: Vec<LocalLight>,
+    pub local_light_shadows: Vec<LocalLightShadow>,
     pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
 }
@@ -299,6 +302,7 @@ impl RenderBackend for VulkanBackend {
             },
             environment,
             lights: &snapshot.local_lights,
+            local_light_shadows: &snapshot.local_light_shadows,
             shadow_cascades: &shadow_cascades,
             light,
             draws: &snapshot.draws,
@@ -590,34 +594,50 @@ fn make_snapshot(
         }));
     }
     let environment = resolve_environment_snapshot(scene.environment.as_ref(), gpu_scene)?;
-    let local_lights = render_local_lights(&scene.local_lights);
+    let (local_lights, local_light_shadows) = render_local_lights(&scene.local_lights);
     Ok(FrameSnapshot {
         camera: scene.camera,
         view: scene.view,
         light: scene.light,
         local_lights,
+        local_light_shadows,
         environment,
         draws,
     })
 }
 
-fn render_local_lights(states: &[LocalLightState]) -> Vec<LocalLight> {
-    states
-        .iter()
-        .map(|state| match *state {
+fn render_local_lights(states: &[LocalLightState]) -> (Vec<LocalLight>, Vec<LocalLightShadow>) {
+    let mut lights = Vec::with_capacity(states.len());
+    let mut shadows = Vec::new();
+    for (light_index, state) in states.iter().enumerate() {
+        match *state {
             LocalLightState::Point {
                 position,
                 color,
                 intensity,
                 range,
-                ..
-            } => LocalLight::Point {
-                position,
-                color_intensity: color.map(|component| {
-                    (f64::from(component) * f64::from(intensity)).min(f64::from(f32::MAX)) as f32
-                }),
-                range,
-            },
+                shadows: casts_shadow,
+            } => {
+                lights.push(LocalLight::Point {
+                    position,
+                    color_intensity: color.map(|component| {
+                        (f64::from(component) * f64::from(intensity)).min(f64::from(f32::MAX))
+                            as f32
+                    }),
+                    range,
+                });
+                if casts_shadow
+                    && let Some(matrices) =
+                        point_shadow_view_projections(Vec3::from_array(position), range)
+                {
+                    shadows.push(LocalLightShadow {
+                        light_index,
+                        matrices: LocalLightShadowMatrices::Point {
+                            matrices: matrices.map(|matrix| matrix.to_cols_array_2d()),
+                        },
+                    });
+                }
+            }
             LocalLightState::Spot {
                 position,
                 direction,
@@ -626,19 +646,39 @@ fn render_local_lights(states: &[LocalLightState]) -> Vec<LocalLight> {
                 range,
                 inner_angle_deg,
                 outer_angle_deg,
-                ..
-            } => LocalLight::Spot {
-                position,
-                direction,
-                color_intensity: color.map(|component| {
-                    (f64::from(component) * f64::from(intensity)).min(f64::from(f32::MAX)) as f32
-                }),
-                range,
-                cos_inner_angle: inner_angle_deg.to_radians().cos().max(0.0),
-                cos_outer_angle: outer_angle_deg.to_radians().cos().max(0.0),
-            },
-        })
-        .collect()
+                shadows: casts_shadow,
+            } => {
+                lights.push(LocalLight::Spot {
+                    position,
+                    direction,
+                    color_intensity: color.map(|component| {
+                        (f64::from(component) * f64::from(intensity)).min(f64::from(f32::MAX))
+                            as f32
+                    }),
+                    range,
+                    cos_inner_angle: inner_angle_deg.to_radians().cos().max(0.0),
+                    cos_outer_angle: outer_angle_deg.to_radians().cos().max(0.0),
+                });
+                if casts_shadow
+                    && let Some(matrix) = spot_shadow_view_projection(
+                        Vec3::from_array(position),
+                        Vec3::from_array(direction),
+                        inner_angle_deg,
+                        outer_angle_deg,
+                        range,
+                    )
+                {
+                    shadows.push(LocalLightShadow {
+                        light_index,
+                        matrices: LocalLightShadowMatrices::Spot {
+                            matrix: matrix.to_cols_array_2d(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+    (lights, shadows)
 }
 
 fn resolve_environment_snapshot(
@@ -1205,6 +1245,7 @@ distance=2.0
             view: CameraSettings::default(),
             light: LightState::default(),
             local_lights: Vec::new(),
+            local_light_shadows: Vec::new(),
             environment: None,
             draws: Vec::<DrawCommand>::new(),
         }
@@ -1231,7 +1272,13 @@ distance=2.0
                 shadows: false,
             },
         ];
-        let mapped = render_local_lights(&scene);
+        let (mapped, shadow_matrices) = render_local_lights(&scene);
+        assert_eq!(shadow_matrices.len(), 1);
+        assert_eq!(shadow_matrices[0].light_index, 0);
+        assert!(matches!(
+            shadow_matrices[0].matrices,
+            engine_render::LocalLightShadowMatrices::Point { .. }
+        ));
         assert_eq!(
             mapped[0],
             LocalLight::Point {
@@ -1260,15 +1307,23 @@ distance=2.0
             range: 5.0,
             inner_angle_deg: 90.0,
             outer_angle_deg: 90.0,
-            shadows: false,
+            shadows: true,
         };
+        let (ninety_lights, ninety_shadows) = render_local_lights(&[ninety_degree]);
         assert!(matches!(
-            render_local_lights(&[ninety_degree])[0],
+            ninety_lights[0],
             LocalLight::Spot {
                 cos_inner_angle: 0.0,
                 cos_outer_angle: 0.0,
                 ..
             }
+        ));
+        assert!(matches!(
+            ninety_shadows.as_slice(),
+            [engine_render::LocalLightShadow {
+                light_index: 0,
+                matrices: engine_render::LocalLightShadowMatrices::Spot { .. },
+            }]
         ));
     }
 
@@ -1296,7 +1351,7 @@ range = 10
         )
         .unwrap();
         let mut world = engine_scene::World::from_document(&document).unwrap();
-        let lights = render_local_lights(&world.build_frame().0.local_lights);
+        let (lights, _) = render_local_lights(&world.build_frame().0.local_lights);
         assert_eq!(lights.len(), 2);
         for light in lights {
             let color_intensity = match light {

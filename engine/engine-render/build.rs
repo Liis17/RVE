@@ -12,6 +12,8 @@ const CLUSTER_GRID_Y: u32 = 9;
 const CLUSTER_GRID_Z: u32 = 24;
 const MAX_CLUSTER_LIGHTS: usize = 128;
 const MAX_RENDERED_LIGHTS: usize = 1024;
+const MAX_LOCAL_SHADOW_LAYERS: usize = 32;
+const LOCAL_SHADOW_MAP_RESOLUTION: u32 = 1024;
 const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = 64;
 
 type ShaderBuild = (
@@ -71,6 +73,12 @@ const SHADERS: &[ShaderBuild] = &[
         naga::ShaderStage::Vertex,
         &[],
         "shadow.vert.spv",
+    ),
+    (
+        "shadow.vert",
+        naga::ShaderStage::Vertex,
+        &[("LOCAL_SHADOW", "1")],
+        "shadow.local.vert.spv",
     ),
     (
         "shadow.frag",
@@ -135,6 +143,10 @@ fn main() {
              pub const CLUSTER_GRID_Z: usize = {CLUSTER_GRID_Z};\n\
              pub const MAX_CLUSTER_LIGHTS: usize = {MAX_CLUSTER_LIGHTS};\n\
              pub const MAX_RENDERED_LIGHTS: usize = {MAX_RENDERED_LIGHTS};\n\
+             /// Maximum point and spot shadow layers shared by a renderer.\n\
+             pub const MAX_LOCAL_SHADOW_LAYERS: usize = {MAX_LOCAL_SHADOW_LAYERS};\n\
+             /// Resolution of each shared point or spot shadow layer.\n\
+             pub const LOCAL_SHADOW_MAP_RESOLUTION: u32 = {LOCAL_SHADOW_MAP_RESOLUTION};\n\
              pub const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = {CLUSTER_COMPUTE_LOCAL_SIZE};\n\
              pub const CLUSTER_COUNT: usize = {cluster_count};\n"
         ),
@@ -162,6 +174,24 @@ fn main() {
                     MAX_CLUSTER_LIGHTS.to_string(),
                 ),
             ]);
+        }
+        if name == "mesh.frag" {
+            shader_options.defines.extend([
+                (
+                    "MAX_LOCAL_SHADOW_LAYERS".to_owned(),
+                    MAX_LOCAL_SHADOW_LAYERS.to_string(),
+                ),
+                (
+                    "LOCAL_SHADOW_MAP_RESOLUTION".to_owned(),
+                    LOCAL_SHADOW_MAP_RESOLUTION.to_string(),
+                ),
+            ]);
+        }
+        if name == "shadow.vert" && shader_options.defines.contains_key("LOCAL_SHADOW") {
+            shader_options.defines.insert(
+                "MAX_LOCAL_SHADOW_LAYERS".to_owned(),
+                MAX_LOCAL_SHADOW_LAYERS.to_string(),
+            );
         }
         if name == "cluster.comp" {
             shader_options.defines.insert(

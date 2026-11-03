@@ -61,7 +61,7 @@ position = [-2.4, 2.2, 1.2]
 color = [1.0, 0.42, 0.16]
 intensity = 35.0
 range = 9.0
-shadows = false
+shadows = true
 
 [[objects]]
 id = "cool-spot"
@@ -76,7 +76,7 @@ intensity = 48.0
 range = 11.0
 inner_angle_deg = 14.0
 outer_angle_deg = 28.0
-shadows = false
+shadows = true
 
 [[objects]]
 id = "shared-cube"
@@ -94,6 +94,18 @@ params = { speed = 30.0 }
 [[objects.heavy_scripts]]
 name = "Bobber"
 params = { amplitude = 0.15, speed = 1.4 }
+
+[[objects]]
+id = "shadow-floor"
+name = "Shadow Floor"
+[objects.transform]
+position = [0.0, 0.35, 0.0]
+scale = [8.0, 0.2, 8.0]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.mesh_renderer.material]
+metallic = 0.0
+roughness = 0.85
 
 [[instances]]
 id = "orbit"

@@ -20,6 +20,12 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 cluster_params;
 } frame;
 
+#ifdef LOCAL_SHADOW
+layout(set = 0, binding = 6, std430) readonly buffer LocalShadowMatrixBuffer {
+    mat4 matrices[MAX_LOCAL_SHADOW_LAYERS];
+} local_shadow_matrix_buffer;
+#endif
+
 layout(push_constant) uniform PushConstants {
     mat4 model;
     mat4 normal_from_model;
@@ -27,6 +33,11 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     out_uv = in_uv;
+#ifdef LOCAL_SHADOW
+    gl_Position = local_shadow_matrix_buffer.matrices[gl_InstanceIndex]
+        * push_constants.model * vec4(in_position, 1.0);
+#else
     gl_Position = frame.shadow_view_projections[gl_InstanceIndex]
         * push_constants.model * vec4(in_position, 1.0);
+#endif
 }

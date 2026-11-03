@@ -649,7 +649,7 @@ pub struct PointLightComponent {
     pub color: [f32; 3],
     pub intensity: f32,
     pub range: f32,
-    /// Зарезервировано для реализации теней локальных источников.
+    /// Запрашивает шестислойные point shadows; при range ниже минимума теней источник остаётся освещённым без тени.
     pub shadows: bool,
 }
 
@@ -673,7 +673,7 @@ pub struct SpotLightComponent {
     pub range: f32,
     pub inner_angle_deg: f32,
     pub outer_angle_deg: f32,
-    /// Зарезервировано для реализации теней локальных источников.
+    /// Запрашивает spot shadow; при range ниже минимума теней источник остаётся освещённым без тени.
     pub shadows: bool,
 }
 

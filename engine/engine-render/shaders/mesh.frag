@@ -34,6 +34,7 @@ struct LocalLightData {
     vec4 cone_params;
     vec4 view_position_range;
     vec4 view_direction;
+    uvec4 shadow_params;
 };
 
 layout(set = 0, binding = 3, std430) readonly buffer LocalLightBuffer {
@@ -48,6 +49,11 @@ struct ClusterRecord {
 layout(set = 0, binding = 4, std430) readonly buffer ClusterBuffer {
     ClusterRecord clusters[];
 } cluster_buffer;
+
+layout(set = 0, binding = 6, std430) readonly buffer LocalShadowMatrixBuffer {
+    mat4 matrices[MAX_LOCAL_SHADOW_LAYERS];
+} local_shadow_matrix_buffer;
+layout(set = 0, binding = 7) uniform texture2DArray local_shadow_map;
 
 layout(set = 1, binding = 0) uniform MaterialUniforms {
     vec4 base_color;
@@ -149,6 +155,56 @@ float spot_attenuation(
         return ray_cosine >= cos_outer_angle ? 1.0 : 0.0;
     }
     return smoothstep(cos_outer_angle, cos_inner_angle, ray_cosine);
+}
+
+uint point_shadow_face_index(vec3 direction) {
+    vec3 magnitude = abs(direction);
+    if (magnitude.x >= magnitude.y && magnitude.x >= magnitude.z) {
+        return direction.x >= 0.0 ? 0u : 1u;
+    }
+    if (magnitude.y >= magnitude.z) {
+        return direction.y >= 0.0 ? 2u : 3u;
+    }
+    return direction.z >= 0.0 ? 4u : 5u;
+}
+
+float local_shadow_visibility(LocalLightData light, vec3 geometric_normal, vec3 to_light) {
+    if (light.shadow_params.z == 0u || light.shadow_params.x >= uint(MAX_LOCAL_SHADOW_LAYERS)) {
+        return 1.0;
+    }
+    uint layer = light.shadow_params.x;
+    if (light.shadow_params.y == 1u) {
+        layer += point_shadow_face_index(in_world_position - light.position_range.xyz);
+    } else if (light.shadow_params.y != 2u) {
+        return 1.0;
+    }
+    if (layer >= uint(MAX_LOCAL_SHADOW_LAYERS)) {
+        return 1.0;
+    }
+    vec4 shadow_clip = local_shadow_matrix_buffer.matrices[layer]
+        * vec4(in_world_position, 1.0);
+    if (shadow_clip.w <= 0.0) {
+        return 1.0;
+    }
+    vec3 shadow_ndc = shadow_clip.xyz / shadow_clip.w;
+    if (any(lessThan(shadow_ndc.xy, vec2(-1.0)))
+        || any(greaterThan(shadow_ndc.xy, vec2(1.0)))
+        || shadow_ndc.z < 0.0 || shadow_ndc.z > 1.0) {
+        return 1.0;
+    }
+    vec2 shadow_uv = vec2(0.5 + 0.5 * shadow_ndc.x, 0.5 - 0.5 * shadow_ndc.y);
+    float bias = max(0.005 * (1.0 - max(dot(geometric_normal, to_light), 0.0)), 0.0005);
+    float visibility = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 offset = vec2(float(x), float(y)) / float(LOCAL_SHADOW_MAP_RESOLUTION);
+            visibility += texture(
+                sampler2DArrayShadow(local_shadow_map, shadow_sampler),
+                vec4(shadow_uv + offset, float(layer), shadow_ndc.z - bias)
+            );
+        }
+    }
+    return visibility / 9.0;
 }
 
 void main() {
@@ -329,7 +385,8 @@ void main() {
             metallic,
             alpha,
             normal_dot_view
-        ) * local_light.color_intensity.rgb * attenuation;
+        ) * local_light.color_intensity.rgb * attenuation
+            * local_shadow_visibility(local_light, geometric_normal, local_light_direction);
     }
     vec3 reflected = reflect(-view, normal);
     mat3 world_to_environment = transpose(mat3(frame.environment_rotation));

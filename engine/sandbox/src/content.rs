@@ -5,8 +5,13 @@ use crate::scene::{
     plane_mesh, shadows_light_direction, sinusoidal_normal_texture,
 };
 use engine_assets::{Model, ModelAlphaMode, ModelMaterial, TextureData};
-use engine_render::{DirectionalLight, LocalLight, SHADOW_MAP_RESOLUTION, Vertex};
-use engine_scene::light::cascade_view_projections;
+use engine_render::{
+    DirectionalLight, LocalLight, LocalLightShadow, LocalLightShadowMatrices,
+    SHADOW_MAP_RESOLUTION, Vertex,
+};
+use engine_scene::light::{
+    cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
+};
 use engine_scene::{CameraSettings, ShadowSettings};
 use glam::{Mat4, Vec3};
 
@@ -244,6 +249,36 @@ impl Content {
         ]
     }
 
+    pub fn local_light_shadows(&self) -> Vec<LocalLightShadow> {
+        if self.motion != Scene::Shadows {
+            return Vec::new();
+        }
+        let mut shadows = Vec::with_capacity(2);
+        if let Some(matrices) = point_shadow_view_projections(Vec3::new(-2.2, 2.0, 1.5), 8.0) {
+            shadows.push(LocalLightShadow {
+                light_index: 0,
+                matrices: LocalLightShadowMatrices::Point {
+                    matrices: matrices.map(|matrix| matrix.to_cols_array_2d()),
+                },
+            });
+        }
+        if let Some(matrix) = spot_shadow_view_projection(
+            Vec3::new(2.2, 3.0, 1.8),
+            Vec3::new(-0.55, -0.72, -0.43),
+            15.0,
+            27.0,
+            10.0,
+        ) {
+            shadows.push(LocalLightShadow {
+                light_index: 1,
+                matrices: LocalLightShadowMatrices::Spot {
+                    matrix: matrix.to_cols_array_2d(),
+                },
+            });
+        }
+        shadows
+    }
+
     pub fn shadow_cascades(
         &self,
         elapsed: f32,
@@ -449,6 +484,18 @@ mod tests {
         assert_eq!(content.light(0.0).color, [1.0; 3]);
         assert_eq!(content.light(0.0).ambient, [0.15; 3]);
         assert_eq!(content.local_lights().len(), 2);
+        let local_shadows = content.local_light_shadows();
+        assert_eq!(local_shadows.len(), 2);
+        assert_eq!(local_shadows[0].light_index, 0);
+        assert!(matches!(
+            local_shadows[0].matrices,
+            engine_render::LocalLightShadowMatrices::Point { .. }
+        ));
+        assert_eq!(local_shadows[1].light_index, 1);
+        assert!(matches!(
+            local_shadows[1].matrices,
+            engine_render::LocalLightShadowMatrices::Spot { .. }
+        ));
         let cascades = content.shadow_cascades(0.0, 1280, 720, CameraSettings::default());
         assert_eq!(cascades.len(), 4);
         assert!(
@@ -463,6 +510,16 @@ mod tests {
             engine_render::DirectionalLight::default()
         );
         assert!(Content::from_scene(Scene::Cube).local_lights().is_empty());
+        assert!(
+            Content::from_scene(Scene::Materials)
+                .local_light_shadows()
+                .is_empty()
+        );
+        assert!(
+            Content::from_scene(Scene::Clustered)
+                .local_light_shadows()
+                .is_empty()
+        );
         assert!(
             Content::from_scene(Scene::Cube)
                 .shadow_cascades(0.0, 1280, 720, CameraSettings::default())

@@ -616,6 +616,7 @@ impl WindowHandler for Sandbox {
                 }
             });
         let local_lights = self.content.local_lights();
+        let local_light_shadows = self.content.local_light_shadows();
         let frame = Frame {
             clear_color: [
                 self.camera_settings.render.clear_color[0],
@@ -637,6 +638,7 @@ impl WindowHandler for Sandbox {
             shadow_cascades: &shadow_cascades,
             light: self.content.light(elapsed),
             lights: &local_lights,
+            local_light_shadows: &local_light_shadows,
             draws: &draws,
             overlay,
             view: ViewSettings {

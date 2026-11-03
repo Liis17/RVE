@@ -25,6 +25,7 @@ struct LocalLightData {
     vec4 cone_params;
     vec4 view_position_range;
     vec4 view_direction;
+    uvec4 shadow_params;
 };
 
 layout(set = 0, binding = 3, std430) readonly buffer LocalLightBuffer {

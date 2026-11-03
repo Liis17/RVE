@@ -23,6 +23,7 @@ pub(crate) struct GpuLocalLight {
     pub cone_params: [f32; 4],
     pub view_position_range: [f32; 4],
     pub view_direction: [f32; 4],
+    pub shadow_params: [u32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -428,9 +429,10 @@ mod tests {
 
     #[test]
     fn one_cluster_keeps_the_first_128_intersections_in_source_order() {
-        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 96);
+        assert_eq!(std::mem::size_of::<GpuLocalLight>(), 112);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, view_position_range), 64);
         assert_eq!(std::mem::offset_of!(GpuLocalLight, view_direction), 80);
+        assert_eq!(std::mem::offset_of!(GpuLocalLight, shadow_params), 96);
         let bounds = ClusterBounds {
             min: [-1.0; 4],
             max: [1.0; 4],

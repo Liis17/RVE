@@ -946,7 +946,7 @@ fn render_scene_frame(
     let Some(parts) = state.frame_parts() else {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
-    let local_lights = render_local_lights(&scene_frame.local_lights);
+    let (local_lights, local_light_shadows) = render_local_lights(&scene_frame.local_lights);
     gpu.scene.build_draws(
         &mut gpu.renderer,
         parts.world,
@@ -979,6 +979,7 @@ fn render_scene_frame(
             scene_settings,
             &scene_frame.light,
             &local_lights,
+            &local_light_shadows,
             has_light,
             scene_frame.environment.as_ref(),
             &scene_shadow_cascades,
@@ -993,6 +994,7 @@ fn render_scene_frame(
             game_settings,
             &scene_frame.light,
             &local_lights,
+            &local_light_shadows,
             has_light,
             scene_frame.environment.as_ref(),
             &game_shadow_cascades,

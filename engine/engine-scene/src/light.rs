@@ -2,17 +2,102 @@
 
 use crate::camera::Camera;
 use glam::camera::rh::proj::directx;
-use glam::camera::rh::view::look_at_mat4;
+use glam::camera::rh::view::{look_at_mat4, look_to_mat4};
 use glam::{Mat4, Vec3};
 
 pub const MAX_SHADOW_CASCADES: u8 = 4;
+/// Below this scene-space range, local lights remain lit but do not receive
+/// shadows; the chosen 1% near plane would be smaller than `1e-5` units.
+pub const MIN_LOCAL_SHADOW_RANGE: f32 = 0.001;
+/// A 180-degree perspective projection is singular. At a 90-degree spot outer
+/// angle, shadows cover a finite cone just inside the horizon; light emission
+/// still uses the authored 90-degree cone.
+pub const SPOT_SHADOW_MAX_FOV: f32 = std::f32::consts::PI - 0.01;
 const PRACTICAL_SPLIT_LAMBDA: f32 = 0.75;
+
+/// Point shadow layer order: +X, -X, +Y, -Y, +Z, -Z. Up vectors keep each
+/// face oriented consistently with the renderer's negative-height viewport.
+pub const POINT_SHADOW_FACE_BASES: [([f32; 3], [f32; 3]); 6] = [
+    ([1.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+    ([-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+    ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+    ([0.0, -1.0, 0.0], [0.0, 0.0, -1.0]),
+    ([0.0, 0.0, 1.0], [0.0, -1.0, 0.0]),
+    ([0.0, 0.0, -1.0], [0.0, -1.0, 0.0]),
+];
 
 /// Настройки каскадных теней направленного света.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowSettings {
     pub distance: f32,
     pub cascades: u8,
+}
+
+/// Six Vulkan-depth point-light shadow view-projection matrices, in
+/// [`POINT_SHADOW_FACE_BASES`] order.
+pub fn point_shadow_view_projections(position: Vec3, range: f32) -> Option<[Mat4; 6]> {
+    if !position.is_finite() {
+        return None;
+    }
+    let near = local_shadow_near_plane(range)?;
+    let projection = directx::perspective(std::f32::consts::FRAC_PI_2, 1.0, near, range);
+    let matrices = std::array::from_fn(|index| {
+        let (direction, up) = POINT_SHADOW_FACE_BASES[index];
+        projection * look_to_mat4(position, Vec3::from_array(direction), Vec3::from_array(up))
+    });
+    (matrices.iter().all(|matrix| matrix.is_finite())).then_some(matrices)
+}
+
+/// Spot-light shadow view-projection matrix using a Vulkan `[0, 1]` depth
+/// projection. Invalid bases or ranges return `None`, leaving the light
+/// unshadowed. Equal inner and outer angles are valid; only the outer angle
+/// determines shadow coverage.
+pub fn spot_shadow_view_projection(
+    position: Vec3,
+    direction: Vec3,
+    inner_angle_deg: f32,
+    outer_angle_deg: f32,
+    range: f32,
+) -> Option<Mat4> {
+    if !position.is_finite()
+        || !direction.is_finite()
+        || !inner_angle_deg.is_finite()
+        || !outer_angle_deg.is_finite()
+        || inner_angle_deg <= 0.0
+        || outer_angle_deg < inner_angle_deg
+        || outer_angle_deg > 90.0
+    {
+        return None;
+    }
+    let scale = direction.abs().max_element();
+    if !scale.is_finite() || scale == 0.0 {
+        return None;
+    }
+    let direction = (direction / scale).normalize();
+    if !direction.is_finite() || direction.length_squared() == 0.0 {
+        return None;
+    }
+    let near = local_shadow_near_plane(range)?;
+    let fov = (2.0 * outer_angle_deg.to_radians()).min(SPOT_SHADOW_MAX_FOV);
+    if !fov.is_finite() || fov <= 0.0 {
+        return None;
+    }
+    let reference_up = if direction.dot(Vec3::Y).abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let matrix = directx::perspective(fov, 1.0, near, range)
+        * look_to_mat4(position, direction, reference_up);
+    matrix.is_finite().then_some(matrix)
+}
+
+fn local_shadow_near_plane(range: f32) -> Option<f32> {
+    if !range.is_finite() || range < MIN_LOCAL_SHADOW_RANGE {
+        return None;
+    }
+    let near = (range * 0.01).min(0.05);
+    (near.is_finite() && near > 0.0 && near < range).then_some(near)
 }
 
 /// Направление лучей солнца в мировом пространстве.
@@ -455,6 +540,89 @@ mod tests {
         assert_eq!(
             cascade_view_projections(camera, 1.0, Vec3::NEG_Y, settings(1, f32::MAX), 2048).len(),
             1
+        );
+    }
+
+    #[test]
+    fn point_shadow_faces_cover_their_axes_and_map_near_and_range_to_vulkan_depth() {
+        let position = Vec3::new(2.0, -3.0, 4.0);
+        let range = 10.0;
+        let near = 0.05;
+        let matrices = super::point_shadow_view_projections(position, range).unwrap();
+        for (matrix, (direction, _)) in matrices.iter().zip(super::POINT_SHADOW_FACE_BASES) {
+            let direction = Vec3::from_array(direction);
+            let center = ndc(*matrix, position + direction * 2.0);
+            assert!(center.x.abs() < 1e-5, "{center:?}");
+            assert!(center.y.abs() < 1e-5, "{center:?}");
+
+            let near_depth = ndc(*matrix, position + direction * near).z;
+            let far_depth = ndc(*matrix, position + direction * range).z;
+            assert!(near_depth.abs() < 1e-5, "{near_depth}");
+            assert!((far_depth - 1.0).abs() < 1e-5, "{far_depth}");
+        }
+    }
+
+    #[test]
+    fn spot_shadow_projection_covers_authored_cone_and_equal_angles() {
+        let position = Vec3::new(1.0, 2.0, 3.0);
+        let direction = Vec3::NEG_Z;
+        let range = 10.0;
+        let matrix =
+            super::spot_shadow_view_projection(position, direction, 30.0, 30.0, range).unwrap();
+        let near_depth = ndc(matrix, position + direction * 0.05).z;
+        let far_depth = ndc(matrix, position + direction * range).z;
+        assert!(near_depth.abs() < 1e-5, "{near_depth}");
+        assert!((far_depth - 1.0).abs() < 1e-5, "{far_depth}");
+
+        let half_extent = 5.0 * 30.0_f32.to_radians().tan();
+        for (horizontal, vertical) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+            let corner = position
+                + direction * 5.0
+                + Vec3::new(horizontal * half_extent, vertical * half_extent, 0.0);
+            let projected = ndc(matrix, corner);
+            assert!((projected.x - horizontal).abs() < 1e-5, "{projected:?}");
+            assert!((projected.y - vertical).abs() < 1e-5, "{projected:?}");
+            assert!(projected.z > 0.0 && projected.z < 1.0, "{projected:?}");
+        }
+    }
+
+    #[test]
+    fn ninety_degree_spot_uses_finite_near_horizon_shadow_coverage() {
+        let position = Vec3::ZERO;
+        let direction = Vec3::NEG_Z;
+        let matrix =
+            super::spot_shadow_view_projection(position, direction, 90.0, 90.0, 5.0).unwrap();
+        assert!(matrix.is_finite());
+        let covered_angle = super::SPOT_SHADOW_MAX_FOV * 0.5;
+        let covered = Vec3::new(covered_angle.tan(), 0.0, -1.0);
+        let projected = ndc(matrix, covered);
+        assert!((projected.x - 1.0).abs() < 1e-4, "{projected:?}");
+        let horizon = ndc(matrix, Vec3::new(1000.0, 0.0, -1.0));
+        assert!(horizon.x > 1.0 && horizon.x.is_finite(), "{horizon:?}");
+    }
+
+    #[test]
+    fn local_shadow_projection_rejects_invalid_inputs_and_unrenderably_small_ranges() {
+        assert!(super::point_shadow_view_projections(Vec3::ZERO, 0.000_999).is_none());
+        assert!(super::point_shadow_view_projections(Vec3::ZERO, f32::NAN).is_none());
+        assert!(super::point_shadow_view_projections(Vec3::splat(f32::INFINITY), 1.0).is_none());
+        assert!(super::point_shadow_view_projections(Vec3::ZERO, 0.001).is_some());
+
+        for (direction, inner, outer, range) in [
+            (Vec3::ZERO, 10.0, 20.0, 5.0),
+            (Vec3::Y, 0.0, 20.0, 5.0),
+            (Vec3::Y, 30.0, 20.0, 5.0),
+            (Vec3::Y, 10.0, 91.0, 5.0),
+            (Vec3::Y, 10.0, 20.0, f32::INFINITY),
+        ] {
+            assert!(
+                super::spot_shadow_view_projection(Vec3::ZERO, direction, inner, outer, range)
+                    .is_none()
+            );
+        }
+        assert!(
+            super::spot_shadow_view_projection(Vec3::ZERO, Vec3::Y, 10.0, 10.0, 0.000_999)
+                .is_none()
         );
     }
 }
