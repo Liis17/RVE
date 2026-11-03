@@ -615,7 +615,7 @@ struct MaterialTextures<'a> {
 struct ModelTextureCache {
     loaded_textures: HashMap<u32, usize>,
     loaded_metallic_roughness: HashMap<(Option<u32>, Option<u32>), usize>,
-    loaded_base_color_opacity: HashMap<(Option<u32>, u32, bool), usize>,
+    loaded_base_color_opacity: HashMap<(Option<u32>, u32, bool, u32), usize>,
 }
 
 impl MaterialTextures<'_> {
@@ -754,7 +754,15 @@ fn load_model_material(
         let base_id = textures
             .base_color
             .map(|texture| texture.element.element_id);
-        let key = (base_id, opacity_id, invert);
+        // Invert classic FBX transparency after multiplying color and factor.
+        let transparency_scale = if !invert {
+            1.0
+        } else if material.fbx.transparency_factor.texture.is_some() {
+            map_scalar(&material.fbx.transparency_color)
+        } else {
+            map_scalar(&material.fbx.transparency_factor)
+        };
+        let key = (base_id, opacity_id, invert, transparency_scale.to_bits());
         if let Some(&index) = loaded_base_color_opacity.get(&key) {
             Some(index)
         } else {
@@ -762,6 +770,7 @@ fn load_model_material(
                 base_color_source.map(|index| &model.textures[index]),
                 &model.textures[opacity_index],
                 invert,
+                transparency_scale,
             )
             .map_err(|message| AssetError::Decode {
                 path: model_path.to_owned(),
@@ -910,16 +919,14 @@ fn opacity_factor(material: &ufbx::Material) -> f32 {
         } else {
             1.0
         }
-    } else if material.fbx.transparency_factor.has_value
-        || material.fbx.transparency_factor.texture.is_some()
-    {
-        1.0 - map_scalar(&material.fbx.transparency_factor)
-    } else if material.fbx.transparency_color.has_value
+    } else if material.fbx.transparency_factor.texture.is_some()
         || material.fbx.transparency_color.texture.is_some()
     {
-        1.0 - map_scalar(&material.fbx.transparency_color)
-    } else {
+        // The combined transparency is baked into base color alpha.
         1.0
+    } else {
+        1.0 - map_scalar(&material.fbx.transparency_factor)
+            * map_scalar(&material.fbx.transparency_color)
     }
 }
 
@@ -927,6 +934,7 @@ fn combine_base_color_opacity(
     base_color: Option<&TextureData>,
     opacity: &TextureData,
     invert_opacity: bool,
+    transparency_scale: f32,
 ) -> Result<TextureData, String> {
     if base_color.is_some_and(|base| (base.width, base.height) != (opacity.width, opacity.height)) {
         return Err("base color и opacity карты имеют разные размеры".to_owned());
@@ -940,7 +948,9 @@ fn combine_base_color_opacity(
         .zip(opacity.rgba.as_chunks::<4>().0.iter())
     {
         let opacity = if invert_opacity {
-            255 - opacity_pixel[0]
+            (255.0 - f32::from(opacity_pixel[0]) * transparency_scale)
+                .round()
+                .clamp(0.0, 255.0) as u8
         } else {
             opacity_pixel[0]
         };
@@ -2270,6 +2280,50 @@ mod tests {
         assert_eq!(material.normal_texture, Some(1));
         assert_eq!(material.normal_scale, 1.0);
         assert_eq!(model.textures.len(), 2);
+    }
+
+    #[test]
+    fn classic_transparency_multiplies_color_and_factor_before_inverting() {
+        let temp = TempAssets::new("classic-transparency");
+        for (color, factor, expected) in [(0.0, 1.0, 1.0), (0.5, 0.5, 0.75), (1.0, 0.0, 1.0)] {
+            let properties = format!(
+                "\t\t\tP: \"TransparentColor\", \"Color\", \"\", \"A\", {color}, {color}, {color}\n\t\t\tP: \"TransparencyFactor\", \"Number\", \"\", \"A\", {factor}"
+            );
+            let fbx =
+                arnold_quad_fbx(&properties, &[], false).replace("\tC: \"OO\",3000,5000\n", "");
+            temp.write("model/classic.fbx", fbx.as_bytes());
+            let model = temp.assets().load_model("/model/classic.fbx").unwrap();
+            assert_eq!(model.meshes[0].material.opacity, expected);
+        }
+    }
+
+    #[test]
+    fn classic_transparency_maps_invert_the_combined_scalar_and_map() {
+        let temp = TempAssets::new("classic-transparency-map");
+        for map in ["TransparentColor", "TransparencyFactor"] {
+            let properties = "\t\t\tP: \"TransparentColor\", \"Color\", \"\", \"A\", 0.5, 0.5, 0.5\n\t\t\tP: \"TransparencyFactor\", \"Number\", \"\", \"A\", 0.5";
+            let fbx = arnold_quad_fbx(properties, &[(map, "transparency.png")], false)
+                .replace("\tC: \"OO\",3000,5000\n", "");
+            temp.write("model/classic.fbx", fbx.as_bytes());
+            temp.write(
+                "model/transparency.png",
+                &encode_png(
+                    1,
+                    1,
+                    png::ColorType::Rgba,
+                    png::BitDepth::Eight,
+                    &[128, 128, 128, 255],
+                ),
+            );
+            let model = temp.assets().load_model("/model/classic.fbx").unwrap();
+            let material = &model.meshes[0].material;
+            assert_eq!(material.opacity, 1.0);
+            assert_eq!(
+                model.textures[material.base_color_texture.unwrap()].rgba[3],
+                191
+            );
+            assert_eq!(material.alpha_mode, ModelAlphaMode::Blend);
+        }
     }
 
     #[test]

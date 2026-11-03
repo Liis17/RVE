@@ -4349,7 +4349,10 @@ fn record_scene(
                 vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                     | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
             )
-            .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ)
+            .dst_access_mask(
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
             .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
             .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
