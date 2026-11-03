@@ -10,6 +10,10 @@ use engine_script::{ScriptInterruptHandle, lite_properties};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+
+const LITE_PROPERTIES_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectBuild {
@@ -267,8 +271,9 @@ fn validate_lite_params(
                 let source = String::from_utf8(bytes).map_err(|error| {
                     BuildError::input(format!("скрипт {label} должен быть UTF-8: {error}"))
                 })?;
-                let schema = lite_properties(&label, &source, &ScriptInterruptHandle::new())
-                    .map_err(|error| BuildError::input(error.to_string()))?;
+                let schema =
+                    read_lite_properties_with_timeout(&label, &source, LITE_PROPERTIES_TIMEOUT)
+                        .map_err(BuildError::input)?;
                 schemas.insert(script.path.clone(), schema);
             }
             if let Some(schema) = &schemas[&script.path] {
@@ -282,6 +287,34 @@ fn validate_lite_params(
         }
     }
     Ok(())
+}
+
+fn read_lite_properties_with_timeout(
+    label: &str,
+    source: &str,
+    timeout: Duration,
+) -> Result<Option<ParamSchema>, String> {
+    let interrupt = ScriptInterruptHandle::new();
+    let (done, finished) = mpsc::channel::<()>();
+    let watchdog = {
+        let interrupt = interrupt.clone();
+        std::thread::spawn(move || {
+            if finished.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
+                interrupt.interrupt();
+            }
+        })
+    };
+    let result = lite_properties(label, source, &interrupt);
+    drop(done);
+    let _ = watchdog.join();
+    if interrupt.is_interrupted() {
+        Err(format!(
+            "чтение properties скрипта {label} превысило deadline {} мс",
+            timeout.as_millis()
+        ))
+    } else {
+        result.map_err(|error| error.to_string())
+    }
 }
 
 fn validate_heavy_scripts_configured(
@@ -676,10 +709,11 @@ mod tests {
 
 #[cfg(test)]
 mod lite_params_tests {
-    use super::prepare_project;
+    use super::{prepare_project, read_lite_properties_with_timeout};
     use crate::temporary::TempDir;
     use std::fs;
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     const SCRIPT: &str =
         "return { properties = { speed = { type = \"float\", default = 30, min = 0 } } }\n";
@@ -729,6 +763,20 @@ mod lite_params_tests {
         let error = prepare_project(root.path()).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("rotate.lua"), "{error}");
+    }
+
+    #[test]
+    fn unbounded_lite_properties_are_interrupted_at_the_deadline() {
+        let started = Instant::now();
+        let error = read_lite_properties_with_timeout(
+            "loop.lua",
+            "while true do end",
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("deadline"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
 
