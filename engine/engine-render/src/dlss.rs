@@ -172,6 +172,23 @@ mod runtime {
     use std::path::{Path, PathBuf};
     use std::ptr;
 
+    pub struct EvaluateParameters<'a> {
+        pub device: vk::Device,
+        pub command_buffer: vk::CommandBuffer,
+        pub feature: &'a mut Option<usize>,
+        pub render_extent: vk::Extent2D,
+        pub output_extent: vk::Extent2D,
+        pub color: &'a NgxResourceVk,
+        pub depth: &'a NgxResourceVk,
+        pub motion_vectors: &'a NgxResourceVk,
+        pub exposure: &'a NgxResourceVk,
+        pub output: &'a NgxResourceVk,
+        pub jitter: [f32; 2],
+        pub motion_scale: [f32; 2],
+        pub reset: bool,
+        pub frame_time_delta_ms: f32,
+    }
+
     const SUCCESS: i32 = 1;
     const FEATURE_SUPER_SAMPLING: i32 = 1;
     const API_VERSION: i32 = 0x15;
@@ -407,23 +424,23 @@ mod runtime {
             Ok(())
         }
 
-        pub fn evaluate(
-            &self,
-            device: vk::Device,
-            command_buffer: vk::CommandBuffer,
-            feature: &mut Option<usize>,
-            render_extent: vk::Extent2D,
-            output_extent: vk::Extent2D,
-            color: &NgxResourceVk,
-            depth: &NgxResourceVk,
-            motion_vectors: &NgxResourceVk,
-            exposure: &NgxResourceVk,
-            output: &NgxResourceVk,
-            jitter: [f32; 2],
-            motion_scale: [f32; 2],
-            reset: bool,
-            frame_time_delta_ms: f32,
-        ) -> Result<(), String> {
+        pub fn evaluate(&self, input: EvaluateParameters<'_>) -> Result<(), String> {
+            let EvaluateParameters {
+                device,
+                command_buffer,
+                feature,
+                render_extent,
+                output_extent,
+                color,
+                depth,
+                motion_vectors,
+                exposure,
+                output,
+                jitter,
+                motion_scale,
+                reset,
+                frame_time_delta_ms,
+            } = input;
             let mut raw_parameters = ptr::null_mut();
             // SAFETY: NGX initializes the opaque parameter-map pointer on success.
             check_result(
@@ -657,7 +674,7 @@ mod runtime {
 }
 
 #[cfg(all(windows, feature = "dlss"))]
-pub(super) use runtime::{NgxApi, release_feature};
+pub(super) use runtime::{EvaluateParameters, NgxApi, release_feature};
 
 #[cfg(test)]
 mod tests {

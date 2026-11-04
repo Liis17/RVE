@@ -3154,31 +3154,28 @@ impl Renderer {
         #[cfg(all(windows, feature = "dlss"))]
         let mut dlss_device_ready = false;
         #[cfg(all(windows, feature = "dlss"))]
-        if dlss_instance_ready {
-            if let Some(api) = self.dlss_api.as_ref() {
-                match api.check_support(self.instance()?.handle(), self.physical_device) {
-                    Ok(()) => match api
-                        .device_extensions(self.instance()?.handle(), self.physical_device)
-                    {
-                        Ok(extensions) => {
-                            // SAFETY: the selected physical device belongs to the live instance.
-                            let available = unsafe {
-                                self.instance()?
-                                    .enumerate_device_extension_properties(self.physical_device)
-                            }?;
-                            let missing =
-                                missing_extensions(&extensions, &available, "DLSS device");
-                            if missing.is_empty() {
-                                device_extensions.extend(extensions);
-                                dlss_device_ready = true;
-                            } else {
-                                self.dlss_load_error = Some(missing.join(", "));
-                            }
+        if dlss_instance_ready && let Some(api) = self.dlss_api.as_ref() {
+            match api.check_support(self.instance()?.handle(), self.physical_device) {
+                Ok(()) => match api
+                    .device_extensions(self.instance()?.handle(), self.physical_device)
+                {
+                    Ok(extensions) => {
+                        // SAFETY: the selected physical device belongs to the live instance.
+                        let available = unsafe {
+                            self.instance()?
+                                .enumerate_device_extension_properties(self.physical_device)
+                        }?;
+                        let missing = missing_extensions(&extensions, &available, "DLSS device");
+                        if missing.is_empty() {
+                            device_extensions.extend(extensions);
+                            dlss_device_ready = true;
+                        } else {
+                            self.dlss_load_error = Some(missing.join(", "));
                         }
-                        Err(error) => self.dlss_load_error = Some(error),
-                    },
+                    }
                     Err(error) => self.dlss_load_error = Some(error),
-                }
+                },
+                Err(error) => self.dlss_load_error = Some(error),
             }
         }
         let device_extensions = deduplicate_names(device_extensions);
@@ -8376,22 +8373,22 @@ fn record_dlss_pass(
         false,
     );
     let output = ngx_image_resource(&dlss_view.output, output_extent, true);
-    api.evaluate(
-        device.handle(),
+    api.evaluate(dlss::EvaluateParameters {
+        device: device.handle(),
         command_buffer,
-        &mut dlss_view.feature,
+        feature: &mut dlss_view.feature,
         render_extent,
         output_extent,
-        &color,
-        &depth,
-        &motion_vectors,
-        &exposure,
-        &output,
-        dlss::ngx_jitter_offset(plan.jitter_render_pixels),
-        [render_extent.width as f32, render_extent.height as f32],
-        plan.reset_history,
+        color: &color,
+        depth: &depth,
+        motion_vectors: &motion_vectors,
+        exposure: &exposure,
+        output: &output,
+        jitter: dlss::ngx_jitter_offset(plan.jitter_render_pixels),
+        motion_scale: [render_extent.width as f32, render_extent.height as f32],
+        reset: plan.reset_history,
         frame_time_delta_ms,
-    )?;
+    })?;
 
     pipeline_barrier(
         device,
