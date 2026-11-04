@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use temporal::{Extent as TemporalExtent, TemporalKey, TemporalPlan, TemporalState};
 use ui::{
-    PackedUi, RetireQueue, UiDraw, is_srgb_format, pack_ui, validate_texture_region,
-    validate_viewport_size,
+    PackedUi, RetireQueue, RetiredSwapchains, UiDraw, is_srgb_format, pack_ui,
+    validate_texture_region, validate_viewport_size,
 };
 
 mod clusters;
@@ -903,8 +903,12 @@ pub struct Renderer {
     viewports: Vec<Option<Viewport>>,
     screen_temporal: TemporalView,
     retired: RetireQueue<RetiredResource>,
+    retired_swapchains: RetiredSwapchains<SwapchainBundle>,
+    pending_swapchain_drop: Option<SwapchainBundle>,
     frames: Vec<FrameResources>,
     frame_slot: usize,
+    submission_generation: u64,
+    swapchain_generation: u64,
     #[cfg(windows)]
     fsr_api: Option<Arc<fsr::FfxApi>>,
     #[cfg(windows)]
@@ -1016,8 +1020,12 @@ impl Renderer {
             viewports: Vec::new(),
             screen_temporal: TemporalView::default(),
             retired: RetireQueue::new(FRAMES_IN_FLIGHT),
+            retired_swapchains: RetiredSwapchains::new(FRAMES_IN_FLIGHT),
+            pending_swapchain_drop: None,
             frames: Vec::new(),
             frame_slot: 0,
+            submission_generation: 0,
+            swapchain_generation: 0,
             #[cfg(windows)]
             fsr_api: None,
             #[cfg(windows)]
@@ -1622,6 +1630,8 @@ impl Renderer {
         self.poll_uploads()?;
         self.flush_uploads()?;
         self.retired.slot_completed(frame_slot);
+        self.retired_swapchains
+            .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
         if view.anti_aliasing.is_temporal() {
             ensure_temporal_history(
                 &instance,
@@ -2241,6 +2251,8 @@ impl Renderer {
         self.poll_uploads()?;
         self.flush_uploads()?;
         self.retired.slot_completed(frame_slot);
+        self.retired_swapchains
+            .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
         let submitted_at = Instant::now();
         for ((viewport, frame), (_, _, _fallback_reason, _frame_delta_ms)) in
             scenes.iter().zip(&mut prepared_scenes)
@@ -3126,6 +3138,7 @@ impl Renderer {
                 error,
             )));
         }
+        self.record_frame_submission(frame_slot);
         self.shadow_layout = shadow_layout;
         self.local_shadow_layout = local_shadow_layout;
         self.commit_temporal_submissions(temporal_submissions);
@@ -3144,6 +3157,7 @@ impl Renderer {
         self.frame_slot = (self.frame_slot + 1) % self.frames.len();
         match present_result {
             Ok(present_suboptimal) => {
+                self.retired_swapchains.presented(self.swapchain_generation);
                 if acquire_suboptimal || present_suboptimal {
                     self.swapchain_dirty = true;
                 }
@@ -3198,6 +3212,7 @@ impl Renderer {
             let submit_info = [vk::SubmitInfo2::default().wait_semaphore_infos(&wait_infos)];
             // SAFETY: the empty submit consumes the semaphore signaled by acquire and re-signals the slot fence.
             if unsafe { device.queue_submit2(queue, &submit_info, fence) }.is_ok() {
+                self.record_frame_submission(frame_slot);
                 self.frame_slot = (frame_slot + 1) % self.frames.len();
                 return;
             }
@@ -3236,6 +3251,11 @@ impl Renderer {
             device.destroy_semaphore(old_image_available, None);
         }
         self.frame_slot = (frame_slot + 1) % self.frames.len();
+    }
+
+    fn record_frame_submission(&mut self, frame_slot: usize) {
+        self.submission_generation = self.submission_generation.saturating_add(1);
+        self.frames[frame_slot].submission_generation = self.submission_generation;
     }
 
     fn initialize(&mut self) -> Result<(), RenderError> {
@@ -5601,9 +5621,17 @@ impl Renderer {
             self.swapchain_dirty = true;
             return Ok(());
         }
+        let device = self.device()?.clone();
+        let retired_queue_full = self.retired_swapchains.is_full();
+        if self.pending_swapchain_drop.is_some() || retired_queue_full {
+            // SAFETY: overflow fallback reaches idle before releasing any oldest retired swapchain.
+            unsafe { device.device_wait_idle() }?;
+            drop(self.pending_swapchain_drop.take());
+            if retired_queue_full {
+                drop(self.retired_swapchains.remove_oldest_after_idle());
+            }
+        }
         self.flush_uploads()?;
-        // SAFETY: recreation waits for work submitted by this device before replacing its frame targets.
-        unsafe { self.device()?.device_wait_idle() }?;
         self.poll_uploads()?;
         let old_swapchain = self
             .swapchain
@@ -5611,7 +5639,7 @@ impl Renderer {
             .map_or(vk::SwapchainKHR::null(), |bundle| bundle.handle);
         let new_swapchain = SwapchainBundle::new(
             self.instance()?,
-            self.device()?,
+            &device,
             self.swapchain_loader()?,
             self.surface_loader()?,
             self.physical_device,
@@ -5632,11 +5660,24 @@ impl Renderer {
             );
             self.last_warned_present_mode = Some(self.present_mode);
         }
-        self.swapchain = Some(new_swapchain);
-        for frame in &mut self.frames {
-            frame.target = None;
-        }
+        let replacement_generation = self.swapchain_generation.saturating_add(1);
+        let previous_swapchain = self.swapchain.replace(new_swapchain);
+        self.swapchain_generation = replacement_generation;
         self.swapchain_dirty = false;
+        if let Some(previous_swapchain) = previous_swapchain {
+            let old_image_count = previous_swapchain.images.len();
+            if let Some(oldest) = self.retired_swapchains.retire(
+                previous_swapchain,
+                self.submission_generation,
+                replacement_generation,
+                old_image_count,
+            ) {
+                self.pending_swapchain_drop = Some(oldest);
+                // SAFETY: queue overflow uses device idle as the bounded-queue destruction fallback.
+                unsafe { device.device_wait_idle() }?;
+                drop(self.pending_swapchain_drop.take());
+            }
+        }
         Ok(())
     }
 
@@ -5734,6 +5775,8 @@ impl Drop for Renderer {
         self.pending_upload.take();
         self.in_flight_uploads.clear();
         self.swapchain.take();
+        self.pending_swapchain_drop.take();
+        self.retired_swapchains.clear();
         self.frames.clear();
         self.retired.clear();
         self.environments.clear();
@@ -6528,7 +6571,7 @@ impl SwapchainBundle {
 impl Drop for SwapchainBundle {
     fn drop(&mut self) {
         for semaphore in self.render_finished.drain(..) {
-            // SAFETY: the swapchain is idle before bundle replacement/destruction.
+            // SAFETY: renderer releases retired bundles by its documented frame/present heuristic or idle fallback.
             unsafe { self.device.destroy_semaphore(semaphore, None) };
         }
         for view in self.views.drain(..) {
@@ -6537,7 +6580,7 @@ impl Drop for SwapchainBundle {
         }
         if self.handle != vk::SwapchainKHR::null() {
             let loader = ash::khr::swapchain::Device::new(&self.instance, &self.device);
-            // SAFETY: swapchain semaphores were destroyed and no renderer work is active.
+            // SAFETY: renderer releases retired bundles by its documented frame/present heuristic or idle fallback.
             unsafe { loader.destroy_swapchain(self.handle, None) };
             self.handle = vk::SwapchainKHR::null();
         }
@@ -6560,6 +6603,8 @@ struct FrameResources {
     timestamps: Option<vk::QueryPool>,
     /// Timestamp записаны и отправлены, но ещё не прочитаны.
     timestamps_pending: bool,
+    /// Последняя успешная отправка этого слота; начальный signaled fence не имеет поколения.
+    submission_generation: u64,
 }
 
 impl FrameResources {
@@ -6581,6 +6626,7 @@ impl FrameResources {
             ui_indices: GrowingBuffer::default(),
             timestamps: None,
             timestamps_pending: false,
+            submission_generation: 0,
         };
         // SAFETY: creating an unsignaled binary semaphore uses a valid default create info.
         frame.image_available =
