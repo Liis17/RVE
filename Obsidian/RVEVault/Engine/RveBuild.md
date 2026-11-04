@@ -95,16 +95,33 @@ Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to d
 SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходникам checkout.
 
 `rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain)
-[--vulkan-sdk <dir>]` доступна только в checkout. Выбор toolchain обязателен;
-каталог должен содержать `bin/cargo` и `bin/rustc` (на Windows `.exe`). Дерево
-копируется в `toolchain/`. Отказ от toolchain предназначен для CI.
+[--vulkan-sdk <dir>]` создаёт пакет только из checkout. Готовый пакет работает без
+исходников репозитория: marker выбирает соседние `rve-build`, player и гостевой API.
+Для автономной сборки Rust-скриптов укажи `--rust-toolchain <dir>`; каталог должен
+содержать `bin/cargo` и `bin/rustc` (на Windows `.exe`) и целиком копируется в
+`toolchain/`. `--no-rust-toolchain` предназначен для CI и пакетов без autobuild.
 
-Команда собирает release editor, build и оба player; distribution player без
-console. Артефакты берутся из Cargo JSON. Кэши изолированы в `build/sdk-player`
-и `build/sdk-tools`; на Windows сборка задаёт `-C target-feature=+crt-static`.
-SDK содержит четыре executable, маркер и гостевой `rve-sdk/Cargo.toml`, `src/**`.
+Команда пересобирает release editor, builder и оба player; distribution player без
+console. Пути executable берутся из Cargo JSON. Кэши изолированы в `build/sdk-player`
+и `build/sdk-tools`. На Windows каждому Cargo build передаётся явный target вместе
+с `-C target-feature=+crt-static`, поэтому флаг не затрагивает host proc macros.
+SDK содержит четыре executable, marker, гостевой `rve-sdk/Cargo.toml` и `src/**`.
 На macOS они находятся в `RVE Editor.app/Contents/MacOS`, Vulkan loader/MoltenVK
 и ICD — в `Contents/Resources/Engine`. Публикация атомарная без замены output.
+
+Для Windows автономного guest build подходит rustup toolchain
+`stable-x86_64-pc-windows-gnu --profile minimal`; её sysroot получают через
+`rustup run stable-x86_64-pc-windows-gnu rustc --print sysroot`. В полный bundle
+попадают `rust-lld.exe`, self-contained CRT/import libraries и runtime DLL
+`libgcc_s_seh-1.dll`/`libwinpthread-1.dll`. Когда bundled sysroot содержит GNU target,
+`script_cargo_command` передаёт Cargo encoded rustflags с `linker-flavor=gnu-lld`,
+`link-self-contained=yes` и `crt-static`, используя этот linker по абсолютному пути.
+Стабильный rustc пока принимает flavor `gnu-lld` только с `-Z unstable-options`,
+поэтому builder задаёт `RUSTC_BOOTSTRAP=1` для этого дочернего Cargo. Это позволяет
+собирать гостевой cdylib без установленного MinGW/GCC; код связывается с C ABI и
+загружается из MSVC editor/builder. На macOS для сборки SDK и guest scripts нужны
+Apple Command Line Tools; `rve-build scripts` запускает `xcode-select --install`,
+если CLT отсутствуют.
 
 Если `project.rveproject` содержит `heavy_scripts`, каталог обязан содержать
 `Cargo.toml` с lib-target `crate-type = ["cdylib"]`. Сборщик читает Cargo metadata,
@@ -122,8 +139,9 @@ API из SDK либо checkout синхронизируется в `<project>/.r
 
 При наличии SDK `toolchain/` и metadata, и build запускают его Cargo с явным
 `RUSTC`, отдельным `CARGO_HOME=<project>/.rve/cargo-home` и toolchain/bin в начале
-PATH. Наследуемые Rust flags, rustup toolchain и compiler wrappers убираются.
-Без toolchain действует прежний CARGO/PATH. На macOS отсутствие CLT вызывает
+PATH. Наследуемые Rust flags, rustup toolchain и compiler wrappers убираются; для
+bundled Windows GNU sysroot builder устанавливает только необходимые encoded linker
+flags. Без toolchain действует прежний CARGO/PATH. На macOS отсутствие CLT вызывает
 `xcode-select --install` и операционную ошибку с просьбой повторить сборку после
 установки.
 

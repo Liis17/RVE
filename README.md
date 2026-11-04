@@ -83,19 +83,36 @@ cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist --rust-toolchai
 каталоге, который должен отсутствовать до сборки. Для прямого запуска player CLI имеет вид
 `rve-player [--project <dir>] [--scripts <path>] [--frames N]`.
 
-Команда `rve-build sdk` собирает release редактор, сборщик и оба варианта player
-и создаёт переносимый каталог с `rve-editor`, `rve-build`,
-distribution player `rve-player`, dev player `rve-player-dev`,
-гостевым API `rve-sdk`, выбранным `toolchain/` и маркером `rve-sdk.toml`.
-Обязателен `--rust-toolchain <dir>` либо явный `--no-rust-toolchain` для CI.
+Команда `rve-build sdk` собирает release редактор, сборщик и оба варианта player и
+создаёт переносимый каталог с `rve-editor`, `rve-build`, distribution player
+`rve-player`, dev player `rve-player-dev`, гостевым API `rve-sdk`, выбранным
+`toolchain/` и маркером `rve-sdk.toml`. Укажи `--rust-toolchain <sysroot>`, чтобы
+включить автономную сборку Rust-скриптов. Для CI без сборки guest-кода можно явно
+передать `--no-rust-toolchain`.
+
+На Windows подготовь минимальную GNU toolchain через rustup и передай её sysroot:
+
+~~~powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+$rustToolchain = rustup run stable-x86_64-pc-windows-gnu rustc --print sysroot
+cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist --rust-toolchain $rustToolchain
+~~~
+
+Полный sysroot попадает в дистрибутив вместе с self-contained `rust-lld` и
+MinGW runtime DLL. Сборка скриптов использует их со статическим CRT, поэтому на
+Windows не нужны отдельно установленные GCC или MinGW. Для сборки SDK на macOS
+сначала установи Apple Command Line Tools командой `xcode-select --install` и
+обеспечь доступность Vulkan loader/MoltenVK (`--vulkan-sdk`, `VULKAN_SDK` или
+Homebrew). Передай `--rust-toolchain` sysroot активной macOS toolchain.
+
 На Windows SDK-бинарники собираются с `crt-static`; на macOS создаётся
-`RVE Editor.app` с Vulkan loader/MoltenVK (источник: `--vulkan-sdk`,
-`VULKAN_SDK` или Homebrew). Игровой
-crate подключает SDK через path `../rve-sdk-dist/rve-sdk` в `Cargo.toml`. Рядом с
-`rve-build` маркер включает SDK-режим: checkout движка не нужен, а совместимость
-проверяется по ABI и паре `ARCH-OS` текущей платформы. Без маркера используется
-checkout-режим: distribution player собирается в `build/player`, dev-player — в
-`build/player-dev`.
+`RVE Editor.app` с Vulkan loader/MoltenVK. Внутри SDK marker рядом с `rve-build`
+включает SDK-режим, проверяющий ABI и пару `ARCH-OS`. Готовый каталог можно
+перенести на машину без checkout движка: редактор, builder, player и toolchain
+берутся из соседних файлов SDK. Игровой crate при прямом использовании SDK может
+подключать `../rve-sdk-dist/rve-sdk`; `rve-build scripts` синхронизирует API в
+`<project>/.rve/sdk/rve-sdk` перед сборкой. Без marker builder использует checkout:
+distribution player собирается в `build/player`, dev-player — в `build/player-dev`.
 
 По умолчанию Cargo feature `dev-console` включена у `rve-player`, в том числе при
 `cargo build --release -p rve-player`. Для distribution-бинарника собирай с
@@ -149,7 +166,9 @@ cargo run -p rve-editor -- --project ../examples/demo-game
 cargo run -p rve-editor -- --project ../examples/demo-game --scripts <path-to-script-library>
 ~~~
 
-`--project` необязателен: без него открывается стартовый экран с выбором папки проекта. `--scripts` нужен для Play, если в сцене есть Rust-скрипты; без библиотеки Play не запустится и сообщит об этом в Console. Коды завершения: 0 — успех, 2 — неверные аргументы или настройки проекта, 1 — ошибка окна или Vulkan.
+`--project` необязателен: без него открывается стартовый экран с выбором папки проекта. В File → New Project… можно создать проект из встроенного шаблона с камерой, светом, кубом, Lua-прыжком и Rust-скриптом орбиты. Проект создаётся в выбранной родительской папке; существующая папка не перезаписывается.
+
+Если `project.rveproject` задаёт `heavy_scripts`, редактор без `--scripts` автоматически запускает `rve-build scripts` при открытии проекта и перед Play. Play ждёт успешной сборки; при ошибке он не запускается. Готовая библиотека перезагружается без перезапуска редактора, вне Play. Явный `--scripts <library>` переопределяет автоматическую сборку и используется для Play и схем Inspector. Коды завершения: 0 — успех, 2 — неверные аргументы или настройки проекта, 1 — ошибка окна или Vulkan.
 
 | Действие | Управление |
 |---|---|
