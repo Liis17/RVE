@@ -14,6 +14,7 @@ Parent: [[Index]]
 | `editor/src/app.rs` | `EditorApp`, `render_scene_frame` | `WindowHandler`: цикл кадра и действия (`Action`), диалоги ОС, запуск Play |
 | `engine/engine-ui/src` | `UiBridge`, `ManagedTextures`, `UiTextures`, `ConsoleOverlay` | Общий egui bridge и console overlay для UI pass |
 | `editor/src/console.rs` | console toggle и преобразование команд в Play actions | Состояние и обработка editor console |
+| `editor/src/gestures.rs` | `ScrollNavigation`, `wheel_gestures`, `remap_control_click` | Чистая нормализация жестов и Ctrl+клика |
 | `editor/src/state.rs` | `EditorState`, `SceneViewInfo`, `Action`, `FrameParts` | Раздельное debug-view состояние Scene/Game и состояние панелей без GPU |
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject` | Команды над документом, undo/redo, атомарное сохранение, раскрытие префабов |
 | `editor/src/scene_edit/prefabs.rs` | `OverrideField`, `object_override` | Instantiate, Create Prefab, Unpack, overrides и Apply to Prefab |
@@ -37,7 +38,7 @@ Parent: [[Index]]
 | Коды завершения | 0 — успех; 2 — неверные аргументы, настройки проекта или `bootstrap.rves`; 1 — ошибка окна или renderer |
 | Окно | Размер из `bootstrap.rves` проекта, иначе 1600×900; заголовок содержит проект, сцену и признак несохранённых правок |
 | Раскладка проекта | Как dev-запуск player: `project.rveproject`, `bootstrap.rves`, `Assets/`; ресурсы читаются в `SourceMode::Loose`, поэтому новые файлы видны сразу. Камеры читают общие `.camerasettings` по объявленным scene asset paths |
-| Настройки пользователя | `rve-editor/settings.json` в каталоге настроек ОС (`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` или `~/.config`): до 10 недавних проектов и раскладка egui_dock. Пишется при открытии проекта и выходе; повреждённое поле или раскладка с повторяющимися панелями заменяются значением по умолчанию с предупреждением в Console |
+| Настройки пользователя | `rve-editor/settings.json` в каталоге настроек ОС (`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` или `~/.config`): до 10 недавних проектов, раскладка egui_dock и режим `scroll_navigation` (Auto/Trackpad/Mouse). Пишется при открытии проекта и выходе; повреждённое поле или раскладка с повторяющимися панелями заменяются значением по умолчанию с предупреждением в Console |
 | Pipeline cache | `RendererConfig` всегда запрашивает FIFO; pipeline cache хранится отдельно в каталоге пользователя ОС для `rve-editor`, загружается до создания renderer и атомарно сохраняется после оконного цикла ([[Engine/EnginePlatform]], [[Engine/EngineRender]]) |
 | Автосохранение | `<проект>/.rve/editor/autosave/<сцена>.autosave`, где `~` и `/` пути экранированы как `~7E` и `~2F`, а новая сцена — `~untitled`. Каталог вне `Assets/`, поэтому копии не попадают в ресурсы и сборку |
 | Буфер обмена | Ctrl/Cmd+C кладёт в буфер ОС JSON с ключом `rve_editor_objects` (выделенные поддеревья `SceneObject`); вставка чужого текста игнорируется |
@@ -198,3 +199,11 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - egui, egui-winit и egui_dock закреплены на 0.36.2, 0.36.2 и 0.21.1: egui_dock 0.21.1 требует egui ^0.36, поэтому более новый egui 0.37 недоступен.
 - UI рисуется собственным проходом в `engine-render` по решению пользователя: renderer принимает готовые примитивы и не зависит от egui.
 - Логика кадра сцены (`upload_scene`) перенесена в редактор, а не вынесена в общий крейт: в runtime она `pub(crate)`, и общий крейт ради одного потребителя не создавался.
+
+## Навигация Scene
+
+Edit → Scene Navigation выбирает Auto (по умолчанию), Trackpad (orbit/pan) или Mouse wheel (zoom). Auto запоминает единицы последнего wheel: Point означает тачпад, Line — колесо. Windows precision touchpad в winit 0.30 может давать Line; тогда нужен ручной Trackpad.
+
+Свайп вращает камеру, Shift+свайп переносит её, pinch и Cmd/Ctrl+свайп масштабируют, rotation меняет yaw. Сырые MouseWheel из `input.raw.events` сохраняют обе оси Shift, которые InputState сворачивает в горизонтальную прокрутку. Command wheel пропускается: egui уже включает его в zoom_delta. Alt+Cmd/Ctrl+ЛКМ переносит камеру раньше проверки Alt+ЛКМ orbit. Play сохраняет прежний ввод.
+
+Smart zoom доступен на macOS: DoubleTapGesture взводит однокадровый флаг и запрашивает redraw; над доступной Scene вне Play он вызывает Frame выделения. Флаг сбрасывается в конце UI даже при скрытой Scene. На macOS Ctrl+ЛКМ преобразуется в ПКМ до egui; отпускание сохраняет преобразование после отпускания Ctrl. Ввод скриптов Play через WindowHandler не меняется.

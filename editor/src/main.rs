@@ -6,6 +6,7 @@ mod autosave;
 mod build;
 mod cli;
 mod console;
+mod gestures;
 mod input;
 mod layout;
 mod new_project;

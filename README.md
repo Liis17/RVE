@@ -228,10 +228,19 @@ Scene и Game имеют отдельный selector `View`; Inspector реда�
 | Инструменты Move, Rotate, Scale | W, E, R |
 | Фокус на выделенном, удаление | F, Delete |
 | Орбита камеры | ПКМ или Alt+ЛКМ |
+| Тачпад: свайп двумя пальцами | Orbit (Auto при Point scroll или режим Trackpad) |
+| Shift + свайп | Pan по двум осям |
+| Pinch / Cmd/Ctrl + свайп | Zoom |
+| Rotation | Поворот камеры вокруг цели |
+| Smart zoom (двойное касание двумя пальцами, macOS) | Frame выделения, как F |
+| Alt + Cmd/Ctrl + ЛКМ | Pan |
+| Ctrl + клик (macOS) | Контекстное меню, как ПКМ |
 | Панорама, зум | СКМ, колесо |
 | Полёт | ПКМ + WASD (Q и E — вниз и вверх) |
 | Добавить модель в сцену | Перетащить `.fbx` из Project в Hierarchy или Scene |
 | Импорт файлов | Кнопка Import в Project или перетаскивание файлов в окно |
+
+Навигация Scene выбирается в Edit → Scene Navigation: Auto, Trackpad (orbit/pan), Mouse wheel (zoom). Режим сохраняется в settings.json. Auto различает Point и Line scroll; на Windows precision touchpad может требовать ручного выбора Trackpad из-за ограничения winit 0.30.
 
 Вкладка Game показывает сцену глазами камеры; при нескольких камерах её можно выбрать в выпадающем списке над изображением. Выбор влияет только на вкладку: игра идёт от первой камеры в файле сцены.
 

@@ -85,6 +85,16 @@ impl EditorCamera {
         self.target += (self.up() * dy - self.right() * dx) * world_per_point;
     }
 
+    pub fn zoom_by(&mut self, factor: f32) {
+        if factor.is_finite() && factor > 0.0 {
+            self.distance = (self.distance / factor).clamp(MIN_DISTANCE, MAX_DISTANCE);
+        }
+    }
+
+    pub fn turn(&mut self, radians: f32) {
+        self.yaw -= radians;
+    }
+
     pub fn zoom(&mut self, wheel_points: f32) {
         self.distance = (self.distance * (-wheel_points * ZOOM_PER_WHEEL_POINT).exp())
             .clamp(MIN_DISTANCE, MAX_DISTANCE);
@@ -153,6 +163,28 @@ pub fn ground_point(ray: Ray, max_distance: f32) -> Option<Vec3> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gesture_zoom_and_turn_preserve_target_and_bound_distance() {
+        let mut camera = EditorCamera::default();
+        let original = camera;
+        camera.zoom_by(2.0);
+        assert_eq!(camera.distance, original.distance / 2.0);
+        for invalid in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            let before = camera;
+            camera.zoom_by(invalid);
+            assert_eq!(camera, before);
+        }
+        camera.zoom_by(f32::MIN_POSITIVE);
+        assert_eq!(camera.distance, MAX_DISTANCE);
+        camera.zoom_by(f32::MAX);
+        assert_eq!(camera.distance, MIN_DISTANCE);
+        let mut orbit = original;
+        orbit.orbit(1.0, 0.0);
+        camera.turn(ORBIT_RADIANS_PER_POINT);
+        assert_eq!(camera.yaw, orbit.yaw);
+        assert_eq!(camera.target, original.target);
+    }
 
     fn assert_near(a: Vec3, b: Vec3) {
         assert!((a - b).length() < 1e-3, "{a} != {b}");

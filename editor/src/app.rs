@@ -39,6 +39,7 @@ const BUILD_POLL: Duration = Duration::from_millis(50);
 
 pub struct EditorApp {
     state: EditorState,
+    control_click: bool,
     dock: DockState<Tab>,
     /// Файл настроек пользователя; `None`, если каталог настроек ОС неизвестен.
     settings: Option<SettingsStore>,
@@ -81,9 +82,11 @@ impl EditorApp {
             state.log.push(LogLevel::Warn, problem);
         }
         let dock = user.layout_or_default();
+        state.scroll_navigation = user.scroll_navigation;
         state.recent_projects = user.recent_projects;
         Self {
             state,
+            control_click: false,
             dock,
             settings,
             initial_project: project,
@@ -257,6 +260,7 @@ impl EditorApp {
         let settings = UserSettings {
             recent_projects: self.state.recent_projects.clone(),
             layout: Some(self.dock.clone()),
+            scroll_navigation: self.state.scroll_navigation,
         };
         if let Err(error) = store.save(&settings) {
             self.state.log.push(LogLevel::Warn, error);
@@ -1050,7 +1054,10 @@ impl EditorApp {
                 Some(self.bridge.register_viewport(gpu.scene.game_viewport));
         }
 
-        let raw_input = egui_state.take_egui_input(window);
+        let mut raw_input = egui_state.take_egui_input(window);
+        if cfg!(target_os = "macos") {
+            crate::gestures::remap_control_click(&mut raw_input.events, &mut self.control_click);
+        }
         let console_lines = if self.state.console_open {
             snapshot_console_lines(&self.state)
         } else {
@@ -1497,6 +1504,10 @@ impl WindowHandler for EditorApp {
     }
 
     fn window_event(&mut self, window: &Window, event: &WindowEvent) {
+        if matches!(event, WindowEvent::DoubleTapGesture { .. }) {
+            self.state.smart_zoom = true;
+            window.request_redraw();
+        }
         if let WindowEvent::KeyboardInput {
             event,
             is_synthetic,
