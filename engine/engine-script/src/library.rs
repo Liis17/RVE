@@ -352,3 +352,34 @@ unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>,
     }
     ParamSchema::new(specs).map(Some)
 }
+
+#[cfg(all(test, windows))]
+mod ownership_tests {
+    #[test]
+    fn host_retains_module_until_it_is_dropped() {
+        use super::*;
+        let module = Arc::new(unsafe { libloading::Library::new("kernel32.dll") }.unwrap());
+        let weak = Arc::downgrade(&module);
+        let library = ScriptLibrary {
+            scripts: HashMap::new(),
+            library: Some(module),
+        };
+        let scene = engine_scene::SceneDocument::parse(
+            "empty",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let world = engine_scene::World::from_document(&scene).unwrap();
+        let host = crate::ScriptHost::load(
+            &world,
+            "empty",
+            &std::collections::BTreeMap::new(),
+            Some(&library),
+        )
+        .unwrap();
+        drop(library);
+        assert!(weak.upgrade().is_some());
+        drop(host);
+        assert!(weak.upgrade().is_none());
+    }
+}

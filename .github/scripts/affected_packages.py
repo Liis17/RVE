@@ -48,6 +48,8 @@ def affected_packages(metadata, paths):
     }
     changed = set()
     for path in paths:
+        if path.startswith("editor/templates/new_project/") and "rve-build" in packages:
+            changed.add("rve-build")
         absolute = root / path
         owners = [directory for directory in directories if absolute.is_relative_to(directory)]
         if owners:

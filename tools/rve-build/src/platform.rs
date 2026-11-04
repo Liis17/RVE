@@ -158,8 +158,39 @@ fn vulkan_sources(
     sources
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn bundled_vulkan_files(exe_dir: &Path) -> Result<VulkanFiles, BuildError> {
+    let engine = exe_dir
+        .parent()
+        .ok_or_else(|| BuildError::operational("invalid SDK directory"))?
+        .join("Resources/Engine");
+    let files = VulkanFiles {
+        loader: engine.join("libvulkan.1.dylib"),
+        molten: engine.join("libMoltenVK.dylib"),
+        icd: engine.join("MoltenVK_icd.json"),
+    };
+    if [&files.loader, &files.molten, &files.icd]
+        .into_iter()
+        .all(|p| is_regular_file(p))
+    {
+        Ok(files)
+    } else {
+        Err(BuildError::operational(format!(
+            "SDK Vulkan files missing in {}",
+            engine.display()
+        )))
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn find_macos_vulkan_files(sdk: Option<&Path>) -> Result<VulkanFiles, BuildError> {
+    if sdk.is_none() {
+        let exe = crate::player::current_executable_path()?;
+        let dir = crate::player::executable_directory(&exe)?;
+        if dir.join("rve-sdk.toml").is_file() {
+            return bundled_vulkan_files(&dir);
+        }
+    }
     let sources = vulkan_sources(
         sdk,
         std::env::var_os("VULKAN_SDK").map(PathBuf::from),
@@ -658,5 +689,28 @@ mod tests {
 
         assert_ne!(fs::read(&copy).unwrap(), original);
         assert_eq!(fs::read(&source).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
+mod bundled_tests {
+    #[test]
+    fn reads_vulkan_from_sdk_resources_without_system_installation() {
+        let temp = crate::temporary::TempDir::create(&std::env::temp_dir(), "sdk-vulkan").unwrap();
+        let exe = temp.path().join("Contents/MacOS");
+        let engine = temp.path().join("Contents/Resources/Engine");
+        assert!(super::bundled_vulkan_files(&exe).is_err());
+        std::fs::create_dir_all(&engine).unwrap();
+        for file in [
+            "libvulkan.1.dylib",
+            "libMoltenVK.dylib",
+            "MoltenVK_icd.json",
+        ] {
+            std::fs::write(engine.join(file), b"fixture").unwrap();
+        }
+        assert_eq!(
+            super::bundled_vulkan_files(&exe).unwrap().loader,
+            engine.join("libvulkan.1.dylib")
+        );
     }
 }

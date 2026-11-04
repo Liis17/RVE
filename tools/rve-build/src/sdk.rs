@@ -285,6 +285,18 @@ fn validate_toolchain(root: &Path) -> Result<(), BuildError> {
             )));
         }
     }
+    #[cfg(windows)]
+    {
+        let target = root
+            .join("lib/rustlib")
+            .join(format!("{}-pc-windows-gnu", std::env::consts::ARCH));
+        if !target.join("bin/rust-lld.exe").is_file() || !target.join("lib/self-contained").is_dir()
+        {
+            return Err(BuildError::input(
+                "Windows SDK requires a GNU toolchain with rust-lld.exe and self-contained libraries",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -615,6 +627,16 @@ mod tests {
             b"rustc",
         )
         .unwrap();
+        #[cfg(windows)]
+        {
+            assert!(super::validate_toolchain(&toolchain).is_err());
+            let target = toolchain
+                .join("lib/rustlib")
+                .join(format!("{}-pc-windows-gnu", std::env::consts::ARCH));
+            fs::create_dir_all(target.join("bin")).unwrap();
+            fs::create_dir_all(target.join("lib/self-contained")).unwrap();
+            fs::write(target.join("bin/rust-lld.exe"), b"lld").unwrap();
+        }
         super::validate_toolchain(&toolchain).unwrap();
         let rve_editor = source.join("rve-editor");
         fs::write(&rve_editor, b"editor binary").unwrap();

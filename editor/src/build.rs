@@ -251,6 +251,7 @@ pub fn cleanup_script_generations(project: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+    let mut first_error = None;
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
@@ -260,11 +261,12 @@ pub fn cleanup_script_generations(project: &Path) -> std::io::Result<()> {
             && ["dll", "dylib", "so"]
                 .iter()
                 .any(|extension| name.ends_with(&format!(".{extension}")))
+            && let Err(error) = std::fs::remove_file(entry.path())
         {
-            std::fs::remove_file(entry.path())?;
+            first_error.get_or_insert(error);
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(windows)]

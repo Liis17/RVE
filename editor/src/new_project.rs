@@ -50,7 +50,9 @@ pub fn create_project(name: &str, parent: &Path) -> Result<PathBuf, String> {
     }
     let parent =
         fs::canonicalize(&parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    let target = parent.join(&id);
+    #[cfg(windows)]
+    let parent = engine_files::strip_windows_verbatim_prefix(&parent).map_err(|e| e.to_string())?;
+    let target = parent.join(&name);
     match fs::symlink_metadata(&target) {
         Ok(_) => {
             return Err(format!(
@@ -86,17 +88,24 @@ pub fn create_project(name: &str, parent: &Path) -> Result<PathBuf, String> {
 }
 
 fn clean_project_name(name: &str) -> Result<String, String> {
-    let name = name
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
     let name = name.trim();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if name
+        .chars()
+        .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+        || name.ends_with(['.', ' '])
+        || matches!(name, "." | "..")
+        || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    {
+        return Err("недопустимое имя папки проекта".to_owned());
+    }
     if name.is_empty() {
         Err("название проекта не должно быть пустым".to_owned())
     } else {
@@ -252,6 +261,7 @@ mod tests {
     fn creates_a_project_the_editor_can_open_and_validate() {
         let parent = temporary_parent();
         let project_dir = create_project("First Game", &parent).unwrap();
+        assert_eq!(project_dir.file_name().unwrap(), "First Game");
         let project = OpenProject::open(&project_dir).unwrap();
         assert_eq!(project.settings.id, "first-game");
         assert_eq!(project.settings.name, "First Game");
@@ -287,6 +297,19 @@ mod tests {
     }
 
     #[test]
+    fn preserves_unicode_folder_names_and_rejects_path_components() {
+        let parent = temporary_parent();
+        let first = create_project("Моя игра", &parent).unwrap();
+        let second = create_project("Другая игра", &parent).unwrap();
+        assert_eq!(first.file_name().unwrap(), "Моя игра");
+        assert_ne!(first, second);
+        for name in ["../escape", "CON", "bad:name", "bad\\name", ".."] {
+            assert!(create_project(name, &parent).is_err());
+        }
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn sanitizes_project_names_to_valid_ids() {
         assert_eq!(project_id("  My Demo: Game!!  "), "my-demo-game");
         assert_eq!(project_id("---"), "new-project");
@@ -296,7 +319,7 @@ mod tests {
     #[test]
     fn refuses_an_existing_project_folder_without_overwriting_it() {
         let parent = temporary_parent();
-        let existing = parent.join("first-game");
+        let existing = parent.join("First Game");
         fs::create_dir(&existing).unwrap();
         let sentinel = existing.join("keep.txt");
         fs::write(&sentinel, "user data").unwrap();

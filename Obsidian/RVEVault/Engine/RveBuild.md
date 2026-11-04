@@ -206,3 +206,10 @@ MoltenVK (Apache-2.0).
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,
 `archives.rs`, `player.rs`, `sdk.rs`, `ico.rs`, `platform.rs`, `temporary.rs`.
+
+В SDK-режиме на macOS Build Player берёт Vulkan из bundled `Contents/Resources/Engine`;
+явный `--vulkan-sdk` сохраняет приоритет. Windows SDK принимает только toolchain
+с GNU `rust-lld.exe` и self-contained libraries. Для встроенного GNU linker используются
+`RUSTC_BOOTSTRAP=1` и gated `gnu-lld`; при обновлении Rust нужна повторная smoke-проверка,
+в том числе зависимостей с proc-macro и build.rs. Сторонние native зависимости могут
+требовать дополнительных инструментов.

@@ -159,7 +159,7 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 
 ## New Project
 
-File → New Project… принимает имя проекта и родительскую папку, выбранную через системный picker. Имя нормализуется в допустимый `ProjectSettings.id`; каталог с таким id не перезаписывается. Генератор записывает встроенные UTF-8 шаблоны и модель cube из sibling staging-каталога, затем публикует папку атомарным no-replace rename. После генерации `OpenProjectAt` идёт через обычную проверку несохранённых изменений. `project.rveproject` задаёт `heavy_scripts = "Scripts"` и включённую `/scenes/main.rvescene`; шаблон содержит камеру, directional light, FBX cube, Lua Jump с Inspector-параметрами height/duration и Rust Orbit cdylib со схемой radius/height/speed. `.rve/` исключена в шаблонном `.gitignore`.
+File → New Project… принимает имя проекта и родительскую папку, выбранную через системный picker. Папка сохраняет введённое имя; отдельный `ProjectSettings.id` нормализуется. Существующая папка не перезаписывается, итоговый путь показан в диалоге. Генератор записывает встроенные UTF-8 шаблоны и модель cube из sibling staging-каталога, затем публикует папку атомарным no-replace rename. После генерации `OpenProjectAt` идёт через обычную проверку несохранённых изменений. `project.rveproject` задаёт `heavy_scripts = "Scripts"` и включённую `/scenes/main.rvescene`; шаблон содержит камеру, directional light, FBX cube, Lua Jump с Inspector-параметрами height/duration и Rust Orbit cdylib со схемой radius/height/speed. `.rve/` исключена в шаблонном `.gitignore`.
 
 ## Build Player
 

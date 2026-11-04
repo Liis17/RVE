@@ -826,6 +826,12 @@ impl EditorApp {
         let Some(scene) = &self.state.scene else {
             return;
         };
+        if scene.document().is_prefab() {
+            self.state
+                .log
+                .error("Play недоступен для префаба: откройте сцену");
+            return;
+        }
         let needs_library = scene
             .view()
             .objects
@@ -1652,6 +1658,27 @@ mod tests {
         });
         full_output.textures_delta.clear();
         console_output
+    }
+
+    #[test]
+    fn pending_play_rechecks_the_current_document_after_build() {
+        let mut app = EditorApp::new(None, None);
+        app.state.scene = Some(
+            EditorScene::parse(
+                VirtualPath::parse("prefabs/test.rveprefab").unwrap(),
+                "[[objects]]\nid = \"root\"\n",
+                crate::scene_edit::no_prefabs(),
+            )
+            .unwrap(),
+        );
+        app.start_play_now();
+        assert!(!app.state.is_playing());
+        assert!(
+            app.state
+                .log
+                .entries()
+                .any(|entry| entry.message.contains("префаба"))
+        );
     }
 
     #[test]

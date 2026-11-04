@@ -66,6 +66,12 @@ fn show_new_project_dialog(ctx: &egui::Context, state: &mut EditorState) {
                 dialog.parent = parent.display().to_string();
             }
         });
+        ui.label(
+            std::path::Path::new(&dialog.parent)
+                .join(dialog.name.trim())
+                .display()
+                .to_string(),
+        );
         if let Some(error) = &dialog.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
