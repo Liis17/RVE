@@ -54,6 +54,12 @@ float catmull_rom_weight(float value) {
     return 0.0;
 }
 
+float reconstruction_window(float distance) {
+    float normalized = clamp(abs(distance), 0.0, 1.0);
+    float smooth_weight = normalized * normalized * (3.0 - 2.0 * normalized);
+    return mix(1.0, 0.06, smooth_weight);
+}
+
 vec4 sample_history_catmull(vec2 uv, ivec2 size) {
     vec2 position = uv * vec2(size) - 0.5;
     ivec2 base = ivec2(floor(position));
@@ -94,9 +100,10 @@ void main() {
         }
     }
 
-    vec2 current_uv = (vec2(closest_pixel) + 0.5 - jitter_render) / render_size;
+    vec2 depth_sample_uv = (vec2(closest_pixel) + 0.5 - jitter_render) / render_size;
     vec2 velocity = texelFetch(velocity_image, closest_pixel, 0).xy;
-    vec2 history_uv = current_uv + velocity;
+    vec2 output_uv = gl_FragCoord.xy / output_size;
+    vec2 history_uv = output_uv + velocity;
 
     vec3 current_sum = vec3(0.0);
     float current_weight = 0.0;
@@ -106,22 +113,21 @@ void main() {
     vec3 neighborhood_square_sum = vec3(0.0);
     float neighborhood_weight = 0.0;
     for (int y = -1; y <= 1; ++y) {
-        float py = float(y);
-        float gaussian_y = exp(-2.0 * py * py);
-        float blackman_harris_y = y == 0 ? 1.0 : 0.06;
         for (int x = -1; x <= 1; ++x) {
-            float px = float(x);
-            float gaussian = gaussian_y * exp(-2.0 * px * px);
-            float blackman_harris = blackman_harris_y * (x == 0 ? 1.0 : 0.06);
-            ivec2 pixel = clamp(closest_pixel + ivec2(x, y), ivec2(0), render_size_i - 1);
+            ivec2 pixel = clamp(center + ivec2(x, y), ivec2(0), render_size_i - 1);
+            vec2 sample_delta = vec2(pixel) + 0.5 - render_position;
+            float gaussian = exp(-2.0 * dot(sample_delta, sample_delta));
+            float reconstruction_weight = gaussian
+                * reconstruction_window(sample_delta.x)
+                * reconstruction_window(sample_delta.y);
             vec3 color = texelFetch(current_hdr_image, pixel, 0).rgb;
             float karis = 1.0 / (1.0 + dot(color, vec3(0.2126, 0.7152, 0.0722)));
-            float weight = gaussian * blackman_harris * karis;
+            float weight = reconstruction_weight * karis;
             current_sum += color * weight;
             current_weight += weight;
 
             vec3 ycocg = to_ycocg(color);
-            float box_weight = gaussian * blackman_harris;
+            float box_weight = reconstruction_weight;
             neighborhood_min = min(neighborhood_min, ycocg);
             neighborhood_max = max(neighborhood_max, ycocg);
             neighborhood_sum += ycocg * box_weight;
@@ -147,8 +153,8 @@ void main() {
         && push_constants.params.w < 0.5
         && history_inside) {
         vec4 world_h = frame.inverse_view_projection * vec4(
-            current_uv.x * 2.0 - 1.0,
-            1.0 - current_uv.y * 2.0,
+            depth_sample_uv.x * 2.0 - 1.0,
+            1.0 - depth_sample_uv.y * 2.0,
             closest_depth,
             1.0
         );

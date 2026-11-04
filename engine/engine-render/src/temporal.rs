@@ -196,6 +196,102 @@ mod tests {
         }
     }
 
+    fn reconstruction_window(distance: f32) -> f32 {
+        let normalized = distance.abs().clamp(0.0, 1.0);
+        let smooth = normalized * normalized * (3.0 - 2.0 * normalized);
+        1.0 - 0.94 * smooth
+    }
+
+    fn reconstruction_weights(position: [f32; 2]) -> [[f32; 3]; 3] {
+        let center = [position[0].floor() as i32, position[1].floor() as i32];
+        let mut weights = [[0.0; 3]; 3];
+        for y in -1..=1 {
+            let dy = center[1] as f32 + y as f32 + 0.5 - position[1];
+            for x in -1..=1 {
+                let dx = center[0] as f32 + x as f32 + 0.5 - position[0];
+                weights[(y + 1) as usize][(x + 1) as usize] = (-2.0 * (dx * dx + dy * dy)).exp()
+                    * reconstruction_window(dx)
+                    * reconstruction_window(dy);
+            }
+        }
+        weights
+    }
+
+    fn reconstruct_karis(image: &[[f32; 5]; 5], position: [f32; 2]) -> f32 {
+        let center = [position[0].floor() as i32, position[1].floor() as i32];
+        let weights = reconstruction_weights(position);
+        let mut sum = 0.0;
+        let mut total = 0.0;
+        for y in -1..=1 {
+            for x in -1..=1 {
+                let pixel_x = (center[0] + x).clamp(0, 4) as usize;
+                let pixel_y = (center[1] + y).clamp(0, 4) as usize;
+                let color = image[pixel_y][pixel_x];
+                let weight = weights[(y + 1) as usize][(x + 1) as usize];
+                let karis = 1.0 / (1.0 + color);
+                sum += color * weight * karis;
+                total += weight * karis;
+            }
+        }
+        sum / total
+    }
+
+    fn closest_depth_pixel(depths: &[[f32; 5]; 5], position: [f32; 2]) -> [usize; 2] {
+        let center = [position[0].floor() as i32, position[1].floor() as i32];
+        let mut closest = [
+            center[0].clamp(0, 4) as usize,
+            center[1].clamp(0, 4) as usize,
+        ];
+        let mut closest_depth = 1.0;
+        for y in -1..=1 {
+            for x in -1..=1 {
+                let pixel = [
+                    (center[0] + x).clamp(0, 4) as usize,
+                    (center[1] + y).clamp(0, 4) as usize,
+                ];
+                let depth = depths[pixel[1]][pixel[0]];
+                if depth < closest_depth {
+                    closest_depth = depth;
+                    closest = pixel;
+                }
+            }
+        }
+        closest
+    }
+
+    fn reference_resolve(
+        image: &[[f32; 5]; 5],
+        depths: &[[f32; 5]; 5],
+        output_sample: [f32; 2],
+    ) -> (f32, [usize; 2]) {
+        (
+            reconstruct_karis(image, output_sample),
+            closest_depth_pixel(depths, output_sample),
+        )
+    }
+
+    fn integer_center_reconstruct(image: &[[f32; 5]; 5], center: [usize; 2]) -> f32 {
+        let mut sum = 0.0;
+        let mut total = 0.0;
+        for y in -1..=1 {
+            let gaussian_y = (-2.0 * (y * y) as f32).exp();
+            let window_y = if y == 0 { 1.0 } else { 0.06 };
+            for x in -1..=1 {
+                let pixel_x = (center[0] as i32 + x).clamp(0, 4) as usize;
+                let pixel_y = (center[1] as i32 + y).clamp(0, 4) as usize;
+                let color = image[pixel_y][pixel_x];
+                let weight = gaussian_y
+                    * (-2.0 * (x * x) as f32).exp()
+                    * window_y
+                    * if x == 0 { 1.0 } else { 0.06 };
+                let karis = 1.0 / (1.0 + color);
+                sum += color * weight * karis;
+                total += weight * karis;
+            }
+        }
+        sum / total
+    }
+
     #[test]
     fn phase_count_scales_quadratically_with_upscale_ratio() {
         assert_eq!(
@@ -231,6 +327,69 @@ mod tests {
             ),
             13
         );
+    }
+
+    #[test]
+    fn flat_depth_dilation_does_not_move_reconstruction_off_the_output_sample() {
+        let mut image = [[0.0; 5]; 5];
+        image[2][2] = 1.0;
+        let depths = [[0.5; 5]; 5];
+        let output_sample = [2.5, 2.5];
+        let (reconstructed, dilated_pixel) = reference_resolve(&image, &depths, output_sample);
+
+        assert_eq!(dilated_pixel, [1, 1]);
+        let neighbor_centered = integer_center_reconstruct(&image, dilated_pixel);
+        assert!(reconstructed > 0.9);
+        assert!(neighbor_centered < 0.01);
+    }
+
+    #[test]
+    fn reconstruction_weights_change_with_fractional_render_position() {
+        let left = reconstruction_weights([2.25, 2.5]);
+        let right = reconstruction_weights([2.75, 2.5]);
+
+        assert_ne!(left, right);
+        assert!(right[1][2] > left[1][2]);
+        assert!(left[1][0] > right[1][0]);
+    }
+
+    #[test]
+    fn depth_edge_dilation_changes_velocity_without_shifting_color_reconstruction() {
+        let image = std::array::from_fn(|y| std::array::from_fn(|x| (x + y) as f32 / 16.0));
+        let mut first_depths = [[1.0; 5]; 5];
+        first_depths[1][1] = 0.2;
+        let mut second_depths = [[1.0; 5]; 5];
+        second_depths[3][3] = 0.1;
+        let output_sample = [2.5, 2.5];
+        let mut velocities = [[[0.0, 0.0]; 5]; 5];
+        velocities[3][3] = [0.25, -0.125];
+        let (first_color, first_pixel) = reference_resolve(&image, &first_depths, output_sample);
+        let (second_color, second_pixel) = reference_resolve(&image, &second_depths, output_sample);
+        let first_velocity = velocities[first_pixel[1]][first_pixel[0]];
+        let second_velocity = velocities[second_pixel[1]][second_pixel[0]];
+        let output_uv = [0.5, 0.5];
+        let first_history_uv = [
+            output_uv[0] + first_velocity[0],
+            output_uv[1] + first_velocity[1],
+        ];
+        let second_history_uv = [
+            output_uv[0] + second_velocity[0],
+            output_uv[1] + second_velocity[1],
+        ];
+
+        assert_eq!(first_pixel, [1, 1]);
+        assert_eq!(second_pixel, [3, 3]);
+        assert_eq!(first_color, second_color);
+        assert_ne!(first_history_uv, second_history_uv);
+        let first_depth_uv = [
+            (first_pixel[0] as f32 + 0.5) / 5.0,
+            (first_pixel[1] as f32 + 0.5) / 5.0,
+        ];
+        let second_depth_uv = [
+            (second_pixel[0] as f32 + 0.5) / 5.0,
+            (second_pixel[1] as f32 + 0.5) / 5.0,
+        ];
+        assert_ne!(first_depth_uv, second_depth_uv);
     }
 
     #[test]
