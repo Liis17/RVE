@@ -201,6 +201,80 @@ fn scripts_library_filename() -> &'static str {
     "libgame_scripts.so"
 }
 
+pub(crate) fn scripts_project(project: &Path) -> Result<Option<PathBuf>, BuildError> {
+    build_game_scripts(&prepare_project(project)?, false)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_command_line_tools() -> Result<(), BuildError> {
+    let status = Command::new("xcode-select")
+        .arg("-p")
+        .status()
+        .map_err(|e| BuildError::operational(format!("xcode-select: {e}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    Command::new("xcode-select")
+        .arg("--install")
+        .status()
+        .map_err(|e| BuildError::operational(format!("xcode-select --install: {e}")))?;
+    Err(BuildError::operational(
+        "Установите Command Line Tools в открывшемся диалоге и повторите сборку",
+    ))
+}
+
+fn script_cargo_command(project: &Path, toolchain: Option<&Path>) -> Result<Command, BuildError> {
+    let Some(toolchain) = toolchain else {
+        return Ok(Command::new(
+            std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+        ));
+    };
+    let bin = toolchain.join("bin");
+    let mut command = Command::new(bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)));
+    let mut paths = vec![bin.clone()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    command
+        .env(
+            "RUSTC",
+            bin.join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .env("CARGO_HOME", project.join(".rve/cargo-home"))
+        .env(
+            "PATH",
+            std::env::join_paths(paths).map_err(|e| BuildError::operational(e.to_string()))?,
+        )
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_BOOTSTRAP")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    #[cfg(windows)]
+    {
+        let target = format!("{}-pc-windows-gnu", std::env::consts::ARCH);
+        let linker = toolchain
+            .join("lib/rustlib")
+            .join(target)
+            .join("bin/rust-lld.exe");
+        if linker.is_file() {
+            let rustflags = [
+                "-Zunstable-options".to_owned(),
+                "-Clinker-flavor=gnu-lld".to_owned(),
+                format!("-Clinker={}", linker.display()),
+                "-Clink-self-contained=yes".to_owned(),
+                "-Ctarget-feature=+crt-static".to_owned(),
+            ]
+            .join("\u{1f}");
+            command
+                .env("RUSTC_BOOTSTRAP", "1")
+                .env("CARGO_ENCODED_RUSTFLAGS", rustflags);
+        }
+    }
+    Ok(command)
+}
+
 fn build_game_scripts(
     project: &ProjectBuild,
     release: bool,
@@ -210,13 +284,26 @@ fn build_game_scripts(
     };
     let project_root = normalize_build_path(&project.project_dir)?;
     let scripts_dir = manifest_path.parent().unwrap_or(&project_root);
-    let target = cargo_cdylib_target(&manifest_path)?;
+    let exe = current_executable_path()?;
+    let exe_dir = executable_directory(&exe)?;
+    let sdk_root = if exe_dir.join("rve-sdk.toml").is_file() {
+        exe_dir
+    } else {
+        repo_root()?.join("engine")
+    };
+    sdk::sync_guest_sdk(
+        &sdk_root.join("rve-sdk"),
+        &project_root.join(".rve/sdk/rve-sdk"),
+    )?;
+    #[cfg(target_os = "macos")]
+    ensure_command_line_tools()?;
+    let toolchain = sdk_root.join("toolchain");
+    let bundled = toolchain.is_dir().then_some(toolchain.as_path());
+    let target = cargo_cdylib_target(&manifest_path, &project_root, bundled)?;
     let target_dir = normalize_build_path(&project_root.join(".rve/target"))?;
     create_dir_all(&target_dir)?;
 
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-
-    let mut command = Command::new(&cargo);
+    let mut command = script_cargo_command(&project_root, bundled)?;
     command
         .arg("build")
         .arg("--lib")
@@ -361,10 +448,13 @@ struct CdylibTarget {
     target_name: String,
 }
 
-fn cargo_cdylib_target(manifest_path: &Path) -> Result<CdylibTarget, BuildError> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+fn cargo_cdylib_target(
+    manifest_path: &Path,
+    project: &Path,
+    toolchain: Option<&Path>,
+) -> Result<CdylibTarget, BuildError> {
     let stdout = run_cargo(
-        Command::new(cargo)
+        script_cargo_command(project, toolchain)?
             .arg("metadata")
             .arg("--no-deps")
             .arg("--format-version")
@@ -570,6 +660,69 @@ pub(crate) fn build_checkout_player(
     );
     normalize_build_path(&executable)
         .map_err(|error| BuildError::operational(format!("сборка rve-player: {error}")))
+}
+
+pub(crate) fn build_sdk_binary(
+    package: &str,
+    distribution_player: bool,
+    dlss: bool,
+) -> Result<PathBuf, BuildError> {
+    let mut command = sdk_build_command(package, distribution_player, dlss)?;
+    let stdout = run_cargo(&mut command, "SDK build", CargoFailure::Operational)?;
+    let artifact =
+        parse_cargo_output(&stdout, package, "bin", None).map_err(BuildError::operational)?;
+    let executable = artifact
+        .executable
+        .ok_or_else(|| BuildError::operational("cargo did not report executable"))?;
+    normalize_build_path(&executable)
+}
+
+fn sdk_build_command(
+    package: &str,
+    distribution_player: bool,
+    dlss: bool,
+) -> Result<Command, BuildError> {
+    let root = repo_root()?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let cache = if distribution_player {
+        "sdk-player"
+    } else {
+        "sdk-tools"
+    };
+    let mut command = Command::new(cargo);
+    command
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            package,
+            "--message-format=json",
+        ])
+        .current_dir(root.join("build"))
+        .env("CARGO_TARGET_DIR", root.join("build").join(cache));
+    if distribution_player {
+        command.arg("--no-default-features");
+    }
+    if dlss {
+        command.args(["--features", "dlss"]);
+    }
+    if cfg!(windows) {
+        // An explicit target keeps crt-static off host proc-macro crates.
+        let environment = if cfg!(target_env = "gnu") {
+            "gnu"
+        } else {
+            "msvc"
+        };
+        command.args([
+            "--target",
+            &format!("{}-pc-windows-{environment}", std::env::consts::ARCH),
+        ]);
+        command
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", "-C target-feature=+crt-static");
+    }
+    Ok(command)
 }
 
 fn checkout_player_target_dir(root: &Path, flavor: PlayerFlavor) -> PathBuf {
@@ -902,8 +1055,8 @@ mod tests {
     use super::{
         CargoArtifact, CargoFailure, PlayerFlavor, build_distribution, checkout_player_target_dir,
         copy_dlss_runtime, copy_fsr_runtime, heavy_scripts_manifest, parse_cargo_output,
-        parse_cdylib_target, player_file_name, select_library_file, validate_heavy_scripts,
-        validate_staged_archives,
+        parse_cdylib_target, player_file_name, sdk_build_command, select_library_file,
+        validate_heavy_scripts, validate_staged_archives,
     };
     use crate::error::BuildError;
     use crate::project::{HeavyScriptUse, ProjectBuild};
@@ -931,6 +1084,147 @@ mod tests {
         };
         // SAFETY: script_module! stores the descriptors and names in static storage.
         unsafe { ScriptLibrary::from_module(module) }.unwrap()
+    }
+
+    #[test]
+    fn bundled_command_uses_private_compiler_and_cargo_home() {
+        let project = Path::new("project");
+        let toolchain = Path::new("sdk/toolchain");
+        let command = super::script_cargo_command(project, Some(toolchain)).unwrap();
+        assert_eq!(
+            command.get_program(),
+            toolchain.join(format!("bin/cargo{}", std::env::consts::EXE_SUFFIX))
+        );
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env[std::ffi::OsStr::new("RUSTC")],
+            Some(
+                toolchain
+                    .join("bin")
+                    .join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
+                    .as_os_str()
+            )
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("CARGO_HOME")],
+            Some(project.join(".rve/cargo-home").as_os_str())
+        );
+        assert_eq!(env[std::ffi::OsStr::new("RUSTUP_TOOLCHAIN")], None);
+        assert_eq!(env[std::ffi::OsStr::new("RUSTFLAGS")], None);
+        assert_eq!(
+            std::env::split_paths(env[std::ffi::OsStr::new("PATH")].unwrap())
+                .next()
+                .unwrap(),
+            toolchain.join("bin")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bundled_windows_gnu_toolchain_uses_its_self_contained_linker() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-bundled-gnu-linker").unwrap();
+        let toolchain = root.path().join("toolchain with spaces");
+        let linker = toolchain
+            .join("lib/rustlib")
+            .join(format!("{}-pc-windows-gnu", std::env::consts::ARCH))
+            .join("bin/rust-lld.exe");
+        fs::create_dir_all(linker.parent().unwrap()).unwrap();
+        fs::write(&linker, b"test linker marker").unwrap();
+
+        let command =
+            super::script_cargo_command(&root.path().join("project"), Some(&toolchain)).unwrap();
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            env[std::ffi::OsStr::new("RUSTC_BOOTSTRAP")],
+            Some(std::ffi::OsStr::new("1"))
+        );
+        let encoded = env[std::ffi::OsStr::new("CARGO_ENCODED_RUSTFLAGS")]
+            .unwrap()
+            .to_string_lossy();
+        assert_eq!(
+            encoded.split('\u{1f}').collect::<Vec<_>>(),
+            [
+                "-Zunstable-options",
+                "-Clinker-flavor=gnu-lld",
+                &format!("-Clinker={}", linker.display()),
+                "-Clink-self-contained=yes",
+                "-Ctarget-feature=+crt-static",
+            ]
+        );
+    }
+
+    #[test]
+    fn new_project_template_builds_and_loads_its_heavy_scripts() {
+        fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+            fs::create_dir_all(destination)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                let destination = destination.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_tree(&entry.path(), &destination)?;
+                } else {
+                    fs::copy(entry.path(), destination)?;
+                }
+            }
+            Ok(())
+        }
+
+        let parent = TempDir::create(&std::env::temp_dir(), "rve-new-project-template").unwrap();
+        let project = parent.path().join("new-project");
+        let template =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../editor/templates/new_project");
+        copy_tree(&template, &project).unwrap();
+
+        let library_path = super::scripts_project(&project).unwrap().unwrap();
+        // SAFETY: the generated library remains on disk and follows the editor guest ABI.
+        let library = unsafe { ScriptLibrary::load(&library_path) }.unwrap();
+        assert!(library.contains_script("Orbit"));
+        let schema = library.schema("Orbit").unwrap();
+        assert_eq!(
+            schema
+                .specs()
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            ["radius", "height", "speed"]
+        );
+    }
+
+    #[test]
+    fn sdk_player_builds_preserve_dlss_and_distribution_settings() {
+        for distribution in [false, true] {
+            for dlss in [false, true] {
+                let command = sdk_build_command("rve-player", distribution, dlss).unwrap();
+                let arguments: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                assert_eq!(arguments.contains(&"--no-default-features"), distribution);
+                assert_eq!(
+                    arguments
+                        .windows(2)
+                        .any(|args| args == ["--features", "dlss"]),
+                    dlss
+                );
+                assert!(arguments.contains(&"--release"));
+                let cache = command
+                    .get_envs()
+                    .find(|(key, _)| *key == "CARGO_TARGET_DIR")
+                    .unwrap()
+                    .1
+                    .unwrap();
+                assert!(Path::new(cache).ends_with(if distribution {
+                    "sdk-player"
+                } else {
+                    "sdk-tools"
+                }));
+                if cfg!(windows) {
+                    assert!(command.get_envs().any(|(key, value)| key == "RUSTFLAGS"
+                        && value == Some(std::ffi::OsStr::new("-C target-feature=+crt-static"))));
+                }
+            }
+        }
     }
 
     #[test]

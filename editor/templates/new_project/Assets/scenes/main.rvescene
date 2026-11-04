@@ -1,0 +1,42 @@
+[[assets]]
+path = "/models/cube.fbx"
+
+[[assets]]
+path = "/cameras/default.camerasettings"
+
+[[assets]]
+path = "/scripts/jump.lua"
+
+[[objects]]
+id = "camera"
+name = "Camera"
+[objects.transform]
+position = [0.0, 2.2, 6.0]
+[objects.camera]
+settings = "/cameras/default.camerasettings"
+[[objects.heavy_scripts]]
+name = "Orbit"
+params = { radius = 6.0, height = 2.2, speed = 20.0 }
+
+[[objects]]
+id = "sun"
+name = "Directional Light"
+[objects.transform]
+rotation = [-35.0, 30.0, 0.0]
+[objects.directional_light]
+color = [1.0, 0.95, 0.82]
+ambient = [0.18, 0.18, 0.2]
+shadows = true
+shadow_distance = 80.0
+shadow_cascades = 4
+
+[[objects]]
+id = "cube"
+name = "Cube"
+[objects.transform]
+position = [0.0, 1.0, 0.0]
+[objects.mesh_renderer]
+model = "/models/cube.fbx"
+[[objects.lite_scripts]]
+path = "/scripts/jump.lua"
+params = { height = 2.0, duration = 0.8 }

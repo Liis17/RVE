@@ -1,7 +1,7 @@
 //! Состояние редактора, общее для панелей и обработчиков действий; не зависит от GPU.
 
 use crate::assets_fs::{AssetEntry, AssetKind};
-use crate::build::BuildJob;
+use crate::build::{BuildJob, ScriptGeneration, ScriptsJob};
 use crate::console::ConsoleLog;
 use crate::play::PlaySession;
 use crate::previews::PreviewCache;
@@ -34,6 +34,11 @@ pub enum Action {
     OpenProject,
     /// Открыть проект из списка недавних.
     OpenProjectAt(PathBuf),
+    NewProject,
+    CreateProject {
+        name: String,
+        parent: PathBuf,
+    },
     Save,
     SaveAs,
     Exit,
@@ -115,12 +120,19 @@ pub struct EditorState {
     /// Недавние проекты из настроек пользователя, последний открытый — первым.
     pub recent_projects: Vec<PathBuf>,
     pub library: Option<ScriptLibrary>,
+    /// Библиотека, созданная автоматической сборкой; её копия загружается отдельно от Cargo target.
+    pub script_generation: Option<ScriptGeneration>,
+    /// Фоновая сборка heavy_scripts при открытии проекта или перед Play.
+    pub scripts_job: Option<ScriptsJob>,
+    /// Play, ожидающий успешного завершения автоматической сборки скриптов.
+    pub pending_play: bool,
     pub actions: Vec<Action>,
     pub unsaved_prompt: Option<UnsavedPrompt>,
     pub recovery_prompt: Option<RecoveryPrompt>,
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
+    pub new_project_dialog: Option<crate::new_project::NewProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
     /// В прошлом кадре фокус был в текстовом поле: Esc этого кадра закрывает поле,
     /// а не снимает выделение.
@@ -172,12 +184,16 @@ impl EditorState {
             scripts_path,
             recent_projects: Vec::new(),
             library: None,
+            script_generation: None,
+            scripts_job: None,
+            pending_play: false,
             actions: Vec::new(),
             unsaved_prompt: None,
             recovery_prompt: None,
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_dialog: None,
+            new_project_dialog: None,
             hierarchy_rename: None,
             text_focused_last_frame: false,
             console_open: false,
@@ -212,6 +228,25 @@ impl EditorState {
 
     pub fn action(&mut self, action: Action) {
         self.actions.push(action);
+    }
+
+    /// Returns false and queues Play while project scripts must be compiled first.
+    pub fn request_play(&mut self) -> bool {
+        if self.scripts_path.is_none()
+            && self
+                .project
+                .as_ref()
+                .is_some_and(|project| project.settings.heavy_scripts.is_some())
+        {
+            self.pending_play = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn finish_pending_play(&mut self, build_succeeded: bool) -> bool {
+        std::mem::take(&mut self.pending_play) && build_succeeded
     }
 
     /// Мир текущего кадра: копия Play-режима либо мир, собранный из документа.
@@ -705,5 +740,23 @@ settings = "/cameras/problem.camerasettings"
     fn hanging_schema_chunk_is_interrupted() {
         let timeout = Duration::from_millis(20);
         assert!(read_lite_schema("loop.lua", "while true do end", timeout).is_err());
+    }
+
+    #[test]
+    fn play_waits_for_auto_scripts_build_and_is_cancelled_on_failure() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(std::path::Path::new(dir)).unwrap());
+
+        assert!(!state.request_play());
+        assert!(state.pending_play);
+        assert!(!state.finish_pending_play(false));
+        assert!(!state.pending_play);
+
+        assert!(!state.request_play());
+        assert!(state.finish_pending_play(true));
+
+        state.scripts_path = Some(PathBuf::from("manual.dll"));
+        assert!(state.request_play());
     }
 }

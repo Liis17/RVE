@@ -1,0 +1,8 @@
+id = "new-project"
+name = "New Project"
+version = "1.0.0"
+heavy_scripts = "Scripts"
+
+[[scenes]]
+path = "/scenes/main.rvescene"
+enabled = true
