@@ -6,7 +6,7 @@ use std::ptr;
 use std::sync::Arc;
 
 pub(crate) const CREATE_UPSCALE_TYPE: u64 = 0x0001_0000;
-pub(crate) const CREATE_BACKEND_VK_TYPE: u64 = 0x0100_0003;
+pub(crate) const CREATE_BACKEND_VK_TYPE: u64 = 0x0000_0003;
 pub(crate) const DISPATCH_UPSCALE_TYPE: u64 = 0x0001_0001;
 
 pub(crate) const UPSCALE_ENABLE_HDR: u32 = 1 << 0;
@@ -17,7 +17,7 @@ pub(crate) const RESOURCE_STATE_UNORDERED_ACCESS: u32 = 1 << 1;
 pub(crate) const RESOURCE_STATE_PIXEL_COMPUTE_READ: u32 = (1 << 2) | (1 << 3);
 pub(crate) const FORMAT_R16G16B16A16_FLOAT: u32 = 4;
 pub(crate) const FORMAT_R16G16_FLOAT: u32 = 18;
-pub(crate) const FORMAT_R32_FLOAT: u32 = 26;
+pub(crate) const FORMAT_R32_FLOAT: u32 = 28;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -373,6 +373,22 @@ mod tests {
     use std::mem::{offset_of, size_of};
 
     #[test]
+    fn numeric_values_match_fidelityfx_sdk_1_1_4_headers() {
+        assert_eq!(CREATE_UPSCALE_TYPE, 0x0001_0000);
+        assert_eq!(CREATE_BACKEND_VK_TYPE, 0x0000_0003);
+        assert_eq!(DISPATCH_UPSCALE_TYPE, 0x0001_0001);
+        assert_eq!(UPSCALE_ENABLE_HDR, 1);
+        assert_eq!(RESOURCE_USAGE_UAV, 2);
+        assert_eq!(RESOURCE_USAGE_DEPTH_TARGET, 4);
+        assert_eq!(RESOURCE_TYPE_TEXTURE_2D, 2);
+        assert_eq!(RESOURCE_STATE_UNORDERED_ACCESS, 2);
+        assert_eq!(RESOURCE_STATE_PIXEL_COMPUTE_READ, 12);
+        assert_eq!(FORMAT_R16G16B16A16_FLOAT, 4);
+        assert_eq!(FORMAT_R16G16_FLOAT, 18);
+        assert_eq!(FORMAT_R32_FLOAT, 28);
+    }
+
+    #[test]
     fn ffx_c_struct_layout_matches_the_64_bit_api_headers() {
         assert_eq!(size_of::<FfxApiHeader>(), 16);
         assert_eq!(size_of::<FfxResourceDescription>(), 32);
@@ -448,15 +464,22 @@ mod tests {
             [0.1, 100.0, std::f32::consts::FRAC_PI_3],
         );
 
-        assert_eq!(desc.header.type_id, DISPATCH_UPSCALE_TYPE);
+        assert_eq!(desc.header.type_id, 0x0001_0001);
         assert_eq!(desc.command_list, placeholder);
         assert_eq!(desc.color.resource, placeholder);
-        assert_eq!(desc.color.description.format, FORMAT_R16G16B16A16_FLOAT);
-        assert_eq!(desc.depth.description.usage, RESOURCE_USAGE_DEPTH_TARGET);
-        assert_eq!(desc.motion_vectors.description.format, FORMAT_R16G16_FLOAT);
+        assert_eq!(desc.color.description.resource_type, 2);
+        assert_eq!(desc.color.description.format, 4);
+        assert_eq!(desc.depth.description.resource_type, 2);
+        assert_eq!(desc.depth.description.format, 28);
+        assert_eq!(desc.depth.description.usage, 4);
+        assert_eq!(desc.depth.state, 12);
+        assert_eq!(desc.motion_vectors.description.format, 18);
         assert_eq!(desc.exposure.description.width, 1);
         assert_eq!(desc.exposure.description.height, 1);
-        assert_eq!(desc.output.description.usage, RESOURCE_USAGE_UAV);
+        assert_eq!(desc.exposure.description.resource_type, 2);
+        assert_eq!(desc.exposure.description.format, 28);
+        assert_eq!(desc.exposure.description.usage, 0);
+        assert_eq!(desc.output.description.usage, 2);
         assert_eq!(desc.jitter_offset.x, 0.25);
         assert_eq!(desc.jitter_offset.y, -0.125);
         assert_eq!(desc.motion_vector_scale.x, 640.0);
