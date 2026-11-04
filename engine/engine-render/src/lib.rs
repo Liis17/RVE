@@ -675,6 +675,14 @@ pub enum FrameStatus {
     Skipped,
 }
 
+/// Presentation status and whether this render attempt reached a successful queue submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameOutcome {
+    pub status: FrameStatus,
+    /// True after `vkQueueSubmit2` succeeds, including a later out-of-date present.
+    pub submitted: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcquireAction {
     Acquired { image_index: u32, suboptimal: bool },
@@ -1513,6 +1521,15 @@ impl Renderer {
 
     /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
     pub fn render_frame(&mut self, frame: &Frame<'_>) -> Result<FrameStatus, RenderError> {
+        self.render_frame_with_outcome(frame)
+            .map(|outcome| outcome.status)
+    }
+
+    /// Renders a frame and reports if its command buffer was successfully submitted.
+    pub fn render_frame_with_outcome(
+        &mut self,
+        frame: &Frame<'_>,
+    ) -> Result<FrameOutcome, RenderError> {
         validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         validate_overlay(frame.overlay)?;
@@ -1537,12 +1554,18 @@ impl Renderer {
         let (environment_set, skybox) = self.environment_set_for(frame.environment)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             self.screen_temporal.state.missed();
-            return Ok(FrameStatus::Skipped);
+            return Ok(FrameOutcome {
+                status: FrameStatus::Skipped,
+                submitted: false,
+            });
         }
         if self.swapchain_dirty || self.swapchain.is_none() {
             self.screen_temporal.state.missed();
             self.recreate_swapchain()?;
-            return Ok(FrameStatus::Skipped);
+            return Ok(FrameOutcome {
+                status: FrameStatus::Skipped,
+                submitted: false,
+            });
         }
 
         let instance = self.instance()?.clone();
@@ -1766,7 +1789,10 @@ impl Renderer {
         )?
         else {
             self.screen_temporal.state.missed();
-            return Ok(FrameStatus::Skipped);
+            return Ok(FrameOutcome {
+                status: FrameStatus::Skipped,
+                submitted: false,
+            });
         };
 
         let shadow = ShadowPass {
@@ -2016,6 +2042,17 @@ impl Renderer {
         ui: &[UiPrimitive<'_>],
         clear: [f32; 4],
     ) -> Result<FrameStatus, RenderError> {
+        self.render_frame_with_ui_outcome(scenes, ui, clear)
+            .map(|outcome| outcome.status)
+    }
+
+    /// Renders viewport scenes and UI and reports if their command buffer was submitted.
+    pub fn render_frame_with_ui_outcome(
+        &mut self,
+        scenes: &[(ViewportId, &Frame<'_>)],
+        ui: &[UiPrimitive<'_>],
+        clear: [f32; 4],
+    ) -> Result<FrameOutcome, RenderError> {
         validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
         self.screen_temporal.state.missed();
         self.miss_unlisted_viewports(scenes);
@@ -2061,12 +2098,18 @@ impl Renderer {
         self.validate_ui_images(&packed, scenes)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             self.miss_all_temporal_views();
-            return Ok(FrameStatus::Skipped);
+            return Ok(FrameOutcome {
+                status: FrameStatus::Skipped,
+                submitted: false,
+            });
         }
         if self.swapchain_dirty || self.swapchain.is_none() {
             self.miss_all_temporal_views();
             self.recreate_swapchain()?;
-            return Ok(FrameStatus::Skipped);
+            return Ok(FrameOutcome {
+                status: FrameStatus::Skipped,
+                submitted: false,
+            });
         }
 
         let instance = self.instance()?.clone();
@@ -2347,7 +2390,10 @@ impl Renderer {
         )?
         else {
             self.miss_all_temporal_views();
-            return Ok(FrameStatus::Skipped);
+            return Ok(FrameOutcome {
+                status: FrameStatus::Skipped,
+                submitted: false,
+            });
         };
 
         let mut draws = Vec::with_capacity(packed.draws.len());
@@ -2848,7 +2894,7 @@ impl Renderer {
         wait_stage: vk::PipelineStageFlags2,
         timestamps_written: bool,
         temporal_submissions: &[TemporalSubmission],
-    ) -> Result<FrameStatus, RenderError> {
+    ) -> Result<FrameOutcome, RenderError> {
         let device = self.device()?.clone();
         let swapchain_loader = self.swapchain_loader()?.clone();
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
@@ -2907,11 +2953,17 @@ impl Renderer {
                 if acquire_suboptimal || present_suboptimal {
                     self.swapchain_dirty = true;
                 }
-                Ok(FrameStatus::Presented)
+                Ok(FrameOutcome {
+                    status: FrameStatus::Presented,
+                    submitted: true,
+                })
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.swapchain_dirty = true;
-                Ok(FrameStatus::Skipped)
+                Ok(FrameOutcome {
+                    status: FrameStatus::Skipped,
+                    submitted: true,
+                })
             }
             Err(error) => Err(RenderError::Vulkan(error)),
         }
