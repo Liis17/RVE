@@ -39,7 +39,55 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     show_apply_prompt(ui.ctx(), state);
     show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
+    show_new_project_dialog(ui.ctx(), state);
     state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
+}
+
+fn show_new_project_dialog(ctx: &egui::Context, state: &mut EditorState) {
+    let Some(mut dialog) = state.new_project_dialog.take() else {
+        return;
+    };
+    let mut close = false;
+    egui::Modal::new(egui::Id::new("new_project")).show(ctx, |ui| {
+        ui.set_min_width(420.0);
+        ui.heading("New Project");
+        ui.label("Project name");
+        ui.text_edit_singleline(&mut dialog.name);
+        ui.add_space(6.0);
+        ui.label("Parent folder");
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [ui.available_width() - 104.0, 24.0],
+                egui::TextEdit::singleline(&mut dialog.parent),
+            );
+            if ui.button("Browse…").clicked()
+                && let Some(parent) = rfd::FileDialog::new().pick_folder()
+            {
+                dialog.parent = parent.display().to_string();
+            }
+        });
+        if let Some(error) = &dialog.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!dialog.name.trim().is_empty(), egui::Button::new("Create"))
+                .clicked()
+            {
+                state.action(Action::CreateProject {
+                    name: dialog.name.clone(),
+                    parent: std::path::PathBuf::from(&dialog.parent),
+                });
+            }
+            if ui.button("Cancel").clicked() {
+                close = true;
+            }
+        });
+    });
+    if !close {
+        state.new_project_dialog = Some(dialog);
+    }
 }
 
 fn show_recovery_prompt(ctx: &egui::Context, state: &mut EditorState) {

@@ -993,6 +993,43 @@ mod tests {
     }
 
     #[test]
+    fn new_project_template_builds_and_loads_its_heavy_scripts() {
+        fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+            fs::create_dir_all(destination)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                let destination = destination.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_tree(&entry.path(), &destination)?;
+                } else {
+                    fs::copy(entry.path(), destination)?;
+                }
+            }
+            Ok(())
+        }
+
+        let parent = TempDir::create(&std::env::temp_dir(), "rve-new-project-template").unwrap();
+        let project = parent.path().join("new-project");
+        let template =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../editor/templates/new_project");
+        copy_tree(&template, &project).unwrap();
+
+        let library_path = super::scripts_project(&project).unwrap().unwrap();
+        // SAFETY: the generated library remains on disk and follows the editor guest ABI.
+        let library = unsafe { ScriptLibrary::load(&library_path) }.unwrap();
+        assert!(library.contains_script("Orbit"));
+        let schema = library.schema("Orbit").unwrap();
+        assert_eq!(
+            schema
+                .specs()
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            ["radius", "height", "speed"]
+        );
+    }
+
+    #[test]
     fn checkout_player_build_arguments_and_targets_follow_flavor() {
         let root = Path::new("checkout");
         assert_eq!(

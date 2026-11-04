@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "new-project-scripts"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+rve-sdk = { path = "../.rve/sdk/rve-sdk" }

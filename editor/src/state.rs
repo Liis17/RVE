@@ -33,6 +33,11 @@ pub enum Action {
     OpenProject,
     /// Открыть проект из списка недавних.
     OpenProjectAt(PathBuf),
+    NewProject,
+    CreateProject {
+        name: String,
+        parent: PathBuf,
+    },
     Save,
     SaveAs,
     Exit,
@@ -124,6 +129,7 @@ pub struct EditorState {
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
+    pub new_project_dialog: Option<crate::new_project::NewProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
     /// В прошлом кадре фокус был в текстовом поле: Esc этого кадра закрывает поле,
     /// а не снимает выделение.
@@ -182,6 +188,7 @@ impl EditorState {
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_dialog: None,
+            new_project_dialog: None,
             hierarchy_rename: None,
             text_focused_last_frame: false,
             console_open: false,

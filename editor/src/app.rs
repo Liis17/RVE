@@ -460,6 +460,7 @@ impl EditorApp {
                 }
             }
             Action::OpenProjectAt(dir) => self.open_project(&dir),
+            Action::NewProject | Action::CreateProject { .. } => {}
             Action::Exit => self.exit = true,
             Action::BuildPlayer => self.start_build(),
             Action::CreatePrefab(id) => self.create_prefab(&id),
@@ -923,6 +924,23 @@ impl EditorApp {
                 }
                 Action::Play => self.start_play(),
                 Action::Stop => self.stop_play(),
+                Action::NewProject => {
+                    self.state.new_project_dialog =
+                        Some(crate::new_project::NewProjectDialog::default());
+                }
+                Action::CreateProject { name, parent } => {
+                    match crate::new_project::create_project(&name, &parent) {
+                        Ok(dir) => {
+                            self.state.new_project_dialog = None;
+                            self.run_guarded(Action::OpenProjectAt(dir));
+                        }
+                        Err(error) => {
+                            if let Some(dialog) = &mut self.state.new_project_dialog {
+                                dialog.error = Some(error);
+                            }
+                        }
+                    }
+                }
                 Action::ImportDialog => {
                     if let Some(files) = rfd::FileDialog::new().pick_files() {
                         self.import(&files);
@@ -1127,6 +1145,7 @@ impl EditorApp {
 fn console_modal_open(state: &EditorState) -> bool {
     state.unsaved_prompt.is_some()
         || state.project_dialog.is_some()
+        || state.new_project_dialog.is_some()
         || state.recovery_prompt.is_some()
         || state.apply_prompt.is_some()
 }

@@ -8,6 +8,7 @@ mod cli;
 mod console;
 mod input;
 mod layout;
+mod new_project;
 mod play;
 mod previews;
 mod project;

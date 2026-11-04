@@ -864,6 +864,31 @@ fn build_player_menu_item_queues_the_action() {
 }
 
 #[test]
+fn new_project_menu_item_queues_the_action() {
+    let mut harness = Harness::new();
+    let mut dock = default_layout();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness
+            .ctx
+            .run_ui(input, |ui| toolbar::show(ui, state, &mut dock));
+        output.textures_delta.clear();
+        output.shapes
+    };
+    let mut click = |harness: &mut Harness, text: &str| {
+        let shapes = frame(harness, Vec::new());
+        let at = find_text(&shapes, text).unwrap_or_else(|| panic!("{text} not shown"));
+        frame(harness, vec![Event::PointerMoved(at)]);
+        frame(harness, vec![button(at, PointerButton::Primary, true)]);
+        frame(harness, vec![button(at, PointerButton::Primary, false)]);
+    };
+    click(&mut harness, "File");
+    click(&mut harness, "New Project…");
+    assert_eq!(harness.state.actions, [crate::state::Action::NewProject]);
+}
+
+#[test]
 fn stop_button_cancels_a_play_request_waiting_for_script_build() {
     let mut harness = Harness::new();
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");

@@ -174,6 +174,12 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
         .is_some_and(|scene| scene.selection().is_some());
     ui.menu_button("File", |ui| {
         if ui
+            .add_enabled(!state.is_playing(), egui::Button::new("New Project…"))
+            .clicked()
+        {
+            state.action(Action::NewProject);
+        }
+        if ui
             .add_enabled(editing, egui::Button::new("New Scene"))
             .clicked()
         {
