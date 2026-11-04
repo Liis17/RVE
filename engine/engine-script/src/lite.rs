@@ -25,7 +25,11 @@ use std::time::{Duration, Instant};
 const LUA_HOOK_INSTRUCTION_INTERVAL: u32 = 1_000;
 const LUA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-pub(crate) type EventQueue = Rc<RefCell<Vec<ScriptEvent>>>;
+pub(crate) const MAX_PENDING_LOG_EVENTS: usize = 1_024;
+pub(crate) const MAX_LOG_MESSAGE_BYTES: usize = 4_096;
+const LOG_TRUNCATION_MARKER: &str = "…";
+
+pub(crate) type EventQueue = Rc<RefCell<ScriptEventQueue>>;
 pub(crate) type ActiveSource = Rc<RefCell<String>>;
 pub(crate) type ActiveCall = Rc<Cell<*mut ScriptTransaction>>;
 pub(crate) type ActiveOwner = Rc<Cell<Option<usize>>>;
@@ -43,6 +47,87 @@ pub(crate) struct RegisteredLuaCommand {
 }
 
 pub(crate) type LuaCommands = Rc<RefCell<std::collections::BTreeMap<String, RegisteredLuaCommand>>>;
+
+#[derive(Default)]
+pub(crate) struct ScriptEventQueue {
+    events: Vec<ScriptEvent>,
+    pending_log_events: usize,
+    dropped_log_events: usize,
+}
+
+impl ScriptEventQueue {
+    pub(crate) fn push(&mut self, event: ScriptEvent) {
+        self.events.push(event);
+    }
+
+    pub(crate) fn push_log(&mut self, mut event: ScriptEvent) {
+        if !self.has_log_capacity() {
+            self.record_dropped_log();
+            return;
+        }
+        truncate_log_message(&mut event.message);
+        self.pending_log_events += 1;
+        self.events.push(event);
+    }
+
+    pub(crate) fn has_log_capacity(&self) -> bool {
+        self.pending_log_events < MAX_PENDING_LOG_EVENTS
+    }
+
+    pub(crate) fn record_dropped_log(&mut self) {
+        self.dropped_log_events = self.dropped_log_events.saturating_add(1);
+    }
+
+    pub(crate) fn drain(&mut self) -> Vec<ScriptEvent> {
+        let mut events = std::mem::take(&mut self.events);
+        if self.dropped_log_events > 0 {
+            events.push(ScriptEvent {
+                level: ScriptEventLevel::Warn,
+                source: "engine-script".to_owned(),
+                message: format!("{} script log messages dropped", self.dropped_log_events),
+            });
+        }
+        self.pending_log_events = 0;
+        self.dropped_log_events = 0;
+        events
+    }
+}
+
+impl std::ops::Deref for ScriptEventQueue {
+    type Target = [ScriptEvent];
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+fn truncate_log_message(message: &mut String) {
+    if message.len() > MAX_LOG_MESSAGE_BYTES {
+        truncate_to_boundary(message, MAX_LOG_MESSAGE_BYTES - LOG_TRUNCATION_MARKER.len());
+        message.push_str(LOG_TRUNCATION_MARKER);
+    }
+}
+
+fn truncate_to_boundary(message: &mut String, max_bytes: usize) {
+    let mut end = max_bytes.min(message.len());
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+}
+
+pub(crate) fn bounded_lua_log_message(bytes: &[u8]) -> String {
+    let prefix_len = bytes.len().min(MAX_LOG_MESSAGE_BYTES);
+    let mut message = String::from_utf8_lossy(&bytes[..prefix_len]).into_owned();
+    if bytes.len() > prefix_len || message.len() > MAX_LOG_MESSAGE_BYTES {
+        truncate_to_boundary(
+            &mut message,
+            MAX_LOG_MESSAGE_BYTES - LOG_TRUNCATION_MARKER.len(),
+        );
+        message.push_str(LOG_TRUNCATION_MARKER);
+    }
+    message
+}
 
 pub(crate) struct LuaState {
     pub(crate) lua: Lua,
@@ -240,7 +325,7 @@ pub(crate) fn create_lua(
         lua.create_function({
             let events = events.clone();
             let active_source = active_source.clone();
-            move |_, (text, level): (String, Option<String>)| {
+            move |_, (text, level): (LuaString, Option<String>)| {
                 let level = match level.as_deref().unwrap_or("info") {
                     "log" | "info" => ScriptEventLevel::Info,
                     "warning" | "warn" => ScriptEventLevel::Warn,
@@ -251,10 +336,15 @@ pub(crate) fn create_lua(
                         )));
                     }
                 };
-                events.borrow_mut().push(ScriptEvent {
+                if !events.borrow().has_log_capacity() {
+                    events.borrow_mut().record_dropped_log();
+                    return Ok(());
+                }
+                let message = bounded_lua_log_message(&text.as_bytes());
+                events.borrow_mut().push_log(ScriptEvent {
                     level,
                     source: active_source.borrow().clone(),
-                    message: text,
+                    message,
                 });
                 Ok(())
             }
@@ -465,7 +555,7 @@ pub(crate) fn properties(
     interrupted: Arc<AtomicBool>,
 ) -> Result<Option<ParamSchema>, String> {
     let state = create_lua(
-        Rc::new(RefCell::new(Vec::new())),
+        Rc::new(RefCell::new(ScriptEventQueue::default())),
         Rc::new(RefCell::new(label.to_owned())),
         Rc::new(Cell::new(std::ptr::null_mut())),
         Rc::new(Cell::new(None)),
@@ -589,18 +679,55 @@ fn log_function(
     level: ScriptEventLevel,
 ) -> mlua::Result<Function> {
     lua.create_function(move |_, arguments: MultiValue| {
-        let mut parts = Vec::with_capacity(arguments.len());
-        for argument in arguments {
-            let string = tostring.call::<LuaString>(argument)?;
-            parts.push(string.to_string_lossy());
+        if !events.borrow().has_log_capacity() {
+            events.borrow_mut().record_dropped_log();
+            return Ok(());
         }
-        events.borrow_mut().push(ScriptEvent {
+        let mut message = String::new();
+        let mut truncated = false;
+        for (index, argument) in arguments.into_iter().enumerate() {
+            let string = tostring.call::<LuaString>(argument)?;
+            if truncated {
+                continue;
+            }
+            let part = bounded_lua_log_message(&string.as_bytes());
+            truncated = append_log_piece(&mut message, &part, index != 0);
+        }
+        events.borrow_mut().push_log(ScriptEvent {
             level,
             source: active_source.borrow().clone(),
-            message: parts.join(" "),
+            message,
         });
         Ok(())
     })
+}
+
+fn append_log_piece(message: &mut String, part: &str, separator: bool) -> bool {
+    let joined_len = message
+        .len()
+        .saturating_add(usize::from(separator))
+        .saturating_add(part.len());
+    if joined_len <= MAX_LOG_MESSAGE_BYTES {
+        if separator {
+            message.push(' ');
+        }
+        message.push_str(part);
+        return false;
+    }
+
+    let content_limit = MAX_LOG_MESSAGE_BYTES - LOG_TRUNCATION_MARKER.len();
+    truncate_to_boundary(message, content_limit);
+    if separator && message.len() < content_limit {
+        message.push(' ');
+    }
+    let available = content_limit - message.len();
+    let mut end = part.len().min(available);
+    while !part.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.push_str(&part[..end]);
+    message.push_str(LOG_TRUNCATION_MARKER);
+    true
 }
 
 fn register_command_function(

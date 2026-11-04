@@ -2,7 +2,7 @@ use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
 use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LuaCommands,
-    LuaInstance, RegisteredCommandCallback,
+    LuaInstance, RegisteredCommandCallback, ScriptEventQueue,
 };
 use crate::transaction::{
     MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction,
@@ -225,7 +225,7 @@ impl ScriptHost {
             interrupt,
             call_time_limit,
         } = options;
-        let events = Rc::new(RefCell::new(Vec::new()));
+        let events = Rc::new(RefCell::new(ScriptEventQueue::default()));
         let active_source = Rc::new(RefCell::new(scene_name.to_owned()));
         let active_call = Rc::new(Cell::new(std::ptr::null_mut()));
         let active_owner = Rc::new(Cell::new(None));
@@ -455,7 +455,7 @@ impl ScriptHost {
 
     /// Takes all log and runtime-error events accumulated since the previous drain.
     pub fn drain_events(&mut self) -> Vec<ScriptEvent> {
-        std::mem::take(&mut *self.events.borrow_mut())
+        self.events.borrow_mut().drain()
     }
 
     pub fn command_catalog(&self) -> CommandCatalog {

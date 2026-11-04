@@ -1390,6 +1390,86 @@ return Script
 }
 
 #[test]
+fn lua_print_queue_caps_at_1024_and_reports_drops_once_per_drain() {
+    let mut world = one_camera(
+        "[[assets]]\npath=\"/logs.lua\"\n[[objects.lite_scripts]]\npath=\"/logs.lua\"\n",
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  for index = 1, 2000 do print("log", index) end
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("logs.lua", source)]), None).unwrap();
+
+    for _ in 0..2 {
+        host.update(&mut world, 0.1, ScriptTime::default());
+        let events = host.drain_events();
+        assert_eq!(events.len(), 1_025);
+        assert!(
+            events[..1_024]
+                .iter()
+                .all(|event| event.level == ScriptEventLevel::Info)
+        );
+        assert_eq!(events[1_024].level, ScriptEventLevel::Warn);
+        assert_eq!(events[1_024].message, "976 script log messages dropped");
+    }
+}
+
+#[test]
+fn host_failures_are_kept_when_the_log_queue_is_full() {
+    let mut world = one_camera(
+        "[[assets]]\npath=\"/failure.lua\"\n[[objects.lite_scripts]]\npath=\"/failure.lua\"\n",
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  for index = 1, 2000 do print("log", index) end
+  error("host failure after logs")
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("failure.lua", source)]), None).unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert_eq!(events.len(), 1_026);
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("host failure after logs")
+    }));
+    assert_eq!(
+        events.last().unwrap().message,
+        "976 script log messages dropped"
+    );
+}
+
+#[test]
+fn oversized_lua_logs_are_truncated_at_a_utf8_boundary() {
+    let mut world = one_camera(
+        "[[assets]]\npath=\"/long-log.lua\"\n[[objects.lite_scripts]]\npath=\"/long-log.lua\"\n",
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  print(string.rep("é", 3000))
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("long-log.lua", source)]), None).unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].message.len() <= 4_096);
+    assert!(events[0].message.ends_with('…'));
+    assert!(events[0].message.is_char_boundary(events[0].message.len()));
+}
+
+#[test]
 fn lua_object_writes_are_transactional_and_world_matrices_are_phase_snapshots() {
     let mut world = world(
         r#"
