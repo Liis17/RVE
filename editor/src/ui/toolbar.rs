@@ -222,6 +222,16 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
         }
     });
     ui.menu_button("Edit", |ui| {
+        ui.menu_button("Scene Navigation", |ui| {
+            use crate::gestures::ScrollNavigation;
+            for (mode, hint) in [
+                (ScrollNavigation::Auto, "Point scroll: orbit/pan; line scroll: zoom. On Windows select Trackpad manually if needed."),
+                (ScrollNavigation::Trackpad, "Swipe to orbit, Shift+swipe to pan, pinch or Cmd/Ctrl+swipe to zoom."),
+                (ScrollNavigation::Mouse, "Scroll wheel zooms the scene."),
+            ] {
+                ui.selectable_value(&mut state.scroll_navigation, mode, mode.label()).on_hover_text(hint);
+            }
+        });
         let scene = state.scene.as_ref();
         let can_undo = editing && scene.is_some_and(|scene| scene.can_undo());
         let can_redo = editing && scene.is_some_and(|scene| scene.can_redo());

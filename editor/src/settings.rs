@@ -14,6 +14,7 @@ const FILE_NAME: &str = "settings.json";
 
 #[derive(Debug, Default)]
 pub struct UserSettings {
+    pub scroll_navigation: crate::gestures::ScrollNavigation,
     /// Каталоги проектов, последний открытый — первым.
     pub recent_projects: Vec<PathBuf>,
     /// Раскладка панелей; `None` — раскладка по умолчанию.
@@ -101,6 +102,8 @@ impl SettingsStore {
         let mut problems = Vec::new();
         let settings = UserSettings {
             recent_projects: field(&value, "recent_projects", &mut problems).unwrap_or_default(),
+            scroll_navigation: field(&value, "scroll_navigation", &mut problems)
+                .unwrap_or_default(),
             layout: field(&value, "layout", &mut problems),
         };
         let message = (!problems.is_empty()).then(|| {
@@ -121,6 +124,7 @@ impl SettingsStore {
         let value = serde_json::json!({
             "recent_projects": settings.recent_projects,
             "layout": settings.layout,
+            "scroll_navigation": settings.scroll_navigation,
         });
         let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
         write_atomic(&self.file, text.as_bytes())
@@ -210,12 +214,14 @@ mod tests {
         layout.remove_tab(console);
         let settings = UserSettings {
             recent_projects: vec![PathBuf::from("a"), PathBuf::from("b")],
+            scroll_navigation: crate::gestures::ScrollNavigation::Trackpad,
             layout: Some(layout.clone()),
         };
         store.save(&settings).unwrap();
         let (loaded, message) = store.load();
         assert_eq!(message, None);
         assert_eq!(loaded.recent_projects, settings.recent_projects);
+        assert_eq!(loaded.scroll_navigation, settings.scroll_navigation);
         assert_eq!(tabs(&loaded.layout_or_default()), tabs(&layout));
         assert!(
             !std::fs::read_dir(dir.0.join("nested"))
@@ -257,6 +263,7 @@ mod tests {
         layout.push_to_first_leaf(Tab::Console);
         let settings = UserSettings {
             recent_projects: Vec::new(),
+            scroll_navigation: crate::gestures::ScrollNavigation::Trackpad,
             layout: Some(layout),
         };
         assert_eq!(tabs(&settings.layout_or_default()), tabs(&default_layout()));
@@ -278,5 +285,22 @@ mod tests {
                 .count(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+    #[test]
+    fn invalid_navigation_reports_problem() {
+        let mut problems = Vec::new();
+        let mode: crate::gestures::ScrollNavigation = field(
+            &serde_json::json!({"scroll_navigation": "broken"}),
+            "scroll_navigation",
+            &mut problems,
+        )
+        .unwrap_or_default();
+        assert_eq!(mode, crate::gestures::ScrollNavigation::Auto);
+        assert!(problems[0].contains("scroll_navigation"));
     }
 }

@@ -39,6 +39,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     show_apply_prompt(ui.ctx(), state);
     show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
+    state.smart_zoom = false;
     state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
 }
 

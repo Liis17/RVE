@@ -1165,3 +1165,144 @@ fn hierarchy_marks_prefab_instances_and_does_not_drag_their_objects() {
         Some("door")
     );
 }
+
+#[test]
+fn scene_scroll_modes_and_native_gestures() {
+    use crate::gestures::ScrollNavigation as Mode;
+    use egui::MouseWheelUnit as Unit;
+    for (mode, unit, orbit) in [
+        (Mode::Auto, Unit::Point, true),
+        (Mode::Auto, Unit::Line, false),
+        (Mode::Mouse, Unit::Point, false),
+        (Mode::Trackpad, Unit::Line, true),
+    ] {
+        let mut h = Harness::new();
+        h.state.scroll_navigation = mode;
+        h.panel(
+            vec![Event::PointerMoved(pos2(640.0, 360.0))],
+            scene_view::show,
+        );
+        let before = h.state.camera;
+        h.panel(
+            vec![Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit,
+                delta: vec2(20.0, 30.0),
+                modifiers: Modifiers::NONE,
+            }],
+            scene_view::show,
+        );
+        if orbit {
+            assert_ne!(h.state.camera.yaw, before.yaw);
+            assert_eq!(h.state.camera.distance, before.distance);
+        } else {
+            assert_ne!(h.state.camera.distance, before.distance);
+            assert_eq!(h.state.camera.yaw, before.yaw);
+        }
+        assert!(!h.scene().is_dirty());
+    }
+    let mut h = Harness::new();
+    h.panel(
+        vec![Event::PointerMoved(pos2(640.0, 360.0))],
+        scene_view::show,
+    );
+    let before = h.state.camera;
+    h.panel(
+        vec![Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            unit: Unit::Point,
+            delta: vec2(20.0, 30.0),
+            modifiers: Modifiers::SHIFT,
+        }],
+        scene_view::show,
+    );
+    assert_ne!(h.state.camera.target, before.target);
+    assert_eq!(h.state.camera.yaw, before.yaw);
+    h.panel(vec![Event::Zoom(2.0), Event::Rotate(0.3)], scene_view::show);
+    assert_eq!(h.state.camera.distance, before.distance / 2.0);
+    assert!((h.state.camera.yaw - (before.yaw - 0.3)).abs() < 1e-5);
+}
+
+#[test]
+fn scene_navigation_menu_changes_mode() {
+    let mut harness = Harness::new();
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+    harness.state.project = Some(OpenProject::open(Path::new(dir)).unwrap());
+    let mut dock = default_layout();
+    let mut frame = |harness: &mut Harness, events: Vec<Event>| {
+        let input = harness.input(events);
+        let state = &mut harness.state;
+        let mut output = harness
+            .ctx
+            .run_ui(input, |ui| toolbar::show(ui, state, &mut dock));
+        output.textures_delta.clear();
+        output.shapes
+    };
+    let mut click = |harness: &mut Harness, text: &str| {
+        let shapes = frame(harness, Vec::new());
+        let at = find_text(&shapes, text).unwrap_or_else(|| panic!("{text} not shown"));
+        frame(harness, vec![Event::PointerMoved(at)]);
+        frame(harness, vec![button(at, PointerButton::Primary, true)]);
+        frame(harness, vec![button(at, PointerButton::Primary, false)]);
+    };
+    click(&mut harness, "Edit");
+    click(&mut harness, "Scene Navigation");
+    click(&mut harness, "Trackpad (orbit/pan)");
+    assert_eq!(
+        harness.state.scroll_navigation,
+        crate::gestures::ScrollNavigation::Trackpad
+    );
+}
+
+#[test]
+fn alt_command_drag_pans_without_orbit_or_document_edits() {
+    let mut h = Harness::new();
+    let start = pos2(200.0, 200.0);
+    let end = start + vec2(80.0, 35.0);
+    let mods = Modifiers {
+        alt: true,
+        command: true,
+        ..Modifiers::NONE
+    };
+    let before = h.state.camera;
+    h.panel(vec![Event::PointerMoved(start)], scene_view::show);
+    let mut press = button(start, PointerButton::Primary, true);
+    if let Event::PointerButton { modifiers, .. } = &mut press {
+        *modifiers = mods;
+    }
+    h.panel(vec![Event::ModifiersChanged(mods), press], scene_view::show);
+    h.panel(vec![Event::PointerMoved(end)], scene_view::show);
+    h.panel(
+        vec![button(end, PointerButton::Primary, false)],
+        scene_view::show,
+    );
+    assert_eq!(h.state.camera.yaw, before.yaw);
+    assert_ne!(h.state.camera.target, before.target);
+    assert!(!h.scene().is_dirty());
+}
+
+#[test]
+fn smart_zoom_frames_only_edit_scene_under_pointer_and_resets_when_hidden() {
+    let (mut h, id) = harness_with_cube();
+    h.scene_mut().select(Some(&id));
+    h.state.smart_zoom = true;
+    h.panel(
+        vec![Event::PointerMoved(pos2(640.0, 360.0))],
+        scene_view::show,
+    );
+    assert!((h.state.camera.target - CUBE_POSITION).length() < 1e-5);
+    let document = h.scene().document().clone();
+    h.state.play =
+        Some(crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap());
+    h.state.camera.target = Vec3::splat(99.0);
+    let before = h.state.camera;
+    h.panel(Vec::new(), scene_view::show);
+    assert_eq!(h.state.camera, before);
+    h.state.play = None;
+    // Full UI without a project has no Scene panel, but still consumes the flag.
+    let mut dock = default_layout();
+    let input = h.input(Vec::new());
+    let mut output = h.ctx.run_ui(input, |ui| show(ui, &mut h.state, &mut dock));
+    output.textures_delta.clear();
+    assert!(!h.state.smart_zoom);
+}

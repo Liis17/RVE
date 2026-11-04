@@ -157,15 +157,41 @@ fn handle_camera(ui: &egui::Ui, state: &mut EditorState, response: &egui::Respon
         let step = FLY_UNITS_PER_SECOND * dt;
         state.camera.fly(forward * step, right * step, up * step);
         ui.ctx().request_repaint();
+    } else if primary_alt && ui.input(|input| input.modifiers.command) {
+        state.camera.pan(delta.x, delta.y, rect.height());
     } else if secondary || primary_alt {
         state.camera.orbit(delta.x, delta.y);
     } else if middle {
         state.camera.pan(delta.x, delta.y, rect.height());
     }
     if response.contains_pointer() {
-        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-        if scroll != 0.0 {
-            state.camera.zoom(scroll);
+        let line_points = ui
+            .ctx()
+            .options(|options| options.input_options.line_scroll_speed);
+        let gestures =
+            ui.input(|input| crate::gestures::wheel_gestures(&input.raw.events, line_points));
+        if let Some(trackpad) = gestures.trackpad {
+            state.last_wheel_trackpad = trackpad;
+        }
+        let trackpad = match state.scroll_navigation {
+            crate::gestures::ScrollNavigation::Auto => state.last_wheel_trackpad,
+            crate::gestures::ScrollNavigation::Trackpad => true,
+            crate::gestures::ScrollNavigation::Mouse => false,
+        };
+        if trackpad {
+            state.camera.orbit(gestures.orbit.x, gestures.orbit.y);
+            state
+                .camera
+                .pan(gestures.pan.x, gestures.pan.y, rect.height());
+        } else {
+            state
+                .camera
+                .zoom(ui.input(|input| input.smooth_scroll_delta.y));
+        }
+        state.camera.zoom_by(ui.input(|input| input.zoom_delta()));
+        state.camera.turn(ui.input(|input| input.rotation_delta()));
+        if state.smart_zoom {
+            focus_selection(state);
         }
     }
 }
