@@ -29,6 +29,15 @@ Terminal, поэтому `rve-build` публикует macOS-релиз как 
 Если loader, effect или поддержка Vulkan недоступны, запрос FSR переключается на TAA
 и выводит одно предупреждение. На macOS FSR недоступен.
 
+Windows `runtime.dlss_library` указывает на проектную `nvngx_dlss.dll`: dev-player
+разрешает путь от проекта, release-player ищет файл по имени в `Engine/`. Для NGX
+runtime `RendererConfig::upscalers` также получает один из двух идентификаторов:
+GUID-like `dlss_project_id` вместе с `dlss_engine_version` либо выданный NVIDIA
+`dlss_application_id`. Если player собран с feature `dlss`, renderer запрашивает
+NGX instance/device extensions до их создания и проверяет DLSS support выбранного
+физического устройства. При отсутствующей DLL, SDK feature или поддержке Vulkan
+запрос `Dlss` переходит на TAA и пишет одно предупреждение. На macOS DLSS недоступен.
+
 Параметр `--scripts <path>` задаёт ABI-библиотеку Rust-скриптов. В release layout,
 если параметр не задан, runtime выбирает `Engine/game_scripts.dll` на Windows или
 `Engine/libgame_scripts.dylib` на macOS, только если файл существует. В dev-режиме

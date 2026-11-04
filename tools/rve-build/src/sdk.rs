@@ -13,6 +13,8 @@ pub(crate) struct SdkManifest {
     pub(crate) engine_version: String,
     abi_version: u32,
     target: String,
+    #[serde(default)]
+    pub(crate) dlss_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -27,6 +29,15 @@ pub(crate) enum PlayerLocation {
 pub(crate) fn locate_player_in(
     executable_dir: &Path,
     flavor: player::PlayerFlavor,
+    checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<PathBuf, BuildError>,
+) -> Result<PlayerLocation, BuildError> {
+    locate_player_in_with_dlss(executable_dir, flavor, false, checkout_player)
+}
+
+pub(crate) fn locate_player_in_with_dlss(
+    executable_dir: &Path,
+    flavor: player::PlayerFlavor,
+    requires_dlss: bool,
     checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<PathBuf, BuildError>,
 ) -> Result<PlayerLocation, BuildError> {
     let marker = executable_dir.join(SDK_MARKER);
@@ -55,6 +66,11 @@ pub(crate) fn locate_player_in(
         ))
     })?;
     validate_sdk_manifest(&manifest)?;
+    if requires_dlss && !manifest.dlss_enabled {
+        return Err(BuildError::operational(
+            "этот SDK player собран без DLSS; пересоберите SDK с RVE_DLSS_SDK, указывающим на NVIDIA DLSS SDK",
+        ));
+    }
 
     let executable = executable_dir.join(player_filename(flavor));
     if !executable.is_file() {
@@ -118,13 +134,14 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
 
     let rve_build = player::current_executable_path()?;
     let executable_dir = player::executable_directory(&rve_build)?;
+    let dlss_enabled = cfg!(windows) && std::env::var_os("RVE_DLSS_SDK").is_some();
     let location = locate_player_in(
         &executable_dir,
         player::PlayerFlavor::Distribution,
-        player::build_checkout_player,
+        |flavor| player::build_checkout_player(flavor, dlss_enabled),
     )?;
     let rve_player = checkout_player_for_sdk(location)?;
-    let rve_player_dev = player::build_checkout_player(player::PlayerFlavor::Dev)?;
+    let rve_player_dev = player::build_checkout_player(player::PlayerFlavor::Dev, dlss_enabled)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -158,6 +175,7 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
             engine_version: env!("CARGO_PKG_VERSION"),
             abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
             target: &current_target(),
+            dlss_enabled,
         },
     )?;
 
@@ -196,6 +214,7 @@ struct SdkSources<'a> {
     engine_version: &'a str,
     abi_version: u32,
     target: &'a str,
+    dlss_enabled: bool,
 }
 
 fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), BuildError> {
@@ -218,8 +237,8 @@ fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), B
     copy_directory(&sources.rve_sdk.join("src"), &sdk_directory.join("src"))?;
 
     let marker = format!(
-        "engine_version = {:?}\nabi_version = {}\ntarget = {:?}\n",
-        sources.engine_version, sources.abi_version, sources.target
+        "engine_version = {:?}\nabi_version = {}\ntarget = {:?}\ndlss_enabled = {}\n",
+        sources.engine_version, sources.abi_version, sources.target, sources.dlss_enabled
     );
     fs::write(staging.join(SDK_MARKER), marker).map_err(|error| {
         BuildError::operational(format!("не удалось записать SDK-маркер: {error}"))
@@ -256,7 +275,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), BuildError> {
 mod tests {
     use super::{
         PlayerLocation, SdkManifest, SdkSources, assemble_sdk_layout, checkout_player_for_sdk,
-        current_target, locate_player_in, player_filename,
+        current_target, locate_player_in, locate_player_in_with_dlss, player_filename,
     };
     use crate::error::BuildError;
     use crate::player::PlayerFlavor;
@@ -265,7 +284,9 @@ mod tests {
     use std::path::PathBuf;
 
     fn sdk_marker(abi_version: u32, target: &str) -> String {
-        format!("engine_version = \"0.1.0\"\nabi_version = {abi_version}\ntarget = \"{target}\"\n")
+        format!(
+            "engine_version = \"0.1.0\"\nabi_version = {abi_version}\ntarget = \"{target}\"\ndlss_enabled = false\n"
+        )
     }
 
     fn player_name() -> &'static str {
@@ -356,6 +377,24 @@ mod tests {
     }
 
     #[test]
+    fn sdk_without_dlss_cannot_satisfy_a_dlss_project() {
+        let root = temp_dir("rve-sdk-no-dlss");
+        fs::write(
+            root.path().join("rve-sdk.toml"),
+            sdk_marker(rve_sdk::abi::RVE_SCRIPT_ABI_VERSION, &current_target()),
+        )
+        .unwrap();
+
+        let error = locate_player_in_with_dlss(root.path(), PlayerFlavor::Dev, true, |_| {
+            panic!("checkout must not be used for an SDK")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("SDK player собран без DLSS"));
+    }
+
+    #[test]
     fn sdk_command_is_rejected_when_the_current_player_location_is_sdk_mode() {
         let error = checkout_player_for_sdk(PlayerLocation::Sdk {
             executable: PathBuf::from("sdk/rve-player"),
@@ -363,6 +402,7 @@ mod tests {
                 engine_version: "0.1.0".to_owned(),
                 abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
                 target: current_target(),
+                dlss_enabled: false,
             },
         })
         .unwrap_err();
@@ -489,6 +529,7 @@ mod tests {
                 engine_version: "0.1.0-test",
                 abi_version: 42,
                 target: &target,
+                dlss_enabled: true,
             },
         )
         .unwrap();
@@ -518,5 +559,6 @@ mod tests {
         assert!(marker.contains("engine_version = \"0.1.0-test\""));
         assert!(marker.contains("abi_version = 42"));
         assert!(marker.contains(&format!("target = \"{target}\"")));
+        assert!(marker.contains("dlss_enabled = true"));
     }
 }

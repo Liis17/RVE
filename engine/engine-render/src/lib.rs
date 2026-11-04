@@ -22,6 +22,8 @@ use ui::{
 
 mod clusters;
 mod culling;
+#[cfg(any(test, all(windows, feature = "dlss")))]
+mod dlss;
 #[allow(dead_code)]
 mod fsr;
 mod temporal;
@@ -576,6 +578,14 @@ pub struct RendererConfig {
 pub struct UpscalerConfig {
     /// Path to the signed AMD `amd_fidelityfx_loader_vk.dll` runtime on Windows.
     pub fsr_library: Option<std::path::PathBuf>,
+    /// Path to the NVIDIA `nvngx_dlss.dll` feature runtime on Windows.
+    pub dlss_library: Option<std::path::PathBuf>,
+    /// NGX custom project GUID-like identifier, mutually exclusive with `dlss_application_id`.
+    pub dlss_project_id: Option<String>,
+    /// NVIDIA-provided NGX application ID, mutually exclusive with `dlss_project_id`.
+    pub dlss_application_id: Option<u64>,
+    /// Engine version supplied with `dlss_project_id`.
+    pub dlss_engine_version: Option<String>,
 }
 
 /// Возможности выбранного физического устройства.
@@ -858,6 +868,9 @@ pub struct Renderer {
     fsr_api: Option<Arc<fsr::FfxApi>>,
     #[cfg(windows)]
     fsr_load_error: Option<String>,
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss_api: Option<dlss::NgxApi>,
+    dlss_load_error: Option<String>,
     fsr_warning_emitted: bool,
     dlss_warning_emitted: bool,
     swapchain: Option<SwapchainBundle>,
@@ -967,6 +980,9 @@ impl Renderer {
             fsr_api: None,
             #[cfg(windows)]
             fsr_load_error: None,
+            #[cfg(all(windows, feature = "dlss"))]
+            dlss_api: None,
+            dlss_load_error: None,
             fsr_warning_emitted: false,
             dlss_warning_emitted: false,
             swapchain: None,
@@ -1595,9 +1611,35 @@ impl Renderer {
                 fsr_fallback_reason = Some(error);
             }
         } else if view.anti_aliasing == AntiAliasing::Dlss {
-            let error = "DLSS backend is not available".to_owned();
-            warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
-            fsr_fallback_reason = Some(error);
+            #[cfg(all(windows, feature = "dlss"))]
+            let error = if self.capabilities.dlss {
+                ensure_dlss_view(
+                    &instance,
+                    &device,
+                    self.physical_device,
+                    &mut self.screen_temporal,
+                    render_extent,
+                    output_extent,
+                    &mut self.retired,
+                )
+                .err()
+            } else {
+                Some(
+                    self.dlss_load_error
+                        .clone()
+                        .unwrap_or_else(|| "DLSS runtime is unavailable".to_owned()),
+                )
+            };
+            #[cfg(not(all(windows, feature = "dlss")))]
+            let error = Some(
+                self.dlss_load_error
+                    .clone()
+                    .unwrap_or_else(|| "DLSS support is unavailable".to_owned()),
+            );
+            if let Some(error) = error {
+                warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
+                fsr_fallback_reason = Some(error);
+            }
         }
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
@@ -1826,6 +1868,8 @@ impl Renderer {
             self.capabilities.dlss,
         );
         let temporal_record = if view.anti_aliasing.is_temporal() {
+            #[cfg(all(windows, feature = "dlss"))]
+            let dlss_api = self.dlss_api.as_ref();
             let temporal = &mut self.screen_temporal;
             let history = temporal
                 .history
@@ -1834,6 +1878,10 @@ impl Renderer {
             #[cfg(windows)]
             let fsr = (temporal_backend == TemporalBackend::Fsr && fsr_fallback_reason.is_none())
                 .then_some(temporal.fsr.as_deref_mut())
+                .flatten();
+            #[cfg(all(windows, feature = "dlss"))]
+            let dlss = (temporal_backend == TemporalBackend::Dlss && fsr_fallback_reason.is_none())
+                .then_some(temporal.dlss.as_deref_mut())
                 .flatten();
             Some(TemporalResolveRecord {
                 history,
@@ -1853,6 +1901,10 @@ impl Renderer {
                 frame_time_delta_ms,
                 #[cfg(windows)]
                 camera: fsr_camera_parameters(frame.camera.projection),
+                #[cfg(all(windows, feature = "dlss"))]
+                dlss_api,
+                #[cfg(all(windows, feature = "dlss"))]
+                dlss,
             })
         } else {
             None
@@ -1903,6 +1955,21 @@ impl Renderer {
                 self.screen_temporal.fsr_attempted = true;
             }
         }
+        #[cfg(all(windows, feature = "dlss"))]
+        if let Some(error) = temporal_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.dlss_error.as_deref())
+        {
+            warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, error);
+            self.capabilities.dlss = false;
+            self.dlss_load_error = Some(error.to_owned());
+            #[cfg(all(windows, feature = "dlss"))]
+            if let Some(dlss) = self.screen_temporal.dlss.take() {
+                self.retired.retire(RetiredResource::DlssView(dlss), 0);
+                self.screen_temporal.dlss_error = Some(error.to_owned());
+                self.screen_temporal.dlss_attempted = true;
+            }
+        }
         self.shadow_layout = shadow_layout;
         self.local_shadow_layout = local_shadow_layout;
 
@@ -1921,7 +1988,11 @@ impl Renderer {
             #[cfg(windows)]
             fsr_used: temporal_outcome
                 .as_ref()
-                .is_some_and(|outcome| !outcome.used_taa),
+                .is_some_and(|outcome| outcome.used_fsr),
+            #[cfg(all(windows, feature = "dlss"))]
+            dlss_used: temporal_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.used_dlss),
             submitted_at,
         }];
         self.submit_and_present(
@@ -2084,9 +2155,40 @@ impl Renderer {
                 && extent.height > 0
                 && view.anti_aliasing == AntiAliasing::Dlss
             {
-                let error = "DLSS backend is not available".to_owned();
-                warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
-                *fallback_reason = Some(error);
+                #[cfg(all(windows, feature = "dlss"))]
+                if self.capabilities.dlss {
+                    let entry = self.viewports[viewport.0]
+                        .as_mut()
+                        .ok_or_else(unknown_viewport)?;
+                    if let Err(error) = ensure_dlss_view(
+                        &instance,
+                        &device,
+                        self.physical_device,
+                        &mut entry.temporal,
+                        scaled_extent(extent, frame.view.render_scale),
+                        extent,
+                        &mut self.retired,
+                    ) {
+                        warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
+                        *fallback_reason = Some(error);
+                    }
+                } else {
+                    let error = self
+                        .dlss_load_error
+                        .clone()
+                        .unwrap_or_else(|| "DLSS runtime is unavailable".to_owned());
+                    warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
+                    *fallback_reason = Some(error);
+                }
+                #[cfg(not(all(windows, feature = "dlss")))]
+                {
+                    let error = self
+                        .dlss_load_error
+                        .clone()
+                        .unwrap_or_else(|| "DLSS support is unavailable".to_owned());
+                    warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
+                    *fallback_reason = Some(error);
+                }
             }
         }
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
@@ -2321,7 +2423,7 @@ impl Renderer {
                         output_set,
                         local_shadow_matrices,
                         frame_delta_ms,
-                        fsr_fallback_reason,
+                        upscaler_fallback_reason,
                     ),
                 )| {
                     (
@@ -2370,7 +2472,7 @@ impl Renderer {
                         *tonemap_set,
                         *output_set,
                         *frame_delta_ms,
-                        fsr_fallback_reason.clone(),
+                        upscaler_fallback_reason.clone(),
                     )
                 },
             )
@@ -2430,6 +2532,8 @@ impl Renderer {
         let post_sampler = target_resources.post_sampler;
         let mut temporal_submissions = Vec::with_capacity(scene_passes.len());
         let mut fsr_dispatch_errors = Vec::new();
+        #[cfg(all(windows, feature = "dlss"))]
+        let mut dlss_dispatch_errors = Vec::new();
         for (
             viewport,
             shadow,
@@ -2437,7 +2541,7 @@ impl Renderer {
             tonemap_set,
             output_set,
             frame_delta_ms,
-            fsr_fallback_reason,
+            upscaler_fallback_reason,
         ) in &scene_passes
         {
             let Some(entry) = self.viewports[viewport.0].as_mut() else {
@@ -2470,8 +2574,14 @@ impl Renderer {
                     self.capabilities.dlss,
                 );
                 #[cfg(windows)]
-                let fsr = (backend == TemporalBackend::Fsr && fsr_fallback_reason.is_none())
+                let fsr = (backend == TemporalBackend::Fsr && upscaler_fallback_reason.is_none())
                     .then_some(temporal.fsr.as_deref_mut())
+                    .flatten();
+                #[cfg(all(windows, feature = "dlss"))]
+                let dlss_api = self.dlss_api.as_ref();
+                #[cfg(all(windows, feature = "dlss"))]
+                let dlss = (backend == TemporalBackend::Dlss && upscaler_fallback_reason.is_none())
+                    .then_some(temporal.dlss.as_deref_mut())
                     .flatten();
                 Some(record_temporal_resolve_and_tonemap(
                     &device,
@@ -2503,6 +2613,10 @@ impl Renderer {
                         frame_time_delta_ms: *frame_delta_ms,
                         #[cfg(windows)]
                         camera: pass.fsr_camera,
+                        #[cfg(all(windows, feature = "dlss"))]
+                        dlss_api,
+                        #[cfg(all(windows, feature = "dlss"))]
+                        dlss,
                     },
                 )?)
             } else {
@@ -2551,6 +2665,13 @@ impl Renderer {
             {
                 fsr_dispatch_errors.push((*viewport, error.to_owned()));
             }
+            #[cfg(all(windows, feature = "dlss"))]
+            if let Some(error) = temporal_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.dlss_error.as_deref())
+            {
+                dlss_dispatch_errors.push((*viewport, error.to_owned()));
+            }
             temporal_submissions.push(TemporalSubmission {
                 view: TemporalViewId::Viewport(*viewport),
                 plan: pass.temporal_plan,
@@ -2561,7 +2682,11 @@ impl Renderer {
                 #[cfg(windows)]
                 fsr_used: temporal_outcome
                     .as_ref()
-                    .is_some_and(|outcome| !outcome.used_taa),
+                    .is_some_and(|outcome| outcome.used_fsr),
+                #[cfg(all(windows, feature = "dlss"))]
+                dlss_used: temporal_outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.used_dlss),
                 submitted_at,
             });
         }
@@ -2574,6 +2699,22 @@ impl Renderer {
                 }
                 viewport.temporal.fsr_error = Some(error);
                 viewport.temporal.fsr_attempted = true;
+            }
+        }
+        #[cfg(all(windows, feature = "dlss"))]
+        if let Some((_, error)) = dlss_dispatch_errors.first() {
+            warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, error);
+            self.capabilities.dlss = false;
+            self.dlss_load_error = Some(error.clone());
+            if let Some(dlss) = self.screen_temporal.dlss.take() {
+                self.retired.retire(RetiredResource::DlssView(dlss), 0);
+            }
+            for viewport in self.viewports.iter_mut().flatten() {
+                if let Some(dlss) = viewport.temporal.dlss.take() {
+                    self.retired.retire(RetiredResource::DlssView(dlss), 0);
+                }
+                viewport.temporal.dlss_attempted = true;
+                viewport.temporal.dlss_error = Some(error.clone());
             }
         }
         record_ui(
@@ -2685,6 +2826,14 @@ impl Renderer {
                     temporal.fsr_attempted = false;
                     temporal.fsr_error = None;
                 }
+                #[cfg(all(windows, feature = "dlss"))]
+                if submission.dlss_used {
+                    if let Some(dlss) = temporal.dlss.take() {
+                        self.retired.retire(RetiredResource::DlssView(dlss), 0);
+                    }
+                    temporal.dlss_attempted = false;
+                    temporal.dlss_error = None;
+                }
             }
         }
     }
@@ -2713,7 +2862,10 @@ impl Renderer {
 
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
         // SAFETY: эта точка — непосредственно перед submit, которому принадлежит fence.
-        unsafe { device.reset_fences(&[fence]) }?;
+        if let Err(error) = unsafe { device.reset_fences(&[fence]) } {
+            self.miss_temporal_submissions(temporal_submissions);
+            return Err(RenderError::Vulkan(error));
+        }
 
         let wait_infos = [vk::SemaphoreSubmitInfo::default()
             .semaphore(image_available)
@@ -2766,6 +2918,33 @@ impl Renderer {
     }
 
     fn initialize(&mut self) -> Result<(), RenderError> {
+        #[cfg(all(windows, feature = "dlss"))]
+        {
+            if let Some(path) = self.config.upscalers.dlss_library.as_deref() {
+                match dlss::NgxApi::new(
+                    self.config.upscalers.dlss_project_id.as_deref(),
+                    self.config.upscalers.dlss_application_id,
+                    self.config.upscalers.dlss_engine_version.as_deref(),
+                    path,
+                ) {
+                    Ok(api) => self.dlss_api = Some(api),
+                    Err(error) => self.dlss_load_error = Some(error),
+                }
+            } else {
+                self.dlss_load_error = Some("DLSS runtime DLL is not configured".to_owned());
+            }
+        }
+        #[cfg(not(all(windows, feature = "dlss")))]
+        {
+            self.dlss_load_error = Some(if self.config.upscalers.dlss_library.is_some() {
+                "DLSS support was not compiled into this target".to_owned()
+            } else if cfg!(windows) {
+                "DLSS runtime DLL is not configured".to_owned()
+            } else {
+                "DLSS is only available on Windows".to_owned()
+            });
+        }
+
         let display_handle = self.window.display_handle().map_err(RenderError::Handle)?;
         let required = engine_platform::enumerate_required_extensions(display_handle.as_raw())
             .map_err(RenderError::Vulkan)?;
@@ -2787,10 +2966,31 @@ impl Renderer {
                 .iter()
                 .map(|name| CString::from(*name)),
         );
-        let requested_instance_extensions = deduplicate_names(requested_instance_extensions);
         let available_instance_extensions =
             // SAFETY: querying loader extension properties does not require an instance.
             unsafe { self.entry.enumerate_instance_extension_properties(None) }?;
+        #[cfg(all(windows, feature = "dlss"))]
+        let mut dlss_instance_ready = false;
+        #[cfg(all(windows, feature = "dlss"))]
+        if let Some(api) = self.dlss_api.as_ref() {
+            match api.instance_extensions() {
+                Ok(extensions) => {
+                    let missing = missing_extensions(
+                        &extensions,
+                        &available_instance_extensions,
+                        "DLSS instance",
+                    );
+                    if missing.is_empty() {
+                        requested_instance_extensions.extend(extensions);
+                        dlss_instance_ready = true;
+                    } else {
+                        self.dlss_load_error = Some(missing.join(", "));
+                    }
+                }
+                Err(error) => self.dlss_load_error = Some(error),
+            }
+        }
+        let requested_instance_extensions = deduplicate_names(requested_instance_extensions);
         check_extensions(
             &requested_instance_extensions,
             &available_instance_extensions,
@@ -2857,13 +3057,13 @@ impl Renderer {
         ));
         self.surface = Some(surface);
 
-        let required_device_extensions =
+        let base_device_extensions =
             required_device_extensions(&self.config.extra_device_extensions);
         let choice = choose_device(
             self.instance()?,
             self.surface_loader()?,
             self.surface()?,
-            &required_device_extensions,
+            &base_device_extensions,
         )?;
         self.physical_device = choice.physical_device;
         self.queue_family_index = choice.queue_family_index;
@@ -2882,11 +3082,45 @@ impl Renderer {
             dlss: false,
         };
 
+        #[allow(unused_mut)]
+        let mut device_extensions = base_device_extensions;
+        #[cfg(all(windows, feature = "dlss"))]
+        let mut dlss_device_ready = false;
+        #[cfg(all(windows, feature = "dlss"))]
+        if dlss_instance_ready {
+            if let Some(api) = self.dlss_api.as_ref() {
+                match api.check_support(self.instance()?.handle(), self.physical_device) {
+                    Ok(()) => match api
+                        .device_extensions(self.instance()?.handle(), self.physical_device)
+                    {
+                        Ok(extensions) => {
+                            // SAFETY: the selected physical device belongs to the live instance.
+                            let available = unsafe {
+                                self.instance()?
+                                    .enumerate_device_extension_properties(self.physical_device)
+                            }?;
+                            let missing =
+                                missing_extensions(&extensions, &available, "DLSS device");
+                            if missing.is_empty() {
+                                device_extensions.extend(extensions);
+                                dlss_device_ready = true;
+                            } else {
+                                self.dlss_load_error = Some(missing.join(", "));
+                            }
+                        }
+                        Err(error) => self.dlss_load_error = Some(error),
+                    },
+                    Err(error) => self.dlss_load_error = Some(error),
+                }
+            }
+        }
+        let device_extensions = deduplicate_names(device_extensions);
+
         let queue_priority = [1.0_f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(self.queue_family_index)
             .queue_priorities(&queue_priority)];
-        let extension_pointers = required_device_extensions
+        let extension_pointers = device_extensions
             .iter()
             .map(|name| name.as_ptr())
             .collect::<Vec<_>>();
@@ -2913,6 +3147,20 @@ impl Renderer {
                 .create_device(self.physical_device, &device_info, None)
         }?;
         self.device = Some(device);
+        #[cfg(all(windows, feature = "dlss"))]
+        if dlss_device_ready {
+            let instance_handle = self.instance()?.handle();
+            let device_handle = self.device()?.handle();
+            if let Some(api) = self.dlss_api.as_mut() {
+                match api.initialize(instance_handle, self.physical_device, device_handle) {
+                    Ok(()) => {
+                        self.capabilities.dlss = true;
+                        self.dlss_load_error = None;
+                    }
+                    Err(error) => self.dlss_load_error = Some(error),
+                }
+            }
+        }
         self.queue =
             // SAFETY: queue family and index were checked during physical-device selection.
             unsafe { self.device()?.get_device_queue(self.queue_family_index, 0) };
@@ -5169,6 +5417,10 @@ impl Drop for Renderer {
         self.screen_temporal.history.take();
         #[cfg(windows)]
         self.screen_temporal.fsr.take();
+        #[cfg(all(windows, feature = "dlss"))]
+        self.screen_temporal.dlss.take();
+        #[cfg(all(windows, feature = "dlss"))]
+        self.dlss_api.take();
         self.ui_textures.clear();
         self.meshes.clear();
         self.materials.clear();
@@ -6634,6 +6886,14 @@ struct TemporalView {
     fsr_error: Option<String>,
     #[cfg(windows)]
     fsr_extents: Option<([u32; 2], [u32; 2])>,
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss: Option<Box<DlssView>>,
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss_attempted: bool,
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss_error: Option<String>,
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss_extents: Option<([u32; 2], [u32; 2])>,
 }
 
 struct TemporalHistory {
@@ -6705,6 +6965,68 @@ impl FsrView {
     }
 }
 
+#[cfg(all(windows, feature = "dlss"))]
+struct DlssView {
+    output: DeviceImage,
+    exposure: DeviceImage,
+    render_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
+    output_layout: vk::ImageLayout,
+    exposure_layout: vk::ImageLayout,
+    feature: Option<usize>,
+}
+
+#[cfg(all(windows, feature = "dlss"))]
+impl DlssView {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        render_extent: vk::Extent2D,
+        output_extent: vk::Extent2D,
+    ) -> Result<Self, RenderError> {
+        let output = DeviceImage::new(
+            instance,
+            device,
+            physical_device,
+            output_extent,
+            OFFSCREEN_FORMAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            color_subresource_range(),
+        )?;
+        let exposure = DeviceImage::new(
+            instance,
+            device,
+            physical_device,
+            vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            vk::Format::R32_SFLOAT,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            color_subresource_range(),
+        )?;
+        Ok(Self {
+            output,
+            exposure,
+            render_extent,
+            output_extent,
+            output_layout: vk::ImageLayout::UNDEFINED,
+            exposure_layout: vk::ImageLayout::UNDEFINED,
+            feature: None,
+        })
+    }
+}
+
+#[cfg(all(windows, feature = "dlss"))]
+impl Drop for DlssView {
+    fn drop(&mut self) {
+        if let Some(feature) = self.feature.take() {
+            dlss::release_feature(feature);
+        }
+    }
+}
+
 impl TemporalHistory {
     fn new(
         instance: &ash::Instance,
@@ -6753,6 +7075,8 @@ struct TemporalSubmission {
     layouts: Option<[vk::ImageLayout; 2]>,
     #[cfg(windows)]
     fsr_used: bool,
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss_used: bool,
     submitted_at: Instant,
 }
 
@@ -6836,6 +7160,63 @@ fn ensure_fsr_view(
             let error = error.to_string();
             temporal.fsr_error = Some(error.clone());
             temporal.fsr_attempted = true;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "dlss"))]
+fn ensure_dlss_view(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    temporal: &mut TemporalView,
+    render_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
+    retired: &mut RetireQueue<RetiredResource>,
+) -> Result<(), String> {
+    let render_size = [render_extent.width, render_extent.height];
+    let output_size = [output_extent.width, output_extent.height];
+    if temporal.dlss_extents == Some((render_size, output_size)) {
+        if temporal.dlss.is_some() {
+            return Ok(());
+        }
+        if temporal.dlss_attempted {
+            return Err(temporal
+                .dlss_error
+                .clone()
+                .unwrap_or_else(|| "DLSS view creation failed".to_owned()));
+        }
+    }
+    if temporal.dlss_extents != Some((render_size, output_size)) {
+        temporal.dlss_extents = Some((render_size, output_size));
+        temporal.dlss_attempted = false;
+        temporal.dlss_error = None;
+    }
+    if temporal.dlss.as_ref().is_some_and(|view| {
+        view.render_extent == render_extent && view.output_extent == output_extent
+    }) {
+        return Ok(());
+    }
+    if let Some(previous) = temporal.dlss.take() {
+        retired.retire(RetiredResource::DlssView(previous), 0);
+    }
+    temporal.dlss_attempted = true;
+    temporal.dlss_error = None;
+    match DlssView::new(
+        instance,
+        device,
+        physical_device,
+        render_extent,
+        output_extent,
+    ) {
+        Ok(view) => {
+            temporal.dlss = Some(Box::new(view));
+            Ok(())
+        }
+        Err(error) => {
+            let error = error.to_string();
+            temporal.dlss_error = Some(error.clone());
             Err(error)
         }
     }
@@ -6948,6 +7329,8 @@ enum RetiredResource {
     TemporalHistory(#[allow(dead_code)] Box<TemporalHistory>),
     #[cfg(windows)]
     FsrView(#[allow(dead_code)] Box<FsrView>),
+    #[cfg(all(windows, feature = "dlss"))]
+    DlssView(#[allow(dead_code)] Box<DlssView>),
     Environment(#[allow(dead_code)] Box<GpuEnvironment>),
 }
 
@@ -7214,6 +7597,10 @@ struct DeviceImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    #[cfg(all(windows, feature = "dlss"))]
+    format: vk::Format,
+    #[cfg(all(windows, feature = "dlss"))]
+    subresource_range: vk::ImageSubresourceRange,
     layer_views: Vec<vk::ImageView>,
     mip_array_views: Vec<vk::ImageView>,
 }
@@ -7360,6 +7747,10 @@ impl DeviceImage {
             image,
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
+            #[cfg(all(windows, feature = "dlss"))]
+            format,
+            #[cfg(all(windows, feature = "dlss"))]
+            subresource_range,
             layer_views: Vec::new(),
             mip_array_views: Vec::new(),
         };
@@ -7468,11 +7859,20 @@ struct TemporalResolveRecord<'a> {
     frame_time_delta_ms: f32,
     #[cfg(windows)]
     camera: [f32; 3],
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss_api: Option<&'a dlss::NgxApi>,
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss: Option<&'a mut DlssView>,
 }
 
 struct TemporalResolveOutcome {
     used_taa: bool,
+    used_fsr: bool,
+    #[cfg(all(windows, feature = "dlss"))]
+    used_dlss: bool,
     fsr_error: Option<String>,
+    #[cfg(all(windows, feature = "dlss"))]
+    dlss_error: Option<String>,
     output_extent: vk::Extent2D,
 }
 
@@ -7496,7 +7896,12 @@ fn record_temporal_resolve_and_tonemap(
     mut resolve: TemporalResolveRecord<'_>,
 ) -> Result<TemporalResolveOutcome, RenderError> {
     let mut fsr_error = None;
+    #[cfg(all(windows, feature = "dlss"))]
+    let mut dlss_error = None;
     let mut used_taa = true;
+    let mut used_fsr = false;
+    #[cfg(all(windows, feature = "dlss"))]
+    let mut used_dlss = false;
     let mut reset_taa_history = false;
     #[cfg(windows)]
     let mut resolved_source = None;
@@ -7516,10 +7921,36 @@ fn record_temporal_resolve_and_tonemap(
         ) {
             Ok(()) => {
                 used_taa = false;
+                used_fsr = true;
                 resolved_source = Some(&fsr.output);
             }
             Err(error) => {
                 fsr_error = Some(error);
+                reset_taa_history = true;
+            }
+        }
+    }
+    #[cfg(all(windows, feature = "dlss"))]
+    if resolve.backend == TemporalBackend::Dlss
+        && let (Some(api), Some(dlss)) = (resolve.dlss_api, resolve.dlss.as_deref_mut())
+    {
+        match record_dlss_pass(
+            device,
+            command_buffer,
+            scene,
+            dlss,
+            api,
+            resolve.plan,
+            resolve.exposure_ev,
+            resolve.frame_time_delta_ms,
+        ) {
+            Ok(()) => {
+                used_taa = false;
+                used_dlss = true;
+                resolved_source = Some(&dlss.output);
+            }
+            Err(error) => {
+                dlss_error = Some(error);
                 reset_taa_history = true;
             }
         }
@@ -7547,7 +7978,9 @@ fn record_temporal_resolve_and_tonemap(
     } else {
         #[cfg(windows)]
         {
-            resolved_source.ok_or(RenderError::InvalidState("FSR output отсутствует"))?
+            resolved_source.ok_or(RenderError::InvalidState(
+                "temporal upscaler output отсутствует",
+            ))?
         }
         #[cfg(not(windows))]
         {
@@ -7574,7 +8007,12 @@ fn record_temporal_resolve_and_tonemap(
     );
     Ok(TemporalResolveOutcome {
         used_taa,
+        used_fsr,
+        #[cfg(all(windows, feature = "dlss"))]
+        used_dlss,
         fsr_error,
+        #[cfg(all(windows, feature = "dlss"))]
+        dlss_error,
         output_extent,
     })
 }
@@ -7731,6 +8169,188 @@ fn record_fsr_pass(
     fsr.context.dispatch(&dispatch)?;
     fsr.output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     Ok(())
+}
+
+#[cfg(all(windows, feature = "dlss"))]
+#[allow(clippy::too_many_arguments)]
+fn record_dlss_pass(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    scene: &mut OffscreenTarget,
+    dlss_view: &mut DlssView,
+    api: &dlss::NgxApi,
+    plan: TemporalPlan,
+    exposure_ev: f32,
+    frame_time_delta_ms: f32,
+) -> Result<(), String> {
+    for (image, layout, range) in [
+        (&scene.color, &mut scene.layout, color_subresource_range()),
+        (
+            &scene.velocity,
+            &mut scene.velocity_layout,
+            color_subresource_range(),
+        ),
+        (
+            &scene.depth,
+            &mut scene.depth_layout,
+            depth_subresource_range(),
+        ),
+    ] {
+        if *layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            let (source_stage, source_access) = offscreen_previous_use(*layout);
+            pipeline_barrier(
+                device,
+                command_buffer,
+                image_layout_barrier(
+                    image.image,
+                    *layout,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    source_stage,
+                    source_access,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    range,
+                ),
+            );
+            *layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        }
+    }
+
+    let exposure_source = if dlss_view.exposure_layout == vk::ImageLayout::UNDEFINED {
+        (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+    } else {
+        (
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        )
+    };
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            dlss_view.exposure.image,
+            dlss_view.exposure_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            exposure_source.0,
+            exposure_source.1,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            color_subresource_range(),
+        ),
+    );
+    let exposure = [fsr::exposure_value(exposure_ev), 0.0, 0.0, 0.0];
+    // SAFETY: the 1x1 exposure image is in TRANSFER_DST_OPTIMAL and the range covers its only subresource.
+    unsafe {
+        device.cmd_clear_color_image(
+            command_buffer,
+            dlss_view.exposure.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue { float32: exposure },
+            &[color_subresource_range()],
+        )
+    };
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            dlss_view.exposure.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            color_subresource_range(),
+        ),
+    );
+    dlss_view.exposure_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+    let (output_stage, output_access) = offscreen_previous_use(dlss_view.output_layout);
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            dlss_view.output.image,
+            dlss_view.output_layout,
+            vk::ImageLayout::GENERAL,
+            output_stage,
+            output_access,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+            color_subresource_range(),
+        ),
+    );
+    dlss_view.output_layout = vk::ImageLayout::GENERAL;
+
+    let render_extent = dlss_view.render_extent;
+    let output_extent = dlss_view.output_extent;
+    let color = ngx_image_resource(&scene.color, render_extent, false);
+    let depth = ngx_image_resource(&scene.depth, render_extent, false);
+    let motion_vectors = ngx_image_resource(&scene.velocity, render_extent, false);
+    let exposure = ngx_image_resource(
+        &dlss_view.exposure,
+        vk::Extent2D {
+            width: 1,
+            height: 1,
+        },
+        false,
+    );
+    let output = ngx_image_resource(&dlss_view.output, output_extent, true);
+    api.evaluate(
+        device.handle(),
+        command_buffer,
+        &mut dlss_view.feature,
+        render_extent,
+        output_extent,
+        &color,
+        &depth,
+        &motion_vectors,
+        &exposure,
+        &output,
+        dlss::ngx_jitter_offset(plan.jitter_render_pixels),
+        [render_extent.width as f32, render_extent.height as f32],
+        plan.reset_history,
+        frame_time_delta_ms,
+    )?;
+
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            dlss_view.output.image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_WRITE,
+            offscreen_sampled_stages(),
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            color_subresource_range(),
+        ),
+    );
+    dlss_view.output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    Ok(())
+}
+
+#[cfg(all(windows, feature = "dlss"))]
+fn ngx_image_resource(
+    image: &DeviceImage,
+    extent: vk::Extent2D,
+    read_write: bool,
+) -> dlss::NgxResourceVk {
+    dlss::NgxResourceVk {
+        resource: dlss::NgxResourceUnion {
+            image_view: dlss::NgxImageViewInfo {
+                image_view: image.view.as_raw(),
+                image: image.image.as_raw(),
+                subresource_range: image.subresource_range,
+                format: image.format.as_raw(),
+                width: extent.width,
+                height: extent.height,
+            },
+        },
+        resource_type: 0,
+        read_write,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8284,7 +8904,7 @@ fn record_scene(
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            offscreen_sampled_stages(),
             vk::AccessFlags2::SHADER_SAMPLED_READ,
             color_subresource_range(),
         ),
@@ -8300,7 +8920,7 @@ fn record_scene(
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
             vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            offscreen_sampled_stages(),
             vk::AccessFlags2::SHADER_SAMPLED_READ,
             depth_subresource_range(),
         ),
@@ -9719,7 +10339,7 @@ fn texture_format_reasons(
     .collect()
 }
 
-/// Возвращает источник доступа текущего layout цвета перед следующим проходом сцены.
+/// Возвращает источник доступа offscreen image перед повторной записью.
 fn offscreen_previous_use(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
     match layout {
         vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
@@ -9728,7 +10348,7 @@ fn offscreen_previous_use(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, 
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         ),
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            offscreen_sampled_stages(),
             vk::AccessFlags2::SHADER_SAMPLED_READ,
         ),
         _ => (
@@ -9736,6 +10356,10 @@ fn offscreen_previous_use(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, 
             vk::AccessFlags2::TRANSFER_READ,
         ),
     }
+}
+
+fn offscreen_sampled_stages() -> vk::PipelineStageFlags2 {
+    vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER
 }
 
 fn color_subresource_range() -> vk::ImageSubresourceRange {
@@ -11914,13 +12538,13 @@ mod tests {
         material_uniform_bytes, mesh_upload_layout, mip_extent, mip_level_count,
         missing_extensions, missing_offscreen_format_features, missing_post_format_features,
         missing_texture_format_features, missing_velocity_format_features, normal_matrix,
-        offscreen_previous_use, overlay_vertex_bytes, point_shadow_face_index, push_constant_bytes,
-        sampler_anisotropy, scaled_extent, scene_viewport, select_composite_alpha,
-        select_local_light_entries, select_local_lights, select_local_shadow_slots,
-        select_present_mode, select_surface_extent, select_temporal_backend,
-        shadow_array_limits_suitable, shadow_caster_is_outside, shadow_casters,
-        shadow_layout_source, shadow_subresource_range, texture_format, texture_format_reasons,
-        texture_mip_blit_region, texture_mip_destination_shader_barrier,
+        offscreen_previous_use, offscreen_sampled_stages, overlay_vertex_bytes,
+        point_shadow_face_index, push_constant_bytes, sampler_anisotropy, scaled_extent,
+        scene_viewport, select_composite_alpha, select_local_light_entries, select_local_lights,
+        select_local_shadow_slots, select_present_mode, select_surface_extent,
+        select_temporal_backend, shadow_array_limits_suitable, shadow_caster_is_outside,
+        shadow_casters, shadow_layout_source, shadow_subresource_range, texture_format,
+        texture_format_reasons, texture_mip_blit_region, texture_mip_destination_shader_barrier,
         texture_mip_shader_barrier, texture_mip_source_barrier, texture_staging_size,
         texture_upload_barrier, timestamp_duration, transform_tangent_normal,
         upload_batch_capacity, upload_batch_flush_required, upload_data_layout,
@@ -12643,9 +13267,13 @@ mod tests {
         assert_eq!(
             offscreen_previous_use(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
             (
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_SAMPLED_READ
             )
+        );
+        assert_eq!(
+            offscreen_sampled_stages(),
+            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER
         );
     }
 

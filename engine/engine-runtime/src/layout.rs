@@ -124,6 +124,24 @@ impl Layout {
             None
         }
     }
+
+    pub fn dlss_library_path(&self, configured_path: Option<&str>) -> Option<PathBuf> {
+        #[cfg(windows)]
+        {
+            let configured_path = configured_path?;
+            let root = self.bootstrap.parent()?;
+            if self.source_mode == SourceMode::Registry {
+                Some(root.join(Path::new(configured_path).file_name()?))
+            } else {
+                Some(root.join(configured_path))
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = configured_path;
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +229,22 @@ mod tests {
             Some(Path::new("C:/games/demo/Engine/amd_fidelityfx_loader_vk.dll").into())
         );
         assert_eq!(release.fsr_library_path(None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dlss_runtime_path_uses_project_relative_path_in_dev_and_engine_name_in_release() {
+        let dev = Layout::dev(Path::new("C:/projects/demo"));
+        assert_eq!(
+            dev.dlss_library_path(Some("vendor/nvngx_dlss.dll")),
+            Some(Path::new("C:/projects/demo/vendor/nvngx_dlss.dll").into())
+        );
+        let release = Layout::release(Path::new("C:/games/demo"));
+        assert_eq!(
+            release.dlss_library_path(Some("vendor/nvngx_dlss.dll")),
+            Some(Path::new("C:/games/demo/Engine/nvngx_dlss.dll").into())
+        );
+        assert_eq!(release.dlss_library_path(None), None);
     }
 
     #[test]

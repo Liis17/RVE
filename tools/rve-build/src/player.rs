@@ -30,7 +30,7 @@ impl PlayerFlavor {
         }
     }
 
-    fn cargo_arguments(self) -> Vec<&'static str> {
+    fn cargo_arguments(self, dlss: bool) -> Vec<&'static str> {
         let mut arguments = vec!["build"];
         if self == Self::Distribution {
             arguments.push("--release");
@@ -38,6 +38,9 @@ impl PlayerFlavor {
         arguments.extend(["--locked", "-p", "rve-player"]);
         if self == Self::Distribution {
             arguments.push("--no-default-features");
+        }
+        if dlss {
+            arguments.extend(["--features", "dlss"]);
         }
         arguments.push("--message-format=json");
         arguments
@@ -59,7 +62,13 @@ pub(crate) fn build_distribution(
     #[cfg(not(target_os = "macos"))]
     let _ = vulkan_sdk;
 
-    let executable = locate_player(PlayerFlavor::Distribution)?;
+    #[cfg(windows)]
+    let executable = locate_player(
+        PlayerFlavor::Distribution,
+        project.settings.runtime.dlss_library.is_some(),
+    )?;
+    #[cfg(not(windows))]
+    let executable = locate_player(PlayerFlavor::Distribution, false)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -114,6 +123,8 @@ pub(crate) fn build_distribution(
     }
     #[cfg(windows)]
     copy_fsr_runtime(&project, &engine_dir)?;
+    #[cfg(windows)]
+    copy_dlss_runtime(&project, &engine_dir)?;
     let assets_dir = resources_dir.join("Assets");
     build_project_archives(&project, &assets_dir)?;
     validate_staged_archives(&assets_dir)?;
@@ -153,7 +164,13 @@ pub(crate) fn build_distribution(
 pub(crate) fn run_project(project_dir: &Path, player_args: &[OsString]) -> Result<i32, BuildError> {
     let project = prepare_project(project_dir)?;
     let scripts_library = build_game_scripts(&project, false)?;
-    let executable = locate_player(PlayerFlavor::Dev)?;
+    #[cfg(windows)]
+    let executable = locate_player(
+        PlayerFlavor::Dev,
+        project.settings.runtime.dlss_library.is_some(),
+    )?;
+    #[cfg(not(windows))]
+    let executable = locate_player(PlayerFlavor::Dev, false)?;
     let project_dir = normalize_build_path(&project.project_dir)?;
     let mut command = Command::new(&executable);
     command.arg("--project").arg(project_dir);
@@ -475,10 +492,12 @@ fn parse_cargo_output(
         .ok_or_else(|| format!("cargo output не содержит target {target_name:?} с kind {kind:?}"))
 }
 
-fn locate_player(flavor: PlayerFlavor) -> Result<PathBuf, BuildError> {
+fn locate_player(flavor: PlayerFlavor, dlss: bool) -> Result<PathBuf, BuildError> {
     let executable = current_executable_path()?;
     let executable_dir = executable_directory(&executable)?;
-    match sdk::locate_player_in(&executable_dir, flavor, build_checkout_player)? {
+    match sdk::locate_player_in_with_dlss(&executable_dir, flavor, dlss, |flavor| {
+        build_checkout_player(flavor, dlss)
+    })? {
         PlayerLocation::Checkout(executable) => Ok(executable),
         PlayerLocation::Sdk {
             executable,
@@ -518,13 +537,16 @@ pub(crate) fn executable_directory(executable: &Path) -> Result<PathBuf, BuildEr
     })
 }
 
-pub(crate) fn build_checkout_player(flavor: PlayerFlavor) -> Result<PathBuf, BuildError> {
+pub(crate) fn build_checkout_player(
+    flavor: PlayerFlavor,
+    dlss: bool,
+) -> Result<PathBuf, BuildError> {
     let root = repo_root()?;
     let target_dir = normalize_build_path(&checkout_player_target_dir(&root, flavor))?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let stdout = run_cargo(
         Command::new(cargo)
-            .args(flavor.cargo_arguments())
+            .args(flavor.cargo_arguments(dlss))
             .current_dir(&root)
             .env("CARGO_TARGET_DIR", &target_dir),
         match flavor {
@@ -740,6 +762,28 @@ fn copy_fsr_runtime(project: &ProjectBuild, engine_dir: &Path) -> Result<(), Bui
     )
 }
 
+#[cfg(any(windows, test))]
+fn copy_dlss_runtime(project: &ProjectBuild, engine_dir: &Path) -> Result<(), BuildError> {
+    let Some(relative) = project.settings.runtime.dlss_library.as_deref() else {
+        return Ok(());
+    };
+    let root = fs::canonicalize(&project.project_dir).map_err(|error| {
+        BuildError::input(format!(
+            "не удалось открыть каталог проекта для DLSS: {error}"
+        ))
+    })?;
+    let library = fs::canonicalize(root.join(relative)).map_err(|error| {
+        BuildError::input(format!("DLSS runtime DLL не найден ({relative}): {error}"))
+    })?;
+    if !library.starts_with(&root) || !library.is_file() {
+        return Err(BuildError::input(format!(
+            "runtime.dlss_library должен указывать на файл внутри проекта: {relative}"
+        )));
+    }
+    create_dir_all(engine_dir)?;
+    copy_file(&library, &engine_dir.join("nvngx_dlss.dll"))
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn write_file(path: &Path, contents: &[u8]) -> Result<(), BuildError> {
     match fs::read(path) {
@@ -857,8 +901,9 @@ pub(crate) fn normalize_build_path(path: &Path) -> Result<PathBuf, BuildError> {
 mod tests {
     use super::{
         CargoArtifact, CargoFailure, PlayerFlavor, build_distribution, checkout_player_target_dir,
-        copy_fsr_runtime, heavy_scripts_manifest, parse_cargo_output, parse_cdylib_target,
-        player_file_name, select_library_file, validate_heavy_scripts, validate_staged_archives,
+        copy_dlss_runtime, copy_fsr_runtime, heavy_scripts_manifest, parse_cargo_output,
+        parse_cdylib_target, player_file_name, select_library_file, validate_heavy_scripts,
+        validate_staged_archives,
     };
     use crate::error::BuildError;
     use crate::project::{HeavyScriptUse, ProjectBuild};
@@ -892,7 +937,7 @@ mod tests {
     fn checkout_player_build_arguments_and_targets_follow_flavor() {
         let root = Path::new("checkout");
         assert_eq!(
-            PlayerFlavor::Distribution.cargo_arguments(),
+            PlayerFlavor::Distribution.cargo_arguments(false),
             [
                 "build",
                 "--release",
@@ -904,7 +949,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            PlayerFlavor::Dev.cargo_arguments(),
+            PlayerFlavor::Dev.cargo_arguments(false),
             [
                 "build",
                 "--locked",
@@ -912,6 +957,18 @@ mod tests {
                 "rve-player",
                 "--message-format=json"
             ]
+        );
+        assert!(
+            PlayerFlavor::Distribution
+                .cargo_arguments(true)
+                .windows(2)
+                .any(|args| args == ["--features", "dlss"])
+        );
+        assert!(
+            PlayerFlavor::Dev
+                .cargo_arguments(true)
+                .windows(2)
+                .any(|args| args == ["--features", "dlss"])
         );
         assert_eq!(
             checkout_player_target_dir(root, PlayerFlavor::Distribution),
@@ -983,6 +1040,39 @@ mod tests {
 
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("upscaler effect DLL"));
+    }
+
+    #[test]
+    fn copies_configured_dlss_runtime_into_engine_directory() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-dlss-package").unwrap();
+        let project_dir = root.path().join("project");
+        let vendor_dir = project_dir.join("vendor");
+        let engine_dir = root.path().join("output/Engine");
+        fs::create_dir_all(&vendor_dir).unwrap();
+        fs::write(vendor_dir.join("nvngx_dlss.dll"), b"DLSS runtime").unwrap();
+        let mut project = sample_project(&project_dir, None);
+        project.settings.runtime.dlss_library = Some("vendor/nvngx_dlss.dll".to_owned());
+
+        copy_dlss_runtime(&project, &engine_dir).unwrap();
+
+        assert_eq!(
+            fs::read(engine_dir.join("nvngx_dlss.dll")).unwrap(),
+            b"DLSS runtime"
+        );
+    }
+
+    #[test]
+    fn configured_dlss_runtime_must_exist_before_packaging() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-dlss-missing").unwrap();
+        let project_dir = root.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut project = sample_project(&project_dir, None);
+        project.settings.runtime.dlss_library = Some("vendor/nvngx_dlss.dll".to_owned());
+
+        let error = copy_dlss_runtime(&project, &root.path().join("output/Engine")).unwrap_err();
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("DLSS runtime DLL не найден"));
     }
 
     #[test]

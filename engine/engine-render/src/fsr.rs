@@ -181,8 +181,8 @@ pub(crate) fn dispatch_description(
         transparency_and_composition: null_resource(),
         output,
         jitter_offset: FfxFloatCoords2D {
-            x: -jitter_pixels[0],
-            y: -jitter_pixels[1],
+            x: jitter_pixels[0],
+            y: jitter_pixels[1],
         },
         motion_vector_scale: FfxFloatCoords2D {
             x: render_size[0] as f32,
@@ -457,8 +457,8 @@ mod tests {
         assert_eq!(desc.exposure.description.width, 1);
         assert_eq!(desc.exposure.description.height, 1);
         assert_eq!(desc.output.description.usage, RESOURCE_USAGE_UAV);
-        assert_eq!(desc.jitter_offset.x, -0.25);
-        assert_eq!(desc.jitter_offset.y, 0.125);
+        assert_eq!(desc.jitter_offset.x, 0.25);
+        assert_eq!(desc.jitter_offset.y, -0.125);
         assert_eq!(desc.motion_vector_scale.x, 640.0);
         assert_eq!(desc.motion_vector_scale.y, 360.0);
         assert_eq!(desc.render_size.width, 640);

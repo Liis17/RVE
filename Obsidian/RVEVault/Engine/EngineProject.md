@@ -58,6 +58,9 @@ Parent: [[Index]]
 | `requirements.min_ram_mb`, `requirements.min_cpu_threads` | Минимум RAM и число логических CPU; default обоих значений — 0, то есть минимум не ограничен |
 | `runtime.background_tick_hz` | Частота обновлений скриптов в фоне; default 30, ноль запрещён |
 | `runtime.fsr_library` | Необязательный относительный путь внутри проекта к AMD Vulkan loader DLL (`.dll`); default отсутствует. Соседняя `amd_fidelityfx_upscaler_vk.dll` обязательна для сборки Windows-релиза |
+| `runtime.dlss_library` | Необязательный относительный путь внутри проекта к `nvngx_dlss.dll`; default отсутствует. Идентификатор NGX задаётся ровно одним из `dlss_project_id` или `dlss_application_id` |
+| `runtime.dlss_project_id`, `runtime.dlss_engine_version` | GUID-подобный project ID и версия RVE engine; оба требуются при выборе project ID и запрещены с application ID |
+| `runtime.dlss_application_id` | Необязательный положительный NVIDIA application ID; взаимоисключается с project ID и engine version |
 
 Например, при наличии официальных FSR DLL в `vendor/` Windows-проект может задать:
 
@@ -70,6 +73,13 @@ fsr_library = "vendor/amd_fidelityfx_loader_vk.dll"
 `rve-build build` проверяет и копирует loader вместе с соседним upscaler effect DLL
 в `Engine/`; dev-player разрешает путь относительно каталога проекта. Без доступного
 FSR runtime запрос `anti_aliasing = "fsr"` переходит на TAA с одним предупреждением.
+
+Для Windows DLSS путь к библиотеке должен оканчиваться на `nvngx_dlss.dll`;
+identifier проверяется при разборе проекта. В dev-player библиотека читается по
+относительному пути в проекте, в release — по имени из `Engine/`. Для `rve-build`
+нужен `RVE_DLSS_SDK` с Windows x64 SDK и библиотекой `nvsdk_ngx_s.lib`. Если
+SDK/backend или подходящая поддержка Vulkan недоступны, запрос `anti_aliasing =
+"dlss"` переходит на TAA с одним предупреждением.
 
 Пути загрузки проекта и коды выхода `rve-player` описаны в
 [[Engine/EngineRuntime]]. `rve-build` сериализует настройки через

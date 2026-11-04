@@ -153,6 +153,7 @@ fn run_from_args(
         Err(error) => return fail(2, format!("ошибка проекта: {error}")),
     };
     let fsr_library = layout.fsr_library_path(project.runtime.fsr_library.as_deref());
+    let dlss_library = layout.dlss_library_path(project.runtime.dlss_library.as_deref());
 
     if !bootstrap.allow_multiple_instances {
         let outcome = acquire_or_activate(
@@ -307,6 +308,10 @@ fn run_from_args(
             present_mode: bootstrap.present_mode,
             pipeline_cache_path,
             fsr_library,
+            dlss_library,
+            dlss_project_id: project.runtime.dlss_project_id,
+            dlss_application_id: project.runtime.dlss_application_id,
+            dlss_engine_version: project.runtime.dlss_engine_version,
             pipeline_cache,
             frame_limit: args.frames,
             debug_view,

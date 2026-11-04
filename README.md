@@ -149,6 +149,26 @@ fsr_library = "vendor/amd_fidelityfx_loader_vk.dll"
 читает их прямо из каталога проекта. Без доступного FSR SDK запрос `fsr` использует
 TAA и выводит одно предупреждение. На macOS доступен только TAA.
 
+Для DLSS на Windows добавь официальный `nvngx_dlss.dll` в каталог проекта и укажи
+NGX identifier в `project.rveproject`:
+
+```toml
+[runtime]
+dlss_library = "vendor/nvngx_dlss.dll"
+dlss_project_id = "a0f57b54-1daf-4934-90ae-c4035c19df04"
+dlss_engine_version = "0.1.0"
+```
+
+Вместо `dlss_project_id` и `dlss_engine_version` можно задать выданный NVIDIA
+`dlss_application_id`. Для компиляции нужен Windows x64 NVIDIA DLSS SDK: задай
+`RVE_DLSS_SDK` на его корневой каталог, содержащий
+`lib/Windows_x86_64/x64/nvsdk_ngx_s.lib`. `rve-build run` собирает dev-player с
+этой feature, а `rve-build build` копирует проектную `nvngx_dlss.dll` в `Engine/`.
+Если SDK создаётся с DLSS, его marker сохраняет это свойство; `run`/`build` сообщают,
+если SDK player был собран без DLSS. Репозиторий не содержит NGX SDK или DLSS DLL.
+Без включённого backend, NGX runtime или поддержки выбранного GPU запрос `dlss`
+переходит на TAA с одним предупреждением. На macOS доступен только TAA.
+
 ## Редактор
 
 `rve-editor` — редактор сцен: панели Scene, Game, Hierarchy, Inspector, Project и Console можно перетаскивать и собирать во вкладки.
