@@ -672,6 +672,30 @@ impl From<vk::Result> for RenderError {
     }
 }
 
+enum SubmitAndPresentError {
+    BeforeSubmit(RenderError),
+    AfterSubmit(RenderError),
+}
+
+struct AcquiredFrameSubmission<'a> {
+    device: &'a ash::Device,
+    swapchain_loader: &'a ash::khr::swapchain::Device,
+    queue: vk::Queue,
+    frame_slot: usize,
+    fence: vk::Fence,
+    image_available: vk::Semaphore,
+    command_buffer: vk::CommandBuffer,
+    swapchain_handle: vk::SwapchainKHR,
+    render_finished: vk::Semaphore,
+    image_index: usize,
+    acquire_suboptimal: bool,
+    wait_stage: vk::PipelineStageFlags2,
+    timestamps_written: bool,
+    temporal_submissions: &'a [TemporalSubmission],
+    shadow_layout: vk::ImageLayout,
+    local_shadow_layout: vk::ImageLayout,
+}
+
 /// Результат попытки показать кадр.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameStatus {
@@ -693,6 +717,11 @@ enum AcquireAction {
     OutOfDate,
     Skipped,
     Failed(vk::Result),
+}
+
+enum AcquireImageError {
+    BeforeAcquire(RenderError),
+    AfterAcquire(RenderError),
 }
 
 fn classify_acquire_result(result: Result<(u32, bool), vk::Result>) -> AcquireAction {
@@ -891,6 +920,7 @@ pub struct Renderer {
     last_warned_present_mode: Option<PresentMode>,
     output_extent: vk::Extent2D,
     swapchain_dirty: bool,
+    frame_slots_lost: bool,
     config: RendererConfig,
     capabilities: Capabilities,
     window: Arc<dyn WindowHandleOwner>,
@@ -1003,6 +1033,7 @@ impl Renderer {
             last_warned_present_mode: None,
             output_extent: vk::Extent2D { width, height },
             swapchain_dirty: true,
+            frame_slots_lost: false,
             config,
             capabilities: Capabilities {
                 device_name: String::new(),
@@ -1534,6 +1565,11 @@ impl Renderer {
         &mut self,
         frame: &Frame<'_>,
     ) -> Result<FrameOutcome, RenderError> {
+        if self.frame_slots_lost {
+            return Err(RenderError::InvalidState(
+                "ресурсы синхронизации кадровых слотов потеряны",
+            ));
+        }
         validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         validate_overlay(frame.overlay)?;
@@ -1674,6 +1710,9 @@ impl Renderer {
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
+        let swapchain_handle = swapchain.handle;
+        let swapchain_image_count = swapchain.images.len();
+        let queue = self.queue;
         let taa_set_layout = self.taa_set_layout()?;
         let frame_resources = self
             .frames
@@ -1681,8 +1720,6 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
         let image_available = frame_resources.image_available;
         let command_buffer = frame_resources.command_buffer;
-        let swapchain_handle = swapchain.handle;
-        let image_count = swapchain.images.len();
 
         if let Some(gpu_time) = frame_resources.read_gpu_time(
             &device,
@@ -1736,6 +1773,77 @@ impl Renderer {
         let post_sampler = self
             .post_sampler
             .ok_or(RenderError::InvalidState("post sampler отсутствует"))?;
+        let shadow_pipeline = self
+            .shadow_pipeline
+            .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?;
+        let local_shadow_pipeline = self.local_shadow_pipeline.ok_or(RenderError::InvalidState(
+            "local shadow pipeline отсутствует",
+        ))?;
+        let pipeline_layout = self
+            .pipeline_layout
+            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+        let scene_pipeline = self
+            .pipeline
+            .ok_or(RenderError::InvalidState("pipeline отсутствует"))?;
+        let mask_pipeline = self
+            .mask_pipeline
+            .ok_or(RenderError::InvalidState("mask pipeline отсутствует"))?;
+        let blend_pipeline = self
+            .blend_pipeline
+            .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?;
+        let overdraw_pipeline = self
+            .overdraw_pipeline
+            .ok_or(RenderError::InvalidState("overdraw pipeline отсутствует"))?;
+        let cluster_pipeline = self
+            .cluster_pipeline
+            .ok_or(RenderError::InvalidState("cluster pipeline отсутствует"))?;
+        let cluster_pipeline_layout =
+            self.cluster_pipeline_layout
+                .ok_or(RenderError::InvalidState(
+                    "cluster pipeline layout отсутствует",
+                ))?;
+        let skybox_pipeline = self
+            .skybox_pipeline
+            .ok_or(RenderError::InvalidState("skybox pipeline отсутствует"))?;
+        let tonemap_pipeline = self
+            .tonemap_pipeline
+            .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?;
+        let output_pipeline = self
+            .output_pipeline
+            .ok_or(RenderError::InvalidState("output pipeline отсутствует"))?;
+        let post_pipeline_layout = self.post_pipeline_layout.ok_or(RenderError::InvalidState(
+            "post pipeline layout отсутствует",
+        ))?;
+        let taa_pipeline = self
+            .taa_pipeline
+            .ok_or(RenderError::InvalidState("TAA pipeline отсутствует"))?;
+        let taa_pipeline_layout = self
+            .taa_pipeline_layout
+            .ok_or(RenderError::InvalidState("TAA pipeline layout отсутствует"))?;
+        let shadow_image = self
+            .shadow_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
+        let local_shadow_image = self
+            .local_shadow_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("local shadow map отсутствует"))?;
+        if view.anti_aliasing.is_temporal() && self.screen_temporal.history.is_none() {
+            return Err(RenderError::InvalidState("TAA history отсутствует"));
+        }
+        let overlay_resources =
+            if frame.overlay.is_empty() || frame_resources.overlay_buffer.buffer.is_none() {
+                None
+            } else {
+                Some((
+                    self.overlay_pipeline
+                        .ok_or(RenderError::InvalidState("overlay pipeline отсутствует"))?,
+                    self.overlay_pipeline_layout
+                        .ok_or(RenderError::InvalidState(
+                            "overlay pipeline layout отсутствует",
+                        ))?,
+                ))
+            };
         let target_changed = frame_resources.target.as_ref().is_none_or(|target| {
             target.render_extent != render_extent || target.output_extent != output_extent
         });
@@ -1787,14 +1895,22 @@ impl Renderer {
             tonemap_source,
             post_sampler,
         );
-        let Some((image_index, acquire_suboptimal)) = acquire_image(
+        let acquired = match acquire_image(
             &swapchain_loader,
             swapchain_handle,
             image_available,
-            image_count,
+            swapchain_image_count,
             &mut self.swapchain_dirty,
-        )?
-        else {
+        ) {
+            Ok(acquired) => acquired,
+            Err(AcquireImageError::BeforeAcquire(error)) => return Err(error),
+            Err(AcquireImageError::AfterAcquire(error)) => {
+                self.screen_temporal.state.missed();
+                self.abandon_acquired_frame(frame_slot, &device, queue, image_available);
+                return Err(error);
+            }
+        };
+        let Some((image_index, acquire_suboptimal)) = acquired else {
             self.screen_temporal.state.missed();
             return Ok(FrameOutcome {
                 status: FrameStatus::Skipped,
@@ -1802,179 +1918,148 @@ impl Renderer {
             });
         };
 
-        let shadow = ShadowPass {
-            pipeline: self
-                .shadow_pipeline
-                .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?,
-            local_pipeline: self.local_shadow_pipeline.ok_or(RenderError::InvalidState(
-                "local shadow pipeline отсутствует",
-            ))?,
-            pipeline_layout: self
-                .pipeline_layout
-                .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
-            frame_set,
-            meshes: &self.meshes,
-            materials: &self.materials,
-            draws: frame.draws,
-            shadow_cascades: frame.shadow_cascades,
-            local_shadow_matrices: &prepared.local_shadow_matrices,
-        };
-        let shadow_image = self
-            .shadow_image
-            .as_ref()
-            .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
-        let local_shadow_image = self
-            .local_shadow_image
-            .as_ref()
-            .ok_or(RenderError::InvalidState("local shadow map отсутствует"))?;
-        let scene = ScenePass {
-            pipeline: self
-                .pipeline
-                .ok_or(RenderError::InvalidState("pipeline отсутствует"))?,
-            mask_pipeline: self
-                .mask_pipeline
-                .ok_or(RenderError::InvalidState("mask pipeline отсутствует"))?,
-            blend_pipeline: self
-                .blend_pipeline
-                .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?,
-            overdraw_pipeline: self
-                .overdraw_pipeline
-                .ok_or(RenderError::InvalidState("overdraw pipeline отсутствует"))?,
-            wireframe_pipeline: self.wireframe_pipeline,
-            pipeline_layout: self
-                .pipeline_layout
-                .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?,
-            frame_set,
-            cluster_pipeline: self
-                .cluster_pipeline
-                .ok_or(RenderError::InvalidState("cluster pipeline отсутствует"))?,
-            cluster_pipeline_layout: self.cluster_pipeline_layout.ok_or(
-                RenderError::InvalidState("cluster pipeline layout отсутствует"),
-            )?,
-            environment_set,
-            skybox_pipeline: self
-                .skybox_pipeline
-                .ok_or(RenderError::InvalidState("skybox pipeline отсутствует"))?,
-            skybox,
-            meshes: &self.meshes,
-            materials: &self.materials,
-            draws: frame.draws,
-            view_projection: multiply_4x4(frame.camera.projection, frame.camera.view),
-            #[cfg(windows)]
-            fsr_camera: fsr_camera_parameters(frame.camera.projection),
-            culling_padding: [
-                temporal_plan.jitter_ndc[0].abs(),
-                temporal_plan.jitter_ndc[1].abs(),
-            ],
-            temporal_plan,
-            camera_position: frame.camera.position,
-            clear_color: frame.clear_color,
-            debug_view: frame.debug_view,
-            timestamps,
-            view,
-        };
-        let frame_resources = &mut self.frames[frame_slot];
-        let overlay =
-            match &frame_resources.overlay_buffer.buffer {
-                Some(buffer) if !frame.overlay.is_empty() => Some(OverlayPass {
-                    pipeline: self
-                        .overlay_pipeline
-                        .ok_or(RenderError::InvalidState("overlay pipeline отсутствует"))?,
-                    pipeline_layout: self.overlay_pipeline_layout.ok_or(
-                        RenderError::InvalidState("overlay pipeline layout отсутствует"),
-                    )?,
+        let swapchain_image = swapchain.images[image_index];
+        let swapchain_view = swapchain.views[image_index];
+        let swapchain_extent = swapchain.extent;
+        let render_finished = swapchain.render_finished[image_index];
+        let output_is_srgb = is_srgb_format(self.surface_format.format);
+        let recorded = (|| {
+            let shadow = ShadowPass {
+                pipeline: shadow_pipeline,
+                local_pipeline: local_shadow_pipeline,
+                pipeline_layout,
+                frame_set,
+                meshes: &self.meshes,
+                materials: &self.materials,
+                draws: frame.draws,
+                shadow_cascades: frame.shadow_cascades,
+                local_shadow_matrices: &prepared.local_shadow_matrices,
+            };
+            let scene = ScenePass {
+                pipeline: scene_pipeline,
+                mask_pipeline,
+                blend_pipeline,
+                overdraw_pipeline,
+                wireframe_pipeline: self.wireframe_pipeline,
+                pipeline_layout,
+                frame_set,
+                cluster_pipeline,
+                cluster_pipeline_layout,
+                environment_set,
+                skybox_pipeline,
+                skybox,
+                meshes: &self.meshes,
+                materials: &self.materials,
+                draws: frame.draws,
+                view_projection: multiply_4x4(frame.camera.projection, frame.camera.view),
+                #[cfg(windows)]
+                fsr_camera: fsr_camera_parameters(frame.camera.projection),
+                culling_padding: [
+                    temporal_plan.jitter_ndc[0].abs(),
+                    temporal_plan.jitter_ndc[1].abs(),
+                ],
+                temporal_plan,
+                camera_position: frame.camera.position,
+                clear_color: frame.clear_color,
+                debug_view: frame.debug_view,
+                timestamps,
+                view,
+            };
+            let frame_resources = &mut self.frames[frame_slot];
+            let overlay = match (&frame_resources.overlay_buffer.buffer, overlay_resources) {
+                (Some(buffer), Some((pipeline, pipeline_layout))) => Some(OverlayPass {
+                    pipeline,
+                    pipeline_layout,
                     vertex_buffer: buffer.buffer,
                     // validate_overlay проверил, что число вершин помещается в u32.
                     vertex_count: frame.overlay.len() as u32,
                 }),
                 _ => None,
             };
-        let target = frame_resources
-            .target
-            .as_mut()
-            .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
-        let mut shadow_layout = self.shadow_layout;
-        let mut local_shadow_layout = self.local_shadow_layout;
-        #[cfg(windows)]
-        let temporal_backend = select_temporal_backend(
-            view.anti_aliasing,
-            self.capabilities.fsr,
-            self.capabilities.dlss,
-        );
-        let temporal_record = if view.anti_aliasing.is_temporal() {
-            #[cfg(all(windows, feature = "dlss"))]
-            let dlss_api = self.dlss_api.as_ref();
-            let temporal = &mut self.screen_temporal;
-            let history = temporal
-                .history
-                .as_ref()
-                .ok_or(RenderError::InvalidState("TAA history отсутствует"))?;
+            let target = frame_resources
+                .target
+                .as_mut()
+                .expect("frame target was created before acquire");
+            let mut shadow_layout = self.shadow_layout;
+            let mut local_shadow_layout = self.local_shadow_layout;
             #[cfg(windows)]
-            let fsr = (temporal_backend == TemporalBackend::Fsr && fsr_fallback_reason.is_none())
+            let temporal_backend = select_temporal_backend(
+                view.anti_aliasing,
+                self.capabilities.fsr,
+                self.capabilities.dlss,
+            );
+            let temporal_record = if view.anti_aliasing.is_temporal() {
+                #[cfg(all(windows, feature = "dlss"))]
+                let dlss_api = self.dlss_api.as_ref();
+                let temporal = &mut self.screen_temporal;
+                let history = temporal
+                    .history
+                    .as_ref()
+                    .expect("temporal history was validated before acquire");
+                #[cfg(windows)]
+                let fsr = (temporal_backend == TemporalBackend::Fsr
+                    && fsr_fallback_reason.is_none())
                 .then_some(temporal.fsr.as_deref_mut())
                 .flatten();
-            #[cfg(all(windows, feature = "dlss"))]
-            let dlss = (temporal_backend == TemporalBackend::Dlss && fsr_fallback_reason.is_none())
+                #[cfg(all(windows, feature = "dlss"))]
+                let dlss = (temporal_backend == TemporalBackend::Dlss
+                    && fsr_fallback_reason.is_none())
                 .then_some(temporal.dlss.as_deref_mut())
                 .flatten();
-            Some(TemporalResolveRecord {
-                history,
-                #[cfg(windows)]
-                backend: temporal_backend,
-                plan: temporal_plan,
-                taa_pipeline: self
-                    .taa_pipeline
-                    .ok_or(RenderError::InvalidState("TAA pipeline отсутствует"))?,
-                taa_pipeline_layout: self
-                    .taa_pipeline_layout
-                    .ok_or(RenderError::InvalidState("TAA pipeline layout отсутствует"))?,
-                #[cfg(windows)]
-                fsr,
-                #[cfg(windows)]
-                exposure_ev: view.exposure_ev,
-                #[cfg(windows)]
-                frame_time_delta_ms,
-                #[cfg(windows)]
-                camera: fsr_camera_parameters(frame.camera.projection),
-                #[cfg(all(windows, feature = "dlss"))]
-                dlss_api,
-                #[cfg(all(windows, feature = "dlss"))]
-                dlss,
-            })
-        } else {
-            None
-        };
-        let temporal_outcome = match record_frame(
-            &device,
-            command_buffer,
-            target,
-            shadow_image,
-            &mut shadow_layout,
-            local_shadow_image,
-            &mut local_shadow_layout,
-            swapchain.images[image_index],
-            swapchain.views[image_index],
-            swapchain.extent,
-            view,
-            frame_resources.tonemap_set,
-            post_sampler,
-            frame_resources.output_set,
-            self.tonemap_pipeline
-                .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?,
-            self.output_pipeline
-                .ok_or(RenderError::InvalidState("output pipeline отсутствует"))?,
-            self.post_pipeline_layout.ok_or(RenderError::InvalidState(
-                "post pipeline layout отсутствует",
-            ))?,
-            is_srgb_format(self.surface_format.format),
-            &shadow,
-            &scene,
-            overlay.as_ref(),
-            temporal_record,
-        ) {
-            Ok(outcome) => outcome,
+                Some(TemporalResolveRecord {
+                    history,
+                    #[cfg(windows)]
+                    backend: temporal_backend,
+                    plan: temporal_plan,
+                    taa_pipeline,
+                    taa_pipeline_layout,
+                    #[cfg(windows)]
+                    fsr,
+                    #[cfg(windows)]
+                    exposure_ev: view.exposure_ev,
+                    #[cfg(windows)]
+                    frame_time_delta_ms,
+                    #[cfg(windows)]
+                    camera: fsr_camera_parameters(frame.camera.projection),
+                    #[cfg(all(windows, feature = "dlss"))]
+                    dlss_api,
+                    #[cfg(all(windows, feature = "dlss"))]
+                    dlss,
+                })
+            } else {
+                None
+            };
+            let temporal_outcome = record_frame(
+                &device,
+                command_buffer,
+                target,
+                shadow_image,
+                &mut shadow_layout,
+                local_shadow_image,
+                &mut local_shadow_layout,
+                swapchain_image,
+                swapchain_view,
+                swapchain_extent,
+                view,
+                frame_resources.tonemap_set,
+                post_sampler,
+                frame_resources.output_set,
+                tonemap_pipeline,
+                output_pipeline,
+                post_pipeline_layout,
+                output_is_srgb,
+                &shadow,
+                &scene,
+                overlay.as_ref(),
+                temporal_record,
+            )?;
+            Ok((temporal_outcome, shadow_layout, local_shadow_layout))
+        })();
+        let (temporal_outcome, shadow_layout, local_shadow_layout) = match recorded {
+            Ok(recorded) => recorded,
             Err(error) => {
                 self.screen_temporal.state.missed();
+                self.abandon_acquired_frame(frame_slot, &device, queue, image_available);
                 return Err(error);
             }
         };
@@ -2005,9 +2090,6 @@ impl Renderer {
                 self.screen_temporal.dlss_attempted = true;
             }
         }
-        self.shadow_layout = shadow_layout;
-        self.local_shadow_layout = local_shadow_layout;
-
         let temporal_submissions = [TemporalSubmission {
             view: TemporalViewId::Screen,
             plan: temporal_plan,
@@ -2030,13 +2112,32 @@ impl Renderer {
                 .is_some_and(|outcome| outcome.used_dlss),
             submitted_at,
         }];
-        self.submit_and_present(
+        match self.submit_and_present(AcquiredFrameSubmission {
+            device: &device,
+            swapchain_loader: &swapchain_loader,
+            queue,
+            frame_slot,
+            fence,
+            image_available,
+            command_buffer,
+            swapchain_handle,
+            render_finished,
             image_index,
             acquire_suboptimal,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            timestamps.is_some(),
-            &temporal_submissions,
-        )
+            wait_stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            timestamps_written: timestamps.is_some(),
+            temporal_submissions: &temporal_submissions,
+            shadow_layout,
+            local_shadow_layout,
+        }) {
+            Ok(outcome) => Ok(outcome),
+            Err(SubmitAndPresentError::BeforeSubmit(error)) => {
+                self.screen_temporal.state.missed();
+                self.abandon_acquired_frame(frame_slot, &device, queue, image_available);
+                Err(error)
+            }
+            Err(SubmitAndPresentError::AfterSubmit(error)) => Err(error),
+        }
     }
 
     /// Рисует сцены в их viewport targets и UI прямо в swapchain image.
@@ -2062,6 +2163,11 @@ impl Renderer {
         ui: &[UiPrimitive<'_>],
         clear: [f32; 4],
     ) -> Result<FrameOutcome, RenderError> {
+        if self.frame_slots_lost {
+            return Err(RenderError::InvalidState(
+                "ресурсы синхронизации кадровых слотов потеряны",
+            ));
+        }
         validate_scene_viewports(scenes.iter().map(|(viewport, _)| *viewport))?;
         self.screen_temporal.state.missed();
         self.miss_unlisted_viewports(scenes);
@@ -2249,6 +2355,12 @@ impl Renderer {
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
             "swapchain отсутствует после создания",
         ))?;
+        let swapchain_handle = swapchain.handle;
+        let swapchain_image_count = swapchain.images.len();
+        let queue = self.queue;
+        let image_set_layout = self.texture_set_layout()?;
+        let taa_set_layout = self.taa_set_layout()?;
+        let frame_set_layout = self.frame_set_layout()?;
         let frame_resources = self
             .frames
             .get_mut(frame_slot)
@@ -2281,15 +2393,15 @@ impl Renderer {
         // Выделение идёт до acquire, чтобы ошибка памяти не оставила захваченный image и
         // сигнальный semaphore.
         let target_resources = ViewportTargetResources {
-            image_set_layout: self.texture_set_layout()?,
-            taa_set_layout: self.taa_set_layout()?,
+            image_set_layout,
+            taa_set_layout,
             image_sampler: self
                 .ui_sampler
                 .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?,
             post_sampler: self
                 .post_sampler
                 .ok_or(RenderError::InvalidState("post sampler отсутствует"))?,
-            frame_set_layout: self.frame_set_layout()?,
+            frame_set_layout,
             shadow_view: self
                 .shadow_image
                 .as_ref()
@@ -2304,6 +2416,90 @@ impl Renderer {
                 .shadow_sampler
                 .ok_or(RenderError::InvalidState("shadow sampler отсутствует"))?,
         };
+        let pipeline_layout = self
+            .pipeline_layout
+            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
+        let shadow_pipeline = self
+            .shadow_pipeline
+            .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?;
+        let local_shadow_pipeline = self.local_shadow_pipeline.ok_or(RenderError::InvalidState(
+            "local shadow pipeline отсутствует",
+        ))?;
+        let scene_pipeline = self
+            .pipeline
+            .ok_or(RenderError::InvalidState("pipeline отсутствует"))?;
+        let mask_pipeline = self
+            .mask_pipeline
+            .ok_or(RenderError::InvalidState("mask pipeline отсутствует"))?;
+        let blend_pipeline = self
+            .blend_pipeline
+            .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?;
+        let overdraw_pipeline = self
+            .overdraw_pipeline
+            .ok_or(RenderError::InvalidState("overdraw pipeline отсутствует"))?;
+        let wireframe_pipeline = self.wireframe_pipeline;
+        let cluster_pipeline = self
+            .cluster_pipeline
+            .ok_or(RenderError::InvalidState("cluster pipeline отсутствует"))?;
+        let cluster_pipeline_layout =
+            self.cluster_pipeline_layout
+                .ok_or(RenderError::InvalidState(
+                    "cluster pipeline layout отсутствует",
+                ))?;
+        let skybox_pipeline = self
+            .skybox_pipeline
+            .ok_or(RenderError::InvalidState("skybox pipeline отсутствует"))?;
+        let ui_pipeline = self
+            .ui_pipeline
+            .ok_or(RenderError::InvalidState("UI pipeline отсутствует"))?;
+        let ui_pipeline_layout = self
+            .ui_pipeline_layout
+            .ok_or(RenderError::InvalidState("UI pipeline layout отсутствует"))?;
+        let tonemap_pipeline = self
+            .tonemap_pipeline
+            .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?;
+        let viewport_output_pipeline =
+            self.viewport_output_pipeline
+                .ok_or(RenderError::InvalidState(
+                    "viewport output pipeline отсутствует",
+                ))?;
+        let post_pipeline_layout = self.post_pipeline_layout.ok_or(RenderError::InvalidState(
+            "post pipeline layout отсутствует",
+        ))?;
+        let taa_pipeline = self
+            .taa_pipeline
+            .ok_or(RenderError::InvalidState("TAA pipeline отсутствует"))?;
+        let taa_pipeline_layout = self
+            .taa_pipeline_layout
+            .ok_or(RenderError::InvalidState("TAA pipeline layout отсутствует"))?;
+        let shadow_image = self
+            .shadow_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
+        let local_shadow_image = self
+            .local_shadow_image
+            .as_ref()
+            .ok_or(RenderError::InvalidState("local shadow map отсутствует"))?;
+        for (viewport, frame) in scenes {
+            let extent = self.viewports[viewport.0]
+                .as_ref()
+                .expect("viewports were validated before acquire")
+                .extent;
+            if extent.width > 0
+                && extent.height > 0
+                && effective_view_settings(frame.view, frame.debug_view)
+                    .anti_aliasing
+                    .is_temporal()
+                && self.viewports[viewport.0]
+                    .as_ref()
+                    .and_then(|entry| entry.temporal.history.as_ref())
+                    .is_none()
+            {
+                return Err(RenderError::InvalidState("TAA history отсутствует"));
+            }
+        }
+        let slot_timestamps = frame_resources.timestamps;
+        let framebuffer_is_srgb = is_srgb_format(self.surface_format.format);
         let physical_device = self.physical_device;
         let mut rendered = Vec::with_capacity(scenes.len());
         for ((scene, prepared_scene), environment) in scenes
@@ -2382,8 +2578,7 @@ impl Renderer {
                 *plan,
                 frame_set,
                 *environment_set,
-                self.skybox_pipeline
-                    .ok_or(RenderError::InvalidState("skybox pipeline отсутствует"))?,
+                skybox_pipeline,
                 *skybox,
                 target.tonemap_set,
                 target.output_set,
@@ -2392,21 +2587,6 @@ impl Renderer {
                 fallback_reason.clone(),
             ));
         }
-
-        let Some((image_index, acquire_suboptimal)) = acquire_image(
-            &swapchain_loader,
-            swapchain.handle,
-            image_available,
-            swapchain.images.len(),
-            &mut self.swapchain_dirty,
-        )?
-        else {
-            self.miss_all_temporal_views();
-            return Ok(FrameOutcome {
-                status: FrameStatus::Skipped,
-                submitted: false,
-            });
-        };
 
         let mut draws = Vec::with_capacity(packed.draws.len());
         for draw in &packed.draws {
@@ -2429,40 +2609,33 @@ impl Renderer {
             draws.push((*draw, set, image_is_linear));
         }
 
-        let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
-            "swapchain отсутствует после создания",
-        ))?;
-        let pipeline_layout = self
-            .pipeline_layout
-            .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
-        let shadow_pipeline = self
-            .shadow_pipeline
-            .ok_or(RenderError::InvalidState("shadow pipeline отсутствует"))?;
-        let local_shadow_pipeline = self.local_shadow_pipeline.ok_or(RenderError::InvalidState(
-            "local shadow pipeline отсутствует",
-        ))?;
-        let scene_pipeline = self
-            .pipeline
-            .ok_or(RenderError::InvalidState("pipeline отсутствует"))?;
-        let mask_pipeline = self
-            .mask_pipeline
-            .ok_or(RenderError::InvalidState("mask pipeline отсутствует"))?;
-        let blend_pipeline = self
-            .blend_pipeline
-            .ok_or(RenderError::InvalidState("blend pipeline отсутствует"))?;
-        let overdraw_pipeline = self
-            .overdraw_pipeline
-            .ok_or(RenderError::InvalidState("overdraw pipeline отсутствует"))?;
-        let wireframe_pipeline = self.wireframe_pipeline;
-        let cluster_pipeline = self
-            .cluster_pipeline
-            .ok_or(RenderError::InvalidState("cluster pipeline отсутствует"))?;
-        let cluster_pipeline_layout =
-            self.cluster_pipeline_layout
-                .ok_or(RenderError::InvalidState(
-                    "cluster pipeline layout отсутствует",
-                ))?;
-        let slot_timestamps = self.frames[frame_slot].timestamps;
+        let acquired = match acquire_image(
+            &swapchain_loader,
+            swapchain_handle,
+            image_available,
+            swapchain_image_count,
+            &mut self.swapchain_dirty,
+        ) {
+            Ok(acquired) => acquired,
+            Err(AcquireImageError::BeforeAcquire(error)) => return Err(error),
+            Err(AcquireImageError::AfterAcquire(error)) => {
+                self.miss_all_temporal_views();
+                self.abandon_acquired_frame(frame_slot, &device, queue, image_available);
+                return Err(error);
+            }
+        };
+        let Some((image_index, acquire_suboptimal)) = acquired else {
+            self.miss_all_temporal_views();
+            return Ok(FrameOutcome {
+                status: FrameStatus::Skipped,
+                submitted: false,
+            });
+        };
+        let swapchain_image = swapchain.images[image_index];
+        let swapchain_view = swapchain.views[image_index];
+        let swapchain_extent = swapchain.extent;
+        let render_finished = swapchain.render_finished[image_index];
+
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -2536,21 +2709,9 @@ impl Renderer {
             )
             .collect::<Vec<_>>();
         let timestamps = !scene_passes.is_empty() && slot_timestamps.is_some();
-        let shadow_image = self
-            .shadow_image
-            .as_ref()
-            .ok_or(RenderError::InvalidState("shadow map отсутствует"))?;
-        let local_shadow_image = self
-            .local_shadow_image
-            .as_ref()
-            .ok_or(RenderError::InvalidState("local shadow map отсутствует"))?;
         let ui_pass = UiPass {
-            pipeline: self
-                .ui_pipeline
-                .ok_or(RenderError::InvalidState("UI pipeline отсутствует"))?,
-            pipeline_layout: self
-                .ui_pipeline_layout
-                .ok_or(RenderError::InvalidState("UI pipeline layout отсутствует"))?,
+            pipeline: ui_pipeline,
+            pipeline_layout: ui_pipeline_layout,
             vertex_buffer: self.frames[frame_slot]
                 .ui_vertices
                 .buffer
@@ -2561,242 +2722,254 @@ impl Renderer {
                 .buffer
                 .as_ref()
                 .map(|buffer| buffer.buffer),
-            framebuffer_is_srgb: is_srgb_format(self.surface_format.format),
+            framebuffer_is_srgb,
             draws: &draws,
-            view: swapchain.views[image_index],
+            view: swapchain_view,
             clear,
         };
 
-        begin_command_buffer(&device, command_buffer)?;
-        let mut shadow_layout = self.shadow_layout;
-        let mut local_shadow_layout = self.local_shadow_layout;
-        let tonemap_pipeline = self
-            .tonemap_pipeline
-            .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?;
-        let viewport_output_pipeline =
-            self.viewport_output_pipeline
-                .ok_or(RenderError::InvalidState(
-                    "viewport output pipeline отсутствует",
-                ))?;
-        let post_pipeline_layout = self.post_pipeline_layout.ok_or(RenderError::InvalidState(
-            "post pipeline layout отсутствует",
-        ))?;
-        let taa_pipeline = self
-            .taa_pipeline
-            .ok_or(RenderError::InvalidState("TAA pipeline отсутствует"))?;
-        let taa_pipeline_layout = self
-            .taa_pipeline_layout
-            .ok_or(RenderError::InvalidState("TAA pipeline layout отсутствует"))?;
-        let post_sampler = target_resources.post_sampler;
-        let mut temporal_submissions = Vec::with_capacity(scene_passes.len());
-        let mut fsr_dispatch_errors = Vec::new();
-        #[cfg(all(windows, feature = "dlss"))]
-        let mut dlss_dispatch_errors = Vec::new();
-        for (
-            viewport,
-            shadow,
-            pass,
-            tonemap_set,
-            output_set,
-            _frame_delta_ms,
-            _upscaler_fallback_reason,
-        ) in &scene_passes
-        {
-            let Some(entry) = self.viewports[viewport.0].as_mut() else {
-                continue;
-            };
-            let Some(target) = entry.targets[frame_slot].as_mut() else {
-                continue;
-            };
-            record_scene(
-                &device,
-                command_buffer,
-                &mut target.scene,
-                shadow_image,
-                &mut shadow_layout,
-                local_shadow_image,
-                &mut local_shadow_layout,
-                target.render_extent,
+        let recorded = (|| {
+            begin_command_buffer(&device, command_buffer)?;
+            let mut shadow_layout = self.shadow_layout;
+            let mut local_shadow_layout = self.local_shadow_layout;
+            let post_sampler = target_resources.post_sampler;
+            let mut temporal_submissions = Vec::with_capacity(scene_passes.len());
+            let mut fsr_dispatch_errors = Vec::new();
+            #[cfg(all(windows, feature = "dlss"))]
+            let mut dlss_dispatch_errors = Vec::new();
+            for (
+                viewport,
                 shadow,
                 pass,
-            );
-            let temporal_outcome = if pass.view.anti_aliasing.is_temporal() {
-                let temporal = &mut entry.temporal;
-                let history = temporal
-                    .history
-                    .as_ref()
-                    .ok_or(RenderError::InvalidState("TAA history отсутствует"))?;
-                #[cfg(windows)]
-                let backend = select_temporal_backend(
-                    pass.view.anti_aliasing,
-                    self.capabilities.fsr,
-                    self.capabilities.dlss,
-                );
-                #[cfg(windows)]
-                let fsr = (backend == TemporalBackend::Fsr && _upscaler_fallback_reason.is_none())
-                    .then_some(temporal.fsr.as_deref_mut())
-                    .flatten();
-                #[cfg(all(windows, feature = "dlss"))]
-                let dlss_api = self.dlss_api.as_ref();
-                #[cfg(all(windows, feature = "dlss"))]
-                let dlss = (backend == TemporalBackend::Dlss
-                    && _upscaler_fallback_reason.is_none())
-                .then_some(temporal.dlss.as_deref_mut())
-                .flatten();
-                Some(record_temporal_resolve_and_tonemap(
+                tonemap_set,
+                output_set,
+                _frame_delta_ms,
+                _upscaler_fallback_reason,
+            ) in &scene_passes
+            {
+                let Some(entry) = self.viewports[viewport.0].as_mut() else {
+                    continue;
+                };
+                let Some(target) = entry.targets[frame_slot].as_mut() else {
+                    continue;
+                };
+                record_scene(
                     &device,
                     command_buffer,
                     &mut target.scene,
-                    &mut target.ldr,
-                    &mut target.ldr_layout,
-                    *tonemap_set,
-                    post_sampler,
-                    pass.frame_set,
-                    target.extent,
-                    pass.view,
-                    pass.debug_view,
-                    pass.timestamps,
-                    tonemap_pipeline,
-                    post_pipeline_layout,
-                    target.taa_set,
-                    TemporalResolveRecord {
-                        history,
-                        #[cfg(windows)]
-                        backend,
-                        plan: pass.temporal_plan,
-                        taa_pipeline,
-                        taa_pipeline_layout,
-                        #[cfg(windows)]
-                        fsr,
-                        #[cfg(windows)]
-                        exposure_ev: pass.view.exposure_ev,
-                        #[cfg(windows)]
-                        frame_time_delta_ms: *_frame_delta_ms,
-                        #[cfg(windows)]
-                        camera: pass.fsr_camera,
-                        #[cfg(all(windows, feature = "dlss"))]
-                        dlss_api,
-                        #[cfg(all(windows, feature = "dlss"))]
-                        dlss,
-                    },
-                )?)
-            } else {
-                write_image_set(&device, *tonemap_set, target.scene.color.view, post_sampler);
-                record_tonemap_pass(
+                    shadow_image,
+                    &mut shadow_layout,
+                    local_shadow_image,
+                    &mut local_shadow_layout,
+                    target.render_extent,
+                    shadow,
+                    pass,
+                );
+                let temporal_outcome = if pass.view.anti_aliasing.is_temporal() {
+                    let temporal = &mut entry.temporal;
+                    let history = temporal
+                        .history
+                        .as_ref()
+                        .expect("temporal history was validated before acquire");
+                    #[cfg(windows)]
+                    let backend = select_temporal_backend(
+                        pass.view.anti_aliasing,
+                        self.capabilities.fsr,
+                        self.capabilities.dlss,
+                    );
+                    #[cfg(windows)]
+                    let fsr = (backend == TemporalBackend::Fsr
+                        && _upscaler_fallback_reason.is_none())
+                    .then_some(temporal.fsr.as_deref_mut())
+                    .flatten();
+                    #[cfg(all(windows, feature = "dlss"))]
+                    let dlss_api = self.dlss_api.as_ref();
+                    #[cfg(all(windows, feature = "dlss"))]
+                    let dlss = (backend == TemporalBackend::Dlss
+                        && _upscaler_fallback_reason.is_none())
+                    .then_some(temporal.dlss.as_deref_mut())
+                    .flatten();
+                    Some(record_temporal_resolve_and_tonemap(
+                        &device,
+                        command_buffer,
+                        &mut target.scene,
+                        &mut target.ldr,
+                        &mut target.ldr_layout,
+                        *tonemap_set,
+                        post_sampler,
+                        pass.frame_set,
+                        target.extent,
+                        pass.view,
+                        pass.debug_view,
+                        pass.timestamps,
+                        tonemap_pipeline,
+                        post_pipeline_layout,
+                        target.taa_set,
+                        TemporalResolveRecord {
+                            history,
+                            #[cfg(windows)]
+                            backend,
+                            plan: pass.temporal_plan,
+                            taa_pipeline,
+                            taa_pipeline_layout,
+                            #[cfg(windows)]
+                            fsr,
+                            #[cfg(windows)]
+                            exposure_ev: pass.view.exposure_ev,
+                            #[cfg(windows)]
+                            frame_time_delta_ms: *_frame_delta_ms,
+                            #[cfg(windows)]
+                            camera: pass.fsr_camera,
+                            #[cfg(all(windows, feature = "dlss"))]
+                            dlss_api,
+                            #[cfg(all(windows, feature = "dlss"))]
+                            dlss,
+                        },
+                    )?)
+                } else {
+                    write_image_set(&device, *tonemap_set, target.scene.color.view, post_sampler);
+                    record_tonemap_pass(
+                        &device,
+                        command_buffer,
+                        &target.scene.color,
+                        target.scene.layout,
+                        &target.ldr,
+                        &mut target.ldr_layout,
+                        target.render_extent,
+                        *tonemap_set,
+                        tonemap_pipeline,
+                        post_pipeline_layout,
+                        pass.view,
+                        pass.debug_view,
+                        pass.timestamps,
+                    );
+                    target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                    None
+                };
+                let output_source_extent = temporal_outcome
+                    .as_ref()
+                    .map_or(target.render_extent, |outcome| outcome.output_extent);
+                record_output_pass(
                     &device,
                     command_buffer,
-                    &target.scene.color,
-                    target.scene.layout,
-                    &target.ldr,
-                    &mut target.ldr_layout,
-                    target.render_extent,
-                    *tonemap_set,
-                    tonemap_pipeline,
+                    target.output.image,
+                    target.output.view,
+                    output_source_extent,
+                    target.extent,
+                    target.output_layout,
+                    *output_set,
+                    viewport_output_pipeline,
                     post_pipeline_layout,
-                    pass.view,
-                    pass.debug_view,
-                    pass.timestamps,
+                    pass.view.anti_aliasing,
+                    true,
+                    None,
+                    true,
                 );
-                target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-                None
-            };
-            let output_source_extent = temporal_outcome
-                .as_ref()
-                .map_or(target.render_extent, |outcome| outcome.output_extent);
-            record_output_pass(
-                &device,
-                command_buffer,
-                target.output.image,
-                target.output.view,
-                output_source_extent,
-                target.extent,
-                target.output_layout,
-                *output_set,
-                viewport_output_pipeline,
-                post_pipeline_layout,
-                pass.view.anti_aliasing,
-                true,
-                None,
-                true,
-            );
-            target.output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-            if let Some(error) = temporal_outcome
-                .as_ref()
-                .and_then(|outcome| outcome.fsr_error.as_deref())
-            {
-                fsr_dispatch_errors.push((*viewport, error.to_owned()));
+                target.output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                if let Some(error) = temporal_outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.fsr_error.as_deref())
+                {
+                    fsr_dispatch_errors.push((*viewport, error.to_owned()));
+                }
+                #[cfg(all(windows, feature = "dlss"))]
+                if let Some(error) = temporal_outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.dlss_error.as_deref())
+                {
+                    dlss_dispatch_errors.push((*viewport, error.to_owned()));
+                }
+                temporal_submissions.push(TemporalSubmission {
+                    view: TemporalViewId::Viewport(*viewport),
+                    plan: pass.temporal_plan,
+                    layouts: temporal_outcome
+                        .as_ref()
+                        .is_some_and(|outcome| outcome.used_taa)
+                        .then_some([vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; 2]),
+                    #[cfg(windows)]
+                    fsr_used: temporal_outcome
+                        .as_ref()
+                        .is_some_and(|outcome| outcome.used_fsr),
+                    #[cfg(all(windows, feature = "dlss"))]
+                    dlss_used: temporal_outcome
+                        .as_ref()
+                        .is_some_and(|outcome| outcome.used_dlss),
+                    submitted_at,
+                });
+            }
+            for (_viewport, error) in fsr_dispatch_errors {
+                warn_temporal_fallback("FSR", &mut self.fsr_warning_emitted, &error);
+                #[cfg(windows)]
+                if let Some(Some(viewport)) = self.viewports.get_mut(_viewport.0) {
+                    if let Some(fsr) = viewport.temporal.fsr.take() {
+                        self.retired.retire(RetiredResource::FsrView(fsr), 0);
+                    }
+                    viewport.temporal.fsr_error = Some(error);
+                    viewport.temporal.fsr_attempted = true;
+                }
             }
             #[cfg(all(windows, feature = "dlss"))]
-            if let Some(error) = temporal_outcome
-                .as_ref()
-                .and_then(|outcome| outcome.dlss_error.as_deref())
-            {
-                dlss_dispatch_errors.push((*viewport, error.to_owned()));
-            }
-            temporal_submissions.push(TemporalSubmission {
-                view: TemporalViewId::Viewport(*viewport),
-                plan: pass.temporal_plan,
-                layouts: temporal_outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.used_taa)
-                    .then_some([vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; 2]),
-                #[cfg(windows)]
-                fsr_used: temporal_outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.used_fsr),
-                #[cfg(all(windows, feature = "dlss"))]
-                dlss_used: temporal_outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.used_dlss),
-                submitted_at,
-            });
-        }
-        for (_viewport, error) in fsr_dispatch_errors {
-            warn_temporal_fallback("FSR", &mut self.fsr_warning_emitted, &error);
-            #[cfg(windows)]
-            if let Some(Some(viewport)) = self.viewports.get_mut(_viewport.0) {
-                if let Some(fsr) = viewport.temporal.fsr.take() {
-                    self.retired.retire(RetiredResource::FsrView(fsr), 0);
-                }
-                viewport.temporal.fsr_error = Some(error);
-                viewport.temporal.fsr_attempted = true;
-            }
-        }
-        #[cfg(all(windows, feature = "dlss"))]
-        if let Some((_, error)) = dlss_dispatch_errors.first() {
-            warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, error);
-            self.capabilities.dlss = false;
-            self.dlss_load_error = Some(error.clone());
-            if let Some(dlss) = self.screen_temporal.dlss.take() {
-                self.retired.retire(RetiredResource::DlssView(dlss), 0);
-            }
-            for viewport in self.viewports.iter_mut().flatten() {
-                if let Some(dlss) = viewport.temporal.dlss.take() {
+            if let Some((_, error)) = dlss_dispatch_errors.first() {
+                warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, error);
+                self.capabilities.dlss = false;
+                self.dlss_load_error = Some(error.clone());
+                if let Some(dlss) = self.screen_temporal.dlss.take() {
                     self.retired.retire(RetiredResource::DlssView(dlss), 0);
                 }
-                viewport.temporal.dlss_attempted = true;
-                viewport.temporal.dlss_error = Some(error.clone());
+                for viewport in self.viewports.iter_mut().flatten() {
+                    if let Some(dlss) = viewport.temporal.dlss.take() {
+                        self.retired.retire(RetiredResource::DlssView(dlss), 0);
+                    }
+                    viewport.temporal.dlss_attempted = true;
+                    viewport.temporal.dlss_error = Some(error.clone());
+                }
             }
-        }
-        record_ui(
-            &device,
-            command_buffer,
-            swapchain.images[image_index],
-            swapchain.extent,
-            &ui_pass,
-        );
-        // SAFETY: command recording is complete before the command buffer is submitted.
-        unsafe { device.end_command_buffer(command_buffer) }?;
-        self.shadow_layout = shadow_layout;
-        self.local_shadow_layout = local_shadow_layout;
+            record_ui(
+                &device,
+                command_buffer,
+                swapchain_image,
+                swapchain_extent,
+                &ui_pass,
+            );
+            // SAFETY: command recording is complete before the command buffer is submitted.
+            unsafe { device.end_command_buffer(command_buffer) }?;
+            Ok((temporal_submissions, shadow_layout, local_shadow_layout))
+        })();
+        let (temporal_submissions, shadow_layout, local_shadow_layout) = match recorded {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                self.miss_all_temporal_views();
+                self.abandon_acquired_frame(frame_slot, &device, queue, image_available);
+                return Err(error);
+            }
+        };
 
-        self.submit_and_present(
+        match self.submit_and_present(AcquiredFrameSubmission {
+            device: &device,
+            swapchain_loader: &swapchain_loader,
+            queue,
+            frame_slot,
+            fence,
+            image_available,
+            command_buffer,
+            swapchain_handle,
+            render_finished,
             image_index,
             acquire_suboptimal,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            timestamps,
-            &temporal_submissions,
-        )
+            wait_stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            timestamps_written: timestamps,
+            temporal_submissions: &temporal_submissions,
+            shadow_layout,
+            local_shadow_layout,
+        }) {
+            Ok(outcome) => Ok(outcome),
+            Err(SubmitAndPresentError::BeforeSubmit(error)) => {
+                self.miss_temporal_submissions(&temporal_submissions);
+                self.abandon_acquired_frame(frame_slot, &device, queue, image_available);
+                Err(error)
+            }
+            Err(SubmitAndPresentError::AfterSubmit(error)) => Err(error),
+        }
     }
 
     fn ui_texture(&self, texture: UiTextureId) -> Result<&UiTexture, RenderError> {
@@ -2904,28 +3077,32 @@ impl Renderer {
     /// `wait_stage` — стадия первого обращения к swapchain image в этом command buffer.
     fn submit_and_present(
         &mut self,
-        image_index: usize,
-        acquire_suboptimal: bool,
-        wait_stage: vk::PipelineStageFlags2,
-        timestamps_written: bool,
-        temporal_submissions: &[TemporalSubmission],
-    ) -> Result<FrameOutcome, RenderError> {
-        let device = self.device()?.clone();
-        let swapchain_loader = self.swapchain_loader()?.clone();
-        let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
-            "swapchain отсутствует после создания",
-        ))?;
-        let frame_slot = self.frame_slot;
-        let fence = self.frames[frame_slot].fence;
-        let image_available = self.frames[frame_slot].image_available;
-        let command_buffer = self.frames[frame_slot].command_buffer;
-        let swapchain_handle = swapchain.handle;
-
+        acquired: AcquiredFrameSubmission<'_>,
+    ) -> Result<FrameOutcome, SubmitAndPresentError> {
+        let AcquiredFrameSubmission {
+            device,
+            swapchain_loader,
+            queue,
+            frame_slot,
+            fence,
+            image_available,
+            command_buffer,
+            swapchain_handle,
+            render_finished,
+            image_index,
+            acquire_suboptimal,
+            wait_stage,
+            timestamps_written,
+            temporal_submissions,
+            shadow_layout,
+            local_shadow_layout,
+        } = acquired;
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
         // SAFETY: эта точка — непосредственно перед submit, которому принадлежит fence.
         if let Err(error) = unsafe { device.reset_fences(&[fence]) } {
-            self.miss_temporal_submissions(temporal_submissions);
-            return Err(RenderError::Vulkan(error));
+            return Err(SubmitAndPresentError::BeforeSubmit(RenderError::Vulkan(
+                error,
+            )));
         }
 
         let wait_infos = [vk::SemaphoreSubmitInfo::default()
@@ -2935,7 +3112,6 @@ impl Renderer {
         let command_infos = [vk::CommandBufferSubmitInfo::default()
             .command_buffer(command_buffer)
             .device_mask(0)];
-        let render_finished = swapchain.render_finished[image_index];
         let signal_infos = [vk::SemaphoreSubmitInfo::default()
             .semaphore(render_finished)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -2945,10 +3121,13 @@ impl Renderer {
             .command_buffer_infos(&command_infos)
             .signal_semaphore_infos(&signal_infos)];
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
-        if let Err(error) = unsafe { device.queue_submit2(self.queue, &submit_info, fence) } {
-            self.miss_temporal_submissions(temporal_submissions);
-            return Err(RenderError::Vulkan(error));
+        if let Err(error) = unsafe { device.queue_submit2(queue, &submit_info, fence) } {
+            return Err(SubmitAndPresentError::BeforeSubmit(RenderError::Vulkan(
+                error,
+            )));
         }
+        self.shadow_layout = shadow_layout;
+        self.local_shadow_layout = local_shadow_layout;
         self.commit_temporal_submissions(temporal_submissions);
         // Результаты timestamp читаются после следующего ожидания fence этого слота.
         self.frames[frame_slot].timestamps_pending = timestamps_written;
@@ -2961,7 +3140,7 @@ impl Renderer {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
         // SAFETY: present waits on the semaphore signaled by the preceding queue submission.
-        let present_result = unsafe { swapchain_loader.queue_present(self.queue, &present_info) };
+        let present_result = unsafe { swapchain_loader.queue_present(queue, &present_info) };
         self.frame_slot = (self.frame_slot + 1) % self.frames.len();
         match present_result {
             Ok(present_suboptimal) => {
@@ -2980,8 +3159,83 @@ impl Renderer {
                     submitted: true,
                 })
             }
-            Err(error) => Err(RenderError::Vulkan(error)),
+            Err(error) => {
+                self.swapchain_dirty = true;
+                Err(SubmitAndPresentError::AfterSubmit(RenderError::Vulkan(
+                    error,
+                )))
+            }
         }
+    }
+
+    fn abandon_acquired_frame(
+        &mut self,
+        frame_slot: usize,
+        device: &ash::Device,
+        queue: vk::Queue,
+        image_available: vk::Semaphore,
+    ) {
+        self.swapchain_dirty = true;
+        if let Some(frame) = self.frames.get_mut(frame_slot) {
+            frame.target = None;
+            for viewport in self.viewports.iter_mut().flatten() {
+                if let Some(target) = viewport.targets.get_mut(frame_slot) {
+                    target.take();
+                }
+            }
+        } else {
+            self.frame_slots_lost = true;
+            return;
+        }
+
+        let fence = self.frames[frame_slot].fence;
+        let reset = unsafe { device.reset_fences(&[fence]) };
+        if reset.is_ok() {
+            let wait_infos = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(image_available)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .device_index(0)];
+            let submit_info = [vk::SubmitInfo2::default().wait_semaphore_infos(&wait_infos)];
+            // SAFETY: the empty submit consumes the semaphore signaled by acquire and re-signals the slot fence.
+            if unsafe { device.queue_submit2(queue, &submit_info, fence) }.is_ok() {
+                self.frame_slot = (frame_slot + 1) % self.frames.len();
+                return;
+            }
+        }
+
+        // SAFETY: the old synchronization objects may have uncertain state after a failed recovery submit.
+        let _ = unsafe { device.device_wait_idle() };
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        // SAFETY: this new fence starts signaled and is not referenced by any submission.
+        let new_fence = match unsafe { device.create_fence(&fence_info, None) } {
+            Ok(fence) => fence,
+            Err(_) => {
+                self.frame_slots_lost = true;
+                return;
+            }
+        };
+        // SAFETY: a default create info is valid for a new binary semaphore.
+        let new_image_available =
+            match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
+                Ok(semaphore) => semaphore,
+                Err(_) => {
+                    // SAFETY: new_fence was created above and has not been submitted.
+                    unsafe { device.destroy_fence(new_fence, None) };
+                    self.frame_slots_lost = true;
+                    return;
+                }
+            };
+
+        let frame = &mut self.frames[frame_slot];
+        let old_fence = std::mem::replace(&mut frame.fence, new_fence);
+        let old_image_available =
+            std::mem::replace(&mut frame.image_available, new_image_available);
+        // SAFETY: device_wait_idle was attempted before replacing and destroying these objects.
+        unsafe {
+            device.destroy_fence(old_fence, None);
+            device.destroy_semaphore(old_image_available, None);
+        }
+        self.frame_slot = (frame_slot + 1) % self.frames.len();
     }
 
     fn initialize(&mut self) -> Result<(), RenderError> {
@@ -7620,7 +7874,7 @@ fn acquire_image(
     image_available: vk::Semaphore,
     image_count: usize,
     swapchain_dirty: &mut bool,
-) -> Result<Option<(usize, bool)>, RenderError> {
+) -> Result<Option<(usize, bool)>, AcquireImageError> {
     // SAFETY: swapchain живёт в renderer до окончания acquire и получает валидный semaphore.
     let acquire_result = unsafe {
         swapchain_loader.acquire_next_image(
@@ -7644,14 +7898,16 @@ fn acquire_image(
             // frame_slot is unchanged, and reset_fences runs only after a successful acquire.
             return Ok(None);
         }
-        AcquireAction::Failed(error) => return Err(RenderError::Vulkan(error)),
+        AcquireAction::Failed(error) => {
+            return Err(AcquireImageError::BeforeAcquire(RenderError::Vulkan(error)));
+        }
     };
     let image_index = image_index as usize;
     if image_index >= image_count {
         *swapchain_dirty = true;
-        return Err(RenderError::InvalidState(
+        return Err(AcquireImageError::AfterAcquire(RenderError::InvalidState(
             "Vulkan вернул неверный индекс swapchain image",
-        ));
+        )));
     }
     Ok(Some((image_index, suboptimal)))
 }
