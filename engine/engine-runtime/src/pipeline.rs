@@ -25,7 +25,8 @@ use engine_scene::{
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
 use engine_script::{
-    ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary, ScriptTime,
+    ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary,
+    ScriptLoadOptions, ScriptTime,
 };
 #[cfg(feature = "dev-console")]
 use engine_ui::render::UiBridge;
@@ -42,6 +43,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const SCRIPTS_THREAD: &str = "rve-scripts";
 pub(crate) const RENDER_THREAD: &str = "rve-render";
+pub(crate) const SCRIPT_CALL_TIME_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub(crate) struct FrameSnapshot {
@@ -678,12 +680,15 @@ fn scripts_thread(
             return;
         }
     };
-    let mut scripts = match ScriptHost::load_with_interrupt(
+    let mut scripts = match ScriptHost::load_with_options(
         &world,
         &scene_name,
         &sources,
         library.as_ref(),
-        interrupt.clone(),
+        ScriptLoadOptions {
+            interrupt: interrupt.clone(),
+            call_time_limit: Some(SCRIPT_CALL_TIME_LIMIT),
+        },
     ) {
         Ok(scripts) => scripts,
         Err(error) => {

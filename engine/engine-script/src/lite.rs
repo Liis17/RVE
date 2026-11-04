@@ -20,6 +20,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const LUA_HOOK_INSTRUCTION_INTERVAL: u32 = 1_000;
 const LUA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
@@ -47,6 +48,112 @@ pub(crate) struct LuaState {
     pub(crate) lua: Lua,
     pub(crate) base_environment: Table,
     pub(crate) time: Table,
+    pub(crate) call_deadline: CallDeadline,
+}
+
+#[derive(Clone)]
+pub(crate) struct CallDeadline {
+    deadline: Rc<Cell<Option<Instant>>>,
+    expired: Rc<Cell<bool>>,
+    call_time_limit: Option<Duration>,
+    interrupted: Arc<AtomicBool>,
+}
+
+pub(crate) struct ActiveCallDeadline<'lua> {
+    lua: &'lua Lua,
+    deadline: CallDeadline,
+    owns_deadline: bool,
+}
+
+impl CallDeadline {
+    pub(crate) fn new(call_time_limit: Option<Duration>, interrupted: Arc<AtomicBool>) -> Self {
+        Self {
+            deadline: Rc::new(Cell::new(None)),
+            expired: Rc::new(Cell::new(false)),
+            call_time_limit,
+            interrupted,
+        }
+    }
+
+    pub(crate) fn enter<'lua>(&self, lua: &'lua Lua) -> ActiveCallDeadline<'lua> {
+        let owns_deadline = if let Some(limit) = self.call_time_limit {
+            if self.deadline.get().is_none() {
+                let now = Instant::now();
+                self.deadline
+                    .set(Some(now.checked_add(limit).unwrap_or(now)));
+                self.expired.set(false);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        ActiveCallDeadline {
+            lua,
+            deadline: self.clone(),
+            owns_deadline,
+        }
+    }
+
+    fn install_sparse_hook(&self, lua: &Lua) -> mlua::Result<()> {
+        let deadline = self.clone();
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(LUA_HOOK_INSTRUCTION_INTERVAL),
+            move |lua, _| {
+                if deadline.interrupted.load(Ordering::Acquire) {
+                    deadline.install_dense_hook(lua)?;
+                    return Err(LuaError::runtime("Lua execution interrupted"));
+                }
+                if deadline
+                    .deadline
+                    .get()
+                    .is_some_and(|expires_at| Instant::now() >= expires_at)
+                {
+                    deadline.expired.set(true);
+                    deadline.install_dense_hook(lua)?;
+                    return Err(LuaError::runtime(deadline.timeout_message()));
+                }
+                Ok(VmState::Continue)
+            },
+        )
+    }
+
+    fn install_dense_hook(&self, lua: &Lua) -> mlua::Result<()> {
+        let interrupted = self.interrupted.clone();
+        let expired = self.expired.clone();
+        let timeout_message = self.timeout_message();
+        lua.set_hook(HookTriggers::new().every_nth_instruction(1), move |_, _| {
+            if interrupted.load(Ordering::Acquire) {
+                Err(LuaError::runtime("Lua execution interrupted"))
+            } else if expired.get() {
+                Err(LuaError::runtime(timeout_message.clone()))
+            } else {
+                Ok(VmState::Continue)
+            }
+        })
+    }
+
+    fn timeout_message(&self) -> String {
+        format!(
+            "Lua call exceeded time limit of {:?}",
+            self.call_time_limit.unwrap_or_default()
+        )
+    }
+}
+
+impl Drop for ActiveCallDeadline<'_> {
+    fn drop(&mut self) {
+        if !self.owns_deadline {
+            return;
+        }
+        let expired = self.deadline.expired.get();
+        self.deadline.deadline.set(None);
+        self.deadline.expired.set(false);
+        if expired && !self.deadline.interrupted.load(Ordering::Acquire) {
+            let _ = self.deadline.install_sparse_hook(self.lua);
+        }
+    }
 }
 
 pub(crate) fn create_lua(
@@ -56,7 +163,7 @@ pub(crate) fn create_lua(
     active_owner: ActiveOwner,
     commands: LuaCommands,
     commands_generation: CommandGeneration,
-    interrupted: Arc<AtomicBool>,
+    call_deadline: CallDeadline,
 ) -> mlua::Result<LuaState> {
     let lua = Lua::new_with(
         // mlua always opens the Lua base library; these flags select the remaining libraries.
@@ -64,31 +171,7 @@ pub(crate) fn create_lua(
         LuaOptions::default(),
     )?;
     lua.set_memory_limit(LUA_MEMORY_LIMIT_BYTES)?;
-    let dense_hook_enabled = Arc::new(AtomicBool::new(false));
-    lua.set_hook(
-        HookTriggers::new().every_nth_instruction(LUA_HOOK_INSTRUCTION_INTERVAL),
-        {
-            let interrupted = interrupted.clone();
-            let dense_hook_enabled = dense_hook_enabled.clone();
-            move |lua, _| {
-                if !interrupted.load(Ordering::Acquire) {
-                    return Ok(VmState::Continue);
-                }
-                if !dense_hook_enabled.load(Ordering::Acquire) {
-                    let interrupted = interrupted.clone();
-                    lua.set_hook(HookTriggers::new().every_nth_instruction(1), move |_, _| {
-                        if interrupted.load(Ordering::Acquire) {
-                            Err(LuaError::runtime("Lua execution interrupted"))
-                        } else {
-                            Ok(VmState::Continue)
-                        }
-                    })?;
-                    dense_hook_enabled.store(true, Ordering::Release);
-                }
-                Err(LuaError::runtime("Lua execution interrupted"))
-            }
-        },
-    )?;
+    call_deadline.install_sparse_hook(&lua)?;
 
     let globals = lua.globals();
     globals.set("dofile", Value::Nil)?;
@@ -204,6 +287,7 @@ pub(crate) fn create_lua(
         lua,
         base_environment: globals,
         time,
+        call_deadline,
     })
 }
 
@@ -387,7 +471,7 @@ pub(crate) fn properties(
         Rc::new(Cell::new(None)),
         Rc::new(RefCell::new(std::collections::BTreeMap::new())),
         Rc::new(Cell::new(0)),
-        interrupted,
+        CallDeadline::new(None, interrupted),
     )
     .map_err(|error| error.to_string())?;
     compile_class(&state.lua, &state.base_environment, label, source).map(|(_, schema)| schema)
