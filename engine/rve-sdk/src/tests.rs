@@ -675,9 +675,15 @@ fn guest_camera_wrappers_report_when_callbacks_are_unavailable() {
 fn camera_sdk_enum_codes_and_raw_settings_validation_are_stable() {
     assert_eq!(AntiAliasing::Fxaa.code(), 0);
     assert_eq!(AntiAliasing::None.code(), 1);
+    assert_eq!(AntiAliasing::Taa.code(), 2);
+    assert_eq!(AntiAliasing::Fsr.code(), 3);
+    assert_eq!(AntiAliasing::Dlss.code(), 4);
     assert_eq!(AntiAliasing::from_code(0), Some(AntiAliasing::Fxaa));
     assert_eq!(AntiAliasing::from_code(1), Some(AntiAliasing::None));
-    assert_eq!(AntiAliasing::from_code(2), None);
+    assert_eq!(AntiAliasing::from_code(2), Some(AntiAliasing::Taa));
+    assert_eq!(AntiAliasing::from_code(3), Some(AntiAliasing::Fsr));
+    assert_eq!(AntiAliasing::from_code(4), Some(AntiAliasing::Dlss));
+    assert_eq!(AntiAliasing::from_code(5), None);
     assert_eq!(Tonemapper::Aces.code(), 0);
     assert_eq!(Tonemapper::Neutral.code(), 1);
     assert_eq!(Tonemapper::None.code(), 2);

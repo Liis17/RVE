@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [features]
 dev-console = ["dep:egui", "dep:egui-winit", "dep:engine-ui", "dep:winit"]
+dlss = ["engine-render/dlss"]
 
 [dependencies]
 engine-console = { path = "../engine-console" }

@@ -99,6 +99,31 @@ impl OpenProject {
         String::from_utf8(bytes).map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))
     }
 
+    /// Writes an edited `.camerasettings` asset without creating an unassigned file.
+    pub fn save_camera_settings(
+        &self,
+        path: &VirtualPath,
+        settings: &CameraSettings,
+    ) -> Result<(), String> {
+        if !path
+            .as_str()
+            .to_ascii_lowercase()
+            .ends_with(".camerasettings")
+        {
+            return Err(format!("{path}: ожидается ресурс .camerasettings"));
+        }
+        settings.validate().map_err(|error| error.to_string())?;
+        let file = self
+            .assets_dir
+            .resolve(path.as_str())
+            .map_err(|error| format!("{path}: {error}"))?;
+        if !file.is_file() {
+            return Err(format!("{path}: файл настроек камеры не найден"));
+        }
+        let source = settings.to_toml().map_err(|error| error.to_string())?;
+        std::fs::write(file, source).map_err(|error| format!("{path}: {error}"))
+    }
+
     /// Загрузчик префабов проекта для [`crate::scene_edit::EditorScene`].
     pub fn prefab_loader(&self) -> PrefabLoader {
         let cache = Rc::clone(&self.prefabs);
@@ -379,5 +404,30 @@ mod tests {
             42.0
         );
         assert_eq!(world.camera_settings(camera).unwrap().projection.near, 0.25);
+    }
+
+    #[test]
+    fn camera_settings_asset_edits_are_validated_and_saved() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        fs::create_dir_all(temp.0.join("Assets/cameras")).unwrap();
+        fs::write(
+            temp.0.join("Assets/cameras/main.camerasettings"),
+            "[projection]\nfov_deg = 42.0\n",
+        )
+        .unwrap();
+        let project = OpenProject::open(&temp.0).unwrap();
+        let path = VirtualPath::parse("cameras/main.camerasettings").unwrap();
+        let mut settings = CameraSettings::default();
+        settings.render.anti_aliasing = engine_scene::AntiAliasing::Taa;
+        project.save_camera_settings(&path, &settings).unwrap();
+        let saved = CameraSettings::parse(
+            path.to_string(),
+            &fs::read_to_string(temp.0.join("Assets/cameras/main.camerasettings")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.render.anti_aliasing, engine_scene::AntiAliasing::Taa);
+
+        let missing = VirtualPath::parse("cameras/missing.camerasettings").unwrap();
+        assert!(project.save_camera_settings(&missing, &settings).is_err());
     }
 }

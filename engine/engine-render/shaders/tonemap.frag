@@ -42,16 +42,33 @@ vec3 pbr_neutral(vec3 color) {
     return mix(color, vec3(new_peak), gray);
 }
 
+vec3 overdraw_heat(float value) {
+    if (value < 0.25) return mix(vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 1.0), value * 4.0);
+    if (value < 0.5) return mix(vec3(0.0, 1.0, 1.0), vec3(0.0, 1.0, 0.0), (value - 0.25) * 4.0);
+    if (value < 0.75) return mix(vec3(0.0, 1.0, 0.0), vec3(1.0, 1.0, 0.0), (value - 0.5) * 4.0);
+    return mix(vec3(1.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), (value - 0.75) * 4.0);
+}
+
 void main() {
     vec3 color = textureLod(sampler2D(source_image, source_sampler), in_uv, 0.0).rgb;
-    color *= exp2(push_constants.params.x);
-    int tonemapper = int(push_constants.params.y + 0.5);
-    if (tonemapper == 0) {
-        color = aces(color);
-    } else if (tonemapper == 1) {
-        color = pbr_neutral(color);
+    int debug_view = int(push_constants.params.z + 0.5);
+    if (debug_view == 3) {
+        float normalized_count = clamp(log2(color.r + 1.0) / log2(9.0), 0.0, 1.0);
+        color = overdraw_heat(normalized_count);
     } else {
-        color = clamp(color, 0.0, 1.0);
+        if (debug_view == 0 || debug_view == 1) {
+            color *= exp2(push_constants.params.x);
+            int tonemapper = int(push_constants.params.y + 0.5);
+            if (tonemapper == 0) {
+                color = aces(color);
+            } else if (tonemapper == 1) {
+                color = pbr_neutral(color);
+            } else {
+                color = clamp(color, 0.0, 1.0);
+            }
+        } else {
+            color = clamp(color, 0.0, 1.0);
+        }
     }
     vec3 perceptual_color = linear_to_srgb(color);
     float luma = dot(perceptual_color, vec3(0.2126, 0.7152, 0.0722));

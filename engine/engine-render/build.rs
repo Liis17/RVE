@@ -69,6 +69,12 @@ const SHADERS: &[ShaderBuild] = &[
         "mesh.frag.blend.spv",
     ),
     (
+        "wireframe.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "wireframe.frag.spv",
+    ),
+    (
         "shadow.vert",
         naga::ShaderStage::Vertex,
         &[],
@@ -118,6 +124,7 @@ const SHADERS: &[ShaderBuild] = &[
         &[],
         "output.frag.spv",
     ),
+    ("taa.frag", naga::ShaderStage::Fragment, &[], "taa.frag.spv"),
     (
         "skybox.vert",
         naga::ShaderStage::Vertex,
@@ -133,6 +140,32 @@ const SHADERS: &[ShaderBuild] = &[
 ];
 
 fn main() {
+    if env::var_os("CARGO_FEATURE_DLSS").is_some() {
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        if target_os != "windows" || target_arch != "x86_64" || target_env != "msvc" {
+            panic!("engine-render feature `dlss` requires the Windows x86_64 MSVC target");
+        }
+        let sdk_root = env::var_os("RVE_DLSS_SDK").unwrap_or_else(|| {
+            panic!("engine-render feature `dlss` requires RVE_DLSS_SDK to point to the NVIDIA DLSS SDK root")
+        });
+        let sdk_root = PathBuf::from(sdk_root);
+        let library_directory = sdk_root.join("lib/Windows_x86_64/x64");
+        let library = library_directory.join("nvsdk_ngx_s.lib");
+        if !library.is_file() {
+            panic!(
+                "NVIDIA DLSS SDK library is missing: {}; set RVE_DLSS_SDK to a Windows_x86_64 SDK root containing lib/Windows_x86_64/x64/nvsdk_ngx_s.lib",
+                library.display()
+            );
+        }
+        println!(
+            "cargo:rustc-link-search=native={}",
+            library_directory.display()
+        );
+        println!("cargo:rustc-link-lib=static=nvsdk_ngx_s");
+        println!("cargo:rerun-if-env-changed=RVE_DLSS_SDK");
+    }
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo задаёт OUT_DIR"));
     let cluster_count = CLUSTER_GRID_X * CLUSTER_GRID_Y * CLUSTER_GRID_Z;
     fs::write(

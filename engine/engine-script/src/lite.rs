@@ -824,6 +824,9 @@ fn camera_settings_table(lua: &Lua, settings: CameraSettings) -> mlua::Result<Ta
         match settings.render.anti_aliasing {
             AntiAliasing::Fxaa => "fxaa",
             AntiAliasing::None => "none",
+            AntiAliasing::Taa => "taa",
+            AntiAliasing::Fsr => "fsr",
+            AntiAliasing::Dlss => "dlss",
         },
     )?;
     result.set("render", render)?;
@@ -872,9 +875,12 @@ fn apply_camera_settings_table(table: &Table, settings: &mut CameraSettings) -> 
             settings.render.anti_aliasing = match value.to_str()?.as_ref() {
                 "fxaa" => AntiAliasing::Fxaa,
                 "none" => AntiAliasing::None,
+                "taa" => AntiAliasing::Taa,
+                "fsr" => AntiAliasing::Fsr,
+                "dlss" => AntiAliasing::Dlss,
                 _ => {
                     return Err(LuaError::runtime(
-                        "render.anti_aliasing must be \"fxaa\" or \"none\"",
+                        "render.anti_aliasing must be \"fxaa\", \"none\", \"taa\", \"fsr\", or \"dlss\"",
                     ));
                 }
             };

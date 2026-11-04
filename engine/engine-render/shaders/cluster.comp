@@ -16,6 +16,8 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 local_light_params;
     mat4 view;
     vec4 cluster_params;
+    mat4 previous_view_projection;
+    vec4 render_params;
 } frame;
 
 struct LocalLightData {

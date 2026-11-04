@@ -11,6 +11,12 @@ pub const RVE_SCRIPT_ABI_VERSION: u32 = 4;
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_NONE: u32 = 1;
+/// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
+pub const RVE_ANTI_ALIASING_TAA: u32 = 2;
+/// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
+pub const RVE_ANTI_ALIASING_FSR: u32 = 3;
+/// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
+pub const RVE_ANTI_ALIASING_DLSS: u32 = 4;
 /// Camera tonemapper code for [`RveCameraSettings::tonemapper`].
 pub const RVE_TONEMAPPER_ACES: u32 = 0;
 /// Camera tonemapper code for [`RveCameraSettings::tonemapper`].
@@ -807,9 +813,9 @@ unsafe impl Sync for RveModule {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Key, MouseButton, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_TONEMAPPER_ACES,
-        RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn,
-        RveHost,
+        Key, MouseButton, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA,
+        RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
+        RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn, RveHost,
     };
 
     #[test]
@@ -879,6 +885,9 @@ mod tests {
     fn camera_settings_codes_and_c_layout_are_stable_and_appended_to_host() {
         assert_eq!(RVE_ANTI_ALIASING_FXAA, 0);
         assert_eq!(RVE_ANTI_ALIASING_NONE, 1);
+        assert_eq!(RVE_ANTI_ALIASING_TAA, 2);
+        assert_eq!(RVE_ANTI_ALIASING_FSR, 3);
+        assert_eq!(RVE_ANTI_ALIASING_DLSS, 4);
         assert_eq!(RVE_TONEMAPPER_ACES, 0);
         assert_eq!(RVE_TONEMAPPER_NEUTRAL, 1);
         assert_eq!(RVE_TONEMAPPER_NONE, 2);

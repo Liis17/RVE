@@ -1,6 +1,7 @@
 //! Панели и диалоги редактора.
 
 pub mod console;
+mod debug_view;
 pub mod game_view;
 pub mod hierarchy;
 pub mod inspector;

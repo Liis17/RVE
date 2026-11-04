@@ -131,6 +131,9 @@ pub enum AntiAliasing {
     #[default]
     Fxaa,
     None,
+    Taa,
+    Fsr,
+    Dlss,
 }
 
 /// Ручная экспозиция и оператор преобразования HDR в LDR.
@@ -254,6 +257,30 @@ tonemapper = "neutral"
         ] {
             let error = CameraSettings::parse("bad-enum.camerasettings", input).unwrap_err();
             assert!(error.to_string().contains("bad-enum.camerasettings"));
+        }
+    }
+
+    #[test]
+    fn anti_aliasing_modes_round_trip_with_lowercase_names() {
+        for (name, expected) in [
+            ("fxaa", AntiAliasing::Fxaa),
+            ("none", AntiAliasing::None),
+            ("taa", AntiAliasing::Taa),
+            ("fsr", AntiAliasing::Fsr),
+            ("dlss", AntiAliasing::Dlss),
+        ] {
+            let settings = CameraSettings::parse(
+                "anti-aliasing.camerasettings",
+                &format!("[render]\nanti_aliasing = \"{name}\""),
+            )
+            .unwrap();
+            assert_eq!(settings.render.anti_aliasing, expected);
+            assert!(
+                settings
+                    .to_toml()
+                    .unwrap()
+                    .contains(&format!("anti_aliasing = \"{name}\""))
+            );
         }
     }
 

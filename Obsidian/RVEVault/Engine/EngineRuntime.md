@@ -23,6 +23,21 @@ Parent: [[Index]]
 `Contents/Resources` того же бандла: Finder запускает «голый» исполняемый файл через
 Terminal, поэтому `rve-build` публикует macOS-релиз как `.app`.
 
+На Windows `runtime.fsr_library` задаёт путь к FSR loader DLL: dev-player читает его
+относительно каталога проекта, release-player ищет файл с тем же именем в `Engine/`.
+`rve-build build` помещает туда также соседний `amd_fidelityfx_upscaler_vk.dll`.
+Если loader, effect или поддержка Vulkan недоступны, запрос FSR переключается на TAA
+и выводит одно предупреждение. На macOS FSR недоступен.
+
+Windows `runtime.dlss_library` указывает на проектную `nvngx_dlss.dll`: dev-player
+разрешает путь от проекта, release-player ищет файл по имени в `Engine/`. Для NGX
+runtime `RendererConfig::upscalers` также получает один из двух идентификаторов:
+GUID-like `dlss_project_id` вместе с `dlss_engine_version` либо выданный NVIDIA
+`dlss_application_id`. Если player собран с feature `dlss`, renderer запрашивает
+NGX instance/device extensions до их создания и проверяет DLSS support выбранного
+физического устройства. При отсутствующей DLL, SDK feature или поддержке Vulkan
+запрос `Dlss` переходит на TAA и пишет одно предупреждение. На macOS DLSS недоступен.
+
 Параметр `--scripts <path>` задаёт ABI-библиотеку Rust-скриптов. В release layout,
 если параметр не задан, runtime выбирает `Engine/game_scripts.dll` на Windows или
 `Engine/libgame_scripts.dylib` на macOS, только если файл существует. В dev-режиме
@@ -31,6 +46,12 @@ Terminal, поэтому `rve-build` публикует macOS-релиз как 
 отсутствующее значение и значение, начинающееся с `--`, являются ошибкой CLI с
 кодом 2. Относительный путь `--scripts` разрешается от текущего рабочего каталога и
 приводится к абсолютному; существующие пути нормализуются по правилам платформы.
+
+`--debug-view lit|wireframe|normals|overdraw|lod|cascades` доступен только вместе с
+`--project`; неправильный режим и применение к release layout завершаются кодом 2.
+Dev-player с developer console циклически меняет поддерживаемые режимы клавишей F8;
+режим пропускается, если окно не в фокусе или консоль открыта. Wireframe включается в
+цикл только при поддержке `fillModeNonSolid`; F8 не передаёт клавишу скриптам.
 
 Заголовок окна берётся из bootstrap, затем из `ProjectSettings.name`. `AppIcon`
 загружается через `Assets::load_texture` до создания окна; ошибка загрузки относится
@@ -56,7 +77,7 @@ Terminal, поэтому `rve-build` публикует macOS-релиз как 
 
 ## Конвейер и отменяемые ожидания
 
-Scripts thread выполняет `start`, затем цикл `update(dt)` → `World::build_frame` → `FrameSnapshot`. Снимок включает выбранную активную камеру и её settings, мировую позицию камеры для specular view-вектора и skybox, directional light, все локальные point/spot состояния, матрицы затеняемых источников, необязательный environment state и draw-команды с material IDs объектов. LOD выбирается по расстоянию от camera position до мировой позиции объекта; `cull_distance` исключает объект из draw list и его shadow draws. Renderer выполняет culling мешей по bounds отдельно для камеры и каждой directional/local shadow view; сначала отбирает до 1024 локальных источников для camera frustum, затем назначает им до 32 shadow layers по расстоянию камеры (point = 6 слоёв, spot = 1) с исходным индексом как tie-break. LOD distance использует мировой origin объекта без учёта масштаба, размера на экране и hysteresis. Время приходит из монотонного `Clock`; `dt` отражает фактически прошедшее время. Снимки передаются через `flume::bounded(1)`, а отправитель выбирает между готовностью очереди и control-каналом через `Selector`, поэтому заполненная очередь не блокирует Shutdown.
+Scripts thread выполняет `start`, затем цикл `update(dt)` → `World::build_frame` → `FrameSnapshot`. Снимок включает выбранную активную камеру и её settings, мировую позицию камеры для specular view-вектора и skybox, directional light, все локальные point/spot состояния, матрицы затеняемых источников, необязательный environment state и draw-команды с material IDs объектов. Для каждого видимого объекта снимок хранит модель и диапазон его draw-команд по `ObjectHandle`. Перед каждой попыткой render thread выставляет предыдущую модель из последнего успешно отправленного renderer кадра; текущие модели и активная камера фиксируются только после успешного queue submit. Поэтому повторный render последнего снимка использует текущую модель как предыдущую, а объекты, отсутствующие в отправленном кадре, удаляются из истории. Pause, render error и пропуск до submit не продвигают историю; `OUT_OF_DATE` при present после успешного submit продвигает её. Смена активной камеры сохраняет reset temporal history до первого успешного submit с новой камерой и не повторяет reset в последующих кадрах. Телепортация объекта скриптом отдельно не распознаётся: большая разница матриц может дать большой motion vector на один кадр. LOD выбирается по расстоянию от camera position до мировой позиции объекта; `cull_distance` исключает объект из draw list и его shadow draws. Renderer выполняет culling мешей по bounds отдельно для камеры и каждой directional/local shadow view; сначала отбирает до 1024 локальных источников для camera frustum, затем назначает им до 32 shadow layers по расстоянию камеры (point = 6 слоёв, spot = 1) с исходным индексом как tie-break. LOD distance использует мировой origin объекта без учёта масштаба, размера на экране и hysteresis. Время приходит из монотонного `Clock`; `dt` отражает фактически прошедшее время. Снимки передаются через `flume::bounded(1)`, а отправитель выбирает между готовностью очереди и control-каналом через `Selector`, поэтому заполненная очередь не блокирует Shutdown.
 
 Оконный поток передаёт события в `Arc<Mutex<InputAccumulator>>` короткими операциями. Перед каждым `ScriptHost::update` scripts thread забирает `take_frame`: удерживаемые клавиши и кнопки сохраняются, pressed/released и накопленные mouse/wheel delta сбрасываются. `ScriptInput` копируется в host, поэтому все экземпляры и message callbacks одного update видят один снимок. Потеря фокуса и вход в Background освобождают все удерживаемые клавиши и кнопки с `released` edge. Фоновый snapshot не содержит удерживаемого ввода, кроме ещё не выданных `released` от сброса; новые события в Background отбрасываются. До первого `CursorMoved` позиция курсора равна `[0, 0]`; `CursorLeft` не обрабатывается, поэтому последняя позиция сохраняется после выхода из окна, потери фокуса и перехода в Background. Mouse/wheel delta сбрасываются.
 
@@ -83,7 +104,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 | Файл | Ответственность |
 |---|---|
 | `engine/engine-runtime/src/lib.rs` | `run_player`, layout startup, resources, project lock, hardware check и lifecycle модулей |
-| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames` и usage |
+| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames`, dev-only `--debug-view` и usage |
 | `engine/engine-runtime/src/layout.rs` | release/dev пути и выбор ABI-библиотеки |
 | `engine/engine-runtime/src/activation.rs` | `PendingActivation` и single-instance handshake |
 | `engine/engine-runtime/src/hardware.rs` | чистое решение по device/RAM/CPU требованиям |
@@ -91,7 +112,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 | `engine/engine-runtime/src/scene.rs` | CPU-preload сцены и загрузка GPU-таблицы ресурсов |
 | `engine/engine-runtime/src/pipeline.rs` | snapshots, script/render loops, fakeable backend и status guard |
 | `engine/engine-runtime/src/input.rs` | `InputAccumulator`, переходы состояния и кадровые input snapshots |
-| `engine/engine-runtime/src/player.rs` | `WindowHandler`, renderer handoff и shutdown окна |
+| `engine/engine-runtime/src/player.rs` | `WindowHandler`, F8 debug-view control, renderer handoff и shutdown окна |
 | `engine/engine-runtime/src/console.rs` | UI snapshots, latest-only slot и интеграция console-команд с scripts thread |
 | `engine/rve-player/src/main.rs` | бинарный entry point |
 

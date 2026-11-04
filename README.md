@@ -81,7 +81,9 @@ cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist --rust-toolchai
 `rve-build run` собирает игру и запускает dev-player с включённой developer console.
 `rve-build build` собирает distribution-player без console и создаёт релиз в указанном
 каталоге, который должен отсутствовать до сборки. Для прямого запуска player CLI имеет вид
-`rve-player [--project <dir>] [--scripts <path>] [--frames N]`.
+`rve-player [--project <dir>] [--scripts <path>] [--frames N] [--debug-view lit|wireframe|normals|overdraw|lod|cascades]`.
+`--debug-view` принимает только dev-запуск с `--project`; в dev-player F8 циклически
+меняет поддерживаемые режимы, если окно в фокусе и developer console закрыта.
 
 Команда `rve-build sdk` собирает release редактор, сборщик и оба варианта player и
 создаёт переносимый каталог с `rve-editor`, `rve-build`, distribution player
@@ -169,6 +171,39 @@ release-плеер автоматически ищет библиотеку в `
 рядом в каталоге релиза. Подробности — в [описании сборщика](Obsidian/RVEVault/Engine/RveBuild.md)
 и [runtime-путей](Obsidian/RVEVault/Engine/EngineRuntime.md).
 
+Для FSR на Windows положи официальный `amd_fidelityfx_loader_vk.dll` и соседний
+`amd_fidelityfx_upscaler_vk.dll` в каталог проекта и укажи loader в
+`project.rveproject`:
+
+```toml
+[runtime]
+fsr_library = "vendor/amd_fidelityfx_loader_vk.dll"
+```
+
+`rve-build build` проверяет и копирует обе DLL в `Engine/`; в dev-запуске player
+читает их прямо из каталога проекта. Без доступного FSR SDK запрос `fsr` использует
+TAA и выводит одно предупреждение. На macOS доступен только TAA.
+
+Для DLSS на Windows добавь официальный `nvngx_dlss.dll` в каталог проекта и укажи
+NGX identifier в `project.rveproject`:
+
+```toml
+[runtime]
+dlss_library = "vendor/nvngx_dlss.dll"
+dlss_project_id = "a0f57b54-1daf-4934-90ae-c4035c19df04"
+dlss_engine_version = "0.1.0"
+```
+
+Вместо `dlss_project_id` и `dlss_engine_version` можно задать выданный NVIDIA
+`dlss_application_id`. Для компиляции нужен Windows x64 NVIDIA DLSS SDK: задай
+`RVE_DLSS_SDK` на его корневой каталог, содержащий
+`lib/Windows_x86_64/x64/nvsdk_ngx_s.lib`. `rve-build run` собирает dev-player с
+этой feature, а `rve-build build` копирует проектную `nvngx_dlss.dll` в `Engine/`.
+Если SDK создаётся с DLSS, его marker сохраняет это свойство; `run`/`build` сообщают,
+если SDK player был собран без DLSS. Репозиторий не содержит NGX SDK или DLSS DLL.
+Без включённого backend, NGX runtime или поддержки выбранного GPU запрос `dlss`
+переходит на TAA с одним предупреждением. На macOS доступен только TAA.
+
 ## Редактор
 
 `rve-editor` — редактор сцен: панели Scene, Game, Hierarchy, Inspector, Project и Console можно перетаскивать и собирать во вкладки.
@@ -182,6 +217,9 @@ cargo run -p rve-editor -- --project ../examples/demo-game --scripts <path-to-sc
 `--project` необязателен: без него открывается стартовый экран с выбором папки проекта. В File → New Project… можно создать проект из встроенного шаблона с камерой, светом, кубом, Lua-прыжком и Rust-скриптом орбиты. Проект создаётся в выбранной родительской папке; существующая папка не перезаписывается.
 
 Если `project.rveproject` задаёт `heavy_scripts`, редактор без `--scripts` автоматически запускает `rve-build scripts` при открытии проекта и перед Play. Play ждёт успешной сборки; при ошибке он не запускается. Готовая библиотека перезагружается без перезапуска редактора, вне Play. Явный `--scripts <library>` переопределяет автоматическую сборку и используется для Play и схем Inspector. Коды завершения: 0 — успех, 2 — неверные аргументы или настройки проекта, 1 — ошибка окна или Vulkan.
+
+Scene и Game имеют отдельный selector `View`; Inspector редактирует Anti-Aliasing у
+назначенного `.camerasettings` и сразу записывает этот ресурс.
 
 | Действие | Управление |
 |---|---|

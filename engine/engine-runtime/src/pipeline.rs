@@ -7,8 +7,8 @@ use crate::module_host::{ModuleHost, panic_message};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, LocalLight,
+    AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameStatus, LocalLight,
     LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId, ProceduralSky, Renderer,
     SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
 };
@@ -43,15 +43,24 @@ use std::time::{Duration, Instant};
 pub(crate) const SCRIPTS_THREAD: &str = "rve-scripts";
 pub(crate) const RENDER_THREAD: &str = "rve-render";
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct FrameSnapshot {
     pub camera: Camera,
+    pub active_camera: ObjectHandle,
     pub view: CameraSettings,
+    pub reset_history: bool,
     pub light: LightState,
     pub local_lights: Vec<LocalLight>,
     pub local_light_shadows: Vec<LocalLightShadow>,
     pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
+    object_motion: HashMap<ObjectHandle, ObjectMotion>,
+}
+
+#[derive(Clone, Debug)]
+struct ObjectMotion {
+    model: [[f32; 4]; 4],
+    draw_range: std::ops::Range<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +112,8 @@ pub(crate) enum ScriptControl {
 pub(crate) enum RenderControl {
     Resize(u32, u32),
     Occluded(bool),
+    #[cfg(feature = "dev-console")]
+    DebugView(DebugView),
     #[cfg(feature = "dev-console")]
     ConsoleUiChanged,
     Shutdown,
@@ -175,12 +186,14 @@ impl Clock for MonotonicClock {
 
 pub(crate) trait RenderBackend: Send {
     fn resize(&mut self, width: u32, height: u32);
+    #[cfg(feature = "dev-console")]
+    fn set_debug_view(&mut self, _debug_view: DebugView) {}
     fn render(
         &mut self,
         snapshot: &FrameSnapshot,
         width: u32,
         height: u32,
-    ) -> Result<FrameStatus, String>;
+    ) -> Result<FrameOutcome, String>;
     #[cfg(feature = "dev-console")]
     fn take_console_ui(&mut self) -> Option<ConsoleUiFrame> {
         None
@@ -194,7 +207,7 @@ pub(crate) trait RenderBackend: Send {
         width: u32,
         height: u32,
         _ui: &mut ConsoleUiFrame,
-    ) -> Result<FrameStatus, String> {
+    ) -> Result<FrameOutcome, String> {
         self.render(snapshot, width, height)
     }
     #[cfg(feature = "dev-console")]
@@ -255,6 +268,7 @@ pub(crate) enum ScriptStartupError {
 
 pub(crate) struct VulkanBackend {
     renderer: Renderer,
+    debug_view: DebugView,
     current_environment: Option<(EnvironmentCacheKey, EnvironmentId)>,
     pipeline_cache_path: Option<std::path::PathBuf>,
     #[cfg(feature = "dev-console")]
@@ -271,9 +285,14 @@ type PendingConsoleCommands = VecDeque<CommandLine>;
 type PendingConsoleCommands = ();
 
 impl VulkanBackend {
-    pub fn new(renderer: Renderer, pipeline_cache_path: Option<std::path::PathBuf>) -> Self {
+    pub fn new(
+        renderer: Renderer,
+        pipeline_cache_path: Option<std::path::PathBuf>,
+        debug_view: DebugView,
+    ) -> Self {
         Self {
             renderer,
+            debug_view,
             current_environment: None,
             pipeline_cache_path,
             #[cfg(feature = "dev-console")]
@@ -362,12 +381,17 @@ impl RenderBackend for VulkanBackend {
         self.renderer.resize(width, height);
     }
 
+    #[cfg(feature = "dev-console")]
+    fn set_debug_view(&mut self, debug_view: DebugView) {
+        self.debug_view = debug_view;
+    }
+
     fn render(
         &mut self,
         snapshot: &FrameSnapshot,
         width: u32,
         height: u32,
-    ) -> Result<FrameStatus, String> {
+    ) -> Result<FrameOutcome, String> {
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let frame = Frame {
             clear_color: [
@@ -388,6 +412,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
+            debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 exposure_ev: snapshot.view.color.exposure_ev,
@@ -399,11 +424,15 @@ impl RenderBackend for VulkanBackend {
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
+                    AntiAliasing::Taa => RenderAntiAliasing::Taa,
+                    AntiAliasing::Fsr => RenderAntiAliasing::Fsr,
+                    AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
+            reset_history: snapshot.reset_history,
         };
         self.renderer
-            .render_frame(&frame)
+            .render_frame_with_outcome(&frame)
             .map_err(|error| error.to_string())
     }
 
@@ -435,7 +464,7 @@ impl RenderBackend for VulkanBackend {
         width: u32,
         height: u32,
         ui: &mut ConsoleUiFrame,
-    ) -> Result<FrameStatus, String> {
+    ) -> Result<FrameOutcome, String> {
         if !ui.textures_delta.set.is_empty() {
             if let Err(error) = self
                 .ui_bridge
@@ -488,6 +517,7 @@ impl RenderBackend for VulkanBackend {
             light,
             draws: &snapshot.draws,
             overlay: &[],
+            debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 exposure_ev: snapshot.view.color.exposure_ev,
@@ -499,8 +529,12 @@ impl RenderBackend for VulkanBackend {
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
+                    AntiAliasing::Taa => RenderAntiAliasing::Taa,
+                    AntiAliasing::Fsr => RenderAntiAliasing::Fsr,
+                    AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
+            reset_history: snapshot.reset_history,
         };
         let vertices = [
             UiVertex {
@@ -534,18 +568,18 @@ impl RenderBackend for VulkanBackend {
             indices: &indices,
         });
         primitives.extend(converted.iter().map(|mesh| mesh.primitive()));
-        let status = self
+        let outcome = self
             .renderer
-            .render_frame_with_ui(&[(viewport, &scene)], &primitives, [0.0, 0.0, 0.0, 1.0])
+            .render_frame_with_ui_outcome(&[(viewport, &scene)], &primitives, [0.0, 0.0, 0.0, 1.0])
             .map_err(|error| error.to_string())?;
-        if status == FrameStatus::Presented && !ui.textures_delta.free.is_empty() {
+        if outcome.status == FrameStatus::Presented && !ui.textures_delta.free.is_empty() {
             self.ui_bridge
                 .managed
                 .apply_frees(&ui.textures_delta, &mut self.renderer)
                 .map_err(|error| error.to_string())?;
             ui.textures_delta.free.clear();
         }
-        Ok(status)
+        Ok(outcome)
     }
 
     #[cfg(feature = "dev-console")]
@@ -709,7 +743,6 @@ fn scripts_thread(
     let now = clock.now();
     let mut next_background_tick =
         now.saturating_add(if background { interval } else { Duration::ZERO });
-
     loop {
         sync_input_background(&input, background, &mut applied_background);
         if background {
@@ -879,6 +912,43 @@ fn load_script_library(
         .map_err(|error| error.to_string())
 }
 
+#[derive(Default)]
+struct MotionHistory {
+    active_camera: Option<ObjectHandle>,
+    previous_models: HashMap<ObjectHandle, [[f32; 4]; 4]>,
+}
+
+impl MotionHistory {
+    fn previous_model(&self, object: ObjectHandle, camera_changed: bool) -> Option<[[f32; 4]; 4]> {
+        if camera_changed {
+            None
+        } else {
+            self.previous_models.get(&object).copied()
+        }
+    }
+
+    fn prepare(&self, snapshot: &mut FrameSnapshot) {
+        let camera_changed = self
+            .active_camera
+            .is_some_and(|previous| previous != snapshot.active_camera);
+        snapshot.reset_history = camera_changed;
+        for (object, motion) in &snapshot.object_motion {
+            let previous_model = self.previous_model(*object, camera_changed);
+            for draw in &mut snapshot.draws[motion.draw_range.clone()] {
+                draw.previous_model = previous_model;
+            }
+        }
+    }
+
+    fn submitted(&mut self, snapshot: &FrameSnapshot) {
+        self.previous_models.clear();
+        for (object, motion) in &snapshot.object_motion {
+            self.previous_models.insert(*object, motion.model);
+        }
+        self.active_camera = Some(snapshot.active_camera);
+    }
+}
+
 fn make_snapshot(
     scene: engine_scene::SceneFrame,
     world: &World,
@@ -886,30 +956,51 @@ fn make_snapshot(
 ) -> Result<FrameSnapshot, String> {
     let mut draws = Vec::new();
     let camera_position = scene.camera.position;
+    let mut object_motion = HashMap::new();
     for instance in scene.meshes {
         let Some(levels) = gpu_scene.by_object.get(&instance.object) else {
             continue;
         };
-        let Some(meshes) = selected_level(world, instance.object, camera_position, levels) else {
+        let Some((lod_level, meshes)) =
+            selected_level(world, instance.object, camera_position, levels)
+        else {
             continue;
         };
-        draws.extend(meshes.iter().map(|(mesh, material)| DrawCommand {
-            mesh: *mesh,
-            material: Some(*material),
-            model: instance.model.to_cols_array_2d(),
-            casts_shadow: true,
-        }));
+        let model = instance.model.to_cols_array_2d();
+        let draw_start = draws.len();
+        for (mesh, material) in meshes {
+            draws.push(DrawCommand {
+                mesh: *mesh,
+                material: Some(*material),
+                model,
+                previous_model: None,
+                lod_level,
+                casts_shadow: true,
+            });
+        }
+        if draw_start != draws.len() {
+            object_motion.insert(
+                instance.object,
+                ObjectMotion {
+                    model,
+                    draw_range: draw_start..draws.len(),
+                },
+            );
+        }
     }
     let environment = resolve_environment_snapshot(scene.environment.as_ref(), gpu_scene)?;
     let (local_lights, local_light_shadows) = render_local_lights(&scene.local_lights);
     Ok(FrameSnapshot {
         camera: scene.camera,
+        active_camera: world.active_camera(),
         view: scene.view,
+        reset_history: false,
         light: scene.light,
         local_lights,
         local_light_shadows,
         environment,
         draws,
+        object_motion,
     })
 }
 
@@ -1066,8 +1157,9 @@ fn selected_level<'a, T>(
     object: ObjectHandle,
     eye: Vec3,
     levels: &'a [T],
-) -> Option<&'a T> {
-    levels.get(world.lod_level(object, eye)?)
+) -> Option<(u8, &'a T)> {
+    let level = world.lod_level(object, eye)?;
+    Some((level.try_into().ok()?, levels.get(level)?))
 }
 
 fn print_script_events(events: Vec<ScriptEvent>) {
@@ -1307,12 +1399,18 @@ fn render_loop(
     let mut occluded = false;
     let mut paused = false;
     let mut presented = 0_u64;
+    let mut motion_history = MotionHistory::default();
+    #[cfg(feature = "dev-console")]
+    let mut debug_view_dirty = false;
     let mut latest_snapshot: Option<Arc<FrameSnapshot>> = None;
     #[cfg(feature = "dev-console")]
     let mut ui_frame = ConsoleUiFrame::default();
     #[cfg(feature = "dev-console")]
     let mut console_active = false;
     loop {
+        #[cfg(feature = "dev-console")]
+        let mut should_render = std::mem::take(&mut debug_view_dirty);
+        #[cfg(not(feature = "dev-console"))]
         let mut should_render = false;
         loop {
             match control_rx.try_recv() {
@@ -1331,6 +1429,11 @@ fn render_loop(
                     {
                         should_render = true;
                     }
+                }
+                #[cfg(feature = "dev-console")]
+                Ok(RenderControl::DebugView(value)) => {
+                    backend.set_debug_view(value);
+                    should_render = true;
                 }
                 #[cfg(feature = "dev-console")]
                 Ok(RenderControl::ConsoleUiChanged) => should_render = true,
@@ -1371,17 +1474,18 @@ fn render_loop(
         }
 
         if should_render
-            && let Some(snapshot) = latest_snapshot.as_ref()
-            && let Some(frame_status) = render_snapshot(
+            && let Some(snapshot) = latest_snapshot.as_mut()
+            && let Some(outcome) = render_snapshot(
                 backend,
-                Arc::clone(snapshot),
+                Arc::make_mut(snapshot),
+                &mut motion_history,
                 paused,
                 width,
                 height,
                 #[cfg(feature = "dev-console")]
                 &mut ui_frame,
             )?
-            && frame_status == FrameStatus::Presented
+            && outcome.status == FrameStatus::Presented
         {
             presented = presented.saturating_add(1);
             if frame_limit.is_some_and(|limit| presented >= limit) {
@@ -1401,15 +1505,24 @@ fn render_loop(
             }
             RenderSelection::Control(Ok(RenderControl::Occluded(value))) => occluded = value,
             #[cfg(feature = "dev-console")]
+            RenderSelection::Control(Ok(RenderControl::DebugView(value))) => {
+                backend.set_debug_view(value);
+                debug_view_dirty = true;
+            }
+            #[cfg(feature = "dev-console")]
             RenderSelection::Control(Ok(RenderControl::ConsoleUiChanged)) => {}
             RenderSelection::Control(Ok(RenderControl::Shutdown))
             | RenderSelection::Control(Err(_))
             | RenderSelection::Frame(Err(_)) => return Ok(()),
             RenderSelection::Frame(Ok(snapshot)) => {
-                latest_snapshot = Some(Arc::clone(&snapshot));
-                let Some(frame_status) = render_snapshot(
+                latest_snapshot = Some(snapshot);
+                let Some(snapshot) = latest_snapshot.as_mut() else {
+                    continue;
+                };
+                let Some(outcome) = render_snapshot(
                     backend,
-                    snapshot,
+                    Arc::make_mut(snapshot),
+                    &mut motion_history,
                     paused,
                     width,
                     height,
@@ -1419,7 +1532,7 @@ fn render_loop(
                 else {
                     continue;
                 };
-                if frame_status == FrameStatus::Presented {
+                if outcome.status == FrameStatus::Presented {
                     presented = presented.saturating_add(1);
                     if frame_limit.is_some_and(|limit| presented >= limit) {
                         return Ok(());
@@ -1432,23 +1545,29 @@ fn render_loop(
 
 fn render_snapshot(
     backend: &mut dyn RenderBackend,
-    snapshot: Arc<FrameSnapshot>,
+    snapshot: &mut FrameSnapshot,
+    motion_history: &mut MotionHistory,
     paused: bool,
     width: u32,
     height: u32,
     #[cfg(feature = "dev-console")] ui_frame: &mut ConsoleUiFrame,
-) -> Result<Option<FrameStatus>, String> {
+) -> Result<Option<FrameOutcome>, String> {
     if paused {
-        drop(snapshot);
         return Ok(None);
     }
+    motion_history.prepare(snapshot);
     #[cfg(feature = "dev-console")]
-    if ui_frame.visible {
-        return backend
-            .render_console(&snapshot, width, height, ui_frame)
-            .map(Some);
+    let outcome = if ui_frame.visible {
+        backend.render_console(snapshot, width, height, ui_frame)?
+    } else {
+        backend.render(snapshot, width, height)?
+    };
+    #[cfg(not(feature = "dev-console"))]
+    let outcome = backend.render(snapshot, width, height)?;
+    if outcome.submitted {
+        motion_history.submitted(snapshot);
     }
-    backend.render(&snapshot, width, height).map(Some)
+    Ok(Some(outcome))
 }
 
 #[cfg(test)]
@@ -1463,8 +1582,8 @@ mod tests {
     use super::execute_console_commands;
     use super::{
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
-        GpuSceneTable, RenderBackend, RenderControl, RenderThreadConfig, RuntimeStatus,
-        SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig,
+        GpuSceneTable, MotionHistory, RenderBackend, RenderControl, RenderThreadConfig,
+        RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig,
         log_script_events_with, make_snapshot, procedural_environment_key, render_local_lights,
         render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
         sync_input_background, wait_background_tick,
@@ -1475,12 +1594,12 @@ mod tests {
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
     use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
-    use engine_render::{DrawCommand, FrameStatus, LocalLight};
+    use engine_render::{DrawCommand, FrameOutcome, FrameStatus, LocalLight};
     use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
-    use engine_scene::{LocalLightState, SceneDocument, World};
+    use engine_scene::{LocalLightState, ObjectHandle, SceneDocument, World};
     use engine_script::{
         Key, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
     };
@@ -1550,6 +1669,108 @@ mod tests {
     struct FakeMeshId(usize);
 
     #[test]
+    fn motion_history_tracks_submitted_models_by_object_handle() {
+        let (camera_a, _, first, second) = motion_test_handles();
+        let first_model = [[1.0; 4]; 4];
+        let second_model = [[2.0; 4]; 4];
+        let next_model = [[3.0; 4]; 4];
+        let mut history = MotionHistory::default();
+        let mut backend = FakeBackend::default();
+        let mut snapshot =
+            motion_snapshot(camera_a, &[(first, first_model), (second, second_model)]);
+
+        render_test_snapshot(&mut backend, &mut snapshot, &mut history, false).unwrap();
+        assert_eq!(history.previous_models.get(&first), Some(&first_model));
+        assert_eq!(history.previous_models.get(&second), Some(&second_model));
+        assert_eq!(history.previous_model(first, false), Some(first_model));
+
+        let mut snapshot = motion_snapshot(camera_a, &[(first, next_model)]);
+        assert_eq!(history.previous_model(first, false), Some(first_model));
+        render_test_snapshot(&mut backend, &mut snapshot, &mut history, false).unwrap();
+        assert_eq!(history.previous_models.len(), 1);
+        assert_eq!(history.previous_models.get(&first), Some(&next_model));
+        assert!(!history.previous_models.contains_key(&second));
+
+        // Re-rendering the same latest snapshot uses its already-submitted transform.
+        assert_eq!(history.previous_model(first, false), Some(next_model));
+        render_test_snapshot(&mut backend, &mut snapshot, &mut history, false).unwrap();
+        assert_eq!(backend.renders, 3);
+        assert!(!snapshot.reset_history);
+    }
+
+    #[test]
+    fn motion_history_advances_only_after_a_successful_queue_submission() {
+        let (camera_a, _, first, _) = motion_test_handles();
+        let model = [[1.0; 4]; 4];
+        let mut snapshot = motion_snapshot(camera_a, &[(first, model)]);
+        let mut history = MotionHistory::default();
+        let mut backend = FakeBackend {
+            outcome: Some(FrameOutcome {
+                status: FrameStatus::Skipped,
+                submitted: false,
+            }),
+            ..Default::default()
+        };
+
+        assert!(
+            render_test_snapshot(&mut backend, &mut snapshot, &mut history, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(history.previous_models.is_empty());
+
+        backend.fail = true;
+        assert!(render_test_snapshot(&mut backend, &mut snapshot, &mut history, false).is_err());
+        assert!(history.previous_models.is_empty());
+
+        backend.fail = false;
+        render_test_snapshot(&mut backend, &mut snapshot, &mut history, false).unwrap();
+        assert!(history.previous_models.is_empty());
+
+        // A present can be skipped after submit (for example, OUT_OF_DATE); the submitted
+        // scene frame still advances temporal model history.
+        backend.outcome = Some(FrameOutcome {
+            status: FrameStatus::Skipped,
+            submitted: true,
+        });
+        render_test_snapshot(&mut backend, &mut snapshot, &mut history, false).unwrap();
+        assert_eq!(history.previous_models.get(&first), Some(&model));
+    }
+
+    #[test]
+    fn camera_reset_persists_until_submission_then_is_consumed_once() {
+        let (camera_a, camera_b, first, _) = motion_test_handles();
+        let first_model = [[1.0; 4]; 4];
+        let second_model = [[2.0; 4]; 4];
+        let mut history = MotionHistory::default();
+        let mut backend = FakeBackend::default();
+        let mut first_frame = motion_snapshot(camera_a, &[(first, first_model)]);
+        render_test_snapshot(&mut backend, &mut first_frame, &mut history, false).unwrap();
+
+        let mut switched_frame = motion_snapshot(camera_b, &[(first, second_model)]);
+        backend.outcome = Some(FrameOutcome {
+            status: FrameStatus::Skipped,
+            submitted: false,
+        });
+        render_test_snapshot(&mut backend, &mut switched_frame, &mut history, false).unwrap();
+        assert!(switched_frame.reset_history);
+        assert_eq!(history.active_camera, Some(camera_a));
+        assert_eq!(history.previous_models.get(&first), Some(&first_model));
+
+        backend.outcome = Some(FrameOutcome {
+            status: FrameStatus::Presented,
+            submitted: true,
+        });
+        render_test_snapshot(&mut backend, &mut switched_frame, &mut history, false).unwrap();
+        assert!(switched_frame.reset_history);
+        assert_eq!(history.active_camera, Some(camera_b));
+        assert_eq!(history.previous_models.get(&first), Some(&second_model));
+
+        render_test_snapshot(&mut backend, &mut switched_frame, &mut history, false).unwrap();
+        assert!(!switched_frame.reset_history);
+    }
+
+    #[test]
     fn snapshot_level_selection_uses_distance_and_skips_culled_objects() {
         let input = r#"
 [[assets]]
@@ -1578,11 +1799,11 @@ distance=2.0
 
         assert_eq!(
             selected_level(&world, object, Vec3::ZERO, &level_meshes),
-            Some(&level_meshes[1])
+            Some((1, &level_meshes[1]))
         );
         assert_eq!(
             selected_level(&world, object, Vec3::new(0.0, 0.0, -4.5), &level_meshes),
-            Some(&level_meshes[0])
+            Some((0, &level_meshes[0]))
         );
         assert_eq!(
             selected_level(&world, object, Vec3::new(0.0, 0.0, 3.0), &level_meshes),
@@ -1594,6 +1815,7 @@ distance=2.0
     struct FakeBackend {
         renders: usize,
         shared_renders: Option<Arc<AtomicUsize>>,
+        outcome: Option<FrameOutcome>,
         fail: bool,
         panic: bool,
         panic_wait_idle: bool,
@@ -1611,7 +1833,7 @@ distance=2.0
             _snapshot: &FrameSnapshot,
             _width: u32,
             _height: u32,
-        ) -> Result<FrameStatus, String> {
+        ) -> Result<FrameOutcome, String> {
             self.renders += 1;
             if let Some(renders) = &self.shared_renders {
                 renders.fetch_add(1, Ordering::SeqCst);
@@ -1620,7 +1842,10 @@ distance=2.0
             if self.fail {
                 Err("fake render failure".to_owned())
             } else {
-                Ok(FrameStatus::Presented)
+                Ok(self.outcome.unwrap_or(FrameOutcome {
+                    status: FrameStatus::Presented,
+                    submitted: true,
+                }))
             }
         }
 
@@ -1640,7 +1865,7 @@ distance=2.0
             width: u32,
             height: u32,
             ui: &mut ConsoleUiFrame,
-        ) -> Result<FrameStatus, String> {
+        ) -> Result<FrameOutcome, String> {
             assert!(ui.visible);
             let status = self.render(snapshot, width, height)?;
             if let Some(rendered) = &self.console_rendered {
@@ -1648,6 +1873,26 @@ distance=2.0
             }
             Ok(status)
         }
+    }
+
+    fn render_test_snapshot(
+        backend: &mut FakeBackend,
+        snapshot: &mut FrameSnapshot,
+        history: &mut MotionHistory,
+        paused: bool,
+    ) -> Result<Option<FrameOutcome>, String> {
+        #[cfg(feature = "dev-console")]
+        let mut ui_frame = ConsoleUiFrame::default();
+        render_snapshot(
+            backend,
+            snapshot,
+            history,
+            paused,
+            640,
+            480,
+            #[cfg(feature = "dev-console")]
+            &mut ui_frame,
+        )
     }
 
     #[derive(Default)]
@@ -1766,6 +2011,7 @@ distance=2.0
     }
 
     fn empty_snapshot() -> FrameSnapshot {
+        let active_camera = motion_test_handles().0;
         FrameSnapshot {
             camera: Camera {
                 position: Vec3::new(0.0, 0.0, 4.0),
@@ -1775,12 +2021,66 @@ distance=2.0
                 near: 0.1,
                 far: 100.0,
             },
+            active_camera,
             view: CameraSettings::default(),
+            reset_history: false,
             light: LightState::default(),
             local_lights: Vec::new(),
             local_light_shadows: Vec::new(),
             environment: None,
             draws: Vec::<DrawCommand>::new(),
+            object_motion: HashMap::new(),
+        }
+    }
+
+    fn motion_test_handles() -> (ObjectHandle, ObjectHandle, ObjectHandle, ObjectHandle) {
+        let document = SceneDocument::parse(
+            "motion.rvescene",
+            "[[objects]]\nid=\"camera_a\"\n[objects.camera]\nactive=true\n[[objects]]\nid=\"camera_b\"\n[objects.camera]\n[[objects]]\nid=\"first\"\n[[objects]]\nid=\"second\"\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        (
+            world.handle("camera_a").unwrap(),
+            world.handle("camera_b").unwrap(),
+            world.handle("first").unwrap(),
+            world.handle("second").unwrap(),
+        )
+    }
+
+    fn motion_snapshot(
+        active_camera: ObjectHandle,
+        objects: &[(ObjectHandle, [[f32; 4]; 4])],
+    ) -> FrameSnapshot {
+        FrameSnapshot {
+            camera: Camera {
+                position: Vec3::new(0.0, 0.0, 4.0),
+                target: Vec3::ZERO,
+                up: Vec3::Y,
+                fov_narrow: std::f32::consts::FRAC_PI_4,
+                near: 0.1,
+                far: 100.0,
+            },
+            active_camera,
+            view: CameraSettings::default(),
+            reset_history: false,
+            light: LightState::default(),
+            local_lights: Vec::new(),
+            local_light_shadows: Vec::new(),
+            environment: None,
+            draws: Vec::new(),
+            object_motion: objects
+                .iter()
+                .map(|(object, model)| {
+                    (
+                        *object,
+                        super::ObjectMotion {
+                            model: *model,
+                            draw_range: 0..0,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -1930,7 +2230,7 @@ range = 10
         let mut world = World::from_document(&document).unwrap();
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty());
-        assert!(make_snapshot(frame.clone(), &world, &GpuSceneTable::default()).is_err());
+        assert!(make_snapshot(frame.clone(), &world, &GpuSceneTable::default(),).is_err());
 
         let source = Arc::new(EnvironmentSource::Equirect {
             width: 2,
@@ -2242,10 +2542,13 @@ return Script
     #[test]
     fn paused_snapshot_is_dropped_without_calling_the_renderer() {
         let mut backend = FakeBackend::default();
+        let mut snapshot = empty_snapshot();
+        let mut history = MotionHistory::default();
         assert!(
             render_snapshot(
                 &mut backend,
-                Arc::new(empty_snapshot()),
+                &mut snapshot,
+                &mut history,
                 true,
                 0,
                 0,
