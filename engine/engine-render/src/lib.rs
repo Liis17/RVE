@@ -5593,7 +5593,12 @@ impl Renderer {
     }
 
     fn recreate_swapchain(&mut self) -> Result<(), RenderError> {
-        if self.output_extent.width == 0 || self.output_extent.height == 0 {
+        let capabilities = unsafe {
+            self.surface_loader()?
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface()?)
+        }?;
+        if usable_surface_extent(capabilities, self.output_extent).is_none() {
+            self.swapchain_dirty = true;
             return Ok(());
         }
         self.flush_uploads()?;
@@ -5613,6 +5618,7 @@ impl Renderer {
             self.surface()?,
             self.surface_format,
             self.output_extent,
+            capabilities,
             old_swapchain,
             self.config.present_mode,
         )?;
@@ -6448,22 +6454,17 @@ impl SwapchainBundle {
         surface: vk::SurfaceKHR,
         surface_format: vk::SurfaceFormatKHR,
         requested_extent: vk::Extent2D,
+        capabilities: vk::SurfaceCapabilitiesKHR,
         old_swapchain: vk::SwapchainKHR,
         requested_present_mode: PresentMode,
     ) -> Result<Self, RenderError> {
-        // SAFETY: device and surface are alive and associated with this instance.
-        let capabilities = unsafe {
-            surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
-        }?;
         if !capabilities.supported_usage_flags.contains(SWAPCHAIN_USAGE) {
             return Err(RenderError::Unsupported(
                 "surface больше не поддерживает COLOR_ATTACHMENT".to_owned(),
             ));
         }
-        let extent = select_surface_extent(capabilities, requested_extent);
-        if extent.width == 0 || extent.height == 0 {
-            return Err(RenderError::InvalidConfig("swapchain extent равен нулю"));
-        }
+        let extent = usable_surface_extent(capabilities, requested_extent)
+            .ok_or(RenderError::InvalidConfig("swapchain extent равен нулю"))?;
         let mut image_count = capabilities.min_image_count.saturating_add(1);
         if capabilities.max_image_count != 0 {
             image_count = image_count.min(capabilities.max_image_count);
@@ -12828,6 +12829,17 @@ fn select_surface_extent(
     }
 }
 
+fn usable_surface_extent(
+    capabilities: vk::SurfaceCapabilitiesKHR,
+    requested: vk::Extent2D,
+) -> Option<vk::Extent2D> {
+    if requested.width == 0 || requested.height == 0 {
+        return None;
+    }
+    let extent = select_surface_extent(capabilities, requested);
+    (extent.width != 0 && extent.height != 0).then_some(extent)
+}
+
 fn select_composite_alpha(
     supported: vk::CompositeAlphaFlagsKHR,
 ) -> Option<vk::CompositeAlphaFlagsKHR> {
@@ -12881,9 +12893,9 @@ mod tests {
         texture_mip_shader_barrier, texture_mip_source_barrier, texture_staging_size,
         texture_upload_barrier, timestamp_duration, transform_tangent_normal,
         upload_batch_capacity, upload_batch_flush_required, upload_data_layout,
-        validate_debug_view, validate_draws, validate_material, validate_mesh, validate_overlay,
-        validate_pipeline_cache, validate_render_scale, validate_texture, validate_view_settings,
-        vertex_bytes,
+        usable_surface_extent, validate_debug_view, validate_draws, validate_material,
+        validate_mesh, validate_overlay, validate_pipeline_cache, validate_render_scale,
+        validate_texture, validate_view_settings, vertex_bytes,
     };
     use super::{LocalShadowKind, SelectedLocalLight};
     use ash::vk;
@@ -15682,6 +15694,93 @@ mod tests {
                 width: 1920,
                 height: 1080,
             }
+        );
+    }
+
+    #[test]
+    fn usable_surface_extent_skips_zero_and_resolves_fixed_or_clamped_sizes() {
+        let variable = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+            min_image_extent: vk::Extent2D {
+                width: 100,
+                height: 100,
+            },
+            max_image_extent: vk::Extent2D {
+                width: 800,
+                height: 600,
+            },
+            ..Default::default()
+        };
+        for requested in [
+            vk::Extent2D {
+                width: 0,
+                height: 720,
+            },
+            vk::Extent2D {
+                width: 1280,
+                height: 0,
+            },
+            vk::Extent2D {
+                width: 0,
+                height: 0,
+            },
+        ] {
+            assert_eq!(usable_surface_extent(variable, requested), None);
+        }
+        assert_eq!(
+            usable_surface_extent(
+                variable,
+                vk::Extent2D {
+                    width: 50,
+                    height: 900,
+                }
+            ),
+            Some(vk::Extent2D {
+                width: 100,
+                height: 600,
+            })
+        );
+
+        let fixed = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            ..variable
+        };
+        assert_eq!(
+            usable_surface_extent(
+                fixed,
+                vk::Extent2D {
+                    width: 1280,
+                    height: 720,
+                }
+            ),
+            Some(vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            })
+        );
+
+        let fixed_zero = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: 1920,
+                height: 0,
+            },
+            ..fixed
+        };
+        assert_eq!(
+            usable_surface_extent(
+                fixed_zero,
+                vk::Extent2D {
+                    width: 1280,
+                    height: 720,
+                }
+            ),
+            None
         );
     }
 
