@@ -563,7 +563,7 @@ impl ScriptHost {
                         Value::String(message) => Some(message.to_string_lossy()),
                         _ => None,
                     })
-                    .map_err(|error| (error.to_string(), false)),
+                    .map_err(|error| (error.to_string(), self.call_deadline.is_expired())),
                 CommandCallback::Abi => {
                     let ScriptKind::Heavy(HeavyInstance::Abi(script)) =
                         &mut self.instances[owner].kind
@@ -600,9 +600,9 @@ impl ScriptHost {
         }
         let result = match result {
             Ok(result) => result,
-            Err((message, panicked)) => {
+            Err((message, disable_owner)) => {
                 self.transaction.discard();
-                if panicked {
+                if disable_owner {
                     self.disable_instance(owner);
                 }
                 self.events.borrow_mut().push(ScriptEvent {
@@ -715,12 +715,6 @@ impl ScriptHost {
                 if !instance.enabled || !is_target {
                     continue;
                 }
-                if matches!(
-                    &instance.kind,
-                    ScriptKind::Lite(lite) if !lite.has_message_callback()
-                ) {
-                    continue;
-                }
                 match self.call_instance(
                     index,
                     world,
@@ -792,28 +786,39 @@ impl ScriptHost {
                     active_owner,
                     Some(index),
                 );
-                let callback = match time_error {
-                    Some(message) => Err(LuaError::runtime(message.to_owned())),
-                    None => lite_instance
-                        .set_transform(initial)
-                        .and_then(|()| match phase {
-                            Phase::Start => lite_instance.invoke_start(),
-                            Phase::Update(dt) => lite_instance.invoke_update(dt),
-                            Phase::Message => match message {
-                                Some(message) => lite_instance.invoke_message(
-                                    lua,
-                                    &message.sender_id,
-                                    &message.name,
-                                    &message.value,
-                                ),
-                                None => Err(LuaError::runtime("missing message data")),
-                            },
-                            Phase::Destroy => lite_instance.invoke_destroy(),
-                        }),
+                let has_callback = if matches!(phase, Phase::Message) {
+                    lite_instance.has_message_callback()
+                } else {
+                    Ok(true)
                 };
-                callback
-                    .and_then(|()| lite_instance.transform())
-                    .map(Some)
+                has_callback
+                    .and_then(|has_callback| {
+                        if !has_callback {
+                            return Ok(None);
+                        }
+                        let callback = match time_error {
+                            Some(message) => Err(LuaError::runtime(message.to_owned())),
+                            None => {
+                                lite_instance
+                                    .set_transform(initial)
+                                    .and_then(|()| match phase {
+                                        Phase::Start => lite_instance.invoke_start(),
+                                        Phase::Update(dt) => lite_instance.invoke_update(dt),
+                                        Phase::Message => match message {
+                                            Some(message) => lite_instance.invoke_message(
+                                                lua,
+                                                &message.sender_id,
+                                                &message.name,
+                                                &message.value,
+                                            ),
+                                            None => Err(LuaError::runtime("missing message data")),
+                                        },
+                                        Phase::Destroy => lite_instance.invoke_destroy(),
+                                    })
+                            }
+                        };
+                        callback.and_then(|()| lite_instance.transform()).map(Some)
+                    })
                     .map_err(|error| error.to_string())
             }
             ScriptKind::Heavy(HeavyInstance::Abi(script)) => {

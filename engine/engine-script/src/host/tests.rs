@@ -1304,6 +1304,144 @@ return Neighbor
 }
 
 #[test]
+fn lua_message_callback_lookup_obeys_the_call_deadline() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/lookup.lua"
+[[assets]]
+path = "/neighbor.lua"
+[[objects]]
+id = "lookup"
+[[objects.lite_scripts]]
+path = "/lookup.lua"
+[[objects]]
+id = "neighbor"
+[[objects.lite_scripts]]
+path = "/neighbor.lua"
+"#,
+    );
+    let lookup_source = r#"
+local Script = {}
+function Script:on_start()
+  setmetatable(Script, { __index = function(_, key)
+    if key == "on_message" then
+      for _ = 1, 100000000 do end
+      rve.log_info("lookup escaped")
+    end
+  end })
+  rve.broadcast("probe", true)
+end
+return Script
+"#;
+    let neighbor_source = r#"
+local Neighbor = {}
+function Neighbor:on_update() rve.log_info("neighbor progressed") end
+return Neighbor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[
+            ("lookup.lua", lookup_source),
+            ("neighbor.lua", neighbor_source),
+        ]),
+        None,
+        ScriptLoadOptions {
+            call_time_limit: Some(Duration::from_millis(50)),
+            ..ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("Lua call exceeded time limit"))
+    );
+    assert!(!events.iter().any(|event| event.message == "lookup escaped"));
+    assert!(!host.instances[0].enabled);
+    assert!(host.instances[1].enabled);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message == "neighbor progressed")
+    );
+}
+
+#[test]
+fn lua_console_deadline_disables_owner_and_removes_its_commands() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/command.lua"
+[[assets]]
+path = "/neighbor.lua"
+[[objects]]
+id = "command"
+[[objects.lite_scripts]]
+path = "/command.lua"
+[[objects]]
+id = "neighbor"
+[[objects.lite_scripts]]
+path = "/neighbor.lua"
+"#,
+    );
+    let command_source = r#"
+local Script = {}
+function Script:on_start()
+  rve.console.register("loop", function() while true do end end)
+  rve.console.register("other", function() end)
+end
+return Script
+"#;
+    let neighbor_source = r#"
+local Neighbor = {}
+function Neighbor:on_update() rve.log_info("neighbor progressed") end
+return Neighbor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[
+            ("command.lua", command_source),
+            ("neighbor.lua", neighbor_source),
+        ]),
+        None,
+        ScriptLoadOptions {
+            call_time_limit: Some(Duration::from_millis(50)),
+            ..ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let command = CommandLine {
+        name: "loop".into(),
+        args: vec![],
+    };
+    assert!(matches!(host.execute_command(&mut world, &command),
+        Err(crate::CommandError::Failed(message)) if message.contains("Lua call exceeded time limit")));
+    assert!(host.command_catalog().get("loop").is_none());
+    assert!(host.command_catalog().get("other").is_none());
+    assert!(!host.instances[0].enabled);
+    assert!(host.instances[1].enabled);
+    assert!(matches!(
+        host.execute_command(&mut world, &command),
+        Err(crate::CommandError::Unknown(_))
+    ));
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message == "neighbor progressed")
+    );
+}
+
+#[test]
 fn lua_call_deadline_cannot_be_caught_by_pcall() {
     let mut world = one_camera(
         "[[assets]]\npath=\"/pcall-loop.lua\"\n[[objects.lite_scripts]]\npath=\"/pcall-loop.lua\"\n",

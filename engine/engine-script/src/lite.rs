@@ -151,6 +151,10 @@ pub(crate) struct ActiveCallDeadline<'lua> {
 }
 
 impl CallDeadline {
+    pub(crate) fn is_expired(&self) -> bool {
+        self.expired.get()
+    }
+
     pub(crate) fn new(call_time_limit: Option<Duration>, interrupted: Arc<AtomicBool>) -> Self {
         Self {
             deadline: Rc::new(Cell::new(None)),
@@ -624,8 +628,10 @@ impl LuaInstance {
         self.invoke("on_destroy", (self.instance.clone(),))
     }
 
-    pub(crate) fn has_message_callback(&self) -> bool {
-        !matches!(self.class.get::<Value>("on_message"), Ok(Value::Nil))
+    pub(crate) fn has_message_callback(&self) -> mlua::Result<bool> {
+        self.class
+            .get::<Value>("on_message")
+            .map(|value| !matches!(value, Value::Nil))
     }
 
     pub(crate) fn invoke_message(
