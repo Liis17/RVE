@@ -1,6 +1,8 @@
 //! Vulkan-рендерер, форматы изображений и материалы сцены.
 
-use ash::{Entry, vk, vk::Handle as _};
+#[cfg(windows)]
+use ash::vk::Handle as _;
+use ash::{Entry, vk};
 
 pub mod environment;
 
@@ -436,6 +438,7 @@ impl AntiAliasing {
     }
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TemporalBackend {
     Taa,
@@ -443,6 +446,7 @@ enum TemporalBackend {
     Dlss,
 }
 
+#[cfg(any(windows, test))]
 fn select_temporal_backend(
     anti_aliasing: AntiAliasing,
     fsr_available: bool,
@@ -1596,6 +1600,7 @@ impl Renderer {
         #[cfg(windows)]
         let frame_time_delta_ms =
             temporal_frame_delta_ms(self.screen_temporal.last_submitted_at, submitted_at);
+        #[cfg(windows)]
         let mut fsr_fallback_reason = None;
         if view.anti_aliasing == AntiAliasing::Fsr {
             #[cfg(windows)]
@@ -1631,7 +1636,6 @@ impl Renderer {
             {
                 let error = "FSR is only available on Windows".to_owned();
                 warn_temporal_fallback("FSR", &mut self.fsr_warning_emitted, &error);
-                fsr_fallback_reason = Some(error);
             }
         } else if view.anti_aliasing == AntiAliasing::Dlss {
             #[cfg(all(windows, feature = "dlss"))]
@@ -1661,7 +1665,10 @@ impl Renderer {
             );
             if let Some(error) = error {
                 warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
-                fsr_fallback_reason = Some(error);
+                #[cfg(windows)]
+                {
+                    fsr_fallback_reason = Some(error);
+                }
             }
         }
         let swapchain = self.swapchain.as_ref().ok_or(RenderError::InvalidState(
@@ -1888,6 +1895,7 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("offscreen target отсутствует"))?;
         let mut shadow_layout = self.shadow_layout;
         let mut local_shadow_layout = self.local_shadow_layout;
+        #[cfg(windows)]
         let temporal_backend = select_temporal_backend(
             view.anti_aliasing,
             self.capabilities.fsr,
@@ -1911,6 +1919,7 @@ impl Renderer {
                 .flatten();
             Some(TemporalResolveRecord {
                 history,
+                #[cfg(windows)]
                 backend: temporal_backend,
                 plan: temporal_plan,
                 taa_pipeline: self
@@ -2127,7 +2136,7 @@ impl Renderer {
         self.flush_uploads()?;
         self.retired.slot_completed(frame_slot);
         let submitted_at = Instant::now();
-        for ((viewport, frame), (_, _, fallback_reason, frame_delta_ms)) in
+        for ((viewport, frame), (_, _, _fallback_reason, _frame_delta_ms)) in
             scenes.iter().zip(&mut prepared_scenes)
         {
             let extent = self.viewports[viewport.0]
@@ -2139,7 +2148,8 @@ impl Renderer {
                     .as_mut()
                     .ok_or_else(unknown_viewport)?
                     .temporal;
-                *frame_delta_ms = temporal_frame_delta_ms(temporal.last_submitted_at, submitted_at);
+                *_frame_delta_ms =
+                    temporal_frame_delta_ms(temporal.last_submitted_at, submitted_at);
             }
             let view = effective_view_settings(frame.view, frame.debug_view);
             if extent.width > 0 && extent.height > 0 && view.anti_aliasing.is_temporal() {
@@ -2161,7 +2171,7 @@ impl Renderer {
                     let Some(api) = self.fsr_api.as_ref().cloned() else {
                         let error = "FSR capability has no loaded API".to_owned();
                         warn_temporal_fallback("FSR", &mut self.fsr_warning_emitted, &error);
-                        *fallback_reason = Some(error);
+                        *_fallback_reason = Some(error);
                         continue;
                     };
                     let entry = self.viewports[viewport.0]
@@ -2178,7 +2188,7 @@ impl Renderer {
                         &mut self.retired,
                     ) {
                         warn_temporal_fallback("FSR", &mut self.fsr_warning_emitted, &error);
-                        *fallback_reason = Some(error);
+                        *_fallback_reason = Some(error);
                     }
                 } else {
                     let error = self
@@ -2186,13 +2196,12 @@ impl Renderer {
                         .clone()
                         .unwrap_or_else(|| "FSR runtime is unavailable".to_owned());
                     warn_temporal_fallback("FSR", &mut self.fsr_warning_emitted, &error);
-                    *fallback_reason = Some(error);
+                    *_fallback_reason = Some(error);
                 }
                 #[cfg(not(windows))]
                 {
                     let error = "FSR is only available on Windows".to_owned();
                     warn_temporal_fallback("FSR", &mut self.fsr_warning_emitted, &error);
-                    *fallback_reason = Some(error);
                 }
             } else if extent.width > 0
                 && extent.height > 0
@@ -2213,7 +2222,7 @@ impl Renderer {
                         &mut self.retired,
                     ) {
                         warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
-                        *fallback_reason = Some(error);
+                        *_fallback_reason = Some(error);
                     }
                 } else {
                     let error = self
@@ -2221,7 +2230,7 @@ impl Renderer {
                         .clone()
                         .unwrap_or_else(|| "DLSS runtime is unavailable".to_owned());
                     warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
-                    *fallback_reason = Some(error);
+                    *_fallback_reason = Some(error);
                 }
                 #[cfg(not(all(windows, feature = "dlss")))]
                 {
@@ -2230,7 +2239,10 @@ impl Renderer {
                         .clone()
                         .unwrap_or_else(|| "DLSS support is unavailable".to_owned());
                     warn_temporal_fallback("DLSS", &mut self.dlss_warning_emitted, &error);
-                    *fallback_reason = Some(error);
+                    #[cfg(windows)]
+                    {
+                        *_fallback_reason = Some(error);
+                    }
                 }
             }
         }
@@ -2586,8 +2598,8 @@ impl Renderer {
             pass,
             tonemap_set,
             output_set,
-            frame_delta_ms,
-            upscaler_fallback_reason,
+            _frame_delta_ms,
+            _upscaler_fallback_reason,
         ) in &scene_passes
         {
             let Some(entry) = self.viewports[viewport.0].as_mut() else {
@@ -2614,21 +2626,23 @@ impl Renderer {
                     .history
                     .as_ref()
                     .ok_or(RenderError::InvalidState("TAA history отсутствует"))?;
+                #[cfg(windows)]
                 let backend = select_temporal_backend(
                     pass.view.anti_aliasing,
                     self.capabilities.fsr,
                     self.capabilities.dlss,
                 );
                 #[cfg(windows)]
-                let fsr = (backend == TemporalBackend::Fsr && upscaler_fallback_reason.is_none())
+                let fsr = (backend == TemporalBackend::Fsr && _upscaler_fallback_reason.is_none())
                     .then_some(temporal.fsr.as_deref_mut())
                     .flatten();
                 #[cfg(all(windows, feature = "dlss"))]
                 let dlss_api = self.dlss_api.as_ref();
                 #[cfg(all(windows, feature = "dlss"))]
-                let dlss = (backend == TemporalBackend::Dlss && upscaler_fallback_reason.is_none())
-                    .then_some(temporal.dlss.as_deref_mut())
-                    .flatten();
+                let dlss = (backend == TemporalBackend::Dlss
+                    && _upscaler_fallback_reason.is_none())
+                .then_some(temporal.dlss.as_deref_mut())
+                .flatten();
                 Some(record_temporal_resolve_and_tonemap(
                     &device,
                     command_buffer,
@@ -2647,6 +2661,7 @@ impl Renderer {
                     target.taa_set,
                     TemporalResolveRecord {
                         history,
+                        #[cfg(windows)]
                         backend,
                         plan: pass.temporal_plan,
                         taa_pipeline,
@@ -2656,7 +2671,7 @@ impl Renderer {
                         #[cfg(windows)]
                         exposure_ev: pass.view.exposure_ev,
                         #[cfg(windows)]
-                        frame_time_delta_ms: *frame_delta_ms,
+                        frame_time_delta_ms: *_frame_delta_ms,
                         #[cfg(windows)]
                         camera: pass.fsr_camera,
                         #[cfg(all(windows, feature = "dlss"))]
@@ -7899,6 +7914,7 @@ impl Drop for DeviceImage {
 
 struct TemporalResolveRecord<'a> {
     history: &'a TemporalHistory,
+    #[cfg(windows)]
     backend: TemporalBackend,
     plan: TemporalPlan,
     taa_pipeline: vk::Pipeline,
@@ -7919,6 +7935,7 @@ struct TemporalResolveRecord<'a> {
 
 struct TemporalResolveOutcome {
     used_taa: bool,
+    #[cfg(windows)]
     used_fsr: bool,
     #[cfg(all(windows, feature = "dlss"))]
     used_dlss: bool,
@@ -7945,21 +7962,31 @@ fn record_temporal_resolve_and_tonemap(
     tonemap_pipeline: vk::Pipeline,
     post_pipeline_layout: vk::PipelineLayout,
     taa_set: vk::DescriptorSet,
-    mut resolve: TemporalResolveRecord<'_>,
+    resolve: TemporalResolveRecord<'_>,
 ) -> Result<TemporalResolveOutcome, RenderError> {
+    #[cfg(windows)]
     let mut fsr_error = None;
+    #[cfg(not(windows))]
+    let fsr_error = None;
     #[cfg(all(windows, feature = "dlss"))]
     let mut dlss_error = None;
+    #[cfg(windows)]
     let mut used_taa = true;
+    #[cfg(not(windows))]
+    let used_taa = true;
+    #[cfg(windows)]
     let mut used_fsr = false;
     #[cfg(all(windows, feature = "dlss"))]
     let mut used_dlss = false;
+    #[cfg(windows)]
     let mut reset_taa_history = false;
+    #[cfg(not(windows))]
+    let reset_taa_history = false;
     #[cfg(windows)]
     let mut resolved_source = None;
     #[cfg(windows)]
     if resolve.backend == TemporalBackend::Fsr
-        && let Some(fsr) = resolve.fsr.as_deref_mut()
+        && let Some(fsr) = resolve.fsr
     {
         match record_fsr_pass(
             device,
@@ -7984,7 +8011,7 @@ fn record_temporal_resolve_and_tonemap(
     }
     #[cfg(all(windows, feature = "dlss"))]
     if resolve.backend == TemporalBackend::Dlss
-        && let (Some(api), Some(dlss)) = (resolve.dlss_api, resolve.dlss.as_deref_mut())
+        && let (Some(api), Some(dlss)) = (resolve.dlss_api, resolve.dlss)
     {
         match record_dlss_pass(
             device,
@@ -8059,6 +8086,7 @@ fn record_temporal_resolve_and_tonemap(
     );
     Ok(TemporalResolveOutcome {
         used_taa,
+        #[cfg(windows)]
         used_fsr,
         #[cfg(all(windows, feature = "dlss"))]
         used_dlss,
