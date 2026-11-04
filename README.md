@@ -117,11 +117,11 @@ Homebrew). Передай `--rust-toolchain` sysroot активной macOS tool
 distribution player собирается в `build/player`, dev-player — в `build/player-dev`.
 
 Workflow `.github/workflows/sdk-release.yml` публикует Windows x64 дистрибутив
-`sdk-verified.zip` в GitHub Releases после подходящих push в `main`. Изменения
+`sdk-verified.zip` в GitHub Releases после подходящих push в `mommy`. Изменения
 редактора, builder, player, гостевого API и их транзитивных Cargo-зависимостей,
 общих настроек Cargo или самого конвейера публикации запускают сборку. Изменения
 документации, примеров и независимых инструментов её пропускают. Ручной запуск
-`SDK Release` из `main` принудительно собирает дистрибутив.
+`SDK Release` из `mommy` принудительно собирает дистрибутив.
 Каждый коммит получает отдельный prerelease `sdk-<полный SHA>`; повторный запуск
 обновляет ZIP в том же релизе. Обычный latest release не меняется. Перед публикацией
 архив распаковывается во временный каталог, где из шаблона New Project собираются

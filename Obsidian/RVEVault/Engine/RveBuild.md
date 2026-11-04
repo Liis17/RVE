@@ -11,12 +11,12 @@ dev-режиме. Инструмент является внешним crate wor
 ## Конвейер
 
 Автоматическая публикация Windows x64 SDK описана в
-`.github/workflows/sdk-release.yml`: push в `main` проходит отбор
+`.github/workflows/sdk-release.yml`: push в `mommy` проходит отбор
 `.github/scripts/select_sdk_release.py` по графу зависимостей Cargo из
 `affected_packages.py`. Выпуск нужен при изменении `rve-editor`, `rve-build`,
 `rve-player`, `rve-sdk` или их зависимостей, общих настроек сборки и файлов
 конвейера выпуска. Документация, примеры и независимые инструменты пропускаются.
-Ручной запуск из `main` принудительный; отсутствие базы сравнения также требует сборки.
+Ручной запуск из `mommy` принудительный; отсутствие базы сравнения также требует сборки.
 SDK собирается MSVC с bundled GNU toolchain, затем
 `package_sdk_release.py` создаёт `sdk-verified.zip` с корнем `sdk-verified/`,
 распаковывает его во временный каталог и проверяет `scripts` и `build` на шаблоне

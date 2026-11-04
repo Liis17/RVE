@@ -2,7 +2,7 @@ name: SDK Release
 
 on:
   push:
-    branches: [main]
+    branches: [mommy]
   workflow_dispatch:
 
 permissions:
@@ -31,7 +31,7 @@ jobs:
   release:
     name: Build and publish Windows x64 SDK
     needs: changes
-    if: ${{ needs.changes.outputs.build_sdk == 'true' && github.ref == 'refs/heads/main' }}
+    if: ${{ needs.changes.outputs.build_sdk == 'true' && github.ref == 'refs/heads/mommy' }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
