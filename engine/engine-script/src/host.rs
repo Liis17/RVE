@@ -2,7 +2,7 @@ use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
 use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LuaCommands,
-    LuaInstance, RegisteredCommandCallback,
+    LuaInstance, RegisteredCommandCallback, ScriptEventQueue,
 };
 use crate::transaction::{
     MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction,
@@ -20,6 +20,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 /// Script source compilation or heavy-factory failure during host creation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +75,15 @@ impl Error for ScriptLoadError {}
 #[derive(Clone, Debug)]
 pub struct ScriptInterruptHandle {
     interrupted: Arc<AtomicBool>,
+}
+
+/// Options that control Lua loading and per-call execution.
+///
+/// The time limit applies to Lua instruction execution; synchronous Rust ABI callbacks cannot be preempted.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptLoadOptions {
+    pub interrupt: ScriptInterruptHandle,
+    pub call_time_limit: Option<Duration>,
 }
 
 impl ScriptInterruptHandle {
@@ -138,6 +148,7 @@ pub struct ScriptHost {
     queued_bytes: usize,
     delivery_messages: Vec<PendingMessage>,
     lua_time: Table,
+    call_deadline: lite::CallDeadline,
     interrupt: ScriptInterruptHandle,
     scene_name: String,
     interruption_reported: bool,
@@ -190,12 +201,37 @@ impl ScriptHost {
         library: Option<&ScriptLibrary>,
         interrupt: ScriptInterruptHandle,
     ) -> Result<Self, ScriptLoadError> {
-        let events = Rc::new(RefCell::new(Vec::new()));
+        Self::load_with_options(
+            world,
+            scene_name,
+            sources,
+            library,
+            ScriptLoadOptions {
+                interrupt,
+                call_time_limit: None,
+            },
+        )
+    }
+
+    /// Loads scripts with a sticky interrupt and an optional limit for each Lua call.
+    pub fn load_with_options(
+        world: &World,
+        scene_name: &str,
+        sources: &BTreeMap<String, String>,
+        library: Option<&ScriptLibrary>,
+        options: ScriptLoadOptions,
+    ) -> Result<Self, ScriptLoadError> {
+        let ScriptLoadOptions {
+            interrupt,
+            call_time_limit,
+        } = options;
+        let events = Rc::new(RefCell::new(ScriptEventQueue::default()));
         let active_source = Rc::new(RefCell::new(scene_name.to_owned()));
         let active_call = Rc::new(Cell::new(std::ptr::null_mut()));
         let active_owner = Rc::new(Cell::new(None));
         let commands = Rc::new(RefCell::new(BTreeMap::new()));
         let commands_generation = Rc::new(Cell::new(0));
+        let call_deadline = lite::CallDeadline::new(call_time_limit, interrupt.interrupted.clone());
         let lua_state = lite::create_lua(
             events.clone(),
             active_source.clone(),
@@ -203,7 +239,7 @@ impl ScriptHost {
             active_owner.clone(),
             commands.clone(),
             commands_generation.clone(),
-            interrupt.interrupted.clone(),
+            call_deadline,
         )
         .map_err(|error| ScriptLoadError::LuaHost(error.to_string()))?;
         let lua = lua_state.lua;
@@ -224,6 +260,7 @@ impl ScriptHost {
             queued_bytes: 0,
             delivery_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             lua_time: lua_state.time,
+            call_deadline: lua_state.call_deadline,
             interrupt,
             scene_name: scene_name.to_owned(),
             interruption_reported: false,
@@ -258,6 +295,8 @@ impl ScriptHost {
                         (host.queued_messages.len(), host.queued_bytes),
                     );
                     let _active_call = ActiveCallGuard::new(
+                        &host.lua,
+                        Some(&host.call_deadline),
                         &host.active_call,
                         &mut host.transaction as *mut ScriptTransaction,
                         &host.active_owner,
@@ -416,7 +455,7 @@ impl ScriptHost {
 
     /// Takes all log and runtime-error events accumulated since the previous drain.
     pub fn drain_events(&mut self) -> Vec<ScriptEvent> {
-        std::mem::take(&mut *self.events.borrow_mut())
+        self.events.borrow_mut().drain()
     }
 
     pub fn command_catalog(&self) -> CommandCatalog {
@@ -507,7 +546,11 @@ impl ScriptHost {
         );
         let transaction_ptr = &mut self.transaction as *mut ScriptTransaction;
         let result: Result<Option<String>, (String, bool)> = {
+            let call_deadline =
+                matches!(&callback, CommandCallback::Lua(_)).then_some(&self.call_deadline);
             let _guard = ActiveCallGuard::new(
+                &self.lua,
+                call_deadline,
                 &self.active_call,
                 transaction_ptr,
                 &self.active_owner,
@@ -520,7 +563,7 @@ impl ScriptHost {
                         Value::String(message) => Some(message.to_string_lossy()),
                         _ => None,
                     })
-                    .map_err(|error| (error.to_string(), false)),
+                    .map_err(|error| (error.to_string(), self.call_deadline.is_expired())),
                 CommandCallback::Abi => {
                     let ScriptKind::Heavy(HeavyInstance::Abi(script)) =
                         &mut self.instances[owner].kind
@@ -557,9 +600,9 @@ impl ScriptHost {
         }
         let result = match result {
             Ok(result) => result,
-            Err((message, panicked)) => {
+            Err((message, disable_owner)) => {
                 self.transaction.discard();
-                if panicked {
+                if disable_owner {
                     self.disable_instance(owner);
                 }
                 self.events.borrow_mut().push(ScriptEvent {
@@ -672,12 +715,6 @@ impl ScriptHost {
                 if !instance.enabled || !is_target {
                     continue;
                 }
-                if matches!(
-                    &instance.kind,
-                    ScriptKind::Lite(lite) if !lite.has_message_callback()
-                ) {
-                    continue;
-                }
                 match self.call_instance(
                     index,
                     world,
@@ -712,6 +749,7 @@ impl ScriptHost {
             active_source,
             active_call,
             active_owner,
+            call_deadline,
             transaction,
             input,
             queued_messages,
@@ -740,30 +778,47 @@ impl ScriptHost {
         let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {
             ScriptKind::Lite(lite_instance) => {
                 *active_source.borrow_mut() = instance.source.clone();
-                let _active_call =
-                    ActiveCallGuard::new(active_call, transaction_ptr, active_owner, Some(index));
-                let callback = match time_error {
-                    Some(message) => Err(LuaError::runtime(message.to_owned())),
-                    None => lite_instance
-                        .set_transform(initial)
-                        .and_then(|()| match phase {
-                            Phase::Start => lite_instance.invoke_start(),
-                            Phase::Update(dt) => lite_instance.invoke_update(dt),
-                            Phase::Message => match message {
-                                Some(message) => lite_instance.invoke_message(
-                                    lua,
-                                    &message.sender_id,
-                                    &message.name,
-                                    &message.value,
-                                ),
-                                None => Err(LuaError::runtime("missing message data")),
-                            },
-                            Phase::Destroy => lite_instance.invoke_destroy(),
-                        }),
+                let _active_call = ActiveCallGuard::new(
+                    lua,
+                    Some(call_deadline),
+                    active_call,
+                    transaction_ptr,
+                    active_owner,
+                    Some(index),
+                );
+                let has_callback = if matches!(phase, Phase::Message) {
+                    lite_instance.has_message_callback()
+                } else {
+                    Ok(true)
                 };
-                callback
-                    .and_then(|()| lite_instance.transform())
-                    .map(Some)
+                has_callback
+                    .and_then(|has_callback| {
+                        if !has_callback {
+                            return Ok(None);
+                        }
+                        let callback = match time_error {
+                            Some(message) => Err(LuaError::runtime(message.to_owned())),
+                            None => {
+                                lite_instance
+                                    .set_transform(initial)
+                                    .and_then(|()| match phase {
+                                        Phase::Start => lite_instance.invoke_start(),
+                                        Phase::Update(dt) => lite_instance.invoke_update(dt),
+                                        Phase::Message => match message {
+                                            Some(message) => lite_instance.invoke_message(
+                                                lua,
+                                                &message.sender_id,
+                                                &message.name,
+                                                &message.value,
+                                            ),
+                                            None => Err(LuaError::runtime("missing message data")),
+                                        },
+                                        Phase::Destroy => lite_instance.invoke_destroy(),
+                                    })
+                            }
+                        };
+                        callback.and_then(|()| lite_instance.transform()).map(Some)
+                    })
                     .map_err(|error| error.to_string())
             }
             ScriptKind::Heavy(HeavyInstance::Abi(script)) => {
@@ -901,13 +956,16 @@ enum CallOutcome {
     Failed(String),
 }
 
-struct ActiveCallGuard {
+struct ActiveCallGuard<'lua> {
     active_call: ActiveCall,
     active_owner: ActiveOwner,
+    _deadline: Option<lite::ActiveCallDeadline<'lua>>,
 }
 
-impl ActiveCallGuard {
+impl<'lua> ActiveCallGuard<'lua> {
     fn new(
+        lua: &'lua Lua,
+        call_deadline: Option<&lite::CallDeadline>,
         active_call: &ActiveCall,
         transaction: *mut ScriptTransaction,
         active_owner: &ActiveOwner,
@@ -918,11 +976,12 @@ impl ActiveCallGuard {
         Self {
             active_call: active_call.clone(),
             active_owner: active_owner.clone(),
+            _deadline: call_deadline.map(|deadline| deadline.enter(lua)),
         }
     }
 }
 
-impl Drop for ActiveCallGuard {
+impl Drop for ActiveCallGuard<'_> {
     fn drop(&mut self) {
         self.active_call.set(std::ptr::null_mut());
         self.active_owner.set(None);

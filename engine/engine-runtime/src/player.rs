@@ -23,13 +23,13 @@ use engine_window::{Key, MouseButton, Window, WindowConfig, WindowHandler, Windo
 use flume::{Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-#[cfg(feature = "dev-console")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(feature = "dev-console")]
 use winit::event::{ElementState, WindowEvent};
 #[cfg(feature = "dev-console")]
 use winit::keyboard::{KeyCode, PhysicalKey};
+
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct WindowExit(WindowProxy);
 
@@ -125,6 +125,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         interrupt,
         status: Arc::clone(&status),
         render_stopped_rx: None,
+        close_deadline: None,
         window_exit: None,
         render_started: false,
         cleaned: false,
@@ -186,6 +187,7 @@ struct PlayerWindow<'a> {
     interrupt: ScriptInterruptHandle,
     status: Arc<RuntimeStatus>,
     render_stopped_rx: Option<Receiver<()>>,
+    close_deadline: Option<Instant>,
     window_exit: Option<Arc<dyn ExitRequester>>,
     render_started: bool,
     cleaned: bool,
@@ -252,12 +254,11 @@ impl PlayerWindow<'_> {
         if self.render_started && !self.status.render_stopped() {
             let _ = self.render_tx.send(RenderControl::Shutdown);
             if let Some(receiver) = &self.render_stopped_rx {
-                wait_for_render_or_detach(
-                    self.modules,
-                    &self.status,
-                    receiver,
-                    Duration::from_secs(2),
-                );
+                let timeout = self
+                    .close_deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(CLOSE_TIMEOUT);
+                wait_for_render_or_detach(self.modules, &self.status, receiver, timeout);
             }
         }
 
@@ -640,13 +641,17 @@ impl WindowHandler for PlayerWindow<'_> {
         }
     }
 
-    #[cfg(feature = "dev-console")]
     fn next_wakeup(&mut self) -> Option<Instant> {
-        if self.console_open {
-            self.console_repaint_at
-        } else {
-            None
+        #[cfg(feature = "dev-console")]
+        if self.console_open
+            && let Some(console_wakeup) = self.console_repaint_at
+        {
+            return Some(
+                self.close_deadline
+                    .map_or(console_wakeup, |current| current.min(console_wakeup)),
+            );
         }
+        self.close_deadline
     }
 
     fn init(&mut self, window: Arc<Window>) -> bool {
@@ -737,10 +742,20 @@ impl WindowHandler for PlayerWindow<'_> {
         true
     }
 
-    #[cfg(feature = "dev-console")]
-    fn update(&mut self, window: &Window) -> bool {
-        self.update_console(window);
-        true
+    fn update(&mut self, _window: &Window) -> bool {
+        if close_timed_out(
+            Instant::now(),
+            self.close_deadline,
+            self.status.render_stopped(),
+        ) {
+            self.status
+                .record_failure("поток рендера не завершился после закрытия окна");
+            false
+        } else {
+            #[cfg(feature = "dev-console")]
+            self.update_console(_window);
+            true
+        }
     }
 
     fn resized(&mut self, width: u32, height: u32) {
@@ -752,6 +767,8 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 
     fn close_requested(&mut self) -> bool {
+        self.close_deadline
+            .get_or_insert_with(|| Instant::now() + CLOSE_TIMEOUT);
         let _ = self.script_tx.send(ScriptControl::Shutdown);
         let _ = self.render_tx.send(RenderControl::Shutdown);
         false
@@ -843,6 +860,10 @@ impl WindowHandler for PlayerWindow<'_> {
     }
 }
 
+fn close_timed_out(now: Instant, deadline: Option<Instant>, render_stopped: bool) -> bool {
+    !render_stopped && deadline.is_some_and(|deadline| now >= deadline)
+}
+
 #[cfg(feature = "dev-console")]
 fn next_debug_view(current: DebugView, wireframe_supported: bool) -> DebugView {
     let views = [
@@ -905,14 +926,28 @@ mod debug_view_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeThreads, cleanup_threads, wait_for_render_or_detach, wait_for_scripts_or_detach,
+        RuntimeThreads, cleanup_threads, close_timed_out, wait_for_render_or_detach,
+        wait_for_scripts_or_detach,
     };
     use crate::module_host::ModuleHost;
     use crate::pipeline::RuntimeStatus;
     use engine_script::ScriptInterruptHandle;
     use flume::bounded;
     use std::sync::{Arc, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn close_timeout_only_expires_when_renderer_is_still_live() {
+        let now = Instant::now();
+        assert!(!close_timed_out(now, None, false));
+        assert!(!close_timed_out(
+            now,
+            Some(now + Duration::from_millis(1)),
+            false
+        ));
+        assert!(close_timed_out(now, Some(now), false));
+        assert!(!close_timed_out(now, Some(now), true));
+    }
 
     #[derive(Default)]
     struct FakeThreads(Vec<String>);

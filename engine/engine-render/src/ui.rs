@@ -2,6 +2,7 @@
 
 use crate::RenderError;
 use ash::vk;
+use std::collections::VecDeque;
 
 /// Вершина UI pass.
 ///
@@ -215,6 +216,96 @@ pub(crate) struct RetireQueue<T> {
     entries: Vec<(u32, u64, T)>,
 }
 
+/// Swapchains retired while older submissions and presentations may still reference them.
+///
+/// The release condition is a conservative heuristic: all frame slots must wait for a
+/// submission made after retirement, and at least one successful present per old image must
+/// follow. Vulkan does not guarantee that this proves presentation-engine completion; a
+/// swapchain present-fence extension would provide an exact signal.
+pub(crate) struct RetiredSwapchains<T> {
+    all_slots: u32,
+    entries: VecDeque<(u32, u64, u64, usize, T)>,
+}
+
+impl<T> RetiredSwapchains<T> {
+    const CAPACITY: usize = 4;
+
+    pub fn new(slot_count: usize) -> Self {
+        Self {
+            all_slots: (1_u32 << slot_count) - 1,
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// Retires a swapchain and returns the oldest item when the bounded queue overflows.
+    pub fn retire(
+        &mut self,
+        swapchain: T,
+        retired_at_submission_generation: u64,
+        replacement_generation: u64,
+        old_image_count: usize,
+    ) -> Option<T> {
+        self.entries.push_back((
+            self.all_slots,
+            retired_at_submission_generation,
+            replacement_generation,
+            old_image_count,
+            swapchain,
+        ));
+        self.collect();
+        if self.entries.len() > Self::CAPACITY {
+            self.entries
+                .pop_front()
+                .map(|(_, _, _, _, swapchain)| swapchain)
+        } else {
+            None
+        }
+    }
+
+    /// A slot counts only after waiting for a submission generation newer than retirement.
+    pub fn slot_completed(&mut self, slot: usize, submission_generation: u64) {
+        for (pending_slots, retired_at, _, _, _) in &mut self.entries {
+            if submission_generation > *retired_at {
+                *pending_slots &= !(1_u32 << slot);
+            }
+        }
+        self.collect();
+    }
+
+    /// Counts only successful presents of the replacement swapchain.
+    pub fn presented(&mut self, replacement_generation: u64) {
+        for (_, _, item_replacement_generation, pending_presents, _) in &mut self.entries {
+            if *item_replacement_generation == replacement_generation {
+                *pending_presents = pending_presents.saturating_sub(1);
+            }
+        }
+        self.collect();
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= Self::CAPACITY
+    }
+
+    /// Removes the oldest swapchain; the caller must first wait for device idle.
+    pub fn remove_oldest_after_idle(&mut self) -> Option<T> {
+        self.entries
+            .pop_front()
+            .map(|(_, _, _, _, swapchain)| swapchain)
+    }
+
+    fn collect(&mut self) {
+        self.entries
+            .retain(|(pending_slots, _, _, pending_presents, _)| {
+                *pending_slots != 0 || *pending_presents != 0
+            });
+    }
+
+    /// Destroys all retired swapchains; valid only after `device_wait_idle`.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 impl<T> RetireQueue<T> {
     pub fn new(slot_count: usize) -> Self {
         Self {
@@ -397,6 +488,54 @@ mod tests {
         queue.retire(Rc::clone(&resource), 0);
         queue.clear();
         assert_eq!(Rc::strong_count(&resource), 1);
+    }
+
+    #[test]
+    fn retired_swapchain_waits_for_post_retirement_slots_and_successful_presents() {
+        let swapchain = Rc::new(());
+        let mut queue = RetiredSwapchains::new(2);
+        assert!(queue.retire(Rc::clone(&swapchain), 4, 8, 2).is_none());
+
+        queue.slot_completed(0, 4);
+        queue.slot_completed(1, 4);
+        queue.presented(9);
+        queue.presented(9);
+        assert_eq!(Rc::strong_count(&swapchain), 2);
+
+        queue.slot_completed(0, 5);
+        assert_eq!(Rc::strong_count(&swapchain), 2);
+        queue.slot_completed(1, 5);
+        assert_eq!(Rc::strong_count(&swapchain), 2);
+        queue.presented(8);
+        assert_eq!(Rc::strong_count(&swapchain), 2);
+        queue.presented(8);
+        assert_eq!(Rc::strong_count(&swapchain), 1);
+    }
+
+    #[test]
+    fn retired_swapchain_queue_overflow_returns_the_oldest_item() {
+        let swapchains = (0..5).map(|_| Rc::new(())).collect::<Vec<_>>();
+        let mut queue = RetiredSwapchains::new(2);
+        for swapchain in &swapchains[..4] {
+            assert!(queue.retire(Rc::clone(swapchain), 0, 1, 1).is_none());
+        }
+        let oldest = queue.retire(Rc::clone(&swapchains[4]), 0, 1, 1).unwrap();
+        assert!(Rc::ptr_eq(&oldest, &swapchains[0]));
+        assert_eq!(Rc::strong_count(&swapchains[0]), 2);
+        drop(oldest);
+        assert_eq!(Rc::strong_count(&swapchains[0]), 1);
+    }
+
+    #[test]
+    fn retired_swapchains_are_dropped_by_clear() {
+        let first = Rc::new(());
+        let second = Rc::new(());
+        let mut queue = RetiredSwapchains::new(2);
+        queue.retire(Rc::clone(&first), 0, 1, 1);
+        queue.retire(Rc::clone(&second), 0, 1, 1);
+        queue.clear();
+        assert_eq!(Rc::strong_count(&first), 1);
+        assert_eq!(Rc::strong_count(&second), 1);
     }
 
     #[test]

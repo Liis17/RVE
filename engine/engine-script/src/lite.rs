@@ -20,11 +20,16 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const LUA_HOOK_INSTRUCTION_INTERVAL: u32 = 1_000;
 const LUA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-pub(crate) type EventQueue = Rc<RefCell<Vec<ScriptEvent>>>;
+pub(crate) const MAX_PENDING_LOG_EVENTS: usize = 1_024;
+pub(crate) const MAX_LOG_MESSAGE_BYTES: usize = 4_096;
+const LOG_TRUNCATION_MARKER: &str = "…";
+
+pub(crate) type EventQueue = Rc<RefCell<ScriptEventQueue>>;
 pub(crate) type ActiveSource = Rc<RefCell<String>>;
 pub(crate) type ActiveCall = Rc<Cell<*mut ScriptTransaction>>;
 pub(crate) type ActiveOwner = Rc<Cell<Option<usize>>>;
@@ -43,10 +48,201 @@ pub(crate) struct RegisteredLuaCommand {
 
 pub(crate) type LuaCommands = Rc<RefCell<std::collections::BTreeMap<String, RegisteredLuaCommand>>>;
 
+#[derive(Default)]
+pub(crate) struct ScriptEventQueue {
+    events: Vec<ScriptEvent>,
+    pending_log_events: usize,
+    dropped_log_events: usize,
+}
+
+impl ScriptEventQueue {
+    pub(crate) fn push(&mut self, event: ScriptEvent) {
+        self.events.push(event);
+    }
+
+    pub(crate) fn push_log(&mut self, mut event: ScriptEvent) {
+        if !self.has_log_capacity() {
+            self.record_dropped_log();
+            return;
+        }
+        truncate_log_message(&mut event.message);
+        self.pending_log_events += 1;
+        self.events.push(event);
+    }
+
+    pub(crate) fn has_log_capacity(&self) -> bool {
+        self.pending_log_events < MAX_PENDING_LOG_EVENTS
+    }
+
+    pub(crate) fn record_dropped_log(&mut self) {
+        self.dropped_log_events = self.dropped_log_events.saturating_add(1);
+    }
+
+    pub(crate) fn drain(&mut self) -> Vec<ScriptEvent> {
+        let mut events = std::mem::take(&mut self.events);
+        if self.dropped_log_events > 0 {
+            events.push(ScriptEvent {
+                level: ScriptEventLevel::Warn,
+                source: "engine-script".to_owned(),
+                message: format!("{} script log messages dropped", self.dropped_log_events),
+            });
+        }
+        self.pending_log_events = 0;
+        self.dropped_log_events = 0;
+        events
+    }
+}
+
+impl std::ops::Deref for ScriptEventQueue {
+    type Target = [ScriptEvent];
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+fn truncate_log_message(message: &mut String) {
+    if message.len() > MAX_LOG_MESSAGE_BYTES {
+        truncate_to_boundary(message, MAX_LOG_MESSAGE_BYTES - LOG_TRUNCATION_MARKER.len());
+        message.push_str(LOG_TRUNCATION_MARKER);
+    }
+}
+
+fn truncate_to_boundary(message: &mut String, max_bytes: usize) {
+    let mut end = max_bytes.min(message.len());
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+}
+
+pub(crate) fn bounded_lua_log_message(bytes: &[u8]) -> String {
+    let prefix_len = bytes.len().min(MAX_LOG_MESSAGE_BYTES);
+    let mut message = String::from_utf8_lossy(&bytes[..prefix_len]).into_owned();
+    if bytes.len() > prefix_len || message.len() > MAX_LOG_MESSAGE_BYTES {
+        truncate_to_boundary(
+            &mut message,
+            MAX_LOG_MESSAGE_BYTES - LOG_TRUNCATION_MARKER.len(),
+        );
+        message.push_str(LOG_TRUNCATION_MARKER);
+    }
+    message
+}
+
 pub(crate) struct LuaState {
     pub(crate) lua: Lua,
     pub(crate) base_environment: Table,
     pub(crate) time: Table,
+    pub(crate) call_deadline: CallDeadline,
+}
+
+#[derive(Clone)]
+pub(crate) struct CallDeadline {
+    deadline: Rc<Cell<Option<Instant>>>,
+    expired: Rc<Cell<bool>>,
+    call_time_limit: Option<Duration>,
+    interrupted: Arc<AtomicBool>,
+}
+
+pub(crate) struct ActiveCallDeadline<'lua> {
+    lua: &'lua Lua,
+    deadline: CallDeadline,
+    owns_deadline: bool,
+}
+
+impl CallDeadline {
+    pub(crate) fn is_expired(&self) -> bool {
+        self.expired.get()
+    }
+
+    pub(crate) fn new(call_time_limit: Option<Duration>, interrupted: Arc<AtomicBool>) -> Self {
+        Self {
+            deadline: Rc::new(Cell::new(None)),
+            expired: Rc::new(Cell::new(false)),
+            call_time_limit,
+            interrupted,
+        }
+    }
+
+    pub(crate) fn enter<'lua>(&self, lua: &'lua Lua) -> ActiveCallDeadline<'lua> {
+        let owns_deadline = if let Some(limit) = self.call_time_limit {
+            if self.deadline.get().is_none() {
+                let now = Instant::now();
+                self.deadline
+                    .set(Some(now.checked_add(limit).unwrap_or(now)));
+                self.expired.set(false);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        ActiveCallDeadline {
+            lua,
+            deadline: self.clone(),
+            owns_deadline,
+        }
+    }
+
+    fn install_sparse_hook(&self, lua: &Lua) -> mlua::Result<()> {
+        let deadline = self.clone();
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(LUA_HOOK_INSTRUCTION_INTERVAL),
+            move |lua, _| {
+                if deadline.interrupted.load(Ordering::Acquire) {
+                    deadline.install_dense_hook(lua)?;
+                    return Err(LuaError::runtime("Lua execution interrupted"));
+                }
+                if deadline
+                    .deadline
+                    .get()
+                    .is_some_and(|expires_at| Instant::now() >= expires_at)
+                {
+                    deadline.expired.set(true);
+                    deadline.install_dense_hook(lua)?;
+                    return Err(LuaError::runtime(deadline.timeout_message()));
+                }
+                Ok(VmState::Continue)
+            },
+        )
+    }
+
+    fn install_dense_hook(&self, lua: &Lua) -> mlua::Result<()> {
+        let interrupted = self.interrupted.clone();
+        let expired = self.expired.clone();
+        let timeout_message = self.timeout_message();
+        lua.set_hook(HookTriggers::new().every_nth_instruction(1), move |_, _| {
+            if interrupted.load(Ordering::Acquire) {
+                Err(LuaError::runtime("Lua execution interrupted"))
+            } else if expired.get() {
+                Err(LuaError::runtime(timeout_message.clone()))
+            } else {
+                Ok(VmState::Continue)
+            }
+        })
+    }
+
+    fn timeout_message(&self) -> String {
+        format!(
+            "Lua call exceeded time limit of {:?}",
+            self.call_time_limit.unwrap_or_default()
+        )
+    }
+}
+
+impl Drop for ActiveCallDeadline<'_> {
+    fn drop(&mut self) {
+        if !self.owns_deadline {
+            return;
+        }
+        let expired = self.deadline.expired.get();
+        self.deadline.deadline.set(None);
+        self.deadline.expired.set(false);
+        if expired && !self.deadline.interrupted.load(Ordering::Acquire) {
+            let _ = self.deadline.install_sparse_hook(self.lua);
+        }
+    }
 }
 
 pub(crate) fn create_lua(
@@ -56,7 +252,7 @@ pub(crate) fn create_lua(
     active_owner: ActiveOwner,
     commands: LuaCommands,
     commands_generation: CommandGeneration,
-    interrupted: Arc<AtomicBool>,
+    call_deadline: CallDeadline,
 ) -> mlua::Result<LuaState> {
     let lua = Lua::new_with(
         // mlua always opens the Lua base library; these flags select the remaining libraries.
@@ -64,31 +260,7 @@ pub(crate) fn create_lua(
         LuaOptions::default(),
     )?;
     lua.set_memory_limit(LUA_MEMORY_LIMIT_BYTES)?;
-    let dense_hook_enabled = Arc::new(AtomicBool::new(false));
-    lua.set_hook(
-        HookTriggers::new().every_nth_instruction(LUA_HOOK_INSTRUCTION_INTERVAL),
-        {
-            let interrupted = interrupted.clone();
-            let dense_hook_enabled = dense_hook_enabled.clone();
-            move |lua, _| {
-                if !interrupted.load(Ordering::Acquire) {
-                    return Ok(VmState::Continue);
-                }
-                if !dense_hook_enabled.load(Ordering::Acquire) {
-                    let interrupted = interrupted.clone();
-                    lua.set_hook(HookTriggers::new().every_nth_instruction(1), move |_, _| {
-                        if interrupted.load(Ordering::Acquire) {
-                            Err(LuaError::runtime("Lua execution interrupted"))
-                        } else {
-                            Ok(VmState::Continue)
-                        }
-                    })?;
-                    dense_hook_enabled.store(true, Ordering::Release);
-                }
-                Err(LuaError::runtime("Lua execution interrupted"))
-            }
-        },
-    )?;
+    call_deadline.install_sparse_hook(&lua)?;
 
     let globals = lua.globals();
     globals.set("dofile", Value::Nil)?;
@@ -157,7 +329,7 @@ pub(crate) fn create_lua(
         lua.create_function({
             let events = events.clone();
             let active_source = active_source.clone();
-            move |_, (text, level): (String, Option<String>)| {
+            move |_, (text, level): (LuaString, Option<String>)| {
                 let level = match level.as_deref().unwrap_or("info") {
                     "log" | "info" => ScriptEventLevel::Info,
                     "warning" | "warn" => ScriptEventLevel::Warn,
@@ -168,10 +340,15 @@ pub(crate) fn create_lua(
                         )));
                     }
                 };
-                events.borrow_mut().push(ScriptEvent {
+                if !events.borrow().has_log_capacity() {
+                    events.borrow_mut().record_dropped_log();
+                    return Ok(());
+                }
+                let message = bounded_lua_log_message(&text.as_bytes());
+                events.borrow_mut().push_log(ScriptEvent {
                     level,
                     source: active_source.borrow().clone(),
-                    message: text,
+                    message,
                 });
                 Ok(())
             }
@@ -204,6 +381,7 @@ pub(crate) fn create_lua(
         lua,
         base_environment: globals,
         time,
+        call_deadline,
     })
 }
 
@@ -381,13 +559,13 @@ pub(crate) fn properties(
     interrupted: Arc<AtomicBool>,
 ) -> Result<Option<ParamSchema>, String> {
     let state = create_lua(
-        Rc::new(RefCell::new(Vec::new())),
+        Rc::new(RefCell::new(ScriptEventQueue::default())),
         Rc::new(RefCell::new(label.to_owned())),
         Rc::new(Cell::new(std::ptr::null_mut())),
         Rc::new(Cell::new(None)),
         Rc::new(RefCell::new(std::collections::BTreeMap::new())),
         Rc::new(Cell::new(0)),
-        interrupted,
+        CallDeadline::new(None, interrupted),
     )
     .map_err(|error| error.to_string())?;
     compile_class(&state.lua, &state.base_environment, label, source).map(|(_, schema)| schema)
@@ -450,8 +628,10 @@ impl LuaInstance {
         self.invoke("on_destroy", (self.instance.clone(),))
     }
 
-    pub(crate) fn has_message_callback(&self) -> bool {
-        !matches!(self.class.get::<Value>("on_message"), Ok(Value::Nil))
+    pub(crate) fn has_message_callback(&self) -> mlua::Result<bool> {
+        self.class
+            .get::<Value>("on_message")
+            .map(|value| !matches!(value, Value::Nil))
     }
 
     pub(crate) fn invoke_message(
@@ -505,18 +685,55 @@ fn log_function(
     level: ScriptEventLevel,
 ) -> mlua::Result<Function> {
     lua.create_function(move |_, arguments: MultiValue| {
-        let mut parts = Vec::with_capacity(arguments.len());
-        for argument in arguments {
-            let string = tostring.call::<LuaString>(argument)?;
-            parts.push(string.to_string_lossy());
+        if !events.borrow().has_log_capacity() {
+            events.borrow_mut().record_dropped_log();
+            return Ok(());
         }
-        events.borrow_mut().push(ScriptEvent {
+        let mut message = String::new();
+        let mut truncated = false;
+        for (index, argument) in arguments.into_iter().enumerate() {
+            let string = tostring.call::<LuaString>(argument)?;
+            if truncated {
+                continue;
+            }
+            let part = bounded_lua_log_message(&string.as_bytes());
+            truncated = append_log_piece(&mut message, &part, index != 0);
+        }
+        events.borrow_mut().push_log(ScriptEvent {
             level,
             source: active_source.borrow().clone(),
-            message: parts.join(" "),
+            message,
         });
         Ok(())
     })
+}
+
+fn append_log_piece(message: &mut String, part: &str, separator: bool) -> bool {
+    let joined_len = message
+        .len()
+        .saturating_add(usize::from(separator))
+        .saturating_add(part.len());
+    if joined_len <= MAX_LOG_MESSAGE_BYTES {
+        if separator {
+            message.push(' ');
+        }
+        message.push_str(part);
+        return false;
+    }
+
+    let content_limit = MAX_LOG_MESSAGE_BYTES - LOG_TRUNCATION_MARKER.len();
+    truncate_to_boundary(message, content_limit);
+    if separator && message.len() < content_limit {
+        message.push(' ');
+    }
+    let available = content_limit - message.len();
+    let mut end = part.len().min(available);
+    while !part.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.push_str(&part[..end]);
+    message.push_str(LOG_TRUNCATION_MARKER);
+    true
 }
 
 fn register_command_function(

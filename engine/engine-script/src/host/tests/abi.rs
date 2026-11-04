@@ -24,6 +24,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 static PROBE_DROPS: AtomicUsize = AtomicUsize::new(0);
 static CREATE_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 static ERROR_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
+static BULK_MESSAGE_DELIVERIES: AtomicUsize = AtomicUsize::new(0);
 
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK
@@ -342,6 +343,9 @@ impl Script for MessageScript {
             );
             assert!(ctx.send("sender", "reply", &Value::Bool(true)));
             ctx.transform.position[2] = 1.0;
+        }
+        if self.role == "receiver" && name == "bulk" {
+            BULK_MESSAGE_DELIVERIES.fetch_add(1, Ordering::SeqCst);
         }
         ctx.log_info(format!("{}:{name}:{sender}", self.role));
     }
@@ -1648,6 +1652,8 @@ params = { role = "receiver" }
 
 #[test]
 fn abi_message_queue_limit_is_shared_and_drops_excess_messages() {
+    let _lock = test_lock();
+    BULK_MESSAGE_DELIVERIES.store(0, Ordering::SeqCst);
     let library = library();
     let mut world = world(
         r#"
@@ -1675,21 +1681,17 @@ params = { role = "receiver" }
 
     let events = host.drain_events();
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.message == "receiver:bulk:sender")
-            .count(),
+        BULK_MESSAGE_DELIVERIES.load(Ordering::SeqCst),
         MAX_MESSAGES_PER_FRAME
     );
     assert!(events.iter().any(|event| {
         event.level == crate::ScriptEventLevel::Error
             && event.message.contains("dropped 4 message(s)")
     }));
-    assert!(
-        events
-            .iter()
-            .any(|event| event.message == "bulk_sender:update")
-    );
+    assert!(events.iter().any(|event| {
+        event.level == crate::ScriptEventLevel::Warn
+            && event.message == "3074 script log messages dropped"
+    }));
 }
 
 #[test]

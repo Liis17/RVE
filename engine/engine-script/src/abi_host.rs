@@ -1,6 +1,7 @@
 use crate::abi_string::read_abi_str;
 use crate::lite::{
-    CommandGeneration, EventQueue, LuaCommands, RegisteredCommandCallback, RegisteredLuaCommand,
+    CommandGeneration, EventQueue, LuaCommands, MAX_LOG_MESSAGE_BYTES, RegisteredCommandCallback,
+    RegisteredLuaCommand,
 };
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
@@ -386,9 +387,11 @@ unsafe extern "C" fn host_set_error(ctx: *mut c_void, message: RveStr) {
 
 unsafe extern "C" fn host_log(ctx: *mut c_void, level: u32, message: RveStr) {
     guarded(ctx, (), |context| {
-        let message = unsafe { read_abi_str(message) }
-            .map(str::to_owned)
-            .unwrap_or_else(|_| "guest supplied an invalid log message".to_owned());
+        if !context.events.borrow().has_log_capacity() {
+            context.events.borrow_mut().record_dropped_log();
+            return;
+        }
+        let message = unsafe { read_abi_log_message(message) };
         #[cfg(test)]
         if message == "__rve_test_host_log_panic__" {
             panic!("test host log panic");
@@ -399,12 +402,40 @@ unsafe extern "C" fn host_log(ctx: *mut c_void, level: u32, message: RveStr) {
             RVE_LOG_ERROR => ScriptEventLevel::Error,
             _ => ScriptEventLevel::Error,
         };
-        context.events.borrow_mut().push(ScriptEvent {
+        context.events.borrow_mut().push_log(ScriptEvent {
             level,
             source: context.source.to_owned(),
             message,
         });
     });
+}
+
+/// Reads an ABI log message with bounded copying; oversized messages are truncated with a marker.
+///
+/// # Safety
+/// For nonzero lengths, `value.ptr` must refer to readable storage for `value.len` bytes.
+unsafe fn read_abi_log_message(value: RveStr) -> String {
+    if value.len <= MAX_LOG_MESSAGE_BYTES {
+        return unsafe { read_abi_str(value) }
+            .map(str::to_owned)
+            .unwrap_or_else(|_| "guest supplied an invalid log message".to_owned());
+    }
+    if value.ptr.is_null() {
+        return "guest supplied an invalid log message".to_owned();
+    }
+
+    let content_limit = MAX_LOG_MESSAGE_BYTES - "…".len();
+    // SAFETY: the caller guarantees readable storage for value.len and content_limit is smaller.
+    let prefix = unsafe { std::slice::from_raw_parts(value.ptr.cast::<u8>(), content_limit) };
+    match std::str::from_utf8(prefix) {
+        Ok(message) => format!("{message}…"),
+        Err(error) if error.error_len().is_none() => {
+            let valid_prefix = std::str::from_utf8(&prefix[..error.valid_up_to()])
+                .expect("valid_up_to is the valid UTF-8 prefix");
+            format!("{valid_prefix}…")
+        }
+        Err(_) => "guest supplied an invalid log message".to_owned(),
+    }
 }
 
 unsafe extern "C" fn host_find_object(ctx: *mut c_void, id: RveStr) -> u64 {
@@ -1050,6 +1081,48 @@ mod tests {
         assert_eq!(events[1].level, ScriptEventLevel::Warn);
         assert_eq!(events[2].level, ScriptEventLevel::Error);
         assert_eq!(events[3].level, ScriptEventLevel::Error);
+    }
+
+    #[test]
+    fn abi_logs_share_the_pending_log_limit() {
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/object/Probe");
+        let host = context.host(ScriptTime::default());
+        // SAFETY: the host context and static string remain live through each callback.
+        unsafe {
+            for _ in 0..2_000 {
+                (host.log)(host.ctx, RVE_LOG_INFO, RveStr::from_static("abi log"));
+            }
+        }
+
+        let drained = events.borrow_mut().drain();
+        assert_eq!(drained.len(), 1_025);
+        assert!(
+            drained[..1_024]
+                .iter()
+                .all(|event| event.level == ScriptEventLevel::Info)
+        );
+        assert_eq!(drained[1_024].level, ScriptEventLevel::Warn);
+        assert_eq!(drained[1_024].message, "976 script log messages dropped");
+    }
+
+    #[test]
+    fn oversized_abi_logs_are_truncated_without_copying_the_tail() {
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/object/Probe");
+        let host = context.host(ScriptTime::default());
+        let message = "é".repeat(3_000);
+        // SAFETY: the host context and borrowed message remain live through this callback.
+        unsafe {
+            (host.log)(host.ctx, RVE_LOG_INFO, RveStr::from_str_ref(&message));
+        }
+
+        let drained = events.borrow_mut().drain();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].message.len() <= MAX_LOG_MESSAGE_BYTES);
+        assert!(drained[0].message.ends_with('…'));
     }
 
     #[test]

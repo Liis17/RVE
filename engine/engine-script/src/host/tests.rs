@@ -1,4 +1,4 @@
-use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError};
+use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions};
 use crate::{Key, MouseButton, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime};
 use engine_console::CommandLine;
 use engine_scene::{SceneDocument, World};
@@ -1227,6 +1227,384 @@ fn interrupt_handle_cancels_infinite_top_level_chunk_during_load() {
         Err(ScriptLoadError::Lite { ref path, ref message })
             if path == "load-loop.lua" && message.to_lowercase().contains("interrupted")
     ));
+}
+
+#[test]
+fn lua_call_deadline_disables_only_the_overrunning_script() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/loop.lua"
+[[assets]]
+path = "/neighbor.lua"
+[[objects]]
+id = "loop"
+[[objects.lite_scripts]]
+path = "/loop.lua"
+[[objects]]
+id = "neighbor"
+[[objects.lite_scripts]]
+path = "/neighbor.lua"
+"#,
+    );
+    let loop_source = r#"
+local Loop = {}
+function Loop:on_update()
+  while true do end
+end
+return Loop
+"#;
+    let neighbor_source = r#"
+local Neighbor = {}
+function Neighbor:on_update()
+  rve.log_info("neighbor progressed")
+end
+return Neighbor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("loop.lua", loop_source), ("neighbor.lua", neighbor_source)]),
+        None,
+        ScriptLoadOptions {
+            interrupt: ScriptInterruptHandle::new(),
+            call_time_limit: Some(Duration::from_millis(50)),
+        },
+    )
+    .unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let first_events = host.drain_events();
+    assert!(first_events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event
+                .message
+                .contains("Lua call exceeded time limit of 50ms")
+    }));
+    assert!(first_events.iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "neighbor progressed"
+    }));
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let next_events = host.drain_events();
+    assert_eq!(
+        next_events
+            .iter()
+            .filter(|event| event.level == ScriptEventLevel::Error)
+            .count(),
+        0
+    );
+    assert_eq!(
+        next_events
+            .iter()
+            .filter(|event| event.message == "neighbor progressed")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn lua_message_callback_lookup_obeys_the_call_deadline() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/lookup.lua"
+[[assets]]
+path = "/neighbor.lua"
+[[objects]]
+id = "lookup"
+[[objects.lite_scripts]]
+path = "/lookup.lua"
+[[objects]]
+id = "neighbor"
+[[objects.lite_scripts]]
+path = "/neighbor.lua"
+"#,
+    );
+    let lookup_source = r#"
+local Script = {}
+function Script:on_start()
+  setmetatable(Script, { __index = function(_, key)
+    if key == "on_message" then
+      for _ = 1, 100000000 do end
+      rve.log_info("lookup escaped")
+    end
+  end })
+  rve.broadcast("probe", true)
+end
+return Script
+"#;
+    let neighbor_source = r#"
+local Neighbor = {}
+function Neighbor:on_update() rve.log_info("neighbor progressed") end
+return Neighbor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[
+            ("lookup.lua", lookup_source),
+            ("neighbor.lua", neighbor_source),
+        ]),
+        None,
+        ScriptLoadOptions {
+            call_time_limit: Some(Duration::from_millis(50)),
+            ..ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("Lua call exceeded time limit"))
+    );
+    assert!(!events.iter().any(|event| event.message == "lookup escaped"));
+    assert!(!host.instances[0].enabled);
+    assert!(host.instances[1].enabled);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message == "neighbor progressed")
+    );
+}
+
+#[test]
+fn lua_console_deadline_disables_owner_and_removes_its_commands() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/command.lua"
+[[assets]]
+path = "/neighbor.lua"
+[[objects]]
+id = "command"
+[[objects.lite_scripts]]
+path = "/command.lua"
+[[objects]]
+id = "neighbor"
+[[objects.lite_scripts]]
+path = "/neighbor.lua"
+"#,
+    );
+    let command_source = r#"
+local Script = {}
+function Script:on_start()
+  rve.console.register("loop", function() while true do end end)
+  rve.console.register("other", function() end)
+end
+return Script
+"#;
+    let neighbor_source = r#"
+local Neighbor = {}
+function Neighbor:on_update() rve.log_info("neighbor progressed") end
+return Neighbor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[
+            ("command.lua", command_source),
+            ("neighbor.lua", neighbor_source),
+        ]),
+        None,
+        ScriptLoadOptions {
+            call_time_limit: Some(Duration::from_millis(50)),
+            ..ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let command = CommandLine {
+        name: "loop".into(),
+        args: vec![],
+    };
+    assert!(matches!(host.execute_command(&mut world, &command),
+        Err(crate::CommandError::Failed(message)) if message.contains("Lua call exceeded time limit")));
+    assert!(host.command_catalog().get("loop").is_none());
+    assert!(host.command_catalog().get("other").is_none());
+    assert!(!host.instances[0].enabled);
+    assert!(host.instances[1].enabled);
+    assert!(matches!(
+        host.execute_command(&mut world, &command),
+        Err(crate::CommandError::Unknown(_))
+    ));
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message == "neighbor progressed")
+    );
+}
+
+#[test]
+fn lua_call_deadline_cannot_be_caught_by_pcall() {
+    let mut world = one_camera(
+        "[[assets]]\npath=\"/pcall-loop.lua\"\n[[objects.lite_scripts]]\npath=\"/pcall-loop.lua\"\n",
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  pcall(function() while true do end end)
+  rve.log_info("pcall escaped")
+end
+return Script
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("pcall-loop.lua", source)]),
+        None,
+        ScriptLoadOptions {
+            interrupt: ScriptInterruptHandle::new(),
+            call_time_limit: Some(Duration::from_millis(50)),
+        },
+    )
+    .unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event
+                .message
+                .contains("Lua call exceeded time limit of 50ms")
+    }));
+    assert!(!events.iter().any(|event| event.message == "pcall escaped"));
+}
+
+#[test]
+fn lua_call_deadline_applies_to_top_level_chunks_and_is_optional() {
+    let mut world = one_camera(
+        "[[assets]]\npath=\"/load-loop.lua\"\n[[objects.lite_scripts]]\npath=\"/load-loop.lua\"\n",
+    );
+    let result = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("load-loop.lua", "while true do end")]),
+        None,
+        ScriptLoadOptions {
+            interrupt: ScriptInterruptHandle::new(),
+            call_time_limit: Some(Duration::from_millis(50)),
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ScriptLoadError::Lite { ref path, ref message })
+            if path == "load-loop.lua"
+                && message.contains("Lua call exceeded time limit of 50ms")
+    ));
+
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local total = 0
+  for index = 1, 100 do total = total + index end
+  rve.log_info("no limit", total)
+end
+return Script
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("load-loop.lua", source)]),
+        None,
+        ScriptLoadOptions {
+            interrupt: ScriptInterruptHandle::new(),
+            call_time_limit: None,
+        },
+    )
+    .unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message == "no limit 5050")
+    );
+}
+
+#[test]
+fn lua_print_queue_caps_at_1024_and_reports_drops_once_per_drain() {
+    let mut world = one_camera(
+        "[[assets]]\npath=\"/logs.lua\"\n[[objects.lite_scripts]]\npath=\"/logs.lua\"\n",
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  for index = 1, 2000 do print("log", index) end
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("logs.lua", source)]), None).unwrap();
+
+    for _ in 0..2 {
+        host.update(&mut world, 0.1, ScriptTime::default());
+        let events = host.drain_events();
+        assert_eq!(events.len(), 1_025);
+        assert!(
+            events[..1_024]
+                .iter()
+                .all(|event| event.level == ScriptEventLevel::Info)
+        );
+        assert_eq!(events[1_024].level, ScriptEventLevel::Warn);
+        assert_eq!(events[1_024].message, "976 script log messages dropped");
+    }
+}
+
+#[test]
+fn host_failures_are_kept_when_the_log_queue_is_full() {
+    let mut world = one_camera(
+        "[[assets]]\npath=\"/failure.lua\"\n[[objects.lite_scripts]]\npath=\"/failure.lua\"\n",
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  for index = 1, 2000 do print("log", index) end
+  error("host failure after logs")
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("failure.lua", source)]), None).unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert_eq!(events.len(), 1_026);
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("host failure after logs")
+    }));
+    assert_eq!(
+        events.last().unwrap().message,
+        "976 script log messages dropped"
+    );
+}
+
+#[test]
+fn oversized_lua_logs_are_truncated_at_a_utf8_boundary() {
+    let mut world = one_camera(
+        "[[assets]]\npath=\"/long-log.lua\"\n[[objects.lite_scripts]]\npath=\"/long-log.lua\"\n",
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  print(string.rep("é", 3000))
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("long-log.lua", source)]), None).unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].message.len() <= 4_096);
+    assert!(events[0].message.ends_with('…'));
+    assert!(events[0].message.is_char_boundary(events[0].message.len()));
 }
 
 #[test]

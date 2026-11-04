@@ -32,7 +32,8 @@ use layout::{
 };
 use module_host::ModuleHost;
 use pipeline::{
-    Clock, MonotonicClock, RuntimeStatus, ScriptStartupError, ScriptThreadConfig, start_scripts,
+    Clock, MonotonicClock, RuntimeStatus, SCRIPTS_THREAD, ScriptStartupError, ScriptThreadConfig,
+    start_scripts,
 };
 use scene::{PreparedScene, load_scene};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sysinfo::{CpuRefreshKind, System};
+
+const SCRIPTS_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const SCRIPTS_READY_GRACE: Duration = Duration::from_secs(2);
 
 /// Runs an RVE game using the release layout or a loose-file development project.
 pub fn run_player() -> ExitCode {
@@ -280,7 +284,17 @@ fn run_from_args(
             return fail(1, format!("не удалось запустить поток скриптов: {error}"));
         }
     };
-    if let Err((code, message)) = scripts_ready_result(script_thread.ready.recv()) {
+    let mut scripts_ready_timed_out = false;
+    if let Err((code, message)) = wait_scripts_ready(
+        &script_thread.ready,
+        &interrupt,
+        SCRIPTS_READY_TIMEOUT,
+        SCRIPTS_READY_GRACE,
+        &mut scripts_ready_timed_out,
+    ) {
+        if scripts_ready_timed_out {
+            modules.detach(SCRIPTS_THREAD);
+        }
         for error in modules.shutdown() {
             log::error!("Ошибка остановки модуля: {error}");
         }
@@ -381,6 +395,53 @@ fn scripts_ready_result(
     }
 }
 
+fn wait_scripts_ready(
+    receiver: &std::sync::mpsc::Receiver<Result<(), ScriptStartupError>>,
+    interrupt: &ScriptInterruptHandle,
+    timeout: Duration,
+    grace: Duration,
+    timed_out: &mut bool,
+) -> Result<(), (u8, String)> {
+    wait_scripts_ready_after_timeout(
+        receiver,
+        timeout,
+        grace,
+        || interrupt.interrupt(),
+        timed_out,
+    )
+}
+
+fn wait_scripts_ready_after_timeout(
+    receiver: &std::sync::mpsc::Receiver<Result<(), ScriptStartupError>>,
+    timeout: Duration,
+    grace: Duration,
+    on_timeout: impl FnOnce(),
+    timed_out: &mut bool,
+) -> Result<(), (u8, String)> {
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => scripts_ready_result(Ok(result)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            scripts_ready_result(Err(std::sync::mpsc::RecvError))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            on_timeout();
+            match receiver.recv_timeout(grace) {
+                Ok(result) => scripts_ready_result(Ok(result)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    scripts_ready_result(Err(std::sync::mpsc::RecvError))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    *timed_out = true;
+                    Err((
+                        1,
+                        format!("поток скриптов не подтвердил запуск за {timeout:?}"),
+                    ))
+                }
+            }
+        }
+    }
+}
+
 fn load_window_icon(
     bootstrap: &BootstrapConfig,
     assets: &Assets,
@@ -456,12 +517,17 @@ fn fail(code: u8, message: impl AsRef<str>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_project_settings, scripts_ready_result};
+    use super::{
+        load_project_settings, scripts_ready_result, wait_scripts_ready,
+        wait_scripts_ready_after_timeout,
+    };
     use crate::layout::ProjectSettingsLocation;
     use crate::pipeline::ScriptStartupError;
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -502,6 +568,102 @@ mod tests {
         .unwrap_err();
         assert_eq!(code, 2);
         assert!(message.contains("bad.lua"));
+    }
+
+    #[test]
+    fn script_ready_handshake_accepts_ready_and_preserves_disconnect() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        ready_tx.send(Ok(())).unwrap();
+        let mut timed_out = false;
+        assert!(
+            wait_scripts_ready(
+                &ready_rx,
+                &engine_script::ScriptInterruptHandle::new(),
+                Duration::ZERO,
+                Duration::ZERO,
+                &mut timed_out,
+            )
+            .is_ok()
+        );
+        assert!(!timed_out);
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        drop(ready_tx);
+        let mut timed_out = false;
+        let (code, message) = wait_scripts_ready(
+            &ready_rx,
+            &engine_script::ScriptInterruptHandle::new(),
+            Duration::ZERO,
+            Duration::ZERO,
+            &mut timed_out,
+        )
+        .unwrap_err();
+        assert_eq!(code, 1);
+        assert!(message.contains("не подтвердил запуск"));
+        assert!(!timed_out);
+    }
+
+    #[test]
+    fn script_ready_timeout_interrupts_then_accepts_grace_response() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let interrupt = engine_script::ScriptInterruptHandle::new();
+        let timeout_interrupt = interrupt.clone();
+        let mut timed_out = false;
+        assert!(
+            wait_scripts_ready_after_timeout(
+                &ready_rx,
+                Duration::ZERO,
+                Duration::ZERO,
+                move || {
+                    timeout_interrupt.interrupt();
+                    ready_tx.send(Ok(())).unwrap();
+                },
+                &mut timed_out,
+            )
+            .is_ok()
+        );
+        assert!(interrupt.is_interrupted());
+        assert!(!timed_out);
+    }
+
+    #[test]
+    fn late_script_load_error_during_grace_keeps_exit_code_two() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let mut timed_out = false;
+        let (code, message) = wait_scripts_ready_after_timeout(
+            &ready_rx,
+            Duration::ZERO,
+            Duration::ZERO,
+            move || {
+                ready_tx
+                    .send(Err(ScriptStartupError::Load("late load error".to_owned())))
+                    .unwrap();
+            },
+            &mut timed_out,
+        )
+        .unwrap_err();
+        assert_eq!(code, 2);
+        assert!(message.contains("late load error"));
+        assert!(!timed_out);
+    }
+
+    #[test]
+    fn script_ready_timeout_interrupts_and_reports_failure_after_grace() {
+        let (_ready_tx, ready_rx) = mpsc::channel();
+        let interrupt = engine_script::ScriptInterruptHandle::new();
+        let mut timed_out = false;
+        let (code, message) = wait_scripts_ready(
+            &ready_rx,
+            &interrupt,
+            Duration::ZERO,
+            Duration::ZERO,
+            &mut timed_out,
+        )
+        .unwrap_err();
+        assert_eq!(code, 1);
+        assert!(message.contains("не подтвердил запуск за"));
+        assert!(interrupt.is_interrupted());
+        assert!(timed_out);
     }
 
     #[test]
