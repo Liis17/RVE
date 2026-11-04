@@ -114,6 +114,19 @@ Homebrew). Передай `--rust-toolchain` sysroot активной macOS tool
 `<project>/.rve/sdk/rve-sdk` перед сборкой. Без marker builder использует checkout:
 distribution player собирается в `build/player`, dev-player — в `build/player-dev`.
 
+Workflow `.github/workflows/sdk-release.yml` публикует Windows x64 дистрибутив
+`sdk-verified.zip` в GitHub Releases после подходящих push в `main`. Изменения
+редактора, builder, player, гостевого API и их транзитивных Cargo-зависимостей,
+общих настроек Cargo или самого конвейера публикации запускают сборку. Изменения
+документации, примеров и независимых инструментов её пропускают. Ручной запуск
+`SDK Release` из `main` принудительно собирает дистрибутив.
+Каждый коммит получает отдельный prerelease `sdk-<полный SHA>`; повторный запуск
+обновляет ZIP в том же релизе. Обычный latest release не меняется. Перед публикацией
+архив распаковывается во временный каталог, где из шаблона New Project собираются
+Rust-скрипты и готовый player при PATH только с системными каталогами Windows.
+Дополнительные секреты не нужны: публикация использует `GITHUB_TOKEN` с
+`contents: write` только в задании выпуска.
+
 По умолчанию Cargo feature `dev-console` включена у `rve-player`, в том числе при
 `cargo build --release -p rve-player`. Для distribution-бинарника собирай с
 `--no-default-features`; `rve-build build` уже делает это автоматически.
