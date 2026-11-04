@@ -229,8 +229,30 @@ fn script_cargo_command(project: &Path, toolchain: Option<&Path>) -> Result<Comm
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_BOOTSTRAP")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    #[cfg(windows)]
+    {
+        let target = format!("{}-pc-windows-gnu", std::env::consts::ARCH);
+        let linker = toolchain
+            .join("lib/rustlib")
+            .join(target)
+            .join("bin/rust-lld.exe");
+        if linker.is_file() {
+            let rustflags = [
+                "-Zunstable-options".to_owned(),
+                "-Clinker-flavor=gnu-lld".to_owned(),
+                format!("-Clinker={}", linker.display()),
+                "-Clink-self-contained=yes".to_owned(),
+                "-Ctarget-feature=+crt-static".to_owned(),
+            ]
+            .join("\u{1f}");
+            command
+                .env("RUSTC_BOOTSTRAP", "1")
+                .env("CARGO_ENCODED_RUSTFLAGS", rustflags);
+        }
+    }
     Ok(command)
 }
 
@@ -989,6 +1011,41 @@ mod tests {
                 .next()
                 .unwrap(),
             toolchain.join("bin")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bundled_windows_gnu_toolchain_uses_its_self_contained_linker() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-bundled-gnu-linker").unwrap();
+        let toolchain = root.path().join("toolchain with spaces");
+        let linker = toolchain
+            .join("lib/rustlib")
+            .join(format!("{}-pc-windows-gnu", std::env::consts::ARCH))
+            .join("bin/rust-lld.exe");
+        fs::create_dir_all(linker.parent().unwrap()).unwrap();
+        fs::write(&linker, b"test linker marker").unwrap();
+
+        let command =
+            super::script_cargo_command(&root.path().join("project"), Some(&toolchain)).unwrap();
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            env[std::ffi::OsStr::new("RUSTC_BOOTSTRAP")],
+            Some(std::ffi::OsStr::new("1"))
+        );
+        let encoded = env[std::ffi::OsStr::new("CARGO_ENCODED_RUSTFLAGS")]
+            .unwrap()
+            .to_string_lossy();
+        assert_eq!(
+            encoded.split('\u{1f}').collect::<Vec<_>>(),
+            [
+                "-Zunstable-options",
+                "-Clinker-flavor=gnu-lld",
+                &format!("-Clinker={}", linker.display()),
+                "-Clink-self-contained=yes",
+                "-Ctarget-feature=+crt-static",
+            ]
         );
     }
 
