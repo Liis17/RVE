@@ -15,25 +15,26 @@ Parent: [[Index]]
 | `engine/engine-ui/src` | `UiBridge`, `ManagedTextures`, `UiTextures`, `ConsoleOverlay` | Общий egui bridge и console overlay для UI pass |
 | `editor/src/console.rs` | console toggle и преобразование команд в Play actions | Состояние и обработка editor console |
 | `editor/src/gestures.rs` | `ScrollNavigation`, `wheel_gestures`, `remap_control_click` | Чистая нормализация жестов и Ctrl+клика |
-| `editor/src/state.rs` | `EditorState`, `Action`, `FrameParts` | Состояние панелей без GPU |
+| `editor/src/state.rs` | `EditorState`, `SceneViewInfo`, `Action`, `FrameParts` | Раздельное debug-view состояние Scene/Game и состояние панелей без GPU |
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject` | Команды над документом, undo/redo, атомарное сохранение, раскрытие префабов |
 | `editor/src/scene_edit/prefabs.rs` | `OverrideField`, `object_override` | Instantiate, Create Prefab, Unpack, overrides и Apply to Prefab |
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject`, `Component` | Команды над документом, выделение, undo/redo, буфер обмена объектов, атомарное сохранение |
 | `editor/src/settings.rs` | `SettingsStore`, `UserSettings` | Настройки пользователя: недавние проекты и раскладка панелей |
 | `editor/src/autosave.rs` | `AutosaveStore` | Копии несохранённых сцен и их восстановление |
 | `editor/src/assets_fs.rs` | `AssetsDir` | Файловые операции в `Assets/` с проверкой путей |
-| `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose |
+| `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` |
+| `editor/src/new_project.rs` | `create_project` | Встроенный starter template и атомарное создание нового проекта |
 | `editor/src/previews.rs` | `PreviewCache` | Фоновое декодирование PNG/Radiance HDR, tone mapping HDR thumbnails и LRU-кэш UI-текстур |
-| `editor/src/build.rs` | `BuildJob`, `locate_build_tool` | File → Build Player: дочерний процесс `rve-build` и его вывод в Console |
+| `editor/src/build.rs` | `BuildJob`, `ScriptsJob`, `ScriptGeneration`, `locate_build_tool` | File → Build Player и автоматическая сборка heavy scripts через дочерний `rve-build`; вывод идёт в Console |
 | `editor/src/play.rs` | `PlaySession`, `Watchdog` | Копия мира и скрипты на главном потоке, прерывание зависшего Lua |
 | `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
-| `editor/src/ui/` | `show`, `scene_view`, `game_view`, `hierarchy`, `inspector`, `project_panel`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
+| `editor/src/ui/` | `show`, `scene_view`, `game_view`, `debug_view`, `hierarchy`, `inspector`, `project_panel`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
 
 ## Публичные контракты
 
 | Контракт | Поведение |
 |---|---|
-| CLI | `rve-editor [--project <dir>] [--scripts <library>]`. Без `--project` показывается стартовый экран с выбором проекта. `--scripts` — ABI-библиотека для Play и схем параметров Inspector |
+| CLI | `rve-editor [--project <dir>] [--scripts <library>]`. Без `--project` показывается стартовый экран. Если `--scripts` задан, эта ABI-библиотека заменяет autobuild; иначе проект с `heavy_scripts` собирается при открытии и перед Play |
 | Коды завершения | 0 — успех; 2 — неверные аргументы, настройки проекта или `bootstrap.rves`; 1 — ошибка окна или renderer |
 | Окно | Размер из `bootstrap.rves` проекта, иначе 1600×900; заголовок содержит проект, сцену и признак несохранённых правок |
 | Раскладка проекта | Как dev-запуск player: `project.rveproject`, `bootstrap.rves`, `Assets/`; ресурсы читаются в `SourceMode::Loose`, поэтому новые файлы видны сразу. Камеры читают общие `.camerasettings` по объявленным scene asset paths |
@@ -44,7 +45,7 @@ Parent: [[Index]]
 
 ## Поток кадра
 
-`EditorApp::frame` сначала выполняет накопленные действия, затем `draw_frame`: загрузка готовых превью, `egui::Context::run_ui`, обработка platform output, применение `TexturesDelta`, тесселяция, шаг Play, подготовка сцены и один вызов `Renderer::render_frame_with_ui`, после него — освобождение текстур egui. Размеры viewport берутся из прямоугольников панелей Scene и Game этого же кадра, поэтому изображение не отстаёт от раскладки. Scene и Game рисуются отдельными scene pass; скрытая панель свой pass не выполняет, поэтому вкладки в одной группе стоят как одна сцена.
+`EditorApp::frame` сначала выполняет накопленные действия, затем `draw_frame`: загрузка готовых превью, `egui::Context::run_ui`, обработка platform output, применение `TexturesDelta`, тесселяция, шаг Play, подготовка сцены и один вызов `Renderer::render_frame_with_ui`, после него — освобождение текстур egui. Размеры viewport берутся из прямоугольников панелей Scene и Game этого же кадра, поэтому изображение не отстаёт от раскладки. Scene и Game рисуются отдельными scene pass и хранят собственные `DebugView`; скрытая панель свой pass не выполняет, поэтому вкладки в одной группе стоят как одна сцена. Combo `View` скрывает Wireframe, если GPU не поддерживает `fillModeNonSolid`.
 
 Каждый viewport получает собственный список draws, `FrameCamera`, environment, локальные lights, local shadow requests/matrices и camera-relative directional shadow cascades. Runtime helpers из `engine-scene::light` строят матрицы из мирового состояния lights; renderer независимо распределяет 32 слоя с учётом camera distance для каждой панели. Scene использует камеру редактора вне Play и камеру сцены в Play; Game использует выбранную игровую камеру, поэтому проекция, cluster lists, environment transform, выбор локальных источников/теней и каскады считаются отдельно для каждой панели. Общий local shadow array перерисовывается последовательно перед каждым viewport opaque pass; матрицы лежат в per-frame viewport buffers. Сетка добавляется только к списку Scene. Обе панели используют общие кэши FBX/PNG/HDR и могут независимо выбрать разные LOD одного объекта.
 
@@ -62,7 +63,7 @@ Parent: [[Index]]
 
 Выделение — упорядоченный набор, последний объект активный: его показывает Inspector, по нему наводится камера (F). Ctrl/Cmd-щелчок в Scene и Hierarchy переключает объект, Shift-щелчок добавляет. Групповые удаление, дублирование, копирование и гизмо применяются к поддеревьям выделенных объектов без потомков уже выделенного предка и занимают одну запись истории; при ошибке валидации не меняется ни один объект. Вставка и дублирование дают копиям свободные id, переназначают `parent` внутри набора, оставляют корень под прежним родителем, если он есть в сцене, и добавляют ресурсы объектов в список сцены, поэтому объекты можно вставить в другую сцену.
 
-Схема сцены требует хотя бы одну камеру и не более одного directional light; Point/Spot Light допускаются множественно и независимо от directional. При нескольких камерах ровно одна должна быть активной; добавление, дублирование и удаление камер сохраняют это правило. Inspector задаёт camera settings asset и активность; старые поля FOV/near/far в компоненте больше не поддерживаются. Для directional light Inspector задаёт конечную положительную `shadow_distance` и число `shadow_cascades` от 1 до 4. Сохранение: `to_toml`, проверочный `parse`, запись во временный файл рядом и `rename`. Комментарии и форматирование исходного TOML не сохраняются.
+Схема сцены требует хотя бы одну камеру и не более одного directional light; Point/Spot Light допускаются множественно и независимо от directional. При нескольких камерах ровно одна должна быть активной; добавление, дублирование и удаление камер сохраняют это правило. Inspector задаёт camera settings asset и активность; AA picker меняет `render.anti_aliasing` выбранного `.camerasettings` и сразу сохраняет ресурс через `CameraSettings::to_toml`, обновляя все камеры текущего мира, которые его используют. Без назначенного ресурса AA недоступен. Старые поля FOV/near/far в компоненте больше не поддерживаются. Для directional light Inspector задаёт конечную положительную `shadow_distance` и число `shadow_cascades` от 1 до 4. Сохранение сцены: `to_toml`, проверочный `parse`, запись во временный файл рядом и `rename`. Комментарии и форматирование исходных TOML не сохраняются.
 
 Модель, брошенная на Scene, ложится на пол `y = 0` под курсором, а при промахе мимо пола — в цель камеры; брошенная в корень Hierarchy или созданная из меню появляется в цели камеры, дочерняя — в начале координат родителя. После загрузки новой модели камера наводится на неё только если объект почти не виден: занимает единицы пикселей или камера внутри него (`EditorCamera::needs_framing`). Модели FBX читаются в метрах по единице файла, поэтому файл без `UnitScaleFactor` считается сантиметровым.
 
@@ -77,7 +78,7 @@ Parent: [[Index]]
 Inspector показывает `params` скрипта по его схеме ([[Engine/EngineScene#Схема параметров скриптов]]), если схема есть.
 
 - Lua: схема `properties` читается `engine_script::lite_properties` при первом показе компонента и кэшируется в `EditorState::lite_schemas`. Чтение ограничено 5 секундами, после этого chunk прерывается. Кэш сбрасывается в Refresh. Ошибка схемы пишется в Console один раз, а у компонента появляется пометка, и остаётся свободный редактор.
-- Rust: схема берётся из `ScriptLibrary::schema`. Библиотека `--scripts` загружается при открытии проекта и затем используется в Play. Выгрузки нет: после пересборки cdylib редактор нужно перезапустить. При загруженной библиотеке Add Component → Rust Script предлагает имена из `script_names()`, без неё — текстовое поле.
+- Rust: схема берётся из `ScriptLibrary::schema`. При автоматической сборке редактор копирует новый cdylib в `<project>/.rve/editor/scripts/` и перезагружает его вне Play, поэтому новая схема сразу доступна Inspector. С явным `--scripts` используется указанная пользователем библиотека. При загруженной библиотеке Add Component → Rust Script предлагает имена из `script_names()`, без неё — текстовое поле.
 - Со схемой:
   - поля идут в порядке объявления, виджет выбирается по типу, диапазон DragValue — по `min`/`max`;
   - ключ, которого нет в сцене, показывается со значением по умолчанию бледной подписью и записывается в документ только после правки;
@@ -101,7 +102,11 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 в Play`. Выполнение использует Play watchdog; Lua может быть прервана, Rust callback —
 нет. Полный контракт shared UI и logger см. в [[Engine/EngineConsole]].
 
-`PlaySession` создаёт `World` с проверенными `.camerasettings` и `ScriptHost` из документа и работает на главном потоке. Документ не меняется: Stop вызывает `on_destroy` и удаляет сессию, поэтому правки скриптов отбрасываются. Во время Play панели отключены, `EditorState::edit_scene` не выполняет правки, а панель Scene использует активную камеру сцены вместо камеры редактора. Ввод скриптов принимается над изображением Scene и Game. Выпадающий список Game меняет только preview панели; активную игровую камеру задаёт camera component сцены (`active = true`, либо единственная камера). Heavy-скрипты требуют `--scripts`; без библиотеки Play не запускается и пишет ошибку в Console.
+`PlaySession` создаёт `World` с проверенными `.camerasettings` и `ScriptHost` из документа и работает на главном потоке. Документ не меняется: Stop вызывает `on_destroy` и удаляет сессию, поэтому правки скриптов отбрасываются. Во время Play панели отключены, `EditorState::edit_scene` не выполняет правки, а панель Scene использует активную камеру сцены вместо камеры редактора. Ввод скриптов принимается над изображением Scene и Game. Выпадающий список Game меняет только preview панели; активную игровую камеру задаёт camera component сцены (`active = true`, либо единственная камера).
+
+Если не передан `--scripts`, открытие проекта с `heavy_scripts` запускает `rve-build scripts`. Play, запрошенный во время сборки, ждёт её результата; неуспех не создаёт `PlaySession`. При завершении редактор разбирает последний stdout путь, загружает библиотеку и только после этого выполняет ожидающий Play. Для отсутствующего `heavy_scripts` сборщик успешно возвращает пустой путь. Явный `--scripts` пропускает autobuild и используется напрямую.
+
+Сборка работает через `ScriptsJob`, который наследует у `BuildJob` вывод и управление process tree. Windows SDK mode берёт соседний `rve-build` при `rve-sdk.toml`; marker запрещает fallback к checkout, если соседнего builder нет. Смена проекта отменяет прежнюю сборку и ожидающий Play. Stop также отменяет ожидающий Play. Перед заменой DLL editor выгружает библиотеку только вне Play; каждый собранный файл копируется в `.rve/editor/scripts/rve-scripts-<mtime>-<size>.<ext>`, чтобы Cargo target оставался доступен. При открытии проекта удаляются только оставшиеся файлы с таким префиксом после выгрузки прежнего host/library.
 
 `Watchdog` прерывает Lua, если загрузка, кадр или `on_destroy` выполняются дольше 5 секунд. Прерывание постоянно и отключает все lite-скрипты сессии. ABI-скрипты прервать нельзя: зависший Rust-скрипт останавливает весь редактор.
 
@@ -153,6 +158,10 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 
 **Undo и файлы.** Create Prefab и Apply to Prefab пишут файлы вне истории сцены: undo возвращает сцену, но файл префаба остаётся.
 
+## New Project
+
+File → New Project… принимает имя проекта и родительскую папку, выбранную через системный picker. Папка сохраняет введённое имя; отдельный `ProjectSettings.id` нормализуется. Существующая папка не перезаписывается, итоговый путь показан в диалоге. Генератор записывает встроенные UTF-8 шаблоны и модель cube из sibling staging-каталога, затем публикует папку атомарным no-replace rename. После генерации `OpenProjectAt` идёт через обычную проверку несохранённых изменений. `project.rveproject` задаёт `heavy_scripts = "Scripts"` и включённую `/scenes/main.rvescene`; шаблон содержит камеру, directional light, FBX cube, Lua Jump с Inspector-параметрами height/duration и Rust Orbit cdylib со схемой radius/height/speed. `.rve/` исключена в шаблонном `.gitignore`.
+
 ## Build Player
 
 File → Build Player… собирает релиз через [[Engine/RveBuild]] командой `rve-build build <project> --output <папка>/<id проекта>`. `rve-build` запускается дочерним процессом, а не библиотекой: он ищет player рядом со своим exe, загружает cdylib скриптов в свой процесс, а паника сборки не должна ронять редактор.
@@ -166,6 +175,8 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 ## Панель Game
 
 `ui/game_view.rs` показывает сцену глазами камеры из документа, без сетки и маркеров. При нескольких камерах над изображением есть выпадающий список; выбор хранится в `EditorState::game_camera`, сбрасывается при смене сцены, а удалённая камера заменяется активной, затем первой. Preview использует settings выбранной камеры. Панель не сохраняется в файл сцены и не меняет активную камеру.
+
+`SceneRenderer` строит Scene и Game draw lists с одной картой предыдущих мировых матриц по `ObjectHandle`. Оба списка читают предыдущий кадр до общей фиксации новых матриц после renderer-вызова; объекты, не попавшие ни в один draw list, удаляются из карты. Переход Play и смена выбранной Game-камеры сбрасывают карту и temporal history обоих preview.
 
 ## Автосохранение
 

@@ -13,6 +13,8 @@ pub(crate) struct SdkManifest {
     pub(crate) engine_version: String,
     abi_version: u32,
     target: String,
+    #[serde(default)]
+    pub(crate) dlss_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -27,6 +29,15 @@ pub(crate) enum PlayerLocation {
 pub(crate) fn locate_player_in(
     executable_dir: &Path,
     flavor: player::PlayerFlavor,
+    checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<PathBuf, BuildError>,
+) -> Result<PlayerLocation, BuildError> {
+    locate_player_in_with_dlss(executable_dir, flavor, false, checkout_player)
+}
+
+pub(crate) fn locate_player_in_with_dlss(
+    executable_dir: &Path,
+    flavor: player::PlayerFlavor,
+    requires_dlss: bool,
     checkout_player: impl FnOnce(player::PlayerFlavor) -> Result<PathBuf, BuildError>,
 ) -> Result<PlayerLocation, BuildError> {
     let marker = executable_dir.join(SDK_MARKER);
@@ -55,6 +66,11 @@ pub(crate) fn locate_player_in(
         ))
     })?;
     validate_sdk_manifest(&manifest)?;
+    if requires_dlss && !manifest.dlss_enabled {
+        return Err(BuildError::operational(
+            "этот SDK player собран без DLSS; пересоберите SDK с RVE_DLSS_SDK, указывающим на NVIDIA DLSS SDK",
+        ));
+    }
 
     let executable = executable_dir.join(player_filename(flavor));
     if !executable.is_file() {
@@ -100,6 +116,14 @@ fn player_filename(flavor: player::PlayerFlavor) -> &'static str {
     }
 }
 
+fn editor_filename() -> &'static str {
+    if cfg!(windows) {
+        "rve-editor.exe"
+    } else {
+        "rve-editor"
+    }
+}
+
 fn rve_build_filename() -> &'static str {
     if cfg!(windows) {
         "rve-build.exe"
@@ -112,19 +136,35 @@ pub(crate) fn current_target() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
 
-pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
+pub(crate) fn build_sdk(
+    output: &Path,
+    rust_toolchain: Option<&Path>,
+    vulkan_sdk: Option<&Path>,
+) -> Result<(), BuildError> {
+    if let Some(toolchain) = rust_toolchain {
+        validate_toolchain(toolchain)?;
+    }
     let output = player::absolute_output_path(output)?;
     player::ensure_output_missing(&output)?;
 
     let rve_build = player::current_executable_path()?;
     let executable_dir = player::executable_directory(&rve_build)?;
+    let dlss_enabled = cfg!(windows) && std::env::var_os("RVE_DLSS_SDK").is_some();
     let location = locate_player_in(
         &executable_dir,
         player::PlayerFlavor::Distribution,
-        player::build_checkout_player,
+        |flavor| {
+            player::build_sdk_binary(
+                "rve-player",
+                flavor == player::PlayerFlavor::Distribution,
+                dlss_enabled,
+            )
+        },
     )?;
     let rve_player = checkout_player_for_sdk(location)?;
-    let rve_player_dev = player::build_checkout_player(player::PlayerFlavor::Dev)?;
+    let rve_player_dev = player::build_sdk_binary("rve-player", false, dlss_enabled)?;
+    let rve_editor = player::build_sdk_binary("rve-editor", false, false)?;
+    let rve_build = player::build_sdk_binary("rve-build", false, false)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -148,9 +188,36 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
 
     let staging = TempDir::create(&output_parent, "rve-build-sdk")?;
     let root = player::repo_root()?;
+    #[cfg(target_os = "macos")]
+    let binary_dir = {
+        let contents = staging.path().join("RVE Editor.app/Contents");
+        player::create_dir_all(&contents.join("MacOS"))?;
+        let plist = platform::info_plist(
+            "rve-editor",
+            "RVE Editor",
+            "editor",
+            env!("CARGO_PKG_VERSION"),
+        );
+        fs::write(contents.join("Info.plist"), plist)
+            .map_err(|e| BuildError::operational(e.to_string()))?;
+        let engine = contents.join("Resources/Engine");
+        player::create_dir_all(&engine)?;
+        platform::copy_macos_vulkan_files(
+            &platform::find_macos_vulkan_files(vulkan_sdk)?,
+            &engine,
+        )?;
+        contents.join("MacOS")
+    };
+    #[cfg(not(target_os = "macos"))]
+    let binary_dir = {
+        let _ = vulkan_sdk;
+        staging.path().to_owned()
+    };
     assemble_sdk_layout(
-        staging.path(),
+        &binary_dir,
         &SdkSources {
+            rve_editor: &rve_editor,
+            rust_toolchain,
             rve_build: &rve_build,
             rve_player: &rve_player,
             rve_player_dev: &rve_player_dev,
@@ -158,14 +225,9 @@ pub(crate) fn build_sdk(output: &Path) -> Result<(), BuildError> {
             engine_version: env!("CARGO_PKG_VERSION"),
             abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
             target: &current_target(),
+            dlss_enabled,
         },
     )?;
-
-    if cfg!(debug_assertions) {
-        eprintln!(
-            "предупреждение: SDK содержит текущую debug-сборку rve-build; для распространяемого SDK запустите `cargo run --release -p rve-build -- sdk --output <dir>`"
-        );
-    }
 
     match platform::publish_directory_no_replace(staging.path(), &output) {
         Ok(()) => Ok(()),
@@ -189,6 +251,8 @@ fn checkout_player_for_sdk(location: PlayerLocation) -> Result<PathBuf, BuildErr
 }
 
 struct SdkSources<'a> {
+    rve_editor: &'a Path,
+    rust_toolchain: Option<&'a Path>,
     rve_build: &'a Path,
     rve_player: &'a Path,
     rve_player_dev: &'a Path,
@@ -196,9 +260,15 @@ struct SdkSources<'a> {
     engine_version: &'a str,
     abi_version: u32,
     target: &'a str,
+    dlss_enabled: bool,
 }
 
 fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), BuildError> {
+    if let Some(toolchain) = sources.rust_toolchain {
+        validate_toolchain(toolchain)?;
+        copy_directory(toolchain, &staging.join("toolchain"))?;
+    }
+    player::copy_file(sources.rve_editor, &staging.join(editor_filename()))?;
     player::copy_file(sources.rve_build, &staging.join(rve_build_filename()))?;
     player::copy_file(
         sources.rve_player,
@@ -218,12 +288,83 @@ fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), B
     copy_directory(&sources.rve_sdk.join("src"), &sdk_directory.join("src"))?;
 
     let marker = format!(
-        "engine_version = {:?}\nabi_version = {}\ntarget = {:?}\n",
-        sources.engine_version, sources.abi_version, sources.target
+        "engine_version = {:?}\nabi_version = {}\ntarget = {:?}\ndlss_enabled = {}\n",
+        sources.engine_version, sources.abi_version, sources.target, sources.dlss_enabled
     );
     fs::write(staging.join(SDK_MARKER), marker).map_err(|error| {
         BuildError::operational(format!("не удалось записать SDK-маркер: {error}"))
     })
+}
+
+fn validate_toolchain(root: &Path) -> Result<(), BuildError> {
+    for binary in ["cargo", "rustc"] {
+        let path = root
+            .join("bin")
+            .join(format!("{binary}{}", std::env::consts::EXE_SUFFIX));
+        if !path.is_file() {
+            return Err(BuildError::input(format!(
+                "toolchain missing {}",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let target = root
+            .join("lib/rustlib")
+            .join(format!("{}-pc-windows-gnu", std::env::consts::ARCH));
+        if !target.join("bin/rust-lld.exe").is_file() || !target.join("lib/self-contained").is_dir()
+        {
+            return Err(BuildError::input(
+                "Windows SDK requires a GNU toolchain with rust-lld.exe and self-contained libraries",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Copies only changed guest API files so Cargo keeps its incremental cache.
+pub(crate) fn sync_guest_sdk(source: &Path, destination: &Path) -> Result<(), BuildError> {
+    fn sync(source: &Path, destination: &Path) -> Result<(), BuildError> {
+        player::create_dir_all(destination)?;
+        for entry in fs::read_dir(source).map_err(|e| BuildError::operational(e.to_string()))? {
+            let entry = entry.map_err(|e| BuildError::operational(e.to_string()))?;
+            let target = destination.join(entry.file_name());
+            if entry.path().is_dir() {
+                sync(&entry.path(), &target)?;
+            } else {
+                let bytes =
+                    fs::read(entry.path()).map_err(|e| BuildError::operational(e.to_string()))?;
+                if fs::read(&target).ok().as_deref() != Some(bytes.as_slice()) {
+                    fs::write(&target, bytes)
+                        .map_err(|e| BuildError::operational(e.to_string()))?;
+                }
+            }
+        }
+        for entry in
+            fs::read_dir(destination).map_err(|e| BuildError::operational(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| BuildError::operational(e.to_string()))?;
+            if !source.join(entry.file_name()).exists() {
+                if entry.path().is_dir() {
+                    fs::remove_dir_all(entry.path())
+                } else {
+                    fs::remove_file(entry.path())
+                }
+                .map_err(|e| BuildError::operational(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+    player::create_dir_all(destination)?;
+    let manifest = source.join("Cargo.toml");
+    let bytes = fs::read(&manifest)
+        .map_err(|e| BuildError::operational(format!("{}: {e}", manifest.display())))?;
+    let target = destination.join("Cargo.toml");
+    if fs::read(&target).ok().as_deref() != Some(bytes.as_slice()) {
+        fs::write(target, bytes).map_err(|e| BuildError::operational(e.to_string()))?;
+    }
+    sync(&source.join("src"), &destination.join("src"))
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<(), BuildError> {
@@ -256,7 +397,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), BuildError> {
 mod tests {
     use super::{
         PlayerLocation, SdkManifest, SdkSources, assemble_sdk_layout, checkout_player_for_sdk,
-        current_target, locate_player_in, player_filename,
+        current_target, locate_player_in, locate_player_in_with_dlss, player_filename,
     };
     use crate::error::BuildError;
     use crate::player::PlayerFlavor;
@@ -265,7 +406,9 @@ mod tests {
     use std::path::PathBuf;
 
     fn sdk_marker(abi_version: u32, target: &str) -> String {
-        format!("engine_version = \"0.1.0\"\nabi_version = {abi_version}\ntarget = \"{target}\"\n")
+        format!(
+            "engine_version = \"0.1.0\"\nabi_version = {abi_version}\ntarget = \"{target}\"\ndlss_enabled = false\n"
+        )
     }
 
     fn player_name() -> &'static str {
@@ -286,6 +429,26 @@ mod tests {
 
     fn temp_dir(prefix: &str) -> TempDir {
         TempDir::create(&std::env::temp_dir(), prefix).unwrap()
+    }
+
+    #[test]
+    fn guest_sync_preserves_unchanged_files_and_updates_and_removes_changed_sources() {
+        let temp = temp_dir("guest-sync");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("guest");
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("Cargo.toml"), "manifest").unwrap();
+        fs::write(source.join("src/lib.rs"), "first").unwrap();
+        super::sync_guest_sdk(&source, &destination).unwrap();
+        let file = destination.join("src/lib.rs");
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        super::sync_guest_sdk(&source, &destination).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+        fs::write(source.join("src/lib.rs"), "second").unwrap();
+        fs::write(destination.join("src/obsolete.rs"), "obsolete").unwrap();
+        super::sync_guest_sdk(&source, &destination).unwrap();
+        assert_eq!(fs::read_to_string(file).unwrap(), "second");
+        assert!(!destination.join("src/obsolete.rs").exists());
     }
 
     #[test]
@@ -356,6 +519,24 @@ mod tests {
     }
 
     #[test]
+    fn sdk_without_dlss_cannot_satisfy_a_dlss_project() {
+        let root = temp_dir("rve-sdk-no-dlss");
+        fs::write(
+            root.path().join("rve-sdk.toml"),
+            sdk_marker(rve_sdk::abi::RVE_SCRIPT_ABI_VERSION, &current_target()),
+        )
+        .unwrap();
+
+        let error = locate_player_in_with_dlss(root.path(), PlayerFlavor::Dev, true, |_| {
+            panic!("checkout must not be used for an SDK")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("SDK player собран без DLSS"));
+    }
+
+    #[test]
     fn sdk_command_is_rejected_when_the_current_player_location_is_sdk_mode() {
         let error = checkout_player_for_sdk(PlayerLocation::Sdk {
             executable: PathBuf::from("sdk/rve-player"),
@@ -363,6 +544,7 @@ mod tests {
                 engine_version: "0.1.0".to_owned(),
                 abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
                 target: current_target(),
+                dlss_enabled: false,
             },
         })
         .unwrap_err();
@@ -451,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_layout_copies_only_the_cli_player_and_sdk_sources() {
+    fn sdk_layout_copies_editor_toolchain_players_and_guest_api() {
         let root = temp_dir("rve-sdk-layout");
         let source = root.path().join("source");
         let staging = root.path().join("staging");
@@ -475,6 +657,33 @@ mod tests {
         fs::write(sdk_source.join("target/ignored"), b"not packaged").unwrap();
         fs::create_dir(&staging).unwrap();
 
+        let toolchain = source.join("toolchain");
+        fs::create_dir_all(toolchain.join("bin")).unwrap();
+        assert!(super::validate_toolchain(&toolchain).is_err());
+        fs::write(
+            toolchain.join(format!("bin/cargo{}", std::env::consts::EXE_SUFFIX)),
+            b"cargo",
+        )
+        .unwrap();
+        assert!(super::validate_toolchain(&toolchain).is_err());
+        fs::write(
+            toolchain.join(format!("bin/rustc{}", std::env::consts::EXE_SUFFIX)),
+            b"rustc",
+        )
+        .unwrap();
+        #[cfg(windows)]
+        {
+            assert!(super::validate_toolchain(&toolchain).is_err());
+            let target = toolchain
+                .join("lib/rustlib")
+                .join(format!("{}-pc-windows-gnu", std::env::consts::ARCH));
+            fs::create_dir_all(target.join("bin")).unwrap();
+            fs::create_dir_all(target.join("lib/self-contained")).unwrap();
+            fs::write(target.join("bin/rust-lld.exe"), b"lld").unwrap();
+        }
+        super::validate_toolchain(&toolchain).unwrap();
+        let rve_editor = source.join("rve-editor");
+        fs::write(&rve_editor, b"editor binary").unwrap();
         let rve_build = source.join("rve-build");
         let rve_player = source.join("rve-player");
         let rve_player_dev = source.join("rve-player-dev");
@@ -482,6 +691,8 @@ mod tests {
         assemble_sdk_layout(
             &staging,
             &SdkSources {
+                rve_editor: &rve_editor,
+                rust_toolchain: Some(&toolchain),
                 rve_build: &rve_build,
                 rve_player: &rve_player,
                 rve_player_dev: &rve_player_dev,
@@ -489,6 +700,7 @@ mod tests {
                 engine_version: "0.1.0-test",
                 abi_version: 42,
                 target: &target,
+                dlss_enabled: true,
             },
         )
         .unwrap();
@@ -513,10 +725,23 @@ mod tests {
             fs::read(staging.join("rve-sdk/src/nested/api.rs")).unwrap(),
             b"pub fn nested() {}\n"
         );
+        assert_eq!(
+            fs::read(staging.join(super::editor_filename())).unwrap(),
+            b"editor binary"
+        );
+        assert_eq!(
+            fs::read(staging.join(format!(
+                "toolchain/bin/rustc{}",
+                std::env::consts::EXE_SUFFIX
+            )))
+            .unwrap(),
+            b"rustc"
+        );
         assert!(!staging.join("rve-sdk/target").exists());
         let marker = fs::read_to_string(staging.join("rve-sdk.toml")).unwrap();
         assert!(marker.contains("engine_version = \"0.1.0-test\""));
         assert!(marker.contains("abi_version = 42"));
         assert!(marker.contains(&format!("target = \"{target}\"")));
+        assert!(marker.contains("dlss_enabled = true"));
     }
 }

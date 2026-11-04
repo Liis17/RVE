@@ -23,6 +23,19 @@ rve-sdk = { path = "<sdk>/rve-sdk" }
 `rve-player` сохраняйте рядом `rve-sdk.toml`: он включает SDK-режим и фиксирует ABI
 и платформу.
 
+`rve-build scripts` синхронизирует гостевой crate в `<project>/.rve/sdk/rve-sdk`
+перед сборкой, независимо от того, запущен ли builder из checkout или переносимого
+SDK. Новый проект использует этот путь из `Scripts/Cargo.toml`:
+
+```toml
+[dependencies]
+rve-sdk = { path = "../.rve/sdk/rve-sdk" }
+```
+
+Папка `.rve/` находится вне `Assets/` и исключена шаблонным `.gitignore`.
+Синхронизация обновляет изменённые файлы, сохраняет mtime совпадающих и удаляет
+исходники API, которые исчезли из установленной версии.
+
 Реализация создаёт тип, реализующий `rve_sdk::Script`, и функцию-фабрику,
 принимающую `&rve_sdk::Params`. `rve_sdk::export_scripts!` экспортирует ABI entry
 point с именами heavy-скриптов, на которые ссылаются сцены. Пример —

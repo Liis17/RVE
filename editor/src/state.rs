@@ -1,7 +1,7 @@
 //! Состояние редактора, общее для панелей и обработчиков действий; не зависит от GPU.
 
 use crate::assets_fs::{AssetEntry, AssetKind};
-use crate::build::BuildJob;
+use crate::build::{BuildJob, ScriptGeneration, ScriptsJob};
 use crate::console::ConsoleLog;
 use crate::play::PlaySession;
 use crate::previews::PreviewCache;
@@ -12,7 +12,8 @@ use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
 use engine_files::VirtualPath;
-use engine_scene::World;
+use engine_render::DebugView;
+use engine_scene::{AntiAliasing, CameraSettings, World};
 use engine_script::{ParamSchema, ScriptInterruptHandle, ScriptLibrary};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +34,11 @@ pub enum Action {
     OpenProject,
     /// Открыть проект из списка недавних.
     OpenProjectAt(PathBuf),
+    NewProject,
+    CreateProject {
+        name: String,
+        parent: PathBuf,
+    },
     Save,
     SaveAs,
     Exit,
@@ -87,6 +93,8 @@ pub struct SceneViewInfo {
     pub size: [u32; 2],
     /// Прямоугольник изображения Game в координатах egui за текущий кадр.
     pub rect: Option<egui::Rect>,
+    /// Render diagnostic selected for this panel.
+    pub debug_view: DebugView,
 }
 
 /// Раздельные заимствования состояния для подготовки кадра сцены.
@@ -115,12 +123,19 @@ pub struct EditorState {
     /// Недавние проекты из настроек пользователя, последний открытый — первым.
     pub recent_projects: Vec<PathBuf>,
     pub library: Option<ScriptLibrary>,
+    /// Библиотека, созданная автоматической сборкой; её копия загружается отдельно от Cargo target.
+    pub script_generation: Option<ScriptGeneration>,
+    /// Фоновая сборка heavy_scripts при открытии проекта или перед Play.
+    pub scripts_job: Option<ScriptsJob>,
+    /// Play, ожидающий успешного завершения автоматической сборки скриптов.
+    pub pending_play: bool,
     pub actions: Vec<Action>,
     pub unsaved_prompt: Option<UnsavedPrompt>,
     pub recovery_prompt: Option<RecoveryPrompt>,
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
+    pub new_project_dialog: Option<crate::new_project::NewProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
     /// В прошлом кадре фокус был в текстовом поле: Esc этого кадра закрывает поле,
     /// а не снимает выделение.
@@ -137,6 +152,8 @@ pub struct EditorState {
     pub scene_view: SceneViewInfo,
     pub game_viewport_texture: Option<egui::TextureId>,
     pub game_view: SceneViewInfo,
+    /// Optional renderer features used to filter the debug-view controls.
+    pub wireframe_supported: bool,
     /// Id камеры вкладки Game; панель заменяет отсутствующую камеру первой в документе.
     pub game_camera: Option<String>,
     /// Объект с новой моделью: после её загрузки камера покажет его, если он почти не виден.
@@ -173,12 +190,16 @@ impl EditorState {
             scripts_path,
             recent_projects: Vec::new(),
             library: None,
+            script_generation: None,
+            scripts_job: None,
+            pending_play: false,
             actions: Vec::new(),
             unsaved_prompt: None,
             recovery_prompt: None,
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_dialog: None,
+            new_project_dialog: None,
             hierarchy_rename: None,
             text_focused_last_frame: false,
             console_open: false,
@@ -190,6 +211,7 @@ impl EditorState {
             scene_view: SceneViewInfo::default(),
             game_viewport_texture: None,
             game_view: SceneViewInfo::default(),
+            wireframe_supported: false,
             game_camera: None,
             pending_frame: None,
             models: HashMap::new(),
@@ -212,6 +234,25 @@ impl EditorState {
 
     pub fn action(&mut self, action: Action) {
         self.actions.push(action);
+    }
+
+    /// Returns false and queues Play while project scripts must be compiled first.
+    pub fn request_play(&mut self) -> bool {
+        if self.scripts_path.is_none()
+            && self
+                .project
+                .as_ref()
+                .is_some_and(|project| project.settings.heavy_scripts.is_some())
+        {
+            self.pending_play = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn finish_pending_play(&mut self, build_succeeded: bool) -> bool {
+        std::mem::take(&mut self.pending_play) && build_succeeded
     }
 
     /// Мир текущего кадра: копия Play-режима либо мир, собранный из документа.
@@ -258,6 +299,66 @@ impl EditorState {
             loader: &mut self.model_loader,
             log: &mut self.log,
         })
+    }
+
+    pub fn camera_settings_for(&mut self, id: &str) -> Option<CameraSettings> {
+        let world = self.world_mut()?;
+        let handle = world.handle(id)?;
+        world.camera_settings(handle).copied()
+    }
+
+    /// Persists an AA change to the camera's assigned settings asset and refreshes all
+    /// cameras that share that asset in the current editor world.
+    pub fn set_camera_anti_aliasing(&mut self, id: &str, anti_aliasing: AntiAliasing) {
+        if self.is_playing() {
+            return;
+        }
+        let path = self
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.object(id))
+            .and_then(|object| object.camera.as_ref())
+            .and_then(|camera| camera.settings.clone());
+        let Some(path) = path else {
+            self.log.error("Назначьте камере ресурс .camerasettings");
+            return;
+        };
+        let Some(mut settings) = self.camera_settings_for(id) else {
+            self.log.error(format!("камера {id:?} не найдена в мире"));
+            return;
+        };
+        settings.render.anti_aliasing = anti_aliasing;
+        let Some(project) = self.project.as_ref() else {
+            self.log.error("проект не открыт");
+            return;
+        };
+        if let Err(error) = project.save_camera_settings(&path, &settings) {
+            self.log.error(error);
+            return;
+        }
+        let handles = self
+            .world_mut()
+            .map(|world| {
+                world
+                    .objects()
+                    .iter()
+                    .filter(|object| {
+                        object
+                            .camera
+                            .as_ref()
+                            .and_then(|camera| camera.settings.as_ref())
+                            == Some(&path)
+                    })
+                    .map(|object| object.handle)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(world) = self.world_mut() {
+            for handle in handles {
+                let _ = world.set_camera_settings(handle, settings);
+            }
+        }
+        self.log.info(format!("Сохранены настройки камеры {path}"));
     }
 
     /// Сбрасывает данные, связанные с прежней сценой.
@@ -415,7 +516,6 @@ mod tests {
     use super::*;
     use crate::project::OpenProject;
     use crate::scene_edit::{EditorScene, no_prefabs};
-    use engine_scene::CameraSettings;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -555,6 +655,42 @@ settings = "/cameras/problem.camerasettings"
     }
 
     #[test]
+    fn camera_anti_aliasing_edits_update_the_asset_and_editor_world() {
+        let temp = TempProject::new(None);
+        let mut state = state_with_camera_assets(&temp.0);
+        state.edit_scene(|scene| {
+            scene.set_camera_settings(
+                "camera-b",
+                Some(VirtualPath::parse("/cameras/valid.camerasettings").unwrap()),
+            )
+        });
+        state.set_camera_anti_aliasing("camera-a", AntiAliasing::Taa);
+
+        let settings = CameraSettings::parse(
+            "saved camera settings",
+            &fs::read_to_string(temp.0.join("Assets/cameras/valid.camerasettings")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings.render.anti_aliasing, AntiAliasing::Taa);
+        assert_eq!(
+            state
+                .camera_settings_for("camera-a")
+                .unwrap()
+                .render
+                .anti_aliasing,
+            AntiAliasing::Taa
+        );
+        assert_eq!(
+            state
+                .camera_settings_for("camera-b")
+                .unwrap()
+                .render
+                .anti_aliasing,
+            AntiAliasing::Taa
+        );
+    }
+
+    #[test]
     fn dropping_a_non_model_asset_is_rejected() {
         let mut state = state_with_scene();
         state.create_from_asset("textures/a.png", None, [0.0; 3]);
@@ -610,5 +746,23 @@ settings = "/cameras/problem.camerasettings"
     fn hanging_schema_chunk_is_interrupted() {
         let timeout = Duration::from_millis(20);
         assert!(read_lite_schema("loop.lua", "while true do end", timeout).is_err());
+    }
+
+    #[test]
+    fn play_waits_for_auto_scripts_build_and_is_cancelled_on_failure() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(std::path::Path::new(dir)).unwrap());
+
+        assert!(!state.request_play());
+        assert!(state.pending_play);
+        assert!(!state.finish_pending_play(false));
+        assert!(!state.pending_play);
+
+        assert!(!state.request_play());
+        assert!(state.finish_pending_play(true));
+
+        state.scripts_path = Some(PathBuf::from("manual.dll"));
+        assert!(state.request_play());
     }
 }

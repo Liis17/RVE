@@ -56,6 +56,13 @@ class PackageSelectionTests(unittest.TestCase):
         self.assertEqual(self.select(["editor/src/main.rs"]), ["rve-editor"])
         self.assertIn("rve-editor", self.select(["engine/render/src/lib.rs"]))
 
+    def test_editor_templates_also_select_builder_validation(self):
+        for name, directory in [("rve-editor", "editor"), ("rve-build", "tools/rve-build")]:
+            self.metadata["packages"].append(package(name, directory=directory))
+            self.metadata["workspace_members"].append(name)
+        self.assertEqual(self.select(["editor/templates/new_project/Scripts/src/lib.rs"]),
+                         ["rve-build", "rve-editor"])
+
     def test_independent_package_does_not_select_other_projects(self):
         self.assertEqual(self.select(["engine/audio/src/lib.rs"]), ["audio"])
 

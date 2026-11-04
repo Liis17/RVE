@@ -1,5 +1,5 @@
 use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
-use crate::library::ScriptLibrary;
+use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LuaCommands,
     LuaInstance, RegisteredCommandCallback,
@@ -126,6 +126,7 @@ struct ScriptInstance {
 pub struct ScriptHost {
     lua: Lua,
     instances: Vec<ScriptInstance>,
+    _loaded_library: Option<SharedLibrary>,
     events: EventQueue,
     active_source: ActiveSource,
     active_call: ActiveCall,
@@ -207,9 +208,11 @@ impl ScriptHost {
         .map_err(|error| ScriptLoadError::LuaHost(error.to_string()))?;
         let lua = lua_state.lua;
         let base_environment = lua_state.base_environment;
+        let loaded_library = library.and_then(ScriptLibrary::shared_library);
         let mut host = Self {
             lua,
             instances: Vec::new(),
+            _loaded_library: loaded_library,
             events,
             active_source,
             active_call,

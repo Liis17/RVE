@@ -12,10 +12,14 @@ use std::error::Error;
 use std::fmt;
 use std::mem;
 use std::path::Path;
+use std::sync::Arc;
 
-/// A script library that has been validated and deliberately kept loaded for process lifetime.
+pub(crate) type SharedLibrary = Arc<libloading::Library>;
+
+/// A validated script library. Loaded modules stay mapped while any host uses them.
 pub struct ScriptLibrary {
     scripts: HashMap<String, (&'static RveScriptDesc, Option<ParamSchema>)>,
+    library: Option<SharedLibrary>,
 }
 
 /// Failure while opening or validating an ABI script module.
@@ -88,8 +92,8 @@ impl Error for ScriptLibraryError {}
 impl ScriptLibrary {
     /// Opens and validates an ABI script library.
     ///
-    /// A successfully opened library is intentionally never unloaded, including if symbol
-    /// lookup or ABI validation later fails. Loading executes native initialization code.
+    /// The library is unloaded after this value and all script hosts using it are dropped.
+    /// Loading executes native initialization code.
     ///
     /// # Safety
     /// The library and its initializers must be trusted. Its `rve_script_module` entry point must
@@ -99,12 +103,11 @@ impl ScriptLibrary {
         // SAFETY: loading is exposed as unsafe because it runs unknown native initialization code.
         let library = unsafe { libloading::Library::new(path.as_ref()) }
             .map_err(|error| ScriptLibraryError::Open(error.to_string()))?;
-        // Copy the function pointer so the Symbol borrow ends before the library is leaked.
+        // Copy the function pointer so the Symbol borrow ends before we call into the library.
         let entry_point = unsafe {
             library.get::<unsafe extern "C" fn() -> *const RveModule>(b"rve_script_module\0")
         }
         .map(|symbol| *symbol);
-        mem::forget(library);
         let entry_point = entry_point
             .map_err(|error| ScriptLibraryError::MissingEntryPoint(error.to_string()))?;
         // SAFETY: part of this function's caller contract.
@@ -112,8 +115,10 @@ impl ScriptLibrary {
         if module.is_null() {
             return Err(ScriptLibraryError::NullModule);
         }
-        // SAFETY: the entry point must return a process-lifetime module per the caller contract.
-        unsafe { Self::from_module(module) }
+        // SAFETY: the entry point must return an immutable module valid while the library remains loaded.
+        let mut scripts = unsafe { Self::from_module(module) }?;
+        scripts.library = Some(Arc::new(library));
+        Ok(scripts)
     }
 
     /// Validates a process-lifetime module. Primarily useful for in-process integrations and tests.
@@ -165,6 +170,7 @@ impl ScriptLibrary {
         if count == 0 {
             return Ok(Self {
                 scripts: HashMap::new(),
+                library: None,
             });
         }
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
@@ -242,11 +248,18 @@ impl ScriptLibrary {
                 return Err(ScriptLibraryError::DuplicateScriptName(name));
             }
         }
-        Ok(Self { scripts })
+        Ok(Self {
+            scripts,
+            library: None,
+        })
     }
 
     pub(crate) fn script(&self, name: &str) -> Option<&'static RveScriptDesc> {
         self.scripts.get(name).map(|(descriptor, _)| *descriptor)
+    }
+
+    pub(crate) fn shared_library(&self) -> Option<SharedLibrary> {
+        self.library.as_ref().map(Arc::clone)
     }
 
     /// Registered script names in ascending order.
@@ -338,4 +351,35 @@ unsafe fn read_schema(descriptor: &RveScriptDesc) -> Result<Option<ParamSchema>,
         });
     }
     ParamSchema::new(specs).map(Some)
+}
+
+#[cfg(all(test, windows))]
+mod ownership_tests {
+    #[test]
+    fn host_retains_module_until_it_is_dropped() {
+        use super::*;
+        let module = Arc::new(unsafe { libloading::Library::new("kernel32.dll") }.unwrap());
+        let weak = Arc::downgrade(&module);
+        let library = ScriptLibrary {
+            scripts: HashMap::new(),
+            library: Some(module),
+        };
+        let scene = engine_scene::SceneDocument::parse(
+            "empty",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let world = engine_scene::World::from_document(&scene).unwrap();
+        let host = crate::ScriptHost::load(
+            &world,
+            "empty",
+            &std::collections::BTreeMap::new(),
+            Some(&library),
+        )
+        .unwrap();
+        drop(library);
+        assert!(weak.upgrade().is_some());
+        drop(host);
+        assert!(weak.upgrade().is_none());
+    }
 }

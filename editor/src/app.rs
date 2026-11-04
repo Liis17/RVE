@@ -141,6 +141,30 @@ impl EditorApp {
     fn open_project(&mut self, dir: &Path) {
         match OpenProject::open(dir) {
             Ok(project) => {
+                self.cancel_project_jobs();
+                self.stop_play();
+                let previous_generation = self.state.script_generation.take();
+                self.state.library = None;
+                if let Some(generation) = previous_generation
+                    && let Err(error) = std::fs::remove_file(&generation.path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    self.state.log.push(
+                        LogLevel::Warn,
+                        format!("{}: {error}", generation.path.display()),
+                    );
+                }
+                if self.state.scripts_path.is_none()
+                    && let Err(error) = crate::build::cleanup_script_generations(&project.root)
+                {
+                    self.state.log.push(
+                        LogLevel::Warn,
+                        format!(
+                            "{}: {error}",
+                            project.root.join(".rve/editor/scripts").display()
+                        ),
+                    );
+                }
                 self.state
                     .log
                     .info(format!("Открыт проект {}", project.settings.name));
@@ -152,7 +176,16 @@ impl EditorApp {
                 self.state.project = Some(project);
                 self.save_settings();
                 self.state.current_folder.clear();
-                self.load_library();
+                if self.state.scripts_path.is_some() {
+                    self.load_manual_library();
+                } else if self
+                    .state
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| project.settings.heavy_scripts.is_some())
+                {
+                    self.start_scripts_build();
+                }
                 self.refresh_assets();
                 match start {
                     Some(path) => self.open_scene(&path),
@@ -160,6 +193,57 @@ impl EditorApp {
                 }
             }
             Err(error) => self.state.log.error(error),
+        }
+    }
+
+    fn cancel_project_jobs(&mut self) {
+        if let Some(job) = self.state.build.take() {
+            job.kill();
+        }
+        if let Some(job) = self.state.scripts_job.take() {
+            job.kill();
+        }
+        self.state.pending_play = false;
+    }
+
+    fn start_scripts_build(&mut self) -> bool {
+        if self.state.scripts_job.is_some() {
+            return true;
+        }
+        let Some(project) = &self.state.project else {
+            return false;
+        };
+        if project.settings.heavy_scripts.is_none() || self.state.scripts_path.is_some() {
+            return false;
+        }
+        let project_dir = project.root.clone();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_owned));
+        let tool = match crate::build::locate_build_tool(
+            exe_dir.as_deref(),
+            &crate::build::checkout_workspace(),
+            std::env::var_os("CARGO"),
+        ) {
+            Ok(tool) => tool,
+            Err(error) => {
+                self.state.log.error(error);
+                return false;
+            }
+        };
+        let command = tool.scripts_command(&project_dir);
+        match crate::build::ScriptsJob::spawn(command, project_dir.clone()) {
+            Ok(job) => {
+                self.state
+                    .log
+                    .info(format!("Build scripts: {}", project_dir.display()));
+                self.state.scripts_job = Some(job);
+                true
+            }
+            Err(error) => {
+                self.state.log.error(format!("rve-build scripts: {error}"));
+                false
+            }
         }
     }
 
@@ -380,6 +464,7 @@ impl EditorApp {
                 }
             }
             Action::OpenProjectAt(dir) => self.open_project(&dir),
+            Action::NewProject | Action::CreateProject { .. } => {}
             Action::Exit => self.exit = true,
             Action::BuildPlayer => self.start_build(),
             Action::CreatePrefab(id) => self.create_prefab(&id),
@@ -523,6 +608,108 @@ impl EditorApp {
         any
     }
 
+    fn poll_scripts_build(&mut self) -> bool {
+        let Some(job) = &mut self.state.scripts_job else {
+            return false;
+        };
+        let lines = job.poll();
+        let finished = job.is_finished();
+        let completion = job.completion().cloned();
+        let any = !lines.is_empty();
+        for (level, line) in lines {
+            self.state.log.push(level, line);
+        }
+        if !finished {
+            return any;
+        }
+        self.state.scripts_job = None;
+        let succeeded = match completion {
+            Some(completion) => match crate::build::scripts_library_from_completion(&completion) {
+                Ok(Some(path)) => match self.reload_generated_library(&path) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        self.state.log.error(error);
+                        false
+                    }
+                },
+                Ok(None) => {
+                    self.clear_generated_library();
+                    true
+                }
+                Err(error) => {
+                    self.state.log.error(error);
+                    false
+                }
+            },
+            None => {
+                self.state
+                    .log
+                    .error("scripts build finished without an exit result");
+                false
+            }
+        };
+        if self.state.finish_pending_play(succeeded) {
+            self.start_play_now();
+        }
+        true
+    }
+
+    fn reload_generated_library(&mut self, source: &Path) -> Result<(), String> {
+        if self.state.play.is_some() {
+            return Err("scripts cannot be reloaded during Play".to_owned());
+        }
+        let project = self
+            .state
+            .project
+            .as_ref()
+            .ok_or_else(|| "no project is open".to_owned())?;
+        let generation = crate::build::copy_script_generation(
+            &project.root,
+            source,
+            self.state.script_generation.as_ref(),
+        )
+        .map_err(|error| format!("{}: {error}", source.display()))?;
+        let Some(generation) = generation else {
+            return Ok(());
+        };
+
+        let old_generation = self.state.script_generation.take();
+        drop(self.state.library.take());
+        if let Some(old) = old_generation
+            && let Err(error) = std::fs::remove_file(&old.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            let _ = std::fs::remove_file(&generation.path);
+            return Err(format!("{}: {error}", old.path.display()));
+        }
+        // SAFETY: generated project code is trusted for Play; the generation copy remains present.
+        match unsafe { ScriptLibrary::load(&generation.path) } {
+            Ok(library) => {
+                self.state.library = Some(library);
+                self.state.script_generation = Some(generation);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&generation.path);
+                Err(format!("{}: {error}", generation.path.display()))
+            }
+        }
+    }
+
+    fn clear_generated_library(&mut self) {
+        let generation = self.state.script_generation.take();
+        drop(self.state.library.take());
+        if let Some(generation) = generation
+            && let Err(error) = std::fs::remove_file(&generation.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.state.log.push(
+                LogLevel::Warn,
+                format!("{}: {error}", generation.path.display()),
+            );
+        }
+    }
+
     fn assets_root(&self) -> Option<PathBuf> {
         Some(self.state.project.as_ref()?.assets_dir.root().to_owned())
     }
@@ -630,6 +817,25 @@ impl EditorApp {
                 .error("Play недоступен для префаба: откройте сцену");
             return;
         }
+        if !self.state.request_play() {
+            if self.state.scripts_job.is_none() && !self.start_scripts_build() {
+                self.state.pending_play = false;
+            }
+            return;
+        }
+        self.start_play_now();
+    }
+
+    fn start_play_now(&mut self) {
+        let Some(scene) = &self.state.scene else {
+            return;
+        };
+        if scene.document().is_prefab() {
+            self.state
+                .log
+                .error("Play недоступен для префаба: откройте сцену");
+            return;
+        }
         let needs_library = scene
             .view()
             .objects
@@ -639,10 +845,10 @@ impl EditorApp {
             if self.state.scripts_path.is_none() {
                 self.state
                     .log
-                    .error("В сцене есть Rust-скрипты: запустите редактор с --scripts <library>");
+                    .error("В сцене есть Rust-скрипты, но библиотека не загружена");
                 return;
             }
-            if !self.load_library() {
+            if !self.load_manual_library() {
                 return;
             }
         }
@@ -670,9 +876,8 @@ impl EditorApp {
         }
     }
 
-    /// Загружает `--scripts` один раз: схемы нужны Inspector, сама библиотека — Play.
-    /// Выгрузки нет, поэтому после пересборки cdylib редактор нужно перезапустить.
-    fn load_library(&mut self) -> bool {
+    /// Loads the explicit `--scripts` library used for Inspector schemas and Play.
+    fn load_manual_library(&mut self) -> bool {
         if self.state.library.is_some() {
             return true;
         }
@@ -693,6 +898,7 @@ impl EditorApp {
     }
 
     fn stop_play(&mut self) {
+        self.state.pending_play = false;
         if let Some(session) = self.state.play.take() {
             let events = session.stop();
             self.state.log.push_script_events(events);
@@ -728,6 +934,23 @@ impl EditorApp {
                 }
                 Action::Play => self.start_play(),
                 Action::Stop => self.stop_play(),
+                Action::NewProject => {
+                    self.state.new_project_dialog =
+                        Some(crate::new_project::NewProjectDialog::default());
+                }
+                Action::CreateProject { name, parent } => {
+                    match crate::new_project::create_project(&name, &parent) {
+                        Ok(dir) => {
+                            self.state.new_project_dialog = None;
+                            self.run_guarded(Action::OpenProjectAt(dir));
+                        }
+                        Err(error) => {
+                            if let Some(dialog) = &mut self.state.new_project_dialog {
+                                dialog.error = Some(error);
+                            }
+                        }
+                    }
+                }
                 Action::ImportDialog => {
                     if let Some(files) = rfd::FileDialog::new().pick_files() {
                         self.import(&files);
@@ -935,6 +1158,7 @@ impl EditorApp {
 fn console_modal_open(state: &EditorState) -> bool {
     state.unsaved_prompt.is_some()
         || state.project_dialog.is_some()
+        || state.new_project_dialog.is_some()
         || state.recovery_prompt.is_some()
         || state.apply_prompt.is_some()
 }
@@ -1034,6 +1258,8 @@ fn render_scene_frame(
     };
     let scene_size = drawable(state.scene_view);
     let game_size = drawable(state.game_view);
+    let scene_debug_view = state.scene_view.debug_view;
+    let game_debug_view = state.game_view.debug_view;
     if scene_size.is_none() && game_size.is_none() {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     }
@@ -1046,7 +1272,7 @@ fn render_scene_frame(
     let pending_frame = state.pending_frame.take();
     // Модель ещё разбирается в фоне: наведение камеры ждёт её готовности.
     let mut still_loading = None;
-    let (scene_frame, game_camera, game_settings, has_light, frame_target) = {
+    let (scene_frame, game_camera, game_settings, game_camera_handle, has_light, frame_target) = {
         let Some(parts) = state.frame_parts() else {
             return render_ui_only(&mut gpu.renderer, ui, &[]);
         };
@@ -1104,6 +1330,7 @@ fn render_scene_frame(
             scene_frame,
             game_camera,
             game_settings,
+            game_camera_handle,
             has_light,
             frame_target,
         )
@@ -1128,6 +1355,7 @@ fn render_scene_frame(
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
     let (local_lights, local_light_shadows) = render_local_lights(&scene_frame.local_lights);
+    gpu.scene.begin_motion_frame(game_camera_handle, playing);
     gpu.scene.build_draws(
         &mut gpu.renderer,
         parts.world,
@@ -1165,6 +1393,7 @@ fn render_scene_frame(
             scene_frame.environment.as_ref(),
             &scene_shadow_cascades,
             true,
+            scene_debug_view,
         )
     });
     let game_view = game_size.map(|[width, height]| {
@@ -1180,6 +1409,7 @@ fn render_scene_frame(
             scene_frame.environment.as_ref(),
             &game_shadow_cascades,
             false,
+            game_debug_view,
         )
     });
     let mut scenes = Vec::with_capacity(2);
@@ -1194,8 +1424,13 @@ fn render_scene_frame(
         .map(|(viewport, _)| *viewport)
         .collect::<Vec<_>>();
     let primitives = visible_primitives(ui, &drawn);
-    gpu.renderer
-        .render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR)
+    let result = gpu
+        .renderer
+        .render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR);
+    if result.is_ok() {
+        gpu.scene.commit_motion_history();
+    }
+    result
 }
 
 /// Примитивы без изображений viewport, которые не рисуются в этом кадре.
@@ -1243,6 +1478,7 @@ impl WindowHandler for EditorApp {
                 return false;
             }
         };
+        self.state.wireframe_supported = renderer.capabilities().wireframe;
         let scene = match SceneRenderer::new(&mut renderer) {
             Ok(scene) => scene,
             Err(error) => {
@@ -1328,13 +1564,14 @@ impl WindowHandler for EditorApp {
         self.autosave_tick();
         let previews_pending = self.state.previews.has_pending();
         let build_output = self.poll_build();
+        let scripts_output = self.poll_scripts_build();
         let background_pending = self.background_pending();
         if let Some(deadline) = self.repaint_at
             && Instant::now() >= deadline
         {
             self.repaint_at = None;
             window.request_redraw();
-        } else if previews_pending || build_output || background_pending {
+        } else if previews_pending || build_output || scripts_output || background_pending {
             window.request_redraw();
         }
         !self.exit
@@ -1349,10 +1586,21 @@ impl WindowHandler for EditorApp {
             .build
             .is_some()
             .then(|| Instant::now() + BUILD_POLL);
-        [self.repaint_at, preview, build, self.autosave_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+        let scripts = self
+            .state
+            .scripts_job
+            .is_some()
+            .then(|| Instant::now() + BUILD_POLL);
+        [
+            self.repaint_at,
+            preview,
+            build,
+            scripts,
+            self.autosave_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn close_requested(&mut self) -> bool {
@@ -1367,6 +1615,9 @@ impl WindowHandler for EditorApp {
     fn exiting(&mut self) {
         self.stop_play();
         if let Some(job) = self.state.build.take() {
+            job.kill();
+        }
+        if let Some(job) = self.state.scripts_job.take() {
             job.kill();
         }
         self.save_settings();
@@ -1430,6 +1681,27 @@ mod tests {
         });
         full_output.textures_delta.clear();
         console_output
+    }
+
+    #[test]
+    fn pending_play_rechecks_the_current_document_after_build() {
+        let mut app = EditorApp::new(None, None);
+        app.state.scene = Some(
+            EditorScene::parse(
+                VirtualPath::parse("prefabs/test.rveprefab").unwrap(),
+                "[[objects]]\nid = \"root\"\n",
+                crate::scene_edit::no_prefabs(),
+            )
+            .unwrap(),
+        );
+        app.start_play_now();
+        assert!(!app.state.is_playing());
+        assert!(
+            app.state
+                .log
+                .entries()
+                .any(|entry| entry.message.contains("префаба"))
+        );
     }
 
     #[test]

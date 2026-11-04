@@ -8,8 +8,8 @@ use crate::state::{Action, AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, EnvironmentComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS,
-    MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
+    AntiAliasing, CameraComponent, EnvironmentComponent, HeavyScript, LodGroup, LodLevel,
+    MAX_LOD_LEVELS, MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
     ProceduralSkyComponent, SceneObject, SceneTransform, SpotLightComponent,
 };
 use std::collections::BTreeMap;
@@ -469,6 +469,30 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
                     }
                 }
                 ui.end_row();
+                ui.label("Anti-Aliasing").on_hover_text(
+                    "Immediately saves to the assigned .camerasettings asset; TOML comments and formatting are not preserved.",
+                );
+                if camera.settings.is_some() {
+                    let current = state
+                        .camera_settings_for(id)
+                        .unwrap_or_default()
+                        .render
+                        .anti_aliasing;
+                    let mut anti_aliasing = current;
+                    egui::ComboBox::from_id_salt("camera_anti_aliasing")
+                        .selected_text(anti_aliasing_label(anti_aliasing))
+                        .show_ui(ui, |ui| {
+                            for (value, label) in ANTI_ALIASING_OPTIONS {
+                                ui.selectable_value(&mut anti_aliasing, value, label);
+                            }
+                        });
+                    if anti_aliasing != current {
+                        state.set_camera_anti_aliasing(id, anti_aliasing);
+                    }
+                } else {
+                    ui.label("Assign a .camerasettings asset");
+                }
+                ui.end_row();
                 ui.label("Active");
                 let mut active = camera.active;
                 let response = ui.checkbox(&mut active, "");
@@ -487,6 +511,24 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
         state.edit_scene(|scene| scene.remove_camera(id));
     }
     run_menu_action(state, id, ComponentKind::Camera, action);
+}
+
+const ANTI_ALIASING_OPTIONS: [(AntiAliasing, &str); 5] = [
+    (AntiAliasing::Fxaa, "FXAA"),
+    (AntiAliasing::None, "None"),
+    (AntiAliasing::Taa, "TAA"),
+    (AntiAliasing::Fsr, "FSR"),
+    (AntiAliasing::Dlss, "DLSS"),
+];
+
+const fn anti_aliasing_label(value: AntiAliasing) -> &'static str {
+    match value {
+        AntiAliasing::Fxaa => "FXAA",
+        AntiAliasing::None => "None",
+        AntiAliasing::Taa => "TAA",
+        AntiAliasing::Fsr => "FSR",
+        AntiAliasing::Dlss => "DLSS",
+    }
 }
 
 /// Выбор ресурса из выпадающего списка или перетаскиванием из Project.
@@ -1901,6 +1943,21 @@ mod tests {
         assert!(camera(&state, &other).settings.is_none());
         assert!(state.scene.as_mut().unwrap().undo());
         assert!(camera(&state, &other).settings.is_some());
+    }
+
+    #[test]
+    fn camera_antialiasing_picker_covers_every_serialized_mode() {
+        assert_eq!(
+            ANTI_ALIASING_OPTIONS.map(|(value, _)| value),
+            [
+                AntiAliasing::Fxaa,
+                AntiAliasing::None,
+                AntiAliasing::Taa,
+                AntiAliasing::Fsr,
+                AntiAliasing::Dlss,
+            ]
+        );
+        assert_eq!(anti_aliasing_label(AntiAliasing::Dlss), "DLSS");
     }
 }
 

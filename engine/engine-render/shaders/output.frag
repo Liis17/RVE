@@ -12,7 +12,13 @@ layout(push_constant) uniform PushConstants {
 } push_constants;
 
 vec4 sample_source(vec2 uv) {
-    return textureLod(sampler2D(source_image, source_sampler), uv, 0.0);
+    vec2 image_size = vec2(textureSize(sampler2D(source_image, source_sampler), 0));
+    vec2 content_extent = 1.0 / push_constants.params.xy;
+    vec2 minimum_uv = 0.5 / image_size;
+    vec2 maximum_uv = max((content_extent - 0.5) / image_size, minimum_uv);
+    return textureLod(
+        sampler2D(source_image, source_sampler), clamp(uv, minimum_uv, maximum_uv), 0.0
+    );
 }
 
 vec3 linear_to_srgb(vec3 value) {
@@ -129,11 +135,16 @@ vec3 fxaa(vec2 uv) {
 }
 
 void main() {
+    vec2 source_extent = 1.0 / push_constants.params.xy;
+    vec2 source_scale = source_extent / vec2(textureSize(
+        sampler2D(source_image, source_sampler), 0
+    ));
+    vec2 source_uv = in_uv * source_scale;
     vec3 linear_color;
     if (push_constants.params.z > 0.5) {
-        linear_color = sample_source(in_uv).rgb;
+        linear_color = sample_source(source_uv).rgb;
     } else {
-        vec3 filtered_srgb = clamp(fxaa(in_uv), 0.0, 1.0);
+        vec3 filtered_srgb = clamp(fxaa(source_uv), 0.0, 1.0);
         linear_color = srgb_to_linear(filtered_srgb);
     }
     if (push_constants.params.w < 0.5) {

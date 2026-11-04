@@ -10,6 +10,20 @@ dev-режиме. Инструмент является внешним crate wor
 
 ## Конвейер
 
+Автоматическая публикация Windows x64 SDK описана в
+`.github/workflows/sdk-release.yml`: push в `main` проходит отбор
+`.github/scripts/select_sdk_release.py` по графу зависимостей Cargo из
+`affected_packages.py`. Выпуск нужен при изменении `rve-editor`, `rve-build`,
+`rve-player`, `rve-sdk` или их зависимостей, общих настроек сборки и файлов
+конвейера выпуска. Документация, примеры и независимые инструменты пропускаются.
+Ручной запуск из `main` принудительный; отсутствие базы сравнения также требует сборки.
+SDK собирается MSVC с bundled GNU toolchain, затем
+`package_sdk_release.py` создаёт `sdk-verified.zip` с корнем `sdk-verified/`,
+распаковывает его во временный каталог и проверяет `scripts` и `build` на шаблоне
+New Project при PATH только с системными каталогами Windows. Успешный архив
+публикуется как prerelease `sdk-<полный SHA>`, без изменения latest release;
+повторный запуск заменяет asset того же релиза. Проверка не запускает GUI или GPU.
+
 `rve-build build <project-dir> --output <dir> [--vulkan-sdk <dir>]` читает
 `project.rveproject` и `bootstrap.rves`, открывает `<project>/Assets` через
 `ResourceSystem` в `SourceMode::Loose`, затем проверяет каждую включённую сцену с
@@ -58,6 +72,20 @@ Lite-, heavy-скрипты и их параметры также берутся
 версия из `ProjectSettings.version`). Бандл нужен, чтобы запуск из Finder не открывал
 Terminal. Бандл не подписывается, `.icns` из AppIcon не создаётся.
 
+Если Windows-проект задаёт `runtime.fsr_library`, builder проверяет, что loader DLL и
+соседний `amd_fidelityfx_upscaler_vk.dll` находятся внутри каталога проекта, и
+копирует их в `Engine/` рядом с player. FSR SDK DLL пользователь поставляет сам;
+репозиторий их не содержит. Отсутствующая или выходящая за проект DLL — ошибка
+входного проекта с кодом 2.
+
+Если Windows-проект задаёт `runtime.dlss_library`, builder проверяет, что
+`nvngx_dlss.dll` находится внутри проекта, собирает checkout player с feature `dlss`
+и копирует runtime DLL в `Engine/`. Для player build требуется `RVE_DLSS_SDK` с
+официальным Windows x64 SDK и `nvsdk_ngx_s.lib`; NGX binaries репозиторий не содержит.
+Dev-player использует библиотеку из проекта. При сборке SDK команда включает DLSS,
+только если `RVE_DLSS_SDK` задан, и записывает `dlss_enabled` в `rve-sdk.toml`;
+`run`/`build` с проектом, требующим DLSS, отклоняют SDK player без этой feature.
+
 ## Назначение архивов
 
 - Явный `[[assets]].archive` сохраняется и имеет приоритет для этого ресурса.
@@ -80,12 +108,16 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 Без маркера используется checkout-режим. Distribution flavor собирает пакет
 `rve-player` командой `cargo build --release --locked -p rve-player
 --no-default-features` и задаёт `CARGO_TARGET_DIR=<checkout>/build/player`; dev flavor
-собирает default features в `build/player-dev`. Путь к исполняемому файлу берётся из
+собирает default features в `build/player-dev`. Для Windows-проекта с
+`runtime.dlss_library` добавляется `--features dlss`, а `RVE_DLSS_SDK` должен
+указывать на SDK root с `nvsdk_ngx_s.lib`. Путь к исполняемому файлу берётся из
 Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to date` по полю `fresh`
 этого артефакта.
 
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
-`engine_version`, `abi_version` и `target`. Маркер распространяемого SDK должен
+`engine_version`, `abi_version`, `target` и `dlss_enabled`. Последнее поле по
+умолчанию false для старых SDK и отражает DLSS feature prebuilt player. Маркер
+распространяемого SDK должен
 указывать текущий `RVE_SCRIPT_ABI_VERSION`; player принимает heavy-script ABI версии
 `RVE_SCRIPT_ABI_MIN_VERSION..=RVE_SCRIPT_ABI_VERSION`, чтобы загружать v3-модули с
 таблицей скриптов предыдущей версии. `target` должен совпадать с парой `ARCH-OS`, например
@@ -94,15 +126,34 @@ Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to d
 ошибка TOML, несовпадение ABI или платформы завершают команду операционной ошибкой.
 SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходникам checkout.
 
-`rve-build sdk --output <dir>` доступна только в checkout-режиме. Она собирает
-distribution `rve-player` в `build/player` и dev `rve-player-dev` в `build/player-dev`,
-затем атомарно публикует новый каталог без замены существующего. Каталог содержит
-`rve-build[.exe]`, `rve-player[.exe]`, `rve-player-dev[.exe]`, `rve-sdk.toml` и
-`rve-sdk/Cargo.toml` с деревом `rve-sdk/src/**`; `target/` не
-копируется. `rve-build` копирует собственный запущенный executable. При debug-сборке
-команда предупреждает об этом; для распространяемого SDK рекомендуется запускать
-`cargo run --release -p rve-build -- sdk --output <dir>`. Клиентский crate указывает
-на `<sdk>/rve-sdk` как path-зависимость (см. [[Engine/RveSdk]]).
+`rve-build sdk --output <dir> (--rust-toolchain <dir> | --no-rust-toolchain)
+[--vulkan-sdk <dir>]` создаёт пакет только из checkout. Готовый пакет работает без
+исходников репозитория: marker выбирает соседние `rve-build`, player и гостевой API.
+Для автономной сборки Rust-скриптов укажи `--rust-toolchain <dir>`; каталог должен
+содержать `bin/cargo` и `bin/rustc` (на Windows `.exe`) и целиком копируется в
+`toolchain/`. `--no-rust-toolchain` предназначен для CI и пакетов без autobuild.
+
+Команда пересобирает release editor, builder и оба player; distribution player без
+console. Пути executable берутся из Cargo JSON. Кэши изолированы в `build/sdk-player`
+и `build/sdk-tools`. На Windows каждому Cargo build передаётся явный target вместе
+с `-C target-feature=+crt-static`, поэтому флаг не затрагивает host proc macros.
+SDK содержит четыре executable, marker, гостевой `rve-sdk/Cargo.toml` и `src/**`.
+На macOS они находятся в `RVE Editor.app/Contents/MacOS`, Vulkan loader/MoltenVK
+и ICD — в `Contents/Resources/Engine`. Публикация атомарная без замены output.
+
+Для Windows автономного guest build подходит rustup toolchain
+`stable-x86_64-pc-windows-gnu --profile minimal`; её sysroot получают через
+`rustup run stable-x86_64-pc-windows-gnu rustc --print sysroot`. В полный bundle
+попадают `rust-lld.exe`, self-contained CRT/import libraries и runtime DLL
+`libgcc_s_seh-1.dll`/`libwinpthread-1.dll`. Когда bundled sysroot содержит GNU target,
+`script_cargo_command` передаёт Cargo encoded rustflags с `linker-flavor=gnu-lld`,
+`link-self-contained=yes` и `crt-static`, используя этот linker по абсолютному пути.
+Стабильный rustc пока принимает flavor `gnu-lld` только с `-Z unstable-options`,
+поэтому builder задаёт `RUSTC_BOOTSTRAP=1` для этого дочернего Cargo. Это позволяет
+собирать гостевой cdylib без установленного MinGW/GCC; код связывается с C ABI и
+загружается из MSVC editor/builder. На macOS для сборки SDK и guest scripts нужны
+Apple Command Line Tools; `rve-build scripts` запускает `xcode-select --install`,
+если CLT отсутствуют.
 
 Если `project.rveproject` содержит `heavy_scripts`, каталог обязан содержать
 `Cargo.toml` с lib-target `crate-type = ["cdylib"]`. Сборщик читает Cargo metadata,
@@ -111,6 +162,20 @@ distribution `rve-player` в `build/player` и dev `rve-player-dev` в `build/pl
 `--release`, а `run` использует debug-профиль. Библиотека выбирается из
 `compiler-artifact` по package id из metadata, имени target, kind `cdylib` и
 расширению текущей платформы. Cargo.lock скриптов остаётся в зоне проекта.
+
+`rve-build scripts <project-dir>` собирает debug cdylib с теми же проверками ABI,
+имён и параметров и выводит абсолютный путь последней строкой stdout. Без
+`heavy_scripts` выводит пустую строку и завершается успешно. Перед Cargo гостевой
+API из SDK либо checkout синхронизируется в `<project>/.rve/sdk/rve-sdk`;
+совпадающие файлы сохраняют mtime, удалённые исходники убираются.
+
+При наличии SDK `toolchain/` и metadata, и build запускают его Cargo с явным
+`RUSTC`, отдельным `CARGO_HOME=<project>/.rve/cargo-home` и toolchain/bin в начале
+PATH. Наследуемые Rust flags, rustup toolchain и compiler wrappers убираются; для
+bundled Windows GNU sysroot builder устанавливает только необходимые encoded linker
+flags. Без toolchain действует прежний CARGO/PATH. На macOS отсутствие CLT вызывает
+`xcode-select --install` и операционную ошибку с просьбой повторить сборку после
+установки.
 
 Собранную библиотеку сборщик загружает через `ScriptLibrary` и проверяет, что она
 регистрирует каждое имя heavy-скрипта из включённых сцен. Ссылка сцены на heavy без
@@ -173,3 +238,10 @@ MoltenVK (Apache-2.0).
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,
 `archives.rs`, `player.rs`, `sdk.rs`, `ico.rs`, `platform.rs`, `temporary.rs`.
+
+В SDK-режиме на macOS Build Player берёт Vulkan из bundled `Contents/Resources/Engine`;
+явный `--vulkan-sdk` сохраняет приоритет. Windows SDK принимает только toolchain
+с GNU `rust-lld.exe` и self-contained libraries. Для встроенного GNU linker используются
+`RUSTC_BOOTSTRAP=1` и gated `gnu-lld`; при обновлении Rust нужна повторная smoke-проверка,
+в том числе зависимостей с proc-macro и build.rs. Сторонние native зависимости могут
+требовать дополнительных инструментов.

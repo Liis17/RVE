@@ -6,7 +6,7 @@ use crate::viewport::model_loader::ModelLoader;
 use engine_assets::{Model, ModelAlphaMode};
 use engine_render::AlphaMode;
 use engine_render::{
-    AntiAliasing as RenderAntiAliasing, DirectionalLight, DrawCommand, EnvironmentId,
+    AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, LocalLight, LocalLightShadow,
     LocalLightShadowMatrices, Material, MaterialId, MeshId, ProceduralSky, RenderError, Renderer,
     SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex,
@@ -48,6 +48,45 @@ pub struct SceneRenderer {
     grid_material: Option<MaterialId>,
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
+    motion_history: MotionHistory,
+}
+
+#[derive(Default)]
+struct MotionHistory {
+    previous_models: HashMap<ObjectHandle, [[f32; 4]; 4]>,
+    current_models: HashMap<ObjectHandle, [[f32; 4]; 4]>,
+    game_camera: Option<ObjectHandle>,
+    playing: Option<bool>,
+    reset_pending: bool,
+}
+
+impl MotionHistory {
+    fn begin_frame(&mut self, game_camera: ObjectHandle, playing: bool) {
+        let reset = self
+            .game_camera
+            .is_some_and(|previous| previous != game_camera)
+            || self.playing.is_some_and(|previous| previous != playing);
+        if reset {
+            self.previous_models.clear();
+            self.reset_pending = true;
+        }
+        self.game_camera = Some(game_camera);
+        self.playing = Some(playing);
+        self.current_models.clear();
+    }
+
+    fn previous_model(&self, object: ObjectHandle) -> Option<[[f32; 4]; 4]> {
+        self.previous_models.get(&object).copied()
+    }
+
+    fn record_current(&mut self, object: ObjectHandle, model: [[f32; 4]; 4]) {
+        self.current_models.insert(object, model);
+    }
+
+    fn commit_frame(&mut self) {
+        self.previous_models = std::mem::take(&mut self.current_models);
+        self.reset_pending = false;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +112,7 @@ impl SceneRenderer {
             grid_material: None,
             scene_draws: Vec::new(),
             game_draws: Vec::new(),
+            motion_history: MotionHistory::default(),
         })
     }
 
@@ -267,6 +307,7 @@ impl SceneRenderer {
                 frame,
                 scene_eye,
                 &mut resources,
+                &mut self.motion_history,
                 &mut self.scene_draws,
             )?;
             append_world_draws(
@@ -275,6 +316,7 @@ impl SceneRenderer {
                 frame,
                 game_eye,
                 &mut resources,
+                &mut self.motion_history,
                 &mut self.game_draws,
             )?;
             resources.used_object_materials
@@ -315,10 +357,20 @@ impl SceneRenderer {
                 mesh: grid,
                 material: Some(grid_material),
                 model: Mat4::from_scale(Vec3::splat(grid_scale(distance))).to_cols_array_2d(),
+                previous_model: None,
+                lod_level: 0,
                 casts_shadow: false,
             });
         }
         Ok(())
+    }
+
+    pub fn begin_motion_frame(&mut self, game_camera: ObjectHandle, playing: bool) {
+        self.motion_history.begin_frame(game_camera, playing);
+    }
+
+    pub fn commit_motion_history(&mut self) {
+        self.motion_history.commit_frame();
     }
 
     /// Собирает `Frame` для заданной матрицы камеры; `with_grid` выбирает Scene draw list.
@@ -336,6 +388,7 @@ impl SceneRenderer {
         environment_state: Option<&EnvironmentState>,
         shadow_cascades: &'a [[[f32; 4]; 4]],
         with_grid: bool,
+        debug_view: DebugView,
     ) -> Frame<'a> {
         let light = frame_light(light, scene_has_light);
         let environment = self.frame_environment(environment_state);
@@ -362,6 +415,8 @@ impl SceneRenderer {
                 &self.game_draws
             },
             overlay: &[],
+            debug_view,
+            reset_history: self.motion_history.reset_pending,
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
                 exposure_ev: settings.color.exposure_ev,
@@ -373,6 +428,9 @@ impl SceneRenderer {
                 anti_aliasing: match settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
+                    AntiAliasing::Taa => RenderAntiAliasing::Taa,
+                    AntiAliasing::Fsr => RenderAntiAliasing::Fsr,
+                    AntiAliasing::Dlss => RenderAntiAliasing::Dlss,
                 },
             },
         }
@@ -513,6 +571,7 @@ fn append_world_draws(
     frame: &SceneFrame,
     eye: Vec3,
     resources: &mut DrawResources<'_>,
+    motion_history: &mut MotionHistory,
     draws: &mut Vec<DrawCommand>,
 ) -> Result<(), RenderError> {
     for instance in &frame.meshes {
@@ -609,8 +668,11 @@ fn append_world_draws(
                 mesh: *mesh_id,
                 material: Some(material_id),
                 model: instance.model.to_cols_array_2d(),
+                previous_model: motion_history.previous_model(instance.object),
+                lod_level: u8::try_from(level).unwrap_or(u8::MAX),
                 casts_shadow: true,
             });
+            motion_history.record_current(instance.object, instance.model.to_cols_array_2d());
         }
     }
     Ok(())
@@ -1360,5 +1422,43 @@ range = 10
         assert_eq!(resolved.base_color_texture, None);
         assert_eq!(resolved.metallic_roughness_texture, None);
         assert_eq!(resolved.normal_texture, None);
+    }
+
+    #[test]
+    fn editor_motion_history_is_shared_until_frame_commit_and_resets_on_camera_or_play_change() {
+        let document = engine_scene::SceneDocument::parse(
+            "motion.rvescene",
+            "[[objects]]\nid = \"main\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"game\"\n[objects.camera]\n[[objects]]\nid = \"mesh\"\n[objects.transform]\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let main_camera = world.handle("main").unwrap();
+        let game_camera = world.handle("game").unwrap();
+        let mesh = world.handle("mesh").unwrap();
+        let first_model = Mat4::from_translation(Vec3::X).to_cols_array_2d();
+        let next_model = Mat4::from_translation(Vec3::Y).to_cols_array_2d();
+        let mut history = MotionHistory::default();
+
+        history.begin_frame(game_camera, false);
+        history.record_current(mesh, first_model);
+        assert_eq!(history.previous_model(mesh), None);
+        history.record_current(mesh, first_model);
+        assert_eq!(history.previous_model(mesh), None);
+        history.commit_frame();
+
+        history.begin_frame(game_camera, false);
+        history.record_current(mesh, next_model);
+        assert_eq!(history.previous_model(mesh), Some(first_model));
+        assert_eq!(history.previous_model(mesh), Some(first_model));
+        history.commit_frame();
+        assert_eq!(history.previous_model(mesh), Some(next_model));
+
+        history.begin_frame(main_camera, false);
+        assert!(history.reset_pending);
+        assert_eq!(history.previous_model(mesh), None);
+        history.commit_frame();
+        history.begin_frame(main_camera, true);
+        assert!(history.reset_pending);
+        assert_eq!(history.previous_model(mesh), None);
     }
 }
