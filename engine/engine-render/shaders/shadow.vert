@@ -18,6 +18,8 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 local_light_params;
     mat4 view;
     vec4 cluster_params;
+    mat4 previous_view_projection;
+    vec4 render_params;
 } frame;
 
 #ifdef LOCAL_SHADOW
@@ -29,6 +31,8 @@ layout(set = 0, binding = 6, std430) readonly buffer LocalShadowMatrixBuffer {
 layout(push_constant) uniform PushConstants {
     mat4 model;
     mat4 normal_from_model;
+    mat4 previous_model;
+    uvec4 params;
 } push_constants;
 
 void main() {

@@ -46,12 +46,27 @@ pub struct ProjectRequirements {
 pub struct RuntimeSettings {
     #[serde(default = "default_background_tick_hz")]
     pub background_tick_hz: u32,
+    #[serde(default)]
+    pub fsr_library: Option<String>,
+    #[serde(default)]
+    pub dlss_library: Option<String>,
+    #[serde(default)]
+    pub dlss_project_id: Option<String>,
+    #[serde(default)]
+    pub dlss_application_id: Option<u64>,
+    #[serde(default)]
+    pub dlss_engine_version: Option<String>,
 }
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             background_tick_hz: default_background_tick_hz(),
+            fsr_library: None,
+            dlss_library: None,
+            dlss_project_id: None,
+            dlss_application_id: None,
+            dlss_engine_version: None,
         }
     }
 }
@@ -141,9 +156,83 @@ impl ProjectSettings {
         if self.runtime.background_tick_hz == 0 {
             return Err("runtime.background_tick_hz должен быть больше нуля".to_owned());
         }
+        if let Some(path) = &self.runtime.fsr_library
+            && (!is_relative_project_path(path)
+                || !Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("dll")))
+        {
+            return Err(
+                "runtime.fsr_library должен быть относительным путём к DLL внутри каталога проекта"
+                    .to_owned(),
+            );
+        }
+        if let Some(path) = &self.runtime.dlss_library
+            && (!is_relative_project_path(path)
+                || !Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("nvngx_dlss.dll")))
+        {
+            return Err(
+                "runtime.dlss_library должен указывать на nvngx_dlss.dll внутри каталога проекта"
+                    .to_owned(),
+            );
+        }
+        if self.runtime.dlss_library.is_some() {
+            validate_dlss_identity(
+                self.runtime.dlss_project_id.as_deref(),
+                self.runtime.dlss_application_id,
+                self.runtime.dlss_engine_version.as_deref(),
+            )?;
+        } else if self.runtime.dlss_project_id.is_some()
+            || self.runtime.dlss_application_id.is_some()
+            || self.runtime.dlss_engine_version.is_some()
+        {
+            return Err("runtime DLSS identifiers require runtime.dlss_library".to_owned());
+        }
 
         Ok(())
     }
+}
+
+fn validate_dlss_identity(
+    project_id: Option<&str>,
+    application_id: Option<u64>,
+    engine_version: Option<&str>,
+) -> Result<(), String> {
+    if project_id.is_some() == application_id.is_some() {
+        return Err(
+            "runtime DLSS requires exactly one of dlss_project_id or dlss_application_id"
+                .to_owned(),
+        );
+    }
+    if let Some(project_id) = project_id {
+        let bytes = project_id.as_bytes();
+        if bytes.len() != 36
+            || !bytes.iter().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => *byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            })
+        {
+            return Err(
+                "runtime.dlss_project_id должен быть GUID-подобным hex идентификатором".to_owned(),
+            );
+        }
+        if engine_version.is_none_or(|version| {
+            version.trim().is_empty() || version.len() > 64 || version.contains('\0')
+        }) {
+            return Err(
+                "runtime.dlss_engine_version должен содержать от 1 до 64 символов без NUL"
+                    .to_owned(),
+            );
+        }
+    } else if application_id == Some(0) {
+        return Err("runtime.dlss_application_id должен быть больше нуля".to_owned());
+    } else if engine_version.is_some() {
+        return Err("runtime.dlss_engine_version требует runtime.dlss_project_id".to_owned());
+    }
+    Ok(())
 }
 
 fn is_relative_project_path(value: &str) -> bool {
@@ -224,6 +313,11 @@ mod tests {
         assert_eq!(settings.requirements.min_cpu_threads, 0);
         assert_eq!(settings.runtime, RuntimeSettings::default());
         assert_eq!(settings.runtime.background_tick_hz, 30);
+        assert_eq!(settings.runtime.fsr_library, None);
+        assert_eq!(settings.runtime.dlss_library, None);
+        assert_eq!(settings.runtime.dlss_project_id, None);
+        assert_eq!(settings.runtime.dlss_application_id, None);
+        assert_eq!(settings.runtime.dlss_engine_version, None);
         assert_eq!(settings.starting_scene(), Some("scenes/start.rvescene"));
     }
 
@@ -351,10 +445,93 @@ mod tests {
         let invalid = ProjectSettings {
             runtime: RuntimeSettings {
                 background_tick_hz: 0,
+                fsr_library: None,
+                ..RuntimeSettings::default()
             },
             ..settings
         };
         assert!(invalid.to_toml().is_err());
+    }
+
+    #[test]
+    fn validates_optional_fsr_loader_path() {
+        let settings = ProjectSettings::parse(&format!(
+            "{}\n[runtime]\nfsr_library = \"vendor/amd_fidelityfx_loader_vk.dll\"\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.runtime.fsr_library.as_deref(),
+            Some("vendor/amd_fidelityfx_loader_vk.dll")
+        );
+        assert_eq!(
+            ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap(),
+            settings
+        );
+
+        for path in [
+            "",
+            "../loader.dll",
+            "C:/vendor/loader.dll",
+            "vendor/loader.bin",
+        ] {
+            let contents = format!(
+                "{}\n[runtime]\nfsr_library = {path:?}\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            );
+            assert!(
+                ProjectSettings::parse(&contents)
+                    .unwrap_err()
+                    .contains("runtime.fsr_library"),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_optional_dlss_runtime_and_identity() {
+        let project_id = "a0f57b54-1daf-4934-90ae-c4035c19df04";
+        let settings = ProjectSettings::parse(&format!(
+            "{}\n[runtime]\ndlss_library = \"vendor/nvngx_dlss.dll\"\ndlss_project_id = {project_id:?}\ndlss_engine_version = \"0.1.0\"\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.runtime.dlss_library.as_deref(),
+            Some("vendor/nvngx_dlss.dll")
+        );
+        assert_eq!(
+            settings.runtime.dlss_project_id.as_deref(),
+            Some(project_id)
+        );
+        assert_eq!(
+            ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap(),
+            settings
+        );
+
+        let app_id = ProjectSettings::parse(&format!(
+            "{}\n[runtime]\ndlss_library = \"vendor/nvngx_dlss.dll\"\ndlss_application_id = 42\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(app_id.runtime.dlss_application_id, Some(42));
+
+        for runtime in [
+            "dlss_library = \"../nvngx_dlss.dll\"\ndlss_application_id = 42",
+            "dlss_library = \"vendor/other.dll\"\ndlss_application_id = 42",
+            "dlss_library = \"vendor/nvngx_dlss.dll\"",
+            "dlss_library = \"vendor/nvngx_dlss.dll\"\ndlss_project_id = \"bad\"\ndlss_engine_version = \"0.1\"",
+            "dlss_library = \"vendor/nvngx_dlss.dll\"\ndlss_project_id = \"a0f57b54-1daf-4934-90ae-c4035c19df04\"\ndlss_application_id = 42\ndlss_engine_version = \"0.1\"",
+            "dlss_library = \"vendor/nvngx_dlss.dll\"\ndlss_application_id = 0",
+            "dlss_library = \"vendor/nvngx_dlss.dll\"\ndlss_project_id = \"a0f57b54-1daf-4934-90ae-c4035c19df04\"\ndlss_engine_version = \" \"",
+        ] {
+            let contents = format!(
+                "{}\n[runtime]\n{runtime}\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            );
+            let error = ProjectSettings::parse(&contents).unwrap_err();
+            assert!(error.to_ascii_lowercase().contains("dlss"), "{runtime:?}");
+        }
     }
 
     #[test]

@@ -48,6 +48,15 @@ fn distance_to_segment(point: Pos2, a: Pos2, b: Pos2) -> f32 {
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.horizontal(|ui| {
+        ui.label("View");
+        super::debug_view::picker(
+            ui,
+            "scene_debug_view",
+            &mut state.scene_view.debug_view,
+            state.wireframe_supported,
+        );
+    });
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
     let pixels_per_point = ui.ctx().pixels_per_point();

@@ -1027,6 +1027,8 @@ fn render_scene_frame(
     };
     let scene_size = drawable(state.scene_view);
     let game_size = drawable(state.game_view);
+    let scene_debug_view = state.scene_view.debug_view;
+    let game_debug_view = state.game_view.debug_view;
     if scene_size.is_none() && game_size.is_none() {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     }
@@ -1039,7 +1041,7 @@ fn render_scene_frame(
     let pending_frame = state.pending_frame.take();
     // Модель ещё разбирается в фоне: наведение камеры ждёт её готовности.
     let mut still_loading = None;
-    let (scene_frame, game_camera, game_settings, has_light, frame_target) = {
+    let (scene_frame, game_camera, game_settings, game_camera_handle, has_light, frame_target) = {
         let Some(parts) = state.frame_parts() else {
             return render_ui_only(&mut gpu.renderer, ui, &[]);
         };
@@ -1097,6 +1099,7 @@ fn render_scene_frame(
             scene_frame,
             game_camera,
             game_settings,
+            game_camera_handle,
             has_light,
             frame_target,
         )
@@ -1121,6 +1124,7 @@ fn render_scene_frame(
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
     let (local_lights, local_light_shadows) = render_local_lights(&scene_frame.local_lights);
+    gpu.scene.begin_motion_frame(game_camera_handle, playing);
     gpu.scene.build_draws(
         &mut gpu.renderer,
         parts.world,
@@ -1158,6 +1162,7 @@ fn render_scene_frame(
             scene_frame.environment.as_ref(),
             &scene_shadow_cascades,
             true,
+            scene_debug_view,
         )
     });
     let game_view = game_size.map(|[width, height]| {
@@ -1173,6 +1178,7 @@ fn render_scene_frame(
             scene_frame.environment.as_ref(),
             &game_shadow_cascades,
             false,
+            game_debug_view,
         )
     });
     let mut scenes = Vec::with_capacity(2);
@@ -1187,8 +1193,13 @@ fn render_scene_frame(
         .map(|(viewport, _)| *viewport)
         .collect::<Vec<_>>();
     let primitives = visible_primitives(ui, &drawn);
-    gpu.renderer
-        .render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR)
+    let result = gpu
+        .renderer
+        .render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR);
+    if result.is_ok() {
+        gpu.scene.commit_motion_history();
+    }
+    result
 }
 
 /// Примитивы без изображений viewport, которые не рисуются в этом кадре.
@@ -1236,6 +1247,7 @@ impl WindowHandler for EditorApp {
                 return false;
             }
         };
+        self.state.wireframe_supported = renderer.capabilities().wireframe;
         let scene = match SceneRenderer::new(&mut renderer) {
             Ok(scene) => scene,
             Err(error) => {

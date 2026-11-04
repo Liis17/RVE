@@ -729,6 +729,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "engine-platform",
+ "libloading 0.9.0",
  "log",
  "naga",
  "raw-window-handle",

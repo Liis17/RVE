@@ -58,6 +58,20 @@ Lite-, heavy-скрипты и их параметры также берутся
 версия из `ProjectSettings.version`). Бандл нужен, чтобы запуск из Finder не открывал
 Terminal. Бандл не подписывается, `.icns` из AppIcon не создаётся.
 
+Если Windows-проект задаёт `runtime.fsr_library`, builder проверяет, что loader DLL и
+соседний `amd_fidelityfx_upscaler_vk.dll` находятся внутри каталога проекта, и
+копирует их в `Engine/` рядом с player. FSR SDK DLL пользователь поставляет сам;
+репозиторий их не содержит. Отсутствующая или выходящая за проект DLL — ошибка
+входного проекта с кодом 2.
+
+Если Windows-проект задаёт `runtime.dlss_library`, builder проверяет, что
+`nvngx_dlss.dll` находится внутри проекта, собирает checkout player с feature `dlss`
+и копирует runtime DLL в `Engine/`. Для player build требуется `RVE_DLSS_SDK` с
+официальным Windows x64 SDK и `nvsdk_ngx_s.lib`; NGX binaries репозиторий не содержит.
+Dev-player использует библиотеку из проекта. При сборке SDK команда включает DLSS,
+только если `RVE_DLSS_SDK` задан, и записывает `dlss_enabled` в `rve-sdk.toml`;
+`run`/`build` с проектом, требующим DLSS, отклоняют SDK player без этой feature.
+
 ## Назначение архивов
 
 - Явный `[[assets]].archive` сохраняется и имеет приоритет для этого ресурса.
@@ -80,12 +94,16 @@ Terminal. Бандл не подписывается, `.icns` из AppIcon не 
 Без маркера используется checkout-режим. Distribution flavor собирает пакет
 `rve-player` командой `cargo build --release --locked -p rve-player
 --no-default-features` и задаёт `CARGO_TARGET_DIR=<checkout>/build/player`; dev flavor
-собирает default features в `build/player-dev`. Путь к исполняемому файлу берётся из
+собирает default features в `build/player-dev`. Для Windows-проекта с
+`runtime.dlss_library` добавляется `--features dlss`, а `RVE_DLSS_SDK` должен
+указывать на SDK root с `nvsdk_ngx_s.lib`. Путь к исполняемому файлу берётся из
 Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to date` по полю `fresh`
 этого артефакта.
 
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
-`engine_version`, `abi_version` и `target`. Маркер распространяемого SDK должен
+`engine_version`, `abi_version`, `target` и `dlss_enabled`. Последнее поле по
+умолчанию false для старых SDK и отражает DLSS feature prebuilt player. Маркер
+распространяемого SDK должен
 указывать текущий `RVE_SCRIPT_ABI_VERSION`; player принимает heavy-script ABI версии
 `RVE_SCRIPT_ABI_MIN_VERSION..=RVE_SCRIPT_ABI_VERSION`, чтобы загружать v3-модули с
 таблицей скриптов предыдущей версии. `target` должен совпадать с парой `ARCH-OS`, например

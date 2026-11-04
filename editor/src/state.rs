@@ -12,7 +12,8 @@ use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
 use engine_files::VirtualPath;
-use engine_scene::World;
+use engine_render::DebugView;
+use engine_scene::{AntiAliasing, CameraSettings, World};
 use engine_script::{ParamSchema, ScriptInterruptHandle, ScriptLibrary};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -87,6 +88,8 @@ pub struct SceneViewInfo {
     pub size: [u32; 2],
     /// Прямоугольник изображения Game в координатах egui за текущий кадр.
     pub rect: Option<egui::Rect>,
+    /// Render diagnostic selected for this panel.
+    pub debug_view: DebugView,
 }
 
 /// Раздельные заимствования состояния для подготовки кадра сцены.
@@ -134,6 +137,8 @@ pub struct EditorState {
     pub scene_view: SceneViewInfo,
     pub game_viewport_texture: Option<egui::TextureId>,
     pub game_view: SceneViewInfo,
+    /// Optional renderer features used to filter the debug-view controls.
+    pub wireframe_supported: bool,
     /// Id камеры вкладки Game; панель заменяет отсутствующую камеру первой в документе.
     pub game_camera: Option<String>,
     /// Объект с новой моделью: после её загрузки камера покажет его, если он почти не виден.
@@ -184,6 +189,7 @@ impl EditorState {
             scene_view: SceneViewInfo::default(),
             game_viewport_texture: None,
             game_view: SceneViewInfo::default(),
+            wireframe_supported: false,
             game_camera: None,
             pending_frame: None,
             models: HashMap::new(),
@@ -252,6 +258,66 @@ impl EditorState {
             loader: &mut self.model_loader,
             log: &mut self.log,
         })
+    }
+
+    pub fn camera_settings_for(&mut self, id: &str) -> Option<CameraSettings> {
+        let world = self.world_mut()?;
+        let handle = world.handle(id)?;
+        world.camera_settings(handle).copied()
+    }
+
+    /// Persists an AA change to the camera's assigned settings asset and refreshes all
+    /// cameras that share that asset in the current editor world.
+    pub fn set_camera_anti_aliasing(&mut self, id: &str, anti_aliasing: AntiAliasing) {
+        if self.is_playing() {
+            return;
+        }
+        let path = self
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.object(id))
+            .and_then(|object| object.camera.as_ref())
+            .and_then(|camera| camera.settings.clone());
+        let Some(path) = path else {
+            self.log.error("Назначьте камере ресурс .camerasettings");
+            return;
+        };
+        let Some(mut settings) = self.camera_settings_for(id) else {
+            self.log.error(format!("камера {id:?} не найдена в мире"));
+            return;
+        };
+        settings.render.anti_aliasing = anti_aliasing;
+        let Some(project) = self.project.as_ref() else {
+            self.log.error("проект не открыт");
+            return;
+        };
+        if let Err(error) = project.save_camera_settings(&path, &settings) {
+            self.log.error(error);
+            return;
+        }
+        let handles = self
+            .world_mut()
+            .map(|world| {
+                world
+                    .objects()
+                    .iter()
+                    .filter(|object| {
+                        object
+                            .camera
+                            .as_ref()
+                            .and_then(|camera| camera.settings.as_ref())
+                            == Some(&path)
+                    })
+                    .map(|object| object.handle)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(world) = self.world_mut() {
+            for handle in handles {
+                let _ = world.set_camera_settings(handle, settings);
+            }
+        }
+        self.log.info(format!("Сохранены настройки камеры {path}"));
     }
 
     /// Сбрасывает данные, связанные с прежней сценой.
@@ -409,7 +475,6 @@ mod tests {
     use super::*;
     use crate::project::OpenProject;
     use crate::scene_edit::{EditorScene, no_prefabs};
-    use engine_scene::CameraSettings;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -546,6 +611,42 @@ settings = "/cameras/problem.camerasettings"
         state.create_object(&NewObject::DirectionalLight, None);
         assert_eq!(state.log.entries().count(), 1);
         assert_eq!(state.scene.as_ref().unwrap().document().objects.len(), 2);
+    }
+
+    #[test]
+    fn camera_anti_aliasing_edits_update_the_asset_and_editor_world() {
+        let temp = TempProject::new(None);
+        let mut state = state_with_camera_assets(&temp.0);
+        state.edit_scene(|scene| {
+            scene.set_camera_settings(
+                "camera-b",
+                Some(VirtualPath::parse("/cameras/valid.camerasettings").unwrap()),
+            )
+        });
+        state.set_camera_anti_aliasing("camera-a", AntiAliasing::Taa);
+
+        let settings = CameraSettings::parse(
+            "saved camera settings",
+            &fs::read_to_string(temp.0.join("Assets/cameras/valid.camerasettings")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings.render.anti_aliasing, AntiAliasing::Taa);
+        assert_eq!(
+            state
+                .camera_settings_for("camera-a")
+                .unwrap()
+                .render
+                .anti_aliasing,
+            AntiAliasing::Taa
+        );
+        assert_eq!(
+            state
+                .camera_settings_for("camera-b")
+                .unwrap()
+                .render
+                .anti_aliasing,
+            AntiAliasing::Taa
+        );
     }
 
     #[test]

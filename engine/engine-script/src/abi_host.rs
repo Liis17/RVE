@@ -13,11 +13,11 @@ use engine_scene::{
     ProjectionSettings, Tonemapper,
 };
 use rve_sdk::abi::{
-    RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_LOG_ERROR, RVE_LOG_INFO, RVE_LOG_WARN,
-    RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY,
-    RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveCameraSettings,
-    RveHost, RveParamEntry, RveParams, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform,
-    RveValue, RveValueData,
+    RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
+    RVE_ANTI_ALIASING_TAA, RVE_LOG_ERROR, RVE_LOG_INFO, RVE_LOG_WARN, RVE_TONEMAPPER_ACES,
+    RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
+    RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveCameraSettings, RveHost, RveParamEntry, RveParams,
+    RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -674,6 +674,9 @@ fn camera_settings_to_abi(settings: CameraSettings) -> RveCameraSettings {
         anti_aliasing: match settings.render.anti_aliasing {
             AntiAliasing::Fxaa => RVE_ANTI_ALIASING_FXAA,
             AntiAliasing::None => RVE_ANTI_ALIASING_NONE,
+            AntiAliasing::Taa => RVE_ANTI_ALIASING_TAA,
+            AntiAliasing::Fsr => RVE_ANTI_ALIASING_FSR,
+            AntiAliasing::Dlss => RVE_ANTI_ALIASING_DLSS,
         },
         tonemapper: match settings.color.tonemapper {
             Tonemapper::Aces => RVE_TONEMAPPER_ACES,
@@ -687,6 +690,9 @@ fn camera_settings_from_abi(value: RveCameraSettings) -> Option<CameraSettings> 
     let anti_aliasing = match value.anti_aliasing {
         RVE_ANTI_ALIASING_FXAA => AntiAliasing::Fxaa,
         RVE_ANTI_ALIASING_NONE => AntiAliasing::None,
+        RVE_ANTI_ALIASING_TAA => AntiAliasing::Taa,
+        RVE_ANTI_ALIASING_FSR => AntiAliasing::Fsr,
+        RVE_ANTI_ALIASING_DLSS => AntiAliasing::Dlss,
         _ => return None,
     };
     let tonemapper = match value.tonemapper {

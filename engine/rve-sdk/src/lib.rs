@@ -7,10 +7,10 @@ pub mod abi;
 
 pub use abi::{Key, MouseButton};
 use abi::{
-    RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
-    RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT,
-    RVE_VALUE_STR, RveArray, RveCameraSettings, RveHost, RveParams, RveStr, RveTime, RveTransform,
-    RveValue, RveValueData,
+    RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
+    RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
+    RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
+    RveCameraSettings, RveHost, RveParams, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -179,6 +179,12 @@ pub enum AntiAliasing {
     Fxaa = RVE_ANTI_ALIASING_FXAA,
     /// Bilinear output filtering.
     None = RVE_ANTI_ALIASING_NONE,
+    /// Temporal anti-aliasing and upscaling.
+    Taa = RVE_ANTI_ALIASING_TAA,
+    /// AMD FidelityFX upscaling; falls back to TAA when the backend is unavailable.
+    Fsr = RVE_ANTI_ALIASING_FSR,
+    /// NVIDIA DLSS upscaling; falls back to TAA when the backend is unavailable.
+    Dlss = RVE_ANTI_ALIASING_DLSS,
 }
 
 impl AntiAliasing {
@@ -187,6 +193,9 @@ impl AntiAliasing {
         match code {
             RVE_ANTI_ALIASING_FXAA => Some(Self::Fxaa),
             RVE_ANTI_ALIASING_NONE => Some(Self::None),
+            RVE_ANTI_ALIASING_TAA => Some(Self::Taa),
+            RVE_ANTI_ALIASING_FSR => Some(Self::Fsr),
+            RVE_ANTI_ALIASING_DLSS => Some(Self::Dlss),
             _ => None,
         }
     }
