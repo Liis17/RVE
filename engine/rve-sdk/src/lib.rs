@@ -508,6 +508,51 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Stages an input context change. Returns false when unavailable or invalid.
+    pub fn set_input_context(&mut self, name: &str) -> bool {
+        let Some(callback) = self.host.set_input_context else {
+            return false;
+        };
+        // SAFETY: the context name is borrowed for the duration of the callback.
+        unsafe { callback(self.host.ctx, RveStr::from_str_ref(name)) }
+    }
+
+    /// Replaces one action binding slot. Returns false when unavailable or invalid.
+    pub fn rebind(
+        &mut self,
+        context: &str,
+        action: &str,
+        slot: &str,
+        inputs: &[PhysicalInput],
+    ) -> bool {
+        let Some(callback) = self.host.rebind_action else {
+            return false;
+        };
+        let names: Vec<_> = inputs.iter().map(|input| input.name()).collect();
+        let abi_names: Vec<_> = names
+            .iter()
+            .map(|name| RveStr::from_str_ref(name))
+            .collect();
+        // SAFETY: all strings and the array remain alive for the callback.
+        unsafe {
+            callback(
+                self.host.ctx,
+                RveStr::from_str_ref(context),
+                RveStr::from_str_ref(action),
+                RveStr::from_str_ref(slot),
+                abi_names.as_ptr(),
+                abi_names.len(),
+            )
+        }
+    }
+
+    /// Stages restoration of all input bindings to their project defaults.
+    pub fn reset_bindings(&mut self) -> bool {
+        self.host
+            .reset_bindings
+            .is_some_and(|callback| unsafe { callback(self.host.ctx) })
+    }
+
     fn object_string(&self, callback: abi::RveObjectStringFn) -> Option<String> {
         let mut value = RveStr::empty();
         // SAFETY: the host pointer and output slot are valid during this callback.
@@ -568,6 +613,98 @@ impl Console<'_> {
 }
 
 impl Input<'_> {
+    /// Returns whether a button action is currently down.
+    pub fn action_down(&self, name: &str) -> bool {
+        self.action_state(name) & abi::RVE_INPUT_DOWN != 0
+    }
+
+    /// Returns whether a button action became down this frame.
+    pub fn action_pressed(&self, name: &str) -> bool {
+        self.action_state(name) & abi::RVE_INPUT_PRESSED != 0
+    }
+
+    /// Returns whether a button action became released this frame.
+    pub fn action_released(&self, name: &str) -> bool {
+        self.action_state(name) & abi::RVE_INPUT_RELEASED != 0
+    }
+
+    /// Reads an axis action, or returns `None` when unavailable, unknown, or the wrong kind.
+    pub fn axis(&self, name: &str) -> Option<f32> {
+        self.action_value(name, abi::RVE_ACTION_AXIS)
+            .map(|value| value[0])
+    }
+
+    /// Reads a vector2 action, or returns `None` when unavailable, unknown, or the wrong kind.
+    pub fn vector(&self, name: &str) -> Option<[f32; 2]> {
+        self.action_value(name, abi::RVE_ACTION_VECTOR2)
+    }
+
+    /// Returns the active input context when this host exposes ABI v5 input actions.
+    pub fn context(&self) -> Option<String> {
+        let callback = self.host.input_context?;
+        let mut value = RveStr::empty();
+        // SAFETY: output storage is local and returned strings are callback-scoped.
+        if !unsafe { callback(self.host.ctx, &mut value) } {
+            return None;
+        }
+        // SAFETY: ABI v5 host keeps this borrowed string alive through the callback.
+        unsafe { value.to_str().ok().map(str::to_owned) }
+    }
+
+    /// Returns a slot's bindings, including `Some(Vec::new())` for an empty valid slot.
+    pub fn bindings(&self, context: &str, action: &str, slot: &str) -> Option<Vec<String>> {
+        let callback = self.host.action_binding?;
+        let mut values = Vec::new();
+        for index in 0..=abi::RVE_INPUT_MAX_BINDINGS {
+            let mut value = RveStr::empty();
+            // SAFETY: names and output storage are valid during the host callback.
+            if !unsafe {
+                callback(
+                    self.host.ctx,
+                    RveStr::from_str_ref(context),
+                    RveStr::from_str_ref(action),
+                    RveStr::from_str_ref(slot),
+                    index,
+                    &mut value,
+                )
+            } {
+                return if index == 0 { None } else { Some(values) };
+            }
+            // SAFETY: ABI v5 host returns callback-scoped UTF-8 strings.
+            let name = unsafe { value.to_str().ok()? };
+            if index == 0 && name.is_empty() {
+                return Some(values);
+            }
+            if index == abi::RVE_INPUT_MAX_BINDINGS {
+                return None;
+            }
+            values.push(name.to_owned());
+        }
+        unreachable!()
+    }
+
+    /// Returns physical inputs whose raw press edge occurred this frame.
+    pub fn pressed_inputs(&self) -> Vec<String> {
+        let mut pressed = Vec::new();
+        for code in 0..65 {
+            let Some(key) = Key::from_code(code) else {
+                continue;
+            };
+            if self.key_state(key) & abi::RVE_INPUT_PRESSED != 0 {
+                pressed.push(format!("{key:?}"));
+            }
+        }
+        for code in 0..5 {
+            let Some(button) = MouseButton::from_code(code) else {
+                continue;
+            };
+            if self.mouse_button_state(button) & abi::RVE_INPUT_PRESSED != 0 {
+                pressed.push(format!("Mouse.{button:?}"));
+            }
+        }
+        pressed
+    }
+
     /// Returns whether a key is currently held.
     pub fn key_down(&self, key: Key) -> bool {
         self.key_state(key) & abi::RVE_INPUT_DOWN != 0
@@ -616,6 +753,29 @@ impl Input<'_> {
     fn key_state(&self, key: Key) -> u32 {
         // SAFETY: the host pointer remains valid during this script callback.
         unsafe { (self.host.key_state)(self.host.ctx, key as u32) }
+    }
+
+    fn action_state(&self, name: &str) -> u32 {
+        let Some(callback) = self.host.action_state else {
+            return 0;
+        };
+        // SAFETY: the name is borrowed only for the host callback.
+        unsafe {
+            callback(
+                self.host.ctx,
+                RveStr::from_str_ref(name),
+                abi::RVE_ACTION_BUTTON,
+            )
+        }
+    }
+
+    fn action_value(&self, name: &str, kind: u32) -> Option<[f32; 2]> {
+        let callback = self.host.action_value?;
+        let mut value = [0.0; 2];
+        // SAFETY: name and output storage remain valid for the host callback.
+        unsafe {
+            callback(self.host.ctx, RveStr::from_str_ref(name), kind, &mut value).then_some(value)
+        }
     }
 
     fn mouse_button_state(&self, button: MouseButton) -> u32 {

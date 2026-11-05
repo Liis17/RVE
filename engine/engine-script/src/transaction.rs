@@ -183,8 +183,6 @@ impl ScriptTransaction {
     pub(crate) fn input(&self) -> &ScriptInput {
         self.action_frame.input()
     }
-
-    #[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
     pub(crate) fn action_state(
         &self,
         name: &str,
@@ -192,13 +190,9 @@ impl ScriptTransaction {
     ) -> Result<ActionValue, String> {
         self.action_frame.state(name, kind)
     }
-
-    #[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
     pub(crate) fn action_context(&self) -> Option<&str> {
         self.action_frame.context()
     }
-
-    #[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
     pub(crate) fn action_bindings(
         &self,
         context: &str,
@@ -207,8 +201,6 @@ impl ScriptTransaction {
     ) -> Result<Vec<String>, String> {
         self.action_frame.bindings(context, action, slot)
     }
-
-    #[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
     pub(crate) fn stage_action_mutation(&mut self, mutation: ActionMutation) -> Result<(), String> {
         if !self.writable {
             return Err("input mutations are unavailable during script creation".to_owned());

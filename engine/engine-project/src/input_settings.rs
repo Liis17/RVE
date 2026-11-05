@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_CONTEXTS: usize = 32;
 const MAX_ACTIONS_PER_CONTEXT: usize = 128;
-const MAX_INPUTS_PER_SLOT: usize = 16;
+const MAX_INPUTS_PER_SLOT: usize = rve_sdk::abi::RVE_INPUT_MAX_BINDINGS;
 
 /// Project-defined action contexts and their default active context.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

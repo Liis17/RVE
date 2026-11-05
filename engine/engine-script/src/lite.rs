@@ -1,3 +1,4 @@
+use crate::actions::{ActionMutation, ActionValue};
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
     ScriptTransaction,
@@ -6,6 +7,7 @@ use crate::types::{
     ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
 use engine_console::CommandSpec;
+use engine_project::InputActionKind;
 use engine_scene::{
     AntiAliasing, CameraSettings, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue,
     Tonemapper,
@@ -15,7 +17,8 @@ use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, RegistryKey,
     StdLib, Table, UserData, UserDataFields, Value, VmState,
 };
-use rve_sdk::{Key, MouseButton};
+use rve_sdk::abi::RVE_INPUT_MAX_BINDINGS;
+use rve_sdk::{Key, MouseButton, PhysicalInput};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1270,9 +1273,209 @@ fn input_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
     )?;
     input.set(
         "wheel",
-        input_vector_function(lua, active_call, ScriptInput::wheel)?,
+        input_vector_function(lua, active_call.clone(), ScriptInput::wheel)?,
     )?;
+    input.set(
+        "action_down",
+        action_button_function(lua, active_call.clone(), |value| value.down)?,
+    )?;
+    input.set(
+        "action_pressed",
+        action_button_function(lua, active_call.clone(), |value| value.pressed)?,
+    )?;
+    input.set(
+        "action_released",
+        action_button_function(lua, active_call.clone(), |value| value.released)?,
+    )?;
+    input.set("axis", action_axis_function(lua, active_call.clone())?)?;
+    input.set("vector", action_vector_function(lua, active_call.clone())?)?;
+    input.set(
+        "context",
+        action_context_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "set_context",
+        set_context_function(lua, active_call.clone())?,
+    )?;
+    input.set("rebind", rebind_function(lua, active_call.clone())?)?;
+    input.set("bindings", bindings_function(lua, active_call.clone())?)?;
+    input.set(
+        "reset_bindings",
+        reset_bindings_function(lua, active_call.clone())?,
+    )?;
+    input.set("pressed_inputs", pressed_inputs_function(lua, active_call)?)?;
     Ok(input)
+}
+
+fn action_button_function(
+    lua: &Lua,
+    active_call: ActiveCall,
+    state: fn(ActionValue) -> bool,
+) -> mlua::Result<Function> {
+    lua.create_function(move |_, name: LuaString| {
+        let name = name.to_str()?.to_owned();
+        with_active_call(&active_call, |transaction| {
+            let value = transaction
+                .action_state(&name, InputActionKind::Button)
+                .map_err(LuaError::runtime)?;
+            Ok(state(value))
+        })
+    })
+}
+
+fn action_axis_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, name: LuaString| {
+        let name = name.to_str()?.to_owned();
+        with_active_call(&active_call, |transaction| {
+            let value = transaction
+                .action_state(&name, InputActionKind::Axis)
+                .map_err(LuaError::runtime)?;
+            Ok(value.value[0])
+        })
+    })
+}
+
+fn action_vector_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, name: LuaString| {
+        let name = name.to_str()?.to_owned();
+        with_active_call(&active_call, |transaction| {
+            let value = transaction
+                .action_state(&name, InputActionKind::Vector2)
+                .map_err(LuaError::runtime)?;
+            Ok((value.value[0], value.value[1]))
+        })
+    })
+}
+
+fn action_context_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, ()| {
+        with_active_call(&active_call, |transaction| {
+            Ok(transaction.action_context().map(str::to_owned))
+        })
+    })
+}
+
+fn set_context_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, name: LuaString| {
+        let name = name.to_str()?.to_owned();
+        with_active_call(&active_call, |transaction| {
+            transaction
+                .stage_action_mutation(ActionMutation::SetContext(name))
+                .map_err(LuaError::runtime)
+        })
+    })
+}
+
+fn rebind_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(
+        move |_, (context, action, slot, inputs): (LuaString, LuaString, LuaString, Table)| {
+            let context = context.to_str()?.to_owned();
+            let action = action.to_str()?.to_owned();
+            let slot = slot.to_str()?.to_owned();
+            let inputs = read_input_array(&inputs)?;
+            with_active_call(&active_call, |transaction| {
+                transaction
+                    .stage_action_mutation(ActionMutation::Rebind {
+                        context,
+                        action,
+                        slot,
+                        inputs,
+                    })
+                    .map_err(LuaError::runtime)
+            })
+        },
+    )
+}
+
+fn bindings_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(
+        move |lua, (context, action, slot): (LuaString, LuaString, LuaString)| {
+            let context = context.to_str()?.to_owned();
+            let action = action.to_str()?.to_owned();
+            let slot = slot.to_str()?.to_owned();
+            with_active_call(&active_call, |transaction| {
+                let bindings = transaction
+                    .action_bindings(&context, &action, &slot)
+                    .map_err(LuaError::runtime)?;
+                let result = lua.create_table_with_capacity(bindings.len(), 0)?;
+                for (index, binding) in bindings.iter().enumerate() {
+                    result.raw_set(index + 1, binding.as_str())?;
+                }
+                Ok(result)
+            })
+        },
+    )
+}
+
+fn reset_bindings_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, ()| {
+        with_active_call(&active_call, |transaction| {
+            transaction
+                .stage_action_mutation(ActionMutation::ResetBindings)
+                .map_err(LuaError::runtime)
+        })
+    })
+}
+
+fn pressed_inputs_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |lua, ()| {
+        with_active_call(&active_call, |transaction| {
+            let mut inputs = Vec::new();
+            for code in 0..65 {
+                let Some(key) = Key::from_code(code) else {
+                    continue;
+                };
+                if transaction.input().key_pressed(key) {
+                    inputs.push(format!("{key:?}"));
+                }
+            }
+            for code in 0..5 {
+                let Some(button) = MouseButton::from_code(code) else {
+                    continue;
+                };
+                if transaction.input().mouse_pressed(button) {
+                    inputs.push(format!("Mouse.{button:?}"));
+                }
+            }
+            let result = lua.create_table_with_capacity(inputs.len(), 0)?;
+            for (index, input) in inputs.iter().enumerate() {
+                result.raw_set(index + 1, input.as_str())?;
+            }
+            Ok(result)
+        })
+    })
+}
+
+fn read_input_array(table: &Table) -> mlua::Result<Vec<PhysicalInput>> {
+    let mut inputs = Vec::new();
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let Value::Integer(index) = key else {
+            return Err(LuaError::runtime("input bindings must be an array"));
+        };
+        if index < 1 || index > RVE_INPUT_MAX_BINDINGS as i64 {
+            return Err(LuaError::runtime(
+                "input bindings must contain at most 16 entries",
+            ));
+        }
+        let Value::String(value) = value else {
+            return Err(LuaError::runtime("input binding names must be strings"));
+        };
+        let value = value.to_str()?;
+        let input = PhysicalInput::from_name(value.as_ref()).ok_or_else(|| {
+            LuaError::runtime(format!("unknown physical input {:?}", value.as_ref()))
+        })?;
+        inputs.push((index, input));
+    }
+    inputs.sort_by_key(|(index, _)| *index);
+    if inputs
+        .iter()
+        .enumerate()
+        .any(|(offset, (index, _))| *index as usize != offset + 1)
+    {
+        return Err(LuaError::runtime("input bindings must be a dense array"));
+    }
+    Ok(inputs.into_iter().map(|(_, input)| input).collect())
 }
 
 fn key_input_function(

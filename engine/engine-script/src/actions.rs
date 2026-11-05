@@ -3,9 +3,7 @@ use engine_project::{InputAction, InputActionKind, InputSettings};
 use rve_sdk::{Key, MouseButton, PhysicalInput};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
-
-#[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
-const MAX_INPUTS_PER_SLOT: usize = 16;
+const MAX_INPUTS_PER_SLOT: usize = rve_sdk::abi::RVE_INPUT_MAX_BINDINGS;
 
 #[derive(Clone, Debug, PartialEq)]
 struct ActionDefinition {
@@ -45,7 +43,6 @@ impl AnalogSource {
 }
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)] // Queried by the script API wrappers in the next implementation stage.
 struct ActionCatalog {
     contexts: BTreeMap<String, BTreeMap<String, InputActionKind>>,
     action_kinds: BTreeMap<String, InputActionKind>,
@@ -61,7 +58,6 @@ pub(crate) struct ActionValue {
 
 /// Immutable action values and binding definitions for one input frame.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)] // Queried by the script API wrappers in the next implementation stage.
 pub(crate) struct ActionFrame {
     input: ScriptInput,
     context: Option<String>,
@@ -71,7 +67,6 @@ pub(crate) struct ActionFrame {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Constructed by the script API wrappers in the next implementation stage.
 pub(crate) enum ActionMutation {
     SetContext(String),
     Rebind {
@@ -281,13 +276,9 @@ impl ActionFrame {
     pub(crate) fn input(&self) -> &ScriptInput {
         &self.input
     }
-
-    #[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
     pub(crate) fn context(&self) -> Option<&str> {
         self.context.as_deref()
     }
-
-    #[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
     pub(crate) fn state(
         &self,
         name: &str,
@@ -305,8 +296,6 @@ impl ActionFrame {
         }
         Ok(self.values.get(name).copied().unwrap_or_default())
     }
-
-    #[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
     pub(crate) fn bindings(
         &self,
         context: &str,
@@ -325,8 +314,6 @@ impl ActionFrame {
         let values = &self.definitions.contexts[context][action].slots[slot];
         Ok(values.iter().copied().map(PhysicalInput::name).collect())
     }
-
-    #[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
     pub(crate) fn validate_mutation(&self, mutation: &ActionMutation) -> Result<(), String> {
         match mutation {
             ActionMutation::SetContext(name) => {
@@ -626,8 +613,6 @@ fn down_mouse(input: ScriptInput) -> u8 {
 fn down_inputs(input: ScriptInput) -> (u128, u8) {
     (down_keys(input), down_mouse(input))
 }
-
-#[allow(dead_code)] // Used by the script API wrappers in the next implementation stage.
 fn validate_slot_name(kind: InputActionKind, slot: &str) -> Result<(), String> {
     let valid = match kind {
         InputActionKind::Button => slot == "inputs",

@@ -437,6 +437,13 @@ fn host(state: &mut HostState) -> RveHost {
         set_active_camera: Some(set_active_camera),
         register_command: Some(register_command),
         unregister_command: Some(unregister_command),
+        action_state: None,
+        action_value: None,
+        input_context: None,
+        set_input_context: None,
+        rebind_action: None,
+        action_binding: None,
+        reset_bindings: None,
     }
 }
 
@@ -1092,11 +1099,42 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, command),
         size_of::<RveScriptDescV3>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 4);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 5);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
+    assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
         offset_of!(RveHost, register_command),
         offset_of!(RveHost, set_active_camera)
             + size_of::<Option<crate::abi::RveSetActiveCameraFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, action_state),
+        offset_of!(RveHost, unregister_command)
+            + size_of::<Option<crate::abi::RveUnregisterCommandFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, action_value),
+        offset_of!(RveHost, action_state) + size_of::<Option<crate::abi::RveActionStateFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, input_context),
+        offset_of!(RveHost, action_value) + size_of::<Option<crate::abi::RveActionValueFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_input_context),
+        offset_of!(RveHost, input_context) + size_of::<Option<crate::abi::RveInputContextFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, rebind_action),
+        offset_of!(RveHost, set_input_context)
+            + size_of::<Option<crate::abi::RveSetInputContextFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, action_binding),
+        offset_of!(RveHost, rebind_action) + size_of::<Option<crate::abi::RveRebindActionFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, reset_bindings),
+        offset_of!(RveHost, action_binding) + size_of::<Option<crate::abi::RveActionBindingFn>>()
     );
 }
