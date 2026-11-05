@@ -1,6 +1,7 @@
 //! Графический редактор игровых сцен и ресурсов RVE.
 
 mod app;
+mod asset_watch;
 mod assets_fs;
 mod autosave;
 mod build;
