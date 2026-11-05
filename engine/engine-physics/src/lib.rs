@@ -1,5 +1,17 @@
 //! Столкновения и физическая симуляция игрового мира.
 
+pub mod bvh;
+mod error;
+pub mod hull;
+pub mod ray;
+pub mod shape;
+
+pub use bvh::TriMesh;
+pub use error::GeometryError;
+pub use hull::{Hull, MAX_HULL_INPUT_POINTS, MAX_HULL_ITERATIONS, MAX_HULL_VERTICES, Plane};
+pub use ray::{Ray, RayHit, raycast};
+pub use shape::{Aabb, MassProperties, Pose, Shape};
+
 use std::sync::mpsc::Receiver;
 
 #[derive(Default)]

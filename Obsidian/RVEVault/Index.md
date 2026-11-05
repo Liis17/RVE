@@ -28,7 +28,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |
 | [[Engine/RveEditor]] | Графический редактор сцен на egui: панели, правки с undo, вьюпорт и Play |
 
-Пустые модули `engine-audio`, `engine-physics`, `engine-network` и `engine-neural` описаны в [[Architecture]]; отдельных заметок для них нет.
+Пустые модули `engine-audio`, `engine-network` и `engine-neural` описаны в [[Architecture]]; отдельных заметок для них нет.
 
 ## Обновление памяти
 

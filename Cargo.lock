@@ -684,6 +684,9 @@ dependencies = [
 [[package]]
 name = "engine-physics"
 version = "0.1.0"
+dependencies = [
+ "glam",
+]
 
 [[package]]
 name = "engine-platform"
