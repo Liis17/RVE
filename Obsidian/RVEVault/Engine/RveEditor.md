@@ -94,6 +94,12 @@ Inspector показывает `params` скрипта по его схеме ([
 
 ## Play
 
+Перед созданием `PlaySession` редактор передаёт настройки `[input]` открытого проекта
+в `ScriptHost`; player runtime использует тот же evaluator действий. `clear_input`
+освобождает удерживаемые клавиши и сбрасывает mouse/wheel delta при открытии Console и
+потере фокуса, чтобы прошлое движение не превращалось в analog action после блокировки.
+Переключения контекста и переназначения ограничены текущей Play-сессией.
+
 Developer console рисуется поверх Game прямоугольника после dock UI; существующая
 вкладка Console остаётся журналом `EditorState::log`, куда поступают script events.
 Backquote открывает overlay только без modal, а открытая консоль блокирует Play input и

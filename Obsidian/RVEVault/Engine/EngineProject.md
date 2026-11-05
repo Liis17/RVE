@@ -14,8 +14,9 @@ Parent: [[Index]]
 |---|---|---|
 | `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Формат начальных настроек, значения по умолчанию и проверки |
 | `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
+| `engine/engine-project/src/input_settings.rs` | `InputSettings`, `InputAction` | Схема игровых действий, проверка физических имён вводов и ограничений |
 | `engine/engine-project/src/lib.rs` | публичные реэкспорты | API крейта |
-| `engine/engine-project/Cargo.toml` | зависимости | `engine-files`, `serde`, `toml` |
+| `engine/engine-project/Cargo.toml` | зависимости | `engine-files`, `rve-sdk`, `serde`, `toml` |
 | `engine/sandbox/src/main.rs` | загрузка bootstrap | Настройки sandbox из текущего каталога |
 | `engine/engine-runtime/src/layout.rs`, `engine/engine-runtime/src/lib.rs` | `Layout`, `load_project_settings` | Dev/release расположение файлов и загрузка проекта в `rve-player` |
 | `tools/rve-build/src/project.rs`, `tools/rve-build/src/archives.rs` | `prepare_project`, сборка архивов | Проверка входного проекта и упаковка настроек для release |
@@ -53,6 +54,7 @@ Parent: [[Index]]
 | `id` | Стабильный ключ `[A-Za-z0-9_-]{1,64}`. Используется как singleton lock key, если в bootstrap запрещены несколько экземпляров |
 | `name` | Непустое имя игры |
 | `version` | Непустая строка; отдельной проверки SemVer нет |
+| `input` | Необязательные именованные действия и контексты; без секции остаётся пустая карта без активного контекста. Формат описан ниже |
 | `heavy_scripts` | Необязательный непустой относительный путь к crate Rust-скриптов внутри проекта; абсолютные пути и выход через `..` запрещены |
 | `scenes` | Упорядоченный список `{ path, enabled }`; `enabled` по умолчанию `true`. Пути — уникальные virtual paths `.rvescene`; должна быть хотя бы одна включённая сцена, и первая включённая становится стартовой |
 | `requirements.min_ram_mb`, `requirements.min_cpu_threads` | Минимум RAM и число логических CPU; default обоих значений — 0, то есть минимум не ограничен |
@@ -61,6 +63,54 @@ Parent: [[Index]]
 | `runtime.dlss_library` | Необязательный относительный путь внутри проекта к `nvngx_dlss.dll`; default отсутствует. Идентификатор NGX задаётся ровно одним из `dlss_project_id` или `dlss_application_id` |
 | `runtime.dlss_project_id`, `runtime.dlss_engine_version` | GUID-подобный project ID и версия RVE engine; оба требуются при выборе project ID и запрещены с application ID |
 | `runtime.dlss_application_id` | Необязательный положительный NVIDIA application ID; взаимоисключается с project ID и engine version |
+
+### Игровой ввод `[input]`
+
+`ProjectSettings.input` хранит `InputSettings`; конфигурация сериализуется и обратно
+разбирается через `ProjectSettings::to_toml`. Если секции `[input]` нет, проект
+получает пустые настройки и неактивный контекст, сохраняя совместимость со старыми
+проектами.
+
+```toml
+[input]
+default_context = "game"
+
+[input.contexts.game.Jump]
+kind = "button"
+inputs = ["Space", "Mouse.Left"]
+
+[input.contexts.game.Move]
+kind = "vector2"
+up = ["W"]
+down = ["S"]
+left = ["A"]
+right = ["D"]
+
+[input.contexts.game.Throttle]
+kind = "axis"
+negative = ["Q"]
+positive = ["E"]
+analog = "WheelY"
+scale = 1.0
+```
+
+Контекст содержит действия с видами `button`, `axis` или `vector2`. Кнопка
+использует слот `inputs`; ось — `negative`, `positive`, optional `analog`, `scale`;
+вектор — `up`, `down`, `left`, `right`, optional `analog`, `scale`. Для оси
+аналоговый источник принимает `MouseX`, `MouseY`, `WheelX` или `WheelY`; для
+вектора — `MouseDelta` или `Wheel`. `scale` по умолчанию равен `1.0` и должен быть
+конечным. Поля другого вида и любые неизвестные поля запрещены.
+
+Имена контекстов и действий соответствуют `[A-Za-z0-9_]{1,64}`. Если задан хотя бы
+один контекст, `default_context` обязателен и должен указывать на существующий
+контекст. Одно действие сохраняет одинаковый вид во всех контекстах. Физический ввод
+задаётся именем клавиши `Key` из [[Engine/RveSdk]] или именем кнопки с префиксом
+`Mouse.`, например `Mouse.Left`. В одном слоте нельзя повторять имя; пустые слоты
+разрешены для последующего переназначения. Ограничения: до 32 контекстов, 128
+действий в контексте и 16 вводов в слоте. Проверка физических имён использует
+`rve_sdk::PhysicalInput`.
+
+### Runtime plugins и сериализация
 
 Например, при наличии официальных FSR DLL в `vendor/` Windows-проект может задать:
 
