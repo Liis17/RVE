@@ -1,14 +1,25 @@
 //! Столкновения и физическая симуляция игрового мира.
 
+pub mod broad;
 pub mod bvh;
 mod error;
 pub mod hull;
+pub mod narrow;
 pub mod ray;
 pub mod shape;
 
+pub use broad::{
+    BroadPhaseError, CandidatePair, MAX_BROADPHASE_COMPARISONS, MAX_BROADPHASE_ITEMS,
+    MAX_BROADPHASE_PAIRS, sweep_and_prune,
+};
 pub use bvh::TriMesh;
 pub use error::GeometryError;
 pub use hull::{Hull, MAX_HULL_INPUT_POINTS, MAX_HULL_ITERATIONS, MAX_HULL_VERTICES, Plane};
+pub use narrow::{
+    ContactManifold, ContactPoint, DistanceResult, EPA_MAX_FACES, EPA_MAX_ITERATIONS,
+    GJK_MAX_ITERATIONS, MAX_MANIFOLD_POINTS, MAX_MESH_CANDIDATES, ManifoldCache, NarrowphaseError,
+    PairKey, collide, distance,
+};
 pub use ray::{Ray, RayHit, raycast};
 pub use shape::{Aabb, MassProperties, Pose, Shape};
 
