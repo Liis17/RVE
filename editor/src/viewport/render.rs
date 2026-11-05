@@ -103,6 +103,38 @@ enum EditorEnvironmentKey {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnvironmentCreation {
+    Success,
+    MissingSource,
+    ResourceError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnvironmentTransition {
+    Keep,
+    Replace,
+    DropToDefault,
+}
+
+fn environment_transition(
+    current: Option<&EditorEnvironmentKey>,
+    requested: &EditorEnvironmentKey,
+    creation: EnvironmentCreation,
+) -> EnvironmentTransition {
+    match creation {
+        EnvironmentCreation::Success => EnvironmentTransition::Replace,
+        EnvironmentCreation::MissingSource | EnvironmentCreation::ResourceError
+            if current == Some(requested) =>
+        {
+            EnvironmentTransition::Keep
+        }
+        EnvironmentCreation::MissingSource | EnvironmentCreation::ResourceError => {
+            EnvironmentTransition::DropToDefault
+        }
+    }
+}
+
 impl SceneRenderer {
     pub fn new(renderer: &mut Renderer) -> Result<Self, RenderError> {
         Ok(Self {
@@ -408,11 +440,27 @@ impl SceneRenderer {
                         match renderer.create_environment(&replacement) {
                             Ok(environment) => Some(environment),
                             Err(error) if is_resource_error(&error) => {
+                                let transition = environment_transition(
+                                    self.current_environment
+                                        .as_ref()
+                                        .map(|(current, _)| current),
+                                    &key,
+                                    EnvironmentCreation::ResourceError,
+                                );
                                 let (current, _, _) =
                                     cache_update(previous, Err(error.to_string()));
                                 self.environment_sources.insert(path.clone(), current);
+                                if transition == EnvironmentTransition::Keep {
+                                    log.error(format!(
+                                        "{path}: {error}; сохранено прежнее окружение"
+                                    ));
+                                } else {
+                                    log.error(format!("{path}: {error}"));
+                                    if let Some((_, previous)) = self.current_environment.take() {
+                                        renderer.destroy_environment(previous)?;
+                                    }
+                                }
                                 self.failed_environment = Some(key);
-                                log.error(format!("{path}: {error}; сохранено прежнее окружение"));
                                 continue;
                             }
                             Err(error) => return Err(error),
@@ -698,6 +746,14 @@ impl SceneRenderer {
         };
         match source {
             Some(Ok(environment)) => {
+                let transition = environment_transition(
+                    self.current_environment
+                        .as_ref()
+                        .map(|(current, _)| current),
+                    &key,
+                    EnvironmentCreation::Success,
+                );
+                debug_assert_eq!(transition, EnvironmentTransition::Replace);
                 let previous = self.current_environment.replace((key, environment));
                 self.failed_environment = None;
                 if let Some((_, previous)) = previous {
@@ -705,28 +761,53 @@ impl SceneRenderer {
                 }
             }
             Some(Err(error)) if is_resource_error(&error) => {
-                let had_previous = self.current_environment.is_some();
+                let transition = environment_transition(
+                    self.current_environment
+                        .as_ref()
+                        .map(|(current, _)| current),
+                    &key,
+                    EnvironmentCreation::ResourceError,
+                );
                 let path = state
                     .component
                     .hdr
                     .as_ref()
                     .map_or("environment", VirtualPath::as_str);
-                if had_previous {
+                if transition == EnvironmentTransition::Keep {
                     log.error(format!("{path}: {error}; сохранено прежнее окружение"));
-                    if let Some((current, _)) = &mut self.current_environment {
-                        *current = key.clone();
-                    }
                 } else {
                     log.error(format!("{path}: {error}"));
+                    if let Some((_, previous)) = self.current_environment.take() {
+                        renderer.destroy_environment(previous)?;
+                    }
                 }
                 self.failed_environment = Some(key);
             }
             Some(Err(error)) => return Err(error),
             None => {
-                self.failed_environment = Some(key.clone());
-                if let Some((current, _)) = &mut self.current_environment {
-                    *current = key;
+                let transition = environment_transition(
+                    self.current_environment
+                        .as_ref()
+                        .map(|(current, _)| current),
+                    &key,
+                    EnvironmentCreation::MissingSource,
+                );
+                let path = state
+                    .component
+                    .hdr
+                    .as_ref()
+                    .map_or("environment", VirtualPath::as_str);
+                if transition == EnvironmentTransition::Keep {
+                    log.error(format!(
+                        "{path}: источник окружения недоступен; сохранено прежнее окружение"
+                    ));
+                } else {
+                    log.error(format!("{path}: источник окружения недоступен"));
+                    if let Some((_, previous)) = self.current_environment.take() {
+                        renderer.destroy_environment(previous)?;
+                    }
                 }
+                self.failed_environment = Some(key);
             }
         }
         Ok(())
@@ -1601,6 +1682,36 @@ mod tests {
         hdr.component.hdr = Some(VirtualPath::parse("/environment/sky.hdr").unwrap());
         hdr.component.procedural = None;
         assert_ne!(key, editor_environment_key(&hdr));
+    }
+
+    #[test]
+    fn failed_environment_creation_keeps_only_the_same_key() {
+        let current = EditorEnvironmentKey::Hdr("environment/a.hdr".to_owned());
+        let other = EditorEnvironmentKey::Hdr("environment/b.hdr".to_owned());
+
+        assert_eq!(
+            environment_transition(Some(&current), &current, EnvironmentCreation::ResourceError,),
+            EnvironmentTransition::Keep
+        );
+        assert_eq!(
+            environment_transition(Some(&current), &other, EnvironmentCreation::MissingSource,),
+            EnvironmentTransition::DropToDefault
+        );
+        assert_eq!(
+            environment_transition(Some(&current), &other, EnvironmentCreation::ResourceError,),
+            EnvironmentTransition::DropToDefault
+        );
+    }
+
+    #[test]
+    fn successful_environment_creation_replaces_the_current_key() {
+        let current = EditorEnvironmentKey::Hdr("environment/a.hdr".to_owned());
+        let requested = EditorEnvironmentKey::Hdr("environment/b.hdr".to_owned());
+
+        assert_eq!(
+            environment_transition(Some(&current), &requested, EnvironmentCreation::Success,),
+            EnvironmentTransition::Replace
+        );
     }
 
     #[test]
