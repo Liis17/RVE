@@ -43,9 +43,11 @@ pub struct SceneRenderer {
     pub game_viewport: ViewportId,
     models: HashMap<String, Option<GpuModel>>,
     model_dependencies: HashMap<String, Vec<VirtualPath>>,
+    failed_reloads: HashSet<String>,
     textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
     environment_sources: HashMap<String, Option<Arc<EnvironmentSource>>>,
     current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
+    failed_environment: Option<EditorEnvironmentKey>,
     object_materials: HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     grid: Option<MeshId>,
     grid_material: Option<MaterialId>,
@@ -108,9 +110,11 @@ impl SceneRenderer {
             game_viewport: renderer.create_viewport(1, 1)?,
             models: HashMap::new(),
             model_dependencies: HashMap::new(),
+            failed_reloads: HashSet::new(),
             textures: HashMap::new(),
             environment_sources: HashMap::new(),
             current_environment: None,
+            failed_environment: None,
             object_materials: HashMap::new(),
             grid: None,
             grid_material: None,
@@ -131,6 +135,8 @@ impl SceneRenderer {
         }
         self.environment_sources.clear();
         self.model_dependencies.clear();
+        self.failed_reloads.clear();
+        self.failed_environment = None;
         for model in self.models.drain().filter_map(|(_, model)| model) {
             destroy_model(renderer, model)?;
         }
@@ -170,6 +176,17 @@ impl SceneRenderer {
                     let model = Arc::new(loaded.model);
                     let gpu = match upload_model(renderer, &model) {
                         Ok(gpu) => gpu,
+                        Err(error) if is_resource_error(&error) => {
+                            self.models.insert(path.clone(), previous);
+                            self.failed_reloads.insert(path.clone());
+                            let message = if had_previous {
+                                format!("{path}: {error}; сохранена прежняя версия модели")
+                            } else {
+                                format!("{path}: {error}")
+                            };
+                            log.error(message);
+                            continue;
+                        }
                         Err(error) => {
                             self.models.insert(path, previous);
                             return Err(error);
@@ -179,6 +196,7 @@ impl SceneRenderer {
                     self.models.insert(path.clone(), current);
                     self.model_dependencies
                         .insert(path.clone(), loaded.dependencies);
+                    self.failed_reloads.remove(&path);
                     cpu_models.insert(path, model);
                     if let Some(old) = old {
                         destroy_model(renderer, old)?;
@@ -187,6 +205,7 @@ impl SceneRenderer {
                 Err(error) => {
                     let (current, _, error) = cache_update(previous, Err(error));
                     self.models.insert(path.clone(), current);
+                    self.failed_reloads.insert(path.clone());
                     if let Some(error) = error {
                         if had_previous {
                             log.error(format!("{path}: {error}; сохранена прежняя версия модели"));
@@ -234,10 +253,18 @@ impl SceneRenderer {
                 };
                 if !self.models.contains_key(model_path) {
                     match cpu_models.get(model_path).cloned() {
-                        Some(model) => {
-                            let gpu = upload_model(renderer, &model)?;
-                            self.models.insert(model_path.to_owned(), Some(gpu));
-                        }
+                        Some(model) => match upload_model(renderer, &model) {
+                            Ok(gpu) => {
+                                self.models.insert(model_path.to_owned(), Some(gpu));
+                                self.failed_reloads.remove(model_path);
+                            }
+                            Err(error) if is_resource_error(&error) => {
+                                self.models.insert(model_path.to_owned(), None);
+                                self.failed_reloads.insert(model_path.to_owned());
+                                log.error(format!("{model_path}: {error}"));
+                            }
+                            Err(error) => return Err(error),
+                        },
                         None => {
                             if !loader.request(model_path) {
                                 log.error(format!("{model_path}: фоновая загрузка недоступна"));
@@ -304,12 +331,29 @@ impl SceneRenderer {
             let had_previous = previous.is_some();
             match project.assets.load_texture(&path) {
                 Ok(data) => {
-                    let replacement = renderer.create_texture_with_color_space(
+                    let replacement = match renderer.create_texture_with_color_space(
                         data.width,
                         data.height,
                         &data.rgba,
                         color_space,
-                    )?;
+                    ) {
+                        Ok(replacement) => replacement,
+                        Err(error) if is_resource_error(&error) => {
+                            let (current, _, error) =
+                                cache_update(previous, Err(error.to_string()));
+                            self.textures.insert(key, current);
+                            if let Some(error) = error {
+                                let message = if had_previous {
+                                    format!("{path}: {error}; сохранена прежняя версия текстуры")
+                                } else {
+                                    format!("{path}: {error}")
+                                };
+                                log.error(message);
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let (current, old, _) = cache_update(previous, Ok(replacement));
                     self.textures.insert(key, current);
                     if let Some(old) = old {
@@ -355,15 +399,37 @@ impl SceneRenderer {
                         height: image.height,
                         rgb: image.rgb,
                     });
-                    let (current, _, _) = cache_update(previous, Ok(replacement));
-                    self.environment_sources.insert(path.clone(), current);
-                    if let Some((key, environment)) = self.current_environment.take() {
-                        if matches!(&key, EditorEnvironmentKey::Hdr(current) if same_virtual_path(current, &path))
-                        {
-                            renderer.destroy_environment(environment)?;
-                        } else {
-                            self.current_environment = Some((key, environment));
+                    let key = EditorEnvironmentKey::Hdr(path.clone());
+                    let current_matches = self
+                        .current_environment
+                        .as_ref()
+                        .is_some_and(|(current, _)| current == &key);
+                    let gpu_replacement = if current_matches {
+                        match renderer.create_environment(&replacement) {
+                            Ok(environment) => Some(environment),
+                            Err(error) if is_resource_error(&error) => {
+                                let (current, _, _) =
+                                    cache_update(previous, Err(error.to_string()));
+                                self.environment_sources.insert(path.clone(), current);
+                                self.failed_environment = Some(key);
+                                log.error(format!("{path}: {error}; сохранено прежнее окружение"));
+                                continue;
+                            }
+                            Err(error) => return Err(error),
                         }
+                    } else {
+                        None
+                    };
+                    self.environment_sources
+                        .insert(path.clone(), Some(replacement));
+                    if let Some(environment) = gpu_replacement {
+                        let previous = self.current_environment.replace((key, environment));
+                        self.failed_environment = None;
+                        if let Some((_, previous)) = previous {
+                            renderer.destroy_environment(previous)?;
+                        }
+                    } else if self.failed_environment.as_ref() == Some(&key) {
+                        self.failed_environment = None;
                     }
                 }
                 Err(error) => {
@@ -385,7 +451,13 @@ impl SceneRenderer {
             .pending_paths()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let plan = model_reload_plan(changes, &self.models, &self.model_dependencies, &pending);
+        let plan = model_reload_plan(
+            changes,
+            &self.models,
+            &self.model_dependencies,
+            &self.failed_reloads,
+            &pending,
+        );
         let unknown_dependencies_changed = changes.rescan
             || changes.png_paths().next().is_some()
             || !changes.directory_paths.is_empty();
@@ -415,12 +487,19 @@ impl SceneRenderer {
             return Ok(());
         }
         let gpu = match project.assets.load_texture(path) {
-            Ok(data) => Some(renderer.create_texture_with_color_space(
+            Ok(data) => match renderer.create_texture_with_color_space(
                 data.width,
                 data.height,
                 &data.rgba,
                 color_space,
-            )?),
+            ) {
+                Ok(texture) => Some(texture),
+                Err(error) if is_resource_error(&error) => {
+                    log.error(format!("{path}: {error}"));
+                    None
+                }
+                Err(error) => return Err(error),
+            },
             Err(error) => {
                 log.error(format!("{path}: {error}"));
                 None
@@ -588,11 +667,13 @@ impl SceneRenderer {
         &mut self,
         renderer: &mut Renderer,
         state: Option<&EnvironmentState>,
+        log: &mut ConsoleLog,
     ) -> Result<(), RenderError> {
         let Some(state) = state else {
             if let Some((_, environment)) = self.current_environment.take() {
                 renderer.destroy_environment(environment)?;
             }
+            self.failed_environment = None;
             return Ok(());
         };
         let key = editor_environment_key(state);
@@ -601,6 +682,9 @@ impl SceneRenderer {
             .as_ref()
             .is_some_and(|(current, _)| current == &key)
         {
+            return Ok(());
+        }
+        if self.failed_environment.as_ref() == Some(&key) {
             return Ok(());
         }
         let source = if let Some(path) = &state.component.hdr {
@@ -612,16 +696,39 @@ impl SceneRenderer {
             editor_procedural_sky(state)
                 .map(|sky| renderer.create_environment(&EnvironmentSource::Procedural(sky)))
         };
-        let Some(id) = source.transpose()? else {
-            if let Some((_, environment)) = self.current_environment.take() {
-                renderer.destroy_environment(environment)?;
+        match source {
+            Some(Ok(environment)) => {
+                let previous = self.current_environment.replace((key, environment));
+                self.failed_environment = None;
+                if let Some((_, previous)) = previous {
+                    renderer.destroy_environment(previous)?;
+                }
             }
-            return Ok(());
-        };
-        if let Some((_, environment)) = self.current_environment.take() {
-            renderer.destroy_environment(environment)?;
+            Some(Err(error)) if is_resource_error(&error) => {
+                let had_previous = self.current_environment.is_some();
+                let path = state
+                    .component
+                    .hdr
+                    .as_ref()
+                    .map_or("environment", VirtualPath::as_str);
+                if had_previous {
+                    log.error(format!("{path}: {error}; сохранено прежнее окружение"));
+                    if let Some((current, _)) = &mut self.current_environment {
+                        *current = key.clone();
+                    }
+                } else {
+                    log.error(format!("{path}: {error}"));
+                }
+                self.failed_environment = Some(key);
+            }
+            Some(Err(error)) => return Err(error),
+            None => {
+                self.failed_environment = Some(key.clone());
+                if let Some((current, _)) = &mut self.current_environment {
+                    *current = key;
+                }
+            }
         }
-        self.current_environment = Some((key, id));
         Ok(())
     }
 
@@ -849,6 +956,16 @@ fn cache_update<T>(
     }
 }
 
+fn is_resource_error(error: &RenderError) -> bool {
+    matches!(
+        error,
+        RenderError::InvalidTexture(_)
+            | RenderError::InvalidMesh(_)
+            | RenderError::InvalidMaterial(_)
+            | RenderError::InvalidEnvironment(_)
+    )
+}
+
 struct ModelReloadPlan {
     cached: HashSet<String>,
     pending: HashSet<String>,
@@ -858,6 +975,7 @@ fn model_reload_plan<T>(
     changes: &AssetChanges,
     models: &HashMap<String, Option<T>>,
     dependencies: &HashMap<String, Vec<VirtualPath>>,
+    failed_reloads: &HashSet<String>,
     pending: &[String],
 ) -> ModelReloadPlan {
     let unknown_dependencies_changed = changes.rescan
@@ -877,7 +995,8 @@ fn model_reload_plan<T>(
             (changes.rescan
                 || key_matches_model(changes, path)
                 || dependency_changed
-                || (model.is_none() && unknown_dependencies_changed))
+                || ((model.is_none() || failed_reloads.contains(path))
+                    && unknown_dependencies_changed))
                 .then(|| path.clone())
         })
         .collect();
@@ -1339,6 +1458,21 @@ mod tests {
     }
 
     #[test]
+    fn resource_validation_errors_are_distinguished_from_fatal_errors() {
+        assert!(is_resource_error(&RenderError::InvalidTexture(
+            "bad".to_owned()
+        )));
+        assert!(is_resource_error(&RenderError::InvalidMesh("bad")));
+        assert!(is_resource_error(&RenderError::InvalidMaterial(
+            "bad".to_owned()
+        )));
+        assert!(is_resource_error(&RenderError::InvalidEnvironment(
+            "bad".to_owned()
+        )));
+        assert!(!is_resource_error(&RenderError::InvalidConfig("bad")));
+    }
+
+    #[test]
     fn changed_png_selects_only_models_that_use_it_and_normalizes_slashes() {
         let models = HashMap::from([
             ("/models/a.fbx".to_owned(), Some(())),
@@ -1358,14 +1492,14 @@ mod tests {
             paths: HashSet::from([VirtualPath::parse("textures/a.png").unwrap()]),
             ..AssetChanges::default()
         };
-        let plan = model_reload_plan(&changes, &models, &dependencies, &[]);
+        let plan = model_reload_plan(&changes, &models, &dependencies, &HashSet::new(), &[]);
         assert_eq!(plan.cached, HashSet::from(["/models/a.fbx".to_owned()]));
 
         let fbx_change = AssetChanges {
             paths: HashSet::from([VirtualPath::parse("models/a.fbx").unwrap()]),
             ..AssetChanges::default()
         };
-        let plan = model_reload_plan(&fbx_change, &models, &dependencies, &[]);
+        let plan = model_reload_plan(&fbx_change, &models, &dependencies, &HashSet::new(), &[]);
         assert_eq!(plan.cached, HashSet::from(["/models/a.fbx".to_owned()]));
     }
 
@@ -1378,7 +1512,13 @@ mod tests {
             paths: HashSet::from([VirtualPath::parse("textures/new.png").unwrap()]),
             ..AssetChanges::default()
         };
-        let plan = model_reload_plan(&png_change, &models, &dependencies, &pending);
+        let plan = model_reload_plan(
+            &png_change,
+            &models,
+            &dependencies,
+            &HashSet::new(),
+            &pending,
+        );
         assert_eq!(
             plan.cached,
             HashSet::from(["models/missing.fbx".to_owned()])
@@ -1393,7 +1533,13 @@ mod tests {
             directory_paths: HashSet::from([VirtualPath::parse("textures").unwrap()]),
             ..AssetChanges::default()
         };
-        let plan = model_reload_plan(&folder_change, &models, &dependencies, &pending);
+        let plan = model_reload_plan(
+            &folder_change,
+            &models,
+            &dependencies,
+            &HashSet::new(),
+            &pending,
+        );
         assert_eq!(
             plan.cached,
             HashSet::from(["models/missing.fbx".to_owned()])
@@ -1402,6 +1548,23 @@ mod tests {
             plan.pending,
             HashSet::from(["models/pending.fbx".to_owned()])
         );
+    }
+
+    #[test]
+    fn png_change_retries_a_model_with_a_failed_reload() {
+        let models = HashMap::from([("models/ship.fbx".to_owned(), Some(()))]);
+        let dependencies = HashMap::new();
+        let changes = AssetChanges {
+            paths: HashSet::from([VirtualPath::parse("textures/b.png").unwrap()]),
+            ..AssetChanges::default()
+        };
+        let failed_reloads = HashSet::from(["models/ship.fbx".to_owned()]);
+
+        let plan = model_reload_plan(&changes, &models, &dependencies, &failed_reloads, &[]);
+        assert_eq!(plan.cached, HashSet::from(["models/ship.fbx".to_owned()]));
+
+        let plan = model_reload_plan(&changes, &models, &dependencies, &HashSet::new(), &[]);
+        assert!(plan.cached.is_empty());
     }
 
     #[test]

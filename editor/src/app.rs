@@ -1454,8 +1454,11 @@ fn render_scene_frame(
         game_camera.position,
         grid_camera_distance,
     )?;
-    gpu.scene
-        .sync_environment(&mut gpu.renderer, scene_frame.environment.as_ref())?;
+    gpu.scene.sync_environment(
+        &mut gpu.renderer,
+        scene_frame.environment.as_ref(),
+        parts.log,
+    )?;
     let scene_shadow_cascades = scene_size.map_or_else(Vec::new, |[width, height]| {
         SceneRenderer::shadow_cascades(scene_camera, width, height, &scene_frame.light, has_light)
     });

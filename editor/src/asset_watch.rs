@@ -174,7 +174,9 @@ impl AssetWatcher {
         loop {
             match self.receiver.try_recv() {
                 Ok(event) => {
-                    let classified = classify(event, &self.roots);
+                    let classified = classify(event, &self.roots, |path| {
+                        fs::metadata(path).ok().map(|metadata| metadata.is_dir())
+                    });
                     batch.add(classified.changes, now);
                     if let Some(error) = classified.error {
                         errors.push(error);
@@ -205,7 +207,11 @@ struct ClassifiedEvent {
     error: Option<String>,
 }
 
-fn classify(event: notify::Result<Event>, roots: &WatchRoots) -> ClassifiedEvent {
+fn classify(
+    event: notify::Result<Event>,
+    roots: &WatchRoots,
+    path_is_directory: impl Fn(&Path) -> Option<bool>,
+) -> ClassifiedEvent {
     let event = match event {
         Ok(event) => event,
         Err(error) => {
@@ -232,11 +238,6 @@ fn classify(event: notify::Result<Event>, roots: &WatchRoots) -> ClassifiedEvent
         event.kind,
         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
     );
-    let directory_event = matches!(
-        event.kind,
-        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
-    ) || matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
-        && event.paths.iter().any(|path| path.is_dir());
     let mut paths = HashSet::new();
     let mut directory_paths = HashSet::new();
     let mut inside_assets = false;
@@ -257,12 +258,22 @@ fn classify(event: notify::Result<Event>, roots: &WatchRoots) -> ClassifiedEvent
         let Some(components) = components else {
             continue;
         };
-        if let Ok(path) = VirtualPath::parse(&components.join("/")) {
+        if let Ok(virtual_path) = VirtualPath::parse(&components.join("/")) {
             inside_assets = true;
-            if directory_event {
-                directory_paths.insert(path.clone());
+            let is_directory = match event.kind {
+                EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder) => {
+                    true
+                }
+                EventKind::Create(_) => path_is_directory(path) == Some(true),
+                EventKind::Remove(RemoveKind::File) => false,
+                EventKind::Remove(_) => true,
+                EventKind::Modify(ModifyKind::Name(_)) => path_is_directory(path) != Some(false),
+                _ => false,
+            };
+            if is_directory {
+                directory_paths.insert(virtual_path.clone());
             }
-            paths.insert(path);
+            paths.insert(virtual_path);
         }
     }
     let changes = if inside_assets {
@@ -321,7 +332,17 @@ mod tests {
     }
 
     fn changes(event: notify::Result<Event>, roots: &WatchRoots) -> AssetChanges {
-        classify(event, roots).changes
+        changes_with(event, roots, |path| {
+            fs::metadata(path).ok().map(|metadata| metadata.is_dir())
+        })
+    }
+
+    fn changes_with(
+        event: notify::Result<Event>,
+        roots: &WatchRoots,
+        path_is_directory: impl Fn(&Path) -> Option<bool>,
+    ) -> AssetChanges {
+        classify(event, roots, path_is_directory).changes
     }
 
     #[test]
@@ -374,7 +395,9 @@ mod tests {
     fn watcher_errors_and_rescan_flags_request_a_rescan() {
         let root = TempRoot::new();
         let roots = root.roots();
-        let error = classify(Err(notify::Error::generic("watch failed")), &roots);
+        let error = classify(Err(notify::Error::generic("watch failed")), &roots, |_| {
+            None
+        });
         assert!(error.changes.rescan);
         assert!(error.error.unwrap().contains("watch failed"));
 
@@ -456,6 +479,49 @@ mod tests {
                 .directory_paths
                 .contains(&VirtualPath::parse("textures/world").unwrap())
         );
+    }
+
+    #[test]
+    fn any_create_and_remove_events_classify_directories_and_files() {
+        let root = TempRoot::new();
+        let roots = root.roots();
+        let directory = root.0.join("textures/world");
+        let created_directory = changes_with(
+            event(EventKind::Create(CreateKind::Any), &[&directory]),
+            &roots,
+            |_| Some(true),
+        );
+        assert!(
+            created_directory
+                .directory_paths
+                .contains(&VirtualPath::parse("textures/world").unwrap())
+        );
+
+        let removed_unknown = changes_with(
+            event(EventKind::Remove(RemoveKind::Any), &[&directory]),
+            &roots,
+            |_| None,
+        );
+        assert!(
+            removed_unknown
+                .directory_paths
+                .contains(&VirtualPath::parse("textures/world").unwrap())
+        );
+
+        let created_file = changes_with(
+            event(
+                EventKind::Create(CreateKind::Any),
+                &[&root.0.join("textures/a.png")],
+            ),
+            &roots,
+            |_| Some(false),
+        );
+        assert!(
+            created_file
+                .paths
+                .contains(&VirtualPath::parse("textures/a.png").unwrap())
+        );
+        assert!(created_file.directory_paths.is_empty());
     }
 
     #[test]
