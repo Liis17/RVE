@@ -1,9 +1,11 @@
 //! Подготовка кадра сцены: GPU-кэш ресурсов и команды отрисовки.
 
+use crate::asset_watch::AssetChanges;
 use crate::console::ConsoleLog;
 use crate::project::OpenProject;
 use crate::viewport::model_loader::ModelLoader;
 use engine_assets::{Model, ModelAlphaMode};
+use engine_files::VirtualPath;
 use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
@@ -40,6 +42,7 @@ pub struct SceneRenderer {
     pub viewport: ViewportId,
     pub game_viewport: ViewportId,
     models: HashMap<String, Option<GpuModel>>,
+    model_dependencies: HashMap<String, Vec<VirtualPath>>,
     textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
     environment_sources: HashMap<String, Option<Arc<EnvironmentSource>>>,
     current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
@@ -104,6 +107,7 @@ impl SceneRenderer {
             viewport: renderer.create_viewport(1, 1)?,
             game_viewport: renderer.create_viewport(1, 1)?,
             models: HashMap::new(),
+            model_dependencies: HashMap::new(),
             textures: HashMap::new(),
             environment_sources: HashMap::new(),
             current_environment: None,
@@ -126,6 +130,7 @@ impl SceneRenderer {
             renderer.destroy_environment(environment)?;
         }
         self.environment_sources.clear();
+        self.model_dependencies.clear();
         for model in self.models.drain().filter_map(|(_, model)| model) {
             destroy_model(renderer, model)?;
         }
@@ -152,20 +157,44 @@ impl SceneRenderer {
     ) -> Result<(), RenderError> {
         let mut active_environments = HashSet::new();
         for (path, loaded) in loader.finished() {
-            let gpu = match loaded {
-                Ok(model) => {
-                    let model = Arc::new(model);
-                    let gpu = upload_model(renderer, &model)?;
-                    cpu_models.insert(path.clone(), model);
-                    Some(gpu)
+            let previous = self.models.remove(&path).flatten();
+            let had_previous = previous.is_some();
+            match loaded {
+                Ok(loaded) => {
+                    if let Some(warning) = loaded.dependency_warning {
+                        log.push(
+                            crate::console::LogLevel::Warn,
+                            format!("{path}: не удалось прочитать зависимости модели: {warning}"),
+                        );
+                    }
+                    let model = Arc::new(loaded.model);
+                    let gpu = match upload_model(renderer, &model) {
+                        Ok(gpu) => gpu,
+                        Err(error) => {
+                            self.models.insert(path, previous);
+                            return Err(error);
+                        }
+                    };
+                    let (current, old, _) = cache_update(previous, Ok(gpu));
+                    self.models.insert(path.clone(), current);
+                    self.model_dependencies
+                        .insert(path.clone(), loaded.dependencies);
+                    cpu_models.insert(path, model);
+                    if let Some(old) = old {
+                        destroy_model(renderer, old)?;
+                    }
                 }
                 Err(error) => {
-                    log.error(format!("{path}: {error}"));
-                    None
+                    let (current, _, error) = cache_update(previous, Err(error));
+                    self.models.insert(path.clone(), current);
+                    if let Some(error) = error {
+                        if had_previous {
+                            log.error(format!("{path}: {error}; сохранена прежняя версия модели"));
+                        } else {
+                            log.error(format!("{path}: {error}"));
+                        }
+                    }
                 }
-            };
-            if let Some(Some(previous)) = self.models.insert(path, gpu) {
-                destroy_model(renderer, previous)?;
             }
         }
         for object in world.objects() {
@@ -251,6 +280,107 @@ impl SceneRenderer {
         }
         self.environment_sources
             .retain(|path, _| active_environments.contains(path));
+        Ok(())
+    }
+
+    /// Перезагружает только ресурсы, совпавшие с изменёнными путями или зависимостями.
+    pub fn reload_changed(
+        &mut self,
+        renderer: &mut Renderer,
+        project: &OpenProject,
+        changes: &AssetChanges,
+        loader: &mut ModelLoader,
+        log: &mut ConsoleLog,
+    ) -> Result<(), RenderError> {
+        let texture_keys = self
+            .textures
+            .keys()
+            .filter(|(path, _)| key_matches_changes(changes, path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (path, color_space) in texture_keys {
+            let key = (path.clone(), color_space);
+            let previous = self.textures.get(&key).copied().flatten();
+            let had_previous = previous.is_some();
+            match project.assets.load_texture(&path) {
+                Ok(data) => {
+                    let replacement = renderer.create_texture_with_color_space(
+                        data.width,
+                        data.height,
+                        &data.rgba,
+                        color_space,
+                    )?;
+                    let (current, old, _) = cache_update(previous, Ok(replacement));
+                    self.textures.insert(key, current);
+                    if let Some(old) = old {
+                        renderer.destroy_texture(old)?;
+                    }
+                }
+                Err(error) => {
+                    let (current, _, error) = cache_update(previous, Err(error.to_string()));
+                    self.textures.insert(key, current);
+                    if let Some(error) = error {
+                        let message = if had_previous {
+                            format!("{path}: {error}; сохранена прежняя версия текстуры")
+                        } else {
+                            format!("{path}: {error}")
+                        };
+                        log.error(message);
+                    }
+                }
+            }
+        }
+
+        let environment_paths = self
+            .environment_sources
+            .keys()
+            .filter(|path| key_matches_changes(changes, path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in environment_paths {
+            let previous = self.environment_sources.get(&path).cloned().flatten();
+            let had_previous = previous.is_some();
+            match project.assets.load_hdr(&path) {
+                Ok(image) => {
+                    let replacement = Arc::new(EnvironmentSource::Equirect {
+                        width: image.width,
+                        height: image.height,
+                        rgb: image.rgb,
+                    });
+                    let (current, _, _) = cache_update(previous, Ok(replacement));
+                    self.environment_sources.insert(path.clone(), current);
+                    if let Some((key, environment)) = self.current_environment.take() {
+                        if matches!(&key, EditorEnvironmentKey::Hdr(current) if same_virtual_path(current, &path))
+                        {
+                            renderer.destroy_environment(environment)?;
+                        } else {
+                            self.current_environment = Some((key, environment));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let (current, _, error) = cache_update(previous, Err(error.to_string()));
+                    self.environment_sources.insert(path.clone(), current);
+                    if let Some(error) = error {
+                        let message = if had_previous {
+                            format!("{path}: {error}; сохранена прежняя версия HDR")
+                        } else {
+                            format!("{path}: {error}")
+                        };
+                        log.error(message);
+                    }
+                }
+            }
+        }
+
+        let pending = loader
+            .pending_paths()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let plan = model_reload_plan(changes, &self.models, &self.model_dependencies, &pending);
+        for path in plan.pending.into_iter().chain(plan.cached) {
+            loader.reload(&path);
+        }
         Ok(())
     }
 
@@ -689,6 +819,86 @@ fn destroy_model(renderer: &mut Renderer, model: GpuModel) -> Result<(), RenderE
     Ok(())
 }
 
+fn cache_update<T>(
+    previous: Option<T>,
+    result: Result<T, String>,
+) -> (Option<T>, Option<T>, Option<String>) {
+    let had_previous = previous.is_some();
+    match result {
+        Ok(current) => (Some(current), previous, None),
+        Err(error) if had_previous => (previous, None, Some(error)),
+        Err(error) => (None, None, Some(error)),
+    }
+}
+
+struct ModelReloadPlan {
+    cached: HashSet<String>,
+    pending: HashSet<String>,
+}
+
+fn model_reload_plan<T>(
+    changes: &AssetChanges,
+    models: &HashMap<String, Option<T>>,
+    dependencies: &HashMap<String, Vec<VirtualPath>>,
+    pending: &[String],
+) -> ModelReloadPlan {
+    let unknown_dependencies_changed = changes.rescan
+        || changes.png_paths().next().is_some()
+        || !changes.directory_paths.is_empty();
+    let cached = models
+        .iter()
+        .filter_map(|(path, model)| {
+            let dependency_changed = dependencies
+                .iter()
+                .find(|(candidate, _)| same_virtual_path(candidate, path))
+                .is_some_and(|(_, paths)| {
+                    paths
+                        .iter()
+                        .any(|path| key_matches_changes(changes, path.as_str()))
+                });
+            (changes.rescan
+                || key_matches_changes(changes, path)
+                || dependency_changed
+                || (model.is_none() && unknown_dependencies_changed))
+                .then(|| path.clone())
+        })
+        .collect();
+    let pending = pending
+        .iter()
+        .filter(|path| unknown_dependencies_changed || key_matches_changes(changes, path))
+        .cloned()
+        .collect();
+    ModelReloadPlan { cached, pending }
+}
+
+fn key_matches_changes(changes: &AssetChanges, key: &str) -> bool {
+    if changes.rescan {
+        return true;
+    }
+    let Ok(key) = VirtualPath::parse(key) else {
+        return false;
+    };
+    changes
+        .paths
+        .iter()
+        .any(|changed| path_is_parent(changed, &key))
+}
+
+fn path_is_parent(changed: &VirtualPath, key: &VirtualPath) -> bool {
+    key.as_str() == changed.as_str()
+        || key
+            .as_str()
+            .strip_prefix(changed.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn same_virtual_path(left: &str, right: &str) -> bool {
+    matches!(
+        (VirtualPath::parse(left), VirtualPath::parse(right)),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
 fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, RenderError> {
     let mut textures_by_role = HashMap::new();
     let mut textures = Vec::new();
@@ -1077,6 +1287,90 @@ mod tests {
             near: 0.1,
             far: 100.0,
         }
+    }
+
+    #[test]
+    fn cache_update_preserves_old_values_on_error_and_returns_replaced_values() {
+        let (current, old, error) = cache_update(Some(1), Err("broken".to_owned()));
+        assert_eq!(current, Some(1));
+        assert_eq!(old, None);
+        assert_eq!(error.as_deref(), Some("broken"));
+
+        let (current, old, error) = cache_update(None::<i32>, Err("missing".to_owned()));
+        assert_eq!(current, None);
+        assert_eq!(old, None);
+        assert_eq!(error.as_deref(), Some("missing"));
+
+        let (current, old, error) = cache_update(Some(1), Ok(2));
+        assert_eq!(current, Some(2));
+        assert_eq!(old, Some(1));
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn changed_png_selects_only_models_that_use_it_and_normalizes_slashes() {
+        let models = HashMap::from([
+            ("/models/a.fbx".to_owned(), Some(())),
+            ("models/b.fbx".to_owned(), Some(())),
+        ]);
+        let dependencies = HashMap::from([
+            (
+                "models/a.fbx".to_owned(),
+                vec![VirtualPath::parse("/textures/a.png").unwrap()],
+            ),
+            (
+                "/models/b.fbx".to_owned(),
+                vec![VirtualPath::parse("textures/b.png").unwrap()],
+            ),
+        ]);
+        let changes = AssetChanges {
+            paths: HashSet::from([VirtualPath::parse("textures/a.png").unwrap()]),
+            ..AssetChanges::default()
+        };
+        let plan = model_reload_plan(&changes, &models, &dependencies, &[]);
+        assert_eq!(plan.cached, HashSet::from(["/models/a.fbx".to_owned()]));
+
+        let fbx_change = AssetChanges {
+            paths: HashSet::from([VirtualPath::parse("models/a.fbx").unwrap()]),
+            ..AssetChanges::default()
+        };
+        let plan = model_reload_plan(&fbx_change, &models, &dependencies, &[]);
+        assert_eq!(plan.cached, HashSet::from(["/models/a.fbx".to_owned()]));
+    }
+
+    #[test]
+    fn png_or_directory_change_retries_failed_models_and_stales_pending_models() {
+        let models = HashMap::from([("models/missing.fbx".to_owned(), None::<()>)]);
+        let dependencies = HashMap::new();
+        let pending = vec!["models/pending.fbx".to_owned()];
+        let png_change = AssetChanges {
+            paths: HashSet::from([VirtualPath::parse("textures/new.png").unwrap()]),
+            ..AssetChanges::default()
+        };
+        let plan = model_reload_plan(&png_change, &models, &dependencies, &pending);
+        assert_eq!(
+            plan.cached,
+            HashSet::from(["models/missing.fbx".to_owned()])
+        );
+        assert_eq!(
+            plan.pending,
+            HashSet::from(["models/pending.fbx".to_owned()])
+        );
+
+        let folder_change = AssetChanges {
+            paths: HashSet::from([VirtualPath::parse("textures").unwrap()]),
+            directory_paths: HashSet::from([VirtualPath::parse("textures").unwrap()]),
+            ..AssetChanges::default()
+        };
+        let plan = model_reload_plan(&folder_change, &models, &dependencies, &pending);
+        assert_eq!(
+            plan.cached,
+            HashSet::from(["models/missing.fbx".to_owned()])
+        );
+        assert_eq!(
+            plan.pending,
+            HashSet::from(["models/pending.fbx".to_owned()])
+        );
     }
 
     #[test]

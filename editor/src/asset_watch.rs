@@ -2,7 +2,7 @@
 
 use engine_files::VirtualPath;
 use engine_window::WindowProxy;
-use notify::event::{EventKind, ModifyKind};
+use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::fs;
@@ -16,13 +16,17 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AssetChanges {
     pub paths: HashSet<VirtualPath>,
+    pub directory_paths: HashSet<VirtualPath>,
     pub tree_changed: bool,
     pub rescan: bool,
 }
 
 impl AssetChanges {
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty() && !self.tree_changed && !self.rescan
+        self.paths.is_empty()
+            && self.directory_paths.is_empty()
+            && !self.tree_changed
+            && !self.rescan
     }
 
     pub fn paths_with_extension(
@@ -76,6 +80,7 @@ impl AssetChanges {
 
     fn extend(&mut self, mut other: Self) {
         self.paths.extend(other.paths.drain());
+        self.directory_paths.extend(other.directory_paths.drain());
         self.tree_changed |= other.tree_changed;
         self.rescan |= other.rescan;
     }
@@ -227,7 +232,13 @@ fn classify(event: notify::Result<Event>, roots: &WatchRoots) -> ClassifiedEvent
         event.kind,
         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
     );
+    let directory_event = matches!(
+        event.kind,
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
+    ) || matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
+        && event.paths.iter().any(|path| path.is_dir());
     let mut paths = HashSet::new();
+    let mut directory_paths = HashSet::new();
     let mut inside_assets = false;
     let mut assets_root = false;
     for path in &event.paths {
@@ -247,12 +258,16 @@ fn classify(event: notify::Result<Event>, roots: &WatchRoots) -> ClassifiedEvent
             continue;
         };
         if let Ok(path) = VirtualPath::parse(&components.join("/")) {
+            if directory_event {
+                directory_paths.insert(path.clone());
+            }
             paths.insert(path);
         }
     }
     let changes = if inside_assets {
         AssetChanges {
             paths,
+            directory_paths,
             tree_changed: assets_root || tree_event,
             rescan: false,
         }
@@ -412,6 +427,19 @@ mod tests {
         assert!(
             !result
                 .contains_path_or_parent(&VirtualPath::parse("textures/world-old/a.png").unwrap())
+        );
+
+        let root = TempRoot::new();
+        let directory = root.0.join("textures/world");
+        fs::create_dir_all(&directory).unwrap();
+        let folder = changes(
+            event(EventKind::Create(CreateKind::Folder), &[&directory]),
+            &root.roots(),
+        );
+        assert!(
+            folder
+                .directory_paths
+                .contains(&VirtualPath::parse("textures/world").unwrap())
         );
     }
 

@@ -275,7 +275,7 @@ impl EditorApp {
             Ok(tree) => self.state.asset_tree = tree,
             Err(error) => self.state.log.error(error.to_string()),
         }
-        self.state.previews.invalidate();
+        self.state.previews.clear();
         self.state.lite_schemas.clear();
         project.clear_prefabs();
         if let Some(scene) = &mut self.state.scene
@@ -1045,7 +1045,7 @@ impl EditorApp {
         };
         self.state
             .previews
-            .upload(&mut gpu.renderer, &mut self.bridge)?;
+            .upload(&mut gpu.renderer, &mut self.bridge, &mut self.state.log)?;
         if self.state.viewport_texture.is_none() {
             self.state.viewport_texture = Some(self.bridge.register_viewport(gpu.scene.viewport));
         }
