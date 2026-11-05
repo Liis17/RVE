@@ -16,10 +16,11 @@ pub use camera_settings::{
     ProjectionSettings, Tonemapper,
 };
 pub use document::{
-    CameraComponent, DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript,
-    LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer,
-    ParamValue, PointLightComponent, ProceduralSkyComponent, SceneAsset, SceneDocument, SceneError,
-    SceneObject, SceneTransform, SpotLightComponent,
+    CameraComponent, CharacterControllerComponent, ColliderComponent, ColliderShape,
+    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup, LodLevel,
+    MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue,
+    PointLightComponent, ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneAsset,
+    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
 };
 pub use params::{ParamKind, ParamSchema, ParamSpec};
 pub use prefab::{

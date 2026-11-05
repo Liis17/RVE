@@ -304,6 +304,83 @@ fn point_and_spot_prefab_overrides_replace_whole_components() {
 }
 
 #[test]
+fn physics_prefab_overrides_replace_whole_components() {
+    let prefab = r#"
+[[objects]]
+id = "box"
+[objects.collider]
+friction = 0.2
+[objects.rigid_body]
+kind = "kinematic"
+mass = 5.0
+"#;
+    let library = Library::new(&[("prefabs/box.rveprefab", prefab)]);
+    let document = scene(
+        r#"
+[[assets]]
+path = "/prefabs/box.rveprefab"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[instances]]
+id = "crate"
+prefab = "/prefabs/box.rveprefab"
+[[instances.overrides]]
+target = "box"
+collider = { friction = 0.8 }
+rigid_body = { mass = 2.0 }
+"#,
+    );
+    let expanded = library.expand(&document).unwrap().document;
+    let crate_object = object(&expanded, "crate");
+    assert_eq!(
+        crate_object.collider,
+        Some(crate::ColliderComponent {
+            friction: 0.8,
+            ..crate::ColliderComponent::default()
+        })
+    );
+    assert_eq!(
+        crate_object.rigid_body,
+        Some(crate::RigidBodyComponent {
+            mass: 2.0,
+            ..crate::RigidBodyComponent::default()
+        })
+    );
+
+    let prefab = r#"
+[[objects]]
+id = "player"
+[objects.character_controller]
+radius = 0.6
+"#;
+    let library = Library::new(&[("prefabs/player.rveprefab", prefab)]);
+    let document = scene(
+        r#"
+[[assets]]
+path = "/prefabs/player.rveprefab"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[instances]]
+id = "player"
+prefab = "/prefabs/player.rveprefab"
+[[instances.overrides]]
+target = "player"
+character_controller = { radius = 0.4 }
+"#,
+    );
+    let expanded = library.expand(&document).unwrap().document;
+    assert_eq!(
+        object(&expanded, "player").character_controller,
+        Some(crate::CharacterControllerComponent {
+            radius: 0.4,
+            ..crate::CharacterControllerComponent::default()
+        })
+    );
+}
+
+#[test]
 fn camera_only_in_a_prefab_satisfies_the_scene() {
     let prefab = "[[objects]]\nid = \"eye\"\n[objects.camera]\n";
     let library = Library::new(&[("prefabs/eye.rveprefab", prefab)]);

@@ -5,11 +5,12 @@
 //! остальные объекты — `<экземпляр>.<id в префабе>`, у вложенных — `a.b.c`.
 
 use crate::document::{
-    CameraComponent, DirectionalLightComponent, DocumentKind, EnvironmentComponent,
-    MaterialAlphaMode, MaterialOverride, ParamValue, PointLightComponent, SceneAsset,
-    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
-    option_virtual_path_serde, require_asset_path, require_extension, valid_ascii_name,
-    validate_environment, validate_material_override, virtual_path_serde,
+    CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
+    DocumentKind, EnvironmentComponent, MaterialAlphaMode, MaterialOverride, ParamValue,
+    PointLightComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform, SpotLightComponent, option_virtual_path_serde, require_asset_path,
+    require_extension, valid_ascii_name, validate_environment, validate_material_override,
+    virtual_path_serde,
 };
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,12 @@ pub struct PrefabOverride {
     pub point_light: Option<PointLightComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spot_light: Option<SpotLightComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collider: Option<ColliderComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rigid_body: Option<RigidBodyComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_controller: Option<CharacterControllerComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -250,6 +257,27 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .as_mut()
             .ok_or("override spot_light: у объекта нет spot_light")?;
         *target = light;
+    }
+    if let Some(collider) = change.collider {
+        let target = object
+            .collider
+            .as_mut()
+            .ok_or("override collider: у объекта нет collider")?;
+        *target = collider;
+    }
+    if let Some(body) = change.rigid_body {
+        let target = object
+            .rigid_body
+            .as_mut()
+            .ok_or("override rigid_body: у объекта нет rigid_body")?;
+        *target = body;
+    }
+    if let Some(controller) = change.character_controller {
+        let target = object
+            .character_controller
+            .as_mut()
+            .ok_or("override character_controller: у объекта нет character_controller")?;
+        *target = controller;
     }
     if let Some(environment) = &change.environment {
         let target = object

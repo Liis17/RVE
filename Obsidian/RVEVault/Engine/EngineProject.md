@@ -13,7 +13,7 @@ Parent: [[Index]]
 | Файл | Значимые символы | Роль |
 |---|---|---|
 | `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Формат начальных настроек, значения по умолчанию и проверки |
-| `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
+| `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings`, `PhysicsSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
 | `engine/engine-project/src/lib.rs` | публичные реэкспорты | API крейта |
 | `engine/engine-project/Cargo.toml` | зависимости | `engine-files`, `serde`, `toml` |
 | `engine/sandbox/src/main.rs` | загрузка bootstrap | Настройки sandbox из текущего каталога |
@@ -61,6 +61,19 @@ Parent: [[Index]]
 | `runtime.dlss_library` | Необязательный относительный путь внутри проекта к `nvngx_dlss.dll`; default отсутствует. Идентификатор NGX задаётся ровно одним из `dlss_project_id` или `dlss_application_id` |
 | `runtime.dlss_project_id`, `runtime.dlss_engine_version` | GUID-подобный project ID и версия RVE engine; оба требуются при выборе project ID и запрещены с application ID |
 | `runtime.dlss_application_id` | Необязательный положительный NVIDIA application ID; взаимоисключается с project ID и engine version |
+| `physics.gravity` | Конечный вектор ускорения; default `[0, -9.81, 0]` |
+| `physics.fixed_hz` | Частота фиксированного шага, `1..=1000`; default `60` |
+| `physics.max_substeps` | Максимум подшагов за один update, `1..=64`; default `8` |
+
+Секция `[physics]` необязательна. Сейчас `ProjectSettings` разбирает, проверяет и
+сериализует эти значения; runtime ещё не использует их для симуляции.
+
+```toml
+[physics]
+gravity = [0.0, -9.81, 0.0]
+fixed_hz = 60
+max_substeps = 8
+```
 
 Например, при наличии официальных FSR DLL в `vendor/` Windows-проект может задать:
 

@@ -3,8 +3,9 @@
 use crate::CameraSettings;
 use crate::camera::Camera;
 use crate::document::{
-    CameraComponent, DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript,
-    LodGroup, PointLightComponent, SceneDocument, SceneError, SceneObject, SpotLightComponent,
+    CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
+    EnvironmentComponent, HeavyScript, LiteScript, LodGroup, PointLightComponent,
+    RigidBodyComponent, SceneDocument, SceneError, SceneObject, SpotLightComponent,
     camera_from_matrix, light_direction_from_matrix,
 };
 use crate::light::ShadowSettings;
@@ -80,6 +81,9 @@ pub struct WorldObject {
     pub point_light: Option<PointLightComponent>,
     pub spot_light: Option<SpotLightComponent>,
     pub environment: Option<EnvironmentComponent>,
+    pub collider: Option<ColliderComponent>,
+    pub rigid_body: Option<RigidBodyComponent>,
+    pub character_controller: Option<CharacterControllerComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
 }
@@ -284,6 +288,11 @@ impl World {
         self.object(handle).map(|object| &object.transform)
     }
 
+    /// Returns the cached world rotation independent of scale, including zero scale.
+    pub fn world_rotation(&self, handle: ObjectHandle) -> Option<Quat> {
+        self.world_rotations.get(handle.0).copied()
+    }
+
     /// Заменяет локальную трансформацию объекта, сохраняя углы Эйлера в градусах.
     pub fn set_local_transform(
         &mut self,
@@ -298,6 +307,49 @@ impl World {
             ));
         };
         object.transform = transform;
+        Ok(())
+    }
+
+    /// Sets world pose on a root object while preserving its local scale.
+    pub fn set_root_pose(
+        &mut self,
+        handle: ObjectHandle,
+        position: Vec3,
+        rotation: Quat,
+    ) -> Result<(), SceneError> {
+        let length_squared = rotation.length_squared();
+        if !position.is_finite()
+            || !rotation.is_finite()
+            || !length_squared.is_finite()
+            || length_squared <= 1e-12
+        {
+            return Err(SceneError::new(
+                &self.source_label,
+                None,
+                "root pose должен содержать конечные position и ненулевой rotation",
+            ));
+        }
+
+        let Some(object) = self.objects.get_mut(handle.0) else {
+            return Err(SceneError::new(
+                &self.source_label,
+                None,
+                format!("неизвестный handle объекта {}", handle.0),
+            ));
+        };
+        if object.parent.is_some() {
+            return Err(SceneError::new(
+                &self.source_label,
+                Some(&object.id),
+                "set_root_pose допускается только для корневого объекта",
+            ));
+        }
+
+        let (yaw, pitch, roll) = rotation.normalize().to_euler(EulerRot::YXZ);
+        object.transform.position = position;
+        object.transform.rotation_deg =
+            Vec3::new(pitch, yaw, roll) * (180.0 / std::f32::consts::PI);
+        self.recalculate_world_matrices();
         Ok(())
     }
 
@@ -566,6 +618,9 @@ fn world_object(
         point_light: object.point_light,
         spot_light: object.spot_light,
         environment: object.environment.clone(),
+        collider: object.collider,
+        rigid_body: object.rigid_body,
+        character_controller: object.character_controller,
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
     }
@@ -673,7 +728,7 @@ fn local_light_position_from_matrix(matrix: Mat4) -> Option<[f32; 3]> {
 mod tests {
     use super::{LocalTransform, ObjectHandle, World};
     use crate::{SceneDocument, light::ShadowSettings};
-    use glam::{Mat3, Mat4, Quat, Vec3};
+    use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 
     const CAMERA_SCENE: &str = r#"
 [[objects]]
@@ -907,6 +962,82 @@ scale=[0.0,0.0,0.0]
             world.object(handle).unwrap().transform.position,
             transform.position
         );
+    }
+
+    #[test]
+    fn set_root_pose_preserves_scale_and_updates_child_matrices() {
+        let input = format!(
+            "{CAMERA_SCENE}\n[[objects]]\nid=\"child\"\nparent=\"camera\"\n\
+             [objects.transform]\nposition=[1.0,2.0,3.0]\nrotation=[10.0,20.0,30.0]\n"
+        );
+        let mut world = World::from_document(&parse(&input)).unwrap();
+        let root = world.handle("camera").unwrap();
+        let child = world.handle("child").unwrap();
+        let scale = Vec3::new(-2.0, 3.0, 0.5);
+        world
+            .set_local_transform(
+                root,
+                LocalTransform {
+                    scale,
+                    ..LocalTransform::default()
+                },
+            )
+            .unwrap();
+        world.recalculate_world_matrices();
+
+        let position = Vec3::new(4.0, -3.0, 7.0);
+        let rotation = Quat::from_euler(EulerRot::YXZ, 0.7, -0.4, 0.2);
+        world.set_root_pose(root, position, rotation).unwrap();
+
+        let root_transform = *world.local_transform(root).unwrap();
+        assert_eq!(root_transform.scale, scale);
+        assert!(root_transform.position.abs_diff_eq(position, 1e-6));
+        assert!(
+            world
+                .world_rotation(root)
+                .unwrap()
+                .abs_diff_eq(rotation, 1e-5)
+        );
+        let expected_child =
+            root_transform.matrix() * world.local_transform(child).unwrap().matrix();
+        assert!(
+            world
+                .world_matrix(child)
+                .unwrap()
+                .abs_diff_eq(expected_child, 1e-5)
+        );
+    }
+
+    #[test]
+    fn set_root_pose_rejects_non_root_objects() {
+        let input = format!("{CAMERA_SCENE}\n[[objects]]\nid=\"child\"\nparent=\"camera\"\n");
+        let mut world = World::from_document(&parse(&input)).unwrap();
+        let child = world.handle("child").unwrap();
+        let error = world
+            .set_root_pose(child, Vec3::ONE, Quat::IDENTITY)
+            .unwrap_err();
+        assert!(error.message.contains("только для корневого"));
+    }
+
+    #[test]
+    fn world_rotation_cache_is_valid_for_zero_scale_objects() {
+        let input = format!(
+            "{CAMERA_SCENE}\n[[objects]]\nid=\"collapsed\"\n\
+             [objects.transform]\nscale=[0.0,0.0,0.0]\nrotation=[15.0,25.0,35.0]\n"
+        );
+        let world = World::from_document(&parse(&input)).unwrap();
+        let collapsed = world.handle("collapsed").unwrap();
+        let rotation = world.world_rotation(collapsed).unwrap();
+        assert!(rotation.is_finite());
+        assert!(rotation.abs_diff_eq(
+            Quat::from_euler(
+                EulerRot::YXZ,
+                25.0_f32.to_radians(),
+                15.0_f32.to_radians(),
+                35.0_f32.to_radians(),
+            ),
+            1e-5
+        ));
     }
 
     #[test]

@@ -473,14 +473,7 @@ fn world_for_view(view: &engine_scene::SceneDocument) -> Result<World, engine_sc
         parent: root,
         transform: engine_scene::SceneTransform::default(),
         camera: Some(engine_scene::CameraComponent::default()),
-        mesh_renderer: None,
-        lod_group: None,
-        directional_light: None,
-        point_light: None,
-        spot_light: None,
-        environment: None,
-        lite_scripts: Vec::new(),
-        heavy_scripts: Vec::new(),
+        ..engine_scene::SceneObject::default()
     });
     World::from_document(&view)
 }

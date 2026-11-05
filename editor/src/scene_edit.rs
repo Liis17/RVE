@@ -505,16 +505,7 @@ impl EditorScene {
             id: id.clone(),
             name: Some(name),
             parent: parent.map(str::to_owned),
-            transform: SceneTransform::default(),
-            camera: None,
-            mesh_renderer: None,
-            lod_group: None,
-            directional_light: None,
-            point_light: None,
-            spot_light: None,
-            environment: None,
-            lite_scripts: Vec::new(),
-            heavy_scripts: Vec::new(),
+            ..SceneObject::default()
         };
         self.edit(None, |document| {
             match kind {
