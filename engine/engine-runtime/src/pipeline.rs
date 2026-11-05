@@ -688,6 +688,7 @@ fn scripts_thread(
         ScriptLoadOptions {
             interrupt: interrupt.clone(),
             call_time_limit: Some(SCRIPT_CALL_TIME_LIMIT),
+            input: engine_project::InputSettings::default(),
         },
     ) {
         Ok(scripts) => scripts,

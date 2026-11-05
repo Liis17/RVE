@@ -1269,6 +1269,7 @@ return Neighbor
         ScriptLoadOptions {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
+            input: Default::default(),
         },
     )
     .unwrap();
@@ -1462,6 +1463,7 @@ return Script
         ScriptLoadOptions {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
+            input: Default::default(),
         },
     )
     .unwrap();
@@ -1490,6 +1492,7 @@ fn lua_call_deadline_applies_to_top_level_chunks_and_is_optional() {
         ScriptLoadOptions {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
+            input: Default::default(),
         },
     );
     assert!(matches!(
@@ -1516,6 +1519,7 @@ return Script
         ScriptLoadOptions {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: None,
+            input: Default::default(),
         },
     )
     .unwrap();

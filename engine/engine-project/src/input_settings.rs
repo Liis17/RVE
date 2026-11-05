@@ -119,7 +119,7 @@ impl PartialEq for InputAction {
 impl Eq for InputAction {}
 
 impl InputSettings {
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.contexts.len() > MAX_CONTEXTS {
             return Err(format!(
                 "input.contexts не может содержать больше {MAX_CONTEXTS} контекстов"
