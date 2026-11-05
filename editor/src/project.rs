@@ -180,6 +180,11 @@ impl OpenProject {
         self.prefabs.reload(paths)
     }
 
+    /// Возвращает пути документов, уже загруженных в кэш префабов.
+    pub fn cached_prefab_paths(&self) -> HashSet<VirtualPath> {
+        self.prefabs.documents.borrow().keys().cloned().collect()
+    }
+
     /// Возвращает прежние документы, если раскрытие сцены после обновления не удалось.
     pub fn restore_prefabs(&self, previous: HashMap<VirtualPath, SceneDocument>) {
         self.prefabs.restore(previous);

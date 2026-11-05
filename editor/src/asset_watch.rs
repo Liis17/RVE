@@ -245,8 +245,8 @@ fn classify(event: notify::Result<Event>, roots: &WatchRoots) -> ClassifiedEvent
         let Some(relative) = roots.relative_path(path) else {
             continue;
         };
-        inside_assets = true;
         if relative.as_os_str().is_empty() {
+            inside_assets = true;
             assets_root = true;
             continue;
         }
@@ -258,6 +258,7 @@ fn classify(event: notify::Result<Event>, roots: &WatchRoots) -> ClassifiedEvent
             continue;
         };
         if let Ok(path) = VirtualPath::parse(&components.join("/")) {
+            inside_assets = true;
             if directory_event {
                 directory_paths.insert(path.clone());
             }
@@ -331,6 +332,20 @@ mod tests {
                 EventKind::Create(CreateKind::File),
                 &[&root.0.parent().unwrap().join("elsewhere.png")],
             ),
+            &root.roots(),
+        );
+        assert!(result.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_are_ignored() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = TempRoot::new();
+        let path = root.0.join(std::ffi::OsStr::from_bytes(b"bad-\xff.png"));
+        let result = changes(
+            Ok(Event::new(EventKind::Create(CreateKind::File)).add_path(path)),
             &root.roots(),
         );
         assert!(result.is_empty());

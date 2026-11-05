@@ -1,5 +1,6 @@
 //! Приложение редактора: окно, цикл кадра egui + renderer и выполнение действий.
 
+use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
@@ -23,7 +24,7 @@ use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
 use engine_ui::console::ConsoleOverlay;
 use engine_ui::render::{ConvertedMesh, UiBridge};
-use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler};
+use engine_window::{Key, MouseButton, Window, WindowEvent, WindowHandler, WindowProxy};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -58,6 +59,9 @@ pub struct EditorApp {
     pub exit_code: u8,
     window_title: String,
     window: Option<Arc<Window>>,
+    proxy: Option<WindowProxy>,
+    asset_watcher: Option<AssetWatcher>,
+    asset_changes: ChangeBatch,
     pipeline_cache_path: Option<PathBuf>,
     pipeline_cache: Vec<u8>,
 }
@@ -103,6 +107,9 @@ impl EditorApp {
             exit_code: 0,
             window_title: String::new(),
             window: None,
+            proxy: None,
+            asset_watcher: None,
+            asset_changes: ChangeBatch::default(),
             pipeline_cache_path,
             pipeline_cache,
         }
@@ -176,6 +183,9 @@ impl EditorApp {
                 self.state.project = Some(project);
                 self.save_settings();
                 self.state.current_folder.clear();
+                self.reset_project_assets();
+                self.watch_project_assets();
+                self.refresh_tree_only();
                 if self.state.scripts_path.is_some() {
                     self.load_manual_library();
                 } else if self
@@ -186,7 +196,6 @@ impl EditorApp {
                 {
                     self.start_scripts_build();
                 }
-                self.refresh_assets();
                 match start {
                     Some(path) => self.open_scene(&path),
                     None => self.new_scene(),
@@ -204,6 +213,42 @@ impl EditorApp {
             job.kill();
         }
         self.state.pending_play = false;
+    }
+
+    fn reset_project_assets(&mut self) {
+        self.asset_changes = ChangeBatch::default();
+        self.state.previews.clear();
+        self.state.clear_lite_schemas();
+        self.state.models.clear();
+        if let Some(assets) = self
+            .state
+            .project
+            .as_ref()
+            .map(|project| project.assets.clone())
+        {
+            self.state.model_loader.restart(assets);
+        }
+        if let Some(gpu) = &mut self.gpu
+            && let Err(error) = gpu
+                .scene
+                .clear_cache(&mut gpu.renderer, &mut self.state.models)
+        {
+            self.fail(&error);
+        }
+    }
+
+    fn watch_project_assets(&mut self) {
+        self.asset_watcher = None;
+        let (Some(proxy), Some(project)) = (&self.proxy, &self.state.project) else {
+            return;
+        };
+        match AssetWatcher::new(project.assets_dir.root(), proxy.clone()) {
+            Ok(watcher) => self.asset_watcher = Some(watcher),
+            Err(error) => self.state.log.push(
+                LogLevel::Warn,
+                format!("Автообновление ресурсов недоступно: {error}"),
+            ),
+        }
     }
 
     fn start_scripts_build(&mut self) -> bool {
@@ -267,28 +312,72 @@ impl EditorApp {
         }
     }
 
-    fn refresh_assets(&mut self) {
-        let Some(project) = &self.state.project else {
-            return;
-        };
-        match project.assets_dir.list() {
-            Ok(tree) => self.state.asset_tree = tree,
-            Err(error) => self.state.log.error(error.to_string()),
+    fn apply_asset_changes(&mut self, changes: AssetChanges) {
+        if changes.tree_changed || changes.rescan {
+            self.refresh_tree_only();
         }
-        self.state.previews.clear();
-        self.state.lite_schemas.clear();
-        project.clear_prefabs();
-        if let Some(scene) = &mut self.state.scene
+        if changes.rescan {
+            self.state.previews.refresh_all();
+        } else {
+            self.state.previews.refresh_paths(&changes.paths);
+        }
+        self.state.refresh_lite_schemas(&changes);
+
+        let prefab_reload = self.state.project.as_ref().map(|project| {
+            let cached = project.cached_prefab_paths();
+            let mut paths = changes
+                .prefab_paths()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            paths.extend(
+                cached
+                    .iter()
+                    .filter(|path| changes.rescan || changes.contains_path_or_parent(path))
+                    .cloned(),
+            );
+            let reload_scene = !paths.is_empty();
+            let (previous, errors) = project.reload_prefabs(&paths);
+            (previous, reload_scene, errors)
+        });
+        let (prefab_previous, reload_scene, prefab_errors) = prefab_reload.unwrap_or_default();
+        for error in prefab_errors {
+            self.state.log.error(error);
+        }
+        if reload_scene
+            && let Some(scene) = &mut self.state.scene
             && let Err(error) = scene.reload_prefabs()
         {
             self.state.log.error(error);
+            if let Some(project) = &self.state.project {
+                project.restore_prefabs(prefab_previous);
+            }
         }
-        // Модели, разбор которых начался до сброса, загружаются заново.
-        self.state.model_loader.restart(project.assets.clone());
-        if let Some(gpu) = &mut self.gpu
-            && let Err(error) = gpu
-                .scene
-                .clear_cache(&mut gpu.renderer, &mut self.state.models)
+
+        let camera_settings_changed = changes.rescan
+            || changes.camera_settings_paths().next().is_some()
+            || self.state.scene.as_ref().is_some_and(|scene| {
+                scene.view().assets.iter().any(|asset| {
+                    asset
+                        .path
+                        .as_str()
+                        .to_ascii_lowercase()
+                        .ends_with(".camerasettings")
+                        && changes.contains_path_or_parent(&asset.path)
+                })
+            });
+        if camera_settings_changed {
+            self.state.camera_settings_changed();
+        }
+
+        if let Some(project) = &self.state.project
+            && let Some(gpu) = &mut self.gpu
+            && let Err(error) = gpu.scene.reload_changed(
+                &mut gpu.renderer,
+                project,
+                &changes,
+                &mut self.state.model_loader,
+                &mut self.state.log,
+            )
         {
             self.fail(&error);
         }
@@ -800,10 +889,11 @@ impl EditorApp {
     }
 
     fn refresh_tree_only(&mut self) {
-        if let Some(project) = &self.state.project
-            && let Ok(tree) = project.assets_dir.list()
-        {
-            self.state.asset_tree = tree;
+        if let Some(project) = &self.state.project {
+            match project.assets_dir.list() {
+                Ok(tree) => self.state.asset_tree = tree,
+                Err(error) => self.state.log.error(error.to_string()),
+            }
         }
     }
 
@@ -916,7 +1006,7 @@ impl EditorApp {
                 Err(error) => self.state.log.error(format!("{}: {error}", file.display())),
             }
         }
-        self.refresh_assets();
+        self.refresh_tree_only();
     }
 
     fn run_actions(&mut self) {
@@ -957,7 +1047,7 @@ impl EditorApp {
                     }
                 }
                 Action::ImportFiles(files) => self.import(&files),
-                Action::RefreshAssets => self.refresh_assets(),
+                Action::RefreshTree => self.refresh_tree_only(),
                 Action::BuildPlayer => {
                     if self.state.is_playing() {
                         self.state.log.error("Сначала остановите Play-режим");
@@ -1459,6 +1549,10 @@ fn render_ui_only(
 }
 
 impl WindowHandler for EditorApp {
+    fn attach_proxy(&mut self, proxy: WindowProxy) {
+        self.proxy = Some(proxy);
+    }
+
     fn init(&mut self, window: Arc<Window>) -> bool {
         let size = window.inner_size();
         let renderer = Renderer::new(
@@ -1561,6 +1655,22 @@ impl WindowHandler for EditorApp {
 
     fn update(&mut self, window: &Window) -> bool {
         // Здесь, а не в кадре: при простое окно просыпается к сроку без перерисовки.
+        let now = Instant::now();
+        let watcher_errors = self
+            .asset_watcher
+            .as_mut()
+            .map(|watcher| watcher.drain(&mut self.asset_changes, now))
+            .unwrap_or_default();
+        for error in watcher_errors {
+            self.state.log.push(LogLevel::Warn, error);
+        }
+        if let Some(changes) = self.asset_changes.take_ready(now) {
+            self.apply_asset_changes(changes);
+            window.request_redraw();
+        }
+        if self.exit {
+            return false;
+        }
         self.autosave_tick();
         let previews_pending = self.state.previews.has_pending();
         let build_output = self.poll_build();
@@ -1597,6 +1707,7 @@ impl WindowHandler for EditorApp {
             build,
             scripts,
             self.autosave_deadline(),
+            self.asset_changes.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1614,6 +1725,8 @@ impl WindowHandler for EditorApp {
 
     fn exiting(&mut self) {
         self.stop_play();
+        self.asset_watcher = None;
+        self.proxy = None;
         if let Some(job) = self.state.build.take() {
             job.kill();
         }

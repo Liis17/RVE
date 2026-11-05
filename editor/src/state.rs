@@ -47,8 +47,8 @@ pub enum Action {
     Stop,
     ImportDialog,
     ImportFiles(Vec<PathBuf>),
-    /// Файловая структура изменилась: обновить ресурсы проекта.
-    RefreshAssets,
+    /// Отразить собственную файловую операцию в дереве Project.
+    RefreshTree,
     /// Выбрать каталог и собрать релиз проекта через `rve-build`; сцена сохраняется заранее.
     BuildPlayer,
     /// Сохранить поддерево объекта в новый префаб и заменить его экземпляром.
@@ -482,6 +482,12 @@ impl EditorState {
                 })
                 .cloned(),
         );
+    }
+
+    /// Сбрасывает кэш Lua-схем при смене проекта.
+    pub fn clear_lite_schemas(&mut self) {
+        self.lite_schemas.clear();
+        self.dirty_lite_schemas.clear();
     }
 
     /// Сбрасывает edit-world после изменения `.camerasettings`, вне Play.

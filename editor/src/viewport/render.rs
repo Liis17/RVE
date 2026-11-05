@@ -334,7 +334,15 @@ impl SceneRenderer {
         let environment_paths = self
             .environment_sources
             .keys()
-            .filter(|path| key_matches_changes(changes, path))
+            .filter(|path| {
+                changes.rescan
+                    || changes
+                        .hdr_paths()
+                        .any(|changed| same_virtual_path(changed.as_str(), path))
+                    || changes.directory_paths.iter().any(|changed| {
+                        VirtualPath::parse(path).is_ok_and(|key| path_is_parent(changed, &key))
+                    })
+            })
             .cloned()
             .collect::<Vec<_>>();
         for path in environment_paths {
@@ -378,7 +386,17 @@ impl SceneRenderer {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let plan = model_reload_plan(changes, &self.models, &self.model_dependencies, &pending);
-        for path in plan.pending.into_iter().chain(plan.cached) {
+        let unknown_dependencies_changed = changes.rescan
+            || changes.png_paths().next().is_some()
+            || !changes.directory_paths.is_empty();
+        if unknown_dependencies_changed {
+            loader.stale_pending();
+        } else {
+            for path in plan.pending {
+                loader.reload(&path);
+            }
+        }
+        for path in plan.cached {
             loader.reload(&path);
         }
         Ok(())
@@ -857,7 +875,7 @@ fn model_reload_plan<T>(
                         .any(|path| key_matches_changes(changes, path.as_str()))
                 });
             (changes.rescan
-                || key_matches_changes(changes, path)
+                || key_matches_model(changes, path)
                 || dependency_changed
                 || (model.is_none() && unknown_dependencies_changed))
                 .then(|| path.clone())
@@ -865,7 +883,7 @@ fn model_reload_plan<T>(
         .collect();
     let pending = pending
         .iter()
-        .filter(|path| unknown_dependencies_changed || key_matches_changes(changes, path))
+        .filter(|path| unknown_dependencies_changed || key_matches_model(changes, path))
         .cloned()
         .collect();
     ModelReloadPlan { cached, pending }
@@ -882,6 +900,19 @@ fn key_matches_changes(changes: &AssetChanges, key: &str) -> bool {
         .paths
         .iter()
         .any(|changed| path_is_parent(changed, &key))
+}
+
+fn key_matches_model(changes: &AssetChanges, key: &str) -> bool {
+    if changes.rescan {
+        return true;
+    }
+    changes
+        .fbx_paths()
+        .any(|changed| same_virtual_path(changed.as_str(), key))
+        || changes
+            .directory_paths
+            .iter()
+            .any(|changed| VirtualPath::parse(key).is_ok_and(|key| path_is_parent(changed, &key)))
 }
 
 fn path_is_parent(changed: &VirtualPath, key: &VirtualPath) -> bool {
