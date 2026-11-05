@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 
 use crate::bvh::TriMesh;
 use crate::{Aabb, GeometryError, Pose, Shape};
@@ -1071,8 +1071,8 @@ impl SupportPoint {
 #[derive(Clone)]
 struct ClosestSimplex {
     points: Vec<SupportPoint>,
-    weights: Vec<f32>,
-    difference: Vec3,
+    weights: Vec<f64>,
+    difference: DVec3,
 }
 
 struct GjkResult {
@@ -1092,7 +1092,8 @@ fn gjk<A: SupportMap, B: SupportMap>(a: &A, b: &B) -> Result<GjkResult, Narrowph
 
     for _ in 0..GJK_MAX_ITERATIONS {
         let distance_squared = closest.difference.length_squared();
-        if distance_squared <= epsilon * epsilon {
+        let epsilon_squared = (epsilon as f64).powi(2);
+        if distance_squared <= epsilon_squared {
             let witnesses = witnesses(&closest);
             return Ok(GjkResult {
                 distance: DistanceResult {
@@ -1106,20 +1107,27 @@ fn gjk<A: SupportMap, B: SupportMap>(a: &A, b: &B) -> Result<GjkResult, Narrowph
             });
         }
 
-        direction = -closest.difference;
+        let direction64 = -closest.difference;
+        let direction = direction64.as_vec3();
         let next = SupportPoint::new(a, b, direction)?;
-        let improvement = next.difference.dot(direction) - closest.difference.dot(direction);
-        let duplicate = closest
-            .points
-            .iter()
-            .any(|point| point.difference.distance_squared(next.difference) <= epsilon * epsilon);
-        if improvement <= epsilon * direction.length() || duplicate {
+        let next_difference = next.difference.as_dvec3();
+        let improvement = next_difference.dot(direction64) - closest.difference.dot(direction64);
+        let duplicate = closest.points.iter().any(|point| {
+            point
+                .difference
+                .as_dvec3()
+                .distance_squared(next_difference)
+                <= epsilon_squared
+        });
+        if improvement <= epsilon as f64 * direction64.length() || duplicate {
             let distance = distance_squared.sqrt();
             let (point_a, point_b) = witnesses(&closest);
             return Ok(GjkResult {
                 distance: DistanceResult {
-                    distance,
-                    normal: (-closest.difference / distance).normalize_or_zero(),
+                    distance: distance as f32,
+                    normal: (-closest.difference / distance)
+                        .as_vec3()
+                        .normalize_or_zero(),
                     point_a,
                     point_b,
                 },
@@ -1134,16 +1142,18 @@ fn gjk<A: SupportMap, B: SupportMap>(a: &A, b: &B) -> Result<GjkResult, Narrowph
         closest = closest_simplex(&simplex)?;
         // Simplex reduction can discard a support point and repeat with a tiny false improvement.
         // Only treat that stagnation as separation when the support plane proves a positive gap.
-        if closest.difference.length_squared() > epsilon * epsilon
-            && closest.difference.distance_squared(previous_difference) <= epsilon * epsilon
-            && dot64(next.difference, direction) < -(epsilon as f64) * direction.length() as f64
+        if closest.difference.length_squared() > epsilon_squared
+            && closest.difference.distance_squared(previous_difference) <= epsilon_squared
+            && next_difference.dot(direction64) < -(epsilon as f64) * direction64.length()
         {
             let distance = closest.difference.length();
             let (point_a, point_b) = witnesses(&closest);
             return Ok(GjkResult {
                 distance: DistanceResult {
-                    distance,
-                    normal: (-closest.difference / distance).normalize_or_zero(),
+                    distance: distance as f32,
+                    normal: (-closest.difference / distance)
+                        .as_vec3()
+                        .normalize_or_zero(),
                     point_a,
                     point_b,
                 },
@@ -1177,18 +1187,19 @@ fn closest_simplex(points: &[SupportPoint]) -> Result<ClosestSimplex, Narrowphas
         for weight in &mut weights {
             *weight = weight.max(0.0);
         }
-        let sum = weights.iter().sum::<f32>();
-        if sum <= f32::MIN_POSITIVE {
+        let sum = weights.iter().sum::<f64>();
+        if sum <= f64::MIN_POSITIVE {
             continue;
         }
         for weight in &mut weights {
             *weight /= sum;
         }
+        // Keep cancellation in near-zero closest points out of f32 before the next search direction.
         let difference = indices
             .iter()
             .zip(&weights)
-            .map(|(index, weight)| points[*index].difference * *weight)
-            .sum::<Vec3>();
+            .map(|(index, weight)| points[*index].difference.as_dvec3() * *weight)
+            .sum::<DVec3>();
         let candidate = ClosestSimplex {
             points: indices.iter().map(|index| points[*index]).collect(),
             weights,
@@ -1204,7 +1215,7 @@ fn closest_simplex(points: &[SupportPoint]) -> Result<ClosestSimplex, Narrowphas
     best.ok_or(NarrowphaseError::DegenerateSimplex)
 }
 
-fn closest_weights(points: &[SupportPoint], indices: &[usize]) -> Option<Vec<f32>> {
+fn closest_weights(points: &[SupportPoint], indices: &[usize]) -> Option<Vec<f64>> {
     let count = indices.len();
     if count == 1 {
         return Some(vec![1.0]);
@@ -1225,12 +1236,7 @@ fn closest_weights(points: &[SupportPoint], indices: &[usize]) -> Option<Vec<f32
     matrix[count][count] = 0.0;
     matrix[count][dimension] = 1.0;
     let solution = solve_linear(matrix, dimension)?;
-    Some(
-        solution[..count]
-            .iter()
-            .map(|value| *value as f32)
-            .collect(),
-    )
+    Some(solution[..count].to_vec())
 }
 
 fn solve_linear(mut matrix: [[f64; 6]; 5], dimension: usize) -> Option<[f64; 5]> {
@@ -1275,14 +1281,16 @@ fn witnesses(simplex: &ClosestSimplex) -> (Vec3, Vec3) {
         .points
         .iter()
         .zip(&simplex.weights)
-        .map(|(point, weight)| point.point_a * *weight)
-        .sum();
+        .map(|(point, weight)| point.point_a.as_dvec3() * *weight)
+        .sum::<DVec3>()
+        .as_vec3();
     let point_b = simplex
         .points
         .iter()
         .zip(&simplex.weights)
-        .map(|(point, weight)| point.point_b * *weight)
-        .sum();
+        .map(|(point, weight)| point.point_b.as_dvec3() * *weight)
+        .sum::<DVec3>()
+        .as_vec3();
     (point_a, point_b)
 }
 
@@ -1602,7 +1610,7 @@ fn dot64(left: Vec3, right: Vec3) -> f64 {
 mod tests {
     use super::{ManifoldCache, NarrowphaseError, PairKey, collide, distance};
     use crate::{Hull, Pose, Shape, TriMesh};
-    use glam::{Quat, Vec3};
+    use glam::{EulerRot, Quat, Vec3};
     use std::sync::Arc;
 
     fn cube() -> Shape {
@@ -1910,6 +1918,143 @@ mod tests {
                     .all(|contact| contact.penetration > 0.0)
             );
         }
+    }
+
+    #[test]
+    fn near_degenerate_rotated_cube_hulls_return_accurate_separation() {
+        let hull = cube();
+        let pose = Pose::new(
+            Vec3::new(-0.746_299_9, -0.981_468_4, -0.648_807_1),
+            Quat::from_xyzw(0.050_731_134, 0.061_450_034, 0.442_501, 0.893_220_66),
+        )
+        .unwrap();
+        let box_shape = Shape::cuboid(Vec3::splat(0.5)).unwrap();
+
+        assert!(
+            hull.aabb(Pose::IDENTITY)
+                .unwrap()
+                .overlaps(hull.aabb(pose).unwrap())
+        );
+        assert!(
+            collide(&box_shape, Pose::IDENTITY, &box_shape, pose)
+                .unwrap()
+                .is_none()
+        );
+        let collision = collide(&hull, Pose::IDENTITY, &hull, pose);
+        let separation = distance(&hull, Pose::IDENTITY, &hull, pose);
+        assert!(matches!(&collision, Ok(None)), "{collision:?}");
+        assert!(separation.is_ok(), "{separation:?}");
+        let separation = separation.unwrap();
+        assert!(
+            (separation.distance - 0.000_088_199).abs() < 1.0e-6,
+            "{separation:?}"
+        );
+        assert!(
+            ((separation.point_b - separation.point_a).length() - separation.distance).abs()
+                < 1.0e-6,
+            "{separation:?}"
+        );
+
+        let near_touch_pose = Pose::new(
+            pose.position - separation.normal * (separation.distance - 1.0e-5),
+            pose.rotation,
+        )
+        .unwrap();
+        assert!(
+            collide(&box_shape, Pose::IDENTITY, &box_shape, near_touch_pose)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            collide(&hull, Pose::IDENTITY, &hull, near_touch_pose)
+                .unwrap()
+                .is_none()
+        );
+
+        let touching_pose = Pose::new(
+            pose.position - separation.normal * separation.distance,
+            pose.rotation,
+        )
+        .unwrap();
+        assert!(
+            collide(&box_shape, Pose::IDENTITY, &box_shape, touching_pose)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            collide(&hull, Pose::IDENTITY, &hull, touching_pose)
+                .unwrap()
+                .is_some()
+        );
+
+        let nearby_overlap_pose = Pose::new(
+            pose.position - separation.normal * (separation.distance + 1.0e-4),
+            pose.rotation,
+        )
+        .unwrap();
+        assert!(
+            collide(&box_shape, Pose::IDENTITY, &box_shape, nearby_overlap_pose)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            collide(&hull, Pose::IDENTITY, &hull, nearby_overlap_pose)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rotated_cube_hull_gjk_matches_box_sat_for_deterministic_poses() {
+        let hull = cube();
+        let box_shape = Shape::cuboid(Vec3::splat(0.5)).unwrap();
+        let mut state = 0x8f31_4a27_u32;
+        let mut overlaps = 0;
+        let mut separations = 0;
+
+        for _ in 0..96 {
+            let mut sample = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1_u32 << 24) as f32
+            };
+            let position = Vec3::new(
+                (sample() * 2.0 - 1.0) * 1.7,
+                (sample() * 2.0 - 1.0) * 1.7,
+                (sample() * 2.0 - 1.0) * 1.7,
+            );
+            let rotation = Quat::from_euler(
+                EulerRot::XYZ,
+                (sample() * 2.0 - 1.0) * std::f32::consts::PI,
+                (sample() * 2.0 - 1.0) * std::f32::consts::PI,
+                (sample() * 2.0 - 1.0) * std::f32::consts::PI,
+            );
+            let pose = Pose::new(position, rotation).unwrap();
+            let sat_overlap = collide(&box_shape, Pose::IDENTITY, &box_shape, pose)
+                .unwrap()
+                .is_some();
+            let hull_overlap = collide(&hull, Pose::IDENTITY, &hull, pose)
+                .unwrap_or_else(|error| panic!("pose {pose:?}: {error}"))
+                .is_some();
+            assert_eq!(hull_overlap, sat_overlap, "pose {pose:?}");
+            if sat_overlap {
+                overlaps += 1;
+            } else {
+                separations += 1;
+                let result = distance(&hull, Pose::IDENTITY, &hull, pose)
+                    .unwrap_or_else(|error| panic!("pose {pose:?}: {error}"));
+                assert!(
+                    result.distance.is_finite() && result.distance > 0.0,
+                    "{result:?}"
+                );
+                assert!(
+                    ((result.point_b - result.point_a).length() - result.distance).abs() < 1.0e-5,
+                    "{result:?}"
+                );
+            }
+        }
+
+        assert!(overlaps > 20, "only {overlaps} overlap poses");
+        assert!(separations > 20, "only {separations} separated poses");
     }
 
     #[test]

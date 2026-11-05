@@ -1555,20 +1555,28 @@ mod tests {
             Vec3::new(0.5, 0.5, 0.5),
         ];
         let shape = Shape::ConvexHull(Arc::new(Hull::from_points(&points).unwrap()));
-        let pose = Pose::new(
-            Vec3::new(-0.804_056_2, -0.969_654_3, -0.700_818_3),
-            Quat::from_xyzw(0.040_864_84, 0.080_302_73, 0.444_840_82, 0.891_065_8),
-        )
-        .unwrap();
-        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
-        world
-            .insert_body(BodyDesc::static_collider(shape.clone(), Pose::IDENTITY))
-            .unwrap();
-        world
-            .insert_body(BodyDesc::dynamic(shape, pose, 1.0))
-            .unwrap();
-
-        assert!(world.step_fixed(1.0 / 60.0).is_ok());
+        let poses = [
+            Pose::new(
+                Vec3::new(-0.804_056_2, -0.969_654_3, -0.700_818_3),
+                Quat::from_xyzw(0.040_864_84, 0.080_302_73, 0.444_840_82, 0.891_065_8),
+            )
+            .unwrap(),
+            Pose::new(
+                Vec3::new(-0.746_299_9, -0.981_468_4, -0.648_807_1),
+                Quat::from_xyzw(0.050_731_134, 0.061_450_034, 0.442_501, 0.893_220_66),
+            )
+            .unwrap(),
+        ];
+        for pose in poses {
+            let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+            world
+                .insert_body(BodyDesc::static_collider(shape.clone(), Pose::IDENTITY))
+                .unwrap();
+            world
+                .insert_body(BodyDesc::dynamic(shape.clone(), pose, 1.0))
+                .unwrap();
+            assert!(world.step_fixed(1.0 / 60.0).is_ok(), "{pose:?}");
+        }
     }
 
     #[test]
