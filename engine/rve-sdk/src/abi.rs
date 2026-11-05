@@ -255,6 +255,32 @@ impl MouseButton {
     }
 }
 
+/// A physical keyboard key or mouse button used by project input bindings.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PhysicalInput {
+    Key(Key),
+    MouseButton(MouseButton),
+}
+
+impl PhysicalInput {
+    /// Parses a stable key name or a `Mouse.<Button>` name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        if let Some(button) = name.strip_prefix("Mouse.") {
+            MouseButton::from_name(button).map(Self::MouseButton)
+        } else {
+            Key::from_name(name).map(Self::Key)
+        }
+    }
+
+    /// Returns the stable name used by project input bindings.
+    pub fn name(self) -> String {
+        match self {
+            Self::Key(key) => format!("{key:?}"),
+            Self::MouseButton(button) => format!("Mouse.{button:?}"),
+        }
+    }
+}
+
 /// Value tag for a boolean.
 pub const RVE_VALUE_BOOL: u32 = 0;
 /// Value tag for a signed 64-bit integer.
@@ -813,9 +839,10 @@ unsafe impl Sync for RveModule {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Key, MouseButton, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA,
-        RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
-        RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn, RveHost,
+        Key, MouseButton, PhysicalInput, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR,
+        RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES,
+        RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn,
+        RveHost,
     };
 
     #[test]
@@ -879,6 +906,26 @@ mod tests {
             Some(MouseButton::Forward)
         );
         assert_eq!(MouseButton::from_name("UnknownButton"), None);
+    }
+
+    #[test]
+    fn physical_input_names_are_stable_and_explicit_for_mouse_buttons() {
+        assert_eq!(
+            PhysicalInput::from_name("Space"),
+            Some(PhysicalInput::Key(Key::Space))
+        );
+        assert_eq!(
+            PhysicalInput::from_name("Mouse.Left"),
+            Some(PhysicalInput::MouseButton(MouseButton::Left))
+        );
+        assert_eq!(PhysicalInput::Key(Key::ArrowUp).name(), "ArrowUp");
+        assert_eq!(
+            PhysicalInput::MouseButton(MouseButton::Forward).name(),
+            "Mouse.Forward"
+        );
+        assert_eq!(PhysicalInput::from_name("Left"), None);
+        assert_eq!(PhysicalInput::from_name("Mouse.Unknown"), None);
+        assert_eq!(PhysicalInput::from_name("Mouse.Left.Extra"), None);
     }
 
     #[test]

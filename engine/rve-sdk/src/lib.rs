@@ -5,7 +5,7 @@
 
 pub mod abi;
 
-pub use abi::{Key, MouseButton};
+pub use abi::{Key, MouseButton, PhysicalInput};
 use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
     RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,

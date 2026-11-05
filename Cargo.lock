@@ -719,6 +719,7 @@ name = "engine-project"
 version = "0.1.0"
 dependencies = [
  "engine-files",
+ "rve-sdk",
  "serde",
  "toml",
 ]
