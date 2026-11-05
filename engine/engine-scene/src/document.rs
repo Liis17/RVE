@@ -1104,7 +1104,7 @@ fn validate_physics_components(source: &str, object: &SceneObject) -> Result<(),
         if controller.radius <= 0.0
             || controller.height <= 0.0
             || controller.step_height < 0.0
-            || !(0.0..90.0).contains(&controller.max_slope_deg)
+            || !(0.0 < controller.max_slope_deg && controller.max_slope_deg < 90.0)
             || controller.snap_distance < 0.0
             || controller.skin < 0.0
             || controller.push_strength < 0.0
@@ -2685,6 +2685,8 @@ push_strength = 2.0
             "radius=0.0",
             "height=nan",
             "step_height=-0.1",
+            "max_slope_deg=0.0",
+            "max_slope_deg=-0.1",
             "max_slope_deg=90.0",
             "snap_distance=-0.1",
             "skin=-0.1",
