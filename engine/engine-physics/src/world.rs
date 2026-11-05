@@ -380,13 +380,11 @@ impl PhysicsWorld {
             if desc.kind == BodyKind::Dynamic {
                 let properties = desc.collider.shape.mass_properties(desc.mass)?;
                 let center = desc.collider.offset + properties.center_of_mass;
-                let parallel_axis = Mat3::from_diagonal(Vec3::splat(center.length_squared()))
-                    - Mat3::from_cols(center * center.x, center * center.y, center * center.z);
-                let inertia = properties.inertia + parallel_axis * desc.mass;
                 let inverse_inertia = if desc.lock_rotation {
                     Mat3::ZERO
                 } else {
-                    inertia
+                    properties
+                        .inertia
                         .try_inverse()
                         .ok_or(PhysicsWorldError::InvalidBody)?
                 };
@@ -948,8 +946,9 @@ mod tests {
         BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent, PhysicsWorld,
         PhysicsWorldError, StepDriver,
     };
-    use crate::{Pose, Shape};
+    use crate::{Hull, Pose, Shape, TriMesh};
     use glam::{Quat, Vec3};
+    use std::sync::Arc;
 
     fn box_shape(half: f32) -> Shape {
         Shape::cuboid(Vec3::splat(half)).unwrap()
@@ -990,6 +989,30 @@ mod tests {
         ball.linear_damping = 0.02;
         let ball = world.insert_body(ball).unwrap();
         (world, floor, ball)
+    }
+
+    fn angular_response(
+        shape: Shape,
+        pose: Pose,
+        offset: Vec3,
+        point: Vec3,
+        impulse: Vec3,
+    ) -> Vec3 {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut desc = BodyDesc::dynamic(shape, pose, 1.0);
+        desc.collider.offset = offset;
+        let body = world.insert_body(desc).unwrap();
+        world
+            .apply_command(
+                PhysicsCommand::AddImpulse {
+                    body,
+                    impulse,
+                    point: Some(point),
+                },
+                0.0,
+            )
+            .unwrap();
+        world.body_angular_velocity(body).unwrap()
     }
 
     #[test]
@@ -1517,5 +1540,145 @@ mod tests {
             StepDriver::new(PhysicsWorld::default(), 60, 65),
             Err(PhysicsWorldError::InvalidStepConfig)
         ));
+    }
+
+    #[test]
+    fn separated_rotated_cube_hulls_do_not_abort_a_world_step() {
+        let points = [
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, -0.5, -0.5),
+            Vec3::new(-0.5, 0.5, -0.5),
+            Vec3::new(0.5, 0.5, -0.5),
+            Vec3::new(-0.5, -0.5, 0.5),
+            Vec3::new(0.5, -0.5, 0.5),
+            Vec3::new(-0.5, 0.5, 0.5),
+            Vec3::new(0.5, 0.5, 0.5),
+        ];
+        let shape = Shape::ConvexHull(Arc::new(Hull::from_points(&points).unwrap()));
+        let pose = Pose::new(
+            Vec3::new(-0.804_056_2, -0.969_654_3, -0.700_818_3),
+            Quat::from_xyzw(0.040_864_84, 0.080_302_73, 0.444_840_82, 0.891_065_8),
+        )
+        .unwrap();
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        world
+            .insert_body(BodyDesc::static_collider(shape.clone(), Pose::IDENTITY))
+            .unwrap();
+        world
+            .insert_body(BodyDesc::dynamic(shape, pose, 1.0))
+            .unwrap();
+
+        assert!(world.step_fixed(1.0 / 60.0).is_ok());
+    }
+
+    #[test]
+    fn mesh_contact_witness_drift_does_not_create_spurious_angular_response() {
+        fn world_with_ball(start_x: f32) -> (PhysicsWorld, BodyHandle) {
+            let triangle = Arc::new(
+                TriMesh::new(
+                    vec![
+                        Vec3::new(-100.0, 0.0, -100.0),
+                        Vec3::new(0.0, 0.0, 100.0),
+                        Vec3::new(100.0, 0.0, -100.0),
+                    ],
+                    vec![[0, 1, 2]],
+                )
+                .unwrap(),
+            );
+            let mut world = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0)).unwrap();
+            let mut floor = BodyDesc::static_collider(Shape::TriMesh(triangle), Pose::IDENTITY);
+            floor.collider.friction = 1.0;
+            world.insert_body(floor).unwrap();
+            let mut ball = BodyDesc::dynamic(
+                Shape::sphere(0.5).unwrap(),
+                Pose::new(Vec3::new(start_x, 0.49, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            );
+            ball.collider.friction = 1.0;
+            ball.linear_damping = 0.0;
+            ball.angular_damping = 0.0;
+            let ball = world.insert_body(ball).unwrap();
+            (world, ball)
+        }
+
+        let (mut cached_world, cached_ball) = world_with_ball(0.0);
+        cached_world.step_fixed(1.0 / 60.0).unwrap();
+        cached_world
+            .apply_command(
+                PhysicsCommand::Teleport {
+                    body: cached_ball,
+                    pose: Pose::new(Vec3::new(5.0, 0.49, 0.0), Quat::IDENTITY).unwrap(),
+                },
+                0.0,
+            )
+            .unwrap();
+        cached_world
+            .apply_command(
+                PhysicsCommand::SetVelocity {
+                    body: cached_ball,
+                    velocity: Vec3::new(0.0, 0.0, 10.0),
+                },
+                0.0,
+            )
+            .unwrap();
+        cached_world.step_fixed(1.0 / 60.0).unwrap();
+
+        let (mut fresh_world, fresh_ball) = world_with_ball(5.0);
+        fresh_world
+            .apply_command(
+                PhysicsCommand::SetVelocity {
+                    body: fresh_ball,
+                    velocity: Vec3::new(0.0, 0.0, 10.0),
+                },
+                0.0,
+            )
+            .unwrap();
+        fresh_world.step_fixed(1.0 / 60.0).unwrap();
+
+        let cached_angular = cached_world.body_angular_velocity(cached_ball).unwrap();
+        let fresh_angular = fresh_world.body_angular_velocity(fresh_ball).unwrap();
+        assert!(
+            cached_angular.y.abs() < 1.0e-3 && (cached_angular.y - fresh_angular.y).abs() < 1.0e-3,
+            "cached={cached_angular:?}, fresh={fresh_angular:?}"
+        );
+    }
+
+    #[test]
+    fn collider_origin_and_offset_preserve_center_of_mass_inertia() {
+        let box_shape = box_shape(0.5);
+        let origin_box = angular_response(
+            box_shape.clone(),
+            Pose::IDENTITY,
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+        );
+        let offset_box = angular_response(
+            box_shape,
+            Pose::new(Vec3::new(-2.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::X,
+            Vec3::Y,
+        );
+        assert!((origin_box.z - 6.0).abs() < 1.0e-5, "{origin_box:?}");
+        assert!(origin_box.abs_diff_eq(offset_box, 1.0e-5), "{offset_box:?}");
+
+        let hull = Shape::ConvexHull(Arc::new(
+            Hull::from_points(&[Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z]).unwrap(),
+        ));
+        let rotation = Quat::from_rotation_y(0.63) * Quat::from_rotation_z(-0.27);
+        let collider_pose = Pose::new(Vec3::new(3.0, 2.0, -1.0), rotation).unwrap();
+        let center = hull.mass_properties(1.0).unwrap().center_of_mass;
+        let point = collider_pose.position + rotation * (center + Vec3::X);
+        let impulse = rotation * Vec3::Y;
+        let origin_hull = angular_response(hull.clone(), collider_pose, Vec3::ZERO, point, impulse);
+        let offset = Vec3::new(1.5, -0.7, 2.0);
+        let shifted_origin =
+            Pose::new(collider_pose.position - rotation * offset, rotation).unwrap();
+        let offset_hull = angular_response(hull, shifted_origin, offset, point, impulse);
+        assert!(
+            origin_hull.abs_diff_eq(offset_hull, 1.0e-5),
+            "origin={origin_hull:?}, offset={offset_hull:?}"
+        );
     }
 }

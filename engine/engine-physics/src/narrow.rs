@@ -137,8 +137,8 @@ impl ManifoldCache {
         let mut points = Vec::with_capacity(generated.contacts.len());
 
         for contact in &mut generated.contacts {
-            let mut local_a = inverse_transform_point(pose_a, contact.point_a);
-            let mut local_b = inverse_transform_point(pose_b, contact.point_b);
+            let local_a = inverse_transform_point(pose_a, contact.point_a);
+            let local_b = inverse_transform_point(pose_b, contact.point_b);
             let matching = preserve
                 .then(|| {
                     old.and_then(|entry| {
@@ -148,13 +148,10 @@ impl ManifoldCache {
                             .enumerate()
                             .filter(|(index, cached)| {
                                 !used.contains(index)
-                                    && ((contact.feature_id != 0
-                                        && cached.feature_id == contact.feature_id)
-                                        || (contact.feature_id == 0
-                                            && cached.feature_id == 0
-                                            && cached.local_a.distance_squared(local_a)
-                                                + cached.local_b.distance_squared(local_b)
-                                                <= 0.02_f32.powi(2)))
+                                    && cached.feature_id == contact.feature_id
+                                    && cached.local_a.distance_squared(local_a)
+                                        + cached.local_b.distance_squared(local_b)
+                                        <= 0.02_f32.powi(2)
                             })
                             .min_by(|(_, left), (_, right)| {
                                 (left.local_a.distance_squared(local_a)
@@ -171,17 +168,9 @@ impl ManifoldCache {
 
             if let Some((index, cached)) = matching {
                 used.insert(index);
-                local_a = cached.local_a;
-                local_b = cached.local_b;
-                contact.point_a = transform_point(pose_a, local_a);
-                contact.point_b = transform_point(pose_b, local_b);
-                contact.position = (contact.point_a + contact.point_b) * 0.5;
                 contact.normal_impulse = cached.normal_impulse;
                 contact.tangent_impulse = cached.tangent_impulse
                     - generated.normal * cached.tangent_impulse.dot(generated.normal);
-                if contact.feature_id == 0 {
-                    contact.feature_id = cached.feature_id;
-                }
             }
             points.push(CachedPoint {
                 local_a,
@@ -1098,8 +1087,8 @@ fn gjk<A: SupportMap, B: SupportMap>(a: &A, b: &B) -> Result<GjkResult, Narrowph
     if direction.length_squared() <= epsilon * epsilon {
         direction = Vec3::X;
     }
-    let mut simplex = vec![SupportPoint::new(a, b, direction)?];
-    let mut closest = closest_simplex(&simplex)?;
+    let first = SupportPoint::new(a, b, direction)?;
+    let mut closest = closest_simplex(&[first])?;
 
     for _ in 0..GJK_MAX_ITERATIONS {
         let distance_squared = closest.difference.length_squared();
@@ -1120,11 +1109,11 @@ fn gjk<A: SupportMap, B: SupportMap>(a: &A, b: &B) -> Result<GjkResult, Narrowph
         direction = -closest.difference;
         let next = SupportPoint::new(a, b, direction)?;
         let improvement = next.difference.dot(direction) - closest.difference.dot(direction);
-        if improvement <= epsilon * direction.length()
-            || closest.points.iter().any(|point| {
-                point.difference.distance_squared(next.difference) <= epsilon * epsilon
-            })
-        {
+        let duplicate = closest
+            .points
+            .iter()
+            .any(|point| point.difference.distance_squared(next.difference) <= epsilon * epsilon);
+        if improvement <= epsilon * direction.length() || duplicate {
             let distance = distance_squared.sqrt();
             let (point_a, point_b) = witnesses(&closest);
             return Ok(GjkResult {
@@ -1139,9 +1128,29 @@ fn gjk<A: SupportMap, B: SupportMap>(a: &A, b: &B) -> Result<GjkResult, Narrowph
             });
         }
 
-        simplex = closest.points;
+        let previous_difference = closest.difference;
+        let mut simplex = closest.points;
         simplex.push(next);
         closest = closest_simplex(&simplex)?;
+        // Simplex reduction can discard a support point and repeat with a tiny false improvement.
+        // Only treat that stagnation as separation when the support plane proves a positive gap.
+        if closest.difference.length_squared() > epsilon * epsilon
+            && closest.difference.distance_squared(previous_difference) <= epsilon * epsilon
+            && dot64(next.difference, direction) < -(epsilon as f64) * direction.length() as f64
+        {
+            let distance = closest.difference.length();
+            let (point_a, point_b) = witnesses(&closest);
+            return Ok(GjkResult {
+                distance: DistanceResult {
+                    distance,
+                    normal: (-closest.difference / distance).normalize_or_zero(),
+                    point_a,
+                    point_b,
+                },
+                simplex: closest.points,
+                intersects: false,
+            });
+        }
     }
     Err(NarrowphaseError::GjkIterationLimit)
 }
@@ -1850,5 +1859,108 @@ mod tests {
                 .abs_diff_eq(Vec3::Y * 0.2, 1.0e-5)
         );
         assert!((second.contacts[0].point_a.x - 0.51).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn rotated_cube_hulls_resolve_nearby_separation_and_overlap() {
+        let hull = cube();
+        let separated_pose = Pose::new(
+            Vec3::new(-0.804_056_2, -0.969_654_3, -0.700_818_3),
+            Quat::from_xyzw(0.040_864_84, 0.080_302_73, 0.444_840_82, 0.891_065_8),
+        )
+        .unwrap();
+        let box_shape = Shape::cuboid(Vec3::splat(0.5)).unwrap();
+
+        assert!(
+            hull.aabb(Pose::IDENTITY)
+                .unwrap()
+                .overlaps(hull.aabb(separated_pose).unwrap())
+        );
+        assert!(
+            collide(&box_shape, Pose::IDENTITY, &box_shape, separated_pose)
+                .unwrap()
+                .is_none()
+        );
+        let hull_collision = collide(&hull, Pose::IDENTITY, &hull, separated_pose);
+        let hull_distance = distance(&hull, Pose::IDENTITY, &hull, separated_pose);
+        assert!(matches!(&hull_collision, Ok(None)), "{hull_collision:?}");
+        assert!(hull_distance.is_ok(), "{hull_distance:?}");
+        let separated = hull_distance.unwrap();
+        assert!(separated.distance > 0.0, "{separated:?}");
+        assert!(
+            (separated.distance - 0.006_76).abs() < 1.0e-4,
+            "{separated:?}"
+        );
+        assert!(
+            ((separated.point_b - separated.point_a).length() - separated.distance).abs() < 1.0e-4,
+            "{separated:?}"
+        );
+
+        for factor in [0.9, 0.5, 0.1] {
+            let nearby_pose =
+                Pose::new(separated_pose.position * factor, separated_pose.rotation).unwrap();
+            let manifold = collide(&hull, Pose::IDENTITY, &hull, nearby_pose)
+                .unwrap()
+                .unwrap_or_else(|| panic!("expected rotated hull overlap at {factor}"));
+            assert!(!manifold.contacts.is_empty());
+            assert!(
+                manifold
+                    .contacts
+                    .iter()
+                    .all(|contact| contact.penetration > 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn manifold_cache_keeps_fresh_witnesses_on_a_shared_mesh_triangle() {
+        let sphere = Shape::sphere(0.5).unwrap();
+        let mesh = Shape::TriMesh(Arc::new(
+            TriMesh::new(
+                vec![
+                    Vec3::new(-100.0, 0.0, -100.0),
+                    Vec3::new(0.0, 0.0, 100.0),
+                    Vec3::new(100.0, 0.0, -100.0),
+                ],
+                vec![[0, 1, 2]],
+            )
+            .unwrap(),
+        ));
+        let key = PairKey::new(4, 9);
+        let mut cache = ManifoldCache::default();
+
+        for (index, x) in [0.0, 0.01, 1.0, 5.0].into_iter().enumerate() {
+            let sphere_pose = Pose::new(Vec3::new(x, 0.49, 0.0), Quat::IDENTITY).unwrap();
+            let fresh = collide(&sphere, sphere_pose, &mesh, Pose::IDENTITY)
+                .unwrap()
+                .unwrap();
+            let fresh_witness = fresh.contacts[0].point_b;
+            assert!((fresh_witness.x - x).abs() < 1.0e-3, "{fresh:?}");
+
+            let updated = cache
+                .update(key, sphere_pose, Pose::IDENTITY, fresh)
+                .unwrap();
+            let cached_witness = updated.contacts[0].point_b;
+            assert!(
+                (cached_witness.x - x).abs() < 1.0e-3,
+                "x={x}, witness={cached_witness:?}"
+            );
+            if index == 0 {
+                let mut with_impulses = updated;
+                with_impulses.contacts[0].normal_impulse = 1.25;
+                with_impulses.contacts[0].tangent_impulse = Vec3::X * 0.2;
+                cache.store_impulses(key, &with_impulses);
+            } else if index == 1 {
+                assert_eq!(updated.contacts[0].normal_impulse, 1.25);
+                assert!(
+                    updated.contacts[0]
+                        .tangent_impulse
+                        .abs_diff_eq(Vec3::X * 0.2, 1e-5)
+                );
+            } else {
+                assert_eq!(updated.contacts[0].normal_impulse, 0.0);
+                assert_eq!(updated.contacts[0].tangent_impulse, Vec3::ZERO);
+            }
+        }
     }
 }
