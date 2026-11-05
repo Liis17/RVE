@@ -3,6 +3,28 @@ name = "RVE Demo"
 version = "1.0.0"
 heavy_scripts = "HeavyScripts"
 
+[input]
+default_context = "game"
+
+[input.contexts.game.Jump]
+kind = "button"
+inputs = ["Space"]
+
+[input.contexts.game.Move]
+kind = "vector2"
+up = ["W"]
+down = ["S"]
+left = ["A"]
+right = ["D"]
+
+[input.contexts.game.Escape]
+kind = "button"
+inputs = ["Escape"]
+
+[input.contexts.menu.Escape]
+kind = "button"
+inputs = ["Escape"]
+
 [[scenes]]
 path = "/scenes/main.rvescene"
 enabled = true

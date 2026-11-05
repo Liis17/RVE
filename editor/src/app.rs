@@ -133,7 +133,7 @@ impl EditorApp {
         if self.state.console_open
             && let Some(play) = &mut self.state.play
         {
-            play.input_mut().release_all();
+            play.clear_input();
         }
         true
     }
@@ -863,6 +863,7 @@ impl EditorApp {
                 scene.view(),
                 world,
                 self.state.library.as_ref(),
+                &project.settings.input,
                 |path| project.read_text(path),
             )
         })();
@@ -1653,7 +1654,7 @@ impl WindowHandler for EditorApp {
 
     fn focused(&mut self, focused: bool) {
         if !focused && let Some(play) = &mut self.state.play {
-            play.input_mut().release_all();
+            play.clear_input();
         }
     }
 }

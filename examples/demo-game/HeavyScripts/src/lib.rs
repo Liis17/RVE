@@ -12,9 +12,12 @@ impl Script for Bobber {
         context.log_info("Bobber started");
     }
 
-    fn on_update(&mut self, context: &mut Context<'_>, _dt: f32) {
+    fn on_update(&mut self, context: &mut Context<'_>, dt: f32) {
         let phase = context.time().elapsed as f32 * self.speed;
+        let movement = context.input().vector("Move").unwrap_or_default();
         context.transform.position[1] = self.base_y + phase.sin() * self.amplitude;
+        context.transform.position[0] += movement[0] * dt;
+        context.transform.position[1] += movement[1] * dt;
     }
 
     fn on_message(&mut self, context: &mut Context<'_>, sender: &str, name: &str, value: &Value) {

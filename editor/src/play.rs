@@ -1,10 +1,11 @@
 //! Play-режим: копия мира сцены и скрипты на главном потоке редактора.
 
 use engine_console::{CommandCatalog, CommandLine};
+use engine_project::InputSettings;
 use engine_scene::{SceneDocument, World};
 use engine_script::{
     CommandError, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
-    ScriptTime,
+    ScriptLoadOptions, ScriptTime,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -118,7 +119,13 @@ impl PlaySession {
         read_source: impl FnMut(&str) -> Result<String, String>,
     ) -> Result<Self, String> {
         let world = World::from_document(document).map_err(|error| error.to_string())?;
-        Self::start_with_world(document, world, library, read_source)
+        Self::start_with_world(
+            document,
+            world,
+            library,
+            &InputSettings::default(),
+            read_source,
+        )
     }
 
     /// Starts from a world whose referenced camera settings are already loaded.
@@ -126,9 +133,17 @@ impl PlaySession {
         document: &SceneDocument,
         world: World,
         library: Option<&ScriptLibrary>,
+        input_settings: &InputSettings,
         read_source: impl FnMut(&str) -> Result<String, String>,
     ) -> Result<Self, String> {
-        Self::start_with_world_limit(document, world, library, read_source, SCRIPT_TIME_LIMIT)
+        Self::start_with_world_limit(
+            document,
+            world,
+            library,
+            input_settings,
+            read_source,
+            SCRIPT_TIME_LIMIT,
+        )
     }
 
     #[cfg(test)]
@@ -139,13 +154,21 @@ impl PlaySession {
         time_limit: Duration,
     ) -> Result<Self, String> {
         let world = World::from_document(document).map_err(|error| error.to_string())?;
-        Self::start_with_world_limit(document, world, library, read_source, time_limit)
+        Self::start_with_world_limit(
+            document,
+            world,
+            library,
+            &InputSettings::default(),
+            read_source,
+            time_limit,
+        )
     }
 
     fn start_with_world_limit(
         document: &SceneDocument,
         world: World,
         library: Option<&ScriptLibrary>,
+        input_settings: &InputSettings,
         mut read_source: impl FnMut(&str) -> Result<String, String>,
         time_limit: Duration,
     ) -> Result<Self, String> {
@@ -162,12 +185,16 @@ impl PlaySession {
         let watchdog = Watchdog::start(interrupt.clone())
             .map_err(|error| format!("не удалось запустить watchdog скриптов: {error}"))?;
         watchdog.set_deadline(Some(Instant::now() + time_limit));
-        let host = ScriptHost::load_with_interrupt(
+        let host = ScriptHost::load_with_options(
             &world,
             document.source_label(),
             &sources,
             library,
-            interrupt,
+            ScriptLoadOptions {
+                interrupt,
+                call_time_limit: None,
+                input: input_settings.clone(),
+            },
         )
         .map_err(|error| error.to_string())?;
         watchdog.set_deadline(None);
@@ -201,6 +228,11 @@ impl PlaySession {
     /// Вводит состояние кнопок и клавиш для следующего обновления.
     pub fn input_mut(&mut self) -> &mut ScriptInput {
         &mut self.input
+    }
+
+    pub(crate) fn clear_input(&mut self) {
+        self.input.release_all();
+        self.input.clear_pointer();
     }
 
     pub fn command_catalog(&self) -> CommandCatalog {
@@ -266,6 +298,7 @@ impl PlaySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_project::InputAction;
 
     const SCENE: &str = r#"
 [[assets]]
@@ -301,8 +334,19 @@ return Rotate
         SceneDocument::parse("scene", source).unwrap()
     }
 
-    fn start(script: &'static str) -> Result<PlaySession, String> {
+    fn start(script: &str) -> Result<PlaySession, String> {
         PlaySession::start(&document(SCENE), None, |_| Ok(script.to_owned()))
+    }
+
+    fn start_with_input_settings(
+        script: &str,
+        input_settings: InputSettings,
+    ) -> Result<PlaySession, String> {
+        let document = document(SCENE);
+        let world = World::from_document(&document).map_err(|error| error.to_string())?;
+        PlaySession::start_with_world(&document, world, None, &input_settings, |_| {
+            Ok(script.to_owned())
+        })
     }
 
     fn rotation_y(session: &mut PlaySession) -> f32 {
@@ -404,7 +448,7 @@ function S:on_update(dt)
 end
 return S
 "#;
-        let mut session = start(Box::leak(script.to_owned().into_boxed_str())).unwrap();
+        let mut session = start(script).unwrap();
         session.input_mut().set_key(engine_script::Key::Space, true);
         session.step(0.1);
         assert!(
@@ -412,6 +456,67 @@ return S
                 .drain_events()
                 .iter()
                 .any(|event| event.message == "space")
+        );
+    }
+
+    #[test]
+    fn project_input_actions_reach_editor_play() {
+        let script = r#"
+local S = {}
+function S:on_update()
+  if rve.input.action_pressed("Jump") then rve.log_info("jump action") end
+end
+return S
+"#;
+        let input_settings = InputSettings {
+            default_context: Some("game".to_owned()),
+            contexts: std::collections::BTreeMap::from([(
+                "game".to_owned(),
+                std::collections::BTreeMap::from([(
+                    "Jump".to_owned(),
+                    InputAction::Button {
+                        inputs: vec!["Space".to_owned()],
+                    },
+                )]),
+            )]),
+        };
+        let mut session = start_with_input_settings(script, input_settings).unwrap();
+        session.input_mut().set_key(engine_script::Key::Space, true);
+        session.step(0.1);
+        assert!(
+            session
+                .drain_events()
+                .iter()
+                .any(|event| event.message == "jump action")
+        );
+    }
+
+    #[test]
+    fn clear_input_releases_buttons_and_discards_pointer_deltas() {
+        let script = r#"
+local S = {}
+function S:on_update()
+  local dx, dy = rve.input.mouse_delta()
+  local wx, wy = rve.input.wheel()
+  if rve.input.key_released("Space") and not rve.input.key_down("Space")
+      and dx == 0 and dy == 0 and wx == 0 and wy == 0 then
+    rve.log_info("play input cleared")
+  end
+end
+return S
+"#;
+        let mut session = start(Box::leak(script.to_owned().into_boxed_str())).unwrap();
+        let input = session.input_mut();
+        input.set_key(engine_script::Key::Space, true);
+        input.add_mouse_delta(10.0, -5.0);
+        input.add_wheel(0.0, 2.0);
+        session.clear_input();
+        session.step(0.1);
+        assert!(
+            session
+                .drain_events()
+                .iter()
+                .any(|event| event.message == "play input cleared")
         );
     }
 
