@@ -7,6 +7,8 @@ pub mod hull;
 pub mod narrow;
 pub mod ray;
 pub mod shape;
+mod solver;
+pub mod world;
 
 pub use broad::{
     BroadPhaseError, CandidatePair, MAX_BROADPHASE_COMPARISONS, MAX_BROADPHASE_ITEMS,
@@ -22,6 +24,10 @@ pub use narrow::{
 };
 pub use ray::{Ray, RayHit, raycast};
 pub use shape::{Aabb, MassProperties, Pose, Shape};
+pub use world::{
+    BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent, PhysicsWorld,
+    PhysicsWorldError, StepDriver, StepResult,
+};
 
 use std::sync::mpsc::Receiver;
 

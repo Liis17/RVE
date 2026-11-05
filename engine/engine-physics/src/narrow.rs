@@ -546,44 +546,190 @@ fn box_box_contacts(
     half_a: Vec3,
     pose_b: Pose,
     half_b: Vec3,
-    _normal: Vec3,
+    normal: Vec3,
     penetration: f32,
     epsilon: f32,
 ) -> Vec<ContactPoint> {
+    let axes_a = box_axes(pose_a);
+    let axes_b = box_axes(pose_b);
+    let face_a = (0..3)
+        .max_by(|&left, &right| {
+            axes_a[left]
+                .dot(normal)
+                .abs()
+                .total_cmp(&axes_a[right].dot(normal).abs())
+        })
+        .unwrap_or(0);
+    let face_b = (0..3)
+        .max_by(|&left, &right| {
+            axes_b[left]
+                .dot(normal)
+                .abs()
+                .total_cmp(&axes_b[right].dot(normal).abs())
+        })
+        .unwrap_or(0);
+    let alignment_a = axes_a[face_a].dot(normal).abs();
+    let alignment_b = axes_b[face_b].dot(normal).abs();
+    if alignment_a.max(alignment_b) < 0.98 {
+        return vec![support_contact_boxes(
+            pose_a,
+            half_a,
+            pose_b,
+            half_b,
+            normal,
+            penetration,
+        )];
+    }
+
+    let reference_a = alignment_a >= alignment_b;
+    let (reference_pose, reference_half, reference_axes, reference_axis, reference_normal) =
+        if reference_a {
+            let sign = if axes_a[face_a].dot(normal) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            (pose_a, half_a, axes_a, face_a, axes_a[face_a] * sign)
+        } else {
+            let sign = if axes_b[face_b].dot(-normal) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            (pose_b, half_b, axes_b, face_b, axes_b[face_b] * sign)
+        };
+    let face_sign = if reference_axes[reference_axis].dot(reference_normal) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let reference_center = reference_pose.position
+        + reference_axes[reference_axis] * (face_sign * reference_half[reference_axis]);
+    let (incident_pose, incident_half, incident_axes, incident_axis, incident_normal) =
+        if reference_a {
+            let axis = face_b;
+            let sign = if axes_b[axis].dot(-normal) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            (pose_b, half_b, axes_b, axis, axes_b[axis] * sign)
+        } else {
+            let axis = face_a;
+            let sign = if axes_a[axis].dot(normal) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            (pose_a, half_a, axes_a, axis, axes_a[axis] * sign)
+        };
+    let mut polygon = box_face_vertices(
+        incident_pose,
+        incident_half,
+        incident_axes,
+        incident_axis,
+        incident_normal,
+    );
+    for axis in 0..3 {
+        if axis == reference_axis {
+            continue;
+        }
+        for sign in [-1.0, 1.0] {
+            polygon = clip_polygon_to_face(
+                polygon,
+                reference_center,
+                reference_axes[axis] * sign,
+                reference_half[axis],
+                epsilon,
+            );
+        }
+    }
+
     let mut contacts = Vec::new();
-    for (vertex_index, local) in box_vertices(half_a).into_iter().enumerate() {
-        let point_a = transform_point(pose_a, local);
-        let local_b = inverse_transform_point(pose_b, point_a);
-        if local_b.abs().cmple(half_b + Vec3::splat(epsilon)).all() {
-            let (axis, sign, _) = nearest_box_face(local_b, half_b);
-            let mut boundary = local_b;
-            boundary[axis] = sign * half_b[axis];
-            let point_b = transform_point(pose_b, boundary);
-            contacts.push(contact_point(
-                point_a,
-                point_b,
-                penetration,
-                box_feature_id(0, vertex_index, axis, sign),
-            ));
+    for point in polygon {
+        let signed_distance = (point - reference_center).dot(reference_normal);
+        if signed_distance > epsilon {
+            continue;
         }
+        let reference_point = point - reference_normal * signed_distance;
+        let (point_a, point_b) = if reference_a {
+            (reference_point, point)
+        } else {
+            (point, reference_point)
+        };
+        contacts.push(contact_point(
+            point_a,
+            point_b,
+            (-signed_distance).max(0.0),
+            0,
+        ));
     }
-    for (vertex_index, local) in box_vertices(half_b).into_iter().enumerate() {
-        let point_b = transform_point(pose_b, local);
-        let local_a = inverse_transform_point(pose_a, point_b);
-        if local_a.abs().cmple(half_a + Vec3::splat(epsilon)).all() {
-            let (axis, sign, _) = nearest_box_face(local_a, half_a);
-            let mut boundary = local_a;
-            boundary[axis] = sign * half_a[axis];
-            let point_a = transform_point(pose_a, boundary);
-            contacts.push(contact_point(
-                point_a,
-                point_b,
-                penetration,
-                box_feature_id(1, vertex_index, axis, sign),
-            ));
+    reduce_contacts(contacts, epsilon)
+}
+
+fn box_axes(pose: Pose) -> [Vec3; 3] {
+    [
+        pose.rotation * Vec3::X,
+        pose.rotation * Vec3::Y,
+        pose.rotation * Vec3::Z,
+    ]
+}
+
+fn box_face_vertices(
+    pose: Pose,
+    half: Vec3,
+    axes: [Vec3; 3],
+    face_axis: usize,
+    face_normal: Vec3,
+) -> Vec<Vec3> {
+    let sign = if axes[face_axis].dot(face_normal) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let center = pose.position + axes[face_axis] * (sign * half[face_axis]);
+    let tangent_axes: Vec<_> = (0..3).filter(|axis| *axis != face_axis).collect();
+    let u = axes[tangent_axes[0]] * half[tangent_axes[0]];
+    let v = axes[tangent_axes[1]] * half[tangent_axes[1]];
+    vec![
+        center - u - v,
+        center + u - v,
+        center + u + v,
+        center - u + v,
+    ]
+}
+
+fn clip_polygon_to_face(
+    polygon: Vec<Vec3>,
+    origin: Vec3,
+    axis: Vec3,
+    half_extent: f32,
+    epsilon: f32,
+) -> Vec<Vec3> {
+    if polygon.is_empty() {
+        return polygon;
+    }
+    let mut clipped = Vec::with_capacity(8);
+    let mut previous = *polygon.last().expect("nonempty polygon");
+    let mut previous_distance = (previous - origin).dot(axis) - half_extent;
+    for current in polygon {
+        let current_distance = (current - origin).dot(axis) - half_extent;
+        let previous_inside = previous_distance <= epsilon;
+        let current_inside = current_distance <= epsilon;
+        if previous_inside != current_inside {
+            let denominator = previous_distance - current_distance;
+            if denominator.abs() > f32::MIN_POSITIVE {
+                let fraction = previous_distance / denominator;
+                clipped.push(previous.lerp(current, fraction.clamp(0.0, 1.0)));
+            }
         }
+        if current_inside {
+            clipped.push(current);
+        }
+        previous = current;
+        previous_distance = current_distance;
     }
-    contacts
+    clipped
 }
 
 fn support_contact_boxes(
@@ -736,16 +882,6 @@ fn reduce_contacts(contacts: Vec<ContactPoint>, epsilon: f32) -> Vec<ContactPoin
     selected.into_iter().map(|index| contacts[index]).collect()
 }
 
-fn box_vertices(half: Vec3) -> [Vec3; 8] {
-    std::array::from_fn(|index| {
-        Vec3::new(
-            if index & 1 == 0 { -half.x } else { half.x },
-            if index & 2 == 0 { -half.y } else { half.y },
-            if index & 4 == 0 { -half.z } else { half.z },
-        )
-    })
-}
-
 fn box_projection_radius(half: Vec3, axes: [Vec3; 3], axis: Vec3) -> f32 {
     half.x * axis.dot(axes[0]).abs()
         + half.y * axis.dot(axes[1]).abs()
@@ -779,11 +915,6 @@ fn axis_vector(axis: usize) -> Vec3 {
         1 => Vec3::Y,
         _ => Vec3::Z,
     }
-}
-
-fn box_feature_id(side: u64, vertex: usize, face_axis: usize, face_sign: f32) -> u64 {
-    let face = (face_axis * 2 + usize::from(face_sign > 0.0)) as u64;
-    (side << 40) | ((vertex as u64) << 8) | (face + 1)
 }
 
 fn closest_point_segment(point: Vec3, start: Vec3, end: Vec3) -> Vec3 {
