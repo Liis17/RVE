@@ -3,7 +3,7 @@ use crate::lite::EventQueue;
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
 use engine_scene::{CameraSettings, LocalTransform, ObjectHandle, ParamValue, World};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
@@ -100,7 +100,7 @@ pub(crate) struct ScriptTransaction {
     queued_message_count: usize,
     queued_message_bytes: usize,
     overflowed_messages: usize,
-    action_frame: Arc<ActionFrame>,
+    action_frame: Option<Arc<ActionFrame>>,
     pending_action_mutations: Vec<ActionMutation>,
     #[cfg(test)]
     peak_pending_bytes: usize,
@@ -121,7 +121,7 @@ impl Default for ScriptTransaction {
             queued_message_count: 0,
             queued_message_bytes: 0,
             overflowed_messages: 0,
-            action_frame: Arc::new(ActionFrame::default()),
+            action_frame: None,
             pending_action_mutations: Vec::with_capacity(2),
             #[cfg(test)]
             peak_pending_bytes: 0,
@@ -130,6 +130,13 @@ impl Default for ScriptTransaction {
 }
 
 impl ScriptTransaction {
+    fn action_frame(&self) -> &ActionFrame {
+        static EMPTY_FRAME: OnceLock<ActionFrame> = OnceLock::new();
+        self.action_frame
+            .as_deref()
+            .unwrap_or_else(|| EMPTY_FRAME.get_or_init(ActionFrame::default))
+    }
+
     #[cfg(test)]
     pub(crate) fn begin(
         &mut self,
@@ -162,7 +169,7 @@ impl ScriptTransaction {
         self.world = world;
         self.self_object = Some(self_object);
         self.writable = writable;
-        self.action_frame = action_frame;
+        self.action_frame = Some(action_frame);
         self.source.clear();
         self.source.push_str(source);
         self.pending_transforms.clear();
@@ -181,17 +188,17 @@ impl ScriptTransaction {
     }
 
     pub(crate) fn input(&self) -> &ScriptInput {
-        self.action_frame.input()
+        self.action_frame().input()
     }
     pub(crate) fn action_state(
         &self,
         name: &str,
         kind: engine_project::InputActionKind,
     ) -> Result<ActionValue, String> {
-        self.action_frame.state(name, kind)
+        self.action_frame().state(name, kind)
     }
     pub(crate) fn action_context(&self) -> Option<&str> {
-        self.action_frame.context()
+        self.action_frame().context()
     }
     pub(crate) fn action_bindings(
         &self,
@@ -199,13 +206,13 @@ impl ScriptTransaction {
         action: &str,
         slot: &str,
     ) -> Result<Vec<String>, String> {
-        self.action_frame.bindings(context, action, slot)
+        self.action_frame().bindings(context, action, slot)
     }
     pub(crate) fn stage_action_mutation(&mut self, mutation: ActionMutation) -> Result<(), String> {
         if !self.writable {
             return Err("input mutations are unavailable during script creation".to_owned());
         }
-        self.action_frame.validate_mutation(&mutation)?;
+        self.action_frame().validate_mutation(&mutation)?;
         self.pending_action_mutations.push(mutation);
         Ok(())
     }
@@ -516,6 +523,7 @@ impl ScriptTransaction {
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
         self.world = std::ptr::null();
+        self.action_frame = None;
         Ok(std::mem::take(&mut self.pending_action_mutations))
     }
 
@@ -530,6 +538,7 @@ impl ScriptTransaction {
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
         self.world = std::ptr::null();
+        self.action_frame = None;
     }
 
     #[cfg(test)]

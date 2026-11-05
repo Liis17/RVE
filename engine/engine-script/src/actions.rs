@@ -46,6 +46,10 @@ impl AnalogSource {
 struct ActionCatalog {
     contexts: BTreeMap<String, BTreeMap<String, InputActionKind>>,
     action_kinds: BTreeMap<String, InputActionKind>,
+    action_indices: BTreeMap<String, usize>,
+    binding_indices: BTreeMap<String, BTreeMap<String, usize>>,
+    action_count: usize,
+    binding_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -60,8 +64,8 @@ pub(crate) struct ActionValue {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ActionFrame {
     input: ScriptInput,
-    context: Option<String>,
-    values: BTreeMap<String, ActionValue>,
+    context: Option<Arc<str>>,
+    values: Vec<ActionValue>,
     definitions: Arc<ActionDefinitions>,
     catalog: Arc<ActionCatalog>,
 }
@@ -83,11 +87,20 @@ pub(crate) struct InputActions {
     base: Arc<ActionDefinitions>,
     definitions: Arc<ActionDefinitions>,
     catalog: Arc<ActionCatalog>,
-    context: Option<String>,
+    context: Option<Arc<str>>,
     frame: Arc<ActionFrame>,
-    suppressed_keys: u128,
-    suppressed_mouse: u8,
+    context_suppression: InputMask,
+    binding_suppression: Vec<InputMask>,
+    changed_bindings: Vec<bool>,
+    active_actions: Vec<bool>,
+    tombstones: Vec<usize>,
     pending_mutations: Vec<ActionMutation>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InputMask {
+    keys: u128,
+    mouse: u8,
 }
 
 impl InputActions {
@@ -95,11 +108,13 @@ impl InputActions {
         settings.validate()?;
         let definitions = Arc::new(compile_definitions(&settings)?);
         let catalog = Arc::new(compile_catalog(&definitions));
-        let context = settings.default_context;
+        let context = settings.default_context.map(Arc::from);
+        let binding_count = catalog.binding_count;
+        let action_count = catalog.action_count;
         let frame = Arc::new(ActionFrame {
             input: ScriptInput::default(),
             context: context.clone(),
-            values: BTreeMap::new(),
+            values: vec![ActionValue::default(); action_count],
             definitions: Arc::clone(&definitions),
             catalog: Arc::clone(&catalog),
         });
@@ -109,8 +124,11 @@ impl InputActions {
             catalog,
             context,
             frame,
-            suppressed_keys: 0,
-            suppressed_mouse: 0,
+            context_suppression: InputMask::default(),
+            binding_suppression: vec![InputMask::default(); binding_count],
+            changed_bindings: vec![false; binding_count],
+            active_actions: vec![false; action_count],
+            tombstones: Vec::with_capacity(action_count),
             pending_mutations: Vec::new(),
         })
     }
@@ -124,17 +142,23 @@ impl InputActions {
     }
 
     pub(crate) fn set_input(&mut self, input: ScriptInput) {
-        self.suppressed_keys &= down_keys(input);
-        self.suppressed_mouse &= down_mouse(input);
+        let held = unreleased_down_inputs(input);
+        self.context_suppression.keys &= held.keys;
+        self.context_suppression.mouse &= held.mouse;
+        for suppression in &mut self.binding_suppression {
+            suppression.keys &= held.keys;
+            suppression.mouse &= held.mouse;
+        }
 
+        self.changed_bindings.fill(false);
+        self.active_actions.fill(false);
+        self.tombstones.clear();
         let old_context = self.context.clone();
-        let old_definitions = Arc::clone(&self.definitions);
-        let mut definitions = (*old_definitions).clone();
         let mut context = old_context.clone();
-        let mutations = std::mem::take(&mut self.pending_mutations);
-        for mutation in mutations {
+        let mut definitions = None;
+        for mutation in self.pending_mutations.drain(..) {
             match mutation {
-                ActionMutation::SetContext(name) => context = Some(name),
+                ActionMutation::SetContext(name) => context = Some(Arc::from(name)),
                 ActionMutation::Rebind {
                     context,
                     action,
@@ -142,6 +166,7 @@ impl InputActions {
                     inputs,
                 } => {
                     definitions
+                        .get_or_insert_with(|| (*self.definitions).clone())
                         .contexts
                         .get_mut(&context)
                         .unwrap()
@@ -150,111 +175,136 @@ impl InputActions {
                         .slots
                         .insert(slot, inputs);
                 }
-                ActionMutation::ResetBindings => definitions = (*self.base).clone(),
+                ActionMutation::ResetBindings => definitions = Some((*self.base).clone()),
             }
         }
 
         let changed_context = context != old_context;
-        let changed_definitions = definitions != *old_definitions;
-        let changed_actions =
-            changed_definitions.then(|| changed_action_bindings(&old_definitions, &definitions));
-        let changed = changed_context || changed_definitions;
-        if changed {
-            let down = down_inputs(input);
-            self.suppressed_keys |= down.0;
-            self.suppressed_mouse |= down.1;
+        let changed_actions = definitions
+            .as_ref()
+            .map(|definitions| changed_action_bindings(&self.definitions, definitions));
+        let definitions = if let Some(definitions) = definitions {
+            if changed_actions.as_ref().is_some_and(BTreeSet::is_empty) {
+                Arc::clone(&self.definitions)
+            } else {
+                Arc::new(definitions)
+            }
+        } else {
+            Arc::clone(&self.definitions)
+        };
+        let changed_actions = changed_actions.filter(|actions| !actions.is_empty());
+
+        if let Some(changed_actions) = &changed_actions {
+            for (context_name, action_name) in changed_actions {
+                let index = self.catalog.binding_indices[context_name][action_name];
+                self.changed_bindings[index] = true;
+            }
         }
 
-        let mut values = BTreeMap::new();
-        let mut tombstones = BTreeSet::new();
         if changed_context {
-            for (name, value) in &self.frame.values {
+            for (index, value) in self.frame.values.iter().enumerate() {
                 if value.down {
-                    tombstones.insert(name.clone());
+                    self.tombstones.push(index);
                 }
             }
+            self.context_suppression.keys |= held.keys;
+            self.context_suppression.mouse |= held.mouse;
         } else if let Some(changed_actions) = &changed_actions {
             for (changed_context, action) in changed_actions {
-                if self.context.as_deref() == Some(changed_context.as_str())
-                    && self
-                        .frame
-                        .values
-                        .get(action)
-                        .is_some_and(|value| value.down)
-                {
-                    tombstones.insert(action.clone());
+                if context.as_deref() == Some(changed_context.as_str()) {
+                    let action_index = self.catalog.action_indices[action];
+                    if self.frame.values[action_index].down
+                        && !self.tombstones.contains(&action_index)
+                    {
+                        self.tombstones.push(action_index);
+                    }
+                    let binding_index = self.catalog.binding_indices[changed_context][action];
+                    let definition = &definitions.contexts[changed_context][action];
+                    let bound = bound_inputs(definition);
+                    self.binding_suppression[binding_index].keys |= held.keys & bound.keys;
+                    self.binding_suppression[binding_index].mouse |= held.mouse & bound.mouse;
                 }
             }
         }
 
+        let frame = Arc::make_mut(&mut self.frame);
+        if changed_context {
+            frame.values.fill(ActionValue::default());
+        }
         if let Some(context_name) = context.as_deref()
             && let Some(actions) = definitions.contexts.get(context_name)
         {
             for (name, definition) in actions {
+                let action_index = self.catalog.action_indices[name];
+                self.active_actions[action_index] = true;
+                let binding_index = self.catalog.binding_indices[context_name][name];
                 let previous_down = !changed_context
-                    && !changed_actions.as_ref().is_some_and(|changed| {
-                        changed.contains(&(context_name.to_owned(), name.clone()))
-                    })
-                    && self.frame.values.get(name).is_some_and(|value| value.down);
-                let value = evaluate_action(
+                    && !self.changed_bindings[binding_index]
+                    && frame.values[action_index].down;
+                let suppression = self.binding_suppression[binding_index];
+                frame.values[action_index] = evaluate_action(
                     input,
                     definition,
                     previous_down,
-                    self.suppressed_keys,
-                    self.suppressed_mouse,
+                    self.context_suppression.keys | suppression.keys,
+                    self.context_suppression.mouse | suppression.mouse,
                 );
-                values.insert(name.clone(), value);
             }
         }
-        for name in tombstones {
-            values.insert(
-                name,
-                ActionValue {
-                    released: true,
-                    ..ActionValue::default()
-                },
-            );
+        for (index, active) in self.active_actions.iter().enumerate() {
+            if !active {
+                frame.values[index] = ActionValue::default();
+            }
+        }
+        for index in &self.tombstones {
+            frame.values[*index] = ActionValue {
+                released: true,
+                ..ActionValue::default()
+            };
         }
 
-        self.context = context.clone();
-        self.definitions = Arc::new(definitions);
-        self.frame = Arc::new(ActionFrame {
-            input,
-            context,
-            values,
-            definitions: Arc::clone(&self.definitions),
-            catalog: Arc::clone(&self.catalog),
-        });
+        self.context = context;
+        self.definitions = definitions;
+        frame.input = input;
+        frame.context = self.context.clone();
+        frame.definitions = Arc::clone(&self.definitions);
     }
 
     pub(crate) fn clear_frame_transients(&mut self) {
         let mut input = self.frame.input;
         input.clear_frame_transients();
-        let mut values = BTreeMap::new();
+        let definitions = &self.definitions;
+        let catalog = &self.catalog;
+        let context_suppression = self.context_suppression;
+        let binding_suppression = &self.binding_suppression;
+        self.active_actions.fill(false);
+        let frame = Arc::make_mut(&mut self.frame);
         if let Some(context) = self.context.as_deref()
-            && let Some(actions) = self.definitions.contexts.get(context)
+            && let Some(actions) = definitions.contexts.get(context)
         {
             for (name, definition) in actions {
-                let previous_down = self.frame.values.get(name).is_some_and(|value| value.down);
-                values.insert(
-                    name.clone(),
-                    evaluate_action(
-                        input,
-                        definition,
-                        previous_down,
-                        self.suppressed_keys,
-                        self.suppressed_mouse,
-                    ),
+                let action_index = catalog.action_indices[name];
+                self.active_actions[action_index] = true;
+                let binding_index = catalog.binding_indices[context][name];
+                let previous_down = frame.values[action_index].down;
+                let suppression = binding_suppression[binding_index];
+                frame.values[action_index] = evaluate_action(
+                    input,
+                    definition,
+                    previous_down,
+                    context_suppression.keys | suppression.keys,
+                    context_suppression.mouse | suppression.mouse,
                 );
             }
         }
-        self.frame = Arc::new(ActionFrame {
-            input,
-            context: self.context.clone(),
-            values,
-            definitions: Arc::clone(&self.definitions),
-            catalog: Arc::clone(&self.catalog),
-        });
+        for (index, active) in self.active_actions.iter().enumerate() {
+            if !active {
+                frame.values[index] = ActionValue::default();
+            }
+        }
+        frame.input = input;
+        frame.context = self.context.clone();
+        frame.definitions = Arc::clone(&self.definitions);
     }
 }
 
@@ -294,7 +344,8 @@ impl ActionFrame {
                 "input action {name:?} has kind {kind:?}, expected {expected_kind:?}"
             ));
         }
-        Ok(self.values.get(name).copied().unwrap_or_default())
+        let index = self.catalog.action_indices[name];
+        Ok(self.values[index])
     }
     pub(crate) fn bindings(
         &self,
@@ -405,19 +456,30 @@ fn compile_definitions(settings: &InputSettings) -> Result<ActionDefinitions, St
 fn compile_catalog(definitions: &ActionDefinitions) -> ActionCatalog {
     let mut contexts = BTreeMap::new();
     let mut action_kinds = BTreeMap::new();
+    let mut action_indices = BTreeMap::new();
+    let mut binding_indices = BTreeMap::new();
+    let mut binding_count = 0;
     for (context_name, actions) in &definitions.contexts {
-        let context_actions = actions
-            .iter()
-            .map(|(name, definition)| {
-                action_kinds.insert(name.clone(), definition.kind);
-                (name.clone(), definition.kind)
-            })
-            .collect();
+        let mut context_actions = BTreeMap::new();
+        let mut context_indices = BTreeMap::new();
+        for (name, definition) in actions {
+            action_kinds.insert(name.clone(), definition.kind);
+            let action_index = action_indices.len();
+            action_indices.entry(name.clone()).or_insert(action_index);
+            context_actions.insert(name.clone(), definition.kind);
+            context_indices.insert(name.clone(), binding_count);
+            binding_count += 1;
+        }
         contexts.insert(context_name.clone(), context_actions);
+        binding_indices.insert(context_name.clone(), context_indices);
     }
     ActionCatalog {
         contexts,
         action_kinds,
+        action_count: action_indices.len(),
+        binding_count,
+        action_indices,
+        binding_indices,
     }
 }
 
@@ -590,28 +652,34 @@ fn is_suppressed(binding: PhysicalInput, keys: u128, mouse: u8) -> bool {
     }
 }
 
-fn down_keys(input: ScriptInput) -> u128 {
-    let mut keys = 0;
+fn unreleased_down_inputs(input: ScriptInput) -> InputMask {
+    let mut held = InputMask::default();
     for code in 0..=Key::SuperRight as u32 {
-        if input.key_state(code) & RVE_INPUT_DOWN != 0 {
-            keys |= 1_u128 << code;
+        let state = input.key_state(code);
+        if state & RVE_INPUT_DOWN != 0 && state & RVE_INPUT_RELEASED == 0 {
+            held.keys |= 1_u128 << code;
         }
     }
-    keys
-}
-
-fn down_mouse(input: ScriptInput) -> u8 {
-    let mut mouse = 0;
     for code in 0..=MouseButton::Forward as u32 {
-        if input.mouse_button_state(code) & RVE_INPUT_DOWN != 0 {
-            mouse |= 1_u8 << code;
+        let state = input.mouse_button_state(code);
+        if state & RVE_INPUT_DOWN != 0 && state & RVE_INPUT_RELEASED == 0 {
+            held.mouse |= 1_u8 << code;
         }
     }
-    mouse
+    held
 }
 
-fn down_inputs(input: ScriptInput) -> (u128, u8) {
-    (down_keys(input), down_mouse(input))
+fn bound_inputs(definition: &ActionDefinition) -> InputMask {
+    let mut bound = InputMask::default();
+    for inputs in definition.slots.values() {
+        for input in inputs {
+            match input {
+                PhysicalInput::Key(key) => bound.keys |= 1_u128 << *key as u32,
+                PhysicalInput::MouseButton(button) => bound.mouse |= 1_u8 << *button as u32,
+            }
+        }
+    }
+    bound
 }
 fn validate_slot_name(kind: InputActionKind, slot: &str) -> Result<(), String> {
     let valid = match kind {
@@ -628,6 +696,7 @@ fn validate_slot_name(kind: InputActionKind, slot: &str) -> Result<(), String> {
 
 const RVE_INPUT_DOWN: u32 = 1;
 const RVE_INPUT_PRESSED: u32 = 2;
+const RVE_INPUT_RELEASED: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -654,6 +723,12 @@ mod tests {
                             "Fire".to_owned(),
                             InputAction::Button {
                                 inputs: vec!["A".to_owned(), "B".to_owned()],
+                            },
+                        ),
+                        (
+                            "Climb".to_owned(),
+                            InputAction::Button {
+                                inputs: vec!["W".to_owned()],
                             },
                         ),
                         (
@@ -691,12 +766,26 @@ mod tests {
                 ),
                 (
                     "menu".to_owned(),
-                    BTreeMap::from([(
-                        "Back".to_owned(),
-                        InputAction::Button {
-                            inputs: vec!["Escape".to_owned()],
-                        },
-                    )]),
+                    BTreeMap::from([
+                        (
+                            "Jump".to_owned(),
+                            InputAction::Button {
+                                inputs: vec!["Escape".to_owned()],
+                            },
+                        ),
+                        (
+                            "Back".to_owned(),
+                            InputAction::Button {
+                                inputs: vec!["Escape".to_owned()],
+                            },
+                        ),
+                        (
+                            "Click".to_owned(),
+                            InputAction::Button {
+                                inputs: vec!["Mouse.Left".to_owned()],
+                            },
+                        ),
+                    ]),
                 ),
             ]),
         }
@@ -958,6 +1047,175 @@ mod tests {
                 .unwrap()
                 .down
         );
+    }
+
+    #[test]
+    fn rebinding_inactive_context_does_not_suppress_active_held_actions() {
+        let mut actions = actions();
+        let mut input = ScriptInput::default();
+        input.set_key(Key::W, true);
+        actions.set_input(input.take_frame());
+
+        actions.queue_mutations(vec![ActionMutation::Rebind {
+            context: "menu".to_owned(),
+            action: "Jump".to_owned(),
+            slot: "inputs".to_owned(),
+            inputs: vec![physical("B")],
+        }]);
+        actions.set_input(input.take_frame());
+
+        let frame = actions.frame();
+        assert_eq!(frame.context(), Some("game"));
+        assert_eq!(
+            frame.state("Move", InputActionKind::Vector2).unwrap().value,
+            [0.0, 1.0]
+        );
+        let climb = frame.state("Climb", InputActionKind::Button).unwrap();
+        assert!(climb.down);
+        assert!(!climb.pressed && !climb.released);
+        let jump = frame.state("Jump", InputActionKind::Button).unwrap();
+        assert!(jump.down);
+        assert!(!jump.pressed && !jump.released);
+    }
+
+    #[test]
+    fn rebind_and_reset_suppression_is_scoped_to_changed_actions() {
+        let mut actions = actions();
+        let mut input = ScriptInput::default();
+        input.set_key(Key::W, true);
+        actions.set_input(input.take_frame());
+        assert!(
+            actions
+                .frame()
+                .state("Climb", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
+
+        actions.queue_mutations(vec![ActionMutation::Rebind {
+            context: "game".to_owned(),
+            action: "Jump".to_owned(),
+            slot: "inputs".to_owned(),
+            inputs: vec![physical("D")],
+        }]);
+        input.set_key(Key::D, true);
+        actions.set_input(input.take_frame());
+
+        let frame = actions.frame();
+        let jump = frame.state("Jump", InputActionKind::Button).unwrap();
+        assert!(!jump.down && !jump.pressed && jump.released);
+        let climb = frame.state("Climb", InputActionKind::Button).unwrap();
+        assert!(climb.down);
+        assert!(!climb.pressed && !climb.released);
+        let movement = frame.state("Move", InputActionKind::Vector2).unwrap().value;
+        let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((movement[0] - diagonal).abs() < 0.00001);
+        assert!((movement[1] - diagonal).abs() < 0.00001);
+
+        actions.queue_mutations(vec![ActionMutation::ResetBindings]);
+        actions.set_input(input.take_frame());
+
+        let frame = actions.frame();
+        let jump = frame.state("Jump", InputActionKind::Button).unwrap();
+        assert!(!jump.down && !jump.pressed && !jump.released);
+        let climb = frame.state("Climb", InputActionKind::Button).unwrap();
+        assert!(climb.down);
+        assert!(!climb.pressed && !climb.released);
+        assert_eq!(
+            frame.state("Move", InputActionKind::Vector2).unwrap().value,
+            [diagonal, diagonal]
+        );
+    }
+
+    #[test]
+    fn context_suppression_clears_on_release_edge_before_key_and_mouse_evaluation() {
+        let mut actions = actions();
+        let mut input = ScriptInput::default();
+        input.set_key(Key::Escape, true);
+        input.set_mouse_button(rve_sdk::MouseButton::Left, true);
+        actions.queue_mutations(vec![ActionMutation::SetContext("menu".to_owned())]);
+        actions.set_input(input.take_frame());
+        assert!(
+            !actions
+                .frame()
+                .state("Back", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
+        assert!(
+            !actions
+                .frame()
+                .state("Click", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
+
+        input.set_key(Key::Escape, false);
+        input.set_key(Key::Escape, true);
+        input.set_mouse_button(rve_sdk::MouseButton::Left, false);
+        input.set_mouse_button(rve_sdk::MouseButton::Left, true);
+        actions.set_input(input.take_frame());
+
+        for name in ["Back", "Click"] {
+            let action = actions
+                .frame()
+                .state(name, InputActionKind::Button)
+                .unwrap();
+            assert!(
+                action.down && action.pressed,
+                "{name} should press on re-press"
+            );
+            assert!(
+                !action.released,
+                "{name} should not report release while down"
+            );
+        }
+    }
+
+    #[test]
+    fn steady_state_input_keeps_compiled_definitions() {
+        let mut actions = actions();
+        let definitions = std::sync::Arc::as_ptr(&actions.definitions);
+        let frame_definitions = std::sync::Arc::as_ptr(&actions.frame.definitions);
+        let frame = std::sync::Arc::as_ptr(&actions.frame);
+        let values = actions.frame.values.as_ptr();
+        let values_capacity = actions.frame.values.capacity();
+
+        actions.set_input(ScriptInput::default());
+
+        assert!(std::ptr::eq(
+            definitions,
+            std::sync::Arc::as_ptr(&actions.definitions)
+        ));
+        assert!(std::ptr::eq(
+            frame_definitions,
+            std::sync::Arc::as_ptr(&actions.frame.definitions)
+        ));
+        assert!(std::ptr::eq(frame, std::sync::Arc::as_ptr(&actions.frame)));
+        assert_eq!(values, actions.frame.values.as_ptr());
+        assert_eq!(values_capacity, actions.frame.values.capacity());
+
+        let snapshot = actions.frame();
+        let snapshot_value = snapshot.state("Jump", InputActionKind::Button).unwrap();
+        let mut input = ScriptInput::default();
+        input.set_key(Key::Space, true);
+        actions.set_input(input.take_frame());
+        assert_eq!(
+            snapshot.state("Jump", InputActionKind::Button).unwrap(),
+            snapshot_value
+        );
+        assert!(
+            actions
+                .frame()
+                .state("Jump", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
+
+        drop(snapshot);
+        let values = actions.frame.values.as_ptr();
+        actions.set_input(input.take_frame());
+        assert_eq!(values, actions.frame.values.as_ptr());
     }
 
     #[test]

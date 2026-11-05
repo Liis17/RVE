@@ -1313,10 +1313,10 @@ fn action_button_function(
     state: fn(ActionValue) -> bool,
 ) -> mlua::Result<Function> {
     lua.create_function(move |_, name: LuaString| {
-        let name = name.to_str()?.to_owned();
+        let name = name.to_str()?;
         with_active_call(&active_call, |transaction| {
             let value = transaction
-                .action_state(&name, InputActionKind::Button)
+                .action_state(name.as_ref(), InputActionKind::Button)
                 .map_err(LuaError::runtime)?;
             Ok(state(value))
         })
@@ -1325,10 +1325,10 @@ fn action_button_function(
 
 fn action_axis_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
     lua.create_function(move |_, name: LuaString| {
-        let name = name.to_str()?.to_owned();
+        let name = name.to_str()?;
         with_active_call(&active_call, |transaction| {
             let value = transaction
-                .action_state(&name, InputActionKind::Axis)
+                .action_state(name.as_ref(), InputActionKind::Axis)
                 .map_err(LuaError::runtime)?;
             Ok(value.value[0])
         })
@@ -1337,10 +1337,10 @@ fn action_axis_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Func
 
 fn action_vector_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
     lua.create_function(move |_, name: LuaString| {
-        let name = name.to_str()?.to_owned();
+        let name = name.to_str()?;
         with_active_call(&active_call, |transaction| {
             let value = transaction
-                .action_state(&name, InputActionKind::Vector2)
+                .action_state(name.as_ref(), InputActionKind::Vector2)
                 .map_err(LuaError::runtime)?;
             Ok((value.value[0], value.value[1]))
         })
