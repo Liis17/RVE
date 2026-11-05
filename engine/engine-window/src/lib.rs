@@ -276,6 +276,7 @@ impl RedrawMode {
 enum InternalEvent {
     RequestFocus,
     RequestExit,
+    Wake,
 }
 
 /// Потокобезопасный handle для запросов в оконный цикл событий.
@@ -300,6 +301,13 @@ impl WindowProxy {
     /// После завершения цикла событий запрос игнорируется.
     pub fn request_exit(&self) {
         let _ = self.event_loop_proxy.send_event(InternalEvent::RequestExit);
+    }
+
+    /// Будит цикл событий, чтобы он снова вызвал `WindowHandler::update`.
+    ///
+    /// Само событие не меняет состояние окна и игнорируется оконным циклом.
+    pub fn wake(&self) {
+        let _ = self.event_loop_proxy.send_event(InternalEvent::Wake);
     }
 }
 
@@ -590,6 +598,7 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                 }
             }
             InternalEvent::RequestExit => self.stop(event_loop),
+            InternalEvent::Wake => {}
         }
     }
 
