@@ -226,6 +226,7 @@ pub(crate) trait ExitRequester: Send + Sync {
 pub(crate) struct ScriptThreadConfig {
     pub scene_name: String,
     pub sources: std::collections::BTreeMap<String, String>,
+    pub input_settings: engine_project::InputSettings,
     pub scripts_library: Option<PathBuf>,
     #[cfg(test)]
     pub script_module: Option<&'static rve_sdk::abi::RveModule>,
@@ -652,6 +653,7 @@ fn scripts_thread(
     let ScriptThreadConfig {
         scene_name,
         sources,
+        input_settings,
         scripts_library,
         #[cfg(test)]
         script_module,
@@ -688,6 +690,7 @@ fn scripts_thread(
         ScriptLoadOptions {
             interrupt: interrupt.clone(),
             call_time_limit: Some(SCRIPT_CALL_TIME_LIMIT),
+            input: input_settings,
         },
     ) {
         Ok(scripts) => scripts,
@@ -1599,6 +1602,7 @@ mod tests {
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
     use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
+    use engine_project::{InputAction, InputSettings};
     use engine_render::{DrawCommand, FrameOutcome, FrameStatus, LocalLight};
     use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
@@ -1620,6 +1624,90 @@ mod tests {
 
     fn test_input() -> Arc<Mutex<InputAccumulator>> {
         Arc::new(Mutex::new(InputAccumulator::default()))
+    }
+
+    #[test]
+    fn scripts_receive_project_input_settings() {
+        let document = SceneDocument::parse(
+            "input.rvescene",
+            r#"
+[[assets]]
+path = "/input.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let script = r#"
+local Input = {}
+function Input:on_update()
+  if rve.input.action_pressed("Jump") then
+    self.transform.position = { x = 9, y = 0, z = 0 }
+  end
+end
+return Input
+"#;
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (render_tx, render_rx) = flume::unbounded();
+        let input = test_input();
+        {
+            let mut accumulator = lock_input(&input);
+            accumulator.focused(true);
+            accumulator.key(engine_window::Key::Space, true);
+        }
+        let mut modules = ModuleHost::new();
+        let thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "input.rvescene".to_owned(),
+                sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
+                input_settings: InputSettings {
+                    default_context: Some("game".to_owned()),
+                    contexts: BTreeMap::from([(
+                        "game".to_owned(),
+                        BTreeMap::from([(
+                            "Jump".to_owned(),
+                            InputAction::Button {
+                                inputs: vec!["Space".to_owned()],
+                            },
+                        )]),
+                    )]),
+                },
+                scripts_library: None,
+                script_module: None,
+                interrupt: ScriptInterruptHandle::new(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 30,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::new(RuntimeStatus::default()),
+                input,
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
+            },
+        )
+        .unwrap();
+        thread.ready.recv().unwrap().unwrap();
+        script_tx
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+        let snapshot = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(snapshot.camera.position.x, 9.0);
+
+        script_tx.send(ScriptControl::Shutdown).unwrap();
+        thread.stopped.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
+        modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(modules.shutdown().is_empty());
     }
 
     #[cfg(feature = "dev-console")]
@@ -2373,6 +2461,7 @@ return Script
             ScriptThreadConfig {
                 scene_name: "scene.rvescene".to_owned(),
                 sources,
+                input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
@@ -2651,6 +2740,7 @@ return Script
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
                 sources: BTreeMap::new(),
+                input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
                 script_module: Some(script_module()),
                 interrupt: ScriptInterruptHandle::new(),
@@ -2733,6 +2823,7 @@ return Script
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
                 sources: BTreeMap::new(),
+                input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
                 script_module: Some(input_probe_module()),
                 interrupt: ScriptInterruptHandle::new(),
@@ -2950,6 +3041,7 @@ return Script
                     "scripts/bad.lua".to_owned(),
                     "this is not valid Lua !!!".to_owned(),
                 )]),
+                input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
                 script_module: None,
                 interrupt,
@@ -2996,6 +3088,7 @@ return Script
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
                 sources: BTreeMap::new(),
+                input_settings: engine_project::InputSettings::default(),
                 scripts_library: Some(library),
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
@@ -3041,6 +3134,7 @@ return Script
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
                 sources: BTreeMap::new(),
+                input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
                 script_module: Some(script_module()),
                 interrupt: interrupt.clone(),
@@ -3103,6 +3197,7 @@ return Script
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
                 sources: BTreeMap::new(),
+                input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),

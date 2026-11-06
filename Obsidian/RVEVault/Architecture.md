@@ -67,10 +67,10 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - `sandbox` зависит от `engine-core`, `engine-project`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, glam, sysinfo и font8x8.
 - `rve-player` зависит от `engine-runtime`; runtime соединяет `engine-project`, `engine-files`, `engine-platform`, `engine-window`, `engine-render`, `engine-assets`, `engine-resources`, `engine-scene`, `engine-script`, `engine-console` и пустые доменные модули. Feature `dev-console` включает опциональные `engine-ui`, egui и winit; она включена по умолчанию у Cargo-пакета player и отключена для distribution-сборки `rve-build`. `engine-files` снимает Windows verbatim-префикс в `Layout`; flume обслуживает управляющие каналы и ограниченную очередь снимков, sysinfo сверяет RAM и CPU с требованиями проекта.
 - `rve-build` использует `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak`, `engine-files` и `engine-script`: проверяет включённые сцены и ресурсы, собирает Rust-скрипты как `cdylib`, проверяет их ABI и имена, затем собирает distribution-player из checkout в `build/player`, а dev-player — в `build/player-dev`. Платформенный конвейер macOS дополнительно собирает Vulkan loader и MoltenVK в релиз; подробности — в [[Engine/RveBuild]].
-- `engine-project` зависит от `engine-files`, serde и toml; контракты файлов и их потребители описаны в [[Engine/EngineProject]].
+- `engine-project` зависит от `engine-files`, `rve-sdk`, serde и toml; `rve-sdk::PhysicalInput` переиспользуется для проверки имён клавиш и кнопок мыши в проектной input-схеме. Контракты файлов и их потребители описаны в [[Engine/EngineProject]].
 - `engine-pak` зависит от `engine-files`, blake3, zstd, lz4_flex, serde и toml; он содержит и wire-формат архивов, и отдельный TOML-контракт `ArchiveSetRegistry`. Инструмент `rvepak` зависит от него. `engine-resources` использует `engine-files`, `engine-pak` и bounded channels flume; `engine-assets`, sandbox и runtime получают данные через его handle. `engine-files` не имеет внешних зависимостей.
 - `engine-scene` зависит от glam, `engine-files`, serde и toml: документы `.rvescene` используют `VirtualPath`, а `World` рассчитывает сцены независимо от renderer и script runtime. Runtime игры использует документы и `World`; sandbox продолжает строить процедурную демонстрационную сцену на математических компонентах.
-- `engine-script` зависит от `engine-scene`, `engine-console`, `mlua` с Lua 5.4 и vendored исходниками, `rve-sdk` и `libloading`. Он связывает `World` с Lua и Rust-скриптами из ABI-библиотеки, не зависит от runtime, renderer или window; Lua state и экземпляры остаются на scripts thread, а отдельный interrupt handle можно передать другому потоку.
+- `engine-script` зависит от `engine-project`, `engine-scene`, `engine-console`, `mlua` с Lua 5.4 и vendored исходниками, `rve-sdk` и `libloading`. Он связывает `World` с Lua и Rust-скриптами из ABI-библиотеки и рассчитывает именованные input actions из `InputSettings`; не зависит от runtime, renderer или window. Lua state и экземпляры остаются на scripts thread, а отдельный interrupt handle можно передать другому потоку.
 - `rve-sdk` — самостоятельный крейт без зависимостей; он задаёт C ABI и гостевой API для игровых `cdylib`.
 - `engine-assets` зависит от `engine-resources`, ufbx и png; от renderer и окна не зависит. `Assets::model_dependencies` использует тот же поиск внешних текстур и stat-источник, что и `load_model`, чтобы builder мог собрать зависимости без декодирования PNG.
 - `engine-window` зависит от winit.
@@ -125,6 +125,18 @@ startup-потоке, внешние текстуры читаются чере�
 Источники: `engine/engine-runtime/src/lib.rs`, `engine/engine-runtime/src/player.rs`, `engine/engine-runtime/src/pipeline.rs`, `engine/engine-runtime/src/scene.rs`, `engine/rve-player/src/main.rs`.
 
 Ввод следует через отдельный поток событий: `engine-window` переводит winit в собственные `Key`/`MouseButton` и вызывает `WindowHandler`; `PlayerWindow` на главном потоке коротко обновляет `Arc<Mutex<InputAccumulator>>`. Scripts thread перед каждым update забирает кадровый snapshot и передаёт его Lua и Rust ABI через `ScriptInput`. Потеря фокуса и Background генерируют released edges и очищают удерживаемое состояние; детали описаны в [[Engine/EngineWindow]], [[Engine/EngineRuntime]], [[Engine/EngineScript]] и [[Engine/RveSdk]].
+
+### Игровой ввод
+
+`project.rveproject` хранит button/axis/vector2 actions и один default context в
+`[input]`; схема проверяется в `engine-project`. Runtime передаёт её `engine-script`,
+а редактор — при запуске Play. `ScriptHost::set_input` рассчитывает actions из общего
+`ScriptInput` snapshot. Изменения контекста и bindings транзакционны: они видны со
+следующего snapshot, а не меняют ввод внутри текущей callback-фазы. SDK v5 добавляет
+nullable action callbacks в конец ABI host; прежние ABI v3/v4 сохраняют свой layout.
+Контракты схемы, API и вычисления описаны в [[Engine/EngineProject]],
+[[Engine/EngineScript]], [[Engine/RveSdk]], [[Engine/EngineRuntime]] и
+[[Engine/RveEditor]].
 
 ### Vulkan-кадр
 
