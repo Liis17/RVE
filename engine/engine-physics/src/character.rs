@@ -8,6 +8,7 @@ use crate::{GeometryError, Pose, Shape};
 
 pub const CHARACTER_MOVE_ITERATIONS: usize = 4;
 pub const MAX_PUSH_SPEED: f32 = 10.0;
+const STEP_EXTRA_ITERATIONS: usize = 8;
 const MOVEMENT_EPSILON_SQUARED: f32 = 1.0e-10;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -316,21 +317,52 @@ impl CharacterController {
             return Ok(None);
         }
         let raised_pose = Pose::new(start_pose.position + up, start_pose.rotation)?;
-        // Центр капсулы у грани ступени отстоит от её ребра на радиус. Пока центр за ребром,
-        // нижняя полусфера касается ребра наклонной нормалью и шаг отклоняется, поэтому
-        // проверка шага переносит капсулу на радиус + skin дальше текущего смещения.
-        let reach = horizontal.normalize() * (horizontal.length() + self.radius + self.skin);
-        let mut stepped = self.slide(snapshot, body, shape, raised_pose, reach, overrides)?;
+        let mut stepped = self.slide(snapshot, body, shape, raised_pose, horizontal, overrides)?;
         let down = -Vec3::Y * (self.step_height + self.skin);
-        let down_pose = Pose::new(stepped.position, start_pose.rotation)?;
-        let Some(ground) = snapshot
-            .shape_cast_with_overrides(shape, down_pose, down, self.skin, filter, overrides)?
-        else {
-            return Ok(None);
+        let dir = horizontal.normalize();
+        let probe = |origin: Vec3| -> Result<Option<QueryHit>, CharacterError> {
+            let pose = Pose::new(origin, start_pose.rotation)?;
+            Ok(snapshot
+                .shape_cast_with_overrides(shape, pose, down, self.skin, filter, overrides)?
+                .filter(|hit| self.is_walkable(-hit.normal)))
         };
-        if !self.is_walkable(-ground.normal) {
-            return Ok(None);
-        }
+        let ground = match probe(stepped.position)? {
+            Some(hit) => hit,
+            None => {
+                // Центр у грани ступени, опора на ребре: нижняя полусфера касается ребра
+                // наклонной нормалью. Двигаем капсулу минимально вдоль направления запроса,
+                // не дальше свободного пути и радиуса + skin, и ищем опору заново.
+                let max_extra = self.radius + self.skin;
+                let free = snapshot
+                    .shape_cast_with_overrides(
+                        shape,
+                        Pose::new(stepped.position, start_pose.rotation)?,
+                        dir * max_extra,
+                        self.skin,
+                        filter,
+                        overrides,
+                    )?
+                    .map_or(max_extra, |hit| hit.distance);
+                let mut high = free;
+                if probe(stepped.position + dir * high)?.is_none() {
+                    return Ok(None);
+                }
+                let mut low = 0.0_f32;
+                for _ in 0..STEP_EXTRA_ITERATIONS {
+                    let middle = 0.5 * (low + high);
+                    if probe(stepped.position + dir * middle)?.is_some() {
+                        high = middle;
+                    } else {
+                        low = middle;
+                    }
+                }
+                stepped.position += dir * high;
+                let Some(hit) = probe(stepped.position)? else {
+                    return Ok(None);
+                };
+                hit
+            }
+        };
         let final_position = stepped.position + down * ground.fraction;
         if final_position.y - start_pose.position.y > self.step_height + self.skin + 1.0e-4 {
             return Ok(None);
@@ -570,6 +602,108 @@ mod tests {
         assert!(result.translation.x > 0.05, "{result:?}");
         assert!(result.translation.y > 0.1, "{result:?}");
         assert!(result.grounded, "{result:?}");
+    }
+
+    #[test]
+    fn step_up_does_not_add_displacement_beyond_the_request_on_a_step() {
+        // Ступень 0.2 при запросе 0.1: кадр шага не должен уходить дальше запроса с запасом
+        // радиуса + skin.
+        let mut world = world_with_floor();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.4, 0.1, 1.0)).unwrap(),
+                Pose::new(Vec3::new(1.4, 0.1, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let result = controller(0.35, 45.0, 0.2)
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::new(Vec3::new(0.7, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                Vec3::X * 0.1,
+            )
+            .unwrap();
+        assert!(result.translation.x <= 0.2, "{result:?}");
+        assert!(result.grounded, "{result:?}");
+        // Нижняя полусфера ложится на ребро ступени (наклон 45°), полный подъём — за несколько кадров.
+        assert!(result.translation.y > 0.1, "{result:?}");
+    }
+
+    #[test]
+    fn diagonal_slide_along_wall_keeps_requested_z_when_step_height_is_set() {
+        // Вдоль стены по Z шаг не должен добавлять смещение: z равен запрошенному.
+        let mut world = world_with_floor();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.2, 0.15, 5.0)).unwrap(),
+                Pose::new(Vec3::new(1.0, 0.15, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let requested = Vec3::new(0.5, 0.0, 0.3);
+        let result = controller(0.35, 45.0, 0.2)
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::new(Vec3::new(0.5, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                requested,
+            )
+            .unwrap();
+        assert!(
+            (result.translation.z - requested.z).abs() < 1.0e-3,
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn slow_ascent_with_small_steps_ends_on_the_top_face() {
+        // Ступень 0.02 проходится по 0.05 за кадр: капсула должна подняться на верх, а не
+        // зависнуть у грани.
+        let mut world = world_with_floor();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.4, 0.01, 1.0)).unwrap(),
+                Pose::new(Vec3::new(1.4, 0.01, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let controller = controller(0.35, 45.0, 0.2);
+        let mut pose = Pose::new(Vec3::new(0.5, 0.5, 0.0), Quat::IDENTITY).unwrap();
+        let mut grounded = false;
+        for _ in 0..12 {
+            let result = controller
+                .move_capsule(&snapshot, BodyHandle(u64::MAX), pose, Vec3::X * 0.05)
+                .unwrap();
+            pose.position += result.translation;
+            grounded = result.grounded;
+        }
+        assert!(pose.position.x > 1.05 && pose.position.x < 1.5, "{pose:?}");
+        // Центр на верхней грани 0.02 + половина капсулы 0.5 + skin 0.01.
+        assert!((pose.position.y - 0.53).abs() < 1.0e-3, "{pose:?}");
+        assert!(grounded);
+    }
+
+    #[test]
+    fn low_thin_barrier_does_not_carry_capsule_beyond_the_request() {
+        // Барьер 0.2 (≤ step_height) толщиной 0.05: шаг переносит капсулу, но не дальше запроса.
+        let mut world = world_with_floor();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.025, 0.1, 1.0)).unwrap(),
+                Pose::new(Vec3::new(1.025, 0.1, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let result = controller(0.35, 45.0, 0.2)
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::new(Vec3::new(0.5, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                Vec3::X,
+            )
+            .unwrap();
+        assert!(result.translation.x <= 1.0 + 1.0e-4, "{result:?}");
     }
 
     #[test]
