@@ -10,6 +10,9 @@ use crate::{Aabb, DistanceResult, GeometryError, NarrowphaseError, Pose, Shape, 
 
 pub const MAX_QUERY_CANDIDATES: usize = MAX_BROADPHASE_ITEMS;
 pub const MAX_SHAPE_CAST_ITERATIONS: usize = 32;
+/// Допуск сходимости conservative advancement: расстояние в пределах `skin` с округлением
+/// float не должно растягивать каждую итерацию на доли 1e-9 до исчерпания лимита.
+const CAST_DISTANCE_TOLERANCE: f32 = 1.0e-5;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryFilter {
@@ -437,7 +440,7 @@ fn conservative_advance(
         if !distance.distance.is_finite() || !distance.normal.is_finite() {
             return Err(QueryError::InvalidCast);
         }
-        if distance.distance <= skin {
+        if distance.distance <= skin + CAST_DISTANCE_TOLERANCE {
             return Ok(
                 (displacement.dot(distance.normal) > 0.0).then_some((fraction as f32, distance))
             );
@@ -475,7 +478,7 @@ fn query_hit_precedes(candidate: QueryHit, current: QueryHit) -> bool {
 mod tests {
     use super::QueryFilter;
     use crate::world::{BodyDesc, PhysicsWorld};
-    use crate::{Pose, Ray, Shape, TriMesh};
+    use crate::{DistanceResult, Pose, Ray, Shape, TriMesh};
     use glam::{Quat, Vec3};
     use std::sync::Arc;
 
@@ -622,5 +625,23 @@ mod tests {
             )
             .unwrap();
         assert!(horizontal.is_none());
+    }
+
+    #[test]
+    fn conservative_advance_stops_at_skin_contact_despite_float_noise() {
+        // Расстояние на контакте чуть больше skin из-за округления (0.020000001 при skin 0.02):
+        // без допуска каждая итерация продвигает луч на доли 1e-9 и лимит итераций исчерпывается.
+        let skin = 0.02;
+        let contact = super::conservative_advance(Vec3::new(0.0, 0.0, -0.0667), skin, |_| {
+            Ok(DistanceResult {
+                distance: skin + 1.0e-7,
+                normal: Vec3::NEG_Z,
+                point_a: Vec3::ZERO,
+                point_b: Vec3::ZERO,
+            })
+        })
+        .expect("cast must converge at skin contact");
+        let (fraction, _) = contact.expect("approaching contact must be reported");
+        assert_eq!(fraction, 0.0);
     }
 }
