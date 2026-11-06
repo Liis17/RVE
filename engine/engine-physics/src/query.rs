@@ -280,6 +280,7 @@ impl QuerySnapshot {
         let end_pose = Pose::new(pose.position + displacement, pose.rotation)?;
         let end_bounds = shape.aabb(end_pose)?;
         let sweep_bounds = expand_aabb(start_bounds.union(end_bounds), skin)?;
+        let tolerance = cast_tolerance(pose.position, displacement);
         let mut closest = None;
 
         for index in self.candidates(sweep_bounds, filter, overrides)? {
@@ -290,11 +291,12 @@ impl QuerySnapshot {
                     pose,
                     displacement,
                     skin,
+                    tolerance,
                     collider.pose,
                     mesh,
                     sweep_bounds,
                 )?,
-                other => conservative_advance(displacement, skin, |offset| {
+                other => conservative_advance(displacement, skin, tolerance, |offset| {
                     let cast_pose = Pose::new(pose.position + offset, pose.rotation)?;
                     crate::distance(shape, cast_pose, other, collider.pose).map_err(Into::into)
                 })?
@@ -376,6 +378,7 @@ fn cast_against_mesh(
     pose: Pose,
     displacement: Vec3,
     skin: f32,
+    tolerance: f32,
     mesh_pose: Pose,
     mesh: &TriMesh,
     sweep_bounds: Aabb,
@@ -398,20 +401,21 @@ fn cast_against_mesh(
             .cross(vertices[2] - vertices[0])
             .try_normalize()
             .ok_or(GeometryError::DegenerateTriangle)?;
-        let Some((fraction, distance)) = conservative_advance(displacement, skin, |offset| {
-            let cast_pose = Pose::new(pose.position + offset, pose.rotation)?;
-            let mut distance = convex_triangle_distance(shape, cast_pose, vertices)?;
-            if distance.distance <= skin {
-                let center = (vertices[0] + vertices[1] + vertices[2]) / 3.0;
-                let outward = if (cast_pose.position - center).dot(triangle_normal) >= 0.0 {
-                    triangle_normal
-                } else {
-                    -triangle_normal
-                };
-                distance.normal = -outward;
-            }
-            Ok(distance)
-        })?
+        let Some((fraction, distance)) =
+            conservative_advance(displacement, skin, tolerance, |offset| {
+                let cast_pose = Pose::new(pose.position + offset, pose.rotation)?;
+                let mut distance = convex_triangle_distance(shape, cast_pose, vertices)?;
+                if distance.distance <= skin {
+                    let center = (vertices[0] + vertices[1] + vertices[2]) / 3.0;
+                    let outward = if (cast_pose.position - center).dot(triangle_normal) >= 0.0 {
+                        triangle_normal
+                    } else {
+                        -triangle_normal
+                    };
+                    distance.normal = -outward;
+                }
+                Ok(distance)
+            })?
         else {
             continue;
         };
@@ -428,9 +432,21 @@ fn cast_against_mesh(
     Ok(closest)
 }
 
+/// Допуск сходимости: не меньше абсолютного минимума и не меньше нескольких ulp координат
+/// (|x|≈500 м даёт шаг float ≈3e-5), иначе контакт на skin срывается в шум округления.
+fn cast_tolerance(position: Vec3, displacement: Vec3) -> f32 {
+    let scale = position
+        .abs()
+        .max_element()
+        .max(displacement.abs().max_element())
+        .max(1.0);
+    (8.0 * f32::EPSILON * scale).max(CAST_DISTANCE_TOLERANCE)
+}
+
 fn conservative_advance(
     displacement: Vec3,
     skin: f32,
+    tolerance: f32,
     mut distance_at: impl FnMut(Vec3) -> Result<DistanceResult, QueryError>,
 ) -> Result<Option<(f32, DistanceResult)>, QueryError> {
     let mut fraction = 0.0_f64;
@@ -440,7 +456,7 @@ fn conservative_advance(
         if !distance.distance.is_finite() || !distance.normal.is_finite() {
             return Err(QueryError::InvalidCast);
         }
-        if distance.distance <= skin + CAST_DISTANCE_TOLERANCE {
+        if distance.distance <= skin + tolerance {
             return Ok(
                 (displacement.dot(distance.normal) > 0.0).then_some((fraction as f32, distance))
             );
@@ -632,15 +648,40 @@ mod tests {
         // Расстояние на контакте чуть больше skin из-за округления (0.020000001 при skin 0.02):
         // без допуска каждая итерация продвигает луч на доли 1e-9 и лимит итераций исчерпывается.
         let skin = 0.02;
-        let contact = super::conservative_advance(Vec3::new(0.0, 0.0, -0.0667), skin, |_| {
+        let contact = super::conservative_advance(
+            Vec3::new(0.0, 0.0, -0.0667),
+            skin,
+            super::CAST_DISTANCE_TOLERANCE,
+            |_| {
+                Ok(DistanceResult {
+                    distance: skin + 1.0e-7,
+                    normal: Vec3::NEG_Z,
+                    point_a: Vec3::ZERO,
+                    point_b: Vec3::ZERO,
+                })
+            },
+        )
+        .expect("cast must converge at skin contact");
+        let (fraction, _) = contact.expect("approaching contact must be reported");
+        assert_eq!(fraction, 0.0);
+    }
+
+    #[test]
+    fn conservative_advance_converges_on_float_noise_far_from_origin() {
+        // При |x|≈500 м шаг float ≈3e-5 больше абсолютного допуска 1e-5: расстояние остаётся
+        // skin + шум при любом смещении и без относительного допуска исчерпывает лимит итераций.
+        let skin = 0.02;
+        let displacement = Vec3::new(0.0, 0.0, -0.0667);
+        let tolerance = super::cast_tolerance(Vec3::new(500.2, 0.0, 0.0), displacement);
+        let contact = super::conservative_advance(displacement, skin, tolerance, |_| {
             Ok(DistanceResult {
-                distance: skin + 1.0e-7,
+                distance: skin + 3.05e-5,
                 normal: Vec3::NEG_Z,
                 point_a: Vec3::ZERO,
                 point_b: Vec3::ZERO,
             })
         })
-        .expect("cast must converge at skin contact");
+        .expect("cast must converge at skin contact far from origin");
         let (fraction, _) = contact.expect("approaching contact must be reported");
         assert_eq!(fraction, 0.0);
     }
