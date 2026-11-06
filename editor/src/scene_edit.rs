@@ -3,10 +3,10 @@
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup,
-    MeshRenderer, ObjectOrigin, PointLightComponent, PrefabInstance, PrefabOverride,
-    ProceduralSkyComponent, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
-    SpotLightComponent,
+    CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
+    EnvironmentComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin, PointLightComponent,
+    PrefabInstance, PrefabOverride, ProceduralSkyComponent, RigidBodyComponent, SceneAsset,
+    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -80,6 +80,9 @@ pub enum ComponentKind {
     PointLight,
     SpotLight,
     Environment,
+    Collider,
+    RigidBody,
+    CharacterController,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -93,6 +96,9 @@ pub enum Component {
     PointLight(PointLightComponent),
     SpotLight(SpotLightComponent),
     Environment(EnvironmentComponent),
+    Collider(ColliderComponent),
+    RigidBody(RigidBodyComponent),
+    CharacterController(CharacterControllerComponent),
 }
 
 impl Component {
@@ -106,6 +112,9 @@ impl Component {
             Self::PointLight(_) => ComponentKind::PointLight,
             Self::SpotLight(_) => ComponentKind::SpotLight,
             Self::Environment(_) => ComponentKind::Environment,
+            Self::Collider(_) => ComponentKind::Collider,
+            Self::RigidBody(_) => ComponentKind::RigidBody,
+            Self::CharacterController(_) => ComponentKind::CharacterController,
         }
     }
 
@@ -120,6 +129,11 @@ impl Component {
             ComponentKind::PointLight => Self::PointLight(object.point_light?),
             ComponentKind::SpotLight => Self::SpotLight(object.spot_light?),
             ComponentKind::Environment => Self::Environment(object.environment.clone()?),
+            ComponentKind::Collider => Self::Collider(object.collider?),
+            ComponentKind::RigidBody => Self::RigidBody(object.rigid_body?),
+            ComponentKind::CharacterController => {
+                Self::CharacterController(object.character_controller?)
+            }
         })
     }
 
@@ -139,6 +153,11 @@ impl Component {
             ComponentKind::PointLight => Self::PointLight(PointLightComponent::default()),
             ComponentKind::SpotLight => Self::SpotLight(SpotLightComponent::default()),
             ComponentKind::Environment => Self::Environment(default_environment()),
+            ComponentKind::Collider => Self::Collider(ColliderComponent::default()),
+            ComponentKind::RigidBody => Self::RigidBody(RigidBodyComponent::default()),
+            ComponentKind::CharacterController => {
+                Self::CharacterController(CharacterControllerComponent::default())
+            }
         })
     }
 
@@ -156,6 +175,9 @@ impl Component {
             Self::PointLight(value) => object.point_light = Some(value),
             Self::SpotLight(value) => object.spot_light = Some(value),
             Self::Environment(value) => object.environment = Some(value),
+            Self::Collider(value) => object.collider = Some(value),
+            Self::RigidBody(value) => object.rigid_body = Some(value),
+            Self::CharacterController(value) => object.character_controller = Some(value),
         }
     }
 }
@@ -1172,6 +1194,27 @@ impl EditorScene {
         self.edit_object(id, None, |object| {
             object.mesh_renderer = None;
             object.lod_group = None;
+            Ok(())
+        })
+    }
+
+    /// Удаляет физический компонент одной правкой. Rigid Body без коллайдера документ не
+    /// принимает, поэтому коллайдер удаляется вместе с телом.
+    pub fn remove_physics_component(
+        &mut self,
+        id: &str,
+        kind: ComponentKind,
+    ) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            match kind {
+                ComponentKind::Collider => {
+                    object.collider = None;
+                    object.rigid_body = None;
+                }
+                ComponentKind::RigidBody => object.rigid_body = None,
+                ComponentKind::CharacterController => object.character_controller = None,
+                other => return Err(format!("{other:?} не является физическим компонентом")),
+            }
             Ok(())
         })
     }
@@ -2214,6 +2257,78 @@ mod tests {
         assert_eq!(
             target.object(&target_id).unwrap().point_light,
             Some(PointLightComponent::default())
+        );
+    }
+
+    #[test]
+    fn physics_components_add_edit_and_remove_as_undoable_steps() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene
+            .set_component(&id, Component::Collider(ColliderComponent::default()))
+            .unwrap();
+        scene
+            .set_component(&id, Component::RigidBody(RigidBodyComponent::default()))
+            .unwrap();
+        scene
+            .edit_object(&id, Some("collider-friction"), |object| {
+                object.collider.as_mut().unwrap().friction = 0.9;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(scene.object(&id).unwrap().collider.unwrap().friction, 0.9);
+        assert!(scene.undo());
+        assert_eq!(scene.object(&id).unwrap().collider.unwrap().friction, 0.5);
+
+        // Коллайдер нельзя убрать, оставив тело: удаление идёт одной правкой, один undo вернёт оба.
+        scene
+            .remove_physics_component(&id, ComponentKind::Collider)
+            .unwrap();
+        let object = scene.object(&id).unwrap();
+        assert!(object.collider.is_none() && object.rigid_body.is_none());
+        assert!(scene.undo());
+        let object = scene.object(&id).unwrap();
+        assert!(object.collider.is_some() && object.rigid_body.is_some());
+        assert!(scene.redo());
+        assert!(scene.object(&id).unwrap().collider.is_none());
+    }
+
+    #[test]
+    fn controller_and_body_components_follow_document_rules_and_roll_back() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let body = Component::RigidBody(RigidBodyComponent::default());
+        let error = scene.set_component(&id, body).unwrap_err();
+        assert!(error.contains("требует collider"), "{error}");
+        assert!(scene.object(&id).unwrap().rigid_body.is_none());
+
+        let mesh = Component::Collider(ColliderComponent {
+            shape: engine_scene::ColliderShape::TriangleMesh,
+            ..ColliderComponent::default()
+        });
+        let error = scene.set_component(&id, mesh).unwrap_err();
+        assert!(error.contains("mesh_renderer"), "{error}");
+
+        scene
+            .set_component(
+                &id,
+                Component::CharacterController(CharacterControllerComponent::default()),
+            )
+            .unwrap();
+        let error = scene
+            .set_component(&id, Component::Collider(ColliderComponent::default()))
+            .unwrap_err();
+        assert!(error.contains("несовместим"), "{error}");
+        assert!(scene.object(&id).unwrap().collider.is_none());
+
+        scene
+            .remove_physics_component(&id, ComponentKind::CharacterController)
+            .unwrap();
+        assert!(scene.object(&id).unwrap().character_controller.is_none());
+        assert!(
+            scene
+                .remove_physics_component(&id, ComponentKind::PointLight)
+                .is_err()
         );
     }
 

@@ -36,8 +36,9 @@ pub use query::{
 };
 pub use ray::{Ray, RayHit, raycast};
 pub use scene::{
-    ModelGeometry, ModelMesh, PhysicsSceneBinding, PhysicsSceneBody, PhysicsSceneDesc,
-    PhysicsSceneError, PhysicsSceneSync, PhysicsSceneSyncError,
+    ModelGeometry, ModelMesh, ObjectWorldTransform, PhysicsSceneBinding, PhysicsSceneBody,
+    PhysicsSceneDesc, PhysicsSceneError, PhysicsSceneSync, PhysicsSceneSyncError,
+    character_capsule_shape, object_world_transform, primitive_collider_shape,
 };
 pub use shape::{Aabb, MassProperties, Pose, Shape};
 pub use thread::{

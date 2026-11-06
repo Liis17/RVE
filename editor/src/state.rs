@@ -8,6 +8,7 @@ use crate::previews::PreviewCache;
 use crate::project::OpenProject;
 use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::EditorCamera;
+use crate::viewport::colliders::ColliderCache;
 use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
@@ -95,6 +96,8 @@ pub struct SceneViewInfo {
     pub rect: Option<egui::Rect>,
     /// Render diagnostic selected for this panel.
     pub debug_view: DebugView,
+    /// Рисовать рёбра всех коллайдеров; выделенный объект рисуется всегда.
+    pub show_colliders: bool,
 }
 
 /// Раздельные заимствования состояния для подготовки кадра сцены.
@@ -169,6 +172,8 @@ pub struct EditorState {
     pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
     /// Фоновый разбор FBX для `models`.
     pub model_loader: ModelLoader,
+    /// Выпуклые оболочки и trimesh для рёбер коллайдеров и ошибок инспектора.
+    pub collider_cache: ColliderCache,
     edit_world: Option<(u64, World)>,
 }
 
@@ -219,6 +224,7 @@ impl EditorState {
             apply_prompt: None,
             lite_schemas: HashMap::new(),
             model_loader: ModelLoader::default(),
+            collider_cache: ColliderCache::default(),
             edit_world: None,
         }
     }

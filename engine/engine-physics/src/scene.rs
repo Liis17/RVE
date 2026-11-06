@@ -350,13 +350,15 @@ impl PhysicsSceneSync {
     }
 }
 
+/// Мировая поза объекта и знаковый масштаб, которым физика запекает его коллайдеры.
 #[derive(Clone, Copy)]
-struct ObjectWorldTransform {
-    pose: Pose,
-    scale: Vec3,
+pub struct ObjectWorldTransform {
+    pub pose: Pose,
+    pub scale: Vec3,
 }
 
-fn object_world_transform(
+/// Поза и масштаб объекта так же, как при построении сцены физики.
+pub fn object_world_transform(
     world: &World,
     object: ObjectHandle,
 ) -> Result<ObjectWorldTransform, PhysicsSceneError> {
@@ -432,6 +434,39 @@ fn scale_character(
     )
 }
 
+/// Примитив коллайдера (`box`, `sphere`, `capsule`) с размерами, запечёнными по масштабу объекта.
+/// Для `convex_mesh` и `triangle_mesh` возвращает ошибку: их строит [`PhysicsSceneDesc::from_world`].
+pub fn primitive_collider_shape(
+    component: ColliderComponent,
+    scale: Vec3,
+) -> Result<Shape, GeometryError> {
+    match component.shape {
+        ColliderShape::Box => {
+            Shape::cuboid(Vec3::from_array(component.half_extents).abs() * scale.abs())
+        }
+        ColliderShape::Sphere => Shape::sphere(component.radius * scale.abs().max_element()),
+        ColliderShape::Capsule => {
+            let radial_scale = scale.x.abs().max(scale.z.abs());
+            Shape::capsule(
+                component.radius * radial_scale,
+                component.height * scale.y.abs(),
+            )
+        }
+        ColliderShape::ConvexMesh | ColliderShape::TriangleMesh => {
+            Err(GeometryError::InvalidDimensions)
+        }
+    }
+}
+
+/// Капсула character controller с размерами, запечёнными по масштабу объекта.
+pub fn character_capsule_shape(
+    component: CharacterControllerComponent,
+    scale: Vec3,
+) -> Result<Shape, PhysicsSceneError> {
+    let radial_scale = scale.x.abs().max(scale.z.abs());
+    Ok(scale_character(component, radial_scale, scale)?.capsule()?)
+}
+
 fn build_shape(
     component: ColliderComponent,
     scale: Vec3,
@@ -439,16 +474,8 @@ fn build_shape(
     models: &HashMap<&str, &ModelGeometry>,
 ) -> Result<Shape, PhysicsSceneError> {
     Ok(match component.shape {
-        ColliderShape::Box => {
-            Shape::cuboid(Vec3::from_array(component.half_extents).abs() * scale.abs())?
-        }
-        ColliderShape::Sphere => Shape::sphere(component.radius * scale.abs().max_element())?,
-        ColliderShape::Capsule => {
-            let radial_scale = scale.x.abs().max(scale.z.abs());
-            Shape::capsule(
-                component.radius * radial_scale,
-                component.height * scale.y.abs(),
-            )?
+        ColliderShape::Box | ColliderShape::Sphere | ColliderShape::Capsule => {
+            primitive_collider_shape(component, scale)?
         }
         ColliderShape::ConvexMesh => {
             let geometry = model_geometry(mesh_renderer, models)?;
@@ -530,10 +557,13 @@ fn triangle_geometry(
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelGeometry, ModelMesh, PhysicsSceneDesc, PhysicsSceneSync};
+    use super::{
+        ModelGeometry, ModelMesh, PhysicsSceneDesc, PhysicsSceneSync, character_capsule_shape,
+        primitive_collider_shape,
+    };
     use crate::world::{BodyKind, PhysicsCommand};
     use crate::{Pose, Ray, Shape, raycast};
-    use engine_scene::{LocalTransform, SceneDocument, World};
+    use engine_scene::{ColliderComponent, ColliderShape, LocalTransform, SceneDocument, World};
     use glam::{Quat, Vec3};
 
     const CAMERA: &str = "[[objects]]\nid='camera'\n[objects.camera]\n";
@@ -799,6 +829,57 @@ mod tests {
         );
         assert!(sync.sync_world_commands(&mut scene).unwrap().is_empty());
         assert_eq!(driver.world().body_pose(body).unwrap().position, Vec3::ZERO);
+    }
+
+    #[test]
+    fn primitive_helpers_bake_signed_scale_like_scene_build() {
+        let box_component = ColliderComponent {
+            shape: ColliderShape::Box,
+            half_extents: [1.0, 2.0, 3.0],
+            ..ColliderComponent::default()
+        };
+        assert_eq!(
+            primitive_collider_shape(box_component, Vec3::new(-2.0, 0.5, -1.0)).unwrap(),
+            Shape::Box {
+                half_extents: Vec3::new(2.0, 1.0, 3.0)
+            }
+        );
+        let sphere = ColliderComponent {
+            shape: ColliderShape::Sphere,
+            radius: 1.0,
+            ..ColliderComponent::default()
+        };
+        assert_eq!(
+            primitive_collider_shape(sphere, Vec3::new(1.0, -3.0, 2.0)).unwrap(),
+            Shape::Sphere { radius: 3.0 }
+        );
+        let capsule = ColliderComponent {
+            shape: ColliderShape::Capsule,
+            radius: 0.5,
+            height: 2.0,
+            ..ColliderComponent::default()
+        };
+        assert_eq!(
+            primitive_collider_shape(capsule, Vec3::new(2.0, -3.0, -1.0)).unwrap(),
+            Shape::Capsule {
+                radius: 1.0,
+                height: 6.0
+            }
+        );
+        let mesh = ColliderComponent {
+            shape: ColliderShape::TriangleMesh,
+            ..ColliderComponent::default()
+        };
+        assert!(primitive_collider_shape(mesh, Vec3::ONE).is_err());
+
+        let controller = engine_scene::CharacterControllerComponent::default();
+        assert_eq!(
+            character_capsule_shape(controller, Vec3::new(2.0, 0.5, 1.0)).unwrap(),
+            Shape::Capsule {
+                radius: 0.7,
+                height: 0.55
+            }
+        );
     }
 
     #[test]
