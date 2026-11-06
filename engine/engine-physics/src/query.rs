@@ -21,6 +21,7 @@ pub struct QueryFilter {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct QueryOverrides<'a> {
     pub excluded: &'a [BodyHandle],
+    /// Entries may be in any order; the last matching body entry wins.
     pub enabled: &'a [(BodyHandle, bool)],
 }
 
@@ -346,9 +347,10 @@ impl QuerySnapshot {
             }
             let enabled = overrides
                 .enabled
-                .binary_search_by_key(&collider.body, |(body, _)| *body)
-                .ok()
-                .map_or(collider.enabled, |index| overrides.enabled[index].1);
+                .iter()
+                .rev()
+                .find_map(|(body, enabled)| (*body == collider.body).then_some(*enabled))
+                .unwrap_or(collider.enabled);
             if enabled
                 && collider.bounds.max.x >= query.min.x
                 && collider.bounds.overlaps(query)
@@ -542,6 +544,49 @@ mod tests {
             )
             .unwrap();
         assert!(ignored_hit.is_none());
+    }
+
+    #[test]
+    fn reversed_enabled_overrides_filter_rays_and_shape_casts() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let first = world
+            .insert_body(BodyDesc::static_collider(
+                Shape::sphere(0.25).unwrap(),
+                Pose::new(Vec3::X, Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let second = world
+            .insert_body(BodyDesc::static_collider(
+                Shape::sphere(0.25).unwrap(),
+                Pose::new(Vec3::X * 2.0, Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let enabled = [(second, false), (first, false)];
+        let ray = Ray::new(Vec3::ZERO, Vec3::X, 3.0).unwrap();
+
+        assert!(
+            snapshot
+                .raycast_with_enabled_overrides(&ray, QueryFilter::default(), &[], &enabled)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            snapshot
+                .shape_cast_with_overrides(
+                    &Shape::sphere(0.1).unwrap(),
+                    Pose::IDENTITY,
+                    Vec3::X * 3.0,
+                    0.0,
+                    QueryFilter::default(),
+                    super::QueryOverrides {
+                        excluded: &[],
+                        enabled: &enabled,
+                    },
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

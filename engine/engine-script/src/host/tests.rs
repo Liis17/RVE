@@ -2,8 +2,8 @@ use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOption
 use crate::{Key, MouseButton, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime};
 use engine_console::CommandLine;
 use engine_physics::{
-    BodyDesc, BodyHandle, BodyKind, CharacterController, ColliderDesc, PhysicsCommand,
-    PhysicsSceneBinding, PhysicsWorld, Pose, Shape, StepDriver,
+    BodyDesc, BodyHandle, BodyKind, CharacterController, ColliderDesc, MAX_PUSH_SPEED,
+    PhysicsCommand, PhysicsSceneBinding, PhysicsWorld, Pose, Shape, StepDriver,
 };
 use engine_scene::{LocalTransform, SceneDocument, World};
 use glam::{Quat, Vec3};
@@ -619,7 +619,7 @@ return Script
 
 #[test]
 fn repeated_character_moves_create_one_push_and_zero_dt_creates_none() {
-    fn run(dt: f32) -> (Vec<PhysicsCommand>, Vec3) {
+    fn run(dt: f32) -> (Vec<PhysicsCommand>, Vec3, Option<Vec3>) {
         let mut world = world(
             r#"
 [[assets]]
@@ -654,6 +654,36 @@ id = "crate"
                 1.0,
             ))
             .unwrap();
+        let snapshot = physics.query_snapshot().unwrap();
+        let first_move = controller
+            .move_capsule(&snapshot, player_body, Pose::IDENTITY, Vec3::X * 0.4)
+            .unwrap();
+        let second_move = controller
+            .move_capsule(
+                &snapshot,
+                player_body,
+                Pose::new(first_move.translation, Quat::IDENTITY).unwrap(),
+                Vec3::X * 0.4,
+            )
+            .unwrap();
+        let mut expected_hit = None;
+        let mut blocked_displacement = Vec3::ZERO;
+        let mut normal_sum = Vec3::ZERO;
+        for hit in first_move
+            .hits
+            .iter()
+            .chain(&second_move.hits)
+            .filter(|hit| hit.body == crate_body)
+        {
+            expected_hit.get_or_insert(*hit);
+            blocked_displacement += hit.blocked_displacement;
+            normal_sum += hit.normal * hit.blocked_displacement.length();
+        }
+        let expected_impulse = expected_hit.and_then(|mut hit| {
+            hit.blocked_displacement = blocked_displacement;
+            hit.normal = normal_sum.normalize_or_zero();
+            controller.push_impulse(&hit, dt)
+        });
         let bindings = [
             PhysicsSceneBinding {
                 object: player,
@@ -679,15 +709,16 @@ return Script
 "#;
         let mut host =
             ScriptHost::load(&world, "scene", &sources(&[("move.lua", source)]), None).unwrap();
-        host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+        host.set_physics_snapshot(snapshot, &bindings);
         host.update(&mut world, dt, ScriptTime::default());
         (
             host.drain_physics_commands(),
             world.local_transform(player).unwrap().position,
+            expected_impulse,
         )
     }
 
-    let (commands, position) = run(1.0 / 60.0);
+    let (commands, position, expected_impulse) = run(1.0 / 60.0);
     let pushes = commands
         .iter()
         .filter(|command| {
@@ -705,11 +736,149 @@ return Script
         PhysicsCommand::AddImpulse { impulse, .. } => *impulse,
         _ => unreachable!(),
     };
-    assert!(impulse.is_finite() && impulse.length() > 0.0);
+    let expected_impulse = expected_impulse.unwrap();
+    assert!(
+        (impulse - expected_impulse).length() < 1.0e-4,
+        "impulse={impulse:?}, controller formula={expected_impulse:?}"
+    );
+    assert!(
+        (impulse.length() - MAX_PUSH_SPEED).abs() < 1.0e-4,
+        "{impulse:?}"
+    );
     assert!(position.x > 0.0 && position.x < 0.3);
 
-    let (commands, _) = run(0.0);
-    assert!(commands.is_empty());
+    for dt in [0.0, 0.5e-6] {
+        let (commands, _, expected_impulse) = run(dt);
+        assert!(commands.is_empty(), "dt={dt}");
+        assert!(expected_impulse.is_none(), "dt={dt}");
+    }
+}
+
+#[test]
+fn character_moves_in_start_message_and_collision_callbacks_do_not_push() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/player.lua"
+[[assets]]
+path = "/sender.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/player.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/sender.lua"
+[[objects]]
+id = "crate"
+[[objects]]
+id = "other"
+"#,
+    );
+    let player = world.handle("player").unwrap();
+    let crate_handle = world.handle("crate").unwrap();
+    let other = world.handle("other").unwrap();
+    let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let player_body = physics
+        .insert_body({
+            let mut desc = BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::IDENTITY,
+                ColliderDesc::new(controller.capsule().unwrap()),
+            );
+            desc.character_controller = true;
+            desc
+        })
+        .unwrap();
+    let crate_body = physics
+        .insert_body(BodyDesc::dynamic(
+            Shape::cuboid(Vec3::splat(0.25)).unwrap(),
+            Pose::new(Vec3::new(0.75, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            1.0,
+        ))
+        .unwrap();
+    let other_body = physics
+        .insert_body(BodyDesc::static_collider(
+            Shape::sphere(0.25).unwrap(),
+            Pose::new(Vec3::new(4.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+        ))
+        .unwrap();
+    let bindings = [
+        PhysicsSceneBinding {
+            object: player,
+            body: player_body,
+            kind: BodyKind::Kinematic,
+            character_controller: Some(controller),
+        },
+        PhysicsSceneBinding {
+            object: crate_handle,
+            body: crate_body,
+            kind: BodyKind::Dynamic,
+            character_controller: None,
+        },
+        PhysicsSceneBinding {
+            object: other,
+            body: other_body,
+            kind: BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let player_script = r#"
+local Script = {}
+function Script:on_start() rve.find("player"):move({x=1,y=0,z=0}) end
+function Script:on_message(_, name)
+  if name == "move" then rve.find("player"):move({x=1,y=0,z=0}) end
+end
+function Script:on_collision_enter()
+  rve.find("player"):move({x=1,y=0,z=0})
+end
+return Script
+"#;
+    let sender_script = r#"
+local Script = {}
+function Script:on_update()
+  if self.sent then return end
+  rve.send("player", "move", true)
+  self.sent = true
+end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("player.lua", player_script), ("sender.lua", sender_script)]),
+        None,
+    )
+    .unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+
+    host.start(&mut world, ScriptTime::default());
+    assert!(
+        host.drain_physics_commands().is_empty(),
+        "start emitted a push"
+    );
+
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(host.drain_physics_commands().is_empty());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(
+        host.drain_physics_commands().is_empty(),
+        "message emitted a push"
+    );
+
+    host.queue_physics_events([engine_physics::PhysicsEvent::CollisionEnter {
+        first: player_body,
+        second: other_body,
+        point: Vec3::X,
+        normal: Vec3::X,
+    }]);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert!(
+        host.drain_physics_commands().is_empty(),
+        "collision emitted a push"
+    );
 }
 
 #[test]
@@ -777,7 +946,9 @@ return Script
 
 #[test]
 fn character_push_impulse_produces_similar_dynamic_displacement_at_30_60_144_fps() {
-    fn run(fps: u32) -> (f32, Vec3, usize) {
+    const FIXED_HZ: u32 = 60;
+
+    fn run(fps: u32) -> (f32, Vec3, usize, usize) {
         let mut world = world(
             r#"
 [[assets]]
@@ -826,11 +997,16 @@ id = "crate"
                 character_controller: None,
             },
         ];
-        let mut driver = StepDriver::new(physics, 60, 8).unwrap();
+        let mut driver = StepDriver::new(physics, FIXED_HZ, 8).unwrap();
         let source = r#"
 local Script = {}
 function Script:on_update(dt)
-  rve.find("player"):move({x=dt,y=0,z=0})
+  if self.did_push then return end
+  local player = rve.find("player")
+  player:move({x=1,y=0,z=0})
+  -- Disable contact after this one command to isolate its impulse response at each FPS.
+  player:set_collider_enabled(false)
+  self.did_push = true
 end
 return Script
 "#;
@@ -838,6 +1014,7 @@ return Script
             ScriptHost::load(&world, "scene", &sources(&[("move.lua", source)]), None).unwrap();
         let delta = 1.0 / fps as f32;
         let mut push_count = 0;
+        let mut substep_count = 0;
         for frame in 0..fps {
             host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), &bindings);
             host.update(
@@ -861,29 +1038,42 @@ return Script
                 )
                 .unwrap(),
             });
-            driver.advance_step(delta, commands).unwrap();
+            substep_count += driver.advance_step(delta, commands).unwrap().substeps;
         }
         (
-            driver.world().body_pose(crate_body).unwrap().position.x,
+            driver.world().body_pose(crate_body).unwrap().position.x - 0.75,
             driver.world().body_velocity(crate_body).unwrap(),
             push_count,
+            substep_count,
         )
     }
 
-    let crate_displacements = [run(30), run(60), run(144)];
-    assert!(crate_displacements.iter().all(|value| value.0 > 0.5));
-    let min = crate_displacements
-        .iter()
-        .map(|value| value.0)
-        .fold(f32::INFINITY, f32::min);
-    let max = crate_displacements
-        .iter()
-        .copied()
-        .map(|value| value.0)
-        .fold(f32::NEG_INFINITY, f32::max);
+    let push_results = [(30, run(30)), (60, run(60)), (144, run(144))];
+    println!("FPS push results (displacement, velocity, push count, substeps): {push_results:?}");
     assert!(
-        max - min < 0.25,
-        "crate displacements={crate_displacements:?}"
+        push_results
+            .iter()
+            .all(|(_, (displacement, velocity, push_count, substeps))| {
+                *displacement > 1.0
+                    && (velocity.x - MAX_PUSH_SPEED).abs() < 1.0e-4
+                    && *push_count == 1
+                    && *substeps >= 59
+            }),
+        "each FPS run must move the dynamic body and emit pushes: {push_results:?}"
+    );
+    let min = push_results
+        .iter()
+        .map(|(_, (displacement, _, _, _))| *displacement)
+        .fold(f32::INFINITY, f32::min);
+    let max = push_results
+        .iter()
+        .map(|(_, (displacement, _, _, _))| *displacement)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let one_fixed_step_at_max_push_speed = MAX_PUSH_SPEED / FIXED_HZ as f32 + 1.0e-4;
+    assert!(
+        max - min <= one_fixed_step_at_max_push_speed,
+        "crate displacement spread={} exceeds one 60 Hz fixed step at the capped push speed ({one_fixed_step_at_max_push_speed}): {push_results:?}",
+        max - min,
     );
 }
 

@@ -718,9 +718,7 @@ impl ScriptTransaction {
                 if let Some(impulse) = pending.controller.push_impulse(&hit, dt) {
                     physics_commands.push(PhysicsCommand::AddImpulse {
                         body: hit.body,
-                        // Scale the velocity correction by elapsed update time so render frequency
-                        // does not multiply the total push impulse.
-                        impulse: impulse * dt,
+                        impulse,
                         point: None,
                     });
                 }
