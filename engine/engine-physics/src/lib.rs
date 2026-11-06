@@ -8,8 +8,10 @@ pub mod hull;
 pub mod narrow;
 pub mod query;
 pub mod ray;
+pub mod scene;
 pub mod shape;
 mod solver;
+pub mod thread;
 pub mod world;
 
 pub use broad::{
@@ -33,7 +35,15 @@ pub use query::{
     QuerySnapshot,
 };
 pub use ray::{Ray, RayHit, raycast};
+pub use scene::{
+    ModelGeometry, ModelMesh, PhysicsSceneBinding, PhysicsSceneBody, PhysicsSceneDesc,
+    PhysicsSceneError, PhysicsSceneSync, PhysicsSceneSyncError,
+};
 pub use shape::{Aabb, MassProperties, Pose, Shape};
+pub use thread::{
+    PhysicsClient, PhysicsClientError, PhysicsInitialization, PhysicsReceive, PhysicsReply,
+    PhysicsRequest, PhysicsServer, PhysicsServerError, PhysicsStepResult,
+};
 pub use world::{
     BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent, PhysicsWorld,
     PhysicsWorldError, StepDriver, StepResult,

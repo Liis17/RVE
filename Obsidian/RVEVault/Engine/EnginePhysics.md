@@ -16,6 +16,8 @@ GJK ограничен 64 итерациями, EPA — 64 итерациями 
 
 `StepDriver` применяет команды один раз на каждый полученный `Step`, даже при нуле подшагов. `AddForce` добавляет импульс `force × Step.dt`; отложенная kinematic target сохраняется при нулевом числе подшагов и достигается линейно за выполненные подшаги. Аккумулятор ограничивает число подшагов, лишнее время ограничивается одним fixed step; каждый вызов возвращает poses и events в `StepResult`.
 
-`PhysicsEngine::run` пока остаётся совместимой потоковой заглушкой и ждёт сигнал остановки. `PhysicsWorld`, `StepDriver`, query snapshots и `CharacterController` доступны как детерминированный CPU API, но ещё не подключены к runtime-потоку или script API.
+`PhysicsSceneDesc::from_world` строит CPU-описание физических тел из `engine_scene::World` и переданных вызывающим кодом позиций/индексов базовых моделей; LOD не используется. Масштаб запекается в геометрию при загрузке. `PhysicsSceneSync` применяет dynamic poses через `World::set_root_pose`, сохраняет позу после чтения обратно из world cache и формирует Teleport/KinematicTarget при изменении позиции или вращения. Сравнение кватернионов считает эквивалентными знаки `q` и `-q`; world pose читает перенос матрицы и кэшированный world rotation без разложения матрицы, поэтому изменение масштаба после загрузки не создаёт ложный teleport.
 
-Источник: `engine/engine-physics/src/{broad.rs,narrow.rs,solver.rs,world.rs,shape.rs,hull.rs,bvh.rs,ray.rs,query.rs,character.rs}`.
+`PhysicsServer::run` принимает Init, Step с последовательным номером и Shutdown через flume. Init возвращает результат sequence 0 с query snapshot; каждый Step возвращает snapshot, poses и events, включая вызов без fixed substep. `PhysicsClient` соблюдает lockstep, проверяет sequence и ждёт только при outstanding Step через flume Selector вместе с переданным вызывающим control-каналом. Канальный протокол и scene sync пока не подключены к runtime-потоку или script API; `PhysicsEngine::run` остаётся совместимой потоковой заглушкой.
+
+Источник: `engine/engine-physics/src/{broad.rs,narrow.rs,solver.rs,world.rs,shape.rs,hull.rs,bvh.rs,ray.rs,query.rs,character.rs,scene.rs,thread.rs}`.

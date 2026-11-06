@@ -873,6 +873,20 @@ impl StepDriver {
         self.accumulator
     }
 
+    /// Returns the unadvanced initial state without refreshing contact-pair events.
+    pub fn initial_result(&self) -> StepResult {
+        StepResult {
+            substeps: 0,
+            poses: self
+                .world
+                .bodies
+                .values()
+                .map(|body| (body.handle, body.pose))
+                .collect(),
+            events: Vec::new(),
+        }
+    }
+
     /// Applies frame commands once, then runs the capped number of fixed substeps.
     pub fn advance_step(
         &mut self,

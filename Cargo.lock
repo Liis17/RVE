@@ -685,6 +685,8 @@ dependencies = [
 name = "engine-physics"
 version = "0.1.0"
 dependencies = [
+ "engine-scene",
+ "flume",
  "glam",
 ]
 
