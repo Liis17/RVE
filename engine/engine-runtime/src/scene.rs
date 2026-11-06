@@ -603,6 +603,7 @@ mod tests {
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
+    use engine_physics::BodyKind;
     use engine_project::PhysicsSettings;
     use engine_render::{AlphaMode, EnvironmentSource, TextureColorSpace};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
@@ -731,6 +732,53 @@ id = "camera"
             .err()
             .expect("zero-scale collider should fail physics prebuild");
         assert!(error.contains("scale"), "{error}");
+    }
+
+    #[test]
+    fn demo_game_scenes_load_and_build_physics_without_gpu() {
+        let assets = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/demo-game/Assets"
+        ));
+        let resources = LooseResources::new(assets);
+        let handle = resources.system.handle();
+        for scene in [
+            "/scenes/physics.rvescene",
+            "/scenes/main.rvescene",
+            "/scenes/second.rvescene",
+        ] {
+            let prepared = load_scene(&handle, &resources.assets, scene)
+                .unwrap_or_else(|error| panic!("{scene}: {error}"));
+            prepared
+                .build_physics(&PhysicsSettings::default())
+                .unwrap_or_else(|error| panic!("{scene}: {error}"));
+        }
+
+        let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        engine_script::ScriptHost::load(
+            &prepared.world,
+            "/scenes/physics.rvescene",
+            &prepared.sources,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("physics scripts: {error}"));
+        let (_, bindings) = prepared.build_physics(&PhysicsSettings::default()).unwrap();
+        // 10 статических коллайдеров, 4 монеты-триггера, 4 ящика и 1 персонаж.
+        assert_eq!(bindings.len(), 19);
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding.kind == BodyKind::Dynamic)
+                .count(),
+            4
+        );
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding.character_controller.is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]
