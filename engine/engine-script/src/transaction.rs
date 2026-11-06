@@ -113,6 +113,7 @@ pub(crate) struct ScriptTransaction {
     pending_camera_settings: HashMap<ObjectHandle, CameraSettings>,
     pending_active_camera: Option<ObjectHandle>,
     pending_messages: Vec<PendingMessage>,
+    pending_warnings: Vec<String>,
     pending_bytes: usize,
     queued_message_count: usize,
     queued_message_bytes: usize,
@@ -146,6 +147,7 @@ impl Default for ScriptTransaction {
             pending_camera_settings: HashMap::with_capacity(2),
             pending_active_camera: None,
             pending_messages: Vec::with_capacity(16),
+            pending_warnings: Vec::new(),
             pending_bytes: 0,
             queued_message_count: 0,
             queued_message_bytes: 0,
@@ -177,6 +179,7 @@ impl ScriptTransaction {
         self.pending_camera_settings.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
+        self.pending_warnings.clear();
         self.pending_physics_commands.clear();
         self.pending_grounded.clear();
         self.pending_collider_enabled.clear();
@@ -368,6 +371,12 @@ impl ScriptTransaction {
             return Err("could not stage character transform".to_owned());
         }
         self.pending_grounded.insert(object, result.grounded);
+        if result.degraded && self.physics.borrow_mut().first_degraded_move(object) {
+            self.pending_warnings.push(
+                "character movement hit a physics query limit and stopped at its current position"
+                    .to_owned(),
+            );
+        }
         // A slide can report one body on multiple iterations; count this request once per body.
         for (index, hit) in result.hits.iter().enumerate() {
             if hit.body_kind != BodyKind::Dynamic {
@@ -786,6 +795,13 @@ impl ScriptTransaction {
                 });
             }
         }
+        for message in self.pending_warnings.drain(..) {
+            events.borrow_mut().push(ScriptEvent {
+                level: ScriptEventLevel::Warn,
+                source: self.source.clone(),
+                message,
+            });
+        }
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
         self.world = std::ptr::null();
@@ -797,6 +813,7 @@ impl ScriptTransaction {
         self.pending_camera_settings.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
+        self.pending_warnings.clear();
         self.pending_physics_commands.clear();
         self.pending_grounded.clear();
         self.pending_collider_enabled.clear();

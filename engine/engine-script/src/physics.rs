@@ -2,7 +2,7 @@ use engine_physics::{
     BodyHandle, PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot,
 };
 use engine_scene::ObjectHandle;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -12,6 +12,7 @@ pub(crate) struct PhysicsScriptState {
     objects: HashMap<BodyHandle, ObjectHandle>,
     grounded: HashMap<ObjectHandle, bool>,
     enabled_overrides: HashMap<BodyHandle, bool>,
+    degraded_reported: HashSet<ObjectHandle>,
     commands: Vec<PhysicsCommand>,
     events: Vec<PhysicsEvent>,
 }
@@ -19,6 +20,11 @@ pub(crate) struct PhysicsScriptState {
 impl PhysicsScriptState {
     pub(crate) fn is_attached(&self) -> bool {
         self.snapshot.is_some()
+    }
+
+    /// Returns true only the first time a character object reports a limited move in this session.
+    pub(crate) fn first_degraded_move(&mut self, object: ObjectHandle) -> bool {
+        self.degraded_reported.insert(object)
     }
 
     pub(crate) fn set_snapshot(

@@ -44,6 +44,20 @@ impl fmt::Display for NarrowphaseError {
 
 impl std::error::Error for NarrowphaseError {}
 
+impl NarrowphaseError {
+    /// Численный лимит или вырожденный симплекс: один вычислительный сбой, не нарушение входа.
+    pub(crate) fn is_numeric_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::GjkIterationLimit
+                | Self::EpaIterationLimit
+                | Self::EpaFaceLimit
+                | Self::DegenerateSimplex
+                | Self::CandidateLimit
+        )
+    }
+}
+
 impl From<GeometryError> for NarrowphaseError {
     fn from(value: GeometryError) -> Self {
         Self::Geometry(value)

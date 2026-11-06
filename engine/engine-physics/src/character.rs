@@ -78,6 +78,8 @@ pub struct CharacterMoveResult {
     pub blocked_displacement: Vec3,
     pub grounded: bool,
     pub hits: Vec<CharacterHit>,
+    /// True when a numeric query limit stopped part of the move at its current position.
+    pub degraded: bool,
 }
 
 #[derive(Default)]
@@ -86,6 +88,22 @@ struct SlideResult {
     blocked_displacement: Vec3,
     grounded: bool,
     hits: Vec<CharacterHit>,
+    degraded: bool,
+}
+
+fn is_numeric_limit(error: &CharacterError) -> bool {
+    match error {
+        CharacterError::Query(error) => is_numeric_query_limit(error),
+        _ => false,
+    }
+}
+
+fn is_numeric_query_limit(error: &QueryError) -> bool {
+    match error {
+        QueryError::ShapeCastIterationLimit | QueryError::CandidateLimit => true,
+        QueryError::Narrowphase(error) => error.is_numeric_limit(),
+        _ => false,
+    }
 }
 
 impl CharacterController {
@@ -182,27 +200,40 @@ impl CharacterController {
         };
         let mut movement =
             self.slide(snapshot, body, &shape, start_pose, displacement, overrides)?;
+        let mut degraded = movement.degraded;
         if self.step_height > 0.0
             && movement.hits.iter().any(|hit| {
                 hit.blocked_displacement.length_squared() > MOVEMENT_EPSILON_SQUARED
                     && !self.is_walkable(-hit.normal)
             })
-            && let Some(stepped) =
-                self.try_step(snapshot, body, &shape, start_pose, displacement, overrides)?
-            && horizontal_progress(stepped.position - start_pose.position)
-                > horizontal_progress(movement.position - start_pose.position) + 1.0e-4
         {
-            movement = stepped;
+            match self.try_step(snapshot, body, &shape, start_pose, displacement, overrides) {
+                Ok(Some(stepped))
+                    if horizontal_progress(stepped.position - start_pose.position)
+                        > horizontal_progress(movement.position - start_pose.position) + 1.0e-4 =>
+                {
+                    degraded |= stepped.degraded;
+                    movement = stepped;
+                }
+                Ok(Some(stepped)) => degraded |= stepped.degraded,
+                Ok(None) => {}
+                Err(error) if is_numeric_limit(&error) => degraded = true,
+                Err(error) => return Err(error),
+            }
         }
         if !movement.grounded && displacement.y <= 0.0 {
-            self.snap_to_ground(
+            match self.snap_to_ground(
                 snapshot,
                 body,
                 start_pose.rotation,
                 &shape,
                 &mut movement,
                 overrides,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(error) if is_numeric_limit(&error) => degraded = true,
+                Err(error) => return Err(error),
+            }
         }
         for hit in &mut movement.hits {
             hit.requested_displacement = displacement;
@@ -212,6 +243,7 @@ impl CharacterController {
             blocked_displacement: movement.blocked_displacement,
             grounded: movement.grounded,
             hits: movement.hits,
+            degraded,
         })
     }
 
@@ -264,11 +296,24 @@ impl CharacterController {
                 break;
             }
             let pose = Pose::new(result.position, start_pose.rotation)?;
-            let Some(hit) = snapshot
-                .shape_cast_with_overrides(shape, pose, remaining, self.skin, filter, overrides)?
-            else {
-                result.position += remaining;
-                break;
+            let hit = match snapshot.shape_cast_with_overrides(
+                shape,
+                pose,
+                remaining,
+                self.skin,
+                filter,
+                overrides,
+            ) {
+                Ok(Some(hit)) => hit,
+                Ok(None) => {
+                    result.position += remaining;
+                    break;
+                }
+                Err(error) if is_numeric_query_limit(&error) => {
+                    result.degraded = true;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
             };
             let travel = remaining * hit.fraction;
             result.position += travel;
@@ -874,6 +919,44 @@ mod tests {
             controller(0.0, 45.0, 0.0)
                 .push_impulse(dynamic_hit, 0.0)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn numeric_query_limit_stops_the_move_without_failing_it() {
+        // Центральный веер из 16385 треугольников: все кандидаты в AABB капсулы, лимит mesh-кандидатов
+        // превышен. Это численный сбой: движение останавливается на текущей позиции, без ошибки.
+        let mut vertices = vec![Vec3::new(0.0, 0.5, 0.0)];
+        let ring = crate::narrow::MAX_MESH_CANDIDATES + 1;
+        for index in 0..ring {
+            let angle = index as f32 / ring as f32 * std::f32::consts::TAU;
+            vertices.push(Vec3::new(0.1 * angle.cos(), 0.5, 0.1 * angle.sin()));
+        }
+        let triangles = (0..ring)
+            .map(|index| [0, index as u32 + 1, ((index + 1) % ring) as u32 + 1])
+            .collect();
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::TriMesh(Arc::new(TriMesh::new(vertices, triangles).unwrap())),
+                Pose::IDENTITY,
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let controller = controller(0.35, 45.0, 0.2);
+        let start = Pose::new(Vec3::new(0.0, 0.5, 0.0), Quat::IDENTITY).unwrap();
+
+        let result = controller
+            .move_capsule(&snapshot, BodyHandle(u64::MAX), start, Vec3::X * 0.1)
+            .expect("numeric query limit must not fail the move");
+        assert!(result.degraded, "{result:?}");
+        assert!(result.translation.length() < 1.0e-6, "{result:?}");
+
+        assert_eq!(
+            controller
+                .move_capsule(&snapshot, BodyHandle(u64::MAX), start, Vec3::NAN)
+                .err(),
+            Some(CharacterError::NonFiniteInput)
         );
     }
 

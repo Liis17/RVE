@@ -269,6 +269,83 @@ return Script
 }
 
 #[test]
+fn limited_character_move_warns_once_and_keeps_the_script_running() {
+    // Веер из MAX_MESH_CANDIDATES + 1 треугольников в точке капсулы: численный лимит на каждом move.
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/limited.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/limited.lua"
+"#,
+    );
+    let player = world.handle("player").unwrap();
+    let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let body = physics
+        .insert_body({
+            let mut desc = BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::IDENTITY,
+                ColliderDesc::new(controller.capsule().unwrap()),
+            );
+            desc.character_controller = true;
+            desc
+        })
+        .unwrap();
+    let ring = engine_physics::MAX_MESH_CANDIDATES + 1;
+    let mut vertices = vec![Vec3::new(0.0, 0.5, 0.0)];
+    vertices.extend((0..ring).map(|index| {
+        let angle = index as f32 / ring as f32 * std::f32::consts::TAU;
+        Vec3::new(0.1 * angle.cos(), 0.5, 0.1 * angle.sin())
+    }));
+    let triangles = (0..ring)
+        .map(|index| [0, index as u32 + 1, ((index + 1) % ring) as u32 + 1])
+        .collect();
+    physics
+        .insert_body(BodyDesc::static_collider(
+            Shape::TriMesh(std::sync::Arc::new(
+                engine_physics::TriMesh::new(vertices, triangles).unwrap(),
+            )),
+            Pose::IDENTITY,
+        ))
+        .unwrap();
+    let bindings = [PhysicsSceneBinding {
+        object: player,
+        body,
+        kind: BodyKind::Kinematic,
+        character_controller: Some(controller),
+    }];
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("player"):move({x=0.1,y=0,z=0})
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("limited.lua", source)]), None).unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    for _ in 0..3 {
+        host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    }
+
+    let events = host.drain_events();
+    assert!(
+        !events.iter().any(|event| event.level == ScriptEventLevel::Error),
+        "{events:?}"
+    );
+    let warnings = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+    assert_eq!(warnings, 1, "{events:?}");
+    assert_eq!(world.local_transform(player).unwrap().position, Vec3::ZERO);
+}
+
+#[test]
 fn failed_lua_callback_discards_movement_and_dynamic_pushes() {
     let mut world = world(
         r#"
