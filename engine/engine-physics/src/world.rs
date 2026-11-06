@@ -360,6 +360,7 @@ pub struct PhysicsWorld {
     active_pairs: BTreeMap<PairKey, ActivePair>,
     manifolds: ManifoldCache,
     next_body_id: u64,
+    skipped_pairs: usize,
 }
 
 impl Default for PhysicsWorld {
@@ -379,6 +380,7 @@ impl PhysicsWorld {
             active_pairs: BTreeMap::new(),
             manifolds: ManifoldCache::default(),
             next_body_id: 1,
+            skipped_pairs: 0,
         })
     }
 
@@ -565,10 +567,19 @@ impl PhysicsWorld {
                 current.insert(key, previous.clone());
                 continue;
             }
-            let Some(mut manifold) =
-                collide(&collider_a.shape, *pose_a, &collider_b.shape, *pose_b)?
-            else {
-                continue;
+            let outcome = collide(&collider_a.shape, *pose_a, &collider_b.shape, *pose_b);
+            let mut manifold = match outcome {
+                Ok(Some(manifold)) => manifold,
+                Ok(None) => continue,
+                Err(error) if error.is_numeric_limit() => {
+                    // Пара не решается на этом шаге; существование пары сохраняется как было.
+                    self.skipped_pairs += 1;
+                    if let Some(previous) = self.active_pairs.get(&key) {
+                        current.insert(key, previous.clone());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
             };
             if pair_kind == PairKind::Collision {
                 self.wake_contact_pair(*handle_a, *handle_b);
@@ -831,6 +842,8 @@ pub struct StepResult {
     pub substeps: usize,
     pub poses: Vec<(BodyHandle, Pose)>,
     pub events: Vec<PhysicsEvent>,
+    /// Pairs whose narrowphase hit a numeric limit during this step and were kept unresolved.
+    pub skipped_pairs: usize,
 }
 
 pub struct StepDriver {
@@ -884,6 +897,7 @@ impl StepDriver {
                 .map(|body| (body.handle, body.pose))
                 .collect(),
             events: Vec::new(),
+            skipped_pairs: 0,
         }
     }
 
@@ -894,6 +908,7 @@ impl StepDriver {
         commands: impl IntoIterator<Item = PhysicsCommand>,
     ) -> Result<StepResult, PhysicsWorldError> {
         validate_nonnegative_dt(dt)?;
+        self.world.skipped_pairs = 0;
         for command in commands {
             self.world.apply_command(command, dt)?;
         }
@@ -919,6 +934,7 @@ impl StepDriver {
             substeps,
             poses,
             events,
+            skipped_pairs: self.world.skipped_pairs,
         })
     }
 }
@@ -1797,6 +1813,58 @@ mod tests {
             cached_angular.y.abs() < 1.0e-3 && (cached_angular.y - fresh_angular.y).abs() < 1.0e-3,
             "cached={cached_angular:?}, fresh={fresh_angular:?}"
         );
+    }
+
+    #[test]
+    fn narrowphase_limit_skips_only_the_failing_pair_for_one_step() {
+        // Веер из MAX_MESH_CANDIDATES + 1 треугольников у начала координат: пара «ящик–веер»
+        // упирается в лимит кандидатов narrowphase, а свободно падающее тело шагает дальше.
+        let ring = crate::narrow::MAX_MESH_CANDIDATES + 1;
+        let mut vertices = vec![Vec3::new(0.0, 0.5, 0.0)];
+        vertices.extend((0..ring).map(|index| {
+            let angle = index as f32 / ring as f32 * std::f32::consts::TAU;
+            Vec3::new(0.1 * angle.cos(), 0.5, 0.1 * angle.sin())
+        }));
+        let triangles = (0..ring)
+            .map(|index| [0, index as u32 + 1, ((index + 1) % ring) as u32 + 1])
+            .collect();
+        let mut world = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0)).unwrap();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::TriMesh(Arc::new(TriMesh::new(vertices, triangles).unwrap())),
+                Pose::IDENTITY,
+            ))
+            .unwrap();
+        world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.1),
+                Pose::new(Vec3::new(0.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let falling = world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.1),
+                Pose::new(Vec3::new(10.0, 5.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        let result = driver
+            .advance_step(1.0 / 60.0, Vec::new())
+            .expect("narrowphase limit must not fail the step");
+
+        assert!(result.skipped_pairs >= 1, "{result:?}");
+        let falling_y = result
+            .poses
+            .iter()
+            .find(|(handle, _)| *handle == falling)
+            .unwrap()
+            .1
+            .position
+            .y;
+        assert!(falling_y < 5.0, "{falling_y}");
     }
 
     #[test]
