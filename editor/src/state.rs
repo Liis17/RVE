@@ -9,6 +9,7 @@ use crate::previews::PreviewCache;
 use crate::project::OpenProject;
 use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::EditorCamera;
+use crate::viewport::colliders::ColliderCache;
 use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use crate::viewport::model_loader::ModelLoader;
 use engine_assets::Model;
@@ -96,6 +97,8 @@ pub struct SceneViewInfo {
     pub rect: Option<egui::Rect>,
     /// Render diagnostic selected for this panel.
     pub debug_view: DebugView,
+    /// Рисовать рёбра всех коллайдеров; выделенный объект рисуется всегда.
+    pub show_colliders: bool,
 }
 
 /// Раздельные заимствования состояния для подготовки кадра сцены.
@@ -170,6 +173,8 @@ pub struct EditorState {
     pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
     /// Фоновый разбор FBX для `models`.
     pub model_loader: ModelLoader,
+    /// Выпуклые оболочки и trimesh для рёбер коллайдеров и ошибок инспектора.
+    pub collider_cache: ColliderCache,
     edit_world: Option<(u64, World)>,
     dirty_lite_schemas: HashSet<String>,
     camera_settings_error_revision: Option<u64>,
@@ -222,6 +227,7 @@ impl EditorState {
             apply_prompt: None,
             lite_schemas: HashMap::new(),
             model_loader: ModelLoader::default(),
+            collider_cache: ColliderCache::default(),
             edit_world: None,
             dirty_lite_schemas: HashSet::new(),
             camera_settings_error_revision: None,
@@ -537,14 +543,7 @@ fn world_for_view(view: &engine_scene::SceneDocument) -> Result<World, engine_sc
         parent: root,
         transform: engine_scene::SceneTransform::default(),
         camera: Some(engine_scene::CameraComponent::default()),
-        mesh_renderer: None,
-        lod_group: None,
-        directional_light: None,
-        point_light: None,
-        spot_light: None,
-        environment: None,
-        lite_scripts: Vec::new(),
-        heavy_scripts: Vec::new(),
+        ..engine_scene::SceneObject::default()
     });
     World::from_document(&view)
 }

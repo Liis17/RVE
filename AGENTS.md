@@ -22,6 +22,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 | `Obsidian/RVEVault/Engine/EnginePak.md` | RVEPAK, builder и реестр архивов |
 | `Obsidian/RVEVault/Engine/EngineResources.md` | Фоновое чтение loose и packed бинарных ресурсов |
 | `Obsidian/RVEVault/Engine/EngineAssets.md` | Ресурсы: FBX и PNG из `assets` |
+| `Obsidian/RVEVault/Engine/EnginePhysics.md` | Геометрия, solver, fixed-step мир, character controller и протокол `rve-physics` |
 | `Obsidian/RVEVault/Engine/EngineScript.md` | Lua и Rust-скрипты сцен |
 | `Obsidian/RVEVault/Engine/EngineConsole.md` | Буфер лога, команды и общий egui developer console |
 | `Obsidian/RVEVault/Engine/RveSdk.md` | C ABI и гостевой API Rust-скриптов |
@@ -57,7 +58,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 
 - В `engine-core`, `engine-window` и `engine-render` проверяй публичный API и его использование в `engine/sandbox`.
 - Изменения `engine-window`, `engine-render`, `engine-platform`, `engine-scene`,
-  `engine-script`, `engine-resources` и `engine-project` проверяй также на
+  `engine-script`, `engine-resources`, `engine-project` и `engine-physics` проверяй также на
   потребителях `engine-runtime`/`rve-player` и `rve-build`, если они используют
   изменённый крейт. Прямые workspace-зависимости:
   - `engine-runtime`: `engine-assets`, `engine-files`, `engine-audio`,
@@ -66,8 +67,9 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
     `engine-script`, `engine-window`, `engine-console`, `engine-ui`.
   - `rve-build`: `engine-assets`, `engine-files`, `engine-pak`, `engine-project`,
     `engine-resources`, `engine-scene`.
+  - `engine-script` (потребители `engine-runtime` и `rve-editor`): `engine-console`, `engine-physics`, `engine-scene`, `rve-sdk`.
   - `rve-player`: `engine-runtime`.
-  - `rve-editor`: `engine-assets`, `engine-files`, `engine-project`, `engine-render`,
+  - `rve-editor`: `engine-assets`, `engine-files`, `engine-physics`, `engine-project`, `engine-render`,
     `engine-resources`, `engine-scene`, `engine-script`, `engine-window`,
     `engine-console`, `engine-ui`.
 - При изменении `engine-platform` проверяй общий интерфейс, адаптеры `engine-platform-windows` и `engine-platform-macos` и вызовы из renderer.

@@ -10,12 +10,12 @@ use engine_project::{InputAction, InputSettings};
 use engine_scene::World;
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost,
-    RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveStatus, RveStr,
-    RveTransform, RveValue,
+    RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4,
+    RveStatus, RveStr, RveTransform, RveValue,
 };
 use rve_sdk::{
-    AntiAliasing, CameraSettings, ConsoleLevel, Key, MouseButton, Params, PhysicalInput, Script,
-    Tonemapper, Value,
+    AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Key, MouseButton, Params,
+    PhysicalInput, Script, Tonemapper, Value,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -45,6 +45,7 @@ struct Probe {
 }
 
 struct InputProbe;
+struct PhysicsProbe;
 struct InputActionsProbe(u8);
 
 struct CameraControl {
@@ -141,6 +142,10 @@ fn input_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(InputProbe))
 }
 
+fn physics_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PhysicsProbe))
+}
+
 impl Script for InputProbe {
     fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
         let input = ctx.input();
@@ -154,6 +159,37 @@ impl Script for InputProbe {
         assert_eq!(input.mouse_delta(), [2.5, -3.0]);
         assert_eq!(input.wheel(), [1.0, 0.5]);
         ctx.log_info("ABI input snapshot");
+    }
+}
+
+impl Script for PhysicsProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let actor = ctx.find("actor").expect("actor exists");
+        let crate_object = ctx.find("crate").expect("crate exists");
+        let hit = ctx
+            .physics()
+            .raycast([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 10.0)
+            .expect("raycast succeeds")
+            .expect("crate hit");
+        assert_eq!(hit.object.id(ctx).as_deref(), Some("crate"));
+        assert!(hit.distance > 4.0);
+        assert_eq!(crate_object.get_velocity(ctx).unwrap(), [0.0; 3]);
+        crate_object.set_velocity(ctx, [1.0, 0.0, 0.0]).unwrap();
+        crate_object.add_impulse(ctx, [0.0, 1.0, 0.0]).unwrap();
+        crate_object.add_force(ctx, [0.0, 0.0, 2.0]).unwrap();
+        let movement = actor.move_character(ctx, [0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(movement.translation, [0.0; 3]);
+        assert!(!movement.grounded);
+        assert!(!actor.is_grounded(ctx).unwrap());
+        crate_object.set_collider_enabled(ctx, false).unwrap();
+        assert!(!crate_object.is_collider_enabled(ctx).unwrap());
+        assert!(
+            ctx.physics()
+                .raycast([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 10.0)
+                .unwrap()
+                .is_none()
+        );
+        ctx.log_info("ABI physics API committed");
     }
 }
 
@@ -271,6 +307,19 @@ impl Script for Probe {
         if self.panic_destroy {
             panic!("destroy panic");
         }
+    }
+
+    fn on_collision_enter(
+        &mut self,
+        ctx: &mut rve_sdk::Context<'_>,
+        other: rve_sdk::Object,
+        contact: CollisionContact,
+    ) {
+        let id = other.id(ctx).expect("physics event object is readable");
+        ctx.log_info(format!(
+            "abi collision:{id}:{}:{}",
+            contact.point[0], contact.normal[0]
+        ));
     }
 }
 
@@ -470,6 +519,7 @@ fn sdk_module() -> &'static RveModule {
         "Message" => message_factory,
         "Limits" => limit_message_factory,
         "InputProbe" => input_probe_factory,
+        "PhysicsProbe" => physics_probe_factory,
         "InputActionsProbe" => input_actions_probe_factory,
         "CameraControl" => camera_control_factory,
         "AbiConsoleCommand" => abi_console_command_factory,
@@ -606,6 +656,227 @@ fn abi_v3_descriptor_loads_without_reading_a_command_tail() {
     assert!(descriptor.command.is_none());
 }
 
+#[test]
+fn abi_v4_descriptor_loads_without_reading_the_v6_collision_tail() {
+    let module = command_probe_module(4);
+    // SAFETY: the v4 module and exact-sized descriptor table are leaked for the test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let descriptor = library.script("Probe").unwrap();
+    assert!(descriptor.command.is_some());
+    assert!(descriptor.collision.is_none());
+}
+
+#[test]
+fn abi_v5_descriptor_uses_the_command_layout_without_collision() {
+    let module = command_probe_module(5);
+    // SAFETY: the v5 module and its two exact-sized descriptors are leaked for the test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    // The second entry checks that the loader strides by the v4/v5 descriptor size.
+    for name in ["Probe", "ProbeSecond"] {
+        let descriptor = library.script(name).unwrap();
+        assert!(descriptor.command.is_some());
+        assert!(descriptor.collision.is_none());
+    }
+}
+
+#[test]
+fn abi_v3_v4_and_v5_normalized_descriptors_run_without_appended_callbacks() {
+    let _lock = test_lock();
+    for module in [
+        v3_probe_module(),
+        command_probe_module(4),
+        command_probe_module(5),
+    ] {
+        // SAFETY: each module and its version-specific descriptor table live for this test.
+        let library =
+            unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+        let mut world = scripted_world("Probe", r#"{ label = "legacy" }"#);
+        let mut host = load_host(&world, &library);
+        host.start(
+            &mut world,
+            ScriptTime {
+                elapsed: 3.5,
+                frame: 17,
+            },
+        );
+        assert!(
+            message_list(&mut host)
+                .iter()
+                .any(|message| message == "start:legacy")
+        );
+    }
+}
+
+/// Builds a module with the `RveScriptDescV4` layout (no collision tail) for ABI 4 or 5.
+fn command_probe_module(abi_version: u32) -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let probe = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
+        .iter()
+        .find(|script| unsafe { script.name.to_str() }.ok() == Some("Probe"))
+        .expect("Probe descriptor exists");
+    let entry = |name| RveScriptDescV4 {
+        name,
+        create: probe.create,
+        start: probe.start,
+        update: probe.update,
+        message: probe.message,
+        destroy: probe.destroy,
+        drop: probe.drop,
+        params: probe.params,
+        param_count: probe.param_count,
+        command: probe.command,
+    };
+    let scripts = Box::leak(Box::new([
+        entry(probe.name),
+        entry(RveStr::from_static("ProbeSecond")),
+    ]));
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: scripts.as_ptr().cast(),
+        script_count: scripts.len(),
+    }))
+}
+
+#[test]
+fn abi_v6_collision_callback_receives_other_and_contact() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+name = "Camera object"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "Probe"
+[[objects]]
+id = "second"
+"#,
+    );
+    let camera = world.handle("camera").unwrap();
+    let second = world.handle("second").unwrap();
+    let physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    let bindings = [
+        engine_physics::PhysicsSceneBinding {
+            object: camera,
+            body: engine_physics::BodyHandle(101),
+            kind: engine_physics::BodyKind::Static,
+            character_controller: None,
+        },
+        engine_physics::PhysicsSceneBinding {
+            object: second,
+            body: engine_physics::BodyHandle(102),
+            kind: engine_physics::BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let mut host = load_host(&world, &library());
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.queue_physics_events([engine_physics::PhysicsEvent::CollisionEnter {
+        first: engine_physics::BodyHandle(101),
+        second: engine_physics::BodyHandle(102),
+        point: glam::Vec3::X,
+        normal: glam::Vec3::X,
+    }]);
+
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "abi collision:second:1:1")
+    );
+}
+
+#[test]
+fn abi_v6_physics_host_callbacks_query_and_stage_commands() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "PhysicsProbe"
+[[objects]]
+id = "crate"
+"#,
+    );
+    let actor = world.handle("actor").unwrap();
+    let crate_object = world.handle("crate").unwrap();
+    let controller =
+        engine_physics::CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+    let mut physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    let actor_body = physics
+        .insert_body({
+            let mut desc = engine_physics::BodyDesc::new(
+                engine_physics::BodyKind::Kinematic,
+                engine_physics::Pose::IDENTITY,
+                engine_physics::ColliderDesc::new(controller.capsule().unwrap()),
+            );
+            desc.character_controller = true;
+            desc
+        })
+        .unwrap();
+    let crate_body = physics
+        .insert_body(engine_physics::BodyDesc::dynamic(
+            engine_physics::Shape::sphere(0.5).unwrap(),
+            engine_physics::Pose::new(glam::Vec3::X * 5.0, glam::Quat::IDENTITY).unwrap(),
+            1.0,
+        ))
+        .unwrap();
+    let bindings = [
+        engine_physics::PhysicsSceneBinding {
+            object: actor,
+            body: actor_body,
+            kind: engine_physics::BodyKind::Kinematic,
+            character_controller: Some(controller),
+        },
+        engine_physics::PhysicsSceneBinding {
+            object: crate_object,
+            body: crate_body,
+            kind: engine_physics::BodyKind::Dynamic,
+            character_controller: None,
+        },
+    ];
+    let mut host = load_host(&world, &library());
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let commands = host.drain_physics_commands();
+    assert_eq!(commands.len(), 4);
+    assert!(
+        matches!(commands[0], engine_physics::PhysicsCommand::SetVelocity { body, velocity }
+        if body == crate_body && velocity == glam::Vec3::X)
+    );
+    assert!(
+        matches!(commands[1], engine_physics::PhysicsCommand::AddImpulse { body, impulse, .. }
+        if body == crate_body && impulse == glam::Vec3::Y)
+    );
+    assert!(
+        matches!(commands[2], engine_physics::PhysicsCommand::AddForce { body, force, .. }
+        if body == crate_body && force == glam::Vec3::Z * 2.0)
+    );
+    assert!(
+        matches!(commands[3], engine_physics::PhysicsCommand::SetColliderEnabled { body, enabled: false }
+        if body == crate_body)
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "ABI physics API committed")
+    );
+}
+
 fn v3_probe_module() -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
@@ -634,15 +905,34 @@ fn v3_probe_module() -> &'static RveModule {
     }))
 }
 
+/// Presents the `AbiConsoleCommand` descriptor as an ABI 4 table. The v6 table cannot be reused
+/// directly because its stride is larger than the v4 descriptor layout.
 fn v4_sdk_module() -> &'static RveModule {
     let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let command = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
+        .iter()
+        .find(|script| unsafe { script.name.to_str() }.ok() == Some("AbiConsoleCommand"))
+        .expect("AbiConsoleCommand descriptor exists");
+    let scripts = Box::leak(Box::new([RveScriptDescV4 {
+        name: command.name,
+        create: command.create,
+        start: command.start,
+        update: command.update,
+        message: command.message,
+        destroy: command.destroy,
+        drop: command.drop,
+        params: command.params,
+        param_count: command.param_count,
+        command: command.command,
+    }]));
     Box::leak(Box::new(RveModule {
         header: RveHeader {
             abi_version: 4,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
-        scripts: current.scripts,
-        script_count: current.script_count,
+        scripts: scripts.as_ptr().cast(),
+        script_count: scripts.len(),
     }))
 }
 
@@ -1095,6 +1385,7 @@ fn null_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1115,6 +1406,7 @@ fn null_name_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1136,6 +1428,7 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1537,6 +1830,7 @@ fn error_message_module() -> &'static RveModule {
             params: std::ptr::null(),
             param_count: 0,
             command: None,
+            collision: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -1549,6 +1843,7 @@ fn error_message_module() -> &'static RveModule {
             params: std::ptr::null(),
             param_count: 0,
             command: None,
+            collision: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -1577,6 +1872,7 @@ fn set_local_during_create_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -1594,6 +1890,7 @@ fn poisoned_create_module() -> &'static RveModule {
         params: std::ptr::null(),
         param_count: 0,
         command: None,
+        collision: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2120,6 +2417,7 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         params: params.as_ptr(),
         param_count: params.len(),
         command: None,
+        collision: None,
     }]));
     RveModule::new(scripts)
 }
@@ -2196,6 +2494,7 @@ fn malformed_parameter_tables_are_rejected() {
             params: std::ptr::null(),
             param_count: 1,
             command: None,
+            collision: None,
         }]));
         module.scripts = scripts.as_ptr();
         module

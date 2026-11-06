@@ -8,9 +8,10 @@ use crate::state::{Action, AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    AntiAliasing, CameraComponent, EnvironmentComponent, HeavyScript, LodGroup, LodLevel,
-    MAX_LOD_LEVELS, MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
-    ProceduralSkyComponent, SceneObject, SceneTransform, SpotLightComponent,
+    AntiAliasing, CameraComponent, CharacterControllerComponent, ColliderComponent, ColliderShape,
+    EnvironmentComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode,
+    ParamSchema, ParamSpec, ParamValue, PointLightComponent, ProceduralSkyComponent,
+    RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform, SpotLightComponent,
 };
 use std::collections::BTreeMap;
 
@@ -139,6 +140,15 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     }
     if let Some(environment) = &object.environment {
         show_environment(ui, state, id, environment);
+    }
+    if let Some(collider) = object.collider {
+        show_collider(ui, state, object, collider);
+    }
+    if let Some(body) = object.rigid_body {
+        show_rigid_body(ui, state, id, body);
+    }
+    if let Some(controller) = object.character_controller {
+        show_character_controller(ui, state, id, controller);
     }
     for index in 0..object.lite_scripts.len() {
         show_lite_script(ui, state, object, index);
@@ -1239,6 +1249,359 @@ fn show_spot_light(
     run_menu_action(state, id, ComponentKind::SpotLight, action);
 }
 
+const COLLIDER_SHAPES: [(ColliderShape, &str); 5] = [
+    (ColliderShape::Box, "Box"),
+    (ColliderShape::Sphere, "Sphere"),
+    (ColliderShape::Capsule, "Capsule"),
+    (ColliderShape::ConvexMesh, "Convex Mesh"),
+    (ColliderShape::TriangleMesh, "Triangle Mesh"),
+];
+
+const BODY_KINDS: [(RigidBodyKind, &str); 3] = [
+    (RigidBodyKind::Static, "Static"),
+    (RigidBodyKind::Kinematic, "Kinematic"),
+    (RigidBodyKind::Dynamic, "Dynamic"),
+];
+
+/// Одна строка метки и числового поля; диапазон совпадает с проверкой документа.
+fn drag_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    speed: f64,
+    range: std::ops::RangeInclusive<f32>,
+) -> egui::Response {
+    ui.label(label);
+    let response = ui.add(egui::DragValue::new(value).speed(speed).range(range));
+    ui.end_row();
+    response
+}
+
+/// Вектор размеров: все компоненты должны быть больше нуля.
+fn size_row(ui: &mut egui::Ui, label: &str, value: &mut [f32; 3]) -> egui::Response {
+    ui.label(label);
+    let response = ui
+        .horizontal(|ui| {
+            let mut combined: Option<egui::Response> = None;
+            for component in value.iter_mut() {
+                let field = egui::DragValue::new(component)
+                    .speed(0.02)
+                    .range(f32::MIN_POSITIVE..=f32::MAX);
+                merge_response(&mut combined, ui.add(field));
+            }
+            combined.expect("вектор содержит три компонента")
+        })
+        .inner;
+    ui.end_row();
+    response
+}
+
+/// Выбор варианта перечисления. Это дискретная правка: применяется сразу, без объединения.
+fn choice_row<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    label: &str,
+    current: T,
+    options: &[(T, &str)],
+    change: impl FnOnce(&mut SceneObject, T),
+) {
+    ui.label(label);
+    let mut chosen = current;
+    let current_text = options
+        .iter()
+        .find(|(value, _)| *value == current)
+        .map_or("", |(_, text)| *text);
+    egui::ComboBox::from_id_salt((id, label))
+        .selected_text(current_text)
+        .show_ui(ui, |ui| {
+            for (value, text) in options {
+                ui.selectable_value(&mut chosen, *value, *text);
+            }
+        });
+    ui.end_row();
+    if chosen != current {
+        state.edit_scene(|scene| {
+            scene.edit_object(id, None, |object| {
+                change(object, chosen);
+                Ok(())
+            })
+        });
+    }
+}
+
+fn show_collider(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    object: &SceneObject,
+    collider: ColliderComponent,
+) {
+    let id = object.id.as_str();
+    let field = OverrideField::Collider;
+    let menu = component_menu(state, id, ComponentKind::Collider);
+    let action = component_header(
+        ui,
+        "Collider",
+        id,
+        mark(state, id, field.clone()),
+        Some(menu),
+        true,
+        |ui| {
+            egui::Grid::new("collider").num_columns(2).show(ui, |ui| {
+                choice_row(
+                    ui,
+                    state,
+                    id,
+                    "Shape",
+                    collider.shape,
+                    &COLLIDER_SHAPES,
+                    |object, shape| object.collider = Some(ColliderComponent { shape, ..collider }),
+                );
+                let mut value = collider;
+                let mut combined: Option<egui::Response> = None;
+                match collider.shape {
+                    ColliderShape::Box => {
+                        let response = size_row(ui, "Half Extents", &mut value.half_extents);
+                        merge_response(&mut combined, response);
+                    }
+                    ColliderShape::Sphere => {
+                        let response = drag_row(
+                            ui,
+                            "Radius",
+                            &mut value.radius,
+                            0.01,
+                            f32::MIN_POSITIVE..=f32::MAX,
+                        );
+                        merge_response(&mut combined, response);
+                    }
+                    ColliderShape::Capsule => {
+                        let radius = drag_row(
+                            ui,
+                            "Radius",
+                            &mut value.radius,
+                            0.01,
+                            f32::MIN_POSITIVE..=f32::MAX,
+                        );
+                        let height = drag_row(
+                            ui,
+                            "Height",
+                            &mut value.height,
+                            0.01,
+                            f32::MIN_POSITIVE..=f32::MAX,
+                        );
+                        merge_response(&mut combined, radius | height);
+                    }
+                    ColliderShape::ConvexMesh | ColliderShape::TriangleMesh => {}
+                }
+                let offset = vec3_row(ui, "Offset", &mut value.offset, 0.02);
+                merge_response(&mut combined, offset);
+                ui.label("Trigger");
+                let trigger = ui.checkbox(&mut value.trigger, "");
+                ui.end_row();
+                merge_response(&mut combined, trigger);
+                let friction = drag_row(ui, "Friction", &mut value.friction, 0.01, 0.0..=f32::MAX);
+                merge_response(&mut combined, friction);
+                let restitution =
+                    drag_row(ui, "Restitution", &mut value.restitution, 0.01, 0.0..=1.0);
+                merge_response(&mut combined, restitution);
+                if let Some(response) = combined {
+                    commit(state, id, "collider", &response, |object| {
+                        object.collider = Some(value);
+                    });
+                }
+            });
+            if let Some(error) = mesh_geometry_error(state, object, collider.shape) {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("Геометрия коллайдера не строится: {error}"),
+                );
+            }
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| scene.remove_physics_component(id, ComponentKind::Collider));
+    }
+    run_menu_action(state, id, ComponentKind::Collider, action);
+}
+
+/// Ошибка построения выпуклой оболочки или trimesh по модели; `None`, если форма строится
+/// или модель ещё загружается.
+fn mesh_geometry_error(
+    state: &mut EditorState,
+    object: &SceneObject,
+    shape: ColliderShape,
+) -> Option<String> {
+    if !matches!(
+        shape,
+        ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+    ) {
+        return None;
+    }
+    let path = object.mesh_renderer.as_ref()?.model.as_str().to_owned();
+    let model = state.models.get(&path).cloned()?;
+    let built = if shape == ColliderShape::ConvexMesh {
+        state.collider_cache.hull(&path, &model).map(|_| ())
+    } else {
+        state.collider_cache.mesh(&path, &model).map(|_| ())
+    };
+    built.err()
+}
+
+fn show_rigid_body(ui: &mut egui::Ui, state: &mut EditorState, id: &str, body: RigidBodyComponent) {
+    let field = OverrideField::RigidBody;
+    let menu = component_menu(state, id, ComponentKind::RigidBody);
+    let action = component_header(
+        ui,
+        "Rigid Body",
+        id,
+        mark(state, id, field.clone()),
+        Some(menu),
+        true,
+        |ui| {
+            egui::Grid::new("rigid_body").num_columns(2).show(ui, |ui| {
+                choice_row(
+                    ui,
+                    state,
+                    id,
+                    "Kind",
+                    body.kind,
+                    &BODY_KINDS,
+                    |object, kind| object.rigid_body = Some(RigidBodyComponent { kind, ..body }),
+                );
+                let mut value = body;
+                let mut combined: Option<egui::Response> = None;
+                let mass = drag_row(
+                    ui,
+                    "Mass",
+                    &mut value.mass,
+                    0.05,
+                    f32::MIN_POSITIVE..=f32::MAX,
+                );
+                merge_response(&mut combined, mass);
+                let linear = drag_row(
+                    ui,
+                    "Linear Damping",
+                    &mut value.linear_damping,
+                    0.01,
+                    0.0..=f32::MAX,
+                );
+                merge_response(&mut combined, linear);
+                let angular = drag_row(
+                    ui,
+                    "Angular Damping",
+                    &mut value.angular_damping,
+                    0.01,
+                    0.0..=f32::MAX,
+                );
+                merge_response(&mut combined, angular);
+                let gravity = drag_row(
+                    ui,
+                    "Gravity Scale",
+                    &mut value.gravity_scale,
+                    0.01,
+                    -f32::MAX..=f32::MAX,
+                );
+                merge_response(&mut combined, gravity);
+                ui.label("Lock Rotation");
+                let lock = ui.checkbox(&mut value.lock_rotation, "");
+                ui.end_row();
+                merge_response(&mut combined, lock);
+                if let Some(response) = combined {
+                    commit(state, id, "rigid_body", &response, |object| {
+                        object.rigid_body = Some(value);
+                    });
+                }
+            });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| scene.remove_physics_component(id, ComponentKind::RigidBody));
+    }
+    run_menu_action(state, id, ComponentKind::RigidBody, action);
+}
+
+fn show_character_controller(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    controller: CharacterControllerComponent,
+) {
+    let field = OverrideField::CharacterController;
+    let menu = component_menu(state, id, ComponentKind::CharacterController);
+    let action = component_header(
+        ui,
+        "Character Controller",
+        id,
+        mark(state, id, field.clone()),
+        Some(menu),
+        true,
+        |ui| {
+            egui::Grid::new("character_controller")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    let mut value = controller;
+                    let mut combined: Option<egui::Response> = None;
+                    let fields: [(&str, &mut f32, f64, std::ops::RangeInclusive<f32>); 7] = [
+                        (
+                            "Radius",
+                            &mut value.radius,
+                            0.01,
+                            f32::MIN_POSITIVE..=f32::MAX,
+                        ),
+                        (
+                            "Height",
+                            &mut value.height,
+                            0.01,
+                            f32::MIN_POSITIVE..=f32::MAX,
+                        ),
+                        ("Step Height", &mut value.step_height, 0.01, 0.0..=f32::MAX),
+                        ("Max Slope (°)", &mut value.max_slope_deg, 0.5, 0.01..=89.99),
+                        (
+                            "Snap Distance",
+                            &mut value.snap_distance,
+                            0.01,
+                            0.0..=f32::MAX,
+                        ),
+                        ("Skin", &mut value.skin, 0.001, 0.0..=f32::MAX),
+                        (
+                            "Push Strength",
+                            &mut value.push_strength,
+                            0.05,
+                            0.0..=f32::MAX,
+                        ),
+                    ];
+                    for (label, field, speed, range) in fields {
+                        let response = drag_row(ui, label, field, speed, range);
+                        merge_response(&mut combined, response);
+                    }
+                    if let Some(response) = combined {
+                        commit(state, id, "character_controller", &response, |object| {
+                            object.character_controller = Some(value);
+                        });
+                    }
+                });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| {
+            scene.remove_physics_component(id, ComponentKind::CharacterController)
+        });
+    }
+    run_menu_action(state, id, ComponentKind::CharacterController, action);
+}
+
 fn show_environment(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -1805,6 +2168,36 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                     object.directional_light = Some(default_light());
                     Ok(())
                 })
+            });
+        }
+        // Тело требует коллайдер, а контроллер — отсутствия коллайдера и тела; документ проверяет
+        // это же, меню просто не предлагает заведомо неверные варианты.
+        if object.collider.is_none()
+            && object.character_controller.is_none()
+            && ui.button("Collider").clicked()
+        {
+            state.edit_scene(|scene| {
+                scene.set_component(id, Component::Collider(ColliderComponent::default()))
+            });
+        }
+        if object.collider.is_some()
+            && object.rigid_body.is_none()
+            && ui.button("Rigid Body").clicked()
+        {
+            state.edit_scene(|scene| {
+                scene.set_component(id, Component::RigidBody(RigidBodyComponent::default()))
+            });
+        }
+        if object.collider.is_none()
+            && object.rigid_body.is_none()
+            && object.character_controller.is_none()
+            && ui.button("Character Controller").clicked()
+        {
+            state.edit_scene(|scene| {
+                scene.set_component(
+                    id,
+                    Component::CharacterController(CharacterControllerComponent::default()),
+                )
             });
         }
         if object.point_light.is_none() && ui.button("Point Light").clicked() {

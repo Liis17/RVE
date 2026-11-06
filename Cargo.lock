@@ -684,6 +684,11 @@ dependencies = [
 [[package]]
 name = "engine-physics"
 version = "0.1.0"
+dependencies = [
+ "engine-scene",
+ "flume",
+ "glam",
+]
 
 [[package]]
 name = "engine-platform"
@@ -789,8 +794,10 @@ name = "engine-script"
 version = "0.1.0"
 dependencies = [
  "engine-console",
+ "engine-physics",
  "engine-project",
  "engine-scene",
+ "glam",
  "libloading 0.9.0",
  "mlua",
  "rve-sdk",
@@ -2483,6 +2490,7 @@ dependencies = [
  "engine-assets",
  "engine-console",
  "engine-files",
+ "engine-physics",
  "engine-platform",
  "engine-project",
  "engine-render",
@@ -2491,6 +2499,7 @@ dependencies = [
  "engine-script",
  "engine-ui",
  "engine-window",
+ "flume",
  "glam",
  "libc",
  "notify",

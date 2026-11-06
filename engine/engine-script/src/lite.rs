@@ -7,11 +7,13 @@ use crate::types::{
     ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
 use engine_console::CommandSpec;
+use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
     AntiAliasing, CameraSettings, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue,
     Tonemapper,
 };
+use glam::Vec3;
 use mlua::chunk::ChunkMode;
 use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, RegistryKey,
@@ -372,6 +374,12 @@ pub(crate) fn create_lua(
     )?;
     rve.set("console", console)?;
     rve.set("find", find_function(&lua, active_call.clone())?)?;
+    let physics = lua.create_table()?;
+    physics.set(
+        "raycast",
+        physics_raycast_function(&lua, active_call.clone())?,
+    )?;
+    rve.set("physics", physics)?;
     rve.set(
         "active_camera",
         active_camera_function(&lua, active_call.clone())?,
@@ -407,7 +415,16 @@ pub(crate) fn compile_class(
         Value::Table(class) => class,
         _ => return Err("script chunk must return a class table".to_owned()),
     };
-    for callback in ["on_start", "on_update", "on_message", "on_destroy"] {
+    for callback in [
+        "on_start",
+        "on_update",
+        "on_message",
+        "on_destroy",
+        "on_collision_enter",
+        "on_collision_exit",
+        "on_trigger_enter",
+        "on_trigger_exit",
+    ] {
         match class
             .get::<Value>(callback)
             .map_err(|error| error.to_string())?
@@ -580,6 +597,14 @@ pub(crate) struct LuaInstance {
     transform: mlua::AnyUserData,
 }
 
+pub(crate) struct LitePhysicsEvent {
+    pub(crate) callback: &'static str,
+    pub(crate) other: ObjectHandle,
+    pub(crate) point: Vec3,
+    pub(crate) normal: Vec3,
+    pub(crate) has_contact: bool,
+}
+
 impl LuaInstance {
     pub(crate) fn new(
         lua: &Lua,
@@ -653,6 +678,34 @@ impl LuaInstance {
                 param_value(lua, value)?,
             ),
         )
+    }
+
+    pub(crate) fn invoke_physics_event(
+        &self,
+        lua: &Lua,
+        active_call: &ActiveCall,
+        event: LitePhysicsEvent,
+    ) -> mlua::Result<()> {
+        let other_data = with_active_call(active_call, |transaction| {
+            Ok(transaction
+                .object_id(event.other)
+                .zip(transaction.object_name(event.other))
+                .map(|(id, name)| (id.to_owned(), name.to_owned())))
+        })?;
+        let Some((id, name)) = other_data else {
+            return Err(LuaError::runtime(
+                "physics event references an unknown object",
+            ));
+        };
+        let other = object_table(lua, event.other, id, name, active_call.clone())?;
+        if event.has_contact {
+            let contact = lua.create_table()?;
+            contact.set("point", vector_table(lua, event.point.to_array())?)?;
+            contact.set("normal", vector_table(lua, event.normal.to_array())?)?;
+            self.invoke(event.callback, (self.instance.clone(), other, contact))
+        } else {
+            self.invoke(event.callback, (self.instance.clone(), other))
+        }
     }
 
     fn invoke<A>(&self, name: &str, args: A) -> mlua::Result<()>
@@ -877,6 +930,7 @@ fn object_table(
     let object = lua.create_table()?;
     object.set("id", id)?;
     object.set("name", name)?;
+    object.raw_set("_rve_handle", handle.index() as i64 + 1)?;
 
     let get_active = active_call.clone();
     object.set(
@@ -1011,7 +1065,7 @@ fn object_table(
         })?,
     )?;
 
-    let matrix_active = active_call;
+    let matrix_active = active_call.clone();
     object.set(
         "world_matrix",
         lua.create_function(move |lua, _arguments: MultiValue| {
@@ -1021,7 +1075,213 @@ fn object_table(
             matrix.map(|matrix| matrix_table(lua, matrix)).transpose()
         })?,
     )?;
+    add_physics_object_api(lua, &object, handle, active_call)?;
     Ok(object)
+}
+
+fn add_physics_object_api(
+    lua: &Lua,
+    object: &Table,
+    handle: ObjectHandle,
+    active_call: ActiveCall,
+) -> mlua::Result<()> {
+    let get_active = active_call.clone();
+    object.set(
+        "get_velocity",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            let velocity = with_active_call(&get_active, |transaction| {
+                transaction.body_velocity(handle).map_err(LuaError::runtime)
+            })?;
+            vector_table(lua, velocity.to_array())
+        })?,
+    )?;
+
+    for (name, setter) in [
+        ("set_velocity", true),
+        ("add_impulse", false),
+        ("add_force", false),
+    ] {
+        let set_active = active_call.clone();
+        object.set(
+            name,
+            lua.create_function(move |_, arguments: MultiValue| {
+                let vector = method_argument(arguments, name)?;
+                let Value::Table(vector) = vector else {
+                    return Err(LuaError::runtime(format!(
+                        "object.{name} expects a vector table"
+                    )));
+                };
+                let vector = Vec3::from_array(read_vector(&vector, name)?);
+                with_active_call(&set_active, |transaction| {
+                    let result = if setter {
+                        transaction.set_body_velocity(handle, vector)
+                    } else if name == "add_impulse" {
+                        transaction.add_body_impulse(handle, vector)
+                    } else {
+                        transaction.add_body_force(handle, vector)
+                    };
+                    result.map_err(LuaError::runtime)
+                })
+            })?,
+        )?;
+    }
+
+    let move_active = active_call.clone();
+    object.set(
+        "move",
+        lua.create_function(move |lua, arguments: MultiValue| {
+            let displacement = method_argument(arguments, "object.move")?;
+            let Value::Table(displacement) = displacement else {
+                return Err(LuaError::runtime(
+                    "object.move expects a displacement vector",
+                ));
+            };
+            let displacement = Vec3::from_array(read_vector(&displacement, "displacement")?);
+            let result = with_active_call(&move_active, |transaction| {
+                transaction
+                    .move_character(handle, displacement)
+                    .map_err(LuaError::runtime)
+            })?;
+            let result_table = lua.create_table()?;
+            result_table.set("grounded", result.grounded)?;
+            result_table.set("collided", !result.hits.is_empty())?;
+            Ok(result_table)
+        })?,
+    )?;
+
+    let grounded_active = active_call.clone();
+    object.set(
+        "is_grounded",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&grounded_active, |transaction| {
+                transaction.is_grounded(handle).map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let enabled_active = active_call.clone();
+    object.set(
+        "set_collider_enabled",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let enabled = method_argument(arguments, "object.set_collider_enabled")?;
+            let Value::Boolean(enabled) = enabled else {
+                return Err(LuaError::runtime(
+                    "object.set_collider_enabled expects a boolean",
+                ));
+            };
+            with_active_call(&enabled_active, |transaction| {
+                transaction
+                    .set_collider_enabled(handle, enabled)
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let is_enabled_active = active_call;
+    object.set(
+        "is_collider_enabled",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&is_enabled_active, |transaction| {
+                transaction
+                    .collider_enabled(handle)
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    Ok(())
+}
+
+fn method_argument(mut arguments: MultiValue, name: &str) -> mlua::Result<Value> {
+    let Some(first) = arguments.pop_front() else {
+        return Err(LuaError::runtime(format!("{name} is missing its argument")));
+    };
+    let value = if matches!(first, Value::Table(_)) {
+        arguments.pop_front().unwrap_or(first)
+    } else {
+        first
+    };
+    if arguments.pop_front().is_some() {
+        return Err(LuaError::runtime(format!("{name} expects one argument")));
+    }
+    Ok(value)
+}
+
+fn physics_raycast_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(
+        move |lua,
+              (origin, direction, max_distance, options): (
+                  Table,
+                  Table,
+                  f64,
+                  Option<Table>,
+              )| {
+            let origin = Vec3::from_array(read_vector(&origin, "origin")?);
+            let direction = Vec3::from_array(read_vector(&direction, "direction")?);
+            let max_distance = max_distance as f32;
+            if !max_distance.is_finite() || max_distance < 0.0 {
+                return Err(LuaError::runtime("raycast max_distance must be finite and nonnegative"));
+            }
+            let (include_triggers, ignore) = if let Some(options) = options {
+                let include_triggers = match options.get::<Value>("include_triggers")? {
+                    Value::Nil => false,
+                    Value::Boolean(value) => value,
+                    _ => return Err(LuaError::runtime("opts.include_triggers must be a boolean")),
+                };
+                let ignore = match options.get::<Value>("ignore")? {
+                    Value::Nil => None,
+                    Value::Table(object) => {
+                        let id = object.get::<String>("id").map_err(|_| {
+                            LuaError::runtime("opts.ignore must be an object returned by rve.find")
+                        })?;
+                        Some(id)
+                    }
+                    _ => return Err(LuaError::runtime("opts.ignore must be an object")),
+                };
+                (include_triggers, ignore)
+            } else {
+                (false, None)
+            };
+            let ray = Ray::new(origin, direction, max_distance)
+                .map_err(|error| LuaError::runtime(error.to_string()))?;
+            let hit = with_active_call(&active_call, |transaction| {
+                let ignore = ignore
+                    .as_deref()
+                    .map(|id| {
+                        transaction
+                            .handle_by_id(id)
+                            .ok_or_else(|| LuaError::runtime("opts.ignore object no longer exists"))
+                    })
+                    .transpose()?;
+                transaction
+                    .physics_raycast(ray, include_triggers, ignore)
+                    .map_err(LuaError::runtime)
+            })?;
+            let Some(hit) = hit else {
+                return Ok(Option::<Table>::None);
+            };
+            let result = lua.create_table()?;
+            let object = with_active_call(&active_call, |transaction| {
+                let Some(handle) = transaction.physics_object(hit.body) else {
+                    return Ok(None);
+                };
+                let Some(id) = transaction.object_id(handle).map(str::to_owned) else {
+                    return Ok(None);
+                };
+                let Some(name) = transaction.object_name(handle).map(str::to_owned) else {
+                    return Ok(None);
+                };
+                object_table(lua, handle, id, name, active_call.clone()).map(Some)
+            })?;
+            let Some(object) = object else {
+                return Ok(Option::<Table>::None);
+            };
+            result.set("object", object)?;
+            result.set("point", vector_table(lua, hit.point.to_array())?)?;
+            result.set("normal", vector_table(lua, hit.normal.to_array())?)?;
+            result.set("distance", hit.distance as f64)?;
+            Ok(Some(result))
+        },
+    )
 }
 
 fn camera_settings_table(lua: &Lua, settings: CameraSettings) -> mlua::Result<Table> {

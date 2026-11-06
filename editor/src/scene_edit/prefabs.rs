@@ -509,6 +509,15 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.environment.is_some() {
         base.environment = outer.environment.clone();
     }
+    if outer.collider.is_some() {
+        base.collider = outer.collider;
+    }
+    if outer.rigid_body.is_some() {
+        base.rigid_body = outer.rigid_body;
+    }
+    if outer.character_controller.is_some() {
+        base.character_controller = outer.character_controller;
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -540,6 +549,9 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.point_light.is_none()
         && change.spot_light.is_none()
         && change.environment.is_none()
+        && change.collider.is_none()
+        && change.rigid_body.is_none()
+        && change.character_controller.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -623,6 +635,21 @@ pub(crate) fn object_override(
     match (&base.environment, &edited.environment) {
         (None, None) => {}
         (Some(from), Some(to)) => change.environment = (to != from).then(|| to.clone()),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.collider, edited.collider) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.collider = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.rigid_body, edited.rigid_body) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.rigid_body = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.character_controller, edited.character_controller) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.character_controller = (to != from).then_some(to),
         _ => return Err(COMPONENTS.to_owned()),
     }
     if base.lite_scripts.len() != edited.lite_scripts.len()
@@ -766,6 +793,9 @@ pub enum OverrideField {
     PointLight,
     SpotLight,
     Environment,
+    Collider,
+    RigidBody,
+    CharacterController,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -793,6 +823,9 @@ impl EditorScene {
             OverrideField::PointLight => change.point_light.is_some(),
             OverrideField::SpotLight => change.spot_light.is_some(),
             OverrideField::Environment => change.environment.is_some(),
+            OverrideField::Collider => change.collider.is_some(),
+            OverrideField::RigidBody => change.rigid_body.is_some(),
+            OverrideField::CharacterController => change.character_controller.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -832,6 +865,9 @@ impl EditorScene {
                     OverrideField::PointLight => change.point_light = None,
                     OverrideField::SpotLight => change.spot_light = None,
                     OverrideField::Environment => change.environment = None,
+                    OverrideField::Collider => change.collider = None,
+                    OverrideField::RigidBody => change.rigid_body = None,
+                    OverrideField::CharacterController => change.character_controller = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }
@@ -963,12 +999,12 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Component, EditorScene, NewObject, PrefabLoader};
-    use super::{OverrideField, material_diff, material_paths, merge_material};
+    use super::super::{Component, ComponentKind, EditorScene, NewObject, PrefabLoader};
+    use super::{OverrideField, material_diff, material_paths, merge_material, merge_override};
     use engine_files::VirtualPath;
     use engine_scene::{
-        MaterialAlphaMode, MaterialOverride, ParamValue, SceneDocument, SceneError, SceneTransform,
-        World,
+        ColliderComponent, MaterialAlphaMode, MaterialOverride, ParamValue, PrefabOverride,
+        RigidBodyComponent, RigidBodyKind, SceneDocument, SceneError, SceneTransform, World,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -1394,6 +1430,109 @@ mod tests {
                 .outer_angle_deg,
             20.0
         );
+    }
+
+    #[test]
+    fn physics_prefab_overrides_replace_whole_components_and_keep_each_other() {
+        let prefab = "[[objects]]\nid = \"crate\"\n[objects.collider]\nhalf_extents = [0.5, 0.5, 0.5]\n[objects.rigid_body]\nkind = \"dynamic\"\nmass = 2.0\n";
+        let files = Files::with(&[("prefabs/crate.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/crate.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("crate", None, |object| {
+                object.collider.as_mut().unwrap().friction = 0.9;
+                object.rigid_body.as_mut().unwrap().mass = 5.0;
+                Ok(())
+            })
+            .unwrap();
+        let change = scene.object_override("crate").unwrap();
+        assert_eq!(change.collider, scene.object("crate").unwrap().collider);
+        assert_eq!(change.rigid_body, scene.object("crate").unwrap().rigid_body);
+        assert!(scene.is_overridden("crate", &OverrideField::Collider));
+        assert!(scene.is_overridden("crate", &OverrideField::RigidBody));
+        let (_, applied) = scene.prefab_with_override("crate").unwrap();
+        assert_eq!(applied.objects[0].collider, change.collider);
+        assert_eq!(applied.objects[0].rigid_body, change.rigid_body);
+
+        // Откат одного компонента не должен стереть override второго.
+        scene
+            .revert_field("crate", &OverrideField::RigidBody)
+            .unwrap();
+        assert!(!scene.is_overridden("crate", &OverrideField::RigidBody));
+        assert!(scene.is_overridden("crate", &OverrideField::Collider));
+        assert_eq!(scene.object("crate").unwrap().rigid_body.unwrap().mass, 2.0);
+        scene
+            .revert_field("crate", &OverrideField::Collider)
+            .unwrap();
+        assert_eq!(
+            scene.object("crate").unwrap().collider.unwrap().friction,
+            0.5
+        );
+        assert!(scene.object_override("crate").is_none());
+    }
+
+    #[test]
+    fn adding_or_removing_physics_components_of_instance_objects_is_rejected() {
+        let prefab = "[[objects]]\nid = \"crate\"\n[objects.collider]\n";
+        let files = Files::with(&[("prefabs/crate.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/crate.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        assert!(
+            scene
+                .remove_physics_component("crate", ComponentKind::Collider)
+                .is_err()
+        );
+        assert!(
+            scene
+                .set_component("crate", Component::RigidBody(RigidBodyComponent::default()))
+                .is_err()
+        );
+        assert!(scene.object("crate").unwrap().rigid_body.is_none());
+    }
+
+    #[test]
+    fn nested_merge_keeps_physics_overrides_from_both_levels() {
+        let mut base = PrefabOverride {
+            target: "crate".to_owned(),
+            collider: Some(ColliderComponent {
+                friction: 0.2,
+                ..ColliderComponent::default()
+            }),
+            ..PrefabOverride::default()
+        };
+        let outer = PrefabOverride {
+            target: "crate".to_owned(),
+            rigid_body: Some(RigidBodyComponent {
+                kind: RigidBodyKind::Kinematic,
+                ..RigidBodyComponent::default()
+            }),
+            ..PrefabOverride::default()
+        };
+        merge_override(&mut base, &outer);
+        assert_eq!(base.collider.unwrap().friction, 0.2);
+        assert_eq!(base.rigid_body.unwrap().kind, RigidBodyKind::Kinematic);
+
+        let replacement = PrefabOverride {
+            target: "crate".to_owned(),
+            collider: Some(ColliderComponent {
+                friction: 0.8,
+                ..ColliderComponent::default()
+            }),
+            ..PrefabOverride::default()
+        };
+        merge_override(&mut base, &replacement);
+        assert_eq!(base.collider.unwrap().friction, 0.8);
     }
 
     #[test]

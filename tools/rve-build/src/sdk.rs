@@ -588,8 +588,8 @@ mod tests {
     }
 
     #[test]
-    fn sdk_marker_rejects_pre_v5_abi_versions() {
-        for abi_version in [3, 4] {
+    fn sdk_marker_rejects_pre_v6_abi_versions() {
+        for abi_version in [3, 4, 5] {
             let root = temp_dir("rve-sdk-legacy-abi");
             fs::write(
                 root.path().join("rve-sdk.toml"),
@@ -606,7 +606,7 @@ mod tests {
                     .to_string()
                     .contains(&format!("ABI version {abi_version}"))
             );
-            assert!(error.to_string().contains("ожидаемой версией 5"));
+            assert!(error.to_string().contains("ожидаемой версией 6"));
         }
     }
 

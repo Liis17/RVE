@@ -1,8 +1,16 @@
 use crate::actions::{ActionFrame, ActionMutation, ActionValue};
 use crate::lite::EventQueue;
+use crate::physics::PhysicsScriptState;
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
+use engine_physics::{
+    BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
+    QueryHit, Ray,
+};
 use engine_scene::{CameraSettings, LocalTransform, ObjectHandle, ParamValue, World};
+use glam::{EulerRot, Quat, Vec3};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
@@ -74,6 +82,17 @@ pub(crate) struct PendingMessage {
     estimated_size: usize,
 }
 
+pub(crate) struct ScriptTransactionInit<'a> {
+    pub(crate) world: &'a World,
+    pub(crate) self_object: ObjectHandle,
+    pub(crate) source: &'a str,
+    pub(crate) writable: bool,
+    pub(crate) actions: Arc<ActionFrame>,
+    pub(crate) queued_messages: (usize, usize),
+    pub(crate) physics: Rc<RefCell<PhysicsScriptState>>,
+    pub(crate) physics_phase_dt: Option<f32>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueueMessageError {
     ReadOnly,
@@ -96,14 +115,28 @@ pub(crate) struct ScriptTransaction {
     pending_camera_settings: HashMap<ObjectHandle, CameraSettings>,
     pending_active_camera: Option<ObjectHandle>,
     pending_messages: Vec<PendingMessage>,
+    pending_warnings: Vec<String>,
     pending_bytes: usize,
     queued_message_count: usize,
     queued_message_bytes: usize,
     overflowed_messages: usize,
     action_frame: Option<Arc<ActionFrame>>,
+    physics: Rc<RefCell<PhysicsScriptState>>,
+    physics_phase_dt: Option<f32>,
+    pending_physics_commands: Vec<PhysicsCommand>,
+    pending_grounded: HashMap<ObjectHandle, bool>,
+    pending_collider_enabled: HashMap<BodyHandle, bool>,
+    pending_pushes: HashMap<BodyHandle, PendingPush>,
     pending_action_mutations: Vec<ActionMutation>,
     #[cfg(test)]
     peak_pending_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingPush {
+    controller: engine_physics::CharacterController,
+    hit: CharacterHit,
+    normal_sum: Vec3,
 }
 
 impl Default for ScriptTransaction {
@@ -117,11 +150,18 @@ impl Default for ScriptTransaction {
             pending_camera_settings: HashMap::with_capacity(2),
             pending_active_camera: None,
             pending_messages: Vec::with_capacity(16),
+            pending_warnings: Vec::new(),
             pending_bytes: 0,
             queued_message_count: 0,
             queued_message_bytes: 0,
             overflowed_messages: 0,
             action_frame: None,
+            physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
+            physics_phase_dt: None,
+            pending_physics_commands: Vec::new(),
+            pending_grounded: HashMap::new(),
+            pending_collider_enabled: HashMap::new(),
+            pending_pushes: HashMap::new(),
             pending_action_mutations: Vec::with_capacity(2),
             #[cfg(test)]
             peak_pending_bytes: 0,
@@ -137,54 +177,37 @@ impl ScriptTransaction {
             .unwrap_or_else(|| EMPTY_FRAME.get_or_init(ActionFrame::default))
     }
 
-    #[cfg(test)]
-    pub(crate) fn begin(
-        &mut self,
-        world: &World,
-        self_object: ObjectHandle,
-        source: &str,
-        writable: bool,
-        input: ScriptInput,
-        queued_messages: (usize, usize),
-    ) {
-        self.begin_with_actions(
-            world,
-            self_object,
-            source,
-            writable,
-            Arc::new(ActionFrame::empty(input)),
-            queued_messages,
-        );
-    }
-
-    pub(crate) fn begin_with_actions(
-        &mut self,
-        world: &World,
-        self_object: ObjectHandle,
-        source: &str,
-        writable: bool,
-        action_frame: Arc<ActionFrame>,
-        queued_messages: (usize, usize),
-    ) {
-        self.world = world;
-        self.self_object = Some(self_object);
-        self.writable = writable;
-        self.action_frame = Some(action_frame);
+    pub(crate) fn begin(&mut self, init: ScriptTransactionInit<'_>) {
+        self.world = init.world;
+        self.self_object = Some(init.self_object);
+        self.writable = init.writable;
+        self.action_frame = Some(init.actions);
+        self.physics = init.physics;
+        self.physics_phase_dt = init.physics_phase_dt;
         self.source.clear();
-        self.source.push_str(source);
+        self.source.push_str(init.source);
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
+        self.pending_warnings.clear();
+        self.pending_physics_commands.clear();
+        self.pending_grounded.clear();
+        self.pending_collider_enabled.clear();
+        self.pending_pushes.clear();
         self.pending_bytes = 0;
-        self.queued_message_count = queued_messages.0;
-        self.queued_message_bytes = queued_messages.1;
+        self.queued_message_count = init.queued_messages.0;
+        self.queued_message_bytes = init.queued_messages.1;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
     }
 
     pub(crate) fn writable(&self) -> bool {
         self.writable
+    }
+
+    pub(crate) fn physics_attached(&self) -> bool {
+        self.physics.borrow().is_attached()
     }
 
     pub(crate) fn input(&self) -> &ScriptInput {
@@ -215,6 +238,257 @@ impl ScriptTransaction {
         self.action_frame().validate_mutation(&mutation)?;
         self.pending_action_mutations.push(mutation);
         Ok(())
+    }
+
+    pub(crate) fn physics_raycast(
+        &self,
+        ray: Ray,
+        include_triggers: bool,
+        ignore: Option<ObjectHandle>,
+    ) -> Result<Option<QueryHit>, String> {
+        let physics = self.physics.borrow();
+        let snapshot = physics.snapshot()?;
+        let self_controller = self
+            .self_object
+            .and_then(|object| physics.optional_binding(object))
+            .filter(|binding| binding.character_controller.is_some())
+            .map(|binding| binding.body);
+        let (ignore, excluded) = match ignore {
+            Some(object) => {
+                let ignore = physics.binding(object)?.body;
+                let excluded = self_controller
+                    .filter(|body| *body != ignore)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                (Some(ignore), excluded)
+            }
+            None => (self_controller, Vec::new()),
+        };
+        let mut overrides = physics.enabled_overrides();
+        overrides.extend(
+            self.pending_collider_enabled
+                .iter()
+                .map(|(body, enabled)| (*body, *enabled)),
+        );
+        overrides = merge_enabled_overrides(overrides);
+        snapshot
+            .raycast_with_enabled_overrides(
+                &ray,
+                QueryFilter {
+                    ignore,
+                    include_triggers,
+                },
+                &excluded,
+                &overrides,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn physics_object(&self, body: BodyHandle) -> Option<ObjectHandle> {
+        self.physics.borrow().object(body)
+    }
+
+    pub(crate) fn body_velocity(&self, object: ObjectHandle) -> Result<Vec3, String> {
+        let physics = self.physics.borrow();
+        let binding = physics.binding(object)?;
+        if binding.kind != BodyKind::Dynamic {
+            return Err("object does not have a dynamic rigid body".to_owned());
+        }
+        physics
+            .snapshot()?
+            .body_state(binding.body)
+            .map(|state| state.body_velocity)
+            .ok_or_else(|| "physics body is missing from the query snapshot".to_owned())
+    }
+
+    pub(crate) fn set_body_velocity(
+        &mut self,
+        object: ObjectHandle,
+        velocity: Vec3,
+    ) -> Result<(), String> {
+        self.push_body_command(object, velocity, |body| PhysicsCommand::SetVelocity {
+            body,
+            velocity,
+        })
+    }
+
+    pub(crate) fn add_body_impulse(
+        &mut self,
+        object: ObjectHandle,
+        impulse: Vec3,
+    ) -> Result<(), String> {
+        self.push_body_command(object, impulse, |body| PhysicsCommand::AddImpulse {
+            body,
+            impulse,
+            point: None,
+        })
+    }
+
+    pub(crate) fn add_body_force(
+        &mut self,
+        object: ObjectHandle,
+        force: Vec3,
+    ) -> Result<(), String> {
+        self.push_body_command(object, force, |body| PhysicsCommand::AddForce {
+            body,
+            force,
+            point: None,
+        })
+    }
+
+    fn push_body_command(
+        &mut self,
+        object: ObjectHandle,
+        vector: Vec3,
+        command: impl FnOnce(BodyHandle) -> PhysicsCommand,
+    ) -> Result<(), String> {
+        if !self.writable {
+            return Err(
+                "physics commands are only available during writable script callbacks".to_owned(),
+            );
+        }
+        if !vector.is_finite() {
+            return Err("physics vector must be finite".to_owned());
+        }
+        let binding = self.physics.borrow().binding(object)?;
+        if binding.kind != BodyKind::Dynamic {
+            return Err("object does not have a dynamic rigid body".to_owned());
+        }
+        self.pending_physics_commands.push(command(binding.body));
+        Ok(())
+    }
+
+    pub(crate) fn move_character(
+        &mut self,
+        object: ObjectHandle,
+        displacement: Vec3,
+    ) -> Result<CharacterMoveResult, String> {
+        if !self.writable {
+            return Err(
+                "character movement is only available during writable script callbacks".to_owned(),
+            );
+        }
+        if !displacement.is_finite() {
+            return Err("character displacement must be finite".to_owned());
+        }
+        let binding = self.physics.borrow().binding(object)?;
+        let controller = binding
+            .character_controller
+            .ok_or_else(|| "object does not have a character controller".to_owned())?;
+        let mut transform = self
+            .local_transform(object)
+            .ok_or_else(|| "character object no longer exists".to_owned())?;
+        let rotation = Vec3::from_array(transform.rotation) * (std::f32::consts::PI / 180.0);
+        let rotation = Quat::from_euler(EulerRot::YXZ, rotation.y, rotation.x, rotation.z);
+        let pose = Pose::new(Vec3::from_array(transform.position), rotation)
+            .map_err(|error| error.to_string())?;
+        let (snapshot, mut overrides) = {
+            let physics = self.physics.borrow();
+            let snapshot = physics.shared_snapshot()?;
+            let mut overrides = physics.enabled_overrides();
+            overrides.extend(
+                self.pending_collider_enabled
+                    .iter()
+                    .map(|(body, enabled)| (*body, *enabled)),
+            );
+            (snapshot, overrides)
+        };
+        overrides = merge_enabled_overrides(overrides);
+        let result = controller
+            .move_capsule_with_enabled_overrides(
+                &snapshot,
+                binding.body,
+                pose,
+                displacement,
+                &[],
+                &overrides,
+            )
+            .map_err(|error| error.to_string())?;
+        transform.position = (Vec3::from_array(transform.position) + result.translation).to_array();
+        if !self.set_local_transform(object, transform) {
+            return Err("could not stage character transform".to_owned());
+        }
+        self.pending_grounded.insert(object, result.grounded);
+        if result.degraded && self.physics.borrow_mut().first_degraded_move(object) {
+            self.pending_warnings.push(
+                "character movement hit a physics query limit and stopped at its current position"
+                    .to_owned(),
+            );
+        }
+        // A slide can report one body on multiple iterations; count this request once per body.
+        for (index, hit) in result.hits.iter().enumerate() {
+            if hit.body_kind != BodyKind::Dynamic {
+                continue;
+            }
+            let first_hit_for_body = !result.hits[..index]
+                .iter()
+                .any(|previous| previous.body == hit.body);
+            self.accumulate_push(controller, *hit, first_hit_for_body);
+        }
+        Ok(result)
+    }
+
+    fn accumulate_push(
+        &mut self,
+        controller: engine_physics::CharacterController,
+        mut hit: CharacterHit,
+        include_requested_displacement: bool,
+    ) {
+        if !include_requested_displacement {
+            hit.requested_displacement = Vec3::ZERO;
+        }
+        self.pending_pushes
+            .entry(hit.body)
+            .and_modify(|pending| {
+                pending.hit.blocked_displacement += hit.blocked_displacement;
+                pending.hit.requested_displacement += hit.requested_displacement;
+                pending.normal_sum += hit.normal * hit.blocked_displacement.length();
+            })
+            .or_insert(PendingPush {
+                controller,
+                normal_sum: hit.normal * hit.blocked_displacement.length(),
+                hit,
+            });
+    }
+
+    pub(crate) fn is_grounded(&self, object: ObjectHandle) -> Result<bool, String> {
+        let binding = self.physics.borrow().binding(object)?;
+        if binding.character_controller.is_none() {
+            return Err("object does not have a character controller".to_owned());
+        }
+        Ok(self
+            .pending_grounded
+            .get(&object)
+            .copied()
+            .unwrap_or_else(|| self.physics.borrow().grounded(object)))
+    }
+
+    pub(crate) fn set_collider_enabled(
+        &mut self,
+        object: ObjectHandle,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if !self.writable {
+            return Err(
+                "collider changes are only available during writable script callbacks".to_owned(),
+            );
+        }
+        let binding = self.physics.borrow().binding(object)?;
+        self.pending_collider_enabled.insert(binding.body, enabled);
+        self.pending_physics_commands
+            .push(PhysicsCommand::SetColliderEnabled {
+                body: binding.body,
+                enabled,
+            });
+        Ok(())
+    }
+
+    pub(crate) fn collider_enabled(&self, object: ObjectHandle) -> Result<bool, String> {
+        let binding = self.physics.borrow().binding(object)?;
+        if let Some(enabled) = self.pending_collider_enabled.get(&binding.body) {
+            return Ok(*enabled);
+        }
+        self.physics.borrow().collider_enabled(binding.body)
     }
 
     fn world(&self) -> Option<&World> {
@@ -459,6 +733,14 @@ impl ScriptTransaction {
             self.discard();
             return Err("script produced a non-finite transform".to_owned());
         }
+        if self
+            .pending_physics_commands
+            .iter()
+            .any(|command| !physics_command_is_finite(*command))
+        {
+            self.discard();
+            return Err("script produced a non-finite physics command".to_owned());
+        }
         if !handles_exist {
             self.discard();
             return Err("script wrote a transform for an unknown object".to_owned());
@@ -480,6 +762,31 @@ impl ScriptTransaction {
             return Err("script selected an object without a camera as active".to_owned());
         }
 
+        let mut physics_commands = std::mem::take(&mut self.pending_physics_commands);
+        if let Some(dt) = self
+            .physics_phase_dt
+            .filter(|dt| *dt >= 1.0e-6 && dt.is_finite())
+        {
+            for pending in self.pending_pushes.values() {
+                let mut hit = pending.hit;
+                hit.normal = pending.normal_sum.normalize_or_zero();
+                if let Some(impulse) = pending.controller.push_impulse(&hit, dt) {
+                    physics_commands.push(PhysicsCommand::AddImpulse {
+                        body: hit.body,
+                        impulse,
+                        point: None,
+                    });
+                }
+            }
+        }
+        if physics_commands
+            .iter()
+            .any(|command| !physics_command_is_finite(*command))
+        {
+            self.discard();
+            return Err("script produced a non-finite physics command".to_owned());
+        }
+
         for (handle, transform) in self.pending_transforms.drain() {
             // Handles and all transforms were validated before applying any write.
             world
@@ -496,6 +803,12 @@ impl ScriptTransaction {
                 .set_active_camera(handle)
                 .expect("validated active camera target remains present during commit");
         }
+
+        self.physics.borrow_mut().commit(
+            physics_commands,
+            std::mem::take(&mut self.pending_grounded),
+            std::mem::take(&mut self.pending_collider_enabled),
+        );
 
         if !self.pending_messages.is_empty() || self.overflowed_messages != 0 {
             let mut dropped = self.overflowed_messages;
@@ -520,6 +833,13 @@ impl ScriptTransaction {
                 });
             }
         }
+        for message in self.pending_warnings.drain(..) {
+            events.borrow_mut().push(ScriptEvent {
+                level: ScriptEventLevel::Warn,
+                source: self.source.clone(),
+                message,
+            });
+        }
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
         self.world = std::ptr::null();
@@ -532,6 +852,11 @@ impl ScriptTransaction {
         self.pending_camera_settings.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
+        self.pending_warnings.clear();
+        self.pending_physics_commands.clear();
+        self.pending_grounded.clear();
+        self.pending_collider_enabled.clear();
+        self.pending_pushes.clear();
         self.pending_bytes = 0;
         self.queued_message_count = 0;
         self.queued_message_bytes = 0;
@@ -544,6 +869,32 @@ impl ScriptTransaction {
     #[cfg(test)]
     pub(crate) fn peak_pending_bytes(&self) -> usize {
         self.peak_pending_bytes
+    }
+}
+
+fn merge_enabled_overrides(
+    overrides: impl IntoIterator<Item = (BodyHandle, bool)>,
+) -> Vec<(BodyHandle, bool)> {
+    let mut merged = std::collections::BTreeMap::new();
+    for (body, enabled) in overrides {
+        merged.insert(body, enabled);
+    }
+    merged.into_iter().collect()
+}
+
+fn physics_command_is_finite(command: PhysicsCommand) -> bool {
+    match command {
+        PhysicsCommand::SetVelocity { velocity, .. } => velocity.is_finite(),
+        PhysicsCommand::AddImpulse { impulse, point, .. } => {
+            impulse.is_finite() && point.is_none_or(Vec3::is_finite)
+        }
+        PhysicsCommand::AddForce { force, point, .. } => {
+            force.is_finite() && point.is_none_or(Vec3::is_finite)
+        }
+        PhysicsCommand::Teleport { pose, .. } | PhysicsCommand::KinematicTarget { pose, .. } => {
+            pose.position.is_finite() && pose.rotation.is_finite()
+        }
+        PhysicsCommand::SetColliderEnabled { .. } => true,
     }
 }
 

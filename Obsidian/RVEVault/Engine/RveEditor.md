@@ -27,7 +27,7 @@ Parent: [[Index]]
 | `editor/src/new_project.rs` | `create_project` | Встроенный starter template и атомарное создание нового проекта |
 | `editor/src/previews.rs` | `PreviewCache` | Фоновое декодирование PNG/Radiance HDR, tone mapping HDR thumbnails и LRU-кэш UI-текстур |
 | `editor/src/build.rs` | `BuildJob`, `ScriptsJob`, `ScriptGeneration`, `locate_build_tool` | File → Build Player и автоматическая сборка heavy scripts через дочерний `rve-build`; вывод идёт в Console |
-| `editor/src/play.rs` | `PlaySession`, `Watchdog` | Копия мира и скрипты на главном потоке, прерывание зависшего Lua |
+| `editor/src/play.rs` | `PlaySession`, `PlayPhysics`, `Watchdog` | Копия мира, скрипты и per-Play physics thread, прерывание зависшего Lua |
 | `editor/src/viewport/` | `SceneRenderer`, `ModelLoader`, `EditorCamera`, `GizmoDrag`, `ray_model` | GPU-кэши моделей, материалов и IBL environments, фоновый разбор FBX, камера редактора, математика гизмо и привязки, picking |
 | `editor/src/ui/` | `show`, `scene_view`, `game_view`, `debug_view`, `hierarchy`, `inspector`, `project_panel`, `console`, `toolbar` | Панели; `ui/tests.rs` проверяет интерфейс через `RawInput` без окна и GPU |
 
@@ -122,7 +122,7 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 в Play`. Выполнение использует Play watchdog; Lua может быть прервана, Rust callback —
 нет. Полный контракт shared UI и logger см. в [[Engine/EngineConsole]].
 
-`PlaySession` создаёт `World` с проверенными `.camerasettings` и `ScriptHost` из документа и работает на главном потоке. Документ не меняется: Stop вызывает `on_destroy` и удаляет сессию, поэтому правки скриптов отбрасываются. Во время Play панели отключены, `EditorState::edit_scene` не выполняет правки, а панель Scene использует активную камеру сцены вместо камеры редактора. Ввод скриптов принимается над изображением Scene и Game. Выпадающий список Game меняет только preview панели; активную игровую камеру задаёт camera component сцены (`active = true`, либо единственная камера).
+`PlaySession` создаёт `World` с проверенными `.camerasettings` и `ScriptHost` из документа и выполняет callbacks на главном потоке. Для Play из проекта редактор строит `PhysicsSceneDesc` по настройкам проекта и CPU-геометрии базовых моделей, затем запускает отдельный `PhysicsServer` thread. Sequence 0 snapshot доступен скриптам до `on_start`. Перед каждым активным update Play получает предыдущий Step, применяет dynamic poses и передаёт snapshot/events скриптам; после update изменения мира и команды отправляются со следующим Step с тем же capped `dt`. Пауза не делает update или Step; после возобновления Play сначала получает только ранее outstanding результат. Stop, ошибка шага и Drop отправляют Shutdown и join-ят physics thread; ошибки построения или шага показываются в Console. Документ не меняется: Stop вызывает `on_destroy` и удаляет сессию, поэтому правки скриптов отбрасываются. Во время Play панели отключены, `EditorState::edit_scene` не выполняет правки, а панель Scene использует активную камеру сцены вместо камеры редактора. Ввод скриптов принимается над изображением Scene и Game. Выпадающий список Game меняет только preview панели; активную игровую камеру задаёт camera component сцены (`active = true`, либо единственная камера).
 
 Если не передан `--scripts`, открытие проекта с `heavy_scripts` запускает `rve-build scripts`. Play, запрошенный во время сборки, ждёт её результата; неуспех не создаёт `PlaySession`. При завершении редактор разбирает последний stdout путь, загружает библиотеку и только после этого выполняет ожидающий Play. Для отсутствующего `heavy_scripts` сборщик успешно возвращает пустой путь. Явный `--scripts` пропускает autobuild и используется напрямую.
 
@@ -131,6 +131,13 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 `Watchdog` прерывает Lua, если загрузка, кадр или `on_destroy` выполняются дольше 5 секунд. Прерывание постоянно и отключает все lite-скрипты сессии. ABI-скрипты прервать нельзя: зависший Rust-скрипт останавливает весь редактор.
 
 Сетка редактора рисуется с `casts_shadow = false`: иначе её линии попадают в shadow map и ложатся тенями на объекты.
+
+## Физика
+
+- Инспектор редактирует `collider`, `rigid_body` и `character_controller` через общий undo. Формы коллайдера: Box, Sphere, Capsule, Convex Mesh и Triangle Mesh; hull и trimesh берут геометрию базовой модели `mesh_renderer`, ошибка hull показывается в инспекторе.
+- Add Component предлагает `Collider` и `Character Controller`, если у объекта нет конфликтующего компонента, и `Rigid Body` только при наличии коллайдера.
+- Префаб переопределяет `collider`, `rigid_body` и `character_controller` целиком, как и `point_light`.
+- Флажок `Colliders` во вьюпорте Scene рисует рёбра коллайдеров всех объектов; без него рисуются только выделенные. Геометрия строится функциями `engine-physics` в `editor/src/viewport/colliders.rs`. Trimesh с более чем `MAX_MESH_WIRE_EDGES` = 4096 рёбрами рисуется своим AABB.
 
 ## Префабы
 

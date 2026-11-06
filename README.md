@@ -153,9 +153,9 @@ local move_x, move_y = rve.input.vector("Move")
 включить автономную сборку Rust-скриптов. Для CI без сборки guest-кода можно явно
 передать `--no-rust-toolchain`.
 
-Guest API использует ABI v5; host продолжает загружать библиотеки ABI v3 и v4.
+Guest API использует ABI v6; host продолжает загружать библиотеки ABI v3, v4 и v5.
 Переносимый SDK marker требует точного совпадения ABI, поэтому комплект с marker
-v4 нужно пересобрать командой `rve-build sdk`. Builder автоматически синхронизирует
+v5 нужно пересобрать командой `rve-build sdk`. Builder автоматически синхронизирует
 SDK в `<project>/.rve/sdk` перед сборкой проектных Rust scripts.
 
 На Windows подготовь минимальную GNU toolchain через rustup и передай её sysroot:
@@ -313,6 +313,48 @@ Scene и Game имеют отдельный selector `View`; Inspector реда�
 Play не меняет документ: Stop возвращает сцену к состоянию до запуска. Lua, зависший дольше 5 секунд, прерывается, но зависший Rust-скрипт прервать нельзя, и он остановит редактор.
 
 Ограничения: раскладка панелей не сохраняется; изменения в `Assets/` автоматически отражаются в Project и обновляют затронутые ресурсы, но переименование или удаление файла не обновляет ссылки в сценах. При сохранении комментарии в файле сцены теряются.
+
+## Физика
+
+Физика работает в отдельном потоке `rve-physics` с фиксированным шагом. Сцена задаёт тела компонентами, а проект — параметрами мира:
+
+```toml
+# project.rveproject
+[physics]
+gravity = [0.0, -9.81, 0.0]
+fixed_hz = 60        # 1..=1000
+max_substeps = 8     # 1..=64
+```
+
+Компоненты объекта в `.rvescene`:
+
+- `collider` — `shape` (`box`, `sphere`, `capsule`, `convex_mesh`, `triangle_mesh`), размеры, `offset`, `trigger`, `friction`, `restitution`.
+- `rigid_body` — `kind` (`static`, `kinematic`, `dynamic`), `mass`, демпфирование, `gravity_scale`, `lock_rotation`. Требует `collider`.
+- `character_controller` — капсула `radius`/`height`, `step_height`, `max_slope_deg`, `snap_distance`, `skin`, `push_strength`. Несовместим с `collider` и `rigid_body`.
+
+Объекты `dynamic` и `character_controller` должны быть корневыми; их дети разрешены. Mesh-формы используют базовую модель `mesh_renderer`, размер берётся из мирового масштаба на момент загрузки.
+
+Lua (`rve.physics`, методы объекта, callbacks класса):
+
+```lua
+function Coin:on_trigger_enter(other)
+  rve.find(self.object.id):set_collider_enabled(false)
+end
+
+local hit = rve.physics.raycast(origin, direction, 10.0, { include_triggers = false })
+local result = rve.find(self.object.id):move({ x = dx, y = dy, z = dz }) -- {grounded, collided}
+```
+
+Методы: `get_velocity`, `set_velocity`, `add_impulse`, `add_force` (только dynamic), `move` и `is_grounded` (только `character_controller`), `set_collider_enabled` и `is_collider_enabled`. Callbacks: `on_collision_enter(self, other, contact)`, `on_collision_exit`, `on_trigger_enter`, `on_trigger_exit`. Rust-скрипты получают те же возможности через `rve-sdk` (ABI v5, `Context::physics()`).
+
+Демо `examples/demo-game` стартует со сцены `Assets/scenes/physics.rvescene`: WASD двигает игрока в осях мира, Space прыгает, монеты подбираются при касании.
+
+~~~powershell
+cd build
+cargo run -p rve-player -- --project ../examples/demo-game
+~~~
+
+Ограничения v1: нет интерполяции поз dynamic-тел, нет CCD, raycast и контроллер видят результат прошлого шага, масштаб запекается при загрузке, LOD не используется для коллизий, солвер без islands, стопки выше примерно пяти ящиков могут дрейфовать. Подробности и известные дефекты — в `Obsidian/RVEVault/Engine/EnginePhysics.md`.
 
 ## Обновление проектов и renderer API
 

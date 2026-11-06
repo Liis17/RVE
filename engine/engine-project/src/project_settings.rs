@@ -21,6 +21,8 @@ pub struct ProjectSettings {
     #[serde(default)]
     pub runtime: RuntimeSettings,
     #[serde(default)]
+    pub physics: PhysicsSettings,
+    #[serde(default)]
     pub input: InputSettings,
 }
 
@@ -70,6 +72,41 @@ impl Default for RuntimeSettings {
             dlss_project_id: None,
             dlss_application_id: None,
             dlss_engine_version: None,
+        }
+    }
+}
+
+/// Fixed-step simulation settings for a project.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PhysicsSettings {
+    pub gravity: [f32; 3],
+    pub fixed_hz: u32,
+    pub max_substeps: u32,
+}
+
+impl PartialEq for PhysicsSettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.gravity
+            .into_iter()
+            .zip(other.gravity)
+            .all(|(left, right)| {
+                left == right
+                    || (left.is_nan() && right.is_nan() && left.to_bits() == right.to_bits())
+            })
+            && self.fixed_hz == other.fixed_hz
+            && self.max_substeps == other.max_substeps
+    }
+}
+
+impl Eq for PhysicsSettings {}
+
+impl Default for PhysicsSettings {
+    fn default() -> Self {
+        Self {
+            gravity: [0.0, -9.81, 0.0],
+            fixed_hz: 60,
+            max_substeps: 8,
         }
     }
 }
@@ -159,6 +196,15 @@ impl ProjectSettings {
         }
         if self.runtime.background_tick_hz == 0 {
             return Err("runtime.background_tick_hz должен быть больше нуля".to_owned());
+        }
+        if !self.physics.gravity.into_iter().all(f32::is_finite) {
+            return Err("physics.gravity должен содержать конечные числа".to_owned());
+        }
+        if !(1..=1000).contains(&self.physics.fixed_hz) {
+            return Err("physics.fixed_hz должен быть в диапазоне 1..=1000".to_owned());
+        }
+        if !(1..=64).contains(&self.physics.max_substeps) {
+            return Err("physics.max_substeps должен быть в диапазоне 1..=64".to_owned());
         }
         if let Some(path) = &self.runtime.fsr_library
             && (!is_relative_project_path(path)
@@ -262,7 +308,7 @@ fn default_background_tick_hz() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectSettings, RuntimeSettings};
+    use super::{PhysicsSettings, ProjectSettings, RuntimeSettings};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -288,7 +334,8 @@ mod tests {
              [[scenes]]\npath = \"/levels/menu.rvescene\"\nenabled = false\n\
              [[scenes]]\npath = \"levels/main.rvescene\"\n\
              [requirements]\nmin_ram_mb = 512\nmin_cpu_threads = 4\n\
-             [runtime]\nbackground_tick_hz = 45\n",
+             [runtime]\nbackground_tick_hz = 45\n\
+             [physics]\ngravity = [0.0, -4.0, 0.0]\nfixed_hz = 120\nmax_substeps = 6\n",
         )
         .unwrap();
 
@@ -303,6 +350,14 @@ mod tests {
         assert_eq!(settings.requirements.min_ram_mb, 512);
         assert_eq!(settings.requirements.min_cpu_threads, 4);
         assert_eq!(settings.runtime.background_tick_hz, 45);
+        assert_eq!(
+            settings.physics,
+            PhysicsSettings {
+                gravity: [0.0, -4.0, 0.0],
+                fixed_hz: 120,
+                max_substeps: 6,
+            }
+        );
     }
 
     #[test]
@@ -322,7 +377,26 @@ mod tests {
         assert_eq!(settings.runtime.dlss_project_id, None);
         assert_eq!(settings.runtime.dlss_application_id, None);
         assert_eq!(settings.runtime.dlss_engine_version, None);
+        assert_eq!(settings.physics, PhysicsSettings::default());
         assert_eq!(settings.starting_scene(), Some("scenes/start.rvescene"));
+    }
+
+    #[test]
+    fn rejects_invalid_physics_settings() {
+        for (field, value) in [
+            ("gravity", "[0.0, nan, 0.0]"),
+            ("fixed_hz", "0"),
+            ("fixed_hz", "1001"),
+            ("max_substeps", "0"),
+            ("max_substeps", "65"),
+        ] {
+            let contents = format!(
+                "{}\n[physics]\n{field} = {value}\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            );
+            let error = ProjectSettings::parse(&contents).unwrap_err();
+            assert!(error.contains("physics"), "{field}={value}: {error}");
+        }
     }
 
     #[test]
@@ -451,6 +525,15 @@ mod tests {
                 background_tick_hz: 0,
                 fsr_library: None,
                 ..RuntimeSettings::default()
+            },
+            ..settings.clone()
+        };
+        assert!(invalid.to_toml().is_err());
+
+        let invalid = ProjectSettings {
+            physics: PhysicsSettings {
+                fixed_hz: 0,
+                ..PhysicsSettings::default()
             },
             ..settings
         };

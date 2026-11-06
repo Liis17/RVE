@@ -10,7 +10,8 @@ use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
     RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
     RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveHost, RveParams, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RveCameraSettings, RveCharacterMoveResult, RveHost, RveParams, RveRaycastHit, RveStr, RveTime,
+    RveTransform, RveValue, RveValueData,
 };
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -338,6 +339,20 @@ pub trait Script: 'static {
     fn on_update(&mut self, _ctx: &mut Context<'_>, _dt: f32) {}
     /// Called when a message is delivered to this script.
     fn on_message(&mut self, _ctx: &mut Context<'_>, _sender: &str, _name: &str, _value: &Value) {}
+    /// Called when this object begins touching another collider.
+    fn on_collision_enter(
+        &mut self,
+        _ctx: &mut Context<'_>,
+        _other: Object,
+        _contact: CollisionContact,
+    ) {
+    }
+    /// Called when this object stops touching another collider.
+    fn on_collision_exit(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
+    /// Called when this object begins overlapping a trigger.
+    fn on_trigger_enter(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
+    /// Called when this object stops overlapping a trigger.
+    fn on_trigger_exit(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
     /// Called when the script host is destroyed after this instance has started.
     fn on_destroy(&mut self, _ctx: &mut Context<'_>) {}
     /// Called when a registered developer-console command is submitted.
@@ -374,6 +389,55 @@ pub struct Console<'a> {
 pub struct Input<'a> {
     host: &'a RveHost,
 }
+
+/// Physics query access available during one script callback.
+pub struct Physics<'a> {
+    host: &'a RveHost,
+}
+
+/// Result of a physics raycast.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhysicsRaycastHit {
+    pub object: Object,
+    pub point: [f32; 3],
+    pub normal: [f32; 3],
+    pub distance: f32,
+}
+
+/// Result of character capsule movement.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CharacterMove {
+    pub translation: [f32; 3],
+    pub grounded: bool,
+    pub collided: bool,
+}
+
+/// Contact data for collision-enter callbacks.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CollisionContact {
+    pub point: [f32; 3],
+    /// Points from this script object's collider toward the other collider.
+    pub normal: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicsError {
+    Unavailable,
+    Rejected,
+    InvalidInput,
+}
+
+impl std::fmt::Display for PhysicsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "physics callback is unavailable in this host",
+            Self::Rejected => "physics operation was rejected by the host",
+            Self::InvalidInput => "physics input must be finite and valid",
+        })
+    }
+}
+
+impl std::error::Error for PhysicsError {}
 
 /// Copyable handle to a scene object. It remains stable while its scene is loaded and may be
 /// stored in a script struct. Every operation on it requires the current callback's `Context`.
@@ -422,6 +486,11 @@ impl<'a> Context<'a> {
     /// Returns the input snapshot available during this callback.
     pub fn input(&self) -> Input<'_> {
         Input { host: self.host }
+    }
+
+    /// Returns physics queries available during this callback.
+    pub fn physics(&self) -> Physics<'_> {
+        Physics { host: self.host }
     }
 
     /// Returns this script object's stable runtime handle.
@@ -851,6 +920,129 @@ impl Object {
         Some(matrix)
     }
 
+    /// Reads a dynamic body's latest linear velocity.
+    pub fn get_velocity(&self, ctx: &Context<'_>) -> Result<[f32; 3], PhysicsError> {
+        let callback = ctx.host.get_velocity.ok_or(PhysicsError::Unavailable)?;
+        let mut value = [0.0; 3];
+        // SAFETY: callback and output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return Err(PhysicsError::Rejected);
+        }
+        finite_vector(value)
+            .then_some(value)
+            .ok_or(PhysicsError::InvalidInput)
+    }
+
+    /// Stages a dynamic body's linear velocity.
+    pub fn set_velocity(
+        &self,
+        ctx: &mut Context<'_>,
+        velocity: [f32; 3],
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx.host.set_velocity;
+        self.physics_vector_command(ctx, velocity, callback)
+    }
+
+    /// Stages an impulse on a dynamic body.
+    pub fn add_impulse(
+        &self,
+        ctx: &mut Context<'_>,
+        impulse: [f32; 3],
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx.host.add_impulse;
+        self.physics_vector_command(ctx, impulse, callback)
+    }
+
+    /// Stages a force on a dynamic body for the next physics substeps.
+    pub fn add_force(&self, ctx: &mut Context<'_>, force: [f32; 3]) -> Result<(), PhysicsError> {
+        let callback = ctx.host.add_force;
+        self.physics_vector_command(ctx, force, callback)
+    }
+
+    fn physics_vector_command(
+        &self,
+        ctx: &Context<'_>,
+        value: [f32; 3],
+        callback: Option<abi::RvePhysicsSetVectorFn>,
+    ) -> Result<(), PhysicsError> {
+        if !finite_vector(value) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = callback.ok_or(PhysicsError::Unavailable)?;
+        // SAFETY: callback and vector storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &value) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Moves a character-controller capsule and returns its blocked translation and ground state.
+    pub fn move_character(
+        &self,
+        ctx: &mut Context<'_>,
+        displacement: [f32; 3],
+    ) -> Result<CharacterMove, PhysicsError> {
+        if !finite_vector(displacement) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = ctx.host.move_character.ok_or(PhysicsError::Unavailable)?;
+        let mut result = RveCharacterMoveResult::default();
+        // SAFETY: callback and input/output storage remain valid during this script call.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &displacement, &mut result) } {
+            return Err(PhysicsError::Rejected);
+        }
+        if !finite_vector(result.translation) {
+            return Err(PhysicsError::InvalidInput);
+        }
+        Ok(result.into())
+    }
+
+    /// Reads whether this object's character controller is grounded.
+    pub fn is_grounded(&self, ctx: &Context<'_>) -> Result<bool, PhysicsError> {
+        let callback = ctx.host.is_grounded.ok_or(PhysicsError::Unavailable)?;
+        let mut grounded = false;
+        // SAFETY: callback and output storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut grounded) } {
+            Ok(grounded)
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Stages whether this object's collider participates in queries and contacts.
+    pub fn set_collider_enabled(
+        &self,
+        ctx: &mut Context<'_>,
+        enabled: bool,
+    ) -> Result<(), PhysicsError> {
+        let callback = ctx
+            .host
+            .set_collider_enabled
+            .ok_or(PhysicsError::Unavailable)?;
+        // SAFETY: callback is valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, enabled) } {
+            Ok(())
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
+    /// Reads the collider's latest enabled state, including writes earlier in this callback.
+    pub fn is_collider_enabled(&self, ctx: &Context<'_>) -> Result<bool, PhysicsError> {
+        let callback = ctx
+            .host
+            .is_collider_enabled
+            .ok_or(PhysicsError::Unavailable)?;
+        let mut enabled = false;
+        // SAFETY: callback and output storage remain valid during this script call.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut enabled) } {
+            Ok(enabled)
+        } else {
+            Err(PhysicsError::Rejected)
+        }
+    }
+
     /// Returns this object's stable scene id.
     pub fn id(&self, ctx: &mut Context<'_>) -> Option<String> {
         Self::object_string(ctx, self.handle, ctx.host.object_id)
@@ -874,6 +1066,84 @@ impl Object {
         // SAFETY: the host keeps returned strings alive through the current guest callback.
         unsafe { value.to_str().ok().map(str::to_owned) }
     }
+}
+
+impl Physics<'_> {
+    /// Casts a ray without including triggers or ignoring an object.
+    pub fn raycast(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        max_distance: f32,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        self.raycast_with_options(origin, direction, max_distance, false, None)
+    }
+
+    /// Casts a ray with trigger and self-exclusion options.
+    pub fn raycast_with_options(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        max_distance: f32,
+        include_triggers: bool,
+        ignore: Option<Object>,
+    ) -> Result<Option<PhysicsRaycastHit>, PhysicsError> {
+        if !finite_vector(origin)
+            || !finite_vector(direction)
+            || direction.iter().all(|component| *component == 0.0)
+            || !max_distance.is_finite()
+            || max_distance < 0.0
+        {
+            return Err(PhysicsError::InvalidInput);
+        }
+        let callback = self.host.raycast.ok_or(PhysicsError::Unavailable)?;
+        let mut result = RveRaycastHit::default();
+        // SAFETY: callback and all vector/output storage remain valid through this script call.
+        if !unsafe {
+            callback(
+                self.host.ctx,
+                &origin,
+                &direction,
+                max_distance,
+                include_triggers,
+                ignore.map_or(0, |object| object.handle),
+                &mut result,
+            )
+        } {
+            return Err(PhysicsError::Rejected);
+        }
+        if result.object == 0 {
+            return Ok(None);
+        }
+        if !finite_vector(result.point)
+            || !finite_vector(result.normal)
+            || !result.distance.is_finite()
+        {
+            return Err(PhysicsError::InvalidInput);
+        }
+        Ok(Some(PhysicsRaycastHit {
+            object: Object {
+                handle: result.object,
+            },
+            point: result.point,
+            normal: result.normal,
+            distance: result.distance,
+        }))
+    }
+}
+
+impl From<RveCharacterMoveResult> for CharacterMove {
+    fn from(value: RveCharacterMoveResult) -> Self {
+        Self {
+            translation: value.translation,
+            grounded: value.grounded,
+            collided: value.collided,
+        }
+    }
+}
+
+fn finite_vector(value: [f32; 3]) -> bool {
+    value.into_iter().all(f32::is_finite)
 }
 
 struct BorrowedAbiValue<'a> {
@@ -938,11 +1208,12 @@ impl<'a> BorrowedAbiValue<'a> {
 
 #[doc(hidden)]
 pub mod __private {
-    use super::{Context, Params, Script, ValueError};
+    use super::{CollisionContact, Context, Object, Params, Script, ValueError};
     use crate::abi::{
-        RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RveCommandFn, RveCreateFn, RveDropFn, RveHost,
-        RveMessageFn, RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUpdateFn,
-        RveValue,
+        RVE_COLLISION_ENTER, RVE_COLLISION_EXIT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN,
+        RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCollisionFn, RveCommandFn,
+        RveCreateFn, RveDropFn, RveHost, RveMessageFn, RveParamDesc, RveParams, RveStartFn,
+        RveStatus, RveStr, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
@@ -961,6 +1232,7 @@ pub mod __private {
         destroy: RveStartFn,
         drop: RveDropFn,
         command: RveCommandFn,
+        collision: RveCollisionFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -974,6 +1246,7 @@ pub mod __private {
             params: params.as_ptr(),
             param_count: params.len(),
             command: Some(command),
+            collision: Some(collision),
         }
     }
 
@@ -1076,6 +1349,44 @@ pub mod __private {
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
             let mut context = Context::new(unsafe { &*host })?;
             instance.0.on_message(&mut context, sender, name, &value);
+            context.commit()
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn collision(
+        instance: *mut c_void,
+        host: *const RveHost,
+        event: RveCollisionEvent,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() || event.other == 0 {
+            return report(
+                host,
+                "null or invalid collision callback argument",
+                RveStatus::Error,
+            );
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: instance and host are valid for this synchronous ABI callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new(unsafe { &*host })?;
+            let other = Object {
+                handle: event.other,
+            };
+            match event.kind {
+                RVE_COLLISION_ENTER => instance.0.on_collision_enter(
+                    &mut context,
+                    other,
+                    CollisionContact {
+                        point: event.point,
+                        normal: event.normal,
+                    },
+                ),
+                RVE_COLLISION_EXIT => instance.0.on_collision_exit(&mut context, other),
+                RVE_TRIGGER_ENTER => instance.0.on_trigger_enter(&mut context, other),
+                RVE_TRIGGER_EXIT => instance.0.on_trigger_exit(&mut context, other),
+                _ => return Err("unknown collision event kind".to_owned()),
+            }
             context.commit()
         }));
         status_from_result(host, result)
@@ -1373,6 +1684,14 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: host ABI owns the instance and call-scoped command argument pointers.
             unsafe { $crate::__private::command(instance, host, name, args, arg_count) }
         }
+        unsafe extern "C" fn __rve_collision(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            event: $crate::abi::RveCollisionEvent,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: the host owns the instance and event for this callback.
+            unsafe { $crate::__private::collision(instance, host, event) }
+        }
         unsafe extern "C" fn __rve_destroy(
             instance: *mut ::std::ffi::c_void,
             host: *const $crate::abi::RveHost,
@@ -1395,6 +1714,7 @@ macro_rules! __rve_script_descriptor {
             __rve_destroy,
             __rve_drop_instance,
             __rve_command,
+            __rve_collision,
             $crate::__rve_params!(@munch [] $($params)*),
         )
     }};

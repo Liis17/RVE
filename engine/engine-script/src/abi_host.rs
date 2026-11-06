@@ -4,17 +4,21 @@ use crate::lite::{
     CommandGeneration, EventQueue, LuaCommands, MAX_LOG_MESSAGE_BYTES, RegisteredCommandCallback,
     RegisteredLuaCommand,
 };
+#[cfg(test)]
+use crate::transaction::ScriptTransactionInit;
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
     ScriptTransaction,
 };
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_console::CommandSpec;
+use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, ParamValue,
     ProjectionSettings, Tonemapper,
 };
+use glam::Vec3;
 use rve_sdk::PhysicalInput;
 use rve_sdk::abi::{
     RVE_ACTION_AXIS, RVE_ACTION_BUTTON, RVE_ACTION_VECTOR2, RVE_ANTI_ALIASING_DLSS,
@@ -22,8 +26,9 @@ use rve_sdk::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_MAX_BINDINGS, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR,
     RVE_LOG_INFO, RVE_LOG_WARN, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
     RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveHost, RveParamEntry, RveParams, RveScriptDesc, RveStatus, RveStr,
-    RveTime, RveTransform, RveValue, RveValueData,
+    RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent, RveHost, RveParamEntry,
+    RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue,
+    RveValueData,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -134,6 +139,42 @@ impl<'a> AbiCallContext<'a> {
             set_active_camera: Some(host_set_active_camera),
             register_command: self.commands_allowed.then_some(host_register_command),
             unregister_command: self.commands_allowed.then_some(host_unregister_command),
+            raycast: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_raycast),
+            get_velocity: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_get_velocity),
+            set_velocity: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_set_velocity),
+            add_impulse: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_add_impulse),
+            add_force: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_add_force),
+            move_character: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_move_character),
+            is_grounded: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_is_grounded),
+            set_collider_enabled: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_set_collider_enabled),
+            is_collider_enabled: self
+                .transaction
+                .physics_attached()
+                .then_some(host_physics_is_collider_enabled),
             action_state: Some(host_action_state),
             action_value: Some(host_action_value),
             input_context: Some(host_input_context),
@@ -294,6 +335,45 @@ impl AbiScriptInstance {
             let host = context.host(time);
             // SAFETY: message data, instance, and host remain live throughout the callback.
             unsafe { (self.descriptor.message)(self.instance, &host, sender, name, &value.value) }
+        };
+        context.callback_result(status)
+    }
+
+    pub(crate) fn invoke_physics_event(
+        &mut self,
+        time: ScriptTime,
+        kind: u32,
+        other: u64,
+        point: [f32; 3],
+        normal: [f32; 3],
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), String> {
+        let Some(callback) = self.descriptor.collision else {
+            return Ok(());
+        };
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
+        let event = RveCollisionEvent {
+            kind,
+            other,
+            point,
+            normal,
+        };
+        let status = {
+            let host = context.host(time);
+            // SAFETY: the event, instance, and host remain live throughout the callback.
+            unsafe { callback(self.instance, &host, event) }
         };
         context.callback_result(status)
     }
@@ -613,6 +693,264 @@ unsafe extern "C" fn host_active_camera(ctx: *mut c_void) -> u64 {
 unsafe extern "C" fn host_set_active_camera(ctx: *mut c_void, object: u64) -> bool {
     guarded(ctx, false, |context| {
         context.transaction.set_active_camera_from_abi(object)
+    })
+}
+
+unsafe extern "C" fn host_physics_raycast(
+    ctx: *mut c_void,
+    origin: *const [f32; 3],
+    direction: *const [f32; 3],
+    max_distance: f32,
+    include_triggers: bool,
+    ignore: u64,
+    out: *mut RveRaycastHit,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if origin.is_null() || direction.is_null() || out.is_null() {
+            context.error = Some("raycast received a null vector or output pointer".to_owned());
+            return false;
+        }
+        // SAFETY: non-null input pointers must be readable for this synchronous callback.
+        let origin = Vec3::from_array(unsafe { *origin });
+        // SAFETY: non-null input pointers must be readable for this synchronous callback.
+        let direction = Vec3::from_array(unsafe { *direction });
+        let ray = match Ray::new(origin, direction, max_distance) {
+            Ok(ray) => ray,
+            Err(error) => {
+                context.error = Some(error.to_string());
+                return false;
+            }
+        };
+        let ignore = if ignore == 0 {
+            None
+        } else {
+            let Some(handle) = context.transaction.object_from_abi_handle(ignore) else {
+                context.error = Some("raycast ignore handle is unknown".to_owned());
+                return false;
+            };
+            Some(handle)
+        };
+        let hit = match context
+            .transaction
+            .physics_raycast(ray, include_triggers, ignore)
+        {
+            Ok(hit) => hit,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        let mut result = RveRaycastHit::default();
+        if let Some(hit) = hit {
+            let Some(object) = context.transaction.physics_object(hit.body) else {
+                context.error = Some("raycast hit has no scene object".to_owned());
+                return false;
+            };
+            let Some(object) = context.transaction.abi_handle(object) else {
+                context.error =
+                    Some("raycast object handle cannot be represented by the ABI".to_owned());
+                return false;
+            };
+            result = RveRaycastHit {
+                object,
+                point: hit.point.to_array(),
+                normal: hit.normal.to_array(),
+                distance: hit.distance,
+            };
+        }
+        // SAFETY: out was checked non-null and is writable for this synchronous callback.
+        unsafe { *out = result };
+        true
+    })
+}
+
+unsafe extern "C" fn host_physics_get_velocity(
+    ctx: *mut c_void,
+    object: u64,
+    value: *mut [f32; 3],
+) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("get_velocity received a null output pointer".to_owned());
+            return false;
+        }
+        let Some(object) = context.transaction.object_from_abi_handle(object) else {
+            context.error = Some("get_velocity received an unknown object handle".to_owned());
+            return false;
+        };
+        let velocity = match context.transaction.body_velocity(object) {
+            Ok(velocity) => velocity,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        // SAFETY: value was checked non-null and is writable for this synchronous callback.
+        unsafe { *value = velocity.to_array() };
+        true
+    })
+}
+
+unsafe extern "C" fn host_physics_set_velocity(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    host_physics_vector_command(ctx, object, value, |transaction, object, value| {
+        transaction.set_body_velocity(object, value)
+    })
+}
+
+unsafe extern "C" fn host_physics_add_impulse(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    host_physics_vector_command(ctx, object, value, |transaction, object, value| {
+        transaction.add_body_impulse(object, value)
+    })
+}
+
+unsafe extern "C" fn host_physics_add_force(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    host_physics_vector_command(ctx, object, value, |transaction, object, value| {
+        transaction.add_body_force(object, value)
+    })
+}
+
+fn host_physics_vector_command(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+    command: impl FnOnce(&mut ScriptTransaction, engine_scene::ObjectHandle, Vec3) -> Result<(), String>,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("physics command received a null vector pointer".to_owned());
+            return false;
+        }
+        // SAFETY: value must point to three readable floats for this synchronous callback.
+        let value = Vec3::from_array(unsafe { *value });
+        let Some(object) = context.transaction.object_from_abi_handle(object) else {
+            context.error = Some("physics command received an unknown object handle".to_owned());
+            return false;
+        };
+        match command(context.transaction, object, value) {
+            Ok(()) => true,
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn host_physics_move_character(
+    ctx: *mut c_void,
+    object: u64,
+    displacement: *const [f32; 3],
+    out: *mut RveCharacterMoveResult,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if displacement.is_null() || out.is_null() {
+            context.error =
+                Some("move_character received a null vector or output pointer".to_owned());
+            return false;
+        }
+        // SAFETY: displacement is readable for this synchronous callback.
+        let displacement = Vec3::from_array(unsafe { *displacement });
+        let Some(object) = context.transaction.object_from_abi_handle(object) else {
+            context.error = Some("move_character received an unknown object handle".to_owned());
+            return false;
+        };
+        let movement = match context.transaction.move_character(object, displacement) {
+            Ok(movement) => movement,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        // SAFETY: out was checked non-null and is writable for this synchronous callback.
+        unsafe {
+            *out = RveCharacterMoveResult {
+                translation: movement.translation.to_array(),
+                grounded: movement.grounded,
+                collided: !movement.hits.is_empty(),
+            }
+        };
+        true
+    })
+}
+
+unsafe extern "C" fn host_physics_is_grounded(
+    ctx: *mut c_void,
+    object: u64,
+    value: *mut bool,
+) -> bool {
+    host_physics_get_bool(ctx, object, value, |transaction, object| {
+        transaction.is_grounded(object)
+    })
+}
+
+unsafe extern "C" fn host_physics_is_collider_enabled(
+    ctx: *mut c_void,
+    object: u64,
+    value: *mut bool,
+) -> bool {
+    host_physics_get_bool(ctx, object, value, |transaction, object| {
+        transaction.collider_enabled(object)
+    })
+}
+
+fn host_physics_get_bool(
+    ctx: *mut c_void,
+    object: u64,
+    value: *mut bool,
+    get: impl FnOnce(&ScriptTransaction, engine_scene::ObjectHandle) -> Result<bool, String>,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if value.is_null() {
+            context.error = Some("physics getter received a null output pointer".to_owned());
+            return false;
+        }
+        let Some(object) = context.transaction.object_from_abi_handle(object) else {
+            context.error = Some("physics getter received an unknown object handle".to_owned());
+            return false;
+        };
+        let result = match get(context.transaction, object) {
+            Ok(result) => result,
+            Err(error) => {
+                context.error = Some(error);
+                return false;
+            }
+        };
+        // SAFETY: value was checked non-null and is writable for this synchronous callback.
+        unsafe { *value = result };
+        true
+    })
+}
+
+unsafe extern "C" fn host_physics_set_collider_enabled(
+    ctx: *mut c_void,
+    object: u64,
+    value: bool,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(object) = context.transaction.object_from_abi_handle(object) else {
+            context.error =
+                Some("set_collider_enabled received an unknown object handle".to_owned());
+            return false;
+        };
+        match context.transaction.set_collider_enabled(object, value) {
+            Ok(()) => true,
+            Err(error) => {
+                context.error = Some(error);
+                false
+            }
+        }
     })
 }
 
@@ -1368,14 +1706,20 @@ mod tests {
         let camera = world.active_camera();
         let events = EventQueue::default();
         let mut transaction = ScriptTransaction::default();
-        transaction.begin(
-            &world,
-            camera,
-            "scene/camera/Probe",
-            true,
-            ScriptInput::default(),
-            (0, 0),
-        );
+        transaction.begin(ScriptTransactionInit {
+            world: &world,
+            self_object: camera,
+            source: "scene/camera/Probe",
+            writable: true,
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
+            queued_messages: (0, 0),
+            physics: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::physics::PhysicsScriptState::default(),
+            )),
+            physics_phase_dt: None,
+        });
         {
             let mut context =
                 AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
@@ -1444,14 +1788,20 @@ mod tests {
             assert!(transaction.writable());
         }
 
-        transaction.begin(
-            &world,
-            camera,
-            "scene/camera/Probe",
-            false,
-            ScriptInput::default(),
-            (0, 0),
-        );
+        transaction.begin(ScriptTransactionInit {
+            world: &world,
+            self_object: camera,
+            source: "scene/camera/Probe",
+            writable: false,
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
+            queued_messages: (0, 0),
+            physics: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::physics::PhysicsScriptState::default(),
+            )),
+            physics_phase_dt: None,
+        });
         let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
         let host = context.host(ScriptTime::default());
         let settings = RveCameraSettings::default();

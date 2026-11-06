@@ -2,9 +2,11 @@
 
 use crate::state::{AssetDrag, EditorState};
 use crate::viewport::camera::{Ray, ground_point, project_point, screen_ray};
+use crate::viewport::colliders::{ColliderWire, WireSource, WireStyle, source_wires};
 use crate::viewport::gizmo::{DragTarget, GizmoDrag, GizmoTool, gizmo_axes};
 use crate::viewport::picking::{nearest_hit, ray_model};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use engine_physics::object_world_transform;
 use glam::{Mat4, Vec3};
 
 const AXIS_COLORS: [Color32; 3] = [
@@ -56,6 +58,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
             &mut state.scene_view.debug_view,
             state.wireframe_supported,
         );
+        ui.checkbox(&mut state.scene_view.show_colliders, "Colliders");
     });
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
@@ -101,6 +104,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     };
     draw_markers(ui, &markers, view_projection, rect);
     draw_selection_bounds(ui, state, &markers, view_projection, rect);
+    let wires = collider_wires(state);
+    draw_colliders(ui, &wires, view_projection, rect);
     let gizmo_taken = handle_gizmo(ui, state, &response, view_projection, rect);
     if !gizmo_taken
         && response.clicked()
@@ -292,6 +297,64 @@ fn box_corners(matrix: Mat4, (min, max): ([f32; 3], [f32; 3])) -> [Vec3; 8] {
         };
         matrix.transform_point3(Vec3::new(pick(0), pick(1), pick(2)))
     })
+}
+
+/// Рёбра коллайдеров: при флажке «Colliders» — все объекты, иначе только выделенные.
+/// Ошибку геометрии здесь не показываем: её видно в инспекторе.
+fn collider_wires(state: &mut EditorState) -> Vec<ColliderWire> {
+    let show_all = state.scene_view.show_colliders;
+    let selected: Vec<String> = state
+        .scene
+        .as_ref()
+        .map(|scene| scene.selected_ids().to_vec())
+        .unwrap_or_default();
+    let Some(world) = state.world_mut() else {
+        return Vec::new();
+    };
+    let sources: Vec<WireSource> = world
+        .objects()
+        .iter()
+        .filter(|object| object.collider.is_some() || object.character_controller.is_some())
+        .filter(|object| show_all || selected.contains(&object.id))
+        .filter_map(|object| {
+            Some(WireSource {
+                transform: object_world_transform(world, object.handle).ok()?,
+                collider: object.collider,
+                character: object.character_controller,
+                model: object
+                    .mesh_renderer
+                    .as_ref()
+                    .map(|mesh| mesh.model.as_str().to_owned()),
+            })
+        })
+        .collect();
+    let mut wires = Vec::new();
+    for source in &sources {
+        if let Ok(found) = source_wires(&mut state.collider_cache, &state.models, source) {
+            wires.extend(found);
+        }
+    }
+    wires
+}
+
+fn draw_colliders(ui: &egui::Ui, wires: &[ColliderWire], view_projection: Mat4, rect: Rect) {
+    let painter = ui.painter_at(rect);
+    for wire in wires {
+        let color = match wire.style {
+            WireStyle::Body => Color32::from_rgb(120, 230, 150),
+            WireStyle::Trigger => Color32::from_rgb(110, 210, 255),
+            WireStyle::Character => Color32::from_rgb(255, 170, 90),
+        };
+        let stroke = Stroke::new(1.0, color);
+        for [a, b] in &wire.segments {
+            if let (Some(a), Some(b)) = (
+                to_screen(view_projection, rect, *a),
+                to_screen(view_projection, rect, *b),
+            ) {
+                painter.line_segment([a, b], stroke);
+            }
+        }
+    }
 }
 
 /// Рамки границ моделей выделенных объектов. Рёбра с вершиной за камерой пропускаются.

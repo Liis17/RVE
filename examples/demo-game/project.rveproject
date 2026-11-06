@@ -25,6 +25,11 @@ inputs = ["Escape"]
 kind = "button"
 inputs = ["Escape"]
 
+# Первая включённая сцена — стартовая; физическая демо-сцена запускается первой.
+[[scenes]]
+path = "/scenes/physics.rvescene"
+enabled = true
+
 [[scenes]]
 path = "/scenes/main.rvescene"
 enabled = true

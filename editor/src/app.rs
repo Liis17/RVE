@@ -949,12 +949,15 @@ impl EditorApp {
             let mut world =
                 World::from_document(scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
-            PlaySession::start_with_world(
+            let model_geometry = PlaySession::load_model_geometry(&world, &project.assets)?;
+            PlaySession::start_with_world_and_physics(
                 scene.view(),
                 world,
                 self.state.library.as_ref(),
                 &project.settings.input,
                 |path| project.read_text(path),
+                &model_geometry,
+                &project.settings.physics,
             )
         })();
         match result {
@@ -1195,8 +1198,14 @@ impl EditorApp {
         let ui_primitives: Vec<UiPrimitive<'_>> =
             meshes.iter().map(ConvertedMesh::primitive).collect();
 
-        if let Some(play) = &mut self.state.play {
-            play.tick();
+        let play_error = self.state.play.as_mut().and_then(|play| play.tick().err());
+        if let Some(error) = play_error {
+            self.state.log.error(error);
+            if let Some(session) = self.state.play.take() {
+                self.state.log.push_script_events(session.stop());
+                self.state.log.info("Stop");
+            }
+        } else if let Some(play) = &mut self.state.play {
             let events = play.drain_events();
             self.state.log.push_script_events(events);
         }
@@ -1908,7 +1917,7 @@ end
 return S
 "#;
         state.play = Some(PlaySession::start(&document, None, |_| Ok(script.to_owned())).unwrap());
-        state.play.as_mut().unwrap().tick();
+        state.play.as_mut().unwrap().tick().unwrap();
         submit_console_command(&mut state, "editor.echo hello");
         assert!(
             state

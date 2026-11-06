@@ -15,6 +15,7 @@ egui_dock = { workspace = true, features = ["serde"] }
 winit.workspace = true
 engine-console = { path = "../engine/engine-console" }
 engine-assets = { path = "../engine/engine-assets" }
+engine-physics = { path = "../engine/engine-physics" }
 engine-files = { path = "../engine/engine-files" }
 engine-platform = { path = "../engine/engine-platform" }
 engine-ui = { path = "../engine/engine-ui" }
@@ -29,6 +30,7 @@ glam.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+flume.workspace = true
 
 [dev-dependencies]
 rve-sdk = { path = "../engine/rve-sdk" }

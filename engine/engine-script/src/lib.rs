@@ -6,6 +6,7 @@ mod actions;
 mod host;
 mod library;
 mod lite;
+mod physics;
 mod transaction;
 mod types;
 

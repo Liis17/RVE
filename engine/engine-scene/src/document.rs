@@ -225,6 +225,7 @@ impl SceneDocument {
                 ));
             }
             validate_transform(source, object)?;
+            validate_physics_components(source, object)?;
             if let Some(camera) = &object.camera {
                 camera_count += 1;
                 active_camera_count += usize::from(camera.active);
@@ -449,7 +450,7 @@ pub struct SceneAsset {
 }
 
 /// Объект сцены в порядке документа.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneObject {
     pub id: String,
@@ -473,6 +474,12 @@ pub struct SceneObject {
     pub spot_light: Option<SpotLightComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collider: Option<ColliderComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rigid_body: Option<RigidBodyComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_controller: Option<CharacterControllerComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]
@@ -482,6 +489,109 @@ pub struct SceneObject {
 impl SceneObject {
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// Shape used by a physics collider.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColliderShape {
+    #[default]
+    Box,
+    Sphere,
+    Capsule,
+    ConvexMesh,
+    TriangleMesh,
+}
+
+/// Collider geometry and contact material settings.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ColliderComponent {
+    pub shape: ColliderShape,
+    pub half_extents: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+    pub offset: [f32; 3],
+    pub trigger: bool,
+    pub friction: f32,
+    pub restitution: f32,
+}
+
+impl Default for ColliderComponent {
+    fn default() -> Self {
+        Self {
+            shape: ColliderShape::Box,
+            half_extents: [0.5; 3],
+            radius: 0.5,
+            height: 1.0,
+            offset: [0.0; 3],
+            trigger: false,
+            friction: 0.5,
+            restitution: 0.0,
+        }
+    }
+}
+
+/// Motion type of a rigid body.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RigidBodyKind {
+    Static,
+    Kinematic,
+    #[default]
+    Dynamic,
+}
+
+/// Body settings attached to an object with a collider.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RigidBodyComponent {
+    pub kind: RigidBodyKind,
+    pub mass: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub gravity_scale: f32,
+    pub lock_rotation: bool,
+}
+
+impl Default for RigidBodyComponent {
+    fn default() -> Self {
+        Self {
+            kind: RigidBodyKind::Dynamic,
+            mass: 1.0,
+            linear_damping: 0.0,
+            angular_damping: 0.05,
+            gravity_scale: 1.0,
+            lock_rotation: false,
+        }
+    }
+}
+
+/// Character capsule movement settings.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CharacterControllerComponent {
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
+    pub max_slope_deg: f32,
+    pub snap_distance: f32,
+    pub skin: f32,
+    pub push_strength: f32,
+}
+
+impl Default for CharacterControllerComponent {
+    fn default() -> Self {
+        Self {
+            radius: 0.35,
+            height: 1.1,
+            step_height: 0.3,
+            max_slope_deg: 45.0,
+            snap_distance: 0.2,
+            skin: 0.02,
+            push_strength: 1.0,
+        }
     }
 }
 
@@ -859,6 +969,161 @@ fn validate_transform(source: &str, object: &SceneObject) -> Result<(), SceneErr
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_physics_components(source: &str, object: &SceneObject) -> Result<(), SceneError> {
+    if let Some(collider) = &object.collider {
+        if !collider
+            .half_extents
+            .into_iter()
+            .chain([collider.radius, collider.height])
+            .all(f32::is_finite)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider dimensions должны содержать конечные числа",
+            ));
+        }
+        if !collider.offset.into_iter().all(f32::is_finite) {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider.offset должен содержать конечные числа",
+            ));
+        }
+        if !collider.friction.is_finite() || collider.friction < 0.0 {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider.friction должен быть конечным и >= 0",
+            ));
+        }
+        if !collider.restitution.is_finite() || !(0.0..=1.0).contains(&collider.restitution) {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider.restitution должен быть конечным и находиться в диапазоне [0, 1]",
+            ));
+        }
+        let valid_dimensions = match collider.shape {
+            ColliderShape::Box => collider.half_extents.into_iter().all(|value| value > 0.0),
+            ColliderShape::Sphere => collider.radius > 0.0,
+            ColliderShape::Capsule => collider.radius > 0.0 && collider.height > 0.0,
+            ColliderShape::ConvexMesh | ColliderShape::TriangleMesh => true,
+        };
+        if !valid_dimensions {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider dimensions должны быть > 0 для выбранной формы",
+            ));
+        }
+        if matches!(
+            collider.shape,
+            ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+        ) && object.mesh_renderer.is_none()
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "collider mesh shape требует mesh_renderer",
+            ));
+        }
+    }
+
+    if let Some(body) = &object.rigid_body {
+        if object.collider.is_none() {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "rigid_body требует collider",
+            ));
+        }
+        if !body.mass.is_finite()
+            || body.mass <= 0.0
+            || !body.linear_damping.is_finite()
+            || body.linear_damping < 0.0
+            || !body.angular_damping.is_finite()
+            || body.angular_damping < 0.0
+            || !body.gravity_scale.is_finite()
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "rigid_body mass должен быть > 0, damping >= 0, а все числа конечными",
+            ));
+        }
+        if body.kind == RigidBodyKind::Dynamic
+            && object
+                .collider
+                .is_some_and(|collider| collider.shape == ColliderShape::TriangleMesh)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "dynamic rigid_body несовместим с triangle_mesh",
+            ));
+        }
+        if body.kind == RigidBodyKind::Dynamic && object.parent.is_some() {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "dynamic rigid_body должен быть корневым объектом",
+            ));
+        }
+    }
+
+    if let Some(controller) = &object.character_controller {
+        if object.collider.is_some() || object.rigid_body.is_some() {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "character_controller несовместим с collider и rigid_body",
+            ));
+        }
+        if ![
+            controller.radius,
+            controller.height,
+            controller.step_height,
+            controller.max_slope_deg,
+            controller.snap_distance,
+            controller.skin,
+            controller.push_strength,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "character_controller должен содержать конечные числа",
+            ));
+        }
+        if controller.radius <= 0.0
+            || controller.height <= 0.0
+            || controller.step_height < 0.0
+            || !(0.0 < controller.max_slope_deg && controller.max_slope_deg < 90.0)
+            || controller.snap_distance < 0.0
+            || controller.skin < 0.0
+            || controller.push_strength < 0.0
+        {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "character_controller требует положительные radius/height, slope в (0, 90) и остальные значения >= 0",
+            ));
+        }
+        if object.parent.is_some() {
+            return Err(SceneError::new(
+                source,
+                Some(&object.id),
+                "character_controller должен быть корневым объектом",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1505,7 +1770,10 @@ pub(crate) mod option_virtual_path_serde {
 
 #[cfg(test)]
 mod tests {
-    use super::{LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode, ParamValue, SceneDocument};
+    use super::{
+        CharacterControllerComponent, ColliderComponent, LodGroup, LodLevel, MAX_LOD_LEVELS,
+        MaterialAlphaMode, ParamValue, RigidBodyComponent, SceneDocument,
+    };
     use engine_files::VirtualPath;
 
     const VALID: &str = r#"
@@ -2215,6 +2483,224 @@ scale=[1.0,1.0,0.0]
         assert!(parse(&input).is_ok());
         input.push_str("\n[[objects]]\nid=\"sun2\"\n[objects.directional_light]\n");
         assert!(parse(&input).is_err());
+    }
+
+    #[test]
+    fn physics_components_default_and_round_trip() {
+        let document = parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"box\"\n[objects.collider]\n[objects.rigid_body]\n\
+             [[objects]]\nid=\"player\"\n[objects.character_controller]\n"
+        ))
+        .unwrap();
+        let box_object = &document.objects[1];
+        assert_eq!(box_object.collider, Some(ColliderComponent::default()));
+        assert_eq!(box_object.rigid_body, Some(RigidBodyComponent::default()));
+        assert_eq!(
+            box_object.character_controller, None,
+            "components stay optional per object"
+        );
+        assert_eq!(
+            document.objects[2].character_controller,
+            Some(CharacterControllerComponent::default())
+        );
+
+        let round_trip = parse(&document.to_toml().unwrap()).unwrap();
+        assert_eq!(round_trip.objects[1].collider, box_object.collider);
+        assert_eq!(round_trip.objects[1].rigid_body, box_object.rigid_body);
+        assert_eq!(
+            round_trip.objects[2].character_controller,
+            document.objects[2].character_controller
+        );
+    }
+
+    #[test]
+    fn physics_components_preserve_authored_values_in_round_trip() {
+        let document = parse(&format!(
+            r#"{VALID}
+[[objects]]
+id = "body"
+[objects.collider]
+shape = "capsule"
+radius = 0.25
+height = 0.75
+offset = [1.0, 2.0, 3.0]
+trigger = true
+friction = 0.8
+restitution = 0.5
+[objects.rigid_body]
+kind = "kinematic"
+mass = 3.0
+linear_damping = 0.1
+angular_damping = 0.2
+gravity_scale = -1.0
+lock_rotation = true
+[[objects]]
+id = "player"
+[objects.character_controller]
+radius = 0.4
+height = 1.4
+step_height = 0.5
+max_slope_deg = 60.0
+snap_distance = 0.3
+skin = 0.04
+push_strength = 2.0
+"#
+        ))
+        .unwrap();
+        let round_trip = parse(&document.to_toml().unwrap()).unwrap();
+        assert_eq!(round_trip.objects[1].collider, document.objects[1].collider);
+        assert_eq!(
+            round_trip.objects[1].rigid_body,
+            document.objects[1].rigid_body
+        );
+        assert_eq!(
+            round_trip.objects[2].character_controller,
+            document.objects[2].character_controller
+        );
+    }
+
+    #[test]
+    fn physics_components_validate_shape_dependencies_and_body_relationships() {
+        let missing_collider = format!("{VALID}\n[[objects]]\nid=\"body\"\n[objects.rigid_body]\n");
+        assert!(
+            parse(&missing_collider)
+                .unwrap_err()
+                .message
+                .contains("требует collider")
+        );
+
+        for shape in ["convex_mesh", "triangle_mesh"] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.collider]\nshape=\"{shape}\"\n"
+            );
+            assert!(
+                parse(&input)
+                    .unwrap_err()
+                    .message
+                    .contains("требует mesh_renderer")
+            );
+        }
+
+        let dynamic_triangle_mesh = format!(
+            "[[assets]]\npath=\"/models/mesh.fbx\"\n{VALID}\n\
+             [[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/mesh.fbx\"\n\
+             [objects.collider]\nshape=\"triangle_mesh\"\n[objects.rigid_body]\nkind=\"dynamic\"\n"
+        );
+        assert!(
+            parse(&dynamic_triangle_mesh)
+                .unwrap_err()
+                .message
+                .contains("несовместим с triangle_mesh")
+        );
+
+        let character_with_collider = format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\n[objects.collider]\n\
+             [objects.character_controller]\n"
+        );
+        assert!(
+            parse(&character_with_collider)
+                .unwrap_err()
+                .message
+                .contains("несовместим")
+        );
+
+        let character_with_body = format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\n[objects.collider]\n\
+             [objects.rigid_body]\n[objects.character_controller]\n"
+        );
+        assert!(
+            parse(&character_with_body)
+                .unwrap_err()
+                .message
+                .contains("несовместим")
+        );
+    }
+
+    #[test]
+    fn physics_pose_writers_must_be_roots_but_kinematic_bodies_may_be_children() {
+        let dynamic_child = format!(
+            "{VALID}\n[[objects]]\nid=\"body\"\nparent=\"camera\"\n\
+             [objects.collider]\n[objects.rigid_body]\nkind=\"dynamic\"\n"
+        );
+        assert!(
+            parse(&dynamic_child)
+                .unwrap_err()
+                .message
+                .contains("должен быть корневым")
+        );
+
+        let character_child = format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\nparent=\"camera\"\n\
+             [objects.character_controller]\n"
+        );
+        assert!(
+            parse(&character_child)
+                .unwrap_err()
+                .message
+                .contains("должен быть корневым")
+        );
+
+        let kinematic_child = format!(
+            "{VALID}\n[[objects]]\nid=\"platform\"\nparent=\"camera\"\n\
+             [objects.collider]\n[objects.rigid_body]\nkind=\"kinematic\"\n"
+        );
+        assert!(parse(&kinematic_child).is_ok());
+    }
+
+    #[test]
+    fn physics_components_reject_non_finite_and_out_of_range_values() {
+        for collider in [
+            "shape=\"box\"\nhalf_extents=[0.5, nan, 0.5]",
+            "shape=\"box\"\nhalf_extents=[0.0, 0.5, 0.5]",
+            "shape=\"sphere\"\nradius=0.0",
+            "shape=\"capsule\"\nheight=0.0",
+            "friction=inf",
+            "friction=-0.1",
+            "restitution=1.1",
+            "offset=[0.0, 0.0, nan]",
+            "unknown=true",
+        ] {
+            let input =
+                format!("{VALID}\n[[objects]]\nid=\"shape\"\n[objects.collider]\n{collider}\n");
+            assert!(
+                parse(&input).is_err(),
+                "accepted collider fields {collider}"
+            );
+        }
+
+        for body in [
+            "mass=0.0",
+            "linear_damping=-1.0",
+            "angular_damping=nan",
+            "gravity_scale=inf",
+        ] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"body\"\n[objects.collider]\n\
+                 [objects.rigid_body]\n{body}\n"
+            );
+            assert!(parse(&input).is_err(), "accepted rigid_body.{body}");
+        }
+
+        for field in [
+            "radius=0.0",
+            "height=nan",
+            "step_height=-0.1",
+            "max_slope_deg=0.0",
+            "max_slope_deg=-0.1",
+            "max_slope_deg=90.0",
+            "snap_distance=-0.1",
+            "skin=-0.1",
+            "push_strength=inf",
+            "unknown=true",
+        ] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"player\"\n[objects.character_controller]\n{field}\n"
+            );
+            assert!(
+                parse(&input).is_err(),
+                "accepted character_controller.{field}"
+            );
+        }
     }
 
     #[test]
