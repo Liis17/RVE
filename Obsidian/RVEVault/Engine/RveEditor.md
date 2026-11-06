@@ -112,6 +112,13 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 
 Сетка редактора рисуется с `casts_shadow = false`: иначе её линии попадают в shadow map и ложатся тенями на объекты.
 
+## Физика
+
+- Инспектор редактирует `collider`, `rigid_body` и `character_controller` через общий undo. Формы коллайдера: Box, Sphere, Capsule, Convex Mesh и Triangle Mesh; hull и trimesh берут геометрию базовой модели `mesh_renderer`, ошибка hull показывается в инспекторе.
+- Add Component предлагает `Collider` и `Character Controller`, если у объекта нет конфликтующего компонента, и `Rigid Body` только при наличии коллайдера.
+- Префаб переопределяет `collider`, `rigid_body` и `character_controller` целиком, как и `point_light`.
+- Флажок `Colliders` во вьюпорте Scene рисует рёбра коллайдеров всех объектов; без него рисуются только выделенные. Геометрия строится функциями `engine-physics` в `editor/src/viewport/colliders.rs`. Trimesh с более чем `MAX_MESH_WIRE_EDGES` = 4096 рёбрами рисуется своим AABB.
+
 ## Префабы
 
 Формат и раскрытие описаны в [[Engine/EngineScene#Префабы]].

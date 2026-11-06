@@ -8,7 +8,7 @@ GJK ограничен 64 итерациями, EPA — 64 итерациями 
 
 `PhysicsWorld::query_snapshot` копирует позы, формы, enable/trigger flags, тип тела, скорость и dynamic mass в неизменяемый `Arc<QuerySnapshot>`. `QuerySnapshot::body_state` читает сохранённые body metadata; `raycast_with_enabled_overrides` применяет enabled overrides, а `shape_cast_with_overrides` принимает `QueryOverrides` с exclusions и enabled states. Варианты `*_excluding` исключают перечисленные handles. Это позволяет вызывающему коду выполнять транзакционные query поверх immutable snapshot. Snapshot использует X-упорядоченный AABB-кандидатный проход для raycast и shape cast; запросы по умолчанию исключают выключенные collider и trigger, а фильтр может включить trigger или игнорировать один `BodyHandle`. Выпуклые shape casts используют conservative advancement с лимитом 32 итерации; для triangle mesh проверяются только BVH-треугольники swept bounds, с общим лимитом кандидатов.
 
-`CharacterController` двигает капсулу через collide-and-slide с четырьмя итерациями, skin и фильтром собственного тела. Результат содержит translation, blocked displacement, grounded и obstacle hits с requested и blocked displacement, скоростью и массой для единственного push-импульса вызывающей транзакции. Step-up ограничен `step_height`; `max_slope_deg` должен быть строго между 0° и 90°. Downward snap ограничен максимумом `step_height` и `snap_distance` и пропускается при запрошенном движении вверх, чтобы не отменять прыжок. Character collider — kinematic; пометка `BodyDesc.character_controller` оставляет его solver velocity нулевой, сохраняя trigger-пары и пробуждение динамических тел.
+`CharacterController` двигает капсулу через collide-and-slide с четырьмя итерациями, skin и фильтром собственного тела. Результат содержит translation, blocked displacement, grounded и obstacle hits с requested и blocked displacement, скоростью и массой для единственного push-импульса вызывающей транзакции. Step-up ограничен `step_height`; `max_slope_deg` должен быть строго между 0° и 90°. Проверка ступени сначала ищет потолок над капсулой, затем переносит капсулу вперёд на смещение плюс `radius + skin`: центр капсулы у грани отстоит от ребра ступени на радиус, и без этого нижняя полусфера касается ребра наклонной нормалью, которую `is_walkable` отклоняет. После переноса опора проверяется вниз не выше `step_height + skin`. Downward snap ограничен максимумом `step_height` и `snap_distance` и пропускается при запрошенном движении вверх, чтобы не отменять прыжок. Character collider — kinematic; пометка `BodyDesc.character_controller` оставляет его solver velocity нулевой, сохраняя trigger-пары и пробуждение динамических тел.
 
 Push velocity считается по requested displacement за update `dt`, ограничивается 10 м/с и участвует в импульсе `push_strength * mass * max(0, (v_char - v_body) · normal)`. Заблокированное смещение сохраняет геометрический результат collide-and-slide; в транзакции запрос движения суммируется один раз на dynamic body за каждый вызов `move`.
 
@@ -24,4 +24,27 @@ Push velocity считается по requested displacement за update `dt`, �
 
 `PhysicsServer::run` принимает Init, Step с последовательным номером и Shutdown через flume. Init возвращает результат sequence 0 с query snapshot; каждый Step возвращает snapshot, poses и events, включая вызов без fixed substep. Runtime и editor Play заранее строят `StepDriver` и sequence 0, затем запускают `run_preinitialized`, который принимает Step с sequence 1. Они прикрепляют initial snapshot к `ScriptHost` до `on_start`. `PhysicsClient` соблюдает lockstep, проверяет sequence и ждёт только при outstanding Step через flume Selector вместе с переданным вызывающим control-каналом; без outstanding Step `receive` возвращает сразу. В runtime предыдущий результат и события применяются перед следующим update, а команды и изменения `World` отправляются одним Step с тем же `dt` после update, включая фоновые тики. `PhysicsEngine` удалён после замены runtime-заглушки на `PhysicsServer`.
 
-Источник: `engine/engine-physics/src/{broad.rs,narrow.rs,solver.rs,world.rs,shape.rs,hull.rs,bvh.rs,ray.rs,query.rs,character.rs,scene.rs,thread.rs}`.
+## Скриптовый API
+
+Lua и Rust-скрипты работают с физикой через [[Engine/EngineScript]] и [[Engine/RveSdk]]: callbacks столкновений и триггеров, `rve.physics.raycast`, методы тел и `move` персонажа. Физика не открывает скриптам `PhysicsWorld` напрямую; команды копятся в транзакции callback и применяются при его успешном завершении.
+
+## Демонстрация
+
+`examples/demo-game/Assets/scenes/physics.rvescene` — первая включённая сцена `project.rveproject`, поэтому она стартовая. Сцена содержит пол из triangle mesh, стены, ступени высотой 0.2 м (проходимая) и 0.6 м (блокирующая), пологую рампу 20° и крутой склон 60°, четыре dynamic-ящика, четыре монеты-триггера и игрока с `character_controller` из `player.lua`. Тест `demo_game_scenes_load_and_build_physics_without_gpu` в `engine-runtime` загружает сцены демо, проверяет компиляцию их скриптов и строит `PhysicsSceneDesc` без GPU. Коллайдеры `box` демо используют `half_extents = [1, 1, 1]`, потому что FBX-куб занимает `[-1, 1]`, а размер задаётся масштабом.
+
+## Ограничения v1
+
+- Нет интерполяции поз dynamic-тел: при рендере чаще `fixed_hz` возможен дребезг. Персонаж двигается per-frame и не затронут.
+- Нет CCD: быстрые мелкие тела могут пролетать тонкие стены.
+- Raycast и контроллер видят snapshot прошлого шага: dynamic-тела видны с задержкой до одного шага.
+- Масштаб запекается при загрузке; LOD-модели для коллизий не используются. Изменение масштаба в игре не меняет форму.
+- Dynamic-тела и персонажи — только корневые объекты сцены; валидация `.rvescene` отклоняет `parent` у них.
+- Солвер без islands и CCD: стопки выше примерно пяти ящиков могут дрейфовать.
+- Известный дефект: `move_capsule` возвращает `QueryError::ShapeCastIterationLimit`, если conservative advancement не сходится, например когда капсула скользит вдоль ребра динамического ящика. Ошибка уходит в Lua `move`: callback завершается ошибкой, его транзакция откатывается, а экземпляр скрипта отключается. Регрессионного теста пока нет; дефект воспроизведён зондом на `physics.rvescene`, полный прогон player в окне не выполнялся.
+
+## Решения
+
+- Собственный минимальный солвер без rapier, parry и nalgebra; зависимости крейта — только `glam` и `flume`. Решение пользователя. Цена: слабее rapier по устойчивости стопок и CCD.
+- Шаг физики выполняется в отдельном потоке `rve-physics`. Решение пользователя. Цена: физика видна скриптам с задержкой до одного шага.
+
+Источник: `engine/engine-physics/src/{broad.rs,narrow.rs,solver.rs,world.rs,shape.rs,hull.rs,bvh.rs,ray.rs,query.rs,character.rs,scene.rs,thread.rs}`, `examples/demo-game/Assets/scenes/physics.rvescene`, `engine/engine-runtime/src/scene.rs` (тест демо).
