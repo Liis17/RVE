@@ -811,11 +811,7 @@ fn scripts_thread(
                         stop_after_physics = true;
                     }
                 }
-                Ok(PhysicsWait::Shutdown(result)) => {
-                    if let Err(error) = apply_physics_step(&mut scripts, &mut world, sync, result) {
-                        status.record_failure(format!("ошибка синхронизации физики: {error}"));
-                        let _ = render_tx.send(RenderControl::Shutdown);
-                    }
+                Ok(PhysicsWait::Shutdown) => {
                     stop_after_physics = true;
                 }
                 Err(error) => {
@@ -919,7 +915,11 @@ fn scripts_thread(
                 }
             }
             if let Err(error) = client.step(dt, commands) {
-                status.record_failure(format!("ошибка шага физики: {error}"));
+                // Остановка выставляет interrupt до Shutdown физики: шаг, отправленный уже
+                // после выхода сервера, — ожидаемое завершение, а не сбой.
+                if !interrupt.is_interrupted() {
+                    status.record_failure(format!("ошибка шага физики: {error}"));
+                }
                 let _ = render_tx.send(RenderControl::Shutdown);
                 break;
             }
@@ -1008,7 +1008,7 @@ fn apply_physics_step(
 enum PhysicsWait {
     Idle,
     Step(PhysicsStepResult),
-    Shutdown(PhysicsStepResult),
+    Shutdown,
 }
 
 fn receive_physics_interruptibly(
@@ -1016,22 +1016,17 @@ fn receive_physics_interruptibly(
     control_rx: &Receiver<ScriptControl>,
     mut handle_control: impl FnMut(ScriptControl) -> bool,
 ) -> Result<PhysicsWait, String> {
-    let mut shutdown = false;
     loop {
         match client
             .receive(control_rx)
             .map_err(|error| error.to_string())?
         {
             None => return Ok(PhysicsWait::Idle),
-            Some(PhysicsReceive::Step(result)) => {
-                return Ok(if shutdown {
-                    PhysicsWait::Shutdown(result)
-                } else {
-                    PhysicsWait::Step(result)
-                });
-            }
+            Some(PhysicsReceive::Step(result)) => return Ok(PhysicsWait::Step(result)),
             Some(PhysicsReceive::Interrupted(control)) => {
-                shutdown |= handle_control(control);
+                if handle_control(control) {
+                    return Ok(PhysicsWait::Shutdown);
+                }
             }
         }
     }
@@ -2780,6 +2775,84 @@ return Script
     }
 
     #[test]
+    fn physics_step_sent_after_host_stopped_physics_is_not_a_failure() {
+        let document = SceneDocument::parse(
+            "startup.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let snapshot = PhysicsWorld::new(Vec3::ZERO)
+            .unwrap()
+            .query_snapshot()
+            .unwrap();
+        let initialization = PhysicsInitialization {
+            result: PhysicsStepResult {
+                sequence: 0,
+                substeps: 0,
+                poses: Vec::new(),
+                events: Vec::new(),
+                snapshot,
+            },
+            bindings: Vec::new(),
+        };
+        let (physics_request_tx, physics_request_rx) = flume::unbounded();
+        let (_physics_reply_tx, physics_reply_rx) = flume::unbounded::<PhysicsReply>();
+        // Сервер физики уже вышел по Shutdown хоста, а scripts thread ещё делает шаг.
+        drop(physics_request_rx);
+        let mut modules = ModuleHost::new();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, _frame_rx) = flume::bounded(1);
+        let (render_tx, _render_rx) = flume::unbounded();
+        let interrupt = ScriptInterruptHandle::new();
+        let status = Arc::new(RuntimeStatus::default());
+        let script_thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "startup.rvescene".to_owned(),
+                sources: BTreeMap::new(),
+                scripts_library: None,
+                script_module: None,
+                interrupt: interrupt.clone(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 1,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::clone(&status),
+                input: test_input(),
+                physics_client: Some(PhysicsClient::new_preinitialized(
+                    physics_request_tx,
+                    physics_reply_rx,
+                )),
+                physics_initialization: Some(initialization),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
+            },
+        )
+        .unwrap();
+        script_thread
+            .ready
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        interrupt.interrupt();
+        script_tx
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+
+        script_thread
+            .stopped
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(status.failure_message(), None);
+        modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
     fn physics_steps_use_the_same_injected_delta_in_foreground_and_background() {
         let document = SceneDocument::parse(
             "startup.rvescene",
@@ -3024,15 +3097,13 @@ return Move
                         step_tx.send((dt, has_teleport)).unwrap();
                         let step = driver.advance_step(dt, commands).unwrap();
                         let snapshot = driver.world().query_snapshot().unwrap();
-                        physics_reply_tx
-                            .send(PhysicsReply::Step(PhysicsStepResult {
-                                sequence,
-                                substeps: step.substeps,
-                                poses: step.poses,
-                                events: step.events,
-                                snapshot,
-                            }))
-                            .unwrap();
+                        let _ = physics_reply_tx.send(PhysicsReply::Step(PhysicsStepResult {
+                            sequence,
+                            substeps: step.substeps,
+                            poses: step.poses,
+                            events: step.events,
+                            snapshot,
+                        }));
                     }
                     PhysicsRequest::Shutdown => break,
                     PhysicsRequest::Init(_) => panic!("preinitialized server received Init"),
@@ -3133,11 +3204,7 @@ return Move
     }
 
     #[test]
-    fn shutdown_interrupt_keeps_waiting_until_outstanding_physics_result_is_received() {
-        let snapshot = PhysicsWorld::new(Vec3::ZERO)
-            .unwrap()
-            .query_snapshot()
-            .unwrap();
+    fn shutdown_interrupt_returns_without_outstanding_physics_result() {
         let (request_tx, request_rx) = flume::unbounded();
         let (reply_tx, reply_rx) = flume::unbounded();
         let mut client = PhysicsClient::new_preinitialized(request_tx, reply_rx);
@@ -3149,33 +3216,29 @@ return Move
 
         let (control_tx, control_rx) = flume::unbounded();
         let (control_seen_tx, control_seen_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
         let waiting = std::thread::spawn(move || {
-            receive_physics_interruptibly(&mut client, &control_rx, |control| {
+            let result = receive_physics_interruptibly(&mut client, &control_rx, |control| {
                 if matches!(control, ScriptControl::Shutdown) {
                     control_seen_tx.send(()).unwrap();
                     true
                 } else {
                     false
                 }
-            })
+            });
+            result_tx.send(result).unwrap();
         });
         control_tx.send(ScriptControl::Shutdown).unwrap();
         control_seen_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
-        reply_tx
-            .send(PhysicsReply::Step(PhysicsStepResult {
-                sequence: 1,
-                substeps: 0,
-                poses: Vec::new(),
-                events: Vec::new(),
-                snapshot,
-            }))
-            .unwrap();
-        assert!(matches!(
-            waiting.join().unwrap(),
-            Ok(PhysicsWait::Shutdown(result)) if result.sequence == 1
-        ));
+        let result_before_reply = result_rx.recv_timeout(Duration::from_secs(1));
+        drop(reply_tx);
+        waiting.join().unwrap();
+        assert!(
+            matches!(result_before_reply, Ok(Ok(PhysicsWait::Shutdown))),
+            "script wait should return on Shutdown without a StepResult"
+        );
     }
 
     #[test]

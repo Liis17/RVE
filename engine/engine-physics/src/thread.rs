@@ -252,9 +252,12 @@ impl PhysicsServer {
                             return Err(PhysicsServerError::Step(message));
                         }
                     };
-                    replies
-                        .send(PhysicsReply::Step(result))
-                        .map_err(|_| PhysicsServerError::ReplyChannelDisconnected)?;
+                    if replies.send(PhysicsReply::Step(result)).is_err() {
+                        return match requests.recv() {
+                            Ok(PhysicsRequest::Shutdown) => Ok(()),
+                            _ => Err(PhysicsServerError::ReplyChannelDisconnected),
+                        };
+                    }
                     expected_sequence = expected_sequence
                         .checked_add(1)
                         .ok_or(PhysicsServerError::SequenceOverflow)?;
@@ -496,7 +499,7 @@ impl From<QueryError> for PhysicsServerStepError {
 mod tests {
     use super::{
         PhysicsClient, PhysicsClientError, PhysicsInitialization, PhysicsReceive, PhysicsReply,
-        PhysicsRequest, PhysicsServer, PhysicsStepResult,
+        PhysicsRequest, PhysicsServer, PhysicsServerError, PhysicsStepResult,
     };
     use crate::scene::PhysicsSceneDesc;
     use crate::{PhysicsCommand, PhysicsEvent, PhysicsWorld, Ray};
@@ -638,6 +641,55 @@ mod tests {
         client.shutdown().unwrap();
         drop(control_tx);
         server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn abandoned_step_reply_is_graceful_when_host_shuts_server_down() {
+        let (_, desc) = scene_with_dynamic_sphere();
+        let (driver, _) = desc.build().unwrap();
+        let (request_tx, request_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::unbounded();
+        // Нет получателя ответа: отправка StepResult провалится до того, как сервер его отдаст.
+        drop(reply_rx);
+        request_tx
+            .send(PhysicsRequest::Step {
+                sequence: 1,
+                dt: 0.0,
+                commands: Vec::new(),
+            })
+            .unwrap();
+        request_tx.send(PhysicsRequest::Shutdown).unwrap();
+        let server = std::thread::spawn(move || {
+            PhysicsServer::run_preinitialized(request_rx, reply_tx, driver)
+        });
+
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn abandoned_step_reply_without_shutdown_reports_disconnected_host() {
+        let (_, desc) = scene_with_dynamic_sphere();
+        let (driver, _) = desc.build().unwrap();
+        let (request_tx, request_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::unbounded();
+        drop(reply_rx);
+        request_tx
+            .send(PhysicsRequest::Step {
+                sequence: 1,
+                dt: 0.0,
+                commands: Vec::new(),
+            })
+            .unwrap();
+        // Все отправители пропали без Shutdown: сервер не должен ждать вечно.
+        drop(request_tx);
+        let server = std::thread::spawn(move || {
+            PhysicsServer::run_preinitialized(request_rx, reply_tx, driver)
+        });
+
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(PhysicsServerError::ReplyChannelDisconnected)
+        ));
     }
 
     #[test]
