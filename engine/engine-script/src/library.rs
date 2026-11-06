@@ -157,8 +157,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            5.. => std::mem::size_of::<RveScriptDesc>(),
-            4 => std::mem::size_of::<RveScriptDescV4>(),
+            6.. => std::mem::size_of::<RveScriptDesc>(),
+            4 | 5 => std::mem::size_of::<RveScriptDescV4>(),
             3 => std::mem::size_of::<RveScriptDescV3>(),
             _ => std::mem::size_of::<RveScriptDescV1>(),
         };
@@ -176,10 +176,10 @@ impl ScriptLibrary {
         }
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v5 = (header.abi_version >= 5)
+        let descriptors_v6 = (header.abi_version >= 6)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
-        // SAFETY: version 4 has the command callback but no collision callback.
-        let descriptors_v4 = (header.abi_version == 4).then(|| unsafe {
+        // SAFETY: versions 4 and 5 share the command-callback descriptor without collision.
+        let descriptors_v4 = (4..=5).contains(&header.abi_version).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV4>(), count)
         });
         // SAFETY: version 3 has the parameter fields but no appended command callback.
@@ -192,9 +192,10 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v5 {
+            let descriptor = if let Some(descriptors) = descriptors_v6 {
                 &descriptors[index]
             } else if let Some(descriptors) = descriptors_v4 {
+                // ABI v4 and v5 have no collision pointer; normalize it to `None`.
                 let descriptor = &descriptors[index];
                 Box::leak(Box::new(RveScriptDesc {
                     name: descriptor.name,

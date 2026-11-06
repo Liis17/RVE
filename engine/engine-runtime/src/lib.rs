@@ -276,6 +276,7 @@ fn run_from_args(
         ScriptThreadConfig {
             scene_name: name,
             sources,
+            input_settings: project.input.clone(),
             scripts_library,
             #[cfg(test)]
             script_module: None,

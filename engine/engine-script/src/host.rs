@@ -1,4 +1,5 @@
 use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
+use crate::actions::InputActions;
 use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LitePhysicsEvent,
@@ -13,6 +14,7 @@ use crate::types::{
 };
 use engine_console::{CommandCatalog, CommandLine, CommandSpec};
 use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
+use engine_project::InputSettings;
 use engine_scene::{LocalTransform, ObjectHandle, ParamSchema, World};
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use std::cell::{Cell, RefCell};
@@ -37,6 +39,7 @@ pub enum ScriptLoadError {
         name: String,
         message: String,
     },
+    Input(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +69,7 @@ impl fmt::Display for ScriptLoadError {
                 name,
                 message,
             } => write!(f, "object {object_id:?}, heavy script {name:?}: {message}"),
+            Self::Input(message) => write!(f, "invalid project input settings: {message}"),
         }
     }
 }
@@ -86,6 +90,7 @@ pub struct ScriptInterruptHandle {
 pub struct ScriptLoadOptions {
     pub interrupt: ScriptInterruptHandle,
     pub call_time_limit: Option<Duration>,
+    pub input: InputSettings,
 }
 
 impl ScriptInterruptHandle {
@@ -156,7 +161,7 @@ pub struct ScriptHost {
     interruption_reported: bool,
     started: bool,
     destroyed: bool,
-    input: ScriptInput,
+    actions: InputActions,
     current_time: ScriptTime,
     physics: Rc<RefCell<PhysicsScriptState>>,
 }
@@ -249,6 +254,7 @@ impl ScriptHost {
             ScriptLoadOptions {
                 interrupt,
                 call_time_limit: None,
+                input: InputSettings::default(),
             },
         )
     }
@@ -264,7 +270,9 @@ impl ScriptHost {
         let ScriptLoadOptions {
             interrupt,
             call_time_limit,
+            input: input_settings,
         } = options;
+        let actions = InputActions::new(input_settings).map_err(ScriptLoadError::Input)?;
         let events = Rc::new(RefCell::new(ScriptEventQueue::default()));
         let active_source = Rc::new(RefCell::new(scene_name.to_owned()));
         let active_call = Rc::new(Cell::new(std::ptr::null_mut()));
@@ -306,7 +314,7 @@ impl ScriptHost {
             interruption_reported: false,
             started: false,
             destroyed: false,
-            input: ScriptInput::default(),
+            actions,
             current_time: ScriptTime::default(),
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
         };
@@ -332,7 +340,7 @@ impl ScriptHost {
                         self_object: object.handle,
                         source: &source_label,
                         writable: false,
-                        input: host.input,
+                        actions: host.actions.frame(),
                         queued_messages: (host.queued_messages.len(), host.queued_bytes),
                         physics: host.physics.clone(),
                         physics_phase_dt: None,
@@ -407,7 +415,7 @@ impl ScriptHost {
                         self_object: object.handle,
                         source: &source,
                         writable: false,
-                        input: host.input,
+                        actions: host.actions.frame(),
                         queued_messages: (host.queued_messages.len(), host.queued_bytes),
                         physics: host.physics.clone(),
                         physics_phase_dt: None,
@@ -462,7 +470,7 @@ impl ScriptHost {
 
     /// Replaces the input snapshot used by the next update and its lifecycle callbacks.
     pub fn set_input(&mut self, input: ScriptInput) {
-        self.input = input;
+        self.actions.set_input(input);
     }
 
     /// Attaches the current immutable physics query snapshot and scene-body mapping.
@@ -510,7 +518,7 @@ impl ScriptHost {
             return;
         }
         self.destroyed = true;
-        self.input.clear_frame_transients();
+        self.actions.clear_frame_transients();
         if self.started {
             self.run_phase(world, Phase::Destroy, time);
         }
@@ -605,7 +613,7 @@ impl ScriptHost {
             self_object: handle,
             source: &source,
             writable: true,
-            input: self.input,
+            actions: self.actions.frame(),
             queued_messages: (self.queued_messages.len(), self.queued_bytes),
             physics: self.physics.clone(),
             physics_phase_dt: None,
@@ -679,19 +687,23 @@ impl ScriptHost {
                 return Err(CommandError::Failed(message));
             }
         };
-        if let Err(message) = self.transaction.commit(
+        let mutations = match self.transaction.commit(
             world,
             &mut self.queued_messages,
             &mut self.queued_bytes,
             &self.events,
         ) {
-            self.events.borrow_mut().push(ScriptEvent {
-                level: ScriptEventLevel::Error,
-                source,
-                message: message.clone(),
-            });
-            return Err(CommandError::Failed(message));
-        }
+            Ok(mutations) => mutations,
+            Err(message) => {
+                self.events.borrow_mut().push(ScriptEvent {
+                    level: ScriptEventLevel::Error,
+                    source,
+                    message: message.clone(),
+                });
+                return Err(CommandError::Failed(message));
+            }
+        };
+        self.actions.queue_mutations(mutations);
         if let Some(message) = result {
             self.events.borrow_mut().push(ScriptEvent {
                 level: ScriptEventLevel::Info,
@@ -916,7 +928,7 @@ impl ScriptHost {
             active_owner,
             call_deadline,
             transaction,
-            input,
+            actions,
             queued_messages,
             queued_bytes,
             lua,
@@ -937,7 +949,7 @@ impl ScriptHost {
             self_object: instance.handle,
             source: &instance.source,
             writable: true,
-            input: *input,
+            actions: actions.frame(),
             queued_messages: (queued_messages.len(), *queued_bytes),
             physics: physics.clone(),
             physics_phase_dt: match phase {
@@ -1098,7 +1110,10 @@ impl ScriptHost {
 
         // SAFETY: the callback and all call-scoped transaction borrows have returned.
         match unsafe { (*transaction_ptr).commit(world, queued_messages, queued_bytes, events) } {
-            Ok(()) => CallOutcome::Committed,
+            Ok(mutations) => {
+                actions.queue_mutations(mutations);
+                CallOutcome::Committed
+            }
             Err(message) => CallOutcome::Failed(message),
         }
     }

@@ -1,3 +1,4 @@
+use crate::actions::{ActionFrame, ActionMutation, ActionValue};
 use crate::lite::EventQueue;
 use crate::physics::PhysicsScriptState;
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
@@ -10,6 +11,7 @@ use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
@@ -85,7 +87,7 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) self_object: ObjectHandle,
     pub(crate) source: &'a str,
     pub(crate) writable: bool,
-    pub(crate) input: ScriptInput,
+    pub(crate) actions: Arc<ActionFrame>,
     pub(crate) queued_messages: (usize, usize),
     pub(crate) physics: Rc<RefCell<PhysicsScriptState>>,
     pub(crate) physics_phase_dt: Option<f32>,
@@ -118,13 +120,14 @@ pub(crate) struct ScriptTransaction {
     queued_message_count: usize,
     queued_message_bytes: usize,
     overflowed_messages: usize,
-    input: ScriptInput,
+    action_frame: Option<Arc<ActionFrame>>,
     physics: Rc<RefCell<PhysicsScriptState>>,
     physics_phase_dt: Option<f32>,
     pending_physics_commands: Vec<PhysicsCommand>,
     pending_grounded: HashMap<ObjectHandle, bool>,
     pending_collider_enabled: HashMap<BodyHandle, bool>,
     pending_pushes: HashMap<BodyHandle, PendingPush>,
+    pending_action_mutations: Vec<ActionMutation>,
     #[cfg(test)]
     peak_pending_bytes: usize,
 }
@@ -152,13 +155,14 @@ impl Default for ScriptTransaction {
             queued_message_count: 0,
             queued_message_bytes: 0,
             overflowed_messages: 0,
-            input: ScriptInput::default(),
+            action_frame: None,
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
             physics_phase_dt: None,
             pending_physics_commands: Vec::new(),
             pending_grounded: HashMap::new(),
             pending_collider_enabled: HashMap::new(),
             pending_pushes: HashMap::new(),
+            pending_action_mutations: Vec::with_capacity(2),
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
@@ -166,11 +170,18 @@ impl Default for ScriptTransaction {
 }
 
 impl ScriptTransaction {
+    fn action_frame(&self) -> &ActionFrame {
+        static EMPTY_FRAME: OnceLock<ActionFrame> = OnceLock::new();
+        self.action_frame
+            .as_deref()
+            .unwrap_or_else(|| EMPTY_FRAME.get_or_init(ActionFrame::default))
+    }
+
     pub(crate) fn begin(&mut self, init: ScriptTransactionInit<'_>) {
         self.world = init.world;
         self.self_object = Some(init.self_object);
         self.writable = init.writable;
-        self.input = init.input;
+        self.action_frame = Some(init.actions);
         self.physics = init.physics;
         self.physics_phase_dt = init.physics_phase_dt;
         self.source.clear();
@@ -188,6 +199,7 @@ impl ScriptTransaction {
         self.queued_message_count = init.queued_messages.0;
         self.queued_message_bytes = init.queued_messages.1;
         self.overflowed_messages = 0;
+        self.pending_action_mutations.clear();
     }
 
     pub(crate) fn writable(&self) -> bool {
@@ -199,7 +211,33 @@ impl ScriptTransaction {
     }
 
     pub(crate) fn input(&self) -> &ScriptInput {
-        &self.input
+        self.action_frame().input()
+    }
+    pub(crate) fn action_state(
+        &self,
+        name: &str,
+        kind: engine_project::InputActionKind,
+    ) -> Result<ActionValue, String> {
+        self.action_frame().state(name, kind)
+    }
+    pub(crate) fn action_context(&self) -> Option<&str> {
+        self.action_frame().context()
+    }
+    pub(crate) fn action_bindings(
+        &self,
+        context: &str,
+        action: &str,
+        slot: &str,
+    ) -> Result<Vec<String>, String> {
+        self.action_frame().bindings(context, action, slot)
+    }
+    pub(crate) fn stage_action_mutation(&mut self, mutation: ActionMutation) -> Result<(), String> {
+        if !self.writable {
+            return Err("input mutations are unavailable during script creation".to_owned());
+        }
+        self.action_frame().validate_mutation(&mutation)?;
+        self.pending_action_mutations.push(mutation);
+        Ok(())
     }
 
     pub(crate) fn physics_raycast(
@@ -667,7 +705,7 @@ impl ScriptTransaction {
         queued_messages: &mut Vec<PendingMessage>,
         queued_bytes: &mut usize,
         events: &EventQueue,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<ActionMutation>, String> {
         let transforms_are_finite = self.pending_transforms.values().all(|transform| {
             transform
                 .position
@@ -805,7 +843,8 @@ impl ScriptTransaction {
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
         self.world = std::ptr::null();
-        Ok(())
+        self.action_frame = None;
+        Ok(std::mem::take(&mut self.pending_action_mutations))
     }
 
     pub(crate) fn discard(&mut self) {
@@ -822,7 +861,9 @@ impl ScriptTransaction {
         self.queued_message_count = 0;
         self.queued_message_bytes = 0;
         self.overflowed_messages = 0;
+        self.pending_action_mutations.clear();
         self.world = std::ptr::null();
+        self.action_frame = None;
     }
 
     #[cfg(test)]

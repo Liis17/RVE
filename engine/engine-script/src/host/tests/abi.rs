@@ -6,6 +6,7 @@ use crate::transaction::{
     MAX_MESSAGES_PER_FRAME,
 };
 use crate::types::ScriptEventLevel;
+use engine_project::{InputAction, InputSettings};
 use engine_scene::World;
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost,
@@ -13,8 +14,8 @@ use rve_sdk::abi::{
     RveStatus, RveStr, RveTransform, RveValue,
 };
 use rve_sdk::{
-    AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Key, MouseButton, Params, Script,
-    Tonemapper, Value,
+    AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Key, MouseButton, Params,
+    PhysicalInput, Script, Tonemapper, Value,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -45,6 +46,7 @@ struct Probe {
 
 struct InputProbe;
 struct PhysicsProbe;
+struct InputActionsProbe(u8);
 
 struct CameraControl {
     panic_update: bool,
@@ -188,6 +190,74 @@ impl Script for PhysicsProbe {
                 .is_none()
         );
         ctx.log_info("ABI physics API committed");
+    }
+}
+
+fn input_actions_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(InputActionsProbe(0)))
+}
+
+impl Script for InputActionsProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        match self.0 {
+            0 => {
+                {
+                    let input = ctx.input();
+                    assert_eq!(input.context().as_deref(), Some("game"));
+                    assert!(input.action_down("Jump"));
+                    assert!(input.action_pressed("Jump"));
+                    assert!(!input.action_released("Jump"));
+                    assert_eq!(input.axis("MoveX"), Some(1.5));
+                    let [x, y] = input.vector("Move").unwrap();
+                    assert!((x - 1.7071068).abs() < 0.0001);
+                    assert!((y - 0.20710677).abs() < 0.0001);
+                    assert_eq!(input.axis("Jump"), None);
+                    assert_eq!(input.vector("Missing"), None);
+                    assert!(!input.action_down("Confirm"));
+                    assert_eq!(
+                        input.bindings("game", "Jump", "inputs"),
+                        Some(vec!["Space".to_owned(), "W".to_owned()])
+                    );
+                    assert_eq!(input.bindings("game", "Empty", "inputs"), Some(Vec::new()));
+                    assert_eq!(input.bindings("missing", "Jump", "inputs"), None);
+                    let presses = input.pressed_inputs();
+                    assert!(presses.contains(&"Space".to_owned()));
+                    assert!(presses.contains(&"W".to_owned()));
+                    assert!(presses.contains(&"D".to_owned()));
+                    assert!(presses.contains(&"Mouse.Left".to_owned()));
+                }
+                assert!(ctx.set_input_context("menu"));
+                assert!(ctx.rebind("game", "Jump", "inputs", &[PhysicalInput::Key(Key::Enter)],));
+                ctx.log_info("ABI v5 action snapshot");
+                self.0 = 1;
+            }
+            1 => {
+                {
+                    let input = ctx.input();
+                    assert_eq!(input.context().as_deref(), Some("menu"));
+                    assert!(!input.action_down("Jump"));
+                    assert!(input.action_released("Jump"));
+                    assert_eq!(
+                        input.bindings("game", "Jump", "inputs"),
+                        Some(vec!["Enter".to_owned()])
+                    );
+                    assert!(input.pressed_inputs().is_empty());
+                }
+                assert!(ctx.reset_bindings());
+                ctx.log_info("ABI v5 action mutations");
+                self.0 = 2;
+            }
+            _ => {
+                let input = ctx.input();
+                assert_eq!(input.context().as_deref(), Some("menu"));
+                assert_eq!(
+                    input.bindings("game", "Jump", "inputs"),
+                    Some(vec!["Space".to_owned(), "W".to_owned()])
+                );
+                assert!(!input.action_released("Jump"));
+                ctx.log_info("ABI v5 action reset");
+            }
+        }
     }
 }
 
@@ -450,6 +520,7 @@ fn sdk_module() -> &'static RveModule {
         "Limits" => limit_message_factory,
         "InputProbe" => input_probe_factory,
         "PhysicsProbe" => physics_probe_factory,
+        "InputActionsProbe" => input_actions_probe_factory,
         "CameraControl" => camera_control_factory,
         "AbiConsoleCommand" => abi_console_command_factory,
         "AbiConsoleForeign" => abi_console_foreign_factory,
@@ -461,6 +532,58 @@ fn library() -> crate::ScriptLibrary {
     match unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(sdk_module())) } {
         Ok(library) => library,
         Err(error) => panic!("invalid test ABI module: {error}"),
+    }
+}
+
+fn input_action_settings() -> InputSettings {
+    InputSettings {
+        default_context: Some("game".to_owned()),
+        contexts: BTreeMap::from([
+            (
+                "game".to_owned(),
+                BTreeMap::from([
+                    (
+                        "Jump".to_owned(),
+                        InputAction::Button {
+                            inputs: vec!["Space".to_owned(), "W".to_owned()],
+                        },
+                    ),
+                    (
+                        "MoveX".to_owned(),
+                        InputAction::Axis {
+                            negative: vec!["A".to_owned()],
+                            positive: vec!["D".to_owned()],
+                            analog: Some("MouseX".to_owned()),
+                            scale: 0.25,
+                        },
+                    ),
+                    (
+                        "Move".to_owned(),
+                        InputAction::Vector2 {
+                            up: vec!["W".to_owned()],
+                            down: vec!["S".to_owned()],
+                            left: vec!["A".to_owned()],
+                            right: vec!["D".to_owned()],
+                            analog: Some("MouseDelta".to_owned()),
+                            scale: 0.5,
+                        },
+                    ),
+                    (
+                        "Empty".to_owned(),
+                        InputAction::Button { inputs: Vec::new() },
+                    ),
+                ]),
+            ),
+            (
+                "menu".to_owned(),
+                BTreeMap::from([(
+                    "Confirm".to_owned(),
+                    InputAction::Button {
+                        inputs: vec!["Enter".to_owned()],
+                    },
+                )]),
+            ),
+        ]),
     }
 }
 
@@ -534,8 +657,8 @@ fn abi_v3_descriptor_loads_without_reading_a_command_tail() {
 }
 
 #[test]
-fn abi_v4_descriptor_loads_without_reading_the_v5_collision_tail() {
-    let module = v4_probe_module();
+fn abi_v4_descriptor_loads_without_reading_the_v6_collision_tail() {
+    let module = command_probe_module(4);
     // SAFETY: the v4 module and exact-sized descriptor table are leaked for the test process.
     let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
     let descriptor = library.script("Probe").unwrap();
@@ -544,9 +667,26 @@ fn abi_v4_descriptor_loads_without_reading_the_v5_collision_tail() {
 }
 
 #[test]
-fn abi_v3_and_v4_normalized_descriptors_run_without_appended_callbacks() {
+fn abi_v5_descriptor_uses_the_command_layout_without_collision() {
+    let module = command_probe_module(5);
+    // SAFETY: the v5 module and its two exact-sized descriptors are leaked for the test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    // The second entry checks that the loader strides by the v4/v5 descriptor size.
+    for name in ["Probe", "ProbeSecond"] {
+        let descriptor = library.script(name).unwrap();
+        assert!(descriptor.command.is_some());
+        assert!(descriptor.collision.is_none());
+    }
+}
+
+#[test]
+fn abi_v3_v4_and_v5_normalized_descriptors_run_without_appended_callbacks() {
     let _lock = test_lock();
-    for module in [v3_probe_module(), v4_probe_module()] {
+    for module in [
+        v3_probe_module(),
+        command_probe_module(4),
+        command_probe_module(5),
+    ] {
         // SAFETY: each module and its version-specific descriptor table live for this test.
         let library =
             unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
@@ -567,15 +707,16 @@ fn abi_v3_and_v4_normalized_descriptors_run_without_appended_callbacks() {
     }
 }
 
-fn v4_probe_module() -> &'static RveModule {
+/// Builds a module with the `RveScriptDescV4` layout (no collision tail) for ABI 4 or 5.
+fn command_probe_module(abi_version: u32) -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
     let probe = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
         .iter()
         .find(|script| unsafe { script.name.to_str() }.ok() == Some("Probe"))
         .expect("Probe descriptor exists");
-    let scripts = Box::leak(Box::new([RveScriptDescV4 {
-        name: probe.name,
+    let entry = |name| RveScriptDescV4 {
+        name,
         create: probe.create,
         start: probe.start,
         update: probe.update,
@@ -585,10 +726,14 @@ fn v4_probe_module() -> &'static RveModule {
         params: probe.params,
         param_count: probe.param_count,
         command: probe.command,
-    }]));
+    };
+    let scripts = Box::leak(Box::new([
+        entry(probe.name),
+        entry(RveStr::from_static("ProbeSecond")),
+    ]));
     Box::leak(Box::new(RveModule {
         header: RveHeader {
-            abi_version: 4,
+            abi_version,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
         scripts: scripts.as_ptr().cast(),
@@ -597,7 +742,7 @@ fn v4_probe_module() -> &'static RveModule {
 }
 
 #[test]
-fn abi_v5_collision_callback_receives_other_and_contact() {
+fn abi_v6_collision_callback_receives_other_and_contact() {
     let _lock = test_lock();
     let mut world = world(
         r#"
@@ -654,7 +799,7 @@ id = "second"
 }
 
 #[test]
-fn abi_v5_physics_host_callbacks_query_and_stage_commands() {
+fn abi_v6_physics_host_callbacks_query_and_stage_commands() {
     let _lock = test_lock();
     let mut world = world(
         r#"
@@ -760,6 +905,37 @@ fn v3_probe_module() -> &'static RveModule {
     }))
 }
 
+/// Presents the `AbiConsoleCommand` descriptor as an ABI 4 table. The v6 table cannot be reused
+/// directly because its stride is larger than the v4 descriptor layout.
+fn v4_sdk_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let command = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) }
+        .iter()
+        .find(|script| unsafe { script.name.to_str() }.ok() == Some("AbiConsoleCommand"))
+        .expect("AbiConsoleCommand descriptor exists");
+    let scripts = Box::leak(Box::new([RveScriptDescV4 {
+        name: command.name,
+        create: command.create,
+        start: command.start,
+        update: command.update,
+        message: command.message,
+        destroy: command.destroy,
+        drop: command.drop,
+        params: command.params,
+        param_count: command.param_count,
+        command: command.command,
+    }]));
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 4,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: scripts.as_ptr().cast(),
+        script_count: scripts.len(),
+    }))
+}
+
 #[test]
 fn legacy_abi_v1_and_v2_descriptors_are_rejected() {
     for version in [1, 2] {
@@ -853,6 +1029,32 @@ name = "AbiConsoleForeign"
             .any(|command| command.name == "abi.echo")
     );
     assert!(host.execute_command(&mut world, &unregister).is_err());
+}
+
+#[test]
+fn abi_v4_guest_commands_still_load_and_execute() {
+    let _lock = test_lock();
+    let mut world = scripted_world("AbiConsoleCommand", "{}");
+    // SAFETY: the test module and its SDK descriptor table are process-lifetime allocations.
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(v4_sdk_module())) }.unwrap();
+    let owner = world.handle("camera").unwrap();
+    let mut host = load_host(&world, &library);
+    host.start(&mut world, ScriptTime::default());
+    assert!(
+        host.commands()
+            .iter()
+            .any(|command| command.name == "abi.echo")
+    );
+
+    let command = engine_console::parse_command_line("abi.echo v4").unwrap();
+    host.execute_command(&mut world, &command).unwrap();
+    assert_eq!(world.local_transform(owner).unwrap().position[0], 1.0);
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "echo:v4")
+    );
 }
 
 #[test]
@@ -1048,6 +1250,41 @@ fn abi_guest_reads_the_script_input_snapshot_from_a_module() {
     );
 
     assert_eq!(message_list(&mut host), ["ABI input snapshot"]);
+}
+
+#[test]
+fn abi_v5_input_actions_read_snapshots_and_stage_mutations() {
+    let _lock = test_lock();
+    let mut world = scripted_world("InputActionsProbe", "{}");
+    let library = library();
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &empty_sources(),
+        Some(&library),
+        crate::ScriptLoadOptions {
+            input: input_action_settings(),
+            ..crate::ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    let mut input = crate::ScriptInput::default();
+    input.set_key(Key::Space, true);
+    input.set_key(Key::W, true);
+    input.set_key(Key::D, true);
+    input.set_mouse_button(MouseButton::Left, true);
+    input.add_mouse_delta(2.0, -1.0);
+    host.set_input(input.take_frame());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(message_list(&mut host), ["ABI v5 action snapshot"]);
+
+    host.set_input(input.take_frame());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(message_list(&mut host), ["ABI v5 action mutations"]);
+
+    host.set_input(input.take_frame());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(message_list(&mut host), ["ABI v5 action reset"]);
 }
 
 fn invalid_name_module() -> &'static RveModule {

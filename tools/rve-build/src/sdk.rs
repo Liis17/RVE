@@ -588,20 +588,26 @@ mod tests {
     }
 
     #[test]
-    fn sdk_marker_rejects_legacy_abi_v3_for_the_v5_sdk() {
-        let root = temp_dir("rve-sdk-legacy-abi");
-        fs::write(
-            root.path().join("rve-sdk.toml"),
-            sdk_marker(3, &current_target()),
-        )
-        .unwrap();
+    fn sdk_marker_rejects_pre_v6_abi_versions() {
+        for abi_version in [3, 4, 5] {
+            let root = temp_dir("rve-sdk-legacy-abi");
+            fs::write(
+                root.path().join("rve-sdk.toml"),
+                sdk_marker(abi_version, &current_target()),
+            )
+            .unwrap();
 
-        let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
-            panic!("checkout must not be used")
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("ABI version 3"));
-        assert!(error.to_string().contains("ожидаемой версией 5"));
+            let error = locate_player_in(root.path(), PlayerFlavor::Distribution, |_| {
+                panic!("checkout must not be used")
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("ABI version {abi_version}"))
+            );
+            assert!(error.to_string().contains("ожидаемой версией 6"));
+        }
     }
 
     #[test]

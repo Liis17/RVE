@@ -1,3 +1,4 @@
+use crate::input_settings::InputSettings;
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -21,6 +22,8 @@ pub struct ProjectSettings {
     pub runtime: RuntimeSettings,
     #[serde(default)]
     pub physics: PhysicsSettings,
+    #[serde(default)]
+    pub input: InputSettings,
 }
 
 /// A scene listed by a project, in project order.
@@ -162,6 +165,7 @@ impl ProjectSettings {
         if self.version.trim().is_empty() {
             return Err("version не должен быть пустым".to_owned());
         }
+        self.input.validate()?;
         if let Some(path) = &self.heavy_scripts
             && !is_relative_project_path(path)
         {

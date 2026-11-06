@@ -5,7 +5,7 @@ use std::ffi::c_void;
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 5;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 6;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -30,6 +30,14 @@ pub const RVE_INPUT_DOWN: u32 = 1;
 pub const RVE_INPUT_PRESSED: u32 = 2;
 /// Input state bit: the key or button became released in this frame.
 pub const RVE_INPUT_RELEASED: u32 = 4;
+/// Input action kind code for button actions.
+pub const RVE_ACTION_BUTTON: u32 = 0;
+/// Input action kind code for scalar axis actions.
+pub const RVE_ACTION_AXIS: u32 = 1;
+/// Input action kind code for two-dimensional vector actions.
+pub const RVE_ACTION_VECTOR2: u32 = 2;
+/// Maximum number of physical inputs in one binding slot.
+pub const RVE_INPUT_MAX_BINDINGS: usize = 16;
 
 /// Stable key codes shared by the host ABI and the Rust guest API.
 #[repr(u32)]
@@ -251,6 +259,32 @@ impl MouseButton {
             3 => Some(Self::Back),
             4 => Some(Self::Forward),
             _ => None,
+        }
+    }
+}
+
+/// A physical keyboard key or mouse button used by project input bindings.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PhysicalInput {
+    Key(Key),
+    MouseButton(MouseButton),
+}
+
+impl PhysicalInput {
+    /// Parses a stable key name or a `Mouse.<Button>` name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        if let Some(button) = name.strip_prefix("Mouse.") {
+            MouseButton::from_name(button).map(Self::MouseButton)
+        } else {
+            Key::from_name(name).map(Self::Key)
+        }
+    }
+
+    /// Returns the stable name used by project input bindings.
+    pub fn name(self) -> String {
+        match self {
+            Self::Key(key) => format!("{key:?}"),
+            Self::MouseButton(button) => format!("Mouse.{button:?}"),
         }
     }
 }
@@ -579,6 +613,36 @@ pub type RveRegisterCommandFn =
     unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, description: RveStr) -> u32;
 /// Host command unregistration callback; returns `RveStatus` as a `u32`.
 pub type RveUnregisterCommandFn = unsafe extern "C" fn(ctx: *mut c_void, name: RveStr) -> u32;
+/// Reads button action state flags. Appended in ABI v5.
+pub type RveActionStateFn = unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, kind: u32) -> u32;
+/// Reads an axis or vector2 action value after checking its kind. Appended in ABI v5.
+pub type RveActionValueFn =
+    unsafe extern "C" fn(ctx: *mut c_void, name: RveStr, kind: u32, out: *mut [f32; 2]) -> bool;
+/// Copies the active input context name. Appended in ABI v5.
+pub type RveInputContextFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveStr) -> bool;
+/// Stages an input context change. Appended in ABI v5.
+pub type RveSetInputContextFn = unsafe extern "C" fn(ctx: *mut c_void, name: RveStr) -> bool;
+/// Stages replacement of one action binding slot. Appended in ABI v5.
+pub type RveRebindActionFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    context: RveStr,
+    action: RveStr,
+    slot: RveStr,
+    inputs: *const RveStr,
+    input_count: usize,
+) -> bool;
+/// Iterates one binding slot. A valid empty slot returns true with an empty string at index zero.
+/// Appended in ABI v5.
+pub type RveActionBindingFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    context: RveStr,
+    action: RveStr,
+    slot: RveStr,
+    index: usize,
+    out: *mut RveStr,
+) -> bool;
+/// Stages restoration of the project input bindings. Appended in ABI v5.
+pub type RveResetBindingsFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
 
 pub const RVE_COLLISION_ENTER: u32 = 0;
 pub const RVE_COLLISION_EXIT: u32 = 1;
@@ -687,7 +751,21 @@ pub struct RveHost {
     pub register_command: Option<RveRegisterCommandFn>,
     /// Unregisters a command owned by the active script; appended in ABI v4.
     pub unregister_command: Option<RveUnregisterCommandFn>,
-    /// Optional physics callbacks appended in ABI v5.
+    /// Reads button action flags; appended in ABI v5.
+    pub action_state: Option<RveActionStateFn>,
+    /// Reads an axis or vector2 value; appended in ABI v5.
+    pub action_value: Option<RveActionValueFn>,
+    /// Copies the active input context name; appended in ABI v5.
+    pub input_context: Option<RveInputContextFn>,
+    /// Stages an input context change; appended in ABI v5.
+    pub set_input_context: Option<RveSetInputContextFn>,
+    /// Stages one action binding replacement; appended in ABI v5.
+    pub rebind_action: Option<RveRebindActionFn>,
+    /// Iterates one action binding slot; appended in ABI v5.
+    pub action_binding: Option<RveActionBindingFn>,
+    /// Stages resetting bindings; appended in ABI v5.
+    pub reset_bindings: Option<RveResetBindingsFn>,
+    /// Optional physics callbacks appended in ABI v6.
     pub raycast: Option<RvePhysicsRaycastFn>,
     pub get_velocity: Option<RvePhysicsVectorFn>,
     pub set_velocity: Option<RvePhysicsSetVectorFn>,
@@ -780,10 +858,11 @@ pub struct RveScriptDescV3 {
     pub param_count: usize,
 }
 
-/// Script descriptor layout used by ABI version 4.
+/// Script descriptor layout shared by ABI versions 4 and 5.
 ///
-/// The optional command callback was appended in v4. Versions 1 and 2 use
-/// [`RveScriptDescV1`], and version 3 uses [`RveScriptDescV3`]; both are normalized by the host.
+/// The optional command callback was appended in v4; ABI v5 kept this descriptor unchanged.
+/// Versions 1 and 2 use [`RveScriptDescV1`], and version 3 uses [`RveScriptDescV3`]; both are
+/// normalized by the host.
 #[repr(C)]
 pub struct RveScriptDescV4 {
     /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
@@ -808,7 +887,7 @@ pub struct RveScriptDescV4 {
     pub command: Option<RveCommandFn>,
 }
 
-/// One exported guest script implementation in ABI version 5.
+/// One exported guest script implementation in ABI version 6.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -821,7 +900,7 @@ pub struct RveScriptDesc {
     pub params: *const RveParamDesc,
     pub param_count: usize,
     pub command: Option<RveCommandFn>,
-    /// Optional collision and trigger callback appended in ABI v5.
+    /// Optional collision and trigger callback appended in ABI v6.
     pub collision: Option<RveCollisionFn>,
 }
 
@@ -903,9 +982,10 @@ unsafe impl Sync for RveModule {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Key, MouseButton, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA,
-        RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
-        RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn, RveHost,
+        Key, MouseButton, PhysicalInput, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR,
+        RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES,
+        RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn,
+        RveHost,
     };
 
     #[test]
@@ -969,6 +1049,26 @@ mod tests {
             Some(MouseButton::Forward)
         );
         assert_eq!(MouseButton::from_name("UnknownButton"), None);
+    }
+
+    #[test]
+    fn physical_input_names_are_stable_and_explicit_for_mouse_buttons() {
+        assert_eq!(
+            PhysicalInput::from_name("Space"),
+            Some(PhysicalInput::Key(Key::Space))
+        );
+        assert_eq!(
+            PhysicalInput::from_name("Mouse.Left"),
+            Some(PhysicalInput::MouseButton(MouseButton::Left))
+        );
+        assert_eq!(PhysicalInput::Key(Key::ArrowUp).name(), "ArrowUp");
+        assert_eq!(
+            PhysicalInput::MouseButton(MouseButton::Forward).name(),
+            "Mouse.Forward"
+        );
+        assert_eq!(PhysicalInput::from_name("Left"), None);
+        assert_eq!(PhysicalInput::from_name("Mouse.Unknown"), None);
+        assert_eq!(PhysicalInput::from_name("Mouse.Left.Extra"), None);
     }
 
     #[test]

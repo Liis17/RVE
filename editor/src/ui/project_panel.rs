@@ -15,9 +15,6 @@ pub enum ProjectDialog {
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.horizontal(|ui| {
-        if ui.button("Refresh").clicked() {
-            state.action(Action::RefreshAssets);
-        }
         if ui.button("New Folder").clicked() {
             state.project_dialog = Some(ProjectDialog::NewFolder {
                 name: String::new(),
@@ -310,7 +307,7 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
     match result {
         Ok(message) => {
             state.log.info(message);
-            state.action(Action::RefreshAssets);
+            state.action(Action::RefreshTree);
         }
         Err(error) => state.log.error(error.to_string()),
     }

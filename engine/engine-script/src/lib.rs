@@ -2,6 +2,7 @@
 
 mod abi_host;
 mod abi_string;
+mod actions;
 mod host;
 mod library;
 mod lite;

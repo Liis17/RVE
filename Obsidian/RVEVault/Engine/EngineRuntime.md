@@ -107,7 +107,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 
 | Файл | Ответственность |
 |---|---|
-| `engine/engine-runtime/src/lib.rs` | `run_player`, layout startup, resources, project lock, hardware check и lifecycle модулей |
+| `engine/engine-runtime/src/lib.rs` | `run_player`, layout startup, resources, project lock, hardware check и lifecycle модулей; передача project input settings scripts thread |
 | `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames`, dev-only `--debug-view` и usage |
 | `engine/engine-runtime/src/layout.rs` | release/dev пути и выбор ABI-библиотеки |
 | `engine/engine-runtime/src/activation.rs` | `PendingActivation` и single-instance handshake |
@@ -129,6 +129,14 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 - Pipeline cache приложения использует sanitized `ProjectSettings.name` под пользовательским каталогом кэша; renderer получает bytes до создания и сохраняет данные до Drop в render thread.
 - Renderer создаётся на главном потоке в `init`, затем передаётся render thread. Менять зависимости и поведение upstream-крейтов для runtime не требуется.
 - Потоки `rve-audio`, `rve-network` и `rve-neural` запускаются как отдельные управляемые потоки без доменной работы. `rve-physics` выполняет шаги физики, см. [[Engine/EnginePhysics]].
+
+## Игровые действия ввода
+
+Runtime передаёт `ProjectSettings.input` в `ScriptHost` вместе с исходниками сцены.
+Action evaluation выполняется внутри общего `engine-script::ScriptHost::set_input`,
+поэтому сырые клавиши и действия используют один кадр событий. Потеря фокуса и
+Background сохраняют raw `released` edges и сбрасывают analog deltas; вместе с ними
+обнуляются mouse/wheel actions. См. [[Engine/EngineProject]] и [[Engine/EngineScript]].
 
 ## Developer console
 

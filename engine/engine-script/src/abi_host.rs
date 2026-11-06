@@ -1,4 +1,5 @@
 use crate::abi_string::read_abi_str;
+use crate::actions::ActionMutation;
 use crate::lite::{
     CommandGeneration, EventQueue, LuaCommands, MAX_LOG_MESSAGE_BYTES, RegisteredCommandCallback,
     RegisteredLuaCommand,
@@ -12,18 +13,22 @@ use crate::transaction::{
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_console::CommandSpec;
 use engine_physics::Ray;
+use engine_project::InputActionKind;
 use engine_scene::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, ParamValue,
     ProjectionSettings, Tonemapper,
 };
 use glam::Vec3;
+use rve_sdk::PhysicalInput;
 use rve_sdk::abi::{
-    RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
-    RVE_ANTI_ALIASING_TAA, RVE_LOG_ERROR, RVE_LOG_INFO, RVE_LOG_WARN, RVE_TONEMAPPER_ACES,
-    RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
-    RVE_VALUE_INT, RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult,
-    RveCollisionEvent, RveHost, RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus,
-    RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_ACTION_AXIS, RVE_ACTION_BUTTON, RVE_ACTION_VECTOR2, RVE_ANTI_ALIASING_DLSS,
+    RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA,
+    RVE_INPUT_DOWN, RVE_INPUT_MAX_BINDINGS, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR,
+    RVE_LOG_INFO, RVE_LOG_WARN, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
+    RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
+    RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent, RveHost, RveParamEntry,
+    RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue,
+    RveValueData,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -39,6 +44,7 @@ pub(crate) struct AbiCallContext<'a> {
     command_owner: usize,
     commands_allowed: bool,
     error: Option<String>,
+    action_binding: String,
     poisoned: bool,
 }
 
@@ -77,6 +83,7 @@ impl<'a> AbiCallContext<'a> {
             command_owner: 0,
             commands_allowed: false,
             error: None,
+            action_binding: String::new(),
             poisoned: false,
         }
     }
@@ -98,6 +105,7 @@ impl<'a> AbiCallContext<'a> {
             command_owner: command_access.owner,
             commands_allowed: command_access.allowed,
             error: None,
+            action_binding: String::new(),
             poisoned: false,
         }
     }
@@ -167,6 +175,13 @@ impl<'a> AbiCallContext<'a> {
                 .transaction
                 .physics_attached()
                 .then_some(host_physics_is_collider_enabled),
+            action_state: Some(host_action_state),
+            action_value: Some(host_action_value),
+            input_context: Some(host_input_context),
+            set_input_context: Some(host_set_input_context),
+            rebind_action: Some(host_rebind_action),
+            action_binding: Some(host_action_binding),
+            reset_bindings: Some(host_reset_bindings),
         }
     }
 
@@ -1220,6 +1235,175 @@ unsafe extern "C" fn host_wheel_delta(ctx: *mut c_void, out: *mut [f32; 2]) -> b
     host_input_vector(ctx, out, |input| input.wheel())
 }
 
+unsafe extern "C" fn host_action_state(ctx: *mut c_void, name: RveStr, kind: u32) -> u32 {
+    guarded(ctx, 0, |context| {
+        let Ok(name) = (unsafe { read_abi_str(name) }) else {
+            return 0;
+        };
+        if kind != RVE_ACTION_BUTTON {
+            return 0;
+        }
+        let Ok(value) = context
+            .transaction
+            .action_state(name, InputActionKind::Button)
+        else {
+            return 0;
+        };
+        (u32::from(value.down) * RVE_INPUT_DOWN)
+            | (u32::from(value.pressed) * RVE_INPUT_PRESSED)
+            | (u32::from(value.released) * RVE_INPUT_RELEASED)
+    })
+}
+
+unsafe extern "C" fn host_action_value(
+    ctx: *mut c_void,
+    name: RveStr,
+    kind: u32,
+    out: *mut [f32; 2],
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Ok(name) = (unsafe { read_abi_str(name) }) else {
+            return false;
+        };
+        let kind = match kind {
+            RVE_ACTION_AXIS => InputActionKind::Axis,
+            RVE_ACTION_VECTOR2 => InputActionKind::Vector2,
+            _ => return false,
+        };
+        let Ok(value) = context.transaction.action_state(name, kind) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the guest's writable stack slot.
+        unsafe { *out = value.value };
+        true
+    })
+}
+
+unsafe extern "C" fn host_input_context(ctx: *mut c_void, out: *mut RveStr) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(name) = context.transaction.action_context() else {
+            return false;
+        };
+        // SAFETY: output was checked and the frame owns the context name for this call.
+        unsafe { *out = RveStr::from_str_ref(name) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_set_input_context(ctx: *mut c_void, name: RveStr) -> bool {
+    guarded(ctx, false, |context| {
+        let Ok(name) = (unsafe { read_abi_str(name) }) else {
+            return false;
+        };
+        context
+            .transaction
+            .stage_action_mutation(ActionMutation::SetContext(name.to_owned()))
+            .is_ok()
+    })
+}
+
+unsafe extern "C" fn host_rebind_action(
+    ctx: *mut c_void,
+    context_name: RveStr,
+    action: RveStr,
+    slot: RveStr,
+    inputs: *const RveStr,
+    input_count: usize,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if input_count > RVE_INPUT_MAX_BINDINGS || (input_count > 0 && inputs.is_null()) {
+            return false;
+        }
+        let (Ok(context_name), Ok(action), Ok(slot)) = (
+            unsafe { read_abi_str(context_name) },
+            unsafe { read_abi_str(action) },
+            unsafe { read_abi_str(slot) },
+        ) else {
+            return false;
+        };
+        // SAFETY: the guest promises `input_count` readable RveStr entries when nonzero.
+        let input_names = if input_count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(inputs, input_count) }
+        };
+        let mut physical_inputs = Vec::with_capacity(input_count);
+        for input in input_names {
+            let Ok(input) = (unsafe { read_abi_str(*input) }) else {
+                return false;
+            };
+            let Some(input) = PhysicalInput::from_name(input) else {
+                return false;
+            };
+            physical_inputs.push(input);
+        }
+        context
+            .transaction
+            .stage_action_mutation(ActionMutation::Rebind {
+                context: context_name.to_owned(),
+                action: action.to_owned(),
+                slot: slot.to_owned(),
+                inputs: physical_inputs,
+            })
+            .is_ok()
+    })
+}
+
+unsafe extern "C" fn host_action_binding(
+    ctx: *mut c_void,
+    context_name: RveStr,
+    action: RveStr,
+    slot: RveStr,
+    index: usize,
+    out: *mut RveStr,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let (Ok(context_name), Ok(action), Ok(slot)) = (
+            unsafe { read_abi_str(context_name) },
+            unsafe { read_abi_str(action) },
+            unsafe { read_abi_str(slot) },
+        ) else {
+            return false;
+        };
+        let Ok(bindings) = context
+            .transaction
+            .action_bindings(context_name, action, slot)
+        else {
+            return false;
+        };
+        if bindings.is_empty() && index == 0 {
+            // SAFETY: output was checked; empty is the ABI v5 valid-empty-slot sentinel.
+            unsafe { *out = RveStr::empty() };
+            return true;
+        }
+        let Some(binding) = bindings.get(index) else {
+            return false;
+        };
+        context.action_binding.clone_from(binding);
+        // SAFETY: output was checked and context owns the string until the next host callback.
+        unsafe { *out = RveStr::from_str_ref(&context.action_binding) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_reset_bindings(ctx: *mut c_void) -> bool {
+    guarded(ctx, false, |context| {
+        context
+            .transaction
+            .stage_action_mutation(ActionMutation::ResetBindings)
+            .is_ok()
+    })
+}
+
 fn host_input_vector(
     ctx: *mut c_void,
     out: *mut [f32; 2],
@@ -1487,6 +1671,31 @@ mod tests {
     }
 
     #[test]
+    fn input_mutation_callbacks_reject_script_creation() {
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
+        let host = context.host(ScriptTime::default());
+
+        // SAFETY: callback context and borrowed names remain live for each call.
+        unsafe {
+            assert!(!(host.set_input_context.unwrap())(
+                host.ctx,
+                RveStr::from_static("menu")
+            ));
+            assert!(!(host.reset_bindings.unwrap())(host.ctx));
+            assert!(!(host.rebind_action.unwrap())(
+                host.ctx,
+                RveStr::from_static("game"),
+                RveStr::from_static("Jump"),
+                RveStr::from_static("inputs"),
+                std::ptr::null(),
+                0,
+            ));
+        }
+    }
+
+    #[test]
     fn camera_callbacks_validate_handles_settings_and_creation_writes() {
         let document = SceneDocument::parse(
             "scene.rvescene",
@@ -1502,7 +1711,9 @@ mod tests {
             self_object: camera,
             source: "scene/camera/Probe",
             writable: true,
-            input: ScriptInput::default(),
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
             queued_messages: (0, 0),
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
@@ -1582,7 +1793,9 @@ mod tests {
             self_object: camera,
             source: "scene/camera/Probe",
             writable: false,
-            input: ScriptInput::default(),
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
             queued_messages: (0, 0),
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),

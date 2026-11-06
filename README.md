@@ -85,12 +85,78 @@ cargo run --release -p rve-build -- sdk --output ../rve-sdk-dist --rust-toolchai
 `--debug-view` принимает только dev-запуск с `--project`; в dev-player F8 циклически
 меняет поддерживаемые режимы, если окно в фокусе и developer console закрыта.
 
+### Игровые действия ввода
+
+Назначай именованные действия и их клавиши в необязательной секции `[input]` файла
+`project.rveproject`. Без этой секции проект работает как раньше, с пустым набором
+действий. `button`, `axis` и `vector2` используют имена клавиш (`Space`, `W`) или
+кнопок мыши с префиксом (`Mouse.Left`).
+
+```toml
+[input]
+default_context = "game"
+
+[input.contexts.game.Jump]
+kind = "button"
+inputs = ["Space"]
+
+[input.contexts.game.Move]
+kind = "vector2"
+up = ["W"]
+down = ["S"]
+left = ["A"]
+right = ["D"]
+
+[input.contexts.game.Look]
+kind = "vector2"
+analog = "MouseDelta"
+scale = 0.1
+
+[input.contexts.game.Throttle]
+kind = "axis"
+negative = ["Q"]
+positive = ["E"]
+analog = "WheelY"
+scale = 1.0
+```
+
+Для `axis` источниками analog служат `MouseX`, `MouseY`, `WheelX` и `WheelY`; для
+`vector2` — `MouseDelta` и `Wheel`. Если заданы контексты, `default_context` обязателен;
+он выбирает один начальный активный контекст. В Lua действия доступны через
+`rve.input.action_down(name)`, `rve.input.action_pressed(name)`,
+`rve.input.action_released(name)`, `rve.input.axis(name)` и `rve.input.vector(name)`
+(возвращает `x, y`). `rve.input.context()` возвращает активный контекст;
+`rve.input.set_context(name)` переключает его, а
+`rve.input.rebind(context, action, slot, inputs)` временно заменяет слот.
+`rve.input.bindings(context, action, slot)` читает биндинг,
+`rve.input.reset_bindings()` возвращает настройки проекта,
+`rve.input.pressed_inputs()` перечисляет клавиши и кнопки мыши с новым pressed edge.
+Например:
+
+```lua
+if rve.input.action_pressed("Jump") then
+  rve.log_info("Jump")
+end
+local move_x, move_y = rve.input.vector("Move")
+```
+
+Контекстные изменения и переназначения применяются со следующего кадра скриптов и
+откатываются при ошибке callback; они не сохраняются между запусками. Сырой API
+`key_down`/`key_pressed` и `mouse_down`/`mouse_pressed` остаётся доступен независимо
+от контекста. Неизвестное действие или неправильный вид дают Lua runtime error;
+известное, но неактивное действие возвращает `false` или `0`.
+
 Команда `rve-build sdk` собирает release редактор, сборщик и оба варианта player и
 создаёт переносимый каталог с `rve-editor`, `rve-build`, distribution player
 `rve-player`, dev player `rve-player-dev`, гостевым API `rve-sdk`, выбранным
 `toolchain/` и маркером `rve-sdk.toml`. Укажи `--rust-toolchain <sysroot>`, чтобы
 включить автономную сборку Rust-скриптов. Для CI без сборки guest-кода можно явно
 передать `--no-rust-toolchain`.
+
+Guest API использует ABI v6; host продолжает загружать библиотеки ABI v3, v4 и v5.
+Переносимый SDK marker требует точного совпадения ABI, поэтому комплект с marker
+v5 нужно пересобрать командой `rve-build sdk`. Builder автоматически синхронизирует
+SDK в `<project>/.rve/sdk` перед сборкой проектных Rust scripts.
 
 На Windows подготовь минимальную GNU toolchain через rustup и передай её sysroot:
 
@@ -246,7 +312,7 @@ Scene и Game имеют отдельный selector `View`; Inspector реда�
 
 Play не меняет документ: Stop возвращает сцену к состоянию до запуска. Lua, зависший дольше 5 секунд, прерывается, но зависший Rust-скрипт прервать нельзя, и он остановит редактор.
 
-Ограничения: раскладка панелей не сохраняется, список файлов обновляется кнопкой Refresh, а переименование или удаление файла в Project не обновляет ссылки в сценах. При сохранении комментарии в файле сцены теряются.
+Ограничения: раскладка панелей не сохраняется; изменения в `Assets/` автоматически отражаются в Project и обновляют затронутые ресурсы, но переименование или удаление файла не обновляет ссылки в сценах. При сохранении комментарии в файле сцены теряются.
 
 ## Физика
 

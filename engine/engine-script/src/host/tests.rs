@@ -5,6 +5,7 @@ use engine_physics::{
     BodyDesc, BodyHandle, BodyKind, CharacterController, ColliderDesc, MAX_PUSH_SPEED,
     PhysicsCommand, PhysicsSceneBinding, PhysicsWorld, Pose, Shape, StepDriver,
 };
+use engine_project::{InputAction, InputSettings};
 use engine_scene::{LocalTransform, SceneDocument, World};
 use glam::{Quat, Vec3};
 use rve_sdk::{Context, Params, Script, Value};
@@ -62,6 +63,254 @@ fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .iter()
         .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
         .collect()
+}
+
+fn action_settings() -> InputSettings {
+    InputSettings {
+        default_context: Some("game".to_owned()),
+        contexts: BTreeMap::from([
+            (
+                "game".to_owned(),
+                BTreeMap::from([
+                    (
+                        "Jump".to_owned(),
+                        InputAction::Button {
+                            inputs: vec!["Space".to_owned(), "W".to_owned()],
+                        },
+                    ),
+                    (
+                        "MoveX".to_owned(),
+                        InputAction::Axis {
+                            negative: vec!["A".to_owned()],
+                            positive: vec!["D".to_owned()],
+                            analog: Some("MouseX".to_owned()),
+                            scale: 0.25,
+                        },
+                    ),
+                    (
+                        "Move".to_owned(),
+                        InputAction::Vector2 {
+                            up: vec!["W".to_owned()],
+                            down: vec!["S".to_owned()],
+                            left: vec!["A".to_owned()],
+                            right: vec!["D".to_owned()],
+                            analog: Some("MouseDelta".to_owned()),
+                            scale: 0.5,
+                        },
+                    ),
+                ]),
+            ),
+            (
+                "menu".to_owned(),
+                BTreeMap::from([(
+                    "Confirm".to_owned(),
+                    InputAction::Button {
+                        inputs: vec!["Enter".to_owned()],
+                    },
+                )]),
+            ),
+        ]),
+    }
+}
+
+fn load_with_input(
+    world: &World,
+    sources: &BTreeMap<String, String>,
+    input: InputSettings,
+) -> ScriptHost {
+    ScriptHost::load_with_options(
+        world,
+        "scene",
+        sources,
+        None,
+        ScriptLoadOptions {
+            input,
+            ..ScriptLoadOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn lua_input_actions_read_values_bindings_and_delayed_mutations() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+local function require_value(value, message)
+  if not value then error(message) end
+end
+function Input:on_update()
+  if rve.input.context() == "game" then
+    require_value(rve.input.action_down("Jump"), "Jump down missing")
+    require_value(rve.input.action_pressed("Jump"), "Jump press missing")
+    require_value(not rve.input.action_released("Jump"), "unexpected Jump release")
+    require_value(math.abs(rve.input.axis("MoveX") - 1.5) < 0.0001, "axis value mismatch")
+    local x, y = rve.input.vector("Move")
+    require_value(math.abs(x - 1.7071068) < 0.0001, "vector x mismatch")
+    require_value(math.abs(y - 0.20710677) < 0.0001, "vector y mismatch")
+    local bindings = rve.input.bindings("game", "Jump", "inputs")
+    require_value(bindings[1] == "Space" and bindings[2] == "W", "bindings mismatch")
+    local presses = {}
+    for _, name in ipairs(rve.input.pressed_inputs()) do presses[name] = true end
+    require_value(presses.Space and presses.W and presses.D, "pressed input names mismatch")
+    rve.input.set_context("menu")
+    rve.input.rebind("game", "Jump", "inputs", { "Enter" })
+    require_value(rve.input.context() == "game", "context changed before next input frame")
+    rve.log_info("game action snapshot")
+  else
+    require_value(rve.input.context() == "menu", "menu context missing")
+    require_value(not rve.input.action_down("Jump"), "inactive action stayed down")
+    require_value(rve.input.action_released("Jump"), "context switch release missing")
+    local bindings = rve.input.bindings("game", "Jump", "inputs")
+    require_value(bindings[1] == "Enter" and bindings[2] == nil, "rebind missing")
+    rve.log_info("menu action snapshot")
+  end
+end
+return Input
+"#;
+    let mut host = load_with_input(
+        &world,
+        &sources(&[("input.lua", source)]),
+        action_settings(),
+    );
+    let mut input = ScriptInput::default();
+    input.set_key(Key::Space, true);
+    input.set_key(Key::W, true);
+    input.set_key(Key::D, true);
+    input.add_mouse_delta(2.0, -1.0);
+    host.set_input(input);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "game action snapshot"
+    }));
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "game action snapshot"
+    }));
+
+    input.clear_frame_transients();
+    host.set_input(input);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "menu action snapshot"
+    }));
+}
+
+#[test]
+fn lua_input_actions_reject_unknown_and_wrong_kind_queries() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/input.lua"
+[[objects.lite_scripts]]
+path = "/input.lua"
+"#,
+    );
+    let source = r#"
+local Input = {}
+local function rejects(callback, expected)
+  local ok, message = pcall(callback)
+  if ok or not string.find(tostring(message), expected, 1, true) then
+    error("expected input error containing " .. expected)
+  end
+end
+function Input:on_update()
+  if rve.input.action_down("Confirm") then error("inactive action is down") end
+  rejects(function() rve.input.axis("Jump") end, "expected Axis")
+  rejects(function() rve.input.action_down("MoveX") end, "expected Button")
+  rejects(function() rve.input.vector("Missing") end, "unknown input action")
+  rejects(function() rve.input.bindings("missing", "Jump", "inputs") end, "unknown input context")
+  rejects(function() rve.input.bindings("game", "MoveX", "inputs") end, "unknown Axis input slot")
+  rejects(function() rve.input.rebind("game", "Jump", "inputs", { "Unknown" }) end, "unknown physical input")
+  rve.log_info("input action validation passed")
+end
+return Input
+"#;
+    let mut host = load_with_input(
+        &world,
+        &sources(&[("input.lua", source)]),
+        action_settings(),
+    );
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Info
+                && event.message == "input action validation passed"
+        }),
+        "unexpected input validation events: {events:?}"
+    );
+}
+
+#[test]
+fn lua_input_mutations_are_rolled_back_when_a_callback_fails() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/bad.lua"
+[[assets]]
+path = "/observe.lua"
+[[objects]]
+id = "bad"
+[[objects.lite_scripts]]
+path = "/bad.lua"
+[[objects]]
+id = "observer"
+[[objects.lite_scripts]]
+path = "/observe.lua"
+"#,
+    );
+    let bad = r#"
+local Input = {}
+function Input:on_update()
+    rve.input.set_context("menu")
+    error("input transaction failure")
+end
+return Input
+"#;
+    let observer = r#"
+local Input = {}
+function Input:on_update()
+  if rve.input.context() == "game" then
+    rve.log_info("rollback kept game context")
+  else
+    rve.log_error("input mutation escaped rollback")
+  end
+end
+return Input
+"#;
+    let mut host = load_with_input(
+        &world,
+        &sources(&[("bad.lua", bad), ("observe.lua", observer)]),
+        action_settings(),
+    );
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event.message.contains("input transaction failure")
+    }));
+    host.drain_events();
+
+    let input = ScriptInput::default();
+    host.set_input(input);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "rollback kept game context"
+    }));
+    assert!(
+        events
+            .iter()
+            .all(|event| { event.message != "input mutation escaped rollback" })
+    );
 }
 
 #[test]
@@ -2746,6 +2995,7 @@ return Neighbor
         ScriptLoadOptions {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
+            input: Default::default(),
         },
     )
     .unwrap();
@@ -2939,6 +3189,7 @@ return Script
         ScriptLoadOptions {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
+            input: Default::default(),
         },
     )
     .unwrap();
@@ -2967,6 +3218,7 @@ fn lua_call_deadline_applies_to_top_level_chunks_and_is_optional() {
         ScriptLoadOptions {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
+            input: Default::default(),
         },
     );
     assert!(matches!(
@@ -2993,6 +3245,7 @@ return Script
         ScriptLoadOptions {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: None,
+            input: Default::default(),
         },
     )
     .unwrap();
