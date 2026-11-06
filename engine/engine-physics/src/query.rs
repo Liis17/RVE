@@ -291,7 +291,6 @@ impl QuerySnapshot {
                     pose,
                     displacement,
                     skin,
-                    tolerance,
                     collider.pose,
                     mesh,
                     sweep_bounds,
@@ -378,11 +377,11 @@ fn cast_against_mesh(
     pose: Pose,
     displacement: Vec3,
     skin: f32,
-    tolerance: f32,
     mesh_pose: Pose,
     mesh: &TriMesh,
     sweep_bounds: Aabb,
 ) -> Result<Option<(f32, DistanceResult, Option<u32>)>, QueryError> {
+    let tolerance = cast_tolerance(pose.position, displacement);
     let mesh_inverse = mesh_pose.rotation.inverse();
     let local_corners = sweep_bounds
         .corners()
