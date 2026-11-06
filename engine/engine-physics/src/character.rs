@@ -316,7 +316,11 @@ impl CharacterController {
             return Ok(None);
         }
         let raised_pose = Pose::new(start_pose.position + up, start_pose.rotation)?;
-        let mut stepped = self.slide(snapshot, body, shape, raised_pose, horizontal, overrides)?;
+        // Центр капсулы у грани ступени отстоит от её ребра на радиус. Пока центр за ребром,
+        // нижняя полусфера касается ребра наклонной нормалью и шаг отклоняется, поэтому
+        // проверка шага переносит капсулу на радиус + skin дальше текущего смещения.
+        let reach = horizontal.normalize() * (horizontal.length() + self.radius + self.skin);
+        let mut stepped = self.slide(snapshot, body, shape, raised_pose, reach, overrides)?;
         let down = -Vec3::Y * (self.step_height + self.skin);
         let down_pose = Pose::new(stepped.position, start_pose.rotation)?;
         let Some(ground) = snapshot
@@ -545,6 +549,26 @@ mod tests {
         let tall = move_over_step(0.5);
         assert!(tall.translation.x < 0.5, "{tall:?}");
         assert!(tall.translation.y.abs() < 1.0e-3, "{tall:?}");
+    }
+
+    #[test]
+    fn step_up_is_not_blocked_by_wall_contact_within_skin() {
+        // Капсула уже касается грани ступени в пределах skin: это боковой контакт, не потолок.
+        let mut world = world_with_floor();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.4, 0.1, 1.0)).unwrap(),
+                Pose::new(Vec3::new(1.0, 0.1, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let start = Pose::new(Vec3::new(0.6 - 0.25 - 0.005, 0.5, 0.0), Quat::IDENTITY).unwrap();
+        let result = controller(0.3, 45.0, 0.2)
+            .move_capsule(&snapshot, BodyHandle(u64::MAX), start, Vec3::X * 0.05)
+            .unwrap();
+        assert!(result.translation.x > 0.05, "{result:?}");
+        assert!(result.translation.y > 0.1, "{result:?}");
+        assert!(result.grounded, "{result:?}");
     }
 
     #[test]
