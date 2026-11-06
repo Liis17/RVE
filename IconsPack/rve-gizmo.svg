@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="RVE 3D gizmo axes">
+  <!-- Flat, saturated axes for reliable rendering at small sizes. -->
+  <!-- Y: bright green. Solid stroke avoids a degenerate SVG gradient on a vertical path. -->
+  <path d="M32 34.5 V12.5" fill="none" stroke="#42E77C" stroke-width="4.6" stroke-linecap="round"/>
+  <!-- Z: cyan-blue. -->
+  <path d="M32 34.5 L14.6 44.8" fill="none" stroke="#4DBBFC" stroke-width="4.6" stroke-linecap="round"/>
+  <!-- X: coral red. -->
+  <path d="M32 34.5 L49.4 44.8" fill="none" stroke="#FF666B" stroke-width="4.6" stroke-linecap="round"/>
+</svg>

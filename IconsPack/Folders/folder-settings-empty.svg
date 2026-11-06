@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Settings folder">
+  <defs>
+    <linearGradient id="folderBack" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFBD39"/>
+      <stop offset="1" stop-color="#FF9C25"/>
+    </linearGradient>
+    <linearGradient id="folderFront" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFE079"/>
+      <stop offset="1" stop-color="#FFCC52"/>
+    </linearGradient>
+    <linearGradient id="folderFrontRight" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFD35C"/>
+      <stop offset="1" stop-color="#FFC744"/>
+    </linearGradient>
+    <clipPath id="folderFace"><path d="M7 29 Q7 24 12 24 H52 Q57 24 57 29 V48 Q57 54 51 54 H13 Q7 54 7 48 Z"/></clipPath>
+  </defs>
+  <path d="M7 20 Q7 15 12 15 H23.5 Q26 15 27.8 17.6 L31 21 H51 Q57 21 57 27 V47 H7 Z" fill="url(#folderBack)"/>
+  <path d="M9 24 H55 V30 H9 Z" fill="#EFA024" opacity="0.27"/>
+  <path d="M7 29 Q7 24 12 24 H52 Q57 24 57 29 V48 Q57 54 51 54 H13 Q7 54 7 48 Z" fill="url(#folderFront)"/>
+  <g clip-path="url(#folderFace)"><path d="M33 24 H59 V55 H33 Z" fill="url(#folderFrontRight)" opacity="0.40"/></g>
+
+  <!-- Proper gear overlay on folder face -->
+  <g transform="translate(31.07 37.55) scale(0.845)" opacity="0.38">
+    <path d="M 0,-10.5 L 2.2,-10.5 C 2.7,-10.5 3.1,-10.2 3.2,-9.7 L 3.7,-7.9 C 4.7,-7.6 5.6,-7.1 6.4,-6.5 L 8.1,-7.2 C 8.5,-7.4 9.1,-7.3 9.4,-6.9 L 10.9,-5.4 C 11.2,-5.1 11.3,-4.6 11.1,-4.1 L 10.4,-2.4 C 11.0,-1.6 11.5,-0.7 11.8,0.3 L 13.6,0.8 C 14.1,0.9 14.4,1.4 14.4,1.8 L 14.4,4.1 C 14.4,4.6 14.1,5.0 13.6,5.2 L 11.8,5.6 C 11.5,6.6 11.0,7.5 10.4,8.3 L 11.1,10.0 C 11.3,10.4 11.2,11.0 10.9,11.3 L 9.4,12.8 C 9.1,13.1 8.5,13.2 8.1,13.0 L 6.4,12.3 C 5.6,12.9 4.7,13.4 3.7,13.7 L 3.2,15.5 C 3.1,16.0 2.7,16.3 2.2,16.3 L 0,16.3 C -0.5,16.3 -0.9,16.0 -1.1,15.5 L -1.5,13.7 C -2.6,13.4 -3.5,12.9 -4.3,12.3 L -6.0,13.0 C -6.4,13.2 -6.9,13.1 -7.3,12.8 L -8.8,11.3 C -9.1,11.0 -9.2,10.4 -9.0,10.0 L -8.3,8.3 C -8.9,7.5 -9.4,6.6 -9.7,5.6 L -11.5,5.2 C -11.9,5.0 -12.2,4.6 -12.2,4.1 L -12.2,1.8 C -12.2,1.4 -11.9,0.9 -11.5,0.8 L -9.7,0.3 C -9.4,-0.7 -8.9,-1.6 -8.3,-2.4 L -9.0,-4.1 C -9.2,-4.6 -9.1,-5.1 -8.8,-5.4 L -7.3,-6.9 C -6.9,-7.3 -6.4,-7.4 -6.0,-7.2 L -4.3,-6.5 C -3.5,-7.1 -2.6,-7.6 -1.5,-7.9 L -1.1,-9.7 C -0.9,-10.2 -0.5,-10.5 0,-10.5 Z" fill="#7E8793"/>
+    <circle cx="1.1" cy="2.9" r="5.5" fill="#FFF1C7" opacity="0.98"/>
+  </g>
+</svg>

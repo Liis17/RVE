@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Camera settings file">
+  <defs>
+    <linearGradient id="doc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFE49E"/>
+      <stop offset="1" stop-color="#FFD17B"/>
+    </linearGradient>
+    <linearGradient id="docRight" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFCC77"/>
+      <stop offset="1" stop-color="#FFD88B"/>
+    </linearGradient>
+    <linearGradient id="docFold" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFB228"/><stop offset="1" stop-color="#FB8A00"/></linearGradient>
+    <linearGradient id="docSymbol" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#F9B43D"/><stop offset="1" stop-color="#ED941A"/></linearGradient>
+    <clipPath id="docClip"><path d="M12 4 H40 L54 18 V53 Q54 59 48 59 H12 Q6 59 6 53 V10 Q6 4 12 4Z"/></clipPath>
+  </defs>
+  <path d="M12 4 H40 L54 18 V53 Q54 59 48 59 H12 Q6 59 6 53 V10 Q6 4 12 4Z" fill="url(#doc)"/>
+  <g clip-path="url(#docClip)"><path d="M30 4 H54 V59 H30Z" fill="url(#docRight)" opacity="0.54"/></g>
+  <path d="M40 4 V14 Q40 18 44 18 H54Z" fill="url(#docFold)"/>
+  <rect x="13.5" y="26.5" width="25" height="17" rx="5" fill="url(#docSymbol)"/>
+  <path d="M37 31 44.2 26.7 Q47 25.3 47 28.9 V40.2 Q47 43.6 44.2 42.2 L37 37.8Z" fill="#F2A02B"/>
+  <path d="M 44.800,38.750 L 45.989,37.494 L 47.149,37.772 L 48.250,38.228 L 48.474,39.944 L 49.219,40.581 L 50.949,40.533 L 51.572,41.550 L 52.028,42.651 L 50.973,44.022 L 51.050,45.000 L 52.306,46.189 L 52.028,47.349 L 51.572,48.450 L 49.856,48.674 L 49.219,49.419 L 49.267,51.149 L 48.250,51.772 L 47.149,52.228 L 45.778,51.173 L 44.800,51.250 L 43.611,52.506 L 42.451,52.228 L 41.350,51.772 L 41.126,50.056 L 40.381,49.419 L 38.651,49.467 L 38.028,48.450 L 37.572,47.349 L 38.627,45.978 L 38.550,45.000 L 37.294,43.811 L 37.572,42.651 L 38.028,41.550 L 39.744,41.326 L 40.381,40.581 L 40.333,38.851 L 41.350,38.228 L 42.451,37.772 L 43.822,38.827 Z" fill="#F39C20" stroke="#FFD68A" stroke-width="1.2" stroke-linejoin="round"/>
+  <circle cx="44.8" cy="45.0" r="2.55" fill="#FFD68A"/>
+</svg>
