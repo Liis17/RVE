@@ -1858,6 +1858,40 @@ mod tests {
     }
 
     #[test]
+    fn character_pose_jump_through_a_crate_gives_the_crate_no_velocity() {
+        // Скорость kinematic-капсулы контроллера в солвере нулевая (velocity_at), поэтому перенос
+        // позы через ящик не передаёт ему скорость; толчки идут только через импульс move.
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut character = BodyDesc::new(
+            BodyKind::Kinematic,
+            Pose::new(Vec3::new(-2.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+            ColliderDesc::new(Shape::capsule(0.25, 0.5).unwrap()),
+        );
+        character.character_controller = true;
+        let character = world.insert_body(character).unwrap();
+        let crate_body = world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.25),
+                Pose::new(Vec3::new(0.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        driver
+            .advance_step(
+                1.0 / 60.0,
+                [PhysicsCommand::KinematicTarget {
+                    body: character,
+                    pose: Pose::new(Vec3::new(2.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(driver.world().body_velocity(crate_body), Some(Vec3::ZERO));
+    }
+
+    #[test]
     fn narrowphase_limit_skips_only_the_failing_pair_for_one_step() {
         // Веер из MAX_MESH_CANDIDATES + 1 треугольников у начала координат: пара «ящик–веер»
         // упирается в лимит кандидатов narrowphase, а свободно падающее тело шагает дальше.
