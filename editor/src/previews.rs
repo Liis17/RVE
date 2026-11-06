@@ -1,6 +1,8 @@
 //! Превью PNG для панели Project: декодирование в фоне и LRU-кэш UI-текстур.
 
+use crate::console::ConsoleLog;
 use engine_assets::{HdrImageData, TextureData, decode_hdr, decode_png};
+use engine_files::VirtualPath;
 use engine_render::{RenderError, Renderer, UiTextureId};
 use engine_ui::render::UiBridge;
 use std::collections::{HashMap, HashSet};
@@ -23,10 +25,73 @@ struct Cached {
 pub struct PreviewCache {
     worker: Option<Worker>,
     cached: HashMap<String, Cached>,
-    pending: HashSet<String>,
-    failed: HashSet<String>,
+    sources: HashMap<String, PathBuf>,
+    policy: PreviewPolicy,
     clock: u64,
     clear_requested: bool,
+}
+
+#[derive(Default)]
+struct PreviewPolicy {
+    pending: HashSet<String>,
+    stale: HashSet<String>,
+    failed: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewCompletion {
+    Retry,
+    Insert,
+    Replace,
+    KeepPrevious,
+    Failed,
+}
+
+impl PreviewPolicy {
+    fn can_request(&self, path: &str) -> bool {
+        !self.pending.contains(path) && !self.failed.contains(path)
+    }
+
+    fn begin(&mut self, path: &str) {
+        self.failed.remove(path);
+        self.pending.insert(path.to_owned());
+    }
+
+    fn fail(&mut self, path: &str) {
+        self.failed.insert(path.to_owned());
+    }
+
+    fn refresh(&mut self, path: &str) -> bool {
+        if self.pending.contains(path) {
+            self.stale.insert(path.to_owned());
+            false
+        } else {
+            self.failed.remove(path);
+            true
+        }
+    }
+
+    fn finish(&mut self, path: &str, success: bool, has_cached: bool) -> PreviewCompletion {
+        self.pending.remove(path);
+        if self.stale.remove(path) {
+            return PreviewCompletion::Retry;
+        }
+        if success {
+            self.failed.remove(path);
+            if has_cached {
+                PreviewCompletion::Replace
+            } else {
+                PreviewCompletion::Insert
+            }
+        } else {
+            self.failed.insert(path.to_owned());
+            if has_cached {
+                PreviewCompletion::KeepPrevious
+            } else {
+                PreviewCompletion::Failed
+            }
+        }
+    }
 }
 
 struct Worker {
@@ -78,32 +143,56 @@ impl PreviewCache {
             cached.last_used = self.clock;
             return Some(cached.id);
         }
-        if self.pending.contains(path) || self.failed.contains(path) {
+        if !self.policy.can_request(path) {
             return None;
         }
+        let Some(file) = file() else {
+            self.policy.fail(path);
+            return None;
+        };
+        self.sources.insert(path.to_owned(), file.clone());
         if self.worker.is_none() {
             self.worker = Worker::start().ok();
         }
-        let requested = match (&self.worker, file()) {
-            (Some(worker), Some(file)) => worker.requests.send((path.to_owned(), file)).is_ok(),
-            _ => false,
-        };
+        let requested = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.requests.send((path.to_owned(), file)).is_ok());
         if requested {
-            self.pending.insert(path.to_owned());
+            self.policy.begin(path);
         } else {
-            self.failed.insert(path.to_owned());
+            self.policy.fail(path);
         }
         None
     }
 
-    /// Запрашивает сброс кэша: файлы изменились на диске.
-    pub fn invalidate(&mut self) {
+    /// Повторно декодирует известные превью, затронутые путями или каталогами.
+    pub fn refresh_paths(&mut self, paths: &HashSet<VirtualPath>) {
+        let affected = affected_paths(self.known_paths(), paths, false);
+        for path in affected {
+            self.refresh_path(&path);
+        }
+    }
+
+    /// Повторно декодирует все известные превью после потери событий watcher.
+    pub fn refresh_all(&mut self) {
+        let affected = affected_paths(self.known_paths(), &HashSet::new(), true);
+        for path in affected {
+            self.refresh_path(&path);
+        }
+    }
+
+    /// Полностью очищает записи при смене проекта.
+    pub fn clear(&mut self) {
         self.clear_requested = true;
+        self.worker = None;
+        self.policy = PreviewPolicy::default();
+        self.sources.clear();
     }
 
     /// Есть незавершённые декодирования: окно должно проснуться, чтобы показать результат.
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.policy.pending.is_empty()
     }
 
     /// Загружает готовые изображения в GPU и освобождает лишние; вызывается до построения UI.
@@ -111,13 +200,13 @@ impl PreviewCache {
         &mut self,
         renderer: &mut Renderer,
         bridge: &mut UiBridge,
+        log: &mut ConsoleLog,
     ) -> Result<(), RenderError> {
         if std::mem::take(&mut self.clear_requested) {
             for (_, cached) in self.cached.drain() {
                 bridge.unregister(cached.id);
                 renderer.free_ui_texture(cached.texture)?;
             }
-            self.failed.clear();
         }
         let finished = self
             .worker
@@ -125,14 +214,23 @@ impl PreviewCache {
             .map(|worker| worker.results.try_iter().collect::<Vec<_>>())
             .unwrap_or_default();
         for (path, decoded) in finished {
-            self.pending.remove(&path);
+            let has_cached = self.cached.contains_key(&path);
+            let action = self.policy.finish(&path, decoded.is_ok(), has_cached);
+            if action == PreviewCompletion::Retry {
+                if let Some(file) = self.sources.get(&path).cloned() {
+                    self.request(&path, file);
+                } else {
+                    self.policy.fail(&path);
+                }
+                continue;
+            }
             match decoded {
                 Ok(data) => {
                     let texture =
                         renderer.create_ui_texture(data.width, data.height, &data.rgba)?;
                     let id = bridge.register_texture(texture);
                     self.clock += 1;
-                    self.cached.insert(
+                    let previous = self.cached.insert(
                         path,
                         Cached {
                             texture,
@@ -140,9 +238,17 @@ impl PreviewCache {
                             last_used: self.clock,
                         },
                     );
+                    if let Some(previous) = previous {
+                        bridge.unregister(previous.id);
+                        renderer.free_ui_texture(previous.texture)?;
+                    }
                 }
-                Err(_) => {
-                    self.failed.insert(path);
+                Err(error) => {
+                    if action == PreviewCompletion::KeepPrevious {
+                        log.error(format!("{path}: {error}; сохранена прежняя версия превью"));
+                    } else {
+                        log.error(format!("{path}: {error}"));
+                    }
                 }
             }
         }
@@ -156,9 +262,76 @@ impl PreviewCache {
                 bridge.unregister(cached.id);
                 renderer.free_ui_texture(cached.texture)?;
             }
+            if !self.policy.pending.contains(&path) && !self.policy.failed.contains(&path) {
+                self.sources.remove(&path);
+            }
         }
         Ok(())
     }
+
+    fn known_paths(&self) -> HashSet<String> {
+        self.cached
+            .keys()
+            .chain(self.policy.pending.iter())
+            .chain(self.policy.failed.iter())
+            .cloned()
+            .collect()
+    }
+
+    fn refresh_path(&mut self, path: &str) {
+        if !self.policy.refresh(path) {
+            return;
+        }
+        if let Some(file) = self.sources.get(path).cloned() {
+            self.request(path, file);
+        }
+    }
+
+    fn request(&mut self, path: &str, file: PathBuf) {
+        if !self.policy.can_request(path) {
+            return;
+        }
+        self.sources.insert(path.to_owned(), file.clone());
+        if self.worker.is_none() {
+            self.worker = Worker::start().ok();
+        }
+        let requested = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.requests.send((path.to_owned(), file)).is_ok());
+        if requested {
+            self.policy.begin(path);
+        } else {
+            self.policy.fail(path);
+        }
+    }
+}
+
+fn path_is_parent(changed: &VirtualPath, key: &VirtualPath) -> bool {
+    key.as_str() == changed.as_str()
+        || key
+            .as_str()
+            .strip_prefix(changed.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn affected_paths(
+    candidates: HashSet<String>,
+    changed: &HashSet<VirtualPath>,
+    rescan: bool,
+) -> Vec<String> {
+    candidates
+        .into_iter()
+        .filter(|path| {
+            if rescan {
+                return true;
+            }
+            let Ok(key) = VirtualPath::parse(path) else {
+                return false;
+            };
+            changed.iter().any(|changed| path_is_parent(changed, &key))
+        })
+        .collect()
 }
 
 /// Давно не использованные записи сверх лимита.
@@ -274,6 +447,52 @@ mod tests {
         let entries = [(&names[0], 5), (&names[1], 1), (&names[2], 9)];
         assert_eq!(eviction_order(entries.into_iter(), 2), ["b"]);
         assert!(eviction_order(entries.into_iter(), 3).is_empty());
+    }
+
+    #[test]
+    fn preview_refresh_keeps_a_working_entry_on_error_and_replaces_it_after_repair() {
+        let mut policy = PreviewPolicy::default();
+        policy.begin("preview.png");
+        assert_eq!(
+            policy.finish("preview.png", true, false),
+            PreviewCompletion::Insert
+        );
+
+        assert!(policy.refresh("preview.png"));
+        policy.begin("preview.png");
+        assert_eq!(
+            policy.finish("preview.png", false, true),
+            PreviewCompletion::KeepPrevious
+        );
+        assert!(!policy.can_request("preview.png"));
+
+        assert!(policy.refresh("preview.png"));
+        policy.begin("preview.png");
+        assert_eq!(
+            policy.finish("preview.png", true, true),
+            PreviewCompletion::Replace
+        );
+        assert!(policy.can_request("preview.png"));
+    }
+
+    #[test]
+    fn preview_refresh_discards_pending_results_and_rescan_selects_every_known_path() {
+        let mut policy = PreviewPolicy::default();
+        policy.begin("a.png");
+        assert!(!policy.refresh("a.png"));
+        assert_eq!(
+            policy.finish("a.png", true, false),
+            PreviewCompletion::Retry
+        );
+
+        let candidates = HashSet::from(["a.png".to_owned(), "folder/b.hdr".to_owned()]);
+        let all = affected_paths(candidates.clone(), &HashSet::new(), true);
+        assert_eq!(all.len(), candidates.len());
+        let changed = HashSet::from([VirtualPath::parse("folder").unwrap()]);
+        assert_eq!(
+            affected_paths(candidates, &changed, false),
+            ["folder/b.hdr"]
+        );
     }
 
     #[test]

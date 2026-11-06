@@ -1,5 +1,6 @@
 //! Состояние редактора, общее для панелей и обработчиков действий; не зависит от GPU.
 
+use crate::asset_watch::AssetChanges;
 use crate::assets_fs::{AssetEntry, AssetKind};
 use crate::build::{BuildJob, ScriptGeneration, ScriptsJob};
 use crate::console::ConsoleLog;
@@ -15,7 +16,7 @@ use engine_files::VirtualPath;
 use engine_render::DebugView;
 use engine_scene::{AntiAliasing, CameraSettings, World};
 use engine_script::{ParamSchema, ScriptInterruptHandle, ScriptLibrary};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -46,8 +47,8 @@ pub enum Action {
     Stop,
     ImportDialog,
     ImportFiles(Vec<PathBuf>),
-    /// Файловая структура изменилась: сбросить кэши ресурсов и прочитать дерево заново.
-    RefreshAssets,
+    /// Отразить собственную файловую операцию в дереве Project.
+    RefreshTree,
     /// Выбрать каталог и собрать релиз проекта через `rve-build`; сцена сохраняется заранее.
     BuildPlayer,
     /// Сохранить поддерево объекта в новый префаб и заменить его экземпляром.
@@ -165,11 +166,13 @@ pub struct EditorState {
     /// Идущая сборка релиза; одновременно — не больше одной.
     pub build: Option<BuildJob>,
     /// Схемы `properties` lite-скриптов по пути; ошибка пишется в Console один раз.
-    /// Сбрасывается вместе с кэшами ресурсов.
+    /// Кэшированные схемы читаются повторно после изменения исходного файла.
     pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
     /// Фоновый разбор FBX для `models`.
     pub model_loader: ModelLoader,
     edit_world: Option<(u64, World)>,
+    dirty_lite_schemas: HashSet<String>,
+    camera_settings_error_revision: Option<u64>,
 }
 
 impl EditorState {
@@ -220,6 +223,8 @@ impl EditorState {
             lite_schemas: HashMap::new(),
             model_loader: ModelLoader::default(),
             edit_world: None,
+            dirty_lite_schemas: HashSet::new(),
+            camera_settings_error_revision: None,
         }
     }
 
@@ -270,9 +275,14 @@ impl EditorState {
             match world_for_view(scene.view()) {
                 Ok(mut world) => {
                     if let Some(project) = &self.project
-                        && let Err(error) = project.apply_camera_settings(&mut world)
+                        && let Some(error) = project
+                            .apply_camera_settings_preview(&mut world)
+                            .into_iter()
+                            .next()
+                        && self.camera_settings_error_revision != Some(revision)
                     {
                         self.log.error(error);
+                        self.camera_settings_error_revision = Some(revision);
                     }
                     self.edit_world = Some((revision, world));
                 }
@@ -364,6 +374,7 @@ impl EditorState {
     /// Сбрасывает данные, связанные с прежней сценой.
     pub fn scene_replaced(&mut self) {
         self.edit_world = None;
+        self.camera_settings_error_revision = None;
         self.gizmo_drag = None;
         self.hierarchy_rename = None;
         self.game_camera = None;
@@ -415,22 +426,75 @@ impl EditorState {
         }
     }
 
-    /// Схема `properties` lite-скрипта из кэша; при первом обращении файл читается из проекта.
+    /// Схема `properties` lite-скрипта; изменённый исходник читается при следующем обращении.
     pub fn lite_schema(&mut self, path: &str) -> Result<Option<ParamSchema>, String> {
-        if let Some(schema) = self.lite_schemas.get(path) {
+        let dirty = self.dirty_lite_schemas.remove(path);
+        if !dirty && let Some(schema) = self.lite_schemas.get(path) {
             return schema.clone();
         }
         let Some(project) = &self.project else {
             return Ok(None);
         };
+        let previous = self
+            .lite_schemas
+            .get(path)
+            .and_then(|schema| schema.as_ref().ok())
+            .cloned();
         let result = project
             .read_text(path)
             .and_then(|source| read_lite_schema(path, &source, SCHEMA_TIMEOUT));
         if let Err(error) = &result {
             self.log.error(error.clone());
+            if let Some(previous) = previous {
+                return Ok(previous);
+            }
         }
         self.lite_schemas.insert(path.to_owned(), result.clone());
         result
+    }
+
+    /// Помечает закэшированные Lua-схемы, затронутые изменёнными файлами.
+    pub fn refresh_lite_schemas(&mut self, changes: &AssetChanges) {
+        if changes.rescan {
+            self.dirty_lite_schemas
+                .extend(self.lite_schemas.keys().cloned());
+            return;
+        }
+        let changed = changes
+            .lua_paths()
+            .chain(changes.directory_paths.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        self.dirty_lite_schemas.extend(
+            self.lite_schemas
+                .keys()
+                .filter(|key| {
+                    let Ok(key) = VirtualPath::parse(key) else {
+                        return false;
+                    };
+                    changed.iter().any(|path| {
+                        key == *path
+                            || key
+                                .as_str()
+                                .strip_prefix(path.as_str())
+                                .is_some_and(|suffix| suffix.starts_with('/'))
+                    })
+                })
+                .cloned(),
+        );
+    }
+
+    /// Сбрасывает кэш Lua-схем при смене проекта.
+    pub fn clear_lite_schemas(&mut self) {
+        self.lite_schemas.clear();
+        self.dirty_lite_schemas.clear();
+    }
+
+    /// Сбрасывает edit-world после изменения `.camerasettings`, вне Play.
+    pub fn camera_settings_changed(&mut self) {
+        if !self.is_playing() {
+            self.edit_world = None;
+        }
     }
 
     /// Схема Rust-скрипта из загруженной библиотеки.
@@ -591,6 +655,12 @@ settings = "/cameras/problem.camerasettings"
         state
     }
 
+    fn camera_fov(state: &mut EditorState) -> f32 {
+        let world = state.world_mut().unwrap();
+        let handle = world.handle("camera-a").unwrap();
+        world.camera_settings(handle).unwrap().projection.fov_deg
+    }
+
     #[test]
     fn world_is_rebuilt_only_after_the_document_changes() {
         let mut state = state_with_scene();
@@ -615,10 +685,21 @@ settings = "/cameras/problem.camerasettings"
                     .iter()
                     .filter(|object| object.camera.is_some())
                 {
-                    assert_eq!(
-                        world.camera_settings(object.handle),
-                        Some(&CameraSettings::default())
-                    );
+                    if object.id == "camera-a" {
+                        assert_eq!(
+                            world
+                                .camera_settings(object.handle)
+                                .unwrap()
+                                .projection
+                                .fov_deg,
+                            42.0
+                        );
+                    } else {
+                        assert_eq!(
+                            world.camera_settings(object.handle),
+                            Some(&CameraSettings::default())
+                        );
+                    }
                 }
                 assert!(world.camera_of(world.active_camera()).is_some());
                 if frame < 3 {
@@ -691,6 +772,51 @@ settings = "/cameras/problem.camerasettings"
     }
 
     #[test]
+    fn camera_preview_keeps_last_valid_settings_but_play_stays_strict() {
+        let temp = TempProject::new(None);
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(&temp.0).unwrap());
+        state.scene = Some(
+            EditorScene::parse(
+                VirtualPath::parse("main.rvescene").unwrap(),
+                "[[assets]]\npath = \"/cameras/valid.camerasettings\"\n[[objects]]\nid = \"camera-a\"\n[objects.camera]\nsettings = \"/cameras/valid.camerasettings\"\n",
+                no_prefabs(),
+            )
+            .unwrap(),
+        );
+        let valid_path = temp.0.join("Assets/cameras/valid.camerasettings");
+        assert_eq!(camera_fov(&mut state), 42.0);
+
+        fs::write(
+            &valid_path,
+            "[projection]\nfov_deg = 60.0\nnear = 0.3\nfar = 300.0\n",
+        )
+        .unwrap();
+        state.camera_settings_changed();
+        assert_eq!(camera_fov(&mut state), 60.0);
+
+        fs::write(&valid_path, "[projection]\nfov_deg = 190.0\n").unwrap();
+        state.camera_settings_changed();
+        assert_eq!(camera_fov(&mut state), 60.0);
+        state.create_object(&NewObject::Empty, None);
+        assert_eq!(camera_fov(&mut state), 60.0);
+        let revision = state.scene.as_ref().unwrap().revision();
+        assert_eq!(state.camera_settings_error_revision, Some(revision));
+        assert_eq!(
+            state
+                .log
+                .entries()
+                .filter(|entry| entry.level == crate::console::LogLevel::Error)
+                .count(),
+            1
+        );
+
+        let project = state.project.as_ref().unwrap();
+        let mut play_world = World::from_document(state.scene.as_ref().unwrap().view()).unwrap();
+        assert!(project.apply_camera_settings(&mut play_world).is_err());
+    }
+
+    #[test]
     fn dropping_a_non_model_asset_is_rejected() {
         let mut state = state_with_scene();
         state.create_from_asset("textures/a.png", None, [0.0; 3]);
@@ -740,6 +866,65 @@ settings = "/cameras/problem.camerasettings"
         assert!(state.lite_schema("scripts/missing.lua").is_err());
         assert!(state.lite_schema("scripts/missing.lua").is_err());
         assert_eq!(state.log.entries().count(), 1);
+    }
+
+    #[test]
+    fn changed_lua_schema_keeps_last_valid_on_error_and_reloads_after_fix() {
+        let temp = TempProject::new(None);
+        fs::create_dir_all(temp.0.join("Assets/scripts")).unwrap();
+        let first = temp.0.join("Assets/scripts/first.lua");
+        let second = temp.0.join("Assets/scripts/second.lua");
+        let source = |name: &str| {
+            format!(
+                "local Script = {{}}\nScript.properties = {{ {name} = {{ type = 'float', default = 1 }} }}\nreturn Script\n"
+            )
+        };
+        fs::write(&first, source("speed")).unwrap();
+        fs::write(&second, source("height")).unwrap();
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(&temp.0).unwrap());
+        let first_schema = state.lite_schema("scripts/first.lua").unwrap().unwrap();
+        assert!(first_schema.get("speed").is_some());
+        assert!(
+            state
+                .lite_schema("scripts/second.lua")
+                .unwrap()
+                .unwrap()
+                .get("height")
+                .is_some()
+        );
+
+        fs::write(&first, "this is not valid Lua").unwrap();
+        let changes = AssetChanges {
+            paths: HashSet::from([VirtualPath::parse("scripts/first.lua").unwrap()]),
+            ..AssetChanges::default()
+        };
+        state.refresh_lite_schemas(&changes);
+        assert!(state.dirty_lite_schemas.contains("scripts/first.lua"));
+        assert!(!state.dirty_lite_schemas.contains("scripts/second.lua"));
+        assert!(
+            state
+                .lite_schema("scripts/first.lua")
+                .unwrap()
+                .unwrap()
+                .get("speed")
+                .is_some()
+        );
+        assert_eq!(state.log.entries().count(), 1);
+
+        fs::write(&first, source("height")).unwrap();
+        state.refresh_lite_schemas(&changes);
+        let fixed = state.lite_schema("scripts/first.lua").unwrap().unwrap();
+        assert!(fixed.get("height").is_some());
+        assert!(fixed.get("speed").is_none());
+        assert!(
+            state
+                .lite_schema("scripts/second.lua")
+                .unwrap()
+                .unwrap()
+                .get("height")
+                .is_some()
+        );
     }
 
     #[test]

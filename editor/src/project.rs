@@ -6,9 +6,10 @@ use engine_assets::Assets;
 use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem, SourceMode};
+use engine_scene::world::ObjectHandle;
 use engine_scene::{CameraSettings, SceneDocument, SceneError, World};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -20,10 +21,11 @@ pub struct OpenProject {
     pub assets_dir: AssetsDir,
     pub assets: Assets,
     prefabs: Rc<PrefabCache>,
+    camera_settings: RefCell<HashMap<String, CameraSettings>>,
     resources: ResourceSystem,
 }
 
-/// Разобранные префабы проекта по пути; сбрасывается после Refresh и сохранения префаба.
+/// Разобранные префабы проекта по пути; изменённый документ заменяется после успешного разбора.
 struct PrefabCache {
     handle: ResourceHandle,
     documents: RefCell<HashMap<VirtualPath, SceneDocument>>,
@@ -34,6 +36,14 @@ impl PrefabCache {
         if let Some(document) = self.documents.borrow().get(path) {
             return Ok(document.clone());
         }
+        let document = self.read(path)?;
+        self.documents
+            .borrow_mut()
+            .insert(path.clone(), document.clone());
+        Ok(document)
+    }
+
+    fn read(&self, path: &VirtualPath) -> Result<SceneDocument, SceneError> {
         let label = format!("/{}", path.as_str());
         let error = |message: String| SceneError {
             source: label.clone(),
@@ -48,11 +58,33 @@ impl PrefabCache {
             .map_err(|resource| error(resource.to_string()))?;
         let text = String::from_utf8(bytes)
             .map_err(|utf8| error(format!("файл должен быть UTF-8: {utf8}")))?;
-        let document = SceneDocument::parse_prefab(label.clone(), &text)?;
-        self.documents
-            .borrow_mut()
-            .insert(path.clone(), document.clone());
-        Ok(document)
+        SceneDocument::parse_prefab(label, &text)
+    }
+
+    fn reload(
+        &self,
+        paths: &HashSet<VirtualPath>,
+    ) -> (HashMap<VirtualPath, SceneDocument>, Vec<String>) {
+        let mut documents = self.documents.borrow_mut();
+        let mut previous = HashMap::new();
+        let mut errors = Vec::new();
+        for path in paths {
+            let Some(cached) = documents.get(path).cloned() else {
+                continue;
+            };
+            match self.read(path) {
+                Ok(document) => {
+                    previous.insert(path.clone(), cached);
+                    documents.insert(path.clone(), document);
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        (previous, errors)
+    }
+
+    fn restore(&self, previous: HashMap<VirtualPath, SceneDocument>) {
+        self.documents.borrow_mut().extend(previous);
     }
 }
 
@@ -83,6 +115,7 @@ impl OpenProject {
             assets_dir: AssetsDir::new(root),
             assets,
             prefabs,
+            camera_settings: RefCell::default(),
             resources,
         })
     }
@@ -121,7 +154,11 @@ impl OpenProject {
             return Err(format!("{path}: файл настроек камеры не найден"));
         }
         let source = settings.to_toml().map_err(|error| error.to_string())?;
-        std::fs::write(file, source).map_err(|error| format!("{path}: {error}"))
+        std::fs::write(file, source).map_err(|error| format!("{path}: {error}"))?;
+        self.camera_settings
+            .borrow_mut()
+            .insert(path.as_str().to_owned(), *settings);
+        Ok(())
     }
 
     /// Загрузчик префабов проекта для [`crate::scene_edit::EditorScene`].
@@ -135,24 +172,27 @@ impl OpenProject {
         self.prefabs.documents.borrow_mut().clear();
     }
 
+    /// Перечитывает изменённые префабы, уже находящиеся в кэше.
+    pub fn reload_prefabs(
+        &self,
+        paths: &HashSet<VirtualPath>,
+    ) -> (HashMap<VirtualPath, SceneDocument>, Vec<String>) {
+        self.prefabs.reload(paths)
+    }
+
+    /// Возвращает пути документов, уже загруженных в кэш префабов.
+    pub fn cached_prefab_paths(&self) -> HashSet<VirtualPath> {
+        self.prefabs.documents.borrow().keys().cloned().collect()
+    }
+
+    /// Возвращает прежние документы, если раскрытие сцены после обновления не удалось.
+    pub fn restore_prefabs(&self, previous: HashMap<VirtualPath, SceneDocument>) {
+        self.prefabs.restore(previous);
+    }
+
     /// Загружает общие `.camerasettings` файлы и назначает их камерам мира.
     pub fn apply_camera_settings(&self, world: &mut World) -> Result<(), String> {
-        let cameras = world
-            .objects()
-            .iter()
-            .filter_map(|object| {
-                Some((
-                    object.handle,
-                    object
-                        .camera
-                        .as_ref()?
-                        .settings
-                        .as_ref()?
-                        .as_str()
-                        .to_owned(),
-                ))
-            })
-            .collect::<Vec<_>>();
+        let cameras = camera_paths(world);
         let mut settings_by_path = BTreeMap::new();
         for (_, path) in &cameras {
             if !settings_by_path.contains_key(path) {
@@ -167,7 +207,43 @@ impl OpenProject {
                 .set_camera_settings(handle, settings_by_path[&path])
                 .map_err(|error| error.to_string())?;
         }
+        self.camera_settings.borrow_mut().extend(settings_by_path);
         Ok(())
+    }
+
+    /// Применяет последние валидные настройки камер для мира редактора.
+    pub fn apply_camera_settings_preview(&self, world: &mut World) -> Vec<String> {
+        let cameras = camera_paths(world);
+        let mut settings_by_path = BTreeMap::new();
+        let mut errors = Vec::new();
+        for (_, path) in &cameras {
+            if settings_by_path.contains_key(path) {
+                continue;
+            }
+            let settings = self.read_text(path).and_then(|source| {
+                CameraSettings::parse(path, &source).map_err(|error| error.to_string())
+            });
+            match settings {
+                Ok(settings) => {
+                    settings_by_path.insert(path.clone(), settings);
+                    self.camera_settings
+                        .borrow_mut()
+                        .insert(path.clone(), settings);
+                }
+                Err(error) => {
+                    errors.push(error);
+                    if let Some(settings) = self.camera_settings.borrow().get(path).copied() {
+                        settings_by_path.insert(path.clone(), settings);
+                    }
+                }
+            }
+        }
+        for (handle, path) in cameras {
+            if let Some(settings) = settings_by_path.get(&path) {
+                let _ = world.set_camera_settings(handle, *settings);
+            }
+        }
+        errors
     }
 
     /// Настройки окна проекта; отсутствующий файл не является ошибкой.
@@ -179,6 +255,25 @@ impl OpenProject {
             Ok(BootstrapConfig::default())
         }
     }
+}
+
+fn camera_paths(world: &World) -> Vec<(ObjectHandle, String)> {
+    world
+        .objects()
+        .iter()
+        .filter_map(|object| {
+            Some((
+                object.handle,
+                object
+                    .camera
+                    .as_ref()?
+                    .settings
+                    .as_ref()?
+                    .as_str()
+                    .to_owned(),
+            ))
+        })
+        .collect()
 }
 
 /// Убирает `.` и `..` из абсолютного пути без обращения к диску: один проект,
@@ -208,6 +303,7 @@ impl Drop for OpenProject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene_edit::EditorScene;
     use engine_scene::{SceneDocument, World};
     use glam::Vec3;
     use std::fs;
@@ -404,6 +500,62 @@ mod tests {
             42.0
         );
         assert_eq!(world.camera_settings(camera).unwrap().projection.near, 0.25);
+    }
+
+    #[test]
+    fn prefab_reload_replaces_valid_documents_and_keeps_the_previous_on_error() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        fs::create_dir_all(temp.0.join("Assets/prefabs")).unwrap();
+        let file = temp.0.join("Assets/prefabs/item.rveprefab");
+        fs::write(&file, "[[objects]]\nid = \"old\"\n").unwrap();
+        let project = OpenProject::open(&temp.0).unwrap();
+        let loader = project.prefab_loader();
+        let path = VirtualPath::parse("prefabs/item.rveprefab").unwrap();
+        assert_eq!(loader(&path).unwrap().objects[0].id, "old");
+
+        fs::write(&file, "[[objects]]\nid = \"new\"\n").unwrap();
+        let paths = HashSet::from([path.clone()]);
+        let (previous, errors) = project.reload_prefabs(&paths);
+        assert!(errors.is_empty());
+        assert_eq!(previous[&path].objects[0].id, "old");
+        assert_eq!(loader(&path).unwrap().objects[0].id, "new");
+
+        fs::write(&file, "not a prefab").unwrap();
+        let (previous, errors) = project.reload_prefabs(&paths);
+        assert!(previous.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(loader(&path).unwrap().objects[0].id, "new");
+    }
+
+    #[test]
+    fn prefab_cache_rolls_back_when_scene_expansion_fails() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        fs::create_dir_all(temp.0.join("Assets/prefabs")).unwrap();
+        let file = temp.0.join("Assets/prefabs/item.rveprefab");
+        fs::write(&file, "[[objects]]\nid = \"old\"\n").unwrap();
+        let project = OpenProject::open(&temp.0).unwrap();
+        let path = VirtualPath::parse("prefabs/item.rveprefab").unwrap();
+        let source = "[[assets]]\npath = \"/prefabs/item.rveprefab\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n\n[[objects]]\nid = \"root\"\n[[instances]]\nid = \"item\"\nparent = \"root\"\nprefab = \"/prefabs/item.rveprefab\"\n";
+        let mut scene = EditorScene::parse(
+            VirtualPath::parse("main.rvescene").unwrap(),
+            source,
+            project.prefab_loader(),
+        )
+        .unwrap();
+
+        fs::write(
+            &file,
+            "[[assets]]\npath = \"/prefabs/missing.rveprefab\"\n[[objects]]\nid = \"new\"\n[[instances]]\nid = \"missing\"\nparent = \"new\"\nprefab = \"/prefabs/missing.rveprefab\"\n",
+        )
+        .unwrap();
+        let paths = HashSet::from([path.clone()]);
+        let (previous, errors) = project.reload_prefabs(&paths);
+        assert!(errors.is_empty());
+        assert!(scene.reload_prefabs().is_err());
+        project.restore_prefabs(previous);
+        let restored = project.prefab_loader()(&path).unwrap();
+        assert_eq!(restored.objects[0].id, "old");
+        assert_eq!(scene.view().objects.len(), 3);
     }
 
     #[test]

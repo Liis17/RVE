@@ -24,6 +24,7 @@ engine-resources = { path = "../engine/engine-resources" }
 engine-scene = { path = "../engine/engine-scene" }
 engine-script = { path = "../engine/engine-script" }
 engine-window = { path = "../engine/engine-window" }
+notify.workspace = true
 glam.workspace = true
 rfd.workspace = true
 serde.workspace = true
