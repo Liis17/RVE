@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use glam::{Mat3, Quat, Vec3};
 
-use crate::broad::sweep_and_prune;
+use crate::broad::sweep_and_prune_pairable;
 use crate::narrow::{ManifoldCache, PairKey, collide};
 use crate::query::{QueryCollider, QueryColliderDesc, QueryError, QuerySnapshot};
 use crate::{Aabb, BroadPhaseError, ContactManifold, GeometryError, NarrowphaseError, Pose, Shape};
@@ -543,7 +543,12 @@ impl PhysicsWorld {
             ));
             bounds.push(body.collider_aabb()?);
         }
-        let candidates = sweep_and_prune(&bounds)?;
+        // Пара без динамического тела и без триггера никогда не решается ниже, поэтому такие
+        // тела (static/kinematic) не сравниваются между собой в broadphase.
+        let candidates = sweep_and_prune_pairable(&bounds, |index| {
+            let (_, collider, kind, _) = &proxies[index];
+            *kind == BodyKind::Dynamic || collider.trigger
+        })?;
         let mut current = BTreeMap::new();
         for candidate in candidates {
             let (handle_a, collider_a, kind_a, pose_a) = &proxies[candidate.first];
@@ -1813,6 +1818,43 @@ mod tests {
             cached_angular.y.abs() < 1.0e-3 && (cached_angular.y - fresh_angular.y).abs() < 1.0e-3,
             "cached={cached_angular:?}, fresh={fresh_angular:?}"
         );
+    }
+
+    #[test]
+    fn many_overlapping_static_colliders_do_not_exhaust_the_broadphase_comparison_limit() {
+        // 1500 статиков с перекрытием по X: их попарные сравнения не нужны (пары не порождаются),
+        // поэтому лимит сравнений не исчерпывается, а динамическое тело шагает.
+        let mut world = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0)).unwrap();
+        for index in 0..1500 {
+            world
+                .insert_body(BodyDesc::static_collider(
+                    box_shape(0.1),
+                    Pose::new(Vec3::new(0.0, 0.0, index as f32 * 0.25), Quat::IDENTITY).unwrap(),
+                ))
+                .unwrap();
+        }
+        let falling = world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.1),
+                Pose::new(Vec3::new(0.0, 3.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        let result = driver
+            .advance_step(1.0 / 60.0, Vec::new())
+            .expect("static-only overlaps must not exhaust the broadphase limit");
+
+        let falling_y = result
+            .poses
+            .iter()
+            .find(|(handle, _)| *handle == falling)
+            .unwrap()
+            .1
+            .position
+            .y;
+        assert!(falling_y < 3.0, "{falling_y}");
     }
 
     #[test]

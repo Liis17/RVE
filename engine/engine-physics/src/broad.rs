@@ -33,6 +33,17 @@ impl std::error::Error for BroadPhaseError {}
 
 /// Generates deterministic overlapping AABB pairs using sweep-and-prune on X.
 pub fn sweep_and_prune(bounds: &[Aabb]) -> Result<Vec<CandidatePair>, BroadPhaseError> {
+    sweep_and_prune_pairable(bounds, |_| true)
+}
+
+/// Like [`sweep_and_prune`], but two bodies with `paired(index) == false` are never compared.
+///
+/// Used to skip static–static pairs that the narrowphase filter would discard anyway, so they
+/// neither cost comparisons against the limit nor appear in the candidate list.
+pub fn sweep_and_prune_pairable(
+    bounds: &[Aabb],
+    paired: impl Fn(usize) -> bool,
+) -> Result<Vec<CandidatePair>, BroadPhaseError> {
     if bounds.len() > MAX_BROADPHASE_ITEMS {
         return Err(BroadPhaseError::TooManyItems);
     }
@@ -46,12 +57,18 @@ pub fn sweep_and_prune(bounds: &[Aabb]) -> Result<Vec<CandidatePair>, BroadPhase
             .then_with(|| left.cmp(&right))
     });
 
-    let mut active = Vec::<usize>::new();
+    let mut active_paired = Vec::<usize>::new();
+    let mut active_unpaired = Vec::<usize>::new();
     let mut pairs = Vec::new();
     let mut comparisons = 0;
     for current in order {
-        active.retain(|&index| bounds[index].max.x >= bounds[current].min.x);
-        for &index in &active {
+        let current_paired = paired(current);
+        active_paired.retain(|&index| bounds[index].max.x >= bounds[current].min.x);
+        active_unpaired.retain(|&index| bounds[index].max.x >= bounds[current].min.x);
+        for &index in active_paired
+            .iter()
+            .chain(active_unpaired.iter().filter(|_| current_paired))
+        {
             if comparisons >= MAX_BROADPHASE_COMPARISONS {
                 return Err(BroadPhaseError::ComparisonLimitExceeded);
             }
@@ -66,7 +83,11 @@ pub fn sweep_and_prune(bounds: &[Aabb]) -> Result<Vec<CandidatePair>, BroadPhase
                 });
             }
         }
-        active.push(current);
+        if current_paired {
+            active_paired.push(current);
+        } else {
+            active_unpaired.push(current);
+        }
     }
     pairs.sort_by_key(|pair| (pair.first, pair.second));
     Ok(pairs)
@@ -76,7 +97,7 @@ pub fn sweep_and_prune(bounds: &[Aabb]) -> Result<Vec<CandidatePair>, BroadPhase
 mod tests {
     use super::{
         BroadPhaseError, CandidatePair, MAX_BROADPHASE_COMPARISONS, MAX_BROADPHASE_ITEMS,
-        sweep_and_prune,
+        sweep_and_prune, sweep_and_prune_pairable,
     };
     use crate::Aabb;
     use glam::Vec3;
@@ -95,6 +116,29 @@ mod tests {
                 first: 0,
                 second: 1
             }]
+        );
+    }
+
+    #[test]
+    fn unpaired_bodies_are_not_compared_with_each_other_but_still_pair_with_paired_ones() {
+        let bounds = [
+            Aabb::new(Vec3::ZERO, Vec3::ONE).unwrap(),
+            Aabb::new(Vec3::splat(0.5), Vec3::splat(1.5)).unwrap(),
+            Aabb::new(Vec3::splat(0.25), Vec3::splat(0.75)).unwrap(),
+        ];
+        let pairs = sweep_and_prune_pairable(&bounds, |index| index == 2).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                CandidatePair {
+                    first: 0,
+                    second: 2
+                },
+                CandidatePair {
+                    first: 1,
+                    second: 2
+                },
+            ]
         );
     }
 
