@@ -9,7 +9,9 @@ path = "src/lib.rs"
 
 [dependencies]
 engine-console = { path = "../engine-console" }
+engine-physics = { path = "../engine-physics" }
 engine-scene = { path = "../engine-scene" }
+glam.workspace = true
 libloading.workspace = true
 mlua.workspace = true
 rve-sdk = { path = "../rve-sdk" }

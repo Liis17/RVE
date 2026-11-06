@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_marker_rejects_legacy_abi_v3_for_the_v4_sdk() {
+    fn sdk_marker_rejects_legacy_abi_v3_for_the_v5_sdk() {
         let root = temp_dir("rve-sdk-legacy-abi");
         fs::write(
             root.path().join("rve-sdk.toml"),
@@ -601,7 +601,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("ABI version 3"));
-        assert!(error.to_string().contains("ожидаемой версией 4"));
+        assert!(error.to_string().contains("ожидаемой версией 5"));
     }
 
     #[test]

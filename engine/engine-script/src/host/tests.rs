@@ -1,7 +1,12 @@
 use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions};
 use crate::{Key, MouseButton, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime};
 use engine_console::CommandLine;
-use engine_scene::{SceneDocument, World};
+use engine_physics::{
+    BodyDesc, BodyHandle, BodyKind, CharacterController, ColliderDesc, PhysicsCommand,
+    PhysicsSceneBinding, PhysicsWorld, Pose, Shape, StepDriver,
+};
+use engine_scene::{LocalTransform, SceneDocument, World};
+use glam::{Quat, Vec3};
 use rve_sdk::{Context, Params, Script, Value};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -57,6 +62,1023 @@ fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .iter()
         .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
         .collect()
+}
+
+#[test]
+fn lua_physics_queries_and_commands_use_the_current_snapshot_and_commit_together() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/physics.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/physics.lua"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+[[objects]]
+id = "crate"
+[[objects]]
+id = "trigger"
+"#,
+    );
+    let player = world.handle("player").unwrap();
+    let crate_handle = world.handle("crate").unwrap();
+    let trigger = world.handle("trigger").unwrap();
+    let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let player_body = physics
+        .insert_body({
+            let mut desc = BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+                ColliderDesc::new(controller.capsule().unwrap()),
+            );
+            desc.character_controller = true;
+            desc
+        })
+        .unwrap();
+    let crate_body = physics
+        .insert_body(BodyDesc::dynamic(
+            Shape::sphere(0.5).unwrap(),
+            Pose::new(Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            1.0,
+        ))
+        .unwrap();
+    let trigger_body = physics
+        .insert_body({
+            let mut desc = BodyDesc::static_collider(
+                Shape::sphere(0.5).unwrap(),
+                Pose::new(Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            );
+            desc.collider.trigger = true;
+            desc
+        })
+        .unwrap();
+    let bindings = [
+        PhysicsSceneBinding {
+            object: player,
+            body: player_body,
+            kind: BodyKind::Kinematic,
+            character_controller: Some(controller),
+        },
+        PhysicsSceneBinding {
+            object: crate_handle,
+            body: crate_body,
+            kind: BodyKind::Dynamic,
+            character_controller: None,
+        },
+        PhysicsSceneBinding {
+            object: trigger,
+            body: trigger_body,
+            kind: BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let snapshot = physics.query_snapshot().unwrap();
+    let physics_script = r#"
+local Script = {}
+function Script:on_update()
+  local hit = rve.physics.raycast({x=0,y=0,z=0}, {x=2,y=0,z=0}, 10)
+  assert(hit.object.id == "crate" and hit.distance > 4)
+  local trigger_hit = rve.physics.raycast({x=0,y=0,z=0}, {x=1,y=0,z=0}, 10,
+      {include_triggers=true})
+  assert(trigger_hit.object.id == "trigger")
+  local ignored_trigger = rve.physics.raycast({x=0,y=0,z=0}, {x=1,y=0,z=0}, 10,
+      {ignore=rve.find("trigger")})
+  assert(ignored_trigger.object.id == "crate")
+  local crate = rve.find("crate")
+  local velocity = crate:get_velocity()
+  assert(velocity.x == 0 and velocity.y == 0 and velocity.z == 0)
+  crate:set_velocity({x=1,y=2,z=3})
+  crate:add_impulse({x=0,y=1,z=0})
+  crate:add_force({x=0,y=0,z=4})
+  crate:set_collider_enabled(false)
+  assert(not crate:is_collider_enabled())
+end
+return Script
+"#;
+    let reader_script = r#"
+local Script = {}
+function Script:on_update()
+  local crate = rve.find("crate")
+  assert(not crate:is_collider_enabled())
+  assert(rve.physics.raycast({x=0,y=0,z=0}, {x=1,y=0,z=0}, 10) == nil)
+  rve.log_info("physics overlay visible")
+end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[
+            ("physics.lua", physics_script),
+            ("reader.lua", reader_script),
+        ]),
+        None,
+    )
+    .unwrap();
+    host.set_physics_snapshot(snapshot, &bindings);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let commands = host.drain_physics_commands();
+    assert_eq!(commands.len(), 4);
+    assert!(
+        matches!(commands[0], PhysicsCommand::SetVelocity { body, velocity }
+        if body == crate_body && velocity == Vec3::new(1.0, 2.0, 3.0))
+    );
+    assert!(
+        matches!(commands[1], PhysicsCommand::AddImpulse { body, impulse, .. }
+        if body == crate_body && impulse == Vec3::Y)
+    );
+    assert!(
+        matches!(commands[2], PhysicsCommand::AddForce { body, force, .. }
+        if body == crate_body && force == Vec3::new(0.0, 0.0, 4.0))
+    );
+    assert!(
+        matches!(commands[3], PhysicsCommand::SetColliderEnabled { body, enabled: false }
+        if body == crate_body)
+    );
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message == "physics overlay visible")
+    );
+}
+
+#[test]
+fn character_move_and_set_transform_follow_callback_order() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/order.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/order.lua"
+"#,
+    );
+    let player = world.handle("player").unwrap();
+    let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let body = physics
+        .insert_body({
+            let mut desc = BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::IDENTITY,
+                ColliderDesc::new(controller.capsule().unwrap()),
+            );
+            desc.character_controller = true;
+            desc
+        })
+        .unwrap();
+    let bindings = [PhysicsSceneBinding {
+        object: player,
+        body,
+        kind: BodyKind::Kinematic,
+        character_controller: Some(controller),
+    }];
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local player = rve.find("player")
+  local transform = player:get_transform()
+  transform.position = {x=2,y=0,z=0}
+  player:set_transform(transform)
+  player:move({x=1,y=0,z=0})
+  assert(player:get_transform().position.x == 3)
+
+  transform = player:get_transform()
+  transform.position = {x=5,y=0,z=0}
+  player:set_transform(transform)
+  assert(player:get_transform().position.x == 5)
+  player:move({x=2,y=0,z=0})
+  assert(player:get_transform().position.x == 7)
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("order.lua", source)]), None).unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert_eq!(world.local_transform(player).unwrap().position.x, 7.0);
+    assert!(host.drain_physics_commands().is_empty());
+}
+
+#[test]
+fn failed_lua_callback_discards_movement_and_dynamic_pushes() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/mover.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/mover.lua"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+[[objects]]
+id = "crate"
+"#,
+    );
+    let player = world.handle("player").unwrap();
+    let crate_handle = world.handle("crate").unwrap();
+    let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let player_body = physics
+        .insert_body({
+            let mut desc = BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+                ColliderDesc::new(controller.capsule().unwrap()),
+            );
+            desc.character_controller = true;
+            desc
+        })
+        .unwrap();
+    let crate_body = physics
+        .insert_body(BodyDesc::dynamic(
+            Shape::cuboid(Vec3::splat(0.25)).unwrap(),
+            Pose::new(Vec3::new(0.75, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            1.0,
+        ))
+        .unwrap();
+    let bindings = [
+        PhysicsSceneBinding {
+            object: player,
+            body: player_body,
+            kind: BodyKind::Kinematic,
+            character_controller: Some(controller),
+        },
+        PhysicsSceneBinding {
+            object: crate_handle,
+            body: crate_body,
+            kind: BodyKind::Dynamic,
+            character_controller: None,
+        },
+    ];
+    let mover = r#"
+local Script = {}
+function Script:on_update()
+  local player = rve.find("player")
+  rve.find("crate"):add_impulse({x=0,y=1,z=0})
+  local result = player:move({x=0.6,y=0,z=0})
+  assert(result.collided)
+  error("abort physics transaction")
+end
+return Script
+"#;
+    let reader = r#"
+local Script = {}
+function Script:on_update()
+  local player = rve.find("player")
+  assert(player:get_transform().position.x == 0)
+  assert(not player:is_grounded())
+  assert(rve.find("crate"):is_collider_enabled())
+  rve.log_info("physics rollback observed")
+end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("mover.lua", mover), ("reader.lua", reader)]),
+        None,
+    )
+    .unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert_eq!(world.local_transform(player).unwrap().position, Vec3::ZERO);
+    assert!(host.drain_physics_commands().is_empty());
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "physics rollback observed")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message.contains("abort physics transaction"))
+    );
+}
+
+#[test]
+fn failed_lua_callback_discards_grounded_and_collider_state() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/mover.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/mover.lua"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+[[objects]]
+id = "floor"
+"#,
+    );
+    let player = world.handle("player").unwrap();
+    let floor = world.handle("floor").unwrap();
+    world
+        .set_local_transform(
+            player,
+            LocalTransform {
+                position: Vec3::new(0.0, 0.5, 0.0),
+                ..LocalTransform::default()
+            },
+        )
+        .unwrap();
+    let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.2, 0.01, 1.0).unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let player_body = physics
+        .insert_body({
+            let mut desc = BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::new(Vec3::new(0.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                ColliderDesc::new(controller.capsule().unwrap()),
+            );
+            desc.character_controller = true;
+            desc
+        })
+        .unwrap();
+    let floor_body = physics
+        .insert_body(BodyDesc::static_collider(
+            Shape::cuboid(Vec3::new(5.0, 0.5, 5.0)).unwrap(),
+            Pose::new(Vec3::new(0.0, -0.5, 0.0), Quat::IDENTITY).unwrap(),
+        ))
+        .unwrap();
+    let bindings = [
+        PhysicsSceneBinding {
+            object: player,
+            body: player_body,
+            kind: BodyKind::Kinematic,
+            character_controller: Some(controller),
+        },
+        PhysicsSceneBinding {
+            object: floor,
+            body: floor_body,
+            kind: BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let mover = r#"
+local Script = {}
+function Script:on_update()
+  local result = rve.find("player"):move({x=0,y=-0.1,z=0})
+  assert(result.grounded)
+  rve.find("floor"):set_collider_enabled(false)
+  error("abort grounded transaction")
+end
+return Script
+"#;
+    let reader = r#"
+local Script = {}
+function Script:on_update()
+  local player = rve.find("player")
+  assert(player:get_transform().position.y == 0.5)
+  assert(not player:is_grounded())
+  assert(rve.find("floor"):is_collider_enabled())
+  rve.log_info("grounded rollback observed")
+end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("mover.lua", mover), ("reader.lua", reader)]),
+        None,
+    )
+    .unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert_eq!(world.local_transform(player).unwrap().position.y, 0.5);
+    assert!(host.drain_physics_commands().is_empty());
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "grounded rollback observed")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message.contains("abort grounded transaction"))
+    );
+}
+
+#[test]
+fn lua_physics_rejects_wrong_components_and_non_finite_vectors() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/wrong_controller.lua"
+[[assets]]
+path = "/non_finite.lua"
+[[assets]]
+path = "/wrong_body.lua"
+[[objects]]
+id = "dynamic"
+[[objects.lite_scripts]]
+path = "/wrong_controller.lua"
+[[objects.lite_scripts]]
+path = "/non_finite.lua"
+[[objects]]
+id = "static"
+[[objects.lite_scripts]]
+path = "/wrong_body.lua"
+"#,
+    );
+    let dynamic = world.handle("dynamic").unwrap();
+    let static_handle = world.handle("static").unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let dynamic_body = physics
+        .insert_body(BodyDesc::dynamic(
+            Shape::sphere(0.5).unwrap(),
+            Pose::IDENTITY,
+            1.0,
+        ))
+        .unwrap();
+    let static_body = physics
+        .insert_body(BodyDesc::static_collider(
+            Shape::sphere(0.5).unwrap(),
+            Pose::new(Vec3::X * 3.0, Quat::IDENTITY).unwrap(),
+        ))
+        .unwrap();
+    let bindings = [
+        PhysicsSceneBinding {
+            object: dynamic,
+            body: dynamic_body,
+            kind: BodyKind::Dynamic,
+            character_controller: None,
+        },
+        PhysicsSceneBinding {
+            object: static_handle,
+            body: static_body,
+            kind: BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let wrong_controller = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("dynamic"):move({x=1,y=0,z=0})
+end
+return Script
+"#;
+    let non_finite = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("dynamic"):add_force({x=math.huge,y=0,z=0})
+end
+return Script
+"#;
+    let wrong_body = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("static"):get_velocity()
+end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[
+            ("wrong_controller.lua", wrong_controller),
+            ("non_finite.lua", non_finite),
+            ("wrong_body.lua", wrong_body),
+        ]),
+        None,
+    )
+    .unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(host.drain_physics_commands().is_empty());
+    let messages = host
+        .drain_events()
+        .into_iter()
+        .map(|event| event.message)
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("does not have a character controller"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("must be a finite f32 number"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("does not have a dynamic rigid body"))
+    );
+}
+
+#[test]
+fn lua_physics_reports_unavailable_context_explicitly() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/script.lua"
+[[objects]]
+id = "actor"
+[[objects.lite_scripts]]
+path = "/script.lua"
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  rve.physics.raycast({x=0,y=0,z=0}, {x=1,y=0,z=0}, 5)
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("script.lua", source)]), None).unwrap();
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.message.contains("physics context is not attached"))
+    );
+}
+
+#[test]
+fn repeated_character_moves_create_one_push_and_zero_dt_creates_none() {
+    fn run(dt: f32) -> (Vec<PhysicsCommand>, Vec3) {
+        let mut world = world(
+            r#"
+[[assets]]
+path = "/move.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/move.lua"
+[[objects]]
+id = "crate"
+"#,
+        );
+        let player = world.handle("player").unwrap();
+        let crate_handle = world.handle("crate").unwrap();
+        let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+        let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let player_body = physics
+            .insert_body({
+                let mut desc = BodyDesc::new(
+                    BodyKind::Kinematic,
+                    Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+                    ColliderDesc::new(controller.capsule().unwrap()),
+                );
+                desc.character_controller = true;
+                desc
+            })
+            .unwrap();
+        let crate_body = physics
+            .insert_body(BodyDesc::dynamic(
+                Shape::cuboid(Vec3::splat(0.25)).unwrap(),
+                Pose::new(Vec3::new(0.75, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let bindings = [
+            PhysicsSceneBinding {
+                object: player,
+                body: player_body,
+                kind: BodyKind::Kinematic,
+                character_controller: Some(controller),
+            },
+            PhysicsSceneBinding {
+                object: crate_handle,
+                body: crate_body,
+                kind: BodyKind::Dynamic,
+                character_controller: None,
+            },
+        ];
+        let source = r#"
+local Script = {}
+function Script:on_update(dt)
+  local player = rve.find("player")
+  player:move({x=0.4,y=0,z=0})
+  player:move({x=0.4,y=0,z=0})
+end
+return Script
+"#;
+        let mut host =
+            ScriptHost::load(&world, "scene", &sources(&[("move.lua", source)]), None).unwrap();
+        host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+        host.update(&mut world, dt, ScriptTime::default());
+        (
+            host.drain_physics_commands(),
+            world.local_transform(player).unwrap().position,
+        )
+    }
+
+    let (commands, position) = run(1.0 / 60.0);
+    let pushes = commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                PhysicsCommand::AddImpulse {
+                    body: BodyHandle(2),
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(pushes.len(), 1);
+    let impulse = match pushes[0] {
+        PhysicsCommand::AddImpulse { impulse, .. } => *impulse,
+        _ => unreachable!(),
+    };
+    assert!(impulse.is_finite() && impulse.length() > 0.0);
+    assert!(position.x > 0.0 && position.x < 0.3);
+
+    let (commands, _) = run(0.0);
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn character_displacement_accumulates_independently_of_render_frame_rate() {
+    fn run(fps: u32) -> f32 {
+        let mut world = world(
+            r#"
+[[assets]]
+path = "/move.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/move.lua"
+"#,
+        );
+        let player = world.handle("player").unwrap();
+        let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+        let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let body = physics
+            .insert_body({
+                let mut desc = BodyDesc::new(
+                    BodyKind::Kinematic,
+                    Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+                    ColliderDesc::new(controller.capsule().unwrap()),
+                );
+                desc.character_controller = true;
+                desc
+            })
+            .unwrap();
+        let bindings = [PhysicsSceneBinding {
+            object: player,
+            body,
+            kind: BodyKind::Kinematic,
+            character_controller: Some(controller),
+        }];
+        let source = r#"
+local Script = {}
+function Script:on_update(dt)
+  rve.find("player"):move({x=2*dt,y=0,z=0})
+end
+return Script
+"#;
+        let mut host =
+            ScriptHost::load(&world, "scene", &sources(&[("move.lua", source)]), None).unwrap();
+        let delta = 1.0 / fps as f32;
+        for frame in 0..fps {
+            host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+            host.update(
+                &mut world,
+                delta,
+                ScriptTime {
+                    elapsed: (frame + 1) as f64 * delta as f64,
+                    frame: u64::from(frame + 1),
+                },
+            );
+        }
+        world.local_transform(player).unwrap().position.x
+    }
+
+    let distances = [run(30), run(60), run(144)];
+    for distance in distances {
+        assert!((distance - 2.0).abs() < 1.0e-4, "distance={distance}");
+    }
+}
+
+#[test]
+fn character_push_impulse_produces_similar_dynamic_displacement_at_30_60_144_fps() {
+    fn run(fps: u32) -> (f32, Vec3, usize) {
+        let mut world = world(
+            r#"
+[[assets]]
+path = "/move.lua"
+[[objects]]
+id = "player"
+[[objects.lite_scripts]]
+path = "/move.lua"
+[[objects]]
+id = "crate"
+"#,
+        );
+        let player = world.handle("player").unwrap();
+        let crate_handle = world.handle("crate").unwrap();
+        let controller = CharacterController::new(0.25, 0.5, 0.0, 45.0, 0.0, 0.01, 1.0).unwrap();
+        let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let player_body = physics
+            .insert_body({
+                let mut desc = BodyDesc::new(
+                    BodyKind::Kinematic,
+                    Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+                    ColliderDesc::new(controller.capsule().unwrap()),
+                );
+                desc.character_controller = true;
+                desc
+            })
+            .unwrap();
+        let crate_body = physics
+            .insert_body(BodyDesc::dynamic(
+                Shape::cuboid(Vec3::splat(0.25)).unwrap(),
+                Pose::new(Vec3::new(0.75, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let bindings = [
+            PhysicsSceneBinding {
+                object: player,
+                body: player_body,
+                kind: BodyKind::Kinematic,
+                character_controller: Some(controller),
+            },
+            PhysicsSceneBinding {
+                object: crate_handle,
+                body: crate_body,
+                kind: BodyKind::Dynamic,
+                character_controller: None,
+            },
+        ];
+        let mut driver = StepDriver::new(physics, 60, 8).unwrap();
+        let source = r#"
+local Script = {}
+function Script:on_update(dt)
+  rve.find("player"):move({x=dt,y=0,z=0})
+end
+return Script
+"#;
+        let mut host =
+            ScriptHost::load(&world, "scene", &sources(&[("move.lua", source)]), None).unwrap();
+        let delta = 1.0 / fps as f32;
+        let mut push_count = 0;
+        for frame in 0..fps {
+            host.set_physics_snapshot(driver.world().query_snapshot().unwrap(), &bindings);
+            host.update(
+                &mut world,
+                delta,
+                ScriptTime {
+                    elapsed: (frame + 1) as f64 * delta as f64,
+                    frame: u64::from(frame + 1),
+                },
+            );
+            let mut commands = host.drain_physics_commands();
+            push_count += commands
+                .iter()
+                .filter(|command| matches!(command, PhysicsCommand::AddImpulse { body, .. } if *body == crate_body))
+                .count();
+            commands.push(PhysicsCommand::KinematicTarget {
+                body: player_body,
+                pose: Pose::new(
+                    world.local_transform(player).unwrap().position,
+                    Quat::IDENTITY,
+                )
+                .unwrap(),
+            });
+            driver.advance_step(delta, commands).unwrap();
+        }
+        (
+            driver.world().body_pose(crate_body).unwrap().position.x,
+            driver.world().body_velocity(crate_body).unwrap(),
+            push_count,
+        )
+    }
+
+    let crate_displacements = [run(30), run(60), run(144)];
+    assert!(crate_displacements.iter().all(|value| value.0 > 0.5));
+    let min = crate_displacements
+        .iter()
+        .map(|value| value.0)
+        .fold(f32::INFINITY, f32::min);
+    let max = crate_displacements
+        .iter()
+        .copied()
+        .map(|value| value.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        max - min < 0.25,
+        "crate displacements={crate_displacements:?}"
+    );
+}
+
+#[test]
+fn failed_physics_event_disables_instance_and_discards_its_commands() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/event.lua"
+[[assets]]
+path = "/reader.lua"
+[[objects]]
+id = "sensor"
+[[objects.lite_scripts]]
+path = "/event.lua"
+[[objects.lite_scripts]]
+path = "/reader.lua"
+[[objects]]
+id = "other"
+"#,
+    );
+    let sensor = world.handle("sensor").unwrap();
+    let other = world.handle("other").unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let sensor_body = physics
+        .insert_body({
+            let mut desc = BodyDesc::static_collider(Shape::sphere(0.5).unwrap(), Pose::IDENTITY);
+            desc.collider.trigger = true;
+            desc
+        })
+        .unwrap();
+    let other_body = physics
+        .insert_body(BodyDesc::static_collider(
+            Shape::sphere(0.5).unwrap(),
+            Pose::new(Vec3::X * 2.0, Quat::IDENTITY).unwrap(),
+        ))
+        .unwrap();
+    let bindings = [
+        PhysicsSceneBinding {
+            object: sensor,
+            body: sensor_body,
+            kind: BodyKind::Static,
+            character_controller: None,
+        },
+        PhysicsSceneBinding {
+            object: other,
+            body: other_body,
+            kind: BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let event = r#"
+local Script = {}
+function Script:on_trigger_enter(other)
+  rve.find("sensor"):set_collider_enabled(false)
+  error("abort trigger transaction")
+end
+function Script:on_update()
+  rve.log_info("failed event instance still active")
+end
+return Script
+"#;
+    let reader = r#"
+local Script = {}
+function Script:on_update()
+  assert(rve.find("sensor"):is_collider_enabled())
+  rve.log_info("event command rollback observed")
+end
+return Script
+"#;
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("event.lua", event), ("reader.lua", reader)]),
+        None,
+    )
+    .unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &bindings);
+    host.queue_physics_events([engine_physics::PhysicsEvent::TriggerEnter {
+        first: sensor_body,
+        second: other_body,
+    }]);
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(host.drain_physics_commands().is_empty());
+    let messages = host
+        .drain_events()
+        .into_iter()
+        .map(|event| event.message)
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("abort trigger transaction"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "event command rollback observed")
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message == "failed event instance still active")
+    );
+}
+
+#[test]
+fn lua_collision_and_trigger_events_follow_messages_and_keep_contact_orientation() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/events.lua"
+[[objects]]
+id = "first"
+[[objects.lite_scripts]]
+path = "/events.lua"
+[[objects]]
+id = "second"
+"#,
+    );
+    let first = world.handle("first").unwrap();
+    let second = world.handle("second").unwrap();
+    let physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let snapshot = physics.query_snapshot().unwrap();
+    let bindings = [
+        PhysicsSceneBinding {
+            object: first,
+            body: BodyHandle(11),
+            kind: BodyKind::Static,
+            character_controller: None,
+        },
+        PhysicsSceneBinding {
+            object: second,
+            body: BodyHandle(12),
+            kind: BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let source = r#"
+local Script = {}
+function Script:on_start() rve.send("first", "before_events", true) end
+function Script:on_message(_, name) rve.log_info(name) end
+function Script:on_collision_enter(other, contact)
+  assert(other.id == "second")
+  assert(contact.point.x == 1 and contact.normal.x == 1)
+  rve.log_info("collision_enter")
+end
+function Script:on_collision_exit(other) rve.log_info("collision_exit:" .. other.id) end
+function Script:on_trigger_enter(other) rve.log_info("trigger_enter:" .. other.id) end
+function Script:on_trigger_exit(other) rve.log_info("trigger_exit:" .. other.id) end
+function Script:on_update() rve.log_info("update") end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("events.lua", source)]), None).unwrap();
+    host.set_physics_snapshot(snapshot, &bindings);
+    host.queue_physics_events([
+        engine_physics::PhysicsEvent::CollisionEnter {
+            first: BodyHandle(11),
+            second: BodyHandle(12),
+            point: Vec3::X,
+            normal: Vec3::X,
+        },
+        engine_physics::PhysicsEvent::CollisionExit {
+            first: BodyHandle(11),
+            second: BodyHandle(12),
+        },
+        engine_physics::PhysicsEvent::TriggerEnter {
+            first: BodyHandle(11),
+            second: BodyHandle(12),
+        },
+        engine_physics::PhysicsEvent::TriggerExit {
+            first: BodyHandle(11),
+            second: BodyHandle(12),
+        },
+    ]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    let messages = host
+        .drain_events()
+        .into_iter()
+        .map(|event| event.message)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [
+            "before_events",
+            "collision_enter",
+            "collision_exit:second",
+            "trigger_enter:second",
+            "trigger_exit:second",
+            "update",
+        ]
+    );
 }
 
 #[test]

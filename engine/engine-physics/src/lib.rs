@@ -31,8 +31,8 @@ pub use narrow::{
     PairKey, collide, distance,
 };
 pub use query::{
-    MAX_QUERY_CANDIDATES, MAX_SHAPE_CAST_ITERATIONS, QueryError, QueryFilter, QueryHit,
-    QuerySnapshot,
+    MAX_QUERY_CANDIDATES, MAX_SHAPE_CAST_ITERATIONS, QueryBodyState, QueryError, QueryFilter,
+    QueryHit, QueryOverrides, QuerySnapshot,
 };
 pub use ray::{Ray, RayHit, raycast};
 pub use scene::{

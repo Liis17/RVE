@@ -17,6 +17,13 @@ pub struct QueryFilter {
     pub include_triggers: bool,
 }
 
+/// Additional body exclusions and enabled-state overrides applied over a snapshot.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryOverrides<'a> {
+    pub excluded: &'a [BodyHandle],
+    pub enabled: &'a [(BodyHandle, bool)],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QueryHit {
     pub body: BodyHandle,
@@ -33,6 +40,17 @@ pub struct QueryHit {
     /// Dynamic body mass, or zero for static and kinematic bodies.
     pub mass: f32,
     pub trigger: bool,
+}
+
+/// Immutable body metadata captured with a query snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueryBodyState {
+    pub pose: Pose,
+    pub enabled: bool,
+    pub trigger: bool,
+    pub body_kind: BodyKind,
+    pub body_velocity: Vec3,
+    pub mass: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -138,6 +156,27 @@ impl QuerySnapshot {
     }
 
     pub fn raycast(&self, ray: &Ray, filter: QueryFilter) -> Result<Option<QueryHit>, QueryError> {
+        self.raycast_excluding(ray, filter, &[])
+    }
+
+    /// Raycasts while excluding additional bodies, for transactional collider toggles.
+    pub fn raycast_excluding(
+        &self,
+        ray: &Ray,
+        filter: QueryFilter,
+        excluded: &[BodyHandle],
+    ) -> Result<Option<QueryHit>, QueryError> {
+        self.raycast_with_enabled_overrides(ray, filter, excluded, &[])
+    }
+
+    /// Raycasts with script-staged collider enabled states applied over the snapshot.
+    pub fn raycast_with_enabled_overrides(
+        &self,
+        ray: &Ray,
+        filter: QueryFilter,
+        excluded: &[BodyHandle],
+        enabled_overrides: &[(BodyHandle, bool)],
+    ) -> Result<Option<QueryHit>, QueryError> {
         if !ray.origin.is_finite()
             || !ray.direction.is_finite()
             || !ray.max_distance.is_finite()
@@ -149,7 +188,11 @@ impl QuerySnapshot {
         let end = ray.point_at(ray.max_distance);
         let broad_bounds = Aabb::from_points(&[ray.origin, end])?;
         let mut closest = None;
-        for index in self.candidates(broad_bounds, filter)? {
+        let overrides = QueryOverrides {
+            excluded,
+            enabled: enabled_overrides,
+        };
+        for index in self.candidates(broad_bounds, filter, overrides)? {
             let collider = &self.colliders[index];
             let Some(hit) = raycast(ray, &collider.shape, collider.pose)? else {
                 continue;
@@ -186,6 +229,42 @@ impl QuerySnapshot {
         skin: f32,
         filter: QueryFilter,
     ) -> Result<Option<QueryHit>, QueryError> {
+        self.shape_cast_excluding(shape, pose, displacement, skin, filter, &[])
+    }
+
+    /// Shape-casts while excluding additional bodies, for transactional collider toggles.
+    pub fn shape_cast_excluding(
+        &self,
+        shape: &Shape,
+        pose: Pose,
+        displacement: Vec3,
+        skin: f32,
+        filter: QueryFilter,
+        excluded: &[BodyHandle],
+    ) -> Result<Option<QueryHit>, QueryError> {
+        self.shape_cast_with_overrides(
+            shape,
+            pose,
+            displacement,
+            skin,
+            filter,
+            QueryOverrides {
+                excluded,
+                enabled: &[],
+            },
+        )
+    }
+
+    /// Shape-casts with caller-provided exclusions and enabled states applied over the snapshot.
+    pub fn shape_cast_with_overrides(
+        &self,
+        shape: &Shape,
+        pose: Pose,
+        displacement: Vec3,
+        skin: f32,
+        filter: QueryFilter,
+        overrides: QueryOverrides<'_>,
+    ) -> Result<Option<QueryHit>, QueryError> {
         if !displacement.is_finite() || !skin.is_finite() || skin < 0.0 {
             return Err(QueryError::InvalidCast);
         }
@@ -199,7 +278,7 @@ impl QuerySnapshot {
         let sweep_bounds = expand_aabb(start_bounds.union(end_bounds), skin)?;
         let mut closest = None;
 
-        for index in self.candidates(sweep_bounds, filter)? {
+        for index in self.candidates(sweep_bounds, filter, overrides)? {
             let collider = &self.colliders[index];
             let cast = match &collider.shape {
                 Shape::TriMesh(mesh) => cast_against_mesh(
@@ -239,17 +318,42 @@ impl QuerySnapshot {
         Ok(closest)
     }
 
-    fn candidates(&self, query: Aabb, filter: QueryFilter) -> Result<Vec<usize>, QueryError> {
+    pub fn body_state(&self, body: BodyHandle) -> Option<QueryBodyState> {
+        self.colliders
+            .iter()
+            .find(|collider| collider.body == body)
+            .map(|collider| QueryBodyState {
+                pose: collider.pose,
+                enabled: collider.enabled,
+                trigger: collider.trigger,
+                body_kind: collider.body_kind,
+                body_velocity: collider.body_velocity,
+                mass: collider.mass,
+            })
+    }
+
+    fn candidates(
+        &self,
+        query: Aabb,
+        filter: QueryFilter,
+        overrides: QueryOverrides<'_>,
+    ) -> Result<Vec<usize>, QueryError> {
         let mut candidates = Vec::new();
         for &index in &self.x_order {
             let collider = &self.colliders[index];
             if collider.bounds.min.x > query.max.x {
                 break;
             }
-            if collider.enabled
+            let enabled = overrides
+                .enabled
+                .binary_search_by_key(&collider.body, |(body, _)| *body)
+                .ok()
+                .map_or(collider.enabled, |index| overrides.enabled[index].1);
+            if enabled
                 && collider.bounds.max.x >= query.min.x
                 && collider.bounds.overlaps(query)
                 && filter.ignore != Some(collider.body)
+                && !overrides.excluded.contains(&collider.body)
                 && (filter.include_triggers || !collider.trigger)
             {
                 if candidates.len() == MAX_QUERY_CANDIDATES {

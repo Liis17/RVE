@@ -5,7 +5,7 @@ use std::ffi::c_void;
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 4;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 5;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -580,6 +580,62 @@ pub type RveRegisterCommandFn =
 /// Host command unregistration callback; returns `RveStatus` as a `u32`.
 pub type RveUnregisterCommandFn = unsafe extern "C" fn(ctx: *mut c_void, name: RveStr) -> u32;
 
+pub const RVE_COLLISION_ENTER: u32 = 0;
+pub const RVE_COLLISION_EXIT: u32 = 1;
+pub const RVE_TRIGGER_ENTER: u32 = 2;
+pub const RVE_TRIGGER_EXIT: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveRaycastHit {
+    pub object: u64,
+    pub point: [f32; 3],
+    pub normal: [f32; 3],
+    pub distance: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveCharacterMoveResult {
+    pub translation: [f32; 3],
+    pub grounded: bool,
+    pub collided: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveCollisionEvent {
+    pub kind: u32,
+    pub other: u64,
+    pub point: [f32; 3],
+    /// Contact normal points from this script object's collider toward `other`.
+    pub normal: [f32; 3],
+}
+
+pub type RvePhysicsRaycastFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    origin: *const [f32; 3],
+    direction: *const [f32; 3],
+    max_distance: f32,
+    include_triggers: bool,
+    ignore: u64,
+    out: *mut RveRaycastHit,
+) -> bool;
+pub type RvePhysicsVectorFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *mut [f32; 3]) -> bool;
+pub type RvePhysicsSetVectorFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *const [f32; 3]) -> bool;
+pub type RvePhysicsMoveCharacterFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    displacement: *const [f32; 3],
+    out: *mut RveCharacterMoveResult,
+) -> bool;
+pub type RvePhysicsBoolFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *mut bool) -> bool;
+pub type RvePhysicsSetBoolFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: bool) -> bool;
+
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
 pub struct RveHost {
@@ -631,6 +687,16 @@ pub struct RveHost {
     pub register_command: Option<RveRegisterCommandFn>,
     /// Unregisters a command owned by the active script; appended in ABI v4.
     pub unregister_command: Option<RveUnregisterCommandFn>,
+    /// Optional physics callbacks appended in ABI v5.
+    pub raycast: Option<RvePhysicsRaycastFn>,
+    pub get_velocity: Option<RvePhysicsVectorFn>,
+    pub set_velocity: Option<RvePhysicsSetVectorFn>,
+    pub add_impulse: Option<RvePhysicsSetVectorFn>,
+    pub add_force: Option<RvePhysicsSetVectorFn>,
+    pub move_character: Option<RvePhysicsMoveCharacterFn>,
+    pub is_grounded: Option<RvePhysicsBoolFn>,
+    pub set_collider_enabled: Option<RvePhysicsSetBoolFn>,
+    pub is_collider_enabled: Option<RvePhysicsBoolFn>,
 }
 
 /// Guest factory callback.
@@ -664,6 +730,12 @@ pub type RveCommandFn = unsafe extern "C" fn(
     name: RveStr,
     args: *const RveStr,
     arg_count: usize,
+) -> RveStatus;
+/// Guest collision and trigger callback.
+pub type RveCollisionFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    event: RveCollisionEvent,
 ) -> RveStatus;
 
 /// Script descriptor layout used by ABI versions 1 and 2.
@@ -708,12 +780,12 @@ pub struct RveScriptDescV3 {
     pub param_count: usize,
 }
 
-/// One exported guest script implementation in ABI version 4.
+/// Script descriptor layout used by ABI version 4.
 ///
 /// The optional command callback was appended in v4. Versions 1 and 2 use
 /// [`RveScriptDescV1`], and version 3 uses [`RveScriptDescV3`]; both are normalized by the host.
 #[repr(C)]
-pub struct RveScriptDesc {
+pub struct RveScriptDescV4 {
     /// ASCII script name in the `[A-Za-z0-9_]{1,64}` format.
     pub name: RveStr,
     /// Creates one guest instance.
@@ -734,6 +806,23 @@ pub struct RveScriptDesc {
     pub param_count: usize,
     /// Optional callback for console commands registered by this script.
     pub command: Option<RveCommandFn>,
+}
+
+/// One exported guest script implementation in ABI version 5.
+#[repr(C)]
+pub struct RveScriptDesc {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    /// Optional collision and trigger callback appended in ABI v5.
+    pub collision: Option<RveCollisionFn>,
 }
 
 /// Parameter kind: boolean.
@@ -807,6 +896,7 @@ unsafe impl Sync for RveParamEntry {}
 unsafe impl Sync for RveParamDesc {}
 unsafe impl Sync for RveScriptDescV1 {}
 unsafe impl Sync for RveScriptDescV3 {}
+unsafe impl Sync for RveScriptDescV4 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 

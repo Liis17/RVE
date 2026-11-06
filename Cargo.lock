@@ -793,7 +793,9 @@ name = "engine-script"
 version = "0.1.0"
 dependencies = [
  "engine-console",
+ "engine-physics",
  "engine-scene",
+ "glam",
  "libloading 0.9.0",
  "mlua",
  "rve-sdk",

@@ -1,16 +1,18 @@
 use crate::abi_host::{AbiPhase, AbiScriptCall, AbiScriptInstance};
 use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lite::{
-    self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LuaCommands,
-    LuaInstance, RegisteredCommandCallback, ScriptEventQueue,
+    self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LitePhysicsEvent,
+    LuaCommands, LuaInstance, RegisteredCommandCallback, ScriptEventQueue,
 };
+use crate::physics::PhysicsScriptState;
 use crate::transaction::{
-    MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction,
+    MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction, ScriptTransactionInit,
 };
 use crate::types::{
     ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
 use engine_console::{CommandCatalog, CommandLine, CommandSpec};
+use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
 use engine_scene::{LocalTransform, ObjectHandle, ParamSchema, World};
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use std::cell::{Cell, RefCell};
@@ -156,6 +158,7 @@ pub struct ScriptHost {
     destroyed: bool,
     input: ScriptInput,
     current_time: ScriptTime,
+    physics: Rc<RefCell<PhysicsScriptState>>,
 }
 
 #[derive(Clone, Copy)]
@@ -163,7 +166,44 @@ enum Phase {
     Start,
     Update(f32),
     Message,
+    PhysicsEvent(ScriptPhysicsEvent),
     Destroy,
+}
+
+#[derive(Clone, Copy)]
+struct ScriptPhysicsEvent {
+    kind: ScriptPhysicsEventKind,
+    other: ObjectHandle,
+    point: glam::Vec3,
+    normal: glam::Vec3,
+}
+
+#[derive(Clone, Copy)]
+enum ScriptPhysicsEventKind {
+    CollisionEnter,
+    CollisionExit,
+    TriggerEnter,
+    TriggerExit,
+}
+
+impl ScriptPhysicsEventKind {
+    fn callback_name(self) -> &'static str {
+        match self {
+            Self::CollisionEnter => "on_collision_enter",
+            Self::CollisionExit => "on_collision_exit",
+            Self::TriggerEnter => "on_trigger_enter",
+            Self::TriggerExit => "on_trigger_exit",
+        }
+    }
+
+    fn abi_kind(self) -> u32 {
+        match self {
+            Self::CollisionEnter => rve_sdk::abi::RVE_COLLISION_ENTER,
+            Self::CollisionExit => rve_sdk::abi::RVE_COLLISION_EXIT,
+            Self::TriggerEnter => rve_sdk::abi::RVE_TRIGGER_ENTER,
+            Self::TriggerExit => rve_sdk::abi::RVE_TRIGGER_EXIT,
+        }
+    }
 }
 
 enum CommandCallback {
@@ -268,6 +308,7 @@ impl ScriptHost {
             destroyed: false,
             input: ScriptInput::default(),
             current_time: ScriptTime::default(),
+            physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
         };
         let mut classes: HashMap<String, (Table, Option<ParamSchema>)> = HashMap::new();
 
@@ -286,14 +327,16 @@ impl ScriptHost {
                 } else {
                     let source_label = event_source(scene_name, &object.id, path);
                     *host.active_source.borrow_mut() = source_label.clone();
-                    host.transaction.begin(
+                    host.transaction.begin(ScriptTransactionInit {
                         world,
-                        object.handle,
-                        &source_label,
-                        false,
-                        host.input,
-                        (host.queued_messages.len(), host.queued_bytes),
-                    );
+                        self_object: object.handle,
+                        source: &source_label,
+                        writable: false,
+                        input: host.input,
+                        queued_messages: (host.queued_messages.len(), host.queued_bytes),
+                        physics: host.physics.clone(),
+                        physics_phase_dt: None,
+                    });
                     let _active_call = ActiveCallGuard::new(
                         &host.lua,
                         Some(&host.call_deadline),
@@ -359,14 +402,16 @@ impl ScriptHost {
                     })?;
                     let source = event_source(scene_name, &object.id, &script.name);
                     let owner = host.instances.len();
-                    host.transaction.begin(
+                    host.transaction.begin(ScriptTransactionInit {
                         world,
-                        object.handle,
-                        &source,
-                        false,
-                        host.input,
-                        (host.queued_messages.len(), host.queued_bytes),
-                    );
+                        self_object: object.handle,
+                        source: &source,
+                        writable: false,
+                        input: host.input,
+                        queued_messages: (host.queued_messages.len(), host.queued_bytes),
+                        physics: host.physics.clone(),
+                        physics_phase_dt: None,
+                    });
                     let result = AbiScriptInstance::create(
                         descriptor,
                         &params,
@@ -418,6 +463,25 @@ impl ScriptHost {
     /// Replaces the input snapshot used by the next update and its lifecycle callbacks.
     pub fn set_input(&mut self, input: ScriptInput) {
         self.input = input;
+    }
+
+    /// Attaches the current immutable physics query snapshot and scene-body mapping.
+    pub fn set_physics_snapshot(
+        &mut self,
+        snapshot: Arc<QuerySnapshot>,
+        bindings: &[PhysicsSceneBinding],
+    ) {
+        self.physics.borrow_mut().set_snapshot(snapshot, bindings);
+    }
+
+    /// Queues physics events for delivery after messages at the beginning of the next update.
+    pub fn queue_physics_events(&mut self, events: impl IntoIterator<Item = PhysicsEvent>) {
+        self.physics.borrow_mut().queue_events(events);
+    }
+
+    /// Drains commands committed by successful script callbacks.
+    pub fn drain_physics_commands(&mut self) -> Vec<PhysicsCommand> {
+        self.physics.borrow_mut().drain_commands()
     }
 
     /// Runs on_start once. update also calls start automatically if needed.
@@ -536,14 +600,16 @@ impl ScriptHost {
 
         world.recalculate_world_matrices();
         *self.active_source.borrow_mut() = source.clone();
-        self.transaction.begin(
+        self.transaction.begin(ScriptTransactionInit {
             world,
-            handle,
-            &source,
-            true,
-            self.input,
-            (self.queued_messages.len(), self.queued_bytes),
-        );
+            self_object: handle,
+            source: &source,
+            writable: true,
+            input: self.input,
+            queued_messages: (self.queued_messages.len(), self.queued_bytes),
+            physics: self.physics.clone(),
+            physics_phase_dt: None,
+        });
         let transaction_ptr = &mut self.transaction as *mut ScriptTransaction;
         let result: Result<Option<String>, (String, bool)> = {
             let call_deadline =
@@ -641,6 +707,7 @@ impl ScriptHost {
         world.recalculate_world_matrices();
         if matches!(phase, Phase::Update(_)) {
             self.deliver_messages(world, time);
+            self.deliver_physics_events(world, time);
         }
 
         let time_error = lite::set_time(&self.lua_time, time)
@@ -734,6 +801,104 @@ impl ScriptHost {
         }
     }
 
+    fn deliver_physics_events(&mut self, world: &mut World, time: ScriptTime) {
+        let events = self.physics.borrow_mut().take_events();
+        for event in events {
+            let endpoints = match event {
+                PhysicsEvent::CollisionEnter {
+                    first,
+                    second,
+                    point,
+                    normal,
+                } => Some((
+                    first,
+                    second,
+                    ScriptPhysicsEventKind::CollisionEnter,
+                    point,
+                    normal,
+                )),
+                PhysicsEvent::CollisionExit { first, second } => Some((
+                    first,
+                    second,
+                    ScriptPhysicsEventKind::CollisionExit,
+                    glam::Vec3::ZERO,
+                    glam::Vec3::ZERO,
+                )),
+                PhysicsEvent::TriggerEnter { first, second } => Some((
+                    first,
+                    second,
+                    ScriptPhysicsEventKind::TriggerEnter,
+                    glam::Vec3::ZERO,
+                    glam::Vec3::ZERO,
+                )),
+                PhysicsEvent::TriggerExit { first, second } => Some((
+                    first,
+                    second,
+                    ScriptPhysicsEventKind::TriggerExit,
+                    glam::Vec3::ZERO,
+                    glam::Vec3::ZERO,
+                )),
+            };
+            let Some((first, second, kind, point, normal)) = endpoints else {
+                continue;
+            };
+            let first_object = self.physics.borrow().object(first);
+            let second_object = self.physics.borrow().object(second);
+            let (Some(first_object), Some(second_object)) = (first_object, second_object) else {
+                continue;
+            };
+            self.deliver_physics_event(
+                world,
+                time,
+                first_object,
+                ScriptPhysicsEvent {
+                    kind,
+                    other: second_object,
+                    point,
+                    normal,
+                },
+            );
+            self.deliver_physics_event(
+                world,
+                time,
+                second_object,
+                ScriptPhysicsEvent {
+                    kind,
+                    other: first_object,
+                    point,
+                    normal: -normal,
+                },
+            );
+        }
+    }
+
+    fn deliver_physics_event(
+        &mut self,
+        world: &mut World,
+        time: ScriptTime,
+        object: ObjectHandle,
+        event: ScriptPhysicsEvent,
+    ) {
+        let indexes = self
+            .instances
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instance)| {
+                (instance.enabled && instance.handle == object).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in indexes {
+            match self.call_instance(index, world, Phase::PhysicsEvent(event), time, None, None) {
+                CallOutcome::Committed => {}
+                CallOutcome::Interrupted => self.disable_instance(index),
+                CallOutcome::Failed(message) => {
+                    self.disable_instance(index);
+                    push_error(&self.events, &self.instances[index], message);
+                }
+            }
+        }
+    }
+
     fn call_instance(
         &mut self,
         index: usize,
@@ -758,6 +923,7 @@ impl ScriptHost {
             interrupt,
             commands,
             commands_generation,
+            physics,
             ..
         } = self;
         let instance = &mut instances[index];
@@ -766,14 +932,19 @@ impl ScriptHost {
             return CallOutcome::Failed("object no longer exists".to_owned());
         };
         let initial = script_transform(local);
-        transaction.begin(
+        transaction.begin(ScriptTransactionInit {
             world,
-            instance.handle,
-            &instance.source,
-            true,
-            *input,
-            (queued_messages.len(), *queued_bytes),
-        );
+            self_object: instance.handle,
+            source: &instance.source,
+            writable: true,
+            input: *input,
+            queued_messages: (queued_messages.len(), *queued_bytes),
+            physics: physics.clone(),
+            physics_phase_dt: match phase {
+                Phase::Update(dt) => Some(dt),
+                _ => None,
+            },
+        });
         let transaction_ptr = transaction as *mut ScriptTransaction;
         let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {
             ScriptKind::Lite(lite_instance) => {
@@ -813,6 +984,21 @@ impl ScriptHost {
                                             ),
                                             None => Err(LuaError::runtime("missing message data")),
                                         },
+                                        Phase::PhysicsEvent(event) => lite_instance
+                                            .invoke_physics_event(
+                                                lua,
+                                                active_call,
+                                                LitePhysicsEvent {
+                                                    callback: event.kind.callback_name(),
+                                                    other: event.other,
+                                                    point: event.point,
+                                                    normal: event.normal,
+                                                    has_contact: matches!(
+                                                        event.kind,
+                                                        ScriptPhysicsEventKind::CollisionEnter
+                                                    ),
+                                                },
+                                            ),
                                         Phase::Destroy => lite_instance.invoke_destroy(),
                                     })
                             }
@@ -853,6 +1039,23 @@ impl ScriptHost {
                     },
                     Phase::Start => script.invoke(AbiPhase::Start, time, call),
                     Phase::Update(dt) => script.invoke(AbiPhase::Update(dt), time, call),
+                    Phase::PhysicsEvent(event) => {
+                        let Some(other) = (unsafe { (*transaction_ptr).abi_handle(event.other) })
+                        else {
+                            return CallOutcome::Failed(
+                                "physics event object handle cannot be represented by the ABI"
+                                    .to_owned(),
+                            );
+                        };
+                        script.invoke_physics_event(
+                            time,
+                            event.kind.abi_kind(),
+                            other,
+                            event.point.to_array(),
+                            event.normal.to_array(),
+                            call,
+                        )
+                    }
                     Phase::Destroy => script.invoke(AbiPhase::Destroy, time, call),
                 }
                 .map(|()| None)

@@ -1,8 +1,9 @@
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
     RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveHeader, RveHost, RveModule, RveParamEntry, RveParams, RveScriptDesc,
-    RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RveCameraSettings, RveCharacterMoveResult, RveHeader, RveHost, RveModule, RveParamEntry,
+    RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue,
+    RveValueData,
 };
 use crate::{
     AntiAliasing, CameraSettings, ConsoleLevel, Context, Key, MouseButton, Params, Script,
@@ -198,6 +199,9 @@ struct HostState {
     wheel: [f32; 2],
     camera_settings: RveCameraSettings,
     active_camera: u64,
+    physics_velocity: [f32; 3],
+    physics_enabled: bool,
+    physics_vectors: Vec<(u64, [f32; 3])>,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -437,7 +441,137 @@ fn host(state: &mut HostState) -> RveHost {
         set_active_camera: Some(set_active_camera),
         register_command: Some(register_command),
         unregister_command: Some(unregister_command),
+        raycast: None,
+        get_velocity: None,
+        set_velocity: None,
+        add_impulse: None,
+        add_force: None,
+        move_character: None,
+        is_grounded: None,
+        set_collider_enabled: None,
+        is_collider_enabled: None,
     }
+}
+
+unsafe extern "C" fn physics_raycast(
+    _: *mut c_void,
+    origin: *const [f32; 3],
+    direction: *const [f32; 3],
+    max_distance: f32,
+    _: bool,
+    _: u64,
+    out: *mut RveRaycastHit,
+) -> bool {
+    if origin.is_null() || direction.is_null() || out.is_null() || max_distance <= 0.0 {
+        return false;
+    }
+    // SAFETY: test inputs and output are valid for the callback.
+    unsafe {
+        *out = RveRaycastHit {
+            object: 2,
+            point: [1.0, 2.0, 3.0],
+            normal: [0.0, 1.0, 0.0],
+            distance: 4.5,
+        }
+    };
+    true
+}
+
+unsafe extern "C" fn physics_get_velocity(ctx: *mut c_void, _: u64, out: *mut [f32; 3]) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: the context and output slot are valid for the callback.
+    unsafe { *out = (&*ctx.cast::<HostState>()).physics_velocity };
+    true
+}
+
+unsafe extern "C" fn physics_set_velocity(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: the context and vector pointer are valid for the callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.physics_velocity = unsafe { *value };
+    state.physics_vectors.push((object, state.physics_velocity));
+    true
+}
+
+unsafe extern "C" fn physics_stage_vector(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: the context and vector pointer are valid for the callback.
+    unsafe { &mut *ctx.cast::<HostState>() }
+        .physics_vectors
+        .push((object, unsafe { *value }));
+    true
+}
+
+unsafe extern "C" fn physics_move_character(
+    _: *mut c_void,
+    _: u64,
+    displacement: *const [f32; 3],
+    out: *mut RveCharacterMoveResult,
+) -> bool {
+    if displacement.is_null() || out.is_null() {
+        return false;
+    }
+    // SAFETY: the callback receives valid input and output storage.
+    unsafe {
+        *out = RveCharacterMoveResult {
+            translation: *displacement,
+            grounded: true,
+            collided: false,
+        }
+    };
+    true
+}
+
+unsafe extern "C" fn physics_get_grounded(_: *mut c_void, _: u64, out: *mut bool) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: out is writable for this callback.
+    unsafe { *out = true };
+    true
+}
+
+unsafe extern "C" fn physics_set_enabled(ctx: *mut c_void, _: u64, enabled: bool) -> bool {
+    // SAFETY: the context is live for this callback.
+    unsafe { (&mut *ctx.cast::<HostState>()).physics_enabled = enabled };
+    true
+}
+
+unsafe extern "C" fn physics_get_enabled(ctx: *mut c_void, _: u64, out: *mut bool) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: the context and output pointer are valid for the callback.
+    unsafe { *out = (&*ctx.cast::<HostState>()).physics_enabled };
+    true
+}
+
+fn physics_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.raycast = Some(physics_raycast);
+    host.get_velocity = Some(physics_get_velocity);
+    host.set_velocity = Some(physics_set_velocity);
+    host.add_impulse = Some(physics_stage_vector);
+    host.add_force = Some(physics_stage_vector);
+    host.move_character = Some(physics_move_character);
+    host.is_grounded = Some(physics_get_grounded);
+    host.set_collider_enabled = Some(physics_set_enabled);
+    host.is_collider_enabled = Some(physics_get_enabled);
+    host
 }
 
 fn descriptor(module: &RveModule, name: &str) -> &'static RveScriptDesc {
@@ -482,6 +616,22 @@ fn script_module_macro_builds_abi_table_and_guest_callbacks() {
     assert_eq!(unsafe { (script.start)(instance, &host) }, RveStatus::Ok);
     assert_eq!(state.transform.position, [7.0, 0.0, 0.0]);
     assert_eq!(state.logs, ["guest log"]);
+    // SAFETY: event and callback pointers are valid during this guest call.
+    assert_eq!(
+        unsafe {
+            (script.collision.unwrap())(
+                instance,
+                &host,
+                crate::abi::RveCollisionEvent {
+                    kind: crate::abi::RVE_COLLISION_ENTER,
+                    other: 1,
+                    point: [1.0, 0.0, 0.0],
+                    normal: [1.0, 0.0, 0.0],
+                },
+            )
+        },
+        RveStatus::Ok
+    );
     // SAFETY: drop is called exactly once for this successful create.
     assert_eq!(unsafe { (script.drop)(instance) }, RveStatus::Ok);
 }
@@ -567,6 +717,60 @@ fn console_command_registration_reports_unavailable_optional_host_callbacks() {
     let context = Context::new(&host).unwrap();
     assert!(context.console.register("sdk.cmd", None).is_err());
     assert!(context.console.unregister("sdk.cmd").is_err());
+}
+
+#[test]
+fn sdk_physics_api_wraps_queries_commands_and_character_state() {
+    let mut state = HostState {
+        physics_velocity: [1.0, 2.0, 3.0],
+        physics_enabled: true,
+        ..HostState::default()
+    };
+    let host = physics_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+
+    let hit = context
+        .physics()
+        .raycast_with_options([0.0; 3], [1.0, 0.0, 0.0], 10.0, true, Some(object))
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit.object.id(&mut context).as_deref(), Some("camera"));
+    assert_eq!(hit.point, [1.0, 2.0, 3.0]);
+    assert_eq!(hit.normal, [0.0, 1.0, 0.0]);
+    assert_eq!(hit.distance, 4.5);
+    assert_eq!(object.get_velocity(&context).unwrap(), [1.0, 2.0, 3.0]);
+    object.set_velocity(&mut context, [4.0, 5.0, 6.0]).unwrap();
+    object.add_impulse(&mut context, [0.0, 1.0, 0.0]).unwrap();
+    object.add_force(&mut context, [0.0, 0.0, 2.0]).unwrap();
+    let movement = object
+        .move_character(&mut context, [0.5, 0.0, 0.0])
+        .unwrap();
+    assert_eq!(movement.translation, [0.5, 0.0, 0.0]);
+    assert!(movement.grounded);
+    assert!(!movement.collided);
+    assert!(object.is_grounded(&context).unwrap());
+    object.set_collider_enabled(&mut context, false).unwrap();
+    assert!(!object.is_collider_enabled(&context).unwrap());
+    context.commit().unwrap();
+    assert_eq!(state.physics_velocity, [4.0, 5.0, 6.0]);
+    assert_eq!(state.physics_vectors.len(), 3);
+}
+
+#[test]
+fn sdk_physics_api_reports_absent_optional_callbacks() {
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        context.physics().raycast([0.0; 3], [1.0, 0.0, 0.0], 1.0),
+        Err(crate::PhysicsError::Unavailable)
+    );
+    assert_eq!(
+        object.set_velocity(&mut context, [0.0; 3]),
+        Err(crate::PhysicsError::Unavailable)
+    );
 }
 
 #[test]
@@ -1070,7 +1274,7 @@ fn script_module_macro_exports_typed_parameter_tables() {
 
 #[test]
 fn param_descriptor_layout_is_c_compatible() {
-    use crate::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveParamDesc, RveScriptDescV3};
+    use crate::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveParamDesc, RveScriptDescV3, RveScriptDescV4};
     use std::mem::{align_of, offset_of, size_of};
     let pointer = size_of::<usize>();
     assert_eq!(offset_of!(RveParamDesc, name), 0);
@@ -1092,11 +1296,24 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, command),
         size_of::<RveScriptDescV3>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 4);
+    assert_eq!(
+        offset_of!(RveScriptDescV4, command),
+        size_of::<RveScriptDescV3>()
+    );
+    assert_eq!(
+        offset_of!(RveScriptDesc, collision),
+        size_of::<RveScriptDescV4>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 5);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(
         offset_of!(RveHost, register_command),
         offset_of!(RveHost, set_active_camera)
             + size_of::<Option<crate::abi::RveSetActiveCameraFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, raycast),
+        offset_of!(RveHost, unregister_command)
+            + size_of::<Option<crate::abi::RveUnregisterCommandFn>>()
     );
 }

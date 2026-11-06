@@ -2,7 +2,7 @@ use std::fmt;
 
 use glam::{Quat, Vec3};
 
-use crate::query::{QueryError, QueryFilter, QueryHit, QuerySnapshot};
+use crate::query::{QueryError, QueryFilter, QueryHit, QueryOverrides, QuerySnapshot};
 use crate::world::{BodyHandle, BodyKind};
 use crate::{GeometryError, Pose, Shape};
 
@@ -136,26 +136,70 @@ impl CharacterController {
         start_pose: Pose,
         displacement: Vec3,
     ) -> Result<CharacterMoveResult, CharacterError> {
+        self.move_capsule_excluding(snapshot, body, start_pose, displacement, &[])
+    }
+
+    /// Moves a capsule while ignoring bodies disabled by staged script commands.
+    pub fn move_capsule_excluding(
+        &self,
+        snapshot: &QuerySnapshot,
+        body: BodyHandle,
+        start_pose: Pose,
+        displacement: Vec3,
+        excluded: &[BodyHandle],
+    ) -> Result<CharacterMoveResult, CharacterError> {
+        self.move_capsule_with_enabled_overrides(
+            snapshot,
+            body,
+            start_pose,
+            displacement,
+            excluded,
+            &[],
+        )
+    }
+
+    /// Moves a capsule while applying script-staged collider enabled states.
+    pub fn move_capsule_with_enabled_overrides(
+        &self,
+        snapshot: &QuerySnapshot,
+        body: BodyHandle,
+        start_pose: Pose,
+        displacement: Vec3,
+        excluded: &[BodyHandle],
+        enabled_overrides: &[(BodyHandle, bool)],
+    ) -> Result<CharacterMoveResult, CharacterError> {
         if !displacement.is_finite() {
             return Err(CharacterError::NonFiniteInput);
         }
         let start_pose = Pose::new(start_pose.position, start_pose.rotation)?;
         let shape = self.capsule()?;
-        let mut movement = self.slide(snapshot, body, &shape, start_pose, displacement)?;
+        let overrides = QueryOverrides {
+            excluded,
+            enabled: enabled_overrides,
+        };
+        let mut movement =
+            self.slide(snapshot, body, &shape, start_pose, displacement, overrides)?;
         if self.step_height > 0.0
             && movement.hits.iter().any(|hit| {
                 hit.blocked_displacement.length_squared() > MOVEMENT_EPSILON_SQUARED
                     && !self.is_walkable(-hit.normal)
             })
             && let Some(stepped) =
-                self.try_step(snapshot, body, &shape, start_pose, displacement)?
+                self.try_step(snapshot, body, &shape, start_pose, displacement, overrides)?
             && horizontal_progress(stepped.position - start_pose.position)
                 > horizontal_progress(movement.position - start_pose.position) + 1.0e-4
         {
             movement = stepped;
         }
         if !movement.grounded && displacement.y <= 0.0 {
-            self.snap_to_ground(snapshot, body, start_pose.rotation, &shape, &mut movement)?;
+            self.snap_to_ground(
+                snapshot,
+                body,
+                start_pose.rotation,
+                &shape,
+                &mut movement,
+                overrides,
+            )?;
         }
         Ok(CharacterMoveResult {
             translation: movement.position - start_pose.position,
@@ -184,6 +228,7 @@ impl CharacterController {
         shape: &Shape,
         start_pose: Pose,
         displacement: Vec3,
+        overrides: QueryOverrides<'_>,
     ) -> Result<SlideResult, CharacterError> {
         let mut result = SlideResult {
             position: start_pose.position,
@@ -200,7 +245,9 @@ impl CharacterController {
                 break;
             }
             let pose = Pose::new(result.position, start_pose.rotation)?;
-            let Some(hit) = snapshot.shape_cast(shape, pose, remaining, self.skin, filter)? else {
+            let Some(hit) = snapshot
+                .shape_cast_with_overrides(shape, pose, remaining, self.skin, filter, overrides)?
+            else {
                 result.position += remaining;
                 break;
             };
@@ -233,6 +280,7 @@ impl CharacterController {
         shape: &Shape,
         start_pose: Pose,
         displacement: Vec3,
+        overrides: QueryOverrides<'_>,
     ) -> Result<Option<SlideResult>, CharacterError> {
         let horizontal = Vec3::new(displacement.x, 0.0, displacement.z);
         if horizontal.length_squared() <= MOVEMENT_EPSILON_SQUARED {
@@ -244,16 +292,18 @@ impl CharacterController {
         };
         let up = Vec3::Y * self.step_height;
         if snapshot
-            .shape_cast(shape, start_pose, up, self.skin, filter)?
+            .shape_cast_with_overrides(shape, start_pose, up, self.skin, filter, overrides)?
             .is_some()
         {
             return Ok(None);
         }
         let raised_pose = Pose::new(start_pose.position + up, start_pose.rotation)?;
-        let mut stepped = self.slide(snapshot, body, shape, raised_pose, horizontal)?;
+        let mut stepped = self.slide(snapshot, body, shape, raised_pose, horizontal, overrides)?;
         let down = -Vec3::Y * (self.step_height + self.skin);
         let down_pose = Pose::new(stepped.position, start_pose.rotation)?;
-        let Some(ground) = snapshot.shape_cast(shape, down_pose, down, self.skin, filter)? else {
+        let Some(ground) = snapshot
+            .shape_cast_with_overrides(shape, down_pose, down, self.skin, filter, overrides)?
+        else {
             return Ok(None);
         };
         if !self.is_walkable(-ground.normal) {
@@ -275,6 +325,7 @@ impl CharacterController {
         rotation: Quat,
         shape: &Shape,
         movement: &mut SlideResult,
+        overrides: QueryOverrides<'_>,
     ) -> Result<(), CharacterError> {
         if self.snap_distance <= 0.0 && self.step_height <= 0.0 {
             return Ok(());
@@ -285,7 +336,9 @@ impl CharacterController {
             ignore: Some(body),
             include_triggers: false,
         };
-        let Some(hit) = snapshot.shape_cast(shape, pose, down, self.skin, filter)? else {
+        let Some(hit) =
+            snapshot.shape_cast_with_overrides(shape, pose, down, self.skin, filter, overrides)?
+        else {
             return Ok(());
         };
         if self.is_walkable(-hit.normal) {
