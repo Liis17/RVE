@@ -368,12 +368,15 @@ impl ScriptTransaction {
             return Err("could not stage character transform".to_owned());
         }
         self.pending_grounded.insert(object, result.grounded);
-        for hit in result
-            .hits
-            .iter()
-            .filter(|hit| hit.body_kind == BodyKind::Dynamic)
-        {
-            self.accumulate_push(controller, *hit);
+        // A slide can report one body on multiple iterations; count this request once per body.
+        for (index, hit) in result.hits.iter().enumerate() {
+            if hit.body_kind != BodyKind::Dynamic {
+                continue;
+            }
+            let first_hit_for_body = !result.hits[..index]
+                .iter()
+                .any(|previous| previous.body == hit.body);
+            self.accumulate_push(controller, *hit, first_hit_for_body);
         }
         Ok(result)
     }
@@ -381,12 +384,17 @@ impl ScriptTransaction {
     fn accumulate_push(
         &mut self,
         controller: engine_physics::CharacterController,
-        hit: CharacterHit,
+        mut hit: CharacterHit,
+        include_requested_displacement: bool,
     ) {
+        if !include_requested_displacement {
+            hit.requested_displacement = Vec3::ZERO;
+        }
         self.pending_pushes
             .entry(hit.body)
             .and_modify(|pending| {
                 pending.hit.blocked_displacement += hit.blocked_displacement;
+                pending.hit.requested_displacement += hit.requested_displacement;
                 pending.normal_sum += hit.normal * hit.blocked_displacement.length();
             })
             .or_insert(PendingPush {

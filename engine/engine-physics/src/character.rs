@@ -64,6 +64,8 @@ pub struct CharacterHit {
     pub normal: Vec3,
     pub fraction: f32,
     pub blocked_displacement: Vec3,
+    /// Full displacement requested for this controller move.
+    pub requested_displacement: Vec3,
     pub body_kind: BodyKind,
     pub body_velocity: Vec3,
     pub mass: f32,
@@ -201,6 +203,9 @@ impl CharacterController {
                 overrides,
             )?;
         }
+        for hit in &mut movement.hits {
+            hit.requested_displacement = displacement;
+        }
         Ok(CharacterMoveResult {
             translation: movement.position - start_pose.position,
             blocked_displacement: movement.blocked_displacement,
@@ -209,13 +214,26 @@ impl CharacterController {
         })
     }
 
-    /// Builds the one dynamic-body push impulse for a blocked movement hit.
+    /// Computes a dynamic-body push impulse from requested controller velocity.
     pub fn push_impulse(&self, hit: &CharacterHit, phase_dt: f32) -> Option<Vec3> {
-        if hit.body_kind != BodyKind::Dynamic || !phase_dt.is_finite() || phase_dt < 1.0e-6 {
+        if hit.body_kind != BodyKind::Dynamic
+            || !phase_dt.is_finite()
+            || phase_dt < 1.0e-6
+            || !hit.requested_displacement.is_finite()
+            || !hit.normal.is_finite()
+            || !hit.body_velocity.is_finite()
+            || !hit.mass.is_finite()
+            || hit.mass < 0.0
+            || !self.push_strength.is_finite()
+            || self.push_strength < 0.0
+        {
             return None;
         }
-        let character_velocity =
-            (hit.blocked_displacement / phase_dt).clamp_length_max(MAX_PUSH_SPEED);
+        let requested_velocity = hit.requested_displacement / phase_dt;
+        if !requested_velocity.is_finite() {
+            return None;
+        }
+        let character_velocity = requested_velocity.clamp_length_max(MAX_PUSH_SPEED);
         let relative_speed = character_velocity.dot(hit.normal) - hit.body_velocity.dot(hit.normal);
         let magnitude = self.push_strength * hit.mass * relative_speed.max(0.0);
         magnitude.is_finite().then_some(hit.normal * magnitude)
@@ -360,6 +378,7 @@ fn character_hit(hit: QueryHit, blocked_displacement: Vec3) -> CharacterHit {
         normal: hit.normal,
         fraction: hit.fraction,
         blocked_displacement,
+        requested_displacement: Vec3::ZERO,
         body_kind: hit.body_kind,
         body_velocity: hit.body_velocity,
         mass: hit.mass,
@@ -682,12 +701,48 @@ mod tests {
         let impulse = controller(0.0, 45.0, 0.0)
             .push_impulse(dynamic_hit, 0.1)
             .unwrap();
+        assert_eq!(dynamic_hit.requested_displacement, Vec3::X * 4.0);
         assert!(impulse.x > 0.0, "{impulse:?}");
         assert!(impulse.length() <= 2.0 * 1.5 * MAX_PUSH_SPEED + 1.0e-4);
+        let mut invalid_hit = *dynamic_hit;
+        invalid_hit.requested_displacement.x = f32::NAN;
+        assert!(
+            controller(0.0, 45.0, 0.0)
+                .push_impulse(&invalid_hit, 0.1)
+                .is_none()
+        );
         assert!(
             controller(0.0, 45.0, 0.0)
                 .push_impulse(dynamic_hit, 0.0)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn push_impulse_uses_requested_velocity_for_partial_contact() {
+        let controller = controller(0.0, 45.0, 0.0);
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let body = world
+            .insert_body(BodyDesc::dynamic(
+                Shape::cuboid(Vec3::splat(0.25)).unwrap(),
+                Pose::new(Vec3::new(0.75, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let result = controller
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::IDENTITY,
+                Vec3::X * 0.4,
+            )
+            .unwrap();
+        let hit = result.hits.iter().find(|hit| hit.body == body).unwrap();
+        assert!((hit.fraction - 0.6).abs() < 0.02, "{hit:?}");
+        assert!((hit.blocked_displacement.x - 0.16).abs() < 0.02, "{hit:?}");
+
+        let impulse = controller.push_impulse(hit, 0.4).unwrap();
+        assert!((impulse.x - 1.5).abs() < 1.0e-4, "{impulse:?}");
     }
 }
