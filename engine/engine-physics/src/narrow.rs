@@ -315,6 +315,15 @@ pub fn distance(
     Ok(result.distance)
 }
 
+pub(crate) fn convex_triangle_distance(
+    shape: &Shape,
+    pose: Pose,
+    vertices: [Vec3; 3],
+) -> Result<DistanceResult, NarrowphaseError> {
+    let convex = WorldShape::new(shape, Pose::new(pose.position, pose.rotation)?)?;
+    Ok(gjk(&convex, &TriangleProxy { vertices })?.distance)
+}
+
 fn sphere_sphere(
     center_a: Vec3,
     radius_a: f32,

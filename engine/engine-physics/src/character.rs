@@ -1,0 +1,604 @@
+use std::fmt;
+
+use glam::{Quat, Vec3};
+
+use crate::query::{QueryError, QueryFilter, QueryHit, QuerySnapshot};
+use crate::world::{BodyHandle, BodyKind};
+use crate::{GeometryError, Pose, Shape};
+
+pub const CHARACTER_MOVE_ITERATIONS: usize = 4;
+pub const MAX_PUSH_SPEED: f32 = 10.0;
+const MOVEMENT_EPSILON_SQUARED: f32 = 1.0e-10;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharacterController {
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
+    pub max_slope_deg: f32,
+    pub snap_distance: f32,
+    pub skin: f32,
+    pub push_strength: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CharacterError {
+    Geometry(GeometryError),
+    Query(QueryError),
+    InvalidSettings,
+    NonFiniteInput,
+}
+
+impl fmt::Display for CharacterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Geometry(error) => error.fmt(formatter),
+            Self::Query(error) => error.fmt(formatter),
+            Self::InvalidSettings => {
+                formatter.write_str("character controller settings are invalid")
+            }
+            Self::NonFiniteInput => formatter.write_str("character movement must be finite"),
+        }
+    }
+}
+
+impl std::error::Error for CharacterError {}
+
+impl From<GeometryError> for CharacterError {
+    fn from(value: GeometryError) -> Self {
+        Self::Geometry(value)
+    }
+}
+
+impl From<QueryError> for CharacterError {
+    fn from(value: QueryError) -> Self {
+        Self::Query(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharacterHit {
+    pub body: BodyHandle,
+    pub point: Vec3,
+    /// Direction from the character capsule toward the obstacle.
+    pub normal: Vec3,
+    pub fraction: f32,
+    pub blocked_displacement: Vec3,
+    pub body_kind: BodyKind,
+    pub body_velocity: Vec3,
+    pub mass: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CharacterMoveResult {
+    pub translation: Vec3,
+    pub blocked_displacement: Vec3,
+    pub grounded: bool,
+    pub hits: Vec<CharacterHit>,
+}
+
+#[derive(Default)]
+struct SlideResult {
+    position: Vec3,
+    blocked_displacement: Vec3,
+    grounded: bool,
+    hits: Vec<CharacterHit>,
+}
+
+impl CharacterController {
+    pub fn new(
+        radius: f32,
+        height: f32,
+        step_height: f32,
+        max_slope_deg: f32,
+        snap_distance: f32,
+        skin: f32,
+        push_strength: f32,
+    ) -> Result<Self, CharacterError> {
+        let controller = Self {
+            radius,
+            height,
+            step_height,
+            max_slope_deg,
+            snap_distance,
+            skin,
+            push_strength,
+        };
+        if !radius.is_finite()
+            || !height.is_finite()
+            || !step_height.is_finite()
+            || !max_slope_deg.is_finite()
+            || !snap_distance.is_finite()
+            || !skin.is_finite()
+            || !push_strength.is_finite()
+            || radius <= 0.0
+            || height <= 0.0
+            || step_height < 0.0
+            || !(0.0..90.0).contains(&max_slope_deg)
+            || snap_distance < 0.0
+            || skin < 0.0
+            || push_strength < 0.0
+        {
+            return Err(CharacterError::InvalidSettings);
+        }
+        Ok(controller)
+    }
+
+    pub fn capsule(&self) -> Result<Shape, GeometryError> {
+        Shape::capsule(self.radius, self.height)
+    }
+
+    pub fn move_capsule(
+        &self,
+        snapshot: &QuerySnapshot,
+        body: BodyHandle,
+        start_pose: Pose,
+        displacement: Vec3,
+    ) -> Result<CharacterMoveResult, CharacterError> {
+        if !displacement.is_finite() {
+            return Err(CharacterError::NonFiniteInput);
+        }
+        let start_pose = Pose::new(start_pose.position, start_pose.rotation)?;
+        let shape = self.capsule()?;
+        let mut movement = self.slide(snapshot, body, &shape, start_pose, displacement)?;
+        if self.step_height > 0.0
+            && movement.hits.iter().any(|hit| {
+                hit.blocked_displacement.length_squared() > MOVEMENT_EPSILON_SQUARED
+                    && !self.is_walkable(-hit.normal)
+            })
+            && let Some(stepped) =
+                self.try_step(snapshot, body, &shape, start_pose, displacement)?
+            && horizontal_progress(stepped.position - start_pose.position)
+                > horizontal_progress(movement.position - start_pose.position) + 1.0e-4
+        {
+            movement = stepped;
+        }
+        if !movement.grounded {
+            self.snap_to_ground(snapshot, body, start_pose.rotation, &shape, &mut movement)?;
+        }
+        Ok(CharacterMoveResult {
+            translation: movement.position - start_pose.position,
+            blocked_displacement: movement.blocked_displacement,
+            grounded: movement.grounded,
+            hits: movement.hits,
+        })
+    }
+
+    /// Builds the one dynamic-body push impulse for a blocked movement hit.
+    pub fn push_impulse(&self, hit: &CharacterHit, phase_dt: f32) -> Option<Vec3> {
+        if hit.body_kind != BodyKind::Dynamic || !phase_dt.is_finite() || phase_dt < 1.0e-6 {
+            return None;
+        }
+        let character_velocity =
+            (hit.blocked_displacement / phase_dt).clamp_length_max(MAX_PUSH_SPEED);
+        let relative_speed = character_velocity.dot(hit.normal) - hit.body_velocity.dot(hit.normal);
+        let magnitude = self.push_strength * hit.mass * relative_speed.max(0.0);
+        magnitude.is_finite().then_some(hit.normal * magnitude)
+    }
+
+    fn slide(
+        &self,
+        snapshot: &QuerySnapshot,
+        body: BodyHandle,
+        shape: &Shape,
+        start_pose: Pose,
+        displacement: Vec3,
+    ) -> Result<SlideResult, CharacterError> {
+        let mut result = SlideResult {
+            position: start_pose.position,
+            ..SlideResult::default()
+        };
+        let mut remaining = displacement;
+        let filter = QueryFilter {
+            ignore: Some(body),
+            include_triggers: false,
+        };
+
+        for _ in 0..CHARACTER_MOVE_ITERATIONS {
+            if remaining.length_squared() <= MOVEMENT_EPSILON_SQUARED {
+                break;
+            }
+            let pose = Pose::new(result.position, start_pose.rotation)?;
+            let Some(hit) = snapshot.shape_cast(shape, pose, remaining, self.skin, filter)? else {
+                result.position += remaining;
+                break;
+            };
+            let travel = remaining * hit.fraction;
+            result.position += travel;
+            let unspent = remaining * (1.0 - hit.fraction);
+            let into_obstacle = unspent.dot(hit.normal).max(0.0);
+            if into_obstacle <= 1.0e-6 {
+                result.position += unspent;
+                break;
+            }
+            let blocked = hit.normal * into_obstacle;
+            result.blocked_displacement += blocked;
+            result.grounded |= self.is_walkable(-hit.normal) && displacement.dot(hit.normal) > 0.0;
+            result.hits.push(character_hit(hit, blocked));
+
+            let surface_normal = -hit.normal;
+            if surface_normal.y > 1.0e-3 && !self.is_walkable(surface_normal) {
+                break;
+            }
+            remaining = unspent - blocked;
+        }
+        Ok(result)
+    }
+
+    fn try_step(
+        &self,
+        snapshot: &QuerySnapshot,
+        body: BodyHandle,
+        shape: &Shape,
+        start_pose: Pose,
+        displacement: Vec3,
+    ) -> Result<Option<SlideResult>, CharacterError> {
+        let horizontal = Vec3::new(displacement.x, 0.0, displacement.z);
+        if horizontal.length_squared() <= MOVEMENT_EPSILON_SQUARED {
+            return Ok(None);
+        }
+        let filter = QueryFilter {
+            ignore: Some(body),
+            include_triggers: false,
+        };
+        let up = Vec3::Y * self.step_height;
+        if snapshot
+            .shape_cast(shape, start_pose, up, self.skin, filter)?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let raised_pose = Pose::new(start_pose.position + up, start_pose.rotation)?;
+        let mut stepped = self.slide(snapshot, body, shape, raised_pose, horizontal)?;
+        let down = -Vec3::Y * (self.step_height + self.skin);
+        let down_pose = Pose::new(stepped.position, start_pose.rotation)?;
+        let Some(ground) = snapshot.shape_cast(shape, down_pose, down, self.skin, filter)? else {
+            return Ok(None);
+        };
+        if !self.is_walkable(-ground.normal) {
+            return Ok(None);
+        }
+        let final_position = stepped.position + down * ground.fraction;
+        if final_position.y - start_pose.position.y > self.step_height + self.skin + 1.0e-4 {
+            return Ok(None);
+        }
+        stepped.position = final_position;
+        stepped.grounded = true;
+        Ok(Some(stepped))
+    }
+
+    fn snap_to_ground(
+        &self,
+        snapshot: &QuerySnapshot,
+        body: BodyHandle,
+        rotation: Quat,
+        shape: &Shape,
+        movement: &mut SlideResult,
+    ) -> Result<(), CharacterError> {
+        if self.snap_distance <= 0.0 && self.step_height <= 0.0 {
+            return Ok(());
+        }
+        let pose = Pose::new(movement.position, rotation)?;
+        let down = -Vec3::Y * (self.snap_distance.max(self.step_height) + self.skin);
+        let filter = QueryFilter {
+            ignore: Some(body),
+            include_triggers: false,
+        };
+        let Some(hit) = snapshot.shape_cast(shape, pose, down, self.skin, filter)? else {
+            return Ok(());
+        };
+        if self.is_walkable(-hit.normal) {
+            movement.position += down * hit.fraction;
+            movement.grounded = true;
+        }
+        Ok(())
+    }
+
+    fn is_walkable(&self, surface_normal: Vec3) -> bool {
+        surface_normal.y >= self.max_slope_deg.to_radians().cos()
+    }
+}
+
+fn character_hit(hit: QueryHit, blocked_displacement: Vec3) -> CharacterHit {
+    CharacterHit {
+        body: hit.body,
+        point: hit.point,
+        normal: hit.normal,
+        fraction: hit.fraction,
+        blocked_displacement,
+        body_kind: hit.body_kind,
+        body_velocity: hit.body_velocity,
+        mass: hit.mass,
+    }
+}
+
+fn horizontal_progress(displacement: Vec3) -> f32 {
+    Vec3::new(displacement.x, 0.0, displacement.z).length()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CharacterController, MAX_PUSH_SPEED};
+    use crate::world::{BodyDesc, BodyHandle, BodyKind, PhysicsWorld};
+    use crate::{Pose, Shape, TriMesh};
+    use glam::{Quat, Vec3};
+    use std::sync::Arc;
+
+    fn controller(step_height: f32, max_slope_deg: f32, snap_distance: f32) -> CharacterController {
+        CharacterController::new(
+            0.25,
+            0.5,
+            step_height,
+            max_slope_deg,
+            snap_distance,
+            0.01,
+            1.5,
+        )
+        .unwrap()
+    }
+
+    fn floor() -> Shape {
+        Shape::TriMesh(Arc::new(
+            TriMesh::new(
+                vec![
+                    Vec3::new(-10.0, 0.0, -10.0),
+                    Vec3::new(10.0, 0.0, -10.0),
+                    Vec3::new(10.0, 0.0, 10.0),
+                    Vec3::new(-10.0, 0.0, 10.0),
+                ],
+                vec![[0, 1, 2], [0, 2, 3]],
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn world_with_floor() -> PhysicsWorld {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        world
+            .insert_body(BodyDesc::static_collider(floor(), Pose::IDENTITY))
+            .unwrap();
+        world
+    }
+
+    #[test]
+    fn capsule_blocks_at_wall_and_slides_along_it() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.2, 2.0, 2.0)).unwrap(),
+                Pose::new(Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let result = controller(0.0, 45.0, 0.0)
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::IDENTITY,
+                Vec3::new(2.0, 0.0, 1.0),
+            )
+            .unwrap();
+        assert!((result.translation.x - 0.54).abs() < 0.03, "{result:?}");
+        assert!((result.translation.z - 1.0).abs() < 1.0e-3, "{result:?}");
+        assert!(!result.hits.is_empty());
+    }
+
+    #[test]
+    fn capsule_does_not_tunnel_through_a_wall_on_large_displacement() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.1, 2.0, 2.0)).unwrap(),
+                Pose::new(Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let result = controller(0.0, 45.0, 0.0)
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::IDENTITY,
+                Vec3::X * 100.0,
+            )
+            .unwrap();
+        assert!(result.translation.x < 1.66, "{result:?}");
+        assert!(result.translation.x > 1.5, "{result:?}");
+    }
+
+    fn move_over_step(step_height: f32) -> super::CharacterMoveResult {
+        let mut world = world_with_floor();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.4, step_height * 0.5, 1.0)).unwrap(),
+                Pose::new(Vec3::new(1.0, step_height * 0.5, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        controller(0.35, 45.0, 0.2)
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::new(Vec3::new(0.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                Vec3::X,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn step_up_within_limit_succeeds_and_taller_step_stays_blocked() {
+        let short = move_over_step(0.3);
+        assert!(short.translation.x > 0.8, "{short:?}");
+        assert!(
+            short.translation.y > 0.2 && short.translation.y <= 0.36,
+            "{short:?}"
+        );
+        assert!(short.grounded, "{short:?}");
+
+        let tall = move_over_step(0.5);
+        assert!(tall.translation.x < 0.5, "{tall:?}");
+        assert!(tall.translation.y.abs() < 1.0e-3, "{tall:?}");
+    }
+
+    #[test]
+    fn walking_off_a_platform_snaps_down_by_at_most_step_height() {
+        let mut world = world_with_floor();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(0.5, 0.15, 1.0)).unwrap(),
+                Pose::new(Vec3::new(0.0, 0.15, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let result = CharacterController::new(0.25, 0.5, 0.35, 45.0, 0.1, 0.01, 1.0)
+            .unwrap()
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::new(Vec3::new(0.3, 0.81, 0.0), Quat::IDENTITY).unwrap(),
+                Vec3::X * 1.3,
+            )
+            .unwrap();
+        assert!(result.translation.x > 1.0, "{result:?}");
+        assert!(
+            result.translation.y < -0.2 && result.translation.y >= -0.36,
+            "{result:?}"
+        );
+        assert!(result.grounded, "{result:?}");
+    }
+
+    fn slope_mesh(degrees: f32) -> Shape {
+        let rise = degrees.to_radians().tan() * 10.0;
+        Shape::TriMesh(Arc::new(
+            TriMesh::new(
+                vec![
+                    Vec3::new(-10.0, -rise, -10.0),
+                    Vec3::new(10.0, rise, -10.0),
+                    Vec3::new(10.0, rise, 10.0),
+                    Vec3::new(-10.0, -rise, 10.0),
+                ],
+                vec![[0, 1, 2], [0, 2, 3]],
+            )
+            .unwrap(),
+        ))
+    }
+
+    #[test]
+    fn slope_limit_controls_grounding_and_downward_snap() {
+        for (slope, expected_grounded) in [(30.0, true), (60.0, false)] {
+            let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+            world
+                .insert_body(BodyDesc::static_collider(slope_mesh(slope), Pose::IDENTITY))
+                .unwrap();
+            let snapshot = world.query_snapshot().unwrap();
+            let result = controller(0.0, 45.0, 0.2)
+                .move_capsule(
+                    &snapshot,
+                    BodyHandle(u64::MAX),
+                    Pose::new(Vec3::new(0.0, 0.65, 0.0), Quat::IDENTITY).unwrap(),
+                    Vec3::ZERO,
+                )
+                .unwrap();
+            assert_eq!(
+                result.grounded, expected_grounded,
+                "slope={slope}: {result:?}"
+            );
+            if expected_grounded {
+                assert!(
+                    result.translation.y < 0.0 && result.translation.y > -0.2,
+                    "{result:?}"
+                );
+            }
+
+            let cosine = slope.to_radians().cos();
+            let vertical_offset = (0.25 + 0.25 * cosine + 0.05) / cosine;
+            let walk_result = controller(0.0, 45.0, 0.0)
+                .move_capsule(
+                    &snapshot,
+                    BodyHandle(u64::MAX),
+                    Pose::new(
+                        Vec3::new(-1.0, -slope.to_radians().tan() + vertical_offset, 0.0),
+                        Quat::IDENTITY,
+                    )
+                    .unwrap(),
+                    Vec3::X * 0.5,
+                )
+                .unwrap();
+            if expected_grounded {
+                assert!(
+                    walk_result.translation.x > 0.25,
+                    "slope={slope}: {walk_result:?}"
+                );
+            } else {
+                assert!(
+                    walk_result.translation.x < 0.1,
+                    "slope={slope}: {walk_result:?}"
+                );
+            }
+        }
+
+        let world = world_with_floor();
+        let snapshot = world.query_snapshot().unwrap();
+        let snapped = controller(0.0, 45.0, 0.2)
+            .move_capsule(
+                &snapshot,
+                BodyHandle(u64::MAX),
+                Pose::new(Vec3::new(0.0, 0.62, 0.0), Quat::IDENTITY).unwrap(),
+                Vec3::ZERO,
+            )
+            .unwrap();
+        assert!(snapped.grounded, "{snapped:?}");
+        assert!(
+            snapped.translation.y < 0.0 && snapped.translation.y > -0.2,
+            "{snapped:?}"
+        );
+    }
+
+    #[test]
+    fn character_excludes_itself_and_triggers_but_reports_dynamic_push_metadata() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let character = Shape::capsule(0.25, 0.5).unwrap();
+        let mut character_desc = BodyDesc::new(
+            BodyKind::Kinematic,
+            Pose::IDENTITY,
+            crate::ColliderDesc::new(character),
+        );
+        character_desc.character_controller = true;
+        let character_handle = world.insert_body(character_desc).unwrap();
+        let mut trigger = BodyDesc::static_collider(
+            Shape::cuboid(Vec3::splat(0.3)).unwrap(),
+            Pose::new(Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+        );
+        trigger.collider.trigger = true;
+        let trigger_handle = world.insert_body(trigger).unwrap();
+        let mut dynamic = BodyDesc::dynamic(
+            Shape::cuboid(Vec3::splat(0.25)).unwrap(),
+            Pose::new(Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            2.0,
+        );
+        dynamic.collider.friction = 0.0;
+        let dynamic_handle = world.insert_body(dynamic).unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let result = controller(0.0, 45.0, 0.0)
+            .move_capsule(&snapshot, character_handle, Pose::IDENTITY, Vec3::X * 4.0)
+            .unwrap();
+        let dynamic_hit = result
+            .hits
+            .iter()
+            .find(|hit| hit.body == dynamic_handle)
+            .unwrap();
+        assert!(!result.hits.iter().any(|hit| hit.body == character_handle));
+        assert!(!result.hits.iter().any(|hit| hit.body == trigger_handle));
+        assert_eq!(dynamic_hit.body_kind, BodyKind::Dynamic);
+        assert_eq!(dynamic_hit.mass, 2.0);
+        let impulse = controller(0.0, 45.0, 0.0)
+            .push_impulse(dynamic_hit, 0.1)
+            .unwrap();
+        assert!(impulse.x > 0.0, "{impulse:?}");
+        assert!(impulse.length() <= 2.0 * 1.5 * MAX_PUSH_SPEED + 1.0e-4);
+        assert!(
+            controller(0.0, 45.0, 0.0)
+                .push_impulse(dynamic_hit, 0.0)
+                .is_none()
+        );
+    }
+}

@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use glam::{Mat3, Quat, Vec3};
 
 use crate::broad::sweep_and_prune;
 use crate::narrow::{ManifoldCache, PairKey, collide};
+use crate::query::{QueryCollider, QueryColliderDesc, QueryError, QuerySnapshot};
 use crate::{Aabb, BroadPhaseError, ContactManifold, GeometryError, NarrowphaseError, Pose, Shape};
 
 pub const SOLVER_ITERATIONS: usize = 10;
@@ -54,6 +56,8 @@ pub struct BodyDesc {
     pub kind: BodyKind,
     pub pose: Pose,
     pub collider: ColliderDesc,
+    /// Character kinematics are collision obstacles but contribute zero solver velocity.
+    pub character_controller: bool,
     pub mass: f32,
     pub linear_damping: f32,
     pub angular_damping: f32,
@@ -67,6 +71,7 @@ impl BodyDesc {
             kind,
             pose,
             collider,
+            character_controller: false,
             mass: 1.0,
             linear_damping: 0.0,
             angular_damping: 0.05,
@@ -217,6 +222,7 @@ pub(crate) struct Body {
     pub(crate) inverse_inertia_local: Mat3,
     pub(crate) linear_velocity: Vec3,
     pub(crate) angular_velocity: Vec3,
+    pub(crate) character_controller: bool,
     pub(crate) linear_damping: f32,
     pub(crate) angular_damping: f32,
     pub(crate) gravity_scale: f32,
@@ -246,6 +252,9 @@ impl Body {
     }
 
     pub(crate) fn velocity_at(&self, point: Vec3) -> Vec3 {
+        if self.character_controller {
+            return Vec3::ZERO;
+        }
         self.linear_velocity
             + self
                 .angular_velocity
@@ -401,6 +410,7 @@ impl PhysicsWorld {
                 kind: desc.kind,
                 pose,
                 collider: desc.collider,
+                character_controller: desc.character_controller,
                 inverse_mass,
                 center_of_mass_local,
                 inverse_inertia_local,
@@ -448,6 +458,31 @@ impl PhysicsWorld {
 
     pub fn body_pose(&self, handle: BodyHandle) -> Option<Pose> {
         self.bodies.get(&handle).map(|body| body.pose)
+    }
+
+    /// Captures collider geometry and body metadata in an immutable query snapshot.
+    pub fn query_snapshot(&self) -> Result<Arc<QuerySnapshot>, QueryError> {
+        let colliders = self
+            .bodies
+            .values()
+            .map(|body| {
+                QueryCollider::new(QueryColliderDesc {
+                    body: body.handle,
+                    shape: body.collider.shape.clone(),
+                    pose: body.collider_pose(),
+                    enabled: body.collider.enabled,
+                    trigger: body.collider.trigger,
+                    body_kind: body.kind,
+                    body_velocity: body.linear_velocity,
+                    mass: if body.inverse_mass > 0.0 {
+                        body.inverse_mass.recip()
+                    } else {
+                        0.0
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Arc::new(QuerySnapshot::from_colliders(colliders)?))
     }
 
     pub fn body_velocity(&self, handle: BodyHandle) -> Option<Vec3> {
@@ -763,6 +798,7 @@ fn validate_body_desc(desc: &BodyDesc) -> Result<(), PhysicsWorldError> {
         || desc.angular_damping < 0.0
         || (desc.kind == BodyKind::Dynamic && desc.mass <= 0.0)
         || (desc.kind == BodyKind::Dynamic && matches!(desc.collider.shape, Shape::TriMesh(_)))
+        || (desc.character_controller && desc.kind != BodyKind::Kinematic)
     {
         return Err(PhysicsWorldError::InvalidBody);
     }
@@ -1239,6 +1275,104 @@ mod tests {
             1
         );
         assert!(driver.advance_step(0.0, []).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn kinematic_character_trigger_pair_emits_one_enter_and_one_exit() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut trigger = BodyDesc::static_collider(
+            box_shape(0.5),
+            Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+        );
+        trigger.collider.trigger = true;
+        world.insert_body(trigger).unwrap();
+        let mut character = BodyDesc::new(
+            BodyKind::Kinematic,
+            Pose::new(Vec3::new(-2.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            ColliderDesc::new(Shape::capsule(0.25, 0.5).unwrap()),
+        );
+        character.character_controller = true;
+        let character = world.insert_body(character).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        let enter = driver
+            .advance_step(
+                1.0 / 60.0,
+                [PhysicsCommand::KinematicTarget {
+                    body: character,
+                    pose: Pose::IDENTITY,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            enter
+                .events
+                .iter()
+                .filter(|event| matches!(event, PhysicsEvent::TriggerEnter { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            driver
+                .advance_step(1.0 / 60.0, [])
+                .unwrap()
+                .events
+                .is_empty()
+        );
+
+        let exit = driver
+            .advance_step(
+                1.0 / 60.0,
+                [PhysicsCommand::KinematicTarget {
+                    body: character,
+                    pose: Pose::new(Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            exit.events
+                .iter()
+                .filter(|event| matches!(event, PhysicsEvent::TriggerExit { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            driver
+                .advance_step(1.0 / 60.0, [])
+                .unwrap()
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn character_kinematic_motion_has_zero_solver_velocity() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut character = BodyDesc::new(
+            BodyKind::Kinematic,
+            Pose::new(Vec3::new(-1.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            ColliderDesc::new(Shape::capsule(0.5, 0.5).unwrap()),
+        );
+        character.character_controller = true;
+        let character = world.insert_body(character).unwrap();
+        let dynamic = world
+            .insert_body(BodyDesc::dynamic(
+                Shape::sphere(0.5).unwrap(),
+                Pose::IDENTITY,
+                1.0,
+            ))
+            .unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        driver
+            .advance_step(
+                1.0 / 60.0,
+                [PhysicsCommand::KinematicTarget {
+                    body: character,
+                    pose: Pose::IDENTITY,
+                }],
+            )
+            .unwrap();
+        assert_eq!(driver.world().body_velocity(dynamic).unwrap(), Vec3::ZERO);
     }
 
     #[test]

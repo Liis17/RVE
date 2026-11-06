@@ -6,12 +6,16 @@
 
 GJK ограничен 64 итерациями, EPA — 64 итерациями и 128 гранями. Broadphase и число mesh-кандидатов также ограничены; превышение возвращается как ошибка. `ray::raycast` проверяет sphere, box, capsule, hull planes и BVH triangles в заданной позе. Узкие пары sphere–sphere, sphere–box, sphere–capsule и capsule–capsule используют аналитические контакты; box–box использует SAT. Hull и прочие выпуклые пары проходят support-mapped narrowphase.
 
+`PhysicsWorld::query_snapshot` копирует позы, формы, enable/trigger flags, тип тела, скорость и dynamic mass в неизменяемый `Arc<QuerySnapshot>`. Snapshot использует X-упорядоченный AABB-кандидатный проход для raycast и shape cast; запросы по умолчанию исключают выключенные collider и trigger, а фильтр может включить trigger или игнорировать один `BodyHandle`. Выпуклые shape casts используют conservative advancement с лимитом 32 итерации; для triangle mesh проверяются только BVH-треугольники swept bounds, с общим лимитом кандидатов.
+
+`CharacterController` двигает капсулу через collide-and-slide с четырьмя итерациями, skin и фильтром собственного тела. Результат содержит translation, blocked displacement, grounded и obstacle hits с metadata скорости и массы для единственного push-импульса вызывающей транзакции. Step-up ограничен `step_height`; walkable slope задаётся `max_slope_deg`, а downward snap ограничен максимумом `step_height` и `snap_distance`. Character collider — kinematic; пометка `BodyDesc.character_controller` оставляет его solver velocity нулевой, сохраняя trigger-пары и пробуждение динамических тел.
+
 `PhysicsWorld` хранит static, kinematic и dynamic тела с одним collider на тело; collider имеет локальный offset, trigger, friction, restitution и enable state. Dynamic-тела интегрируют гравитацию и damping с учётом центра массы и world-space inertia. `solver::solve` выполняет 10 последовательных импульсных итераций, warm start manifold impulses, angular response, restitution, две tangent-направленные Coulomb friction, positional correction и сон при скоростях ниже 0.05 м/с и 0.05 рад/с в течение 0.5 секунды.
 
 Контактные пары создаются, только если хотя бы одно тело dynamic. Trigger проверяется против любого non-trigger collider, включая static и kinematic; trigger–trigger пропускается. Sleep сохраняет активную пару и не создаёт повторный Enter. Команды teleport/disable/remove обновляют пары и будят dynamic-соседей; движущийся kinematic будит контактирующие dynamic-тела. Enter/Exit создаются один раз при изменении набора активных пар.
 
 `StepDriver` применяет команды один раз на каждый полученный `Step`, даже при нуле подшагов. `AddForce` добавляет импульс `force × Step.dt`; отложенная kinematic target сохраняется при нулевом числе подшагов и достигается линейно за выполненные подшаги. Аккумулятор ограничивает число подшагов, лишнее время ограничивается одним fixed step; каждый вызов возвращает poses и events в `StepResult`.
 
-`PhysicsEngine::run` пока остаётся совместимой потоковой заглушкой и ждёт сигнал остановки. `PhysicsWorld` и `StepDriver` — детерминированный CPU API, ещё не подключённый к runtime-потоку, script API или immutable query snapshot.
+`PhysicsEngine::run` пока остаётся совместимой потоковой заглушкой и ждёт сигнал остановки. `PhysicsWorld`, `StepDriver`, query snapshots и `CharacterController` доступны как детерминированный CPU API, но ещё не подключены к runtime-потоку или script API.
 
-Источник: `engine/engine-physics/src/{broad.rs,narrow.rs,solver.rs,world.rs,shape.rs,hull.rs,bvh.rs,ray.rs}`.
+Источник: `engine/engine-physics/src/{broad.rs,narrow.rs,solver.rs,world.rs,shape.rs,hull.rs,bvh.rs,ray.rs,query.rs,character.rs}`.
