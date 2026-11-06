@@ -48,6 +48,12 @@ impl PhysicsScriptState {
             .ok_or_else(|| "physics context is not attached".to_owned())
     }
 
+    pub(crate) fn shared_snapshot(&self) -> Result<Arc<QuerySnapshot>, String> {
+        self.snapshot
+            .clone()
+            .ok_or_else(|| "physics context is not attached".to_owned())
+    }
+
     pub(crate) fn binding(&self, object: ObjectHandle) -> Result<PhysicsSceneBinding, String> {
         self.snapshot()?;
         self.bindings

@@ -343,7 +343,7 @@ impl ScriptTransaction {
             .map_err(|error| error.to_string())?;
         let (snapshot, mut overrides) = {
             let physics = self.physics.borrow();
-            let snapshot = physics.snapshot()?.clone();
+            let snapshot = physics.shared_snapshot()?;
             let mut overrides = physics.enabled_overrides();
             overrides.extend(
                 self.pending_collider_enabled
