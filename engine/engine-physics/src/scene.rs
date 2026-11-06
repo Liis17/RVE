@@ -5,7 +5,7 @@ use engine_scene::{
     CharacterControllerComponent, ColliderComponent, ColliderShape, ObjectHandle,
     RigidBodyComponent, RigidBodyKind, World,
 };
-use glam::Vec3;
+use glam::{Mat3, Vec3};
 
 use crate::character::{CharacterController, CharacterError};
 use crate::hull::Hull;
@@ -163,7 +163,7 @@ impl PhysicsSceneDesc {
                 if object.rigid_body.is_some() {
                     return Err(PhysicsSceneError::ConflictingComponents(object.handle));
                 }
-                let radial_scale = transform.scale.x.max(transform.scale.z);
+                let radial_scale = transform.scale.x.abs().max(transform.scale.z.abs());
                 let controller = scale_character(settings, radial_scale, transform.scale)?;
                 let shape = controller.capsule()?;
                 let mut desc = BodyDesc::new(
@@ -366,12 +366,16 @@ fn object_world_transform(
     let rotation = world
         .world_rotation(object)
         .ok_or(PhysicsSceneError::MissingObject(object))?;
+    let world_linear = Mat3::from_mat4(matrix);
+    let rotation_basis = Mat3::from_quat(rotation);
+    // Bake signed component scale in the cached rotation frame; off-diagonal
+    // shear from rotated nonuniform ancestors is intentionally omitted.
     let scale = Vec3::new(
-        matrix.x_axis.truncate().length(),
-        matrix.y_axis.truncate().length(),
-        matrix.z_axis.truncate().length(),
+        rotation_basis.x_axis.dot(world_linear.x_axis),
+        rotation_basis.y_axis.dot(world_linear.y_axis),
+        rotation_basis.z_axis.dot(world_linear.z_axis),
     );
-    if !matrix.is_finite() || !scale.is_finite() || scale.max_element() == 0.0 {
+    if !matrix.is_finite() || !scale.is_finite() || scale.abs().max_element() == 0.0 {
         return Err(PhysicsSceneError::InvalidObjectTransform(object));
     }
     let pose = Pose::new(matrix.w_axis.truncate(), rotation)?;
@@ -419,11 +423,11 @@ fn scale_character(
 ) -> Result<CharacterController, CharacterError> {
     CharacterController::new(
         component.radius * radial_scale,
-        component.height * scale.y,
-        component.step_height * scale.y,
+        component.height * scale.y.abs(),
+        component.step_height * scale.y.abs(),
         component.max_slope_deg,
-        component.snap_distance * scale.y,
-        component.skin * scale.max_element(),
+        component.snap_distance * scale.y.abs(),
+        component.skin * scale.abs().max_element(),
         component.push_strength,
     )
 }
@@ -435,11 +439,16 @@ fn build_shape(
     models: &HashMap<&str, &ModelGeometry>,
 ) -> Result<Shape, PhysicsSceneError> {
     Ok(match component.shape {
-        ColliderShape::Box => Shape::cuboid(Vec3::from_array(component.half_extents) * scale)?,
-        ColliderShape::Sphere => Shape::sphere(component.radius * scale.max_element())?,
+        ColliderShape::Box => {
+            Shape::cuboid(Vec3::from_array(component.half_extents).abs() * scale.abs())?
+        }
+        ColliderShape::Sphere => Shape::sphere(component.radius * scale.abs().max_element())?,
         ColliderShape::Capsule => {
-            let radial_scale = scale.x.max(scale.z);
-            Shape::capsule(component.radius * radial_scale, component.height * scale.y)?
+            let radial_scale = scale.x.abs().max(scale.z.abs());
+            Shape::capsule(
+                component.radius * radial_scale,
+                component.height * scale.y.abs(),
+            )?
         }
         ColliderShape::ConvexMesh => {
             let geometry = model_geometry(mesh_renderer, models)?;
@@ -523,7 +532,7 @@ fn triangle_geometry(
 mod tests {
     use super::{ModelGeometry, ModelMesh, PhysicsSceneDesc, PhysicsSceneSync};
     use crate::world::{BodyKind, PhysicsCommand};
-    use crate::{Pose, Shape};
+    use crate::{Pose, Ray, Shape, raycast};
     use engine_scene::{LocalTransform, SceneDocument, World};
     use glam::{Quat, Vec3};
 
@@ -584,6 +593,52 @@ mod tests {
     }
 
     #[test]
+    fn negative_root_scale_reflects_offsets_hulls_and_triangle_meshes() {
+        let scene = world(&format!(
+            "{CAMERA}\n[[assets]]\npath='/models/asymmetric.fbx'\n\
+             [[objects]]\nid='offset'\n[objects.transform]\nscale=[-1,1,1]\n\
+             [objects.collider]\nshape='box'\nhalf_extents=[0.25,0.25,0.25]\noffset=[1,0,0]\n\
+             [[objects]]\nid='hull'\n[objects.transform]\nscale=[-1,1,1]\n\
+             [objects.mesh_renderer]\nmodel='/models/asymmetric.fbx'\n\
+             [objects.collider]\nshape='convex_mesh'\n\
+             [[objects]]\nid='mesh'\n[objects.transform]\nscale=[-1,1,1]\n\
+             [objects.mesh_renderer]\nmodel='/models/asymmetric.fbx'\n\
+             [objects.collider]\nshape='triangle_mesh'\n"
+        ));
+        let model = ModelGeometry {
+            path: "models/asymmetric.fbx".to_owned(),
+            meshes: vec![ModelMesh {
+                positions: vec![
+                    Vec3::ZERO,
+                    Vec3::new(2.0, 0.0, 0.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                ],
+                indices: vec![0, 1, 2],
+            }],
+        };
+        let descriptor = desc(&scene, &[model]);
+        assert_eq!(descriptor.bodies[0].desc.collider.offset, -Vec3::X);
+        let hull = &descriptor.bodies[1].desc.collider.shape;
+        let triangle_mesh = &descriptor.bodies[2].desc.collider.shape;
+        let left_ray = Ray::new(Vec3::new(-0.5, 0.2, 2.0), -Vec3::Z, 4.0).unwrap();
+        let right_ray = Ray::new(Vec3::new(0.5, 0.2, 2.0), -Vec3::Z, 4.0).unwrap();
+
+        assert!(raycast(&left_ray, hull, Pose::IDENTITY).unwrap().is_some());
+        assert!(raycast(&right_ray, hull, Pose::IDENTITY).unwrap().is_none());
+        assert!(
+            raycast(&left_ray, triangle_mesh, Pose::IDENTITY)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            raycast(&right_ray, triangle_mesh, Pose::IDENTITY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn missing_and_degenerate_model_geometry_are_errors() {
         let scene = world(&format!(
             "{CAMERA}\n[[assets]]\npath='/models/cube.fbx'\n\
@@ -631,8 +686,9 @@ mod tests {
     fn collider_under_rotated_nonuniform_parent_uses_finite_cached_world_pose() {
         let mut scene = world(&format!(
             "{CAMERA}\n[[objects]]\nid='parent'\n\
-             [objects.transform]\nrotation=[0,45,0]\nscale=[2,1,0.5]\n\
+             [objects.transform]\nrotation=[0,30,0]\nscale=[2,1,0.5]\n\
              [[objects]]\nid='floor'\nparent='parent'\n\
+             [objects.transform]\nrotation=[0,45,0]\n\
              [objects.collider]\nshape='box'\nhalf_extents=[0.5,0.5,0.5]\n"
         ));
         let descriptor = desc(&scene, &[]);
@@ -641,8 +697,23 @@ mod tests {
             panic!("expected box")
         };
         assert!(half_extents.is_finite());
-        assert!(half_extents.x > 0.0 && half_extents.y > 0.0 && half_extents.z > 0.0);
+        assert!((half_extents.x - 0.625).abs() < 1.0e-5, "{half_extents:?}");
+        assert!((half_extents.y - 0.5).abs() < 1.0e-5, "{half_extents:?}");
+        assert!((half_extents.z - 0.625).abs() < 1.0e-5, "{half_extents:?}");
         assert!(descriptor.bodies[0].desc.pose.rotation.is_finite());
+        assert!(
+            descriptor.bodies[0]
+                .desc
+                .pose
+                .rotation
+                .dot(
+                    scene
+                        .world_rotation(scene.handle("floor").unwrap())
+                        .unwrap()
+                )
+                .abs()
+                > 0.999_99
+        );
 
         let (_, bindings) = descriptor.clone().build().unwrap();
         let mut sync = PhysicsSceneSync::new(&scene, bindings).unwrap();

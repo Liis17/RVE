@@ -114,7 +114,8 @@ impl CharacterController {
             || radius <= 0.0
             || height <= 0.0
             || step_height < 0.0
-            || !(0.0..90.0).contains(&max_slope_deg)
+            || max_slope_deg <= 0.0
+            || max_slope_deg >= 90.0
             || snap_distance < 0.0
             || skin < 0.0
             || push_strength < 0.0
@@ -153,7 +154,7 @@ impl CharacterController {
         {
             movement = stepped;
         }
-        if !movement.grounded {
+        if !movement.grounded && displacement.y <= 0.0 {
             self.snap_to_ground(snapshot, body, start_pose.rotation, &shape, &mut movement)?;
         }
         Ok(CharacterMoveResult {
@@ -318,7 +319,7 @@ fn horizontal_progress(displacement: Vec3) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CharacterController, MAX_PUSH_SPEED};
+    use super::{CharacterController, CharacterError, MAX_PUSH_SPEED};
     use crate::world::{BodyDesc, BodyHandle, BodyKind, PhysicsWorld};
     use crate::{Pose, Shape, TriMesh};
     use glam::{Quat, Vec3};
@@ -335,6 +336,17 @@ mod tests {
             1.5,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn constructor_rejects_zero_negative_and_ninety_degree_slope_limits() {
+        for slope in [0.0, -0.1, 90.0] {
+            assert_eq!(
+                CharacterController::new(0.25, 0.5, 0.0, slope, 0.0, 0.01, 1.0).err(),
+                Some(CharacterError::InvalidSettings),
+                "slope={slope}"
+            );
+        }
     }
 
     fn floor() -> Shape {
@@ -403,6 +415,30 @@ mod tests {
             .unwrap();
         assert!(result.translation.x < 1.66, "{result:?}");
         assert!(result.translation.x > 1.5, "{result:?}");
+    }
+
+    #[test]
+    fn upward_jump_moves_up_across_frames_then_descending_motion_snaps_to_ground() {
+        let world = world_with_floor();
+        let snapshot = world.query_snapshot().unwrap();
+        let controller = controller(0.0, 45.0, 0.2);
+        let body = BodyHandle(u64::MAX);
+        let mut pose = Pose::new(Vec3::new(0.0, 0.5, 0.0), Quat::IDENTITY).unwrap();
+
+        for _ in 0..2 {
+            let result = controller
+                .move_capsule(&snapshot, body, pose, Vec3::Y * 0.04)
+                .unwrap();
+            assert!(result.translation.y > 0.039, "{result:?}");
+            assert!(!result.grounded, "{result:?}");
+            pose.position += result.translation;
+        }
+
+        let descending = controller
+            .move_capsule(&snapshot, body, pose, -Vec3::Y * 0.02)
+            .unwrap();
+        assert!(descending.grounded, "{descending:?}");
+        assert!(descending.translation.y < -0.03, "{descending:?}");
     }
 
     fn move_over_step(step_height: f32) -> super::CharacterMoveResult {
