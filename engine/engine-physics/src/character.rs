@@ -296,14 +296,9 @@ impl CharacterController {
                 break;
             }
             let pose = Pose::new(result.position, start_pose.rotation)?;
-            let hit = match snapshot.shape_cast_with_overrides(
-                shape,
-                pose,
-                remaining,
-                self.skin,
-                filter,
-                overrides,
-            ) {
+            let hit = match snapshot
+                .shape_cast_with_overrides(shape, pose, remaining, self.skin, filter, overrides)
+            {
                 Ok(Some(hit)) => hit,
                 Ok(None) => {
                     result.position += remaining;

@@ -334,7 +334,9 @@ return Script
 
     let events = host.drain_events();
     assert!(
-        !events.iter().any(|event| event.level == ScriptEventLevel::Error),
+        !events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error),
         "{events:?}"
     );
     let warnings = events
