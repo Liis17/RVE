@@ -1,12 +1,19 @@
 //! Play-режим: копия мира сцены и скрипты на главном потоке редактора.
 
+use engine_assets::Assets;
 use engine_console::{CommandCatalog, CommandLine};
-use engine_scene::{SceneDocument, World};
+use engine_physics::{
+    ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsClient, PhysicsInitialization,
+    PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync, PhysicsServer, PhysicsServerError,
+};
+use engine_project::PhysicsSettings;
+use engine_scene::{ColliderShape, SceneDocument, World};
 use engine_script::{
     CommandError, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
     ScriptTime,
 };
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -99,6 +106,7 @@ fn watch(shared: &WatchdogShared, interrupt: &ScriptInterruptHandle) {
 pub struct PlaySession {
     world: World,
     host: ScriptHost,
+    physics: Option<PlayPhysics>,
     watchdog: Watchdog,
     time_limit: Duration,
     paused: bool,
@@ -122,13 +130,87 @@ impl PlaySession {
     }
 
     /// Starts from a world whose referenced camera settings are already loaded.
+    #[cfg(test)]
     pub fn start_with_world(
         document: &SceneDocument,
         world: World,
         library: Option<&ScriptLibrary>,
         read_source: impl FnMut(&str) -> Result<String, String>,
     ) -> Result<Self, String> {
-        Self::start_with_world_limit(document, world, library, read_source, SCRIPT_TIME_LIMIT)
+        Self::start_with_world_limit(
+            document,
+            world,
+            library,
+            read_source,
+            &[],
+            &PhysicsSettings::default(),
+            SCRIPT_TIME_LIMIT,
+        )
+    }
+
+    /// Starts Play with project physics settings and CPU geometry for mesh colliders.
+    pub fn start_with_world_and_physics(
+        document: &SceneDocument,
+        world: World,
+        library: Option<&ScriptLibrary>,
+        read_source: impl FnMut(&str) -> Result<String, String>,
+        model_geometry: &[ModelGeometry],
+        physics_settings: &PhysicsSettings,
+    ) -> Result<Self, String> {
+        Self::start_with_world_limit(
+            document,
+            world,
+            library,
+            read_source,
+            model_geometry,
+            physics_settings,
+            SCRIPT_TIME_LIMIT,
+        )
+    }
+
+    /// Loads the CPU model geometry required by convex and triangle-mesh colliders.
+    pub fn load_model_geometry(
+        world: &World,
+        assets: &Assets,
+    ) -> Result<Vec<ModelGeometry>, String> {
+        let paths = world
+            .objects()
+            .iter()
+            .filter_map(|object| {
+                let collider = object.collider?;
+                if matches!(
+                    collider.shape,
+                    ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+                ) {
+                    Some(object.mesh_renderer.as_ref()?.model.as_str().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        paths
+            .into_iter()
+            .map(|path| {
+                let model = assets
+                    .load_model(&path)
+                    .map_err(|error| format!("{path}: {error}"))?;
+                Ok(ModelGeometry {
+                    path,
+                    meshes: model
+                        .meshes
+                        .iter()
+                        .map(|mesh| PhysicsModelMesh {
+                            positions: mesh
+                                .vertices
+                                .iter()
+                                .map(|vertex| glam::Vec3::from_array(vertex.position))
+                                .collect(),
+                            indices: mesh.indices.clone(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -139,7 +221,15 @@ impl PlaySession {
         time_limit: Duration,
     ) -> Result<Self, String> {
         let world = World::from_document(document).map_err(|error| error.to_string())?;
-        Self::start_with_world_limit(document, world, library, read_source, time_limit)
+        Self::start_with_world_limit(
+            document,
+            world,
+            library,
+            read_source,
+            &[],
+            &PhysicsSettings::default(),
+            time_limit,
+        )
     }
 
     fn start_with_world_limit(
@@ -147,6 +237,8 @@ impl PlaySession {
         world: World,
         library: Option<&ScriptLibrary>,
         mut read_source: impl FnMut(&str) -> Result<String, String>,
+        model_geometry: &[ModelGeometry],
+        physics_settings: &PhysicsSettings,
         time_limit: Duration,
     ) -> Result<Self, String> {
         let mut sources = BTreeMap::new();
@@ -162,7 +254,7 @@ impl PlaySession {
         let watchdog = Watchdog::start(interrupt.clone())
             .map_err(|error| format!("не удалось запустить watchdog скриптов: {error}"))?;
         watchdog.set_deadline(Some(Instant::now() + time_limit));
-        let host = ScriptHost::load_with_interrupt(
+        let mut host = ScriptHost::load_with_interrupt(
             &world,
             document.source_label(),
             &sources,
@@ -171,9 +263,21 @@ impl PlaySession {
         )
         .map_err(|error| error.to_string())?;
         watchdog.set_deadline(None);
+        let desc = PhysicsSceneDesc::from_world(
+            &world,
+            model_geometry,
+            glam::Vec3::from_array(physics_settings.gravity),
+            physics_settings.fixed_hz,
+            physics_settings.max_substeps as usize,
+        )
+        .map_err(|error| error.to_string())?;
+        let (driver, bindings) = desc.build().map_err(|error| error.to_string())?;
+        let (physics, initial_snapshot) = PlayPhysics::start(&world, driver, bindings)?;
+        host.set_physics_snapshot(initial_snapshot, physics.sync.bindings());
         Ok(Self {
             world,
             host,
+            physics: Some(physics),
             watchdog,
             time_limit,
             paused: false,
@@ -217,19 +321,22 @@ impl PlaySession {
     }
 
     /// Выполняет один кадр скриптов, если сцена не на паузе.
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> Result<(), String> {
         let now = Instant::now();
         let dt = now
             .duration_since(self.last_tick)
             .as_secs_f32()
             .min(MAX_DELTA_SECONDS);
         self.last_tick = now;
-        self.step(dt);
+        self.step(dt)
     }
 
-    fn step(&mut self, dt: f32) {
+    fn step(&mut self, dt: f32) -> Result<(), String> {
         if self.paused {
-            return;
+            return Ok(());
+        }
+        if let Some(physics) = &mut self.physics {
+            physics.receive(&mut self.world, &mut self.host)?;
         }
         self.elapsed += f64::from(dt);
         self.frame += 1;
@@ -239,6 +346,20 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.update(&mut self.world, dt, time);
         self.watchdog.set_deadline(None);
+        if let Some(physics) = &mut self.physics {
+            let mut commands = self.host.drain_physics_commands();
+            commands.extend(
+                physics
+                    .sync
+                    .sync_world_commands(&mut self.world)
+                    .map_err(|error| error.to_string())?,
+            );
+            physics
+                .client
+                .step(dt, commands)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     fn script_time(&self) -> ScriptTime {
@@ -259,7 +380,121 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.destroy(&mut self.world, time);
         self.watchdog.set_deadline(None);
-        self.host.drain_events()
+        let mut events = self.host.drain_events();
+        if let Some(mut physics) = self.physics.take()
+            && let Err(error) = physics.shutdown()
+        {
+            events.push(physics_error_event(error));
+        }
+        events
+    }
+}
+
+impl Drop for PlaySession {
+    fn drop(&mut self) {
+        if let Some(mut physics) = self.physics.take() {
+            let _ = physics.shutdown();
+        }
+    }
+}
+
+struct PlayPhysics {
+    client: PhysicsClient,
+    sync: PhysicsSceneSync,
+    _control_tx: flume::Sender<()>,
+    control_rx: flume::Receiver<()>,
+    worker: Option<JoinHandle<Result<(), PhysicsServerError>>>,
+}
+
+impl PlayPhysics {
+    fn start(
+        world: &World,
+        driver: engine_physics::StepDriver,
+        bindings: Vec<engine_physics::PhysicsSceneBinding>,
+    ) -> Result<(Self, Arc<engine_physics::QuerySnapshot>), String> {
+        let initialization =
+            PhysicsInitialization::from_prebuilt(&driver, bindings).map_err(|error| {
+                format!("не удалось создать начальный snapshot физики Play: {error}")
+            })?;
+        let sync = PhysicsSceneSync::new(world, initialization.bindings.clone())
+            .map_err(|error| format!("не удалось синхронизировать физику Play: {error}"))?;
+        let snapshot = Arc::clone(&initialization.result.snapshot);
+        let (request_tx, request_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::unbounded();
+        let worker = std::thread::Builder::new()
+            .name("rve-editor-physics".to_owned())
+            .spawn(move || PhysicsServer::run_preinitialized(request_rx, reply_tx, driver))
+            .map_err(|error| format!("не удалось запустить физику Play: {error}"))?;
+        let (control_tx, control_rx) = flume::unbounded();
+        Ok((
+            Self {
+                client: PhysicsClient::new_preinitialized(request_tx, reply_rx),
+                sync,
+                _control_tx: control_tx,
+                control_rx,
+                worker: Some(worker),
+            },
+            snapshot,
+        ))
+    }
+
+    fn receive(&mut self, world: &mut World, host: &mut ScriptHost) -> Result<(), String> {
+        match self
+            .client
+            .receive(&self.control_rx)
+            .map_err(|error| format!("ошибка шага физики Play: {error}"))?
+        {
+            None => Ok(()),
+            Some(PhysicsReceive::Step(result)) => {
+                self.sync
+                    .apply_physics_poses(world, &result.poses)
+                    .map_err(|error| error.to_string())?;
+                host.set_physics_snapshot(result.snapshot, self.sync.bindings());
+                host.queue_physics_events(result.events);
+                Ok(())
+            }
+            Some(PhysicsReceive::Interrupted(())) => {
+                Err("физика Play получила неожиданное сообщение управления".to_owned())
+            }
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        let mut error = self
+            .client
+            .shutdown()
+            .err()
+            .map(|error| format!("не удалось остановить физику Play: {error}"));
+        if let Some(worker) = self.worker.take() {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(server_error)) => {
+                    error.get_or_insert_with(|| {
+                        format!("поток физики Play завершился: {server_error}")
+                    });
+                }
+                Err(_) => {
+                    error.get_or_insert_with(|| "поток физики Play завершился паникой".to_owned());
+                }
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for PlayPhysics {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.shutdown();
+        }
+    }
+}
+
+fn physics_error_event(message: String) -> ScriptEvent {
+    ScriptEvent {
+        level: engine_script::ScriptEventLevel::Error,
+        source: "physics".to_owned(),
+        message,
     }
 }
 
@@ -315,7 +550,7 @@ return Rotate
     fn lua_script_changes_the_play_world_but_not_the_document() {
         let document = document(SCENE);
         let mut session = PlaySession::start(&document, None, |_| Ok(ROTATE.to_owned())).unwrap();
-        session.step(0.5);
+        session.step(0.5).unwrap();
         assert!((rotation_y(&mut session) - 45.0).abs() < 1e-3);
         let original = document.objects.iter().find(|o| o.id == "spinner").unwrap();
         assert_eq!(original.transform.rotation, [0.0; 3]);
@@ -324,21 +559,114 @@ return Rotate
     #[test]
     fn pause_stops_updates_and_resume_continues() {
         let mut session = start(ROTATE).unwrap();
-        session.step(0.5);
+        session.step(0.5).unwrap();
         session.set_paused(true);
         assert!(session.is_paused());
-        session.step(0.5);
-        session.tick();
+        session.step(0.5).unwrap();
+        session.tick().unwrap();
         assert!((rotation_y(&mut session) - 45.0).abs() < 1e-3);
         session.set_paused(false);
-        session.step(0.5);
+        session.step(0.5).unwrap();
         assert!((rotation_y(&mut session) - 90.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn play_receives_initial_physics_snapshot_before_on_start() {
+        let source = r#"
+[[assets]]
+path = "probe.lua"
+[[objects]]
+id = "camera"
+[objects.transform]
+position = [0.0, 0.0, -2.0]
+[objects.camera]
+[[objects.lite_scripts]]
+path = "probe.lua"
+[[objects]]
+id = "wall"
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+"#;
+        let script = r#"
+local Script = {}
+function Script:on_start()
+  local hit = rve.physics.raycast({x=0,y=0,z=-2}, {x=0,y=0,z=1}, 5)
+  assert(hit and hit.object.id == "wall")
+  self.transform.position = {x=3,y=0,z=-2}
+end
+return Script
+"#;
+        let mut session =
+            PlaySession::start(&document(source), None, |_| Ok(script.to_owned())).unwrap();
+        session.step(0.0).unwrap();
+        let camera = session.world.handle("camera").unwrap();
+        assert_eq!(
+            session.world.local_transform(camera).unwrap().position.x,
+            3.0
+        );
+        session.stop();
+    }
+
+    #[test]
+    fn pause_does_not_submit_or_wait_for_an_extra_physics_step() {
+        let source = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.0, 2.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+"#;
+        let mut session =
+            PlaySession::start(&document(source), None, |_| Ok(String::new())).unwrap();
+        session.step(1.0 / 60.0).unwrap();
+        session.set_paused(true);
+        session.step(0.5).unwrap();
+        session.tick().unwrap();
+        session.set_paused(false);
+        session.step(1.0 / 60.0).unwrap();
+
+        let ball = session.world.handle("ball").unwrap();
+        assert!(session.world.local_transform(ball).unwrap().position.y < 2.0);
+        session.stop();
+    }
+
+    #[test]
+    fn dropping_play_shuts_down_physics_with_an_outstanding_step() {
+        let source = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.0, 2.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+"#;
+        let mut session =
+            PlaySession::start(&document(source), None, |_| Ok(String::new())).unwrap();
+        session.step(1.0 / 60.0).unwrap();
+
+        drop(session);
     }
 
     #[test]
     fn stop_runs_on_destroy_and_reports_events() {
         let mut session = start(ROTATE).unwrap();
-        session.step(0.1);
+        session.step(0.1).unwrap();
         assert!(
             session
                 .drain_events()
@@ -378,10 +706,10 @@ return Rotate
             Duration::from_millis(50),
         )
         .unwrap();
-        session.step(0.1);
+        session.step(0.1).unwrap();
         assert!(!session.drain_events().is_empty());
         // Прерывание постоянно: следующий кадр не должен снова зависнуть.
-        session.step(0.1);
+        session.step(0.1).unwrap();
     }
 
     #[test]
@@ -406,7 +734,7 @@ return S
 "#;
         let mut session = start(Box::leak(script.to_owned().into_boxed_str())).unwrap();
         session.input_mut().set_key(engine_script::Key::Space, true);
-        session.step(0.1);
+        session.step(0.1).unwrap();
         assert!(
             session
                 .drain_events()
@@ -427,7 +755,7 @@ end
 return S
 "#;
         let mut session = start(script).unwrap();
-        session.tick();
+        session.tick().unwrap();
         assert_eq!(
             session.command_catalog().get("echo").unwrap().description,
             "write one argument"

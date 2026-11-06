@@ -47,7 +47,7 @@ Lua API `rve.console.write(text, level?)` создаёт `ScriptEvent`; уров
 
 ## Физика скриптов
 
-Физический контекст необязателен. До интеграции runtime вызывающий код задаёт `ScriptHost::set_physics_snapshot(Arc<QuerySnapshot>, bindings)`, передаёт результаты событий через `queue_physics_events` и забирает подтверждённые команды через `drain_physics_commands`; host сам не создаёт и не шагает `PhysicsWorld`.
+Физический контекст необязателен. Runtime и editor Play подключают immutable snapshot и bindings до `on_start`, передают результаты и события перед update и забирают committed команды после него. Вне этих интеграций вызывающий код может использовать те же `ScriptHost` hooks напрямую; host не создаёт и не шагает `PhysicsWorld`.
 
 Lua `rve.physics.raycast(origin, direction, max_distance, options?)` возвращает `nil` либо hit с `object`, `point`, `normal` и `distance`. По умолчанию triggers исключены; `options.include_triggers` включает их, `options.ignore` задаёт объект. Если скрипт принадлежит controller, его капсула автоматически исключается. Объектный API добавляет `get_velocity`, `set_velocity`, `add_impulse`, `add_force`, `move`, `is_grounded`, `set_collider_enabled` и `is_collider_enabled`. Первые четыре метода требуют dynamic rigid body, `move` и `is_grounded` — character controller, а collider-переключатели — физическое тело с collider; неверный компонент и не конечный вектор дают runtime error.
 

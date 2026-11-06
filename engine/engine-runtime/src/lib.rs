@@ -20,6 +20,9 @@ use engine_assets::{Assets, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::ConsoleBuffer;
 use engine_console::install_logger;
+use engine_physics::{
+    PhysicsClient, PhysicsInitialization, PhysicsRequest, PhysicsServer, StepDriver,
+};
 use engine_platform::{Acquire, ActivationError, InstanceLock, activate_running_instance};
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_render::{DebugView, probe_devices};
@@ -231,14 +234,29 @@ fn run_from_args(
         Ok(prepared) => prepared,
         Err(error) => return fail(2, format!("ошибка загрузки сцены: {error}")),
     };
+    let (physics_driver, physics_bindings) = match prepared.build_physics(&project.physics) {
+        Ok(physics) => physics,
+        Err(error) => return fail(2, format!("ошибка построения физической сцены: {error}")),
+    };
+    let physics_initialization =
+        match PhysicsInitialization::from_prebuilt(&physics_driver, physics_bindings) {
+            Ok(initialization) => initialization,
+            Err(error) => {
+                return fail(2, format!("ошибка инициализации физической сцены: {error}"));
+            }
+        };
 
     let mut modules = ModuleHost::new();
-    if let Err(error) = start_empty_modules(&mut modules) {
-        for error in modules.shutdown() {
-            log::error!("Ошибка остановки модуля: {error}");
+    let status = Arc::new(RuntimeStatus::default());
+    let physics_client = match start_modules(&mut modules, physics_driver, Arc::clone(&status)) {
+        Ok(client) => client,
+        Err(error) => {
+            for error in modules.shutdown() {
+                log::error!("Ошибка остановки модуля: {error}");
+            }
+            return fail(1, format!("не удалось запустить модуль: {error}"));
         }
-        return fail(1, format!("не удалось запустить модуль: {error}"));
-    }
+    };
 
     let PreparedScene {
         world,
@@ -250,7 +268,6 @@ fn run_from_args(
     let (frame_tx, frame_rx) = flume::bounded(1);
     let (render_tx, render_rx) = flume::unbounded();
     let interrupt = ScriptInterruptHandle::new();
-    let status = Arc::new(RuntimeStatus::default());
     let input = Arc::new(Mutex::new(input::InputAccumulator::default()));
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
     let script_thread = match start_scripts(
@@ -271,6 +288,8 @@ fn run_from_args(
             render_tx: render_tx.clone(),
             status: Arc::clone(&status),
             input: Arc::clone(&input),
+            physics_client: Some(physics_client),
+            physics_initialization: Some(physics_initialization),
             #[cfg(feature = "dev-console")]
             command_catalog: Arc::clone(&command_catalog),
         },
@@ -390,6 +409,9 @@ fn scripts_ready_result(
         Ok(Err(ScriptStartupError::Load(error))) => {
             Err((2, format!("ошибка загрузки скриптов: {error}")))
         }
+        Ok(Err(ScriptStartupError::Physics(error))) => {
+            Err((1, format!("ошибка запуска физики: {error}")))
+        }
         Ok(Err(ScriptStartupError::Panic(error))) => Err((1, error)),
         Err(error) => Err((1, format!("поток скриптов не подтвердил запуск: {error}"))),
     }
@@ -463,7 +485,11 @@ fn load_window_icon(
     }))
 }
 
-fn start_empty_modules(modules: &mut ModuleHost) -> std::io::Result<()> {
+fn start_modules(
+    modules: &mut ModuleHost,
+    physics_driver: StepDriver,
+    status: Arc<RuntimeStatus>,
+) -> std::io::Result<PhysicsClient> {
     let (audio_tx, audio_rx) = std::sync::mpsc::channel();
     modules.spawn(
         "rve-audio",
@@ -475,14 +501,24 @@ fn start_empty_modules(modules: &mut ModuleHost) -> std::io::Result<()> {
         },
     )?;
 
-    let (physics_tx, physics_rx) = std::sync::mpsc::channel();
+    let (physics_request_tx, physics_request_rx) = flume::unbounded();
+    let (physics_reply_tx, physics_reply_rx) = flume::unbounded();
+    let physics_stop_tx = physics_request_tx.clone();
+    let physics_status = Arc::clone(&status);
     modules.spawn(
         "rve-physics",
         move || {
-            let _ = physics_tx.send(());
+            let _ = physics_stop_tx.send(PhysicsRequest::Shutdown);
         },
         move || {
-            engine_physics::PhysicsEngine::new().run(physics_rx);
+            if let Err(error) = PhysicsServer::run_preinitialized(
+                physics_request_rx,
+                physics_reply_tx,
+                physics_driver,
+            ) {
+                physics_status
+                    .record_failure(format!("поток физики завершился с ошибкой: {error}"));
+            }
         },
     )?;
 
@@ -507,7 +543,10 @@ fn start_empty_modules(modules: &mut ModuleHost) -> std::io::Result<()> {
             engine_neural::NeuralEngine::new().run(neural_rx);
         },
     )?;
-    Ok(())
+    Ok(PhysicsClient::new_preinitialized(
+        physics_request_tx,
+        physics_reply_rx,
+    ))
 }
 
 fn fail(code: u8, message: impl AsRef<str>) -> ExitCode {
@@ -568,6 +607,16 @@ mod tests {
         .unwrap_err();
         assert_eq!(code, 2);
         assert!(message.contains("bad.lua"));
+    }
+
+    #[test]
+    fn physics_startup_failure_maps_to_runtime_exit_code_one() {
+        let (code, message) = scripts_ready_result(Ok(Err(ScriptStartupError::Physics(
+            "server disconnected".to_owned(),
+        ))))
+        .unwrap_err();
+        assert_eq!(code, 1);
+        assert!(message.contains("server disconnected"));
     }
 
     #[test]

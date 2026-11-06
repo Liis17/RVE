@@ -6,6 +6,9 @@ use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
+use engine_physics::{
+    PhysicsClient, PhysicsInitialization, PhysicsReceive, PhysicsSceneSync, PhysicsStepResult,
+};
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameStatus, LocalLight,
@@ -238,6 +241,8 @@ pub(crate) struct ScriptThreadConfig {
     pub render_tx: Sender<RenderControl>,
     pub status: Arc<RuntimeStatus>,
     pub input: Arc<Mutex<InputAccumulator>>,
+    pub physics_client: Option<PhysicsClient>,
+    pub physics_initialization: Option<PhysicsInitialization>,
     #[cfg(feature = "dev-console")]
     pub command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
 }
@@ -265,6 +270,7 @@ pub(crate) struct RenderThreadConfig {
 #[derive(Debug)]
 pub(crate) enum ScriptStartupError {
     Load(String),
+    Physics(String),
     Panic(String),
 }
 
@@ -665,6 +671,8 @@ fn scripts_thread(
         input,
         #[cfg(feature = "dev-console")]
         command_catalog,
+        physics_client,
+        physics_initialization,
         ..
     } = config;
     let library = match load_script_library(
@@ -698,6 +706,32 @@ fn scripts_thread(
             return;
         }
     };
+    let mut physics_client = physics_client;
+    let mut physics_sync = None;
+    match (physics_client.as_mut(), physics_initialization) {
+        (Some(_), Some(initialization)) => {
+            let sync = match PhysicsSceneSync::new(&world, initialization.bindings) {
+                Ok(sync) => sync,
+                Err(error) => {
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx.send(Err(ScriptStartupError::Physics(error.to_string())));
+                    }
+                    return;
+                }
+            };
+            scripts.set_physics_snapshot(initialization.result.snapshot, sync.bindings());
+            physics_sync = Some(sync);
+        }
+        (None, None) => {}
+        _ => {
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(Err(ScriptStartupError::Physics(
+                    "physics client and initialization must be provided together".to_owned(),
+                )));
+            }
+            return;
+        }
+    }
     if let Some(ready_tx) = ready_tx.take()
         && ready_tx.send(Ok(())).is_err()
     {
@@ -749,6 +783,51 @@ fn scripts_thread(
     let mut next_background_tick =
         now.saturating_add(if background { interval } else { Duration::ZERO });
     loop {
+        let mut stop_after_physics = false;
+        if let (Some(client), Some(sync)) = (&mut physics_client, &mut physics_sync) {
+            let received =
+                receive_physics_interruptibly(client, &control_rx, |control| match control {
+                    ScriptControl::Shutdown => true,
+                    ScriptControl::Background(value) => {
+                        background = value;
+                        if value {
+                            next_background_tick = clock.now().saturating_add(interval);
+                        }
+                        false
+                    }
+                    ScriptControl::Go(_) => false,
+                    #[cfg(feature = "dev-console")]
+                    ScriptControl::Console(command) => {
+                        pending_console_commands.push_back(command);
+                        false
+                    }
+                });
+            match received {
+                Ok(PhysicsWait::Idle) => {}
+                Ok(PhysicsWait::Step(result)) => {
+                    if let Err(error) = apply_physics_step(&mut scripts, &mut world, sync, result) {
+                        status.record_failure(format!("ошибка синхронизации физики: {error}"));
+                        let _ = render_tx.send(RenderControl::Shutdown);
+                        stop_after_physics = true;
+                    }
+                }
+                Ok(PhysicsWait::Shutdown(result)) => {
+                    if let Err(error) = apply_physics_step(&mut scripts, &mut world, sync, result) {
+                        status.record_failure(format!("ошибка синхронизации физики: {error}"));
+                        let _ = render_tx.send(RenderControl::Shutdown);
+                    }
+                    stop_after_physics = true;
+                }
+                Err(error) => {
+                    status.record_failure(format!("ошибка потока физики: {error}"));
+                    let _ = render_tx.send(RenderControl::Shutdown);
+                    stop_after_physics = true;
+                }
+            }
+        }
+        if stop_after_physics {
+            break;
+        }
         sync_input_background(&input, background, &mut applied_background);
         if background {
             if !wait_background_tick(
@@ -829,6 +908,22 @@ fn scripts_thread(
             &command_catalog,
             &mut published_catalog_generation,
         );
+        if let (Some(client), Some(sync)) = (&mut physics_client, &mut physics_sync) {
+            let mut commands = scripts.drain_physics_commands();
+            match sync.sync_world_commands(&mut world) {
+                Ok(world_commands) => commands.extend(world_commands),
+                Err(error) => {
+                    status.record_failure(format!("ошибка синхронизации сцены с физикой: {error}"));
+                    let _ = render_tx.send(RenderControl::Shutdown);
+                    break;
+                }
+            }
+            if let Err(error) = client.step(dt, commands) {
+                status.record_failure(format!("ошибка шага физики: {error}"));
+                let _ = render_tx.send(RenderControl::Shutdown);
+                break;
+            }
+        }
         if background {
             next_background_tick = now.saturating_add(interval);
             continue;
@@ -894,6 +989,51 @@ fn sync_input_background(
     if *applied_background != background {
         lock_input(input).set_background(background);
         *applied_background = background;
+    }
+}
+
+fn apply_physics_step(
+    scripts: &mut ScriptHost,
+    world: &mut World,
+    sync: &mut PhysicsSceneSync,
+    result: PhysicsStepResult,
+) -> Result<(), String> {
+    sync.apply_physics_poses(world, &result.poses)
+        .map_err(|error| error.to_string())?;
+    scripts.set_physics_snapshot(result.snapshot, sync.bindings());
+    scripts.queue_physics_events(result.events);
+    Ok(())
+}
+
+enum PhysicsWait {
+    Idle,
+    Step(PhysicsStepResult),
+    Shutdown(PhysicsStepResult),
+}
+
+fn receive_physics_interruptibly(
+    client: &mut PhysicsClient,
+    control_rx: &Receiver<ScriptControl>,
+    mut handle_control: impl FnMut(ScriptControl) -> bool,
+) -> Result<PhysicsWait, String> {
+    let mut shutdown = false;
+    loop {
+        match client
+            .receive(control_rx)
+            .map_err(|error| error.to_string())?
+        {
+            None => return Ok(PhysicsWait::Idle),
+            Some(PhysicsReceive::Step(result)) => {
+                return Ok(if shutdown {
+                    PhysicsWait::Shutdown(result)
+                } else {
+                    PhysicsWait::Step(result)
+                });
+            }
+            Some(PhysicsReceive::Interrupted(control)) => {
+                shutdown |= handle_control(control);
+            }
+        }
     }
 }
 
@@ -1587,9 +1727,10 @@ mod tests {
     use super::execute_console_commands;
     use super::{
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
-        GpuSceneTable, MotionHistory, RenderBackend, RenderControl, RenderThreadConfig,
-        RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError, ScriptThreadConfig,
-        log_script_events_with, make_snapshot, procedural_environment_key, render_local_lights,
+        GpuSceneTable, MotionHistory, PhysicsWait, RenderBackend, RenderControl,
+        RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
+        ScriptThreadConfig, apply_physics_step, log_script_events_with, make_snapshot,
+        procedural_environment_key, receive_physics_interruptibly, render_local_lights,
         render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
         sync_input_background, wait_background_tick,
     };
@@ -1599,6 +1740,11 @@ mod tests {
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
     use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
+    use engine_physics::{
+        PhysicsClient, PhysicsCommand, PhysicsEvent, PhysicsInitialization, PhysicsReply,
+        PhysicsRequest, PhysicsSceneDesc, PhysicsSceneSync, PhysicsServer, PhysicsStepResult,
+        PhysicsWorld, Pose,
+    };
     use engine_render::{DrawCommand, FrameOutcome, FrameStatus, LocalLight};
     use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
@@ -1985,8 +2131,8 @@ distance=2.0
     struct TickProbe;
 
     impl Script for TickProbe {
-        fn on_update(&mut self, ctx: &mut Context<'_>, _dt: f32) {
-            ctx.transform.position[0] += 1.0;
+        fn on_update(&mut self, ctx: &mut Context<'_>, dt: f32) {
+            ctx.transform.position[0] += dt;
         }
     }
 
@@ -2384,6 +2530,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                physics_client: None,
+                physics_initialization: None,
                 command_catalog: Arc::clone(&catalog),
             },
         )
@@ -2632,7 +2780,7 @@ return Script
     }
 
     #[test]
-    fn background_before_go_is_kept_and_ticks_without_sending_snapshots() {
+    fn physics_steps_use_the_same_injected_delta_in_foreground_and_background() {
         let document = SceneDocument::parse(
             "startup.rvescene",
             "[[objects]]\nid = \"camera\"\n[objects.camera]\n\n[[objects.heavy_scripts]]\nname = \"TickProbe\"\n",
@@ -2645,6 +2793,44 @@ return Script
         let (script_tx, script_rx) = flume::unbounded();
         let (frame_tx, frame_rx) = flume::bounded(1);
         let (render_tx, render_rx) = flume::unbounded();
+        let snapshot = PhysicsWorld::new(Vec3::ZERO)
+            .unwrap()
+            .query_snapshot()
+            .unwrap();
+        let initialization = PhysicsInitialization {
+            result: PhysicsStepResult {
+                sequence: 0,
+                substeps: 0,
+                poses: Vec::new(),
+                events: Vec::new(),
+                snapshot: Arc::clone(&snapshot),
+            },
+            bindings: Vec::new(),
+        };
+        let (physics_request_tx, physics_request_rx) = flume::unbounded();
+        let (physics_reply_tx, physics_reply_rx) = flume::unbounded();
+        let physics_stop_tx = physics_request_tx.clone();
+        let (physics_dt_tx, physics_dt_rx) = mpsc::channel();
+        let physics_worker = std::thread::spawn(move || {
+            while let Ok(request) = physics_request_rx.recv() {
+                match request {
+                    PhysicsRequest::Step { sequence, dt, .. } => {
+                        physics_dt_tx.send(dt).unwrap();
+                        physics_reply_tx
+                            .send(PhysicsReply::Step(PhysicsStepResult {
+                                sequence,
+                                substeps: 0,
+                                poses: Vec::new(),
+                                events: Vec::<PhysicsEvent>::new(),
+                                snapshot: Arc::clone(&snapshot),
+                            }))
+                            .unwrap();
+                    }
+                    PhysicsRequest::Shutdown => break,
+                    PhysicsRequest::Init(_) => panic!("preinitialized server received Init"),
+                }
+            }
+        });
         let script_thread = start_scripts(
             &mut modules,
             world,
@@ -2662,6 +2848,11 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                physics_client: Some(PhysicsClient::new_preinitialized(
+                    physics_request_tx,
+                    physics_reply_rx,
+                )),
+                physics_initialization: Some(initialization),
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -2687,12 +2878,17 @@ return Script
 
         clock.advance(Duration::from_millis(500));
         script_tx.send(ScriptControl::Background(true)).unwrap();
+        let background_dt = physics_dt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(background_dt, 1.0);
         waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(frame_rx.try_recv().is_err());
+        clock.advance(Duration::from_millis(250));
         script_tx.send(ScriptControl::Background(false)).unwrap();
 
+        let foreground_dt = physics_dt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(foreground_dt, 0.25);
         let snapshot = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(snapshot.camera.position.x, 2.0);
+        assert!((snapshot.camera.position.x - background_dt - foreground_dt).abs() < 1.0e-6);
         script_tx.send(ScriptControl::Shutdown).unwrap();
         script_thread
             .stopped
@@ -2701,6 +2897,373 @@ return Script
         assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
         modules.join_named(SCRIPTS_THREAD).unwrap();
         assert!(modules.shutdown().is_empty());
+        physics_stop_tx.send(PhysicsRequest::Shutdown).unwrap();
+        physics_worker.join().unwrap();
+    }
+
+    #[test]
+    fn initial_physics_snapshot_is_available_to_on_start_raycast() {
+        let script = r#"
+local Script = {}
+function Script:on_start()
+  local hit = rve.physics.raycast({x=0,y=0,z=-2}, {x=0,y=0,z=1}, 5)
+  assert(hit and hit.object.id == "wall")
+  self.transform.position = {x=3,y=0,z=-2}
+end
+return Script
+"#;
+        let document = SceneDocument::parse(
+            "physics-start.rvescene",
+            "[[assets]]\npath='probe.lua'\n[[objects]]\nid='camera'\n[objects.transform]\nposition=[0.0,0.0,-2.0]\n[objects.camera]\n[[objects.lite_scripts]]\npath='probe.lua'\n[[objects]]\nid='wall'\n[objects.collider]\nshape='sphere'\nradius=0.5\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let desc = PhysicsSceneDesc::from_world(&world, &[], Vec3::ZERO, 60, 8).unwrap();
+        let (driver, bindings) = desc.build().unwrap();
+        let initialization = PhysicsInitialization::from_prebuilt(&driver, bindings).unwrap();
+        let (physics_request_tx, physics_request_rx) = flume::unbounded();
+        let (physics_reply_tx, physics_reply_rx) = flume::unbounded();
+        let physics_stop_tx = physics_request_tx.clone();
+        let physics_worker = std::thread::spawn(move || {
+            PhysicsServer::run_preinitialized(physics_request_rx, physics_reply_tx, driver)
+        });
+        let mut modules = ModuleHost::new();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (render_tx, render_rx) = flume::unbounded();
+        let script_thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "physics-start.rvescene".to_owned(),
+                sources: BTreeMap::from([("probe.lua".to_owned(), script.to_owned())]),
+                scripts_library: None,
+                script_module: None,
+                interrupt: ScriptInterruptHandle::new(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 30,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::new(RuntimeStatus::default()),
+                input: test_input(),
+                physics_client: Some(PhysicsClient::new_preinitialized(
+                    physics_request_tx,
+                    physics_reply_rx,
+                )),
+                physics_initialization: Some(initialization),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
+            },
+        )
+        .unwrap();
+        script_thread.ready.recv().unwrap().unwrap();
+        script_tx
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+        let frame = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!((frame.camera.position.x - 3.0).abs() < 1.0e-5);
+
+        script_tx.send(ScriptControl::Shutdown).unwrap();
+        script_thread
+            .stopped
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
+        modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(modules.shutdown().is_empty());
+        physics_stop_tx.send(PhysicsRequest::Shutdown).unwrap();
+        physics_worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn script_transform_is_sent_as_zero_substep_physics_teleport() {
+        let script = r#"
+local Move = {}
+function Move:on_start()
+  self.transform.position = {x=4,y=2,z=0}
+end
+return Move
+"#;
+        let document = SceneDocument::parse(
+            "physics-teleport.rvescene",
+            "[[assets]]\npath='move.lua'\n[[objects]]\nid='camera'\n[objects.camera]\n[[objects]]\nid='ball'\n[objects.transform]\nposition=[0.0,2.0,0.0]\n[objects.collider]\nshape='sphere'\nradius=0.5\n[objects.rigid_body]\nkind='dynamic'\n[[objects.lite_scripts]]\npath='move.lua'\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let ball = world.handle("ball").unwrap();
+        let desc = PhysicsSceneDesc::from_world(&world, &[], Vec3::ZERO, 60, 8).unwrap();
+        let (driver, bindings) = desc.build().unwrap();
+        let body = bindings
+            .iter()
+            .find(|binding| binding.object == ball)
+            .unwrap()
+            .body;
+        let initialization =
+            PhysicsInitialization::from_prebuilt(&driver, bindings.clone()).unwrap();
+        let (physics_request_tx, physics_request_rx) = flume::unbounded();
+        let (physics_reply_tx, physics_reply_rx) = flume::unbounded();
+        let (step_tx, step_rx) = mpsc::channel();
+        let physics_worker = std::thread::spawn(move || {
+            let mut driver = driver;
+            while let Ok(request) = physics_request_rx.recv() {
+                match request {
+                    PhysicsRequest::Step {
+                        sequence,
+                        dt,
+                        commands,
+                    } => {
+                        let has_teleport = commands.iter().any(|command| {
+                            matches!(
+                                command,
+                                PhysicsCommand::Teleport { body: target, pose }
+                                    if *target == body && pose.position.x == 4.0
+                            )
+                        });
+                        step_tx.send((dt, has_teleport)).unwrap();
+                        let step = driver.advance_step(dt, commands).unwrap();
+                        let snapshot = driver.world().query_snapshot().unwrap();
+                        physics_reply_tx
+                            .send(PhysicsReply::Step(PhysicsStepResult {
+                                sequence,
+                                substeps: step.substeps,
+                                poses: step.poses,
+                                events: step.events,
+                                snapshot,
+                            }))
+                            .unwrap();
+                    }
+                    PhysicsRequest::Shutdown => break,
+                    PhysicsRequest::Init(_) => panic!("preinitialized server received Init"),
+                }
+            }
+        });
+        let mut modules = ModuleHost::new();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (render_tx, render_rx) = flume::unbounded();
+        let script_thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "physics-teleport.rvescene".to_owned(),
+                sources: BTreeMap::from([("move.lua".to_owned(), script.to_owned())]),
+                scripts_library: None,
+                script_module: None,
+                interrupt: ScriptInterruptHandle::new(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 30,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::new(RuntimeStatus::default()),
+                input: test_input(),
+                physics_client: Some(PhysicsClient::new_preinitialized(
+                    physics_request_tx,
+                    physics_reply_rx,
+                )),
+                physics_initialization: Some(initialization),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
+            },
+        )
+        .unwrap();
+        script_thread.ready.recv().unwrap().unwrap();
+        script_tx
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+
+        let (dt, has_teleport) = step_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(dt, 0.0);
+        assert!(has_teleport, "script transform was not sent as a Teleport");
+        frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        script_tx.send(ScriptControl::Shutdown).unwrap();
+        script_thread
+            .stopped
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
+        modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(modules.shutdown().is_empty());
+        physics_worker.join().unwrap();
+    }
+
+    #[test]
+    fn physics_pose_sync_remains_finite_after_runtime_scale_becomes_zero() {
+        let document = SceneDocument::parse(
+            "physics-scale.rvescene",
+            "[[objects]]\nid='camera'\n[objects.camera]\n[[objects]]\nid='ball'\n[objects.transform]\nposition=[0.0,2.0,0.0]\n[objects.collider]\nshape='sphere'\nradius=0.5\n[objects.rigid_body]\nkind='dynamic'\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let desc = PhysicsSceneDesc::from_world(&world, &[], Vec3::ZERO, 60, 8).unwrap();
+        let (driver, bindings) = desc.build().unwrap();
+        let initialization =
+            PhysicsInitialization::from_prebuilt(&driver, bindings.clone()).unwrap();
+        let mut sync = PhysicsSceneSync::new(&world, bindings.clone()).unwrap();
+        let ball = bindings[0].object;
+        let mut transform = *world.local_transform(ball).unwrap();
+        transform.scale = Vec3::ZERO;
+        world.set_local_transform(ball, transform).unwrap();
+        world.recalculate_world_matrices();
+        let mut scripts =
+            ScriptHost::load(&world, "physics-scale", &BTreeMap::new(), None).unwrap();
+
+        apply_physics_step(
+            &mut scripts,
+            &mut world,
+            &mut sync,
+            PhysicsStepResult {
+                sequence: 1,
+                substeps: 0,
+                poses: vec![(
+                    bindings[0].body,
+                    Pose::new(Vec3::new(0.0, 2.0, 0.0), glam::Quat::IDENTITY).unwrap(),
+                )],
+                events: Vec::new(),
+                snapshot: initialization.result.snapshot,
+            },
+        )
+        .unwrap();
+
+        assert!(world.world_matrix(ball).unwrap().is_finite());
+        assert!(world.world_rotation(ball).unwrap().is_finite());
+    }
+
+    #[test]
+    fn shutdown_interrupt_keeps_waiting_until_outstanding_physics_result_is_received() {
+        let snapshot = PhysicsWorld::new(Vec3::ZERO)
+            .unwrap()
+            .query_snapshot()
+            .unwrap();
+        let (request_tx, request_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::unbounded();
+        let mut client = PhysicsClient::new_preinitialized(request_tx, reply_rx);
+        assert_eq!(client.step(0.1, Vec::new()).unwrap(), 1);
+        assert!(matches!(
+            request_rx.recv().unwrap(),
+            PhysicsRequest::Step { sequence: 1, .. }
+        ));
+
+        let (control_tx, control_rx) = flume::unbounded();
+        let (control_seen_tx, control_seen_rx) = mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            receive_physics_interruptibly(&mut client, &control_rx, |control| {
+                if matches!(control, ScriptControl::Shutdown) {
+                    control_seen_tx.send(()).unwrap();
+                    true
+                } else {
+                    false
+                }
+            })
+        });
+        control_tx.send(ScriptControl::Shutdown).unwrap();
+        control_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        reply_tx
+            .send(PhysicsReply::Step(PhysicsStepResult {
+                sequence: 1,
+                substeps: 0,
+                poses: Vec::new(),
+                events: Vec::new(),
+                snapshot,
+            }))
+            .unwrap();
+        assert!(matches!(
+            waiting.join().unwrap(),
+            Ok(PhysicsWait::Shutdown(result)) if result.sequence == 1
+        ));
+    }
+
+    #[test]
+    fn physics_reply_disconnect_sets_runtime_exit_code_one() {
+        let world = World::from_document(
+            &SceneDocument::parse(
+                "physics-failure.rvescene",
+                "[[objects]]\nid='camera'\n[objects.camera]\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let snapshot = PhysicsWorld::new(Vec3::ZERO)
+            .unwrap()
+            .query_snapshot()
+            .unwrap();
+        let initialization = PhysicsInitialization {
+            result: PhysicsStepResult {
+                sequence: 0,
+                substeps: 0,
+                poses: Vec::new(),
+                events: Vec::new(),
+                snapshot,
+            },
+            bindings: Vec::new(),
+        };
+        let (physics_request_tx, physics_request_rx) = flume::unbounded();
+        let (physics_reply_tx, physics_reply_rx) = flume::unbounded();
+        let physics_worker = std::thread::spawn(move || {
+            assert!(matches!(
+                physics_request_rx.recv().unwrap(),
+                PhysicsRequest::Step { sequence: 1, .. }
+            ));
+            drop(physics_reply_tx);
+        });
+        let status = Arc::new(RuntimeStatus::default());
+        let mut modules = ModuleHost::new();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (render_tx, render_rx) = flume::unbounded();
+        let script_thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "physics-failure.rvescene".to_owned(),
+                sources: BTreeMap::new(),
+                scripts_library: None,
+                script_module: None,
+                interrupt: ScriptInterruptHandle::new(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 30,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::clone(&status),
+                input: test_input(),
+                physics_client: Some(PhysicsClient::new_preinitialized(
+                    physics_request_tx,
+                    physics_reply_rx,
+                )),
+                physics_initialization: Some(initialization),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
+            },
+        )
+        .unwrap();
+        script_thread.ready.recv().unwrap().unwrap();
+        script_tx
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+        frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        script_thread
+            .stopped
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(status.exit_code(), 1);
+        assert!(
+            status
+                .failure_message()
+                .unwrap()
+                .contains("ошибка потока физики")
+        );
+        assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
+        modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(modules.shutdown().is_empty());
+        physics_worker.join().unwrap();
     }
 
     #[test]
@@ -2744,6 +3307,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: Arc::clone(&input),
+                physics_client: None,
+                physics_initialization: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -2961,6 +3526,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                physics_client: None,
+                physics_initialization: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3007,6 +3574,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                physics_client: None,
+                physics_initialization: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3052,6 +3621,8 @@ return Script
                 render_tx,
                 status: Arc::new(RuntimeStatus::default()),
                 input: test_input(),
+                physics_client: None,
+                physics_initialization: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3114,6 +3685,8 @@ return Script
                 render_tx,
                 status: Arc::clone(&status),
                 input: test_input(),
+                physics_client: None,
+                physics_initialization: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },

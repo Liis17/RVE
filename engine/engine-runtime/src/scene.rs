@@ -1,6 +1,10 @@
 use crate::pipeline::GpuSceneTable;
 use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, TextureData};
 use engine_files::VirtualPath;
+use engine_physics::{
+    ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsSceneBinding, PhysicsSceneDesc, StepDriver,
+};
+use engine_project::PhysicsSettings;
 use engine_render::{
     AlphaMode, EnvironmentSource, Material, MaterialId, RenderError, Renderer, TextureColorSpace,
     TextureId, Vertex,
@@ -10,6 +14,7 @@ use engine_scene::CameraSettings;
 use engine_scene::{
     MaterialAlphaMode, MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand,
 };
+use glam::Vec3;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::Arc;
@@ -32,6 +37,43 @@ pub(crate) struct PreparedScene {
     pub name: String,
     pub sources: BTreeMap<String, String>,
     pub render_assets: PreparedRenderAssets,
+}
+
+impl PreparedScene {
+    pub(crate) fn build_physics(
+        &self,
+        settings: &PhysicsSettings,
+    ) -> Result<(StepDriver, Vec<PhysicsSceneBinding>), String> {
+        let model_geometry = self
+            .render_assets
+            .models
+            .iter()
+            .map(|(path, model)| ModelGeometry {
+                path: path.clone(),
+                meshes: model
+                    .meshes
+                    .iter()
+                    .map(|mesh| PhysicsModelMesh {
+                        positions: mesh
+                            .vertices
+                            .iter()
+                            .map(|vertex| Vec3::from_array(vertex.position))
+                            .collect(),
+                        indices: mesh.indices.clone(),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        PhysicsSceneDesc::from_world(
+            &self.world,
+            &model_geometry,
+            Vec3::from_array(settings.gravity),
+            settings.fixed_hz,
+            settings.max_substeps as usize,
+        )
+        .and_then(|desc| desc.build())
+        .map_err(|error| error.to_string())
+    }
 }
 
 pub(crate) fn load_scene(
@@ -561,6 +603,7 @@ mod tests {
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
+    use engine_project::PhysicsSettings;
     use engine_render::{AlphaMode, EnvironmentSource, TextureColorSpace};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::{MaterialAlphaMode, MaterialOverride, SceneDocument, World};
@@ -663,6 +706,31 @@ id = "camera"
         assert!(prepared.render_assets.models.is_empty());
         assert!(prepared.render_assets.objects.is_empty());
         assert!(prepared.sources.is_empty());
+    }
+
+    #[test]
+    fn physics_scene_is_built_from_loaded_world_before_runtime_startup() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!(
+                "{CAMERA_SCENE}\n[[objects]]\nid = \"body\"\n[objects.transform]\nscale = [0.0, 0.0, 0.0]\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\n"
+            )
+            .as_bytes(),
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+
+        let error = prepared
+            .build_physics(&PhysicsSettings::default())
+            .err()
+            .expect("zero-scale collider should fail physics prebuild");
+        assert!(error.contains("scale"), "{error}");
     }
 
     #[test]

@@ -67,7 +67,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
   - `rve-build`: `engine-assets`, `engine-files`, `engine-pak`, `engine-project`,
     `engine-resources`, `engine-scene`.
   - `rve-player`: `engine-runtime`.
-  - `rve-editor`: `engine-assets`, `engine-files`, `engine-project`, `engine-render`,
+  - `rve-editor`: `engine-assets`, `engine-files`, `engine-physics`, `engine-project`, `engine-render`,
     `engine-resources`, `engine-scene`, `engine-script`, `engine-window`,
     `engine-console`, `engine-ui`.
 - При изменении `engine-platform` проверяй общий интерфейс, адаптеры `engine-platform-windows` и `engine-platform-macos` и вызовы из renderer.

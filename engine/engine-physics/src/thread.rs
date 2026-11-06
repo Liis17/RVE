@@ -37,6 +37,18 @@ pub struct PhysicsInitialization {
     pub bindings: Vec<PhysicsSceneBinding>,
 }
 
+impl PhysicsInitialization {
+    /// Builds sequence zero from an already prepared driver, without starting a worker.
+    pub fn from_prebuilt(
+        driver: &StepDriver,
+        bindings: Vec<PhysicsSceneBinding>,
+    ) -> Result<Self, PhysicsServerError> {
+        let result = build_initial_result(driver)
+            .map_err(|error| PhysicsServerError::Initialization(error.to_string()))?;
+        Ok(Self { result, bindings })
+    }
+}
+
 pub enum PhysicsReply {
     Initialized(PhysicsInitialization),
     Step(PhysicsStepResult),
@@ -155,7 +167,7 @@ impl PhysicsServer {
         let PhysicsRequest::Init(desc) = initial else {
             return Err(PhysicsServerError::ExpectedInit);
         };
-        let (mut driver, bindings) = match desc.build() {
+        let (driver, bindings) = match desc.build() {
             Ok(scene) => scene,
             Err(error) => {
                 let message = error.to_string();
@@ -163,6 +175,24 @@ impl PhysicsServer {
                 return Err(PhysicsServerError::Initialization(message));
             }
         };
+        Self::run_initialized(requests, replies, driver, bindings)
+    }
+
+    /// Runs steps after the caller has already created sequence zero.
+    pub fn run_preinitialized(
+        requests: Receiver<PhysicsRequest>,
+        replies: Sender<PhysicsReply>,
+        driver: StepDriver,
+    ) -> Result<(), PhysicsServerError> {
+        Self::run_steps(requests, replies, driver)
+    }
+
+    fn run_initialized(
+        requests: Receiver<PhysicsRequest>,
+        replies: Sender<PhysicsReply>,
+        driver: StepDriver,
+        bindings: Vec<PhysicsSceneBinding>,
+    ) -> Result<(), PhysicsServerError> {
         let initial_result = match build_initial_result(&driver) {
             Ok(result) => result,
             Err(error) => {
@@ -178,6 +208,14 @@ impl PhysicsServer {
             }))
             .map_err(|_| PhysicsServerError::ReplyChannelDisconnected)?;
 
+        Self::run_steps(requests, replies, driver)
+    }
+
+    fn run_steps(
+        requests: Receiver<PhysicsRequest>,
+        replies: Sender<PhysicsReply>,
+        mut driver: StepDriver,
+    ) -> Result<(), PhysicsServerError> {
         let mut expected_sequence = 1_u64;
         loop {
             let request = requests
@@ -245,6 +283,20 @@ impl PhysicsClient {
         }
     }
 
+    /// Creates a client after sequence zero was built by `PhysicsInitialization::from_prebuilt`.
+    pub fn new_preinitialized(
+        requests: Sender<PhysicsRequest>,
+        replies: Receiver<PhysicsReply>,
+    ) -> Self {
+        Self {
+            requests,
+            replies,
+            initialized: true,
+            next_sequence: 1,
+            outstanding: None,
+        }
+    }
+
     /// Sends Init and waits for sequence zero and the initial query snapshot.
     pub fn initialize(
         &mut self,
@@ -256,6 +308,10 @@ impl PhysicsClient {
         self.requests
             .send(PhysicsRequest::Init(desc))
             .map_err(|_| PhysicsClientError::RequestChannelDisconnected)?;
+        self.receive_initialization()
+    }
+
+    fn receive_initialization(&mut self) -> Result<PhysicsInitialization, PhysicsClientError> {
         let reply = self
             .replies
             .recv()
@@ -556,6 +612,32 @@ mod tests {
         client.shutdown().unwrap();
         drop(control_tx);
         assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn preinitialized_server_steps_after_caller_builds_sequence_zero() {
+        let (request_tx, request_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::unbounded();
+        let (_, desc) = scene_with_dynamic_sphere();
+        let (driver, bindings) = desc.build().unwrap();
+        let body = bindings[0].body;
+        let initial = PhysicsInitialization::from_prebuilt(&driver, bindings).unwrap();
+        assert_eq!(initial.result.sequence, 0);
+        assert!(initial.result.snapshot.body_state(body).is_some());
+        let server = std::thread::spawn(move || {
+            PhysicsServer::run_preinitialized(request_rx, reply_tx, driver)
+        });
+        let mut client = PhysicsClient::new_preinitialized(request_tx, reply_rx);
+
+        let (control_tx, control_rx) = flume::unbounded::<()>();
+        client.step(1.0 / 60.0, Vec::new()).unwrap();
+        let Some(PhysicsReceive::Step(result)) = client.receive(&control_rx).unwrap() else {
+            panic!("expected preinitialized server step result")
+        };
+        assert_eq!(result.sequence, 1);
+        client.shutdown().unwrap();
+        drop(control_tx);
+        server.join().unwrap().unwrap();
     }
 
     #[test]
