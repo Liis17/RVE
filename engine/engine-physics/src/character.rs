@@ -552,8 +552,9 @@ mod tests {
     }
 
     #[test]
-    fn step_up_is_not_blocked_by_wall_contact_within_skin() {
-        // Капсула уже касается грани ступени в пределах skin: это боковой контакт, не потолок.
+    fn step_up_reaches_the_top_when_blocked_at_the_step_face() {
+        // Капсула упирается в грань ступени. Её нижняя полусфера должна перейти на верхнюю
+        // поверхность, а не касаться ребра наклонной нормалью, которую шаг отклоняет.
         let mut world = world_with_floor();
         world
             .insert_body(BodyDesc::static_collider(
