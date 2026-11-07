@@ -127,14 +127,7 @@ impl OpenProject {
 
     /// Читает текстовый ресурс, например исходник Lua или файл сцены.
     pub fn read_text(&self, path: &str) -> Result<String, String> {
-        let bytes = self
-            .resources
-            .handle()
-            .read_all(path)
-            .map_err(|error| format!("{path}: {error}"))?
-            .wait()
-            .map_err(|error| format!("{path}: {error}"))?;
-        String::from_utf8(bytes).map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))
+        read_resource_text(&self.resources.handle(), path)
     }
 
     /// Writes an edited `.camerasettings` asset without creating an unassigned file.
@@ -260,6 +253,16 @@ impl OpenProject {
             Ok(BootstrapConfig::default())
         }
     }
+}
+
+/// Читает текстовый ресурс через `handle`. Пригодно из фоновых потоков: `ResourceHandle` клонируется.
+pub fn read_resource_text(handle: &ResourceHandle, path: &str) -> Result<String, String> {
+    let bytes = handle
+        .read_all(path)
+        .map_err(|error| format!("{path}: {error}"))?
+        .wait()
+        .map_err(|error| format!("{path}: {error}"))?;
+    String::from_utf8(bytes).map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))
 }
 
 fn camera_paths(world: &World) -> Vec<(ObjectHandle, String)> {

@@ -1,5 +1,6 @@
 //! Play-режим: копия мира сцены и скрипты на главном потоке редактора.
 
+use crate::project::read_resource_text;
 use engine_assets::Assets;
 use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
@@ -9,19 +10,22 @@ use engine_physics::{
     PhysicsCommand, PhysicsInitialization, PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync,
     PhysicsServer, PhysicsServerError, ShapeCache,
 };
-use engine_project::{InputSettings, PhysicsSettings};
+use engine_project::{InputSettings, PhysicsSettings, PrefabCatalogFile};
+use engine_resources::ResourceHandle;
 use engine_scene::prefab::PREFAB_EXTENSION;
 use engine_scene::{
     AudioRequest, ColliderComponent, ColliderShape, MeshRenderer, ObjectHandle, PrefabTemplate,
     SceneDocument, VoiceId, World,
 };
 use engine_script::{
-    CommandError, PrefabCatalog, PrefabKind, PrefabSpec, ScriptEvent, ScriptHost, ScriptInput,
-    ScriptInterruptHandle, ScriptLibrary, ScriptLoadOptions, ScriptTime,
+    CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, ScriptEvent, ScriptHost,
+    ScriptInput, ScriptInterruptHandle, ScriptLibrary, ScriptLoadOptions, ScriptTime,
+    SpawnedObject, WorldChanges,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -109,14 +113,17 @@ fn watch(shared: &WatchdogShared, interrupt: &ScriptInterruptHandle) {
     }
 }
 
-/// Быстрые префабы Play: шаблоны для `spawn`, их лимиты и Lua-исходники скриптов. Строятся
-/// из `[[assets]]` сцены, как в `rve-runtime`.
+/// Префабы Play: быстрые — шаблоны из `[[assets]]` сцены, тяжёлые — записи списка проекта.
+/// Быстрые строятся сразу, как в `rve-runtime`; тяжёлые лишь попадают в каталог и грузятся
+/// фоновым потоком по заявке хоста.
 #[derive(Default)]
 pub struct PlayPrefabs {
     templates: BTreeMap<String, Arc<PrefabTemplate>>,
     catalog: PrefabCatalog,
     /// Исходники lite-скриптов шаблонов; без них `register_prefab` не скомпилирует класс.
     sources: BTreeMap<String, String>,
+    /// Ресурсы проекта для фоновой загрузки тяжёлых префабов; без них они не грузятся.
+    resources: Option<ResourceHandle>,
 }
 
 impl PlayPrefabs {
@@ -125,10 +132,14 @@ impl PlayPrefabs {
     /// каталог, и `spawn` по нему ошибку не даст. Причина возвращается предупреждением для лога
     /// Play. Префаб с камерой или светом, который используется экземпляром сцены, предупреждения
     /// не даёт. `instanced` — файлы, раскрытые экземплярами документа.
+    ///
+    /// Записи `heavy` без пути из `[[assets]]` сцены попадают в каталог как тяжёлые. Путь,
+    /// который сцена объявила быстрым, остаётся быстрым, даже если он есть в списке проекта.
     pub fn load(
         document: &SceneDocument,
         read_text: &mut dyn FnMut(&str) -> Result<String, String>,
         instanced: &[VirtualPath],
+        heavy: &PrefabCatalogFile,
     ) -> (Self, Vec<String>) {
         let mut prefabs = Self::default();
         let mut warnings = Vec::new();
@@ -172,7 +183,33 @@ impl PlayPrefabs {
                 .templates
                 .insert(path.to_owned(), Arc::new(template));
         }
+        for entry in &heavy.prefabs {
+            let Ok(path) = VirtualPath::parse(&entry.path) else {
+                warnings.push(format!("префаб {:?} в списке проекта пропущен", entry.path));
+                continue;
+            };
+            let fast_in_scene = document
+                .assets
+                .iter()
+                .any(|asset| asset.path == path && is_prefab_path(asset.path.as_str()));
+            if fast_in_scene {
+                continue;
+            }
+            prefabs.catalog.insert(
+                path.as_str(),
+                PrefabSpec {
+                    kind: PrefabKind::Heavy,
+                    max_instances: entry.max_instances,
+                },
+            );
+        }
         (prefabs, warnings)
+    }
+
+    /// Задаёт ресурсы проекта, из которых фоновый поток читает тяжёлые префабы.
+    pub fn with_resources(mut self, resources: ResourceHandle) -> Self {
+        self.resources = Some(resources);
+        self
     }
 
     /// Нужна ли Play библиотека Rust-скриптов: её требуют heavy-скрипты шаблонов.
@@ -236,6 +273,185 @@ fn root_body(sync: &PhysicsSceneSync, root: ObjectHandle) -> Option<BodyHandle> 
         .map(|binding| binding.body)
 }
 
+/// Пути моделей мешевых коллайдеров объектов шаблона.
+fn template_collider_models(template: &PrefabTemplate) -> impl Iterator<Item = &str> {
+    template
+        .objects()
+        .iter()
+        .filter_map(|object| mesh_collider_model(object.collider, object.mesh_renderer.as_ref()))
+}
+
+/// Геометрия модели для мешевого коллайдера: позиции и индексы мешей.
+fn collider_geometry(assets: &Assets, path: &str) -> Result<ModelGeometry, String> {
+    let model = assets
+        .load_model(path)
+        .map_err(|error| format!("{path}: {error}"))?;
+    Ok(ModelGeometry {
+        path: path.to_owned(),
+        meshes: model
+            .meshes
+            .iter()
+            .map(|mesh| PhysicsModelMesh {
+                positions: mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| glam::Vec3::from_array(vertex.position))
+                    .collect(),
+                indices: mesh.indices.clone(),
+            })
+            .collect(),
+    })
+}
+
+/// Имя потока, который готовит тяжёлый префаб для Play.
+const HEAVY_LOAD_THREAD: &str = "rve-editor-prefab-load";
+const HEAVY_LOAD_INTERRUPTED: &str = "загрузка префаба прервана";
+
+/// Тяжёлый префаб, подготовленный фоновым потоком: шаблон, Lua-исходники и геометрия физики.
+/// GPU здесь не нужен: модели редактор подгружает лениво, как и объекты сцены.
+struct HeavyPrefab {
+    template: Arc<PrefabTemplate>,
+    sources: BTreeMap<String, String>,
+    geometry: Vec<ModelGeometry>,
+}
+
+/// Ответ фонового потока. `load_id` отличает ответ текущей загрузки от устаревшей.
+struct HeavyReply {
+    path: String,
+    load_id: u64,
+    result: Result<HeavyPrefab, String>,
+}
+
+/// Фоновая загрузка тяжёлых префабов Play: по потоку на загрузку, ответы в общий канал.
+///
+/// Потоки не join-ятся. При остановке сессии флаг `stop` сообщает им, что результат не нужен,
+/// а ответы уходят в канал без получателя. Поток, который сейчас читает файл, завершится сам.
+struct HeavyLoads {
+    resources: Option<ResourceHandle>,
+    next_load_id: u64,
+    /// Загрузки, ответ на которые ещё ждётся: путь → `load_id`.
+    pending: BTreeMap<String, u64>,
+    /// Загруженные префабы: путь → модели, на которые он ссылается в физике.
+    loaded: BTreeMap<String, Vec<String>>,
+    reply_tx: flume::Sender<HeavyReply>,
+    replies: flume::Receiver<HeavyReply>,
+    stop: Arc<AtomicBool>,
+}
+
+impl HeavyLoads {
+    fn new(resources: Option<ResourceHandle>) -> Self {
+        let (reply_tx, replies) = flume::unbounded();
+        Self {
+            resources,
+            next_load_id: 0,
+            pending: BTreeMap::new(),
+            loaded: BTreeMap::new(),
+            reply_tx,
+            replies,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Запускает загрузку `path`. Ошибка означает, что поток не создан, и префаб неудачен.
+    fn start(&mut self, path: &str) -> Result<(), String> {
+        let resources = self
+            .resources
+            .clone()
+            .ok_or_else(|| format!("{path}: ресурсы проекта недоступны для тяжёлого префаба"))?;
+        self.next_load_id += 1;
+        let load_id = self.next_load_id;
+        let owned = path.to_owned();
+        let stop = Arc::clone(&self.stop);
+        let replies = self.reply_tx.clone();
+        std::thread::Builder::new()
+            .name(HEAVY_LOAD_THREAD.to_owned())
+            .spawn(move || {
+                let result = load_heavy_prefab(&resources, &owned, &stop);
+                // Канал закрыт, если сессия уже остановлена: тогда ответ никому не нужен.
+                let _ = replies.send(HeavyReply {
+                    path: owned,
+                    load_id,
+                    result,
+                });
+            })
+            .map_err(|error| format!("{path}: не удалось запустить поток загрузки: {error}"))?;
+        self.pending.insert(path.to_owned(), load_id);
+        Ok(())
+    }
+
+    /// Ждёт ли загрузка `path` ответа с номером `load_id`.
+    fn is_current(&self, path: &str, load_id: u64) -> bool {
+        self.pending.get(path) == Some(&load_id)
+    }
+
+    fn try_reply(&self) -> Option<HeavyReply> {
+        self.replies.try_recv().ok()
+    }
+
+    /// Загрузка получила ответ, поэтому больше не ждётся.
+    fn finish(&mut self, path: &str) {
+        self.pending.remove(path);
+    }
+
+    /// Префаб загружен и зарегистрирован. `models` — пути геометрии, которую он добавил в физику.
+    fn mark_loaded(&mut self, path: &str, models: Vec<String>) {
+        self.loaded.insert(path.to_owned(), models);
+    }
+
+    /// Забывает префаб при выгрузке и возвращает его модели. Загрузка в полёте тоже снимается,
+    /// поэтому её ответ станет устаревшим.
+    fn forget(&mut self, path: &str) -> Vec<String> {
+        self.pending.remove(path);
+        self.loaded.remove(path).unwrap_or_default()
+    }
+}
+
+impl Drop for HeavyLoads {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+/// Готовит тяжёлый префаб в фоновом потоке тем же путём, что и `PlayPrefabs::load`, но читает
+/// ресурсы проекта. Прерывание проверяется между шагами: без него поток дочитал бы все файлы
+/// после остановки сессии.
+fn load_heavy_prefab(
+    resources: &ResourceHandle,
+    path: &str,
+    stop: &AtomicBool,
+) -> Result<HeavyPrefab, String> {
+    let interrupted = || stop.load(Ordering::Acquire);
+    let prefab_path =
+        VirtualPath::parse(path).map_err(|_| format!("некорректный путь префаба {path:?}"))?;
+    let template = PrefabTemplate::load(&prefab_path, &mut |child: &VirtualPath| {
+        read_resource_text(resources, &format!("/{}", child.as_str()))
+    })
+    .map_err(|error| error.to_string())?;
+    template
+        .check_spawnable()
+        .map_err(|error| error.to_string())?;
+    let sources = lite_sources(&template, &mut |script: &str| {
+        if interrupted() {
+            return Err(HEAVY_LOAD_INTERRUPTED.to_owned());
+        }
+        read_resource_text(resources, script)
+    })?;
+    let assets = Assets::with_resources(resources.clone());
+    let models = template_collider_models(&template).collect::<BTreeSet<_>>();
+    let mut geometry = Vec::with_capacity(models.len());
+    for model in models {
+        if interrupted() {
+            return Err(HEAVY_LOAD_INTERRUPTED.to_owned());
+        }
+        geometry.push(collider_geometry(&assets, model)?);
+    }
+    Ok(HeavyPrefab {
+        template: Arc::new(template),
+        sources,
+        geometry,
+    })
+}
+
 /// Запущенная сцена. Документ не меняется: правки скриптов живут только в этом мире,
 /// поэтому Stop возвращает редактор к исходному документу простым удалением сессии.
 pub struct PlaySession {
@@ -250,6 +466,7 @@ pub struct PlaySession {
     frame: u64,
     last_tick: Instant,
     input: ScriptInput,
+    heavy: HeavyLoads,
 }
 
 impl PlaySession {
@@ -340,35 +557,12 @@ impl PlaySession {
                 prefabs
                     .templates
                     .values()
-                    .flat_map(|template| template.objects())
-                    .filter_map(|object| {
-                        mesh_collider_model(object.collider, object.mesh_renderer.as_ref())
-                    }),
+                    .flat_map(|template| template_collider_models(template)),
             )
-            .map(str::to_owned)
             .collect::<BTreeSet<_>>();
         paths
             .into_iter()
-            .map(|path| {
-                let model = assets
-                    .load_model(&path)
-                    .map_err(|error| format!("{path}: {error}"))?;
-                Ok(ModelGeometry {
-                    path,
-                    meshes: model
-                        .meshes
-                        .iter()
-                        .map(|mesh| PhysicsModelMesh {
-                            positions: mesh
-                                .vertices
-                                .iter()
-                                .map(|vertex| glam::Vec3::from_array(vertex.position))
-                                .collect(),
-                            indices: mesh.indices.clone(),
-                        })
-                        .collect(),
-                })
-            })
+            .map(|path| collider_geometry(assets, path))
             .collect()
     }
 
@@ -411,6 +605,7 @@ impl PlaySession {
             templates,
             catalog,
             mut sources,
+            resources,
         } = prefabs;
         for object in world.objects() {
             for script in &object.lite_scripts {
@@ -471,6 +666,7 @@ impl PlaySession {
             frame: 0,
             last_tick: Instant::now(),
             input: ScriptInput::default(),
+            heavy: HeavyLoads::new(resources),
         })
     }
 
@@ -529,6 +725,8 @@ impl PlaySession {
     }
 
     fn step(&mut self, dt: f32) -> Result<(), String> {
+        // Регистрация готового префаба не выполняет кадр, поэтому её можно делать и на паузе.
+        self.receive_heavy_replies();
         if self.paused {
             return Ok(());
         }
@@ -570,26 +768,41 @@ impl PlaySession {
         Ok(())
     }
 
-    /// Применяет spawn и destroy, закоммиченные скриптами: удаляет тела, вставляет тела новых
-    /// объектов, ставит им скорости и запускает звук. Порядок тот же, что в `rve-runtime`:
-    /// тела удаляются и вставляются до синхронизации поз, поэтому новые тела не телепортируются.
-    /// Отказ физики откатывает spawn; тело до вставки не создаётся, поэтому удалять нечего.
+    /// Применяет закоммиченные скриптами изменения мира: spawn, destroy и заявки тяжёлых
+    /// префабов. Порядок тот же, что в `rve-runtime`: тела удаляются и вставляются до
+    /// синхронизации поз, поэтому новые тела не телепортируются. Выгрузка может сразу запросить
+    /// новую загрузку (отложенный spawn), поэтому заявки вычитываются, пока очередь не опустеет.
     fn apply_world_changes(&mut self) {
-        let changes = self.host.drain_world_changes();
-        if changes.spawned.is_empty() && changes.despawned.is_empty() {
+        loop {
+            let WorldChanges {
+                spawned,
+                despawned,
+                prefab_requests,
+            } = self.host.drain_world_changes();
+            if spawned.is_empty() && despawned.is_empty() && prefab_requests.is_empty() {
+                return;
+            }
+            self.apply_spawns(spawned, &despawned);
+            self.apply_prefab_requests(prefab_requests);
+        }
+    }
+
+    /// Вставляет тела spawn-объектов и удаляет тела уничтоженных. Отказ физики откатывает spawn;
+    /// тело до вставки не создаётся, поэтому удалять нечего.
+    fn apply_spawns(&mut self, spawned: Vec<SpawnedObject>, despawned: &[ObjectHandle]) {
+        if spawned.is_empty() && despawned.is_empty() {
             return;
         }
-        let mut requests: Vec<AudioRequest> = changes
-            .despawned
+        let mut requests: Vec<AudioRequest> = despawned
             .iter()
             .map(|&object| AudioRequest::StopSource { object })
             .collect();
         if let Some(physics) = &mut self.physics {
             physics
                 .changes
-                .extend(physics.sync.remove_objects(&changes.despawned));
+                .extend(physics.sync.remove_objects(despawned));
         }
-        for spawned in &changes.spawned {
+        for spawned in &spawned {
             // Объект, созданный и удалённый в одной фазе, уже не жив: тело и звук ему не нужны.
             if !self.world.is_alive(spawned.handle) {
                 continue;
@@ -640,6 +853,77 @@ impl PlaySession {
         if let Some(audio) = &mut self.audio {
             audio.bridge.apply(requests, &self.world);
         }
+    }
+
+    /// Выполняет заявки хоста на тяжёлые префабы. Загрузку запускает фоновый поток; выгрузка
+    /// снимает геометрию физики и сообщает хосту, что ресурсы ушли.
+    fn apply_prefab_requests(&mut self, requests: Vec<PrefabRequest>) {
+        for request in requests {
+            match request {
+                PrefabRequest::Load(path) => {
+                    if let Err(error) = self.heavy.start(&path) {
+                        self.host.prefab_failed(&self.world, &path, &error);
+                    }
+                }
+                PrefabRequest::Unload(path) => {
+                    let models = self.heavy.forget(&path);
+                    if let Some(physics) = &mut self.physics {
+                        physics.remove_heavy_geometry(&models);
+                    }
+                    self.host.prefab_released(&path);
+                }
+            }
+        }
+    }
+
+    /// Забирает готовые ответы фоновых загрузок, не дожидаясь их.
+    fn receive_heavy_replies(&mut self) {
+        while let Some(reply) = self.heavy.try_reply() {
+            self.apply_heavy_reply(reply);
+        }
+    }
+
+    /// Регистрирует загруженный префаб и добавляет его геометрию в физику. Неудачная загрузка
+    /// или регистрация переводит префаб в `failed`: его ожидающие spawn получают Error. Ответ
+    /// устаревшей загрузки отбрасывается.
+    fn apply_heavy_reply(&mut self, reply: HeavyReply) {
+        let HeavyReply {
+            path,
+            load_id,
+            result,
+        } = reply;
+        if !self.heavy.is_current(&path, load_id) {
+            return;
+        }
+        self.heavy.finish(&path);
+        let HeavyPrefab {
+            template,
+            sources,
+            geometry,
+        } = match result {
+            Ok(prefab) => prefab,
+            Err(error) => {
+                self.host.prefab_failed(&self.world, &path, &error);
+                return;
+            }
+        };
+        // Регистрация компилирует Lua шаблона: зависший top-level chunk прерывает watchdog.
+        self.watchdog
+            .set_deadline(Some(Instant::now() + self.time_limit));
+        let registered = self
+            .host
+            .register_prefab(&self.world, &path, template, &sources);
+        self.watchdog.set_deadline(None);
+        if let Err(error) = registered {
+            self.host
+                .prefab_failed(&self.world, &path, &error.to_string());
+            return;
+        }
+        let models = geometry.iter().map(|model| model.path.clone()).collect();
+        if let Some(physics) = &mut self.physics {
+            physics.add_heavy_geometry(geometry);
+        }
+        self.heavy.mark_loaded(&path, models);
     }
 
     fn script_time(&self) -> ScriptTime {
@@ -727,6 +1011,9 @@ struct PlayPhysics {
     sync: PhysicsSceneSync,
     /// Геометрия мешевых коллайдеров: по ней вставляются тела spawn-объектов.
     geometry: Vec<ModelGeometry>,
+    /// Сколько загруженных тяжёлых префабов ссылаются на модель, добавленную ими в `geometry`.
+    /// Модели сцены сюда не попадают и никогда не удаляются.
+    heavy_users: BTreeMap<String, usize>,
     /// Формы мешей spawn-объектов; переиспользуются между spawn одной модели.
     shapes: ShapeCache,
     /// Вставки и удаления тел, которые уйдут в ближайший `step_with_changes`.
@@ -764,6 +1051,7 @@ impl PlayPhysics {
                 client: PhysicsClient::new_preinitialized(request_tx, reply_rx),
                 sync,
                 geometry,
+                heavy_users: BTreeMap::new(),
                 shapes: ShapeCache::default(),
                 changes: Vec::new(),
                 velocities: Vec::new(),
@@ -773,6 +1061,38 @@ impl PlayPhysics {
             },
             snapshot,
         ))
+    }
+
+    /// Добавляет геометрию тяжёлого префаба. Модель, которая уже есть в `geometry`, не
+    /// дублируется: её ссылки считаются, но выгрузка удаляет только модели тяжёлых префабов.
+    fn add_heavy_geometry(&mut self, models: Vec<ModelGeometry>) {
+        for model in models {
+            if let Some(users) = self.heavy_users.get_mut(&model.path) {
+                *users += 1;
+                continue;
+            }
+            if self.geometry.iter().any(|known| known.path == model.path) {
+                continue;
+            }
+            self.heavy_users.insert(model.path.clone(), 1);
+            self.geometry.push(model);
+        }
+    }
+
+    /// Снимает ссылки выгруженного префаба. Модель уходит вместе с формами кэша, когда её больше
+    /// никто не использует. Модели сцены и быстрых префабов не трогаются.
+    fn remove_heavy_geometry(&mut self, paths: &[String]) {
+        for path in paths {
+            let Some(users) = self.heavy_users.get_mut(path) else {
+                continue;
+            };
+            *users -= 1;
+            if *users == 0 {
+                self.heavy_users.remove(path);
+                self.geometry.retain(|model| &model.path != path);
+                self.shapes.remove_model(path);
+            }
+        }
     }
 
     fn receive(&mut self, world: &mut World, host: &mut ScriptHost) -> Result<(), String> {
@@ -838,7 +1158,11 @@ fn physics_error_event(message: String) -> ScriptEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_project::InputAction;
+    use engine_project::{InputAction, PrefabCatalogEntry};
+    use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
+    use engine_script::PrefabStatus;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
 
     const SCENE: &str = r#"
 [[assets]]
@@ -1301,7 +1625,8 @@ spatial = true
     fn start_with_prefabs(source: &str, files: &[(&str, &str)]) -> Result<PlaySession, String> {
         let document = document(source);
         let mut read = files_reader(files);
-        let (prefabs, warnings) = PlayPrefabs::load(&document, &mut read, &[]);
+        let (prefabs, warnings) =
+            PlayPrefabs::load(&document, &mut read, &[], &PrefabCatalogFile::default());
         assert!(warnings.is_empty(), "{warnings:?}");
         let world = World::from_document(&document).map_err(|error| error.to_string())?;
         PlaySession::start_with_world_limit(
@@ -1507,7 +1832,8 @@ id = "camera"
         ];
         let document = document(source);
         let mut read = files_reader(&files);
-        let (prefabs, warnings) = PlayPrefabs::load(&document, &mut read, &[]);
+        let heavy = PrefabCatalogFile::default();
+        let (prefabs, warnings) = PlayPrefabs::load(&document, &mut read, &[], &heavy);
         assert!(prefabs.catalog.get("prefabs/ball.rveprefab").is_some());
         assert!(prefabs.catalog.get("prefabs/broken.rveprefab").is_none());
         assert!(prefabs.catalog.get("prefabs/cam.rveprefab").is_none());
@@ -1516,7 +1842,308 @@ id = "camera"
 
         // Префаб с камерой, который экземпляр сцены использует как есть, предупреждения не даёт.
         let instanced = [VirtualPath::parse("prefabs/cam.rveprefab").unwrap()];
-        let (_, warnings) = PlayPrefabs::load(&document, &mut read, &instanced);
+        let (_, warnings) = PlayPrefabs::load(&document, &mut read, &instanced, &heavy);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    const BALL: &str = "prefabs/ball.rveprefab";
+    const HEAVY_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Сцена без быстрых префабов: только скрипт-спавнер.
+    const HEAVY_SCENE: &str = r#"
+[[assets]]
+path = "/spawner.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "gun"
+[[objects.lite_scripts]]
+path = "/spawner.lua"
+"#;
+
+    const SPAWN_MISSING: &str = r#"
+local Spawner = {}
+local spawned = false
+function Spawner:on_update(dt)
+  if not spawned then
+    spawned = true
+    rve.spawn("prefabs/missing.rveprefab", { id = "shot" })
+  end
+end
+return Spawner
+"#;
+
+    const SPAWN_CAMERA: &str = r#"
+local Spawner = {}
+local spawned = false
+function Spawner:on_update(dt)
+  if not spawned then
+    spawned = true
+    rve.spawn("prefabs/cam.rveprefab", { id = "shot" })
+  end
+end
+return Spawner
+"#;
+
+    const CAMERA_PREFAB: &str = "[[objects]]\nid = \"cam\"\n[objects.camera]\n";
+
+    /// Создаёт шар в первом кадре, выгружает префаб во втором и уничтожает шар в третьем.
+    const SPAWN_UNLOAD_DESTROY: &str = r#"
+local Spawner = {}
+local step = 0
+function Spawner:on_update(dt)
+  step = step + 1
+  if step == 1 then rve.spawn("prefabs/ball.rveprefab", { id = "shot" }) end
+  if step == 2 then rve.prefabs.unload("prefabs/ball.rveprefab") end
+  if step == 3 then rve.destroy("shot") end
+end
+return Spawner
+"#;
+
+    /// Список проекта с путями без `max_instances`.
+    fn heavy_catalog(paths: &[&str]) -> PrefabCatalogFile {
+        PrefabCatalogFile {
+            prefabs: paths
+                .iter()
+                .map(|path| PrefabCatalogEntry {
+                    path: (*path).to_owned(),
+                    archive: None,
+                    max_instances: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Временный каталог `Assets` с `files`. Файлы читаются через `ResourceSystem`, как в
+    /// редакторе; каталог удаляется вместе с объектом.
+    struct TempAssets {
+        parent: PathBuf,
+        resources: ResourceSystem,
+    }
+
+    impl TempAssets {
+        fn new(files: &[(&str, &str)]) -> Self {
+            static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+            let parent = std::env::temp_dir().join(format!(
+                "rve-play-heavy-{}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            let root = parent.join("Assets");
+            std::fs::create_dir_all(&root).unwrap();
+            for (name, text) in files {
+                let file = root.join(name);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, text).unwrap();
+            }
+            let resources = ResourceSystem::start(ResourceConfig {
+                root,
+                source_mode: SourceMode::Loose,
+                ..ResourceConfig::default()
+            })
+            .unwrap();
+            Self { parent, resources }
+        }
+
+        fn handle(&self) -> ResourceHandle {
+            self.resources.handle()
+        }
+    }
+
+    impl Drop for TempAssets {
+        fn drop(&mut self) {
+            let _ = self.resources.shutdown();
+            let _ = std::fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    /// Запускает Play со сценой `source`; тяжёлые префабы из `catalog` грузятся из `assets`.
+    fn start_heavy(source: &str, assets: &TempAssets, catalog: &PrefabCatalogFile) -> PlaySession {
+        let document = document(source);
+        let handle = assets.handle();
+        let mut read = |path: &str| read_resource_text(&handle, path);
+        let (prefabs, warnings) = PlayPrefabs::load(&document, &mut read, &[], catalog);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let world = World::from_document(&document).unwrap();
+        PlaySession::start_with_world_limit(
+            &document,
+            world,
+            None,
+            &InputSettings::default(),
+            read,
+            prefabs.with_resources(assets.handle()),
+            Vec::new(),
+            &PhysicsSettings::default(),
+            SCRIPT_TIME_LIMIT,
+            AudioConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// Ждёт ответа фоновой загрузки и применяет его, как это делает `step`.
+    fn finish_heavy_load(session: &mut PlaySession) {
+        let reply = session
+            .heavy
+            .replies
+            .recv_timeout(HEAVY_TEST_TIMEOUT)
+            .expect("фоновая загрузка ответила");
+        session.apply_heavy_reply(reply);
+    }
+
+    fn spawned_ball(session: &mut PlaySession) -> Option<ObjectHandle> {
+        session
+            .world_mut()
+            .objects()
+            .iter()
+            .find(|object| object.id.starts_with("ball@"))
+            .map(|object| object.handle)
+    }
+
+    #[test]
+    fn heavy_spawn_waits_for_its_load_then_appears_and_starts_on_the_next_tick() {
+        let assets = TempAssets::new(&ball_files(SPAWN_ONCE));
+        let mut session = start_heavy(
+            HEAVY_SCENE,
+            &assets,
+            &heavy_catalog(&["/prefabs/ball.rveprefab"]),
+        );
+        session.step(0.1).unwrap();
+        assert!(spawned_ball(&mut session).is_none());
+        assert_eq!(
+            session.host.prefab_status(BALL),
+            Some(PrefabStatus::Loading)
+        );
+
+        finish_heavy_load(&mut session);
+        session.step(0.1).unwrap();
+        assert!(spawned_ball(&mut session).is_some());
+        assert!(!has_message(&mut session, "ball start"));
+
+        session.step(0.1).unwrap();
+        assert!(has_message(&mut session, "ball start"));
+        session.stop();
+    }
+
+    /// Spawn префаба, который не загрузится: объект мёртв, причина попадает в Error-события.
+    fn assert_heavy_spawn_fails(files: &[(&str, &str)], path: &str) {
+        let assets = TempAssets::new(files);
+        let mut session = start_heavy(HEAVY_SCENE, &assets, &heavy_catalog(&[path]));
+        session.step(0.1).unwrap();
+        finish_heavy_load(&mut session);
+        assert_eq!(
+            session.host.prefab_status(path.trim_start_matches('/')),
+            Some(PrefabStatus::Failed)
+        );
+        assert!(session.world_mut().handle("shot").is_none());
+        let events = session.drain_events();
+        assert!(
+            events.iter().any(|event| {
+                event.level == engine_script::ScriptEventLevel::Error
+                    && event.message.contains("failed to load")
+            }),
+            "{events:?}"
+        );
+        session.stop();
+    }
+
+    #[test]
+    fn heavy_prefab_that_cannot_be_read_kills_its_pending_spawn_with_an_error() {
+        assert_heavy_spawn_fails(
+            &[("spawner.lua", SPAWN_MISSING)],
+            "/prefabs/missing.rveprefab",
+        );
+    }
+
+    #[test]
+    fn heavy_prefab_with_a_camera_is_rejected_when_it_loads() {
+        assert_heavy_spawn_fails(
+            &[
+                ("spawner.lua", SPAWN_CAMERA),
+                ("prefabs/cam.rveprefab", CAMERA_PREFAB),
+            ],
+            "/prefabs/cam.rveprefab",
+        );
+    }
+
+    #[test]
+    fn unloading_after_the_last_instance_is_destroyed_returns_the_prefab_to_unloaded() {
+        let assets = TempAssets::new(&ball_files(SPAWN_UNLOAD_DESTROY));
+        let mut session = start_heavy(
+            HEAVY_SCENE,
+            &assets,
+            &heavy_catalog(&["/prefabs/ball.rveprefab"]),
+        );
+        session.step(0.1).unwrap();
+        finish_heavy_load(&mut session);
+        // Выгрузка ждёт объект: пока он жив, префаб остаётся загруженным.
+        session.step(0.1).unwrap();
+        assert!(session.world_mut().handle("shot").is_some());
+        assert_eq!(session.host.prefab_status(BALL), Some(PrefabStatus::Loaded));
+
+        session.step(0.1).unwrap();
+        assert!(session.world_mut().handle("shot").is_none());
+        assert_eq!(
+            session.host.prefab_status(BALL),
+            Some(PrefabStatus::Unloaded)
+        );
+        session.stop();
+    }
+
+    #[test]
+    fn a_fast_prefab_of_the_scene_takes_precedence_over_the_project_list() {
+        let assets = TempAssets::new(&ball_files(SPAWN_ONCE));
+        let mut session = start_heavy(
+            BALL_SCENE,
+            &assets,
+            &heavy_catalog(&["/prefabs/ball.rveprefab"]),
+        );
+        session.step(0.1).unwrap();
+        assert_eq!(
+            session.host.prefab_status(BALL),
+            Some(PrefabStatus::Resident)
+        );
+        assert!(spawned_ball(&mut session).is_some());
+        assert!(session.heavy.pending.is_empty());
+        session.stop();
+    }
+
+    #[test]
+    fn a_reply_of_a_superseded_load_is_discarded() {
+        let assets = TempAssets::new(&ball_files(SPAWN_ONCE));
+        let mut session = start_heavy(
+            HEAVY_SCENE,
+            &assets,
+            &heavy_catalog(&["/prefabs/ball.rveprefab"]),
+        );
+        session.step(0.1).unwrap();
+        let current = session.heavy.pending[BALL];
+        session.apply_heavy_reply(HeavyReply {
+            path: BALL.to_owned(),
+            load_id: current + 1,
+            result: Err("устаревший ответ".to_owned()),
+        });
+        assert_eq!(
+            session.host.prefab_status(BALL),
+            Some(PrefabStatus::Loading)
+        );
+        assert!(session.drain_events().is_empty());
+
+        finish_heavy_load(&mut session);
+        assert_eq!(session.host.prefab_status(BALL), Some(PrefabStatus::Loaded));
+        session.stop();
+    }
+
+    #[test]
+    fn dropping_play_does_not_wait_for_a_heavy_load_in_progress() {
+        let assets = TempAssets::new(&ball_files(SPAWN_ONCE));
+        let mut session = start_heavy(
+            HEAVY_SCENE,
+            &assets,
+            &heavy_catalog(&["/prefabs/ball.rveprefab"]),
+        );
+        session.step(0.1).unwrap();
+        assert!(session.heavy.pending.contains_key(BALL));
+        drop(session);
     }
 }

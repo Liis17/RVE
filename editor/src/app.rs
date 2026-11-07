@@ -19,6 +19,7 @@ use engine_console::{
     CommandCatalog, ConsoleBuffer, ConsoleLevel, ConsoleLine, install_logger, parse_command_line,
 };
 use engine_files::VirtualPath;
+use engine_project::{PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile};
 use engine_render::{
     FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
 };
@@ -934,11 +935,20 @@ impl EditorApp {
         let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
             return;
         };
+        let heavy = match PrefabCatalogFile::load(project.root.join(PREFAB_CATALOG_FILE_NAME)) {
+            Ok(heavy) => heavy,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
         let (prefabs, warnings) = PlayPrefabs::load(
             scene.view(),
             &mut |path| project.read_text(path),
             scene.instanced_prefabs(),
+            &heavy,
         );
+        let prefabs = prefabs.with_resources(project.resource_handle());
         let needs_library = prefabs.has_heavy_scripts()
             || scene
                 .view()
