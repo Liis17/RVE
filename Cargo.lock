@@ -716,6 +716,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-animation"
+version = "0.1.0"
+dependencies = [
+ "engine-assets",
+ "glam",
+ "ufbx",
+]
+
+[[package]]
 name = "engine-assets"
 version = "0.2.0"
 dependencies = [
