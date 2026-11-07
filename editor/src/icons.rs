@@ -1,5 +1,7 @@
-//! Иконки папок для панели Project: растеризованы из `IconsPack` при сборке (`build.rs`).
+//! Иконки панели Project и компонентов Inspector: растеризованы из `IconsPack` при сборке (`build.rs`).
 
+use crate::assets_fs::AssetKind;
+use crate::scene_edit::ComponentKind;
 use engine_render::{RenderError, Renderer};
 use engine_ui::render::UiBridge;
 use std::collections::HashMap;
@@ -24,6 +26,23 @@ pub fn folder_icon(name: &str, has_children: bool) -> &'static str {
         (_, false) if name.eq_ignore_ascii_case("settings") => "Folders/folder-settings-empty",
         (_, true) => "Folders/folder-files",
         (_, false) => "Folders/folder-empty",
+    }
+}
+
+/// Иконка плитки файла; `None` — плитка показывает превью или заглушку по типу.
+pub fn file_icon(kind: AssetKind) -> Option<&'static str> {
+    match kind {
+        AssetKind::CameraSettings => Some("camera-settings"),
+        _ => None,
+    }
+}
+
+/// Иконка в заголовке компонента Inspector; `None` — заголовок без иконки.
+pub fn component_icon(kind: ComponentKind) -> Option<&'static str> {
+    match kind {
+        ComponentKind::Transform => Some("rve-gizmo"),
+        ComponentKind::Camera => Some("camera"),
+        _ => None,
     }
 }
 
@@ -85,6 +104,26 @@ mod tests {
                 let icon = folder_icon(name, has_children);
                 assert!(SOURCES.iter().any(|source| source.name == icon), "{icon}");
             }
+        }
+    }
+
+    #[test]
+    fn transform_camera_and_camera_settings_have_icons_in_the_generated_list() {
+        assert_eq!(component_icon(ComponentKind::Transform), Some("rve-gizmo"));
+        assert_eq!(component_icon(ComponentKind::Camera), Some("camera"));
+        assert_eq!(component_icon(ComponentKind::MeshRenderer), None);
+        assert_eq!(
+            file_icon(AssetKind::CameraSettings),
+            Some("camera-settings")
+        );
+        assert_eq!(file_icon(AssetKind::Scene), None);
+        for icon in [
+            component_icon(ComponentKind::Transform),
+            component_icon(ComponentKind::Camera),
+            file_icon(AssetKind::CameraSettings),
+        ] {
+            let icon = icon.unwrap();
+            assert!(SOURCES.iter().any(|source| source.name == icon), "{icon}");
         }
     }
 

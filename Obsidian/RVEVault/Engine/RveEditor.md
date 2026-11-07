@@ -26,7 +26,7 @@ Parent: [[Index]]
 | `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` |
 | `editor/src/new_project.rs` | `create_project` | Встроенный starter template и атомарное создание нового проекта |
 | `editor/src/previews.rs` | `PreviewCache` | Фоновое декодирование PNG/Radiance HDR, tone mapping HDR thumbnails и LRU-кэш UI-текстур |
-| `editor/src/icons.rs` | `IconCache`, `folder_icon` | Иконки папок из `IconsPack/Folders`: выбор по имени и содержимому, загрузка UI-текстур один раз |
+| `editor/src/icons.rs` | `IconCache`, `folder_icon`, `file_icon`, `component_icon` | Иконки из `IconsPack`: выбор для папок, файлов Project и заголовков компонентов Inspector, загрузка UI-текстур один раз |
 | `editor/build.rs` | — | Растеризация `IconsPack/**/*.svg` через resvg в RGBA 128×128 на этапе сборки |
 | `editor/src/build.rs` | `BuildJob`, `ScriptsJob`, `ScriptGeneration`, `locate_build_tool` | File → Build Player и автоматическая сборка heavy scripts через дочерний `rve-build`; вывод идёт в Console |
 | `editor/src/play.rs` | `PlaySession`, `PlayPhysics`, `Watchdog` | Копия мира, скрипты и per-Play physics thread, прерывание зависшего Lua |
@@ -213,7 +213,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 
 Плитки папок в Project показывают иконки из `IconsPack/Folders`. Растеризация идёт в `editor/build.rs` (resvg как build-dependency, в рантайм не попадает): каждый `IconsPack/**/*.svg` превращается в предумноженный RGBA8 128×128 и получает имя без расширения (`Folders/folder-git`). Добавленный или изменённый SVG попадает в следующую сборку редактора. Отсутствующий каталог даёт пустой список, и папки рисуются заглушкой `DIR`; пока каталога нет, build script выполняется при каждой сборке. Ошибка разбора SVG валит сборку. UI-текстуры загружаются один раз после создания renderer и живут до выхода.
 
-Выбор иконки (`icons::folder_icon`): `.git` → `folder-git`, `settings` без учёта регистра → `folder-settings`, остальные папки → `folder-files`. Папка без содержимого (пустой `AssetEntry::children`) получает суффикс `-empty` (`folder-git-empty`, `folder-settings-empty`, `folder-empty`). Файлы по-прежнему показывают превью или заглушку по типу. Подписи плиток центрируются. Дерево папок выводит ту же иконку перед подписью (высота равна высоте строки); без загруженной текстуры остаётся одна подпись.
+Выбор иконки (`icons::folder_icon`): `.git` → `folder-git`, `settings` без учёта регистра → `folder-settings`, остальные папки → `folder-files`. Папка без содержимого (пустой `AssetEntry::children`) получает суффикс `-empty` (`folder-git-empty`, `folder-settings-empty`, `folder-empty`). Файлы выбирают иконку через `icons::file_icon`: `.camerasettings` → `camera-settings`; у PNG/HDR превью важнее иконки, остальные типы без иконки показывают заглушку по типу. Заголовки компонентов Inspector выводят иконку из `icons::component_icon` перед подписью (высота равна высоте строки): Transform → `rve-gizmo`, Camera → `camera`; у остальных компонентов и скриптов иконки нет. Подписи плиток центрируются. Дерево папок выводит ту же иконку перед подписью (высота равна высоте строки); без загруженной текстуры остаётся одна подпись.
 
 ## Автосохранение
 

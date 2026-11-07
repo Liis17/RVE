@@ -1,6 +1,7 @@
 //! Панель Inspector: поля и компоненты выбранного объекта.
 
 use crate::assets_fs::AssetKind;
+use crate::icons;
 use crate::scene_edit::{
     Component, ComponentKind, OverrideField, default_environment, default_light,
 };
@@ -311,7 +312,10 @@ fn show_transform(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObje
     let menu = component_menu(state, id, ComponentKind::Transform);
     let action = component_header(
         ui,
-        "Transform",
+        HeaderTitle {
+            text: "Transform",
+            icon: component_icon(state, ComponentKind::Transform),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -395,10 +399,22 @@ fn run_menu_action(state: &mut EditorState, id: &str, kind: ComponentKind, actio
     }
 }
 
-/// Заголовок компонента: кнопка удаления и контекстное меню Reset/Copy/Paste по щелчку ПКМ.
+/// Подпись заголовка компонента и иконка перед ней.
+#[derive(Clone, Copy)]
+struct HeaderTitle<'a> {
+    text: &'a str,
+    icon: Option<egui::TextureId>,
+}
+
+/// Загруженная иконка компонента; без рисунка или до загрузки — `None`.
+fn component_icon(state: &EditorState, kind: ComponentKind) -> Option<egui::TextureId> {
+    icons::component_icon(kind).and_then(|name| state.icons.get(name))
+}
+
+/// Заголовок компонента: иконка (если есть), кнопка удаления и контекстное меню Reset/Copy/Paste по щелчку ПКМ.
 fn component_header(
     ui: &mut egui::Ui,
-    title: &str,
+    title: HeaderTitle<'_>,
     salt: impl std::hash::Hash + std::fmt::Debug,
     mark: Mark,
     menu: Option<ComponentMenu>,
@@ -406,11 +422,19 @@ fn component_header(
     body: impl FnOnce(&mut egui::Ui),
 ) -> HeaderAction {
     let mut action = HeaderAction::None;
-    let id = ui.make_persistent_id(("component", title, salt));
+    let id = ui.make_persistent_id(("component", title.text, salt));
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
         .show_header(ui, |ui| {
+            if let Some(texture) = title.icon {
+                let size = ui.spacing().interact_size.y;
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    texture,
+                    egui::vec2(size, size),
+                )));
+            }
             let label = ui.add(
-                egui::Label::new(marked_text(title, mark.overridden)).sense(egui::Sense::click()),
+                egui::Label::new(marked_text(title.text, mark.overridden))
+                    .sense(egui::Sense::click()),
             );
             if let Some(menu) = menu {
                 label.context_menu(|ui| {
@@ -453,7 +477,10 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
     let menu = component_menu(state, id, ComponentKind::Camera);
     let action = component_header(
         ui,
-        "Camera",
+        HeaderTitle {
+            text: "Camera",
+            icon: component_icon(state, ComponentKind::Camera),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -592,7 +619,10 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     let menu = component_menu(state, id, ComponentKind::MeshRenderer);
     let action = component_header(
         ui,
-        "Mesh Renderer",
+        HeaderTitle {
+            text: "Mesh Renderer",
+            icon: component_icon(state, ComponentKind::MeshRenderer),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -909,7 +939,10 @@ fn show_lod_group(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObje
     let menu = component_menu(state, id, ComponentKind::LodGroup);
     let action = component_header(
         ui,
-        "LOD Group",
+        HeaderTitle {
+            text: "LOD Group",
+            icon: component_icon(state, ComponentKind::LodGroup),
+        },
         id,
         Mark {
             locked,
@@ -1049,7 +1082,10 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
     let menu = component_menu(state, id, ComponentKind::DirectionalLight);
     let action = component_header(
         ui,
-        "Directional Light",
+        HeaderTitle {
+            text: "Directional Light",
+            icon: component_icon(state, ComponentKind::DirectionalLight),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -1118,7 +1154,10 @@ fn show_point_light(
     let field = OverrideField::PointLight;
     let action = component_header(
         ui,
-        "Point Light",
+        HeaderTitle {
+            text: "Point Light",
+            icon: component_icon(state, ComponentKind::PointLight),
+        },
         id,
         mark(state, id, field.clone()),
         Some(component_menu(state, id, ComponentKind::PointLight)),
@@ -1182,7 +1221,10 @@ fn show_spot_light(
     let field = OverrideField::SpotLight;
     let action = component_header(
         ui,
-        "Spot Light",
+        HeaderTitle {
+            text: "Spot Light",
+            icon: component_icon(state, ComponentKind::SpotLight),
+        },
         id,
         mark(state, id, field.clone()),
         Some(component_menu(state, id, ComponentKind::SpotLight)),
@@ -1341,7 +1383,10 @@ fn show_collider(
     let menu = component_menu(state, id, ComponentKind::Collider);
     let action = component_header(
         ui,
-        "Collider",
+        HeaderTitle {
+            text: "Collider",
+            icon: component_icon(state, ComponentKind::Collider),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -1456,7 +1501,10 @@ fn show_rigid_body(ui: &mut egui::Ui, state: &mut EditorState, id: &str, body: R
     let menu = component_menu(state, id, ComponentKind::RigidBody);
     let action = component_header(
         ui,
-        "Rigid Body",
+        HeaderTitle {
+            text: "Rigid Body",
+            icon: component_icon(state, ComponentKind::RigidBody),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -1538,7 +1586,10 @@ fn show_character_controller(
     let menu = component_menu(state, id, ComponentKind::CharacterController);
     let action = component_header(
         ui,
-        "Character Controller",
+        HeaderTitle {
+            text: "Character Controller",
+            icon: component_icon(state, ComponentKind::CharacterController),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -1611,7 +1662,10 @@ fn show_environment(
     let field = OverrideField::Environment;
     let action = component_header(
         ui,
-        "Environment",
+        HeaderTitle {
+            text: "Environment",
+            icon: component_icon(state, ComponentKind::Environment),
+        },
         id,
         mark(state, id, field.clone()),
         Some(component_menu(state, id, ComponentKind::Environment)),
@@ -1786,7 +1840,10 @@ fn show_lite_script(
     let mut reset = None;
     let action = component_header(
         ui,
-        &title,
+        HeaderTitle {
+            text: &title,
+            icon: None,
+        },
         (id, index),
         mark(state, id, field.clone()),
         None,
@@ -1851,7 +1908,10 @@ fn show_heavy_script(
     let mut reset = None;
     let action = component_header(
         ui,
-        &title,
+        HeaderTitle {
+            text: &title,
+            icon: None,
+        },
         (id, index),
         mark(state, id, field.clone()),
         None,
