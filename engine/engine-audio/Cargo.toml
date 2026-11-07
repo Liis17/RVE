@@ -13,6 +13,7 @@ engine-resources = { path = "../engine-resources" }
 engine-scene = { path = "../engine-scene" }
 flume.workspace = true
 lewton.workspace = true
+rtrb.workspace = true
 log.workspace = true
 
 [dev-dependencies]

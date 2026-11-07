@@ -185,7 +185,7 @@ struct Harness {
     handle: AudioHandle,
     commands: Receiver<Command>,
     core: Core,
-    mixer: Receiver<MixerCommand>,
+    mixer: rtrb::Consumer<MixerCommand>,
     decode_jobs: Receiver<DecodeJob>,
     reads: flume::Sender<Result<Vec<u8>, String>>,
     reads_started: Arc<AtomicUsize>,
@@ -212,7 +212,7 @@ impl Harness {
                 Err(flume::TryRecvError::Disconnected) => Some(Err("канал закрыт".to_owned())),
             }) as ReadPoll)
         });
-        let (mixer_tx, mixer) = flume::unbounded();
+        let (mixer_tx, mixer) = RingBuffer::new(MIXER_CAPACITY);
         let (decode_tx, decode_jobs) = flume::unbounded();
         let core = Core {
             lanes,
@@ -224,6 +224,7 @@ impl Harness {
             failed: HashSet::new(),
             pending: Vec::new(),
             mixer: Some(mixer_tx),
+            outbox: VecDeque::new(),
             events: events_tx,
             decode_tx,
         };
@@ -256,6 +257,11 @@ impl Harness {
     fn reads(&self) -> usize {
         self.reads_started.load(AtomicOrdering::Relaxed)
     }
+
+    /// Команды, дошедшие до кольца микшера, в порядке отправки.
+    fn sent(&mut self) -> Vec<MixerCommand> {
+        std::iter::from_fn(|| self.mixer.pop().ok()).collect()
+    }
 }
 
 #[test]
@@ -267,7 +273,7 @@ fn stop_before_the_clip_loads_cancels_the_play() {
     h.handle.stop(voice(1)).unwrap();
     h.reads.send(Ok(wav_bytes(2205))).unwrap();
     h.step();
-    let sent: Vec<MixerCommand> = h.mixer.try_iter().collect();
+    let sent = h.sent();
     assert!(
         sent.iter()
             .all(|command| matches!(command, MixerCommand::Stop { .. })),
@@ -284,15 +290,15 @@ fn ready_clip_is_sent_to_the_mixer_on_its_lane_and_cached_for_later_plays() {
         .unwrap();
     h.reads.send(Ok(wav_bytes(2205))).unwrap();
     h.step();
-    match h.mixer.try_recv() {
-        Ok(MixerCommand::Play {
+    match h.sent().as_slice() {
+        [MixerCommand::Play {
             voice: id,
             lane,
             clip,
             ..
-        }) => {
-            assert_eq!(id, voice(1));
-            assert_eq!(lane, 0);
+        }] => {
+            assert_eq!(*id, voice(1));
+            assert_eq!(*lane, 0);
             assert_eq!(clip.frames(), 2205);
         }
         other => panic!("ожидалась команда Play: {other:?}"),
@@ -303,8 +309,8 @@ fn ready_clip_is_sent_to_the_mixer_on_its_lane_and_cached_for_later_plays() {
         .unwrap();
     h.step();
     assert!(matches!(
-        h.mixer.try_recv(),
-        Ok(MixerCommand::Play { voice: id, .. }) if id == voice(2)
+        h.sent().as_slice(),
+        [MixerCommand::Play { voice: id, .. }] if *id == voice(2)
     ));
     assert_eq!(h.reads(), 1, "второй запуск берёт клип из кеша");
 }
@@ -318,7 +324,7 @@ fn a_clip_that_cannot_be_read_releases_its_lane_and_plays_nothing() {
     h.reads.send(Err("не найден".to_owned())).unwrap();
     h.step();
     assert_eq!(h.handle.lane_of(voice(1)), None);
-    assert!(h.mixer.try_iter().next().is_none());
+    assert!(h.sent().is_empty());
 
     h.handle
         .play(voice(2), "audio/missing.wav", request(false))
@@ -337,7 +343,7 @@ fn corrupt_bytes_fail_the_clip_and_release_its_lane() {
     h.reads.send(Ok(b"not a wav".to_vec())).unwrap();
     h.step();
     assert_eq!(h.handle.lane_of(voice(1)), None);
-    assert!(h.mixer.try_iter().next().is_none());
+    assert!(h.sent().is_empty());
 }
 
 #[test]
@@ -350,7 +356,7 @@ fn clip_over_the_cache_budget_fails_without_panicking() {
     h.reads.send(Ok(wav_bytes(2205))).unwrap();
     h.step();
     assert_eq!(h.handle.lane_of(voice(1)), None);
-    assert!(h.mixer.try_iter().next().is_none());
+    assert!(h.sent().is_empty());
 }
 
 #[test]
@@ -365,7 +371,7 @@ fn stop_all_drops_every_waiting_play() {
     h.handle.stop_all().unwrap();
     h.reads.send(Ok(wav_bytes(2205))).unwrap();
     h.step();
-    let sent: Vec<MixerCommand> = h.mixer.try_iter().collect();
+    let sent = h.sent();
     assert!(
         sent.iter()
             .all(|command| matches!(command, MixerCommand::StopAll)),
@@ -381,7 +387,7 @@ fn ended_voice_frees_its_lane_and_reports_the_event() {
         .unwrap();
     h.reads.send(Ok(wav_bytes(2205))).unwrap();
     h.step();
-    assert!(matches!(h.mixer.try_recv(), Ok(MixerCommand::Play { .. })));
+    assert!(matches!(h.sent().as_slice(), [MixerCommand::Play { .. }]));
     h.core.voice_ended(voice(1));
     assert_eq!(h.handle.lane_of(voice(1)), None);
     assert_eq!(
@@ -398,4 +404,28 @@ fn preload_starts_one_read_per_path() {
         .unwrap();
     h.step();
     assert_eq!(h.reads(), 1);
+}
+
+#[test]
+fn commands_beyond_the_mixer_ring_wait_in_order_and_none_are_lost() {
+    let mut h = Harness::new();
+    let total = MIXER_CAPACITY + 16;
+    for index in 0..total {
+        h.core.send_mixer(MixerCommand::SetGroupVolume {
+            group: AudioGroup::Music,
+            volume: index as f32,
+        });
+    }
+    assert_eq!(h.core.outbox.len(), 16, "кольцо вмещает MIXER_CAPACITY команд");
+    let mut received = h.sent();
+    h.core.flush_mixer();
+    received.extend(h.sent());
+    let volumes: Vec<f32> = received
+        .iter()
+        .map(|command| match command {
+            MixerCommand::SetGroupVolume { volume, .. } => *volume,
+            other => panic!("неожиданная команда: {other:?}"),
+        })
+        .collect();
+    assert_eq!(volumes, (0..total).map(|i| i as f32).collect::<Vec<_>>());
 }

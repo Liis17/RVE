@@ -1,14 +1,15 @@
 //! Вывод на устройство по умолчанию через `cpal`. Тонкая обёртка: вся логика в [`Mixer`].
 //!
-//! Callback не выделяет память: буфер для конвертации в формат устройства создаётся до
-//! запуска потока. Команды читаются пачками по [`COMMANDS_PER_CALLBACK`], завершённые
-//! голоса отдаются через `try_send`; непереданные остаются в микшере до следующего вызова.
+//! Callback не выделяет память, не освобождает память и не берёт блокировок: буфер для
+//! конвертации создаётся до запуска потока, команды и завершённые голоса идут через
+//! SPSC-кольца `rtrb`. Команды читаются пачками по [`COMMANDS_PER_CALLBACK`]; завершённые
+//! голоса, которые не влезли в кольцо, остаются в микшере до следующего вызова.
 
 use crate::mixer::{Mixer, MixerCommand, Spatial};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use engine_scene::VoiceId;
-use flume::{Receiver, Sender};
+use rtrb::{Consumer, Producer};
 use std::sync::Arc;
 
 /// Кадров, которые callback конвертирует за один проход через scratch-буфер.
@@ -24,8 +25,8 @@ pub struct Output {
 /// Открывает устройство вывода по умолчанию и запускает поток. Ошибка не паникует:
 /// вызывающий код выводит предупреждение и работает без звука.
 pub fn open(
-    commands: Receiver<MixerCommand>,
-    ended: Sender<VoiceId>,
+    commands: Consumer<MixerCommand>,
+    ended: Producer<VoiceId>,
     spatial: Arc<Spatial>,
 ) -> Result<Output, String> {
     let host = cpal::default_host();
@@ -58,8 +59,8 @@ pub fn open(
 
 struct CallbackState {
     mixer: Mixer,
-    commands: Receiver<MixerCommand>,
-    ended: Sender<VoiceId>,
+    commands: Consumer<MixerCommand>,
+    ended: Producer<VoiceId>,
 }
 
 fn build<T>(
@@ -76,7 +77,7 @@ where
         config,
         move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
             for _ in 0..COMMANDS_PER_CALLBACK {
-                match state.commands.try_recv() {
+                match state.commands.pop() {
                     Ok(command) => state.mixer.apply(command),
                     Err(_) => break,
                 }
@@ -88,10 +89,10 @@ where
                     *sample = T::from_sample(*value);
                 }
             }
-            let ended = &state.ended;
-            state
-                .mixer
-                .drain_ended(|voice| ended.try_send(voice).is_ok());
+            let CallbackState {
+                mixer, ended, ..
+            } = &mut state;
+            mixer.drain_ended(|voice| ended.push(voice).is_ok());
         },
         |error| log::warn!("ошибка аудиопотока: {error}"),
         None,

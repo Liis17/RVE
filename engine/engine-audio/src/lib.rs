@@ -23,7 +23,8 @@ use engine_resources::{ResourceHandle, ResourceRequest};
 use engine_scene::{AudioGroup, VoiceId};
 use flume::{Receiver, Selector, Sender, TrySendError};
 use mixer::{MixerCommand, Spatial, VOICE_SLOTS};
-use std::collections::{HashMap, HashSet};
+use rtrb::{Consumer, Producer, PushError, RingBuffer};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -32,15 +33,13 @@ use std::time::Duration;
 
 /// Бюджет декодированных клипов в кеше (512 МБ).
 const CACHE_LIMIT_BYTES: usize = 512 * 1024 * 1024;
-/// Ожидание команд, пока есть незавершённые чтения.
+/// Ожидание команд, пока есть незавершённые чтения или микшер (опрос кольца завершённых голосов).
 const READ_POLL: Duration = Duration::from_millis(10);
 /// Ожидание команд без чтений.
 const IDLE_POLL: Duration = Duration::from_millis(500);
-/// Сколько ждать места в очереди микшера, прежде чем отказаться от команды.
-const MIXER_SEND_TIMEOUT: Duration = Duration::from_millis(20);
 const COMMAND_CAPACITY: usize = 1024;
+/// Кольцо команд микшера (поток `rve-audio` → callback).
 const MIXER_CAPACITY: usize = 1024;
-const ENDED_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Default)]
 pub struct AudioConfig {
@@ -299,10 +298,10 @@ pub struct AudioEngine {
     config: AudioConfig,
     commands: Receiver<Command>,
     events_tx: Sender<AudioEvent>,
-    ended_tx: Sender<VoiceId>,
-    ended_rx: Receiver<VoiceId>,
-    mixer_tx: Sender<MixerCommand>,
-    mixer_rx: Receiver<MixerCommand>,
+    ended_tx: Producer<VoiceId>,
+    ended_rx: Consumer<VoiceId>,
+    mixer_tx: Producer<MixerCommand>,
+    mixer_rx: Consumer<MixerCommand>,
     lanes: Arc<Mutex<Lanes>>,
     spatial: Arc<Spatial>,
 }
@@ -311,8 +310,8 @@ impl AudioEngine {
     pub fn new(config: AudioConfig) -> (Self, AudioHandle) {
         let (command_tx, commands) = flume::bounded(COMMAND_CAPACITY);
         let (events_tx, events_rx) = flume::unbounded();
-        let (ended_tx, ended_rx) = flume::bounded(ENDED_CAPACITY);
-        let (mixer_tx, mixer_rx) = flume::bounded(MIXER_CAPACITY);
+        let (ended_tx, ended_rx) = RingBuffer::new(mixer::ENDED_CAPACITY);
+        let (mixer_tx, mixer_rx) = RingBuffer::new(MIXER_CAPACITY);
         let lanes = Arc::new(Mutex::new(Lanes::default()));
         let spatial = Arc::new(Spatial::new());
         let handle = AudioHandle {
@@ -343,7 +342,7 @@ impl AudioEngine {
             commands,
             events_tx,
             ended_tx,
-            ended_rx,
+            mut ended_rx,
             mixer_tx,
             mixer_rx,
             lanes,
@@ -361,7 +360,7 @@ impl AudioEngine {
 
         let read = read_source(config.resources);
         let (output, mixer) = if config.output {
-            match output::open(mixer_rx, ended_tx.clone(), Arc::clone(&spatial)) {
+            match output::open(mixer_rx, ended_tx, Arc::clone(&spatial)) {
                 Ok(output) => (Some(output), Some(mixer_tx)),
                 Err(error) => {
                     log::warn!("звук отключён: {error}; игра продолжает работу без звука");
@@ -382,18 +381,20 @@ impl AudioEngine {
             failed: HashSet::new(),
             pending: Vec::new(),
             mixer,
+            outbox: VecDeque::new(),
             events: events_tx,
             decode_tx,
         };
         loop {
+            // Устройство присылает завершённые голоса через кольцо: опрашиваем его при каждом
+            // пробуждении, а пробуждаемся не реже READ_POLL, пока есть микшер или чтения.
             let incoming = Selector::new()
                 .recv(&commands, Incoming::Command)
                 .recv(&decoded_rx, Incoming::Decoded)
-                .recv(&ended_rx, Incoming::Ended)
-                .wait_timeout(if core.loading.is_empty() {
-                    IDLE_POLL
-                } else {
+                .wait_timeout(if core.mixer.is_some() || !core.loading.is_empty() {
                     READ_POLL
+                } else {
+                    IDLE_POLL
                 });
             match incoming {
                 Ok(Incoming::Command(Ok(command))) => {
@@ -403,10 +404,13 @@ impl AudioEngine {
                 }
                 Ok(Incoming::Command(Err(_))) => break,
                 Ok(Incoming::Decoded(Ok(decoded))) => core.decoded(decoded),
-                Ok(Incoming::Ended(Ok(voice))) => core.voice_ended(voice),
-                // `keepalive_decoded` и `ended_tx` живут до конца `run`, поэтому отключения не бывает.
-                Ok(Incoming::Decoded(Err(_))) | Ok(Incoming::Ended(Err(_))) | Err(_) => {}
+                // `keepalive_decoded` живёт до конца `run`, поэтому отключения не бывает.
+                Ok(Incoming::Decoded(Err(_))) | Err(_) => {}
             }
+            while let Ok(voice) = ended_rx.pop() {
+                core.voice_ended(voice);
+            }
+            core.flush_mixer();
             core.poll_reads();
         }
 
@@ -424,7 +428,6 @@ impl AudioEngine {
 enum Incoming {
     Command(Result<Command, flume::RecvError>),
     Decoded(Result<Decoded, flume::RecvError>),
-    Ended(Result<VoiceId, flume::RecvError>),
 }
 
 type ReadPoll = Box<dyn FnMut() -> Option<Result<Vec<u8>, String>>>;
@@ -458,7 +461,9 @@ struct Core {
     cache_bytes: usize,
     failed: HashSet<String>,
     pending: Vec<Pending>,
-    mixer: Option<Sender<MixerCommand>>,
+    mixer: Option<Producer<MixerCommand>>,
+    /// Команды микшера, которые не влезли в кольцо; уходят в порядке поступления.
+    outbox: VecDeque<MixerCommand>,
     events: Sender<AudioEvent>,
     decode_tx: Sender<DecodeJob>,
 }
@@ -628,12 +633,24 @@ impl Core {
             .release(voice);
     }
 
-    fn send_mixer(&self, command: MixerCommand) {
-        let Some(mixer) = &self.mixer else {
+    fn send_mixer(&mut self, command: MixerCommand) {
+        if self.mixer.is_none() {
+            return;
+        }
+        self.outbox.push_back(command);
+        self.flush_mixer();
+    }
+
+    /// Переносит команды из `outbox` в кольцо, пока в нём есть место.
+    fn flush_mixer(&mut self) {
+        let Some(mixer) = self.mixer.as_mut() else {
             return;
         };
-        if mixer.send_timeout(command, MIXER_SEND_TIMEOUT).is_err() {
-            log::warn!("очередь микшера переполнена; звуковая команда отброшена");
+        while let Some(command) = self.outbox.pop_front() {
+            if let Err(PushError::Full(command)) = mixer.push(command) {
+                self.outbox.push_front(command);
+                break;
+            }
         }
     }
 }

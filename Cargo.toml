@@ -28,6 +28,7 @@ mlua = { version = "=0.12.2", default-features = false, features = ["lua54", "ve
 # naga 30.0.1 не собирает glsl-in без wgsl-in или spv-in: модуль interpolator скрыт за ними.
 naga = { version = "=30.0.1", features = ["glsl-in", "spv-out", "wgsl-in"] }
 notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"] }
+rtrb = "=0.4.0"
 objc2-app-kit = { version = "=0.2.2", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSResponder"] }
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGSession"] }
 objc2-foundation = { version = "=0.2.2", default-features = false, features = ["std", "NSThread"] }
