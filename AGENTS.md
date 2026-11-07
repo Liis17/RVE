@@ -68,7 +68,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
   - `rve-build`: `engine-assets`, `engine-files`, `engine-pak`, `engine-project`,
     `engine-resources`, `engine-scene`.
   - `engine-script` (потребители `engine-runtime` и `rve-editor`): `engine-console`, `engine-files`, `engine-physics`, `engine-scene`, `rve-sdk`.
-  - `engine-audio` (потребители `engine-runtime` и `rve-editor`): `engine-resources`, `engine-scene`, `cpal`, `lewton`, `flume`, `log`.
+  - `engine-audio` (потребители `engine-runtime` и `rve-editor`): `engine-resources`, `engine-scene`, `cpal`, `lewton`, `flume`, `rtrb`, `log`.
   - `rve-player`: `engine-runtime`.
   - `rve-editor`: `engine-assets`, `engine-files`, `engine-physics`, `engine-project`, `engine-render`,
     `engine-audio`, `engine-resources`, `engine-scene`, `engine-script`, `engine-window`,
