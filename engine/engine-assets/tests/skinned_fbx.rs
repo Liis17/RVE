@@ -189,7 +189,7 @@ fn clip_loading_rejects_files_without_animation_stacks() {
         .unwrap_err();
     match error {
         AssetError::Decode { message, .. } => {
-            assert_eq!(message, "в FBX нет анимационных стеков");
+            assert_eq!(message, "нет анимационных стеков с ключами");
         }
         other => panic!("ожидалась ошибка декодирования, получено {other:?}"),
     }
@@ -236,7 +236,7 @@ fn clip_loading_rejects_stacks_without_keys_like_missing_stacks() {
         .unwrap_err();
     match error {
         AssetError::Decode { message, .. } => {
-            assert_eq!(message, "в FBX нет анимационных стеков");
+            assert_eq!(message, "нет анимационных стеков с ключами");
         }
         other => panic!("ожидалась ошибка декодирования, получено {other:?}"),
     }

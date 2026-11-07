@@ -325,7 +325,7 @@ impl Assets {
         if clips.is_empty() {
             return Err(AssetError::Decode {
                 path,
-                message: "в FBX нет анимационных стеков".to_owned(),
+                message: "нет анимационных стеков с ключами".to_owned(),
             });
         }
         Ok(clips)
