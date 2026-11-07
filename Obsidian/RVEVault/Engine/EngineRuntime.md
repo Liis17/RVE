@@ -117,6 +117,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 | `engine/engine-runtime/src/pipeline.rs` | snapshots, script/render loops, fakeable backend и status guard |
 | `engine/engine-runtime/src/input.rs` | `InputAccumulator`, переходы состояния и кадровые input snapshots |
 | `engine/engine-runtime/src/player.rs` | `WindowHandler`, F8 debug-view control, renderer handoff и shutdown окна |
+| `engine/engine-runtime/src/cursor.rs` | `CursorControl`: состояние курсора скриптов и консоли, отправка в окно и отложенная отправка при подключении |
 | `engine/engine-runtime/src/console.rs` | UI snapshots, latest-only slot и интеграция console-команд с scripts thread |
 | `engine/rve-player/src/main.rs` | бинарный entry point |
 
@@ -146,6 +147,12 @@ Background сохраняют raw `released` edges и сбрасывают analo
 - Поток рендера: ожидание снимка, вызов backend, CPU-фазы и GPU-проходы первого вида из `take_frame_profile` ([[Engine/EngineRender]]). Вместе с окнами он публикует группу `Resources` (источник `resources`): дельту `ResourceStats` за интервал, `in flight` и максимумы очереди и чтения с запуска ([[Engine/EngineResources]]).
 - Старт: `StartupProfile` записывает фазы до окна (`hardware probe`, `window icon`, `scene load`, `physics build`, `physics module`, `scripts start`, `scripts ready`) и в `PlayerWindow::init` — `renderer` (создание `Renderer`) и `GPU upload` (`upload_scene`: модели, текстуры, материалы). Отчёт публикуется после GPU upload, а в лог одной записью пишется при первом показанном кадре. Окружение (IBL) в отчёт старта не входит: `Renderer::create_environment` вызывается лениво на render-потоке при первом кадре с окружением, и его время попадает в фазу `render backend`.
 - С `dev-console`: F3 переключает оверлей профайлера. Оверлей работает при закрытой консоли, не блокирует игровой ввод и обновляется раз в 500 мс. Команда `profile` выводит отчёты в консоль. Она перехватывается главным потоком до отправки скриптам и имеет приоритет над одноимённой командой скрипта; при затенении в лог пишется одно предупреждение. Строка `profile` добавлена в каталог команд для help и автодополнения. Таблица рисуется `engine_ui::profiler`.
+
+## Курсор игрока
+
+`engine/engine-runtime/src/cursor.rs` (`CursorControl`) передаёт в окно состояние курсора, которое задают скрипты. Поток скриптов переводит `ScriptCursor` в `engine_window::CursorState` без точки удержания, то есть удержание идёт в центре окна. Эффективное состояние — обычный курсор, пока открыта dev-консоль, иначе запрос скриптов. В окно уходит только изменившееся эффективное значение; запрос, записанный до подключения окна, отправляется при подключении. Отправка идёт вне замка данных, но под отдельным замком порядка, чтобы состояния приходили в том порядке, в котором менялись.
+
+Начальное состояние задаётся до `start` из флагов `[objects.camera.cursor]` активной камеры (`World::active_camera_cursor`). Флаги неактивных камер не применяются. После `start`, каждого `update` и выполненной консольной команды поток скриптов публикует курсор, если он изменился. Освобождение курсора при выходе и потере фокуса выполняет окно ([[Engine/EngineWindow]]).
 
 ## Developer console
 

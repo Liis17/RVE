@@ -15,6 +15,7 @@ mod input;
 mod layout;
 mod new_project;
 mod play;
+mod play_cursor;
 mod previews;
 mod profile;
 mod project;
@@ -30,11 +31,10 @@ use engine_window::{RedrawMode, WindowConfig};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Версия редактора из `Cargo.toml`.
-#[allow(dead_code)]
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 const DEFAULT_WINDOW_SIZE: (u32, u32) = (1600, 900);
+
+/// Версия редактора из `Cargo.toml`; пишется в журнал при запуске.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Проверяет аргументы до создания окна и собирает его настройки.
 fn prepare(args: &cli::EditorArgs) -> Result<WindowConfig, String> {

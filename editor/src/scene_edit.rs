@@ -3,11 +3,11 @@
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    AudioSourceComponent, CameraComponent, CharacterControllerComponent, ColliderComponent,
-    DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup, MeshRenderer,
-    ObjectOrigin, PointLightComponent, PrefabInstance, PrefabOverride, ProceduralSkyComponent,
-    RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
-    SpotLightComponent,
+    AudioSourceComponent, CameraComponent, CameraCursor, CharacterControllerComponent,
+    ColliderComponent, DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup,
+    MeshRenderer, ObjectOrigin, PointLightComponent, PrefabInstance, PrefabOverride,
+    ProceduralSkyComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform, SpotLightComponent,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -1133,6 +1133,18 @@ impl EditorScene {
         })
     }
 
+    /// Задаёт флаги курсора камеры для старта сцены; действуют, только если камера активна.
+    pub fn set_camera_cursor(&mut self, id: &str, cursor: CameraCursor) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            let camera = object
+                .camera
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+            camera.cursor = cursor;
+            Ok(())
+        })
+    }
+
     /// Заменяет scene material override; текстуры добавляются в список ресурсов сцены.
     /// Override без заданных полей удаляется.
     pub fn set_material(
@@ -1886,6 +1898,34 @@ mod tests {
         assert_eq!(scene.document().assets.len(), 3);
         assert!(scene.set_mesh(&id, path("/t.png"), None).is_err());
         assert!(scene.add_lite_script(&id, path("/m.fbx")).is_err());
+    }
+
+    #[test]
+    fn camera_cursor_flags_are_written_to_the_document_and_undoable() {
+        let mut scene = scene();
+        let cursor = CameraCursor {
+            hide_on_start: true,
+            lock_on_start: true,
+        };
+        scene.set_camera_cursor("camera", cursor).unwrap();
+        let stored = |scene: &EditorScene| {
+            scene
+                .document()
+                .objects
+                .iter()
+                .find(|object| object.id == "camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .cursor
+        };
+        assert_eq!(stored(&scene), cursor);
+        assert!(scene.undo());
+        assert_eq!(stored(&scene), CameraCursor::default());
+        assert!(scene.redo());
+        assert_eq!(stored(&scene), cursor);
+        assert!(scene.set_camera_cursor("missing", cursor).is_err());
     }
 
     #[test]

@@ -2,6 +2,7 @@
 use crate::console::ConsoleUiSlot;
 #[cfg(feature = "dev-console")]
 use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
+use crate::cursor::CursorControl;
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use crate::profiling::{
@@ -35,7 +36,7 @@ use engine_scene::{
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
 use engine_script::{
-    ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary,
+    ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary,
     ScriptLoadOptions, ScriptTime,
 };
 #[cfg(feature = "dev-console")]
@@ -275,6 +276,7 @@ pub(crate) struct ScriptThreadConfig {
     pub render_tx: Sender<RenderControl>,
     pub status: Arc<RuntimeStatus>,
     pub input: Arc<Mutex<InputAccumulator>>,
+    pub cursor: CursorControl,
     pub physics_client: Option<PhysicsClient>,
     pub physics_initialization: Option<PhysicsInitialization>,
     /// Sound subsystem handle; `None` disables audio for this scripts thread.
@@ -712,6 +714,7 @@ fn scripts_thread(
         render_tx,
         status,
         input,
+        cursor,
         #[cfg(feature = "dev-console")]
         command_catalog,
         physics_client,
@@ -818,8 +821,11 @@ fn scripts_thread(
         elapsed: last_tick.as_secs_f64(),
         frame: frame_number,
     };
+    let mut published_cursor = None;
+    set_initial_cursor(&mut scripts, &world, &cursor, &mut published_cursor);
     scripts.start(&mut world, start_time);
     print_script_events(scripts.drain_events());
+    publish_script_cursor(&scripts, &cursor, &mut published_cursor);
     let mut audio = audio.map(engine_audio::AudioBridge::new);
     if let Some(audio) = audio.as_mut() {
         // Матрицы до первого кадра не посчитаны; play_on_start берёт позиции из них.
@@ -953,6 +959,7 @@ fn scripts_thread(
             {
                 log::error!(target: "console", "command {name} failed: {error}");
             }
+            publish_script_cursor(&scripts, &cursor, &mut published_cursor);
             publish_command_catalog(
                 &scripts,
                 &command_catalog,
@@ -968,6 +975,7 @@ fn scripts_thread(
         scripts.set_input(input_frame);
         let update_started = Instant::now();
         scripts.update(&mut world, dt, time);
+        publish_script_cursor(&scripts, &cursor, &mut published_cursor);
         timings.record(
             script_phase::LOOP,
             script_phase::SCRIPTS_UPDATE,
@@ -1409,6 +1417,30 @@ fn selected_level<'a, T>(
 ) -> Option<(u8, &'a T)> {
     let level = world.lod_level(object, eye)?;
     Some((level.try_into().ok()?, levels.get(level)?))
+}
+
+/// Задаёт курсор скриптов из флагов активной камеры и публикует его до запуска скриптов.
+fn set_initial_cursor(
+    scripts: &mut ScriptHost,
+    world: &World,
+    cursor: &CursorControl,
+    published: &mut Option<ScriptCursor>,
+) {
+    scripts.set_cursor(ScriptCursor::from(world.active_camera_cursor()));
+    publish_script_cursor(scripts, cursor, published);
+}
+
+/// Публикует курсор скриптов, если он отличается от последней опубликованного значения.
+fn publish_script_cursor(
+    scripts: &ScriptHost,
+    cursor: &CursorControl,
+    published: &mut Option<ScriptCursor>,
+) {
+    let current = scripts.cursor();
+    if *published != Some(current) {
+        *published = Some(current);
+        cursor.set_script_cursor(current);
+    }
 }
 
 fn print_script_events(events: Vec<ScriptEvent>) {
@@ -1887,6 +1919,8 @@ mod tests {
     };
     #[cfg(feature = "dev-console")]
     use super::{PROFILE_COMMAND, PROFILE_COMMAND_DESCRIPTION, publish_command_catalog};
+    use super::{publish_script_cursor, set_initial_cursor};
+    use crate::cursor::{CursorControl, RecordingCursorSink};
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
@@ -1911,6 +1945,7 @@ mod tests {
     use engine_script::{
         Key, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
     };
+    use engine_window::CursorState;
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
@@ -1966,6 +2001,7 @@ return Input
             world,
             ScriptThreadConfig {
                 scene_name: "input.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
                 input_settings: InputSettings {
                     default_context: Some("game".to_owned()),
@@ -2835,6 +2871,7 @@ return Script
             world,
             ScriptThreadConfig {
                 scene_name: "scene.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 sources,
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
@@ -3176,6 +3213,7 @@ return Script
             world,
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::new(),
                 scripts_library: None,
@@ -3279,6 +3317,7 @@ return Script
             world,
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
@@ -3382,6 +3421,7 @@ return Script
             world,
             ScriptThreadConfig {
                 scene_name: "physics-start.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::from([("probe.lua".to_owned(), script.to_owned())]),
                 scripts_library: None,
@@ -3494,6 +3534,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_name: "physics-teleport.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::from([("move.lua".to_owned(), script.to_owned())]),
                 scripts_library: None,
@@ -3661,6 +3702,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_name: "physics-failure.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::new(),
                 scripts_library: None,
@@ -3737,6 +3779,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
@@ -3957,6 +4000,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 sources: BTreeMap::from([(
                     "scripts/bad.lua".to_owned(),
                     "this is not valid Lua !!!".to_owned(),
@@ -4010,6 +4054,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: Some(library),
@@ -4059,6 +4104,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
@@ -4125,6 +4171,7 @@ return Move
             world,
             ScriptThreadConfig {
                 scene_name: "startup.rvescene".to_owned(),
+                cursor: CursorControl::default(),
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
@@ -4160,5 +4207,64 @@ return Move
         assert_eq!(status.exit_code(), 1);
         assert!(status.failure_message().unwrap().contains("clock panic"));
         assert!(modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn active_camera_cursor_flags_are_published_before_scripts_start() {
+        let document = SceneDocument::parse(
+            "cursor.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[objects.camera.cursor]\nhide_on_start = true\nlock_on_start = true\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let mut scripts = ScriptHost::load(&world, "scene", &BTreeMap::new(), None).unwrap();
+        let control = CursorControl::default();
+        let sink = std::sync::Arc::new(RecordingCursorSink::default());
+        control.attach_sink(sink.clone());
+        let mut published = None;
+
+        set_initial_cursor(&mut scripts, &world, &control, &mut published);
+
+        assert_eq!(
+            sink.0.lock().unwrap().last(),
+            Some(&CursorState {
+                visible: false,
+                locked: true,
+                lock_position: None,
+            })
+        );
+    }
+
+    #[test]
+    fn script_cursor_change_is_published_after_update_once() {
+        let document = SceneDocument::parse(
+            "cursor.rvescene",
+            "[[assets]]\npath = \"/cursor.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects.lite_scripts]]\npath = \"/cursor.lua\"\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let source = "local Cursor = {}\nfunction Cursor:on_update()\n  rve.input.set_cursor_locked(true)\nend\nreturn Cursor\n";
+        let sources = BTreeMap::from([("cursor.lua".to_owned(), source.to_owned())]);
+        let mut scripts = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+        let control = CursorControl::default();
+        let sink = std::sync::Arc::new(RecordingCursorSink::default());
+        control.attach_sink(sink.clone());
+        let mut published = None;
+        set_initial_cursor(&mut scripts, &world, &control, &mut published);
+
+        scripts.update(&mut world, 0.1, ScriptTime::default());
+        publish_script_cursor(&scripts, &control, &mut published);
+
+        let states = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            states.last(),
+            Some(&CursorState {
+                visible: true,
+                locked: true,
+                lock_position: None,
+            })
+        );
+        publish_script_cursor(&scripts, &control, &mut published);
+        assert_eq!(sink.0.lock().unwrap().len(), states.len());
     }
 }

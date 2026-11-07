@@ -7,6 +7,7 @@ mod activation;
 mod cli;
 #[cfg(feature = "dev-console")]
 mod console;
+mod cursor;
 #[cfg(any(feature = "dev-console", test))]
 mod dev_overlays;
 mod hardware;
@@ -22,6 +23,7 @@ use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_
 use cli::{PlayerArgs, USAGE};
 #[cfg(feature = "dev-console")]
 use console::{CommandCatalogSnapshot, ConsoleUiSlot};
+use cursor::CursorControl;
 use engine_assets::{Assets, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::ConsoleBuffer;
@@ -293,6 +295,7 @@ fn run_from_args(
     let (render_tx, render_rx) = flume::unbounded();
     let interrupt = ScriptInterruptHandle::new();
     let input = Arc::new(Mutex::new(input::InputAccumulator::default()));
+    let cursor = CursorControl::default();
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
     let script_thread = match start_scripts(
         &mut modules,
@@ -313,6 +316,7 @@ fn run_from_args(
             render_tx: render_tx.clone(),
             status: Arc::clone(&status),
             input: Arc::clone(&input),
+            cursor: cursor.clone(),
             physics_client: Some(physics_client),
             physics_initialization: Some(physics_initialization),
             audio: Some(audio_handle),
@@ -379,6 +383,7 @@ fn run_from_args(
             debug_view,
             render_assets,
             activation,
+            cursor,
             script_tx,
             render_tx,
             render_rx,

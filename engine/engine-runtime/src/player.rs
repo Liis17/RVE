@@ -1,6 +1,7 @@
 use crate::activation::PendingActivation;
 #[cfg(feature = "dev-console")]
 use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame, ConsoleUiSlot, snapshot_lines};
+use crate::cursor::CursorControl;
 #[cfg(feature = "dev-console")]
 use crate::dev_overlays::DevOverlays;
 use crate::input::{InputAccumulator, lock_input};
@@ -59,6 +60,7 @@ pub(crate) struct PlayerConfig {
     pub debug_view: DebugView,
     pub render_assets: PreparedRenderAssets,
     pub activation: PendingActivation,
+    pub cursor: CursorControl,
     pub script_tx: Sender<ScriptControl>,
     pub render_tx: Sender<RenderControl>,
     pub render_rx: Receiver<RenderControl>,
@@ -92,6 +94,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         debug_view,
         render_assets,
         activation,
+        cursor,
         script_tx,
         render_tx,
         render_rx,
@@ -127,6 +130,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         render_assets,
         modules,
         activation,
+        cursor,
         script_tx,
         render_tx,
         render_rx,
@@ -191,6 +195,7 @@ struct PlayerWindow<'a> {
     render_assets: PreparedRenderAssets,
     modules: &'a mut ModuleHost,
     activation: PendingActivation,
+    cursor: CursorControl,
     script_tx: Sender<ScriptControl>,
     render_tx: Sender<RenderControl>,
     render_rx: Receiver<RenderControl>,
@@ -293,6 +298,7 @@ impl PlayerWindow<'_> {
         }
         self.console_overlay.set_open(open);
         self.overlays = self.overlays.with_console(open);
+        self.cursor.set_console_open(open);
         self.apply_overlays(window);
     }
 
@@ -678,6 +684,7 @@ fn wait_for_render_or_detach(
 impl WindowHandler for PlayerWindow<'_> {
     fn attach_proxy(&mut self, proxy: WindowProxy) {
         self.activation.attach(proxy.clone());
+        self.cursor.attach(proxy.clone());
         self.window_exit = Some(Arc::new(WindowExit(proxy)));
     }
 

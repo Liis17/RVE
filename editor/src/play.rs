@@ -11,8 +11,8 @@ use engine_physics::{
 use engine_project::{InputSettings, PhysicsSettings};
 use engine_scene::{ColliderShape, SceneDocument, World};
 use engine_script::{
-    CommandError, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
-    ScriptLoadOptions, ScriptTime,
+    CommandError, ScriptCursor, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle,
+    ScriptLibrary, ScriptLoadOptions, ScriptTime,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -291,6 +291,7 @@ impl PlaySession {
         )
         .map_err(|error| error.to_string())?;
         watchdog.set_deadline(None);
+        host.set_cursor(ScriptCursor::from(world.active_camera_cursor()));
         let desc = PhysicsSceneDesc::from_world(
             &world,
             model_geometry,
@@ -333,6 +334,11 @@ impl PlaySession {
 
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    /// Курсор, установленный скриптами последним успешным вызовом или флагами камеры при старте.
+    pub fn cursor(&self) -> ScriptCursor {
+        self.host.cursor()
     }
 
     /// Пауза не накапливает время: первый кадр после неё получает обычный шаг.
@@ -678,6 +684,23 @@ return Rotate
         assert!((rotation_y(&mut session) - 45.0).abs() < 1e-3);
         let original = document.objects.iter().find(|o| o.id == "spinner").unwrap();
         assert_eq!(original.transform.rotation, [0.0; 3]);
+    }
+
+    #[test]
+    fn play_starts_with_the_active_camera_cursor_flags() {
+        let scene = SCENE.replace(
+            "[objects.camera]\n",
+            "[objects.camera]\n[objects.camera.cursor]\nhide_on_start = true\nlock_on_start = true\n",
+        );
+        let session =
+            PlaySession::start(&document(&scene), None, |_| Ok(ROTATE.to_owned())).unwrap();
+        assert_eq!(
+            session.cursor(),
+            ScriptCursor {
+                visible: false,
+                locked: true,
+            }
+        );
     }
 
     #[test]

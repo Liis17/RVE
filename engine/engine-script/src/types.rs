@@ -1,4 +1,4 @@
-use engine_scene::ParamValue;
+use engine_scene::{CameraCursor, ParamValue};
 use rve_sdk::{Key, MouseButton};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -11,6 +11,34 @@ pub type ScriptParams = BTreeMap<String, ParamValue>;
 pub struct ScriptTime {
     pub elapsed: f64,
     pub frame: u64,
+}
+
+/// Состояние курсора окна, которое скрипты задают через `rve.input` или Rust SDK.
+///
+/// По умолчанию курсор видим и не удерживается. Значения применяет хост: engine-script
+/// не зависит от окна и не вызывает winit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptCursor {
+    pub visible: bool,
+    pub locked: bool,
+}
+
+impl Default for ScriptCursor {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            locked: false,
+        }
+    }
+}
+
+impl From<CameraCursor> for ScriptCursor {
+    fn from(cursor: CameraCursor) -> Self {
+        Self {
+            visible: !cursor.hide_on_start,
+            locked: cursor.lock_on_start,
+        }
+    }
 }
 
 /// Copyable input snapshot shared by every script during one update.

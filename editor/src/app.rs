@@ -5,6 +5,7 @@ use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
 use crate::play::PlaySession;
+use crate::play_cursor;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
 use crate::settings::{SettingsStore, UserSettings};
@@ -43,6 +44,8 @@ const BUILD_POLL: Duration = Duration::from_millis(50);
 pub struct EditorApp {
     state: EditorState,
     control_click: bool,
+    /// Окно в фокусе по событиям winit; без фокуса Play не захватывает курсор.
+    window_focused: bool,
     /// Модификаторы из `ModifiersChanged`: numpad-команды Scene различаются по Ctrl.
     modifiers: ModifiersState,
     dock: DockState<Tab>,
@@ -95,6 +98,7 @@ impl EditorApp {
         Self {
             state,
             control_click: false,
+            window_focused: false,
             modifiers: ModifiersState::empty(),
             dock,
             settings,
@@ -972,6 +976,8 @@ impl EditorApp {
         match result {
             Ok(session) => {
                 self.state.enter_play(session);
+                self.state.play_cursor.reset();
+                play_cursor::focus_game_tab(&mut self.dock);
                 self.state.log.info("Play");
             }
             Err(error) => self.state.log.error(error),
@@ -1177,9 +1183,12 @@ impl EditorApp {
         let dock = &mut self.dock;
         let console_overlay = &mut self.console_overlay;
         let console_open = state.console_open;
+        let window_focused = self.window_focused;
         let mut console_output = Default::default();
+        let mut cursor_request = None;
         let mut output = self.egui_ctx.run_ui(raw_input, |ui| {
             ui::show(ui, state, dock);
+            cursor_request = play_cursor::sync(ui.ctx(), state, dock, window_focused);
             if console_open && let Some(rect) = state.game_view.rect {
                 console_output =
                     console_overlay.show(ui.ctx(), rect, &console_lines, &command_catalog);
@@ -1192,6 +1201,9 @@ impl EditorApp {
         if let Some(command) = console_output.submitted {
             submit_console_command(&mut self.state, &command);
             window.request_redraw();
+        }
+        if let (Some(request), Some(proxy)) = (cursor_request, &self.proxy) {
+            proxy.set_cursor(request);
         }
         egui_state.handle_platform_output(window, std::mem::take(&mut output.platform_output));
         let repaint_delay = output
@@ -1275,7 +1287,7 @@ impl EditorApp {
     }
 }
 
-fn console_modal_open(state: &EditorState) -> bool {
+pub(crate) fn console_modal_open(state: &EditorState) -> bool {
     state.unsaved_prompt.is_some()
         || state.project_dialog.is_some()
         || state.new_project_dialog.is_some()
@@ -1630,6 +1642,9 @@ impl WindowHandler for EditorApp {
         ));
         self.gpu = Some(GpuState { renderer, scene });
         self.window = Some(Arc::clone(&window));
+        self.state
+            .log
+            .info(format!("RVE Editor {}", crate::VERSION));
         if let Some(project) = self.initial_project.take() {
             self.open_project(&project);
         }
@@ -1803,6 +1818,9 @@ impl WindowHandler for EditorApp {
         if self.state.console_open {
             return;
         }
+        if pressed && key == Key::Escape && self.state.play_cursor.captured() {
+            self.state.play_cursor.escape();
+        }
         if (!pressed || self.state.pointer_over_view())
             && let Some(play) = &mut self.state.play
         {
@@ -1815,6 +1833,9 @@ impl WindowHandler for EditorApp {
         if self.state.console_open {
             return;
         }
+        if pressed && button == MouseButton::Left && self.state.game_view.hovered {
+            self.state.play_cursor.game_clicked();
+        }
         if (!pressed || self.state.pointer_over_view())
             && let Some(play) = &mut self.state.play
         {
@@ -1823,9 +1844,24 @@ impl WindowHandler for EditorApp {
         }
     }
 
+    fn mouse_motion(&mut self, dx: f64, dy: f64) {
+        let over_view = self.state.pointer_over_view();
+        if self.state.play_cursor.motion_source(over_view) != play_cursor::MotionSource::Raw {
+            return;
+        }
+        if let Some(play) = &mut self.state.play {
+            play.input_mut().add_mouse_delta(dx as f32, dy as f32);
+        }
+    }
+
     fn focused(&mut self, focused: bool) {
+        self.window_focused = focused;
         if !focused && let Some(play) = &mut self.state.play {
             play.clear_input();
+        }
+        // Захват пересчитывается в кадре: без перерисовки освобождение дошло бы с задержкой.
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 }
