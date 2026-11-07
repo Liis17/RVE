@@ -936,6 +936,8 @@ pub fn sort_passes(count: u32) -> Vec<SortPass> {
 
 /// Потоки в workgroup сортировки; совпадает с `PARTICLE_COMPUTE_LOCAL_SIZE`.
 const PARTICLE_SORT_THREADS: u32 = crate::PARTICLE_COMPUTE_LOCAL_SIZE;
+/// Блок сортировки в shared-памяти — два элемента на поток: CPU-эталон и шейдер используют один BLOCK.
+const _: () = assert!(SORT_BLOCK_SIZE == 2 * PARTICLE_SORT_THREADS);
 
 #[cfg(test)]
 /// Ключ сортировки назад-вперёд: по возрастанию первыми идут самые дальние. Мёртвые — максимум.
@@ -1631,6 +1633,32 @@ mod tests {
         assert_eq!(size_of::<EmitterParamsGpu>() % 16, 0);
         assert_eq!(size_of::<EmitterParamsGpu>(), 256);
         assert_eq!(offset_of!(EmitterParamsGpu, color_values), 16 * 7);
+    }
+
+    #[test]
+    fn emitter_params_std140_offsets_match_ubo_layout() {
+        use std::mem::offset_of;
+        // Все поля — vec4/uvec4; массив цветов занимает четыре слота подряд (112..176), как в `particle_*.comp`.
+        let offsets = [
+            offset_of!(EmitterParamsGpu, shape),
+            offset_of!(EmitterParamsGpu, box_extents),
+            offset_of!(EmitterParamsGpu, lifetime_speed),
+            offset_of!(EmitterParamsGpu, size_rotation),
+            offset_of!(EmitterParamsGpu, angular_drag),
+            offset_of!(EmitterParamsGpu, gravity),
+            offset_of!(EmitterParamsGpu, color_times),
+            offset_of!(EmitterParamsGpu, color_values),
+            offset_of!(EmitterParamsGpu, size_times),
+            offset_of!(EmitterParamsGpu, size_values),
+            offset_of!(EmitterParamsGpu, flipbook),
+            offset_of!(EmitterParamsGpu, collision),
+            offset_of!(EmitterParamsGpu, counts),
+        ];
+        assert_eq!(
+            offsets,
+            [0, 16, 32, 48, 64, 80, 96, 112, 176, 192, 208, 224, 240]
+        );
+        assert_eq!(size_of::<EmitterParamsGpu>(), 256);
     }
 
     #[test]

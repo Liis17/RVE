@@ -1182,6 +1182,7 @@ mod shader_tests {
         for shader in [
             PARTICLE_SPAWN_SHADER,
             PARTICLE_SIM_SHADER,
+            PARTICLE_SORT_SHADER,
             PARTICLE_VERTEX_SHADER,
             PARTICLE_FRAGMENT_SHADER,
         ] {
