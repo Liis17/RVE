@@ -64,6 +64,13 @@ impl RollingStat {
         self.last = value;
     }
 
+    /// Сбрасывает окно без освобождения памяти: метка снова станет пустой.
+    pub fn clear(&mut self) {
+        self.samples.clear();
+        self.next = 0;
+        self.last = Duration::ZERO;
+    }
+
     /// Возвращает последнее, среднее и максимальное значение окна.
     pub fn summary(&self) -> StatSummary {
         if self.samples.is_empty() {
@@ -254,6 +261,26 @@ mod tests {
     #[test]
     fn empty_window_has_zero_summary() {
         assert_eq!(RollingStat::new(4).summary(), StatSummary::default());
+    }
+
+    #[test]
+    fn cleared_window_is_empty_and_accepts_new_samples() {
+        let mut stat = RollingStat::new(3);
+        stat.push(ms(5));
+        stat.push(ms(7));
+
+        stat.clear();
+        assert_eq!(stat.summary(), StatSummary::default());
+
+        stat.push(ms(2));
+        let summary = stat.summary();
+        assert_eq!(summary.samples, 1);
+        assert_eq!(
+            summary.max,
+            ms(2),
+            "значения до сброса не должны попадать в максимум"
+        );
+        assert_eq!(summary.last, ms(2));
     }
 
     #[test]

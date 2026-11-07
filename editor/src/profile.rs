@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use engine_core::profile::{ProfileGroup, ProfileReport, ProfileRow, RollingStat};
-use engine_render::{FrameProfile, GpuPass, ProfiledView, ViewportId};
+use engine_render::{FrameProfile, GpuPass, GpuViewTimings, ProfiledView, ViewportId};
 use engine_script::ScriptUpdateProfile;
 
 /// Число последних кадров и шагов, по которым вкладка считает last, avg и max.
@@ -76,22 +76,18 @@ impl EditorProfile {
         for (window, elapsed) in self.cpu.iter_mut().zip(phases) {
             window.push(elapsed);
         }
-        let Some(gpu) = frame.gpu else {
-            return;
-        };
-        for view in gpu.views.iter().flatten() {
-            let target = match view.key {
-                ProfiledView::Viewport(id) if id == scene => &mut self.scene,
-                ProfiledView::Viewport(id) if id == game => &mut self.game,
-                _ => continue,
-            };
-            for (window, pass) in target.iter_mut().zip(view.passes) {
-                if let Some(elapsed) = pass {
-                    window.push(elapsed);
-                }
-            }
-            target[GpuPass::COUNT].push(view.total);
-        }
+        let views = frame
+            .gpu
+            .iter()
+            .flat_map(|gpu| gpu.views.iter().flatten())
+            .map(|view| (view.key, *view));
+        record_gpu(
+            &mut self.scene,
+            &mut self.game,
+            ProfiledView::Viewport(scene),
+            ProfiledView::Viewport(game),
+            views,
+        );
     }
 
     /// Записывает фазы шага Play.
@@ -129,6 +125,45 @@ impl EditorProfile {
     }
 }
 
+/// Записывает GPU-виды кадра в окна Scene и Game. Вид, которого нет в кадре, сбрасывает свои окна:
+/// значения прошлых кадров не приписываются виду, который сейчас не рисуется.
+///
+/// Ключи обобщены, потому что `ViewportId` создаётся только в `engine-render`; `record_frame`
+/// передаёт `ProfiledView::Viewport`.
+fn record_gpu<K: Copy + PartialEq>(
+    scene: &mut [RollingStat],
+    game: &mut [RollingStat],
+    scene_key: K,
+    game_key: K,
+    views: impl IntoIterator<Item = (K, GpuViewTimings)>,
+) {
+    let mut scene_view = None;
+    let mut game_view = None;
+    for (key, view) in views {
+        if key == scene_key {
+            scene_view = Some(view);
+        } else if key == game_key {
+            game_view = Some(view);
+        }
+    }
+    record_view(scene, scene_view);
+    record_view(game, game_view);
+}
+
+fn record_view(windows: &mut [RollingStat], view: Option<GpuViewTimings>) {
+    let Some(view) = view else {
+        windows.iter_mut().for_each(RollingStat::clear);
+        return;
+    };
+    for (window, pass) in windows.iter_mut().zip(view.passes) {
+        match pass {
+            Some(elapsed) => window.push(elapsed),
+            None => window.clear(),
+        }
+    }
+    windows[GpuPass::COUNT].push(view.total);
+}
+
 fn group(name: &'static str, labels: &[&'static str], windows: &[RollingStat]) -> ProfileGroup {
     ProfileGroup {
         name,
@@ -148,11 +183,32 @@ fn group(name: &'static str, labels: &[&'static str], windows: &[RollingStat]) -
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorProfile, PlayStep};
+    use super::{EditorProfile, PlayStep, record_gpu, windows};
+    use engine_render::{GpuPass, GpuViewTimings, ProfiledView};
     use std::time::Duration;
+
+    const SCENE: u8 = 1;
+    const GAME: u8 = 2;
+    const OTHER: u8 = 3;
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
+    }
+
+    fn timings(passes: &[(GpuPass, u64)], total: u64) -> GpuViewTimings {
+        let mut slots = [None; GpuPass::COUNT];
+        for &(pass, value) in passes {
+            slots[pass as usize] = Some(ms(value));
+        }
+        GpuViewTimings {
+            key: ProfiledView::Screen,
+            passes: slots,
+            total: ms(total),
+        }
+    }
+
+    fn gpu_windows() -> Vec<engine_core::profile::RollingStat> {
+        windows(GpuPass::COUNT + 1)
     }
 
     fn row_samples(
@@ -194,5 +250,89 @@ mod tests {
         let report = EditorProfile::default().report();
         let names: Vec<&str> = report.groups.iter().map(|group| group.name).collect();
         assert_eq!(names, ["Renderer CPU", "GPU Scene", "GPU Game", "Play"]);
+    }
+
+    #[test]
+    fn scene_and_game_views_keep_their_own_samples() {
+        let mut scene = gpu_windows();
+        let mut game = gpu_windows();
+
+        record_gpu(
+            &mut scene,
+            &mut game,
+            SCENE,
+            GAME,
+            [
+                (SCENE, timings(&[(GpuPass::Clusters, 2)], 2)),
+                (GAME, timings(&[(GpuPass::Tonemap, 5)], 5)),
+            ],
+        );
+
+        assert_eq!(scene[GpuPass::Clusters as usize].summary().last, ms(2));
+        assert_eq!(scene[GpuPass::Tonemap as usize].summary().samples, 0);
+        assert_eq!(scene[GpuPass::COUNT].summary().last, ms(2));
+        assert_eq!(game[GpuPass::Tonemap as usize].summary().last, ms(5));
+        assert_eq!(game[GpuPass::Clusters as usize].summary().samples, 0);
+        assert_eq!(game[GpuPass::COUNT].summary().last, ms(5));
+    }
+
+    #[test]
+    fn view_missing_from_frame_resets_and_foreign_views_are_not_attributed() {
+        let mut scene = gpu_windows();
+        let mut game = gpu_windows();
+        record_gpu(
+            &mut scene,
+            &mut game,
+            SCENE,
+            GAME,
+            [
+                (SCENE, timings(&[(GpuPass::Clusters, 2)], 2)),
+                (GAME, timings(&[(GpuPass::Tonemap, 5)], 5)),
+            ],
+        );
+
+        // Scene ушёл из кадра; вместо него пришёл чужой вид и новый замер Game.
+        record_gpu(
+            &mut scene,
+            &mut game,
+            SCENE,
+            GAME,
+            [
+                (OTHER, timings(&[(GpuPass::Clusters, 9)], 9)),
+                (GAME, timings(&[(GpuPass::Tonemap, 6)], 6)),
+            ],
+        );
+
+        assert_eq!(scene[GpuPass::Clusters as usize].summary().samples, 0);
+        assert_eq!(scene[GpuPass::COUNT].summary().samples, 0);
+        assert_eq!(game[GpuPass::Clusters as usize].summary().samples, 0);
+        let tonemap = game[GpuPass::Tonemap as usize].summary();
+        assert_eq!(tonemap.samples, 2);
+        assert_eq!(tonemap.last, ms(6));
+        assert_eq!(tonemap.max, ms(6));
+    }
+
+    #[test]
+    fn pass_absent_from_frame_is_reported_as_missing() {
+        let mut scene = gpu_windows();
+        let mut game = gpu_windows();
+        record_gpu(
+            &mut scene,
+            &mut game,
+            SCENE,
+            GAME,
+            [(SCENE, timings(&[(GpuPass::Clusters, 2)], 2))],
+        );
+
+        record_gpu(
+            &mut scene,
+            &mut game,
+            SCENE,
+            GAME,
+            [(SCENE, timings(&[(GpuPass::Tonemap, 1)], 1))],
+        );
+
+        assert_eq!(scene[GpuPass::Clusters as usize].summary().samples, 0);
+        assert_eq!(scene[GpuPass::Tonemap as usize].summary().last, ms(1));
     }
 }

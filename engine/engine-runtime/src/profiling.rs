@@ -117,6 +117,8 @@ struct PhaseGroup {
     title: &'static str,
     labels: Vec<&'static str>,
     stats: Vec<RollingStat>,
+    /// Была ли запись метки с последней публикации. Метка без записей за интервал сбрасывается.
+    touched: Vec<bool>,
 }
 
 /// Окна одного потока по группам фаз. Публикует отчёт в доску не чаще [`PUBLISH_INTERVAL`].
@@ -142,6 +144,7 @@ impl PhaseWindow {
                     .iter()
                     .map(|_| RollingStat::new(SAMPLE_WINDOW))
                     .collect(),
+                touched: vec![false; labels.len()],
                 labels,
             })
             .collect();
@@ -155,7 +158,9 @@ impl PhaseWindow {
 
     /// Записывает замер метки `phase` группы `group`.
     pub(crate) fn record(&mut self, group: usize, phase: usize, elapsed: Duration) {
-        self.groups[group].stats[phase].push(elapsed);
+        let group = &mut self.groups[group];
+        group.stats[phase].push(elapsed);
+        group.touched[phase] = true;
     }
 
     /// Записывает замер, если он есть; `None` оставляет окно без изменений.
@@ -176,10 +181,23 @@ impl PhaseWindow {
             return;
         }
         self.next_publish = Some(now + PUBLISH_INTERVAL);
+        self.retire_untouched();
         self.board.publish(self.source, self.report());
     }
 
-    /// Строит отчёт по текущим окнам. Метки без замеров получают `None`.
+    /// Сбрасывает окна меток, которых не было в интервале, и начинает новый интервал.
+    fn retire_untouched(&mut self) {
+        for group in &mut self.groups {
+            for (stat, touched) in group.stats.iter_mut().zip(group.touched.iter_mut()) {
+                if !*touched {
+                    stat.clear();
+                }
+                *touched = false;
+            }
+        }
+    }
+
+    /// Строит отчёт по текущим окнам. Метки без замеров, в том числе сброшенные, получают `None`.
     pub(crate) fn report(&self) -> ProfileReport {
         ProfileReport {
             groups: self
@@ -326,6 +344,44 @@ mod tests {
 
         window.publish_if_due(start + PUBLISH_INTERVAL);
         assert!(!Arc::ptr_eq(&first, &board.reports()[0].1));
+    }
+
+    #[test]
+    fn label_missing_for_a_whole_interval_is_reported_as_missing() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        let start = Instant::now();
+        let clusters = GpuPass::Clusters as usize;
+        let tonemap = GpuPass::Tonemap as usize;
+        window.record(render_phase::GPU, clusters, ms(2));
+        window.publish_if_due(start);
+        assert!(gpu_row(&board, "Clusters").is_some());
+
+        window.record(render_phase::GPU, tonemap, ms(1));
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+
+        assert_eq!(gpu_row(&board, "Clusters"), None);
+        assert!(gpu_row(&board, "Tonemap").is_some());
+    }
+
+    #[test]
+    fn label_seen_within_an_interval_keeps_its_window() {
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups());
+        let start = Instant::now();
+        let clusters = GpuPass::Clusters as usize;
+        window.record(render_phase::GPU, clusters, ms(2));
+        window.publish_if_due(start);
+
+        window.record(render_phase::GPU, clusters, ms(4));
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+
+        assert_eq!(gpu_row(&board, "Clusters").map(|s| s.samples), Some(2));
+    }
+
+    fn gpu_row(board: &ProfileBoard, label: &str) -> Option<StatSummary> {
+        let reports = board.reports();
+        row(&reports[0].1, render_phase::GPU, label)
     }
 
     #[test]
