@@ -1,13 +1,18 @@
 name: Rust CI
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
+    branches: [son-croissant, mommy]
+  push:
+    branches: [mommy]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -17,12 +22,14 @@ jobs:
     outputs:
       has_changes: ${{ steps.packages.outputs.has_changes }}
       packages: ${{ steps.packages.outputs.packages }}
+      build_demo: ${{ steps.packages.outputs.has_changes == 'true' && (contains(steps.packages.outputs.packages, 'rve-build') || contains(steps.packages.outputs.packages, 'engine-runtime') || contains(steps.packages.outputs.packages, 'rve-player') || contains(steps.packages.outputs.packages, 'engine-script') || contains(steps.packages.outputs.packages, 'rve-sdk')) }}
+      build_sdk: ${{ steps.sdk.outputs.build_sdk }}
     steps:
       - name: Check out repository and comparison history
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-      - name: Test package selection
+      - name: Test package and release selection
         run: python3 -B -m unittest discover -s .github/scripts -v
       - name: Create build directory
         run: mkdir -p build
@@ -30,16 +37,101 @@ jobs:
         id: packages
         working-directory: build
         run: python3 -B ../.github/scripts/affected_packages.py
+      - name: Select SDK release
+        id: sdk
+        working-directory: build
+        run: python3 -B ../.github/scripts/select_sdk_release.py
 
-  checks:
-    name: Checks (${{ matrix.os }})
+  # Lint, build/test and the demo game run as parallel jobs to shorten PR checks.
+  # Each job compiles separately; rust-cache keys include the job id, so caches do not collide.
+  lint:
+    name: Lint (${{ matrix.os }})
     needs: changes
     if: ${{ needs.changes.outputs.has_changes == 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     env:
       CARGO_PACKAGES: ${{ needs.changes.outputs.packages }}
-      BUILD_DEMO_GAME: ${{ contains(needs.changes.outputs.packages, 'rve-build') || contains(needs.changes.outputs.packages, 'engine-runtime') || contains(needs.changes.outputs.packages, 'rve-player') || contains(needs.changes.outputs.packages, 'engine-script') || contains(needs.changes.outputs.packages, 'rve-sdk') }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Create build directory
+        run: mkdir -p build
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Select Rust stable
+        run: rustup default stable
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> build"
+      - name: Check formatting
+        working-directory: build
+        run: |
+          read -r -a packages <<< "$CARGO_PACKAGES"
+          cargo fmt "${packages[@]}" --check
+      - name: Clippy
+        working-directory: build
+        run: |
+          read -r -a packages <<< "$CARGO_PACKAGES"
+          cargo clippy "${packages[@]}" --all-targets --locked -- -D warnings
+      - name: Clippy player without developer console
+        if: ${{ contains(needs.changes.outputs.packages, 'rve-player') || contains(needs.changes.outputs.packages, 'engine-runtime') }}
+        working-directory: build
+        run: cargo clippy -p rve-player --no-default-features --all-targets --locked -- -D warnings
+
+  test:
+    name: Build and test (${{ matrix.os }})
+    needs: changes
+    if: ${{ needs.changes.outputs.has_changes == 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      CARGO_PACKAGES: ${{ needs.changes.outputs.packages }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Create build directory
+        run: mkdir -p build
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal
+      - name: Select Rust stable
+        run: rustup default stable
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> build"
+      - name: Build affected packages
+        working-directory: build
+        run: |
+          read -r -a packages <<< "$CARGO_PACKAGES"
+          cargo build "${packages[@]}" --locked
+      - name: Test affected packages
+        working-directory: build
+        run: |
+          read -r -a packages <<< "$CARGO_PACKAGES"
+          cargo test "${packages[@]}" --locked
+
+  demo:
+    name: Demo game (${{ matrix.os }})
+    needs: changes
+    if: ${{ needs.changes.outputs.build_demo == 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
@@ -55,51 +147,28 @@ jobs:
         with:
           python-version: "3.x"
       - name: Create build directory
-        shell: bash
         run: mkdir -p build
       - name: Install Rust stable
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install stable --profile minimal
       - name: Select Rust stable
         run: rustup default stable
-      - name: Check formatting
-        working-directory: build
-        run: |
-          read -r -a packages <<< "$CARGO_PACKAGES"
-          cargo fmt "${packages[@]}" --check
-      - name: Clippy
-        working-directory: build
-        run: |
-          read -r -a packages <<< "$CARGO_PACKAGES"
-          cargo clippy "${packages[@]}" --all-targets --locked -- -D warnings
-      - name: Clippy player without developer console
-        if: ${{ contains(needs.changes.outputs.packages, 'rve-player') || contains(needs.changes.outputs.packages, 'engine-runtime') }}
-        working-directory: build
-        run: cargo clippy -p rve-player --no-default-features --all-targets --locked -- -D warnings
-      - name: Build affected packages
-        working-directory: build
-        run: |
-          read -r -a packages <<< "$CARGO_PACKAGES"
-          cargo build "${packages[@]}" --locked
-      - name: Test affected packages
-        working-directory: build
-        run: |
-          read -r -a packages <<< "$CARGO_PACKAGES"
-          cargo test "${packages[@]}" --locked
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> build"
       - name: Install Vulkan runtime for demo build
-        if: ${{ runner.os == 'macOS' && env.BUILD_DEMO_GAME == 'true' }}
+        if: ${{ runner.os == 'macOS' }}
         run: brew install vulkan-loader molten-vk
       - name: Build demo game
-        if: ${{ env.BUILD_DEMO_GAME == 'true' }}
         working-directory: build
         run: cargo run -p rve-build --locked -- build ../examples/demo-game --output demo-out
       - name: Check rve-build checkout cache and SDK isolation
-        if: ${{ env.BUILD_DEMO_GAME == 'true' }}
         working-directory: build
         env:
           PYTHONUTF8: "1"
         run: python -B ../.github/scripts/check_rve_build_sdk.py
       - name: Check Windows GUI-player argument diagnostics
-        if: ${{ runner.os == 'Windows' && env.BUILD_DEMO_GAME == 'true' }}
+        if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         working-directory: build
         run: |
@@ -117,7 +186,7 @@ jobs:
   ci:
     name: CI
     if: ${{ always() }}
-    needs: [changes, checks]
+    needs: [changes, lint, test, demo]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -125,12 +194,86 @@ jobs:
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           HAS_CHANGES: ${{ needs.changes.outputs.has_changes }}
-          CHECKS_RESULT: ${{ needs.checks.result }}
+          BUILD_DEMO: ${{ needs.changes.outputs.build_demo }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          DEMO_RESULT: ${{ needs.demo.result }}
         run: |
           test "$CHANGES_RESULT" = "success"
           if [ "$HAS_CHANGES" = "true" ]; then
-            test "$CHECKS_RESULT" = "success"
+            test "$LINT_RESULT" = "success"
+            test "$TEST_RESULT" = "success"
           else
             test "$HAS_CHANGES" = "false"
-            test "$CHECKS_RESULT" = "skipped"
+            test "$LINT_RESULT" = "skipped"
+            test "$TEST_RESULT" = "skipped"
           fi
+          if [ "$BUILD_DEMO" = "true" ]; then
+            test "$DEMO_RESULT" = "success"
+          else
+            test "$BUILD_DEMO" = "false"
+            test "$DEMO_RESULT" = "skipped"
+          fi
+
+  release:
+    name: Build and publish Windows x64 SDK
+    needs: [changes, ci]
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/mommy' && needs.changes.outputs.build_sdk == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    concurrency:
+      group: sdk-release-${{ github.sha }}
+      cancel-in-progress: false
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: build
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.x"
+      - name: Create build directory
+        working-directory: .
+        run: New-Item -ItemType Directory -Force build
+      - name: Install host and bundled Rust toolchains
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable-x86_64-pc-windows-msvc
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> build"
+          key: sdk-release
+      - name: Build full SDK with bundled GNU toolchain
+        run: |
+          $toolchain = rustup run stable-x86_64-pc-windows-gnu rustc --print sysroot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo run --release -p rve-build --locked -- sdk --output sdk-verified --rust-toolchain $toolchain
+      - name: Archive and verify SDK without system Rust
+        run: python -B ../.github/scripts/package_sdk_release.py sdk-verified sdk-verified.zip
+      - name: Publish verified ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          $tag = "sdk-$env:RELEASE_SHA"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag sdk-verified.zip --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $tag --prerelease=false --latest
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            gh release create $tag sdk-verified.zip --target $env:RELEASE_SHA --title "RVE SDK Windows x64 ($($env:RELEASE_SHA.Substring(0, 12)))" --latest --notes "Autonomous Windows x64 editor, players, guest SDK and Rust GNU toolchain. Scripts and Build Player verified with system-only PATH. Commit: $env:RELEASE_SHA"
+          }

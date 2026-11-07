@@ -5,7 +5,7 @@ use std::ffi::c_void;
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 7;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 8;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -644,17 +644,17 @@ pub type RveActionBindingFn = unsafe extern "C" fn(
 /// Stages restoration of the project input bindings. Appended in ABI v5.
 pub type RveResetBindingsFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
 
-/// Cursor state copied to a guest-provided output slot. Appended in ABI v7.
+/// Cursor state copied to a guest-provided output slot. Appended in ABI v8.
 #[repr(C)]
 pub struct RveCursorState {
     pub visible: bool,
     pub locked: bool,
 }
 
-/// Copies the cursor state applied by the host. Appended in ABI v7.
+/// Copies the cursor state applied by the host. Appended in ABI v8.
 pub type RveCursorStateFn =
     unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveCursorState) -> bool;
-/// Stages a cursor visibility or lock change. Appended in ABI v7.
+/// Stages a cursor visibility or lock change. Appended in ABI v8.
 pub type RveSetCursorFn = unsafe extern "C" fn(ctx: *mut c_void, value: bool) -> bool;
 
 pub const RVE_COLLISION_ENTER: u32 = 0;
@@ -712,6 +712,47 @@ pub type RvePhysicsBoolFn =
     unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: *mut bool) -> bool;
 pub type RvePhysicsSetBoolFn =
     unsafe extern "C" fn(ctx: *mut c_void, object: u64, value: bool) -> bool;
+
+/// Audio group code for [`RveAudioParams::group`] and `audio_set_group_volume`. Appended in ABI v7.
+pub const RVE_AUDIO_GROUP_MASTER: u32 = 0;
+/// Audio group code; see [`RVE_AUDIO_GROUP_MASTER`].
+pub const RVE_AUDIO_GROUP_MUSIC: u32 = 1;
+/// Audio group code; see [`RVE_AUDIO_GROUP_MASTER`].
+pub const RVE_AUDIO_GROUP_EFFECTS: u32 = 2;
+/// Audio group code; see [`RVE_AUDIO_GROUP_MASTER`].
+pub const RVE_AUDIO_GROUP_AMBIENT: u32 = 3;
+
+/// Clip parameters for `audio_play_clip`. Appended in ABI v7.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveAudioParams {
+    /// One of the `RVE_AUDIO_GROUP_*` codes; `master` is rejected for clips.
+    pub group: u32,
+    pub volume: f32,
+    pub looping: bool,
+    /// When false, `position` is ignored and the clip plays without a spatial emitter.
+    pub has_position: bool,
+    pub position: [f32; 3],
+}
+
+/// Audio callback on one scene object; returns `RveStatus` as a `u32`. Appended in ABI v7.
+pub type RveAudioObjectFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
+/// Audio callback on one scene object with a volume; returns `RveStatus` as a `u32`. Appended in ABI v7.
+pub type RveAudioObjectVolumeFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, volume: f32) -> u32;
+/// Starts a clip by virtual path and writes its voice id to `out_voice`; returns `RveStatus` as a `u32`.
+/// Appended in ABI v7.
+pub type RveAudioPlayClipFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioParams,
+    out_voice: *mut u64,
+) -> u32;
+/// Stops one voice by id; returns `RveStatus` as a `u32`. Appended in ABI v7.
+pub type RveAudioVoiceFn = unsafe extern "C" fn(ctx: *mut c_void, voice: u64) -> u32;
+/// Sets one audio group's volume; returns `RveStatus` as a `u32`. Appended in ABI v7.
+pub type RveAudioGroupVolumeFn =
+    unsafe extern "C" fn(ctx: *mut c_void, group: u32, volume: f32) -> u32;
 
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
@@ -788,11 +829,18 @@ pub struct RveHost {
     pub is_grounded: Option<RvePhysicsBoolFn>,
     pub set_collider_enabled: Option<RvePhysicsSetBoolFn>,
     pub is_collider_enabled: Option<RvePhysicsBoolFn>,
-    /// Copies the cursor state applied by the host; appended in ABI v7.
+    /// Audio callbacks appended in ABI v7; `None` marks an unavailable callback.
+    pub audio_play_source: Option<RveAudioObjectFn>,
+    pub audio_stop_source: Option<RveAudioObjectFn>,
+    pub audio_set_source_volume: Option<RveAudioObjectVolumeFn>,
+    pub audio_play_clip: Option<RveAudioPlayClipFn>,
+    pub audio_stop_voice: Option<RveAudioVoiceFn>,
+    pub audio_set_group_volume: Option<RveAudioGroupVolumeFn>,
+    /// Copies the cursor state applied by the host; appended in ABI v8.
     pub cursor_state: Option<RveCursorStateFn>,
-    /// Stages cursor visibility; appended in ABI v7.
+    /// Stages cursor visibility; appended in ABI v8.
     pub set_cursor_visible: Option<RveSetCursorFn>,
-    /// Stages cursor locking; appended in ABI v7.
+    /// Stages cursor locking; appended in ABI v8.
     pub set_cursor_locked: Option<RveSetCursorFn>,
 }
 

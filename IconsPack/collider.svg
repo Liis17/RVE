@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" role="img" aria-label="RVE Collider component">
+  <defs>
+    <linearGradient id="volume" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#97F3D1"/>
+      <stop offset="1" stop-color="#3BC99B"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#C6D8E2"/>
+      <stop offset="1" stop-color="#8198A8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Small object inside a collider volume. The outline is the collision boundary. -->
+  <path d="M32 10 52 21.5 32 33 12 21.5Z" fill="#66E2BB" fill-opacity=".13"/>
+  <path d="M12 21.5 32 33V54L12 42.5Z" fill="#60E3B7" fill-opacity=".08"/>
+  <path d="M52 21.5 32 33V54L52 42.5Z" fill="#48CEA2" fill-opacity=".11"/>
+
+  <!-- Neutral 3D object enclosed by the volume. -->
+  <path d="M32 24.5 40.3 29.3 32 34.2 23.7 29.3Z" fill="#D2E0E8"/>
+  <path d="M23.7 29.3 32 34.2V43.6L23.7 38.8Z" fill="#ABC0CC"/>
+  <path d="M40.3 29.3 32 34.2V43.6L40.3 38.8Z" fill="#849CAB"/>
+
+  <!-- Green isometric collision volume: no vertex handles or triangulation. -->
+  <g stroke-linecap="round" stroke-linejoin="round" stroke-width="3">
+    <path d="M32 10 52 21.5 32 33 12 21.5Z" stroke="#8BEEC8"/>
+    <path d="M12 21.5V42.5L32 54 52 42.5V21.5" stroke="url(#volume)"/>
+    <path d="M32 33V54" stroke="#45D0A2"/>
+  </g>
+</svg>

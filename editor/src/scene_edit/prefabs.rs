@@ -518,6 +518,9 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.character_controller.is_some() {
         base.character_controller = outer.character_controller;
     }
+    if outer.audio_source.is_some() {
+        base.audio_source = outer.audio_source.clone();
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -552,6 +555,7 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.collider.is_none()
         && change.rigid_body.is_none()
         && change.character_controller.is_none()
+        && change.audio_source.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -650,6 +654,11 @@ pub(crate) fn object_override(
     match (base.character_controller, edited.character_controller) {
         (None, None) => {}
         (Some(from), Some(to)) => change.character_controller = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.audio_source, &edited.audio_source) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.audio_source = (to != from).then(|| to.clone()),
         _ => return Err(COMPONENTS.to_owned()),
     }
     if base.lite_scripts.len() != edited.lite_scripts.len()
@@ -796,6 +805,7 @@ pub enum OverrideField {
     Collider,
     RigidBody,
     CharacterController,
+    AudioSource,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -826,6 +836,7 @@ impl EditorScene {
             OverrideField::Collider => change.collider.is_some(),
             OverrideField::RigidBody => change.rigid_body.is_some(),
             OverrideField::CharacterController => change.character_controller.is_some(),
+            OverrideField::AudioSource => change.audio_source.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -868,6 +879,7 @@ impl EditorScene {
                     OverrideField::Collider => change.collider = None,
                     OverrideField::RigidBody => change.rigid_body = None,
                     OverrideField::CharacterController => change.character_controller = None,
+                    OverrideField::AudioSource => change.audio_source = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }
@@ -993,6 +1005,9 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
         .and_then(|environment| environment.hdr.clone())
     {
         paths.push(hdr);
+    }
+    if let Some(audio) = &change.audio_source {
+        paths.push(audio.clip.clone());
     }
     paths
 }
@@ -1368,6 +1383,55 @@ mod tests {
                 .hdr,
             Some(path("/environment/original.hdr"))
         );
+    }
+
+    #[test]
+    fn audio_source_prefab_override_replaces_the_component_registers_its_clip_and_reverts() {
+        let prefab = "[[assets]]\npath = \"/audio/hum.wav\"\n[[objects]]\nid = \"speaker\"\n[objects.audio_source]\nclip = \"/audio/hum.wav\"\nvolume = 0.4\nlooping = true\n";
+        let files = Files::with(&[("prefabs/speaker.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/speaker.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        scene
+            .edit_object("speaker", None, |object| {
+                let audio = object.audio_source.as_mut().unwrap();
+                audio.volume = 0.9;
+                audio.clip = path("/audio/bell.ogg");
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(scene.is_overridden("speaker", &OverrideField::AudioSource));
+        let change = scene.object_override("speaker").unwrap();
+        assert_eq!(
+            change.audio_source,
+            scene.object("speaker").unwrap().audio_source
+        );
+        assert!(
+            scene
+                .view()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/audio/bell.ogg")),
+            "override clip must be declared in the instance document"
+        );
+
+        scene
+            .revert_field("speaker", &OverrideField::AudioSource)
+            .unwrap();
+        assert!(!scene.is_overridden("speaker", &OverrideField::AudioSource));
+        let audio = scene
+            .object("speaker")
+            .unwrap()
+            .audio_source
+            .clone()
+            .unwrap();
+        assert_eq!(audio.clip, path("/audio/hum.wav"));
+        assert_eq!(audio.volume, 0.4);
     }
 
     #[test]

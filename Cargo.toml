@@ -12,6 +12,7 @@ license = "MIT"
 ash = "=0.38.0"
 ash-window = "=0.13.0"
 blake3 = "=1.8.7"
+cpal = "=0.18.2"
 egui = "=0.36.2"
 egui-winit = { version = "=0.36.2", default-features = false, features = ["clipboard", "links"] }
 egui_dock = "=0.21.1"
@@ -19,6 +20,7 @@ font8x8 = { version = "=0.3.1", default-features = false }
 flume = { version = "=0.11.1", default-features = false, features = ["async", "select"] }
 glam = "=0.34.1"
 lz4_flex = "=0.14.0"
+lewton = "=0.10.2"
 libc = "=0.2.190"
 libloading = "=0.9.0"
 log = "=0.4.34"
@@ -26,6 +28,7 @@ mlua = { version = "=0.12.2", default-features = false, features = ["lua54", "ve
 # naga 30.0.1 не собирает glsl-in без wgsl-in или spv-in: модуль interpolator скрыт за ними.
 naga = { version = "=30.0.1", features = ["glsl-in", "spv-out", "wgsl-in"] }
 notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"] }
+rtrb = "=0.4.0"
 objc2-app-kit = { version = "=0.2.2", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSResponder"] }
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGSession"] }
 objc2-foundation = { version = "=0.2.2", default-features = false, features = ["std", "NSThread"] }
@@ -40,3 +43,10 @@ ufbx = "=0.11.5"
 windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 winit = "=0.30.13"
 zstd = "=0.14.2"
+
+# Без оптимизаций кадр редактора в dev-сборке в десятки раз медленнее release.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

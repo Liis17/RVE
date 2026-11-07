@@ -12,11 +12,12 @@ use crate::transaction::{
 };
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_console::CommandSpec;
+use engine_files::VirtualPath;
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
-    AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, ParamValue,
-    ProjectionSettings, Tonemapper,
+    AntiAliasing, AudioGroup, AudioRequest, CameraColorSettings, CameraRenderSettings,
+    CameraSettings, ClipParams, ObjectHandle, ParamValue, ProjectionSettings, Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use rve_sdk::PhysicalInput;
@@ -29,6 +30,10 @@ use rve_sdk::abi::{
     RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent, RveCursorState, RveHost,
     RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime,
     RveTransform, RveValue, RveValueData,
+};
+use rve_sdk::abi::{
+    RVE_AUDIO_GROUP_AMBIENT, RVE_AUDIO_GROUP_EFFECTS, RVE_AUDIO_GROUP_MASTER,
+    RVE_AUDIO_GROUP_MUSIC, RveAudioParams,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -182,6 +187,12 @@ impl<'a> AbiCallContext<'a> {
             rebind_action: Some(host_rebind_action),
             action_binding: Some(host_action_binding),
             reset_bindings: Some(host_reset_bindings),
+            audio_play_source: Some(host_audio_play_source),
+            audio_stop_source: Some(host_audio_stop_source),
+            audio_set_source_volume: Some(host_audio_set_source_volume),
+            audio_play_clip: Some(host_audio_play_clip),
+            audio_stop_voice: Some(host_audio_stop_voice),
+            audio_set_group_volume: Some(host_audio_set_group_volume),
             cursor_state: Some(host_cursor_state),
             set_cursor_visible: Some(host_set_cursor_visible),
             set_cursor_locked: Some(host_set_cursor_locked),
@@ -954,6 +965,186 @@ unsafe extern "C" fn host_physics_set_collider_enabled(
                 false
             }
         }
+    })
+}
+
+/// Converts an audio callback result to `RveStatus`. The reason is also logged at once, because a
+/// guest that ignores the status would otherwise lose it.
+fn audio_result(context: &mut AbiCallContext<'_>, result: Result<(), String>) -> u32 {
+    match result {
+        Ok(()) => RveStatus::Ok as u32,
+        Err(message) => {
+            context.events.borrow_mut().push(ScriptEvent {
+                level: ScriptEventLevel::Error,
+                source: context.source.to_owned(),
+                message: message.clone(),
+            });
+            context.error = Some(message);
+            RveStatus::Error as u32
+        }
+    }
+}
+
+/// Resolves an object for `play_sound`-style calls; the object must have an `audio_source`.
+fn audio_source_object(
+    context: &AbiCallContext<'_>,
+    object: u64,
+    name: &str,
+) -> Result<ObjectHandle, String> {
+    let handle = context
+        .transaction
+        .object_from_abi_handle(object)
+        .ok_or_else(|| format!("{name} received an unknown object handle"))?;
+    if !context.transaction.has_audio_source(handle) {
+        return Err(format!("{name} requires an audio_source component"));
+    }
+    Ok(handle)
+}
+
+fn audio_volume(volume: f32) -> Result<f32, String> {
+    if volume.is_finite() && (0.0..=engine_scene::MAX_AUDIO_VOLUME).contains(&volume) {
+        Ok(volume)
+    } else {
+        Err(format!(
+            "audio volume must be finite and from 0 to {}",
+            engine_scene::MAX_AUDIO_VOLUME
+        ))
+    }
+}
+
+fn audio_group(code: u32) -> Result<AudioGroup, String> {
+    match code {
+        RVE_AUDIO_GROUP_MASTER => Ok(AudioGroup::Master),
+        RVE_AUDIO_GROUP_MUSIC => Ok(AudioGroup::Music),
+        RVE_AUDIO_GROUP_EFFECTS => Ok(AudioGroup::Effects),
+        RVE_AUDIO_GROUP_AMBIENT => Ok(AudioGroup::Ambient),
+        other => Err(format!("unknown audio group code {other}")),
+    }
+}
+
+fn clip_params(params: &RveAudioParams) -> Result<ClipParams, String> {
+    let group = audio_group(params.group)?;
+    if group == AudioGroup::Master {
+        return Err("clips cannot use the master audio group".to_owned());
+    }
+    let position = if params.has_position {
+        if !params.position.iter().all(|axis| axis.is_finite()) {
+            return Err("clip position must be finite".to_owned());
+        }
+        Some(params.position)
+    } else {
+        None
+    };
+    Ok(ClipParams {
+        group,
+        volume: audio_volume(params.volume)?,
+        looping: params.looping,
+        position,
+    })
+}
+
+unsafe extern "C" fn host_audio_play_source(ctx: *mut c_void, object: u64) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = audio_source_object(context, object, "play_sound").and_then(|handle| {
+            context.transaction.stage_audio(AudioRequest::PlaySource {
+                object: handle,
+                voice: VoiceId::allocate(),
+            })
+        });
+        audio_result(context, result)
+    })
+}
+
+unsafe extern "C" fn host_audio_stop_source(ctx: *mut c_void, object: u64) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = audio_source_object(context, object, "stop_sound").and_then(|handle| {
+            context
+                .transaction
+                .stage_audio(AudioRequest::StopSource { object: handle })
+        });
+        audio_result(context, result)
+    })
+}
+
+unsafe extern "C" fn host_audio_set_source_volume(
+    ctx: *mut c_void,
+    object: u64,
+    volume: f32,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = audio_source_object(context, object, "set_sound_volume").and_then(|handle| {
+            let volume = audio_volume(volume)?;
+            context
+                .transaction
+                .stage_audio(AudioRequest::SetSourceVolume {
+                    object: handle,
+                    volume,
+                })
+        });
+        audio_result(context, result)
+    })
+}
+
+unsafe extern "C" fn host_audio_play_clip(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioParams,
+    out_voice: *mut u64,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = stage_play_clip(context, path, params, out_voice);
+        audio_result(context, result)
+    })
+}
+
+fn stage_play_clip(
+    context: &mut AbiCallContext<'_>,
+    path: RveStr,
+    params: *const RveAudioParams,
+    out_voice: *mut u64,
+) -> Result<(), String> {
+    if params.is_null() || out_voice.is_null() {
+        return Err("play_clip received a null pointer".to_owned());
+    }
+    // SAFETY: the guest passes a valid params pointer for this synchronous callback.
+    let params = clip_params(unsafe { &*params })?;
+    // SAFETY: the guest keeps the path string alive for this synchronous callback.
+    let path = unsafe { read_abi_str(path) }
+        .map_err(|_| "play_clip received an invalid path".to_owned())?;
+    let path = VirtualPath::parse(path).map_err(|error| format!("play_clip: {error}"))?;
+    let voice = VoiceId::allocate();
+    context.transaction.stage_audio(AudioRequest::PlayClip {
+        voice,
+        path,
+        params,
+    })?;
+    // SAFETY: out_voice was checked non-null and is writable for this callback.
+    unsafe { *out_voice = voice.get() };
+    Ok(())
+}
+
+unsafe extern "C" fn host_audio_stop_voice(ctx: *mut c_void, voice: u64) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = VoiceId::from_raw(voice)
+            .ok_or_else(|| "stop_voice expects a nonzero voice id".to_owned())
+            .and_then(|voice| {
+                context
+                    .transaction
+                    .stage_audio(AudioRequest::StopVoice { voice })
+            });
+        audio_result(context, result)
+    })
+}
+
+unsafe extern "C" fn host_audio_set_group_volume(ctx: *mut c_void, group: u32, volume: f32) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = audio_group(group).and_then(|group| {
+            let volume = audio_volume(volume)?;
+            context
+                .transaction
+                .stage_audio(AudioRequest::SetGroupVolume { group, volume })
+        });
+        audio_result(context, result)
     })
 }
 
@@ -1747,6 +1938,7 @@ mod tests {
                 crate::actions::ActionFrame::empty(ScriptInput::default()),
             ),
             queued_messages: (0, 0),
+            queued_audio: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -1830,6 +2022,7 @@ mod tests {
                 crate::actions::ActionFrame::empty(ScriptInput::default()),
             ),
             queued_messages: (0, 0),
+            queued_audio: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -1865,6 +2058,7 @@ mod tests {
                 crate::actions::ActionFrame::empty(ScriptInput::default()),
             ),
             queued_messages: (0, 0),
+            queued_audio: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -1891,8 +2085,15 @@ mod tests {
         }
         let mut queued = Vec::new();
         let mut queued_bytes = 0;
+        let mut audio = Vec::new();
         transaction
-            .commit(&mut world, &mut queued, &mut queued_bytes, &events)
+            .commit(
+                &mut world,
+                &mut queued,
+                &mut queued_bytes,
+                &events,
+                &mut audio,
+            )
             .unwrap();
         assert_eq!(
             transaction.cursor(),

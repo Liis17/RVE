@@ -1,5 +1,6 @@
 //! Панель Hierarchy: дерево объектов сцены.
 
+use crate::icons::{IconCache, object_icon};
 use crate::scene_edit::{EditorScene, NewObject};
 use crate::state::{Action, AssetDrag, EditorState};
 use crate::ui::scene_view;
@@ -107,6 +108,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
             let children = children_map(&scene.view().objects);
             let tree = TreeContext {
                 scene,
+                icons: &state.icons,
                 children: &children,
                 rename: rename.as_ref(),
                 rename_focus,
@@ -148,6 +150,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
 
 struct TreeContext<'a> {
     scene: &'a EditorScene,
+    icons: &'a IconCache,
     children: &'a HashMap<Option<&'a str>, Vec<&'a SceneObject>>,
     rename: Option<&'a (String, String)>,
     /// Полю переименования нужно передать фокус в этом кадре.
@@ -236,6 +239,14 @@ impl TreeContext<'_> {
         });
         if instance.is_some() || part {
             text = text.color(PREFAB_COLOR);
+        }
+        // Иконка по компонентам объекта; без текстуры строка остаётся одной подписью.
+        if let Some(texture) = object_icon(object).and_then(|name| self.icons.get(name)) {
+            let size = ui.spacing().interact_size.y;
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                texture,
+                egui::vec2(size, size),
+            )));
         }
         let response =
             ui.add(egui::Button::selectable(selected, text).sense(egui::Sense::click_and_drag()));

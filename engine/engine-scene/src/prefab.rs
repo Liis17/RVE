@@ -4,6 +4,7 @@
 //! `[[instances]]` вставляет раскрытое дерево префаба: корень получает id экземпляра,
 //! остальные объекты — `<экземпляр>.<id в префабе>`, у вложенных — `a.b.c`.
 
+use crate::audio::{AudioSourceComponent, validate_audio_source};
 use crate::document::{
     CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
     DocumentKind, EnvironmentComponent, MaterialAlphaMode, MaterialOverride, ParamValue,
@@ -71,6 +72,8 @@ pub struct PrefabOverride {
     pub rigid_body: Option<RigidBodyComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character_controller: Option<CharacterControllerComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_source: Option<AudioSourceComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -279,6 +282,13 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .ok_or("override character_controller: у объекта нет character_controller")?;
         *target = controller;
     }
+    if let Some(audio) = &change.audio_source {
+        let target = object
+            .audio_source
+            .as_mut()
+            .ok_or("override audio_source: у объекта нет audio_source")?;
+        *target = audio.clone();
+    }
     if let Some(environment) = &change.environment {
         let target = object
             .environment
@@ -445,6 +455,9 @@ pub(crate) fn validate_instances(
             }
             if let Some(environment) = &change.environment {
                 validate_environment(source, id, assets, environment)?;
+            }
+            if let Some(audio) = &change.audio_source {
+                validate_audio_source(source, id, assets, audio)?;
             }
         }
     }

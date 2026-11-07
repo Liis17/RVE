@@ -1,6 +1,6 @@
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
-    RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray,
+    RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams,
     RveCameraSettings, RveCharacterMoveResult, RveCursorState, RveHeader, RveHost, RveModule,
     RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime,
     RveTransform, RveValue, RveValueData,
@@ -204,6 +204,10 @@ struct HostState {
     physics_vectors: Vec<(u64, [f32; 3])>,
     cursor_visible: bool,
     cursor_locked: bool,
+    audio_calls: Vec<String>,
+    /// Status returned by every audio callback; zero is `RveStatus::Ok`.
+    audio_status: u32,
+    next_voice: u64,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -487,6 +491,12 @@ fn host(state: &mut HostState) -> RveHost {
         is_grounded: None,
         set_collider_enabled: None,
         is_collider_enabled: None,
+        audio_play_source: None,
+        audio_stop_source: None,
+        audio_set_source_volume: None,
+        audio_play_clip: None,
+        audio_stop_voice: None,
+        audio_set_group_volume: None,
         cursor_state: Some(cursor_state),
         set_cursor_visible: Some(set_cursor_visible),
         set_cursor_locked: Some(set_cursor_locked),
@@ -810,6 +820,181 @@ fn sdk_physics_api_reports_absent_optional_callbacks() {
     assert_eq!(
         object.set_velocity(&mut context, [0.0; 3]),
         Err(crate::PhysicsError::Unavailable)
+    );
+}
+
+unsafe extern "C" fn audio_object(ctx: *mut c_void, _: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.audio_calls.push("object".to_owned());
+    state.audio_status
+}
+
+unsafe extern "C" fn audio_object_volume(ctx: *mut c_void, _: u64, volume: f32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.audio_calls.push(format!("volume:{volume}"));
+    state.audio_status
+}
+
+unsafe extern "C" fn audio_play_clip(
+    ctx: *mut c_void,
+    path: RveStr,
+    params: *const RveAudioParams,
+    out_voice: *mut u64,
+) -> u32 {
+    // SAFETY: the context, guest path and params are live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let path = unsafe { path.to_str() }.unwrap();
+    let params = unsafe { *params };
+    state.audio_calls.push(format!(
+        "clip:{path}:group={}:volume={}:looping={}:position={:?}",
+        params.group,
+        params.volume,
+        params.looping,
+        params.has_position.then_some(params.position)
+    ));
+    if state.audio_status == 0 {
+        // SAFETY: out_voice is writable for this callback.
+        unsafe { *out_voice = state.next_voice };
+    }
+    state.audio_status
+}
+
+unsafe extern "C" fn audio_stop_voice(ctx: *mut c_void, voice: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.audio_calls.push(format!("stop:{voice}"));
+    state.audio_status
+}
+
+unsafe extern "C" fn audio_group_volume(ctx: *mut c_void, group: u32, volume: f32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.audio_calls.push(format!("group:{group}:{volume}"));
+    state.audio_status
+}
+
+fn audio_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.audio_play_source = Some(audio_object);
+    host.audio_stop_source = Some(audio_object);
+    host.audio_set_source_volume = Some(audio_object_volume);
+    host.audio_play_clip = Some(audio_play_clip);
+    host.audio_stop_voice = Some(audio_stop_voice);
+    host.audio_set_group_volume = Some(audio_group_volume);
+    host
+}
+
+#[test]
+fn sdk_audio_api_forwards_options_and_returns_the_voice_id() {
+    let mut state = HostState {
+        next_voice: 42,
+        ..HostState::default()
+    };
+    let host = audio_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    object.play_sound(&mut context).unwrap();
+    object.set_sound_volume(&mut context, 0.5).unwrap();
+    let voice = context
+        .play_clip(
+            "/audio/hum.wav",
+            crate::ClipOptions {
+                group: crate::AudioGroup::Music,
+                volume: 0.25,
+                looping: true,
+                position: Some([1.0, 2.0, 3.0]),
+            },
+        )
+        .unwrap();
+    assert_eq!(voice, 42);
+    context.stop_voice(voice).unwrap();
+    context
+        .set_group_volume(crate::AudioGroup::Master, 0.75)
+        .unwrap();
+    assert_eq!(
+        state.audio_calls,
+        [
+            "object",
+            "volume:0.5",
+            "clip:/audio/hum.wav:group=1:volume=0.25:looping=true:position=Some([1.0, 2.0, 3.0])",
+            "stop:42",
+            "group:0:0.75",
+        ]
+    );
+}
+
+#[test]
+fn sdk_audio_api_reports_rejections_missing_callbacks_and_invalid_input() {
+    let mut state = HostState {
+        audio_status: 1,
+        ..HostState::default()
+    };
+    let host = audio_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        object.play_sound(&mut context),
+        Err(crate::AudioError::Rejected)
+    );
+    assert_eq!(
+        context.play_clip("/audio/hum.wav", crate::ClipOptions::default()),
+        Err(crate::AudioError::Rejected)
+    );
+    assert_eq!(
+        object.set_sound_volume(&mut context, -1.0),
+        Err(crate::AudioError::InvalidInput)
+    );
+    assert_eq!(
+        object.set_sound_volume(&mut context, crate::MAX_AUDIO_VOLUME + 0.5),
+        Err(crate::AudioError::InvalidInput)
+    );
+    assert_eq!(
+        context.set_group_volume(crate::AudioGroup::Music, 10.0),
+        Err(crate::AudioError::InvalidInput)
+    );
+    let nan_position = crate::ClipOptions {
+        position: Some([f32::NAN, 0.0, 0.0]),
+        ..crate::ClipOptions::default()
+    };
+    assert_eq!(
+        context.play_clip("/audio/hum.wav", nan_position),
+        Err(crate::AudioError::InvalidInput)
+    );
+    assert_eq!(
+        state.audio_calls.len(),
+        2,
+        "invalid input never reaches the host"
+    );
+
+    let mut plain = HostState::default();
+    let plain_host = self::host(&mut plain);
+    let mut context = Context::new(&plain_host).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        object.stop_sound(&mut context),
+        Err(crate::AudioError::Unavailable)
+    );
+    assert_eq!(
+        context.set_group_volume(crate::AudioGroup::Music, 1.0),
+        Err(crate::AudioError::Unavailable)
+    );
+}
+
+#[test]
+fn audio_callbacks_and_params_keep_the_v7_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<crate::abi::RveAudioParams>(), 24);
+    assert_eq!(offset_of!(crate::abi::RveAudioParams, position), 12);
+    assert_eq!(
+        offset_of!(RveHost, audio_play_source),
+        offset_of!(RveHost, is_collider_enabled)
+            + size_of::<Option<crate::abi::RvePhysicsBoolFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, audio_set_group_volume),
+        offset_of!(RveHost, audio_stop_voice) + size_of::<Option<crate::abi::RveAudioVoiceFn>>()
     );
 }
 
@@ -1344,7 +1529,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 7);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 8);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -1388,8 +1573,8 @@ fn param_descriptor_layout_is_c_compatible() {
     );
     assert_eq!(
         offset_of!(RveHost, cursor_state),
-        offset_of!(RveHost, is_collider_enabled)
-            + size_of::<Option<crate::abi::RvePhysicsBoolFn>>()
+        offset_of!(RveHost, audio_set_group_volume)
+            + size_of::<Option<crate::abi::RveAudioGroupVolumeFn>>()
     );
     assert_eq!(
         offset_of!(RveHost, set_cursor_visible),
@@ -1419,7 +1604,7 @@ fn sdk_cursor_api_reads_applied_state_and_stages_changes() {
 }
 
 #[test]
-fn sdk_cursor_api_reports_unavailable_callbacks_before_abi_v7() {
+fn sdk_cursor_api_reports_unavailable_callbacks_before_abi_v8() {
     let mut state = HostState::default();
     let mut host = host(&mut state);
     host.cursor_state = None;

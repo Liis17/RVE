@@ -3,11 +3,11 @@
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent,
-    DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup, MeshRenderer,
-    ObjectOrigin, PointLightComponent, PrefabInstance, PrefabOverride, ProceduralSkyComponent,
-    RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject, SceneTransform,
-    SpotLightComponent,
+    AudioSourceComponent, CameraComponent, CameraCursor, CharacterControllerComponent,
+    ColliderComponent, DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup,
+    MeshRenderer, ObjectOrigin, PointLightComponent, PrefabInstance, PrefabOverride,
+    ProceduralSkyComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform, SpotLightComponent,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -84,6 +84,7 @@ pub enum ComponentKind {
     Collider,
     RigidBody,
     CharacterController,
+    AudioSource,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -100,6 +101,7 @@ pub enum Component {
     Collider(ColliderComponent),
     RigidBody(RigidBodyComponent),
     CharacterController(CharacterControllerComponent),
+    AudioSource(AudioSourceComponent),
 }
 
 impl Component {
@@ -116,6 +118,7 @@ impl Component {
             Self::Collider(_) => ComponentKind::Collider,
             Self::RigidBody(_) => ComponentKind::RigidBody,
             Self::CharacterController(_) => ComponentKind::CharacterController,
+            Self::AudioSource(_) => ComponentKind::AudioSource,
         }
     }
 
@@ -135,6 +138,7 @@ impl Component {
             ComponentKind::CharacterController => {
                 Self::CharacterController(object.character_controller?)
             }
+            ComponentKind::AudioSource => Self::AudioSource(object.audio_source.clone()?),
         })
     }
 
@@ -159,6 +163,10 @@ impl Component {
             ComponentKind::CharacterController => {
                 Self::CharacterController(CharacterControllerComponent::default())
             }
+            // Как и модель Mesh Renderer, клип сохраняется: без него источник не задан.
+            ComponentKind::AudioSource => Self::AudioSource(AudioSourceComponent::with_clip(
+                object.audio_source.as_ref()?.clip.clone(),
+            )),
         })
     }
 
@@ -179,6 +187,7 @@ impl Component {
             Self::Collider(value) => object.collider = Some(value),
             Self::RigidBody(value) => object.rigid_body = Some(value),
             Self::CharacterController(value) => object.character_controller = Some(value),
+            Self::AudioSource(value) => object.audio_source = Some(value),
         }
     }
 }
@@ -1202,6 +1211,14 @@ impl EditorScene {
         })
     }
 
+    /// Удаляет звуковой источник объекта.
+    pub fn remove_audio_source(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.audio_source = None;
+            Ok(())
+        })
+    }
+
     /// Удаляет mesh renderer и его обязательную LOD Group в одной правке.
     pub fn remove_mesh_renderer(&mut self, id: &str) -> Result<(), String> {
         self.edit_object(id, None, |object| {
@@ -1417,6 +1434,9 @@ fn register_object_assets(
                 ensure_asset(document, &texture);
             }
         }
+    }
+    if let Some(audio) = &object.audio_source {
+        ensure_asset(document, &audio.clip);
     }
     for script in &object.lite_scripts {
         ensure_asset(document, &script.path);
@@ -2371,6 +2391,58 @@ mod tests {
                 .remove_physics_component(&id, ComponentKind::PointLight)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn audio_source_registers_its_clip_resets_keeping_it_and_rolls_back_invalid_values() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let clip = VirtualPath::parse("audio/hum.wav").unwrap();
+        let loud = AudioSourceComponent {
+            volume: 0.5,
+            looping: true,
+            ..AudioSourceComponent::with_clip(clip.clone())
+        };
+        scene
+            .set_component(&id, Component::AudioSource(loud))
+            .unwrap();
+        assert!(scene.view().assets.iter().any(|asset| asset.path == clip));
+
+        let copied =
+            Component::read(scene.object(&id).unwrap(), ComponentKind::AudioSource).unwrap();
+        assert!(matches!(
+            copied,
+            Component::AudioSource(ref audio) if audio.volume == 0.5 && audio.looping
+        ));
+
+        let reset =
+            Component::reset(scene.object(&id).unwrap(), ComponentKind::AudioSource).unwrap();
+        scene.set_component(&id, reset).unwrap();
+        let audio = scene.object(&id).unwrap().audio_source.clone().unwrap();
+        assert_eq!(audio, AudioSourceComponent::with_clip(clip.clone()));
+
+        let invalid = AudioSourceComponent {
+            volume: -1.0,
+            ..AudioSourceComponent::with_clip(clip)
+        };
+        let error = scene
+            .set_component(&id, Component::AudioSource(invalid))
+            .unwrap_err();
+        assert!(error.contains("volume"), "{error}");
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .audio_source
+                .as_ref()
+                .unwrap()
+                .volume,
+            1.0
+        );
+
+        scene.remove_audio_source(&id).unwrap();
+        assert!(scene.object(&id).unwrap().audio_source.is_none());
+        assert!(Component::reset(scene.object(&id).unwrap(), ComponentKind::AudioSource).is_none());
     }
 
     #[test]

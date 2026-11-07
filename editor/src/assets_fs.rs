@@ -25,6 +25,7 @@ pub enum AssetKind {
     Model,
     Texture,
     Hdr,
+    Audio,
     Script,
     Other,
 }
@@ -43,6 +44,7 @@ impl AssetKind {
             Some("fbx") => Self::Model,
             Some("png") => Self::Texture,
             Some("hdr") => Self::Hdr,
+            Some("wav" | "ogg") => Self::Audio,
             Some("lua") => Self::Script,
             _ => Self::Other,
         }

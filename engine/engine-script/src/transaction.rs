@@ -6,7 +6,7 @@ use engine_physics::{
     BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
     QueryHit, Ray,
 };
-use engine_scene::{CameraSettings, LocalTransform, ObjectHandle, ParamValue, World};
+use engine_scene::{AudioRequest, CameraSettings, LocalTransform, ObjectHandle, ParamValue, World};
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,6 +14,8 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
+/// Звуковых запросов за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
+pub(crate) const MAX_AUDIO_REQUESTS_PER_FRAME: usize = 256;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_DEPTH: usize = 16;
 pub(crate) const MAX_MESSAGE_ELEMENTS: usize = 1024;
@@ -89,6 +91,8 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) writable: bool,
     pub(crate) actions: Arc<ActionFrame>,
     pub(crate) queued_messages: (usize, usize),
+    /// Звуковые запросы, уже зафиксированные в этом кадре.
+    pub(crate) queued_audio: usize,
     pub(crate) physics: Rc<RefCell<PhysicsScriptState>>,
     pub(crate) physics_phase_dt: Option<f32>,
     /// Состояние курсора, применённое хостом до этого вызова.
@@ -121,6 +125,7 @@ pub(crate) struct ScriptTransaction {
     pending_bytes: usize,
     queued_message_count: usize,
     queued_message_bytes: usize,
+    queued_audio: usize,
     overflowed_messages: usize,
     action_frame: Option<Arc<ActionFrame>>,
     physics: Rc<RefCell<PhysicsScriptState>>,
@@ -134,6 +139,7 @@ pub(crate) struct ScriptTransaction {
     cursor: ScriptCursor,
     pending_cursor_visible: Option<bool>,
     pending_cursor_locked: Option<bool>,
+    pending_audio: Vec<AudioRequest>,
     #[cfg(test)]
     peak_pending_bytes: usize,
 }
@@ -160,6 +166,7 @@ impl Default for ScriptTransaction {
             pending_bytes: 0,
             queued_message_count: 0,
             queued_message_bytes: 0,
+            queued_audio: 0,
             overflowed_messages: 0,
             action_frame: None,
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
@@ -172,6 +179,7 @@ impl Default for ScriptTransaction {
             cursor: ScriptCursor::default(),
             pending_cursor_visible: None,
             pending_cursor_locked: None,
+            pending_audio: Vec::new(),
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
@@ -207,11 +215,13 @@ impl ScriptTransaction {
         self.pending_bytes = 0;
         self.queued_message_count = init.queued_messages.0;
         self.queued_message_bytes = init.queued_messages.1;
+        self.queued_audio = init.queued_audio;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
         self.cursor = init.cursor;
         self.pending_cursor_visible = None;
         self.pending_cursor_locked = None;
+        self.pending_audio.clear();
     }
 
     pub(crate) fn writable(&self) -> bool {
@@ -278,6 +288,27 @@ impl ScriptTransaction {
         self.action_frame().validate_mutation(&mutation)?;
         self.pending_action_mutations.push(mutation);
         Ok(())
+    }
+
+    /// Ставит звуковой запрос до коммита. При отказе скрипта транзакция его отбрасывает.
+    pub(crate) fn stage_audio(&mut self, request: AudioRequest) -> Result<(), String> {
+        if !self.writable {
+            return Err("audio is unavailable during script creation".to_owned());
+        }
+        if self.queued_audio.saturating_add(self.pending_audio.len())
+            >= MAX_AUDIO_REQUESTS_PER_FRAME
+        {
+            return Err(format!(
+                "audio requests limit ({MAX_AUDIO_REQUESTS_PER_FRAME} per frame) reached"
+            ));
+        }
+        self.pending_audio.push(request);
+        Ok(())
+    }
+
+    pub(crate) fn has_audio_source(&self, handle: ObjectHandle) -> bool {
+        self.world()
+            .is_some_and(|world| world.audio_source(handle).is_some())
     }
 
     pub(crate) fn physics_raycast(
@@ -745,6 +776,7 @@ impl ScriptTransaction {
         queued_messages: &mut Vec<PendingMessage>,
         queued_bytes: &mut usize,
         events: &EventQueue,
+        audio: &mut Vec<AudioRequest>,
     ) -> Result<Vec<ActionMutation>, String> {
         let transforms_are_finite = self.pending_transforms.values().all(|transform| {
             transform
@@ -888,6 +920,7 @@ impl ScriptTransaction {
         }
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
+        audio.append(&mut self.pending_audio);
         self.world = std::ptr::null();
         self.action_frame = None;
         Ok(std::mem::take(&mut self.pending_action_mutations))
@@ -910,6 +943,7 @@ impl ScriptTransaction {
         self.pending_action_mutations.clear();
         self.pending_cursor_visible = None;
         self.pending_cursor_locked = None;
+        self.pending_audio.clear();
         self.world = std::ptr::null();
         self.action_frame = None;
     }
