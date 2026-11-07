@@ -758,13 +758,14 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "egui-winit",
  "engine-assets",
  "engine-audio",
  "engine-console",
+ "engine-core",
  "engine-files",
  "engine-network",
  "engine-neural",
@@ -811,10 +812,11 @@ dependencies = [
 
 [[package]]
 name = "engine-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "engine-console",
+ "engine-core",
  "engine-render",
 ]
 

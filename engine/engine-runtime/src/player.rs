@@ -149,6 +149,8 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         #[cfg(feature = "dev-console")]
         console_needs_redraw: false,
         #[cfg(feature = "dev-console")]
+        profile_open: false,
+        #[cfg(feature = "dev-console")]
         console_repaint_at: None,
         #[cfg(feature = "dev-console")]
         seen_console_generation: None,
@@ -217,6 +219,8 @@ struct PlayerWindow<'a> {
     console_needs_redraw: bool,
     #[cfg(feature = "dev-console")]
     console_repaint_at: Option<Instant>,
+    #[cfg(feature = "dev-console")]
+    profile_open: bool,
     #[cfg(feature = "dev-console")]
     seen_console_generation: Option<u64>,
     #[cfg(feature = "dev-console")]
@@ -302,7 +306,7 @@ impl PlayerWindow<'_> {
 
     #[cfg(feature = "dev-console")]
     fn update_console(&mut self, window: &Window) {
-        if !self.console_open {
+        if !self.console_open && !self.profile_open {
             return;
         }
         if self.window_occluded {
@@ -360,10 +364,24 @@ impl PlayerWindow<'_> {
             .catalog
             .clone();
         let mut console_output = Default::default();
+        let profile_open = self.profile_open;
+        let profile_reports: Vec<Arc<engine_core::profile::ProfileReport>> = self
+            .status
+            .profile
+            .reports()
+            .into_iter()
+            .map(|(_, report)| report)
+            .collect();
+        let console_open = self.console_open;
         let output = context.run_ui(raw_input, |_ui| {
-            console_output = self
-                .console_overlay
-                .show(&context, screen_rect, &lines, &catalog);
+            if console_open {
+                console_output = self
+                    .console_overlay
+                    .show(&context, screen_rect, &lines, &catalog);
+            }
+            if profile_open {
+                engine_ui::profiler::overlay(&context, &profile_reports);
+            }
         });
         if console_output.toggled {
             self.set_console_open(self.console_overlay.is_open(), window);
@@ -381,14 +399,21 @@ impl PlayerWindow<'_> {
         if let Some(delay) = repaint_delay {
             self.console_repaint_at = Instant::now().checked_add(delay);
         }
+        if self.profile_open {
+            let refresh = Instant::now() + crate::profiling::PUBLISH_INTERVAL;
+            self.console_repaint_at = Some(
+                self.console_repaint_at
+                    .map_or(refresh, |deadline| deadline.min(refresh)),
+            );
+        }
         if let Some(state) = self.egui_state.as_mut() {
             state.handle_platform_output(window, platform_output);
         }
 
-        let open = self.console_open;
+        let visible = self.console_open || self.profile_open;
         let frame = ConsoleUiFrame {
-            visible: open,
-            primitives: if open {
+            visible,
+            primitives: if visible {
                 context.tessellate(shapes, pixels_per_point)
             } else {
                 Vec::new()
@@ -458,6 +483,31 @@ impl PlayerWindow<'_> {
             format!("> {text}"),
         );
         match command.name.as_str() {
+            "profile" => {
+                if let Err(error) = validate_builtin_args(&command, 0, "profile") {
+                    push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
+                    return;
+                }
+                let reports = self.status.profile.reports();
+                if reports.is_empty() {
+                    push_console_line(
+                        &self.console_buffer,
+                        ConsoleLevel::Info,
+                        "profile",
+                        "данных профайлера ещё нет",
+                    );
+                }
+                for (_, report) in reports {
+                    for line in report.to_string().lines() {
+                        push_console_line(
+                            &self.console_buffer,
+                            ConsoleLevel::Info,
+                            "profile",
+                            line,
+                        );
+                    }
+                }
+            }
             "help" => {
                 if let Err(error) = validate_builtin_args(&command, 1, "help [prefix]") {
                     push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
@@ -623,6 +673,16 @@ impl WindowHandler for PlayerWindow<'_> {
 
     #[cfg(feature = "dev-console")]
     fn window_event(&mut self, window: &Window, event: &WindowEvent) {
+        #[cfg(feature = "dev-console")]
+        if let WindowEvent::KeyboardInput { event, .. } = event
+            && event.physical_key == PhysicalKey::Code(KeyCode::F3)
+        {
+            if event.state == ElementState::Pressed && !event.repeat {
+                self.profile_open = !self.profile_open;
+                self.console_needs_redraw = true;
+            }
+            return;
+        }
         if let WindowEvent::KeyboardInput { event, .. } = event
             && event.physical_key == PhysicalKey::Code(KeyCode::Backquote)
         {
@@ -643,7 +703,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn next_wakeup(&mut self) -> Option<Instant> {
         #[cfg(feature = "dev-console")]
-        if self.console_open
+        if (self.console_open || self.profile_open)
             && let Some(console_wakeup) = self.console_repaint_at
         {
             return Some(

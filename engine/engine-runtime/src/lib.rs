@@ -1,5 +1,8 @@
 //! Startup, module ownership and runtime thread coordination for the RVE player.
 
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod activation;
 mod cli;
 #[cfg(feature = "dev-console")]
@@ -10,6 +13,7 @@ mod layout;
 mod module_host;
 mod pipeline;
 mod player;
+mod profiling;
 mod scene;
 
 use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_or_activate};
@@ -38,11 +42,12 @@ use pipeline::{
     Clock, MonotonicClock, RuntimeStatus, SCRIPTS_THREAD, ScriptStartupError, ScriptThreadConfig,
     start_scripts,
 };
+use profiling::StartupProfile;
 use scene::{PreparedScene, load_scene};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::{CpuRefreshKind, System};
 
 const SCRIPTS_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -198,6 +203,8 @@ fn run_from_args(
         }
     }
 
+    let mut startup = StartupProfile::default();
+    let mut phase_started = Instant::now();
     let mut system = System::new();
     system.refresh_memory();
     system.refresh_cpu_list(CpuRefreshKind::nothing());
@@ -221,11 +228,15 @@ fn run_from_args(
         return ExitCode::from(3);
     }
 
+    startup.record("hardware probe", phase_started.elapsed());
+    phase_started = Instant::now();
     let assets = Assets::with_resources(resource_handle.clone());
     let icon = match load_window_icon(&bootstrap, &assets) {
         Ok(icon) => icon,
         Err(error) => return fail(2, format!("ошибка иконки приложения: {error}")),
     };
+    startup.record("window icon", phase_started.elapsed());
+    phase_started = Instant::now();
     let scene_path = match project.starting_scene() {
         Some(path) => path.to_owned(),
         None => return fail(2, "в проекте не указана стартовая сцена"),
@@ -234,6 +245,8 @@ fn run_from_args(
         Ok(prepared) => prepared,
         Err(error) => return fail(2, format!("ошибка загрузки сцены: {error}")),
     };
+    startup.record("scene load", phase_started.elapsed());
+    phase_started = Instant::now();
     let (physics_driver, physics_bindings) = match prepared.build_physics(&project.physics) {
         Ok(physics) => physics,
         Err(error) => return fail(2, format!("ошибка построения физической сцены: {error}")),
@@ -246,6 +259,8 @@ fn run_from_args(
             }
         };
 
+    startup.record("physics build", phase_started.elapsed());
+    phase_started = Instant::now();
     let mut modules = ModuleHost::new();
     let status = Arc::new(RuntimeStatus::default());
     let physics_client = match start_modules(&mut modules, physics_driver, Arc::clone(&status)) {
@@ -258,6 +273,8 @@ fn run_from_args(
         }
     };
 
+    startup.record("physics module", phase_started.elapsed());
+    phase_started = Instant::now();
     let PreparedScene {
         world,
         name,
@@ -304,6 +321,8 @@ fn run_from_args(
             return fail(1, format!("не удалось запустить поток скриптов: {error}"));
         }
     };
+    startup.record("scripts start", phase_started.elapsed());
+    phase_started = Instant::now();
     let mut scripts_ready_timed_out = false;
     if let Err((code, message)) = wait_scripts_ready(
         &script_thread.ready,
@@ -336,6 +355,8 @@ fn run_from_args(
         icon,
         redraw: RedrawMode::OnDemand,
     };
+    startup.record("scripts ready", phase_started.elapsed());
+    startup.publish(&status.profile);
     let code = player::run_window(
         player::PlayerConfig {
             window: config,
