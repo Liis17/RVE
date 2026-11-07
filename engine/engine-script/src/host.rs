@@ -732,6 +732,31 @@ impl ScriptHost {
         std::mem::take(&mut self.lifecycle.borrow_mut().changes)
     }
 
+    /// Откатывает spawn, который хост уже применил, но мир или физика его отвергли. Поддерево
+    /// `root` удаляется вместе с экземплярами: не стартовавшие экземпляры снимаются без
+    /// `on_destroy` и `on_start`, стартовавшие получают `on_destroy` как при `destroy`.
+    ///
+    /// Удаления не попадают в [`WorldChanges`]: вызывающий код уже получил `spawned` для этого
+    /// корня из последнего `drain_world_changes` и сам снимает его ресурсы. Пишет Error с
+    /// причиной `reason`; его нужно забрать через `drain_events`.
+    pub fn revert_spawn(&mut self, world: &mut World, root: ObjectHandle, reason: &str) {
+        if world.is_alive(root) {
+            let count = world.subtree(&[root]).len();
+            if self
+                .remove_subtrees(world, &[root], self.current_time)
+                .is_some()
+            {
+                // Откат возвращает место в лимите кадра: отказавший spawn его не тратит.
+                self.frame_spawned = self.frame_spawned.saturating_sub(count);
+            }
+        }
+        self.events.borrow_mut().push(ScriptEvent {
+            level: ScriptEventLevel::Error,
+            source: self.scene_name.clone(),
+            message: format!("spawn rolled back: {reason}"),
+        });
+    }
+
     /// Runs on_start once. update also calls start automatically if needed.
     pub fn start(&mut self, world: &mut World, time: ScriptTime) {
         if self.started || self.destroyed {
@@ -1790,12 +1815,28 @@ impl ScriptHost {
                 message: "the active camera cannot be destroyed".to_owned(),
             });
         }
-        let targets = accepted;
-        if targets.is_empty() {
+        if accepted.is_empty() {
             return;
         }
+        if let Some(removed) = self.remove_subtrees(world, &accepted, time) {
+            self.lifecycle
+                .borrow_mut()
+                .changes
+                .despawned
+                .extend(removed);
+        }
+    }
 
-        let doomed: HashSet<ObjectHandle> = world.subtree(&targets).into_iter().collect();
+    /// Удаляет поддеревья `targets` вместе с экземплярами: тела уходят в retire, стартовавшие
+    /// экземпляры получают `on_destroy`, затем объекты удаляются из мира. Возвращает удалённые
+    /// объекты или `None`, если мир отказал (тогда пишется Error и ничего не меняется в учёте).
+    fn remove_subtrees(
+        &mut self,
+        world: &mut World,
+        targets: &[ObjectHandle],
+        time: ScriptTime,
+    ) -> Option<Vec<ObjectHandle>> {
+        let doomed: HashSet<ObjectHandle> = world.subtree(targets).into_iter().collect();
 
         let retired = doomed
             .iter()
@@ -1837,7 +1878,7 @@ impl ScriptHost {
             }
         }
 
-        let removed = match world.despawn_many(&targets) {
+        let removed = match world.despawn_many(targets) {
             Ok(removed) => removed,
             Err(error) => {
                 self.events.borrow_mut().push(ScriptEvent {
@@ -1845,7 +1886,7 @@ impl ScriptHost {
                     source: self.scene_name.clone(),
                     message: error.to_string(),
                 });
-                return;
+                return None;
             }
         };
         let removed_set: HashSet<ObjectHandle> = removed.iter().copied().collect();
@@ -1864,7 +1905,6 @@ impl ScriptHost {
                     prefabs.push(prefab);
                 }
             }
-            lifecycle.changes.despawned.extend(removed.iter().copied());
             for prefab in prefabs {
                 lifecycle.begin_unload_if_idle(&prefab);
             }
@@ -1877,6 +1917,15 @@ impl ScriptHost {
                 self.remove_instance(index);
             }
         }
+        // Экземпляры, которым ещё не поставили on_start, из очереди уходят вместе с ними.
+        let instances = &self.instances;
+        self.start_queue.retain(|&(index, serial)| {
+            instances
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|instance| instance.serial == serial)
+        });
+        Some(removed)
     }
 
     fn take_waiting(&mut self, root: ObjectHandle) -> Option<SpawnRequest> {

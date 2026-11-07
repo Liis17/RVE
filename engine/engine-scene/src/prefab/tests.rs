@@ -823,10 +823,42 @@ fn spawn_template_rejects_camera_directional_light_and_environment() {
             "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"lamp\"\nparent = \"root\"\n{component}"
         );
         let library = Library::new(&[("prefabs/bullet.rveprefab", text.as_str())]);
-        let error = load_template(&library, "prefabs/bullet.rveprefab").unwrap_err();
+        let template = load_template(&library, "prefabs/bullet.rveprefab").unwrap();
+        let error = template.check_spawnable().unwrap_err();
         assert!(error.message.contains(name), "{error}");
         assert_eq!(error.object_id.as_deref(), Some("lamp"));
     }
+}
+
+#[test]
+fn prefab_with_environment_loads_as_a_template_and_only_spawn_is_refused() {
+    let environment = "[objects.environment]\n[objects.environment.procedural]\nzenith_color = [0.2, 0.3, 0.5]\nhorizon_color = [0.8, 0.7, 0.5]\nground_color = [0.1, 0.1, 0.1]\nsun_size_deg = 3.0\nsun_intensity = 2.0\n";
+    let text = format!("[[objects]]\nid = \"sky\"\n{environment}");
+    let library = Library::new(&[("prefabs/sky.rveprefab", text.as_str())]);
+    let template = load_template(&library, "prefabs/sky.rveprefab").unwrap();
+    assert_eq!(template.objects().len(), 1);
+    assert!(template.check_spawnable().is_err());
+}
+
+#[test]
+fn spawnable_template_passes_check_and_structural_errors_still_fail_load() {
+    let library = Library::new(&[(
+        "prefabs/ball.rveprefab",
+        "[[objects]]\nid = \"root\"\n[objects.collider]\n[objects.rigid_body]\nkind = \"dynamic\"\n",
+    )]);
+    assert!(
+        load_template(&library, "prefabs/ball.rveprefab")
+            .unwrap()
+            .check_spawnable()
+            .is_ok()
+    );
+    // Не читается — ошибка загрузки, а не отказ spawn.
+    assert!(load_template(&library, "prefabs/gone.rveprefab").is_err());
+    let broken = Library::new(&[(
+        "prefabs/bad.rveprefab",
+        "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"child\"\nparent = \"missing\"\n",
+    )]);
+    assert!(load_template(&broken, "prefabs/bad.rveprefab").is_err());
 }
 
 #[test]

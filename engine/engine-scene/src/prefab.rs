@@ -394,14 +394,17 @@ pub struct PrefabTemplate {
     /// Индексы `objects` в порядке «родитель раньше потомка».
     pub(crate) order: Vec<usize>,
     pub(crate) root: usize,
+    /// Причина, по которой префаб нельзя заспавнить; `None`, если ограничений нет.
+    spawn_rejection: Option<SceneError>,
 }
 
 impl PrefabTemplate {
-    /// Раскрывает префаб `path` и проверяет его как spawn-шаблон. `read_text` читает текст
+    /// Раскрывает префаб `path` и проверяет его структуру. `read_text` читает текст
     /// `.rveprefab` по виртуальному пути, в том числе вложенных префабов.
     ///
-    /// Spawn-префаб не содержит camera, directional_light и environment. Dynamic rigid body и
-    /// character controller допускаются только у корня: это уже проверяет валидация документа.
+    /// Ошибка возвращается только для префаба, который не читается, не разбирается или
+    /// структурно неверен. Ограничения spawn-префаба проверяет [`Self::check_spawnable`]:
+    /// префаб с камерой или окружением допустим как экземпляр сцены.
     pub fn load(
         path: &VirtualPath,
         read_text: &mut dyn FnMut(&VirtualPath) -> Result<String, String>,
@@ -433,23 +436,7 @@ impl PrefabTemplate {
         };
         let expanded = expand(&document, &mut load)?.document;
         let label = expanded.source_label().to_owned();
-        for object in &expanded.objects {
-            let forbidden = if object.camera.is_some() {
-                "camera"
-            } else if object.directional_light.is_some() {
-                "directional_light"
-            } else if object.environment.is_some() {
-                "environment"
-            } else {
-                continue;
-            };
-            let local = local_id(&object.id);
-            return Err(SceneError::new(
-                &label,
-                (!local.is_empty()).then_some(local),
-                format!("spawn-префаб не может содержать {forbidden}"),
-            ));
-        }
+        let spawn_rejection = spawn_rejection(&expanded.objects, &label);
 
         let index_of = expanded
             .objects
@@ -496,7 +483,16 @@ impl PrefabTemplate {
             parents,
             order,
             root,
+            spawn_rejection,
         })
+    }
+
+    /// Проверяет, что префаб допустим для spawn: в нём нет camera, directional_light и
+    /// environment. Dynamic rigid body и character controller допускаются только у корня:
+    /// это уже проверяет валидация документа при [`Self::load`]. Ошибка не означает, что
+    /// префаб нельзя использовать как экземпляр сцены.
+    pub fn check_spawnable(&self) -> Result<(), SceneError> {
+        self.spawn_rejection.clone().map_or(Ok(()), Err)
     }
 
     /// Ресурсы шаблона, включая ресурсы вложенных префабов.
@@ -521,6 +517,28 @@ fn local_id(expanded: &str) -> &str {
         .strip_prefix(TEMPLATE_INSTANCE)
         .and_then(|rest| rest.strip_prefix('.'))
         .unwrap_or("")
+}
+
+/// Первый объект раскрытого префаба, который запрещён для spawn: camera, directional_light или
+/// environment.
+fn spawn_rejection(objects: &[SceneObject], label: &str) -> Option<SceneError> {
+    objects.iter().find_map(|object| {
+        let forbidden = if object.camera.is_some() {
+            "camera"
+        } else if object.directional_light.is_some() {
+            "directional_light"
+        } else if object.environment.is_some() {
+            "environment"
+        } else {
+            return None;
+        };
+        let local = local_id(&object.id);
+        Some(SceneError::new(
+            label,
+            (!local.is_empty()).then_some(local),
+            format!("spawn-префаб не может содержать {forbidden}"),
+        ))
+    })
 }
 
 /// Раскрытый id: сегменты `[A-Za-z0-9_-]{1,64}` через точку, всего до 255 байт.

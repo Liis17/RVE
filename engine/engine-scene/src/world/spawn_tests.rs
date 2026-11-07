@@ -222,6 +222,23 @@ fn spawn_rejects_dynamic_root_under_a_parent_and_releases_reservations() {
 }
 
 #[test]
+fn spawn_refuses_a_template_with_a_camera_and_releases_its_reservations() {
+    let mut world = world(CAMERA_SCENE);
+    let eye = template(
+        "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"eye\"\nparent = \"root\"\n[objects.camera]\n",
+    );
+    let reserved = vec![world.reserve_object(), world.reserve_object()];
+    let stale = reserved.clone();
+    let error = world
+        .spawn(reserved, &eye, SpawnOptions::default())
+        .unwrap_err();
+    assert!(error.message.contains("camera"), "{error}");
+    assert_eq!(error.object_id.as_deref(), Some("eye"));
+    assert!(stale.iter().all(|&handle| !world.is_reserved(handle)));
+    assert_eq!(world.objects().len(), 1);
+}
+
+#[test]
 fn spawn_rejects_a_missing_parent_and_a_wrong_reservation_count() {
     let mut world = world(CAMERA_SCENE);
     let bullet = template(BULLET);

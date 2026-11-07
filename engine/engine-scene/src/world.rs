@@ -862,6 +862,7 @@ impl World {
         options: &SpawnOptions,
         root_id: &str,
     ) -> Result<Vec<String>, SceneError> {
+        template.check_spawnable()?;
         let source = &self.source_label;
         if let Some(id) = &options.id
             && !valid_ascii_name(id, true)

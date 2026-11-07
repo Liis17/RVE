@@ -1176,13 +1176,13 @@ fn apply_world_changes(
                     }
                 }
                 Err(error) => {
-                    log::error!(
-                        "spawn {:?}: физика отклонила объект, spawn откатывается: {error}",
-                        spawned.prefab
+                    // Откат снимает и экземпляры скриптов; Error из него печатается сразу.
+                    scripts.revert_spawn(
+                        world,
+                        spawned.handle,
+                        &format!("физика отклонила объект {:?}: {error}", spawned.prefab),
                     );
-                    if let Err(error) = world.despawn_many(&[spawned.handle]) {
-                        log::error!("откат spawn {:?}: {error}", spawned.prefab);
-                    }
+                    print_script_events(scripts.drain_events());
                     detach_objects(&mut gpu_scene.by_object, &spawned.objects);
                     continue;
                 }
@@ -4421,6 +4421,72 @@ return Gun
             "id отклонённого spawn должен быть свободен: {:?}",
             retried.changes
         );
+        stop_test_scripts(scripts, worker);
+    }
+
+    /// Probe создаёт тело `dot` один раз на экземпляр. Чтение `self.object` у мёртвого объекта
+    /// даёт nil, поэтому условие по id здесь не годится: вызов самого update должен быть виден.
+    const PROBE_LUA: &str = r#"
+local Probe = {}
+function Probe:on_update(dt)
+  if not self.spawned then
+    self.spawned = true
+    rve.spawn("prefabs/dot.rveprefab")
+  end
+end
+return Probe
+"#;
+    const PROBE_BALL: &str = "[[assets]]\npath = \"probe.lua\"\n[[objects]]\nid = \"root\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.25\n[objects.rigid_body]\nkind = \"dynamic\"\n[[objects.lite_scripts]]\npath = \"probe.lua\"\n";
+
+    #[test]
+    fn spawn_rejected_by_physics_leaves_no_script_instances_behind() {
+        let script = r#"
+local Gun = {}
+function Gun:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 1 then
+    rve.spawn("prefabs/ball.rveprefab", { id = "ball", scale = { x = 0, y = 0, z = 0 } })
+  elseif self.frames == 2 then
+    rve.spawn("prefabs/ball.rveprefab", { id = "ball" })
+  end
+end
+return Gun
+"#;
+        let world =
+            World::from_document(&SceneDocument::parse("spawn.rvescene", SPAWN_SCENE).unwrap())
+                .unwrap();
+        let mut prefabs = ball_prefabs(PROBE_BALL);
+        let dot = "prefabs/dot.rveprefab";
+        prefabs.catalog.insert(
+            dot,
+            PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances: None,
+            },
+        );
+        prefabs
+            .templates
+            .insert(dot.to_owned(), prefab_template(dot, BALL_PREFAB));
+        let (client, initialization, steps, worker) = fake_physics(&world);
+        let scripts = start_test_scripts(
+            world,
+            &[("gun.lua", script), ("probe.lua", PROBE_LUA)],
+            prefabs,
+            Some((client, initialization)),
+        );
+        scripts.thread.ready.recv().unwrap().unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+
+        // Повторный `ball` даёт тело, и его probe даёт тело `dot`. Экземпляр отвергнутого spawn
+        // не должен дать третье тело: иначе его probe вызывался бы у мёртвого объекта.
+        let inserts = (0..5)
+            .flat_map(|_| next_step(&scripts, &steps).changes)
+            .filter(|change| matches!(change, BodyChange::Insert { .. }))
+            .count();
+        assert_eq!(inserts, 2, "отвергнутый spawn оставил экземпляр скрипта");
         stop_test_scripts(scripts, worker);
     }
 

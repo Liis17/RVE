@@ -107,17 +107,23 @@ pub(crate) fn load_scene(
         SceneDocument::parse(scene_path, &contents).map_err(|error| error.to_string())?;
     let expansion = expand(&document, &mut |path| load_prefab(resources, path))
         .map_err(|error| error.to_string())?;
+    let instanced = expansion.prefabs;
     let mut expanded = expansion.document;
-    let prefabs = load_fast_prefabs(resources, &mut expanded)?;
+    let prefabs = load_fast_prefabs(resources, &mut expanded, &instanced)?;
     let world = World::from_document(&expanded).map_err(|error| error.to_string())?;
     prepare_scene(resources, assets, scene_path, world, prefabs)
 }
 
 /// Раскрывает каждый `.rveprefab` из `[[assets]]` сцены в шаблон для spawn. Ассеты шаблонов
 /// добавляются в список ассетов сцены: звук и сборка видят их так же, как ассеты сцены.
+///
+/// Префаб с камерой, светом или окружением не регистрируется для spawn, но это не ошибка
+/// загрузки: он может быть экземпляром сцены. Если такой префаб объявлен только в `[[assets]]`,
+/// пишется один Warn. Ошибки чтения и разбора шаблона остаются ошибками загрузки.
 fn load_fast_prefabs(
     resources: &ResourceHandle,
     document: &mut SceneDocument,
+    instanced: &[VirtualPath],
 ) -> Result<PreparedPrefabs, String> {
     let fast = document
         .assets
@@ -131,6 +137,15 @@ fn load_fast_prefabs(
             read_utf8(resources, &format!("/{}", child.as_str()))
         })
         .map_err(|error| error.to_string())?;
+        if let Err(error) = template.check_spawnable() {
+            if !instanced.contains(&path) {
+                log::warn!(
+                    "префаб {} объявлен в [[assets]], не используется экземплярами и не может быть заспавнен: {error}",
+                    path.as_str()
+                );
+            }
+            continue;
+        }
         for asset in template.assets() {
             if !document.assets.iter().any(|known| known.path == asset.path) {
                 document.assets.push(asset.clone());
@@ -757,7 +772,10 @@ mod tests {
     use engine_render::{AlphaMode, EnvironmentSource, TextureColorSpace};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::{MaterialAlphaMode, MaterialOverride, PrefabTemplate, SceneDocument, World};
-    use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
+    use engine_script::{
+        PrefabCatalog, PrefabKind, PrefabSpec, ScriptEventLevel, ScriptHost, ScriptLoadOptions,
+        ScriptTime,
+    };
     use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::fs;
@@ -1429,7 +1447,7 @@ id = "camera"
     }
 
     #[test]
-    fn load_scene_rejects_a_fast_prefab_that_contains_a_camera() {
+    fn load_scene_skips_a_declared_prefab_with_a_camera_without_failing() {
         let project = TempProject::new();
         project.write(
             "scene.rvescene",
@@ -1440,6 +1458,39 @@ id = "camera"
             b"[[objects]]\nid = \"eye\"\n[objects.camera]\n",
         );
         let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .prefabs
+                .catalog
+                .get("prefabs/eye.rveprefab")
+                .is_none()
+        );
+        assert!(
+            !prepared
+                .prefabs
+                .templates
+                .contains_key("prefabs/eye.rveprefab")
+        );
+    }
+
+    #[test]
+    fn load_scene_reports_a_declared_prefab_that_does_not_parse() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!("[[assets]]\npath = \"/prefabs/broken.rveprefab\"\n{CAMERA_SCENE}").as_bytes(),
+        );
+        project.write(
+            "prefabs/broken.rveprefab",
+            b"[[objects]]\nid = \"a\"\nparent = \"missing\"\n",
+        );
+        let resources = LooseResources::new(project.root());
         let error = load_scene(
             &resources.system.handle(),
             &resources.assets,
@@ -1447,7 +1498,114 @@ id = "camera"
         )
         .err()
         .unwrap();
-        assert!(error.contains("camera"), "{error}");
+        assert!(error.contains("broken.rveprefab"), "{error}");
+    }
+
+    /// Префаб с окружением не регистрируется для spawn. Экземпляр с таким префабом грузится, а
+    /// spawn того же пути из скрипта даёт ошибку вызова, а не ошибку загрузки сцены.
+    #[test]
+    fn unspawnable_prefab_is_not_registered_and_spawning_its_path_is_a_script_error() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!(
+                "[[assets]]\npath = \"/prefabs/sky.rveprefab\"\n[[assets]]\npath = \"/gun.lua\"\n{CAMERA_SCENE}[[objects]]\nid = \"gun\"\n[[objects.lite_scripts]]\npath = \"/gun.lua\"\n"
+            )
+            .as_bytes(),
+        );
+        project.write("prefabs/sky.rveprefab", SKY_PREFAB);
+        project.write("gun.lua", GUN_SPAWNS_SKY);
+        let resources = LooseResources::new(project.root());
+        let mut prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let path = "prefabs/sky.rveprefab";
+        assert!(prepared.prefabs.catalog.get(path).is_none());
+        assert!(!prepared.prefabs.templates.contains_key(path));
+
+        let mut host = ScriptHost::load_with_options(
+            &prepared.world,
+            &prepared.name,
+            &prepared.sources,
+            None,
+            ScriptLoadOptions {
+                prefabs: prepared.prefabs.catalog.clone(),
+                ..ScriptLoadOptions::default()
+            },
+        )
+        .unwrap();
+        host.update(
+            &mut prepared.world,
+            0.1,
+            ScriptTime {
+                elapsed: 0.0,
+                frame: 1,
+            },
+        );
+        let errors = host
+            .drain_events()
+            .into_iter()
+            .filter(|event| event.level == ScriptEventLevel::Error)
+            .map(|event| event.message)
+            .collect::<Vec<_>>();
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("is not in the project prefab list")),
+            "{errors:?}"
+        );
+        assert!(prepared.world.handle("sky").is_none());
+    }
+
+    const SKY_PREFAB: &[u8] = b"[[objects]]\nid = \"sky\"\n[objects.environment]\n[objects.environment.procedural]\nzenith_color = [0.2, 0.3, 0.5]\nhorizon_color = [0.8, 0.7, 0.5]\nground_color = [0.1, 0.1, 0.1]\nsun_size_deg = 3.0\nsun_intensity = 2.0\n";
+    const GUN_SPAWNS_SKY: &[u8] = b"local Gun = {}\nfunction Gun:on_update(dt)\n  rve.spawn(\"prefabs/sky.rveprefab\", { id = \"sky\" })\nend\nreturn Gun\n";
+
+    /// Префаб с окружением, который одновременно объявлен в `[[assets]]` и использован экземпляром,
+    /// грузится: окружение попадает в сцену, а сам префаб не регистрируется для spawn.
+    #[test]
+    fn load_scene_prepares_hdr_environment_assets_introduced_by_prefab_instances() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"/prefabs/sky.rveprefab\"\n{CAMERA_SCENE}\n[[instances]]\nid = \"sky\"\nprefab = \"/prefabs/sky.rveprefab\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        project.write(
+            "prefabs/sky.rveprefab",
+            b"[[assets]]\npath = \"/environment/sky.hdr\"\n[[objects]]\nid = \"environment\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n",
+        );
+        project.write(
+            "environment/sky.hdr",
+            b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n\x80\x80\x80\x81\x40\x60\x80\x82",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let EnvironmentSource::Equirect { width, height, rgb } = prepared
+            .render_assets
+            .environments
+            .get("environment/sky.hdr")
+            .unwrap()
+            .as_ref()
+        else {
+            panic!("HDR environment should be prepared as an equirectangular image");
+        };
+        assert_eq!((*width, *height), (2, 1));
+        assert_eq!(rgb.len(), 6);
+        assert!(
+            prepared
+                .world
+                .object_by_id("sky")
+                .unwrap()
+                .environment
+                .is_some()
+        );
     }
 
     #[test]

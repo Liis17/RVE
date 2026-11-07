@@ -925,3 +925,91 @@ return Bullet
     assert!(error.to_string().contains("creation"), "{error}");
     assert_eq!(other.prefab_status(PREFAB), Some(PrefabStatus::Unloaded));
 }
+
+const GUN_SPAWNS_ON_STEPS: &str = r#"
+local Gun = {}
+local step = 0
+function Gun:on_update(dt)
+  step = step + 1
+  if step == 1 or step == 3 then
+    rve.spawn("prefabs/bullet.rveprefab", { id = "shot" .. step })
+  end
+end
+return Gun
+"#;
+
+#[test]
+fn reverted_spawn_runs_no_callbacks_and_frees_its_slot_for_the_next_spawn() {
+    let mut world = scene(GUN_SCENE);
+    let mut host = fast_host(&world, GUN_SPAWNS_ON_STEPS, None);
+    host.update(&mut world, 0.1, at(0.0, 1));
+    let changes = host.drain_world_changes();
+    let [spawned] = changes.spawned.as_slice() else {
+        panic!("first update should spawn one root: {changes:?}");
+    };
+    let root = spawned.handle;
+
+    host.revert_spawn(&mut world, root, "physics refused");
+    assert!(!world.is_alive(root));
+    assert!(world.handle("shot1").is_none());
+    assert_eq!(errors(&mut host), ["spawn rolled back: physics refused"]);
+    let after_revert = host.drain_world_changes();
+    assert!(after_revert.spawned.is_empty() && after_revert.despawned.is_empty());
+
+    // Отменённый экземпляр не получает on_start и on_update и не даёт ошибку на мёртвом объекте
+    // (без отката экземпляр падал бы с «object no longer exists»).
+    host.update(&mut world, 0.1, at(0.1, 2));
+    let events = host.drain_events();
+    assert!(events.is_empty(), "{events:?}");
+
+    // Слот освобождён: следующий spawn создаёт объект и его экземпляр, который стартует как обычно.
+    host.update(&mut world, 0.1, at(0.2, 3));
+    let next = host.drain_world_changes();
+    assert_eq!(next.spawned.len(), 1);
+    assert!(
+        next.despawned.is_empty(),
+        "откат не должен повторно удаляться"
+    );
+    host.update(&mut world, 0.1, at(0.3, 4));
+    assert_eq!(infos(&mut host), ["start shot3", "update shot3"]);
+    assert!(world.is_alive(next.spawned[0].handle));
+}
+
+#[test]
+fn reverting_a_started_spawn_calls_on_destroy_once_and_removes_its_commands() {
+    let mut world = scene(GUN_SCENE);
+    let mut host = fast_host(&world, GUN_FIRST, None);
+    host.update(&mut world, 0.1, at(0.0, 1));
+    let root = host.drain_world_changes().spawned[0].handle;
+    host.update(&mut world, 0.1, at(0.1, 2));
+    assert_eq!(infos(&mut host), ["start shot", "update shot"]);
+
+    host.revert_spawn(&mut world, root, "late");
+    let events = host.drain_events();
+    let destroyed = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info && event.message == "destroy shot")
+        .count();
+    assert_eq!(destroyed, 1, "{events:?}");
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message == "spawn rolled back: late"
+    }));
+    host.update(&mut world, 0.1, at(0.2, 3));
+    assert!(infos(&mut host).is_empty());
+}
+
+#[test]
+fn revert_of_a_dead_root_only_reports_the_error() {
+    let mut world = scene(GUN_SCENE);
+    let mut host = fast_host(&world, GUN_FIRST, None);
+    host.update(&mut world, 0.1, at(0.0, 1));
+    let root = host.drain_world_changes().spawned[0].handle;
+
+    host.revert_spawn(&mut world, root, "first");
+    host.revert_spawn(&mut world, root, "second");
+    assert_eq!(
+        errors(&mut host),
+        ["spawn rolled back: first", "spawn rolled back: second"]
+    );
+    assert!(host.drain_world_changes().despawned.is_empty());
+}
