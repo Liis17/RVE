@@ -1390,7 +1390,14 @@ fn sync_animation_frame(
     playing: bool,
 ) -> Result<(), RenderError> {
     if playing {
-        return gpu.scene.sync_skins(&mut gpu.renderer, parts.world);
+        gpu.scene.sync_skins(&mut gpu.renderer, parts.world)?;
+        let mut warnings = Vec::new();
+        gpu.scene
+            .report_palette_mismatches(parts.animation, &mut warnings);
+        for warning in warnings {
+            parts.log.push(LogLevel::Warn, warning);
+        }
+        return Ok(());
     }
     parts.animation_preview.retarget(parts.selected);
     let object = parts

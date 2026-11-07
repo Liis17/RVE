@@ -77,8 +77,10 @@ pub struct PreviewStatus {
 /// Мост редактора и его отпечаток: при другом отпечатке мост пересобирается.
 #[derive(Default)]
 pub struct EditorAnimation {
-    /// Поколение моделей вьюпорта и отпечаток аниматоров мира.
-    fingerprint: (u64, String),
+    /// Отпечаток аниматоров мира и поколений их моделей.
+    fingerprint: String,
+    /// Эпоха кэша моделей, на которой прочитаны клипы; при смене клипы читаются заново.
+    clip_epoch: u64,
     bridge: Option<AnimationBridge>,
     clips: ClipCache,
     /// Последнее движение, переданное превью, чтобы не перезапускать его каждый кадр.
@@ -105,28 +107,33 @@ impl EditorAnimation {
         dt
     }
 
-    /// Пересобирает мост при изменении аниматоров или поколения моделей, применяет превью и
+    /// Пересобирает мост при изменении аниматоров или поколений их моделей, применяет превью и
     /// продвигает время.
     ///
-    /// `generation` меняется при каждой перезагрузке моделей и сбросе кэша. `build` возвращает
-    /// `None`, пока нужные модели не готовы: тогда мост остаётся прежним и сборка повторяется
-    /// в следующем кадре. Предупреждения моста добавляются в `warnings`.
+    /// `epoch` меняется при каждой загрузке моделей и сбросе кэша: по нему заново читаются клипы.
+    /// `model_version` возвращает поколение модели по пути; мост пересобирается только когда
+    /// меняется поколение модели, которую использует аниматор. `build` возвращает `None`, пока
+    /// нужные модели не готовы: тогда мост остаётся прежним и сборка повторяется в следующем
+    /// кадре. Предупреждения моста добавляются в `warnings`.
+    #[allow(clippy::too_many_arguments)]
     pub fn advance(
         &mut self,
         world: &World,
-        generation: u64,
+        epoch: u64,
+        model_version: impl Fn(&str) -> u64,
         dt: f32,
         preview: Option<(ObjectHandle, &mut AnimationPreview)>,
         warnings: &mut Vec<String>,
         build: impl FnOnce(&World, &mut ClipCache) -> Option<AnimationBridge>,
     ) {
-        let fingerprint = (generation, animator_fingerprint(world));
+        if epoch != self.clip_epoch {
+            // Файлы клипов могли измениться вместе с моделями: читаем их заново.
+            self.clips.clear();
+            self.clip_epoch = epoch;
+        }
+        let fingerprint = animator_fingerprint(world, model_version);
         if fingerprint != self.fingerprint {
-            if fingerprint.0 != self.fingerprint.0 {
-                // Файлы клипов могли измениться вместе с моделями: читаем их заново.
-                self.clips.clear();
-            }
-            let built = if fingerprint.1.is_empty() {
+            let built = if fingerprint.is_empty() {
                 Some(None)
             } else {
                 build(world, &mut self.clips).map(Some)
@@ -225,19 +232,20 @@ fn preview_requests(
     requests
 }
 
-/// Отпечаток аниматоров сцены: объект, модель и компонент. Меняется при любой правке,
-/// которая влияет на мост, и не меняется при движении объектов. Перезагрузка моделей
-/// отслеживается отдельно через поколение в [`EditorAnimation::advance`].
-pub fn animator_fingerprint(world: &World) -> String {
+/// Отпечаток аниматоров сцены: объект, модель, поколение модели и компонент. Меняется при
+/// правке, которая влияет на мост, при загрузке или ошибке модели аниматора и не меняется при
+/// движении объектов. Модели объектов без аниматора в отпечаток не входят.
+pub fn animator_fingerprint(world: &World, model_version: impl Fn(&str) -> u64) -> String {
     let mut parts = Vec::new();
     for object in world.objects() {
         let (Some(animator), Some(renderer)) = (&object.animator, &object.mesh_renderer) else {
             continue;
         };
+        let path = renderer.model.as_str();
         parts.push(format!(
-            "{}|{}|{animator:?}",
+            "{}|{path}|{}|{animator:?}",
             object.id,
-            renderer.model.as_str()
+            model_version(path)
         ));
     }
     parts.join("\n")
@@ -255,29 +263,39 @@ pub fn project_bridge(world: &World, assets: &Assets) -> AnimationBridge {
 
 /// Мост превью: модели берутся из уже загруженного кэша вьюпорта, клипы — из `clips`.
 /// Все аниматоры начинают с позы покоя, а клип запускает только выбор в инспекторе.
-/// Документ и `play_on_start` при этом не меняются. `None`, пока модель аниматора не
-/// разобрана в фоне.
+/// Документ и `play_on_start` при этом не меняются.
+///
+/// `None`, пока модель аниматора ещё грузится в фоне. Модель, которая не загрузилась
+/// (`failed`), не задерживает мост: её объект пропускается, и `AnimationBridge::build`
+/// выдаёт предупреждение.
 pub fn project_preview_bridge(
     world: &World,
     models: &HashMap<String, Arc<Model>>,
+    failed: impl Fn(&str) -> bool,
     assets: &Assets,
     clips: &mut ClipCache,
 ) -> Option<AnimationBridge> {
-    let pending = world
+    let loading = world
         .objects()
         .iter()
         .filter_map(|object| Some((object.animator.as_ref()?, object.mesh_renderer.as_ref()?)))
-        .any(|(_, renderer)| !models.contains_key(renderer.model.as_str()));
-    if pending {
+        .any(|(_, renderer)| {
+            let path = renderer.model.as_str();
+            !models.contains_key(path) && !failed(path)
+        });
+    if loading {
         return None;
     }
     let mut bridge = AnimationBridge::build(
         world,
         |path| {
-            models
-                .get(path.as_str())
-                .cloned()
-                .ok_or_else(|| format!("модель {} не загружена в редакторе", path.as_str()))
+            models.get(path.as_str()).cloned().ok_or_else(|| {
+                if failed(path.as_str()) {
+                    format!("модель {} не загрузилась, см. консоль", path.as_str())
+                } else {
+                    format!("модель {} не загружена в редакторе", path.as_str())
+                }
+            })
         },
         |path| {
             clips
@@ -379,7 +397,8 @@ mod tests {
     use super::test_support::walk_model;
     use super::*;
     use engine_scene::SceneDocument;
-    use std::collections::HashMap;
+    use std::cell::Cell;
+    use std::collections::{BTreeSet, HashMap};
 
     const SCENE: &str = "[[assets]]\npath = \"/models/hero.fbx\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n";
 
@@ -388,6 +407,25 @@ mod tests {
             Some(fields) => format!("{SCENE}[objects.animator]\n{fields}\n"),
             None => SCENE.to_owned(),
         };
+        World::from_document(&SceneDocument::parse("scene.rvescene", &text).unwrap()).unwrap()
+    }
+
+    /// Сцена с камерой и объектами `(id, модель, есть ли аниматор)`; модели объявляются как assets.
+    fn world_of(objects: &[(&str, &str, bool)]) -> World {
+        let models: BTreeSet<&str> = objects.iter().map(|(_, model, _)| *model).collect();
+        let mut text: String = models
+            .iter()
+            .map(|model| format!("[[assets]]\npath = \"{model}\"\n"))
+            .collect();
+        text.push_str("[[objects]]\nid = \"camera\"\n[objects.camera]\n");
+        for (id, model, animated) in objects {
+            text.push_str(&format!(
+                "[[objects]]\nid = \"{id}\"\n[objects.mesh_renderer]\nmodel = \"{model}\"\n"
+            ));
+            if *animated {
+                text.push_str("[objects.animator]\nspeed = 1.0\n");
+            }
+        }
         World::from_document(&SceneDocument::parse("scene.rvescene", &text).unwrap()).unwrap()
     }
 
@@ -410,19 +448,37 @@ mod tests {
     #[test]
     fn fingerprint_changes_only_with_animator_relevant_edits() {
         let plain = world_with(None);
-        assert_eq!(animator_fingerprint(&plain), "");
+        assert_eq!(animator_fingerprint(&plain, |_| 0), "");
         let animated = world_with(Some("speed = 1.0"));
-        let fingerprint = animator_fingerprint(&animated);
+        let fingerprint = animator_fingerprint(&animated, |_| 0);
         assert!(
             fingerprint.starts_with("hero|models/hero.fbx|"),
             "{fingerprint}"
         );
         let faster = world_with(Some("speed = 2.0"));
-        assert_ne!(animator_fingerprint(&faster), fingerprint);
+        assert_ne!(animator_fingerprint(&faster, |_| 0), fingerprint);
         assert_eq!(
-            animator_fingerprint(&world_with(Some("speed = 1.0"))),
+            animator_fingerprint(&world_with(Some("speed = 1.0")), |_| 0),
             fingerprint
         );
+    }
+
+    #[test]
+    fn fingerprint_follows_the_generation_of_animator_models_only() {
+        let world = world_of(&[
+            ("hero", "/models/hero.fbx", true),
+            ("prop", "/models/prop.fbx", false),
+        ]);
+        let before = animator_fingerprint(&world, |_| 0);
+        let prop_reloaded =
+            animator_fingerprint(&world, |path| if path == "models/prop.fbx" { 5 } else { 0 });
+        assert_eq!(
+            prop_reloaded, before,
+            "модель без аниматора не входит в отпечаток"
+        );
+        let hero_reloaded =
+            animator_fingerprint(&world, |path| if path == "models/hero.fbx" { 5 } else { 0 });
+        assert_ne!(hero_reloaded, before);
     }
 
     #[test]
@@ -480,6 +536,7 @@ mod tests {
         editor.advance(
             &world,
             0,
+            |_| 0,
             0.0,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -488,6 +545,7 @@ mod tests {
         editor.advance(
             &world,
             0,
+            |_| 0,
             0.5,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -502,6 +560,7 @@ mod tests {
         editor.advance(
             &world,
             0,
+            |_| 0,
             0.5,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -529,6 +588,7 @@ mod tests {
         editor.advance(
             &world,
             0,
+            |_| 0,
             0.0,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -547,6 +607,7 @@ mod tests {
         editor.advance(
             &world,
             0,
+            |_| 0,
             0.0,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -565,32 +626,10 @@ mod tests {
         let mut warnings = Vec::new();
         let mut builds = 0;
         for _ in 0..2 {
-            editor.advance(&world, 0, 0.0, None, &mut warnings, |world, clips| {
-                builds += 1;
-                test_bridge(world, clips)
-            });
-        }
-        assert_eq!(builds, 1, "тот же мир не пересобирает мост");
-
-        let faster = world_with(Some("speed = 2.0"));
-        editor.advance(&faster, 0, 0.0, None, &mut warnings, |world, clips| {
-            builds += 1;
-            test_bridge(world, clips)
-        });
-        assert_eq!(builds, 2);
-    }
-
-    #[test]
-    fn the_bridge_is_rebuilt_when_the_model_generation_changes() {
-        // Регрессия: после перезагрузки модели мост со старым скелетом давал палитру другой длины.
-        let world = world_with(Some("speed = 1.0"));
-        let mut editor = EditorAnimation::default();
-        let mut warnings = Vec::new();
-        let mut builds = 0;
-        for generation in [0, 1, 1] {
             editor.advance(
                 &world,
-                generation,
+                0,
+                |_| 0,
                 0.0,
                 None,
                 &mut warnings,
@@ -600,7 +639,115 @@ mod tests {
                 },
             );
         }
-        assert_eq!(builds, 2, "новое поколение пересобирает мост, повтор — нет");
+        assert_eq!(builds, 1, "тот же мир не пересобирает мост");
+
+        let faster = world_with(Some("speed = 2.0"));
+        editor.advance(
+            &faster,
+            0,
+            |_| 0,
+            0.0,
+            None,
+            &mut warnings,
+            |world, clips| {
+                builds += 1;
+                test_bridge(world, clips)
+            },
+        );
+        assert_eq!(builds, 2);
+    }
+
+    #[test]
+    fn the_bridge_is_rebuilt_only_when_an_animator_model_changes() {
+        // Регрессия: после перезагрузки модели мост со старым скелетом давал палитру другой длины.
+        let world = world_with(Some("speed = 1.0"));
+        let mut editor = EditorAnimation::default();
+        let mut warnings = Vec::new();
+        let builds = Cell::new(0);
+        let mut advance = |editor: &mut EditorAnimation, epoch, version| {
+            editor.advance(
+                &world,
+                epoch,
+                |_| version,
+                0.0,
+                None,
+                &mut warnings,
+                |world, clips| {
+                    builds.set(builds.get() + 1);
+                    test_bridge(world, clips)
+                },
+            );
+        };
+        advance(&mut editor, 0, 0);
+        advance(&mut editor, 0, 0);
+        assert_eq!(builds.get(), 1, "тот же отпечаток не пересобирает мост");
+        advance(&mut editor, 1, 0);
+        assert_eq!(
+            builds.get(),
+            1,
+            "новая эпоха кэша без смены модели аниматора не пересобирает мост"
+        );
+        advance(&mut editor, 1, 1);
+        assert_eq!(
+            builds.get(),
+            2,
+            "новое поколение модели аниматора пересобирает мост"
+        );
+    }
+
+    #[test]
+    fn loading_an_unrelated_model_keeps_the_preview_running() {
+        // Регрессия: дозагрузка модели без аниматора сбрасывала клип превью на начало.
+        let world = world_of(&[
+            ("hero", "/models/hero.fbx", true),
+            ("prop", "/models/prop.fbx", false),
+        ]);
+        let hero = world.handle("hero").unwrap();
+        let mut editor = EditorAnimation::default();
+        let mut warnings = Vec::new();
+        let mut preview = AnimationPreview {
+            object: Some("hero".to_owned()),
+            motion: Some("Walk".to_owned()),
+            ..AnimationPreview::default()
+        };
+        editor.advance(
+            &world,
+            0,
+            |_| 0,
+            0.0,
+            Some((hero, &mut preview)),
+            &mut warnings,
+            test_bridge,
+        );
+        editor.advance(
+            &world,
+            0,
+            |_| 0,
+            0.5,
+            Some((hero, &mut preview)),
+            &mut warnings,
+            test_bridge,
+        );
+        assert!((palette_x(&editor, hero) - 1.0).abs() < 1e-5);
+
+        let mut builds = 0;
+        editor.advance(
+            &world,
+            1,
+            |path| u64::from(path == "models/prop.fbx"),
+            0.25,
+            Some((hero, &mut preview)),
+            &mut warnings,
+            |world, clips| {
+                builds += 1;
+                test_bridge(world, clips)
+            },
+        );
+        assert_eq!(builds, 0, "мост не пересобирается");
+        assert!(
+            (palette_x(&editor, hero) - 1.5).abs() < 1e-5,
+            "клип продолжается с 0.75 с, а не начинается заново"
+        );
     }
 
     #[test]
@@ -611,10 +758,48 @@ mod tests {
         let models = HashMap::from([("models/hero.fbx".to_owned(), Arc::new(walk_model()))]);
         let assets = Assets::new("/nonexistent-rve-assets");
         let mut clips = ClipCache::new();
-        let mut bridge =
-            project_preview_bridge(&world, &models, &assets, &mut clips).expect("модель в кэше");
+        let mut bridge = project_preview_bridge(&world, &models, |_| false, &assets, &mut clips)
+            .expect("модель в кэше");
         assert!(bridge.has_animator(hero));
         assert!(bridge.take_warnings().is_empty());
+    }
+
+    #[test]
+    fn a_failed_model_does_not_block_the_preview_of_other_animators() {
+        // Регрессия: одна битая модель не давала превью ни одному аниматору и молчала.
+        let world = world_of(&[
+            ("hero", "/models/hero.fbx", true),
+            ("guard", "/models/broken.fbx", true),
+        ]);
+        let hero = world.handle("hero").unwrap();
+        let guard = world.handle("guard").unwrap();
+        let models = HashMap::from([("models/hero.fbx".to_owned(), Arc::new(walk_model()))]);
+        let assets = Assets::new("/nonexistent-rve-assets");
+        let mut clips = ClipCache::new();
+        let mut bridge = project_preview_bridge(
+            &world,
+            &models,
+            |path| path == "models/broken.fbx",
+            &assets,
+            &mut clips,
+        )
+        .expect("упавшая модель не задерживает мост");
+        assert!(bridge.has_animator(hero));
+        assert!(!bridge.has_animator(guard));
+        let warnings = bridge.take_warnings();
+        assert!(
+            warnings.iter().any(|message| message.starts_with("guard:")),
+            "{warnings:?}"
+        );
+
+        let still_loading = project_preview_bridge(
+            &world,
+            &HashMap::new(),
+            |path| path == "models/broken.fbx",
+            &assets,
+            &mut clips,
+        );
+        assert!(still_loading.is_none(), "пока hero грузится, мост ждёт");
     }
 
     #[test]
@@ -623,21 +808,30 @@ mod tests {
         let assets = Assets::new("/nonexistent-rve-assets");
         let mut clips = ClipCache::new();
         assert!(
-            project_preview_bridge(&world, &HashMap::new(), &assets, &mut clips).is_none(),
+            project_preview_bridge(&world, &HashMap::new(), |_| false, &assets, &mut clips)
+                .is_none(),
             "пока модели нет, мост не строится и предупреждений нет"
         );
         let mut editor = EditorAnimation::default();
         let mut warnings = Vec::new();
         let mut attempts = 0;
         for _ in 0..2 {
-            editor.advance(&world, 0, 0.0, None, &mut warnings, |_, _| {
-                attempts += 1;
-                None
-            });
+            editor.advance(
+                &world,
+                0,
+                |_| 0,
+                0.0,
+                None,
+                &mut warnings,
+                |_, _| {
+                    attempts += 1;
+                    None
+                },
+            );
         }
         assert_eq!(attempts, 2, "сборка повторяется в следующих кадрах");
         assert!(editor.bridge().is_none());
-        editor.advance(&world, 0, 0.0, None, &mut warnings, test_bridge);
+        editor.advance(&world, 0, |_| 0, 0.0, None, &mut warnings, test_bridge);
         assert!(editor.bridge().is_some());
         assert!(warnings.is_empty(), "{warnings:?}");
     }

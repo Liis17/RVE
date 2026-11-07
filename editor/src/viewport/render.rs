@@ -61,6 +61,9 @@ pub struct SceneRenderer {
     models: HashMap<String, Option<GpuModel>>,
     model_dependencies: HashMap<String, Vec<VirtualPath>>,
     failed_reloads: HashSet<String>,
+    /// Поколение каждой модели на момент последней загрузки или ошибки; мост превью
+    /// пересобирается только при смене поколения модели аниматора.
+    model_versions: HashMap<String, u64>,
     textures: HashMap<(String, TextureColorSpace), Option<TextureId>>,
     environment_sources: HashMap<String, Option<Arc<EnvironmentSource>>>,
     current_environment: Option<(EditorEnvironmentKey, EnvironmentId)>,
@@ -75,7 +78,7 @@ pub struct SceneRenderer {
     skins: HashMap<ObjectHandle, SkinnedObject>,
     /// Мост редактора для превью и отпечаток его аниматоров.
     animation: EditorAnimation,
-    /// Поколение моделей: растёт при каждой загрузке или сбросе, пересобирает мост превью.
+    /// Счётчик загрузок моделей и сбросов кэша; по нему заново читаются файлы клипов.
     model_generation: u64,
     /// Объекты, для которых уже выведено предупреждение о несовпадении палитры и меша.
     skin_mismatch_reported: HashSet<ObjectHandle>,
@@ -168,6 +171,7 @@ impl SceneRenderer {
             models: HashMap::new(),
             model_dependencies: HashMap::new(),
             failed_reloads: HashSet::new(),
+            model_versions: HashMap::new(),
             textures: HashMap::new(),
             environment_sources: HashMap::new(),
             current_environment: None,
@@ -199,6 +203,7 @@ impl SceneRenderer {
         self.failed_reloads.clear();
         self.failed_environment = None;
         self.model_generation += 1;
+        self.model_versions.clear();
         self.skin_mismatch_reported.clear();
         self.release_skins(renderer)?;
         for model in self.models.drain().filter_map(|(_, model)| model) {
@@ -232,6 +237,11 @@ impl SceneRenderer {
             self.release_skins(renderer)?;
         }
         for (path, loaded) in finished {
+            // Успех и ошибка меняют состояние модели: мост аниматоров, который её использует,
+            // должен это увидеть (загрузка или предупреждение). Остальные мосты не затрагиваются.
+            self.model_generation += 1;
+            self.model_versions
+                .insert(path.clone(), self.model_generation);
             let previous = self.models.remove(&path).flatten();
             let had_previous = previous.is_some();
             match loaded {
@@ -267,7 +277,6 @@ impl SceneRenderer {
                         .insert(path.clone(), loaded.dependencies);
                     self.failed_reloads.remove(&path);
                     cpu_models.insert(path, model);
-                    self.model_generation += 1;
                     if let Some(old) = old {
                         destroy_model(renderer, old)?;
                     }
@@ -704,30 +713,46 @@ impl SceneRenderer {
         warnings: &mut Vec<String>,
     ) -> Result<(), RenderError> {
         let dt = self.animation.frame_seconds();
-        let generation = self.model_generation;
-        self.animation
-            .advance(world, generation, dt, preview, warnings, |world, clips| {
-                project_preview_bridge(world, models, assets, clips)
-            });
+        let epoch = self.model_generation;
+        let versions = &self.model_versions;
+        self.animation.advance(
+            world,
+            epoch,
+            |path| versions.get(path).copied().unwrap_or(0),
+            dt,
+            preview,
+            warnings,
+            |world, clips| {
+                project_preview_bridge(
+                    world,
+                    models,
+                    |path| is_failed_model(&self.models, &self.failed_reloads, path),
+                    assets,
+                    clips,
+                )
+            },
+        );
         self.sync_skins(renderer, world)?;
-        self.report_palette_mismatches(warnings);
+        self.report_palette_mismatches(None, warnings);
         Ok(())
     }
 
     /// Предупреждает один раз о каждом объекте, чья палитра моста не совпала с числом костей
-    /// меша: такой объект рисуется без скиннинга и не валит кадр.
-    fn report_palette_mismatches(&mut self, warnings: &mut Vec<String>) {
-        let mismatched = match self.animation.bridge() {
+    /// меша: такой объект рисуется без скиннинга и не валит кадр. Проверяется `play` (мост Play),
+    /// а без него — мост превью. Предупреждение снимается, когда несоответствие исчезает.
+    pub fn report_palette_mismatches(
+        &mut self,
+        play: Option<&AnimationBridge>,
+        warnings: &mut Vec<String>,
+    ) {
+        let mismatched = match play.or(self.animation.bridge()) {
             Some(bridge) => palette_mismatches(&self.skins, bridge),
             None => Vec::new(),
         };
-        for (object, model) in mismatched {
-            if self.skin_mismatch_reported.insert(object) {
-                warnings.push(format!(
-                    "{model}: число костей палитры не совпадает с мешем; объект рисуется без скиннинга"
-                ));
-            }
-        }
+        warnings.extend(mismatch_warnings(
+            &mut self.skin_mismatch_reported,
+            mismatched,
+        ));
     }
 
     /// Сведения превью объекта для инспектора.
@@ -1223,6 +1248,24 @@ fn palette_mismatches<M, S>(
     mismatched
 }
 
+/// Предупреждения о несовпадении палитры, которые ещё не выводились. Объект, у которого
+/// несовпадение исчезло, снимается из `reported`: повторное несовпадение даст предупреждение снова.
+fn mismatch_warnings(
+    reported: &mut HashSet<ObjectHandle>,
+    mismatched: Vec<(ObjectHandle, String)>,
+) -> Vec<String> {
+    reported.retain(|object| mismatched.iter().any(|(mismatch, _)| mismatch == object));
+    let mut warnings = Vec::new();
+    for (object, model) in mismatched {
+        if reported.insert(object) {
+            warnings.push(format!(
+                "{model}: число костей палитры не совпадает с мешем; объект рисуется без скиннинга"
+            ));
+        }
+    }
+    warnings
+}
+
 /// Индекс палитры каждого объекта: тот же порядок, что у `joint_palette_refs`.
 fn palette_indices<M, S>(
     skins: &HashMap<ObjectHandle, SkinnedObject<M, S>>,
@@ -1301,6 +1344,15 @@ fn plan_skin_sync<M: PartialEq, S>(
         .collect();
     create.sort_by_key(|object| object.index());
     SkinSyncPlan { release, create }
+}
+
+/// Модель не загрузилась: в кэше есть пустая запись или загрузка зафиксирована как ошибочная.
+fn is_failed_model(
+    models: &HashMap<String, Option<GpuModel>>,
+    failed_reloads: &HashSet<String>,
+    path: &str,
+) -> bool {
+    models.get(path).is_some_and(Option::is_none) || failed_reloads.contains(path)
 }
 
 fn destroy_model(renderer: &mut Renderer, model: GpuModel) -> Result<(), RenderError> {
@@ -2527,6 +2579,29 @@ range = 10
         assert_eq!(
             palette_mismatches(&skins, &bridge),
             vec![(hero, "models/hero.fbx".to_owned())]
+        );
+    }
+
+    #[test]
+    fn palette_mismatch_warns_once_and_again_after_the_palette_matched() {
+        // Регрессия: после того как палитра снова совпала, новое несоответствие молчало.
+        let world = skin_world();
+        let hero = world.handle("hero").unwrap();
+        let mismatch = vec![(hero, "models/hero.fbx".to_owned())];
+        let mut reported = HashSet::new();
+        assert_eq!(mismatch_warnings(&mut reported, mismatch.clone()).len(), 1);
+        assert!(
+            mismatch_warnings(&mut reported, mismatch.clone()).is_empty(),
+            "пока несоответствие держится, предупреждение не повторяется"
+        );
+        assert!(
+            mismatch_warnings(&mut reported, Vec::new()).is_empty(),
+            "палитра совпала"
+        );
+        assert_eq!(
+            mismatch_warnings(&mut reported, mismatch).len(),
+            1,
+            "новое несоответствие выводится снова"
         );
     }
 }
