@@ -4,6 +4,8 @@ layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_normal;
 layout(location = 2) in vec2 in_uv;
 layout(location = 3) in vec3 in_color;
+// Позиция прошлого кадра: binding 1. Для статического меша это тот же буфер.
+layout(location = 4) in vec3 in_previous_position;
 
 layout(location = 0) out vec3 out_normal;
 layout(location = 1) out vec2 out_uv;
@@ -46,7 +48,7 @@ void main() {
     gl_Position.xy += frame.render_params.xy * current_clip.w;
     out_current_clip = current_clip;
     out_previous_clip = frame.previous_view_projection
-        * push_constants.previous_model * vec4(in_position, 1.0);
+        * push_constants.previous_model * vec4(in_previous_position, 1.0);
     for (int cascade = 0; cascade < 4; ++cascade) {
         out_shadow_clip[cascade] = frame.shadow_view_projections[cascade] * world_position;
     }

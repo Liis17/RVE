@@ -623,6 +623,7 @@ impl WindowHandler for Sandbox {
                 }),
                 lod_level: 0,
                 casts_shadow: true,
+                skin: None,
             })
             .collect::<Vec<_>>();
         let gpu_time = renderer.take_gpu_frame_time();
@@ -663,6 +664,7 @@ impl WindowHandler for Sandbox {
         let local_lights = self.content.local_lights();
         let local_light_shadows = self.content.local_light_shadows();
         let frame = Frame {
+            joint_palettes: &[],
             clear_color: [
                 self.camera_settings.render.clear_color[0],
                 self.camera_settings.render.clear_color[1],

@@ -15,6 +15,7 @@ const MAX_RENDERED_LIGHTS: usize = 1024;
 const MAX_LOCAL_SHADOW_LAYERS: usize = 32;
 const LOCAL_SHADOW_MAP_RESOLUTION: u32 = 1024;
 const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = 64;
+const SKIN_COMPUTE_LOCAL_SIZE: u32 = 64;
 
 type ShaderBuild = (
     &'static str,
@@ -48,6 +49,12 @@ const SHADERS: &[ShaderBuild] = &[
         naga::ShaderStage::Compute,
         &[],
         "cluster.comp.spv",
+    ),
+    (
+        "skin.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "skin.comp.spv",
     ),
     ("mesh.vert", naga::ShaderStage::Vertex, &[], "mesh.vert.spv"),
     (
@@ -224,6 +231,12 @@ fn main() {
             shader_options.defines.insert(
                 "MAX_LOCAL_SHADOW_LAYERS".to_owned(),
                 MAX_LOCAL_SHADOW_LAYERS.to_string(),
+            );
+        }
+        if name == "skin.comp" {
+            shader_options.defines.insert(
+                "SKIN_COMPUTE_LOCAL_SIZE".to_owned(),
+                SKIN_COMPUTE_LOCAL_SIZE.to_string(),
             );
         }
         if name == "cluster.comp" {

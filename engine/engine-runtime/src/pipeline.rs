@@ -407,6 +407,7 @@ impl RenderBackend for VulkanBackend {
     ) -> Result<FrameOutcome, String> {
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let frame = Frame {
+            joint_palettes: &[],
             clear_color: [
                 snapshot.view.render.clear_color[0],
                 snapshot.view.render.clear_color[1],
@@ -512,6 +513,7 @@ impl RenderBackend for VulkanBackend {
 
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let scene = Frame {
+            joint_palettes: &[],
             clear_color: [
                 snapshot.view.render.clear_color[0],
                 snapshot.view.render.clear_color[1],
@@ -1143,6 +1145,7 @@ fn make_snapshot(
                 previous_model: None,
                 lod_level,
                 casts_shadow: true,
+                skin: None,
             });
         }
         if draw_start != draws.len() {

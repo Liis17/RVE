@@ -635,6 +635,7 @@ impl SceneRenderer {
                 previous_model: None,
                 lod_level: 0,
                 casts_shadow: false,
+                skin: None,
             });
         }
         Ok(())
@@ -668,6 +669,7 @@ impl SceneRenderer {
         let light = frame_light(light, scene_has_light);
         let environment = self.frame_environment(environment_state);
         Frame {
+            joint_palettes: &[],
             clear_color: [
                 settings.render.clear_color[0],
                 settings.render.clear_color[1],
@@ -1007,6 +1009,7 @@ fn append_world_draws(
                 previous_model: motion_history.previous_model(instance.object),
                 lod_level: u8::try_from(level).unwrap_or(u8::MAX),
                 casts_shadow: true,
+                skin: None,
             });
             motion_history.record_current(instance.object, instance.model.to_cols_array_2d());
         }
