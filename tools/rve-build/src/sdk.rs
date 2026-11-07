@@ -606,7 +606,10 @@ mod tests {
                     .to_string()
                     .contains(&format!("ABI version {abi_version}"))
             );
-            assert!(error.to_string().contains("ожидаемой версией 6"));
+            assert!(error.to_string().contains(&format!(
+                "ожидаемой версией {}",
+                rve_sdk::abi::RVE_SCRIPT_ABI_VERSION
+            )));
         }
     }
 
