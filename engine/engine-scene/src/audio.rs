@@ -1,10 +1,81 @@
 //! Звуковые компоненты сцены. Модуль не зависит от аудио-бэкенда: воспроизведение и микширование — в `engine-audio`.
 
 use crate::document::{SceneError, require_asset_path, virtual_path_serde};
+use crate::world::ObjectHandle;
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Идентификатор голоса. Выделяется один раз за процесс и не повторяется, поэтому
+/// скрипт может сохранить его и позже остановить голос.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VoiceId(NonZeroU64);
+
+static NEXT_VOICE_ID: AtomicU64 = AtomicU64::new(1);
+
+impl VoiceId {
+    pub fn allocate() -> Self {
+        let raw = NEXT_VOICE_ID.fetch_add(1, Ordering::Relaxed);
+        Self(NonZeroU64::new(raw).expect("счётчик голосов не переполняется"))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Восстанавливает id из числа, которое скрипт получил от хоста. Ноль не является id.
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        NonZeroU64::new(raw).map(Self)
+    }
+}
+
+/// Параметры одноразового или зацикленного клипа, запущенного скриптом.
+/// `position` делает голос пространственным с фиксированной точкой излучения.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipParams {
+    pub group: AudioGroup,
+    pub volume: f32,
+    pub looping: bool,
+    pub position: Option<[f32; 3]>,
+}
+
+impl Default for ClipParams {
+    fn default() -> Self {
+        Self {
+            group: AudioGroup::Effects,
+            volume: 1.0,
+            looping: false,
+            position: None,
+        }
+    }
+}
+
+/// Запрос к звуковой подсистеме, накопленный скриптами за кадр.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioRequest {
+    /// `obj:play_sound()`: запуск источника объекта.
+    PlaySource {
+        object: ObjectHandle,
+        voice: VoiceId,
+    },
+    /// `obj:stop_sound()`: остановка текущего голоса источника.
+    StopSource { object: ObjectHandle },
+    /// `obj:set_sound_volume(v)`: громкость текущего голоса и следующих запусков источника.
+    SetSourceVolume { object: ObjectHandle, volume: f32 },
+    /// `rve.audio.play(path, ...)`: клип без привязки к объекту.
+    PlayClip {
+        voice: VoiceId,
+        path: VirtualPath,
+        params: ClipParams,
+    },
+    /// `rve.audio.stop(id)`.
+    StopVoice { voice: VoiceId },
+    /// `rve.audio.set_group_volume(group, v)`.
+    SetGroupVolume { group: AudioGroup, volume: f32 },
+}
 
 /// Группа громкости. `Master` — общий множитель; источники сцены его не назначают.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

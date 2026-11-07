@@ -491,14 +491,15 @@ fn start_modules(
     physics_driver: StepDriver,
     status: Arc<RuntimeStatus>,
 ) -> std::io::Result<PhysicsClient> {
-    let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+    let (audio, audio_handle) =
+        engine_audio::AudioEngine::new(engine_audio::AudioConfig::default());
+    let audio_stop = audio_handle.clone();
     modules.spawn(
         "rve-audio",
+        move || audio_stop.shutdown(),
         move || {
-            let _ = audio_tx.send(());
-        },
-        move || {
-            engine_audio::AudioEngine::new().run(audio_rx);
+            audio.run();
+            drop(audio_handle);
         },
     )?;
 

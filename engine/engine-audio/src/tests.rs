@@ -1,0 +1,401 @@
+use super::*;
+use engine_scene::AudioGroup;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+fn voice(id: u64) -> VoiceId {
+    VoiceId::from_raw(id).expect("тестовый id ненулевой")
+}
+
+fn request(looping: bool) -> PlayRequest {
+    PlayRequest {
+        group: AudioGroup::Effects,
+        volume: 1.0,
+        looping,
+        spatial: None,
+    }
+}
+
+/// Минимальный 16-битный моно WAV нужной длины в кадрах (22050 Гц).
+fn wav_bytes(frames: usize) -> Vec<u8> {
+    let data_len = (frames * 2) as u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&22_050u32.to_le_bytes());
+    out.extend_from_slice(&(22_050u32 * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    out.resize(out.len() + data_len as usize, 0);
+    out
+}
+
+#[test]
+fn lanes_fill_then_evict_the_oldest_one_shot() {
+    let mut table = Lanes::default();
+    for id in 1..=VOICE_SLOTS as u64 {
+        assert_eq!(
+            table.allocate(voice(id), false),
+            Ok(((id - 1) as usize, None))
+        );
+    }
+    assert_eq!(table.allocate(voice(100), false), Ok((0, Some(voice(1)))));
+    assert_eq!(table.lane_of(voice(100)), Some(0));
+    assert_eq!(table.lane_of(voice(1)), None);
+}
+
+#[test]
+fn eviction_skips_loops_and_takes_the_oldest_one_shot() {
+    let mut table = Lanes::default();
+    table.allocate(voice(1), true).unwrap();
+    for id in 2..=VOICE_SLOTS as u64 {
+        table.allocate(voice(id), false).unwrap();
+    }
+    assert_eq!(table.allocate(voice(200), false), Ok((1, Some(voice(2)))));
+    assert_eq!(table.lane_of(voice(1)), Some(0));
+}
+
+#[test]
+fn looping_voices_are_never_evicted() {
+    let mut table = Lanes::default();
+    for id in 1..=VOICE_SLOTS as u64 {
+        table.allocate(voice(id), true).unwrap();
+    }
+    assert_eq!(
+        table.allocate(voice(200), false),
+        Err(AudioError::NoFreeVoice)
+    );
+    assert_eq!(table.lane_of(voice(1)), Some(0));
+}
+
+#[test]
+fn release_frees_only_the_lane_owned_by_that_voice() {
+    let mut table = Lanes::default();
+    table.allocate(voice(1), false).unwrap();
+    assert!(!table.release(voice(2)));
+    assert_eq!(table.lane_of(voice(1)), Some(0));
+    assert!(table.release(voice(1)));
+    assert_eq!(table.lane_of(voice(1)), None);
+}
+
+#[test]
+fn play_reserves_a_lane_and_sends_it_with_the_command() {
+    let (handle, commands, _events) = AudioHandle::detached();
+    handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    let lane = handle.lane_of(voice(1)).expect("слот выделен");
+    match commands.try_recv() {
+        Ok(Command::Play {
+            voice: sent,
+            lane: sent_lane,
+            path,
+            ..
+        }) => {
+            assert_eq!(sent, voice(1));
+            assert_eq!(sent_lane, lane);
+            assert_eq!(path, "audio/hum.wav");
+        }
+        other => panic!("ожидалась команда Play: {other:?}"),
+    }
+}
+
+#[test]
+fn full_pool_sends_stop_for_the_evicted_voice_before_the_new_play() {
+    let (handle, commands, _events) = AudioHandle::detached();
+    for id in 1..=VOICE_SLOTS as u64 {
+        handle
+            .play(voice(id), "audio/hum.wav", request(false))
+            .unwrap();
+    }
+    let _: Vec<Command> = commands.try_iter().collect();
+    handle
+        .play(voice(100), "audio/hum.wav", request(false))
+        .unwrap();
+    let sent: Vec<Command> = commands.try_iter().collect();
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [Command::Stop(stopped), Command::Play { voice: new, .. }]
+                if *stopped == voice(1) && *new == voice(100)
+        ),
+        "{sent:?}"
+    );
+}
+
+#[test]
+fn full_queue_rejects_commands_and_a_rejected_play_gives_back_its_lane() {
+    let (handle, commands, _events) = AudioHandle::detached();
+    for _ in 0..COMMAND_CAPACITY {
+        handle.preload(Vec::new()).unwrap();
+    }
+    assert_eq!(
+        handle.play(voice(1), "audio/hum.wav", request(false)),
+        Err(AudioError::QueueFull)
+    );
+    assert_eq!(handle.lane_of(voice(1)), None);
+    assert_eq!(handle.stop(voice(2)), Err(AudioError::QueueFull));
+    assert_eq!(commands.try_iter().count(), COMMAND_CAPACITY);
+    handle.stop(voice(2)).unwrap();
+    assert!(matches!(commands.try_recv(), Ok(Command::Stop(id)) if id == voice(2)));
+}
+
+#[test]
+fn positions_are_written_without_the_command_queue() {
+    let (handle, commands, _events) = AudioHandle::detached();
+    handle
+        .play(voice(1), "audio/hum.wav", request(true))
+        .unwrap();
+    for _ in 0..COMMAND_CAPACITY - 1 {
+        handle.preload(Vec::new()).unwrap();
+    }
+    assert_eq!(handle.preload(Vec::new()), Err(AudioError::QueueFull));
+    let lane = handle.lane_of(voice(1)).unwrap();
+    for step in 0..10_000 {
+        handle.set_emitter(voice(1), [step as f32, 0.0, 0.0]);
+    }
+    assert_eq!(handle.spatial().emitter(lane), [9_999.0, 0.0, 0.0]);
+    handle.set_emitter(voice(42), [1.0, 1.0, 1.0]);
+    assert_eq!(commands.try_iter().count(), COMMAND_CAPACITY);
+}
+
+#[test]
+fn run_returns_on_shutdown_without_an_output_device() {
+    let (engine, handle) = AudioEngine::new(AudioConfig::default());
+    let worker = thread::spawn(move || engine.run());
+    handle.shutdown();
+    worker.join().unwrap();
+}
+
+#[test]
+fn run_returns_when_every_handle_is_dropped() {
+    let (engine, handle) = AudioEngine::new(AudioConfig::default());
+    let worker = thread::spawn(move || engine.run());
+    drop(handle);
+    worker.join().unwrap();
+}
+
+/// Поток `rve-audio` без запуска: команды подаются из теста, чтения и декодирование — синхронно.
+struct Harness {
+    handle: AudioHandle,
+    commands: Receiver<Command>,
+    core: Core,
+    mixer: Receiver<MixerCommand>,
+    decode_jobs: Receiver<DecodeJob>,
+    reads: flume::Sender<Result<Vec<u8>, String>>,
+    reads_started: Arc<AtomicUsize>,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let (engine, handle) = AudioEngine::new(AudioConfig::default());
+        let AudioEngine {
+            commands,
+            events_tx,
+            lanes,
+            ..
+        } = engine;
+        let (reads, script) = flume::unbounded::<Result<Vec<u8>, String>>();
+        let reads_started = Arc::new(AtomicUsize::new(0));
+        let started = Arc::clone(&reads_started);
+        let read: ReadSource = Box::new(move |_path: &str| {
+            started.fetch_add(1, AtomicOrdering::Relaxed);
+            let script = script.clone();
+            Ok(Box::new(move || match script.try_recv() {
+                Ok(result) => Some(result),
+                Err(flume::TryRecvError::Empty) => None,
+                Err(flume::TryRecvError::Disconnected) => Some(Err("канал закрыт".to_owned())),
+            }) as ReadPoll)
+        });
+        let (mixer_tx, mixer) = flume::unbounded();
+        let (decode_tx, decode_jobs) = flume::unbounded();
+        let core = Core {
+            lanes,
+            read,
+            loading: HashMap::new(),
+            decoding: HashSet::new(),
+            cache: HashMap::new(),
+            cache_bytes: 0,
+            failed: HashSet::new(),
+            pending: Vec::new(),
+            mixer: Some(mixer_tx),
+            events: events_tx,
+            decode_tx,
+        };
+        Self {
+            handle,
+            commands,
+            core,
+            mixer,
+            decode_jobs,
+            reads,
+            reads_started,
+        }
+    }
+
+    /// Выполняет накопленные команды, запускает готовые чтения и декодирует полученные байты.
+    fn step(&mut self) {
+        while let Ok(command) = self.commands.try_recv() {
+            assert!(self.core.command(command));
+        }
+        self.core.poll_reads();
+        while let Ok(job) = self.decode_jobs.try_recv() {
+            let result = decode("wav", &job.bytes);
+            self.core.decoded(Decoded {
+                path: job.path,
+                result,
+            });
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads_started.load(AtomicOrdering::Relaxed)
+    }
+}
+
+#[test]
+fn stop_before_the_clip_loads_cancels_the_play() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    h.handle.stop(voice(1)).unwrap();
+    h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    h.step();
+    let sent: Vec<MixerCommand> = h.mixer.try_iter().collect();
+    assert!(
+        sent.iter()
+            .all(|command| matches!(command, MixerCommand::Stop { .. })),
+        "{sent:?}"
+    );
+    assert_eq!(h.reads(), 1);
+}
+
+#[test]
+fn ready_clip_is_sent_to_the_mixer_on_its_lane_and_cached_for_later_plays() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    h.step();
+    match h.mixer.try_recv() {
+        Ok(MixerCommand::Play {
+            voice: id,
+            lane,
+            clip,
+            ..
+        }) => {
+            assert_eq!(id, voice(1));
+            assert_eq!(lane, 0);
+            assert_eq!(clip.frames(), 2205);
+        }
+        other => panic!("ожидалась команда Play: {other:?}"),
+    }
+
+    h.handle
+        .play(voice(2), "audio/hum.wav", request(false))
+        .unwrap();
+    h.step();
+    assert!(matches!(
+        h.mixer.try_recv(),
+        Ok(MixerCommand::Play { voice: id, .. }) if id == voice(2)
+    ));
+    assert_eq!(h.reads(), 1, "второй запуск берёт клип из кеша");
+}
+
+#[test]
+fn a_clip_that_cannot_be_read_releases_its_lane_and_plays_nothing() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "audio/missing.wav", request(false))
+        .unwrap();
+    h.reads.send(Err("не найден".to_owned())).unwrap();
+    h.step();
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+    assert!(h.mixer.try_iter().next().is_none());
+
+    h.handle
+        .play(voice(2), "audio/missing.wav", request(false))
+        .unwrap();
+    h.step();
+    assert_eq!(h.handle.lane_of(voice(2)), None);
+    assert_eq!(h.reads(), 1, "отказавший путь не читается повторно");
+}
+
+#[test]
+fn corrupt_bytes_fail_the_clip_and_release_its_lane() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    h.reads.send(Ok(b"not a wav".to_vec())).unwrap();
+    h.step();
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+    assert!(h.mixer.try_iter().next().is_none());
+}
+
+#[test]
+fn clip_over_the_cache_budget_fails_without_panicking() {
+    let mut h = Harness::new();
+    h.core.cache_bytes = CACHE_LIMIT_BYTES;
+    h.handle
+        .play(voice(1), "audio/big.wav", request(false))
+        .unwrap();
+    h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    h.step();
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+    assert!(h.mixer.try_iter().next().is_none());
+}
+
+#[test]
+fn stop_all_drops_every_waiting_play() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    h.handle
+        .play(voice(2), "audio/hum.wav", request(false))
+        .unwrap();
+    h.handle.stop_all().unwrap();
+    h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    h.step();
+    let sent: Vec<MixerCommand> = h.mixer.try_iter().collect();
+    assert!(
+        sent.iter()
+            .all(|command| matches!(command, MixerCommand::StopAll)),
+        "{sent:?}"
+    );
+}
+
+#[test]
+fn ended_voice_frees_its_lane_and_reports_the_event() {
+    let mut h = Harness::new();
+    h.handle
+        .play(voice(1), "audio/hum.wav", request(false))
+        .unwrap();
+    h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    h.step();
+    assert!(matches!(h.mixer.try_recv(), Ok(MixerCommand::Play { .. })));
+    h.core.voice_ended(voice(1));
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+    assert_eq!(
+        h.handle.poll_events(),
+        vec![AudioEvent::VoiceEnded(voice(1))]
+    );
+}
+
+#[test]
+fn preload_starts_one_read_per_path() {
+    let mut h = Harness::new();
+    h.handle
+        .preload(vec!["audio/hum.wav".to_owned(), "audio/hum.wav".to_owned()])
+        .unwrap();
+    h.step();
+    assert_eq!(h.reads(), 1);
+}

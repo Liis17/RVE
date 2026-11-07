@@ -1,0 +1,99 @@
+//! Вывод на устройство по умолчанию через `cpal`. Тонкая обёртка: вся логика в [`Mixer`].
+//!
+//! Callback не выделяет память: буфер для конвертации в формат устройства создаётся до
+//! запуска потока. Команды читаются пачками по [`COMMANDS_PER_CALLBACK`], завершённые
+//! голоса отдаются через `try_send`; непереданные остаются в микшере до следующего вызова.
+
+use crate::mixer::{Mixer, MixerCommand, Spatial};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+use engine_scene::VoiceId;
+use flume::{Receiver, Sender};
+use std::sync::Arc;
+
+/// Кадров, которые callback конвертирует за один проход через scratch-буфер.
+const SCRATCH_FRAMES: usize = 8192;
+/// Команд, которые callback забирает из очереди за один вызов.
+const COMMANDS_PER_CALLBACK: usize = 256;
+
+/// Открытый выходной поток. Дроп останавливает устройство.
+pub struct Output {
+    _stream: cpal::Stream,
+}
+
+/// Открывает устройство вывода по умолчанию и запускает поток. Ошибка не паникует:
+/// вызывающий код выводит предупреждение и работает без звука.
+pub fn open(
+    commands: Receiver<MixerCommand>,
+    ended: Sender<VoiceId>,
+    spatial: Arc<Spatial>,
+) -> Result<Output, String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| "устройство вывода не найдено".to_owned())?;
+    let supported = device
+        .default_output_config()
+        .map_err(|error| format!("конфигурация устройства: {error}"))?;
+    let config = supported.config();
+    let mixer = Mixer::new(config.sample_rate, spatial);
+    let state = CallbackState {
+        mixer,
+        commands,
+        ended,
+    };
+    let stream = match supported.sample_format() {
+        SampleFormat::F32 => build::<f32>(&device, config, state),
+        SampleFormat::I16 => build::<i16>(&device, config, state),
+        SampleFormat::U16 => build::<u16>(&device, config, state),
+        SampleFormat::I32 => build::<i32>(&device, config, state),
+        other => return Err(format!("формат сэмплов {other:?} не поддерживается")),
+    }
+    .map_err(|error| format!("поток вывода: {error}"))?;
+    stream
+        .play()
+        .map_err(|error| format!("запуск потока: {error}"))?;
+    Ok(Output { _stream: stream })
+}
+
+struct CallbackState {
+    mixer: Mixer,
+    commands: Receiver<MixerCommand>,
+    ended: Sender<VoiceId>,
+}
+
+fn build<T>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    mut state: CallbackState,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let channels = usize::from(config.channels);
+    let mut scratch = vec![0.0f32; SCRATCH_FRAMES * channels];
+    device.build_output_stream::<T, _, _>(
+        config,
+        move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
+            for _ in 0..COMMANDS_PER_CALLBACK {
+                match state.commands.try_recv() {
+                    Ok(command) => state.mixer.apply(command),
+                    Err(_) => break,
+                }
+            }
+            for chunk in data.chunks_mut(SCRATCH_FRAMES * channels) {
+                let buffer = &mut scratch[..chunk.len()];
+                state.mixer.render(buffer, channels);
+                for (sample, value) in chunk.iter_mut().zip(buffer.iter()) {
+                    *sample = T::from_sample(*value);
+                }
+            }
+            let ended = &state.ended;
+            state
+                .mixer
+                .drain_ended(|voice| ended.try_send(voice).is_ok());
+        },
+        |error| log::warn!("ошибка аудиопотока: {error}"),
+        None,
+    )
+}
