@@ -388,13 +388,16 @@ impl PlayerWindow<'_> {
             .clone();
         let mut console_output = Default::default();
         let profile_open = self.overlays.profile_open();
-        let profile_reports: Vec<Arc<engine_core::profile::ProfileReport>> = self
-            .status
-            .profile
-            .reports()
-            .into_iter()
-            .map(|(_, report)| report)
-            .collect();
+        let profile_reports: Vec<Arc<engine_core::profile::ProfileReport>> = if profile_open {
+            self.status
+                .profile
+                .reports()
+                .into_iter()
+                .map(|(_, report)| report)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let console_open = self.overlays.console_open();
         let output = context.run_ui(raw_input, |_ui| {
             if console_open {
