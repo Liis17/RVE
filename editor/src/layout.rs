@@ -13,16 +13,18 @@ pub enum Tab {
     Inspector,
     Project,
     Console,
+    Profiler,
 }
 
 impl Tab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
         Self::Inspector,
         Self::Project,
         Self::Console,
+        Self::Profiler,
     ];
 
     pub fn title(self) -> &'static str {
@@ -33,6 +35,7 @@ impl Tab {
             Self::Inspector => "Inspector",
             Self::Project => "Project",
             Self::Console => "Console",
+            Self::Profiler => "Profiler",
         }
     }
 }
@@ -75,6 +78,7 @@ impl TabViewer for EditorTabs<'_> {
             Tab::Inspector => ui::inspector::show(ui, self.state),
             Tab::Project => ui::project_panel::show(ui, self.state),
             Tab::Console => ui::console::show(ui, self.state),
+            Tab::Profiler => ui::profiler::show(ui, self.state),
         }
     }
 
@@ -95,13 +99,15 @@ mod tests {
     #[test]
     fn default_layout_contains_every_panel_once() {
         let dock = default_layout();
-        for tab in Tab::ALL {
+        // Profiler открывается из меню вкладок и по умолчанию закрыт.
+        for tab in Tab::ALL.into_iter().filter(|tab| *tab != Tab::Profiler) {
             let count = dock
                 .iter_all_tabs()
                 .filter(|(_, open)| **open == tab)
                 .count();
             assert_eq!(count, 1, "{tab:?}");
         }
+        assert!(!is_open(&dock, Tab::Profiler));
     }
 
     #[test]

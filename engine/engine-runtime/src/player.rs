@@ -2,12 +2,17 @@ use crate::activation::PendingActivation;
 #[cfg(feature = "dev-console")]
 use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame, ConsoleUiSlot, snapshot_lines};
 use crate::cursor::CursorControl;
+#[cfg(feature = "dev-console")]
+use crate::dev_overlays::DevOverlays;
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::ModuleHost;
 use crate::pipeline::{
     ExitRequester, FrameSnapshot, RENDER_THREAD, RenderControl, RenderThreadConfig, RuntimeStatus,
     SCRIPTS_THREAD, ScriptControl, VulkanBackend, start_render,
 };
+use crate::profiling::StartupProfile;
+#[cfg(feature = "dev-console")]
+use crate::profiling::profile_command_lines;
 use crate::scene::{PreparedRenderAssets, upload_scene};
 #[cfg(feature = "dev-console")]
 use egui::{Context, Rect, ViewportId};
@@ -17,6 +22,7 @@ use egui_winit::State as EguiWinitState;
 use engine_console::{CommandLine, ConsoleBuffer, ConsoleLevel, ConsoleLine, parse_command_line};
 use engine_project::BootstrapPresentMode;
 use engine_render::{DebugView, PresentMode, Renderer, RendererConfig, UpscalerConfig};
+use engine_resources::ResourceHandle;
 use engine_script::ScriptInterruptHandle;
 #[cfg(feature = "dev-console")]
 use engine_ui::console::ConsoleOverlay;
@@ -62,6 +68,8 @@ pub(crate) struct PlayerConfig {
     pub script_stopped_rx: std::sync::mpsc::Receiver<()>,
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
+    pub resources: ResourceHandle,
+    pub startup: StartupProfile,
     pub input: Arc<Mutex<InputAccumulator>>,
     #[cfg(feature = "dev-console")]
     pub console_buffer: Arc<Mutex<ConsoleBuffer>>,
@@ -94,6 +102,8 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         script_stopped_rx,
         interrupt,
         status,
+        resources,
+        startup,
         input,
         #[cfg(feature = "dev-console")]
         console_buffer,
@@ -128,6 +138,8 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         script_stopped_rx,
         interrupt,
         status: Arc::clone(&status),
+        resources,
+        startup,
         render_stopped_rx: None,
         close_deadline: None,
         window_exit: None,
@@ -143,7 +155,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         #[cfg(feature = "dev-console")]
         console_overlay: ConsoleOverlay::default(),
         #[cfg(feature = "dev-console")]
-        console_open: false,
+        overlays: DevOverlays::default(),
         #[cfg(feature = "dev-console")]
         egui_state: None,
         #[cfg(feature = "dev-console")]
@@ -191,6 +203,8 @@ struct PlayerWindow<'a> {
     script_stopped_rx: std::sync::mpsc::Receiver<()>,
     interrupt: ScriptInterruptHandle,
     status: Arc<RuntimeStatus>,
+    resources: ResourceHandle,
+    startup: StartupProfile,
     render_stopped_rx: Option<Receiver<()>>,
     close_deadline: Option<Instant>,
     window_exit: Option<Arc<dyn ExitRequester>>,
@@ -211,7 +225,7 @@ struct PlayerWindow<'a> {
     #[cfg(feature = "dev-console")]
     console_overlay: ConsoleOverlay,
     #[cfg(feature = "dev-console")]
-    console_open: bool,
+    overlays: DevOverlays,
     #[cfg(feature = "dev-console")]
     egui_state: Option<EguiWinitState>,
     #[cfg(feature = "dev-console")]
@@ -279,15 +293,28 @@ impl PlayerWindow<'_> {
 
     #[cfg(feature = "dev-console")]
     fn set_console_open(&mut self, open: bool, window: &Window) {
-        if self.console_open == open {
+        if self.overlays.console_open() == open {
             return;
         }
-        self.console_open = open;
-        self.cursor.set_console_open(open);
         self.console_overlay.set_open(open);
+        self.overlays = self.overlays.with_console(open);
+        self.cursor.set_console_open(open);
+        self.apply_overlays(window);
+    }
+
+    #[cfg(feature = "dev-console")]
+    fn toggle_profile(&mut self, window: &Window) {
+        self.overlays = self.overlays.toggled_profile();
+        self.apply_overlays(window);
+    }
+
+    /// Приводит egui-состояние, ввод и последний кадр оверлеев к текущему [`DevOverlays`].
+    #[cfg(feature = "dev-console")]
+    fn apply_overlays(&mut self, window: &Window) {
+        let plan = self.overlays.plan();
         self.console_repaint_at = None;
-        lock_input(&self.input).console_open(open, self.window_focused);
-        if open {
+        lock_input(&self.input).console_open(plan.blocks_game_input, self.window_focused);
+        if plan.egui_context {
             if self.egui_state.is_none() {
                 self.egui_state = Some(new_egui_state(window));
             }
@@ -308,7 +335,7 @@ impl PlayerWindow<'_> {
 
     #[cfg(feature = "dev-console")]
     fn update_console(&mut self, window: &Window) {
-        if !self.console_open {
+        if !self.overlays.plan().egui_context {
             return;
         }
         if self.window_occluded {
@@ -366,10 +393,27 @@ impl PlayerWindow<'_> {
             .catalog
             .clone();
         let mut console_output = Default::default();
+        let profile_open = self.overlays.profile_open();
+        let profile_reports: Vec<Arc<engine_core::profile::ProfileReport>> = if profile_open {
+            self.status
+                .profile
+                .reports()
+                .into_iter()
+                .map(|(_, report)| report)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let console_open = self.overlays.console_open();
         let output = context.run_ui(raw_input, |_ui| {
-            console_output = self
-                .console_overlay
-                .show(&context, screen_rect, &lines, &catalog);
+            if console_open {
+                console_output = self
+                    .console_overlay
+                    .show(&context, screen_rect, &lines, &catalog);
+            }
+            if profile_open {
+                engine_ui::profiler::overlay(&context, &profile_reports);
+            }
         });
         if console_output.toggled {
             self.set_console_open(self.console_overlay.is_open(), window);
@@ -387,14 +431,21 @@ impl PlayerWindow<'_> {
         if let Some(delay) = repaint_delay {
             self.console_repaint_at = Instant::now().checked_add(delay);
         }
+        if self.overlays.profile_open() {
+            let refresh = Instant::now() + crate::profiling::PUBLISH_INTERVAL;
+            self.console_repaint_at = Some(
+                self.console_repaint_at
+                    .map_or(refresh, |deadline| deadline.min(refresh)),
+            );
+        }
         if let Some(state) = self.egui_state.as_mut() {
             state.handle_platform_output(window, platform_output);
         }
 
-        let open = self.console_open;
+        let visible = self.overlays.visible();
         let frame = ConsoleUiFrame {
-            visible: open,
-            primitives: if open {
+            visible,
+            primitives: if visible {
                 context.tessellate(shapes, pixels_per_point)
             } else {
                 Vec::new()
@@ -464,6 +515,15 @@ impl PlayerWindow<'_> {
             format!("> {text}"),
         );
         match command.name.as_str() {
+            "profile" => {
+                if let Err(error) = validate_builtin_args(&command, 0, "profile") {
+                    push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
+                    return;
+                }
+                for line in profile_command_lines(&self.status.profile.reports()) {
+                    push_console_line(&self.console_buffer, ConsoleLevel::Info, "profile", line);
+                }
+            }
             "help" => {
                 if let Err(error) = validate_builtin_args(&command, 1, "help [prefix]") {
                     push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
@@ -630,15 +690,24 @@ impl WindowHandler for PlayerWindow<'_> {
 
     #[cfg(feature = "dev-console")]
     fn window_event(&mut self, window: &Window, event: &WindowEvent) {
+        #[cfg(feature = "dev-console")]
+        if let WindowEvent::KeyboardInput { event, .. } = event
+            && event.physical_key == PhysicalKey::Code(KeyCode::F3)
+        {
+            if event.state == ElementState::Pressed && !event.repeat {
+                self.toggle_profile(window);
+            }
+            return;
+        }
         if let WindowEvent::KeyboardInput { event, .. } = event
             && event.physical_key == PhysicalKey::Code(KeyCode::Backquote)
         {
             if event.state == ElementState::Pressed && !event.repeat {
-                self.set_console_open(!self.console_open, window);
+                self.set_console_open(!self.overlays.console_open(), window);
             }
             return;
         }
-        if self.console_open
+        if self.overlays.console_open()
             && self
                 .egui_state
                 .as_mut()
@@ -650,7 +719,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn next_wakeup(&mut self) -> Option<Instant> {
         #[cfg(feature = "dev-console")]
-        if self.console_open
+        if self.overlays.visible()
             && let Some(console_wakeup) = self.console_repaint_at
         {
             return Some(
@@ -669,6 +738,7 @@ impl WindowHandler for PlayerWindow<'_> {
             lock_input(&self.input).console_open(false, self.window_focused);
         }
         let size = window.inner_size();
+        let phase_started = Instant::now();
         let mut renderer = match Renderer::new(
             Arc::clone(&window),
             size.width,
@@ -696,14 +766,18 @@ impl WindowHandler for PlayerWindow<'_> {
             Ok(renderer) => renderer,
             Err(error) => return self.fail_init(format!("ошибка renderer: {error}")),
         };
+        self.startup.record("renderer", phase_started.elapsed());
         #[cfg(feature = "dev-console")]
         {
             self.wireframe_supported = renderer.capabilities().wireframe;
         }
+        let phase_started = Instant::now();
         let gpu_scene = match upload_scene(&mut renderer, &self.render_assets) {
             Ok(scene) => scene,
             Err(error) => return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}")),
         };
+        self.startup.record("GPU upload", phase_started.elapsed());
+        self.startup.publish(&self.status.profile);
         let Some(frame_rx) = self.frame_rx.take() else {
             return self.fail_init("канал кадров отсутствует при запуске рендера");
         };
@@ -729,6 +803,7 @@ impl WindowHandler for PlayerWindow<'_> {
                 script_tx: self.script_tx.clone(),
                 interrupt: self.interrupt.clone(),
                 status: Arc::clone(&self.status),
+                resources: Some(self.resources.clone()),
                 stopped_tx: render_stopped_tx,
                 exit: window_exit,
             },
@@ -768,7 +843,7 @@ impl WindowHandler for PlayerWindow<'_> {
     fn resized(&mut self, width: u32, height: u32) {
         let _ = self.render_tx.send(RenderControl::Resize(width, height));
         #[cfg(feature = "dev-console")]
-        if width > 0 && height > 0 && self.console_open && !self.window_occluded {
+        if width > 0 && height > 0 && self.overlays.visible() && !self.window_occluded {
             self.console_needs_redraw = true;
         }
     }
@@ -788,7 +863,7 @@ impl WindowHandler for PlayerWindow<'_> {
             self.window_occluded = occluded;
             if occluded {
                 self.console_ui.discard_geometry_preserve_texture_delta();
-            } else if self.console_open {
+            } else if self.overlays.visible() {
                 self.console_needs_redraw = true;
             }
         }
@@ -799,7 +874,7 @@ impl WindowHandler for PlayerWindow<'_> {
         if key == Key::F8 {
             if pressed && !self.f8_down {
                 self.f8_down = true;
-                if !self.console_open && self.window_focused {
+                if !self.overlays.console_open() && self.window_focused {
                     self.debug_view = next_debug_view(self.debug_view, self.wireframe_supported);
                     let _ = self
                         .render_tx
@@ -811,7 +886,7 @@ impl WindowHandler for PlayerWindow<'_> {
             return;
         }
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).key(key, pressed);
@@ -819,7 +894,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).mouse_button(button, pressed);
@@ -827,7 +902,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn cursor_moved(&mut self, x: f64, y: f64) {
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).cursor_moved(x, y);
@@ -835,7 +910,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn mouse_motion(&mut self, dx: f64, dy: f64) {
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).mouse_motion(dx, dy);
@@ -843,7 +918,7 @@ impl WindowHandler for PlayerWindow<'_> {
 
     fn mouse_wheel(&mut self, dx: f32, dy: f32) {
         #[cfg(feature = "dev-console")]
-        if self.console_open {
+        if self.overlays.console_open() {
             return;
         }
         lock_input(&self.input).mouse_wheel(dx, dy);
@@ -856,7 +931,7 @@ impl WindowHandler for PlayerWindow<'_> {
             if !focused {
                 self.f8_down = false;
             }
-            lock_input(&self.input).console_open(self.console_open, self.window_focused);
+            lock_input(&self.input).console_open(self.overlays.console_open(), self.window_focused);
         }
         #[cfg(not(feature = "dev-console"))]
         lock_input(&self.input).focused(focused);

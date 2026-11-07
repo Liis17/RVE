@@ -1,5 +1,6 @@
 //! Play-режим: копия мира сцены и скрипты на главном потоке редактора.
 
+use crate::profile::PlayStep;
 use engine_assets::Assets;
 use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
@@ -116,6 +117,7 @@ pub struct PlaySession {
     frame: u64,
     last_tick: Instant,
     input: ScriptInput,
+    last_step: PlayStep,
 }
 
 impl PlaySession {
@@ -316,12 +318,18 @@ impl PlaySession {
             elapsed: 0.0,
             frame: 0,
             last_tick: Instant::now(),
+            last_step: PlayStep::default(),
             input: ScriptInput::default(),
         })
     }
 
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
+    }
+
+    /// Замеры последнего выполненного шага Play.
+    pub fn last_step(&self) -> PlayStep {
+        self.last_step
     }
 
     pub fn is_paused(&self) -> bool {
@@ -382,8 +390,11 @@ impl PlaySession {
         if self.paused {
             return Ok(());
         }
+        let mut physics_wait = Duration::ZERO;
         if let Some(physics) = &mut self.physics {
+            let started = Instant::now();
             physics.receive(&mut self.world, &mut self.host)?;
+            physics_wait = started.elapsed();
         }
         self.elapsed += f64::from(dt);
         self.frame += 1;
@@ -393,6 +404,8 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.update(&mut self.world, dt, time);
         self.watchdog.set_deadline(None);
+        let physics_started = Instant::now();
+        let mut physics_step = Duration::ZERO;
         if let Some(physics) = &mut self.physics {
             let mut commands = self.host.drain_physics_commands();
             commands.extend(
@@ -405,7 +418,13 @@ impl PlaySession {
                 .client
                 .step(dt, commands)
                 .map_err(|error| error.to_string())?;
+            physics_step = physics_started.elapsed();
         }
+        self.last_step = PlayStep {
+            script: self.host.last_update_profile(),
+            physics_wait,
+            physics_step,
+        };
         if let Some(audio) = &mut self.audio {
             audio
                 .bridge
