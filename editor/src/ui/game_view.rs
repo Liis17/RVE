@@ -3,7 +3,7 @@
 use super::scene_view::feed_play_pointer;
 use crate::state::EditorState;
 use egui::{Color32, Rect, Sense};
-use engine_scene::SceneDocument;
+use engine_scene::{ObjectHandle, SceneDocument, World};
 
 /// Камеры документа в его порядке: id, отображаемое имя и признак активной камеры.
 fn scene_cameras(document: &SceneDocument) -> Vec<(String, String, bool)> {
@@ -31,6 +31,14 @@ fn resolve_camera<'a>(
         .find(|(id, _, _)| Some(id.as_str()) == selected)
         .or_else(|| cameras.iter().find(|(_, _, active)| *active))
         .or_else(|| cameras.first())
+}
+
+/// Камера, которой смотрит Game: выбранная, если она ещё есть в мире, иначе активная камера документа.
+pub fn camera_handle(world: &World, selected: Option<&str>) -> ObjectHandle {
+    selected
+        .and_then(|id| world.handle(id))
+        .filter(|handle| world.camera_of(*handle).is_some())
+        .unwrap_or_else(|| world.active_camera())
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {

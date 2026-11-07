@@ -4,8 +4,8 @@ use super::*;
 use crate::layout::default_layout;
 use crate::project::OpenProject;
 use crate::scene_edit::{EditorScene, NewObject};
-use crate::state::AssetDrag;
-use crate::viewport::camera::project_point;
+use crate::state::{AssetDrag, ViewCommand};
+use crate::viewport::camera::{EditorCamera, View, project_point};
 use crate::viewport::gizmo::GizmoTool;
 use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
 use engine_assets::{Model, ModelMesh, ModelVertex};
@@ -450,6 +450,122 @@ fn tool_shortcuts_are_blocked_while_the_console_is_open() {
         harness.press(key, Modifiers::NONE);
         assert_eq!(harness.state.tool, GizmoTool::Move);
     }
+}
+
+#[test]
+fn queued_numpad_frame_and_standard_view_apply_once_and_keep_the_target() {
+    let (mut harness, id) = harness_with_cube();
+    harness.scene_mut().select(Some(id.as_str()));
+    harness.state.view_commands.push(ViewCommand::Frame);
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    assert!((harness.state.camera.target - CUBE_POSITION).length() < 1e-4);
+    assert!(harness.state.view_commands.is_empty());
+
+    let distance = harness.state.camera.distance;
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Right));
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    let camera = harness.state.camera;
+    assert!((camera.target - CUBE_POSITION).length() < 1e-4);
+    assert_eq!(camera.distance, distance);
+    assert!((camera.eye() - camera.target).normalize().x > 0.999);
+}
+
+#[test]
+fn queued_numpad_commands_are_dropped_while_typing_or_a_dialog_is_open() {
+    let mut harness = Harness::new();
+    let before = harness.state.camera;
+    let text_id = egui::Id::new("numpad_text");
+    let mut text = String::new();
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Top));
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+        ui.ctx().memory_mut(|memory| memory.request_focus(text_id));
+        toolbar::handle_shortcuts(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    assert_eq!(harness.state.camera, before);
+    assert!(harness.state.view_commands.is_empty());
+
+    harness.state.console_open = true;
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Top));
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    assert_eq!(harness.state.camera, before);
+}
+
+#[test]
+fn numpad_zero_aligns_the_scene_camera_to_the_game_camera_or_does_nothing_without_one() {
+    let mut harness = Harness::new();
+    let game = {
+        let world = harness.state.world_mut().unwrap();
+        world.camera_of(world.active_camera()).unwrap()
+    };
+    harness.state.view_commands.push(ViewCommand::AlignToGame);
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    let camera = harness.state.camera;
+    assert!((camera.eye() - game.position).length() < 1e-3);
+    let forward = (game.target - game.position).normalize();
+    assert!((camera.target - camera.eye()).normalize().dot(forward) > 0.999);
+
+    let before = EditorCamera { yaw: 1.0, ..camera };
+    harness.state.camera = before;
+    harness.state.scene = None;
+    harness.state.view_commands.push(ViewCommand::AlignToGame);
+    harness.shortcuts(Vec::new(), Modifiers::NONE);
+    assert_eq!(harness.state.camera, before);
+}
+
+/// Полный кадр интерфейса, как в приложении: `ui::show` сам сбрасывает видимость панелей.
+fn full_frame(harness: &mut Harness, dock: &mut DockState<Tab>) {
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| show(ui, state, dock));
+    output.textures_delta.clear();
+}
+
+#[test]
+fn numpad_view_in_play_needs_the_scene_panel_shown_on_the_previous_frame() {
+    let (mut harness, _id) = harness_with_cube();
+    // Без проекта `ui::show` показывает только стартовый экран, а dock с панелями не рисуется.
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+    harness.state.project = Some(OpenProject::open(Path::new(dir)).unwrap());
+    let mut dock = default_layout();
+    let document = harness.scene().document().clone();
+    harness.state.play =
+        Some(crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap());
+    // Первые кадры раскладывают dock; панель Scene появляется в нём не сразу.
+    for _ in 0..3 {
+        full_frame(&mut harness, &mut dock);
+    }
+    assert!(harness.state.scene_view.visible);
+
+    harness.state.scene_view.visible = false;
+    let before = harness.state.camera;
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Top));
+    full_frame(&mut harness, &mut dock);
+    assert_eq!(harness.state.camera, before);
+    assert!(harness.state.view_commands.is_empty());
+
+    harness
+        .state
+        .view_commands
+        .push(ViewCommand::Look(View::Front));
+    full_frame(&mut harness, &mut dock);
+    assert_eq!(harness.state.camera.yaw, 0.0);
+    assert_eq!(harness.state.camera.pitch, 0.0);
 }
 
 #[test]
@@ -1376,4 +1492,160 @@ fn smart_zoom_frames_only_edit_scene_under_pointer_and_resets_when_hidden() {
     let mut output = h.ctx.run_ui(input, |ui| show(ui, &mut h.state, &mut dock));
     output.textures_delta.clear();
     assert!(!h.state.smart_zoom);
+}
+
+#[test]
+fn project_tile_label_is_centered_under_its_tile() {
+    let mut harness = Harness::new();
+    harness.state.asset_tree = vec![crate::assets_fs::AssetEntry {
+        name: "notes.txt".to_owned(),
+        path: "notes.txt".to_owned(),
+        is_dir: false,
+        children: Vec::new(),
+    }];
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| project_panel::show(ui, state));
+    });
+    output.textures_delta.clear();
+    // Заглушка типа рисуется по центру плитки, как и подпись под ней.
+    let texts = texts(&output.shapes);
+    let placeholder = position_of(&texts, "FILE");
+    let label = position_of(&texts, "notes.txt");
+    assert!(
+        (placeholder.x - label.x).abs() < 0.5,
+        "{label:?} не по центру плитки {placeholder:?}"
+    );
+}
+
+#[test]
+fn clicking_elsewhere_commits_the_hierarchy_rename_once() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    harness.panel(Vec::new(), hierarchy::show);
+    harness.panel(vec![Event::Text("Z".to_owned())], hierarchy::show);
+    assert_eq!(
+        harness.state.hierarchy_rename,
+        Some(("camera".to_owned(), "CameraZ".to_owned()))
+    );
+    // Щелчок мимо строк уводит фокус из поля: переименование завершается.
+    harness.click(pos2(600.0, 600.0), hierarchy::show);
+    assert_eq!(harness.state.hierarchy_rename, None);
+    assert_eq!(
+        harness.scene().object("camera").unwrap().name.as_deref(),
+        Some("CameraZ")
+    );
+}
+
+#[test]
+fn escape_cancels_the_hierarchy_rename() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    let name = harness.scene().object("camera").unwrap().name.clone();
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    harness.panel(Vec::new(), hierarchy::show);
+    harness.panel(vec![Event::Text("Z".to_owned())], hierarchy::show);
+    harness.panel(vec![key(egui::Key::Escape)], hierarchy::show);
+    assert_eq!(harness.state.hierarchy_rename, None);
+    assert_eq!(harness.scene().object("camera").unwrap().name, name);
+}
+
+#[test]
+fn starting_play_cancels_the_hierarchy_rename_and_blocks_new_ones() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("camera"));
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    harness.panel(Vec::new(), hierarchy::show);
+    let document = harness.scene().document().clone();
+    let session = crate::play::PlaySession::start(&document, None, |_| Ok(String::new())).unwrap();
+    harness.state.enter_play(session);
+    assert_eq!(harness.state.hierarchy_rename, None);
+    harness.press(egui::Key::F2, Modifiers::NONE);
+    assert_eq!(harness.state.hierarchy_rename, None);
+}
+
+#[test]
+fn double_clicking_a_hierarchy_row_selects_and_frames_it_without_renaming() {
+    let (mut harness, id) = harness_with_cube();
+    let label = harness
+        .scene()
+        .object(&id)
+        .unwrap()
+        .display_name()
+        .to_owned();
+    let texts = hierarchy_frame(&mut harness, Vec::new());
+    let at = position_of(&texts, &label);
+    hierarchy_frame(&mut harness, vec![Event::PointerMoved(at)]);
+    // Два щелчка подряд в пределах двойного клика egui.
+    for pressed in [true, false, true, false] {
+        hierarchy_frame(
+            &mut harness,
+            vec![button(at, PointerButton::Primary, pressed)],
+        );
+    }
+    hierarchy_frame(&mut harness, Vec::new());
+    assert_eq!(harness.state.hierarchy_rename, None);
+    assert_eq!(harness.scene().selection(), Some(id.as_str()));
+    assert!((harness.state.camera.target - CUBE_POSITION).length() < 1e-4);
+}
+
+#[test]
+fn context_menu_rename_starts_renaming_the_row() {
+    let mut harness = Harness::new();
+    hierarchy_frame(&mut harness, Vec::new());
+    let texts = hierarchy_frame(&mut harness, Vec::new());
+    let row = position_of(&texts, "Camera");
+    hierarchy_frame(&mut harness, vec![Event::PointerMoved(row)]);
+    hierarchy_frame(
+        &mut harness,
+        vec![button(row, PointerButton::Secondary, true)],
+    );
+    hierarchy_frame(
+        &mut harness,
+        vec![button(row, PointerButton::Secondary, false)],
+    );
+    let texts = hierarchy_frame(&mut harness, Vec::new());
+    let rename = position_of(&texts, "Rename");
+    hierarchy_frame(&mut harness, vec![Event::PointerMoved(rename)]);
+    hierarchy_frame(
+        &mut harness,
+        vec![button(rename, PointerButton::Primary, true)],
+    );
+    hierarchy_frame(
+        &mut harness,
+        vec![button(rename, PointerButton::Primary, false)],
+    );
+    hierarchy_frame(&mut harness, Vec::new());
+    assert_eq!(
+        harness.state.hierarchy_rename,
+        Some(("camera".to_owned(), "Camera".to_owned()))
+    );
+}
+
+#[test]
+fn folder_tree_labels_render_without_an_icon_cache() {
+    let mut harness = Harness::new();
+    let folder =
+        |name: &str, children: Vec<crate::assets_fs::AssetEntry>| crate::assets_fs::AssetEntry {
+            name: name.to_owned(),
+            path: name.to_owned(),
+            is_dir: true,
+            children,
+        };
+    harness.state.asset_tree = vec![
+        folder("Models", vec![folder("Textures", Vec::new())]),
+        folder("Empty", Vec::new()),
+    ];
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| project_panel::show(ui, state));
+    });
+    output.textures_delta.clear();
+    let texts = texts(&output.shapes);
+    for label in ["Assets", "Models", "Textures", "Empty"] {
+        position_of(&texts, label);
+    }
 }

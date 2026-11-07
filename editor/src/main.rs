@@ -8,6 +8,7 @@ mod build;
 mod cli;
 mod console;
 mod gestures;
+mod icons;
 mod input;
 mod layout;
 mod new_project;

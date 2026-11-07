@@ -1,6 +1,7 @@
 //! Панель Project: файловый менеджер каталога `Assets/`.
 
 use crate::assets_fs::{AssetEntry, AssetKind};
+use crate::icons::folder_icon;
 use crate::state::{Action, AssetDrag, EditorState};
 
 const TILE_SIZE: f32 = 88.0;
@@ -43,9 +44,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         .show(ui, |ui| {
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                 let root_selected = state.current_folder.is_empty();
-                if ui.selectable_label(root_selected, "Assets").clicked() {
-                    state.current_folder.clear();
-                }
+                ui.horizontal(|ui| {
+                    folder_icon_image(ui, state, "Assets", !state.asset_tree.is_empty());
+                    if ui.selectable_label(root_selected, "Assets").clicked() {
+                        state.current_folder.clear();
+                    }
+                });
                 let tree = std::mem::take(&mut state.asset_tree);
                 folder_tree(ui, state, &tree);
                 state.asset_tree = tree;
@@ -76,14 +80,28 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     });
 }
 
+/// Иконка папки перед подписью в дереве; без загруженной текстуры подпись выводится одна.
+fn folder_icon_image(ui: &mut egui::Ui, state: &EditorState, name: &str, has_children: bool) {
+    let Some(texture) = state.icons.get(folder_icon(name, has_children)) else {
+        return;
+    };
+    let size = ui.spacing().interact_size.y;
+    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+        texture,
+        egui::vec2(size, size),
+    )));
+}
+
 fn folder_tree(ui: &mut egui::Ui, state: &mut EditorState, entries: &[AssetEntry]) {
     for entry in entries.iter().filter(|entry| entry.is_dir) {
         let selected = state.current_folder == entry.path;
         let has_folders = entry.children.iter().any(|child| child.is_dir);
+        let has_children = !entry.children.is_empty();
         if has_folders {
             let id = ui.make_persistent_id(("project_folder", &entry.path));
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
                 .show_header(ui, |ui| {
+                    folder_icon_image(ui, state, &entry.name, has_children);
                     if ui.selectable_label(selected, &entry.name).clicked() {
                         state.current_folder = entry.path.clone();
                     }
@@ -92,6 +110,7 @@ fn folder_tree(ui: &mut egui::Ui, state: &mut EditorState, entries: &[AssetEntry
         } else {
             ui.horizontal(|ui| {
                 ui.add_space(ui.spacing().indent);
+                folder_icon_image(ui, state, &entry.name, has_children);
                 if ui.selectable_label(selected, &entry.name).clicked() {
                     state.current_folder = entry.path.clone();
                 }
@@ -173,7 +192,15 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
             })
         })
         .flatten();
-        match preview {
+        let icon = entry
+            .is_dir
+            .then(|| {
+                state
+                    .icons
+                    .get(folder_icon(&entry.name, !entry.children.is_empty()))
+            })
+            .flatten();
+        match preview.or(icon) {
             Some(texture) => {
                 painter.image(
                     texture,
@@ -197,15 +224,19 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
             egui::pos2(rect.min.x + 2.0, image_rect.max.y + 2.0),
             rect.max - egui::vec2(2.0, 0.0),
         );
-        let galley = painter.layout(
+        let mut job = egui::text::LayoutJob::simple(
             entry.name.clone(),
             egui::FontId::proportional(11.0),
             visuals.text_color(),
             name_rect.width(),
         );
-        painter
-            .with_clip_rect(name_rect)
-            .galley(name_rect.min, galley, visuals.text_color());
+        job.halign = egui::Align::Center;
+        let galley = painter.layout_job(job);
+        painter.with_clip_rect(name_rect).galley(
+            name_rect.center_top(),
+            galley,
+            visuals.text_color(),
+        );
     }
     let response = response.on_hover_text(&entry.path);
     if response.double_clicked() {

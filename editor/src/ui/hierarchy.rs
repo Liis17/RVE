@@ -32,8 +32,14 @@ enum Command {
     Delete(String),
     Duplicate(String),
     BeginRename(String, String),
+    /// Изменение текста в открытом поле переименования.
+    EditRename(String, String),
+    /// Поле переименования получило фокус; повторно его запрашивать не нужно.
+    RenameFocused,
     CommitRename(String, String),
     CancelRename,
+    /// Двойной щелчок: выделить объект и навести на него камеру Scene.
+    Frame(String),
     CreatePrefab(String),
     Unpack(String),
     OpenPrefab(String),
@@ -93,6 +99,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     let editable = !state.is_playing();
     let mut commands = Vec::new();
     let rename = state.hierarchy_rename.clone();
+    let rename_focus = state.hierarchy_rename_focus;
     let query = state.hierarchy_filter.trim();
     let visible = (!query.is_empty()).then(|| filter_visible(&scene.view().objects, query));
     egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
@@ -102,6 +109,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                 scene,
                 children: &children,
                 rename: rename.as_ref(),
+                rename_focus,
                 visible: visible.as_ref(),
             };
             if let Some(roots) = children.get(&None) {
@@ -142,6 +150,8 @@ struct TreeContext<'a> {
     scene: &'a EditorScene,
     children: &'a HashMap<Option<&'a str>, Vec<&'a SceneObject>>,
     rename: Option<&'a (String, String)>,
+    /// Полю переименования нужно передать фокус в этом кадре.
+    rename_focus: bool,
     /// Видимые при фильтре объекты; `None` — фильтра нет.
     visible: Option<&'a HashSet<String>>,
 }
@@ -198,14 +208,21 @@ impl TreeContext<'_> {
             && renaming == &object.id
         {
             let mut text = text.clone();
-            let response = ui.text_edit_singleline(&mut text);
-            response.request_focus();
+            // Явный id: поле должно оставаться тем же виджетом между кадрами.
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .id(egui::Id::new(("hierarchy_rename", &object.id))),
+            );
+            if self.rename_focus {
+                response.request_focus();
+                commands.push(Command::RenameFocused);
+            }
             if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                 commands.push(Command::CancelRename);
             } else if response.lost_focus() {
                 commands.push(Command::CommitRename(object.id.clone(), text));
             } else if response.changed() {
-                commands.push(Command::BeginRename(object.id.clone(), text));
+                commands.push(Command::EditRename(object.id.clone(), text));
             }
             return;
         }
@@ -231,10 +248,7 @@ impl TreeContext<'_> {
             commands.push(Command::Select(object.id.clone(), modifiers));
         }
         if response.double_clicked() {
-            commands.push(Command::BeginRename(
-                object.id.clone(),
-                object.display_name().to_owned(),
-            ));
+            commands.push(Command::Frame(object.id.clone()));
         }
         // Объекты внутри экземпляра не перетаскиваются: менять им родителя нельзя.
         if !part {
@@ -317,7 +331,15 @@ fn apply(state: &mut EditorState, command: Command) {
         Command::Duplicate(id) => {
             state.edit_scene(|scene| scene.duplicate_object(&id));
         }
-        Command::BeginRename(id, text) => state.hierarchy_rename = Some((id, text)),
+        Command::BeginRename(id, text) => state.begin_hierarchy_rename(id, text),
+        Command::EditRename(id, text) => state.hierarchy_rename = Some((id, text)),
+        Command::RenameFocused => state.hierarchy_rename_focus = false,
+        Command::Frame(id) => {
+            if let Some(scene) = &mut state.scene {
+                scene.select(Some(id.as_str()));
+            }
+            scene_view::focus_selection(state);
+        }
         Command::CommitRename(id, text) => {
             state.hierarchy_rename = None;
             state.edit_scene(|scene| {
