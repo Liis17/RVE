@@ -6,7 +6,10 @@ use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
 use engine_scene::CameraSettings;
-use engine_scene::{ParamSchema, ParamValue, SceneDocument, SceneError, expand};
+use engine_scene::{
+    ParamSchema, ParamValue, PrefabTemplate, SceneAsset, SceneDocument, SceneError, SceneObject,
+    expand,
+};
 use engine_script::{ScriptInterruptHandle, lite_properties};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -146,7 +149,12 @@ fn prepare_with_resources(
         let expansion = expand(&document, &mut |prefab| load_prefab(&handle, prefab))
             .map_err(|error| BuildError::input(format!("ошибка сцены /{path}: {error}")))?;
         let document = expansion.document;
-        validate_lite_params(&document, &path, &handle, &mut lite_schemas)?;
+        validate_lite_params(
+            &document.objects,
+            &format!("сцена /{path}"),
+            &handle,
+            &mut lite_schemas,
+        )?;
         heavy_scripts.extend(document.objects.iter().flat_map(|object| {
             object.heavy_scripts.iter().map(|script| HeavyScriptUse {
                 scene: path.to_string(),
@@ -155,6 +163,15 @@ fn prepare_with_resources(
                 params: script.params.clone(),
             })
         }));
+        let mut scene_assets = document.assets.clone();
+        scene_assets.extend(unused_prefab_assets(
+            &path,
+            &document.assets,
+            &expansion.prefabs,
+            &handle,
+            &mut lite_schemas,
+            &mut heavy_scripts,
+        )?);
 
         base_paths.insert(path.clone());
         let scene_index = enabled_scenes.len();
@@ -169,7 +186,7 @@ fn prepare_with_resources(
             require_asset_file(&assets_dir, &prefab)?;
             usages.entry(prefab).or_default().scenes.insert(scene_index);
         }
-        for asset in document.assets {
+        for asset in scene_assets {
             let asset_path = asset.path;
             let usage = usages.entry(asset_path.clone()).or_default();
             usage.scenes.insert(scene_index);
@@ -269,15 +286,57 @@ fn prepare_with_resources(
     })
 }
 
-/// Проверяет `params` lite-скриптов сцены по схеме `properties` их классов; схемы
-/// кэшируются по пути скрипта для всех сцен.
-fn validate_lite_params(
-    document: &SceneDocument,
+/// `.rveprefab` из `[[assets]]` сцены, которого нет среди её экземпляров. Раскрытый документ
+/// его не содержит, поэтому шаблон даёт ресурсы, lite- и heavy-скрипты для spawn. Возвращает
+/// ресурсы шаблона, включая вложенные префабы.
+fn unused_prefab_assets(
     scene: &VirtualPath,
+    assets: &[SceneAsset],
+    instanced: &[VirtualPath],
+    handle: &ResourceHandle,
+    schemas: &mut BTreeMap<VirtualPath, Option<ParamSchema>>,
+    heavy_scripts: &mut Vec<HeavyScriptUse>,
+) -> Result<Vec<SceneAsset>, BuildError> {
+    let mut extra = Vec::new();
+    for asset in assets
+        .iter()
+        .filter(|asset| extension_is(asset.path.as_str(), "rveprefab"))
+    {
+        if instanced.contains(&asset.path) {
+            continue;
+        }
+        let template = PrefabTemplate::load(&asset.path, &mut |child: &VirtualPath| {
+            read_prefab_text(handle, child)
+        })
+        .map_err(|error| BuildError::input(format!("ошибка префаба /{}: {error}", asset.path)))?;
+        validate_lite_params(
+            template.objects(),
+            &format!("префаб /{}", asset.path),
+            handle,
+            schemas,
+        )?;
+        heavy_scripts.extend(template.objects().iter().flat_map(|object| {
+            object.heavy_scripts.iter().map(|script| HeavyScriptUse {
+                scene: scene.to_string(),
+                object: object.id.clone(),
+                name: script.name.clone(),
+                params: script.params.clone(),
+            })
+        }));
+        extra.extend(template.assets().iter().cloned());
+    }
+    Ok(extra)
+}
+
+/// Проверяет `params` lite-скриптов объектов `owner` (сцены или префаба) по схеме
+/// `properties` их классов; схемы кэшируются по пути скрипта для всех документов.
+fn validate_lite_params(
+    objects: &[SceneObject],
+    owner: &str,
     handle: &ResourceHandle,
     schemas: &mut BTreeMap<VirtualPath, Option<ParamSchema>>,
 ) -> Result<(), BuildError> {
-    for object in &document.objects {
+    for object in objects {
         for script in &object.lite_scripts {
             if !schemas.contains_key(&script.path) {
                 let label = format!("/{}", script.path);
@@ -296,7 +355,7 @@ fn validate_lite_params(
             if let Some(schema) = &schemas[&script.path] {
                 schema.resolve(&script.params).map_err(|error| {
                     BuildError::input(format!(
-                        "сцена /{scene}, объект {:?}, скрипт /{}: {error}",
+                        "{owner}, объект {:?}, скрипт /{}: {error}",
                         object.id, script.path
                     ))
                 })?;
@@ -800,18 +859,22 @@ mod lite_params_tests {
 /// Префаб читается из `Assets` через тот же `ResourceHandle`, что и сцены.
 fn load_prefab(handle: &ResourceHandle, path: &VirtualPath) -> Result<SceneDocument, SceneError> {
     let label = format!("/{path}");
-    let error = |message: String| SceneError {
+    let text = read_prefab_text(handle, path).map_err(|message| SceneError {
         source: label.clone(),
         object_id: None,
         message,
-    };
+    })?;
+    SceneDocument::parse_prefab(label, &text)
+}
+
+/// Текст префаба для [`PrefabTemplate::load`] и раскрытия экземпляров.
+fn read_prefab_text(handle: &ResourceHandle, path: &VirtualPath) -> Result<String, String> {
+    let label = format!("/{path}");
     let bytes = handle
         .read_all(label.as_str())
         .and_then(|request| request.wait())
-        .map_err(|resource| error(resource.to_string()))?;
-    let text = String::from_utf8(bytes)
-        .map_err(|utf8| error(format!("файл должен быть UTF-8: {utf8}")))?;
-    SceneDocument::parse_prefab(label.clone(), &text)
+        .map_err(|resource| resource.to_string())?;
+    String::from_utf8(bytes).map_err(|utf8| format!("файл должен быть UTF-8: {utf8}"))
 }
 
 #[cfg(test)]
@@ -913,5 +976,117 @@ mod prefab_tests {
         let error = prepare_project(root.path()).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("bulb.rveprefab"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod unused_prefab_tests {
+    use super::prepare_project;
+    use crate::temporary::TempDir;
+    use engine_files::VirtualPath;
+    use std::fs;
+    use std::path::Path;
+
+    const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
+    const SPARK_SCRIPT: &str =
+        "return { properties = { speed = { type = \"float\", default = 1 } } }\n";
+
+    fn write(root: &Path, path: &str, text: &str) {
+        let path = root.join("Assets").join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    /// Сцена объявляет `spark` в `[[assets]]` без экземпляров. `spark` тянет скрипт и вложенный
+    /// `glow`; `unused` в сцене не упомянут. `max_line` добавляется в запись префаба сцены.
+    fn project(root: &Path, speed: &str, max_line: &str) {
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/scenes/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        write(root, "scripts/spark.lua", SPARK_SCRIPT);
+        write(
+            root,
+            "prefabs/glow.rveprefab",
+            "[[objects]]\nid = \"light\"\n",
+        );
+        write(
+            root,
+            "prefabs/spark.rveprefab",
+            &format!(
+                "[[assets]]\npath = \"/scripts/spark.lua\"\n[[assets]]\npath = \"/prefabs/glow.rveprefab\"\n[[objects]]\nid = \"spark\"\n[[objects.lite_scripts]]\npath = \"/scripts/spark.lua\"\nparams = {speed}\n[[instances]]\nid = \"glow\"\nparent = \"spark\"\nprefab = \"/prefabs/glow.rveprefab\"\n"
+            ),
+        );
+        write(
+            root,
+            "prefabs/unused.rveprefab",
+            "[[objects]]\nid = \"junk\"\n",
+        );
+        write(
+            root,
+            "scenes/main.rvescene",
+            &format!("[[assets]]\npath = \"/prefabs/spark.rveprefab\"\n{max_line}{CAMERA}"),
+        );
+    }
+
+    fn path(value: &str) -> VirtualPath {
+        VirtualPath::parse(value).unwrap()
+    }
+
+    #[test]
+    fn fast_prefab_without_instance_is_packed_with_its_dependencies() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-unused").unwrap();
+        project(root.path(), "{ speed = 2 }", "");
+        let build = prepare_project(root.path()).unwrap();
+        let archive = |value: &str| build.assignments.get(&path(value)).map(String::as_str);
+        assert_eq!(archive("/prefabs/spark.rveprefab"), Some("scene-main"));
+        assert_eq!(archive("/scripts/spark.lua"), Some("scene-main"));
+        assert_eq!(archive("/prefabs/glow.rveprefab"), Some("scene-main"));
+        assert!(build.files.contains_key(&path("/scripts/spark.lua")));
+    }
+
+    #[test]
+    fn prefab_files_that_no_scene_declares_are_not_packed() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-unused").unwrap();
+        project(root.path(), "{ speed = 2 }", "");
+        let build = prepare_project(root.path()).unwrap();
+        assert!(
+            !build
+                .assignments
+                .contains_key(&path("/prefabs/unused.rveprefab"))
+        );
+        assert!(!build.files.contains_key(&path("/prefabs/unused.rveprefab")));
+    }
+
+    #[test]
+    fn invalid_lite_params_inside_an_unused_fast_prefab_are_a_project_error() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-unused").unwrap();
+        project(root.path(), "{ speed = \"fast\" }", "");
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error.to_string().contains("/prefabs/spark.rveprefab"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("/scripts/spark.lua"), "{error}");
+    }
+
+    #[test]
+    fn max_instances_stays_in_the_packed_scene_and_must_be_positive() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-unused").unwrap();
+        project(root.path(), "{ speed = 2 }", "max_instances = 100\n");
+        let build = prepare_project(root.path()).unwrap();
+        let source = fs::read(root.path().join("Assets/scenes/main.rvescene")).unwrap();
+        assert_eq!(
+            fs::read(&build.files[&path("/scenes/main.rvescene")]).unwrap(),
+            source
+        );
+
+        project(root.path(), "{ speed = 2 }", "max_instances = 0\n");
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("max_instances"), "{error}");
     }
 }

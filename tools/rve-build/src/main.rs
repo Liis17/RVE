@@ -12,6 +12,10 @@ mod temporary;
 use cli::CommandLine;
 use std::process;
 
+/// Версия сборщика из `Cargo.toml`.
+#[allow(dead_code)]
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() {
     let code = match cli::parse(std::env::args_os().skip(1)) {
         Ok(CommandLine::Help) => {
