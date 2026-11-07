@@ -344,6 +344,7 @@ impl ScriptHost {
                         writable: false,
                         actions: host.actions.frame(),
                         queued_messages: (host.queued_messages.len(), host.queued_bytes),
+                        queued_audio: host.audio_requests.len(),
                         physics: host.physics.clone(),
                         physics_phase_dt: None,
                     });
@@ -419,6 +420,7 @@ impl ScriptHost {
                         writable: false,
                         actions: host.actions.frame(),
                         queued_messages: (host.queued_messages.len(), host.queued_bytes),
+                        queued_audio: host.audio_requests.len(),
                         physics: host.physics.clone(),
                         physics_phase_dt: None,
                     });
@@ -622,6 +624,7 @@ impl ScriptHost {
             writable: true,
             actions: self.actions.frame(),
             queued_messages: (self.queued_messages.len(), self.queued_bytes),
+            queued_audio: self.audio_requests.len(),
             physics: self.physics.clone(),
             physics_phase_dt: None,
         });
@@ -960,6 +963,7 @@ impl ScriptHost {
             writable: true,
             actions: actions.frame(),
             queued_messages: (queued_messages.len(), *queued_bytes),
+            queued_audio: audio_requests.len(),
             physics: physics.clone(),
             physics_phase_dt: match phase {
                 Phase::Update(dt) => Some(dt),

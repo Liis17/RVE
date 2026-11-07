@@ -1903,6 +1903,7 @@ mod tests {
                 crate::actions::ActionFrame::empty(ScriptInput::default()),
             ),
             queued_messages: (0, 0),
+            queued_audio: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -1985,6 +1986,7 @@ mod tests {
                 crate::actions::ActionFrame::empty(ScriptInput::default()),
             ),
             queued_messages: (0, 0),
+            queued_audio: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),

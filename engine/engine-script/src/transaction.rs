@@ -14,6 +14,8 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
+/// Звуковых запросов за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
+pub(crate) const MAX_AUDIO_REQUESTS_PER_FRAME: usize = 256;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_DEPTH: usize = 16;
 pub(crate) const MAX_MESSAGE_ELEMENTS: usize = 1024;
@@ -89,6 +91,8 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) writable: bool,
     pub(crate) actions: Arc<ActionFrame>,
     pub(crate) queued_messages: (usize, usize),
+    /// Звуковые запросы, уже зафиксированные в этом кадре.
+    pub(crate) queued_audio: usize,
     pub(crate) physics: Rc<RefCell<PhysicsScriptState>>,
     pub(crate) physics_phase_dt: Option<f32>,
 }
@@ -119,6 +123,7 @@ pub(crate) struct ScriptTransaction {
     pending_bytes: usize,
     queued_message_count: usize,
     queued_message_bytes: usize,
+    queued_audio: usize,
     overflowed_messages: usize,
     action_frame: Option<Arc<ActionFrame>>,
     physics: Rc<RefCell<PhysicsScriptState>>,
@@ -155,6 +160,7 @@ impl Default for ScriptTransaction {
             pending_bytes: 0,
             queued_message_count: 0,
             queued_message_bytes: 0,
+            queued_audio: 0,
             overflowed_messages: 0,
             action_frame: None,
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
@@ -200,6 +206,7 @@ impl ScriptTransaction {
         self.pending_bytes = 0;
         self.queued_message_count = init.queued_messages.0;
         self.queued_message_bytes = init.queued_messages.1;
+        self.queued_audio = init.queued_audio;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
         self.pending_audio.clear();
@@ -247,6 +254,11 @@ impl ScriptTransaction {
     pub(crate) fn stage_audio(&mut self, request: AudioRequest) -> Result<(), String> {
         if !self.writable {
             return Err("audio is unavailable during script creation".to_owned());
+        }
+        if self.queued_audio.saturating_add(self.pending_audio.len()) >= MAX_AUDIO_REQUESTS_PER_FRAME {
+            return Err(format!(
+                "audio requests limit ({MAX_AUDIO_REQUESTS_PER_FRAME} per frame) reached"
+            ));
         }
         self.pending_audio.push(request);
         Ok(())

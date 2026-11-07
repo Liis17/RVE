@@ -165,3 +165,35 @@ return Script
     host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
     assert!(host.drain_audio_requests().is_empty());
 }
+
+#[test]
+fn audio_requests_per_frame_are_capped_and_the_overflow_is_a_script_error() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  local accepted = 0
+  for index = 1, 300 do
+    if pcall(rve.audio.play, "/audio/hum.wav") then
+      accepted = accepted + 1
+    end
+  end
+  if accepted ~= 256 then
+    error("accepted " .. accepted)
+  end
+end
+return Script
+"#,
+    );
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(
+        host.drain_audio_requests().len(),
+        crate::transaction::MAX_AUDIO_REQUESTS_PER_FRAME
+    );
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "лимит отклоняет запрос, а не ломает скрипт"
+    );
+}
