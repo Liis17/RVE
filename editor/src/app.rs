@@ -191,6 +191,7 @@ impl EditorApp {
                     project.root.clone(),
                 );
                 self.state.project = Some(project);
+                self.state.project_replaced();
                 self.save_settings();
                 self.state.current_folder.clear();
                 self.reset_project_assets();
@@ -538,8 +539,7 @@ impl EditorApp {
 
     /// Спрашивает о несохранённых изменениях перед действием, отбрасывающим сцену.
     fn run_guarded(&mut self, action: Action) {
-        let dirty = self.state.scene.as_ref().is_some_and(EditorScene::is_dirty);
-        if dirty {
+        if self.state.has_unsaved_changes() {
             self.state.unsaved_prompt = Some(UnsavedPrompt { then: action });
         } else {
             self.run_confirmed(action);
@@ -1115,7 +1115,10 @@ impl EditorApp {
                 }
                 Action::SaveThen(then) => {
                     if self.save(false) {
-                        self.run_confirmed(*then);
+                        match self.state.save_project_prefabs() {
+                            Ok(()) => self.run_confirmed(*then),
+                            Err(error) => self.state.log.error(error),
+                        }
                     }
                 }
                 Action::ApplyToPrefab(id) => {

@@ -76,11 +76,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
             for row in &rows {
                 let key = row.path.as_str();
                 ui.label(format!("/{key}"));
-                ui.label(if row.used {
-                    "используется экземпляром"
+                if row.used {
+                    ui.label("используется экземпляром");
                 } else {
-                    "не используется"
-                });
+                    ui.label("нет экземпляра в сцене").on_hover_text(
+                        "Префаб может спавниться скриптами (rve.spawn) во время игры",
+                    );
+                }
                 let archive_id = ui.make_persistent_id(("scene_prefab_archive", key));
                 let archive = row.archive.as_deref().unwrap_or_default();
                 if let Some(text) = committed_text_field(ui, archive_id, archive, "archive", 120.0)

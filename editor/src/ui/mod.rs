@@ -216,7 +216,8 @@ fn show_apply_prompt(ctx: &egui::Context, state: &mut EditorState) {
 }
 
 /// Текстовое поле, которое отдаёт значение только при уходе фокуса или Enter: промежуточный
-/// текст не попадает в документ. Пока фокуса нет, поле показывает текущее значение.
+/// текст не попадает в документ. Пока фокуса нет, поле показывает текущее значение. Уход фокуса
+/// без изменения значения ничего не отдаёт, поэтому не создаёт пустую правку в undo.
 pub(crate) fn committed_text_field(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -233,7 +234,7 @@ pub(crate) fn committed_text_field(
             .hint_text(hint)
             .desired_width(width),
     );
-    let committed = response.lost_focus().then(|| text.clone());
+    let committed = (response.lost_focus() && text != current).then(|| text.clone());
     if response.has_focus() {
         ui.ctx().data_mut(|data| data.insert_temp(id, text));
     } else {
