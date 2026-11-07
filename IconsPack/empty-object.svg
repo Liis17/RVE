@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Empty Object — outlined cube">
+  <!-- Neutral outline for an empty GameObject in the RVE hierarchy. -->
+  <g fill="none" stroke="#ADB6C1" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round">
+    <!-- upper isometric rhombus -->
+    <path d="M32 11.5 50 22 32 32.4 14 22Z"/>
+    <!-- three vertical edges -->
+    <path d="M14 22V43L32 53.5 50 43V22"/>
+    <path d="M32 32.4V53.5"/>
+  </g>
+</svg>
