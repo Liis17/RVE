@@ -96,7 +96,9 @@ bool surface_normal(ivec2 pixel, float depth, vec3 center, out vec3 normal) {
 }
 
 // Столкновение с видимой геометрией: выталкивание по нормали и отражение скорости.
-void collide(inout vec3 position, inout vec3 velocity) {
+// Частица глубже `-max_travel` под поверхностью (max_travel = |v|·step) не могла прийти спереди за один шаг:
+// она за окклюдером, и вытягивать её на видимую сторону нельзя. Поэтому такие частицы не трогаем.
+void collide(inout vec3 position, inout vec3 velocity, float max_travel) {
     vec4 clip = frame.view_projection * vec4(position, 1.0);
     if (clip.w <= 0.0) {
         return;
@@ -118,6 +120,9 @@ void collide(inout vec3 position, inout vec3 velocity) {
         return;
     }
     float height = dot(position - surface, normal);
+    if (height < -max_travel) {
+        return;
+    }
     float penetration = emitter.collision.z - height;
     if (penetration <= 0.0) {
         return;
@@ -148,9 +153,10 @@ void main() {
     vec3 velocity = particle.velocity_life.xyz;
     velocity += emitter.gravity.xyz * step;
     velocity *= max(0.0, 1.0 - emitter.angular_drag.z * step);
+    float max_travel = length(velocity) * step;
     vec3 position = particle.position_age.xyz + velocity * step;
     if (emitter.collision.w > 0.5) {
-        collide(position, velocity);
+        collide(position, velocity, max_travel);
     }
     particle.position_age.xyz = position;
     particle.position_age.w = age + step;
