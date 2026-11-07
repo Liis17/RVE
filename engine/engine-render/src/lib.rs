@@ -27,7 +27,9 @@ mod culling;
 mod particle_gpu;
 mod particles;
 
-use particle_gpu::{ParticleEmitter, ParticlePass, ParticleSystem, record_particles};
+use particle_gpu::{
+    ParticleEmitter, ParticlePass, ParticleSystem, particle_depth_source_masks, record_particles,
+};
 pub use particles::{
     MAX_ADDITIVE_PARTICLE_CAPACITY, MAX_ALPHA_PARTICLE_CAPACITY, MAX_PARTICLE_CURVE_KEYS,
     MAX_PARTICLE_STEP, ParticleBlend, ParticleBurst, ParticleCollision, ParticleColorKey,
@@ -2898,6 +2900,17 @@ impl Renderer {
         let particle_pipelines = self.particle_pipelines();
         let mut particle_works = Vec::with_capacity(rendered.len());
         for entry in &rendered {
+            // ÐÐ¸Ð´ Ð±ÐµÐ· ÑÐµÐ»Ð¸ Ð½Ðµ Ð·Ð°Ð¿Ð¸ÑÑÐ²Ð°ÐµÑÑÑ: ÐµÐ¼Ñ Ð½Ðµ Ð¾ÑÐ´Ð°ÑÐ¼ Ð¿Ð»Ð°Ð½ Ð¸ Ð½Ðµ ÐºÐ¾Ð¼Ð¼Ð¸ÑÐ¸Ð¼ ÑÐ¾ÑÑÐ¾ÑÐ½Ð¸Ðµ.
+            let has_target = self
+                .viewports
+                .get(entry.0.0)
+                .and_then(Option::as_ref)
+                .and_then(|viewport| viewport.targets.get(frame_slot))
+                .is_some_and(Option::is_some);
+            if !has_target {
+                particle_works.push(Vec::new());
+                continue;
+            }
             particle_works.push(self.particles.plan_view(
                 entry.1.particles,
                 entry.1.particle_step,
@@ -9695,6 +9708,8 @@ fn record_scene(
         ),
     );
     target.velocity_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    // Ð§Ð°ÑÑÐ¸ÑÑ Ð¼Ð¾Ð³Ð»Ð¸ Ð¾ÑÑÐ°Ð²Ð¸ÑÑ depth Ð² read-only: Ð¸ÑÑÐ¾ÑÐ½Ð¸Ðº Ð±Ð°ÑÑÐµÑÐ° Ð·Ð°Ð²Ð¸ÑÐ¸Ñ Ð¾Ñ ÑÐµÐºÑÑÐµÐ³Ð¾ layout.
+    let depth_source = particle_depth_source_masks(target.depth_layout);
     pipeline_barrier(
         device,
         command_buffer,
@@ -9702,10 +9717,8 @@ fn record_scene(
             target.depth.image,
             target.depth_layout,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+            depth_source.0,
+            depth_source.1,
             offscreen_sampled_stages(),
             vk::AccessFlags2::SHADER_SAMPLED_READ,
             depth_subresource_range(),

@@ -41,8 +41,8 @@ const PARTICLE_COMPUTE_PUSH_SIZE: u32 = 112;
 const PARTICLE_VERTEX_PUSH_SIZE: u32 = 32;
 /// Push constants compute-стадий не выходят за гарантированный Vulkan-минимум 128 байт.
 const _: () = assert!(PARTICLE_COMPUTE_PUSH_SIZE <= 128);
-/// Storage buffer descriptors на стадию compute: три в кадровом наборе и один буфер частиц.
-const PARTICLE_COMPUTE_STORAGE_BINDINGS: u32 = 4;
+/// Storage buffer descriptors на стадию compute: три в кадровом наборе (3, 4, 5) и два в наборе частиц (particles, sort).
+const PARTICLE_COMPUTE_STORAGE_BINDINGS: u32 = 5;
 /// Шаг сортировки и порядка: сохраняем «слот → instance» без сортировки в этой стадии.
 const PARTICLE_DRAW_VERTICES: u32 = 6;
 
@@ -851,9 +851,6 @@ pub(crate) fn record_particles(
             pass.pipelines.sim,
         );
     }
-    if needs_compute {
-        mark_pass(device, command_buffer, timestamps, GpuPass::Particles);
-    }
     // Ключи alpha сортируются в каждом виде, где эмиттер рисуется: после симуляции.
     compute_barrier(device, command_buffer);
     for work in pass
@@ -878,6 +875,7 @@ pub(crate) fn record_particles(
     unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 
     record_draws(device, command_buffer, target, render_extent, pass);
+    mark_pass(device, command_buffer, timestamps, GpuPass::Particles);
 }
 
 /// Барьер между compute-проходами частиц: запись storage-буферов → чтение и запись.
@@ -1175,6 +1173,29 @@ mod shader_tests {
 /// Layout depth буфера, в котором частицы читают его в compute и как read-only depth attachment.
 const PARTICLE_DEPTH_LAYOUT: vk::ImageLayout = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
+/// Маски источника барьера depth перед финальным переходом в `SHADER_READ_ONLY_OPTIMAL`. После частиц depth
+/// читается в compute, fragment и depth-тестах без записи.
+pub(crate) fn particle_depth_source_masks(
+    layout: vk::ImageLayout,
+) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    if layout == PARTICLE_DEPTH_LAYOUT {
+        (
+            vk::PipelineStageFlags2::COMPUTE_SHADER
+                | vk::PipelineStageFlags2::FRAGMENT_SHADER
+                | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+        )
+    } else {
+        (
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+        )
+    }
+}
+
 /// Layout depth перед частицами. `None`, если переход не нужен: нет потребителей или depth уже read-only.
 fn particle_depth_transition(current: vk::ImageLayout, consumers: bool) -> Option<vk::ImageLayout> {
     (consumers && current != PARTICLE_DEPTH_LAYOUT).then_some(PARTICLE_DEPTH_LAYOUT)
@@ -1190,6 +1211,25 @@ mod depth_tests {
             particle_depth_transition(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, false),
             None
         );
+    }
+
+    #[test]
+    fn read_only_depth_source_waits_for_compute_fragment_and_depth_tests_with_read_access() {
+        let (stages, access) = particle_depth_source_masks(PARTICLE_DEPTH_LAYOUT);
+        assert!(stages.contains(vk::PipelineStageFlags2::COMPUTE_SHADER));
+        assert!(stages.contains(vk::PipelineStageFlags2::FRAGMENT_SHADER));
+        assert!(stages.contains(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS));
+        assert!(stages.contains(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS));
+        assert!(!access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE));
+        assert!(!access.contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE));
+    }
+
+    #[test]
+    fn attachment_depth_source_keeps_depth_write_masks() {
+        let (stages, access) =
+            particle_depth_source_masks(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+        assert!(!stages.contains(vk::PipelineStageFlags2::COMPUTE_SHADER));
+        assert!(access.contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE));
     }
 
     #[test]

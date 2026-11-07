@@ -452,6 +452,7 @@ mod tests {
         assert_eq!(Scene::parse("shadows"), Some(Scene::Shadows));
         assert_eq!(Scene::parse("materials"), Some(Scene::Materials));
         assert_eq!(Scene::parse("clustered"), Some(Scene::Clustered));
+        assert_eq!(Scene::parse("particles"), Some(Scene::Particles));
         assert_eq!(Scene::parse("Cube"), None);
         assert_eq!(Scene::parse(""), None);
         assert_eq!(Scene::default(), Scene::Shadows);
