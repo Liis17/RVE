@@ -13,12 +13,111 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// The minimum metadata returned by [`ResourceHandle::stat`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceStat {
     /// Decoded byte length of the resource.
     pub size: u64,
+}
+
+/// Число замеров и сумма, максимум одной фазы запросов.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TimingTotals {
+    /// Число замеров: по одному на каждый запрос, дошедший до этой фазы.
+    pub count: u64,
+    pub total: Duration,
+    pub max: Duration,
+}
+
+/// Снимок статистики запросов [`ResourceHandle`].
+///
+/// Поля читаются по отдельности, поэтому снимок во время работы workers может
+/// расходиться между полями.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResourceStats {
+    /// Запросы, которые worker выполнил успешно, включая `stat`.
+    pub completed: u64,
+    /// Запросы, завершившиеся ошибкой, кроме отмены.
+    pub failed: u64,
+    /// Запросы, отменённые до выполнения или во время чтения.
+    pub cancelled: u64,
+    /// Декодированные байты, которые вернули успешные `read_all` и `read_range`.
+    pub bytes: u64,
+    /// Запросы, которые потребитель ещё не получил: в очереди, в работе или с непрочитанным результатом.
+    pub in_flight: usize,
+    /// Время от постановки запроса в очередь до взятия worker'ом.
+    pub queue: TimingTotals,
+    /// Время выполнения запроса worker'ом.
+    pub read: TimingTotals,
+}
+
+/// Счётчики сервиса, которые worker'ы обновляют без блокировок.
+#[derive(Default)]
+struct ResourceCounters {
+    completed: AtomicU64,
+    failed: AtomicU64,
+    cancelled: AtomicU64,
+    bytes: AtomicU64,
+    queue: TimingCounters,
+    read: TimingCounters,
+}
+
+impl ResourceCounters {
+    fn record_outcome(&self, result: &Result<ResponseValue, ResourceError>) {
+        match result {
+            Ok(ResponseValue::Stat(_)) => {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(ResponseValue::Bytes(bytes)) => {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+                self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+            Err(ResourceError::Cancelled) => {
+                self.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self, in_flight: usize) -> ResourceStats {
+        ResourceStats {
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            cancelled: self.cancelled.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            in_flight,
+            queue: self.queue.snapshot(),
+            read: self.read.snapshot(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TimingCounters {
+    count: AtomicU64,
+    total_nanos: AtomicU64,
+    max_nanos: AtomicU64,
+}
+
+impl TimingCounters {
+    fn record(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> TimingTotals {
+        TimingTotals {
+            count: self.count.load(Ordering::Relaxed),
+            total: Duration::from_nanos(self.total_nanos.load(Ordering::Relaxed)),
+            max: Duration::from_nanos(self.max_nanos.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 /// Owner of the coordinator and all resource worker threads.
@@ -96,6 +195,13 @@ impl ResourceHandle {
         &self.inner.root
     }
 
+    /// Returns a snapshot of request statistics for this service.
+    pub fn stats(&self) -> ResourceStats {
+        self.inner
+            .stats
+            .snapshot(self.inner.outstanding.used.load(Ordering::Acquire))
+    }
+
     /// Enqueues a metadata query for a canonical virtual path.
     pub fn stat(
         &self,
@@ -152,6 +258,8 @@ impl ResourceHandle {
             operation,
             control: Arc::clone(&control),
             response: response_tx,
+            submitted_at: Instant::now(),
+            stats: Arc::clone(&self.inner.stats),
             #[cfg(test)]
             panic_for_test: self.inner.panic_next.swap(false, Ordering::AcqRel),
         };
@@ -275,6 +383,7 @@ struct HandleInner {
     stopped: Arc<AtomicBool>,
     gate: Arc<AdmissionGate>,
     fatal_worker_panic: Arc<AtomicBool>,
+    stats: Arc<ResourceCounters>,
     #[cfg(test)]
     panic_next: AtomicBool,
 }
@@ -291,12 +400,15 @@ struct Job {
     operation: Operation,
     control: Arc<JobControl>,
     response: Sender<Response>,
+    submitted_at: Instant,
+    stats: Arc<ResourceCounters>,
     #[cfg(test)]
     panic_for_test: bool,
 }
 
 impl Job {
     fn respond(self, result: Result<ResponseValue, ResourceError>, memory: Option<BudgetLease>) {
+        self.stats.record_outcome(&result);
         let _ = self.response.try_send(Response { result, memory });
     }
 
@@ -662,6 +774,7 @@ fn start_inner(
                     stopped: Arc::clone(&stopped),
                     gate: Arc::clone(&gate),
                     fatal_worker_panic: Arc::clone(&fatal_worker_panic),
+                    stats: Arc::new(ResourceCounters::default()),
                     #[cfg(test)]
                     panic_next: AtomicBool::new(false),
                 }),
@@ -987,6 +1100,7 @@ fn worker_loop(
             Selection::Job(Ok(job)) => job,
         };
         let _panic_guard = WorkerPanicGuard { failure };
+        job.stats.queue.record(job.submitted_at.elapsed());
         if failure.stopped.load(Ordering::Acquire) {
             job.respond_stopped();
             continue;
@@ -999,7 +1113,9 @@ fn worker_loop(
         if job.panic_for_test {
             panic!("injected resource worker panic");
         }
+        let started = Instant::now();
         let result = catch_unwind(AssertUnwindSafe(|| execute_job(&job, &backend)));
+        job.stats.read.record(started.elapsed());
         match result {
             Ok((Ok(value), memory)) => job.respond(Ok(value), memory),
             Ok((Err(error), _)) => {

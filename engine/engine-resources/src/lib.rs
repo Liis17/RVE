@@ -10,9 +10,14 @@ mod error;
 mod service;
 
 pub use error::{ResourceError, ResourceErrorKind};
-pub use service::{ResourceHandle, ResourceRequest, ResourceStat, ResourceSystem};
+pub use service::{
+    ResourceHandle, ResourceRequest, ResourceStat, ResourceStats, ResourceSystem, TimingTotals,
+};
 
 use std::path::PathBuf;
+
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Selects how resource bytes are discovered at startup.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

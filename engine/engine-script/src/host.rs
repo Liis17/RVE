@@ -24,7 +24,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Script source compilation or heavy-factory failure during host creation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +164,36 @@ pub struct ScriptHost {
     actions: InputActions,
     current_time: ScriptTime,
     physics: Rc<RefCell<PhysicsScriptState>>,
+    update_profile: ScriptUpdateProfile,
+}
+
+/// Время последнего `update` хоста по фазам. Все поля нулевые до первого `update`.
+///
+/// `world_matrices`, `messages`, `physics_events`, `lua` и `rust` не перекрываются
+/// и вместе не превышают `total`; остаток доступен через [`Self::other`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScriptUpdateProfile {
+    /// Весь `update`, включая перечисленные ниже фазы.
+    pub total: Duration,
+    /// Пересчёт мировых матриц перед скриптами.
+    pub world_matrices: Duration,
+    /// Доставка сообщений между скриптами.
+    pub messages: Duration,
+    /// Доставка событий физики.
+    pub physics_events: Duration,
+    /// Сумма вызовов Lua-экземпляров.
+    pub lua: Duration,
+    /// Сумма вызовов экземпляров Rust ABI.
+    pub rust: Duration,
+}
+
+impl ScriptUpdateProfile {
+    /// Остаток `total` после перечисленных фаз: выбор экземпляров и служебная работа.
+    pub fn other(&self) -> Duration {
+        let named =
+            self.world_matrices + self.messages + self.physics_events + self.lua + self.rust;
+        self.total.saturating_sub(named)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -313,6 +343,7 @@ impl ScriptHost {
             scene_name: scene_name.to_owned(),
             interruption_reported: false,
             started: false,
+            update_profile: ScriptUpdateProfile::default(),
             destroyed: false,
             actions,
             current_time: ScriptTime::default(),
@@ -510,6 +541,11 @@ impl ScriptHost {
             self.start(world, time);
         }
         self.run_phase(world, Phase::Update(dt), time);
+    }
+
+    /// Возвращает время последнего `update` по фазам; `Start` и `Destroy` сюда не входят.
+    pub fn last_update_profile(&self) -> ScriptUpdateProfile {
+        self.update_profile
     }
 
     /// Runs on_destroy once for enabled instances that have started.
@@ -715,11 +751,19 @@ impl ScriptHost {
     }
 
     fn run_phase(&mut self, world: &mut World, phase: Phase, time: ScriptTime) {
+        let total_started = Instant::now();
+        let mut profile = ScriptUpdateProfile::default();
         self.current_time = time;
+        let started = Instant::now();
         world.recalculate_world_matrices();
+        profile.world_matrices = started.elapsed();
         if matches!(phase, Phase::Update(_)) {
+            let started = Instant::now();
             self.deliver_messages(world, time);
+            profile.messages = started.elapsed();
+            let started = Instant::now();
             self.deliver_physics_events(world, time);
+            profile.physics_events = started.elapsed();
         }
 
         let time_error = lite::set_time(&self.lua_time, time)
@@ -737,7 +781,15 @@ impl ScriptHost {
                 self.disable_instance(index);
                 continue;
             }
-            match self.call_instance(index, world, phase, time, None, time_error.as_deref()) {
+            let started = Instant::now();
+            let outcome =
+                self.call_instance(index, world, phase, time, None, time_error.as_deref());
+            let elapsed = started.elapsed();
+            match &self.instances[index].kind {
+                ScriptKind::Lite(_) => profile.lua += elapsed,
+                ScriptKind::Heavy(_) => profile.rust += elapsed,
+            }
+            match outcome {
                 CallOutcome::Committed => {}
                 CallOutcome::Interrupted => {
                     observed_interrupt = true;
@@ -771,6 +823,10 @@ impl ScriptHost {
                 });
                 self.interruption_reported = true;
             }
+        }
+        if matches!(phase, Phase::Update(_)) {
+            profile.total = total_started.elapsed();
+            self.update_profile = profile;
         }
     }
 

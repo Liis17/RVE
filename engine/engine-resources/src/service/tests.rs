@@ -1215,3 +1215,64 @@ fn resource_handle_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ResourceHandle>();
 }
+
+#[test]
+fn stats_count_completed_reads_with_their_bytes_and_queue_timing() {
+    let root = TempDirectory::new();
+    fs::write(root.path().join("data.bin"), b"hello").unwrap();
+    let system = loose_system(root.path());
+    let handle = system.handle();
+
+    assert_eq!(
+        handle.read_all("data.bin").unwrap().wait().unwrap(),
+        b"hello"
+    );
+
+    let stats = handle.stats();
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.bytes, 5);
+    assert_eq!((stats.failed, stats.cancelled), (0, 0));
+    assert_eq!(stats.in_flight, 0);
+    assert_eq!(stats.queue.count, 1);
+    assert_eq!(stats.read.count, 1);
+}
+
+#[test]
+fn stats_count_failed_requests_separately_from_completed_ones() {
+    let root = TempDirectory::new();
+    let system = loose_system(root.path());
+    let handle = system.handle();
+
+    assert!(handle.read_all("missing.bin").unwrap().wait().is_err());
+
+    let stats = handle.stats();
+    assert_eq!(stats.failed, 1);
+    assert_eq!((stats.completed, stats.cancelled, stats.bytes), (0, 0, 0));
+}
+
+#[test]
+fn stats_count_request_cancelled_while_its_read_is_in_progress() {
+    let root = TempDirectory::new();
+    let gate = Arc::new(ReadGate::default());
+    let (catalog, _reader) = catalog_with_reader(
+        archive_bytes(Codec::None, 4, &[("first.bin", b"abcdefgh")]),
+        Arc::clone(&gate),
+    );
+    let system = injected_system(root.path(), Backend::Packed(catalog), 1, 2, 1024);
+    gate.enable();
+    let handle = system.handle();
+
+    let active = handle.read_all("first.bin").unwrap();
+    assert!(gate.wait_for_arrivals(1, Duration::from_secs(2)));
+    assert_eq!(handle.stats().in_flight, 1);
+    drop(active);
+    gate.release();
+    // Единственный worker берёт запросы по очереди: после stat первое чтение уже учтено.
+    assert_eq!(handle.stat("first.bin").unwrap().wait().unwrap().size, 8);
+
+    let stats = handle.stats();
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.completed, 1, "завершился только stat");
+    assert_eq!(stats.bytes, 0);
+    assert_eq!(stats.in_flight, 0);
+}
