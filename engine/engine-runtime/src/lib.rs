@@ -7,6 +7,8 @@ mod activation;
 mod cli;
 #[cfg(feature = "dev-console")]
 mod console;
+#[cfg(any(feature = "dev-console", test))]
+mod dev_overlays;
 mod hardware;
 mod input;
 mod layout;
