@@ -720,6 +720,8 @@ name = "engine-animation"
 version = "0.1.0"
 dependencies = [
  "engine-assets",
+ "engine-files",
+ "engine-scene",
  "glam",
  "ufbx",
 ]
