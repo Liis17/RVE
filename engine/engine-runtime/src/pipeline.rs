@@ -2352,7 +2352,6 @@ mod tests {
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
-    #[cfg(feature = "dev-console")]
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
