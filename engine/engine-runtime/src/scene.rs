@@ -6,21 +6,25 @@ use engine_physics::{
 };
 use engine_project::PhysicsSettings;
 use engine_render::{
-    AlphaMode, EnvironmentSource, Material, MaterialId, RenderError, Renderer, TextureColorSpace,
-    TextureId, Vertex,
+    AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, RenderError, Renderer,
+    TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::CameraSettings;
+use engine_scene::prefab::PREFAB_EXTENSION;
 use engine_scene::{
-    MaterialAlphaMode, MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand,
+    EnvironmentComponent, LiteScript, LodGroup, MaterialAlphaMode, MaterialOverride, MeshRenderer,
+    ObjectHandle, PrefabTemplate, SceneDocument, SceneError, World, expand,
 };
+use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
 use glam::Vec3;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
+use std::path::Path;
 use std::sync::Arc;
 
+/// Ресурсы одного объекта с мешом: уровни LOD (модель и текстура) и замена материала.
 pub(crate) struct ObjectModel {
-    pub object: ObjectHandle,
     pub levels: Vec<(String, Option<String>)>,
     pub material: Option<MaterialOverride>,
 }
@@ -29,7 +33,18 @@ pub(crate) struct PreparedRenderAssets {
     pub models: HashMap<String, Model>,
     pub textures: HashMap<String, TextureData>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
-    pub objects: Vec<ObjectModel>,
+    /// Объекты сцены с мешами и их хендлы.
+    pub objects: Vec<(ObjectHandle, ObjectModel)>,
+    /// Быстрые префабы по пути. Элемент `i` относится к объекту шаблона `i`; `None` — у объекта
+    /// нет меша.
+    pub prefabs: BTreeMap<String, Vec<Option<ObjectModel>>>,
+}
+
+/// Быстрые префабы сцены: шаблоны для регистрации в скриптах и лимиты создания.
+#[derive(Default)]
+pub(crate) struct PreparedPrefabs {
+    pub templates: BTreeMap<String, Arc<PrefabTemplate>>,
+    pub catalog: PrefabCatalog,
 }
 
 pub(crate) struct PreparedScene {
@@ -37,15 +52,14 @@ pub(crate) struct PreparedScene {
     pub name: String,
     pub sources: BTreeMap<String, String>,
     pub render_assets: PreparedRenderAssets,
+    pub prefabs: PreparedPrefabs,
 }
 
 impl PreparedScene {
-    pub(crate) fn build_physics(
-        &self,
-        settings: &PhysicsSettings,
-    ) -> Result<(StepDriver, Vec<PhysicsSceneBinding>), String> {
-        let model_geometry = self
-            .render_assets
+    /// Геометрия моделей для коллайдеров мешей. Её используют и построение физики сцены, и
+    /// вставка тел spawn-объектов, поэтому строится она один раз.
+    pub(crate) fn physics_geometry(&self) -> Vec<ModelGeometry> {
+        self.render_assets
             .models
             .iter()
             .map(|(path, model)| ModelGeometry {
@@ -63,10 +77,17 @@ impl PreparedScene {
                     })
                     .collect(),
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    pub(crate) fn build_physics(
+        &self,
+        geometry: &[ModelGeometry],
+        settings: &PhysicsSettings,
+    ) -> Result<(StepDriver, Vec<PhysicsSceneBinding>), String> {
         PhysicsSceneDesc::from_world(
             &self.world,
-            &model_geometry,
+            geometry,
             Vec3::from_array(settings.gravity),
             settings.fixed_hz,
             settings.max_substeps as usize,
@@ -86,8 +107,53 @@ pub(crate) fn load_scene(
         SceneDocument::parse(scene_path, &contents).map_err(|error| error.to_string())?;
     let expansion = expand(&document, &mut |path| load_prefab(resources, path))
         .map_err(|error| error.to_string())?;
-    let world = World::from_document(&expansion.document).map_err(|error| error.to_string())?;
-    prepare_scene(resources, assets, scene_path, world)
+    let mut expanded = expansion.document;
+    let prefabs = load_fast_prefabs(resources, &mut expanded)?;
+    let world = World::from_document(&expanded).map_err(|error| error.to_string())?;
+    prepare_scene(resources, assets, scene_path, world, prefabs)
+}
+
+/// Раскрывает каждый `.rveprefab` из `[[assets]]` сцены в шаблон для spawn. Ассеты шаблонов
+/// добавляются в список ассетов сцены: звук и сборка видят их так же, как ассеты сцены.
+fn load_fast_prefabs(
+    resources: &ResourceHandle,
+    document: &mut SceneDocument,
+) -> Result<PreparedPrefabs, String> {
+    let fast = document
+        .assets
+        .iter()
+        .filter(|asset| is_prefab_path(&asset.path))
+        .map(|asset| (asset.path.clone(), asset.max_instances))
+        .collect::<Vec<_>>();
+    let mut prefabs = PreparedPrefabs::default();
+    for (path, max_instances) in fast {
+        let template = PrefabTemplate::load(&path, &mut |child: &VirtualPath| {
+            read_utf8(resources, &format!("/{}", child.as_str()))
+        })
+        .map_err(|error| error.to_string())?;
+        for asset in template.assets() {
+            if !document.assets.iter().any(|known| known.path == asset.path) {
+                document.assets.push(asset.clone());
+            }
+        }
+        prefabs.catalog.insert(
+            path.as_str(),
+            PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances,
+            },
+        );
+        prefabs
+            .templates
+            .insert(path.as_str().to_owned(), Arc::new(template));
+    }
+    Ok(prefabs)
+}
+
+fn is_prefab_path(path: &VirtualPath) -> bool {
+    Path::new(path.as_str())
+        .extension()
+        .is_some_and(|extension| extension == PREFAB_EXTENSION)
 }
 
 /// Префаб читается через тот же `ResourceHandle`, что и сцена, поэтому dev и release
@@ -110,10 +176,30 @@ fn prepare_scene(
     assets: &Assets,
     scene_path: &str,
     world: World,
+    prefabs: PreparedPrefabs,
 ) -> Result<PreparedScene, String> {
-    prepare_scene_with_model_loader(resources, assets, scene_path, world, |path| {
+    prepare_scene_with_model_loader(resources, assets, scene_path, world, prefabs, |path| {
         assets.load_model(path).map_err(|error| error.to_string())
     })
+}
+
+/// Ресурсы объектов сцены и шаблонов префабов, собранные за один проход. Модели и текстуры
+/// общие: объект сцены и префаб с одним FBX загружают его один раз.
+#[derive(Default)]
+struct RenderAssetSet {
+    models: HashMap<String, Model>,
+    textures: HashMap<String, TextureData>,
+    environments: HashMap<String, Arc<EnvironmentSource>>,
+    lite_paths: BTreeSet<String>,
+}
+
+/// Компоненты объекта, из которых готовятся его ресурсы. Одинаковы для объекта мира и для
+/// объекта шаблона префаба.
+struct ObjectParts<'a> {
+    environment: Option<&'a EnvironmentComponent>,
+    mesh_renderer: Option<&'a MeshRenderer>,
+    lod_group: Option<&'a LodGroup>,
+    lite_scripts: &'a [LiteScript],
 }
 
 fn prepare_scene_with_model_loader(
@@ -121,6 +207,7 @@ fn prepare_scene_with_model_loader(
     assets: &Assets,
     scene_path: &str,
     mut world: World,
+    prefabs: PreparedPrefabs,
     mut load_model: impl FnMut(&str) -> Result<Model, String>,
 ) -> Result<PreparedScene, String> {
     let camera_settings = world
@@ -154,20 +241,76 @@ fn prepare_scene_with_model_loader(
             .map_err(|error| error.to_string())?;
     }
 
-    let mut models = HashMap::new();
-    let mut textures = HashMap::new();
-    let mut environments = HashMap::new();
+    let mut set = RenderAssetSet::default();
     let mut objects = Vec::new();
-    let mut lite_paths = std::collections::BTreeSet::new();
-
     for object in world.objects() {
-        if let Some(path) = object
+        let parts = ObjectParts {
+            environment: object.environment.as_ref(),
+            mesh_renderer: object.mesh_renderer.as_ref(),
+            lod_group: object.lod_group.as_ref(),
+            lite_scripts: &object.lite_scripts,
+        };
+        if let Some(model) = set.add_object(assets, scene_path, parts, &mut load_model)? {
+            objects.push((object.handle, model));
+        }
+    }
+    let mut prefab_objects = BTreeMap::new();
+    for (path, template) in &prefabs.templates {
+        let mut levels = Vec::with_capacity(template.objects().len());
+        for object in template.objects() {
+            let parts = ObjectParts {
+                environment: object.environment.as_ref(),
+                mesh_renderer: object.mesh_renderer.as_ref(),
+                lod_group: object.lod_group.as_ref(),
+                lite_scripts: &object.lite_scripts,
+            };
+            levels.push(set.add_object(assets, scene_path, parts, &mut load_model)?);
+        }
+        prefab_objects.insert(path.clone(), levels);
+    }
+
+    let RenderAssetSet {
+        models,
+        textures,
+        environments,
+        lite_paths,
+    } = set;
+    let mut sources = BTreeMap::new();
+    for path in lite_paths {
+        sources.insert(path.clone(), read_utf8(resources, &path)?);
+    }
+
+    Ok(PreparedScene {
+        world,
+        name: scene_path.to_owned(),
+        sources,
+        render_assets: PreparedRenderAssets {
+            models,
+            textures,
+            environments,
+            objects,
+            prefabs: prefab_objects,
+        },
+        prefabs,
+    })
+}
+
+impl RenderAssetSet {
+    /// Готовит ресурсы одного объекта: HDR-окружение, модели уровней LOD, текстуры материалов и
+    /// Lua-исходники. Возвращает модель только для объекта с мешом.
+    fn add_object(
+        &mut self,
+        assets: &Assets,
+        scene_path: &str,
+        parts: ObjectParts<'_>,
+        load_model: &mut impl FnMut(&str) -> Result<Model, String>,
+    ) -> Result<Option<ObjectModel>, String> {
+        if let Some(path) = parts
             .environment
-            .as_ref()
             .and_then(|environment| environment.hdr.as_ref())
         {
             let key = path.as_str().to_owned();
-            if let std::collections::hash_map::Entry::Vacant(entry) = environments.entry(key) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.environments.entry(key) {
                 let image = assets
                     .load_hdr(entry.key())
                     .map_err(|error| format!("{scene_path}: {error}"))?;
@@ -178,12 +321,13 @@ fn prepare_scene_with_model_loader(
                 }));
             }
         }
-        if let Some(mesh) = &object.mesh_renderer {
+        let mut model_object = None;
+        if let Some(mesh) = parts.mesh_renderer {
             let mut levels = vec![(
                 mesh.model.as_str().to_owned(),
                 mesh.texture.as_ref().map(|path| path.as_str().to_owned()),
             )];
-            if let Some(group) = &object.lod_group {
+            if let Some(group) = parts.lod_group {
                 for level in &group.levels {
                     let model_path = VirtualPath::parse(&level.model)
                         .map_err(|error| format!("{scene_path}: {error}"))?
@@ -205,10 +349,10 @@ fn prepare_scene_with_model_loader(
             }
             let material = mesh.material.clone();
             for (model_path, _) in &levels {
-                if !models.contains_key(model_path) {
+                if !self.models.contains_key(model_path) {
                     let model =
                         load_model(model_path).map_err(|error| format!("{scene_path}: {error}"))?;
-                    models.insert(model_path.clone(), model);
+                    self.models.insert(model_path.clone(), model);
                 }
             }
             let scene_texture_paths = levels
@@ -227,40 +371,21 @@ fn prepare_scene_with_model_loader(
                 }))
                 .collect::<Vec<_>>();
             for path in scene_texture_paths {
-                if let std::collections::hash_map::Entry::Vacant(entry) = textures.entry(path) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = self.textures.entry(path)
+                {
                     let texture = assets
                         .load_texture(entry.key())
                         .map_err(|error| format!("{scene_path}: {error}"))?;
                     entry.insert(texture);
                 }
             }
-            objects.push(ObjectModel {
-                object: object.handle,
-                levels,
-                material,
-            });
+            model_object = Some(ObjectModel { levels, material });
         }
-        for script in &object.lite_scripts {
-            lite_paths.insert(script.path.as_str().to_owned());
+        for script in parts.lite_scripts {
+            self.lite_paths.insert(script.path.as_str().to_owned());
         }
+        Ok(model_object)
     }
-
-    let mut sources = BTreeMap::new();
-    for path in lite_paths {
-        sources.insert(path.clone(), read_utf8(resources, &path)?);
-    }
-
-    Ok(PreparedScene {
-        world,
-        name: scene_path.to_owned(),
-        sources,
-        render_assets: PreparedRenderAssets {
-            models,
-            textures,
-            environments,
-            objects,
-        },
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -403,7 +528,7 @@ pub(crate) fn upload_scene(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
 ) -> Result<GpuSceneTable, RenderError> {
-    let mut gpu_models: HashMap<String, Vec<(engine_render::MeshId, MaterialId)>> = HashMap::new();
+    let mut gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = HashMap::new();
     let mut texture_cache = GpuTextureCache::<TextureId>::default();
 
     for (path, model) in &assets.models {
@@ -438,43 +563,67 @@ pub(crate) fn upload_scene(
         environments: assets.environments.clone(),
         ..GpuSceneTable::default()
     };
-    for object in &assets.objects {
-        let mut levels = Vec::with_capacity(object.levels.len());
-        for (model_path, replacement_texture) in &object.levels {
-            let model_meshes = gpu_models.get(model_path).ok_or({
-                RenderError::InvalidState("CPU-модель отсутствует в таблице GPU-ресурсов")
-            })?;
-            if object.material.is_none() && replacement_texture.is_none() {
-                levels.push(model_meshes.clone());
-                continue;
-            }
-            let model = assets.models.get(model_path).ok_or({
-                RenderError::InvalidState(
-                    "CPU-модель отсутствует в таблице подготовленных ресурсов",
-                )
-            })?;
-            let mut draws = Vec::with_capacity(model_meshes.len());
-            for (source_mesh, (mesh_id, _)) in model.meshes.iter().zip(model_meshes) {
-                let resolved = resolve_material(
-                    &source_mesh.material,
-                    replacement_texture.as_deref(),
-                    object.material.as_ref(),
-                );
-                let material_id = upload_resolved_material(
-                    renderer,
-                    &resolved,
-                    model_path,
-                    model,
-                    &assets.textures,
-                    &mut texture_cache,
-                )?;
-                draws.push((*mesh_id, material_id));
-            }
-            levels.push(draws);
+    for (handle, object) in &assets.objects {
+        let levels =
+            upload_object_levels(renderer, assets, &gpu_models, &mut texture_cache, object)?;
+        table.by_object.insert(*handle, levels);
+    }
+    for (path, objects) in &assets.prefabs {
+        let mut templates = Vec::with_capacity(objects.len());
+        for object in objects {
+            templates.push(match object {
+                Some(object) => {
+                    upload_object_levels(renderer, assets, &gpu_models, &mut texture_cache, object)?
+                }
+                None => Vec::new(),
+            });
         }
-        table.by_object.insert(object.object, levels);
+        table.prefabs.insert(path.clone(), templates);
     }
     Ok(table)
+}
+
+/// Уровни LOD объекта. Без замены материала и текстуры переиспользуются меши модели; иначе для
+/// каждой части создаётся материал с заменами.
+fn upload_object_levels(
+    renderer: &mut Renderer,
+    assets: &PreparedRenderAssets,
+    gpu_models: &HashMap<String, Vec<(MeshId, MaterialId)>>,
+    texture_cache: &mut GpuTextureCache<TextureId>,
+    object: &ObjectModel,
+) -> Result<Vec<Vec<(MeshId, MaterialId)>>, RenderError> {
+    let mut levels = Vec::with_capacity(object.levels.len());
+    for (model_path, replacement_texture) in &object.levels {
+        let model_meshes = gpu_models.get(model_path).ok_or({
+            RenderError::InvalidState("CPU-модель отсутствует в таблице GPU-ресурсов")
+        })?;
+        if object.material.is_none() && replacement_texture.is_none() {
+            levels.push(model_meshes.clone());
+            continue;
+        }
+        let model = assets.models.get(model_path).ok_or({
+            RenderError::InvalidState("CPU-модель отсутствует в таблице подготовленных ресурсов")
+        })?;
+        let mut draws = Vec::with_capacity(model_meshes.len());
+        for (source_mesh, (mesh_id, _)) in model.meshes.iter().zip(model_meshes) {
+            let resolved = resolve_material(
+                &source_mesh.material,
+                replacement_texture.as_deref(),
+                object.material.as_ref(),
+            );
+            let material_id = upload_resolved_material(
+                renderer,
+                &resolved,
+                model_path,
+                model,
+                &assets.textures,
+                texture_cache,
+            )?;
+            draws.push((*mesh_id, material_id));
+        }
+        levels.push(draws);
+    }
+    Ok(levels)
 }
 
 fn upload_resolved_material(
@@ -598,7 +747,7 @@ fn upload_material_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuTextureCache, MaterialTextureSource, get_or_insert_texture, load_scene,
+        GpuTextureCache, MaterialTextureSource, PreparedPrefabs, get_or_insert_texture, load_scene,
         prepare_scene_with_model_loader, resolve_material,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
@@ -607,10 +756,13 @@ mod tests {
     use engine_project::PhysicsSettings;
     use engine_render::{AlphaMode, EnvironmentSource, TextureColorSpace};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
-    use engine_scene::{MaterialAlphaMode, MaterialOverride, SceneDocument, World};
+    use engine_scene::{MaterialAlphaMode, MaterialOverride, PrefabTemplate, SceneDocument, World};
+    use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -727,8 +879,9 @@ id = "camera"
         )
         .unwrap();
 
+        let geometry = prepared.physics_geometry();
         let error = prepared
-            .build_physics(&PhysicsSettings::default())
+            .build_physics(&geometry, &PhysicsSettings::default())
             .err()
             .expect("zero-scale collider should fail physics prebuild");
         assert!(error.contains("scale"), "{error}");
@@ -749,8 +902,9 @@ id = "camera"
         ] {
             let prepared = load_scene(&handle, &resources.assets, scene)
                 .unwrap_or_else(|error| panic!("{scene}: {error}"));
+            let geometry = prepared.physics_geometry();
             prepared
-                .build_physics(&PhysicsSettings::default())
+                .build_physics(&geometry, &PhysicsSettings::default())
                 .unwrap_or_else(|error| panic!("{scene}: {error}"));
         }
 
@@ -762,7 +916,10 @@ id = "camera"
             None,
         )
         .unwrap_or_else(|error| panic!("physics scripts: {error}"));
-        let (_, bindings) = prepared.build_physics(&PhysicsSettings::default()).unwrap();
+        let geometry = prepared.physics_geometry();
+        let (_, bindings) = prepared
+            .build_physics(&geometry, &PhysicsSettings::default())
+            .unwrap();
         // 10 статических коллайдеров, 4 монеты-триггера, 4 ящика и 1 персонаж.
         assert_eq!(bindings.len(), 19);
         assert_eq!(
@@ -842,16 +999,12 @@ id = "camera"
     }
 
     #[test]
-    fn load_scene_prepares_hdr_environment_assets_introduced_by_prefabs() {
+    fn load_scene_prepares_hdr_environment_assets_of_scene_objects() {
         let project = TempProject::new();
         let scene_text = format!(
-            "[[assets]]\npath = \"/prefabs/sky.rveprefab\"\n{CAMERA_SCENE}\n[[instances]]\nid = \"sky\"\nprefab = \"/prefabs/sky.rveprefab\"\n"
+            "[[assets]]\npath = \"/environment/sky.hdr\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"sky\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n"
         );
         project.write("scene.rvescene", scene_text.as_bytes());
-        project.write(
-            "prefabs/sky.rveprefab",
-            b"[[assets]]\npath = \"/environment/sky.hdr\"\n[[objects]]\nid = \"environment\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n",
-        );
         project.write(
             "environment/sky.hdr",
             b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n\x80\x80\x80\x81\x40\x60\x80\x82",
@@ -1007,6 +1160,7 @@ id = "camera"
             &resources.assets,
             "scene.rvescene",
             world,
+            PreparedPrefabs::default(),
             |path| {
                 assert_eq!(path, "models/quad.fbx");
                 load_count.set(load_count.get() + 1);
@@ -1042,6 +1196,7 @@ id = "camera"
             &resources.assets,
             "scene.rvescene",
             world,
+            PreparedPrefabs::default(),
             |path| {
                 loaded_paths.push(path.to_owned());
                 Ok(Model {
@@ -1055,14 +1210,14 @@ id = "camera"
         assert_eq!(loaded_paths, ["models/base.fbx", "models/lod.fbx"]);
         assert_eq!(prepared.render_assets.models.len(), 2);
         assert_eq!(
-            prepared.render_assets.objects[0].levels,
+            prepared.render_assets.objects[0].1.levels,
             [
                 ("models/base.fbx".to_owned(), None),
                 ("models/lod.fbx".to_owned(), None),
             ]
         );
         assert_eq!(
-            prepared.render_assets.objects[1].levels,
+            prepared.render_assets.objects[1].1.levels,
             [("models/lod.fbx".to_owned(), None)]
         );
     }
@@ -1227,5 +1382,119 @@ id = "camera"
         assert_eq!(scene_srgb, scene_srgb_reused);
         assert_ne!(scene_srgb, scene_linear);
         assert_eq!(uploads.get(), 4);
+    }
+
+    const SPAWN_BALL_PREFAB: &[u8] = b"[[assets]]\npath = \"/sounds/pop.wav\"\n[[objects]]\nid = \"root\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.1\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+
+    #[test]
+    fn load_scene_prepares_fast_prefabs_listed_in_assets_without_instances() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!(
+                "[[assets]]\npath = \"/prefabs/ball.rveprefab\"\nmax_instances = 8\n{CAMERA_SCENE}"
+            )
+            .as_bytes(),
+        );
+        project.write("prefabs/ball.rveprefab", SPAWN_BALL_PREFAB);
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+
+        let path = "prefabs/ball.rveprefab";
+        assert_eq!(
+            prepared.prefabs.catalog.get(path),
+            Some(PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances: Some(8),
+            })
+        );
+        assert!(prepared.prefabs.templates.contains_key(path));
+        assert!(prepared.world.handle("root").is_none());
+        assert_eq!(prepared.render_assets.prefabs[path].len(), 1);
+        assert!(prepared.render_assets.prefabs[path][0].is_none());
+        assert!(
+            prepared
+                .world
+                .asset_paths()
+                .iter()
+                .any(|asset| asset.as_str() == "sounds/pop.wav"),
+            "ассеты шаблона должны стать ассетами сцены"
+        );
+        assert!(prepared.sources.is_empty());
+    }
+
+    #[test]
+    fn load_scene_rejects_a_fast_prefab_that_contains_a_camera() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!("[[assets]]\npath = \"/prefabs/eye.rveprefab\"\n{CAMERA_SCENE}").as_bytes(),
+        );
+        project.write(
+            "prefabs/eye.rveprefab",
+            b"[[objects]]\nid = \"eye\"\n[objects.camera]\n",
+        );
+        let resources = LooseResources::new(project.root());
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("camera"), "{error}");
+    }
+
+    #[test]
+    fn prefab_templates_prepare_their_mesh_levels_with_the_scene_model_loader() {
+        let prefab_path = "prefabs/ball.rveprefab";
+        let template = PrefabTemplate::load(
+            &VirtualPath::parse(prefab_path).unwrap(),
+            &mut |_| {
+                Ok(
+                    "[[assets]]\npath = \"/models/quad.fbx\"\n[[objects]]\nid = \"root\"\n[objects.mesh_renderer]\nmodel = \"models/quad.fbx\"\n[[objects]]\nid = \"empty\"\nparent = \"root\"\n"
+                        .to_owned(),
+                )
+            },
+        )
+        .unwrap();
+        let prefabs = PreparedPrefabs {
+            templates: BTreeMap::from([(prefab_path.to_owned(), Arc::new(template))]),
+            catalog: PrefabCatalog::default(),
+        };
+        let project = TempProject::new();
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", CAMERA_SCENE).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let loaded_paths = std::cell::RefCell::new(Vec::new());
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            prefabs,
+            |path| {
+                loaded_paths.borrow_mut().push(path.to_owned());
+                Ok(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(loaded_paths.borrow().as_slice(), ["models/quad.fbx"]);
+        let levels = &prepared.render_assets.prefabs[prefab_path];
+        assert_eq!(levels.len(), 2);
+        assert_eq!(
+            levels[0].as_ref().unwrap().levels,
+            [("models/quad.fbx".to_owned(), None)]
+        );
+        assert!(levels[1].is_none());
     }
 }

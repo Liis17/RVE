@@ -4,10 +4,12 @@ use crate::console::ConsoleUiSlot;
 use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
+use crate::scene::PreparedPrefabs;
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
 use engine_physics::{
-    PhysicsClient, PhysicsInitialization, PhysicsReceive, PhysicsSceneSync, PhysicsStepResult,
+    BodyChange, BodyHandle, ModelGeometry, PhysicsClient, PhysicsCommand, PhysicsInitialization,
+    PhysicsReceive, PhysicsSceneSync, PhysicsStepResult, ShapeCache,
 };
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
@@ -22,22 +24,22 @@ use engine_scene::light::{
     cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
 };
 use engine_scene::{
-    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, ObjectHandle,
-    Tonemapper, World,
+    AntiAliasing, AudioRequest, CameraSettings, EnvironmentState, LightState, LocalLightState,
+    ObjectHandle, PrefabTemplate, Tonemapper, VoiceId, World,
 };
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
 use engine_script::{
     ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary,
-    ScriptLoadOptions, ScriptTime,
+    ScriptLoadOptions, ScriptTime, SpawnedObject,
 };
 #[cfg(feature = "dev-console")]
 use engine_ui::render::UiBridge;
 use flume::{Receiver, RecvTimeoutError, Selector, Sender, TryRecvError};
 use glam::{Mat3, Vec3};
-use std::collections::HashMap;
 #[cfg(feature = "dev-console")]
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -92,9 +94,14 @@ pub(crate) enum EnvironmentCacheKey {
     },
 }
 
+/// Уровни LOD объекта: каждый уровень — список пар «меш и материал».
+type GpuLevels = Vec<Vec<(MeshId, MaterialId)>>;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
-    pub by_object: HashMap<ObjectHandle, Vec<Vec<(MeshId, MaterialId)>>>,
+    pub by_object: HashMap<ObjectHandle, GpuLevels>,
+    /// Уровни шаблонов быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
+    pub prefabs: HashMap<String, Vec<GpuLevels>>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
 }
 
@@ -246,6 +253,10 @@ pub(crate) struct ScriptThreadConfig {
     pub physics_initialization: Option<PhysicsInitialization>,
     /// Sound subsystem handle; `None` disables audio for this scripts thread.
     pub audio: Option<engine_audio::AudioHandle>,
+    /// Быстрые префабы сцены: шаблоны для регистрации в скриптах и лимиты создания.
+    pub prefabs: PreparedPrefabs,
+    /// Геометрия моделей для коллайдеров spawn-объектов.
+    pub physics_geometry: Vec<ModelGeometry>,
     #[cfg(feature = "dev-console")]
     pub command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
 }
@@ -678,6 +689,8 @@ fn scripts_thread(
         physics_client,
         physics_initialization,
         audio,
+        prefabs,
+        physics_geometry,
         ..
     } = config;
     let library = match load_script_library(
@@ -702,7 +715,7 @@ fn scripts_thread(
             interrupt: interrupt.clone(),
             call_time_limit: Some(SCRIPT_CALL_TIME_LIMIT),
             input: input_settings,
-            prefabs: Default::default(),
+            prefabs: prefabs.catalog.clone(),
         },
     ) {
         Ok(scripts) => scripts,
@@ -712,6 +725,18 @@ fn scripts_thread(
             }
             return;
         }
+    };
+    for (path, template) in &prefabs.templates {
+        if let Err(error) = scripts.register_prefab(&world, path, Arc::clone(template), &sources) {
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(Err(ScriptStartupError::Load(error.to_string())));
+            }
+            return;
+        }
+    }
+    let mut spawn_physics = SpawnPhysics {
+        geometry: physics_geometry,
+        ..SpawnPhysics::default()
     };
     let mut physics_client = physics_client;
     let mut physics_sync = None;
@@ -761,7 +786,7 @@ fn scripts_thread(
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
         }
     };
-    let Some(gpu_scene) = gpu_scene else {
+    let Some(mut gpu_scene) = gpu_scene else {
         scripts.destroy(&mut world, ScriptTime::default());
         print_script_events(scripts.drain_events());
         return;
@@ -775,6 +800,9 @@ fn scripts_thread(
         elapsed: last_tick.as_secs_f64(),
         frame: frame_number,
     };
+    if let Some(handle) = audio.as_ref() {
+        preload_prefab_sounds(handle, &prefabs.templates);
+    }
     scripts.start(&mut world, start_time);
     print_script_events(scripts.drain_events());
     let mut audio = audio.map(engine_audio::AudioBridge::new);
@@ -784,6 +812,14 @@ fn scripts_thread(
         audio.start(&world);
         audio.apply(scripts.drain_audio_requests(), &world);
     }
+    apply_world_changes(
+        &mut world,
+        &mut scripts,
+        physics_sync.as_mut(),
+        &mut spawn_physics,
+        &mut gpu_scene,
+        audio.as_mut(),
+    );
     #[cfg(feature = "dev-console")]
     let mut published_catalog_generation = u64::MAX;
     #[cfg(feature = "dev-console")]
@@ -902,6 +938,14 @@ fn scripts_thread(
             {
                 log::error!(target: "console", "command {name} failed: {error}");
             }
+            apply_world_changes(
+                &mut world,
+                &mut scripts,
+                physics_sync.as_mut(),
+                &mut spawn_physics,
+                &mut gpu_scene,
+                audio.as_mut(),
+            );
             publish_command_catalog(
                 &scripts,
                 &command_catalog,
@@ -915,6 +959,14 @@ fn scripts_thread(
         if let Some(audio) = audio.as_mut() {
             audio.apply(scripts.drain_audio_requests(), &world);
         }
+        apply_world_changes(
+            &mut world,
+            &mut scripts,
+            physics_sync.as_mut(),
+            &mut spawn_physics,
+            &mut gpu_scene,
+            audio.as_mut(),
+        );
         #[cfg(feature = "dev-console")]
         publish_command_catalog(
             &scripts,
@@ -931,7 +983,9 @@ fn scripts_thread(
                     break;
                 }
             }
-            if let Err(error) = client.step(dt, commands) {
+            commands.append(&mut spawn_physics.velocities);
+            let changes = std::mem::take(&mut spawn_physics.changes);
+            if let Err(error) = client.step_with_changes(dt, changes, commands) {
                 // Остановка выставляет interrupt до Shutdown физики: шаг, отправленный уже
                 // после выхода сервера, — ожидаемое завершение, а не сбой.
                 if !interrupt.is_interrupted() {
@@ -1049,6 +1103,159 @@ fn receive_physics_interruptibly(
                 }
             }
         }
+    }
+}
+
+/// Состояние физики spawn-объектов, которое копится до ближайшего шага физики.
+#[derive(Default)]
+struct SpawnPhysics {
+    /// Формы мешей, построенные для spawn-объектов; переиспользуются между spawn одной модели.
+    shapes: ShapeCache,
+    /// Геометрия моделей для коллайдеров мешей.
+    geometry: Vec<ModelGeometry>,
+    /// Вставки и удаления тел; уходят в `step_with_changes` ближайшего шага.
+    changes: Vec<BodyChange>,
+    /// Скорости, заданные при spawn; применяются сразу после вставки тела в том же шаге.
+    velocities: Vec<PhysicsCommand>,
+}
+
+/// Применяет spawn и destroy, закоммиченные скриптами в фазе: обновляет GPU-таблицу, физику и
+/// звук. Тела удаляются и вставляются до `sync_world_commands`, поэтому позы новых тел не дают
+/// ложных телепортаций.
+fn apply_world_changes(
+    world: &mut World,
+    scripts: &mut ScriptHost,
+    mut physics: Option<&mut PhysicsSceneSync>,
+    spawn_physics: &mut SpawnPhysics,
+    gpu_scene: &mut GpuSceneTable,
+    audio: Option<&mut engine_audio::AudioBridge>,
+) {
+    let changes = scripts.drain_world_changes();
+    if changes.spawned.is_empty() && changes.despawned.is_empty() {
+        return;
+    }
+    let mut requests = Vec::new();
+    for spawned in &changes.spawned {
+        if let Some(templates) = gpu_scene.prefabs.get(&spawned.prefab) {
+            attach_prefab_levels(&mut gpu_scene.by_object, templates, spawned);
+        }
+    }
+    detach_objects(&mut gpu_scene.by_object, &changes.despawned);
+    requests.extend(
+        changes
+            .despawned
+            .iter()
+            .map(|&object| AudioRequest::StopSource { object }),
+    );
+    if let Some(sync) = physics.as_deref_mut() {
+        spawn_physics
+            .changes
+            .extend(sync.remove_objects(&changes.despawned));
+    }
+    for spawned in &changes.spawned {
+        // Объект, созданный и удалённый в одной фазе, уже не жив: тело и звук ему не нужны.
+        if !world.is_alive(spawned.handle) {
+            continue;
+        }
+        if let Some(sync) = physics.as_deref_mut() {
+            let inserted = sync.insert_objects(
+                world,
+                &spawned.objects,
+                &spawn_physics.geometry,
+                &mut spawn_physics.shapes,
+            );
+            match inserted {
+                Ok(inserted) => {
+                    spawn_physics.changes.extend(inserted);
+                    if let Some(velocity) = spawned.initial_velocity
+                        && let Some(body) = root_body(sync, spawned.handle)
+                    {
+                        spawn_physics
+                            .velocities
+                            .push(PhysicsCommand::SetVelocity { body, velocity });
+                    }
+                }
+                Err(error) => {
+                    log::error!(
+                        "spawn {:?}: физика отклонила объект, spawn откатывается: {error}",
+                        spawned.prefab
+                    );
+                    if let Err(error) = world.despawn_many(&[spawned.handle]) {
+                        log::error!("откат spawn {:?}: {error}", spawned.prefab);
+                    }
+                    detach_objects(&mut gpu_scene.by_object, &spawned.objects);
+                    continue;
+                }
+            }
+        }
+        requests.extend(
+            spawned
+                .objects
+                .iter()
+                .filter(|&&object| {
+                    world
+                        .audio_source(object)
+                        .is_some_and(|audio| audio.play_on_start)
+                })
+                .map(|&object| AudioRequest::PlaySource {
+                    object,
+                    voice: VoiceId::allocate(),
+                }),
+        );
+    }
+    if let Some(audio) = audio {
+        audio.apply(requests, world);
+    }
+}
+
+/// Записывает уровни шаблона на объекты поддерева: объект `i` получает уровни шаблона `i`.
+/// Объекты без меша записи не получают.
+fn attach_prefab_levels<T: Clone>(
+    by_object: &mut HashMap<ObjectHandle, Vec<Vec<T>>>,
+    templates: &[Vec<Vec<T>>],
+    spawned: &SpawnedObject,
+) {
+    for (object, levels) in spawned.objects.iter().zip(templates) {
+        if !levels.is_empty() {
+            by_object.insert(*object, levels.clone());
+        }
+    }
+}
+
+fn detach_objects<T>(by_object: &mut HashMap<ObjectHandle, Vec<Vec<T>>>, handles: &[ObjectHandle]) {
+    for handle in handles {
+        by_object.remove(handle);
+    }
+}
+
+/// Тело корня spawn-объекта; `None`, если у корня нет коллайдера и тела не создано.
+fn root_body(sync: &PhysicsSceneSync, root: ObjectHandle) -> Option<BodyHandle> {
+    sync.bindings()
+        .iter()
+        .rev()
+        .find(|binding| binding.object == root)
+        .map(|binding| binding.body)
+}
+
+/// Клипы шаблонов быстрых префабов предзагружаются вместе со сценой: spawn-объект должен
+/// проигрывать звук без ожидания загрузки.
+fn preload_prefab_sounds(
+    audio: &engine_audio::AudioHandle,
+    templates: &BTreeMap<String, Arc<PrefabTemplate>>,
+) {
+    let mut clips = templates
+        .values()
+        .flat_map(|template| template.objects())
+        .filter_map(|object| object.audio_source.as_ref())
+        .map(|source| source.clip.as_str().to_owned())
+        .collect::<Vec<_>>();
+    clips.sort();
+    clips.dedup();
+    if clips.is_empty() {
+        return;
+    }
+    if let Err(error) = audio.preload(clips) {
+        log::warn!("предзагрузка звука префабов: {error}");
     }
 }
 
@@ -1749,12 +1956,15 @@ mod tests {
         render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
         sync_input_background, wait_background_tick,
     };
+    use super::{attach_prefab_levels, detach_objects};
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
+    use crate::scene::PreparedPrefabs;
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
     use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
+    use engine_physics::{BodyChange, BodyKind};
     use engine_physics::{
         PhysicsClient, PhysicsCommand, PhysicsEvent, PhysicsInitialization, PhysicsReply,
         PhysicsRequest, PhysicsSceneDesc, PhysicsSceneSync, PhysicsServer, PhysicsStepResult,
@@ -1770,6 +1980,7 @@ mod tests {
     use engine_script::{
         Key, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
     };
+    use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
     use glam::Vec3;
     use rve_sdk::{Context, Params, Script};
     use std::collections::BTreeMap;
@@ -1839,6 +2050,8 @@ return Input
                     )]),
                 },
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 physics_client: None,
                 physics_initialization: None,
                 audio: None,
@@ -2624,6 +2837,8 @@ return Script
                 sources,
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -2924,6 +3139,8 @@ return Script
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::new(),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: None,
                 interrupt: interrupt.clone(),
                 clock: Arc::new(FakeClock::default()),
@@ -3027,6 +3244,8 @@ return Script
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: Some(script_module()),
                 interrupt: ScriptInterruptHandle::new(),
                 clock: clock.clone(),
@@ -3130,6 +3349,8 @@ return Script
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::from([("probe.lua".to_owned(), script.to_owned())]),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -3243,6 +3464,8 @@ return Move
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::from([("move.lua".to_owned(), script.to_owned())]),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -3410,6 +3633,8 @@ return Move
                 input_settings: engine_project::InputSettings::default(),
                 sources: BTreeMap::new(),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -3486,6 +3711,8 @@ return Move
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: Some(input_probe_module()),
                 interrupt: ScriptInterruptHandle::new(),
                 clock: clock.clone(),
@@ -3707,6 +3934,8 @@ return Move
                 )]),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: None,
                 interrupt,
                 clock: Arc::new(FakeClock::default()),
@@ -3757,6 +3986,8 @@ return Move
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: Some(library),
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -3806,6 +4037,8 @@ return Move
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: Some(script_module()),
                 interrupt: interrupt.clone(),
                 clock: Arc::new(FakeClock::default()),
@@ -3872,6 +4105,8 @@ return Move
                 sources: BTreeMap::new(),
                 input_settings: engine_project::InputSettings::default(),
                 scripts_library: None,
+                prefabs: PreparedPrefabs::default(),
+                physics_geometry: Vec::new(),
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(PanicClock),
@@ -3904,5 +4139,397 @@ return Move
         assert_eq!(status.exit_code(), 1);
         assert!(status.failure_message().unwrap().contains("clock panic"));
         assert!(modules.shutdown().is_empty());
+    }
+
+    const SPAWN_SCENE: &str = "[[assets]]\npath = \"gun.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\n[[objects]]\nid = \"gun\"\n[[objects.lite_scripts]]\npath = \"gun.lua\"\n";
+    const BALL_PREFAB: &str = "[[objects]]\nid = \"root\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.25\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+
+    fn prefab_template(path: &str, text: &str) -> Arc<engine_scene::PrefabTemplate> {
+        let path = engine_files::VirtualPath::parse(path).unwrap();
+        Arc::new(engine_scene::PrefabTemplate::load(&path, &mut |_| Ok(text.to_owned())).unwrap())
+    }
+
+    /// Быстрый префаб «ball» с телом-сферой и без лимита экземпляров.
+    fn ball_prefabs(text: &str) -> PreparedPrefabs {
+        let path = "prefabs/ball.rveprefab";
+        let mut catalog = PrefabCatalog::default();
+        catalog.insert(
+            path,
+            PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances: None,
+            },
+        );
+        PreparedPrefabs {
+            templates: BTreeMap::from([(path.to_owned(), prefab_template(path, text))]),
+            catalog,
+        }
+    }
+
+    /// Один шаг физики глазами теста: что пришло в `step_with_changes`.
+    #[derive(Clone, Debug)]
+    struct StepRecord {
+        changes: Vec<BodyChange>,
+        commands: Vec<PhysicsCommand>,
+    }
+
+    /// Физика без GPU: настоящий `StepDriver` применяет вставки и удаления, тест получает записи.
+    fn fake_physics(
+        world: &World,
+    ) -> (
+        PhysicsClient,
+        PhysicsInitialization,
+        mpsc::Receiver<StepRecord>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let desc = PhysicsSceneDesc::from_world(world, &[], Vec3::ZERO, 60, 8).unwrap();
+        let (driver, bindings) = desc.build().unwrap();
+        let initialization = PhysicsInitialization::from_prebuilt(&driver, bindings).unwrap();
+        let (request_tx, request_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::unbounded();
+        let (record_tx, record_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut driver = driver;
+            while let Ok(request) = request_rx.recv() {
+                match request {
+                    PhysicsRequest::Step {
+                        sequence,
+                        dt,
+                        changes,
+                        commands,
+                    } => {
+                        let _ = record_tx.send(StepRecord {
+                            changes: changes.clone(),
+                            commands: commands.clone(),
+                        });
+                        let step = driver
+                            .advance_step_with_changes(dt, changes, commands)
+                            .expect("fake physics step");
+                        let snapshot = driver.world().query_snapshot().unwrap();
+                        let _ = reply_tx.send(PhysicsReply::Step(PhysicsStepResult {
+                            sequence,
+                            substeps: step.substeps,
+                            poses: step.poses,
+                            events: step.events,
+                            snapshot,
+                        }));
+                    }
+                    PhysicsRequest::Shutdown => break,
+                    PhysicsRequest::Init(_) => panic!("preinitialized server received Init"),
+                }
+            }
+        });
+        (
+            PhysicsClient::new_preinitialized(request_tx, reply_rx),
+            initialization,
+            record_rx,
+            worker,
+        )
+    }
+
+    struct TestScripts {
+        modules: ModuleHost,
+        control: flume::Sender<ScriptControl>,
+        frames: flume::Receiver<Arc<FrameSnapshot>>,
+        thread: super::ScriptThreadHandle,
+        _renders: flume::Receiver<RenderControl>,
+    }
+
+    fn start_test_scripts(
+        world: World,
+        sources: &[(&str, &str)],
+        prefabs: PreparedPrefabs,
+        physics: Option<(PhysicsClient, PhysicsInitialization)>,
+    ) -> TestScripts {
+        let mut modules = ModuleHost::new();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (render_tx, render_rx) = flume::unbounded();
+        let (physics_client, physics_initialization) = match physics {
+            Some((client, initialization)) => (Some(client), Some(initialization)),
+            None => (None, None),
+        };
+        let thread = start_scripts(
+            &mut modules,
+            world,
+            ScriptThreadConfig {
+                scene_name: "spawn.rvescene".to_owned(),
+                sources: sources
+                    .iter()
+                    .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
+                    .collect(),
+                input_settings: engine_project::InputSettings::default(),
+                scripts_library: None,
+                script_module: None,
+                interrupt: ScriptInterruptHandle::new(),
+                clock: Arc::new(FakeClock::default()),
+                background_tick_hz: 30,
+                control_tx: script_tx.clone(),
+                control_rx: script_rx,
+                frame_tx,
+                render_tx,
+                status: Arc::new(RuntimeStatus::default()),
+                input: test_input(),
+                physics_client,
+                physics_initialization,
+                audio: None,
+                prefabs,
+                physics_geometry: Vec::new(),
+                #[cfg(feature = "dev-console")]
+                command_catalog: test_command_catalog(),
+            },
+        )
+        .unwrap();
+        TestScripts {
+            modules,
+            control: script_tx,
+            frames: frame_rx,
+            thread,
+            _renders: render_rx,
+        }
+    }
+
+    /// Ждёт очередной шаг физики и кадр: цикл скриптов отправляет их парой, а кадр нужно
+    /// забрать, иначе цикл встаёт на отправке снимка.
+    fn next_step(scripts: &TestScripts, steps: &mpsc::Receiver<StepRecord>) -> StepRecord {
+        let record = steps
+            .recv_timeout(Duration::from_secs(2))
+            .expect("шаг физики");
+        scripts
+            .frames
+            .recv_timeout(Duration::from_secs(2))
+            .expect("кадр");
+        record
+    }
+
+    fn stop_test_scripts(mut scripts: TestScripts, worker: std::thread::JoinHandle<()>) {
+        scripts.control.send(ScriptControl::Shutdown).unwrap();
+        scripts
+            .thread
+            .stopped
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        scripts.modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(scripts.modules.shutdown().is_empty());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn spawned_prefab_enters_physics_with_its_velocity_and_leaves_on_destroy() {
+        let script = r#"
+local Gun = {}
+function Gun:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 1 then
+    rve.spawn("prefabs/ball.rveprefab", { id = "ball", velocity = { x = 0, y = 0, z = 3 } })
+  elseif self.frames == 3 then
+    rve.destroy("ball")
+  end
+end
+return Gun
+"#;
+        let world =
+            World::from_document(&SceneDocument::parse("spawn.rvescene", SPAWN_SCENE).unwrap())
+                .unwrap();
+        let (client, initialization, steps, worker) = fake_physics(&world);
+        let scripts = start_test_scripts(
+            world,
+            &[("gun.lua", script)],
+            ball_prefabs(BALL_PREFAB),
+            Some((client, initialization)),
+        );
+        scripts.thread.ready.recv().unwrap().unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+
+        let first = next_step(&scripts, &steps);
+        let [BodyChange::Insert { handle, desc }] = first.changes.as_slice() else {
+            panic!("первый шаг должен вставить одно тело: {:?}", first.changes);
+        };
+        assert_eq!(desc.kind, BodyKind::Dynamic);
+        assert!(
+            first.commands.contains(&PhysicsCommand::SetVelocity {
+                body: *handle,
+                velocity: Vec3::new(0.0, 0.0, 3.0),
+            }),
+            "скорость spawn должна идти в том же шаге после вставки: {:?}",
+            first.commands
+        );
+
+        let mut removed = false;
+        for _ in 0..2 {
+            let record = next_step(&scripts, &steps);
+            removed |= record
+                .changes
+                .contains(&BodyChange::Remove { handle: *handle });
+        }
+        assert!(removed, "destroy должен удалить тело в физике");
+        // После удаления шаги продолжаются без ошибок.
+        assert!(next_step(&scripts, &steps).changes.is_empty());
+        stop_test_scripts(scripts, worker);
+    }
+
+    #[test]
+    fn spawn_rejected_by_physics_is_rolled_back_and_frees_its_id() {
+        let script = r#"
+local Gun = {}
+function Gun:on_update(dt)
+  self.frames = (self.frames or 0) + 1
+  if self.frames == 1 then
+    rve.spawn("prefabs/ball.rveprefab", { id = "ball", scale = { x = 0, y = 0, z = 0 } })
+  elseif self.frames == 2 then
+    rve.spawn("prefabs/ball.rveprefab", { id = "ball" })
+  end
+end
+return Gun
+"#;
+        let world =
+            World::from_document(&SceneDocument::parse("spawn.rvescene", SPAWN_SCENE).unwrap())
+                .unwrap();
+        let (client, initialization, steps, worker) = fake_physics(&world);
+        let scripts = start_test_scripts(
+            world,
+            &[("gun.lua", script)],
+            ball_prefabs(BALL_PREFAB),
+            Some((client, initialization)),
+        );
+        scripts.thread.ready.recv().unwrap().unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+
+        // Нулевой масштаб физика отвергает: тело не вставляется, runtime продолжает шаги.
+        let rejected = next_step(&scripts, &steps);
+        assert!(
+            rejected
+                .changes
+                .iter()
+                .all(|change| !matches!(change, BodyChange::Insert { .. })),
+            "отклонённый spawn не должен давать вставку: {:?}",
+            rejected.changes
+        );
+        // Откат освободил id: второй spawn с тем же id получает тело.
+        let retried = next_step(&scripts, &steps);
+        assert!(
+            retried
+                .changes
+                .iter()
+                .any(|change| matches!(change, BodyChange::Insert { .. })),
+            "id отклонённого spawn должен быть свободен: {:?}",
+            retried.changes
+        );
+        stop_test_scripts(scripts, worker);
+    }
+
+    #[test]
+    fn fast_prefab_with_a_missing_script_source_fails_startup_with_a_load_error() {
+        let prefab = "[[assets]]\npath = \"bullet.lua\"\n[[objects]]\nid = \"root\"\n[[objects.lite_scripts]]\npath = \"bullet.lua\"\n";
+        let world =
+            World::from_document(&SceneDocument::parse("spawn.rvescene", SPAWN_SCENE).unwrap())
+                .unwrap();
+        let mut scripts = start_test_scripts(
+            world,
+            &[("gun.lua", "return {}")],
+            ball_prefabs(prefab),
+            None,
+        );
+        match scripts.thread.ready.recv().unwrap() {
+            Err(ScriptStartupError::Load(message)) => {
+                assert!(message.contains("bullet.lua"), "{message}")
+            }
+            other => panic!("ожидалась ошибка загрузки скриптов, получено {other:?}"),
+        }
+        scripts.modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(scripts.modules.shutdown().is_empty());
+    }
+
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn console_destroy_of_a_live_body_does_not_break_the_next_physics_step() {
+        let script = r#"
+local Gun = {}
+function Gun:on_start()
+  rve.spawn("prefabs/ball.rveprefab", { id = "ball" })
+  rve.console.register("kill", function() rve.destroy("ball") end, "")
+end
+return Gun
+"#;
+        let world =
+            World::from_document(&SceneDocument::parse("spawn.rvescene", SPAWN_SCENE).unwrap())
+                .unwrap();
+        let (client, initialization, steps, worker) = fake_physics(&world);
+        let scripts = start_test_scripts(
+            world,
+            &[("gun.lua", script)],
+            ball_prefabs(BALL_PREFAB),
+            Some((client, initialization)),
+        );
+        scripts.thread.ready.recv().unwrap().unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(GpuSceneTable::default()))
+            .unwrap();
+
+        let first = next_step(&scripts, &steps);
+        let [BodyChange::Insert { handle, .. }] = first.changes.as_slice() else {
+            panic!("первый шаг должен вставить тело: {:?}", first.changes);
+        };
+        let handle = *handle;
+        scripts
+            .control
+            .send(ScriptControl::Console(CommandLine {
+                name: "kill".to_owned(),
+                args: Vec::new(),
+            }))
+            .unwrap();
+        // Команда может попасть в любой из ближайших шагов, но удаление должно прийти в одном из них.
+        let mut removed = false;
+        for _ in 0..4 {
+            let record = next_step(&scripts, &steps);
+            removed |= record.changes.contains(&BodyChange::Remove { handle });
+        }
+        assert!(removed, "консольный destroy должен удалить тело");
+        stop_test_scripts(scripts, worker);
+    }
+
+    #[test]
+    fn motion_history_does_not_carry_over_to_a_recycled_handle() {
+        let old = ObjectHandle::from_abi(1).unwrap();
+        let recycled = ObjectHandle::from_abi((1_u64 << 32) | 1).unwrap();
+        let model = [[1.0; 4]; 4];
+        let camera = motion_test_handles().0;
+        let mut history = MotionHistory::default();
+        history.submitted(&motion_snapshot(camera, &[(old, model)]));
+        assert_eq!(history.previous_model(old, false), Some(model));
+        assert_eq!(history.previous_model(recycled, false), None);
+
+        // Удалённый объект выпадает из истории при следующей отправке кадра.
+        history.submitted(&motion_snapshot(camera, &[]));
+        assert_eq!(history.previous_model(old, false), None);
+    }
+
+    #[test]
+    fn prefab_levels_are_copied_per_spawned_object_and_dropped_with_it() {
+        let root = ObjectHandle::from_abi(1).unwrap();
+        let child = ObjectHandle::from_abi(2).unwrap();
+        let spawned = engine_script::SpawnedObject {
+            handle: root,
+            objects: vec![root, child],
+            prefab: "prefabs/ball.rveprefab".to_owned(),
+            template_index: 0,
+            initial_velocity: None,
+        };
+        // Корень с мешом, ребёнок без меша: у ребёнка записи нет.
+        let templates = vec![vec![vec![1_u32, 2]], Vec::new()];
+        let mut by_object = HashMap::new();
+        attach_prefab_levels(&mut by_object, &templates, &spawned);
+        assert_eq!(by_object.get(&root), Some(&vec![vec![1, 2]]));
+        assert!(!by_object.contains_key(&child));
+
+        detach_objects(&mut by_object, &[root]);
+        assert!(by_object.is_empty());
     }
 }

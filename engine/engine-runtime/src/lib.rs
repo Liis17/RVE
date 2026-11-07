@@ -45,6 +45,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sysinfo::{CpuRefreshKind, System};
 
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const SCRIPTS_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SCRIPTS_READY_GRACE: Duration = Duration::from_secs(2);
 
@@ -234,10 +237,12 @@ fn run_from_args(
         Ok(prepared) => prepared,
         Err(error) => return fail(2, format!("ошибка загрузки сцены: {error}")),
     };
-    let (physics_driver, physics_bindings) = match prepared.build_physics(&project.physics) {
-        Ok(physics) => physics,
-        Err(error) => return fail(2, format!("ошибка построения физической сцены: {error}")),
-    };
+    let physics_geometry = prepared.physics_geometry();
+    let (physics_driver, physics_bindings) =
+        match prepared.build_physics(&physics_geometry, &project.physics) {
+            Ok(physics) => physics,
+            Err(error) => return fail(2, format!("ошибка построения физической сцены: {error}")),
+        };
     let physics_initialization =
         match PhysicsInitialization::from_prebuilt(&physics_driver, physics_bindings) {
             Ok(initialization) => initialization,
@@ -268,6 +273,7 @@ fn run_from_args(
         name,
         sources,
         render_assets,
+        prefabs,
     } = prepared;
     let (script_tx, script_rx) = flume::unbounded();
     let (frame_tx, frame_rx) = flume::bounded(1);
@@ -297,6 +303,8 @@ fn run_from_args(
             physics_client: Some(physics_client),
             physics_initialization: Some(physics_initialization),
             audio: Some(audio_handle),
+            prefabs,
+            physics_geometry,
             #[cfg(feature = "dev-console")]
             command_catalog: Arc::clone(&command_catalog),
         },
