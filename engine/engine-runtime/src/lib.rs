@@ -248,8 +248,13 @@ fn run_from_args(
 
     let mut modules = ModuleHost::new();
     let status = Arc::new(RuntimeStatus::default());
-    let physics_client = match start_modules(&mut modules, physics_driver, Arc::clone(&status)) {
-        Ok(client) => client,
+    let (physics_client, audio_handle) = match start_modules(
+        &mut modules,
+        physics_driver,
+        Arc::clone(&status),
+        resource_handle.clone(),
+    ) {
+        Ok(started) => started,
         Err(error) => {
             for error in modules.shutdown() {
                 log::error!("Ошибка остановки модуля: {error}");
@@ -291,6 +296,7 @@ fn run_from_args(
             input: Arc::clone(&input),
             physics_client: Some(physics_client),
             physics_initialization: Some(physics_initialization),
+            audio: Some(audio_handle),
             #[cfg(feature = "dev-console")]
             command_catalog: Arc::clone(&command_catalog),
         },
@@ -490,17 +496,17 @@ fn start_modules(
     modules: &mut ModuleHost,
     physics_driver: StepDriver,
     status: Arc<RuntimeStatus>,
-) -> std::io::Result<PhysicsClient> {
-    let (audio, audio_handle) =
-        engine_audio::AudioEngine::new(engine_audio::AudioConfig::default());
+    resources: ResourceHandle,
+) -> std::io::Result<(PhysicsClient, engine_audio::AudioHandle)> {
+    let (audio, audio_handle) = engine_audio::AudioEngine::new(engine_audio::AudioConfig {
+        resources: Some(resources),
+        output: true,
+    });
     let audio_stop = audio_handle.clone();
     modules.spawn(
         "rve-audio",
         move || audio_stop.shutdown(),
-        move || {
-            audio.run();
-            drop(audio_handle);
-        },
+        move || audio.run(),
     )?;
 
     let (physics_request_tx, physics_request_rx) = flume::unbounded();
@@ -545,9 +551,9 @@ fn start_modules(
             engine_neural::NeuralEngine::new().run(neural_rx);
         },
     )?;
-    Ok(PhysicsClient::new_preinitialized(
-        physics_request_tx,
-        physics_reply_rx,
+    Ok((
+        PhysicsClient::new_preinitialized(physics_request_tx, physics_reply_rx),
+        audio_handle,
     ))
 }
 
