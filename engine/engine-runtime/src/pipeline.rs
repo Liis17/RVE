@@ -482,6 +482,8 @@ impl RenderBackend for VulkanBackend {
                 },
             },
             reset_history: snapshot.reset_history,
+            particles: &[],
+            particle_step: 0.0,
         };
         self.renderer
             .render_frame_with_outcome(&frame)
@@ -587,6 +589,8 @@ impl RenderBackend for VulkanBackend {
                 },
             },
             reset_history: snapshot.reset_history,
+            particles: &[],
+            particle_step: 0.0,
         };
         let vertices = [
             UiVertex {

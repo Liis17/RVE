@@ -1,0 +1,62 @@
+#version 450
+
+layout(local_size_x = PARTICLE_LOCAL_SIZE) in;
+
+// Параметры эмиттера; совпадает с EmitterParamsGpu в particles.rs.
+layout(set = 1, binding = 0, std140) uniform EmitterParams {
+    vec4 shape;
+    vec4 box_extents;
+    vec4 lifetime_speed;
+    vec4 size_rotation;
+    vec4 angular_drag;
+    vec4 gravity;
+    vec4 color_times;
+    vec4 color_values[4];
+    vec4 size_times;
+    vec4 size_values;
+    vec4 flipbook;
+    vec4 collision;
+    uvec4 counts;
+} emitter;
+
+// Совпадает с ParticleGpu в particles.rs: три vec4.
+struct Particle {
+    vec4 position_age;
+    vec4 velocity_life;
+    vec4 params;
+};
+
+layout(set = 1, binding = 1, std430) buffer ParticleBuffer {
+    Particle particles[];
+} particle_buffer;
+
+// Совпадает с SimPushGpu в particles.rs.
+layout(push_constant) uniform SimPush {
+    float step;
+    uint draw_first;
+    uint draw_count;
+    uint capacity;
+} push;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.draw_count) {
+        return;
+    }
+    uint slot = (push.draw_first + index) % push.capacity;
+    Particle particle = particle_buffer.particles[slot];
+    float age = particle.position_age.w;
+    float lifetime = particle.velocity_life.w;
+    if (age >= lifetime) {
+        return;
+    }
+    float step = push.step;
+    vec3 velocity = particle.velocity_life.xyz;
+    velocity += emitter.gravity.xyz * step;
+    velocity *= max(0.0, 1.0 - emitter.angular_drag.z * step);
+    particle.position_age.xyz += velocity * step;
+    particle.position_age.w = age + step;
+    particle.velocity_life.xyz = velocity;
+    particle.params.y += particle.params.z * step;
+    particle_buffer.particles[slot] = particle;
+}

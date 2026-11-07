@@ -11,8 +11,9 @@ use engine_project::{BootstrapConfig, BootstrapPresentMode};
 use engine_render::{
     AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId,
-    MeshId, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
-    Tonemapper as RenderTonemapper, ViewSettings,
+    MeshId, ParticleBlend, ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape, ProceduralSky,
+    Renderer, RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
+    ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
@@ -26,7 +27,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials|clustered] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials|clustered|particles] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -135,7 +136,7 @@ where
                     return Err("флаг --scene указан повторно".to_owned());
                 }
                 let value = args.next().ok_or_else(|| {
-                    "после --scene требуется triangle, cube, shadows, materials или clustered"
+                    "после --scene требуется triangle, cube, shadows, materials, clustered или particles"
                         .to_owned()
                 })?;
                 scene = Some(Scene::parse(&value).ok_or_else(|| {
@@ -287,6 +288,33 @@ struct ResizeTest {
     complete: bool,
 }
 
+/// Процедурный аддитивный фонтан над кубом для ручной проверки путя частиц.
+fn create_particle_emitters(renderer: &mut Renderer) -> Result<Vec<ParticleEmitterFrame>, String> {
+    let desc = ParticleEmitterDesc {
+        capacity: 8192,
+        blend: ParticleBlend::Additive,
+        shape: ParticleShape::Cone {
+            angle: 0.35,
+            radius: 0.05,
+        },
+        rate: 900.0,
+        lifetime: [1.2, 2.2],
+        speed: [2.5, 3.5],
+        size: [0.12, 0.2],
+        gravity: [0.0, -3.0, 0.0],
+        drag: 0.3,
+        ..ParticleEmitterDesc::default()
+    };
+    let emitter = renderer
+        .create_particle_emitter(desc)
+        .map_err(|error| format!("ошибка создания эмиттера частиц: {error}"))?;
+    Ok(vec![ParticleEmitterFrame {
+        emitter,
+        transform: Mat4::from_translation(Vec3::new(0.0, 1.0, 0.0)).to_cols_array_2d(),
+        emitting: true,
+    }])
+}
+
 struct Sandbox {
     renderer: Option<Renderer>,
     content: Content,
@@ -304,6 +332,7 @@ struct Sandbox {
     presented_frames: u64,
     resize_test: ResizeTest,
     debug_overlay: Option<DebugOverlay>,
+    particle_emitters: Vec<ParticleEmitterFrame>,
     failure: Option<String>,
 }
 
@@ -337,6 +366,7 @@ impl Sandbox {
             presented_frames: 0,
             resize_test: ResizeTest::default(),
             debug_overlay: None,
+            particle_emitters: Vec::new(),
             failure: None,
         }
     }
@@ -561,6 +591,15 @@ impl WindowHandler for Sandbox {
                     capabilities.discrete,
                     capabilities.tessellation_shader
                 );
+                if self.content.motion == Scene::Particles {
+                    match create_particle_emitters(&mut renderer) {
+                        Ok(emitters) => self.particle_emitters = emitters,
+                        Err(error) => {
+                            self.failure = Some(error);
+                            return false;
+                        }
+                    }
+                }
                 if let Err(error) = self.upload_content(&mut renderer) {
                     self.failure = Some(error);
                     return false;
@@ -668,6 +707,9 @@ impl WindowHandler for Sandbox {
             });
         let local_lights = self.content.local_lights();
         let local_light_shadows = self.content.local_light_shadows();
+        let particle_step = self
+            .previous_elapsed
+            .map_or(0.0, |previous| (elapsed - previous).max(0.0));
         let frame = Frame {
             clear_color: [
                 self.camera_settings.render.clear_color[0],
@@ -710,6 +752,8 @@ impl WindowHandler for Sandbox {
                 },
             },
             reset_history: false,
+            particles: &self.particle_emitters,
+            particle_step,
         };
         match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {

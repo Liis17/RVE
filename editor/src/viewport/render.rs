@@ -692,6 +692,8 @@ impl SceneRenderer {
             overlay: &[],
             debug_view,
             reset_history: self.motion_history.reset_pending,
+            particles: &[],
+            particle_step: 0.0,
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
                 exposure_ev: settings.color.exposure_ev,
