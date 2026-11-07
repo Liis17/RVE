@@ -51,6 +51,8 @@ pub struct AnimationBridge {
     order: Vec<ObjectHandle>,
     objects: HashMap<ObjectHandle, ObjectAnimation>,
     warnings: Vec<String>,
+    /// Объекты с `animator`, аниматор которых не собрался: запросы к ним дают предупреждение.
+    unbuilt: HashMap<ObjectHandle, String>,
     /// Уже переданные предупреждения: повтор одного и того же сообщения не попадает в журнал.
     reported: HashSet<String>,
 }
@@ -95,6 +97,7 @@ impl AnimationBridge {
                 Ok(model) => model,
                 Err(error) => {
                     bridge.warn(format!("{}: модель не загружена: {error}", object.id));
+                    bridge.unbuilt.insert(object.handle, object.id.clone());
                     continue;
                 }
             };
@@ -103,13 +106,17 @@ impl AnimationBridge {
                     bridge.order.push(object.handle);
                     bridge.objects.insert(object.handle, state);
                 }
-                Err(message) => bridge.warn(format!("{}: {message}", object.id)),
+                Err(message) => {
+                    bridge.warn(format!("{}: {message}", object.id));
+                    bridge.unbuilt.insert(object.handle, object.id.clone());
+                }
             }
         }
         bridge
     }
 
-    /// Применяет запросы скриптов за кадр. Запросы к объектам без аниматора игнорируются.
+    /// Применяет запросы скриптов за кадр. Запросы к объектам без аниматора игнорируются;
+    /// у объекта, чей аниматор не собрался, предупреждение выводится один раз.
     pub fn apply(&mut self, requests: impl IntoIterator<Item = AnimationRequest>) {
         for request in requests {
             let object = match &request {
@@ -120,6 +127,9 @@ impl AnimationBridge {
                 | AnimationRequest::Stop { object } => *object,
             };
             let Some(state) = self.objects.get_mut(&object) else {
+                if let Some(id) = self.unbuilt.get(&object).cloned() {
+                    self.warn(format!("{id}: аниматор не собран; запрос пропущен"));
+                }
                 continue;
             };
             let result = match request {
@@ -491,6 +501,25 @@ mod tests {
         bridge.apply([AnimationRequest::Stop { object: camera }]);
         assert!(bridge.take_warnings().is_empty());
         assert!(bridge.palette(camera).is_none());
+    }
+
+    #[test]
+    fn requests_to_an_animator_that_did_not_build_warn_once_per_object() {
+        let world = world("");
+        let model = Arc::new(Model {
+            skeleton: None,
+            ..walk_model()
+        });
+        let mut bridge =
+            AnimationBridge::build(&world, |_| Ok(model.clone()), |_| Ok(Arc::new(Vec::new())));
+        let hero = world.handle("hero").unwrap();
+        bridge.take_warnings();
+        for _ in 0..2 {
+            bridge.apply([AnimationRequest::Stop { object: hero }]);
+        }
+        let warnings = bridge.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("hero:"), "{warnings:?}");
     }
 
     #[test]
