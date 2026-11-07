@@ -8,8 +8,8 @@
 use crate::decode::Clip;
 use engine_scene::{AudioGroup, VoiceId};
 use std::f32::consts::FRAC_PI_4;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Размер пула голосов. Слот голоса совпадает с «полосой» позиции в [`Spatial`].
 pub const VOICE_SLOTS: usize = 64;
@@ -17,6 +17,8 @@ pub const VOICE_SLOTS: usize = 64;
 const BLOCK_FRAMES: usize = 256;
 /// Длительность fade-out при остановке голоса.
 const FADE_SECONDS: f32 = 0.005;
+/// Сколько раз callback перечитывает позицию, пока писатель её меняет; дальше берётся прежняя.
+const SEQ_READ_ATTEMPTS: usize = 4;
 /// Очередь завершённых голосов, которую callback держит, пока кольцо к потоку `rve-audio` полно.
 /// Потеря события означает утечку слота, поэтому ёмкость с запасом на перезапуски в одном цикле
 /// опроса; `push_ended` при переполнении всё же не выделяет память и не блокирует.
@@ -62,7 +64,8 @@ pub enum MixerCommand {
     },
 }
 
-/// Одно слово seqlock: один писатель, читатели повторяют чтение при изменении.
+/// Значение из нескольких слов под seqlock: писатель меняет его под блокировкой [`Spatial`],
+/// читатель (callback) повторяет чтение не больше [`SEQ_READ_ATTEMPTS`] раз.
 struct SeqSlot<const N: usize> {
     seq: AtomicU32,
     data: [AtomicU32; N],
@@ -86,8 +89,9 @@ impl<const N: usize> SeqSlot<N> {
         self.seq.store(seq.wrapping_add(2), Ordering::Release);
     }
 
-    fn load(&self) -> [f32; N] {
-        loop {
+    /// Возвращает согласованное значение или `None`, если писатель не успел закончить запись.
+    fn try_load(&self) -> Option<[f32; N]> {
+        for _ in 0..SEQ_READ_ATTEMPTS {
             let before = self.seq.load(Ordering::Acquire);
             if before & 1 != 0 {
                 std::hint::spin_loop();
@@ -98,9 +102,10 @@ impl<const N: usize> SeqSlot<N> {
             });
             fence(Ordering::Acquire);
             if self.seq.load(Ordering::Relaxed) == before {
-                return values;
+                return Some(values);
             }
         }
+        None
     }
 }
 
@@ -109,6 +114,9 @@ pub struct Spatial {
     emitters: [SeqSlot<3>; VOICE_SLOTS],
     /// Позиция слушателя и его правая ось (`[px, py, pz, rx, ry, rz]`).
     listener: SeqSlot<6>,
+    /// Писатели (игровой поток, редактор, любые клоны хендла) выстраиваются в очередь здесь.
+    /// Callback только читает и эту блокировку не берёт.
+    writers: Mutex<()>,
 }
 
 impl Spatial {
@@ -116,22 +124,26 @@ impl Spatial {
         Self {
             emitters: std::array::from_fn(|_| SeqSlot::new()),
             listener: SeqSlot::new(),
+            writers: Mutex::new(()),
         }
     }
 
-    /// Пишет позицию излучателя. Вызывается только из одного потока.
+    /// Пишет позицию излучателя. Писатели сериализуются блокировкой `writers`.
     pub fn set_emitter(&self, lane: usize, position: [f32; 3]) {
+        let _writer = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(slot) = self.emitters.get(lane) {
             slot.store(position);
         }
     }
 
-    pub fn emitter(&self, lane: usize) -> [f32; 3] {
-        self.emitters.get(lane).map_or([0.0; 3], SeqSlot::load)
+    /// Позиция излучателя; `None`, если писатель сейчас меняет её (вызывающий берёт прежнюю).
+    pub fn emitter(&self, lane: usize) -> Option<[f32; 3]> {
+        self.emitters.get(lane)?.try_load()
     }
 
-    /// Пишет слушателя. Вызывается только из одного потока.
+    /// Пишет слушателя. Писатели сериализуются блокировкой `writers`.
     pub fn set_listener(&self, position: [f32; 3], right: [f32; 3]) {
+        let _writer = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
         self.listener.store([
             position[0],
             position[1],
@@ -142,9 +154,9 @@ impl Spatial {
         ]);
     }
 
-    fn listener(&self) -> ([f32; 3], [f32; 3]) {
-        let [px, py, pz, rx, ry, rz] = self.listener.load();
-        ([px, py, pz], [rx, ry, rz])
+    fn listener(&self) -> Option<([f32; 3], [f32; 3])> {
+        let [px, py, pz, rx, ry, rz] = self.listener.try_load()?;
+        Some(([px, py, pz], [rx, ry, rz]))
     }
 }
 
@@ -171,6 +183,8 @@ struct Voice {
     gain: f32,
     /// Fade-out после остановки; `None`, пока голос не останавливают.
     fade: Option<Fade>,
+    /// Последняя прочитанная позиция излучателя: используется, пока писатель её меняет.
+    emitter: [f32; 3],
 }
 
 /// Кадры fade-out: всего и осталось.
@@ -195,6 +209,8 @@ pub struct Mixer {
     group_gains: [f32; 4],
     paused: bool,
     ended: EndedQueue,
+    /// Последний согласованный слушатель: используется, пока писатель его меняет.
+    listener: ([f32; 3], [f32; 3]),
 }
 
 impl Mixer {
@@ -211,6 +227,7 @@ impl Mixer {
                 items: [None; ENDED_CAPACITY],
                 len: 0,
             },
+            listener: ([0.0; 3], [0.0; 3]),
         }
     }
 
@@ -264,6 +281,7 @@ impl Mixer {
             lane,
             gain: 0.0,
             fade: None,
+            emitter: [0.0; 3],
         });
     }
 
@@ -315,7 +333,10 @@ impl Mixer {
             return;
         }
         let frames = stereo.len() / 2;
-        let listener = self.spatial.listener();
+        if let Some(listener) = self.spatial.listener() {
+            self.listener = listener;
+        }
+        let listener = self.listener;
         for slot in 0..VOICE_SLOTS {
             let Some(voice) = self.voices[slot].as_mut() else {
                 continue;
@@ -378,10 +399,12 @@ fn mix_voice(
 ) -> bool {
     let (pan_left, pan_right, attenuation) = match voice.distances {
         Some(distances) => {
-            let emitter = spatial.emitter(voice.lane);
+            if let Some(emitter) = spatial.emitter(voice.lane) {
+                voice.emitter = emitter;
+            }
             let (position, right) = listener;
             let (left, right_gain, distance_gain) =
-                spatial_gains(emitter, position, right, distances);
+                spatial_gains(voice.emitter, position, right, distances);
             (left, right_gain, distance_gain)
         }
         None => (1.0, 1.0, 1.0),

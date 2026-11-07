@@ -153,12 +153,23 @@ fn emitter_follows_the_world_matrix_of_the_source() {
     let speaker_voice = rig.bridge.sources[&speaker];
     rig.bridge.sync_positions(&first);
     let lane = rig.handle.lane_of(speaker_voice).unwrap();
-    assert_eq!(rig.handle.spatial().emitter(lane), [3.0, 0.0, 0.0]);
+    assert_eq!(rig.handle.spatial().emitter(lane), Some([3.0, 0.0, 0.0]));
 
     let moved = world(&SCENE.replace("position = [3.0, 0.0, 0.0]", "position = [5.0, 0.0, 0.0]"));
     rig.bridge.sync_positions(&moved);
-    assert_eq!(rig.handle.spatial().emitter(lane), [5.0, 0.0, 0.0]);
+    assert_eq!(rig.handle.spatial().emitter(lane), Some([5.0, 0.0, 0.0]));
     assert_eq!(rig.bridge.emitter_of(speaker), Some([5.0, 0.0, 0.0]));
+}
+
+#[test]
+fn new_spatial_voice_has_its_position_before_the_first_sync() {
+    let mut rig = Rig::new();
+    let mut world = world(SCENE);
+    world.recalculate_world_matrices();
+    let speaker = world.handle("speaker").unwrap();
+    rig.bridge.apply([play_source(speaker, voice(7))], &world);
+    let lane = rig.handle.lane_of(voice(7)).unwrap();
+    assert_eq!(rig.handle.spatial().emitter(lane), Some([3.0, 0.0, 0.0]));
 }
 
 #[test]
@@ -202,7 +213,7 @@ fn clip_outside_assets_still_plays_at_its_position() {
         panic!("ожидался Play: {sent:?}");
     };
     assert_eq!(request.spatial, Some(SCRIPT_DISTANCES));
-    assert_eq!(rig.handle.spatial().emitter(*lane), [1.0, 2.0, 3.0]);
+    assert_eq!(rig.handle.spatial().emitter(*lane), Some([1.0, 2.0, 3.0]));
 }
 
 #[test]

@@ -361,6 +361,35 @@ fn ended_queue_keeps_events_until_the_sink_accepts_them() {
 }
 
 #[test]
+fn seqlock_read_gives_up_after_bounded_attempts_while_a_write_is_open() {
+    let slot = SeqSlot::<3>::new();
+    slot.store([1.0, 2.0, 3.0]);
+    assert_eq!(slot.try_load(), Some([1.0, 2.0, 3.0]));
+    slot.seq.store(slot.seq.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    assert_eq!(slot.try_load(), None);
+}
+
+#[test]
+fn an_open_emitter_write_keeps_the_voice_at_its_previous_position() {
+    let spatial = Arc::new(Spatial::new());
+    spatial.set_emitter(0, [0.0, 0.0, 5.0]);
+    let mut mixer = Mixer::new(RATE, Arc::clone(&spatial));
+    play(&mut mixer, 1, 0, clip(RATE, 1, vec![1.0; 48_000]), spatial_request(true));
+    // Первый блок ещё нарастает от нуля; установившийся уровень — последний кадр.
+    let before = render_mono(&mut mixer, 256);
+
+    let seq = spatial.emitters[0].seq.load(Ordering::Relaxed);
+    spatial.emitters[0].seq.store(seq + 1, Ordering::Relaxed);
+    assert_eq!(spatial.emitter(0), None);
+    let during = render_mono(&mut mixer, 256);
+
+    assert!(
+        during.iter().all(|value| (value - before[255]).abs() < 1e-6),
+        "громкость и панорама прежние: {during:?}"
+    );
+}
+
+#[test]
 fn stopped_voice_fades_out_without_a_jump_while_a_new_voice_starts_on_another_lane() {
     let mut mixer = mixer();
     play(&mut mixer, 1, 0, clip(RATE, 1, vec![0.5; 4800]), request(false));

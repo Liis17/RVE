@@ -6,6 +6,16 @@ fn voice(id: u64) -> VoiceId {
     VoiceId::from_raw(id).expect("тестовый id ненулевой")
 }
 
+fn spatial_request(looping: bool) -> PlayRequest {
+    PlayRequest {
+        spatial: Some(Distances {
+            min: 1.0,
+            max: 30.0,
+        }),
+        ..request(looping)
+    }
+}
+
 fn request(looping: bool) -> PlayRequest {
     PlayRequest {
         group: AudioGroup::Effects,
@@ -171,9 +181,19 @@ fn positions_are_written_without_the_command_queue() {
     for step in 0..10_000 {
         handle.set_emitter(voice(1), [step as f32, 0.0, 0.0]);
     }
-    assert_eq!(handle.spatial().emitter(lane), [9_999.0, 0.0, 0.0]);
+    assert_eq!(handle.spatial().emitter(lane), Some([9_999.0, 0.0, 0.0]));
     handle.set_emitter(voice(42), [1.0, 1.0, 1.0]);
     assert_eq!(commands.try_iter().count(), COMMAND_CAPACITY);
+}
+
+#[test]
+fn play_at_writes_the_emitter_before_the_voice_can_render() {
+    let (handle, _commands, _events) = AudioHandle::detached();
+    handle
+        .play_at(voice(1), "audio/hum.wav", spatial_request(true), [4.0, 0.0, 0.0])
+        .unwrap();
+    let lane = handle.lane_of(voice(1)).unwrap();
+    assert_eq!(handle.spatial().emitter(lane), Some([4.0, 0.0, 0.0]));
 }
 
 #[test]

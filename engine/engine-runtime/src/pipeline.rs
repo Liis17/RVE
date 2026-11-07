@@ -778,6 +778,8 @@ fn scripts_thread(
     print_script_events(scripts.drain_events());
     let mut audio = audio.map(engine_audio::AudioBridge::new);
     if let Some(audio) = audio.as_mut() {
+        // Матрицы до первого кадра не посчитаны; play_on_start берёт позиции из них.
+        world.recalculate_world_matrices();
         audio.start(&world);
         audio.apply(scripts.drain_audio_requests(), &world);
     }

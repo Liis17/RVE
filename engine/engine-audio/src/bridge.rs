@@ -44,6 +44,7 @@ impl AudioBridge {
     }
 
     /// Запоминает `[[assets]]`, предзагружает клипы источников и запускает `play_on_start`.
+    /// Позиции берутся из мировых матриц: вызывающий пересчитывает их до `start`.
     pub fn start(&mut self, world: &World) {
         self.declared = world
             .asset_paths()
@@ -119,12 +120,13 @@ impl AudioBridge {
                         looping: params.looping,
                         spatial: params.position.map(|_| SCRIPT_DISTANCES),
                     };
-                    let result = self.handle.play(voice, path.as_str(), request);
-                    if result.is_ok()
-                        && let Some(position) = params.position
-                    {
-                        self.handle.set_emitter(voice, position);
-                    }
+                    let result = match params.position {
+                        Some(position) => {
+                            self.handle
+                                .play_at(voice, path.as_str(), request, position)
+                        }
+                        None => self.handle.play(voice, path.as_str(), request),
+                    };
                     self.note(result, &format!("воспроизведение /{}", path.as_str()));
                 }
                 AudioRequest::StopVoice { voice } => {
@@ -161,7 +163,12 @@ impl AudioBridge {
             looping: audio.looping,
             spatial: spatial_distances(audio),
         };
-        let result = self.handle.play(voice, audio.clip.as_str(), request);
+        let result = match source_position(world, object, audio) {
+            Some(position) => self
+                .handle
+                .play_at(voice, audio.clip.as_str(), request, position),
+            None => self.handle.play(voice, audio.clip.as_str(), request),
+        };
         if result.is_ok() {
             self.sources.insert(object, voice);
         }
@@ -250,6 +257,20 @@ impl AudioBridge {
             self.sources.retain(|_, current| *current != voice);
         }
     }
+}
+
+/// Позиция пространственного источника по последним мировым матрицам; `None` для неспециальных
+/// источников и для матриц, которые не удалось прочитать.
+fn source_position(
+    world: &World,
+    object: ObjectHandle,
+    audio: &AudioSourceComponent,
+) -> Option<[f32; 3]> {
+    if !audio.spatial {
+        return None;
+    }
+    let position = world.world_matrix(object)?.w_axis.truncate();
+    position.is_finite().then(|| position.to_array())
 }
 
 fn spatial_distances(audio: &AudioSourceComponent) -> Option<Distances> {

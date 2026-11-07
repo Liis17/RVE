@@ -254,7 +254,7 @@ impl PlaySession {
     #[allow(clippy::too_many_arguments)]
     fn start_with_world_limit(
         document: &SceneDocument,
-        world: World,
+        mut world: World,
         library: Option<&ScriptLibrary>,
         input_settings: &InputSettings,
         mut read_source: impl FnMut(&str) -> Result<String, String>,
@@ -301,6 +301,8 @@ impl PlaySession {
         let (physics, initial_snapshot) = PlayPhysics::start(&world, driver, bindings)?;
         host.set_physics_snapshot(initial_snapshot, physics.sync.bindings());
         let mut audio = PlayAudio::start(audio)?;
+        // Матрицы до первого кадра не посчитаны; play_on_start берёт позиции из них.
+        world.recalculate_world_matrices();
         audio.bridge.start(&world);
         Ok(Self {
             world,

@@ -199,8 +199,32 @@ impl AudioHandle {
     /// Запускает клип на голосе `voice`. Слот выделяется сразу; при отсутствии свободных слотов
     /// вытесняется самый старый не-looping голос (он обрывается, см. `mixer`).
     pub fn play(&self, voice: VoiceId, path: &str, request: PlayRequest) -> Result<(), AudioError> {
+        self.start(voice, path, request, None)
+    }
+
+    /// Как [`AudioHandle::play`], но сразу задаёт позицию излучателя: первый блок звучит на месте.
+    pub fn play_at(
+        &self,
+        voice: VoiceId,
+        path: &str,
+        request: PlayRequest,
+        position: [f32; 3],
+    ) -> Result<(), AudioError> {
+        self.start(voice, path, request, Some(position))
+    }
+
+    fn start(
+        &self,
+        voice: VoiceId,
+        path: &str,
+        request: PlayRequest,
+        position: Option<[f32; 3]>,
+    ) -> Result<(), AudioError> {
         let mut lanes = self.locked();
         let (lane, evicted) = lanes.allocate(voice, request.looping)?;
+        if let Some(position) = position {
+            self.spatial.set_emitter(lane, position);
+        }
         let sent = evicted
             .map_or(Ok(()), |evicted| self.send(Command::Stop(evicted.voice)))
             .and_then(|()| {
