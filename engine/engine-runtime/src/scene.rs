@@ -849,8 +849,8 @@ mod tests {
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
     use engine_scene::{MaterialAlphaMode, MaterialOverride, PrefabTemplate, SceneDocument, World};
     use engine_script::{
-        PrefabCatalog, PrefabKind, PrefabSpec, ScriptEventLevel, ScriptHost, ScriptLoadOptions,
-        ScriptTime,
+        Key, MouseButton, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, ScriptEventLevel,
+        ScriptHost, ScriptInput, ScriptLoadOptions, ScriptTime,
     };
     use std::cell::Cell;
     use std::collections::BTreeMap;
@@ -1079,6 +1079,95 @@ id = "camera"
             },
         )
         .unwrap_or_else(|error| panic!("demo prefab scripts: {error}"));
+    }
+
+    /// Стрельба и башня демо-игры как в runtime: быстрые префабы регистрируются у хоста, тяжёлые
+    /// приходят из `prefabs.rveprefabs`, действия — из `project.rveproject`. Столкновение пули не
+    /// моделируется: его проверяет тест скрипта пули в engine-script.
+    #[test]
+    fn demo_game_shooter_spawns_bullets_and_requests_the_tower_prefab() {
+        let demo = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/demo-game"
+        ));
+        let resources = LooseResources::new(&demo.join("Assets"));
+        let handle = resources.system.handle();
+        let mut prepared =
+            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        let project = engine_project::ProjectSettings::parse(
+            &fs::read_to_string(demo.join("project.rveproject")).unwrap(),
+        )
+        .unwrap();
+        let heavy =
+            engine_project::PrefabCatalogFile::load(demo.join("prefabs.rveprefabs")).unwrap();
+        crate::add_heavy_prefabs(&mut prepared.prefabs.catalog, &heavy).unwrap();
+        let mut host = ScriptHost::load_with_options(
+            &prepared.world,
+            &prepared.name,
+            &prepared.sources,
+            None,
+            ScriptLoadOptions {
+                input: project.input,
+                prefabs: prepared.prefabs.catalog.clone(),
+                ..ScriptLoadOptions::default()
+            },
+        )
+        .unwrap();
+        for (path, template) in &prepared.prefabs.templates {
+            host.register_prefab(
+                &prepared.world,
+                path,
+                Arc::clone(template),
+                &prepared.sources,
+            )
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+        // Контроллер игрока читает физику, поэтому снимок и привязки строятся как при старте runtime.
+        let geometry = prepared.physics_geometry();
+        let (driver, bindings) = prepared.build_physics(&geometry, &project.physics).unwrap();
+        let initialization =
+            engine_physics::PhysicsInitialization::from_prebuilt(&driver, bindings).unwrap();
+        let sync = engine_physics::PhysicsSceneSync::new(&prepared.world, initialization.bindings)
+            .unwrap();
+        host.set_physics_snapshot(initialization.result.snapshot, sync.bindings());
+        let errors = |host: &mut ScriptHost| -> Vec<String> {
+            host.drain_events()
+                .into_iter()
+                .filter(|event| event.level == ScriptEventLevel::Error)
+                .map(|event| event.message)
+                .collect()
+        };
+        let time = |frame: u64| ScriptTime {
+            elapsed: frame as f64 / 60.0,
+            frame,
+        };
+
+        // Кнопка fire из проекта: пуля вылетает из камеры, объект получает id `bullet@N`.
+        let mut fire = ScriptInput::default();
+        fire.set_mouse_button(MouseButton::Left, true);
+        host.set_input(fire);
+        host.update(&mut prepared.world, 1.0 / 60.0, time(1));
+        let fired = errors(&mut host);
+        assert!(fired.is_empty(), "{fired:?}");
+        let bullets = prepared
+            .world
+            .objects()
+            .iter()
+            .filter(|object| object.id.starts_with("bullet@"))
+            .count();
+        assert_eq!(bullets, 1);
+
+        // Кнопка spawn_heavy из проекта: башня запрашивает загрузку тяжёлого префаба.
+        let mut tower = ScriptInput::default();
+        tower.set_key(Key::T, true);
+        host.set_input(tower);
+        host.update(&mut prepared.world, 1.0 / 60.0, time(2));
+        let towers = errors(&mut host);
+        assert!(towers.is_empty(), "{towers:?}");
+        assert_eq!(
+            host.drain_world_changes().prefab_requests,
+            [PrefabRequest::Load("prefabs/tower.rveprefab".to_owned())]
+        );
     }
 
     #[test]

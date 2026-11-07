@@ -1,7 +1,8 @@
 use crate::actions::{ActionFrame, ActionMutation, ActionValue};
 use crate::lifecycle::{
     DestroyRequest, Lifecycle, MAX_SPAWN_NAME_BYTES, MAX_SPAWNED_OBJECTS_PER_FRAME, ObjectState,
-    PrefabKind, PrefabRequest, PrefabStatus, SpawnArgs, SpawnRequest, valid_spawn_id,
+    PrefabKind, PrefabRequest, PrefabStatus, SpawnArgs, SpawnRequest, prefab_display, prefab_key,
+    valid_spawn_id,
 };
 use crate::lite::EventQueue;
 use crate::physics::PhysicsScriptState;
@@ -701,20 +702,29 @@ impl ScriptTransaction {
         if !self.lifecycle_writes {
             return Err("spawn is unavailable during destroy callbacks".to_owned());
         }
+        let prefab = prefab_key(prefab)?;
         let world = self
             .world()
             .ok_or_else(|| "spawn is only available during script calls".to_owned())?;
         {
             let lifecycle = self.lifecycle.borrow();
-            let slot = lifecycle
-                .prefabs
-                .get(prefab)
-                .ok_or_else(|| format!("prefab {prefab:?} is not in the project prefab list"))?;
+            let slot = lifecycle.prefabs.get(&prefab).ok_or_else(|| {
+                format!(
+                    "prefab {:?} is not in the project prefab list",
+                    prefab_display(&prefab)
+                )
+            })?;
             if slot.status == PrefabStatus::Failed {
-                return Err(format!("prefab {prefab:?} failed to load"));
+                return Err(format!(
+                    "prefab {:?} failed to load",
+                    prefab_display(&prefab)
+                ));
             }
             if slot.kind == PrefabKind::Fast && slot.template.is_none() {
-                return Err(format!("prefab {prefab:?} is not registered"));
+                return Err(format!(
+                    "prefab {:?} is not registered",
+                    prefab_display(&prefab)
+                ));
             }
             if lifecycle.queued.len() + lifecycle.waiting.len() + self.pending_spawns.len()
                 >= MAX_SPAWNED_OBJECTS_PER_FRAME
@@ -765,7 +775,7 @@ impl ScriptTransaction {
         self.pending_spawns.push(SpawnRequest {
             seq: 0,
             root,
-            prefab: prefab.to_owned(),
+            prefab,
             args,
             source: self.source.clone(),
         });
@@ -796,15 +806,21 @@ impl ScriptTransaction {
         if !self.writable {
             return Err("prefab loading is unavailable during script creation".to_owned());
         }
+        let request = match request {
+            PrefabRequest::Load(path) => PrefabRequest::Load(prefab_key(&path)?),
+            PrefabRequest::Unload(path) => PrefabRequest::Unload(prefab_key(&path)?),
+        };
         let path = match &request {
             PrefabRequest::Load(path) | PrefabRequest::Unload(path) => path.clone(),
         };
         let heavy = {
             let lifecycle = self.lifecycle.borrow();
-            let slot = lifecycle
-                .prefabs
-                .get(&path)
-                .ok_or_else(|| format!("prefab {path:?} is not in the project prefab list"))?;
+            let slot = lifecycle.prefabs.get(&path).ok_or_else(|| {
+                format!(
+                    "prefab {:?} is not in the project prefab list",
+                    prefab_display(&path)
+                )
+            })?;
             slot.kind == PrefabKind::Heavy
         };
         if heavy {
@@ -813,12 +829,13 @@ impl ScriptTransaction {
         Ok(())
     }
 
-    /// Состояние префаба по зафиксированным данным; `None` — путь не в списке проекта.
+    /// Состояние префаба по зафиксированным данным; `None` — путь не в списке проекта или некорректен.
     pub(crate) fn prefab_status(&self, path: &str) -> Option<PrefabStatus> {
+        let key = prefab_key(path).ok()?;
         self.lifecycle
             .borrow()
             .prefabs
-            .get(path)
+            .get(&key)
             .map(|slot| slot.status)
     }
 

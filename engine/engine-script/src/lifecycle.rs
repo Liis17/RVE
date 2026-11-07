@@ -4,6 +4,7 @@
 //! применяет их в конце фазы, когда у него есть `&mut World`. Состояние разделяется между
 //! транзакцией (проверки id и префабов при вызове API) и хостом (очереди и журнал изменений).
 
+use engine_files::VirtualPath;
 use engine_physics::BodyHandle;
 use engine_scene::{ObjectHandle, PrefabTemplate, SpawnOptions};
 use glam::Vec3;
@@ -34,6 +35,19 @@ pub struct PrefabSpec {
     pub kind: PrefabKind,
     /// Лимит живых корней, созданных spawn; при превышении удаляется самый старый.
     pub max_instances: Option<u32>,
+}
+
+/// Ключ префаба в каталоге: канонический virtual path без ведущего слеша. Скрипты и ABI могут
+/// передавать путь и как в файлах сцен (`/prefabs/x.rveprefab`), и без слеша; оба дают один ключ.
+pub(crate) fn prefab_key(path: &str) -> Result<String, String> {
+    VirtualPath::parse(path)
+        .map(|path| path.as_str().to_owned())
+        .map_err(|_| format!("prefab path {path:?} is not a valid asset path"))
+}
+
+/// Путь префаба в сообщениях об ошибках: всегда с ведущим слешем, как в файлах сцен.
+pub(crate) fn prefab_display(key: &str) -> String {
+    format!("/{key}")
 }
 
 /// Префабы, которые скрипты могут создавать. Ключ — канонический virtual path без ведущего слеша.

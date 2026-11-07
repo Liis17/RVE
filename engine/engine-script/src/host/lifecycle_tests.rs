@@ -1013,3 +1013,149 @@ fn revert_of_a_dead_root_only_reports_the_error() {
     );
     assert!(host.drain_world_changes().despawned.is_empty());
 }
+
+/// Пути префабов принимаются и с ведущим слешем, как в файлах сцен, и без него: это один ключ.
+#[test]
+fn prefab_paths_with_and_without_a_leading_slash_name_one_prefab() {
+    const GUN_SPAWNS_WITH_SLASH: &str = r#"
+local Gun = {}
+function Gun:on_update(dt)
+  if self.frames == nil then
+    self.frames = 1
+    rve.spawn("/prefabs/bullet.rveprefab", { id = "shot" })
+  end
+end
+return Gun
+"#;
+    let mut world = scene(GUN_SCENE);
+    let mut host = fast_host(&world, GUN_SPAWNS_WITH_SLASH, None);
+    assert_eq!(
+        host.prefab_status("/prefabs/bullet.rveprefab"),
+        Some(PrefabStatus::Resident)
+    );
+    assert_eq!(
+        host.prefab_status("prefabs/bullet.rveprefab"),
+        Some(PrefabStatus::Resident)
+    );
+
+    host.update(&mut world, 0.1, at(0.0, 1));
+    assert!(errors(&mut host).is_empty());
+    assert!(world.handle("shot").is_some());
+}
+
+/// Тяжёлый префаб: заявка загрузки с ведущим слешем попадает в журнал под каноническим ключом.
+#[test]
+fn heavy_prefab_requests_accept_a_leading_slash() {
+    const GUN_LOADS_WITH_SLASH: &str = r#"
+local Gun = {}
+function Gun:on_start()
+  rve.prefabs.load("/prefabs/bullet.rveprefab")
+end
+return Gun
+"#;
+    let mut world = scene(GUN_SCENE);
+    let mut host = load(
+        &world,
+        &[("gun.lua", GUN_LOADS_WITH_SLASH)],
+        catalog(PrefabKind::Heavy, None),
+    );
+    host.update(&mut world, 0.1, at(0.0, 1));
+    assert!(errors(&mut host).is_empty());
+    assert_eq!(
+        host.drain_world_changes().prefab_requests,
+        [PrefabRequest::Load(PREFAB.to_owned())]
+    );
+    assert_eq!(
+        host.prefab_status("/prefabs/bullet.rveprefab"),
+        Some(PrefabStatus::Loading)
+    );
+}
+
+/// Некорректный путь отвергается spawn-ом с понятной ошибкой, а запросы состояния возвращают `None`.
+#[test]
+fn invalid_prefab_paths_are_refused_by_spawn_and_ignored_by_queries() {
+    const GUN_SPAWNS_ESCAPING_PATH: &str = r#"
+local Gun = {}
+function Gun:on_update(dt)
+  rve.spawn("/prefabs/../bullet.rveprefab")
+end
+return Gun
+"#;
+    let mut world = scene(GUN_SCENE);
+    let mut host = fast_host(&world, GUN_SPAWNS_ESCAPING_PATH, None);
+    assert_eq!(host.prefab_status("/prefabs/../bullet.rveprefab"), None);
+    assert_eq!(host.prefab_status(""), None);
+
+    host.update(&mut world, 0.1, at(0.0, 1));
+    let errors = errors(&mut host);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("is not a valid asset path"),
+        "{errors:?}"
+    );
+}
+
+/// Демо-пуля: столкновение со стеной ставит след из префаба и удаляет пулю. Событие подаётся вручную,
+/// поэтому тест проверяет только скрипт, а не физику.
+#[test]
+fn demo_bullet_collision_spawns_a_hole_and_destroys_the_bullet() {
+    const DEMO_BULLET: &str =
+        include_str!("../../../../examples/demo-game/Assets/scripts/bullet.lua");
+    const DEMO_HOLE: &str =
+        include_str!("../../../../examples/demo-game/Assets/prefabs/bullet_hole.rveprefab");
+    const HOLE: &str = "prefabs/bullet_hole.rveprefab";
+
+    let mut world = scene(
+        "[[assets]]\npath = \"/bullet.lua\"\n[[objects]]\nid = \"bullet\"\n\
+[[objects.lite_scripts]]\npath = \"/bullet.lua\"\n[[objects]]\nid = \"wall\"\n",
+    );
+    let bullet = world.handle("bullet").unwrap();
+    let wall = world.handle("wall").unwrap();
+    let snapshot = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO)
+        .unwrap()
+        .query_snapshot()
+        .unwrap();
+    let bindings = [
+        engine_physics::PhysicsSceneBinding {
+            object: bullet,
+            body: engine_physics::BodyHandle(11),
+            kind: engine_physics::BodyKind::Dynamic,
+            character_controller: None,
+        },
+        engine_physics::PhysicsSceneBinding {
+            object: wall,
+            body: engine_physics::BodyHandle(12),
+            kind: engine_physics::BodyKind::Static,
+            character_controller: None,
+        },
+    ];
+    let mut prefabs = PrefabCatalog::default();
+    prefabs.insert(
+        HOLE,
+        PrefabSpec {
+            kind: PrefabKind::Fast,
+            max_instances: None,
+        },
+    );
+    let mut host = load(&world, &[("bullet.lua", DEMO_BULLET)], prefabs);
+    host.register_prefab(&world, HOLE, template(HOLE, DEMO_HOLE), &BTreeMap::new())
+        .unwrap();
+    host.set_physics_snapshot(snapshot, &bindings);
+    host.queue_physics_events([engine_physics::PhysicsEvent::CollisionEnter {
+        first: engine_physics::BodyHandle(11),
+        second: engine_physics::BodyHandle(12),
+        point: glam::Vec3::new(0.0, 0.0, -4.0),
+        normal: glam::Vec3::Z,
+    }]);
+
+    host.update(&mut world, 1.0 / 60.0, at(1.0 / 60.0, 1));
+    assert!(errors(&mut host).is_empty());
+    assert!(world.handle("bullet").is_none());
+    let holes = world
+        .objects()
+        .iter()
+        .filter(|object| object.id.starts_with("bullet_hole@"))
+        .count();
+    assert_eq!(holes, 1);
+    assert!(world.handle("wall").is_some());
+}

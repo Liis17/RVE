@@ -3,7 +3,7 @@ use crate::actions::InputActions;
 use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lifecycle::{
     Lifecycle, MAX_SPAWNED_OBJECTS_PER_FRAME, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSlot,
-    PrefabStatus, SpawnRequest, SpawnedObject, WorldChanges,
+    PrefabStatus, SpawnRequest, SpawnedObject, WorldChanges, prefab_display, prefab_key,
 };
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LitePhysicsEvent,
@@ -604,13 +604,17 @@ impl ScriptHost {
         template: Arc<PrefabTemplate>,
         sources: &BTreeMap<String, String>,
     ) -> Result<(), ScriptLoadError> {
+        let key = prefab_key(path).map_err(|message| ScriptLoadError::Prefab {
+            path: path.to_owned(),
+            message,
+        })?;
         let (kind, status) = {
             let lifecycle = self.lifecycle.borrow();
             let slot = lifecycle
                 .prefabs
-                .get(path)
+                .get(&key)
                 .ok_or_else(|| ScriptLoadError::Prefab {
-                    path: path.to_owned(),
+                    path: prefab_display(&key),
                     message: "the prefab is not in the project prefab list".to_owned(),
                 })?;
             (slot.kind, slot.status)
@@ -621,7 +625,7 @@ impl ScriptHost {
         };
         if status != expected {
             return Err(ScriptLoadError::Prefab {
-                path: path.to_owned(),
+                path: prefab_display(&key),
                 message: format!(
                     "the prefab is {}, not waiting for registration",
                     status.as_str()
@@ -679,7 +683,7 @@ impl ScriptHost {
         let mut lifecycle = self.lifecycle.borrow_mut();
         let slot = lifecycle
             .prefabs
-            .get_mut(path)
+            .get_mut(&key)
             .expect("prefab slot was checked above");
         slot.register(template);
         slot.status = match kind {
@@ -690,7 +694,7 @@ impl ScriptHost {
             let waiting = std::mem::take(&mut lifecycle.waiting);
             let (ready, rest): (Vec<SpawnRequest>, Vec<SpawnRequest>) = waiting
                 .into_iter()
-                .partition(|request| request.prefab == path);
+                .partition(|request| request.prefab == key);
             lifecycle.waiting = rest;
             lifecycle.queued.extend(ready);
             lifecycle.begin_unload_if_idle(path);
@@ -700,25 +704,31 @@ impl ScriptHost {
 
     /// Состояние префаба; `None` — путь не в списке проекта.
     pub fn prefab_status(&self, path: &str) -> Option<PrefabStatus> {
+        let key = prefab_key(path).ok()?;
         self.lifecycle
             .borrow()
             .prefabs
-            .get(path)
+            .get(&key)
             .map(|slot| slot.status)
     }
 
     /// Вызывающий код освободил ресурсы выгруженного префаба. Если на него ждут spawn,
     /// загрузка начинается снова.
     pub fn prefab_released(&mut self, path: &str) {
-        self.lifecycle.borrow_mut().prefab_released(path);
+        if let Ok(key) = prefab_key(path) {
+            self.lifecycle.borrow_mut().prefab_released(&key);
+        }
     }
 
     /// Загрузка тяжёлого префаба не удалась. Его ожидающие spawn умирают с Error-событием;
     /// `world` нужен, чтобы освободить их резервы.
     pub fn prefab_failed(&mut self, world: &World, path: &str, error: &str) {
+        let Ok(key) = prefab_key(path) else {
+            return;
+        };
         let failed = {
             let mut lifecycle = self.lifecycle.borrow_mut();
-            let Some(slot) = lifecycle.prefabs.get_mut(path) else {
+            let Some(slot) = lifecycle.prefabs.get_mut(&key) else {
                 return;
             };
             if slot.status != PrefabStatus::Loading {
@@ -729,7 +739,7 @@ impl ScriptHost {
             let waiting = std::mem::take(&mut lifecycle.waiting);
             let (failed, rest): (Vec<SpawnRequest>, Vec<SpawnRequest>) = waiting
                 .into_iter()
-                .partition(|request| request.prefab == path);
+                .partition(|request| request.prefab == key);
             lifecycle.waiting = rest;
             failed
         };
@@ -737,7 +747,7 @@ impl ScriptHost {
             self.cancel_spawn(
                 world,
                 &request,
-                format!("prefab {path:?} failed to load: {error}"),
+                format!("prefab {:?} failed to load: {error}", prefab_display(&key)),
             );
         }
     }
@@ -1572,7 +1582,7 @@ impl ScriptHost {
                 request,
                 format!(
                     "prefab {:?} is not in the project prefab list",
-                    request.prefab
+                    prefab_display(&request.prefab)
                 ),
             );
             return;
@@ -1586,7 +1596,10 @@ impl ScriptHost {
             (PrefabStatus::Failed, _) => self.cancel_spawn(
                 world,
                 request,
-                format!("prefab {:?} failed to load", request.prefab),
+                format!(
+                    "prefab {:?} failed to load",
+                    prefab_display(&request.prefab)
+                ),
             ),
             (PrefabStatus::Unloaded | PrefabStatus::Loading | PrefabStatus::Unloading, _)
                 if kind == PrefabKind::Heavy =>
@@ -1598,7 +1611,10 @@ impl ScriptHost {
             _ => self.cancel_spawn(
                 world,
                 request,
-                format!("prefab {:?} is not registered", request.prefab),
+                format!(
+                    "prefab {:?} is not registered",
+                    prefab_display(&request.prefab)
+                ),
             ),
         }
     }
