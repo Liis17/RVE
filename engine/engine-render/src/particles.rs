@@ -1842,7 +1842,11 @@ mod sort_tests {
     fn network_keeps_every_index_once_for_sizes_with_sentinels() {
         for count in [64usize, 128, 256, 1024] {
             let mut keys = pseudo_random_keys(count, count as u32 * 13 + 5);
-            for (index, key) in keys.iter_mut().enumerate().filter(|(index, _)| index % 4 == 3) {
+            for (index, key) in keys
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| index % 4 == 3)
+            {
                 *key = (u32::MAX, index as u32);
             }
             run_network(&mut keys);
@@ -1852,7 +1856,11 @@ mod sort_tests {
             );
             let mut indices: Vec<u32> = keys.iter().map(|(_, index)| *index).collect();
             indices.sort_unstable();
-            assert_eq!(indices, (0..count as u32).collect::<Vec<_>>(), "count {count}");
+            assert_eq!(
+                indices,
+                (0..count as u32).collect::<Vec<_>>(),
+                "count {count}"
+            );
         }
     }
 }

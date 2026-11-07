@@ -14,8 +14,8 @@ use crate::{
     DEPTH_FORMAT, DebugView, DeviceBuffer, GpuPass, HostBuffer, OFFSCREEN_FORMAT, OffscreenTarget,
     OwnedDescriptorPool, ParticleEmitterFrame, ParticleEmitterId, RenderError, Renderer,
     RetiredResource, ShaderModule, Texture, TextureColorSpace, WHITE_SRGB_TEXTURE,
-    create_compute_pipeline, depth_subresource_range, image_layout_barrier, mark_pass,
-    pipeline_barrier, scene_viewport,
+    color_subresource_range, create_compute_pipeline, depth_subresource_range,
+    image_layout_barrier, mark_pass, pipeline_barrier, scene_viewport,
 };
 use ash::vk;
 use std::collections::HashMap;
@@ -39,6 +39,11 @@ const PARTICLE_GPU_SIZE: u64 = 48;
 const PARTICLE_COMPUTE_PUSH_SIZE: u32 = 112;
 /// Push constants вершинного шейдера: диапазон слотов и флаг порядка.
 const PARTICLE_VERTEX_PUSH_SIZE: u32 = 32;
+/// Стадии push constants графического прохода: вершинный шейдер читает диапазон слотов,
+/// фрагментный — размер кадра. Одна константа для layout и для `cmd_push_constants`.
+const PARTICLE_GRAPHICS_PUSH_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
+    vk::ShaderStageFlags::VERTEX.as_raw() | vk::ShaderStageFlags::FRAGMENT.as_raw(),
+);
 /// Push constants compute-стадий не выходят за гарантированный Vulkan-минимум 128 байт.
 const _: () = assert!(PARTICLE_COMPUTE_PUSH_SIZE <= 128);
 /// Storage buffer descriptors на стадию compute: три в кадровом наборе (3, 4, 5) и два в наборе частиц (particles, sort).
@@ -538,7 +543,7 @@ impl Renderer {
         self.particles.compute_layout = Some(compute_layout);
 
         let graphics_ranges = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .stage_flags(PARTICLE_GRAPHICS_PUSH_STAGES)
             .offset(0)
             .size(PARTICLE_VERTEX_PUSH_SIZE)];
         let graphics_info = vk::PipelineLayoutCreateInfo::default()
@@ -949,17 +954,27 @@ fn record_draws(
         return;
     }
     alpha.sort_by(|left, right| right.distance_sq.total_cmp(&left.distance_sq));
+    // HDR color записан предыдущими проходами: ждём их запись, прежде чем загружать цвет (LOAD).
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            target.color.image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            color_subresource_range(),
+        ),
+    );
     let color_attachments = [vk::RenderingAttachmentInfo::default()
         .image_view(target.color.view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .load_op(vk::AttachmentLoadOp::LOAD)
         .store_op(vk::AttachmentStoreOp::STORE)];
-    // Depth только для чтения: тест глубины против геометрии, запись отключена.
-    let depth_attachment = vk::RenderingAttachmentInfo::default()
-        .image_view(target.depth.view)
-        .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::LOAD)
-        .store_op(vk::AttachmentStoreOp::DONT_CARE);
+    let depth_attachment = particle_depth_attachment(target.depth.view);
     let rendering_info = vk::RenderingInfo::default()
         .render_area(vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -1014,7 +1029,7 @@ fn record_draws(
             device.cmd_push_constants(
                 command_buffer,
                 pass.pipelines.graphics_layout,
-                vk::ShaderStageFlags::VERTEX,
+                PARTICLE_GRAPHICS_PUSH_STAGES,
                 0,
                 pod_bytes(&push),
             );
@@ -1147,6 +1162,12 @@ mod tests {
     }
 
     #[test]
+    fn graphics_push_range_covers_vertex_and_fragment_stages() {
+        assert!(PARTICLE_GRAPHICS_PUSH_STAGES.contains(vk::ShaderStageFlags::VERTEX));
+        assert!(PARTICLE_GRAPHICS_PUSH_STAGES.contains(vk::ShaderStageFlags::FRAGMENT));
+    }
+
+    #[test]
     fn particle_storage_stride_matches_shader_struct() {
         assert_eq!(PARTICLE_GPU_SIZE, 48);
     }
@@ -1173,8 +1194,19 @@ mod shader_tests {
 /// Layout depth буфера, в котором частицы читают его в compute и как read-only depth attachment.
 const PARTICLE_DEPTH_LAYOUT: vk::ImageLayout = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
+/// Depth только для чтения: тест глубины против геометрии, запись отключена.
+/// `STORE` сохраняет содержимое: TAA/апскейлеры и последующие проходы читают depth после частиц.
+fn particle_depth_attachment<'a>(view: vk::ImageView) -> vk::RenderingAttachmentInfo<'a> {
+    vk::RenderingAttachmentInfo::default()
+        .image_view(view)
+        .image_layout(PARTICLE_DEPTH_LAYOUT)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)
+}
+
 /// Маски источника барьера depth перед финальным переходом в `SHADER_READ_ONLY_OPTIMAL`. После частиц depth
-/// читается в compute, fragment и depth-тестах без записи.
+/// читается в compute, fragment и depth-тестах; `STORE` в конце прохода частиц — запись в depth-тестах,
+/// поэтому она входит в источник.
 pub(crate) fn particle_depth_source_masks(
     layout: vk::ImageLayout,
 ) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
@@ -1184,7 +1216,9 @@ pub(crate) fn particle_depth_source_masks(
                 | vk::PipelineStageFlags2::FRAGMENT_SHADER
                 | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
         )
     } else {
         (
@@ -1220,8 +1254,15 @@ mod depth_tests {
         assert!(stages.contains(vk::PipelineStageFlags2::FRAGMENT_SHADER));
         assert!(stages.contains(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS));
         assert!(stages.contains(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS));
+        assert!(access.contains(vk::AccessFlags2::SHADER_SAMPLED_READ));
         assert!(!access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE));
-        assert!(!access.contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE));
+    }
+
+    #[test]
+    fn particle_depth_store_keeps_contents_for_later_passes() {
+        let attachment = particle_depth_attachment(vk::ImageView::null());
+        assert_eq!(attachment.store_op, vk::AttachmentStoreOp::STORE);
+        assert_eq!(attachment.image_layout, PARTICLE_DEPTH_LAYOUT);
     }
 
     #[test]
