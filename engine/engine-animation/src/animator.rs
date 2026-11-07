@@ -273,6 +273,29 @@ impl Animator {
         Ok(())
     }
 
+    /// Переводит проигрывающееся движение на `time` секунд. Цикл переносит время по
+    /// длительности, нецикличное зажимается в диапазоне. Отмотка до конца снова даёт событие
+    /// окончания; вес и остальные движения не меняются.
+    pub fn seek(&mut self, motion: &str, time: f32) -> Result<(), AnimatorError> {
+        if !time.is_finite() {
+            return Err(AnimatorError::InvalidValue("время движения"));
+        }
+        let index = self.motion_index(motion)?;
+        let duration = motion_duration(&self.clips, &self.motions[index].source);
+        let Some(playback) = self
+            .playbacks
+            .iter_mut()
+            .find(|playback| playback.motion == index)
+        else {
+            return Err(invalid(motion, "движение не проигрывается"));
+        };
+        playback.time = wrap_time(time, duration, playback.looping);
+        if playback.time < duration {
+            playback.finished = false;
+        }
+        Ok(())
+    }
+
     /// Останавливает все движения: их веса уходят к 0 за `fade` секунд.
     pub fn stop(&mut self, fade: f32) -> Result<(), AnimatorError> {
         let fade = check_fade(fade)?;
@@ -666,6 +689,70 @@ mod tests {
         play(&mut animator, "a", 0.0);
         animator.advance(0.25);
         assert!((animator.time("a").unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn seek_moves_a_playing_motion_and_rearms_its_finish_event() {
+        let mut animator = animator(false);
+        animator
+            .play(
+                "a",
+                PlayOptions {
+                    fade: 0.0,
+                    looping: Some(false),
+                    then: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(animator.advance(1.5).len(), 1, "движение закончилось");
+
+        animator.seek("a", 0.25).unwrap();
+        assert!((animator.time("a").unwrap() - 0.25).abs() < 1e-6);
+        assert!(animator.advance(0.5).is_empty());
+        assert_eq!(
+            animator.advance(0.3).len(),
+            1,
+            "после отмотки событие приходит снова"
+        );
+
+        animator.seek("a", 7.0).unwrap();
+        assert!(
+            (animator.time("a").unwrap() - 1.0).abs() < 1e-6,
+            "зажим в конце"
+        );
+        animator.seek("a", -1.0).unwrap();
+        assert!(animator.time("a").unwrap().abs() < 1e-6, "зажим в начале");
+    }
+
+    #[test]
+    fn seek_wraps_looping_motions_and_rejects_idle_or_invalid_requests() {
+        let mut animator = animator(true);
+        play(&mut animator, "a", 0.0);
+        animator.seek("a", 2.25).unwrap();
+        assert!(
+            (animator.time("a").unwrap() - 0.25).abs() < 1e-6,
+            "цикл переносит время"
+        );
+
+        assert_eq!(
+            animator.seek("b", 0.5),
+            Err(AnimatorError::InvalidMotion {
+                motion: "b".to_owned(),
+                reason: "движение не проигрывается",
+            })
+        );
+        assert_eq!(
+            animator.seek("missing", 0.5),
+            Err(AnimatorError::UnknownMotion("missing".to_owned()))
+        );
+        assert!(matches!(
+            animator.seek("a", f32::NAN),
+            Err(AnimatorError::InvalidValue(_))
+        ));
+        assert!(
+            (animator.time("a").unwrap() - 0.25).abs() < 1e-6,
+            "ошибки не меняют состояние"
+        );
     }
 
     #[test]

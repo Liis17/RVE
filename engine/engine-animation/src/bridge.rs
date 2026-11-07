@@ -185,6 +185,13 @@ impl AnimationBridge {
         self.objects.get(&object).map(|state| &state.animator)
     }
 
+    /// Изменяемый аниматор для управления редактора, например перемотки превью.
+    pub fn animator_mut(&mut self, object: ObjectHandle) -> Option<&mut Animator> {
+        self.objects
+            .get_mut(&object)
+            .map(|state| &mut state.animator)
+    }
+
     pub fn has_animator(&self, object: ObjectHandle) -> bool {
         self.objects.contains_key(&object)
     }
