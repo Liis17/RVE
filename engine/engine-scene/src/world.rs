@@ -7,10 +7,10 @@ use crate::document::{
     CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
     EnvironmentComponent, HeavyScript, LiteScript, LodGroup, PointLightComponent,
     RigidBodyComponent, RigidBodyKind, SceneDocument, SceneError, SceneObject, SpotLightComponent,
-    camera_from_matrix, light_direction_from_matrix,
+    camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
 };
 use crate::light::ShadowSettings;
-use crate::prefab::PrefabTemplate;
+use crate::prefab::{MAX_EXPANDED_ID_BYTES, PrefabTemplate};
 use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::cell::RefCell;
@@ -316,7 +316,8 @@ pub struct SpawnOptions {
     pub scale: Option<Vec3>,
     pub parent: Option<ObjectHandle>,
     pub name: Option<String>,
-    /// Id корня; без него генерируется `<stem>@<serial>`, дети получают `<корень>.<id>`.
+    /// Авторский id корня `[A-Za-z0-9_-]{1,64}`; без него генерируется `<stem>@<serial>`,
+    /// дети получают `<корень>.<id>`.
     pub id: Option<String>,
 }
 
@@ -809,18 +810,22 @@ impl World {
     /// Создаёт объекты шаблона на зарезервированных хендлах, по одному на объект шаблона
     /// в его порядке; возвращает эти хендлы. При отказе резервы освобождаются, мир не меняется.
     ///
-    /// Id проверяется на коллизию с живыми объектами. Резервы без id проверяет вызывающая
-    /// сторона: `World` их не знает.
+    /// Явный id проверяется по формату `[A-Za-z0-9_-]{1,64}` и на коллизию с живыми объектами;
+    /// раскрытые id не длиннее 255 байт. Сгенерированный id занимает первый свободный номер.
+    /// Резервы без id проверяет вызывающая сторона: `World` их не знает.
     pub fn spawn(
         &mut self,
         reserved: Vec<ObjectHandle>,
         template: &PrefabTemplate,
         options: SpawnOptions,
     ) -> Result<Vec<ObjectHandle>, SceneError> {
-        let root_id = options
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("{}@{}", template.stem(), self.spawn_serial));
+        let (root_id, serial) = match &options.id {
+            Some(id) => (id.clone(), None),
+            None => {
+                let serial = self.free_generated_serial(template);
+                (format!("{}@{serial}", template.stem()), Some(serial))
+            }
+        };
         let ids = match self.check_spawn(&reserved, template, &options, &root_id) {
             Ok(ids) => ids,
             Err(error) => {
@@ -830,11 +835,24 @@ impl World {
                 return Err(error);
             }
         };
-        if options.id.is_none() {
-            self.spawn_serial += 1;
+        if let Some(serial) = serial {
+            self.spawn_serial = serial + 1;
         }
         self.insert_spawned(&reserved, template, options, ids);
         Ok(reserved)
+    }
+
+    /// Первый номер `<stem>@<serial>`, при котором ни корень, ни дети не заняты живыми объектами.
+    /// Занятые номера пропускаются, поэтому автоидентификатор не блокируется чужим id.
+    fn free_generated_serial(&self, template: &PrefabTemplate) -> u64 {
+        (self.spawn_serial..)
+            .find(|serial| {
+                let root_id = format!("{}@{serial}", template.stem());
+                spawned_ids(&root_id, template)
+                    .iter()
+                    .all(|id| !self.indices_by_id.contains_key(id))
+            })
+            .expect("номера генерируемых id не исчерпаны")
     }
 
     fn check_spawn(
@@ -845,6 +863,15 @@ impl World {
         root_id: &str,
     ) -> Result<Vec<String>, SceneError> {
         let source = &self.source_label;
+        if let Some(id) = &options.id
+            && !valid_ascii_name(id, true)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(id.as_str()),
+                "id spawn-объекта должен соответствовать [A-Za-z0-9_-]{1,64}",
+            ));
+        }
         if reserved.len() != template.objects.len() {
             return Err(SceneError::new(
                 source,
@@ -906,17 +933,14 @@ impl World {
                 ));
             }
         }
-        let ids = template
-            .objects
-            .iter()
-            .map(|object| {
-                if object.id.is_empty() {
-                    root_id.to_owned()
-                } else {
-                    format!("{root_id}.{}", object.id)
-                }
-            })
-            .collect::<Vec<_>>();
+        let ids = spawned_ids(root_id, template);
+        if let Some(id) = ids.iter().find(|id| id.len() > MAX_EXPANDED_ID_BYTES) {
+            return Err(SceneError::new(
+                source,
+                Some(id.as_str()),
+                format!("раскрытый id длиннее {MAX_EXPANDED_ID_BYTES} байт"),
+            ));
+        }
         {
             let mut seen = HashSet::with_capacity(ids.len());
             for id in &ids {
@@ -1055,6 +1079,21 @@ impl World {
         self.topological_order = order;
         Ok(removed_handles)
     }
+}
+
+/// Id объектов шаблона после spawn в порядке шаблона: корень — `root_id`, дети — `<корень>.<id>`.
+fn spawned_ids(root_id: &str, template: &PrefabTemplate) -> Vec<String> {
+    template
+        .objects
+        .iter()
+        .map(|object| {
+            if object.id.is_empty() {
+                root_id.to_owned()
+            } else {
+                format!("{root_id}.{}", object.id)
+            }
+        })
+        .collect()
 }
 
 /// Убирает элементы с отмеченными индексами, сохраняя порядок остальных.

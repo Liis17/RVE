@@ -884,3 +884,44 @@ fn spawn_template_reports_missing_prefabs_and_dynamic_children() {
     let error = load_template(&library, "prefabs/crate.rveprefab").unwrap_err();
     assert!(error.message.contains("корневым"), "{error}");
 }
+
+#[test]
+fn max_instances_from_nested_prefab_assets_never_reaches_the_scene() {
+    let inner = "[[objects]]\nid = \"core\"\n";
+    let outer = "[[assets]]\npath = \"/prefabs/inner.rveprefab\"\nmax_instances = 5\n[[objects]]\nid = \"base\"\n[[instances]]\nid = \"door\"\nprefab = \"/prefabs/inner.rveprefab\"\nparent = \"base\"\n";
+    let library = Library::new(&[
+        ("prefabs/inner.rveprefab", inner),
+        ("prefabs/outer.rveprefab", outer),
+    ]);
+    let instances = "[[instances]]\nid = \"x\"\nprefab = \"/prefabs/outer.rveprefab\"\n";
+    let max_instances = |expanded: &Expansion, path: &str| {
+        expanded
+            .document
+            .assets
+            .iter()
+            .find(|asset| asset.path.as_str() == path)
+            .and_then(|asset| asset.max_instances)
+    };
+
+    // Лимит внешнего префаба задан сценой, лимит вложенного в префабе не переносится.
+    let declared = "[[assets]]\npath = \"/prefabs/outer.rveprefab\"\nmax_instances = 2\n";
+    let expanded = library
+        .expand(&scene(&format!("{declared}{CAMERA}{instances}")))
+        .unwrap();
+    assert_eq!(max_instances(&expanded, "prefabs/outer.rveprefab"), Some(2));
+    assert_eq!(max_instances(&expanded, "prefabs/inner.rveprefab"), None);
+    assert!(
+        expanded
+            .document
+            .assets
+            .iter()
+            .any(|asset| asset.path.as_str() == "prefabs/inner.rveprefab")
+    );
+
+    // Собственная запись сцены остаётся при слиянии с вложенным префабом.
+    let declared = "[[assets]]\npath = \"/prefabs/outer.rveprefab\"\nmax_instances = 2\n[[assets]]\npath = \"/prefabs/inner.rveprefab\"\nmax_instances = 7\n";
+    let expanded = library
+        .expand(&scene(&format!("{declared}{CAMERA}{instances}")))
+        .unwrap();
+    assert_eq!(max_instances(&expanded, "prefabs/inner.rveprefab"), Some(7));
+}

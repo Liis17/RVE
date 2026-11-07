@@ -782,7 +782,8 @@ fn map_id(instance: &str, root: &str, local: &str) -> String {
 }
 
 /// Объединение `[[assets]]` по пути. Явный архив документа с экземпляром побеждает;
-/// разные явные архивы из разных префабов — ошибка.
+/// разные явные архивы из разных префабов — ошибка. Записи вложенных префабов не несут
+/// `max_instances`: лимит берётся только из записи самого документа.
 struct AssetMerge {
     entries: Vec<SceneAsset>,
     /// Индекс записи и признак, что её архив задан самим документом.
@@ -808,7 +809,11 @@ impl AssetMerge {
                 None => {
                     self.index
                         .insert(asset.path.clone(), (self.entries.len(), false));
-                    self.entries.push(asset.clone());
+                    // Лимит экземпляров задаёт только запись самого документа, не вложенного префаба.
+                    self.entries.push(SceneAsset {
+                        max_instances: None,
+                        ..asset.clone()
+                    });
                 }
                 Some((_, true)) => {}
                 Some((position, false)) => {

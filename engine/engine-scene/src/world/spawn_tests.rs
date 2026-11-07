@@ -1,11 +1,11 @@
 use super::{
-    LightState, LocalTransform, MAX_GENERATION, MAX_LIVE_OBJECTS, ObjectHandle, SpawnOptions,
-    World, document_handle,
+    LightState, LocalLightState, LocalTransform, MAX_GENERATION, MAX_LIVE_OBJECTS, ObjectHandle,
+    SpawnOptions, World, document_handle,
 };
 use crate::document::{SceneDocument, SceneError};
 use crate::prefab::PrefabTemplate;
 use engine_files::VirtualPath;
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 const CAMERA_SCENE: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
 
@@ -402,4 +402,312 @@ fn despawn_keeps_surviving_transforms_and_camera_frame_consistent() {
             .abs_diff_eq(Mat4::from_translation(Vec3::new(4.0, 0.0, 0.0)), 1e-6)
     );
     assert_eq!(world.objects().len(), 2);
+}
+
+/// Шаблон из набора префабов в памяти; ключи — виртуальные пути без ведущего слеша.
+fn template_from(files: &[(&str, &str)], path: &str) -> PrefabTemplate {
+    let path = VirtualPath::parse(path).unwrap();
+    let mut read = |child: &VirtualPath| -> Result<String, String> {
+        files
+            .iter()
+            .find(|(name, _)| *name == child.as_str())
+            .map(|(_, text)| (*text).to_owned())
+            .ok_or_else(|| "не найден".to_owned())
+    };
+    PrefabTemplate::load(&path, &mut read).unwrap()
+}
+
+#[test]
+fn recalculation_after_an_earlier_despawn_keeps_child_matrix_and_rotation_consistent() {
+    let scene = format!(
+        "{CAMERA_SCENE}\n[[objects]]\nid = \"gone\"\n[[objects]]\nid = \"rig\"\n[objects.transform]\nposition = [1.0, 0.0, 0.0]\n[[objects]]\nid = \"kid\"\nparent = \"rig\"\n[objects.transform]\nposition = [0.0, 2.0, 0.0]\nrotation = [0.0, 0.0, 30.0]\n"
+    );
+    let mut world = world(&scene);
+    let gone = world.handle("gone").unwrap();
+    let rig = world.handle("rig").unwrap();
+    let kid = world.handle("kid").unwrap();
+    world.despawn_many(&[gone]).unwrap();
+
+    world
+        .set_local_transform(
+            rig,
+            LocalTransform {
+                position: Vec3::new(5.0, 0.0, 0.0),
+                rotation_deg: Vec3::new(0.0, 90.0, 0.0),
+                scale: Vec3::ONE,
+            },
+        )
+        .unwrap();
+    world.recalculate_world_matrices();
+
+    let rig_matrix = world.world_matrix(rig).unwrap();
+    let kid_matrix = world.world_matrix(kid).unwrap();
+    let kid_local = world.local_transform(kid).unwrap().matrix();
+    assert!(kid_matrix.abs_diff_eq(rig_matrix * kid_local, 1e-5));
+    // Точка (0, 2, 0) у ребёнка при повороте родителя на 90° вокруг Y и сдвиге (5, 0, 0).
+    assert!(
+        kid_matrix
+            .transform_point3(Vec3::ZERO)
+            .abs_diff_eq(Vec3::new(5.0, 2.0, 0.0), 1e-5)
+    );
+    // Кэш вращения совпадает с вращением, выведенным из мировой матрицы (масштаб единичный).
+    let expected = Quat::from_mat4(&kid_matrix);
+    let cached = world.world_rotation(kid).unwrap();
+    assert!(
+        cached.dot(expected).abs() > 1.0 - 1e-5,
+        "{cached:?} vs {expected:?}"
+    );
+}
+
+#[test]
+fn spawn_under_a_parent_after_slot_reuse_keeps_matrices_on_dense_indices() {
+    let scene = format!(
+        "{CAMERA_SCENE}\n[[objects]]\nid = \"rig\"\n[objects.transform]\nposition = [0.0, 0.0, 100.0]\n"
+    );
+    let mut world = world(&scene);
+    let rig = world.handle("rig").unwrap();
+    let lone = template(LONE);
+    let first = spawn(&mut world, &lone, SpawnOptions::default()).unwrap()[0];
+    let kept = spawn(&mut world, &lone, SpawnOptions::default()).unwrap()[0];
+    world.despawn_many(&[first]).unwrap();
+
+    // Освобождённый слот переиспользуется, поэтому плотный индекс корня не совпадает со слотом.
+    let spawned = spawn(
+        &mut world,
+        &template(BULLET),
+        SpawnOptions {
+            parent: Some(rig),
+            ..SpawnOptions::default()
+        },
+    )
+    .unwrap();
+    assert_ne!(world.dense(spawned[0]), Some(spawned[0].index()));
+    assert!(world.is_alive(kept));
+
+    let root = world.world_matrix(spawned[0]).unwrap();
+    assert!(
+        root.transform_point3(Vec3::ZERO)
+            .abs_diff_eq(Vec3::new(1.0, 0.0, 100.0), 1e-5)
+    );
+    // Ребёнок (0, 2, 0) и внук в начале его координат лежат под корнем и родителем.
+    let child = world.world_matrix(spawned[1]).unwrap();
+    assert!(
+        child
+            .transform_point3(Vec3::ZERO)
+            .abs_diff_eq(Vec3::new(1.0, 2.0, 100.0), 1e-5)
+    );
+    let leaf = world.world_matrix(spawned[2]).unwrap();
+    assert!(
+        leaf.transform_point3(Vec3::ZERO)
+            .abs_diff_eq(Vec3::new(1.0, 2.0, 100.0), 1e-5)
+    );
+    assert!(
+        world
+            .world_matrix(rig)
+            .unwrap()
+            .abs_diff_eq(Mat4::from_translation(Vec3::new(0.0, 0.0, 100.0)), 1e-6)
+    );
+    assert!(
+        world
+            .world_matrix(kept)
+            .unwrap()
+            .abs_diff_eq(Mat4::IDENTITY, 1e-6)
+    );
+}
+
+#[test]
+fn surviving_local_light_keeps_its_parameters_after_an_earlier_light_is_despawned() {
+    let scene = format!(
+        "{CAMERA_SCENE}\n[[objects]]\nid = \"gone\"\n[objects.transform]\nposition = [9.0, 0.0, 0.0]\n[objects.point_light]\nintensity = 50.0\n[[objects]]\nid = \"lamp\"\n[objects.transform]\nposition = [2.0, 1.0, 0.0]\n[objects.point_light]\nintensity = 3.0\nrange = 12.0\n"
+    );
+    let mut world = world(&scene);
+    let gone = world.handle("gone").unwrap();
+    let lamp = world.handle("lamp").unwrap();
+    let before = world.build_frame().0.local_lights;
+    assert_eq!(before.len(), 2);
+
+    world.despawn_many(&[gone]).unwrap();
+    // Невалидная позиция выжившей лампы: кадр должен взять её последнее валидное состояние,
+    // а не состояние удалённого объекта, которое раньше стояло по тому же плотному индексу.
+    world
+        .set_local_transform(
+            lamp,
+            LocalTransform {
+                position: Vec3::new(f32::NAN, 1.0, 0.0),
+                ..LocalTransform::default()
+            },
+        )
+        .unwrap();
+    let (frame, warnings) = world.build_frame();
+    let [
+        LocalLightState::Point {
+            position,
+            intensity,
+            range,
+            ..
+        },
+    ] = frame.local_lights.as_slice()
+    else {
+        panic!("ожидалась одна точечная лампа: {:?}", frame.local_lights);
+    };
+    assert_eq!(*position, [2.0, 1.0, 0.0]);
+    assert_eq!(*intensity, 3.0);
+    assert_eq!(*range, 12.0);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].object_id, "lamp");
+}
+
+#[test]
+fn reservations_are_distinct_and_only_held_reservations_can_be_released() {
+    let world = world(CAMERA_SCENE);
+    assert!(!world.release_reservation(document_handle(0)));
+    assert!(!world.release_reservation(ObjectHandle {
+        index: 99,
+        generation: 0,
+    }));
+
+    let first = world.reserve_object();
+    let second = world.reserve_object();
+    assert_ne!(first, second);
+    assert!(world.is_reserved(first) && world.is_reserved(second));
+
+    assert!(world.release_reservation(first));
+    assert!(!world.release_reservation(first));
+    let reused = world.reserve_object();
+    assert_eq!(reused.index(), first.index());
+    assert_ne!(reused, first);
+    assert!(world.is_reserved(reused) && !world.is_reserved(first));
+}
+
+#[test]
+fn invalid_explicit_ids_are_rejected_and_release_their_reservations() {
+    let mut world = world(CAMERA_SCENE);
+    let lone = template(LONE);
+    let too_long = "a".repeat(65);
+    for bad in ["", "a.b", "a@b", "with space", too_long.as_str()] {
+        let reserved = world.reserve_object();
+        let error = world
+            .spawn(
+                vec![reserved],
+                &lone,
+                SpawnOptions {
+                    id: Some(bad.to_owned()),
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.message.contains("[A-Za-z0-9_-]{1,64}"), "{error}");
+        assert!(
+            !world.is_reserved(reserved),
+            "резерв не освобождён для {bad:?}"
+        );
+    }
+    assert_eq!(world.objects().len(), 1);
+
+    let edge = "b".repeat(64);
+    let spawned = spawn(
+        &mut world,
+        &lone,
+        SpawnOptions {
+            id: Some(edge.clone()),
+            ..SpawnOptions::default()
+        },
+    )
+    .expect("64 символа допустимы");
+    assert_eq!(world.object(spawned[0]).unwrap().id, edge);
+}
+
+#[test]
+fn explicit_id_colliding_with_a_live_object_is_rejected_and_leaves_it_untouched() {
+    let mut world = world(CAMERA_SCENE);
+    let lone = template(LONE);
+    let gun = spawn(
+        &mut world,
+        &lone,
+        SpawnOptions {
+            id: Some("gun".to_owned()),
+            ..SpawnOptions::default()
+        },
+    )
+    .unwrap()[0];
+    let error = spawn(
+        &mut world,
+        &lone,
+        SpawnOptions {
+            id: Some("gun".to_owned()),
+            ..SpawnOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.message.contains("уже используется"), "{error}");
+    assert_eq!(world.handle("gun"), Some(gun));
+    assert_eq!(world.objects().len(), 2);
+}
+
+#[test]
+fn expanded_child_ids_longer_than_the_limit_are_rejected() {
+    let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    let l2 = format!("[[objects]]\nid = \"r2\"\n[[objects]]\nid = \"{c}\"\nparent = \"r2\"\n");
+    let l1 = format!(
+        "[[assets]]\npath = \"/prefabs/l2.rveprefab\"\n[[objects]]\nid = \"r1\"\n[[instances]]\nid = \"{b}\"\nprefab = \"/prefabs/l2.rveprefab\"\nparent = \"r1\"\n"
+    );
+    let top = format!(
+        "[[assets]]\npath = \"/prefabs/l1.rveprefab\"\n[[objects]]\nid = \"top\"\n[[instances]]\nid = \"{a}\"\nprefab = \"/prefabs/l1.rveprefab\"\nparent = \"top\"\n"
+    );
+    // Дети шаблона: `a.b.c` (194 байта). Корень `x` даёт `x.a.b.c` (196 байт), корень на 64 символа — 259.
+    let nested = template_from(
+        &[
+            ("prefabs/top.rveprefab", top.as_str()),
+            ("prefabs/l1.rveprefab", l1.as_str()),
+            ("prefabs/l2.rveprefab", l2.as_str()),
+        ],
+        "prefabs/top.rveprefab",
+    );
+    let mut world = world(CAMERA_SCENE);
+    let short = spawn(
+        &mut world,
+        &nested,
+        SpawnOptions {
+            id: Some("x".to_owned()),
+            ..SpawnOptions::default()
+        },
+    )
+    .expect("196 байт укладываются в лимит");
+    assert_eq!(short.len(), 4);
+
+    let reserved = (0..nested.objects.len())
+        .map(|_| world.reserve_object())
+        .collect::<Vec<_>>();
+    let error = world
+        .spawn(
+            reserved.clone(),
+            &nested,
+            SpawnOptions {
+                id: Some("r".repeat(64)),
+                ..SpawnOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(error.message.contains("255"), "{error}");
+    assert!(reserved.iter().all(|&handle| !world.is_reserved(handle)));
+    assert_eq!(world.objects().len(), 5);
+}
+
+#[test]
+fn automatic_ids_skip_serials_that_a_live_object_already_holds() {
+    let mut world = world(CAMERA_SCENE);
+    let lone = template(LONE);
+    let first = spawn(&mut world, &lone, SpawnOptions::default()).unwrap()[0];
+    assert_eq!(world.object(first).unwrap().id, "bullet@0");
+
+    // Счётчик отстаёт от живых объектов: номер 0 занят, автоидентификатор должен его пропустить.
+    world.spawn_serial = 0;
+    let second = spawn(&mut world, &lone, SpawnOptions::default()).unwrap()[0];
+    assert_eq!(world.object(second).unwrap().id, "bullet@1");
+    assert_eq!(world.objects().len(), 3);
+
+    world.spawn_serial = 0;
+    let bullet = spawn(&mut world, &template(BULLET), SpawnOptions::default()).unwrap();
+    assert_eq!(world.object(bullet[0]).unwrap().id, "bullet@2");
+    assert_eq!(world.object(bullet[1]).unwrap().id, "bullet@2.child");
 }
