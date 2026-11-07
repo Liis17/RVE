@@ -527,10 +527,10 @@ pub(crate) fn upload_scene(
         }
         if object.animated
             && let Some((model_path, _)) = object.levels.first()
-            && assets
+            && let Some(skeleton) = assets
                 .models
                 .get(model_path)
-                .is_some_and(|model| model.skeleton.is_some())
+                .and_then(|model| model.skeleton.as_ref())
         {
             // Экземпляр skinning на каждую часть уровня 0: выходные вершины живут отдельно.
             let mut instances = Vec::with_capacity(levels[0].len());
@@ -538,6 +538,9 @@ pub(crate) fn upload_scene(
                 instances.push(renderer.create_skin_instance(*mesh_id)?);
             }
             table.skin_instances.insert(object.object, instances);
+            table
+                .joint_counts
+                .insert(object.object, skeleton.joints.len() as u32);
         }
         table.by_object.insert(object.object, levels);
     }

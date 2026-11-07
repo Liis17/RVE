@@ -108,6 +108,8 @@ pub(crate) struct GpuSceneTable {
     pub animation_clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
     /// Экземпляры skinning по объекту: по одному на часть меша уровня 0.
     pub skin_instances: HashMap<ObjectHandle, Vec<SkinId>>,
+    /// Число костей модели объекта с экземплярами skinning; палитра моста должна иметь ту же длину.
+    pub joint_counts: HashMap<ObjectHandle, u32>,
 }
 
 impl GpuSceneTable {
@@ -803,7 +805,7 @@ fn scripts_thread(
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
         }
     };
-    let Some(gpu_scene) = gpu_scene else {
+    let Some(mut gpu_scene) = gpu_scene else {
         scripts.destroy(&mut world, ScriptTime::default());
         print_script_events(scripts.drain_events());
         return;
@@ -830,6 +832,7 @@ fn scripts_thread(
         audio.apply(scripts.drain_audio_requests(), &world);
     }
     let mut animation = build_animation(&world, &gpu_scene);
+    drop_mismatched_skins(&world, &mut gpu_scene, &animation);
     animation.apply(scripts.drain_animation_requests());
     #[cfg(feature = "dev-console")]
     let mut published_catalog_generation = u64::MAX;
@@ -1267,6 +1270,37 @@ fn build_animation(world: &World, gpu_scene: &GpuSceneTable) -> AnimationBridge 
     );
     log_animation_warnings(&mut animation);
     animation
+}
+
+/// Убирает skinning у объектов, чья палитра моста не совпала с числом костей меша: такой объект
+/// рисуется статично и не валит кадр. Экземпляры остаются у renderer до его завершения.
+fn drop_mismatched_skins(
+    world: &World,
+    gpu_scene: &mut GpuSceneTable,
+    animation: &AnimationBridge,
+) -> Vec<ObjectHandle> {
+    let mut mismatched: Vec<ObjectHandle> = gpu_scene
+        .joint_counts
+        .iter()
+        .filter(|(object, joints)| {
+            animation
+                .palette(**object)
+                .is_some_and(|palette| palette.len() != **joints as usize)
+        })
+        .map(|(object, _)| *object)
+        .collect();
+    mismatched.sort_by_key(|object| object.index());
+    for object in &mismatched {
+        gpu_scene.skin_instances.remove(object);
+        let id = world.object(*object).map_or_else(
+            || format!("объект #{}", object.index()),
+            |item| item.id.clone(),
+        );
+        log::warn!(
+            "[animation] {id}: число костей палитры не совпадает с мешем; объект рисуется без скиннинга"
+        );
+    }
+    mismatched
 }
 
 fn log_animation_warnings(animation: &mut AnimationBridge) {
@@ -1887,10 +1921,10 @@ mod tests {
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
         GpuSceneTable, MotionHistory, PhysicsWait, RenderBackend, RenderControl,
         RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
-        ScriptThreadConfig, apply_physics_step, log_script_events_with, make_snapshot,
-        procedural_environment_key, receive_physics_interruptibly, render_local_lights,
-        render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
-        sync_input_background, wait_background_tick,
+        ScriptThreadConfig, apply_physics_step, drop_mismatched_skins, log_script_events_with,
+        make_snapshot, procedural_environment_key, receive_physics_interruptibly,
+        render_local_lights, render_loop, render_snapshot, render_thread, selected_level,
+        send_snapshot, sync_input_background, wait_background_tick,
     };
     use super::{publish_script_cursor, set_initial_cursor};
     use crate::cursor::{CursorControl, RecordingCursorSink};
@@ -4123,5 +4157,63 @@ return Move
         );
         publish_script_cursor(&scripts, &control, &mut published);
         assert_eq!(sink.0.lock().unwrap().len(), states.len());
+    }
+
+    #[test]
+    fn skinned_object_whose_palette_has_another_joint_count_is_dropped_from_skinning() {
+        // Регрессия: палитра другой длины не должна доходить до renderer и валить кадр.
+        let text = "[[assets]]\npath = \"/models/hero.fbx\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n[objects.animator]\n";
+        let world = World::from_document(
+            &engine_scene::SceneDocument::parse("scene.rvescene", text).unwrap(),
+        )
+        .unwrap();
+        let hero = world.handle("hero").unwrap();
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let model = std::sync::Arc::new(engine_assets::Model {
+            meshes: Vec::new(),
+            textures: Vec::new(),
+            skeleton: Some(engine_assets::ModelSkeleton {
+                nodes: vec![engine_assets::ModelNode {
+                    name: "bone".to_owned(),
+                    parent: None,
+                    inherit_mode: engine_assets::ModelInheritMode::Normal,
+                    inherit_scale_node: None,
+                    rest: engine_assets::ModelTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                        scale: [1.0; 3],
+                    },
+                }],
+                joints: vec![engine_assets::ModelJoint {
+                    node: 0,
+                    inverse_bind: identity,
+                }],
+            }),
+            animations: Vec::new(),
+        });
+        // Палитра моста одна (одна кость), а меш объявлен с двумя костями.
+        let animation = AnimationBridge::build(
+            &world,
+            |_| Ok(model.clone()),
+            |_| Ok(std::sync::Arc::new(Vec::new())),
+        );
+        let mut scene = GpuSceneTable::default();
+        scene.skin_instances.insert(hero, Vec::new());
+        scene.joint_counts.insert(hero, 2);
+        assert_eq!(
+            drop_mismatched_skins(&world, &mut scene, &animation),
+            vec![hero]
+        );
+        assert!(!scene.skin_instances.contains_key(&hero));
+
+        scene.skin_instances.insert(hero, Vec::new());
+        scene.joint_counts.insert(hero, 1);
+        assert!(drop_mismatched_skins(&world, &mut scene, &animation).is_empty());
+        assert!(scene.skin_instances.contains_key(&hero));
     }
 }
