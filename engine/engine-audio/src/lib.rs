@@ -410,8 +410,10 @@ impl AudioEngine {
             core.poll_reads();
         }
 
-        drop(core);
+        // Сначала останавливаем устройство: голоса микшера держат `Arc<Clip>`, и их последняя
+        // ссылка не должна освободиться в callback. Кеш `core` живёт дольше потока вывода.
         drop(output);
+        drop(core);
         drop(keepalive_decoded);
         if let Ok(decoder) = decoder {
             let _ = decoder.join();
