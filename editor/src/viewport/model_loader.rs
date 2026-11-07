@@ -187,6 +187,8 @@ mod tests {
         Model {
             meshes: Vec::new(),
             textures: Vec::new(),
+            skeleton: None,
+            animations: Vec::new(),
         }
     }
 

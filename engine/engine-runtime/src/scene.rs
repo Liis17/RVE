@@ -1013,6 +1013,8 @@ id = "camera"
                 Ok(Model {
                     meshes: Vec::new(),
                     textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
                 })
             },
         )
@@ -1047,6 +1049,8 @@ id = "camera"
                 Ok(Model {
                     meshes: Vec::new(),
                     textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
                 })
             },
         )

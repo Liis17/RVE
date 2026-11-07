@@ -515,8 +515,11 @@ mod tests {
                 vertices,
                 indices: Vec::new(),
                 material: ModelMaterial::default(),
+                skin: None,
             }],
             textures: Vec::new(),
+            skeleton: None,
+            animations: Vec::new(),
         })
     }
 
