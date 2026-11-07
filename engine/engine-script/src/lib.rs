@@ -17,7 +17,7 @@ mod types;
 pub use engine_scene::{ParamKind, ParamSchema, ParamSpec, ParamValue};
 pub use host::{
     CommandError, ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions,
-    lite_properties,
+    ScriptUpdateProfile, lite_properties,
 };
 pub use library::{ScriptLibrary, ScriptLibraryError};
 pub use lifecycle::{

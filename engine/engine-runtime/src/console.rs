@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct CommandCatalogSnapshot {
     pub generation: u64,
     pub catalog: CommandCatalog,
+    /// Скрипт зарегистрировал команду `profile`; встроенная команда при этом не добавляется.
+    pub profile_shadowed: bool,
 }
 
 #[derive(Default)]

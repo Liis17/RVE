@@ -17,10 +17,11 @@ pub enum Tab {
     SceneAssets,
     /// Подокно списка тяжёлых префабов `prefabs.rveprefabs` проекта.
     ProjectPrefabs,
+    Profiler,
 }
 
 impl Tab {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
@@ -29,6 +30,7 @@ impl Tab {
         Self::Console,
         Self::SceneAssets,
         Self::ProjectPrefabs,
+        Self::Profiler,
     ];
 
     pub fn title(self) -> &'static str {
@@ -41,6 +43,7 @@ impl Tab {
             Self::Console => "Console",
             Self::SceneAssets => "Scene Assets",
             Self::ProjectPrefabs => "Project Prefabs",
+            Self::Profiler => "Profiler",
         }
     }
 }
@@ -85,6 +88,7 @@ impl TabViewer for EditorTabs<'_> {
             Tab::Console => ui::console::show(ui, self.state),
             Tab::SceneAssets => ui::scene_assets::show(ui, self.state),
             Tab::ProjectPrefabs => ui::project_prefabs::show(ui, self.state),
+            Tab::Profiler => ui::profiler::show(ui, self.state),
         }
     }
 
@@ -105,7 +109,8 @@ mod tests {
     #[test]
     fn default_layout_contains_every_panel_once() {
         let dock = default_layout();
-        for tab in Tab::ALL {
+        // Profiler открывается из меню вкладок и по умолчанию закрыт.
+        for tab in Tab::ALL.into_iter().filter(|tab| *tab != Tab::Profiler) {
             let count = dock
                 .iter_all_tabs()
                 .filter(|(_, open)| **open == tab)
@@ -115,6 +120,7 @@ mod tests {
             let expected = usize::from(!optional);
             assert_eq!(count, expected, "{tab:?}");
         }
+        assert!(!is_open(&dock, Tab::Profiler));
     }
 
     #[test]

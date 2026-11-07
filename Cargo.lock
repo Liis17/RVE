@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "engine-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "engine-files"
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -838,8 +838,9 @@ dependencies = [
 
 [[package]]
 name = "engine-resources"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "engine-core",
  "engine-files",
  "engine-pak",
  "flume",
@@ -847,13 +848,14 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "egui",
  "egui-winit",
  "engine-assets",
  "engine-audio",
  "engine-console",
+ "engine-core",
  "engine-files",
  "engine-network",
  "engine-neural",
@@ -886,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -901,10 +903,11 @@ dependencies = [
 
 [[package]]
 name = "engine-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "engine-console",
+ "engine-core",
  "engine-render",
 ]
 
@@ -2726,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -2734,6 +2737,7 @@ dependencies = [
  "engine-assets",
  "engine-audio",
  "engine-console",
+ "engine-core",
  "engine-files",
  "engine-physics",
  "engine-platform",

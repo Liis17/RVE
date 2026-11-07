@@ -626,8 +626,14 @@ impl WindowHandler for Sandbox {
             })
             .collect::<Vec<_>>();
         let gpu_time = renderer.take_gpu_frame_time();
+        let frame_profile = renderer.take_frame_profile();
         let overlay = match self.debug_overlay.as_mut() {
-            Some(overlay) => overlay.update(Instant::now(), gpu_time),
+            Some(overlay) => {
+                if let Some(profile) = &frame_profile {
+                    overlay.record_frame_profile(profile);
+                }
+                overlay.update(Instant::now(), gpu_time)
+            }
             None => &[],
         };
         let shadow_cascades = self.content.shadow_cascades(

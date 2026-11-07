@@ -1249,6 +1249,12 @@ impl EditorApp {
             meshes.iter().map(ConvertedMesh::primitive).collect();
 
         let play_error = self.state.play.as_mut().and_then(|play| play.tick().err());
+        if play_error.is_none()
+            && let Some(play) = self.state.play.as_ref()
+            && !play.is_paused()
+        {
+            self.state.profile.record_play(play.last_step());
+        }
         if let Some(error) = play_error {
             self.state.log.error(error);
             if let Some(session) = self.state.play.take() {
@@ -1582,6 +1588,16 @@ fn render_scene_frame(
         .render_frame_with_ui(&scenes, &primitives, WINDOW_CLEAR);
     if result.is_ok() {
         gpu.scene.commit_motion_history();
+    }
+    if let Some(profile) = gpu.renderer.take_frame_profile() {
+        state
+            .profile
+            .record_frame(&profile, gpu.scene.viewport, gpu.scene.game_viewport);
+    }
+    if let Some(project) = state.project.as_ref() {
+        state
+            .profile
+            .record_resources(std::time::Instant::now(), project.resource_stats());
     }
     result
 }
