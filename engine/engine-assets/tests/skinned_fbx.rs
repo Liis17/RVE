@@ -174,6 +174,15 @@ fn clip_only_file_loads_named_clip_without_meshes() {
 }
 
 #[test]
+fn clip_only_file_has_no_model_dependencies_so_builds_can_declare_it() {
+    // Сборка вызывает model_dependencies для каждого объявленного FBX, в том числе клип-only.
+    assert_eq!(
+        fixtures().model_dependencies("/bend_clip.fbx").unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn clip_loading_rejects_files_without_animation_stacks() {
     let error = fixtures()
         .load_animations("/skin_chain_bare.fbx")

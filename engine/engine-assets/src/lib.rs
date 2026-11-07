@@ -340,6 +340,10 @@ impl Assets {
         let virtual_path = virtual_asset_path(asset_path);
         let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
         if !scene_has_triangles(&scene) {
+            // Файл только с клипами (например, из Mixamo) не является моделью и зависимостей не имеет.
+            if !scene.anim_stacks.is_empty() {
+                return Ok(Vec::new());
+            }
             return Err(AssetError::Decode {
                 path,
                 message: "в модели нет треугольников".to_owned(),
