@@ -15,7 +15,7 @@ use crate::types::{
 use engine_console::{CommandCatalog, CommandLine, CommandSpec};
 use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
 use engine_project::InputSettings;
-use engine_scene::{LocalTransform, ObjectHandle, ParamSchema, World};
+use engine_scene::{AudioRequest, LocalTransform, ObjectHandle, ParamSchema, World};
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -153,6 +153,7 @@ pub struct ScriptHost {
     transaction: ScriptTransaction,
     queued_messages: Vec<PendingMessage>,
     queued_bytes: usize,
+    audio_requests: Vec<AudioRequest>,
     delivery_messages: Vec<PendingMessage>,
     lua_time: Table,
     call_deadline: lite::CallDeadline,
@@ -306,6 +307,7 @@ impl ScriptHost {
             transaction: ScriptTransaction::default(),
             queued_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             queued_bytes: 0,
+            audio_requests: Vec::new(),
             delivery_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             lua_time: lua_state.time,
             call_deadline: lua_state.call_deadline,
@@ -530,6 +532,11 @@ impl ScriptHost {
         self.events.borrow_mut().drain()
     }
 
+    /// Takes audio requests committed by scripts since the previous drain, in commit order.
+    pub fn drain_audio_requests(&mut self) -> Vec<AudioRequest> {
+        std::mem::take(&mut self.audio_requests)
+    }
+
     pub fn command_catalog(&self) -> CommandCatalog {
         let mut catalog = CommandCatalog::default();
         for command in self.commands.borrow().values() {
@@ -692,6 +699,7 @@ impl ScriptHost {
             &mut self.queued_messages,
             &mut self.queued_bytes,
             &self.events,
+            &mut self.audio_requests,
         ) {
             Ok(mutations) => mutations,
             Err(message) => {
@@ -931,6 +939,7 @@ impl ScriptHost {
             actions,
             queued_messages,
             queued_bytes,
+            audio_requests,
             lua,
             interrupt,
             commands,
@@ -1109,7 +1118,9 @@ impl ScriptHost {
         }
 
         // SAFETY: the callback and all call-scoped transaction borrows have returned.
-        match unsafe { (*transaction_ptr).commit(world, queued_messages, queued_bytes, events) } {
+        match unsafe {
+            (*transaction_ptr).commit(world, queued_messages, queued_bytes, events, audio_requests)
+        } {
             Ok(mutations) => {
                 actions.queue_mutations(mutations);
                 CallOutcome::Committed
@@ -1266,5 +1277,7 @@ fn event_source(scene_name: &str, object_id: &str, script_name: &str) -> String 
     format!("{scene_name}/{object_id}/{script_name}")
 }
 
+#[cfg(test)]
+mod audio_tests;
 #[cfg(test)]
 mod tests;

@@ -887,6 +887,7 @@ name = "engine-script"
 version = "0.1.0"
 dependencies = [
  "engine-console",
+ "engine-files",
  "engine-physics",
  "engine-project",
  "engine-scene",

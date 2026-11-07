@@ -7,11 +7,12 @@ use crate::types::{
     ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
 };
 use engine_console::CommandSpec;
+use engine_files::VirtualPath;
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
-    AntiAliasing, CameraSettings, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue,
-    Tonemapper,
+    AntiAliasing, AudioGroup, AudioRequest, CameraSettings, ClipParams, ObjectHandle, ParamKind,
+    ParamSchema, ParamSpec, ParamValue, Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use mlua::chunk::ChunkMode;
@@ -386,6 +387,7 @@ pub(crate) fn create_lua(
     )?;
     rve.set("send", send_function(&lua, active_call.clone())?)?;
     rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
+    rve.set("audio", audio_table(&lua, active_call.clone())?)?;
     rve.set("input", input_table(&lua, active_call)?)?;
     globals.set("rve", rve)?;
     Ok(LuaState {
@@ -1075,8 +1077,185 @@ fn object_table(
             matrix.map(|matrix| matrix_table(lua, matrix)).transpose()
         })?,
     )?;
+    add_audio_object_api(lua, &object, handle, active_call.clone())?;
     add_physics_object_api(lua, &object, handle, active_call)?;
     Ok(object)
+}
+
+fn add_audio_object_api(
+    lua: &Lua,
+    object: &Table,
+    handle: ObjectHandle,
+    active_call: ActiveCall,
+) -> mlua::Result<()> {
+    let play_active = active_call.clone();
+    object.set(
+        "play_sound",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&play_active, |transaction| {
+                require_audio_source(transaction, handle, "object.play_sound")?;
+                let voice = VoiceId::allocate();
+                transaction
+                    .stage_audio(AudioRequest::PlaySource {
+                        object: handle,
+                        voice,
+                    })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let stop_active = active_call.clone();
+    object.set(
+        "stop_sound",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&stop_active, |transaction| {
+                require_audio_source(transaction, handle, "object.stop_sound")?;
+                transaction
+                    .stage_audio(AudioRequest::StopSource { object: handle })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    object.set(
+        "set_sound_volume",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let value = method_argument(arguments, "object.set_sound_volume")?;
+            let volume = audio_volume(&value, "object.set_sound_volume")?;
+            with_active_call(&active_call, |transaction| {
+                require_audio_source(transaction, handle, "object.set_sound_volume")?;
+                transaction
+                    .stage_audio(AudioRequest::SetSourceVolume {
+                        object: handle,
+                        volume,
+                    })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    Ok(())
+}
+
+fn require_audio_source(
+    transaction: &ScriptTransaction,
+    handle: ObjectHandle,
+    name: &str,
+) -> mlua::Result<()> {
+    if transaction.has_audio_source(handle) {
+        Ok(())
+    } else {
+        Err(LuaError::runtime(format!(
+            "{name} requires an audio_source component"
+        )))
+    }
+}
+
+/// Громкость из Lua: конечное число не меньше нуля.
+fn audio_volume(value: &Value, name: &str) -> mlua::Result<f32> {
+    let volume = match value {
+        Value::Integer(value) => *value as f64,
+        Value::Number(value) => *value,
+        _ => {
+            return Err(LuaError::runtime(format!(
+                "{name} expects a numeric volume"
+            )));
+        }
+    };
+    let converted = volume as f32;
+    if !volume.is_finite() || !converted.is_finite() || volume < 0.0 {
+        return Err(LuaError::runtime(format!(
+            "{name} volume must be a finite number >= 0"
+        )));
+    }
+    Ok(converted)
+}
+
+fn audio_group(name: &str, allow_master: bool) -> mlua::Result<AudioGroup> {
+    match name {
+        "master" if allow_master => Ok(AudioGroup::Master),
+        "music" => Ok(AudioGroup::Music),
+        "effects" => Ok(AudioGroup::Effects),
+        "ambient" => Ok(AudioGroup::Ambient),
+        other => Err(LuaError::runtime(format!(
+            "unknown audio group {other:?}: expected {}",
+            if allow_master {
+                "master, music, effects or ambient"
+            } else {
+                "music, effects or ambient"
+            }
+        ))),
+    }
+}
+
+/// `rve.audio`: клипы без объекта, остановка по id и громкость групп.
+fn audio_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let audio = lua.create_table()?;
+
+    let play_active = active_call.clone();
+    audio.set(
+        "play",
+        lua.create_function(move |_, (path, options): (String, Option<Table>)| {
+            let path = VirtualPath::parse(&path)
+                .map_err(|error| LuaError::runtime(format!("rve.audio.play: {error}")))?;
+            let mut params = ClipParams::default();
+            if let Some(options) = options {
+                if let Some(group) = options.get::<Option<String>>("group")? {
+                    params.group = audio_group(&group, false)?;
+                }
+                if let Some(volume) = options.get::<Option<Value>>("volume")? {
+                    params.volume = audio_volume(&volume, "rve.audio.play")?;
+                }
+                if let Some(looping) = options.get::<Option<bool>>("looping")? {
+                    params.looping = looping;
+                }
+                if let Some(position) = options.get::<Option<Table>>("position")? {
+                    params.position = Some(read_vector(&position, "rve.audio.play position")?);
+                }
+            }
+            with_active_call(&play_active, |transaction| {
+                let voice = VoiceId::allocate();
+                transaction
+                    .stage_audio(AudioRequest::PlayClip {
+                        voice,
+                        path: path.clone(),
+                        params,
+                    })
+                    .map_err(LuaError::runtime)?;
+                Ok(voice.get() as i64)
+            })
+        })?,
+    )?;
+
+    let stop_active = active_call.clone();
+    audio.set(
+        "stop",
+        lua.create_function(move |_, id: i64| {
+            let voice = u64::try_from(id)
+                .ok()
+                .and_then(VoiceId::from_raw)
+                .ok_or_else(|| LuaError::runtime("rve.audio.stop expects a voice id"))?;
+            with_active_call(&stop_active, |transaction| {
+                transaction
+                    .stage_audio(AudioRequest::StopVoice { voice })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    audio.set(
+        "set_group_volume",
+        lua.create_function(move |_, (group, volume): (String, Value)| {
+            let group = audio_group(&group, true)?;
+            let volume = audio_volume(&volume, "rve.audio.set_group_volume")?;
+            with_active_call(&active_call, |transaction| {
+                transaction
+                    .stage_audio(AudioRequest::SetGroupVolume { group, volume })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    Ok(audio)
 }
 
 fn add_physics_object_api(

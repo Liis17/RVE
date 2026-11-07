@@ -6,7 +6,7 @@ use engine_physics::{
     BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
     QueryHit, Ray,
 };
-use engine_scene::{CameraSettings, LocalTransform, ObjectHandle, ParamValue, World};
+use engine_scene::{AudioRequest, CameraSettings, LocalTransform, ObjectHandle, ParamValue, World};
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -128,6 +128,7 @@ pub(crate) struct ScriptTransaction {
     pending_collider_enabled: HashMap<BodyHandle, bool>,
     pending_pushes: HashMap<BodyHandle, PendingPush>,
     pending_action_mutations: Vec<ActionMutation>,
+    pending_audio: Vec<AudioRequest>,
     #[cfg(test)]
     peak_pending_bytes: usize,
 }
@@ -163,6 +164,7 @@ impl Default for ScriptTransaction {
             pending_collider_enabled: HashMap::new(),
             pending_pushes: HashMap::new(),
             pending_action_mutations: Vec::with_capacity(2),
+            pending_audio: Vec::new(),
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
@@ -200,6 +202,7 @@ impl ScriptTransaction {
         self.queued_message_bytes = init.queued_messages.1;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
+        self.pending_audio.clear();
     }
 
     pub(crate) fn writable(&self) -> bool {
@@ -238,6 +241,20 @@ impl ScriptTransaction {
         self.action_frame().validate_mutation(&mutation)?;
         self.pending_action_mutations.push(mutation);
         Ok(())
+    }
+
+    /// Ставит звуковой запрос до коммита. При отказе скрипта транзакция его отбрасывает.
+    pub(crate) fn stage_audio(&mut self, request: AudioRequest) -> Result<(), String> {
+        if !self.writable {
+            return Err("audio is unavailable during script creation".to_owned());
+        }
+        self.pending_audio.push(request);
+        Ok(())
+    }
+
+    pub(crate) fn has_audio_source(&self, handle: ObjectHandle) -> bool {
+        self.world()
+            .is_some_and(|world| world.audio_source(handle).is_some())
     }
 
     pub(crate) fn physics_raycast(
@@ -705,6 +722,7 @@ impl ScriptTransaction {
         queued_messages: &mut Vec<PendingMessage>,
         queued_bytes: &mut usize,
         events: &EventQueue,
+        audio: &mut Vec<AudioRequest>,
     ) -> Result<Vec<ActionMutation>, String> {
         let transforms_are_finite = self.pending_transforms.values().all(|transform| {
             transform
@@ -842,6 +860,7 @@ impl ScriptTransaction {
         }
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
+        audio.append(&mut self.pending_audio);
         self.world = std::ptr::null();
         self.action_frame = None;
         Ok(std::mem::take(&mut self.pending_action_mutations))
@@ -862,6 +881,7 @@ impl ScriptTransaction {
         self.queued_message_bytes = 0;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
+        self.pending_audio.clear();
         self.world = std::ptr::null();
         self.action_frame = None;
     }
