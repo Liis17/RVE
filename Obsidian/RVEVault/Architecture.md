@@ -20,6 +20,9 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 | zstd 0.14.2 | Независимые Zstandard frames в RVEPAK | `engine/engine-pak/src` |
 | lz4_flex 0.14.0 | Независимые LZ4 blocks в RVEPAK | `engine/engine-pak/src` |
 | flume 0.11.1 | Bounded очереди ресурсов и снимков кадров, каналы управления потоками runtime | `engine/engine-resources/Cargo.toml`, `engine/engine-runtime/Cargo.toml` |
+| cpal 0.18.2 | Вывод звука на устройство Windows/macOS | `engine/engine-audio/src/output.rs` |
+| lewton 0.10.2 | Декодирование Ogg Vorbis клипов | `engine/engine-audio/src/decode.rs` |
+| rtrb 0.4.0 | SPSC-кольца между потоком `rve-audio` и callback вывода | `engine/engine-audio/src/lib.rs`, `engine/engine-audio/src/mixer.rs` |
 | sysinfo 0.39.6 (только фича `system`) | Проверка RAM и логических CPU в runtime, метрики `--debug-overlay` | `engine/engine-runtime/Cargo.toml`, `engine/sandbox/src/debug_overlay.rs` |
 | font8x8 0.3.1 | Bitmap-шрифт 8×8 оверлея | `engine/sandbox/src/debug_overlay.rs` |
 | egui 0.36.2, egui-winit 0.36.2, egui_dock 0.21.1 | Интерфейс редактора и developer console, ввод из winit, встраиваемые панели | `engine/engine-ui/Cargo.toml`, `engine/engine-runtime/Cargo.toml`, `editor/src` |
