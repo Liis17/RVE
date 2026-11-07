@@ -31,15 +31,15 @@ Parent: [[Index]]
 | `Pose::rest`, `Pose::skin_matrices(&Skeleton, out)` | Мировые матрицы узлов в порядке родитель-первым, затем `node_world × inverse_bind` для каждого joint. Режимы `IgnoreParentScale` и `ComponentwiseScale` учитываются при композиции |
 | `blend(inputs, out)`, `line_weights(thresholds, value)` | Нормализованные веса; знаки кватернионов выравниваются к первой позе. Значение вне порогов зажимается к крайней точке, между соседями вес линейный |
 | `Animator::new(clips, motions, default_looping)` | Проверяет непустые уникальные имена, индексы клипов, от 1 до 16 точек в tree и строго возрастающие конечные пороги |
-| `Animator::play(motion, PlayOptions { fade, looping, then })` | Цель 1 у выбранного движения и 0 у остальных за `fade` секунд; `fade = 0` применяется сразу. `looping: None` берёт значение компонента. Ошибка имени не меняет состояние |
-| `Animator::set_weight(motion, weight, fade)` | Ручной вес одного движения, зажатый в `[0, 1]`; остальные движения не меняются |
+| `Animator::play(motion, PlayOptions { fade, looping, then })` | Цель 1 у выбранного движения и 0 у остальных за `fade` секунд; `fade = 0` применяется сразу. Движение, уже проигрывающееся, возвращает цель 1 даже после ручного веса. `looping: None` берёт значение компонента. Ошибка имени не меняет состояние |
+| `Animator::set_weight(motion, weight, fade)` | Ручной вес одного движения, зажатый в `[0, 1]`. С `fade = 0` снапает только это движение: переходы остальных продолжают идти |
 | `Animator::set_parameter(name, value)`, `set_speed(speed)` | Параметры blend tree; скорость конечна и не отрицательна |
 | `Animator::seek(motion, time)` | Переводит проигрывающееся движение на `time`: цикл переносит время, нецикличное зажимается. Отмотка назад снова включает событие окончания |
 | `Animator::stop(fade)` | Веса уходят к нулю за `fade`; при `fade = 0` проигрывания удаляются сразу |
 | `Animator::advance(dt) -> Vec<MotionEvent>` | Продвигает время и веса; возвращает `MotionEvent::Finished { motion }` для каждого окончания |
 | `Animator::sample(&Skeleton, &mut Pose)` | Смесь активных движений; недостающий вес добирается позой покоя |
 | `AnimationBridge::build(world, load_model, load_clips)` | Создаёт аниматор для каждого объекта с `animator` и `mesh_renderer`, если модель имеет скелет. Ошибки клипов и моделей становятся предупреждениями, объект остаётся статическим |
-| `AnimationBridge::apply(requests)` | Применяет `AnimationRequest` (`Play`, `SetWeight`, `SetParameter`, `SetSpeed`, `Stop`). Запросы к объектам без аниматора игнорируются; ошибки уходят в предупреждения |
+| `AnimationBridge::apply(requests)` | Применяет `AnimationRequest` (`Play`, `SetWeight`, `SetParameter`, `SetSpeed`, `Stop`). Запросы к объектам без компонента `animator` игнорируются. Объект с компонентом, чей аниматор не собрался, даёт предупреждение `аниматор не собран` один раз; ошибки запросов тоже уходят в предупреждения |
 | `AnimationBridge::advance(dt) -> Vec<AnimationEvent>` | Продвигает все аниматоры, пересчитывает палитры и возвращает события в порядке объектов сцены |
 | `AnimationBridge::palette(object)`, `animator(object)`, `animator_mut(object)`, `has_animator(object)` | Палитра `[[f32;4];4]` по joints; доступ к аниматору для редактора (перемотка превью) |
 | `AnimationBridge::take_warnings()` | Забирает предупреждения. Одинаковое сообщение попадает в список один раз до следующего забора, общий лимит 32 |
