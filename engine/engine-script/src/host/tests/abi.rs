@@ -7,7 +7,7 @@ use crate::transaction::{
 };
 use crate::types::ScriptEventLevel;
 use engine_project::{InputAction, InputSettings};
-use engine_scene::World;
+use engine_scene::{AudioRequest, World};
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost,
     RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4,
@@ -190,6 +190,47 @@ impl Script for PhysicsProbe {
                 .is_none()
         );
         ctx.log_info("ABI physics API committed");
+    }
+}
+
+struct AudioProbe;
+
+struct AudioRejected;
+
+fn audio_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(AudioProbe))
+}
+
+fn audio_rejected_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(AudioRejected))
+}
+
+impl Script for AudioProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let actor = ctx.find("actor").expect("actor exists");
+        actor.play_sound(ctx).unwrap();
+        actor.set_sound_volume(ctx, 0.5).unwrap();
+        let options = rve_sdk::ClipOptions {
+            position: Some([1.0, 0.0, 0.0]),
+            ..rve_sdk::ClipOptions::default()
+        };
+        let voice = ctx.play_clip("/audio/hum.wav", options).unwrap();
+        ctx.stop_voice(voice).unwrap();
+        ctx.set_group_volume(rve_sdk::AudioGroup::Music, 0.5)
+            .unwrap();
+        ctx.log_info("ABI audio API staged");
+    }
+}
+
+impl Script for AudioRejected {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let actor = ctx.find("actor").expect("actor exists");
+        actor.play_sound(ctx).unwrap();
+        // The guest ignores the status; the host must still report the reason.
+        assert_eq!(
+            ctx.play_clip("../escape.wav", rve_sdk::ClipOptions::default()),
+            Err(rve_sdk::AudioError::Rejected)
+        );
     }
 }
 
@@ -520,6 +561,8 @@ fn sdk_module() -> &'static RveModule {
         "Limits" => limit_message_factory,
         "InputProbe" => input_probe_factory,
         "PhysicsProbe" => physics_probe_factory,
+        "AudioProbe" => audio_probe_factory,
+        "AudioRejected" => audio_rejected_factory,
         "InputActionsProbe" => input_actions_probe_factory,
         "CameraControl" => camera_control_factory,
         "AbiConsoleCommand" => abi_console_command_factory,
@@ -874,6 +917,121 @@ id = "crate"
         message_list(&mut host)
             .iter()
             .any(|message| message == "ABI physics API committed")
+    );
+}
+
+#[test]
+fn abi_v7_audio_callbacks_stage_requests_in_guest_order() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/audio/hum.wav"
+[[objects]]
+id = "actor"
+[objects.audio_source]
+clip = "/audio/hum.wav"
+[[objects.heavy_scripts]]
+name = "AudioProbe"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let requests = host.drain_audio_requests();
+    assert_eq!(requests.len(), 5, "{requests:?}");
+    assert!(matches!(requests[0], AudioRequest::PlaySource { .. }));
+    assert!(matches!(
+        requests[1],
+        AudioRequest::SetSourceVolume { volume, .. } if volume == 0.5
+    ));
+    let played = match &requests[2] {
+        AudioRequest::PlayClip {
+            voice,
+            path,
+            params,
+        } => {
+            assert_eq!(path.as_str(), "audio/hum.wav");
+            assert_eq!(params.position, Some([1.0, 0.0, 0.0]));
+            *voice
+        }
+        other => panic!("ожидался PlayClip: {other:?}"),
+    };
+    assert!(matches!(
+        requests[3],
+        AudioRequest::StopVoice { voice } if voice == played
+    ));
+    assert!(matches!(
+        requests[4],
+        AudioRequest::SetGroupVolume {
+            group: engine_scene::AudioGroup::Music,
+            volume
+        } if volume == 0.5
+    ));
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "ABI audio API staged")
+    );
+}
+
+#[test]
+fn abi_v7_rejected_audio_reason_is_reported_even_when_the_guest_ignores_the_status() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/audio/hum.wav"
+[[objects]]
+id = "actor"
+[objects.audio_source]
+clip = "/audio/hum.wav"
+[[objects.heavy_scripts]]
+name = "AudioRejected"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.starts_with("play_clip:")),
+        "{events:?}"
+    );
+    // The call itself succeeded, so its earlier play_sound is still committed.
+    assert_eq!(host.drain_audio_requests().len(), 1);
+}
+
+#[test]
+fn abi_v6_module_loads_on_the_v7_host() {
+    let _lock = test_lock();
+    let current = sdk_module();
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 6,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: current.scripts,
+        script_count: current.script_count,
+    }));
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v6" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v6")
     );
 }
 
