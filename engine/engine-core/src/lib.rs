@@ -1,6 +1,11 @@
 //! Базовые типы и функции игрового цикла движка.
 
+pub mod profile;
+
 use std::time::{Duration, Instant};
+
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Измеряет время между кадрами и с момента запуска.
 pub struct Time {

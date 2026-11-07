@@ -1,4 +1,6 @@
-use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions};
+use super::{
+    ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions, ScriptUpdateProfile,
+};
 use crate::{
     Key, MouseButton, ScriptCursor, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime,
 };
@@ -4716,6 +4718,50 @@ return Console
     host.destroy(&mut world, ScriptTime::default());
     assert!(host.command_catalog().get("temporary").is_none());
     assert_eq!(host.commands_generation(), 2);
+}
+
+#[test]
+fn update_profile_times_lua_calls_and_stays_zero_before_the_first_update() {
+    let mut world = one_camera(
+        r#"
+[[assets]]
+path = "/profile.lua"
+[[objects.lite_scripts]]
+path = "/profile.lua"
+"#,
+    );
+    let source = r#"
+local Profile = {}
+function Profile:on_update()
+  local total = 0
+  for i = 1, 1000 do total = total + i end
+end
+return Profile
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("profile.lua", source)]), None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    assert_eq!(host.last_update_profile(), ScriptUpdateProfile::default());
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    let profile = host.last_update_profile();
+    assert!(
+        profile.lua > Duration::ZERO,
+        "вызов Lua-скрипта должен быть измерен"
+    );
+    assert_eq!(
+        profile.rust,
+        Duration::ZERO,
+        "без Rust-библиотеки время Rust-вызовов нулевое"
+    );
+    let named = profile.world_matrices
+        + profile.messages
+        + profile.physics_events
+        + profile.lua
+        + profile.rust;
+    assert!(named <= profile.total, "фазы не перекрываются внутри total");
+    assert_eq!(profile.other(), profile.total - named);
 }
 
 fn cursor_script_world() -> World {

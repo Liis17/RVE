@@ -8,6 +8,7 @@ use crate::icons::IconCache;
 use crate::play::PlaySession;
 use crate::play_cursor::PlayCursor;
 use crate::previews::PreviewCache;
+use crate::profile::EditorProfile;
 use crate::project::OpenProject;
 use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::{EditorCamera, View};
@@ -139,6 +140,7 @@ pub struct EditorState {
     pub project: Option<OpenProject>,
     pub scene: Option<EditorScene>,
     pub log: ConsoleLog,
+    pub profile: EditorProfile,
     pub tool: GizmoTool,
     pub space: GizmoSpace,
     pub snap: SnapSettings,
@@ -219,6 +221,7 @@ impl EditorState {
             project: None,
             scene: None,
             log: ConsoleLog::default(),
+            profile: EditorProfile::default(),
             tool: GizmoTool::Move,
             space: GizmoSpace::Global,
             snap: SnapSettings::default(),

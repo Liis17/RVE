@@ -74,6 +74,10 @@ Runtime error Lua, panic ABI-скрипта или не конечная тра�
 
 Если флаг установлен в начале фазы либо перед вызовом lite, lite-экземпляры пропускаются и отключаются; после interrupt `on_destroy` им не вызывается. Host добавляет одно событие `scripts interrupted` на весь host, если в нём есть хотя бы один lite-экземпляр, без событий по одному на экземпляр. ABI-экземпляры продолжают выполнять свои фазы.
 
+## Замеры update
+
+`ScriptHost::last_update_profile() -> ScriptUpdateProfile` возвращает время последнего `update` по фазам: пересчёт мировых матриц, доставку сообщений, доставку событий физики, сумму вызовов Lua-экземпляров и сумму вызовов экземпляров Rust ABI, общий `total`. Фазы не перекрываются; `other()` — остаток `total`. До первого `update` значение нулевое, `start` и `destroy` его не меняют. ABI и `rve-sdk` не меняются.
+
 ## Источники
 
 `engine/engine-script/src/host.rs`, `engine/engine-script/src/actions.rs`, `engine/engine-script/src/transaction.rs`, `engine/engine-script/src/library.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/types.rs`, `engine/rve-sdk/Cargo.toml`.

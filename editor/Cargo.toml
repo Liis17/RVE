@@ -14,6 +14,7 @@ egui-winit.workspace = true
 egui_dock = { workspace = true, features = ["serde"] }
 winit.workspace = true
 engine-console = { path = "../engine/engine-console" }
+engine-core = { path = "../engine/engine-core" }
 engine-assets = { path = "../engine/engine-assets" }
 engine-audio = { path = "../engine/engine-audio" }
 engine-physics = { path = "../engine/engine-physics" }

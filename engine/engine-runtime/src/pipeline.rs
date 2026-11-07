@@ -5,19 +5,26 @@ use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::cursor::CursorControl;
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
+use crate::profiling::{
+    PhaseWindow, SOURCE_RENDER, SOURCE_RESOURCES, SOURCE_SCRIPTS, SOURCE_STARTUP,
+    log_startup_profile, record_frame_profile, record_update_profile, render_groups, render_phase,
+    script_phase, scripts_groups,
+};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
+use engine_core::profile::ProfileBoard;
 use engine_physics::{
     PhysicsClient, PhysicsInitialization, PhysicsReceive, PhysicsSceneSync, PhysicsStepResult,
 };
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameStatus, LocalLight,
-    LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId, ProceduralSky, Renderer,
-    SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
+    FrameStatus, LocalLight, LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId,
+    ProceduralSky, Renderer, SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
 };
 #[cfg(feature = "dev-console")]
 use engine_render::{UiImage, UiPrimitive, UiVertex, ViewportId};
+use engine_resources::ResourceHandle;
 use engine_scene::camera::Camera;
 use engine_scene::light::{
     cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
@@ -48,6 +55,11 @@ use std::time::{Duration, Instant};
 pub(crate) const SCRIPTS_THREAD: &str = "rve-scripts";
 pub(crate) const RENDER_THREAD: &str = "rve-render";
 pub(crate) const SCRIPT_CALL_TIME_LIMIT: Duration = Duration::from_secs(5);
+/// Встроенная команда профайлера: имеет приоритет над одноимённой командой скрипта.
+#[cfg(feature = "dev-console")]
+pub(crate) const PROFILE_COMMAND: &str = "profile";
+#[cfg(feature = "dev-console")]
+const PROFILE_COMMAND_DESCRIPTION: &str = "показать CPU-фазы, GPU-проходы и замеры старта";
 
 #[derive(Clone, Debug)]
 pub(crate) struct FrameSnapshot {
@@ -125,11 +137,28 @@ pub(crate) enum RenderControl {
     Shutdown,
 }
 
-#[derive(Default)]
 pub(crate) struct RuntimeStatus {
     exit_code: AtomicU8,
     render_stopped: AtomicBool,
     error: Mutex<Option<String>>,
+    /// Отчёты профайлера: потоки публикуют, оверлей F3 и команда `profile` читают.
+    pub(crate) profile: Arc<ProfileBoard>,
+}
+
+impl Default for RuntimeStatus {
+    fn default() -> Self {
+        Self {
+            exit_code: AtomicU8::new(0),
+            render_stopped: AtomicBool::new(false),
+            error: Mutex::new(None),
+            profile: Arc::new(ProfileBoard::new(&[
+                SOURCE_SCRIPTS,
+                SOURCE_RENDER,
+                SOURCE_RESOURCES,
+                SOURCE_STARTUP,
+            ])),
+        }
+    }
 }
 
 impl RuntimeStatus {
@@ -200,6 +229,10 @@ pub(crate) trait RenderBackend: Send {
         width: u32,
         height: u32,
     ) -> Result<FrameOutcome, String>;
+    /// Забирает профиль последнего кадра renderer; у тестовых backend профиля нет.
+    fn take_frame_profile(&mut self) -> Option<FrameProfile> {
+        None
+    }
     #[cfg(feature = "dev-console")]
     fn take_console_ui(&mut self) -> Option<ConsoleUiFrame> {
         None
@@ -268,6 +301,8 @@ pub(crate) struct RenderThreadConfig {
     pub script_tx: Sender<ScriptControl>,
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
+    /// Источник статистики ресурсов для профайлера; `None` оставляет источник пустым.
+    pub resources: Option<ResourceHandle>,
     pub stopped_tx: Sender<()>,
     pub exit: Arc<dyn ExitRequester>,
 }
@@ -390,6 +425,10 @@ impl VulkanBackend {
 }
 
 impl RenderBackend for VulkanBackend {
+    fn take_frame_profile(&mut self) -> Option<FrameProfile> {
+        self.renderer.take_frame_profile()
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         self.renderer.resize(width, height);
     }
@@ -771,6 +810,11 @@ fn scripts_thread(
 
     sync_input_background(&input, background, &mut applied_background);
 
+    let mut timings = PhaseWindow::new(
+        SOURCE_SCRIPTS,
+        Arc::clone(&status.profile),
+        scripts_groups(),
+    );
     let mut frame_number = 0_u64;
     let mut last_tick = clock.now();
     let start_time = ScriptTime {
@@ -802,8 +846,10 @@ fn scripts_thread(
     let mut next_background_tick =
         now.saturating_add(if background { interval } else { Duration::ZERO });
     loop {
+        timings.publish_if_due(Instant::now());
         let mut stop_after_physics = false;
         if let (Some(client), Some(sync)) = (&mut physics_client, &mut physics_sync) {
+            let physics_started = Instant::now();
             let received =
                 receive_physics_interruptibly(client, &control_rx, |control| match control {
                     ScriptControl::Shutdown => true,
@@ -821,6 +867,11 @@ fn scripts_thread(
                         false
                     }
                 });
+            timings.record(
+                script_phase::LOOP,
+                script_phase::PHYSICS_WAIT,
+                physics_started.elapsed(),
+            );
             match received {
                 Ok(PhysicsWait::Idle) => {}
                 Ok(PhysicsWait::Step(result)) => {
@@ -900,6 +951,7 @@ fn scripts_thread(
             elapsed: now.as_secs_f64(),
             frame: frame_number,
         };
+        let console_started = Instant::now();
         #[cfg(feature = "dev-console")]
         {
             for (name, error) in
@@ -914,11 +966,23 @@ fn scripts_thread(
                 &mut published_catalog_generation,
             );
         }
+        timings.record(
+            script_phase::LOOP,
+            script_phase::CONSOLE_COMMANDS,
+            console_started.elapsed(),
+        );
         let input_frame = lock_input(&input).take_frame();
         scripts.set_input(input_frame);
+        let update_started = Instant::now();
         scripts.update(&mut world, dt, time);
-        print_script_events(scripts.drain_events());
         publish_script_cursor(&scripts, &cursor, &mut published_cursor);
+        timings.record(
+            script_phase::LOOP,
+            script_phase::SCRIPTS_UPDATE,
+            update_started.elapsed(),
+        );
+        record_update_profile(&mut timings, scripts.last_update_profile());
+        print_script_events(scripts.drain_events());
         if let Some(audio) = audio.as_mut() {
             audio.apply(scripts.drain_audio_requests(), &world);
         }
@@ -928,6 +992,7 @@ fn scripts_thread(
             &command_catalog,
             &mut published_catalog_generation,
         );
+        let sync_started = Instant::now();
         if let (Some(client), Some(sync)) = (&mut physics_client, &mut physics_sync) {
             let mut commands = scripts.drain_physics_commands();
             match sync.sync_world_commands(&mut world) {
@@ -948,12 +1013,23 @@ fn scripts_thread(
                 break;
             }
         }
+        timings.record(
+            script_phase::LOOP,
+            script_phase::PHYSICS_SYNC,
+            sync_started.elapsed(),
+        );
         if background {
             next_background_tick = now.saturating_add(interval);
             continue;
         }
 
+        let build_started = Instant::now();
         let (scene_frame, warnings) = world.build_frame();
+        timings.record(
+            script_phase::LOOP,
+            script_phase::BUILD_FRAME,
+            build_started.elapsed(),
+        );
         for warning in warnings {
             log::warn!(
                 "[scene] {}: объект {}: {}",
@@ -965,14 +1041,22 @@ fn scripts_thread(
         if let Some(audio) = audio.as_mut() {
             audio.sync_positions(&world);
         }
-        let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene) {
+        let snapshot_started = Instant::now();
+        let made = make_snapshot(scene_frame, &world, &gpu_scene);
+        timings.record(
+            script_phase::LOOP,
+            script_phase::MAKE_SNAPSHOT,
+            snapshot_started.elapsed(),
+        );
+        let snapshot = match made {
             Ok(snapshot) => Arc::new(snapshot),
             Err(error) => {
                 status.record_failure(error);
                 break;
             }
         };
-        match send_snapshot(
+        let send_started = Instant::now();
+        let sent = send_snapshot(
             &frame_tx,
             &control_rx,
             snapshot,
@@ -981,7 +1065,13 @@ fn scripts_thread(
             &mut pending_console_commands,
             #[cfg(not(feature = "dev-console"))]
             &mut (),
-        ) {
+        );
+        timings.record(
+            script_phase::LOOP,
+            script_phase::SNAPSHOT_SEND_WAIT,
+            send_started.elapsed(),
+        );
+        match sent {
             SendOutcome::Sent => {}
             SendOutcome::Background => {
                 next_background_tick = clock.now().saturating_add(interval);
@@ -1372,6 +1462,20 @@ fn publish_command_catalog(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     snapshot.generation = generation;
     snapshot.catalog = scripts.command_catalog();
+    let shadowed = snapshot.catalog.get(PROFILE_COMMAND).is_some();
+    if shadowed && !snapshot.profile_shadowed {
+        log::warn!(
+            target: "console",
+            "команда profile из скрипта затенена встроенной командой профайлера"
+        );
+    }
+    snapshot.profile_shadowed = shadowed;
+    if !shadowed
+        && let Ok(spec) =
+            engine_console::CommandSpec::new(PROFILE_COMMAND, PROFILE_COMMAND_DESCRIPTION)
+    {
+        let _ = snapshot.catalog.register(spec);
+    }
     *published_generation = generation;
 }
 
@@ -1510,10 +1614,14 @@ fn render_thread(config: RenderThreadConfig) {
         script_tx,
         interrupt,
         status,
+        resources,
         stopped_tx,
         exit,
         ..
     } = config;
+    let mut profiler =
+        PhaseWindow::new(SOURCE_RENDER, Arc::clone(&status.profile), render_groups())
+            .with_resources(resources);
     let result = catch_unwind(AssertUnwindSafe(|| {
         render_loop(
             &mut *backend,
@@ -1523,6 +1631,7 @@ fn render_thread(config: RenderThreadConfig) {
             &frame_rx,
             &control_rx,
             &script_tx,
+            &mut profiler,
         )
     }));
     let failed = match result {
@@ -1578,6 +1687,7 @@ enum RenderSelection {
     Control(Result<RenderControl, flume::RecvError>),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_loop(
     backend: &mut dyn RenderBackend,
     mut width: u32,
@@ -1586,6 +1696,7 @@ fn render_loop(
     frame_rx: &Receiver<Arc<FrameSnapshot>>,
     control_rx: &Receiver<RenderControl>,
     script_tx: &Sender<ScriptControl>,
+    profiler: &mut PhaseWindow,
 ) -> Result<(), String> {
     let mut occluded = false;
     let mut paused = false;
@@ -1599,6 +1710,7 @@ fn render_loop(
     #[cfg(feature = "dev-console")]
     let mut console_active = false;
     loop {
+        profiler.publish_if_due(Instant::now());
         #[cfg(feature = "dev-console")]
         let mut should_render = std::mem::take(&mut debug_view_dirty);
         #[cfg(not(feature = "dev-console"))]
@@ -1675,20 +1787,30 @@ fn render_loop(
                 height,
                 #[cfg(feature = "dev-console")]
                 &mut ui_frame,
+                profiler,
             )?
             && outcome.status == FrameStatus::Presented
         {
             presented = presented.saturating_add(1);
+            if presented == 1 {
+                log_startup_profile(profiler.board());
+            }
             if frame_limit.is_some_and(|limit| presented >= limit) {
                 return Ok(());
             }
         }
 
-        match Selector::new()
+        let wait_started = Instant::now();
+        let selection = Selector::new()
             .recv(frame_rx, RenderSelection::Frame)
             .recv(control_rx, RenderSelection::Control)
-            .wait()
-        {
+            .wait();
+        profiler.record(
+            render_phase::LOOP,
+            render_phase::FRAME_WAIT,
+            wait_started.elapsed(),
+        );
+        match selection {
             RenderSelection::Control(Ok(RenderControl::Resize(new_width, new_height))) => {
                 width = new_width;
                 height = new_height;
@@ -1719,12 +1841,16 @@ fn render_loop(
                     height,
                     #[cfg(feature = "dev-console")]
                     &mut ui_frame,
+                    profiler,
                 )?
                 else {
                     continue;
                 };
                 if outcome.status == FrameStatus::Presented {
                     presented = presented.saturating_add(1);
+                    if presented == 1 {
+                        log_startup_profile(profiler.board());
+                    }
                     if frame_limit.is_some_and(|limit| presented >= limit) {
                         return Ok(());
                     }
@@ -1734,6 +1860,7 @@ fn render_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_snapshot(
     backend: &mut dyn RenderBackend,
     snapshot: &mut FrameSnapshot,
@@ -1742,11 +1869,13 @@ fn render_snapshot(
     width: u32,
     height: u32,
     #[cfg(feature = "dev-console")] ui_frame: &mut ConsoleUiFrame,
+    profiler: &mut PhaseWindow,
 ) -> Result<Option<FrameOutcome>, String> {
     if paused {
         return Ok(None);
     }
     motion_history.prepare(snapshot);
+    let started = Instant::now();
     #[cfg(feature = "dev-console")]
     let outcome = if ui_frame.visible {
         backend.render_console(snapshot, width, height, ui_frame)?
@@ -1755,6 +1884,14 @@ fn render_snapshot(
     };
     #[cfg(not(feature = "dev-console"))]
     let outcome = backend.render(snapshot, width, height)?;
+    profiler.record(
+        render_phase::LOOP,
+        render_phase::RENDER_BACKEND,
+        started.elapsed(),
+    );
+    if let Some(frame) = backend.take_frame_profile() {
+        record_frame_profile(profiler, &frame);
+    }
     if outcome.submitted {
         motion_history.submitted(snapshot);
     }
@@ -1780,14 +1917,19 @@ mod tests {
         render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
         sync_input_background, wait_background_tick,
     };
+    #[cfg(feature = "dev-console")]
+    use super::{PROFILE_COMMAND, PROFILE_COMMAND_DESCRIPTION, publish_command_catalog};
     use super::{publish_script_cursor, set_initial_cursor};
     use crate::cursor::{CursorControl, RecordingCursorSink};
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
+    use crate::profiling::{PhaseWindow, SOURCE_RENDER, render_groups, render_phase};
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
     use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
+    use engine_core::profile::ProfileBoard;
+    use engine_core::profile::ProfileValue;
     use engine_physics::{
         PhysicsClient, PhysicsCommand, PhysicsEvent, PhysicsInitialization, PhysicsReply,
         PhysicsRequest, PhysicsSceneDesc, PhysicsSceneSync, PhysicsServer, PhysicsStepResult,
@@ -2181,6 +2323,7 @@ distance=2.0
             480,
             #[cfg(feature = "dev-console")]
             &mut ui_frame,
+            &mut render_test_window(),
         )
     }
 
@@ -2609,6 +2752,78 @@ return Script
     }
 
     #[cfg(feature = "dev-console")]
+    fn started_host_with_script(source: &str) -> ScriptHost {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            r#"
+[[assets]]
+path = "/profile.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/profile.lua"
+"#,
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let sources = BTreeMap::from([("profile.lua".to_owned(), source.to_owned())]);
+        let mut host = ScriptHost::load(&world, "scene.rvescene", &sources, None).unwrap();
+        host.start(&mut world, ScriptTime::default());
+        host
+    }
+
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn script_command_named_profile_is_shadowed_by_the_builtin_profiler() {
+        let host = started_host_with_script(
+            r#"
+local Script = {}
+function Script:on_start()
+  rve.console.register("profile", function() end, "script profile")
+end
+return Script
+"#,
+        );
+        let catalog = test_command_catalog();
+        let mut generation = u64::MAX;
+
+        publish_command_catalog(&host, &catalog, &mut generation);
+
+        let snapshot = catalog.lock().unwrap();
+        assert!(snapshot.profile_shadowed);
+        assert_eq!(
+            snapshot
+                .catalog
+                .get(PROFILE_COMMAND)
+                .map(|spec| spec.description.as_str()),
+            Some("script profile"),
+            "при затенении остаётся команда скрипта"
+        );
+    }
+
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn builtin_profile_command_is_listed_when_no_script_registers_it() {
+        let host = started_host_with_script("local Script = {}\nreturn Script\n");
+        let catalog = test_command_catalog();
+        let mut generation = u64::MAX;
+
+        publish_command_catalog(&host, &catalog, &mut generation);
+
+        let snapshot = catalog.lock().unwrap();
+        assert!(!snapshot.profile_shadowed);
+        assert_eq!(
+            snapshot
+                .catalog
+                .get(PROFILE_COMMAND)
+                .map(|spec| spec.description.as_str()),
+            Some(PROFILE_COMMAND_DESCRIPTION)
+        );
+    }
+
+    #[cfg(feature = "dev-console")]
     #[test]
     fn queued_console_command_runs_before_update_and_publishes_catalog() {
         let document = SceneDocument::parse(
@@ -2741,6 +2956,43 @@ return Script
         assert_eq!(frame_rx.len(), 1);
     }
 
+    fn render_test_window() -> PhaseWindow {
+        PhaseWindow::new(
+            SOURCE_RENDER,
+            Arc::new(ProfileBoard::new(&[SOURCE_RENDER])),
+            render_groups(),
+        )
+    }
+
+    #[test]
+    fn render_loop_records_frame_wait_when_its_frame_source_ends() {
+        let (frame_tx, frame_rx) = flume::unbounded::<Arc<FrameSnapshot>>();
+        let (_control_tx, control_rx) = flume::unbounded();
+        let (script_tx, _script_rx) = flume::unbounded();
+        drop(frame_tx);
+        let mut backend = FakeBackend::default();
+        let mut window = render_test_window();
+
+        let result = render_loop(
+            &mut backend,
+            640,
+            480,
+            None,
+            &frame_rx,
+            &control_rx,
+            &script_tx,
+            &mut window,
+        );
+
+        assert!(result.is_ok());
+        let report = window.report();
+        let frame_wait = report.groups[render_phase::LOOP].rows[render_phase::FRAME_WAIT].value;
+        assert!(matches!(
+            frame_wait,
+            ProfileValue::Timing(summary) if summary.samples == 1
+        ));
+    }
+
     #[test]
     fn render_waiting_on_an_empty_queue_stops_on_control_message() {
         let (frame_tx, frame_rx) = flume::bounded(1);
@@ -2756,6 +3008,7 @@ return Script
                 &frame_rx,
                 &control_rx,
                 &script_tx,
+                &mut render_test_window(),
             )
         });
         control_tx.send(RenderControl::Shutdown).unwrap();
@@ -2786,6 +3039,7 @@ return Script
                 &frame_rx,
                 &control_rx,
                 &script_tx,
+                &mut render_test_window(),
             )
         });
 
@@ -2820,6 +3074,7 @@ return Script
                 &frame_rx,
                 &control_rx,
                 &script_tx,
+                &mut render_test_window(),
             )
         });
         control_tx.send(RenderControl::Occluded(true)).unwrap();
@@ -2848,6 +3103,7 @@ return Script
                 0,
                 #[cfg(feature = "dev-console")]
                 &mut ConsoleUiFrame::default(),
+                &mut render_test_window(),
             )
             .unwrap()
             .is_none()
@@ -3656,6 +3912,7 @@ return Move
             script_tx,
             interrupt: interrupt.clone(),
             status: Arc::clone(&status),
+            resources: None,
             stopped_tx,
             exit: Arc::new(FakeExit(exit_tx)),
         });
@@ -3703,6 +3960,7 @@ return Move
                 script_tx,
                 interrupt: ScriptInterruptHandle::new(),
                 status: Arc::clone(&status),
+                resources: None,
                 stopped_tx,
                 exit: Arc::new(FakeExit(exit_tx)),
             });
