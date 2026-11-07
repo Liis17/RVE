@@ -6,6 +6,7 @@ pub mod camera_settings;
 pub mod document;
 pub mod light;
 pub mod params;
+pub mod particles;
 pub mod prefab;
 pub mod transform;
 pub mod world;
@@ -17,6 +18,12 @@ pub use audio::{
     AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
 };
 pub use light::ShadowSettings;
+pub use particles::{
+    MAX_ADDITIVE_PARTICLE_CAPACITY, MAX_ALPHA_PARTICLE_CAPACITY, ParticleBlendMode,
+    ParticleBurstComponent, ParticleCollisionComponent, ParticleColorKeyComponent,
+    ParticleEmitterComponent, ParticleFlipbookComponent, ParticleShapeComponent,
+    ParticleSizeKeyComponent,
+};
 
 pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,
@@ -37,5 +44,5 @@ pub use prefab::{
 };
 pub use world::{
     EnvironmentState, LightState, LocalLightState, LocalTransform, MeshInstance, ObjectHandle,
-    SceneFrame, SceneWarning, World, WorldObject,
+    ParticleEmitterInstance, SceneFrame, SceneWarning, World, WorldObject,
 };

@@ -797,3 +797,54 @@ fn audio_source_prefab_override_replaces_the_whole_component_and_checks_its_clip
     let error = other.expand(&scene(&bad)).unwrap_err();
     assert!(error.message.contains("audio_source"), "{error}");
 }
+
+#[test]
+fn particle_emitter_prefab_override_replaces_the_whole_component_and_checks_texture() {
+    let prefab =
+        "[[objects]]\nid = \"fx\"\n[objects.particle_emitter]\ncapacity = 512\nrate = 40.0\n";
+    let library = Library::new(&[("prefabs/fx.rveprefab", prefab)]);
+    let assets =
+        "[[assets]]\npath = \"/prefabs/fx.rveprefab\"\n[[assets]]\npath = \"/fx/smoke.png\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spark\"\nprefab = \"/prefabs/fx.rveprefab\"\n[[instances.overrides]]\ntarget = \"fx\"\nparticle_emitter = {{ blend = \"alpha\", texture = \"/fx/smoke.png\" }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let emitter = object(&expanded, "spark").particle_emitter.clone().unwrap();
+    assert_eq!(emitter.blend, crate::particles::ParticleBlendMode::Alpha);
+    assert_eq!(
+        emitter.rate, 10.0,
+        "replacement must not keep inherited fields"
+    );
+    assert_eq!(emitter.capacity, 256);
+    assert_eq!(
+        emitter.texture.as_ref().map(|path| path.as_str()),
+        Some("fx/smoke.png")
+    );
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spark\"\nprefab = \"/prefabs/fx.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "spark")
+            .particle_emitter
+            .as_ref()
+            .unwrap()
+            .capacity,
+        512
+    );
+
+    let undeclared = format!(
+        "{CAMERA}[[objects]]\nid = \"fx\"\n[objects.particle_emitter]\ntexture = \"/fx/smoke.png\"\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &undeclared).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\nparticle_emitter = {{ rate = 5.0 }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("particle_emitter"), "{error}");
+}

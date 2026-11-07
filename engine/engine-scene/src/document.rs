@@ -2,6 +2,7 @@
 
 use crate::CameraSettings;
 use crate::audio::{AudioSourceComponent, validate_audio_source};
+use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
 use crate::prefab::PrefabInstance;
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
@@ -264,6 +265,9 @@ impl SceneDocument {
             if let Some(audio) = &object.audio_source {
                 validate_audio_source(source, &object.id, &asset_paths, audio)?;
             }
+            if let Some(emitter) = &object.particle_emitter {
+                validate_particle_emitter(source, &object.id, &asset_paths, emitter)?;
+            }
             if let Some(mesh) = &object.mesh_renderer {
                 require_asset_path(source, &object.id, &asset_paths, &mesh.model, "модель")?;
                 require_extension(source, &object.id, &mesh.model, "fbx", "модель")?;
@@ -486,6 +490,8 @@ pub struct SceneObject {
     pub character_controller: Option<CharacterControllerComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_source: Option<AudioSourceComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub particle_emitter: Option<ParticleEmitterComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]
