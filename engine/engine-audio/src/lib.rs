@@ -27,6 +27,7 @@ use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -188,6 +189,7 @@ pub struct AudioHandle {
     events: Receiver<AudioEvent>,
     lanes: Arc<Mutex<Lanes>>,
     spatial: Arc<Spatial>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl AudioHandle {
@@ -257,8 +259,10 @@ impl AudioHandle {
         self.events.try_iter().collect()
     }
 
-    /// Просит поток `rve-audio` завершиться. Повторный вызов безвреден.
+    /// Просит поток `rve-audio` завершиться. Флаг проверяется перед каждым ожиданием, поэтому
+    /// остановка не зависит от заполненности очереди; `Shutdown` только будит поток. Повтор безвреден.
     pub fn shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
         let _ = self.commands.try_send(Command::Shutdown);
     }
 
@@ -304,6 +308,7 @@ pub struct AudioEngine {
     mixer_rx: Consumer<MixerCommand>,
     lanes: Arc<Mutex<Lanes>>,
     spatial: Arc<Spatial>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl AudioEngine {
@@ -314,11 +319,13 @@ impl AudioEngine {
         let (mixer_tx, mixer_rx) = RingBuffer::new(MIXER_CAPACITY);
         let lanes = Arc::new(Mutex::new(Lanes::default()));
         let spatial = Arc::new(Spatial::new());
+        let stopping = Arc::new(AtomicBool::new(false));
         let handle = AudioHandle {
             commands: command_tx,
             events: events_rx,
             lanes: Arc::clone(&lanes),
             spatial: Arc::clone(&spatial),
+            stopping: Arc::clone(&stopping),
         };
         let engine = Self {
             config,
@@ -330,6 +337,7 @@ impl AudioEngine {
             mixer_rx,
             lanes,
             spatial,
+            stopping,
         };
         (engine, handle)
     }
@@ -347,13 +355,17 @@ impl AudioEngine {
             mixer_rx,
             lanes,
             spatial,
+            stopping,
         } = self;
         let (decode_tx, decode_rx) = flume::unbounded::<DecodeJob>();
         let (decoded_tx, decoded_rx) = flume::unbounded::<Decoded>();
         let keepalive_decoded = decoded_tx.clone();
+        // Отмена нужна только при выходе из `run`: тогда очередь декодера не дочитывается.
+        let cancel_decode = Arc::new(AtomicBool::new(false));
+        let decoder_cancel = Arc::clone(&cancel_decode);
         let decoder = thread::Builder::new()
             .name("rve-audio-decode".into())
-            .spawn(move || decode_loop(decode_rx, decoded_tx));
+            .spawn(move || decode_loop(decode_rx, decoded_tx, &decoder_cancel));
         if let Err(error) = &decoder {
             log::warn!("декодер звука не запущен: {error}; клипы не загрузятся");
         }
@@ -386,6 +398,9 @@ impl AudioEngine {
             decode_tx,
         };
         loop {
+            if stopping.load(Ordering::Acquire) {
+                break;
+            }
             // Устройство присылает завершённые голоса через кольцо: опрашиваем его при каждом
             // пробуждении, а пробуждаемся не реже READ_POLL, пока есть микшер или чтения.
             let incoming = Selector::new()
@@ -414,6 +429,7 @@ impl AudioEngine {
             core.poll_reads();
         }
 
+        cancel_decode.store(true, Ordering::Relaxed);
         // Сначала останавливаем устройство: голоса микшера держат `Arc<Clip>`, и их последняя
         // ссылка не должна освободиться в callback. Кеш `core` живёт дольше потока вывода.
         drop(output);
@@ -655,14 +671,20 @@ impl Core {
     }
 }
 
-fn decode_loop(jobs: Receiver<DecodeJob>, results: Sender<Decoded>) {
+fn decode_loop(jobs: Receiver<DecodeJob>, results: Sender<Decoded>, cancel: &AtomicBool) {
     for DecodeJob { path, bytes } in jobs {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let extension = Path::new(&path)
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_owned();
-        let result = decode(&extension, &bytes);
+        let result = decode(&extension, &bytes, cancel);
+        if matches!(result, Err(DecodeError::Cancelled)) {
+            break;
+        }
         if results.send(Decoded { path, result }).is_err() {
             break;
         }

@@ -7,6 +7,7 @@ use lewton::inside_ogg::OggStreamReader;
 use std::fmt;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Наибольший декодированный клип в сэмплах f32 (256 МБ).
 pub const MAX_CLIP_SAMPLES: usize = 64 * 1024 * 1024;
@@ -36,6 +37,8 @@ pub enum DecodeError {
     Unsupported(String),
     Corrupt(String),
     TooLarge { samples: u64 },
+    /// Декодирование прервано: приложение завершает звуковой поток.
+    Cancelled,
 }
 
 impl fmt::Display for DecodeError {
@@ -47,6 +50,7 @@ impl fmt::Display for DecodeError {
                 f,
                 "клип из {samples} сэмплов больше лимита {MAX_CLIP_SAMPLES}"
             ),
+            Self::Cancelled => write!(f, "декодирование отменено"),
         }
     }
 }
@@ -54,10 +58,11 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Декодирует клип по расширению файла (`wav` или `ogg`, без учёта регистра).
-pub fn decode(extension: &str, bytes: &[u8]) -> Result<Clip, DecodeError> {
+/// `cancel` проверяется между пакетами Ogg; WAV разбирается за один проход.
+pub fn decode(extension: &str, bytes: &[u8], cancel: &AtomicBool) -> Result<Clip, DecodeError> {
     match extension.to_ascii_lowercase().as_str() {
         "wav" => decode_wav(bytes),
-        "ogg" => decode_ogg(bytes),
+        "ogg" => decode_ogg(bytes, cancel),
         other => Err(DecodeError::Unsupported(format!(
             "расширение .{other} не поддерживается"
         ))),
@@ -196,8 +201,9 @@ fn convert(chunk: &[u8], kind: WavSamples) -> Result<f32, DecodeError> {
     })
 }
 
-/// Декодирует Ogg Vorbis; пакеты добавляются по одному, лимит проверяется до роста буфера.
-pub fn decode_ogg(bytes: &[u8]) -> Result<Clip, DecodeError> {
+/// Декодирует Ogg Vorbis; пакеты добавляются по одному, лимит проверяется до роста буфера,
+/// отмена — между пакетами.
+pub fn decode_ogg(bytes: &[u8], cancel: &AtomicBool) -> Result<Clip, DecodeError> {
     let mut reader = OggStreamReader::new(Cursor::new(bytes))
         .map_err(|error| corrupt(&format!("ogg: {error}")))?;
     let channels = u16::from(reader.ident_hdr.audio_channels);
@@ -208,10 +214,15 @@ pub fn decode_ogg(bytes: &[u8]) -> Result<Clip, DecodeError> {
         )));
     }
     let mut out: Vec<f32> = Vec::new();
-    while let Some(packet) = reader
-        .read_dec_packet_generic::<Vec<Vec<f32>>>()
-        .map_err(|error| corrupt(&format!("ogg: {error}")))?
-    {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+        let packet = match reader.read_dec_packet_generic::<Vec<Vec<f32>>>() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(error) => return Err(corrupt(&format!("ogg: {error}"))),
+        };
         if packet.len() != usize::from(channels) {
             return Err(corrupt("число каналов пакета не совпадает с заголовком"));
         }

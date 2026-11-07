@@ -1,6 +1,6 @@
 use super::*;
 use engine_scene::AudioGroup;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 fn voice(id: u64) -> VoiceId {
     VoiceId::from_raw(id).expect("тестовый id ненулевой")
@@ -246,7 +246,7 @@ impl Harness {
         }
         self.core.poll_reads();
         while let Ok(job) = self.decode_jobs.try_recv() {
-            let result = decode("wav", &job.bytes);
+            let result = decode("wav", &job.bytes, &AtomicBool::new(false));
             self.core.decoded(Decoded {
                 path: job.path,
                 result,
@@ -428,4 +428,44 @@ fn commands_beyond_the_mixer_ring_wait_in_order_and_none_are_lost() {
         })
         .collect();
     assert_eq!(volumes, (0..total).map(|i| i as f32).collect::<Vec<_>>());
+}
+
+#[test]
+fn shutdown_ends_run_even_when_the_command_queue_is_full() {
+    let (engine, handle) = AudioEngine::new(AudioConfig::default());
+    for _ in 0..COMMAND_CAPACITY {
+        handle.preload(Vec::new()).unwrap();
+    }
+    assert_eq!(handle.preload(Vec::new()), Err(AudioError::QueueFull));
+    handle.shutdown();
+    // Таймаут — только страховка от зависания: без флага run не вернётся.
+    let (done_tx, done_rx) = flume::bounded(1);
+    thread::spawn(move || {
+        engine.run();
+        let _ = done_tx.send(());
+    });
+    assert!(done_rx.recv_timeout(Duration::from_secs(10)).is_ok());
+}
+
+#[test]
+fn cancelled_decoder_skips_the_queued_jobs() {
+    let jobs = |count: usize| {
+        let (tx, rx) = flume::unbounded();
+        for index in 0..count {
+            tx.send(DecodeJob {
+                path: format!("audio/{index}.wav"),
+                bytes: wav_bytes(2205),
+            })
+            .unwrap();
+        }
+        drop(tx);
+        rx
+    };
+    let (results_tx, results_rx) = flume::unbounded();
+    decode_loop(jobs(3), results_tx, &AtomicBool::new(true));
+    assert!(results_rx.try_iter().next().is_none());
+
+    let (results_tx, results_rx) = flume::unbounded();
+    decode_loop(jobs(3), results_tx, &AtomicBool::new(false));
+    assert_eq!(results_rx.try_iter().count(), 3);
 }

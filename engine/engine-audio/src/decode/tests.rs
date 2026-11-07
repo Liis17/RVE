@@ -2,6 +2,10 @@ use super::*;
 
 const OGG_FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/tone_mono_22050.ogg");
 
+fn live() -> AtomicBool {
+    AtomicBool::new(false)
+}
+
 /// Собирает WAV: `format_tag` — тег формата, `data` — сырые байты данных.
 fn wav(format_tag: u16, channels: u16, rate: u32, bits: u16, data: &[u8]) -> Vec<u8> {
     let block_align = channels * bits / 8;
@@ -162,7 +166,7 @@ fn oversized_sample_count_is_rejected_by_limit() {
 
 #[test]
 fn ogg_fixture_decodes_with_its_declared_format() {
-    let clip = decode_ogg(OGG_FIXTURE).unwrap();
+    let clip = decode_ogg(OGG_FIXTURE, &live()).unwrap();
     assert_eq!(clip.sample_rate, 22_050);
     assert_eq!(clip.channels, 1);
     let seconds = clip.frames() as f32 / 22_050.0;
@@ -178,7 +182,7 @@ fn ogg_fixture_decodes_with_its_declared_format() {
 #[test]
 fn truncated_ogg_fixture_fails_instead_of_panicking() {
     for cut in [0, 16, 100, OGG_FIXTURE.len() / 2] {
-        let result = decode_ogg(&OGG_FIXTURE[..cut]);
+        let result = decode_ogg(&OGG_FIXTURE[..cut], &live());
         assert!(
             result.is_err() || result.unwrap().frames() < 22_050,
             "cut at {cut}"
@@ -188,10 +192,21 @@ fn truncated_ogg_fixture_fails_instead_of_panicking() {
 
 #[test]
 fn extension_selects_the_decoder_and_unknown_ones_are_unsupported() {
-    assert!(decode("WAV", &wav(1, 1, 8_000, 8, &[128])).is_ok());
-    assert!(decode("ogg", OGG_FIXTURE).is_ok());
+    assert!(decode("WAV", &wav(1, 1, 8_000, 8, &[128]), &live()).is_ok());
+    assert!(decode("ogg", OGG_FIXTURE, &live()).is_ok());
     assert!(matches!(
-        decode("mp3", &[]),
+        decode("mp3", &[], &live()),
         Err(DecodeError::Unsupported(_))
     ));
+}
+
+#[test]
+fn cancelled_ogg_decode_stops_before_the_first_packet() {
+    let cancel = AtomicBool::new(true);
+    assert!(matches!(
+        decode_ogg(OGG_FIXTURE, &cancel),
+        Err(DecodeError::Cancelled)
+    ));
+    cancel.store(false, Ordering::Relaxed);
+    assert!(decode_ogg(OGG_FIXTURE, &cancel).is_ok(), "без отмены декодирование проходит");
 }
