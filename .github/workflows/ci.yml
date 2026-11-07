@@ -159,6 +159,11 @@ jobs:
       - name: Install Vulkan runtime for demo build
         if: ${{ runner.os == 'macOS' }}
         run: brew install vulkan-loader molten-vk
+      # rust-cache restores the whole build/ directory, including output from earlier runs,
+      # and rve-build refuses to overwrite an existing output directory.
+      - name: Remove stale demo output
+        working-directory: build
+        run: rm -rf demo-out
       - name: Build demo game
         working-directory: build
         run: cargo run -p rve-build --locked -- build ../examples/demo-game --output demo-out
@@ -254,6 +259,9 @@ jobs:
         with:
           workspaces: ". -> build"
           key: sdk-release
+      # rust-cache restores build/ too; rve-build and the SDK archiver refuse to overwrite existing outputs.
+      - name: Remove stale SDK outputs
+        run: Remove-Item -LiteralPath sdk-verified, sdk-verified.zip -Recurse -Force -ErrorAction SilentlyContinue
       - name: Build full SDK with bundled GNU toolchain
         run: |
           $toolchain = rustup run stable-x86_64-pc-windows-gnu rustc --print sysroot
