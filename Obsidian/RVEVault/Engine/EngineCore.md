@@ -23,12 +23,12 @@ Parent: [[Index]]
 | `Time::frame(&self) -> u64` | Возвращает число выполненных тиков |
 | `Default for Time` | Создаёт новое значение через `Time::new()` |
 | `profile::RollingStat::new(capacity)`, `push`, `summary() -> StatSummary` | Кольцевое окно замеров фиксированной ёмкости; память выделяется в `new`, `push` её не расширяет. Пустое окно даёт нулевой итог с `samples == 0` |
-| `profile::ProfileReport`, `ProfileGroup`, `ProfileRow` | Отчёт для показа: группы строк, метка и итог или `None`. `Display` даёт текст для консоли и лога |
+| `profile::ProfileReport`, `ProfileGroup`, `ProfileRow`, `ProfileValue` | Отчёт для показа: группы строк, метка и значение строки. Значение — итоги окна (`Timing`), одна длительность (`Single`), счётчик (`Count`) или отсутствие значения (`Missing`, показывается как `n/a`). `Display` даёт текст для консоли и лога |
 | `profile::ProfileBoard::new(sources)`, `publish(source, report)`, `reports()` | Доска отчётов по фиксированному набору источников. Публикация меняет `Arc` под коротким lock; чтение возвращает отчёты в порядке регистрации |
 
 ## Зависимости и взаимодействия
 
-Используется в [[Engine/Sandbox]] для времени кадров и меняющегося clear color. Модуль `profile` используют [[Engine/EngineRuntime]] (отчёты потоков, старт и оверлей F3), [[Engine/RveEditor]] (вкладка Profiler) и `engine-ui` (таблица `profiler`). Другие крейты, включая `engine-render`, `engine-script` и `engine-resources`, пишут длительности через `std::time::Duration` и на `engine-core` не опираются.
+Используется в [[Engine/Sandbox]] для времени кадров и меняющегося clear color. Модуль `profile` используют [[Engine/EngineRuntime]] (отчёты потоков, старт и оверлей F3), [[Engine/RveEditor]] (вкладка Profiler) и `engine-ui` (таблица `profiler`). `engine-resources` зависит от `engine-core` ради `ResourceSampler`: группа `Resources` строится там же, где лежит `ResourceStats`, и её используют и runtime, и редактор. `engine-render` и `engine-script` пишут длительности через `std::time::Duration` и на `engine-core` не опираются.
 
 ## Ограничения и важные детали
 

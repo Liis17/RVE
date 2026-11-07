@@ -207,7 +207,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 
 - `Tab::Profiler` закрыта по умолчанию и открывается из меню вкладок toolbar. Показывает CPU-фазы renderer, GPU-проходы видов Scene и Game (сопоставляются по `ViewportId`) и фазы шага Play: скрипты, ожидание и шаг физики.
 - Замеры копятся в `EditorProfile` (`editor/src/profile.rs`) окнами по последним кадрам и шагам; отчёт строится при показе вкладки.
-- Статистика ресурсов в редакторе не выводится.
+- Группа `Resources` показывает ту же дельту `ResourceStats` проекта, что и runtime. Снимок берётся не чаще раза в 500 мс (`EditorProfile::record_resources`).
 
 ## Панель Game
 
