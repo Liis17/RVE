@@ -1221,7 +1221,7 @@ fn show_audio_source(
                     let volume = ui.add(
                         egui::DragValue::new(&mut value.volume)
                             .speed(0.01)
-                            .range(0.0..=f32::MAX),
+                            .range(0.0..=engine_scene::MAX_AUDIO_VOLUME),
                     );
                     ui.end_row();
                     ui.label("Loop");

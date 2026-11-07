@@ -445,7 +445,7 @@ pub enum AudioError {
     Unavailable,
     /// The host refused the request; the reason is reported in the host's script events.
     Rejected,
-    /// A volume or position is not finite, or a volume is negative.
+    /// A volume or position is not finite, or a volume is outside `0.0..=MAX_AUDIO_VOLUME`.
     InvalidInput,
 }
 
@@ -510,8 +510,12 @@ fn audio_status(status: u32) -> Result<(), AudioError> {
     }
 }
 
+/// Наибольшая громкость (×4). Совпадает с `engine_scene::MAX_AUDIO_VOLUME`: rve-sdk не зависит от
+/// engine-scene, поэтому константа повторяется здесь.
+pub const MAX_AUDIO_VOLUME: f32 = 4.0;
+
 fn audio_volume(volume: f32) -> Result<f32, AudioError> {
-    if volume.is_finite() && volume >= 0.0 {
+    if volume.is_finite() && (0.0..=MAX_AUDIO_VOLUME).contains(&volume) {
         Ok(volume)
     } else {
         Err(AudioError::InvalidInput)

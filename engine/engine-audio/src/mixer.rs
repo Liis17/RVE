@@ -317,10 +317,10 @@ impl Mixer {
                 let start = (done + index) * channels;
                 let frame = &mut out[start..start + channels];
                 if channels == 1 {
-                    frame[0] = (left + right) * 0.5;
+                    frame[0] = sanitize((left + right) * 0.5);
                 } else {
-                    frame[0] = left;
-                    frame[1] = right;
+                    frame[0] = sanitize(left);
+                    frame[1] = sanitize(right);
                 }
             }
             done += count;
@@ -520,6 +520,15 @@ pub fn attenuation(distance: f32, distances: Distances) -> f32 {
         0.0
     } else {
         (distances.min / distance) * (distances.max - distance) / (distances.max - distances.min)
+    }
+}
+
+/// Выход устройства: конечные значения в пределах [-1, 1]; NaN и бесконечность дают тишину.
+fn sanitize(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
     }
 }
 

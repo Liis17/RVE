@@ -197,3 +197,31 @@ return Script
         "лимит отклоняет запрос, а не ломает скрипт"
     );
 }
+
+#[test]
+fn volume_above_the_cap_is_rejected_in_lua_and_the_cap_itself_is_accepted() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  assert(pcall(rve.audio.set_group_volume, "music", 4))
+  assert(not pcall(rve.audio.set_group_volume, "music", 4.5))
+  assert(not pcall(rve.audio.play, "/audio/hum.wav", {volume = 5}))
+  assert(pcall(rve.audio.play, "/audio/hum.wav", {volume = 4}))
+end
+return Script
+"#,
+    );
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+    assert_eq!(host.drain_audio_requests().len(), 2);
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error)
+    );
+}
+
+#[test]
+fn sdk_and_scene_agree_on_the_volume_cap() {
+    assert_eq!(rve_sdk::MAX_AUDIO_VOLUME, engine_scene::MAX_AUDIO_VOLUME);
+}

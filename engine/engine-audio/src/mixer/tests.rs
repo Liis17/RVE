@@ -408,3 +408,23 @@ fn stopped_voice_fades_out_without_a_jump_while_a_new_voice_starts_on_another_la
     assert!(out[fade..].iter().all(|value| *value == 0.0));
     assert_eq!(drain(&mut mixer), vec![voice(1)]);
 }
+
+#[test]
+fn device_output_stays_within_unit_range_and_non_finite_samples_become_silence() {
+    let mut mixer = mixer();
+    play(&mut mixer, 1, 0, clip(RATE, 1, vec![1.0; 48_000]), request(true));
+    mixer.apply(MixerCommand::SetVoiceVolume {
+        voice: voice(1),
+        volume: 4.0,
+    });
+    let loud = render_mono(&mut mixer, 512);
+    assert!(loud.iter().all(|value| (-1.0..=1.0).contains(value)), "{loud:?}");
+    assert_eq!(loud.last().copied(), Some(1.0));
+
+    mixer.apply(MixerCommand::SetVoiceVolume {
+        voice: voice(1),
+        volume: f32::NAN,
+    });
+    let broken = render_mono(&mut mixer, 256);
+    assert!(broken.iter().all(|value| *value == 0.0), "{broken:?}");
+}

@@ -913,6 +913,14 @@ fn sdk_audio_api_reports_rejections_missing_callbacks_and_invalid_input() {
         object.set_sound_volume(&mut context, -1.0),
         Err(crate::AudioError::InvalidInput)
     );
+    assert_eq!(
+        object.set_sound_volume(&mut context, crate::MAX_AUDIO_VOLUME + 0.5),
+        Err(crate::AudioError::InvalidInput)
+    );
+    assert_eq!(
+        context.set_group_volume(crate::AudioGroup::Music, 10.0),
+        Err(crate::AudioError::InvalidInput)
+    );
     let nan_position = crate::ClipOptions {
         position: Some([f32::NAN, 0.0, 0.0]),
         ..crate::ClipOptions::default()

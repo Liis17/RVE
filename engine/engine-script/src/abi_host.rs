@@ -999,10 +999,13 @@ fn audio_source_object(
 }
 
 fn audio_volume(volume: f32) -> Result<f32, String> {
-    if volume.is_finite() && volume >= 0.0 {
+    if volume.is_finite() && (0.0..=engine_scene::MAX_AUDIO_VOLUME).contains(&volume) {
         Ok(volume)
     } else {
-        Err("audio volume must be finite and >= 0".to_owned())
+        Err(format!(
+            "audio volume must be finite and from 0 to {}",
+            engine_scene::MAX_AUDIO_VOLUME
+        ))
     }
 }
 

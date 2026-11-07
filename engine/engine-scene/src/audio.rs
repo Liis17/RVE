@@ -140,6 +140,10 @@ fn default_max_distance() -> f32 {
     30.0
 }
 
+/// Наибольшая громкость источника, группы и голоса (усиление ×4). Значение совпадает с
+/// `rve_sdk::MAX_AUDIO_VOLUME`; тест в engine-script сверяет обе константы.
+pub const MAX_AUDIO_VOLUME: f32 = 4.0;
+
 /// Проверяет клип, громкость и дистанции; `assets` — объявленные `[[assets]]` документа.
 pub(crate) fn validate_audio_source(
     source: &str,
@@ -169,11 +173,11 @@ pub(crate) fn validate_audio_source(
             "audio_source.group не может быть master",
         ));
     }
-    if !audio.volume.is_finite() || audio.volume < 0.0 {
+    if !audio.volume.is_finite() || !(0.0..=MAX_AUDIO_VOLUME).contains(&audio.volume) {
         return Err(SceneError::new(
             source,
             Some(object_id),
-            "audio_source.volume должен быть конечным и >= 0",
+            "audio_source.volume должен быть конечным и в диапазоне 0..=4",
         ));
     }
     if !audio.min_distance.is_finite()
@@ -285,6 +289,16 @@ mod tests {
             assert!(error_for(&fields).contains("volume"), "{volume}");
         }
         assert!(parse(&source("clip = \"/audio/hum.wav\"\nvolume = 0.0")).is_ok());
+    }
+
+    #[test]
+    fn volume_is_capped_at_the_maximum_gain() {
+        let at_cap = format!(
+            "clip = \"/audio/hum.wav\"\nvolume = {}",
+            super::MAX_AUDIO_VOLUME
+        );
+        assert!(parse(&source(&at_cap)).is_ok());
+        assert!(error_for("clip = \"/audio/hum.wav\"\nvolume = 4.5").contains("volume"));
     }
 
     #[test]

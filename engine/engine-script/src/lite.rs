@@ -1163,9 +1163,10 @@ fn audio_volume(value: &Value, name: &str) -> mlua::Result<f32> {
         }
     };
     let converted = volume as f32;
-    if !volume.is_finite() || !converted.is_finite() || volume < 0.0 {
+    let max = f64::from(engine_scene::MAX_AUDIO_VOLUME);
+    if !volume.is_finite() || !converted.is_finite() || !(0.0..=max).contains(&volume) {
         return Err(LuaError::runtime(format!(
-            "{name} volume must be a finite number >= 0"
+            "{name} volume must be a finite number from 0 to {max}"
         )));
     }
     Ok(converted)
