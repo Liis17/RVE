@@ -1,5 +1,7 @@
 use super::{ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions};
-use crate::{Key, MouseButton, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime};
+use crate::{
+    Key, MouseButton, ScriptCursor, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime,
+};
 use engine_console::CommandLine;
 use engine_physics::{
     BodyDesc, BodyHandle, BodyKind, CharacterController, ColliderDesc, MAX_PUSH_SPEED,
@@ -4851,5 +4853,183 @@ fn exit_with_a_destroyed_other_is_delivered_only_inside_the_retired_window() {
             .iter()
             .any(|(_, message)| message.starts_with("exit ")),
         "{after:?}"
+    );
+}
+
+fn cursor_script_world() -> World {
+    one_camera(
+        r#"
+[[assets]]
+path = "/cursor.lua"
+[[objects.lite_scripts]]
+path = "/cursor.lua"
+"#,
+    )
+}
+
+#[test]
+fn lua_cursor_changes_are_visible_to_later_reads_and_applied_on_commit() {
+    let mut world = cursor_script_world();
+    let source = r#"
+local Cursor = {}
+function Cursor:on_update()
+  if rve.input.cursor_visible() ~= true or rve.input.cursor_locked() ~= false then
+    error("applied state missing")
+  end
+  rve.input.set_cursor_visible(false)
+  rve.input.set_cursor_locked(true)
+  if rve.input.cursor_visible() ~= false or rve.input.cursor_locked() ~= true then
+    error("staged state not visible to reads")
+  end
+  rve.log_info("cursor staged")
+end
+return Cursor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("cursor.lua", source)]),
+        None,
+        ScriptLoadOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(host.cursor(), ScriptCursor::default());
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "{events:?}"
+    );
+    assert_eq!(
+        host.cursor(),
+        ScriptCursor {
+            visible: false,
+            locked: true,
+        }
+    );
+}
+
+#[test]
+fn failed_lua_callback_discards_staged_cursor_changes() {
+    let mut world = cursor_script_world();
+    let source = r#"
+local Cursor = {}
+function Cursor:on_update()
+  rve.input.set_cursor_visible(false)
+  rve.input.set_cursor_locked(true)
+  error("callback failed")
+end
+return Cursor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("cursor.lua", source)]),
+        None,
+        ScriptLoadOptions::default(),
+    )
+    .unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error && event.message.contains("callback failed")
+    }));
+    assert_eq!(host.cursor(), ScriptCursor::default());
+}
+
+#[test]
+fn cursor_changes_are_rejected_during_script_creation() {
+    let world = cursor_script_world();
+    let source = "rve.input.set_cursor_locked(true)\nreturn {}\n";
+    let error = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("cursor.lua", source)]),
+        None,
+        ScriptLoadOptions::default(),
+    )
+    .err()
+    .expect("cursor changes must not run while the script is created");
+    assert!(
+        error
+            .to_string()
+            .contains("cursor changes are unavailable during script creation"),
+        "{error}"
+    );
+}
+
+#[test]
+fn cursor_arguments_must_be_lua_booleans() {
+    let mut world = cursor_script_world();
+    let source = r#"
+local Cursor = {}
+function Cursor:on_update()
+  rve.input.set_cursor_visible("yes")
+end
+return Cursor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("cursor.lua", source)]),
+        None,
+        ScriptLoadOptions::default(),
+    )
+    .unwrap();
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event
+                .message
+                .contains("rve.input.set_cursor_visible expects a boolean, got string")
+    }));
+    assert_eq!(host.cursor(), ScriptCursor::default());
+}
+
+#[test]
+fn set_cursor_provides_the_initial_state_seen_by_scripts() {
+    let mut world = cursor_script_world();
+    let source = r#"
+local Cursor = {}
+function Cursor:on_update()
+  if rve.input.cursor_visible() ~= false or rve.input.cursor_locked() ~= true then
+    error("initial cursor state mismatch")
+  end
+end
+return Cursor
+"#;
+    let mut host = ScriptHost::load_with_options(
+        &world,
+        "scene",
+        &sources(&[("cursor.lua", source)]),
+        None,
+        ScriptLoadOptions::default(),
+    )
+    .unwrap();
+    host.set_cursor(ScriptCursor {
+        visible: false,
+        locked: true,
+    });
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(
+        host.drain_events()
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error)
+    );
+    assert_eq!(
+        host.cursor(),
+        ScriptCursor {
+            visible: false,
+            locked: true,
+        }
     );
 }

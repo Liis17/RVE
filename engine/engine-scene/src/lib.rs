@@ -23,7 +23,7 @@ pub use camera_settings::{
     ProjectionSettings, Tonemapper,
 };
 pub use document::{
-    CameraComponent, CharacterControllerComponent, ColliderComponent, ColliderShape,
+    CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent, ColliderShape,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup, LodLevel,
     MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue,
     PointLightComponent, ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneAsset,

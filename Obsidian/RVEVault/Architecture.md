@@ -137,6 +137,9 @@ startup-потоке, внешние текстуры читаются чере�
 `ScriptInput` snapshot. Изменения контекста и bindings транзакционны: они видны со
 следующего snapshot, а не меняют ввод внутри текущей callback-фазы. SDK v5 добавляет
 nullable action callbacks в конец ABI host; прежние ABI v3/v4 сохраняют свой layout.
+Курсор идёт в обратном направлении: скрипты задают `ScriptCursor` транзакционно в
+`engine-script`, runtime или редактор переводят его в `engine_window::CursorState`, а
+`engine-window` применяет состояние к winit. `engine-script` окна не знает.
 Контракты схемы, API и вычисления описаны в [[Engine/EngineProject]],
 [[Engine/EngineScript]], [[Engine/RveSdk]], [[Engine/EngineRuntime]] и
 [[Engine/RveEditor]].

@@ -6,9 +6,11 @@ use std::ffi::c_void;
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
 ///
-/// Version 8 appends spawn, destroy, object-state and prefab callbacks after the v7 audio tail.
-/// It is a new number rather than v7 because v7 hosts already accept modules that end at audio.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 8;
+/// Version 8 appends cursor callbacks after the v7 audio tail.
+/// Version 9 appends spawn, destroy, object-state and prefab callbacks after the v8 cursor tail.
+/// Each version is a new number because hosts of the previous version already accept modules
+/// that end at its tail.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 9;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -647,6 +649,19 @@ pub type RveActionBindingFn = unsafe extern "C" fn(
 /// Stages restoration of the project input bindings. Appended in ABI v5.
 pub type RveResetBindingsFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
 
+/// Cursor state copied to a guest-provided output slot. Appended in ABI v8.
+#[repr(C)]
+pub struct RveCursorState {
+    pub visible: bool,
+    pub locked: bool,
+}
+
+/// Copies the cursor state applied by the host. Appended in ABI v8.
+pub type RveCursorStateFn =
+    unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveCursorState) -> bool;
+/// Stages a cursor visibility or lock change. Appended in ABI v8.
+pub type RveSetCursorFn = unsafe extern "C" fn(ctx: *mut c_void, value: bool) -> bool;
+
 pub const RVE_COLLISION_ENTER: u32 = 0;
 pub const RVE_COLLISION_EXIT: u32 = 1;
 pub const RVE_TRIGGER_ENTER: u32 = 2;
@@ -745,7 +760,7 @@ pub type RveAudioGroupVolumeFn =
     unsafe extern "C" fn(ctx: *mut c_void, group: u32, volume: f32) -> u32;
 
 /// Object state code: the handle is dead, or it never named a live or pending object.
-/// Returned by `RveHost::object_state`. Appended in ABI v8.
+/// Returned by `RveHost::object_state`. Appended in ABI v9.
 pub const RVE_OBJECT_DEAD: u32 = 0;
 /// Object state code: the object was spawned in this phase and is not in the world yet.
 pub const RVE_OBJECT_PENDING: u32 = 1;
@@ -753,7 +768,7 @@ pub const RVE_OBJECT_PENDING: u32 = 1;
 pub const RVE_OBJECT_ALIVE: u32 = 2;
 
 /// Prefab state code: the path is not in the project prefab list.
-/// Returned by `RveHost::prefab_state`. Appended in ABI v8.
+/// Returned by `RveHost::prefab_state`. Appended in ABI v9.
 pub const RVE_PREFAB_UNKNOWN: u32 = 0;
 /// Prefab state code: a scene fast prefab, always resident.
 pub const RVE_PREFAB_RESIDENT: u32 = 1;
@@ -792,7 +807,7 @@ pub const RVE_SPAWN_KNOWN_FLAGS: u32 = RVE_SPAWN_HAS_ID
     | RVE_SPAWN_HAS_POSITION;
 
 /// Optional fields of one spawn request. Read only the fields whose presence bit is set in
-/// `flags`; the others may hold any value. Appended in ABI v8.
+/// `flags`; the others may hold any value. Appended in ABI v9.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RveSpawnOptions {
@@ -815,19 +830,19 @@ pub struct RveSpawnOptions {
 }
 
 /// Spawns a prefab by project virtual path (without a leading slash). Returns the pending handle,
-/// or zero when the host refuses. The options pointer may be null. Appended in ABI v8.
+/// or zero when the host refuses. The options pointer may be null. Appended in ABI v9.
 pub type RveSpawnFn =
     unsafe extern "C" fn(ctx: *mut c_void, prefab: RveStr, options: *const RveSpawnOptions) -> u64;
 /// Queues an object subtree for removal; a positive delay is in seconds. Returns `false` for a
-/// dead handle or a refused request. Appended in ABI v8.
+/// dead handle or a refused request. Appended in ABI v9.
 pub type RveDestroyObjectFn =
     unsafe extern "C" fn(ctx: *mut c_void, object: u64, delay: f32) -> bool;
-/// Returns one of the `RVE_OBJECT_*` state codes. Appended in ABI v8.
+/// Returns one of the `RVE_OBJECT_*` state codes. Appended in ABI v9.
 pub type RveObjectStateFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
 /// Requests a heavy prefab load or unload by path; returns `false` when the host refuses.
-/// Appended in ABI v8.
+/// Appended in ABI v9.
 pub type RvePrefabRequestFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
-/// Returns one of the `RVE_PREFAB_*` state codes for a prefab path. Appended in ABI v8.
+/// Returns one of the `RVE_PREFAB_*` state codes for a prefab path. Appended in ABI v9.
 pub type RvePrefabStateFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> u32;
 
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
@@ -913,7 +928,13 @@ pub struct RveHost {
     pub audio_play_clip: Option<RveAudioPlayClipFn>,
     pub audio_stop_voice: Option<RveAudioVoiceFn>,
     pub audio_set_group_volume: Option<RveAudioGroupVolumeFn>,
-    /// Spawn, destroy, object-state and prefab callbacks appended in ABI v8; `None` marks an
+    /// Copies the cursor state applied by the host; appended in ABI v8.
+    pub cursor_state: Option<RveCursorStateFn>,
+    /// Stages cursor visibility; appended in ABI v8.
+    pub set_cursor_visible: Option<RveSetCursorFn>,
+    /// Stages cursor locking; appended in ABI v8.
+    pub set_cursor_locked: Option<RveSetCursorFn>,
+    /// Spawn, destroy, object-state and prefab callbacks appended in ABI v9; `None` marks an
     /// unavailable callback.
     pub spawn: Option<RveSpawnFn>,
     pub destroy: Option<RveDestroyObjectFn>,

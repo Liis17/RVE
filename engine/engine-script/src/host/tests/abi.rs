@@ -1322,10 +1322,10 @@ name = "AudioRejected"
 }
 
 #[test]
-fn abi_v6_and_v7_modules_load_on_the_v8_host() {
+fn abi_v6_to_v8_modules_load_on_the_v9_host() {
     let _lock = test_lock();
     let current = sdk_module();
-    for abi_version in [6, 7] {
+    for abi_version in [6, 7, 8] {
         let module = Box::leak(Box::new(RveModule {
             header: RveHeader {
                 abi_version,
@@ -1350,7 +1350,7 @@ fn abi_v6_and_v7_modules_load_on_the_v8_host() {
             message_list(&mut host)
                 .iter()
                 .any(|message| message == "start:v6"),
-            "guest ABI v{abi_version} runs on the v8 host"
+            "guest ABI v{abi_version} runs on the v9 host"
         );
     }
 }

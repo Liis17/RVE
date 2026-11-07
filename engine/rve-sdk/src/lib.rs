@@ -723,7 +723,7 @@ pub enum PrefabState {
     Unloading,
     /// A heavy prefab whose load failed.
     Failed,
-    /// The host predates ABI v8 and provides no prefab callbacks.
+    /// The host predates ABI v9 and provides no prefab callbacks.
     Unavailable,
 }
 
@@ -750,13 +750,13 @@ pub struct Prefabs<'a> {
 
 impl Prefabs<'_> {
     /// Requests a heavy prefab load. Returns `false` for an unknown path, a refused request, or a
-    /// host without ABI v8.
+    /// host without ABI v9.
     pub fn load(&self, path: &str) -> bool {
         self.request(self.host.prefab_load, path)
     }
 
     /// Requests a heavy prefab unload once its last instance and pending spawns are gone.
-    /// Returns `false` for an unknown path, a refused request, or a host without ABI v8.
+    /// Returns `false` for an unknown path, a refused request, or a host without ABI v9.
     pub fn unload(&self, path: &str) -> bool {
         self.request(self.host.prefab_unload, path)
     }
@@ -786,7 +786,7 @@ impl Context<'_> {
     ///
     /// The object enters the world when the current phase ends. Its `on_start` runs at the next
     /// update, before messages. `None` means the host refused the request (the reason is in the
-    /// script events), an option is not finite, or the host predates ABI v8.
+    /// script events), an option is not finite, or the host predates ABI v9.
     pub fn spawn(&mut self, prefab: &str, options: &SpawnOptions) -> Option<Object> {
         let callback = self.host.spawn?;
         let finite = [
@@ -827,7 +827,7 @@ impl Object {
     /// A zero delay removes it at the end of the current phase. A positive delay is measured on
     /// the script clock; when several destroys target the same object, the earliest due time wins.
     /// Returns `false` for a dead object, a refused request, a negative or non-finite delay, or a
-    /// host without ABI v8.
+    /// host without ABI v9.
     pub fn destroy(&self, ctx: &mut Context<'_>, delay: f32) -> bool {
         if !delay.is_finite() || delay < 0.0 {
             return false;
@@ -849,7 +849,7 @@ impl Object {
         self.state_code(ctx) == Some(abi::RVE_OBJECT_PENDING)
     }
 
-    /// Returns the host's state code, or `None` when the host predates ABI v8.
+    /// Returns the host's state code, or `None` when the host predates ABI v9.
     fn state_code(&self, ctx: &Context<'_>) -> Option<u32> {
         let callback = ctx.host.object_state?;
         // SAFETY: the host callback is valid during this guest call.
@@ -995,6 +995,20 @@ impl<'a> Context<'a> {
         };
         // SAFETY: the context name is borrowed for the duration of the callback.
         unsafe { callback(self.host.ctx, RveStr::from_str_ref(name)) }
+    }
+
+    /// Stages cursor visibility for this callback. Returns false when the host lacks ABI v8 support.
+    pub fn set_cursor_visible(&mut self, visible: bool) -> bool {
+        self.host
+            .set_cursor_visible
+            .is_some_and(|callback| unsafe { callback(self.host.ctx, visible) })
+    }
+
+    /// Stages cursor locking for this callback. Returns false when the host lacks ABI v8 support.
+    pub fn set_cursor_locked(&mut self, locked: bool) -> bool {
+        self.host
+            .set_cursor_locked
+            .is_some_and(|callback| unsafe { callback(self.host.ctx, locked) })
     }
 
     /// Replaces one action binding slot. Returns false when unavailable or invalid.
@@ -1213,6 +1227,26 @@ impl Input<'_> {
     /// Returns whether a mouse button became released in this frame.
     pub fn mouse_released(&self, button: MouseButton) -> bool {
         self.mouse_button_state(button) & abi::RVE_INPUT_RELEASED != 0
+    }
+
+    /// Returns whether the cursor is visible, or `None` when the host predates ABI v8.
+    pub fn cursor_visible(&self) -> Option<bool> {
+        self.cursor_state().map(|state| state.visible)
+    }
+
+    /// Returns whether the cursor is locked, or `None` when the host predates ABI v8.
+    pub fn cursor_locked(&self) -> Option<bool> {
+        self.cursor_state().map(|state| state.locked)
+    }
+
+    fn cursor_state(&self) -> Option<abi::RveCursorState> {
+        let callback = self.host.cursor_state?;
+        let mut state = abi::RveCursorState {
+            visible: true,
+            locked: false,
+        };
+        // SAFETY: the host pointer and output slot remain valid during this script callback.
+        unsafe { callback(self.host.ctx, &mut state) }.then_some(state)
     }
 
     /// Returns the cursor position in physical window pixels.

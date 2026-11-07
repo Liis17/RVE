@@ -1813,6 +1813,7 @@ mod tests {
             object.camera = Some(engine_scene::CameraComponent {
                 settings: None,
                 active: false,
+                cursor: Default::default(),
             });
             Ok(())
         });

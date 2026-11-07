@@ -4,10 +4,10 @@ use crate::CameraSettings;
 use crate::audio::AudioSourceComponent;
 use crate::camera::Camera;
 use crate::document::{
-    CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
-    EnvironmentComponent, HeavyScript, LiteScript, LodGroup, PointLightComponent,
-    RigidBodyComponent, RigidBodyKind, SceneDocument, SceneError, SceneObject, SpotLightComponent,
-    camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
+    CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent,
+    DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup,
+    PointLightComponent, RigidBodyComponent, RigidBodyKind, SceneDocument, SceneError, SceneObject,
+    SpotLightComponent, camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
 };
 use crate::light::ShadowSettings;
 use crate::prefab::{MAX_EXPANDED_ID_BYTES, PrefabTemplate};
@@ -614,6 +614,14 @@ impl World {
     /// Возвращает handle камеры, активной при построении кадра.
     pub fn active_camera(&self) -> ObjectHandle {
         self.active_camera
+    }
+
+    /// Возвращает флаги курсора активной камеры; без camera component — значения по умолчанию.
+    pub fn active_camera_cursor(&self) -> CameraCursor {
+        self.object(self.active_camera)
+            .and_then(|object| object.camera.as_ref())
+            .map(|camera| camera.cursor)
+            .unwrap_or_default()
     }
 
     /// Назначает активной существующую камеру.
@@ -1844,5 +1852,29 @@ position=[0.0,2.0,0.0]
                 .transform_point3(Vec3::ZERO)
                 .abs_diff_eq(Vec3::new(1.0, 2.0, 0.0), 1e-5)
         );
+    }
+
+    #[test]
+    fn active_camera_cursor_comes_from_the_selected_camera_only() {
+        let document = parse(
+            r#"
+[[objects]]
+id = "first"
+[objects.camera]
+[objects.camera.cursor]
+hide_on_start = true
+
+[[objects]]
+id = "second"
+[objects.camera]
+active = true
+[objects.camera.cursor]
+lock_on_start = true
+"#,
+        );
+        let world = World::from_document(&document).unwrap();
+        let cursor = world.active_camera_cursor();
+        assert!(!cursor.hide_on_start);
+        assert!(cursor.lock_on_start);
     }
 }
