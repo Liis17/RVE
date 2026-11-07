@@ -7,13 +7,15 @@ use crate::culling::Frustum;
 use crate::particles::{
     EmitterParamsGpu, MAX_PARTICLE_STEP, ParticleBlend, ParticleEmitterDesc, ParticleEmitterState,
     ParticleSimOwners, ParticleStepPlan, SimPushGpu, SortPushGpu, SpawnBatch, SpawnPushGpu,
-    StepInput, emitter_params, motion_margin, shape_bounds, sort_count, sort_passes, validate_desc,
+    StepInput, VertexPushGpu, emitter_params, motion_margin, shape_bounds, sort_count, sort_passes,
+    validate_desc,
 };
 use crate::{
-    DebugView, DeviceBuffer, GpuPass, HostBuffer, OFFSCREEN_FORMAT, OffscreenTarget,
+    DEPTH_FORMAT, DebugView, DeviceBuffer, GpuPass, HostBuffer, OFFSCREEN_FORMAT, OffscreenTarget,
     OwnedDescriptorPool, ParticleEmitterFrame, ParticleEmitterId, RenderError, Renderer,
     RetiredResource, ShaderModule, Texture, TextureColorSpace, WHITE_SRGB_TEXTURE,
-    create_compute_pipeline, mark_pass, scene_viewport,
+    create_compute_pipeline, depth_subresource_range, image_layout_barrier, mark_pass,
+    pipeline_barrier, scene_viewport,
 };
 use ash::vk;
 use std::collections::HashMap;
@@ -36,7 +38,7 @@ const PARTICLE_GPU_SIZE: u64 = 48;
 /// Push constants compute-стадий: максимум из spawn (112 Б) и sim (16 Б).
 const PARTICLE_COMPUTE_PUSH_SIZE: u32 = 112;
 /// Push constants вершинного шейдера: диапазон слотов и флаг порядка.
-const PARTICLE_VERTEX_PUSH_SIZE: u32 = 16;
+const PARTICLE_VERTEX_PUSH_SIZE: u32 = 32;
 /// Push constants compute-стадий не выходят за гарантированный Vulkan-минимум 128 байт.
 const _: () = assert!(PARTICLE_COMPUTE_PUSH_SIZE <= 128);
 /// Storage buffer descriptors на стадию compute: три в кадровом наборе и один буфер частиц.
@@ -65,6 +67,7 @@ pub(crate) struct ParticleEmitter {
 pub(crate) struct ParticleSystem {
     emitters: Vec<Option<ParticleEmitter>>,
     set_layout: Option<vk::DescriptorSetLayout>,
+    depth_layout: Option<vk::DescriptorSetLayout>,
     compute_layout: Option<vk::PipelineLayout>,
     graphics_layout: Option<vk::PipelineLayout>,
     spawn_pipeline: Option<vk::Pipeline>,
@@ -130,6 +133,13 @@ pub(crate) struct ParticlePass<'a> {
 }
 
 impl ParticleSystem {
+    /// Layout набора с depth буфером вида (binding 0, sampled image).
+    pub(crate) fn depth_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
+        self.depth_layout.ok_or(RenderError::InvalidState(
+            "layout depth набора частиц отсутствует",
+        ))
+    }
+
     /// Освобождает эмиттеры и пайплайны. Вызывается до уничтожения устройства.
     pub(crate) fn destroy(&mut self, device: &ash::Device) {
         self.emitters.clear();
@@ -152,6 +162,10 @@ impl ParticleSystem {
         {
             // SAFETY: every particle pipeline using this layout was destroyed above.
             unsafe { device.destroy_pipeline_layout(layout, None) };
+        }
+        if let Some(layout) = self.depth_layout.take() {
+            // SAFETY: every target set using this layout was freed with its pool.
+            unsafe { device.destroy_descriptor_set_layout(layout, None) };
         }
         if let Some(layout) = self.set_layout.take() {
             // SAFETY: every emitter set using this layout was freed with its pool above.
@@ -499,8 +513,19 @@ impl Renderer {
         // SAFETY: bindings are valid and describe the particle shader interface.
         let set_layout = unsafe { device.create_descriptor_set_layout(&set_layout_info, None) }?;
         self.particles.set_layout = Some(set_layout);
+        let depth_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::FRAGMENT)];
+        let depth_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&depth_bindings);
+        // SAFETY: one sampled-image binding describes the depth input of particle stages.
+        let depth_layout =
+            unsafe { device.create_descriptor_set_layout(&depth_layout_info, None) }?;
+        self.particles.depth_layout = Some(depth_layout);
 
-        let set_layouts = [self.frame_set_layout()?, set_layout];
+        let set_layouts = [self.frame_set_layout()?, set_layout, depth_layout];
         let compute_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
@@ -513,7 +538,7 @@ impl Renderer {
         self.particles.compute_layout = Some(compute_layout);
 
         let graphics_ranges = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(PARTICLE_VERTEX_PUSH_SIZE)];
         let graphics_info = vk::PipelineLayoutCreateInfo::default()
@@ -626,7 +651,11 @@ fn create_particle_graphics_pipeline(
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
+    // Depth только читается: тест LESS против непрозрачной геометрии, запись выключена.
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(false)
+        .depth_compare_op(vk::CompareOp::LESS);
     // Аддитивное смешивание: цвет складывается, альфа не меняется. Альфа-смешивание берёт
     // непредумноженный цвет и альфу из фрагментного шейдера.
     let (src_color, dst_color, src_alpha, dst_alpha) = match blend {
@@ -658,8 +687,9 @@ fn create_particle_graphics_pipeline(
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let color_formats = [OFFSCREEN_FORMAT];
-    let mut rendering_info =
-        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+    let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&color_formats)
+        .depth_attachment_format(DEPTH_FORMAT);
     let info = [vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(&vertex_input)
@@ -694,13 +724,37 @@ fn create_particle_graphics_pipeline(
 pub(crate) fn record_particles(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
-    target: &OffscreenTarget,
+    target: &mut OffscreenTarget,
     render_extent: vk::Extent2D,
     pass: &ParticlePass<'_>,
     timestamps: Option<crate::GpuMarks>,
 ) {
     if pass.works.is_empty() {
         return;
+    }
+    let consumers = pass.works.iter().any(|work| work.owner || work.visible);
+    if let Some(new_layout) = particle_depth_transition(target.depth_layout, consumers) {
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                target.depth.image,
+                target.depth_layout,
+                new_layout,
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::SHADER_SAMPLED_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+                depth_subresource_range(),
+            ),
+        );
+        target.depth_layout = new_layout;
     }
     let needs_compute = pass.works.iter().any(|work| {
         work.owner || (work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Alpha)
@@ -765,7 +819,7 @@ pub(crate) fn record_particles(
                 device,
                 command_buffer,
                 pass,
-                work.set,
+                [work.set, target.depth_set],
                 pod_bytes(&push),
                 spawn.count.div_ceil(crate::PARTICLE_COMPUTE_LOCAL_SIZE),
                 pass.pipelines.spawn,
@@ -783,12 +837,15 @@ pub(crate) fn record_particles(
             draw_first: work.sim_first,
             draw_count: work.sim_count,
             capacity: work.capacity,
+            render_width: render_extent.width as f32,
+            render_height: render_extent.height as f32,
+            padding: [0; 2],
         };
         record_compute(
             device,
             command_buffer,
             pass,
-            work.set,
+            [work.set, target.depth_set],
             pod_bytes(&push),
             work.sim_count.div_ceil(crate::PARTICLE_COMPUTE_LOCAL_SIZE),
             pass.pipelines.sim,
@@ -804,7 +861,7 @@ pub(crate) fn record_particles(
         .iter()
         .filter(|work| work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Alpha)
     {
-        record_sort(device, command_buffer, pass, work);
+        record_sort(device, command_buffer, pass, work, target.depth_set);
     }
 
     // Публикуем результаты симуляции и сортировки для вершинного и фрагментного чтения.
@@ -844,6 +901,7 @@ fn record_sort(
     command_buffer: vk::CommandBuffer,
     pass: &ParticlePass<'_>,
     work: &ParticleWork,
+    depth_set: vk::DescriptorSet,
 ) {
     for sort_pass in sort_passes(work.sort_count) {
         let push = SortPushGpu {
@@ -860,7 +918,7 @@ fn record_sort(
             device,
             command_buffer,
             pass,
-            work.set,
+            [work.set, depth_set],
             pod_bytes(&push),
             sort_pass.groups,
             pass.pipelines.sort,
@@ -898,14 +956,21 @@ fn record_draws(
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .load_op(vk::AttachmentLoadOp::LOAD)
         .store_op(vk::AttachmentStoreOp::STORE)];
+    // Depth только для чтения: тест глубины против геометрии, запись отключена.
+    let depth_attachment = vk::RenderingAttachmentInfo::default()
+        .image_view(target.depth.view)
+        .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE);
     let rendering_info = vk::RenderingInfo::default()
         .render_area(vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: render_extent,
         })
         .layer_count(1)
-        .color_attachments(&color_attachments);
-    // SAFETY: the color attachment is in COLOR_ATTACHMENT_OPTIMAL and matches the pipeline's format.
+        .color_attachments(&color_attachments)
+        .depth_attachment(&depth_attachment);
+    // SAFETY: the color and depth attachments match the pipelines and are in their attachment layouts.
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering_info);
         device.cmd_set_viewport(command_buffer, 0, &[scene_viewport(render_extent)]);
@@ -927,8 +992,16 @@ fn record_draws(
                 .map(|work| (work, pass.pipelines.alpha, 1u32)),
         );
     for (work, pipeline, sorted) in draws {
-        let sets = [pass.frame_set, work.set];
-        let push = [work.draw_first, work.capacity, work.draw_count, sorted];
+        let sets = [pass.frame_set, work.set, target.depth_set];
+        let push = VertexPushGpu {
+            draw_first: work.draw_first,
+            capacity: work.capacity,
+            draw_count: work.draw_count,
+            sorted,
+            render_width: render_extent.width as f32,
+            render_height: render_extent.height as f32,
+            padding: [0; 2],
+        };
         // SAFETY: frame and emitter sets match the graphics layout; the push range covers `push`.
         unsafe {
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -945,7 +1018,7 @@ fn record_draws(
                 pass.pipelines.graphics_layout,
                 vk::ShaderStageFlags::VERTEX,
                 0,
-                words_bytes(&push),
+                pod_bytes(&push),
             );
             device.cmd_draw(
                 command_buffer,
@@ -964,7 +1037,7 @@ fn record_compute(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     pass: &ParticlePass<'_>,
-    emitter_set: vk::DescriptorSet,
+    sets: [vk::DescriptorSet; 2],
     push: &[u8],
     groups: u32,
     pipeline: vk::Pipeline,
@@ -972,7 +1045,7 @@ fn record_compute(
     if groups == 0 {
         return;
     }
-    let sets = [pass.frame_set, emitter_set];
+    let sets = [pass.frame_set, sets[0], sets[1]];
     // SAFETY: pipeline and layout were created together; both sets match the compute layout.
     unsafe {
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -999,11 +1072,6 @@ fn record_compute(
 fn pod_bytes<T: Copy>(value: &T) -> &[u8] {
     // SAFETY: T is a `repr(C)` value of plain 4-byte scalars without padding; the slice covers exactly it.
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
-}
-
-fn words_bytes(words: &[u32]) -> &[u8] {
-    // SAFETY: u32 has no padding and the slice covers exactly the words.
-    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) }
 }
 
 /// Лимиты устройства, нужные GPU-частицам максимальной ёмкости. Входят в общую оценку
@@ -1101,5 +1169,38 @@ mod shader_tests {
             let words = ash::util::read_spv(&mut std::io::Cursor::new(shader)).unwrap();
             assert_eq!(words[0], 0x0723_0203);
         }
+    }
+}
+
+/// Layout depth буфера, в котором частицы читают его в compute и как read-only depth attachment.
+const PARTICLE_DEPTH_LAYOUT: vk::ImageLayout = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+/// Layout depth перед частицами. `None`, если переход не нужен: нет потребителей или depth уже read-only.
+fn particle_depth_transition(current: vk::ImageLayout, consumers: bool) -> Option<vk::ImageLayout> {
+    (consumers && current != PARTICLE_DEPTH_LAYOUT).then_some(PARTICLE_DEPTH_LAYOUT)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    #[test]
+    fn particles_without_consumers_do_not_change_depth_layout() {
+        assert_eq!(
+            particle_depth_transition(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, false),
+            None
+        );
+    }
+
+    #[test]
+    fn particles_move_depth_to_read_only_once_per_view() {
+        assert_eq!(
+            particle_depth_transition(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, true),
+            Some(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+        );
+        assert_eq!(
+            particle_depth_transition(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL, true),
+            None
+        );
     }
 }

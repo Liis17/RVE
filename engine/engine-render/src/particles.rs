@@ -929,6 +929,24 @@ pub struct SimPushGpu {
     pub draw_first: u32,
     pub draw_count: u32,
     pub capacity: u32,
+    /// Размер кадра в пикселях: нужен для проекции частицы в depth буфер.
+    pub render_width: f32,
+    pub render_height: f32,
+    pub padding: [u32; 2],
+}
+
+/// Push constants вершинного и фрагментного шейдеров (`particle.vert`/`particle.frag`), 32 байта.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VertexPushGpu {
+    pub draw_first: u32,
+    pub capacity: u32,
+    pub draw_count: u32,
+    /// 1 — индекс берётся из буфера сортировки (alpha), 0 — из порядка instance.
+    pub sorted: u32,
+    pub render_width: f32,
+    pub render_height: f32,
+    pub padding: [u32; 2],
 }
 
 #[cfg(test)]
@@ -1502,7 +1520,8 @@ mod tests {
             size_of::<SpawnPushGpu>() <= 128,
             "guaranteed Vulkan push constant minimum"
         );
-        assert_eq!(size_of::<SimPushGpu>(), 16);
+        assert_eq!(size_of::<SimPushGpu>(), 32);
+        assert_eq!(size_of::<VertexPushGpu>(), 32);
         assert_eq!(size_of::<EmitterParamsGpu>() % 16, 0);
         assert_eq!(size_of::<EmitterParamsGpu>(), 256);
         assert_eq!(offset_of!(EmitterParamsGpu, color_values), 16 * 7);

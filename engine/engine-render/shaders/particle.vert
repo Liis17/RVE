@@ -53,17 +53,22 @@ layout(set = 1, binding = 2, std430) readonly buffer SortBuffer {
     uvec2 keys[];
 } sort_buffer;
 
-// Совпадает с VertexPushGpu: диапазон слотов и флаг использования порядка сортировки.
+// Совпадает с VertexPushGpu в particles.rs (32 байта): диапазон слотов, порядок и размер кадра.
 layout(push_constant) uniform VertexPush {
     uint draw_first;
     uint capacity;
     uint draw_count;
     uint sorted;
+    float render_width;
+    float render_height;
+    uint padding0;
+    uint padding1;
 } push;
 
 layout(location = 0) out vec2 out_atlas_uv;
 layout(location = 1) out vec4 out_color;
 layout(location = 2) out vec2 out_quad_uv;
+layout(location = 3) out float out_view_depth;
 
 const vec2 CORNERS[6] = vec2[](
     vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
@@ -121,6 +126,7 @@ void main() {
         out_atlas_uv = vec2(0.0);
         out_color = vec4(0.0);
         out_quad_uv = vec2(0.0);
+        out_view_depth = 1.0;
         return;
     }
     float life = clamp(age / lifetime, 0.0, 1.0);
@@ -150,4 +156,5 @@ void main() {
     out_atlas_uv = (cell + quad_uv) / vec2(columns, rows);
     out_color = sample_color(life);
     out_quad_uv = quad_uv;
+    out_view_depth = clip.w;
 }

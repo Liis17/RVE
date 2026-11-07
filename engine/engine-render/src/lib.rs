@@ -2058,6 +2058,7 @@ impl Renderer {
                 render_extent,
                 output_extent,
                 taa_set_layout,
+                self.particles.depth_layout()?,
             )?;
             write_image_set(
                 &device,
@@ -2644,6 +2645,7 @@ impl Renderer {
         let target_resources = ViewportTargetResources {
             image_set_layout,
             taa_set_layout,
+            particle_depth_layout: self.particles.depth_layout()?,
             image_sampler: self
                 .ui_sampler
                 .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?,
@@ -7069,6 +7071,9 @@ struct OffscreenTarget {
     layout: vk::ImageLayout,
     velocity_layout: vk::ImageLayout,
     depth_layout: vk::ImageLayout,
+    /// Набор с depth для проходов частиц; пул освобождается вместе с целью.
+    _depth_pool: OwnedDescriptorPool,
+    depth_set: vk::DescriptorSet,
 }
 
 impl OffscreenTarget {
@@ -7077,7 +7082,18 @@ impl OffscreenTarget {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         extent: vk::Extent2D,
+        depth_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
+        let depth = DeviceImage::new(
+            instance,
+            device,
+            physical_device,
+            extent,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            depth_subresource_range(),
+        )?;
+        let (depth_pool, depth_set) = allocate_depth_set(device, depth_set_layout, depth.view)?;
         Ok(Self {
             color: DeviceImage::new(
                 instance,
@@ -7097,20 +7113,52 @@ impl OffscreenTarget {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 color_subresource_range(),
             )?,
-            depth: DeviceImage::new(
-                instance,
-                device,
-                physical_device,
-                extent,
-                DEPTH_FORMAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                depth_subresource_range(),
-            )?,
+            depth,
             layout: vk::ImageLayout::UNDEFINED,
             velocity_layout: vk::ImageLayout::UNDEFINED,
             depth_layout: vk::ImageLayout::UNDEFINED,
+            _depth_pool: depth_pool,
+            depth_set,
         })
     }
+}
+
+/// Набор с depth изображением вида (binding 0, DEPTH_STENCIL_READ_ONLY_OPTIMAL) для проходов частиц.
+/// Пул принадлежит цели и освобождается вместе с ней.
+fn allocate_depth_set(
+    device: &ash::Device,
+    layout: vk::DescriptorSetLayout,
+    depth_view: vk::ImageView,
+) -> Result<(OwnedDescriptorPool, vk::DescriptorSet), RenderError> {
+    let pool_sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::SAMPLED_IMAGE)
+        .descriptor_count(1)];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(1)
+        .pool_sizes(&pool_sizes);
+    let pool = OwnedDescriptorPool::new(device, &pool_info)?;
+    let layouts = [layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool.handle)
+        .set_layouts(&layouts);
+    // SAFETY: the pool was sized for exactly one set of this layout.
+    let set = unsafe { device.allocate_descriptor_sets(&allocate_info) }?
+        .into_iter()
+        .next()
+        .ok_or(RenderError::InvalidState(
+            "не создан набор depth для частиц",
+        ))?;
+    let image_info = [vk::DescriptorImageInfo::default()
+        .image_view(depth_view)
+        .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+        .image_info(&image_info)];
+    // SAFETY: the write targets the sampled-image binding of the freshly allocated set.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    Ok((pool, set))
 }
 
 struct FrameTarget {
@@ -7131,8 +7179,15 @@ impl FrameTarget {
         render_extent: vk::Extent2D,
         output_extent: vk::Extent2D,
         taa_set_layout: vk::DescriptorSetLayout,
+        particle_depth_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
-        let scene = OffscreenTarget::new(instance, device, physical_device, render_extent)?;
+        let scene = OffscreenTarget::new(
+            instance,
+            device,
+            physical_device,
+            render_extent,
+            particle_depth_layout,
+        )?;
         let ldr = DeviceImage::new(
             instance,
             device,
@@ -7264,6 +7319,7 @@ fn write_local_light_descriptor(
 /// Общие объекты renderer, нужные каждой цели viewport.
 struct ViewportTargetResources {
     image_set_layout: vk::DescriptorSetLayout,
+    particle_depth_layout: vk::DescriptorSetLayout,
     taa_set_layout: vk::DescriptorSetLayout,
     image_sampler: vk::Sampler,
     post_sampler: vk::Sampler,
@@ -7463,7 +7519,13 @@ impl ViewportTarget {
         render_extent: vk::Extent2D,
         resources: &ViewportTargetResources,
     ) -> Result<Self, RenderError> {
-        let scene = OffscreenTarget::new(instance, device, physical_device, render_extent)?;
+        let scene = OffscreenTarget::new(
+            instance,
+            device,
+            physical_device,
+            render_extent,
+            resources.particle_depth_layout,
+        )?;
         let ldr = DeviceImage::new(
             instance,
             device,
@@ -9638,11 +9700,12 @@ fn record_scene(
         command_buffer,
         image_layout_barrier(
             target.depth.image,
-            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            target.depth_layout,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
             offscreen_sampled_stages(),
             vk::AccessFlags2::SHADER_SAMPLED_READ,
             depth_subresource_range(),

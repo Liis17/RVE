@@ -11,9 +11,9 @@ use engine_project::{BootstrapConfig, BootstrapPresentMode};
 use engine_render::{
     AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId,
-    MeshId, ParticleBlend, ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape, ProceduralSky,
-    Renderer, RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
-    ViewSettings,
+    MeshId, ParticleBlend, ParticleCollision, ParticleEmitterDesc, ParticleEmitterFrame,
+    ParticleShape, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
@@ -303,6 +303,11 @@ fn create_particle_emitters(renderer: &mut Renderer) -> Result<Vec<ParticleEmitt
         size: [0.12, 0.2],
         gravity: [0.0, -3.0, 0.0],
         drag: 0.3,
+        collision: Some(ParticleCollision {
+            restitution: 0.4,
+            friction: 0.2,
+            thickness: 0.05,
+        }),
         ..ParticleEmitterDesc::default()
     };
     let smoke = ParticleEmitterDesc {
@@ -317,6 +322,7 @@ fn create_particle_emitters(renderer: &mut Renderer) -> Result<Vec<ParticleEmitt
         size: [0.6, 0.9],
         gravity: [0.0, 0.4, 0.0],
         drag: 0.5,
+        soft_distance: 0.5,
         ..ParticleEmitterDesc::default()
     };
     [
