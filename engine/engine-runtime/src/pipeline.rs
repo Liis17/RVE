@@ -20,7 +20,8 @@ use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
     FrameStatus, LocalLight, LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId,
-    ProceduralSky, Renderer, SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
+    ParticleEmitterFrame, ParticleEmitterId, ProceduralSky, Renderer, SHADOW_MAP_RESOLUTION,
+    Tonemapper as RenderTonemapper, ViewSettings,
 };
 #[cfg(feature = "dev-console")]
 use engine_render::{UiImage, UiPrimitive, UiVertex, ViewportId};
@@ -72,6 +73,9 @@ pub(crate) struct FrameSnapshot {
     pub local_light_shadows: Vec<LocalLightShadow>,
     pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
+    pub particles: Vec<ParticleEmitterFrame>,
+    /// ÐÐ³ÑÐ¾Ð²Ð¾Ðµ Ð²ÑÐµÐ¼Ñ ÑÐºÑÐ¸Ð¿ÑÐ¾Ð²Ð¾Ð³Ð¾ Ð¿Ð¾ÑÐ¾ÐºÐ° Ð½Ð° Ð¼Ð¾Ð¼ÐµÐ½Ñ ÑÐ½Ð¸Ð¼ÐºÐ°; Ð¾ÑÐ½Ð¾Ð²Ð° ÑÐ°Ð³Ð° ÑÐ¸Ð¼ÑÐ»ÑÑÐ¸Ð¸ ÑÐ°ÑÑÐ¸Ñ.
+    pub sim_time: f64,
     object_motion: HashMap<ObjectHandle, ObjectMotion>,
 }
 
@@ -108,6 +112,8 @@ pub(crate) enum EnvironmentCacheKey {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
     pub by_object: HashMap<ObjectHandle, Vec<Vec<(MeshId, MaterialId)>>>,
+    /// Ð­Ð¼Ð¸ÑÑÐµÑÑ ÑÐ°ÑÑÐ¸Ñ Ð¿Ð¾ Ð¾Ð±ÑÐµÐºÑÐ°Ð¼ ÑÑÐµÐ½Ñ; ÑÐ¾Ð·Ð´Ð°ÑÑÑÑ Ð¿ÑÐ¸ Ð·Ð°Ð³ÑÑÐ·ÐºÐµ ÑÑÐµÐ½Ñ.
+    pub particles: HashMap<ObjectHandle, ParticleEmitterId>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
 }
 
@@ -319,6 +325,8 @@ pub(crate) struct VulkanBackend {
     debug_view: DebugView,
     current_environment: Option<(EnvironmentCacheKey, EnvironmentId)>,
     pipeline_cache_path: Option<std::path::PathBuf>,
+    /// ÐÐ³ÑÐ¾Ð²Ð¾Ðµ Ð²ÑÐµÐ¼Ñ Ð¿Ð¾ÑÐ»ÐµÐ´Ð½ÐµÐ³Ð¾ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ ÐºÐ°Ð´ÑÐ°: ÑÐ°Ð³ ÑÐ°ÑÑÐ¸Ñ ÑÑÐ¸ÑÐ°ÐµÑÑÑ Ð¾Ñ Ð½ÐµÐ³Ð¾.
+    last_submitted_sim_time: Option<f64>,
     #[cfg(feature = "dev-console")]
     console_ui: Option<Arc<ConsoleUiSlot>>,
     #[cfg(feature = "dev-console")]
@@ -343,6 +351,7 @@ impl VulkanBackend {
             debug_view,
             current_environment: None,
             pipeline_cache_path,
+            last_submitted_sim_time: None,
             #[cfg(feature = "dev-console")]
             console_ui: None,
             #[cfg(feature = "dev-console")]
@@ -445,6 +454,7 @@ impl RenderBackend for VulkanBackend {
         height: u32,
     ) -> Result<FrameOutcome, String> {
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
+        let particle_step = particle_step(snapshot.sim_time, self.last_submitted_sim_time);
         let frame = Frame {
             clear_color: [
                 snapshot.view.render.clear_color[0],
@@ -482,12 +492,18 @@ impl RenderBackend for VulkanBackend {
                 },
             },
             reset_history: snapshot.reset_history,
-            particles: &[],
-            particle_step: 0.0,
+            particles: &snapshot.particles,
+            particle_step,
         };
-        self.renderer
+        let outcome = self
+            .renderer
             .render_frame_with_outcome(&frame)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // Ð¡Ð¾ÑÑÐ¾ÑÐ½Ð¸Ðµ ÑÐ°ÑÑÐ¸Ñ ÑÑÐ¸ÑÐ°ÐµÑÑÑ Ð¿ÑÐ¾Ð´Ð²Ð¸Ð½ÑÑÑÐ¼ ÑÐ¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ ÐºÐ°Ð´ÑÐ°.
+        if outcome.submitted {
+            self.last_submitted_sim_time = Some(snapshot.sim_time);
+        }
+        Ok(outcome)
     }
 
     fn wait_idle(&mut self) {
@@ -821,6 +837,7 @@ fn scripts_thread(
     );
     let mut frame_number = 0_u64;
     let mut last_tick = clock.now();
+    let mut sim_time = 0.0_f64;
     let start_time = ScriptTime {
         elapsed: last_tick.as_secs_f64(),
         frame: frame_number,
@@ -950,6 +967,7 @@ fn scripts_thread(
         let now = clock.now();
         let dt = now.saturating_sub(last_tick).as_secs_f32();
         last_tick = now;
+        sim_time += f64::from(dt);
         frame_number = frame_number.saturating_add(1);
         let time = ScriptTime {
             elapsed: now.as_secs_f64(),
@@ -1046,7 +1064,10 @@ fn scripts_thread(
             audio.sync_positions(&world);
         }
         let snapshot_started = Instant::now();
-        let made = make_snapshot(scene_frame, &world, &gpu_scene);
+        let made = make_snapshot(scene_frame, &world, &gpu_scene).map(|mut snapshot| {
+            snapshot.sim_time = sim_time;
+            snapshot
+        });
         timings.record(
             script_phase::LOOP,
             script_phase::MAKE_SNAPSHOT,
@@ -1251,6 +1272,18 @@ fn make_snapshot(
     }
     let environment = resolve_environment_snapshot(scene.environment.as_ref(), gpu_scene)?;
     let (local_lights, local_light_shadows) = render_local_lights(&scene.local_lights);
+    let particles = scene
+        .particle_emitters
+        .iter()
+        .filter_map(|instance| {
+            let emitter = gpu_scene.particles.get(&instance.object)?;
+            Some(ParticleEmitterFrame {
+                emitter: *emitter,
+                transform: instance.model.to_cols_array_2d(),
+                emitting: true,
+            })
+        })
+        .collect();
     Ok(FrameSnapshot {
         camera: scene.camera,
         active_camera: world.active_camera(),
@@ -1261,8 +1294,16 @@ fn make_snapshot(
         local_light_shadows,
         environment,
         draws,
+        particles,
+        sim_time: 0.0,
         object_motion,
     })
+}
+
+/// Ð¨Ð°Ð³ ÑÐ¸Ð¼ÑÐ»ÑÑÐ¸Ð¸ ÑÐ°ÑÑÐ¸Ñ: ÑÐºÐ¾Ð»ÑÐºÐ¾ Ð¸Ð³ÑÐ¾Ð²Ð¾Ð³Ð¾ Ð²ÑÐµÐ¼ÐµÐ½Ð¸ Ð¿ÑÐ¾ÑÐ»Ð¾ Ñ Ð¿Ð¾ÑÐ»ÐµÐ´Ð½ÐµÐ³Ð¾ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ ÐºÐ°Ð´ÑÐ°.
+/// ÐÐµÑÐ²ÑÐ¹ ÐºÐ°Ð´Ñ ÑÐ°Ð³Ð° Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐ°ÐµÑ, ÑÑÐ¾Ð±Ñ Ð²ÑÐµÐ¼Ñ Ð·Ð°Ð³ÑÑÐ·ÐºÐ¸ Ð½Ðµ Ð¿ÑÐµÐ²ÑÐ°ÑÐ¸Ð»Ð¾ÑÑ Ð² ÑÐºÐ°ÑÐ¾Ðº.
+fn particle_step(sim_time: f64, last_submitted: Option<f64>) -> f32 {
+    last_submitted.map_or(0.0, |last| (sim_time - last).max(0.0) as f32)
 }
 
 fn render_local_lights(states: &[LocalLightState]) -> (Vec<LocalLight>, Vec<LocalLightShadow>) {
@@ -2449,6 +2490,8 @@ distance=2.0
     fn empty_snapshot() -> FrameSnapshot {
         let active_camera = motion_test_handles().0;
         FrameSnapshot {
+            particles: Vec::new(),
+            sim_time: 0.0,
             camera: Camera {
                 position: Vec3::new(0.0, 0.0, 4.0),
                 target: Vec3::ZERO,
@@ -2489,6 +2532,8 @@ distance=2.0
         objects: &[(ObjectHandle, [[f32; 4]; 4])],
     ) -> FrameSnapshot {
         FrameSnapshot {
+            particles: Vec::new(),
+            sim_time: 0.0,
             camera: Camera {
                 position: Vec3::new(0.0, 0.0, 4.0),
                 target: Vec3::ZERO,
@@ -4270,5 +4315,26 @@ return Move
         );
         publish_script_cursor(&scripts, &control, &mut published);
         assert_eq!(sink.0.lock().unwrap().len(), states.len());
+    }
+}
+
+#[cfg(test)]
+mod particle_step_tests {
+    use super::particle_step;
+
+    #[test]
+    fn first_submitted_frame_does_not_step_particles() {
+        assert_eq!(particle_step(12.0, None), 0.0);
+    }
+
+    #[test]
+    fn step_is_simulation_time_since_last_submitted_frame() {
+        assert!((particle_step(1.5, Some(1.25)) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn non_advancing_or_backwards_time_gives_no_step() {
+        assert_eq!(particle_step(2.0, Some(2.0)), 0.0);
+        assert_eq!(particle_step(1.0, Some(2.0)), 0.0);
     }
 }

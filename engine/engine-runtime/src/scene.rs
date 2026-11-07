@@ -6,13 +6,15 @@ use engine_physics::{
 };
 use engine_project::PhysicsSettings;
 use engine_render::{
-    AlphaMode, EnvironmentSource, Material, MaterialId, RenderError, Renderer, TextureColorSpace,
-    TextureId, Vertex,
+    AlphaMode, EnvironmentSource, Material, MaterialId, ParticleBlend, ParticleBurst,
+    ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook, ParticleShape,
+    ParticleSizeKey, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::CameraSettings;
 use engine_scene::{
-    MaterialAlphaMode, MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand,
+    MaterialAlphaMode, MaterialOverride, ObjectHandle, ParticleBlendMode, ParticleEmitterComponent,
+    ParticleShapeComponent, SceneDocument, SceneError, World, expand,
 };
 use glam::Vec3;
 use std::collections::{BTreeMap, HashMap};
@@ -30,6 +32,14 @@ pub(crate) struct PreparedRenderAssets {
     pub textures: HashMap<String, TextureData>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
     pub objects: Vec<ObjectModel>,
+    pub particles: Vec<ParticleObject>,
+}
+
+/// Ð­Ð¼Ð¸ÑÑÐµÑ ÑÐ°ÑÑÐ¸Ñ Ð¾Ð±ÑÐµÐºÑÐ°: Ð¿Ð°ÑÐ°Ð¼ÐµÑÑÑ ÑÑÐµÐ½Ñ Ð¸ Ð¿ÑÑÑ ÑÐµÐºÑÑÑÑÑ, ÑÐ¶Ðµ Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½Ð½Ð¾Ð¹ Ð² `textures`.
+pub(crate) struct ParticleObject {
+    pub object: ObjectHandle,
+    pub emitter: ParticleEmitterComponent,
+    pub texture: Option<String>,
 }
 
 pub(crate) struct PreparedScene {
@@ -158,6 +168,7 @@ fn prepare_scene_with_model_loader(
     let mut textures = HashMap::new();
     let mut environments = HashMap::new();
     let mut objects = Vec::new();
+    let mut particles = Vec::new();
     let mut lite_paths = std::collections::BTreeSet::new();
 
     for object in world.objects() {
@@ -177,6 +188,26 @@ fn prepare_scene_with_model_loader(
                     rgb: image.rgb,
                 }));
             }
+        }
+        if let Some(emitter) = &object.particle_emitter {
+            let texture = emitter
+                .texture
+                .as_ref()
+                .map(|path| path.as_str().to_owned());
+            if let Some(path) = &texture
+                && let std::collections::hash_map::Entry::Vacant(entry) =
+                    textures.entry(path.clone())
+            {
+                let data = assets
+                    .load_texture(entry.key())
+                    .map_err(|error| format!("{scene_path}: {error}"))?;
+                entry.insert(data);
+            }
+            particles.push(ParticleObject {
+                object: object.handle,
+                emitter: emitter.clone(),
+                texture,
+            });
         }
         if let Some(mesh) = &object.mesh_renderer {
             let mut levels = vec![(
@@ -259,6 +290,7 @@ fn prepare_scene_with_model_loader(
             textures,
             environments,
             objects,
+            particles,
         },
     })
 }
@@ -474,7 +506,99 @@ pub(crate) fn upload_scene(
         }
         table.by_object.insert(object.object, levels);
     }
+    for particle in &assets.particles {
+        let texture = match &particle.texture {
+            Some(path) => {
+                let data = assets.textures.get(path).ok_or(RenderError::InvalidState(
+                    "CPU-ÑÐµÐºÑÑÑÑÐ° ÑÐ°ÑÑÐ¸Ñ Ð¾ÑÑÑÑÑÑÐ²ÑÐµÑ Ð² ÑÐ°Ð±Ð»Ð¸ÑÐµ GPU-ÑÐµÑÑÑÑÐ¾Ð²",
+                ))?;
+                Some(get_or_insert_texture(
+                    &mut texture_cache.scene,
+                    (path.clone(), TextureColorSpace::Srgb),
+                    || {
+                        renderer.create_texture_with_color_space(
+                            data.width,
+                            data.height,
+                            &data.rgba,
+                            TextureColorSpace::Srgb,
+                        )
+                    },
+                )?)
+            }
+            None => None,
+        };
+        let emitter =
+            renderer.create_particle_emitter(particle_emitter_desc(&particle.emitter, texture))?;
+        table.particles.insert(particle.object, emitter);
+    }
     Ok(table)
+}
+
+/// ÐÐµÑÐµÐ²Ð¾Ð´Ð¸Ñ ÐºÐ¾Ð¼Ð¿Ð¾Ð½ÐµÐ½Ñ ÑÑÐµÐ½Ñ Ð² Ð¾Ð¿Ð¸ÑÐ°Ð½Ð¸Ðµ ÑÐ¼Ð¸ÑÑÐµÑÐ° `engine-render`; Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° Ð´Ð¸Ð°Ð¿Ð°Ð·Ð¾Ð½Ð¾Ð² â Ð² engine-scene.
+fn particle_emitter_desc(
+    component: &ParticleEmitterComponent,
+    texture: Option<TextureId>,
+) -> ParticleEmitterDesc {
+    ParticleEmitterDesc {
+        capacity: component.capacity,
+        blend: match component.blend {
+            ParticleBlendMode::Additive => ParticleBlend::Additive,
+            ParticleBlendMode::Alpha => ParticleBlend::Alpha,
+        },
+        shape: match component.shape {
+            ParticleShapeComponent::Point {} => ParticleShape::Point,
+            ParticleShapeComponent::Sphere { radius } => ParticleShape::Sphere { radius },
+            ParticleShapeComponent::Cone { angle, radius } => ParticleShape::Cone { angle, radius },
+            ParticleShapeComponent::Box { half_extents } => ParticleShape::Box { half_extents },
+        },
+        rate: component.rate,
+        bursts: component
+            .bursts
+            .iter()
+            .map(|burst| ParticleBurst {
+                time: burst.time,
+                count: burst.count,
+            })
+            .collect(),
+        duration: component.duration,
+        looping: component.looping,
+        lifetime: component.lifetime,
+        speed: component.speed,
+        size: component.size,
+        rotation: component.rotation,
+        angular_velocity: component.angular_velocity,
+        gravity: component.gravity,
+        drag: component.drag,
+        color_over_life: component
+            .color_over_life
+            .iter()
+            .map(|key| ParticleColorKey {
+                time: key.time,
+                color: key.color,
+            })
+            .collect(),
+        size_over_life: component
+            .size_over_life
+            .iter()
+            .map(|key| ParticleSizeKey {
+                time: key.time,
+                size: key.size,
+            })
+            .collect(),
+        texture,
+        flipbook: ParticleFlipbook {
+            columns: component.flipbook.columns,
+            rows: component.flipbook.rows,
+            frames_per_second: component.flipbook.frames_per_second,
+        },
+        soft_distance: component.soft_distance,
+        collision: component.collision.map(|collision| ParticleCollision {
+            restitution: collision.restitution,
+            friction: collision.friction,
+            thickness: collision.thickness,
+        }),
+        seed: component.seed,
+    }
 }
 
 fn upload_resolved_material(
@@ -1227,5 +1351,104 @@ id = "camera"
         assert_eq!(scene_srgb, scene_srgb_reused);
         assert_ne!(scene_srgb, scene_linear);
         assert_eq!(uploads.get(), 4);
+    }
+}
+
+#[cfg(test)]
+mod particle_mapping_tests {
+    use super::particle_emitter_desc;
+    use engine_render::{
+        MAX_ADDITIVE_PARTICLE_CAPACITY as RENDER_ADDITIVE,
+        MAX_ALPHA_PARTICLE_CAPACITY as RENDER_ALPHA, ParticleBlend, ParticleShape,
+    };
+    use engine_scene::{
+        MAX_ADDITIVE_PARTICLE_CAPACITY as SCENE_ADDITIVE,
+        MAX_ALPHA_PARTICLE_CAPACITY as SCENE_ALPHA, ParticleBlendMode, ParticleBurstComponent,
+        ParticleCollisionComponent, ParticleColorKeyComponent, ParticleEmitterComponent,
+        ParticleShapeComponent,
+    };
+
+    #[test]
+    fn capacity_limits_match_between_scene_and_render() {
+        assert_eq!(SCENE_ADDITIVE, RENDER_ADDITIVE);
+        assert_eq!(SCENE_ALPHA, RENDER_ALPHA);
+    }
+
+    #[test]
+    fn component_maps_every_field_into_render_description() {
+        let component = ParticleEmitterComponent {
+            capacity: 1024,
+            blend: ParticleBlendMode::Alpha,
+            shape: ParticleShapeComponent::Cone {
+                angle: 0.3,
+                radius: 0.5,
+            },
+            rate: 45.0,
+            bursts: vec![ParticleBurstComponent {
+                time: 0.2,
+                count: 9,
+            }],
+            duration: 2.0,
+            looping: false,
+            lifetime: [1.0, 3.0],
+            speed: [0.5, 1.5],
+            size: [0.2, 0.4],
+            rotation: [0.0, 1.0],
+            angular_velocity: [-1.0, 1.0],
+            gravity: [0.0, -9.8, 0.0],
+            drag: 0.25,
+            color_over_life: vec![ParticleColorKeyComponent {
+                time: 0.0,
+                color: [1.0, 0.5, 0.0, 1.0],
+            }],
+            size_over_life: Vec::new(),
+            texture: None,
+            flipbook: engine_scene::ParticleFlipbookComponent {
+                columns: 4,
+                rows: 2,
+                frames_per_second: 6.0,
+            },
+            soft_distance: 0.75,
+            collision: Some(ParticleCollisionComponent {
+                restitution: 0.3,
+                friction: 0.1,
+                thickness: 0.05,
+            }),
+            seed: 42,
+        };
+        let texture = None;
+        let desc = particle_emitter_desc(&component, texture);
+        assert_eq!(desc.capacity, 1024);
+        assert_eq!(desc.blend, ParticleBlend::Alpha);
+        assert_eq!(
+            desc.shape,
+            ParticleShape::Cone {
+                angle: 0.3,
+                radius: 0.5
+            }
+        );
+        assert_eq!(desc.bursts.len(), 1);
+        assert_eq!(desc.bursts[0].count, 9);
+        assert!(!desc.looping);
+        assert_eq!(desc.lifetime, [1.0, 3.0]);
+        assert_eq!(desc.color_over_life[0].color, [1.0, 0.5, 0.0, 1.0]);
+        assert_eq!(desc.flipbook.columns, 4);
+        assert_eq!(desc.flipbook.frames_per_second, 6.0);
+        assert_eq!(desc.soft_distance, 0.75);
+        assert_eq!(
+            desc.collision.map(|collision| collision.restitution),
+            Some(0.3)
+        );
+        assert_eq!(desc.seed, 42);
+        assert_eq!(desc.texture, texture);
+    }
+
+    #[test]
+    fn point_shape_without_texture_maps_to_procedural_point() {
+        let desc = particle_emitter_desc(&ParticleEmitterComponent::default(), None);
+        assert_eq!(desc.shape, ParticleShape::Point);
+        assert_eq!(desc.blend, ParticleBlend::Additive);
+        assert!(desc.collision.is_none());
+        assert!(desc.texture.is_none());
     }
 }
