@@ -78,11 +78,16 @@ void write_keys(uint index) {
     sort_buffer.keys[index] = uvec2(key, index);
 }
 
+// Лексикографический порядок (ключ, индекс): при равных ключах порядок детерминирован по индексу.
+bool key_less(uvec2 a, uvec2 b) {
+    return a.x < b.x || (a.x == b.x && a.y < b.y);
+}
+
 // Сравнивает пару (i, l) внутри блока или глобально и меняет местами по направлению `ascending`.
 void compare_exchange(uint i, uint l, bool ascending, bool local_storage, uint base) {
     uvec2 a = local_storage ? tile[i] : sort_buffer.keys[base + i];
     uvec2 b = local_storage ? tile[l] : sort_buffer.keys[base + l];
-    bool swap_pair = ascending ? a.x > b.x : a.x < b.x;
+    bool swap_pair = ascending ? key_less(b, a) : key_less(a, b);
     if (swap_pair) {
         if (local_storage) {
             tile[i] = b;

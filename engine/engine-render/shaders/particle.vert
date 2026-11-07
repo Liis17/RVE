@@ -115,13 +115,15 @@ float sample_size(float t) {
 }
 
 void main() {
+    // При сортировке instance — индекс из буфера ключей. Паддинг сортировки (индекс вне диапазона
+    // отрисовки) попадает в первые позиции при равных ключах, поэтому проверяем именно индекс.
     uint instance = push.sorted == 1u ? sort_buffer.keys[gl_InstanceIndex].y : gl_InstanceIndex;
     uint slot = (push.draw_first + instance) % push.capacity;
     Particle particle = particle_buffer.particles[slot];
     float age = particle.position_age.w;
     float lifetime = particle.velocity_life.w;
-    if (age < 0.0 || age >= lifetime) {
-        // Мёртвая или ещё не рождённая частица: вершина вне clip volume.
+    if (instance >= push.draw_count || age < 0.0 || age >= lifetime) {
+        // Паддинг, мёртвая или ещё не рождённая частица: вершина вне clip volume.
         gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
         out_atlas_uv = vec2(0.0);
         out_color = vec4(0.0);

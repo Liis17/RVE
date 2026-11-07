@@ -1584,10 +1584,11 @@ mod sort_tests {
         let count = keys.len();
         let block = SORT_BLOCK_SIZE as usize;
         let compare = |keys: &mut [(u32, u32)], i: usize, l: usize, ascending: bool| {
+            // Лексикографический порядок (ключ, индекс), как в `particle_sort.comp`: ничьи детерминированы.
             let out_of_order = if ascending {
-                keys[i].0 > keys[l].0
+                keys[i] > keys[l]
             } else {
-                keys[i].0 < keys[l].0
+                keys[i] < keys[l]
             };
             if out_of_order {
                 keys.swap(i, l);
@@ -1763,5 +1764,95 @@ mod sort_tests {
             sort_key(0.0, true),
             "points behind the camera clamp to zero depth"
         );
+    }
+
+    /// Ключи как `write_keys`: живая частица — ключ глубины, мёртвая и паддинг — сентинел.
+    /// `depths[index]` — глубина частицы в позиции `index` диапазона отрисовки (`None` — мёртвая).
+    fn draw_keys(depths: &[Option<f32>], draw_count: u32) -> Vec<(u32, u32)> {
+        let count = sort_count(draw_count) as usize;
+        (0..count)
+            .map(|index| {
+                let key = match depths.get(index).copied().flatten() {
+                    Some(depth) if index < draw_count as usize => sort_key(depth, true),
+                    _ => u32::MAX,
+                };
+                (key, index as u32)
+            })
+            .collect()
+    }
+
+    /// Слоты, которые рисует `particle.vert` с `sorted = 1`: индекс из буфера сортировки,
+    /// вершины с индексом вне диапазона отрисовки отбрасываются, мёртвые слоты не рисуются.
+    fn drawn_slots(
+        keys: &[(u32, u32)],
+        draw_first: u32,
+        draw_count: u32,
+        capacity: u32,
+        alive_slot: &[bool],
+    ) -> Vec<u32> {
+        keys[..draw_count as usize]
+            .iter()
+            .filter(|(_, index)| *index < draw_count)
+            .map(|(_, index)| (draw_first + index) % capacity)
+            .filter(|slot| alive_slot[*slot as usize])
+            .collect()
+    }
+
+    fn check_sorted_draw_range(capacity: u32, draw_first: u32, draw_count: u32, dead_every: u32) {
+        let mut alive_slot = vec![false; capacity as usize];
+        let depths: Vec<Option<f32>> = (0..draw_count)
+            .map(|index| {
+                let slot = (draw_first + index) % capacity;
+                let alive = index % dead_every != 0;
+                alive_slot[slot as usize] = alive;
+                // Глубина 0 даёт ключ `u32::MAX`, как у мёртвых и паддинга: ничьи в сортировке.
+                let depth = if index % 5 == 1 {
+                    0.0
+                } else {
+                    index as f32 * 0.37 + 0.5
+                };
+                alive.then_some(depth)
+            })
+            .collect();
+        let mut keys = draw_keys(&depths, draw_count);
+        run_network(&mut keys);
+        let mut drawn = drawn_slots(&keys, draw_first, draw_count, capacity, &alive_slot);
+        let mut expected: Vec<u32> = (0..draw_count)
+            .map(|index| (draw_first + index) % capacity)
+            .filter(|slot| alive_slot[*slot as usize])
+            .collect();
+        drawn.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            drawn, expected,
+            "capacity {capacity}, first {draw_first}, count {draw_count}: each live slot drawn once"
+        );
+    }
+
+    #[test]
+    fn sorted_draw_range_draws_each_live_slot_once_with_padding_and_wrap() {
+        // Ёмкость не степень двойки: сорт на 1024 ключей, паддинг попадает в кольцо по модулю.
+        check_sorted_draw_range(1000, 700, 600, 3);
+        check_sorted_draw_range(1000, 0, 512, 2);
+        check_sorted_draw_range(1000, 999, 1000, 4);
+        check_sorted_draw_range(777, 500, 513, 3);
+    }
+
+    #[test]
+    fn network_keeps_every_index_once_for_sizes_with_sentinels() {
+        for count in [64usize, 128, 256, 1024] {
+            let mut keys = pseudo_random_keys(count, count as u32 * 13 + 5);
+            for (index, key) in keys.iter_mut().enumerate().filter(|(index, _)| index % 4 == 3) {
+                *key = (u32::MAX, index as u32);
+            }
+            run_network(&mut keys);
+            assert!(
+                keys.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+                "count {count} is not sorted"
+            );
+            let mut indices: Vec<u32> = keys.iter().map(|(_, index)| *index).collect();
+            indices.sort_unstable();
+            assert_eq!(indices, (0..count as u32).collect::<Vec<_>>(), "count {count}");
+        }
     }
 }
