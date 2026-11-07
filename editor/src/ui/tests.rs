@@ -1765,13 +1765,8 @@ fn project_prefabs_panel_loads_the_project_list_on_first_show() {
         harness.state.project_prefabs.as_ref().unwrap().root(),
         project_root
     );
-    assert!(
-        harness
-            .state
-            .project_prefabs
-            .as_ref()
-            .unwrap()
-            .entries()
-            .is_empty()
-    );
+    // Пример объявляет один тяжёлый префаб в prefabs.rveprefabs; панель должна показать его.
+    let entries = harness.state.project_prefabs.as_ref().unwrap().entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "/prefabs/tower.rveprefab");
 }

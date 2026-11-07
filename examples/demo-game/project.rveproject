@@ -21,6 +21,14 @@ right = ["D"]
 kind = "button"
 inputs = ["Escape"]
 
+[input.contexts.game.fire]
+kind = "button"
+inputs = ["Mouse.Left"]
+
+[input.contexts.game.spawn_heavy]
+kind = "button"
+inputs = ["T"]
+
 [input.contexts.menu.Escape]
 kind = "button"
 inputs = ["Escape"]

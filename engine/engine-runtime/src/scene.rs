@@ -1033,6 +1033,55 @@ id = "camera"
     }
 
     #[test]
+    fn demo_game_fast_prefabs_register_for_spawning_and_their_scripts_load() {
+        let assets = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/demo-game/Assets"
+        ));
+        let resources = LooseResources::new(assets);
+        let handle = resources.system.handle();
+        let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+
+        for path in ["prefabs/bullet.rveprefab", "prefabs/bullet_hole.rveprefab"] {
+            assert!(prepared.prefabs.templates.contains_key(path), "{path}");
+        }
+        let hole = prepared
+            .prefabs
+            .catalog
+            .get("prefabs/bullet_hole.rveprefab")
+            .unwrap();
+        assert_eq!(hole.kind, PrefabKind::Fast);
+        assert_eq!(hole.max_instances, Some(100));
+        let bullet = prepared
+            .prefabs
+            .catalog
+            .get("prefabs/bullet.rveprefab")
+            .unwrap();
+        assert_eq!(bullet.max_instances, None);
+        // Тяжёлый префаб не входит в быстрые: он грузится по rve.prefabs.load.
+        assert!(
+            prepared
+                .prefabs
+                .catalog
+                .get("prefabs/tower.rveprefab")
+                .is_none()
+        );
+
+        // Регистрация компилирует Lua пули и проверяет её params до старта сцены.
+        ScriptHost::load_with_options(
+            &prepared.world,
+            "/scenes/physics.rvescene",
+            &prepared.sources,
+            None,
+            ScriptLoadOptions {
+                prefabs: prepared.prefabs.catalog.clone(),
+                ..ScriptLoadOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("demo prefab scripts: {error}"));
+    }
+
+    #[test]
     fn load_scene_reports_a_missing_lua_source_from_loose_resources() {
         let project = TempProject::new();
         project.write("scene.rvescene", scene_with_lite_script().as_bytes());

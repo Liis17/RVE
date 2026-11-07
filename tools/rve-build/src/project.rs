@@ -1502,3 +1502,51 @@ mod heavy_prefab_tests {
         assert!(error.to_string().contains(".rveprefab"), "{error}");
     }
 }
+
+#[cfg(test)]
+mod demo_game_tests {
+    use super::prepare_project;
+    use engine_files::VirtualPath;
+    use std::path::Path;
+
+    fn path(value: &str) -> VirtualPath {
+        VirtualPath::parse(value).unwrap()
+    }
+
+    #[test]
+    fn demo_game_packs_fast_prefabs_with_the_physics_scene_and_lists_the_heavy_prefab() {
+        let demo = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/demo-game");
+        let build = prepare_project(Path::new(demo)).unwrap();
+
+        // Быстрые префабы объявлены только в physics.rvescene, поэтому живут в её архиве.
+        for prefab in [
+            "/prefabs/bullet.rveprefab",
+            "/prefabs/bullet_hole.rveprefab",
+        ] {
+            assert_eq!(
+                build.assignments[&path(prefab)],
+                "scene-physics",
+                "{prefab}"
+            );
+            assert!(build.files.contains_key(&path(prefab)), "{prefab}");
+        }
+        assert_eq!(
+            build.assignments[&path("/scripts/bullet.lua")],
+            "scene-physics"
+        );
+        assert_eq!(
+            build.assignments[&path("/scripts/shooter.lua")],
+            "scene-physics"
+        );
+
+        // Тяжёлый префаб из prefabs.rveprefabs разобран, упакован и не привязан к сцене.
+        assert_eq!(build.prefabs.prefabs.len(), 1);
+        assert_eq!(build.prefabs.prefabs[0].path, "/prefabs/tower.rveprefab");
+        assert_eq!(build.prefabs.prefabs[0].archive, None);
+        assert_eq!(
+            build.assignments[&path("/prefabs/tower.rveprefab")],
+            "shared"
+        );
+        assert!(build.files.contains_key(&path("/prefabs/tower.rveprefab")));
+    }
+}
