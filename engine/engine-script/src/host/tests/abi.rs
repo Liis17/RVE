@@ -618,6 +618,77 @@ impl SpawnDriver {
     }
 }
 
+/// Destroys `victim` on its first update, then calls every handle-taking object API on the dead
+/// object. The guest must see no-op results and no error, and keep running.
+#[derive(Default)]
+struct DeadHandleProbe {
+    step: u32,
+    victim: Option<rve_sdk::Object>,
+}
+
+fn dead_handle_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(DeadHandleProbe::default()))
+}
+
+impl Script for DeadHandleProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        self.step += 1;
+        if self.step == 1 {
+            let victim = ctx.find("victim").expect("victim exists");
+            self.victim = Some(victim);
+            let destroyed = victim.destroy(ctx, 0.0);
+            ctx.log_info(format!("destroy={destroyed}"));
+            return;
+        }
+        let victim = self.victim.expect("victim was found in the first update");
+        let alive = victim.is_alive(ctx);
+        let velocity = victim.get_velocity(ctx).err();
+        let set_velocity = victim.set_velocity(ctx, [1.0, 0.0, 0.0]).err();
+        let movement = victim.move_character(ctx, [0.0; 3]).err();
+        let matrix_none = victim.world_matrix(ctx).is_none();
+        let transform = rve_sdk::Transform {
+            position: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: [1.0; 3],
+        };
+        let set_transform = victim.set_transform(ctx, transform);
+        ctx.log_info(format!("alive={alive}"));
+        ctx.log_info(format!("velocity_err={velocity:?}"));
+        ctx.log_info(format!("set_velocity_err={set_velocity:?}"));
+        ctx.log_info(format!("move_err={movement:?}"));
+        ctx.log_info(format!("matrix_none={matrix_none}"));
+        ctx.log_info(format!("set_transform={set_transform}"));
+        ctx.log_info("still running");
+    }
+}
+
+/// Destroys `victim` on its first update, then reports each collision exit it receives and keeps
+/// logging its update number.
+#[derive(Default)]
+struct ExitWatcher {
+    step: u32,
+}
+
+fn exit_watcher_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ExitWatcher::default()))
+}
+
+impl Script for ExitWatcher {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        self.step += 1;
+        if self.step == 1 {
+            let victim = ctx.find("victim").expect("victim exists");
+            let destroyed = victim.destroy(ctx, 0.0);
+            ctx.log_info(format!("destroy={destroyed}"));
+        }
+        ctx.log_info(format!("update {}", self.step));
+    }
+
+    fn on_collision_exit(&mut self, ctx: &mut rve_sdk::Context<'_>, other: rve_sdk::Object) {
+        ctx.log_info(format!("exit alive={}", other.is_alive(ctx)));
+    }
+}
+
 /// Heavy script of the spawned bolt: reports its start, the message sent to its id, and its end.
 struct BoltProbe;
 
@@ -677,6 +748,8 @@ fn sdk_module() -> &'static RveModule {
         "SpawnDriver" => spawn_driver_factory,
         "BoltProbe" => bolt_probe_factory,
         "PrefabProbe" => prefab_probe_factory,
+        "DeadHandleProbe" => dead_handle_probe_factory,
+        "ExitWatcher" => exit_watcher_factory,
         "CameraControl" => camera_control_factory,
         "AbiConsoleCommand" => abi_console_command_factory,
         "AbiConsoleForeign" => abi_console_foreign_factory,
@@ -1031,6 +1104,136 @@ id = "crate"
             .iter()
             .any(|message| message == "ABI physics API committed")
     );
+}
+
+#[test]
+fn abi_dead_object_handles_are_noops_with_one_warning() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "probe"
+[[objects.heavy_scripts]]
+name = "DeadHandleProbe"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    // Physics callbacks are offered only while physics is attached, so attach an empty world.
+    let physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &[]);
+    host.update(&mut world, 1.0 / 60.0, at(0.1, 1));
+    assert!(world.handle("victim").is_none());
+    assert_eq!(info_messages(&mut host), ["destroy=true"]);
+
+    host.update(&mut world, 1.0 / 60.0, at(0.2, 2));
+    let events = host.drain_events();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(
+        infos,
+        [
+            "alive=false",
+            "velocity_err=Some(Rejected)",
+            "set_velocity_err=Some(Rejected)",
+            "move_err=Some(Rejected)",
+            "matrix_none=true",
+            "set_transform=false",
+            "still running",
+        ],
+        "every handle-taking call on the dead object is a no-op"
+    );
+    let mut warnings = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+
+    host.update(&mut world, 1.0 / 60.0, at(0.3, 3));
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "no callback error"
+    );
+    warnings += events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+    assert_eq!(warnings, 1, "one warning per script and dead object");
+}
+
+#[test]
+fn abi_exit_with_a_destroyed_other_is_delivered_only_inside_the_retired_window() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "sensor"
+[[objects.heavy_scripts]]
+name = "ExitWatcher"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let sensor = world.handle("sensor").unwrap();
+    let victim = world.handle("victim").unwrap();
+    let mut physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    let sensor_body = physics
+        .insert_body(engine_physics::BodyDesc::static_collider(
+            engine_physics::Shape::sphere(0.5).unwrap(),
+            engine_physics::Pose::IDENTITY,
+        ))
+        .unwrap();
+    let victim_body = physics
+        .insert_body(engine_physics::BodyDesc::static_collider(
+            engine_physics::Shape::sphere(0.5).unwrap(),
+            engine_physics::Pose::new(glam::Vec3::X * 2.0, glam::Quat::IDENTITY).unwrap(),
+        ))
+        .unwrap();
+    let binding = |object, body| engine_physics::PhysicsSceneBinding {
+        object,
+        body,
+        kind: engine_physics::BodyKind::Static,
+        character_controller: None,
+    };
+    let both = [binding(sensor, sensor_body), binding(victim, victim_body)];
+    let sensor_only = [binding(sensor, sensor_body)];
+    let snapshot = physics.query_snapshot().unwrap();
+    let exit = engine_physics::PhysicsEvent::CollisionExit {
+        first: sensor_body,
+        second: victim_body,
+    };
+    let mut host = load_host(&world, &library());
+
+    host.set_physics_snapshot(snapshot.clone(), &both);
+    host.update(&mut world, 1.0 / 60.0, at(0.1, 1));
+    assert!(world.handle("victim").is_none());
+    host.drain_events();
+
+    host.set_physics_snapshot(snapshot.clone(), &sensor_only);
+    host.queue_physics_events([exit.clone()]);
+    host.update(&mut world, 1.0 / 60.0, at(0.2, 2));
+    assert!(
+        info_messages(&mut host).contains(&"exit alive=false".to_owned()),
+        "the survivor receives the exit inside the window"
+    );
+
+    // The window closes with the second result; the stale binding must not reach the guest.
+    host.set_physics_snapshot(snapshot, &both);
+    host.queue_physics_events([exit]);
+    host.update(&mut world, 1.0 / 60.0, at(0.3, 3));
+    let after = info_messages(&mut host);
+    assert!(
+        !after.iter().any(|message| message.starts_with("exit ")),
+        "{after:?}"
+    );
+    assert!(after.contains(&"update 3".to_owned()), "{after:?}");
+    assert!(error_messages(&mut host).is_empty());
 }
 
 #[test]
@@ -2841,7 +3044,7 @@ fn spawn_host(world: &World, library: &crate::ScriptLibrary, template_text: &str
     let path = VirtualPath::parse("prefabs/bolt.rveprefab").unwrap();
     let mut read = |_: &VirtualPath| -> Result<String, String> { Ok(template_text.to_owned()) };
     let template = Arc::new(PrefabTemplate::load(&path, &mut read).unwrap());
-    host.register_prefab("prefabs/bolt.rveprefab", template, &empty_sources())
+    host.register_prefab(world, "prefabs/bolt.rveprefab", template, &empty_sources())
         .unwrap();
     host
 }

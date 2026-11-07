@@ -837,7 +837,8 @@ pub struct RveHost {
     pub ctx: *mut c_void,
     /// Time snapshot for the current lifecycle phase.
     pub time: RveTime,
-    /// Current object's handle, encoded as `index + 1`.
+    /// Current object's handle, encoded as `(generation << 32) | (index + 1)`. The generation
+    /// keeps a stale handle from matching a reused slot; zero means no object.
     pub self_object: u64,
     /// Host error-reporting callback.
     pub set_error: RveSetErrorFn,

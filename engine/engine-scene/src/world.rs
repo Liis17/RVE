@@ -1003,6 +1003,30 @@ impl World {
         }
     }
 
+    /// Живые объекты поддеревьев `roots`, включая сами корни, в порядке «родитель раньше потомка».
+    /// Хендлы, которые не живы, пропускаются. Один проход по порядку топологии: потомок попадает
+    /// в результат, если его родитель уже отмечен.
+    pub fn subtree(&self, roots: &[ObjectHandle]) -> Vec<ObjectHandle> {
+        let mut marked = vec![false; self.objects.len()];
+        for &handle in roots {
+            if let Some(index) = self.dense(handle) {
+                marked[index] = true;
+            }
+        }
+        let mut result = Vec::new();
+        for &index in &self.topological_order {
+            if marked[index]
+                || self
+                    .parent_index(index)
+                    .is_some_and(|parent| marked[parent])
+            {
+                marked[index] = true;
+                result.push(self.objects[index].handle);
+            }
+        }
+        result
+    }
+
     /// Удаляет поддеревья хендлов. Возвращает удалённые хендлы: дети раньше родителей.
     ///
     /// Отказывает, если хендл не жив или в поддереве находится активная камера; при отказе

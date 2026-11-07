@@ -711,3 +711,37 @@ fn automatic_ids_skip_serials_that_a_live_object_already_holds() {
     assert_eq!(world.object(bullet[0]).unwrap().id, "bullet@2");
     assert_eq!(world.object(bullet[1]).unwrap().id, "bullet@2.child");
 }
+
+#[test]
+fn subtree_lists_roots_and_descendants_parents_first_and_skips_dead_handles() {
+    let mut world = world(CAMERA_SCENE);
+    let bullet = template(BULLET);
+    let first = spawn(&mut world, &bullet, SpawnOptions::default()).unwrap();
+    let second = spawn(&mut world, &bullet, SpawnOptions::default()).unwrap();
+    world.despawn_many(&[second[2]]).unwrap();
+
+    // Корень первого поддерева захватывает детей и внука; второй корень не задет.
+    assert_eq!(
+        ids_of(&world, &world.subtree(&[first[0]])),
+        ["bullet@0", "bullet@0.child", "bullet@0.leaf"]
+    );
+    // Потомок в списке корней не дублируется; удалённый и чужой хендлы пропускаются.
+    assert_eq!(
+        ids_of(&world, &world.subtree(&[first[2], first[0], second[0]])),
+        [
+            "bullet@0",
+            "bullet@0.child",
+            "bullet@0.leaf",
+            "bullet@1",
+            "bullet@1.child"
+        ]
+    );
+    assert!(world.subtree(&[second[2]]).is_empty());
+}
+
+fn ids_of(world: &World, handles: &[ObjectHandle]) -> Vec<String> {
+    handles
+        .iter()
+        .map(|&handle| world.object(handle).unwrap().id.clone())
+        .collect()
+}

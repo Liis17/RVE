@@ -8,8 +8,8 @@ use crate::lite::{
 #[cfg(test)]
 use crate::transaction::ScriptTransactionInit;
 use crate::transaction::{
-    MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
-    ScriptTransaction,
+    AbiObject, MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget,
+    QueueMessageError, ScriptTransaction,
 };
 use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_console::CommandSpec;
@@ -746,14 +746,18 @@ unsafe extern "C" fn host_physics_raycast(
                 return false;
             }
         };
+        // A dead or pending object has no body in the query, so it has nothing to ignore.
         let ignore = if ignore == 0 {
             None
         } else {
-            let Some(handle) = context.transaction.object_from_abi_handle(ignore) else {
-                context.error = Some("raycast ignore handle is unknown".to_owned());
-                return false;
-            };
-            Some(handle)
+            match context.transaction.abi_object(ignore) {
+                AbiObject::Alive(handle) => Some(handle),
+                AbiObject::Unavailable => None,
+                AbiObject::Malformed => {
+                    context.error = Some("raycast ignore handle is unknown".to_owned());
+                    return false;
+                }
+            }
         };
         let hit = match context
             .transaction
@@ -799,8 +803,7 @@ unsafe extern "C" fn host_physics_get_velocity(
             context.error = Some("get_velocity received a null output pointer".to_owned());
             return false;
         }
-        let Some(object) = context.transaction.object_from_abi_handle(object) else {
-            context.error = Some("get_velocity received an unknown object handle".to_owned());
+        let Some(object) = live_object(context, object, "get_velocity") else {
             return false;
         };
         let velocity = match context.transaction.body_velocity(object) {
@@ -846,6 +849,19 @@ unsafe extern "C" fn host_physics_add_force(
     })
 }
 
+/// Объект для вызова, который сообщает об ошибке. Мёртвый и pending-объект дают `None` без ошибки
+/// (Warn пишет транзакция); значение, которое не декодируется как хендл, — ошибку в `context.error`.
+fn live_object(context: &mut AbiCallContext<'_>, object: u64, name: &str) -> Option<ObjectHandle> {
+    match context.transaction.abi_object(object) {
+        AbiObject::Alive(handle) => Some(handle),
+        AbiObject::Unavailable => None,
+        AbiObject::Malformed => {
+            context.error = Some(format!("{name} received an unknown object handle"));
+            None
+        }
+    }
+}
+
 fn host_physics_vector_command(
     ctx: *mut c_void,
     object: u64,
@@ -859,8 +875,7 @@ fn host_physics_vector_command(
         }
         // SAFETY: value must point to three readable floats for this synchronous callback.
         let value = Vec3::from_array(unsafe { *value });
-        let Some(object) = context.transaction.object_from_abi_handle(object) else {
-            context.error = Some("physics command received an unknown object handle".to_owned());
+        let Some(object) = live_object(context, object, "physics command") else {
             return false;
         };
         match command(context.transaction, object, value) {
@@ -887,8 +902,7 @@ unsafe extern "C" fn host_physics_move_character(
         }
         // SAFETY: displacement is readable for this synchronous callback.
         let displacement = Vec3::from_array(unsafe { *displacement });
-        let Some(object) = context.transaction.object_from_abi_handle(object) else {
-            context.error = Some("move_character received an unknown object handle".to_owned());
+        let Some(object) = live_object(context, object, "move_character") else {
             return false;
         };
         let movement = match context.transaction.move_character(object, displacement) {
@@ -941,8 +955,7 @@ fn host_physics_get_bool(
             context.error = Some("physics getter received a null output pointer".to_owned());
             return false;
         }
-        let Some(object) = context.transaction.object_from_abi_handle(object) else {
-            context.error = Some("physics getter received an unknown object handle".to_owned());
+        let Some(object) = live_object(context, object, "physics getter") else {
             return false;
         };
         let result = match get(context.transaction, object) {
@@ -964,9 +977,7 @@ unsafe extern "C" fn host_physics_set_collider_enabled(
     value: bool,
 ) -> bool {
     guarded(ctx, false, |context| {
-        let Some(object) = context.transaction.object_from_abi_handle(object) else {
-            context.error =
-                Some("set_collider_enabled received an unknown object handle".to_owned());
+        let Some(object) = live_object(context, object, "set_collider_enabled") else {
             return false;
         };
         match context.transaction.set_collider_enabled(object, value) {
@@ -997,19 +1008,39 @@ fn audio_result(context: &mut AbiCallContext<'_>, result: Result<(), String>) ->
 }
 
 /// Resolves an object for `play_sound`-style calls; the object must have an `audio_source`.
+/// `Ok(None)` means the object is dead or pending: the call does nothing.
 fn audio_source_object(
-    context: &AbiCallContext<'_>,
+    context: &mut AbiCallContext<'_>,
     object: u64,
     name: &str,
-) -> Result<ObjectHandle, String> {
-    let handle = context
-        .transaction
-        .object_from_abi_handle(object)
-        .ok_or_else(|| format!("{name} received an unknown object handle"))?;
+) -> Result<Option<ObjectHandle>, String> {
+    let handle = match context.transaction.abi_object(object) {
+        AbiObject::Alive(handle) => handle,
+        AbiObject::Unavailable => return Ok(None),
+        AbiObject::Malformed => return Err(format!("{name} received an unknown object handle")),
+    };
     if !context.transaction.has_audio_source(handle) {
         return Err(format!("{name} requires an audio_source component"));
     }
-    Ok(handle)
+    Ok(Some(handle))
+}
+
+/// Runs a staged audio call on a resolved source. A dead source returns `Error` without an error
+/// event: the dead-object warning has already been recorded.
+fn audio_source_call(
+    context: &mut AbiCallContext<'_>,
+    object: u64,
+    name: &str,
+    stage: impl FnOnce(&mut ScriptTransaction, ObjectHandle) -> Result<(), String>,
+) -> u32 {
+    match audio_source_object(context, object, name) {
+        Ok(Some(handle)) => {
+            let result = stage(&mut *context.transaction, handle);
+            audio_result(context, result)
+        }
+        Ok(None) => RveStatus::Error as u32,
+        Err(message) => audio_result(context, Err(message)),
+    }
 }
 
 fn audio_volume(volume: f32) -> Result<f32, String> {
@@ -1056,24 +1087,20 @@ fn clip_params(params: &RveAudioParams) -> Result<ClipParams, String> {
 
 unsafe extern "C" fn host_audio_play_source(ctx: *mut c_void, object: u64) -> u32 {
     guarded(ctx, RveStatus::Error as u32, |context| {
-        let result = audio_source_object(context, object, "play_sound").and_then(|handle| {
-            context.transaction.stage_audio(AudioRequest::PlaySource {
+        audio_source_call(context, object, "play_sound", |transaction, handle| {
+            transaction.stage_audio(AudioRequest::PlaySource {
                 object: handle,
                 voice: VoiceId::allocate(),
             })
-        });
-        audio_result(context, result)
+        })
     })
 }
 
 unsafe extern "C" fn host_audio_stop_source(ctx: *mut c_void, object: u64) -> u32 {
     guarded(ctx, RveStatus::Error as u32, |context| {
-        let result = audio_source_object(context, object, "stop_sound").and_then(|handle| {
-            context
-                .transaction
-                .stage_audio(AudioRequest::StopSource { object: handle })
-        });
-        audio_result(context, result)
+        audio_source_call(context, object, "stop_sound", |transaction, handle| {
+            transaction.stage_audio(AudioRequest::StopSource { object: handle })
+        })
     })
 }
 
@@ -1083,16 +1110,18 @@ unsafe extern "C" fn host_audio_set_source_volume(
     volume: f32,
 ) -> u32 {
     guarded(ctx, RveStatus::Error as u32, |context| {
-        let result = audio_source_object(context, object, "set_sound_volume").and_then(|handle| {
-            let volume = audio_volume(volume)?;
-            context
-                .transaction
-                .stage_audio(AudioRequest::SetSourceVolume {
+        audio_source_call(
+            context,
+            object,
+            "set_sound_volume",
+            |transaction, handle| {
+                let volume = audio_volume(volume)?;
+                transaction.stage_audio(AudioRequest::SetSourceVolume {
                     object: handle,
                     volume,
                 })
-        });
-        audio_result(context, result)
+            },
+        )
     })
 }
 
@@ -2072,7 +2101,7 @@ mod tests {
         let mut transaction = ScriptTransaction::default();
         transaction.begin(ScriptTransactionInit {
             world: &world,
-            self_object: camera,
+            self_object: Some(camera),
             source: "scene/camera/Probe",
             writable: true,
             actions: std::sync::Arc::new(
@@ -2160,7 +2189,7 @@ mod tests {
 
         transaction.begin(ScriptTransactionInit {
             world: &world,
-            self_object: camera,
+            self_object: Some(camera),
             source: "scene/camera/Probe",
             writable: false,
             actions: std::sync::Arc::new(

@@ -80,6 +80,7 @@ fn fast_host(world: &World, gun: &str, max_instances: Option<u32>) -> ScriptHost
         catalog(PrefabKind::Fast, max_instances),
     );
     host.register_prefab(
+        world,
         PREFAB,
         template(PREFAB, PREFAB_TEXT),
         &sources(&[("bullet.lua", BULLET_LUA)]),
@@ -291,12 +292,14 @@ return Gun
     );
     let mut host = load(&world, &[("gun.lua", gun)], prefabs);
     host.register_prefab(
+        &world,
         "prefabs/static.rveprefab",
         template("prefabs/static.rveprefab", PREFAB_TEXT),
         &sources(&[("bullet.lua", BULLET_LUA)]),
     )
     .unwrap();
     host.register_prefab(
+        &world,
         "prefabs/dyn.rveprefab",
         template("prefabs/dyn.rveprefab", DYNAMIC_TEXT),
         &sources(&[]),
@@ -442,6 +445,7 @@ return Gun
     );
     let mut host = load(&world, &[("gun.lua", gun)], prefabs);
     host.register_prefab(
+        &world,
         "prefabs/pair.rveprefab",
         template("prefabs/pair.rveprefab", PAIR),
         &sources(&[]),
@@ -599,6 +603,7 @@ return Gun
     assert_eq!(host.prefab_status(PREFAB), Some(PrefabStatus::Loading));
 
     host.register_prefab(
+        &world,
         PREFAB,
         template(PREFAB, PREFAB_TEXT),
         &sources(&[("bullet.lua", BULLET_LUA)]),
@@ -665,6 +670,7 @@ return Gun
         [PrefabRequest::Load(PREFAB.to_owned())]
     );
     host.register_prefab(
+        &world,
         PREFAB,
         template(PREFAB, PREFAB_TEXT),
         &sources(&[("bullet.lua", BULLET_LUA)]),
@@ -697,14 +703,20 @@ fn register_prefab_rejects_unknown_paths_repeats_and_missing_sources() {
     );
     let text = template(PREFAB, PREFAB_TEXT);
     assert!(
-        host.register_prefab("prefabs/missing.rveprefab", text.clone(), &sources(&[]))
-            .is_err()
+        host.register_prefab(
+            &world,
+            "prefabs/missing.rveprefab",
+            text.clone(),
+            &sources(&[])
+        )
+        .is_err()
     );
     let missing_source = host
-        .register_prefab(PREFAB, text.clone(), &sources(&[]))
+        .register_prefab(&world, PREFAB, text.clone(), &sources(&[]))
         .unwrap_err();
     assert!(matches!(missing_source, ScriptLoadError::Lite { .. }));
     host.register_prefab(
+        &world,
         PREFAB,
         text.clone(),
         &sources(&[("bullet.lua", BULLET_LUA)]),
@@ -712,8 +724,13 @@ fn register_prefab_rejects_unknown_paths_repeats_and_missing_sources() {
     .unwrap();
     assert_eq!(host.prefab_status(PREFAB), Some(PrefabStatus::Resident));
     assert!(
-        host.register_prefab(PREFAB, text, &sources(&[("bullet.lua", BULLET_LUA)]))
-            .is_err()
+        host.register_prefab(
+            &world,
+            PREFAB,
+            text,
+            &sources(&[("bullet.lua", BULLET_LUA)])
+        )
+        .is_err()
     );
 }
 
@@ -733,4 +750,178 @@ fn zero_max_instances_is_a_load_error() {
     .err()
     .expect("zero limit is rejected");
     assert!(matches!(error, ScriptLoadError::Prefab { .. }));
+}
+
+#[test]
+fn max_instances_ignores_roots_destroyed_in_the_same_phase() {
+    let gun = r#"
+local Gun = {}
+local step = 0
+function Gun:on_update(dt)
+  step = step + 1
+  if step == 1 then
+    rve.spawn("prefabs/bullet.rveprefab", { id = "a" })
+    rve.spawn("prefabs/bullet.rveprefab", { id = "b" })
+  elseif step == 2 then
+    rve.spawn("prefabs/bullet.rveprefab", { id = "c" })
+    rve.destroy("c")
+  end
+end
+return Gun
+"#;
+    let mut world = scene(GUN_SCENE);
+    let mut host = fast_host(&world, gun, Some(2));
+    host.update(&mut world, 0.1, at(0.1, 1));
+    host.update(&mut world, 0.1, at(0.2, 2));
+    assert!(world.handle("a").is_some());
+    assert!(world.handle("b").is_some());
+    assert!(world.handle("c").is_none());
+    assert!(!infos(&mut host).contains(&"destroy a".to_owned()));
+    assert!(errors(&mut host).is_empty());
+}
+
+#[test]
+fn cancelled_spawns_of_one_phase_unload_a_heavy_prefab_once() {
+    let gun = r#"
+local Gun = {}
+local step = 0
+function Gun:on_update(dt)
+  step = step + 1
+  if step == 1 then rve.prefabs.load("prefabs/bullet.rveprefab") end
+  if step == 2 then
+    rve.spawn("prefabs/bullet.rveprefab", { id = "a", velocity = { x = 1, y = 0, z = 0 } })
+    rve.spawn("prefabs/bullet.rveprefab", { id = "b", velocity = { x = 1, y = 0, z = 0 } })
+    rve.prefabs.unload("prefabs/bullet.rveprefab")
+  end
+end
+return Gun
+"#;
+    let mut world = scene(GUN_SCENE);
+    let mut host = load(
+        &world,
+        &[("gun.lua", gun), ("bullet.lua", BULLET_LUA)],
+        catalog(PrefabKind::Heavy, None),
+    );
+    host.update(&mut world, 0.1, at(0.1, 1));
+    assert_eq!(
+        host.drain_world_changes().prefab_requests,
+        [PrefabRequest::Load(PREFAB.to_owned())]
+    );
+    // A static root makes both queued spawns fail at apply, after the unload was requested.
+    host.register_prefab(
+        &world,
+        PREFAB,
+        template(PREFAB, PREFAB_TEXT),
+        &sources(&[("bullet.lua", BULLET_LUA)]),
+    )
+    .unwrap();
+    host.update(&mut world, 0.1, at(0.2, 2));
+
+    assert_eq!(errors(&mut host).len(), 2);
+    assert_eq!(
+        host.drain_world_changes().prefab_requests,
+        [PrefabRequest::Unload(PREFAB.to_owned())],
+        "one unload and no reload when every queued spawn is cancelled in the same phase"
+    );
+    assert_eq!(host.prefab_status(PREFAB), Some(PrefabStatus::Unloading));
+    host.prefab_released(PREFAB);
+    assert_eq!(host.prefab_status(PREFAB), Some(PrefabStatus::Unloaded));
+    assert!(host.drain_world_changes().prefab_requests.is_empty());
+}
+
+#[test]
+fn spawns_rejected_at_apply_do_not_use_the_frame_object_budget() {
+    // A rejected fast spawn creates two objects before its velocity check fails. Counting them
+    // would exhaust the 4096-object frame budget and reject the valid spawn after them.
+    let gun = r#"
+local Gun = {}
+local step = 0
+function Gun:on_update(dt)
+  step = step + 1
+  if step == 1 then
+    for _ = 1, 2100 do
+      rve.spawn("prefabs/bullet.rveprefab", { velocity = { x = 1, y = 0, z = 0 } })
+    end
+    rve.spawn("prefabs/bullet.rveprefab", { id = "ok" })
+  end
+end
+return Gun
+"#;
+    let mut world = scene(GUN_SCENE);
+    let mut host = fast_host(&world, gun, None);
+    host.update(&mut world, 0.1, at(0.1, 1));
+    assert!(world.handle("ok").is_some());
+    let errors = errors(&mut host);
+    assert_eq!(errors.len(), 2100);
+    assert!(
+        errors
+            .iter()
+            .all(|message| message.contains("dynamic rigid body"))
+    );
+}
+
+#[test]
+fn spawn_names_are_limited_to_256_utf8_bytes() {
+    let gun = r#"
+local Gun = {}
+local step = 0
+function Gun:on_update(dt)
+  step = step + 1
+  if step == 1 then
+    local too_long = pcall(rve.spawn, "prefabs/bullet.rveprefab", { id = "long", name = string.rep("n", 257) })
+    local fits = pcall(rve.spawn, "prefabs/bullet.rveprefab", { id = "fits", name = string.rep("n", 256) })
+    rve.log_info("long=" .. tostring(too_long) .. " fits=" .. tostring(fits))
+  end
+end
+return Gun
+"#;
+    let mut world = scene(GUN_SCENE);
+    let mut host = fast_host(&world, gun, None);
+    host.update(&mut world, 0.1, at(0.1, 1));
+    assert_eq!(infos(&mut host), ["long=false fits=true"]);
+    host.update(&mut world, 0.1, at(0.2, 2));
+    assert!(world.handle("long").is_none());
+    assert!(world.handle("fits").is_some());
+}
+
+#[test]
+fn prefab_scripts_compile_with_read_only_world_access() {
+    let world = scene(GUN_SCENE);
+    let mut host = load(
+        &world,
+        &[("gun.lua", "local Gun = {}\nreturn Gun\n")],
+        catalog(PrefabKind::Fast, None),
+    );
+    // Top-level `rve.find` sees the world, as it does for scene scripts.
+    let finds_gun = r#"
+assert(rve.find("gun") ~= nil, "gun is visible at top level")
+local Bullet = {}
+return Bullet
+"#;
+    host.register_prefab(
+        &world,
+        PREFAB,
+        template(PREFAB, PREFAB_TEXT),
+        &sources(&[("bullet.lua", finds_gun)]),
+    )
+    .unwrap();
+    assert_eq!(host.prefab_status(PREFAB), Some(PrefabStatus::Resident));
+
+    // Top-level spawn is refused, and a refused registration leaves the prefab unchanged.
+    let spawns = r#"rve.spawn("prefabs/bullet.rveprefab", { id = "early" }) return {}"#;
+    let mut other = load(
+        &world,
+        &[("gun.lua", "local Gun = {}\nreturn Gun\n")],
+        catalog(PrefabKind::Fast, None),
+    );
+    let error = other
+        .register_prefab(
+            &world,
+            PREFAB,
+            template(PREFAB, PREFAB_TEXT),
+            &sources(&[("bullet.lua", spawns)]),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("creation"), "{error}");
+    assert_eq!(other.prefab_status(PREFAB), Some(PrefabStatus::Unloaded));
 }

@@ -393,7 +393,7 @@ impl ScriptHost {
                     *host.active_source.borrow_mut() = source_label.clone();
                     host.transaction.begin(ScriptTransactionInit {
                         world,
-                        self_object: object.handle,
+                        self_object: Some(object.handle),
                         source: &source_label,
                         writable: false,
                         actions: host.actions.frame(),
@@ -484,7 +484,7 @@ impl ScriptHost {
                     let serial = host.next_serial();
                     host.transaction.begin(ScriptTransactionInit {
                         world,
-                        self_object: object.handle,
+                        self_object: Some(object.handle),
                         source: &source,
                         writable: false,
                         actions: host.actions.frame(),
@@ -584,6 +584,7 @@ impl ScriptHost {
     /// вызвать [`Self::prefab_failed`], иначе его spawn-заявки останутся в ожидании.
     pub fn register_prefab(
         &mut self,
+        world: &World,
         path: &str,
         template: Arc<PrefabTemplate>,
         sources: &BTreeMap<String, String>,
@@ -617,7 +618,7 @@ impl ScriptHost {
                 continue;
             }
             let class = self
-                .compile_registered_class(script_path, source)
+                .compile_registered_class(world, script_path, source)
                 .map_err(|message| ScriptLoadError::Lite {
                     path: script_path.clone(),
                     message,
@@ -856,7 +857,7 @@ impl ScriptHost {
         *self.active_source.borrow_mut() = source.clone();
         self.transaction.begin(ScriptTransactionInit {
             world,
-            self_object: handle,
+            self_object: Some(handle),
             source: &source,
             writable: true,
             actions: self.actions.frame(),
@@ -1145,8 +1146,8 @@ impl ScriptHost {
                 continue;
             };
             // Удалённое тело ещё известно через привязку, которая живёт до следующего результата шага.
-            let first_object = self.body_object(first);
-            let second_object = self.body_object(second);
+            let first_object = self.body_object(world, first);
+            let second_object = self.body_object(world, second);
             let (Some(first_object), Some(second_object)) = (first_object, second_object) else {
                 continue;
             };
@@ -1175,11 +1176,16 @@ impl ScriptHost {
         }
     }
 
-    fn body_object(&self, body: engine_physics::BodyHandle) -> Option<ObjectHandle> {
-        self.physics
+    /// Объект тела, если он ещё известен: живой или удалённый, но в окне удаления. Для объекта вне
+    /// этих двух состояний `other` не имеет идентичности, и пара пропускается.
+    fn body_object(&self, world: &World, body: engine_physics::BodyHandle) -> Option<ObjectHandle> {
+        let lifecycle = self.lifecycle.borrow();
+        let object = self
+            .physics
             .borrow()
             .object(body)
-            .or_else(|| self.lifecycle.borrow().retired_body(body))
+            .or_else(|| lifecycle.retired_body(body))?;
+        (world.is_alive(object) || lifecycle.retired(object).is_some()).then_some(object)
     }
 
     fn deliver_physics_event(
@@ -1248,7 +1254,7 @@ impl ScriptHost {
         let initial = script_transform(local);
         transaction.begin(ScriptTransactionInit {
             world,
-            self_object: instance.handle,
+            self_object: Some(instance.handle),
             source: &instance.source,
             writable: true,
             actions: actions.frame(),
@@ -1429,25 +1435,24 @@ impl ScriptHost {
     /// Применяет накопленные заявки в конце фазы: spawn в порядке commit, затем удаления,
     /// вытеснение по `max_instances` и созревшие отложенные удаления.
     fn apply_lifecycle(&mut self, world: &mut World, time: ScriptTime) {
-        let mut queued = std::mem::take(&mut self.lifecycle.borrow_mut().queued);
-        queued.sort_by_key(|request| request.seq);
-        for request in queued {
+        self.lifecycle
+            .borrow_mut()
+            .queued
+            .make_contiguous()
+            .sort_by_key(|request| request.seq);
+        // Заявки снимаются по одной, и оставшиеся остаются в очереди: отмена одной заявки видит
+        // остальные и не начинает выгрузку префаба раньше времени.
+        loop {
+            let next = self.lifecycle.borrow_mut().queued.pop_front();
+            let Some(request) = next else {
+                break;
+            };
             self.process_spawn(world, &request);
         }
 
         let mut doomed = Vec::new();
         {
             let mut lifecycle = self.lifecycle.borrow_mut();
-            for slot in lifecycle.prefabs.values_mut() {
-                let Some(max) = slot.max_instances else {
-                    continue;
-                };
-                while slot.live.len() > max as usize {
-                    if let Some(root) = slot.live.pop_front() {
-                        doomed.push(root);
-                    }
-                }
-            }
             for request in std::mem::take(&mut lifecycle.destroys) {
                 match request.due {
                     None => doomed.push(request.handle),
@@ -1471,6 +1476,29 @@ impl ScriptHost {
                 lifecycle.scheduled.remove(handle);
             }
             doomed.extend(due);
+
+            // Лимит считает только корни, которые останутся после фазы. Корни, удаляемые сейчас,
+            // в него не входят, поэтому spawn с немедленным destroy не вытесняет живой экземпляр.
+            let going: HashSet<ObjectHandle> = doomed.iter().copied().collect();
+            for slot in lifecycle.prefabs.values() {
+                let Some(max) = slot.max_instances else {
+                    continue;
+                };
+                let mut staying = slot
+                    .live
+                    .iter()
+                    .filter(|root| !going.contains(root))
+                    .count();
+                for root in &slot.live {
+                    if staying <= max as usize {
+                        break;
+                    }
+                    if !going.contains(root) {
+                        doomed.push(*root);
+                        staying -= 1;
+                    }
+                }
+            }
         }
         self.destroy_objects(world, doomed, time);
     }
@@ -1559,7 +1587,6 @@ impl ScriptHost {
         let handles = world
             .spawn(reserved, template, request.args.options.clone())
             .map_err(|error| error.to_string())?;
-        self.frame_spawned += count;
         let root = request.root;
 
         if request.args.velocity.is_some() {
@@ -1576,6 +1603,8 @@ impl ScriptHost {
             let _ = world.despawn_many(&handles);
             return Err(message);
         }
+        // Счётчик кадра растёт только после успеха: откат поддерева не тратит лимит кадра.
+        self.frame_spawned += count;
 
         let mut lifecycle = self.lifecycle.borrow_mut();
         lifecycle.roots.insert(root, request.prefab.clone());
@@ -1674,7 +1703,7 @@ impl ScriptHost {
                 let serial = self.next_serial();
                 self.transaction.begin(ScriptTransactionInit {
                     world,
-                    self_object: handle,
+                    self_object: Some(handle),
                     source: &source,
                     writable: false,
                     actions: self.actions.frame(),
@@ -1766,13 +1795,7 @@ impl ScriptHost {
             return;
         }
 
-        let target_set: HashSet<ObjectHandle> = targets.iter().copied().collect();
-        let doomed: HashSet<ObjectHandle> = world
-            .objects()
-            .iter()
-            .filter(|object| in_subtree(world, object.handle, &target_set))
-            .map(|object| object.handle)
-            .collect();
+        let doomed: HashSet<ObjectHandle> = world.subtree(&targets).into_iter().collect();
 
         let retired = doomed
             .iter()
@@ -1953,19 +1976,38 @@ impl ScriptHost {
     /// Компилирует класс lite-скрипта вне callback: API движка на верхнем уровне недоступен.
     fn compile_registered_class(
         &mut self,
+        world: &World,
         path: &str,
         source: &str,
     ) -> Result<(Table, Option<ParamSchema>), String> {
         *self.active_source.borrow_mut() = path.to_owned();
-        let _guard = ActiveCallGuard::new(
+        // Как у скриптов сцены: только чтение мира, top-level `rve.find` работает, spawn и destroy нет.
+        self.transaction.begin(ScriptTransactionInit {
+            world,
+            self_object: None,
+            source: path,
+            writable: false,
+            actions: self.actions.frame(),
+            queued_messages: (self.queued_messages.len(), self.queued_bytes),
+            queued_audio: self.audio_requests.len(),
+            physics: self.physics.clone(),
+            physics_phase_dt: None,
+            lifecycle: self.lifecycle.clone(),
+            lifecycle_writes: false,
+            instance_serial: 0,
+        });
+        let guard = ActiveCallGuard::new(
             &self.lua,
             Some(&self.call_deadline),
             &self.active_call,
-            std::ptr::null_mut(),
+            &mut self.transaction as *mut ScriptTransaction,
             &self.active_owner,
             None,
         );
-        lite::compile_class(&self.lua, &self.base_environment, path, source)
+        let result = lite::compile_class(&self.lua, &self.base_environment, path, source);
+        drop(guard);
+        self.transaction.discard();
+        result
     }
 
     fn disable_instance(&mut self, index: usize) {
@@ -2129,17 +2171,6 @@ fn heavy_scripts(
 }
 
 /// Находится ли объект внутри одного из поддеревьев `targets` (включая сами корни).
-fn in_subtree(world: &World, handle: ObjectHandle, targets: &HashSet<ObjectHandle>) -> bool {
-    let mut cursor = Some(handle);
-    while let Some(current) = cursor {
-        if targets.contains(&current) {
-            return true;
-        }
-        cursor = world.object(current).and_then(|object| object.parent);
-    }
-    false
-}
-
 fn script_transform(transform: LocalTransform) -> ScriptTransform {
     ScriptTransform {
         position: transform.position.to_array(),

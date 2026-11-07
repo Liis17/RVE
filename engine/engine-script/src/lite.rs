@@ -696,10 +696,10 @@ impl LuaInstance {
         let other_data = with_active_call(active_call, |transaction| {
             Ok(transaction.object_identity(event.other))
         })?;
+        // Без идентичности `other` нельзя передать скрипту; выживший объект не должен отключаться
+        // из-за того, что привязка тела пережила окно удаления.
         let Some((id, name)) = other_data else {
-            return Err(LuaError::runtime(
-                "physics event references an unknown object",
-            ));
+            return Ok(());
         };
         let other = object_table(lua, event.other, id, name, active_call.clone())?;
         if event.has_contact {

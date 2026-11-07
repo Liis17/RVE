@@ -12,6 +12,14 @@ use std::sync::Arc;
 
 /// Наибольшее число spawn-объектов, которые хост применяет за один кадр.
 pub(crate) const MAX_SPAWNED_OBJECTS_PER_FRAME: usize = 4096;
+/// Наибольшая длина имени spawn-объекта в UTF-8 байтах.
+pub(crate) const MAX_SPAWN_NAME_BYTES: usize = 256;
+/// Предел привязок удалённых объектов. Окно закрывается только результатом шага физики, поэтому
+/// при паузе физики без предела они копились бы; при переполнении все привязки сбрасываются.
+pub(crate) const MAX_RETIRED_OBJECTS: usize = 65_536;
+/// Предел пар «экземпляр + мёртвый объект», по которым уже выдан Warn. При переполнении
+/// набор сбрасывается, и допустим повторный Warn для тех же пар.
+pub(crate) const MAX_WARNED_PAIRS: usize = 65_536;
 
 /// Быстрый префаб загружается вместе со сценой, тяжёлый — по требованию во время игры.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,8 +210,9 @@ pub(crate) struct Lifecycle {
     pub(crate) prefabs: BTreeMap<String, PrefabSlot>,
     /// Явные id заявок, которые закоммичены, но ещё не применены.
     pub(crate) pending_ids: HashMap<String, ObjectHandle>,
-    /// Закоммиченные заявки, которые хост применит в конце фазы.
-    pub(crate) queued: Vec<SpawnRequest>,
+    /// Закоммиченные заявки, которые хост применит в конце фазы. Хост снимает их по одной с начала,
+    /// поэтому оставшиеся заявки видны `begin_unload_if_idle` во время обработки.
+    pub(crate) queued: VecDeque<SpawnRequest>,
     /// Заявки, ждущие загрузки префаба.
     pub(crate) waiting: Vec<SpawnRequest>,
     pub(crate) destroys: Vec<DestroyRequest>,
@@ -217,6 +226,7 @@ pub(crate) struct Lifecycle {
     snapshot_seq: u64,
     /// Пары «экземпляр + мёртвый объект», по которым уже выдан Warn.
     warned: HashMap<u64, HashSet<ObjectHandle>>,
+    warned_pairs: usize,
 }
 
 impl Lifecycle {
@@ -314,6 +324,10 @@ impl Lifecycle {
         id: String,
         name: String,
     ) {
+        if self.retired.len() >= MAX_RETIRED_OBJECTS {
+            self.retired.clear();
+            self.retired_bodies.clear();
+        }
         self.retired_bodies.insert(body, handle);
         self.retired.insert(
             handle,
@@ -350,6 +364,14 @@ impl Lifecycle {
 
     /// Отмечает пару и возвращает `true`, если Warn по ней ещё не выдавали.
     pub(crate) fn mark_warned(&mut self, instance: u64, handle: ObjectHandle) -> bool {
+        if self.has_warned(instance, handle) {
+            return false;
+        }
+        if self.warned_pairs >= MAX_WARNED_PAIRS {
+            self.warned.clear();
+            self.warned_pairs = 0;
+        }
+        self.warned_pairs += 1;
         self.warned.entry(instance).or_default().insert(handle)
     }
 
@@ -360,7 +382,9 @@ impl Lifecycle {
     }
 
     pub(crate) fn forget_instance(&mut self, instance: u64) {
-        self.warned.remove(&instance);
+        if let Some(objects) = self.warned.remove(&instance) {
+            self.warned_pairs -= objects.len();
+        }
     }
 
     /// Заявка, которая ещё не создала объект, но уже резервирует хендл.
@@ -378,4 +402,59 @@ pub(crate) fn valid_spawn_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle(slot: u64) -> ObjectHandle {
+        ObjectHandle::from_abi(slot).expect("slot is non-zero")
+    }
+
+    #[test]
+    fn warned_pairs_warn_once_and_forgotten_instances_release_their_count() {
+        let mut lifecycle = Lifecycle::default();
+        assert!(lifecycle.mark_warned(1, handle(1)));
+        assert!(!lifecycle.mark_warned(1, handle(1)));
+        assert!(lifecycle.mark_warned(2, handle(1)));
+        lifecycle.forget_instance(1);
+        assert_eq!(lifecycle.warned_pairs, 1);
+        assert!(!lifecycle.has_warned(1, handle(1)));
+    }
+
+    #[test]
+    fn warned_pairs_stay_bounded_and_may_warn_again_after_the_reset() {
+        let mut lifecycle = Lifecycle::default();
+        assert!(lifecycle.mark_warned(1, handle(1)));
+        for slot in 1..=MAX_WARNED_PAIRS as u64 {
+            lifecycle.mark_warned(2, handle(slot));
+        }
+        assert!(lifecycle.warned_pairs <= MAX_WARNED_PAIRS);
+        assert!(
+            !lifecycle.has_warned(1, handle(1)),
+            "the first pair was reset"
+        );
+        assert!(lifecycle.mark_warned(1, handle(1)));
+    }
+
+    #[test]
+    fn retired_objects_stay_bounded_while_physics_does_not_advance() {
+        let mut lifecycle = Lifecycle::default();
+        for slot in 1..=MAX_RETIRED_OBJECTS as u64 + 1 {
+            lifecycle.retire(
+                handle(slot),
+                BodyHandle(slot),
+                format!("id{slot}"),
+                String::new(),
+            );
+        }
+        assert!(lifecycle.retired.len() <= MAX_RETIRED_OBJECTS);
+        assert_eq!(lifecycle.retired.len(), lifecycle.retired_bodies.len());
+        assert!(
+            lifecycle
+                .retired(handle(MAX_RETIRED_OBJECTS as u64 + 1))
+                .is_some()
+        );
+    }
 }

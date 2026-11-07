@@ -1,7 +1,7 @@
 use crate::actions::{ActionFrame, ActionMutation, ActionValue};
 use crate::lifecycle::{
-    DestroyRequest, Lifecycle, MAX_SPAWNED_OBJECTS_PER_FRAME, ObjectState, PrefabKind,
-    PrefabRequest, PrefabStatus, SpawnArgs, SpawnRequest, valid_spawn_id,
+    DestroyRequest, Lifecycle, MAX_SPAWN_NAME_BYTES, MAX_SPAWNED_OBJECTS_PER_FRAME, ObjectState,
+    PrefabKind, PrefabRequest, PrefabStatus, SpawnArgs, SpawnRequest, valid_spawn_id,
 };
 use crate::lite::EventQueue;
 use crate::physics::PhysicsScriptState;
@@ -90,7 +90,8 @@ pub(crate) struct PendingMessage {
 
 pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) world: &'a World,
-    pub(crate) self_object: ObjectHandle,
+    /// Объект, чей скрипт выполняется; `None` для top-level chunk, у которого объекта нет.
+    pub(crate) self_object: Option<ObjectHandle>,
     pub(crate) source: &'a str,
     pub(crate) writable: bool,
     pub(crate) actions: Arc<ActionFrame>,
@@ -104,6 +105,16 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) lifecycle_writes: bool,
     /// Серийный номер экземпляра, который выполняет вызов; нужен для предупреждений.
     pub(crate) instance_serial: u64,
+}
+
+/// Результат разбора хендла объекта в вызове ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AbiObject {
+    /// Значение не декодируется как хендл: это ошибка вызова.
+    Malformed,
+    /// Объект мёртв или ещё pending: вызов ничего не делает и не считается ошибкой.
+    Unavailable,
+    Alive(ObjectHandle),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,7 +226,7 @@ impl ScriptTransaction {
 
     pub(crate) fn begin(&mut self, init: ScriptTransactionInit<'_>) {
         self.world = init.world;
-        self.self_object = Some(init.self_object);
+        self.self_object = init.self_object;
         self.writable = init.writable;
         self.action_frame = Some(init.actions);
         self.physics = init.physics;
@@ -687,6 +698,15 @@ impl ScriptTransaction {
         {
             return Err("spawn parent must be an existing object".to_owned());
         }
+        if options
+            .name
+            .as_ref()
+            .is_some_and(|name| name.len() > MAX_SPAWN_NAME_BYTES)
+        {
+            return Err(format!(
+                "spawn name must be at most {MAX_SPAWN_NAME_BYTES} bytes"
+            ));
+        }
         if let Some(id) = &options.id {
             if !valid_spawn_id(id) {
                 return Err(format!("spawn id {id:?} must match [A-Za-z0-9_-]{{1,64}}"));
@@ -848,10 +868,25 @@ impl ScriptTransaction {
             .map(|matrix| matrix.to_cols_array())
     }
 
-    /// Живой объект по ABI-значению; устаревший хендл даёт `None` даже после переиспользования слота.
-    pub(crate) fn object_from_abi_handle(&self, handle: u64) -> Option<ObjectHandle> {
-        let handle = ObjectHandle::from_abi(handle)?;
-        self.world()?.is_alive(handle).then_some(handle)
+    /// Разбирает ABI-значение и проверяет объект. Мёртвый и pending-объект дают `Unavailable`:
+    /// вызов ничего не делает, а Warn пишется один раз на пару «экземпляр + объект».
+    pub(crate) fn abi_object(&mut self, handle: u64) -> AbiObject {
+        let Some(handle) = ObjectHandle::from_abi(handle) else {
+            return AbiObject::Malformed;
+        };
+        match self.object_access(handle) {
+            ObjectState::Alive => AbiObject::Alive(handle),
+            ObjectState::Pending | ObjectState::Dead => AbiObject::Unavailable,
+        }
+    }
+
+    /// Живой объект по ABI-значению без сообщений; устаревший хендл даёт `None` даже после
+    /// переиспользования слота. Мёртвый объект пишет Warn, как и [`Self::abi_object`].
+    pub(crate) fn object_from_abi_handle(&mut self, handle: u64) -> Option<ObjectHandle> {
+        match self.abi_object(handle) {
+            AbiObject::Alive(handle) => Some(handle),
+            AbiObject::Malformed | AbiObject::Unavailable => None,
+        }
     }
 
     pub(crate) fn abi_handle(&self, handle: ObjectHandle) -> Option<u64> {
@@ -1112,7 +1147,7 @@ impl ScriptTransaction {
             let mut lifecycle = self.lifecycle.borrow_mut();
             for mut request in self.pending_spawns.drain(..) {
                 request.seq = lifecycle.next_seq();
-                lifecycle.queued.push(request);
+                lifecycle.queued.push_back(request);
             }
             for (id, handle) in self.pending_ids.drain() {
                 lifecycle.pending_ids.insert(id, handle);
