@@ -389,10 +389,25 @@ pub fn shape_bounds(shape: ParticleShape) -> ParticleAabb {
 
 /// Запас bounds на движение и размер частиц: `speed·T + ½|g|·T² + thickness + размер квада`.
 ///
-/// Квад шириной `size` имеет полудиагональ `size·√2/2`, поэтому берётся `size_max·√2/2`.
-pub fn motion_margin(desc: &ParticleEmitterDesc) -> f32 {
+/// Скорость рождения умножается на линейную часть `transform` (`particle_spawn.comp`), поэтому её
+/// масштабирует норма этой матрицы. Берётся оценка сверху спектральной нормы `√(‖M‖₁·‖M‖∞)`
+/// (максимумы сумм модулей по столбцам и строкам): точна для равномерного масштаба и корректна при сдвиге.
+/// Гравитация и толщина коллизии заданы в мире. Квад шириной `size·c` имеет полудиагональ `size·c·√2/2`,
+/// где `c` — максимум кривой размера, но не меньше 1 (вне ключей размер множится на 1).
+pub fn motion_margin(desc: &ParticleEmitterDesc, transform: [[f32; 4]; 4]) -> f32 {
     let lifetime = desc.lifetime[1];
-    let speed = desc.speed[1];
+    let max_column_sum = (0..3)
+        .map(|column| (0..3).map(|row| transform[column][row].abs()).sum::<f32>())
+        .fold(0.0_f32, f32::max);
+    let max_row_sum = (0..3)
+        .map(|row| {
+            (0..3)
+                .map(|column| transform[column][row].abs())
+                .sum::<f32>()
+        })
+        .fold(0.0_f32, f32::max);
+    let linear_norm = (max_column_sum * max_row_sum).sqrt();
+    let speed = desc.speed[1] * linear_norm;
     let gravity = desc
         .gravity
         .iter()
@@ -400,7 +415,12 @@ pub fn motion_margin(desc: &ParticleEmitterDesc) -> f32 {
         .sum::<f32>()
         .sqrt();
     let thickness = desc.collision.map_or(0.0, |collision| collision.thickness);
-    let half_diagonal = desc.size[1] * std::f32::consts::FRAC_1_SQRT_2;
+    let size_scale = desc
+        .size_over_life
+        .iter()
+        .map(|key| key.size)
+        .fold(1.0_f32, f32::max);
+    let half_diagonal = desc.size[1] * size_scale * std::f32::consts::FRAC_1_SQRT_2;
     speed * lifetime + 0.5 * gravity * lifetime * lifetime + thickness + half_diagonal
 }
 
@@ -412,6 +432,8 @@ pub struct ParticleBatch {
     /// Конец шага рождения + максимальное время жизни: к этому моменту все частицы мертвы.
     pub retire_time: f64,
     pub origin: ParticleAabb,
+    /// Запас движения, посчитанный при рождении: масштаб эмиттера мог измениться позже.
+    pub margin: f32,
 }
 
 /// Состояние эмиттера: кольцевой учёт, время симуляции и дробный перенос эмиссии.
@@ -492,6 +514,7 @@ impl ParticleEmitterState {
                         PreAge::Fixed((end - time) as f32),
                         input.origin,
                         retire_time,
+                        input.motion_margin,
                     ));
                     available -= accepted;
                 }
@@ -510,6 +533,7 @@ impl ParticleEmitterState {
                             PreAge::Random,
                             input.origin,
                             retire_time,
+                            input.motion_margin,
                         ));
                     }
                 } else {
@@ -527,9 +551,8 @@ impl ParticleEmitterState {
         let bounds = next
             .batches
             .iter()
-            .map(|batch| batch.origin)
-            .reduce(ParticleAabb::union)
-            .map(|union| union.expanded(input.motion_margin));
+            .map(|batch| batch.origin.expanded(batch.margin))
+            .reduce(ParticleAabb::union);
 
         ParticleStepPlan {
             spawns,
@@ -548,6 +571,7 @@ impl ParticleEmitterState {
         pre_age: PreAge,
         origin: ParticleAabb,
         retire_time: f64,
+        margin: f32,
     ) -> SpawnBatch {
         let first_serial = self.head;
         self.batches.push_back(ParticleBatch {
@@ -555,6 +579,7 @@ impl ParticleEmitterState {
             count,
             retire_time,
             origin,
+            margin,
         });
         self.head += u64::from(count);
         SpawnBatch {
@@ -952,6 +977,13 @@ pub struct VertexPushGpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IDENTITY: [[f32; 4]; 4] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
 
     fn step_input<'a>(bursts: &'a [ParticleBurst]) -> StepInput<'a> {
         StepInput {
@@ -1418,8 +1450,82 @@ mod tests {
             }),
             ..ParticleEmitterDesc::default()
         };
+        let identity = IDENTITY;
         let expected = 3.0 * 2.0 + 0.5 * 4.0 * 4.0 + 0.2 + std::f32::consts::FRAC_1_SQRT_2;
-        assert!((motion_margin(&desc) - expected).abs() < 1e-5);
+        assert!((motion_margin(&desc, identity) - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn motion_margin_covers_size_curve_above_one() {
+        let desc = ParticleEmitterDesc {
+            speed: [0.0, 0.0],
+            size: [0.1, 1.0],
+            size_over_life: vec![
+                ParticleSizeKey {
+                    time: 0.0,
+                    size: 0.5,
+                },
+                ParticleSizeKey {
+                    time: 1.0,
+                    size: 2.5,
+                },
+            ],
+            ..ParticleEmitterDesc::default()
+        };
+        let expected = 2.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!((motion_margin(&desc, IDENTITY) - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn motion_margin_scales_speed_by_emitter_scale_but_not_translation() {
+        let desc = ParticleEmitterDesc {
+            lifetime: [1.0, 2.0],
+            speed: [0.0, 3.0],
+            size: [0.0, 0.0],
+            gravity: [0.0, -4.0, 0.0],
+            ..ParticleEmitterDesc::default()
+        };
+        let scaled = [
+            [3.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 0.0, 3.0, 0.0],
+            [7.0, 8.0, 9.0, 1.0],
+        ];
+        let expected = 3.0 * 3.0 * 2.0 + 0.5 * 4.0 * 4.0;
+        assert!((motion_margin(&desc, scaled) - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn motion_margin_bounds_shear_without_underestimating() {
+        // Спектральная норма блока [[1, 1], [0, 1]] — золотое сечение (≈1.618).
+        let desc = ParticleEmitterDesc {
+            lifetime: [1.0, 1.0],
+            speed: [0.0, 1.0],
+            ..ParticleEmitterDesc::default()
+        };
+        let sheared = [
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0; 4],
+        ];
+        assert!(motion_margin(&desc, sheared) >= 1.618);
+    }
+
+    #[test]
+    fn batch_keeps_margin_from_its_spawn_step() {
+        let mut state = ParticleEmitterState::default();
+        let mut input = step_input(&[]);
+        input.rate = 10.0;
+        input.lifetime_max = 1.0;
+        input.motion_margin = 2.0;
+        commit(&mut state, &input);
+        // Следующий шаг без спавна и с меньшим запасом (масштаб эмиттера уменьшился).
+        input.emitting = false;
+        input.motion_margin = 0.5;
+        let plan = commit(&mut state, &input);
+        let bounds = plan.bounds.expect("live batch produces bounds");
+        assert!(bounds.max[0] >= 2.0 - 1e-6 && bounds.min[0] <= -2.0 + 1e-6);
     }
 
     #[test]

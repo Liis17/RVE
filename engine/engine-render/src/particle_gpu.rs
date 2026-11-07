@@ -219,7 +219,7 @@ impl ParticleSystem {
                 looping: desc.looping,
                 lifetime_max: desc.lifetime[1],
                 origin,
-                motion_margin: motion_margin(desc),
+                motion_margin: motion_margin(desc, frame_emitter.transform),
                 step: if owner { particle_step } else { 0.0 },
             };
             let plan: ParticleStepPlan = base.plan_step(&input);
