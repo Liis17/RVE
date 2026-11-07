@@ -46,10 +46,10 @@ const LINEAR_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 /// egui хранит значения в гамма-пространстве, поэтому они читаются без перевода; шейдер сам
 /// переводит результат для sRGB-swapchain, и смешивание в этом случае идёт в линейном пространстве.
 const UI_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-/// Resolution of each layer in the shared directional shadow map.
 /// Версия крейта, заданная в `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Resolution of each layer in the shared directional shadow map.
 pub const SHADOW_MAP_RESOLUTION: u32 = 2048;
 const SHADOW_CASCADE_COUNT: usize = 4;
 /// Максимальное ожидание swapchain image перед пропуском кадра.
@@ -6883,12 +6883,7 @@ impl FrameResources {
             Ok(()) | Err(vk::Result::NOT_READY) => {}
             Err(error) => return Err(RenderError::Vulkan(error)),
         }
-        let mut queries = [None; TIMESTAMP_QUERY_COUNT as usize];
-        for (query, [tick, available]) in queries.iter_mut().zip(results) {
-            if available != 0 {
-                *query = Some(tick);
-            }
-        }
+        let queries = available_timestamps(&results);
         Ok(Some(self.gpu_layout.decode(&queries, valid_bits, period)))
     }
 
@@ -9288,14 +9283,13 @@ fn record_scene(
         local_shadow_layout,
         shadow,
     );
-    if !shadow.local_shadow_matrices.is_empty() {
-        mark_pass(
-            device,
-            command_buffer,
-            scene.timestamps,
-            GpuPass::ShadowLocal,
-        );
-    }
+    // Граница ставится всегда: очистка слоёв относится к проходу, даже если локальных источников нет.
+    mark_pass(
+        device,
+        command_buffer,
+        scene.timestamps,
+        GpuPass::ShadowLocal,
+    );
 
     let clear_color = if scene.debug_view == DebugView::Overdraw {
         [0.0, 0.0, 0.0, 1.0]
@@ -12160,6 +12154,12 @@ fn decode_output(marks: &[Option<u64>], valid_bits: u32, period_ns: f32) -> Opti
     ))
 }
 
+/// Разбирает результаты `TYPE_64 | WITH_AVAILABILITY`: на запрос значение и флаг доступности.
+/// Недоступный запрос даёт `None`, даже если в буфере осталось значение прошлой записи.
+fn available_timestamps<const N: usize>(results: &[[u64; 2]; N]) -> [Option<u64>; N] {
+    results.map(|[tick, available]| (available != 0).then_some(tick))
+}
+
 /// Длительность между timestamp с учётом значащих бит и переполнения счётчика.
 fn timestamp_duration(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> Duration {
     let mask = if valid_bits >= 64 {
@@ -13289,7 +13289,7 @@ mod tests {
     use super::{
         GpuPass, GpuProfileLayout, GpuViewTimings, LocalShadowKind, MAX_PROFILED_VIEWS,
         OUTPUT_QUERY_FIRST, ProfiledView, SelectedLocalLight, TIMESTAMP_QUERY_COUNT,
-        VIEW_QUERY_COUNT, ViewportId, decode_output, decode_view,
+        VIEW_QUERY_COUNT, ViewportId, available_timestamps, decode_output, decode_view,
     };
     use ash::vk;
     use std::time::{Duration, Instant};
@@ -16332,6 +16332,30 @@ mod tests {
         assert_eq!(decode_output(&[Some(10), Some(35)], 64, 2.0), Some(ns(50)));
         assert_eq!(decode_output(&[Some(10), None], 64, 1.0), None);
         assert_eq!(decode_output(&[None, Some(35)], 64, 1.0), None);
+    }
+
+    #[test]
+    fn unavailable_timestamps_are_absent_even_with_stale_values() {
+        // Значение 99 осталось в буфере от прошлой записи и не должно попасть в разбор.
+        let results = [[10, 1], [99, 0], [30, 1]];
+
+        assert_eq!(available_timestamps(&results), [Some(10), None, Some(30)]);
+    }
+
+    #[test]
+    fn all_unavailable_timestamps_are_absent() {
+        assert_eq!(
+            available_timestamps(&[[10, 0], [20, 0], [0, 0]]),
+            [None, None, None]
+        );
+    }
+
+    #[test]
+    fn available_timestamps_keep_every_tick_including_zero() {
+        assert_eq!(
+            available_timestamps(&[[1, 1], [0, 1], [3, 7]]),
+            [Some(1), Some(0), Some(3)]
+        );
     }
 
     #[test]
