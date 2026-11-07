@@ -16,6 +16,12 @@ fn request(looping: bool) -> PlayRequest {
 }
 
 /// Минимальный 16-битный моно WAV нужной длины в кадрах (22050 Гц).
+fn evicted_voice(
+    result: Result<(usize, Option<LaneSlot>), AudioError>,
+) -> Result<(usize, Option<VoiceId>), AudioError> {
+    result.map(|(lane, evicted)| (lane, evicted.map(|slot| slot.voice)))
+}
+
 fn wav_bytes(frames: usize) -> Vec<u8> {
     let data_len = (frames * 2) as u32;
     let mut out = Vec::new();
@@ -44,7 +50,10 @@ fn lanes_fill_then_evict_the_oldest_one_shot() {
             Ok(((id - 1) as usize, None))
         );
     }
-    assert_eq!(table.allocate(voice(100), false), Ok((0, Some(voice(1)))));
+    assert_eq!(
+        evicted_voice(table.allocate(voice(100), false)),
+        Ok((0, Some(voice(1))))
+    );
     assert_eq!(table.lane_of(voice(100)), Some(0));
     assert_eq!(table.lane_of(voice(1)), None);
 }
@@ -56,7 +65,10 @@ fn eviction_skips_loops_and_takes_the_oldest_one_shot() {
     for id in 2..=VOICE_SLOTS as u64 {
         table.allocate(voice(id), false).unwrap();
     }
-    assert_eq!(table.allocate(voice(200), false), Ok((1, Some(voice(2)))));
+    assert_eq!(
+        evicted_voice(table.allocate(voice(200), false)),
+        Ok((1, Some(voice(2))))
+    );
     assert_eq!(table.lane_of(voice(1)), Some(0));
 }
 
@@ -280,6 +292,11 @@ fn stop_before_the_clip_loads_cancels_the_play() {
         "{sent:?}"
     );
     assert_eq!(h.reads(), 1);
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+    assert_eq!(
+        h.handle.poll_events(),
+        vec![AudioEvent::VoiceEnded(voice(1))]
+    );
 }
 
 #[test]
@@ -325,6 +342,10 @@ fn a_clip_that_cannot_be_read_releases_its_lane_and_plays_nothing() {
     h.step();
     assert_eq!(h.handle.lane_of(voice(1)), None);
     assert!(h.sent().is_empty());
+    assert_eq!(
+        h.handle.poll_events(),
+        vec![AudioEvent::VoiceEnded(voice(1))]
+    );
 
     h.handle
         .play(voice(2), "audio/missing.wav", request(false))
@@ -468,4 +489,64 @@ fn cancelled_decoder_skips_the_queued_jobs() {
     let (results_tx, results_rx) = flume::unbounded();
     decode_loop(jobs(3), results_tx, &AtomicBool::new(false));
     assert_eq!(results_rx.try_iter().count(), 3);
+}
+
+#[test]
+fn stopped_voice_keeps_its_lane_until_the_mixer_reports_it_ended() {
+    let mut h = Harness::new();
+    h.handle.play(voice(1), "audio/hum.wav", request(false)).unwrap();
+    h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    h.step();
+    let _ = h.sent();
+
+    h.handle.stop(voice(1)).unwrap();
+    h.handle.play(voice(2), "audio/hum.wav", request(false)).unwrap();
+    assert_eq!(h.handle.lane_of(voice(1)), Some(0), "затухающий голос держит слот");
+    assert_eq!(h.handle.lane_of(voice(2)), Some(1), "новый запуск получает другой слот");
+    h.step();
+    assert!(
+        matches!(
+            h.sent().as_slice(),
+            [
+                MixerCommand::Stop { voice: stopped },
+                MixerCommand::Play { voice: started, lane: 1, .. },
+            ] if *stopped == voice(1) && *started == voice(2)
+        ),
+        "порядок: Stop старого, затем Play нового"
+    );
+
+    h.core.voice_ended(voice(1));
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+    assert_eq!(h.handle.lane_of(voice(2)), Some(1));
+}
+
+#[test]
+fn voices_that_never_reach_the_mixer_end_at_once_so_the_source_can_play_again() {
+    let mut h = Harness::new();
+    h.core.mixer = None;
+    h.handle.play(voice(1), "audio/hum.wav", request(true)).unwrap();
+    h.reads.send(Ok(wav_bytes(2205))).unwrap();
+    h.step();
+    assert_eq!(h.handle.lane_of(voice(1)), None);
+    assert_eq!(h.handle.poll_events(), vec![AudioEvent::VoiceEnded(voice(1))]);
+
+    h.handle.play(voice(2), "audio/hum.wav", request(true)).unwrap();
+    h.step();
+    assert_eq!(h.handle.lane_of(voice(2)), None);
+    assert_eq!(h.handle.poll_events(), vec![AudioEvent::VoiceEnded(voice(2))]);
+}
+
+#[test]
+fn stop_on_a_full_queue_keeps_the_voice_and_its_lane() {
+    let (handle, commands, _events) = AudioHandle::detached();
+    handle.play(voice(1), "audio/hum.wav", request(true)).unwrap();
+    for _ in 0..COMMAND_CAPACITY - 1 {
+        handle.preload(Vec::new()).unwrap();
+    }
+    assert_eq!(handle.stop(voice(1)), Err(AudioError::QueueFull));
+    assert_eq!(handle.lane_of(voice(1)), Some(0));
+    let _: Vec<Command> = commands.try_iter().collect();
+    handle.stop(voice(1)).unwrap();
+    assert!(matches!(commands.try_recv(), Ok(Command::Stop(id)) if id == voice(1)));
+    assert_eq!(handle.lane_of(voice(1)), Some(0), "слот освобождает только VoiceEnded");
 }

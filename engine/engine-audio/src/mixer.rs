@@ -243,8 +243,11 @@ impl Mixer {
 
     fn start(&mut self, id: VoiceId, lane: usize, clip: Arc<Clip>, request: PlayRequest) {
         if lane >= VOICE_SLOTS {
+            self.push_ended(id);
             return;
         }
+        // Слот занят только при вытеснении: слот освобождается по VoiceEnded, поэтому остановленный
+        // голос ещё затухает. Вытесненный голос обрывается без fade: одна дорожка — один голос.
         if let Some(previous) = self.voices[lane].take() {
             self.push_ended(previous.id);
         }

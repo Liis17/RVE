@@ -359,3 +359,23 @@ fn ended_queue_keeps_events_until_the_sink_accepts_them() {
     assert_eq!(attempts, vec![voice(1), voice(2)]);
     assert_eq!(drain(&mut mixer), vec![voice(2), voice(3)]);
 }
+
+#[test]
+fn stopped_voice_fades_out_without_a_jump_while_a_new_voice_starts_on_another_lane() {
+    let mut mixer = mixer();
+    play(&mut mixer, 1, 0, clip(RATE, 1, vec![0.5; 4800]), request(false));
+    let _ = render_mono(&mut mixer, 256);
+    mixer.apply(MixerCommand::Stop { voice: voice(1) });
+    play(&mut mixer, 2, 1, clip(RATE, 1, vec![0.0; 4800]), request(false));
+
+    let out = render_mono(&mut mixer, 512);
+    let fade = (FADE_SECONDS * RATE as f32).ceil() as usize;
+    assert!((out[0] - 0.5).abs() < 1e-6, "первый кадр без скачка: {}", out[0]);
+    let largest_step = out
+        .windows(2)
+        .map(|pair| (pair[0] - pair[1]).abs())
+        .fold(0.0f32, f32::max);
+    assert!(largest_step <= 0.5 / fade as f32 + 1e-6, "шаг {largest_step}");
+    assert!(out[fade..].iter().all(|value| *value == 0.0));
+    assert_eq!(drain(&mut mixer), vec![voice(1)]);
+}

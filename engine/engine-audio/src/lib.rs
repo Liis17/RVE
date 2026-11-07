@@ -119,7 +119,7 @@ impl Default for Lanes {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct LaneSlot {
     voice: VoiceId,
     looping: bool,
@@ -128,12 +128,12 @@ struct LaneSlot {
 
 impl Lanes {
     /// Возвращает свободный слот. Если их нет, вытесняет самый старый не-looping голос;
-    /// вытесненный голос возвращается вызывающему для остановки.
+    /// его прежний слот возвращается вызывающему (на случай отката через `Lanes::restore`).
     fn allocate(
         &mut self,
         voice: VoiceId,
         looping: bool,
-    ) -> Result<(usize, Option<VoiceId>), AudioError> {
+    ) -> Result<(usize, Option<LaneSlot>), AudioError> {
         self.started += 1;
         let slot = LaneSlot {
             voice,
@@ -155,8 +155,14 @@ impl Lanes {
             .min_by_key(|&(_, started)| started)
             .map(|(index, _)| index)
             .ok_or(AudioError::NoFreeVoice)?;
-        let evicted = self.slots[victim].replace(slot).map(|lane| lane.voice);
+        let evicted = self.slots[victim].replace(slot);
         Ok((victim, evicted))
+    }
+
+    /// Отменяет `Lanes::allocate`, если команда не ушла: слот возвращается прежнему владельцу
+    /// или освобождается. Вытесненный голос при этом продолжает владеть своим слотом.
+    fn restore(&mut self, lane: usize, previous: Option<LaneSlot>) {
+        self.slots[lane] = previous;
     }
 
     /// Освобождает слот, если его занимает `voice`. Чужой слот не трогает.
@@ -176,9 +182,6 @@ impl Lanes {
             .position(|slot| slot.is_some_and(|lane| lane.voice == voice))
     }
 
-    fn clear(&mut self) {
-        self.slots = [None; VOICE_SLOTS];
-    }
 }
 
 /// Клиентский конец звуковой подсистемы. Клонируется; все методы не блокируют поток
@@ -194,11 +197,12 @@ pub struct AudioHandle {
 
 impl AudioHandle {
     /// Запускает клип на голосе `voice`. Слот выделяется сразу; при отсутствии свободных слотов
-    /// вытесняется самый старый не-looping голос.
+    /// вытесняется самый старый не-looping голос (он обрывается, см. `mixer`).
     pub fn play(&self, voice: VoiceId, path: &str, request: PlayRequest) -> Result<(), AudioError> {
-        let (lane, evicted) = self.locked().allocate(voice, request.looping)?;
+        let mut lanes = self.locked();
+        let (lane, evicted) = lanes.allocate(voice, request.looping)?;
         let sent = evicted
-            .map_or(Ok(()), |evicted| self.send(Command::Stop(evicted)))
+            .map_or(Ok(()), |evicted| self.send(Command::Stop(evicted.voice)))
             .and_then(|()| {
                 self.send(Command::Play {
                     voice,
@@ -208,19 +212,19 @@ impl AudioHandle {
                 })
             });
         if sent.is_err() {
-            self.locked().release(voice);
+            lanes.restore(lane, evicted);
         }
         sent
     }
 
-    /// Останавливает голос с коротким fade-out; слот освобождается сразу.
+    /// Останавливает голос коротким fade-out. Слот остаётся занятым до `VoiceEnded`, поэтому
+    /// новый запуск того же источника получит другой слот и не оборвёт затухающий голос.
+    /// При ошибке очереди голос продолжает звучать и владеет слотом.
     pub fn stop(&self, voice: VoiceId) -> Result<(), AudioError> {
-        self.locked().release(voice);
         self.send(Command::Stop(voice))
     }
 
     pub fn stop_all(&self) -> Result<(), AudioError> {
-        self.locked().clear();
         self.send(Command::StopAll)
     }
 
@@ -495,11 +499,11 @@ impl Core {
                 request,
             } => self.play(voice, lane, path, request),
             Command::Stop(voice) => {
-                self.pending.retain(|pending| pending.voice != voice);
+                self.cancel_pending(|pending| pending.voice == voice);
                 self.send_mixer(MixerCommand::Stop { voice });
             }
             Command::StopAll => {
-                self.pending.clear();
+                self.cancel_pending(|_| true);
                 self.send_mixer(MixerCommand::StopAll);
             }
             Command::SetPaused(paused) => self.send_mixer(MixerCommand::SetPaused(paused)),
@@ -528,17 +532,10 @@ impl Core {
 
     fn play(&mut self, voice: VoiceId, lane: usize, path: String, request: PlayRequest) {
         if let Some(clip) = self.cache.get(&path).cloned() {
-            self.send_mixer(MixerCommand::Play {
-                voice,
-                lane,
-                clip,
-                request,
-            });
-            return;
+            return self.start_voice(voice, lane, clip, request);
         }
         if self.failed.contains(&path) {
-            self.release(voice);
-            return;
+            return self.voice_ended(voice);
         }
         self.pending.push(Pending {
             voice,
@@ -613,30 +610,45 @@ impl Core {
             .partition(|pending| pending.path == path);
         self.pending = waiting;
         for pending in ready {
-            self.send_mixer(MixerCommand::Play {
-                voice: pending.voice,
-                lane: pending.lane,
-                clip: Arc::clone(&clip),
-                request: pending.request,
-            });
+            self.start_voice(pending.voice, pending.lane, Arc::clone(&clip), pending.request);
         }
     }
 
-    /// Сообщает об ошибке клипа один раз и освобождает слоты его ожидающих голосов.
+    /// Отдаёт голос микшеру. Без устройства голос сразу завершается: он никогда не будет звучать.
+    fn start_voice(&mut self, voice: VoiceId, lane: usize, clip: Arc<Clip>, request: PlayRequest) {
+        if self.mixer.is_none() {
+            return self.voice_ended(voice);
+        }
+        self.send_mixer(MixerCommand::Play {
+            voice,
+            lane,
+            clip,
+            request,
+        });
+    }
+
+    /// Сообщает об ошибке клипа один раз и завершает его ожидающие голоса.
     fn fail(&mut self, path: &str, message: impl fmt::Display) {
         log::warn!("аудиоклип {path}: {message}; звук не будет воспроизведён");
         self.failed.insert(path.to_owned());
         self.loading.remove(path);
         self.decoding.remove(path);
-        let (dropped, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.pending)
+        self.cancel_pending(|pending| pending.path == path);
+    }
+
+    /// Убирает ожидающие голоса, которые подходят под `matches`, и завершает их: микшер их не видел.
+    fn cancel_pending(&mut self, matches: impl Fn(&Pending) -> bool) {
+        let (cancelled, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.pending)
             .into_iter()
-            .partition(|pending| pending.path == path);
+            .partition(|pending| matches(pending));
         self.pending = waiting;
-        for pending in dropped {
-            self.release(pending.voice);
+        for pending in cancelled {
+            self.voice_ended(pending.voice);
         }
     }
 
+    /// Освобождает слот голоса и сообщает о завершении. Вызывается один раз на голос: из микшера,
+    /// при отмене ожидающего голоса или когда голос не может начать звучать.
     fn voice_ended(&mut self, voice: VoiceId) {
         self.release(voice);
         let _ = self.events.send(AudioEvent::VoiceEnded(voice));
