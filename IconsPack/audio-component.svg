@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" role="img" aria-label="RVE Audio Component">
+  <defs>
+    <linearGradient id="speaker" x1="12" y1="17" x2="34" y2="47" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A6EEFA"/>
+      <stop offset="1" stop-color="#46BFDB"/>
+    </linearGradient>
+  </defs>
+  <!-- Simple speaker silhouette: a filled body and cone. -->
+  <path d="M12 26.5H21L32.5 17.5C33.5 16.7 35 17.4 35 18.7V45.3C35 46.6 33.5 47.3 32.5 46.5L21 37.5H12C10.3 37.5 9 36.2 9 34.5V29.5C9 27.8 10.3 26.5 12 26.5Z" fill="url(#speaker)" stroke="#64D5EB" stroke-width="2.2" stroke-linejoin="round"/>
+  <!-- Sound waves: round caps and no extra decoration. -->
+  <g stroke="#55CEE5" stroke-linecap="round" stroke-width="3.5">
+    <path d="M40 24.3C42.6 26.1 44 28.8 44 32S42.6 37.9 40 39.7"/>
+    <path d="M45 17.2C50.1 20.6 53 25.7 53 32S50.1 43.4 45 46.8"/>
+  </g>
+</svg>

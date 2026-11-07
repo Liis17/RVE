@@ -107,7 +107,7 @@ cargo run -p sandbox -- --frames 300 --resize-test
 cargo run -p rve-editor -- --project ../examples/demo-game
 ~~~
 
-Для CLI и границ текущего Vulkan пути смотри `README.md`; для контрактов — соответствующие заметки в `Obsidian/RVEVault/`.
+Для CLI sandbox смотри `Obsidian/RVEVault/Engine/Sandbox.md`, для требований Vulkan — `Obsidian/RVEVault/Engine/EngineRender.md`; для контрактов — соответствующие заметки в `Obsidian/RVEVault/`.
 
 Начальные параметры окна читаются из `bootstrap.rves` в текущем рабочем каталоге,
 при обычном запуске sandbox — `build/bootstrap.rves`. Формат: один параметр
@@ -118,8 +118,8 @@ cargo run -p rve-editor -- --project ../examples/demo-game
 При первой подготовке файл можно создать копированием `bootstrap.rves.example` в
 `build/bootstrap.rves`; существующий файл настроек не перезаписывай. Отсутствующий
 файл или параметр сохраняет соответствующее значение по умолчанию (размер окна —
-1280×720); некорректные настройки дают код выхода 2. Подробности: [README.md](README.md)
-и `Obsidian/RVEVault/Engine/EngineProject.md`.
+1280×720); некорректные настройки дают код выхода 2. Подробности:
+`Obsidian/RVEVault/Engine/EngineProject.md`.
 
 ## Тесты и CI
 
@@ -127,7 +127,7 @@ cargo run -p rve-editor -- --project ../examples/demo-game
 - Это правило действует для всех крейтов workspace. Для крейтов-скелетов тесты появляются вместе с первой реализацией; пустые тесты без проверяемого поведения не добавляй.
 - Проверяй наблюдаемое поведение и публичные контракты. Тесты должны быть воспроизводимыми: без реального GPU, Vulkan loader, окна, сети и ожиданий через `sleep`. Графический runtime проверяй отдельно командами sandbox.
 - Перед коммитом запускай `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo build --workspace --locked` и `cargo test --workspace --locked`. Последняя команда включает unit-, integration- и doc-тесты.
-- `.github/workflows/ci.yml` при push и для каждого PR проверяет на Windows и macOS изменённые крейты и все транзитивно зависящие от них крейты через `-p`. Граф берётся из Cargo metadata. Общие настройки, lockfile, CI, неизвестные пути, ручной запуск и push без доступной базы запускают полную проверку. Изменения только документации вне крейтов пропускают проверки Rust; точные правила описаны в `README.md`.
+- `.github/workflows/ci.yml` запускается на pull request в `son-croissant` и `mommy`, на push в `mommy` и вручную (push в feature-ветки без PR не запускает CI). Проверка на Windows и macOS изменённые крейты и все транзитивно зависящие от них крейты через `-p`. Граф берётся из Cargo metadata. Общие настройки, lockfile, CI, неизвестные пути, ручной запуск и push без доступной базы запускают полную проверку. Изменения только документации вне крейтов пропускают проверки Rust; точные правила описаны в `Obsidian/RVEVault/Architecture.md`.
 - Логику выбора крейтов проверяй командой `python3 -B -m unittest discover -s .github/scripts -v` из корня; CI запускает эти тесты на Ubuntu перед выбором крейтов.
 - Во время работы проверяй изменённый компонент, затронутые тесты и зависимые контракты; обязательные проверки перед коммитом выполняй полностью.
 - Не добавляй тесты, лишь повторяющие реализацию или очевидную передачу параметров. Для событийного кода проверяй наблюдаемое событие или состояние вместо произвольных задержек.

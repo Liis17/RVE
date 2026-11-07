@@ -1,7 +1,7 @@
 //! Панель Project: файловый менеджер каталога `Assets/`.
 
 use crate::assets_fs::{AssetEntry, AssetKind};
-use crate::icons::folder_icon;
+use crate::icons::{file_icon, folder_icon};
 use crate::state::{Action, AssetDrag, EditorState};
 
 const TILE_SIZE: f32 = 88.0;
@@ -193,14 +193,12 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
             })
         })
         .flatten();
-        let icon = entry
-            .is_dir
-            .then(|| {
-                state
-                    .icons
-                    .get(folder_icon(&entry.name, !entry.children.is_empty()))
-            })
-            .flatten();
+        let icon = if entry.is_dir {
+            Some(folder_icon(&entry.name, !entry.children.is_empty()))
+        } else {
+            file_icon(AssetKind::of(&entry.path))
+        }
+        .and_then(|name| state.icons.get(name));
         match preview.or(icon) {
             Some(texture) => {
                 painter.image(
