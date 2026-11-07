@@ -110,6 +110,13 @@ pub(crate) struct GpuSceneTable {
     pub skin_instances: HashMap<ObjectHandle, Vec<SkinId>>,
 }
 
+impl GpuSceneTable {
+    /// Все экземпляры skinning сцены; рендер освобождает их при завершении.
+    pub(crate) fn skin_instance_ids(&self) -> Vec<SkinId> {
+        self.skin_instances.values().flatten().copied().collect()
+    }
+}
+
 type FrameLighting = (
     DirectionalLight,
     Vec<[[f32; 4]; 4]>,
@@ -232,6 +239,8 @@ pub(crate) trait RenderBackend: Send {
         Ok(())
     }
     fn wait_idle(&mut self) {}
+    /// Освобождает GPU-ресурсы сцены до уничтожения backend.
+    fn release_scene(&mut self) {}
 }
 
 pub(crate) trait ExitRequester: Send + Sync {
@@ -301,6 +310,8 @@ pub(crate) struct VulkanBackend {
     ui_bridge: UiBridge,
     #[cfg(feature = "dev-console")]
     console_viewport: Option<(ViewportId, u32, u32)>,
+    /// Экземпляры skinning сцены, которые освобождаются в `release_scene`.
+    scene_skin_instances: Vec<SkinId>,
 }
 
 #[cfg(feature = "dev-console")]
@@ -325,12 +336,18 @@ impl VulkanBackend {
             ui_bridge: UiBridge::default(),
             #[cfg(feature = "dev-console")]
             console_viewport: None,
+            scene_skin_instances: Vec::new(),
         }
     }
 
     #[cfg(feature = "dev-console")]
     pub fn with_console(mut self, console_ui: Arc<ConsoleUiSlot>) -> Self {
         self.console_ui = Some(console_ui);
+        self
+    }
+
+    pub fn with_scene_skin_instances(mut self, instances: Vec<SkinId>) -> Self {
+        self.scene_skin_instances = instances;
         self
     }
 
@@ -460,6 +477,14 @@ impl RenderBackend for VulkanBackend {
         self.renderer
             .render_frame_with_outcome(&frame)
             .map_err(|error| error.to_string())
+    }
+
+    fn release_scene(&mut self) {
+        for instance in self.scene_skin_instances.drain(..) {
+            if let Err(error) = self.renderer.destroy_skin_instance(instance) {
+                eprintln!("failed to release skin instance: {error}");
+            }
+        }
     }
 
     fn wait_idle(&mut self) {
@@ -1625,6 +1650,14 @@ fn render_thread(config: RenderThreadConfig) {
     #[cfg(feature = "dev-console")]
     if let Err(error) = backend.close_console() {
         status.record_failure(format!("ошибка освобождения UI консоли: {error}"));
+    }
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| backend.release_scene())) {
+        status.record_failure(format!(
+            "ошибка освобождения ресурсов сцены: {}",
+            panic_message(payload)
+        ));
+        interrupt.interrupt();
+        let _ = script_tx.send(ScriptControl::Shutdown);
     }
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| backend.wait_idle())) {
         status.record_failure(format!(
