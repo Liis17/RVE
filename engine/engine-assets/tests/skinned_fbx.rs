@@ -218,3 +218,26 @@ fn inherit_modes_and_scale_nodes_follow_fbx_inherit_type() {
     assert_eq!(skeleton.nodes[knee].parent, Some(hip));
     assert_eq!(model.animations[0].name, "Idle");
 }
+
+#[test]
+fn stack_without_keys_does_not_make_a_static_model_animated() {
+    // Пустой стек «Take 001» статичной модели: скелет и клипы не строятся, меш грузится как раньше.
+    let model = fixtures().load_model("/static_empty_take.fbx").unwrap();
+    assert_eq!(model.meshes.len(), 1);
+    assert!(model.skeleton.is_none());
+    assert!(model.animations.is_empty());
+    assert!(model.meshes.iter().all(|mesh| mesh.skin.is_none()));
+}
+
+#[test]
+fn clip_loading_rejects_stacks_without_keys_like_missing_stacks() {
+    let error = fixtures()
+        .load_animations("/static_empty_take.fbx")
+        .unwrap_err();
+    match error {
+        AssetError::Decode { message, .. } => {
+            assert_eq!(message, "в FBX нет анимационных стеков");
+        }
+        other => panic!("ожидалась ошибка декодирования, получено {other:?}"),
+    }
+}

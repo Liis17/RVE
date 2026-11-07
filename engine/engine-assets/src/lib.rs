@@ -313,20 +313,22 @@ impl Assets {
         let bytes = self.read_asset(asset_path, &path)?;
         let virtual_path = virtual_asset_path(asset_path);
         let scene = load_fbx_scene(&bytes, &virtual_path, &path)?;
-        if scene.anim_stacks.is_empty() {
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("clip");
+        let clips =
+            animation::bake_clip_file(&scene, stem).map_err(|message| AssetError::Decode {
+                path: path.clone(),
+                message,
+            })?;
+        if clips.is_empty() {
             return Err(AssetError::Decode {
                 path,
                 message: "в FBX нет анимационных стеков".to_owned(),
             });
         }
-        let stem = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("clip");
-        animation::bake_clip_file(&scene, stem).map_err(|message| AssetError::Decode {
-            path: path.clone(),
-            message,
-        })
+        Ok(clips)
     }
 
     /// Возвращает внешние PNG-зависимости FBX без декодирования изображений.
@@ -776,9 +778,10 @@ fn load_fbx(
         message,
     };
     let scene = load_fbx_scene(bytes, virtual_path, path)?;
-    // Скелет нужен при skin или анимациях: тогда все части получают связи с костями.
-    let mut builder = (!scene.skin_deformers.is_empty() || !scene.anim_stacks.is_empty())
-        .then(skin::SkeletonBuilder::default);
+    // Скелет нужен при skin или анимациях с ключами: тогда все части получают связи с костями.
+    let needs_skeleton = !scene.skin_deformers.is_empty()
+        || animation::has_animated_stack(&scene).map_err(&decode_error)?;
+    let mut builder = needs_skeleton.then(skin::SkeletonBuilder::default);
 
     let mut model = Model {
         meshes: Vec::new(),

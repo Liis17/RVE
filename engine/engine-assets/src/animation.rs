@@ -34,46 +34,61 @@ pub struct ModelAnimation {
     pub tracks: Vec<ModelTrack>,
 }
 
-/// Запекает все стеки модели; в клип попадают только узлы скелета.
+/// Есть ли в файле стек с хотя бы одним ключом. Пустой стек, например `Take 001` статичной
+/// модели, анимацией не считается.
+pub(crate) fn has_animated_stack(scene: &ufbx::Scene) -> Result<bool, String> {
+    let mut keys = usize::MAX;
+    for stack in scene.anim_stacks.iter() {
+        let baked = bake_stack(scene, stack, String::new(), &|_| true, &mut keys)?;
+        if !baked.tracks.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Запекает стеки модели с ключами; в клип попадают только узлы скелета.
 pub(crate) fn bake_model_animations(
     builder: &SkeletonBuilder,
     scene: &ufbx::Scene,
 ) -> Result<Vec<ModelAnimation>, String> {
     let mut keys = KEY_LIMIT;
-    scene
-        .anim_stacks
-        .iter()
-        .map(|stack| {
-            bake_stack(
-                scene,
-                stack,
-                stack.element.name.to_string(),
-                &|typed_id| builder.contains(typed_id),
-                &mut keys,
-            )
-        })
-        .collect()
+    let mut animations = Vec::new();
+    for stack in scene.anim_stacks.iter() {
+        let baked = bake_stack(
+            scene,
+            stack,
+            stack.element.name.to_string(),
+            &|typed_id| builder.contains(typed_id),
+            &mut keys,
+        )?;
+        if !baked.tracks.is_empty() {
+            animations.push(baked);
+        }
+    }
+    Ok(animations)
 }
 
-/// Запекает все стеки файла как клипы; имена — stem файла, если стек один.
+/// Запекает стеки файла с ключами как клипы; имена — stem файла, если стек один.
 pub(crate) fn bake_clip_file(
     scene: &ufbx::Scene,
     stem: &str,
 ) -> Result<Vec<ModelAnimation>, String> {
     let mut keys = KEY_LIMIT;
     let single = scene.anim_stacks.len() == 1;
-    scene
-        .anim_stacks
-        .iter()
-        .map(|stack| {
-            let name = if single {
-                stem.to_owned()
-            } else {
-                format!("{stem}:{}", stack.element.name)
-            };
-            bake_stack(scene, stack, name, &|_| true, &mut keys)
-        })
-        .collect()
+    let mut clips = Vec::new();
+    for stack in scene.anim_stacks.iter() {
+        let name = if single {
+            stem.to_owned()
+        } else {
+            format!("{stem}:{}", stack.element.name)
+        };
+        let baked = bake_stack(scene, stack, name, &|_| true, &mut keys)?;
+        if !baked.tracks.is_empty() {
+            clips.push(baked);
+        }
+    }
+    Ok(clips)
 }
 
 fn bake_stack(
