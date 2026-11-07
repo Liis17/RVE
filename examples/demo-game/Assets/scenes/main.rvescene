@@ -121,15 +121,6 @@ lite_params = [{ path = "/scripts/rotate.lua", params = { speed = -120.0 } }]
 [[assets]]
 path = "/audio/hum.wav"
 
-[[assets]]
-path = "/models/worm.fbx"
-
-[[assets]]
-path = "/anims/worm_curl.fbx"
-
-[[assets]]
-path = "/scripts/worm.lua"
-
 [[objects]]
 id = "ambient-hum"
 name = "Ambient Hum"
@@ -144,16 +135,3 @@ play_on_start = true
 spatial = true
 min_distance = 2.0
 max_distance = 25.0
-
-[[objects]]
-id = "worm"
-name = "Worm"
-[objects.transform]
-position = [2.0, 0.0, -1.0]
-[objects.mesh_renderer]
-model = "/models/worm.fbx"
-[objects.animator]
-clips = ["/anims/worm_curl.fbx"]
-play_on_start = false
-[[objects.lite_scripts]]
-path = "/scripts/worm.lua"
