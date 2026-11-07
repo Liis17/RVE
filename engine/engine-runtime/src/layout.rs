@@ -1,5 +1,6 @@
 #[cfg(windows)]
 use engine_files::strip_windows_verbatim_prefix;
+use engine_project::{PREFAB_CATALOG_FILE_NAME, PREFAB_CATALOG_RELEASE_PATH};
 use engine_resources::SourceMode;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -62,6 +63,13 @@ pub(crate) enum ProjectSettingsLocation {
     Resource(&'static str),
 }
 
+/// Где лежит список тяжёлых префабов: файл проекта в dev или ресурс `base` в release.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PrefabCatalogLocation {
+    File(PathBuf),
+    Resource(&'static str),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Layout {
     pub bootstrap: PathBuf,
@@ -69,6 +77,7 @@ pub(crate) struct Layout {
     pub scripts_library: Option<PathBuf>,
     pub source_mode: SourceMode,
     pub project_settings: ProjectSettingsLocation,
+    pub prefab_catalog: PrefabCatalogLocation,
 }
 
 impl Layout {
@@ -85,6 +94,7 @@ impl Layout {
             scripts_library,
             source_mode: SourceMode::Registry,
             project_settings: ProjectSettingsLocation::Resource("/rve/project.toml"),
+            prefab_catalog: PrefabCatalogLocation::Resource(PREFAB_CATALOG_RELEASE_PATH),
         }
     }
 
@@ -95,6 +105,7 @@ impl Layout {
             scripts_library: None,
             source_mode: SourceMode::Loose,
             project_settings: ProjectSettingsLocation::File(project_dir.join("project.rveproject")),
+            prefab_catalog: PrefabCatalogLocation::File(project_dir.join(PREFAB_CATALOG_FILE_NAME)),
         }
     }
 
@@ -146,7 +157,7 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
-    use super::{Layout, ProjectSettingsLocation, app_bundle_resources};
+    use super::{Layout, PrefabCatalogLocation, ProjectSettingsLocation, app_bundle_resources};
     use engine_resources::SourceMode;
     use std::path::Path;
 
@@ -174,6 +185,10 @@ mod tests {
         assert_eq!(
             layout.project_settings,
             ProjectSettingsLocation::Resource("/rve/project.toml")
+        );
+        assert_eq!(
+            layout.prefab_catalog,
+            PrefabCatalogLocation::Resource("/rve/prefabs.toml")
         );
     }
 
@@ -212,6 +227,10 @@ mod tests {
         assert_eq!(
             layout.project_settings,
             ProjectSettingsLocation::File(Path::new("/tmp/demo/project.rveproject").into())
+        );
+        assert_eq!(
+            layout.prefab_catalog,
+            PrefabCatalogLocation::File(Path::new("/tmp/demo/prefabs.rveprefabs").into())
         );
     }
 

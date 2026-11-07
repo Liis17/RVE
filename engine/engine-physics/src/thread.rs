@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -7,8 +8,8 @@ use crate::Pose;
 use crate::query::{QueryError, QuerySnapshot};
 use crate::scene::{PhysicsSceneBinding, PhysicsSceneDesc};
 use crate::world::{
-    BodyHandle, PhysicsCommand, PhysicsEvent, PhysicsWorld, PhysicsWorldError, StepDriver,
-    StepResult,
+    BodyChange, BodyHandle, PhysicsCommand, PhysicsEvent, PhysicsWorld, PhysicsWorldError,
+    StepDriver, StepResult,
 };
 
 #[derive(Clone, Debug)]
@@ -17,6 +18,7 @@ pub enum PhysicsRequest {
     Step {
         sequence: u64,
         dt: f32,
+        changes: Vec<BodyChange>,
         commands: Vec<PhysicsCommand>,
     },
     Shutdown,
@@ -104,6 +106,7 @@ pub enum PhysicsClientError {
     AlreadyInitialized,
     NotInitialized,
     StepOutstanding,
+    InvalidBody { body: BodyHandle, message: String },
     RequestChannelDisconnected,
     ReplyChannelDisconnected,
     ControlChannelDisconnected,
@@ -122,6 +125,9 @@ impl fmt::Display for PhysicsClientError {
             Self::NotInitialized => formatter.write_str("physics client is not initialized"),
             Self::StepOutstanding => {
                 formatter.write_str("physics client already has an outstanding Step")
+            }
+            Self::InvalidBody { body, message } => {
+                write!(formatter, "physics body {} is invalid: {message}", body.0)
             }
             Self::RequestChannelDisconnected => {
                 formatter.write_str("physics request channel disconnected")
@@ -234,6 +240,7 @@ impl PhysicsServer {
                 PhysicsRequest::Step {
                     sequence,
                     dt,
+                    changes,
                     commands,
                 } => {
                     if sequence != expected_sequence {
@@ -244,7 +251,7 @@ impl PhysicsServer {
                         send_failure(&replies, sequence, error.to_string())?;
                         return Err(error);
                     }
-                    let result = match build_result(sequence, &mut driver, dt, commands) {
+                    let result = match build_result(sequence, &mut driver, dt, changes, commands) {
                         Ok(result) => result,
                         Err(error) => {
                             let message = error.to_string();
@@ -349,12 +356,44 @@ impl PhysicsClient {
         dt: f32,
         commands: Vec<PhysicsCommand>,
     ) -> Result<u64, PhysicsClientError> {
+        self.step_with_changes(dt, Vec::new(), commands)
+    }
+
+    /// Queues one frame Step that applies `changes` before `commands`. Inserts are validated
+    /// before sending, so an invalid body neither reaches the server nor consumes a sequence.
+    /// Commands for bodies removed by this Step are dropped, and repeated removals are sent once.
+    pub fn step_with_changes(
+        &mut self,
+        dt: f32,
+        changes: Vec<BodyChange>,
+        mut commands: Vec<PhysicsCommand>,
+    ) -> Result<u64, PhysicsClientError> {
         if !self.initialized {
             return Err(PhysicsClientError::NotInitialized);
         }
         if self.outstanding.is_some() {
             return Err(PhysicsClientError::StepOutstanding);
         }
+        let mut removed = HashSet::new();
+        let mut sent_changes = Vec::with_capacity(changes.len());
+        for change in changes {
+            match &change {
+                BodyChange::Insert { handle, desc } => {
+                    desc.validate()
+                        .map_err(|error| PhysicsClientError::InvalidBody {
+                            body: *handle,
+                            message: error.to_string(),
+                        })?;
+                }
+                BodyChange::Remove { handle } => {
+                    if !removed.insert(*handle) {
+                        continue;
+                    }
+                }
+            }
+            sent_changes.push(change);
+        }
+        commands.retain(|command| !removed.contains(&command.body()));
         let next = self
             .next_sequence
             .checked_add(1)
@@ -364,6 +403,7 @@ impl PhysicsClient {
             .send(PhysicsRequest::Step {
                 sequence,
                 dt,
+                changes: sent_changes,
                 commands,
             })
             .map_err(|_| PhysicsClientError::RequestChannelDisconnected)?;
@@ -433,9 +473,10 @@ fn build_result(
     sequence: u64,
     driver: &mut StepDriver,
     dt: f32,
-    commands: impl IntoIterator<Item = PhysicsCommand>,
+    changes: Vec<BodyChange>,
+    commands: Vec<PhysicsCommand>,
 ) -> Result<PhysicsStepResult, PhysicsServerStepError> {
-    let step = driver.advance_step(dt, commands)?;
+    let step = driver.advance_step_with_changes(dt, changes, commands)?;
     snapshot_result(sequence, step, driver.world())
 }
 
@@ -502,7 +543,10 @@ mod tests {
         PhysicsRequest, PhysicsServer, PhysicsServerError, PhysicsStepResult,
     };
     use crate::scene::PhysicsSceneDesc;
-    use crate::{PhysicsCommand, PhysicsEvent, PhysicsWorld, Ray};
+    use crate::{
+        BodyChange, BodyDesc, BodyHandle, PhysicsCommand, PhysicsEvent, PhysicsWorld, Pose, Ray,
+        Shape,
+    };
     use engine_scene::{SceneDocument, World};
     use flume::Receiver;
     use glam::Vec3;
@@ -655,6 +699,7 @@ mod tests {
             .send(PhysicsRequest::Step {
                 sequence: 1,
                 dt: 0.0,
+                changes: Vec::new(),
                 commands: Vec::new(),
             })
             .unwrap();
@@ -677,6 +722,7 @@ mod tests {
             .send(PhysicsRequest::Step {
                 sequence: 1,
                 dt: 0.0,
+                changes: Vec::new(),
                 commands: Vec::new(),
             })
             .unwrap();
@@ -858,6 +904,7 @@ mod tests {
             .send(PhysicsRequest::Step {
                 sequence: 4,
                 dt: 0.0,
+                changes: Vec::new(),
                 commands: Vec::new(),
             })
             .unwrap();
@@ -866,5 +913,159 @@ mod tests {
             PhysicsReply::Failed { sequence: 4, .. }
         ));
         assert!(server.join().unwrap().is_err());
+    }
+
+    fn dynamic_ball(mass: f32) -> BodyDesc {
+        let mut desc = BodyDesc::dynamic(Shape::sphere(0.5).unwrap(), Pose::IDENTITY, 1.0);
+        desc.mass = mass;
+        desc
+    }
+
+    #[test]
+    fn invalid_insert_is_not_sent_and_does_not_consume_a_sequence() {
+        let (request_tx, request_rx) = flume::unbounded();
+        let (_reply_tx, reply_rx) = flume::unbounded();
+        let mut client = PhysicsClient::new_preinitialized(request_tx, reply_rx);
+        let error = client
+            .step_with_changes(
+                0.0,
+                vec![BodyChange::Insert {
+                    handle: BodyHandle(1),
+                    desc: dynamic_ball(0.0),
+                }],
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PhysicsClientError::InvalidBody {
+                body: BodyHandle(1),
+                ..
+            }
+        ));
+        assert!(request_rx.try_recv().is_err());
+        assert_eq!(client.step(0.0, Vec::new()).unwrap(), 1);
+    }
+
+    #[test]
+    fn repeated_removals_are_sent_once_and_commands_for_removed_bodies_are_dropped() {
+        let (request_tx, request_rx) = flume::unbounded();
+        let (_reply_tx, reply_rx) = flume::unbounded();
+        let mut client = PhysicsClient::new_preinitialized(request_tx, reply_rx);
+        let removed = BodyHandle(3);
+        let kept = BodyHandle(4);
+        client
+            .step_with_changes(
+                0.1,
+                vec![
+                    BodyChange::Remove { handle: removed },
+                    BodyChange::Remove { handle: removed },
+                ],
+                vec![
+                    PhysicsCommand::SetVelocity {
+                        body: removed,
+                        velocity: Vec3::X,
+                    },
+                    PhysicsCommand::Teleport {
+                        body: removed,
+                        pose: Pose::IDENTITY,
+                    },
+                    PhysicsCommand::SetVelocity {
+                        body: kept,
+                        velocity: Vec3::Y,
+                    },
+                ],
+            )
+            .unwrap();
+        match request_rx.try_recv().unwrap() {
+            PhysicsRequest::Step {
+                sequence,
+                changes,
+                commands,
+                ..
+            } => {
+                assert_eq!(sequence, 1);
+                assert_eq!(changes, vec![BodyChange::Remove { handle: removed }]);
+                assert_eq!(
+                    commands,
+                    vec![PhysicsCommand::SetVelocity {
+                        body: kept,
+                        velocity: Vec3::Y,
+                    }]
+                );
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_applies_removal_with_same_step_commands_and_keeps_running_after_rejected_insert() {
+        let (_, desc) = scene_with_dynamic_sphere();
+        let (request_tx, request_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::unbounded();
+        let (_control_tx, control_rx) = flume::unbounded::<()>();
+        let server = std::thread::spawn(move || PhysicsServer::run(request_rx, reply_tx));
+        let mut client = PhysicsClient::new(request_tx, reply_rx);
+        let initialization = client.initialize(desc).unwrap();
+        let body = initialization.bindings[0].body;
+
+        assert!(
+            client
+                .step_with_changes(
+                    1.0 / 60.0,
+                    vec![BodyChange::Insert {
+                        handle: body,
+                        desc: dynamic_ball(0.0),
+                    }],
+                    Vec::new(),
+                )
+                .is_err()
+        );
+
+        client
+            .step_with_changes(
+                1.0 / 60.0,
+                vec![BodyChange::Remove { handle: body }],
+                vec![
+                    PhysicsCommand::SetVelocity {
+                        body,
+                        velocity: Vec3::X,
+                    },
+                    PhysicsCommand::Teleport {
+                        body,
+                        pose: Pose::IDENTITY,
+                    },
+                ],
+            )
+            .unwrap();
+        let PhysicsReceive::Step(removed) = client.receive(&control_rx).unwrap().unwrap() else {
+            panic!("expected the removal Step result")
+        };
+        assert_eq!(removed.sequence, 1);
+        assert!(removed.poses.iter().all(|(handle, _)| *handle != body));
+
+        client
+            .step_with_changes(
+                1.0 / 60.0,
+                vec![BodyChange::Insert {
+                    handle: BodyHandle(2),
+                    desc: dynamic_ball(1.0),
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+        let PhysicsReceive::Step(inserted) = client.receive(&control_rx).unwrap().unwrap() else {
+            panic!("expected the insertion Step result")
+        };
+        assert_eq!(inserted.sequence, 2);
+        assert!(
+            inserted
+                .poses
+                .iter()
+                .any(|(handle, _)| *handle == BodyHandle(2))
+        );
+
+        client.shutdown().unwrap();
+        assert!(server.join().unwrap().is_ok());
     }
 }

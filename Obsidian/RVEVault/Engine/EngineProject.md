@@ -15,6 +15,7 @@ Parent: [[Index]]
 | `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Формат начальных настроек, значения по умолчанию и проверки |
 | `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings`, `PhysicsSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
 | `engine/engine-project/src/input_settings.rs` | `InputSettings`, `InputAction` | Схема игровых действий, проверка физических имён вводов и ограничений |
+| `engine/engine-project/src/prefab_catalog.rs` | `PrefabCatalogFile`, `PrefabCatalogEntry`, `PREFAB_CATALOG_FILE_NAME`, `PREFAB_CATALOG_RELEASE_PATH` | Список тяжёлых префабов проекта: разбор, проверка, сериализация |
 | `engine/engine-project/src/lib.rs` | публичные реэкспорты | API крейта |
 | `engine/engine-project/Cargo.toml` | зависимости | `engine-files`, `rve-sdk`, `serde`, `toml` |
 | `engine/sandbox/src/main.rs` | загрузка bootstrap | Настройки sandbox из текущего каталога |
@@ -150,12 +151,45 @@ SDK/backend или подходящая поддержка Vulkan недосту
 неверно закодированного или невалидного файла проекта он возвращает код 2, а
 прочая ошибка чтения считается операционной и даёт код 1.
 
+## `prefabs.rveprefabs`
+
+Необязательный TOML-файл в корне проекта со списком тяжёлых префабов: это
+`.rveprefab`, которые грузятся с диска во время игры, а не живут в памяти вместе со
+сценой. Схема строгая, неизвестные поля запрещены; отсутствующий файл означает пустой
+список. Пустой файл тоже допустим.
+
+| Поле | Смысл и проверка |
+|---|---|
+| `[[prefabs]].path` | Виртуальный путь `.rveprefab` в `Assets`; путь должен быть валидным и уникальным. Расширение проверяется без учёта регистра |
+| `[[prefabs]].archive` | Необязательный явный архив файла префаба и его зависимостей. Имя проверяется по правилу `SceneAsset::archive` из [[Engine/EngineScene]]: `[A-Za-z0-9_-]{1,64}`, `base` и `shared` запрещены в любом регистре |
+| `[[prefabs]].max_instances` | Необязательный лимит живых spawn-экземпляров; должен быть больше нуля |
+
+```toml
+[[prefabs]]
+path = "/prefabs/house.rveprefab"
+archive = "buildings"
+max_instances = 4
+
+[[prefabs]]
+path = "/prefabs/rock.rveprefab"
+```
+
+Порядок записей сохраняется. `PrefabCatalogFile::to_toml` проверяет список и выдаёт
+детерминированный TOML, который редактор записывает обратно без изменения порядка.
+Отсутствующий файл в `PrefabCatalogFile::load` даёт пустой список; ошибки формата
+и ошибки чтения содержат путь к файлу.
+
+В release список хранится как `/rve/prefabs.toml` в `base`; `rve-build` всегда пишет
+этот файл, даже пустой. Путь зарезервирован: `Assets` его содержать не может. Что
+именно упаковывается и как выбирается архив, описано в [[Engine/RveBuild]].
+
 ## Потребители и границы
 
 - `sandbox` использует только `BootstrapConfig`.
 - `engine-runtime` использует `BootstrapConfig` и `ProjectSettings`; бинарник
   `rve-player` получает их поведение через runtime.
 - `rve-build` проверяет обе конфигурации, сцены и связанные ресурсы перед сборкой.
+- `rve-editor` читает и сохраняет `prefabs.rveprefabs` в подокне «Префабы проекта» ([[Engine/RveEditor#Префабы]]).
 
 Формат `.rvescene` описан в [[Engine/EngineScene]], пути и layout player — в
 [[Engine/EngineRuntime]] и [[Engine/RveBuild]].

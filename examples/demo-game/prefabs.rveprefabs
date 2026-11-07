@@ -1,0 +1,3 @@
+# Тяжёлые префабы проекта: грузятся с диска по rve.prefabs.load и выгружаются по rve.prefabs.unload.
+[[prefabs]]
+path = "/prefabs/tower.rveprefab"

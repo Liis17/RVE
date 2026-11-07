@@ -19,6 +19,7 @@ mod play_cursor;
 mod previews;
 mod profile;
 mod project;
+mod project_prefabs;
 mod scene_edit;
 mod settings;
 mod state;

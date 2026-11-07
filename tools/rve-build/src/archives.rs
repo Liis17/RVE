@@ -6,6 +6,7 @@ use engine_pak::{
     ArchiveSetRegistry, BuildCompression, BuildFileInput, BuildOptions, ProgrammaticArchive,
     build_archive_set,
 };
+use engine_project::PREFAB_CATALOG_RELEASE_PATH;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -16,11 +17,13 @@ pub(crate) fn build_project_archives(
 ) -> Result<ArchiveSetRegistry, BuildError> {
     let project_settings_path = VirtualPath::parse("/rve/project.toml").expect("constant path");
     let registry_path = VirtualPath::parse("/rve/assets.toml").expect("constant path");
-    if project.assignments.contains_key(&project_settings_path)
-        || project.assignments.contains_key(&registry_path)
+    let prefabs_path = VirtualPath::parse(PREFAB_CATALOG_RELEASE_PATH).expect("constant path");
+    if [&project_settings_path, &registry_path, &prefabs_path]
+        .iter()
+        .any(|path| project.assignments.contains_key(*path))
     {
         return Err(BuildError::input(
-            "Assets не может содержать зарезервированные /rve/project.toml или /rve/assets.toml",
+            "Assets не может содержать зарезервированные /rve/project.toml, /rve/assets.toml или /rve/prefabs.toml",
         ));
     }
 
@@ -40,6 +43,7 @@ pub(crate) fn build_project_archives(
     let mut registry_paths = project.assignments.clone();
     registry_paths.insert(project_settings_path.clone(), "base".to_owned());
     registry_paths.insert(registry_path.clone(), "base".to_owned());
+    registry_paths.insert(prefabs_path.clone(), "base".to_owned());
     let registry = ArchiveSetRegistry::new(project.archives.clone(), registry_paths)
         .map_err(|error| BuildError::input(format!("ошибка реестра ресурсов: {error}")))?;
     let registry_toml = registry
@@ -58,6 +62,20 @@ pub(crate) fn build_project_archives(
         BuildError::operational(format!(
             "не удалось записать {}: {error}",
             generated_registry.display()
+        ))
+    })?;
+
+    // Список пишется всегда, даже пустым: runtime читает один формат.
+    let prefabs_toml = project.prefabs.to_toml().map_err(|error| {
+        BuildError::input(format!(
+            "не удалось сериализовать список тяжёлых префабов: {error}"
+        ))
+    })?;
+    let generated_prefabs = generated_rve.join("prefabs.toml");
+    fs::write(&generated_prefabs, prefabs_toml).map_err(|error| {
+        BuildError::operational(format!(
+            "не удалось записать {}: {error}",
+            generated_prefabs.display()
         ))
     })?;
 
@@ -89,6 +107,10 @@ pub(crate) fn build_project_archives(
         .get_mut("base")
         .expect("base archive is always included")
         .push(BuildFileInput::new(&generated_registry, registry_path));
+    archive_inputs
+        .get_mut("base")
+        .expect("base archive is always included")
+        .push(BuildFileInput::new(&generated_prefabs, prefabs_path));
 
     let archives = project
         .archives
@@ -352,5 +374,101 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         let error = prepare_project(project_root.path()).unwrap_err();
         assert!(error.to_string().contains("/cameras/shared.camerasettings"));
         assert!(error.to_string().contains("0 и 180"));
+    }
+}
+
+#[cfg(test)]
+mod prefab_list_tests {
+    use super::build_project_archives;
+    use crate::project::prepare_project;
+    use crate::temporary::TempDir;
+    use engine_files::VirtualPath;
+    use engine_pak::Archive;
+    use engine_project::PrefabCatalogFile;
+    use std::fs;
+    use std::path::Path;
+
+    fn write(root: &Path, path: &str, text: &str) {
+        let path = root.join("Assets").join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    /// Проект с одной сценой без экземпляров, префабом `/prefabs/tower.rveprefab` и
+    /// необязательным `prefabs.rveprefabs`.
+    fn project(root: &Path, list: Option<&str>) {
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/scenes/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        if let Some(list) = list {
+            fs::write(root.join("prefabs.rveprefabs"), list).unwrap();
+        }
+        write(
+            root,
+            "scenes/main.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        );
+        write(root, "textures/tower.png", "texture");
+        write(
+            root,
+            "prefabs/tower.rveprefab",
+            "[[assets]]\npath = \"/textures/tower.png\"\n[[objects]]\nid = \"tower\"\n",
+        );
+    }
+
+    fn base_text(archives_dir: &Path, path: &str) -> String {
+        let base = Archive::open_file(archives_dir.join("base.rvepak")).unwrap();
+        let bytes = base.read_all(&VirtualPath::parse(path).unwrap()).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn release_base_carries_the_prefab_list_and_its_archive_is_in_the_set() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-prefab-list").unwrap();
+        project(
+            root.path(),
+            Some(
+                "[[prefabs]]\npath = \"/prefabs/tower.rveprefab\"\narchive = \"towers\"\nmax_instances = 3\n",
+            ),
+        );
+        let build = prepare_project(root.path()).unwrap();
+        let archives_dir = root.path().join("out-assets");
+        let registry = build_project_archives(&build, &archives_dir).unwrap();
+
+        let text = base_text(&archives_dir, "/rve/prefabs.toml");
+        assert_eq!(PrefabCatalogFile::parse(&text).unwrap(), build.prefabs);
+        assert!(registry.archives().iter().any(|name| name == "towers"));
+        assert!(archives_dir.join("towers.rvepak").is_file());
+    }
+
+    #[test]
+    fn release_base_carries_an_empty_prefab_list_when_the_project_has_no_file() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-prefab-list").unwrap();
+        project(root.path(), None);
+        let build = prepare_project(root.path()).unwrap();
+        let archives_dir = root.path().join("out-assets");
+        build_project_archives(&build, &archives_dir).unwrap();
+
+        let text = base_text(&archives_dir, "/rve/prefabs.toml");
+        assert!(PrefabCatalogFile::parse(&text).unwrap().prefabs.is_empty());
+    }
+
+    #[test]
+    fn rejects_assets_at_the_reserved_prefab_list_path() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-prefab-list").unwrap();
+        project(root.path(), None);
+        write(root.path(), "rve/prefabs.toml", "prefabs = []\n");
+        fs::write(
+            root.path().join("Assets/scenes/main.rvescene"),
+            "[[assets]]\npath = \"/rve/prefabs.toml\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let build = prepare_project(root.path()).unwrap();
+        let error = build_project_archives(&build, &root.path().join("out-assets")).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("/rve/prefabs.toml"), "{error}");
     }
 }
