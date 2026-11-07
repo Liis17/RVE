@@ -28,7 +28,13 @@ pub struct AudioBridge {
     rejected: Vec<String>,
     /// Пути вне `[[assets]]`, о которых уже предупреждали: предупреждение один раз на путь.
     undeclared_warned: HashSet<String>,
+    /// Предупреждения для владельца моста (редактор показывает их в журнале). Копятся до
+    /// `WARNING_LIMIT`, сверх лимита отбрасываются.
+    warnings: Vec<String>,
 }
+
+/// Сколько предупреждений моста хранится до того, как их заберёт владелец.
+const WARNING_LIMIT: usize = 32;
 
 impl AudioBridge {
     pub fn new(handle: AudioHandle) -> Self {
@@ -40,6 +46,7 @@ impl AudioBridge {
             emitters: HashMap::new(),
             rejected: Vec::new(),
             undeclared_warned: HashSet::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -194,11 +201,26 @@ impl AudioBridge {
         let Some(first) = self.rejected.first() else {
             return;
         };
-        log::warn!(
+        let message = format!(
             "звуковых команд отклонено: {}; первая: {first}",
             self.rejected.len()
         );
+        log::warn!("{message}");
+        self.keep_warning(message);
         self.rejected.clear();
+    }
+
+    fn keep_warning(&mut self, message: String) {
+        if self.warnings.len() < WARNING_LIMIT {
+            self.warnings.push(message);
+        }
+    }
+
+    /// Забирает предупреждения, накопившиеся с прошлого вызова: отказы очереди и ошибки звука
+    /// (клип не прочитан, устройство не открылось).
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        self.poll_events();
+        std::mem::take(&mut self.warnings)
     }
 
     /// Пишет позиции излучателей и слушателя по мировым матрицам. Исчезнувший объект останавливается.
@@ -253,8 +275,13 @@ impl AudioBridge {
 
     fn poll_events(&mut self) {
         for event in self.handle.poll_events() {
-            let AudioEvent::VoiceEnded(voice) = event;
-            self.sources.retain(|_, current| *current != voice);
+            match event {
+                AudioEvent::VoiceEnded(voice) => {
+                    self.sources.retain(|_, current| *current != voice);
+                }
+                // Поток звука уже записал ошибку в лог; здесь её только сохраняем для владельца.
+                AudioEvent::Failed(message) => self.keep_warning(message),
+            }
         }
     }
 }

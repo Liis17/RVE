@@ -73,10 +73,13 @@ impl fmt::Display for AudioError {
 impl std::error::Error for AudioError {}
 
 /// Событие для владельцев голосов.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AudioEvent {
     /// Голос закончился, был остановлен или вытеснен новым голосом.
     VoiceEnded(VoiceId),
+    /// Звук не сработал: клип не прочитан или не декодирован, устройство не открылось.
+    /// Текст готов для показа автору сцены.
+    Failed(String),
 }
 
 /// Команды от [`AudioHandle`] к потоку `rve-audio`.
@@ -100,6 +103,8 @@ pub(crate) enum Command {
         volume: f32,
     },
     Preload(Vec<String>),
+    /// Отвечает, когда поток дошёл до этой команды: все предыдущие уже обработаны.
+    Barrier(Sender<()>),
     Shutdown,
 }
 
@@ -264,9 +269,17 @@ impl AudioHandle {
         self.send(Command::SetGroupVolume { group, volume })
     }
 
-    /// Загружает клипы заранее; ошибки появятся в логе при попытке их воспроизвести.
+    /// Загружает клипы заранее; ошибки приходят событием [`AudioEvent::Failed`].
     pub fn preload(&self, paths: Vec<String>) -> Result<(), AudioError> {
         self.send(Command::Preload(paths))
+    }
+
+    /// Блокирует вызывающего, пока поток `rve-audio` не обработает команды, отправленные раньше.
+    /// Нужна тестам и диагностике; в игровом цикле не вызывать.
+    pub fn barrier(&self) -> Result<(), AudioError> {
+        let (reply, done) = flume::bounded(1);
+        self.send(Command::Barrier(reply))?;
+        done.recv().map_err(|_| AudioError::Stopped)
     }
 
     /// Пишет позицию излучателя голоса. Голос без слота (уже завершён) игнорируется.
@@ -403,7 +416,9 @@ impl AudioEngine {
             match output::open(mixer_rx, ended_tx, Arc::clone(&spatial)) {
                 Ok(output) => (Some(output), Some(mixer_tx)),
                 Err(error) => {
-                    log::warn!("звук отключён: {error}; игра продолжает работу без звука");
+                    let message = format!("звук отключён: {error}; игра продолжает работу без звука");
+                    log::warn!("{message}");
+                    let _ = events_tx.send(AudioEvent::Failed(message));
                     (None, None)
                 }
             }
@@ -549,6 +564,9 @@ impl Core {
                     self.ensure_loaded(&path);
                 }
             }
+            Command::Barrier(reply) => {
+                let _ = reply.send(());
+            }
             Command::Shutdown => return false,
         }
         true
@@ -653,7 +671,9 @@ impl Core {
 
     /// Сообщает об ошибке клипа один раз и завершает его ожидающие голоса.
     fn fail(&mut self, path: &str, message: impl fmt::Display) {
-        log::warn!("аудиоклип {path}: {message}; звук не будет воспроизведён");
+        let message = format!("аудиоклип {path}: {message}; звук не будет воспроизведён");
+        log::warn!("{message}");
+        let _ = self.events.send(AudioEvent::Failed(message));
         self.failed.insert(path.to_owned());
         self.loading.remove(path);
         self.decoding.remove(path);

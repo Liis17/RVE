@@ -422,6 +422,13 @@ impl PlaySession {
         self.host.drain_events()
     }
 
+    /// Предупреждения звука, которые ещё не показаны: клип не загрузился, устройство недоступно.
+    pub fn drain_audio_warnings(&mut self) -> Vec<String> {
+        self.audio
+            .as_mut()
+            .map_or_else(Vec::new, |audio| audio.bridge.take_warnings())
+    }
+
     /// Завершает скрипты вызовом `on_destroy` и возвращает последние события.
     pub fn stop(mut self) -> Vec<ScriptEvent> {
         let time = self.script_time();
@@ -946,6 +953,20 @@ looping = true
 play_on_start = true
 spatial = true
 "#;
+
+    #[test]
+    fn a_clip_that_cannot_load_is_reported_for_the_editor_log() {
+        let mut session =
+            PlaySession::start(&document(AUDIO_SCENE), None, |_| Ok(String::new())).unwrap();
+        // Без ресурсов проекта play_on_start-клип не читается; барьер ждёт, пока поток это запишет.
+        session.audio.as_ref().unwrap().handle.barrier().unwrap();
+        let warnings = session.drain_audio_warnings();
+        assert!(
+            warnings.iter().any(|message| message.contains("audio/hum.wav")),
+            "{warnings:?}"
+        );
+        assert!(session.drain_audio_warnings().is_empty(), "предупреждение показывается один раз");
+    }
 
     #[test]
     fn play_audio_follows_a_moved_source_without_build_frame() {

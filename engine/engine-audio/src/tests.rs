@@ -362,9 +362,14 @@ fn a_clip_that_cannot_be_read_releases_its_lane_and_plays_nothing() {
     h.step();
     assert_eq!(h.handle.lane_of(voice(1)), None);
     assert!(h.sent().is_empty());
-    assert_eq!(
-        h.handle.poll_events(),
-        vec![AudioEvent::VoiceEnded(voice(1))]
+    let events = h.handle.poll_events();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [AudioEvent::Failed(message), AudioEvent::VoiceEnded(ended)]
+                if message.contains("audio/missing.wav") && *ended == voice(1)
+        ),
+        "{events:?}"
     );
 
     h.handle
@@ -605,4 +610,24 @@ fn stop_on_a_full_queue_keeps_the_voice_and_its_lane() {
     handle.stop(voice(1)).unwrap();
     assert!(matches!(commands.try_recv(), Ok(Command::Stop(id)) if id == voice(1)));
     assert_eq!(handle.lane_of(voice(1)), Some(0), "слот освобождает только VoiceEnded");
+}
+
+#[test]
+fn barrier_returns_after_earlier_commands_have_reported_their_failures() {
+    let (engine, handle) = AudioEngine::new(AudioConfig::default());
+    let worker = thread::spawn(move || engine.run());
+    handle
+        .preload(vec!["audio/missing.wav".to_owned()])
+        .unwrap();
+    handle.barrier().unwrap();
+    let events = handle.poll_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AudioEvent::Failed(message) if message.contains("audio/missing.wav")
+        )),
+        "{events:?}"
+    );
+    handle.shutdown();
+    worker.join().unwrap();
 }

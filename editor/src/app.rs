@@ -1219,6 +1219,9 @@ impl EditorApp {
         } else if let Some(play) = &mut self.state.play {
             let events = play.drain_events();
             self.state.log.push_script_events(events);
+            for warning in play.drain_audio_warnings() {
+                self.state.log.push(LogLevel::Warn, warning);
+            }
         }
 
         // Камера могла сместиться к новой модели: гизмо и маркеры нужно перестроить.

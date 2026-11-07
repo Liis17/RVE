@@ -305,3 +305,18 @@ fn looping_source_plays_again_after_its_voice_is_reported_ended() {
     rig.bridge.apply([play_source(speaker, voice(2))], &world);
     assert!(matches!(rig.take().as_slice(), [Command::Play { voice: v, .. }] if *v == voice(2)));
 }
+
+#[test]
+fn failures_reported_by_the_thread_are_kept_for_the_owner_once() {
+    let mut rig = Rig::new();
+    let world = world(SCENE);
+    rig.events
+        .send(AudioEvent::Failed("аудиоклип /audio/x.wav: нет".to_owned()))
+        .unwrap();
+    rig.bridge.sync_positions(&world);
+    assert_eq!(
+        rig.bridge.take_warnings(),
+        vec!["аудиоклип /audio/x.wav: нет".to_owned()]
+    );
+    assert!(rig.bridge.take_warnings().is_empty());
+}
