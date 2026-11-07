@@ -758,3 +758,42 @@ fn documents_without_instances_validate_as_before() {
         .is_err()
     );
 }
+
+#[test]
+fn audio_source_prefab_override_replaces_the_whole_component_and_checks_its_clip() {
+    let prefab = "[[assets]]\npath = \"/audio/hum.wav\"\n[[objects]]\nid = \"speaker\"\n[objects.audio_source]\nclip = \"/audio/hum.wav\"\nvolume = 0.4\nlooping = true\n";
+    let library = Library::new(&[("prefabs/speaker.rveprefab", prefab)]);
+    let assets = "[[assets]]\npath = \"/prefabs/speaker.rveprefab\"\n[[assets]]\npath = \"/audio/hum.wav\"\n[[assets]]\npath = \"/audio/bell.ogg\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spk\"\nprefab = \"/prefabs/speaker.rveprefab\"\n[[instances.overrides]]\ntarget = \"speaker\"\naudio_source = {{ clip = \"/audio/bell.ogg\", spatial = true }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let audio = object(&expanded, "spk").audio_source.clone().unwrap();
+    assert_eq!(audio.clip.as_str(), "audio/bell.ogg");
+    assert!(audio.spatial);
+    assert!(!audio.looping, "replacement must not keep inherited fields");
+    assert_eq!(audio.volume, 1.0);
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spk\"\nprefab = \"/prefabs/speaker.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "spk").audio_source.as_ref().unwrap().volume,
+        0.4
+    );
+
+    let missing_clip_asset = format!(
+        "{CAMERA}[[assets]]\npath = \"/prefabs/speaker.rveprefab\"\n[[instances]]\nid = \"spk\"\nprefab = \"/prefabs/speaker.rveprefab\"\n[[instances.overrides]]\ntarget = \"speaker\"\naudio_source = {{ clip = \"/audio/bell.ogg\" }}\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &missing_clip_asset).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\naudio_source = {{ clip = \"/audio/bell.ogg\" }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("audio_source"), "{error}");
+}
