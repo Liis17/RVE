@@ -53,17 +53,47 @@ pub fn component_icon(kind: ComponentKind) -> Option<&'static str> {
 
 /// Иконка строки Hierarchy по компонентам объекта. При нескольких компонентах
 /// побеждает первый: камера, свет (направленный, точечный, прожектор), Mesh Renderer.
+/// Объект только с Transform получает `empty-object`; с другими компонентами — `None`.
 pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
-    if object.camera.is_some() {
+    // Полное деструктурирование: новый компонент SceneObject не скомпилируется,
+    // пока не решено, делает ли он объект непустым.
+    let SceneObject {
+        id: _,
+        name: _,
+        parent: _,
+        transform: _,
+        camera,
+        mesh_renderer,
+        lod_group,
+        directional_light,
+        point_light,
+        spot_light,
+        environment,
+        collider,
+        rigid_body,
+        character_controller,
+        lite_scripts,
+        heavy_scripts,
+    } = object;
+    if camera.is_some() {
         Some("camera")
-    } else if object.directional_light.is_some() {
+    } else if directional_light.is_some() {
         Some("directional-light")
-    } else if object.point_light.is_some() {
+    } else if point_light.is_some() {
         Some("point-light")
-    } else if object.spot_light.is_some() {
+    } else if spot_light.is_some() {
         Some("spot-light")
-    } else if object.mesh_renderer.is_some() {
+    } else if mesh_renderer.is_some() {
         Some("cube")
+    } else if lod_group.is_none()
+        && environment.is_none()
+        && collider.is_none()
+        && rigid_body.is_none()
+        && character_controller.is_none()
+        && lite_scripts.is_empty()
+        && heavy_scripts.is_empty()
+    {
+        Some("empty-object")
     } else {
         None
     }
@@ -188,9 +218,34 @@ mod tests {
     }
 
     #[test]
+    fn only_transform_objects_get_the_empty_object_icon() {
+        let empty = SceneObject {
+            id: "empty".to_owned(),
+            name: Some("Empty".to_owned()),
+            parent: Some("root".to_owned()),
+            ..SceneObject::default()
+        };
+        assert_eq!(object_icon(&empty), Some("empty-object"));
+        assert!(SOURCES.iter().any(|source| source.name == "empty-object"));
+        let with_collider = SceneObject {
+            collider: Some(Default::default()),
+            ..empty.clone()
+        };
+        assert_eq!(object_icon(&with_collider), None);
+        let with_script = SceneObject {
+            lite_scripts: vec![engine_scene::LiteScript {
+                path: VirtualPath::parse("/scripts/spin.lua").unwrap(),
+                params: Default::default(),
+            }],
+            ..empty
+        };
+        assert_eq!(object_icon(&with_script), None);
+    }
+
+    #[test]
     fn object_icon_prefers_camera_then_lights_then_mesh() {
         let mut object = SceneObject::default();
-        assert_eq!(object_icon(&object), None);
+        assert_eq!(object_icon(&object), Some("empty-object"));
         object.mesh_renderer = Some(mesh_renderer());
         assert_eq!(object_icon(&object), Some("cube"));
         object.spot_light = Some(Default::default());
