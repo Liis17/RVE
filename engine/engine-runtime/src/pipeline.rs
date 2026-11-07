@@ -2981,15 +2981,18 @@ return Script
                 match request {
                     PhysicsRequest::Step { sequence, dt, .. } => {
                         physics_dt_tx.send(dt).unwrap();
-                        physics_reply_tx
-                            .send(PhysicsReply::Step(PhysicsStepResult {
-                                sequence,
-                                substeps: 0,
-                                poses: Vec::new(),
-                                events: Vec::<PhysicsEvent>::new(),
-                                snapshot: Arc::clone(&snapshot),
-                            }))
-                            .unwrap();
+                        // Как настоящий сервер: скрипты могут завершиться, не дождавшись
+                        // ответа на последний шаг, и закрыть канал ответов.
+                        let reply = PhysicsReply::Step(PhysicsStepResult {
+                            sequence,
+                            substeps: 0,
+                            poses: Vec::new(),
+                            events: Vec::<PhysicsEvent>::new(),
+                            snapshot: Arc::clone(&snapshot),
+                        });
+                        if physics_reply_tx.send(reply).is_err() {
+                            break;
+                        }
                     }
                     PhysicsRequest::Shutdown => break,
                     PhysicsRequest::Init(_) => panic!("preinitialized server received Init"),
@@ -3063,7 +3066,8 @@ return Script
         assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
         modules.join_named(SCRIPTS_THREAD).unwrap();
         assert!(modules.shutdown().is_empty());
-        physics_stop_tx.send(PhysicsRequest::Shutdown).unwrap();
+        // Воркер мог уже выйти из-за закрытого канала ответов.
+        let _ = physics_stop_tx.send(PhysicsRequest::Shutdown);
         physics_worker.join().unwrap();
     }
 
