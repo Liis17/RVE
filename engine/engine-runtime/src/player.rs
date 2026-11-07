@@ -626,8 +626,9 @@ fn wait_for_scripts_or_detach(
     }
 }
 
-/// Ждёт завершения загрузчика не дольше `timeout`. Зависший загрузчик отсоединяется, а запуск
-/// завершается с кодом 1, как и для потока скриптов.
+/// Ждёт завершения загрузчика не дольше `timeout`. Зависший при штатном закрытии загрузчик
+/// отсоединяется с предупреждением: его результаты уже не нужны, а код выхода не меняется.
+/// Код 1 дает только паника потока, которую показывает `join`.
 fn wait_for_prefab_loader_or_detach(
     modules: &mut impl RuntimeThreads,
     stopped: &std::sync::mpsc::Receiver<()>,
@@ -641,10 +642,7 @@ fn wait_for_prefab_loader_or_detach(
             }
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            log::error!("поток загрузки префабов не остановился за {timeout:?}; отсоединяю его");
-            status.record_failure(format!(
-                "поток загрузки префабов не остановился за {timeout:?}"
-            ));
+            log::warn!("поток загрузки префабов не остановился за {timeout:?}; отсоединяю его");
             modules.detach(PREFAB_LOADER_THREAD);
         }
     }
@@ -1019,13 +1017,14 @@ mod tests {
     }
 
     #[test]
-    fn unresponsive_prefab_loader_is_detached_and_marks_the_run_failed() {
+    fn unresponsive_prefab_loader_is_detached_without_failing_the_run() {
         let (_stopped_tx, stopped_rx) = mpsc::channel::<()>();
         let status = RuntimeStatus::default();
         let mut modules = FakeThreads(Vec::new());
         wait_for_prefab_loader_or_detach(&mut modules, &stopped_rx, &status, Duration::ZERO);
         assert_eq!(modules.0, ["detach:rve-prefabs"]);
-        assert_eq!(status.exit_code(), 1);
+        assert_eq!(status.exit_code(), 0);
+        assert!(status.failure_message().is_none());
     }
 
     #[test]

@@ -750,6 +750,24 @@ fn report(result: Result<(), RenderError>) {
     }
 }
 
+/// Геометрия физики только для моделей мешевых коллайдеров шаблона: остальные модели нужны
+/// лишь для отрисовки. Порядок — по пути модели.
+fn prefab_collider_geometry(
+    template: &PrefabTemplate,
+    models: &HashMap<String, Model>,
+) -> Result<Vec<ModelGeometry>, String> {
+    template
+        .mesh_collider_models()
+        .into_iter()
+        .map(|path| {
+            let model = models
+                .get(path)
+                .ok_or_else(|| format!("модель коллайдера {path} не подготовлена"))?;
+            Ok(model_geometry(path, model))
+        })
+        .collect()
+}
+
 /// Загружает префаб на CPU. Прерывание между объектами, моделями и исходниками даёт
 /// [`LoadError::Interrupted`]; ошибки префаба — [`LoadError::Failed`] с текстом.
 pub(crate) fn load_prefab(
@@ -777,12 +795,8 @@ pub(crate) fn load_prefab(
     if interrupted() {
         return Err(LoadError::Interrupted);
     }
-    let mut geometry: Vec<ModelGeometry> = prepared
-        .models
-        .iter()
-        .map(|(path, model)| model_geometry(path, model))
-        .collect();
-    geometry.sort_by(|left, right| left.path.cmp(&right.path));
+    let geometry =
+        prefab_collider_geometry(&template, &prepared.models).map_err(LoadError::Failed)?;
     Ok(LoadedPrefab {
         token,
         cpu: PrefabCpu {
@@ -1258,5 +1272,57 @@ mod tests {
         assert_eq!(gpu.live.len(), 8);
         state.release(&mut gpu, &load);
         assert!(gpu.live.is_empty());
+    }
+
+    fn template_from(text: &str) -> PrefabTemplate {
+        PrefabTemplate::load(
+            &VirtualPath::parse("/prefabs/test.rveprefab").unwrap(),
+            &mut |_| Ok(text.to_owned()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mesh_without_a_collider_gets_no_physics_geometry() {
+        let template = template_from(
+            "[[assets]]\npath = \"/models/visual.fbx\"\n[[objects]]\nid = \"root\"\n\
+             [[objects]]\nid = \"visual\"\nparent = \"root\"\n[objects.mesh_renderer]\n\
+             model = \"/models/visual.fbx\"\n",
+        );
+        let models = HashMap::from([("models/visual.fbx".to_owned(), model(1))]);
+        assert!(
+            prefab_collider_geometry(&template, &models)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_mesh_collider_models_reach_the_physics_geometry() {
+        let template = template_from(
+            "[[assets]]\npath = \"/models/visual.fbx\"\n[[assets]]\npath = \"/models/hull.fbx\"\n\
+             [[assets]]\npath = \"/models/crate.fbx\"\n[[objects]]\nid = \"root\"\n\
+             [[objects]]\nid = \"visual\"\nparent = \"root\"\n[objects.mesh_renderer]\n\
+             model = \"/models/visual.fbx\"\n[[objects]]\nid = \"hull\"\nparent = \"root\"\n\
+             [objects.mesh_renderer]\nmodel = \"/models/hull.fbx\"\n[objects.collider]\n\
+             shape = \"convex_mesh\"\n[[objects]]\nid = \"crate\"\nparent = \"root\"\n\
+             [objects.mesh_renderer]\nmodel = \"/models/crate.fbx\"\n[objects.collider]\n\
+             shape = \"box\"\nhalf_extents = [1.0, 1.0, 1.0]\n",
+        );
+        let models = HashMap::from([
+            ("models/visual.fbx".to_owned(), model(1)),
+            ("models/hull.fbx".to_owned(), model(2)),
+            ("models/crate.fbx".to_owned(), model(1)),
+        ]);
+        let geometry = prefab_collider_geometry(&template, &models).unwrap();
+        let paths = geometry
+            .iter()
+            .map(|model| model.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["models/hull.fbx"]);
+        assert_eq!(geometry[0].meshes.len(), 2);
+
+        // Модель коллайдера, которой нет среди подготовленных, — ошибка, а не пустая геометрия.
+        assert!(prefab_collider_geometry(&template, &HashMap::new()).is_err());
     }
 }

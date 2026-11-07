@@ -9,9 +9,9 @@ use crate::document::{
     CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
     DocumentKind, EnvironmentComponent, MaterialAlphaMode, MaterialOverride, ParamValue,
     PointLightComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
-    SceneTransform, SpotLightComponent, option_virtual_path_serde, require_asset_path,
-    require_extension, valid_ascii_name, validate_environment, validate_material_override,
-    virtual_path_serde,
+    SceneTransform, SpotLightComponent, mesh_collider_model, option_virtual_path_serde,
+    require_asset_path, require_extension, valid_ascii_name, validate_environment,
+    validate_material_override, virtual_path_serde,
 };
 use crate::world::topological_order;
 use engine_files::VirtualPath;
@@ -503,6 +503,17 @@ impl PrefabTemplate {
     /// Объекты шаблона с id относительно корня; корень — объект без `parent`.
     pub fn objects(&self) -> &[SceneObject] {
         &self.objects
+    }
+
+    /// Пути моделей мешевых коллайдеров объектов шаблона: без повторов, по возрастанию пути.
+    /// Остальные модели шаблона нужны только для отрисовки.
+    pub fn mesh_collider_models(&self) -> BTreeSet<&str> {
+        self.objects
+            .iter()
+            .filter_map(|object| {
+                mesh_collider_model(object.collider, object.mesh_renderer.as_ref())
+            })
+            .collect()
     }
 
     /// Имя файла префаба без расширения: основа для генерируемых id.

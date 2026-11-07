@@ -667,6 +667,23 @@ pub struct MeshRenderer {
     pub material: Option<MaterialOverride>,
 }
 
+/// Модель, геометрия которой нужна мешевому коллайдеру: `model` меш-рендерера, если форма
+/// коллайдера — выпуклый или треугольный меш. Одинакова для сцены, префабов и редактора.
+pub fn mesh_collider_model(
+    collider: Option<ColliderComponent>,
+    mesh: Option<&MeshRenderer>,
+) -> Option<&str> {
+    let collider = collider?;
+    if matches!(
+        collider.shape,
+        ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+    ) {
+        Some(mesh?.model.as_str())
+    } else {
+        None
+    }
+}
+
 pub const MAX_LOD_LEVELS: usize = 6;
 
 /// Дополнительные уровни модели, выбираемые по расстоянию до объекта.

@@ -12,11 +12,9 @@ use engine_physics::{
 };
 use engine_project::{InputSettings, PhysicsSettings, PrefabCatalogFile};
 use engine_resources::ResourceHandle;
+use engine_scene::document::mesh_collider_model;
 use engine_scene::prefab::PREFAB_EXTENSION;
-use engine_scene::{
-    AudioRequest, ColliderComponent, ColliderShape, MeshRenderer, ObjectHandle, PrefabTemplate,
-    SceneDocument, VoiceId, World,
-};
+use engine_scene::{AudioRequest, ObjectHandle, PrefabTemplate, SceneDocument, VoiceId, World};
 use engine_script::{
     CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, ScriptEvent, ScriptHost,
     ScriptInput, ScriptInterruptHandle, ScriptLibrary, ScriptLoadOptions, ScriptTime,
@@ -124,6 +122,8 @@ pub struct PlayPrefabs {
     sources: BTreeMap<String, String>,
     /// Ресурсы проекта для фоновой загрузки тяжёлых префабов; без них они не грузятся.
     resources: Option<ResourceHandle>,
+    /// Документ тяжёлого префаба из списка объявляет heavy-скрипт: Play нужна библиотека.
+    heavy_prefabs_use_scripts: bool,
 }
 
 impl PlayPrefabs {
@@ -135,6 +135,8 @@ impl PlayPrefabs {
     ///
     /// Записи `heavy` без пути из `[[assets]]` сцены попадают в каталог как тяжёлые. Путь,
     /// который сцена объявила быстрым, остаётся быстрым, даже если он есть в списке проекта.
+    /// Документ тяжёлой записи читается только для проверки heavy-скриптов; ассеты и Lua не
+    /// открываются. Ошибку чтения здесь не сообщаем: загрузка префаба выведет её позже.
     pub fn load(
         document: &SceneDocument,
         read_text: &mut dyn FnMut(&str) -> Result<String, String>,
@@ -195,6 +197,15 @@ impl PlayPrefabs {
             if fast_in_scene {
                 continue;
             }
+            if let Ok(template) = PrefabTemplate::load(&path, &mut |child: &VirtualPath| {
+                read_text(&format!("/{}", child.as_str()))
+            }) && template
+                .objects()
+                .iter()
+                .any(|object| !object.heavy_scripts.is_empty())
+            {
+                prefabs.heavy_prefabs_use_scripts = true;
+            }
             prefabs.catalog.insert(
                 path.as_str(),
                 PrefabSpec {
@@ -212,14 +223,16 @@ impl PlayPrefabs {
         self
     }
 
-    /// Нужна ли Play библиотека Rust-скриптов: её требуют heavy-скрипты шаблонов.
+    /// Нужна ли Play библиотека Rust-скриптов: её требуют heavy-скрипты шаблонов быстрых
+    /// префабов и документов тяжёлых префабов списка.
     pub fn has_heavy_scripts(&self) -> bool {
-        self.templates.values().any(|template| {
-            template
-                .objects()
-                .iter()
-                .any(|object| !object.heavy_scripts.is_empty())
-        })
+        self.heavy_prefabs_use_scripts
+            || self.templates.values().any(|template| {
+                template
+                    .objects()
+                    .iter()
+                    .any(|object| !object.heavy_scripts.is_empty())
+            })
     }
 }
 
@@ -248,22 +261,6 @@ fn lite_sources(
     Ok(sources)
 }
 
-/// Модель, геометрия которой нужна мешевому коллайдеру объекта.
-fn mesh_collider_model(
-    collider: Option<ColliderComponent>,
-    mesh: Option<&MeshRenderer>,
-) -> Option<&str> {
-    let collider = collider?;
-    if matches!(
-        collider.shape,
-        ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
-    ) {
-        Some(mesh?.model.as_str())
-    } else {
-        None
-    }
-}
-
 /// Тело корня spawn-объекта; `None`, если у корня нет коллайдера и тело не создавалось.
 fn root_body(sync: &PhysicsSceneSync, root: ObjectHandle) -> Option<BodyHandle> {
     sync.bindings()
@@ -271,14 +268,6 @@ fn root_body(sync: &PhysicsSceneSync, root: ObjectHandle) -> Option<BodyHandle> 
         .rev()
         .find(|binding| binding.object == root)
         .map(|binding| binding.body)
-}
-
-/// Пути моделей мешевых коллайдеров объектов шаблона.
-fn template_collider_models(template: &PrefabTemplate) -> impl Iterator<Item = &str> {
-    template
-        .objects()
-        .iter()
-        .filter_map(|object| mesh_collider_model(object.collider, object.mesh_renderer.as_ref()))
 }
 
 /// Геометрия модели для мешевого коллайдера: позиции и индексы мешей.
@@ -437,7 +426,7 @@ fn load_heavy_prefab(
         read_resource_text(resources, script)
     })?;
     let assets = Assets::with_resources(resources.clone());
-    let models = template_collider_models(&template).collect::<BTreeSet<_>>();
+    let models = template.mesh_collider_models();
     let mut geometry = Vec::with_capacity(models.len());
     for model in models {
         if interrupted() {
@@ -557,7 +546,7 @@ impl PlaySession {
                 prefabs
                     .templates
                     .values()
-                    .flat_map(|template| template_collider_models(template)),
+                    .flat_map(|template| template.mesh_collider_models()),
             )
             .collect::<BTreeSet<_>>();
         paths
@@ -606,6 +595,7 @@ impl PlaySession {
             catalog,
             mut sources,
             resources,
+            heavy_prefabs_use_scripts: _,
         } = prefabs;
         for object in world.objects() {
             for script in &object.lite_scripts {
@@ -1348,6 +1338,30 @@ mass = 1.0
         );
         let events = session.stop();
         assert!(events.iter().any(|event| event.message == "destroyed"));
+    }
+
+    #[test]
+    fn heavy_list_prefab_with_heavy_scripts_needs_the_library_before_play() {
+        // Ассет `missing.lua` не существует: превью читает только документы префабов.
+        const SCRIPTED: &str = "[[assets]]\npath = \"/missing.lua\"\n[[objects]]\nid = \"root\"\n[[objects.heavy_scripts]]\nname = \"Bobber\"\n";
+        const PLAIN: &str = "[[objects]]\nid = \"root\"\n";
+        let files = [
+            ("prefabs/tower.rveprefab", SCRIPTED),
+            ("prefabs/hut.rveprefab", PLAIN),
+            ("prefabs/broken.rveprefab", "[[objects"),
+        ];
+        let document = document(SCENE);
+        let mut read = files_reader(&files);
+        let catalog = heavy_catalog(&["prefabs/tower.rveprefab"]);
+        let (prefabs, warnings) = PlayPrefabs::load(&document, &mut read, &[], &catalog);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(prefabs.has_heavy_scripts());
+
+        for path in ["prefabs/hut.rveprefab", "prefabs/broken.rveprefab"] {
+            let catalog = heavy_catalog(&[path]);
+            let (prefabs, _) = PlayPrefabs::load(&document, &mut read, &[], &catalog);
+            assert!(!prefabs.has_heavy_scripts(), "{path}");
+        }
     }
 
     #[test]

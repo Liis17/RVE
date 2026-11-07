@@ -562,11 +562,17 @@ fn assign_archives(
         }
 
         let usage = usage.expect("non-base paths are present in the usage map");
-        if let Some(first) = usage.explicit_archives.first() {
+        // Запись сцены — решение автора: любой конфликт с ней, в том числе с записью тяжёлого
+        // префаба, остаётся ошибкой. Записи только тяжёлых префабов (файл префаба и его
+        // зависимости) при расхождении дают `shared`.
+        if let Some(first) = usage
+            .explicit_archives
+            .iter()
+            .find(|(owner, _)| matches!(owner, Owner::Scene(_)))
+        {
             if let Some(second) = usage
                 .explicit_archives
                 .iter()
-                .skip(1)
                 .find(|(_, archive)| archive != &first.1)
             {
                 return Err(BuildError::input(format!(
@@ -578,6 +584,19 @@ fn assign_archives(
                 )));
             }
             assignments.insert((*path).clone(), first.1.clone());
+            continue;
+        }
+        if let Some(first) = usage.explicit_archives.first() {
+            let archive = if usage
+                .explicit_archives
+                .iter()
+                .all(|(_, archive)| archive == &first.1)
+            {
+                first.1.clone()
+            } else {
+                "shared".to_owned()
+            };
+            assignments.insert((*path).clone(), archive);
             continue;
         }
 
@@ -1359,6 +1378,35 @@ mod heavy_prefab_tests {
             "{message}"
         );
         assert!(message.contains("/scenes/main.rvescene"), "{message}");
+    }
+
+    #[test]
+    fn dependency_of_two_heavy_prefabs_with_different_archives_goes_to_shared() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-heavy").unwrap();
+        project(
+            root.path(),
+            "",
+            Some(
+                "[[prefabs]]\npath = \"/prefabs/tower.rveprefab\"\narchive = \"towers\"\n\
+                 [[prefabs]]\npath = \"/prefabs/lamp.rveprefab\"\narchive = \"lamps\"\n",
+            ),
+        );
+        write(
+            root.path(),
+            "prefabs/lamp.rveprefab",
+            "[[assets]]\npath = \"/textures/tower.png\"\n[[objects]]\nid = \"lamp\"\n",
+        );
+        let build = prepare_project(root.path()).unwrap();
+        // Общая текстура получает разные явные архивы от двух тяжёлых префабов: она в shared.
+        assert_eq!(build.assignments[&path("/textures/tower.png")], "shared");
+        // Файлы префабов и собственные зависимости остаются в своих архивах.
+        assert_eq!(
+            build.assignments[&path("/prefabs/tower.rveprefab")],
+            "towers"
+        );
+        assert_eq!(build.assignments[&path("/prefabs/lamp.rveprefab")], "lamps");
+        assert_eq!(build.assignments[&path("/scripts/spin.lua")], "towers");
+        assert!(build.archives.iter().any(|archive| archive == "shared"));
     }
 
     #[test]

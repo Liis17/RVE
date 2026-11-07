@@ -2628,10 +2628,20 @@ distance=2.0
         prefab_uploads: VecDeque<LoadedPrefab>,
         /// Куда сообщать об освобождении токенов: тест ждёт событие, а не опрашивает состояние.
         released: Option<mpsc::Sender<PrefabToken>>,
+        /// Куда сообщать о смене debug view: тест ждёт, что цикл уже обработал её.
+        #[cfg(feature = "dev-console")]
+        debug_views: Option<mpsc::Sender<engine_render::DebugView>>,
     }
 
     impl RenderBackend for FakeBackend {
         fn resize(&mut self, _width: u32, _height: u32) {}
+
+        #[cfg(feature = "dev-console")]
+        fn set_debug_view(&mut self, debug_view: engine_render::DebugView) {
+            if let Some(debug_views) = &self.debug_views {
+                let _ = debug_views.send(debug_view);
+            }
+        }
 
         fn submit_prefab(&mut self, prefab: LoadedPrefab) -> Option<PrefabReply> {
             self.prefab_uploads.push_back(prefab);
@@ -5233,6 +5243,8 @@ return Gun
         resources: flume::Sender<RenderResourceRequest>,
         scripts: flume::Receiver<ScriptControl>,
         released: mpsc::Receiver<PrefabToken>,
+        #[cfg(feature = "dev-console")]
+        debug_views: mpsc::Receiver<engine_render::DebugView>,
         renders: Arc<AtomicUsize>,
         worker: std::thread::JoinHandle<Result<(), String>>,
     }
@@ -5243,10 +5255,14 @@ return Gun
         let (script_tx, script_rx) = flume::unbounded();
         let (resource_tx, resource_rx) = flume::unbounded();
         let (released_tx, released_rx) = mpsc::channel();
+        #[cfg(feature = "dev-console")]
+        let (debug_view_tx, debug_view_rx) = mpsc::channel();
         let renders = Arc::new(AtomicUsize::new(0));
         let mut backend = FakeBackend {
             shared_renders: Some(Arc::clone(&renders)),
             released: Some(released_tx),
+            #[cfg(feature = "dev-console")]
+            debug_views: Some(debug_view_tx),
             ..FakeBackend::default()
         };
         let worker = std::thread::spawn(move || {
@@ -5267,6 +5283,8 @@ return Gun
             resources: resource_tx,
             scripts: script_rx,
             released: released_rx,
+            #[cfg(feature = "dev-console")]
+            debug_views: debug_view_rx,
             renders,
             worker,
         }
@@ -5333,6 +5351,71 @@ return Gun
         );
         // Освобождение наступает только после того, как снимок 5 отрисован.
         assert_eq!(render.renders.load(Ordering::SeqCst), 2);
+        render.controls.send(RenderControl::Shutdown).unwrap();
+        assert!(render.worker.join().unwrap().is_ok());
+    }
+
+    /// Удержанный снимок с `seq ≤ last_seq` сбрасывается вместе с освобождением, поэтому
+    /// перерисовка по смене debug view его не рисует. Снимок 4 отправляется только после того,
+    /// как цикл принял смену view: перерисовка успевает отработать до приёма следующего снимка.
+    #[cfg(feature = "dev-console")]
+    #[test]
+    fn redraw_does_not_draw_a_snapshot_dropped_by_release() {
+        let render = start_render_harness();
+        let mut snapshot = empty_snapshot();
+        snapshot.sequence = 3;
+        render.frames.send(Arc::new(snapshot)).unwrap();
+        render
+            .resources
+            .send(RenderResourceRequest::Release {
+                token: render_token(1),
+                last_seq: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            render
+                .released
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            render_token(1)
+        );
+        assert_eq!(render.renders.load(Ordering::SeqCst), 1);
+
+        render
+            .controls
+            .send(RenderControl::DebugView(
+                engine_render::DebugView::Wireframe,
+            ))
+            .unwrap();
+        assert_eq!(
+            render
+                .debug_views
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            engine_render::DebugView::Wireframe
+        );
+        let mut next = empty_snapshot();
+        next.sequence = 4;
+        render.frames.send(Arc::new(next)).unwrap();
+        render
+            .resources
+            .send(RenderResourceRequest::Release {
+                token: render_token(2),
+                last_seq: 4,
+            })
+            .unwrap();
+        assert_eq!(
+            render
+                .released
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            render_token(2)
+        );
+        assert_eq!(
+            render.renders.load(Ordering::SeqCst),
+            2,
+            "перерисовка не должна рисовать сброшенный снимок 3"
+        );
         render.controls.send(RenderControl::Shutdown).unwrap();
         assert!(render.worker.join().unwrap().is_ok());
     }

@@ -960,9 +960,9 @@ impl EditorApp {
         }
         if needs_library && self.state.library.is_none() {
             if self.state.scripts_path.is_none() {
-                self.state
-                    .log
-                    .error("В сцене есть Rust-скрипты, но библиотека не загружена");
+                self.state.log.error(
+                    "В сцене или тяжёлых префабах есть Rust-скрипты, но библиотека не загружена",
+                );
                 return;
             }
             if !self.load_manual_library() {
