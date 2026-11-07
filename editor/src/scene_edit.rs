@@ -283,6 +283,11 @@ impl EditorScene {
         self.expansion.origins.get(id)
     }
 
+    /// Файлы префабов, раскрытые экземплярами этого документа, включая вложенные.
+    pub fn instanced_prefabs(&self) -> &[VirtualPath] {
+        &self.expansion.prefabs
+    }
+
     /// Авторский экземпляр префаба по id.
     pub fn instance(&self, id: &str) -> Option<&PrefabInstance> {
         self.document

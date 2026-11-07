@@ -3,18 +3,25 @@
 use engine_assets::Assets;
 use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
+use engine_files::VirtualPath;
 use engine_physics::{
-    ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsClient, PhysicsInitialization,
-    PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync, PhysicsServer, PhysicsServerError,
+    BodyChange, BodyHandle, ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsClient,
+    PhysicsCommand, PhysicsInitialization, PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync,
+    PhysicsServer, PhysicsServerError, ShapeCache,
 };
 use engine_project::{InputSettings, PhysicsSettings};
-use engine_scene::{ColliderShape, SceneDocument, World};
+use engine_scene::prefab::PREFAB_EXTENSION;
+use engine_scene::{
+    AudioRequest, ColliderComponent, ColliderShape, MeshRenderer, ObjectHandle, PrefabTemplate,
+    SceneDocument, VoiceId, World,
+};
 use engine_script::{
-    CommandError, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
-    ScriptLoadOptions, ScriptTime,
+    CommandError, PrefabCatalog, PrefabKind, PrefabSpec, ScriptEvent, ScriptHost, ScriptInput,
+    ScriptInterruptHandle, ScriptLibrary, ScriptLoadOptions, ScriptTime,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -102,6 +109,133 @@ fn watch(shared: &WatchdogShared, interrupt: &ScriptInterruptHandle) {
     }
 }
 
+/// Быстрые префабы Play: шаблоны для `spawn`, их лимиты и Lua-исходники скриптов. Строятся
+/// из `[[assets]]` сцены, как в `rve-runtime`.
+#[derive(Default)]
+pub struct PlayPrefabs {
+    templates: BTreeMap<String, Arc<PrefabTemplate>>,
+    catalog: PrefabCatalog,
+    /// Исходники lite-скриптов шаблонов; без них `register_prefab` не скомпилирует класс.
+    sources: BTreeMap<String, String>,
+}
+
+impl PlayPrefabs {
+    /// Раскрывает каждый `.rveprefab` из `[[assets]]` документа. Префаб, который не читается,
+    /// не разбирается или не может быть заспавнен, пропускается: его путь не попадает в
+    /// каталог, и `spawn` по нему ошибку не даст. Причина возвращается предупреждением для лога
+    /// Play. Префаб с камерой или светом, который используется экземпляром сцены, предупреждения
+    /// не даёт. `instanced` — файлы, раскрытые экземплярами документа.
+    pub fn load(
+        document: &SceneDocument,
+        read_text: &mut dyn FnMut(&str) -> Result<String, String>,
+        instanced: &[VirtualPath],
+    ) -> (Self, Vec<String>) {
+        let mut prefabs = Self::default();
+        let mut warnings = Vec::new();
+        for asset in document
+            .assets
+            .iter()
+            .filter(|asset| is_prefab_path(asset.path.as_str()))
+        {
+            let path = asset.path.as_str();
+            let template = match PrefabTemplate::load(&asset.path, &mut |child: &VirtualPath| {
+                read_text(&format!("/{}", child.as_str()))
+            }) {
+                Ok(template) => template,
+                Err(error) => {
+                    warnings.push(format!("префаб /{path} пропущен: {error}"));
+                    continue;
+                }
+            };
+            if let Err(error) = template.check_spawnable() {
+                if !instanced.contains(&asset.path) {
+                    warnings.push(format!("префаб /{path} пропущен: {error}"));
+                }
+                continue;
+            }
+            let sources = match lite_sources(&template, read_text) {
+                Ok(sources) => sources,
+                Err(error) => {
+                    warnings.push(format!("префаб /{path} пропущен: {error}"));
+                    continue;
+                }
+            };
+            prefabs.sources.extend(sources);
+            prefabs.catalog.insert(
+                path,
+                PrefabSpec {
+                    kind: PrefabKind::Fast,
+                    max_instances: asset.max_instances,
+                },
+            );
+            prefabs
+                .templates
+                .insert(path.to_owned(), Arc::new(template));
+        }
+        (prefabs, warnings)
+    }
+
+    /// Нужна ли Play библиотека Rust-скриптов: её требуют heavy-скрипты шаблонов.
+    pub fn has_heavy_scripts(&self) -> bool {
+        self.templates.values().any(|template| {
+            template
+                .objects()
+                .iter()
+                .any(|object| !object.heavy_scripts.is_empty())
+        })
+    }
+}
+
+fn is_prefab_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == PREFAB_EXTENSION)
+}
+
+/// Исходники lite-скриптов шаблона. Ошибка чтения любого из них делает префаб непригодным.
+fn lite_sources(
+    template: &PrefabTemplate,
+    read_text: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut sources = BTreeMap::new();
+    for script in template
+        .objects()
+        .iter()
+        .flat_map(|object| &object.lite_scripts)
+    {
+        let path = script.path.as_str();
+        if !sources.contains_key(path) {
+            sources.insert(path.to_owned(), read_text(path)?);
+        }
+    }
+    Ok(sources)
+}
+
+/// Модель, геометрия которой нужна мешевому коллайдеру объекта.
+fn mesh_collider_model(
+    collider: Option<ColliderComponent>,
+    mesh: Option<&MeshRenderer>,
+) -> Option<&str> {
+    let collider = collider?;
+    if matches!(
+        collider.shape,
+        ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+    ) {
+        Some(mesh?.model.as_str())
+    } else {
+        None
+    }
+}
+
+/// Тело корня spawn-объекта; `None`, если у корня нет коллайдера и тело не создавалось.
+fn root_body(sync: &PhysicsSceneSync, root: ObjectHandle) -> Option<BodyHandle> {
+    sync.bindings()
+        .iter()
+        .rev()
+        .find(|binding| binding.object == root)
+        .map(|binding| binding.body)
+}
+
 /// Запущенная сцена. Документ не меняется: правки скриптов живут только в этом мире,
 /// поэтому Stop возвращает редактор к исходному документу простым удалением сессии.
 pub struct PlaySession {
@@ -152,15 +286,17 @@ impl PlaySession {
             library,
             input_settings,
             read_source,
-            &[],
+            PlayPrefabs::default(),
+            Vec::new(),
             &PhysicsSettings::default(),
             SCRIPT_TIME_LIMIT,
             AudioConfig::default(),
         )
     }
 
-    /// Starts Play with project input and physics settings, CPU geometry for mesh colliders and
-    /// the audio configuration (ресурсы проекта и устройство вывода).
+    /// Starts Play with project input and physics settings, the fast prefabs of the scene, CPU
+    /// geometry for mesh colliders and the audio configuration (ресурсы проекта и устройство
+    /// вывода).
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_world_and_physics(
         document: &SceneDocument,
@@ -168,7 +304,8 @@ impl PlaySession {
         library: Option<&ScriptLibrary>,
         input_settings: &InputSettings,
         read_source: impl FnMut(&str) -> Result<String, String>,
-        model_geometry: &[ModelGeometry],
+        prefabs: PlayPrefabs,
+        model_geometry: Vec<ModelGeometry>,
         physics_settings: &PhysicsSettings,
         audio: AudioConfig,
     ) -> Result<Self, String> {
@@ -178,6 +315,7 @@ impl PlaySession {
             library,
             input_settings,
             read_source,
+            prefabs,
             model_geometry,
             physics_settings,
             SCRIPT_TIME_LIMIT,
@@ -185,25 +323,29 @@ impl PlaySession {
         )
     }
 
-    /// Loads the CPU model geometry required by convex and triangle-mesh colliders.
+    /// Loads the CPU model geometry required by convex and triangle-mesh colliders of the scene
+    /// objects and of the fast prefabs: bodies of spawned objects are inserted with it later.
     pub fn load_model_geometry(
         world: &World,
+        prefabs: &PlayPrefabs,
         assets: &Assets,
     ) -> Result<Vec<ModelGeometry>, String> {
         let paths = world
             .objects()
             .iter()
             .filter_map(|object| {
-                let collider = object.collider?;
-                if matches!(
-                    collider.shape,
-                    ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
-                ) {
-                    Some(object.mesh_renderer.as_ref()?.model.as_str().to_owned())
-                } else {
-                    None
-                }
+                mesh_collider_model(object.collider, object.mesh_renderer.as_ref())
             })
+            .chain(
+                prefabs
+                    .templates
+                    .values()
+                    .flat_map(|template| template.objects())
+                    .filter_map(|object| {
+                        mesh_collider_model(object.collider, object.mesh_renderer.as_ref())
+                    }),
+            )
+            .map(str::to_owned)
             .collect::<BTreeSet<_>>();
         paths
             .into_iter()
@@ -244,7 +386,8 @@ impl PlaySession {
             library,
             &InputSettings::default(),
             read_source,
-            &[],
+            PlayPrefabs::default(),
+            Vec::new(),
             &PhysicsSettings::default(),
             time_limit,
             AudioConfig::default(),
@@ -258,12 +401,17 @@ impl PlaySession {
         library: Option<&ScriptLibrary>,
         input_settings: &InputSettings,
         mut read_source: impl FnMut(&str) -> Result<String, String>,
-        model_geometry: &[ModelGeometry],
+        prefabs: PlayPrefabs,
+        model_geometry: Vec<ModelGeometry>,
         physics_settings: &PhysicsSettings,
         time_limit: Duration,
         audio: AudioConfig,
     ) -> Result<Self, String> {
-        let mut sources = BTreeMap::new();
+        let PlayPrefabs {
+            templates,
+            catalog,
+            mut sources,
+        } = prefabs;
         for object in world.objects() {
             for script in &object.lite_scripts {
                 let path = script.path.as_str();
@@ -285,21 +433,27 @@ impl PlaySession {
                 interrupt,
                 call_time_limit: None,
                 input: input_settings.clone(),
-                prefabs: Default::default(),
+                prefabs: catalog,
             },
         )
         .map_err(|error| error.to_string())?;
+        // Регистрация компилирует Lua шаблонов: зависший top-level chunk прерывает watchdog.
+        for (path, template) in templates {
+            host.register_prefab(&world, &path, template, &sources)
+                .map_err(|error| error.to_string())?;
+        }
         watchdog.set_deadline(None);
         let desc = PhysicsSceneDesc::from_world(
             &world,
-            model_geometry,
+            &model_geometry,
             glam::Vec3::from_array(physics_settings.gravity),
             physics_settings.fixed_hz,
             physics_settings.max_substeps as usize,
         )
         .map_err(|error| error.to_string())?;
         let (driver, bindings) = desc.build().map_err(|error| error.to_string())?;
-        let (physics, initial_snapshot) = PlayPhysics::start(&world, driver, bindings)?;
+        let (physics, initial_snapshot) =
+            PlayPhysics::start(&world, driver, bindings, model_geometry)?;
         host.set_physics_snapshot(initial_snapshot, physics.sync.bindings());
         let mut audio = PlayAudio::start(audio)?;
         // Матрицы до первого кадра не посчитаны; play_on_start берёт позиции из них.
@@ -359,6 +513,7 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         let result = self.host.execute_command(&mut self.world, command);
         self.watchdog.set_deadline(None);
+        self.apply_world_changes();
         result
     }
 
@@ -388,6 +543,7 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.update(&mut self.world, dt, time);
         self.watchdog.set_deadline(None);
+        self.apply_world_changes();
         if let Some(physics) = &mut self.physics {
             let mut commands = self.host.drain_physics_commands();
             commands.extend(
@@ -396,9 +552,11 @@ impl PlaySession {
                     .sync_world_commands(&mut self.world)
                     .map_err(|error| error.to_string())?,
             );
+            commands.append(&mut physics.velocities);
+            let changes = std::mem::take(&mut physics.changes);
             physics
                 .client
-                .step(dt, commands)
+                .step_with_changes(dt, changes, commands)
                 .map_err(|error| error.to_string())?;
         }
         if let Some(audio) = &mut self.audio {
@@ -410,6 +568,78 @@ impl PlaySession {
             audio.bridge.sync_positions(&self.world);
         }
         Ok(())
+    }
+
+    /// Применяет spawn и destroy, закоммиченные скриптами: удаляет тела, вставляет тела новых
+    /// объектов, ставит им скорости и запускает звук. Порядок тот же, что в `rve-runtime`:
+    /// тела удаляются и вставляются до синхронизации поз, поэтому новые тела не телепортируются.
+    /// Отказ физики откатывает spawn; тело до вставки не создаётся, поэтому удалять нечего.
+    fn apply_world_changes(&mut self) {
+        let changes = self.host.drain_world_changes();
+        if changes.spawned.is_empty() && changes.despawned.is_empty() {
+            return;
+        }
+        let mut requests: Vec<AudioRequest> = changes
+            .despawned
+            .iter()
+            .map(|&object| AudioRequest::StopSource { object })
+            .collect();
+        if let Some(physics) = &mut self.physics {
+            physics
+                .changes
+                .extend(physics.sync.remove_objects(&changes.despawned));
+        }
+        for spawned in &changes.spawned {
+            // Объект, созданный и удалённый в одной фазе, уже не жив: тело и звук ему не нужны.
+            if !self.world.is_alive(spawned.handle) {
+                continue;
+            }
+            if let Some(physics) = &mut self.physics {
+                let inserted = physics.sync.insert_objects(
+                    &self.world,
+                    &spawned.objects,
+                    &physics.geometry,
+                    &mut physics.shapes,
+                );
+                match inserted {
+                    Ok(inserted) => {
+                        physics.changes.extend(inserted);
+                        if let Some(velocity) = spawned.initial_velocity
+                            && let Some(body) = root_body(&physics.sync, spawned.handle)
+                        {
+                            physics
+                                .velocities
+                                .push(PhysicsCommand::SetVelocity { body, velocity });
+                        }
+                    }
+                    Err(error) => {
+                        self.host.revert_spawn(
+                            &mut self.world,
+                            spawned.handle,
+                            &format!("физика отклонила объект {:?}: {error}", spawned.prefab),
+                        );
+                        continue;
+                    }
+                }
+            }
+            requests.extend(
+                spawned
+                    .objects
+                    .iter()
+                    .filter(|&&object| {
+                        self.world
+                            .audio_source(object)
+                            .is_some_and(|audio| audio.play_on_start)
+                    })
+                    .map(|&object| AudioRequest::PlaySource {
+                        object,
+                        voice: VoiceId::allocate(),
+                    }),
+            );
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.bridge.apply(requests, &self.world);
+        }
     }
 
     fn script_time(&self) -> ScriptTime {
@@ -495,6 +725,14 @@ impl PlayAudio {
 struct PlayPhysics {
     client: PhysicsClient,
     sync: PhysicsSceneSync,
+    /// Геометрия мешевых коллайдеров: по ней вставляются тела spawn-объектов.
+    geometry: Vec<ModelGeometry>,
+    /// Формы мешей spawn-объектов; переиспользуются между spawn одной модели.
+    shapes: ShapeCache,
+    /// Вставки и удаления тел, которые уйдут в ближайший `step_with_changes`.
+    changes: Vec<BodyChange>,
+    /// Скорости корней spawn-объектов; применяются сразу после вставки тела в том же шаге.
+    velocities: Vec<PhysicsCommand>,
     _control_tx: flume::Sender<()>,
     control_rx: flume::Receiver<()>,
     worker: Option<JoinHandle<Result<(), PhysicsServerError>>>,
@@ -505,6 +743,7 @@ impl PlayPhysics {
         world: &World,
         driver: engine_physics::StepDriver,
         bindings: Vec<engine_physics::PhysicsSceneBinding>,
+        geometry: Vec<ModelGeometry>,
     ) -> Result<(Self, Arc<engine_physics::QuerySnapshot>), String> {
         let initialization =
             PhysicsInitialization::from_prebuilt(&driver, bindings).map_err(|error| {
@@ -524,6 +763,10 @@ impl PlayPhysics {
             Self {
                 client: PhysicsClient::new_preinitialized(request_tx, reply_rx),
                 sync,
+                geometry,
+                shapes: ShapeCache::default(),
+                changes: Vec::new(),
+                velocities: Vec::new(),
                 _control_tx: control_tx,
                 control_rx,
                 worker: Some(worker),
@@ -1005,7 +1248,8 @@ spatial = true
             None,
             &InputSettings::default(),
             |_| Ok(String::new()),
-            &[],
+            PlayPrefabs::default(),
+            Vec::new(),
             &PhysicsSettings::default(),
             SCRIPT_TIME_LIMIT,
             audio,
@@ -1037,5 +1281,242 @@ spatial = true
         session.set_paused(false);
         // Stop ждёт завершения потока звука; если он не остановится, тест зависнет.
         assert!(session.stop().is_empty());
+    }
+
+    /// Файлы для тестов: ключи — пути без ведущего слеша, как в `[[assets]]`.
+    fn files_reader<'a>(
+        files: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&str) -> Result<String, String> + 'a {
+        move |path: &str| {
+            let key = path.trim_start_matches('/');
+            files
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, text)| (*text).to_owned())
+                .ok_or_else(|| format!("{path}: файл не найден"))
+        }
+    }
+
+    /// Запускает Play со сценой `source`: префабы и скрипты читаются из `files`.
+    fn start_with_prefabs(source: &str, files: &[(&str, &str)]) -> Result<PlaySession, String> {
+        let document = document(source);
+        let mut read = files_reader(files);
+        let (prefabs, warnings) = PlayPrefabs::load(&document, &mut read, &[]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let world = World::from_document(&document).map_err(|error| error.to_string())?;
+        PlaySession::start_with_world_limit(
+            &document,
+            world,
+            None,
+            &InputSettings::default(),
+            read,
+            prefabs,
+            Vec::new(),
+            &PhysicsSettings::default(),
+            SCRIPT_TIME_LIMIT,
+            AudioConfig::default(),
+        )
+    }
+
+    const BALL_SCENE: &str = r#"
+[[assets]]
+path = "/prefabs/ball.rveprefab"
+[[assets]]
+path = "/spawner.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "gun"
+[[objects.lite_scripts]]
+path = "/spawner.lua"
+"#;
+
+    /// Быстрый префаб: динамический шар у потолка, со своим lite-скриптом.
+    const BALL_PREFAB: &str = r#"
+[[assets]]
+path = "/ball.lua"
+[[objects]]
+id = "ball"
+[objects.transform]
+position = [0.0, 5.0, 0.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+[[objects.lite_scripts]]
+path = "/ball.lua"
+"#;
+
+    const BALL_LUA: &str = r#"
+local Ball = {}
+function Ball:on_start()
+  rve.log_info("ball start")
+end
+function Ball:on_destroy()
+  rve.log_info("ball destroy")
+end
+return Ball
+"#;
+
+    const SPAWN_ONCE: &str = r#"
+local Spawner = {}
+local spawned = false
+function Spawner:on_update(dt)
+  if not spawned then
+    spawned = true
+    rve.spawn("prefabs/ball.rveprefab")
+  end
+end
+return Spawner
+"#;
+
+    const SPAWN_THEN_DESTROY: &str = r#"
+local Spawner = {}
+local calls = 0
+function Spawner:on_update(dt)
+  calls = calls + 1
+  if calls == 1 then
+    rve.spawn("prefabs/ball.rveprefab", { id = "shot" })
+  elseif calls == 3 then
+    rve.destroy("shot")
+  end
+end
+return Spawner
+"#;
+
+    fn ball_files(spawner: &str) -> [(&str, &str); 3] {
+        [
+            ("prefabs/ball.rveprefab", BALL_PREFAB),
+            ("ball.lua", BALL_LUA),
+            ("spawner.lua", spawner),
+        ]
+    }
+
+    fn has_message(session: &mut PlaySession, message: &str) -> bool {
+        session
+            .drain_events()
+            .iter()
+            .any(|event| event.message == message)
+    }
+
+    #[test]
+    fn spawned_prefab_gets_an_at_id_and_starts_on_the_next_tick() {
+        let files = ball_files(SPAWN_ONCE);
+        let mut session = start_with_prefabs(BALL_SCENE, &files).unwrap();
+        session.step(0.1).unwrap();
+        let id = session
+            .world_mut()
+            .objects()
+            .iter()
+            .map(|object| object.id.clone())
+            .find(|id| id.starts_with("ball@"))
+            .expect("spawned object has a generated id");
+        assert!(session.world_mut().handle(&id).is_some());
+        assert!(!has_message(&mut session, "ball start"));
+
+        session.step(0.1).unwrap();
+        assert!(has_message(&mut session, "ball start"));
+        session.stop();
+    }
+
+    #[test]
+    fn destroy_runs_on_destroy_removes_the_body_and_later_steps_stay_healthy() {
+        let files = ball_files(SPAWN_THEN_DESTROY);
+        let mut session = start_with_prefabs(BALL_SCENE, &files).unwrap();
+        session.step(0.1).unwrap();
+        let shot = session.world_mut().handle("shot").expect("spawned object");
+        session.step(0.1).unwrap();
+        assert!(has_message(&mut session, "ball start"));
+
+        session.step(0.1).unwrap();
+        assert!(has_message(&mut session, "ball destroy"));
+        assert!(!session.world_mut().is_alive(shot));
+        let physics = session.physics.as_ref().unwrap();
+        assert!(
+            physics
+                .sync
+                .bindings()
+                .iter()
+                .all(|binding| binding.object != shot)
+        );
+
+        session.step(0.1).unwrap();
+        assert!(
+            session
+                .drain_events()
+                .iter()
+                .all(|event| event.level != engine_script::ScriptEventLevel::Error)
+        );
+        session.stop();
+    }
+
+    #[test]
+    fn spawned_dynamic_body_falls_under_physics() {
+        let files = ball_files(SPAWN_ONCE);
+        let mut session = start_with_prefabs(BALL_SCENE, &files).unwrap();
+        session.step(1.0 / 60.0).unwrap();
+        let ball = session
+            .world_mut()
+            .objects()
+            .iter()
+            .find(|object| object.id.starts_with("ball@"))
+            .map(|object| object.handle)
+            .expect("spawned object");
+        let start_y = session
+            .world_mut()
+            .local_transform(ball)
+            .unwrap()
+            .position
+            .y;
+        for _ in 0..30 {
+            session.step(1.0 / 60.0).unwrap();
+        }
+        let y = session
+            .world_mut()
+            .local_transform(ball)
+            .unwrap()
+            .position
+            .y;
+        assert!(y < start_y - 0.1, "{start_y} -> {y}");
+        session.stop();
+    }
+
+    #[test]
+    fn unusable_fast_prefabs_are_skipped_with_a_warning() {
+        let source = r#"
+[[assets]]
+path = "/prefabs/ball.rveprefab"
+[[assets]]
+path = "/prefabs/broken.rveprefab"
+[[assets]]
+path = "/prefabs/cam.rveprefab"
+[[objects]]
+id = "camera"
+[objects.camera]
+"#;
+        let files = [
+            ("prefabs/ball.rveprefab", BALL_PREFAB),
+            ("ball.lua", BALL_LUA),
+            (
+                "prefabs/cam.rveprefab",
+                "[[objects]]\nid = \"cam\"\n[objects.camera]\n",
+            ),
+        ];
+        let document = document(source);
+        let mut read = files_reader(&files);
+        let (prefabs, warnings) = PlayPrefabs::load(&document, &mut read, &[]);
+        assert!(prefabs.catalog.get("prefabs/ball.rveprefab").is_some());
+        assert!(prefabs.catalog.get("prefabs/broken.rveprefab").is_none());
+        assert!(prefabs.catalog.get("prefabs/cam.rveprefab").is_none());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|warning| warning.contains("broken")));
+
+        // Префаб с камерой, который экземпляр сцены использует как есть, предупреждения не даёт.
+        let instanced = [VirtualPath::parse("prefabs/cam.rveprefab").unwrap()];
+        let (_, warnings) = PlayPrefabs::load(&document, &mut read, &instanced);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 }

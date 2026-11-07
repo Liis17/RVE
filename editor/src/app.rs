@@ -4,7 +4,7 @@ use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
-use crate::play::PlaySession;
+use crate::play::{PlayPrefabs, PlaySession};
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
 use crate::settings::{SettingsStore, UserSettings};
@@ -931,11 +931,23 @@ impl EditorApp {
                 .error("Play недоступен для префаба: откройте сцену");
             return;
         }
-        let needs_library = scene
-            .view()
-            .objects
-            .iter()
-            .any(|object| !object.heavy_scripts.is_empty());
+        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
+            return;
+        };
+        let (prefabs, warnings) = PlayPrefabs::load(
+            scene.view(),
+            &mut |path| project.read_text(path),
+            scene.instanced_prefabs(),
+        );
+        let needs_library = prefabs.has_heavy_scripts()
+            || scene
+                .view()
+                .objects
+                .iter()
+                .any(|object| !object.heavy_scripts.is_empty());
+        for warning in warnings {
+            self.state.log.push(LogLevel::Warn, warning);
+        }
         if needs_library && self.state.library.is_none() {
             if self.state.scripts_path.is_none() {
                 self.state
@@ -954,14 +966,16 @@ impl EditorApp {
             let mut world =
                 World::from_document(scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
-            let model_geometry = PlaySession::load_model_geometry(&world, &project.assets)?;
+            let model_geometry =
+                PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
             PlaySession::start_with_world_and_physics(
                 scene.view(),
                 world,
                 self.state.library.as_ref(),
                 &project.settings.input,
                 |path| project.read_text(path),
-                &model_geometry,
+                prefabs,
+                model_geometry,
                 &project.settings.physics,
                 engine_audio::AudioConfig {
                     resources: Some(project.resource_handle()),
