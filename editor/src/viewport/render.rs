@@ -40,12 +40,15 @@ struct GpuModel {
     textures: Vec<TextureId>,
     /// Меши созданы со скином: модель имеет скелет.
     skinned: bool,
+    /// Число костей скелета; палитра моста должна иметь такую же длину.
+    joint_count: u32,
 }
 
 /// Экземпляры скиннинга объекта с `animator`: путь модели, её меши и по экземпляру на меш.
 /// Типы параметризованы, чтобы планирование синхронизации тестировалось без GPU.
 struct SkinnedObject<M = MeshId, S = SkinId> {
     model: String,
+    joint_count: u32,
     mesh_ids: Vec<M>,
     instances: Vec<S>,
 }
@@ -72,6 +75,10 @@ pub struct SceneRenderer {
     skins: HashMap<ObjectHandle, SkinnedObject>,
     /// Мост редактора для превью и отпечаток его аниматоров.
     animation: EditorAnimation,
+    /// Поколение моделей: растёт при каждой загрузке или сбросе, пересобирает мост превью.
+    model_generation: u64,
+    /// Объекты, для которых уже выведено предупреждение о несовпадении палитры и меша.
+    skin_mismatch_reported: HashSet<ObjectHandle>,
 }
 
 #[derive(Default)]
@@ -173,6 +180,8 @@ impl SceneRenderer {
             motion_history: MotionHistory::default(),
             skins: HashMap::new(),
             animation: EditorAnimation::default(),
+            model_generation: 0,
+            skin_mismatch_reported: HashSet::new(),
         })
     }
 
@@ -189,6 +198,8 @@ impl SceneRenderer {
         self.model_dependencies.clear();
         self.failed_reloads.clear();
         self.failed_environment = None;
+        self.model_generation += 1;
+        self.skin_mismatch_reported.clear();
         self.release_skins(renderer)?;
         for model in self.models.drain().filter_map(|(_, model)| model) {
             destroy_model(renderer, model)?;
@@ -256,6 +267,7 @@ impl SceneRenderer {
                         .insert(path.clone(), loaded.dependencies);
                     self.failed_reloads.remove(&path);
                     cpu_models.insert(path, model);
+                    self.model_generation += 1;
                     if let Some(old) = old {
                         destroy_model(renderer, old)?;
                     }
@@ -672,8 +684,8 @@ impl SceneRenderer {
         Ok(())
     }
 
-    /// Освобождает все экземпляры скиннинга; вызывается перед заменой или сбросом моделей.
-    fn release_skins(&mut self, renderer: &mut Renderer) -> Result<(), RenderError> {
+    /// Освобождает все экземпляры скиннинга; вызывается перед заменой, сбросом моделей и закрытием.
+    pub fn release_skins(&mut self, renderer: &mut Renderer) -> Result<(), RenderError> {
         for (_, skin) in self.skins.drain() {
             release_skin(renderer, skin)?;
         }
@@ -686,16 +698,36 @@ impl SceneRenderer {
         &mut self,
         renderer: &mut Renderer,
         assets: &Assets,
+        models: &HashMap<String, Arc<Model>>,
         world: &World,
         preview: Option<(ObjectHandle, &mut AnimationPreview)>,
         warnings: &mut Vec<String>,
     ) -> Result<(), RenderError> {
         let dt = self.animation.frame_seconds();
+        let generation = self.model_generation;
         self.animation
-            .advance(world, dt, preview, warnings, |world| {
-                project_preview_bridge(world, assets)
+            .advance(world, generation, dt, preview, warnings, |world, clips| {
+                project_preview_bridge(world, models, assets, clips)
             });
-        self.sync_skins(renderer, world)
+        self.sync_skins(renderer, world)?;
+        self.report_palette_mismatches(warnings);
+        Ok(())
+    }
+
+    /// Предупреждает один раз о каждом объекте, чья палитра моста не совпала с числом костей
+    /// меша: такой объект рисуется без скиннинга и не валит кадр.
+    fn report_palette_mismatches(&mut self, warnings: &mut Vec<String>) {
+        let mismatched = match self.animation.bridge() {
+            Some(bridge) => palette_mismatches(&self.skins, bridge),
+            None => Vec::new(),
+        };
+        for (object, model) in mismatched {
+            if self.skin_mismatch_reported.insert(object) {
+                warnings.push(format!(
+                    "{model}: число костей палитры не совпадает с мешем; объект рисуется без скиннинга"
+                ));
+            }
+        }
     }
 
     /// Сведения превью объекта для инспектора.
@@ -736,7 +768,12 @@ impl SceneRenderer {
             let Some((model, mesh_ids)) = wanted.remove(&object) else {
                 continue;
             };
-            let skin = create_skin(renderer, model, mesh_ids)?;
+            let joint_count = self
+                .models
+                .get(&model)
+                .and_then(Option::as_ref)
+                .map_or(0, |gpu| gpu.joint_count);
+            let skin = create_skin(renderer, model, joint_count, mesh_ids)?;
             self.skins.insert(object, skin);
         }
         Ok(())
@@ -1149,18 +1186,41 @@ fn append_world_draws(
     Ok(())
 }
 
-/// Объекты, у которых есть и экземпляры скиннинга, и палитра моста, по порядку handle.
+/// Объекты, у которых есть экземпляры скиннинга и палитра моста той же длины, что число
+/// костей меша, по порядку handle. Объект с другой длиной палитры рисуется статично.
 fn palette_objects<M, S>(
     skins: &HashMap<ObjectHandle, SkinnedObject<M, S>>,
     bridge: &AnimationBridge,
 ) -> Vec<ObjectHandle> {
     let mut objects: Vec<ObjectHandle> = skins
-        .keys()
-        .copied()
-        .filter(|object| bridge.palette(*object).is_some())
+        .iter()
+        .filter(|(object, skin)| {
+            bridge
+                .palette(**object)
+                .is_some_and(|palette| palette.len() == skin.joint_count as usize)
+        })
+        .map(|(object, _)| *object)
         .collect();
     objects.sort_by_key(|object| object.index());
     objects
+}
+
+/// Объекты с палитрой моста, чья длина не совпадает с числом костей меша, и их модели.
+fn palette_mismatches<M, S>(
+    skins: &HashMap<ObjectHandle, SkinnedObject<M, S>>,
+    bridge: &AnimationBridge,
+) -> Vec<(ObjectHandle, String)> {
+    let mut mismatched: Vec<(ObjectHandle, String)> = skins
+        .iter()
+        .filter(|(object, skin)| {
+            bridge
+                .palette(**object)
+                .is_some_and(|palette| palette.len() != skin.joint_count as usize)
+        })
+        .map(|(object, skin)| (*object, skin.model.clone()))
+        .collect();
+    mismatched.sort_by_key(|(object, _)| object.index());
+    mismatched
 }
 
 /// Индекс палитры каждого объекта: тот же порядок, что у `joint_palette_refs`.
@@ -1181,10 +1241,12 @@ fn palette_indices<M, S>(
 fn create_skin(
     renderer: &mut Renderer,
     model: String,
+    joint_count: u32,
     mesh_ids: Vec<MeshId>,
 ) -> Result<SkinnedObject, RenderError> {
     let mut skin = SkinnedObject {
         model,
+        joint_count,
         mesh_ids,
         instances: Vec::new(),
     };
@@ -1460,6 +1522,10 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
         meshes,
         textures,
         skinned: model.skeleton.is_some(),
+        joint_count: model
+            .skeleton
+            .as_ref()
+            .map_or(0, |skeleton| skeleton.joints.len() as u32),
     })
 }
 
@@ -2321,6 +2387,8 @@ range = 10
     fn skin(model: &str, meshes: &[u32]) -> SkinnedObject<u32, u32> {
         SkinnedObject {
             model: model.to_owned(),
+            // Одна кость, как у модели `walk_model` в тестах моста.
+            joint_count: 1,
             mesh_ids: meshes.to_vec(),
             instances: meshes.iter().map(|mesh| mesh + 100).collect(),
         }
@@ -2435,6 +2503,30 @@ range = 10
         assert_eq!(
             palette_indices(&hero_only, Some(&bridge)),
             HashMap::from([(hero, 0)])
+        );
+    }
+
+    #[test]
+    fn palette_of_another_joint_count_is_not_bound_and_is_reported() {
+        // Регрессия: палитра моста старой модели (1 кость) не должна попадать в меш с 2 костями.
+        let world = skin_world();
+        let hero = world.handle("hero").unwrap();
+        let bridge = AnimationBridge::build(
+            &world,
+            |_| {
+                Ok(std::sync::Arc::new(
+                    crate::viewport::animation::test_support::walk_model(),
+                ))
+            },
+            |_| Ok(std::sync::Arc::new(Vec::new())),
+        );
+        let mut two_joints = skin("models/hero.fbx", &[1]);
+        two_joints.joint_count = 2;
+        let skins = HashMap::from([(hero, two_joints)]);
+        assert!(palette_indices(&skins, Some(&bridge)).is_empty());
+        assert_eq!(
+            palette_mismatches(&skins, &bridge),
+            vec![(hero, "models/hero.fbx".to_owned())]
         );
     }
 }

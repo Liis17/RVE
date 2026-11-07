@@ -1407,6 +1407,7 @@ fn sync_animation_frame(
     gpu.scene.sync_animation(
         &mut gpu.renderer,
         &parts.project.assets,
+        &*parts.models,
         &*parts.world,
         preview,
         &mut warnings,
@@ -1850,6 +1851,15 @@ impl WindowHandler for EditorApp {
             job.kill();
         }
         self.save_settings();
+        // Экземпляры скиннинга освобождаются явно до уничтожения renderer.
+        if let Some(gpu) = &mut self.gpu
+            && let Err(error) = gpu.scene.release_skins(&mut gpu.renderer)
+        {
+            self.state.log.push(
+                LogLevel::Warn,
+                format!("освобождение скиннинга при закрытии: {error}"),
+            );
+        }
         // Renderer удерживает окно и освобождается до него.
         self.gpu = None;
         self.egui_state = None;

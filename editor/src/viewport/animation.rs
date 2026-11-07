@@ -6,11 +6,14 @@
 //! Скиннинг GPU и палитры кадра собирает `SceneRenderer`.
 
 use engine_animation::AnimationBridge;
-use engine_assets::Assets;
+use engine_assets::{Assets, Model, ModelAnimation};
 use engine_scene::{AnimationRequest, ObjectHandle, World};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Клипы `animator.clips`, прочитанные с диска. Живут до смены поколения источников.
+pub type ClipCache = HashMap<String, Result<Arc<Vec<ModelAnimation>>, String>>;
 
 /// Дольше этого кадр не продвигает время превью: пауза окна не должна перематывать клип.
 const MAX_FRAME_SECONDS: f32 = 0.25;
@@ -74,8 +77,10 @@ pub struct PreviewStatus {
 /// Мост редактора и его отпечаток: при другом отпечатке мост пересобирается.
 #[derive(Default)]
 pub struct EditorAnimation {
-    fingerprint: String,
+    /// Поколение моделей вьюпорта и отпечаток аниматоров мира.
+    fingerprint: (u64, String),
     bridge: Option<AnimationBridge>,
+    clips: ClipCache,
     /// Последнее движение, переданное превью, чтобы не перезапускать его каждый кадр.
     applied_motion: Option<(ObjectHandle, String)>,
     applied_playing: Option<(ObjectHandle, bool)>,
@@ -100,28 +105,38 @@ impl EditorAnimation {
         dt
     }
 
-    /// Пересобирает мост при изменении аниматоров, применяет превью и продвигает время.
+    /// Пересобирает мост при изменении аниматоров или поколения моделей, применяет превью и
+    /// продвигает время.
     ///
-    /// `build` создаёт мост заново только при другом отпечатке мира. Предупреждения моста
-    /// добавляются в `warnings`.
+    /// `generation` меняется при каждой перезагрузке моделей и сбросе кэша. `build` возвращает
+    /// `None`, пока нужные модели не готовы: тогда мост остаётся прежним и сборка повторяется
+    /// в следующем кадре. Предупреждения моста добавляются в `warnings`.
     pub fn advance(
         &mut self,
         world: &World,
+        generation: u64,
         dt: f32,
         preview: Option<(ObjectHandle, &mut AnimationPreview)>,
         warnings: &mut Vec<String>,
-        build: impl FnOnce(&World) -> AnimationBridge,
+        build: impl FnOnce(&World, &mut ClipCache) -> Option<AnimationBridge>,
     ) {
-        let fingerprint = animator_fingerprint(world);
+        let fingerprint = (generation, animator_fingerprint(world));
         if fingerprint != self.fingerprint {
-            self.fingerprint = fingerprint;
-            self.applied_motion = None;
-            self.applied_playing = None;
-            self.bridge = if self.fingerprint.is_empty() {
-                None
+            if fingerprint.0 != self.fingerprint.0 {
+                // Файлы клипов могли измениться вместе с моделями: читаем их заново.
+                self.clips.clear();
+            }
+            let built = if fingerprint.1.is_empty() {
+                Some(None)
             } else {
-                Some(build(world))
+                build(world, &mut self.clips).map(Some)
             };
+            if let Some(bridge) = built {
+                self.fingerprint = fingerprint;
+                self.applied_motion = None;
+                self.applied_playing = None;
+                self.bridge = bridge;
+            }
         }
         let Some(bridge) = self.bridge.as_mut() else {
             return;
@@ -211,7 +226,8 @@ fn preview_requests(
 }
 
 /// Отпечаток аниматоров сцены: объект, модель и компонент. Меняется при любой правке,
-/// которая влияет на мост, и не меняется при движении объектов.
+/// которая влияет на мост, и не меняется при движении объектов. Перезагрузка моделей
+/// отслеживается отдельно через поколение в [`EditorAnimation::advance`].
 pub fn animator_fingerprint(world: &World) -> String {
     let mut parts = Vec::new();
     for object in world.objects() {
@@ -232,27 +248,60 @@ pub fn animator_fingerprint(world: &World) -> String {
 pub fn project_bridge(world: &World, assets: &Assets) -> AnimationBridge {
     AnimationBridge::build(
         world,
-        |path| {
-            assets
-                .load_model(&format!("/{}", path.as_str()))
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        },
-        |path| {
-            assets
-                .load_animations(&format!("/{}", path.as_str()))
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        },
+        |path| load_model_file(assets, path.as_str()),
+        |path| load_clip_file(assets, path.as_str()),
     )
 }
 
-/// Мост превью для ассетов проекта: все аниматоры начинают с позы покоя, а клип запускает
-/// только выбор в инспекторе. Документ и `play_on_start` при этом не меняются.
-pub fn project_preview_bridge(world: &World, assets: &Assets) -> AnimationBridge {
-    let mut bridge = project_bridge(world, assets);
+/// Мост превью: модели берутся из уже загруженного кэша вьюпорта, клипы — из `clips`.
+/// Все аниматоры начинают с позы покоя, а клип запускает только выбор в инспекторе.
+/// Документ и `play_on_start` при этом не меняются. `None`, пока модель аниматора не
+/// разобрана в фоне.
+pub fn project_preview_bridge(
+    world: &World,
+    models: &HashMap<String, Arc<Model>>,
+    assets: &Assets,
+    clips: &mut ClipCache,
+) -> Option<AnimationBridge> {
+    let pending = world
+        .objects()
+        .iter()
+        .filter_map(|object| Some((object.animator.as_ref()?, object.mesh_renderer.as_ref()?)))
+        .any(|(_, renderer)| !models.contains_key(renderer.model.as_str()));
+    if pending {
+        return None;
+    }
+    let mut bridge = AnimationBridge::build(
+        world,
+        |path| {
+            models
+                .get(path.as_str())
+                .cloned()
+                .ok_or_else(|| format!("модель {} не загружена в редакторе", path.as_str()))
+        },
+        |path| {
+            clips
+                .entry(path.as_str().to_owned())
+                .or_insert_with(|| load_clip_file(assets, path.as_str()))
+                .clone()
+        },
+    );
     rest_all(&mut bridge, world);
-    bridge
+    Some(bridge)
+}
+
+fn load_model_file(assets: &Assets, path: &str) -> Result<Arc<Model>, String> {
+    assets
+        .load_model(&format!("/{path}"))
+        .map(Arc::new)
+        .map_err(|error| error.to_string())
+}
+
+fn load_clip_file(assets: &Assets, path: &str) -> Result<Arc<Vec<ModelAnimation>>, String> {
+    assets
+        .load_animations(&format!("/{path}"))
+        .map(Arc::new)
+        .map_err(|error| error.to_string())
 }
 
 /// Останавливает все аниматоры мира без перехода: превью показывает позу покоя.
@@ -330,6 +379,7 @@ mod tests {
     use super::test_support::walk_model;
     use super::*;
     use engine_scene::SceneDocument;
+    use std::collections::HashMap;
 
     const SCENE: &str = "[[assets]]\npath = \"/models/hero.fbx\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n";
 
@@ -342,14 +392,14 @@ mod tests {
     }
 
     /// Мост превью с одной моделью и без клипов файла, как `project_preview_bridge`.
-    fn test_bridge(world: &World) -> AnimationBridge {
+    fn test_bridge(world: &World, _clips: &mut ClipCache) -> Option<AnimationBridge> {
         let mut bridge = AnimationBridge::build(
             world,
             |_| Ok(Arc::new(walk_model())),
             |_| Ok(Arc::new(Vec::new())),
         );
         rest_all(&mut bridge, world);
-        bridge
+        Some(bridge)
     }
 
     /// X-компонента переноса единственной палитры объекта.
@@ -429,6 +479,7 @@ mod tests {
         };
         editor.advance(
             &world,
+            0,
             0.0,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -436,6 +487,7 @@ mod tests {
         );
         editor.advance(
             &world,
+            0,
             0.5,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -449,6 +501,7 @@ mod tests {
         preview.motion = Some("Walk".to_owned());
         editor.advance(
             &world,
+            0,
             0.5,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -475,6 +528,7 @@ mod tests {
         };
         editor.advance(
             &world,
+            0,
             0.0,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -492,6 +546,7 @@ mod tests {
         preview.seek = Some(0.1);
         editor.advance(
             &world,
+            0,
             0.0,
             Some((hero, &mut preview)),
             &mut warnings,
@@ -510,18 +565,80 @@ mod tests {
         let mut warnings = Vec::new();
         let mut builds = 0;
         for _ in 0..2 {
-            editor.advance(&world, 0.0, None, &mut warnings, |world| {
+            editor.advance(&world, 0, 0.0, None, &mut warnings, |world, clips| {
                 builds += 1;
-                test_bridge(world)
+                test_bridge(world, clips)
             });
         }
         assert_eq!(builds, 1, "тот же мир не пересобирает мост");
 
         let faster = world_with(Some("speed = 2.0"));
-        editor.advance(&faster, 0.0, None, &mut warnings, |world| {
+        editor.advance(&faster, 0, 0.0, None, &mut warnings, |world, clips| {
             builds += 1;
-            test_bridge(world)
+            test_bridge(world, clips)
         });
         assert_eq!(builds, 2);
+    }
+
+    #[test]
+    fn the_bridge_is_rebuilt_when_the_model_generation_changes() {
+        // Регрессия: после перезагрузки модели мост со старым скелетом давал палитру другой длины.
+        let world = world_with(Some("speed = 1.0"));
+        let mut editor = EditorAnimation::default();
+        let mut warnings = Vec::new();
+        let mut builds = 0;
+        for generation in [0, 1, 1] {
+            editor.advance(
+                &world,
+                generation,
+                0.0,
+                None,
+                &mut warnings,
+                |world, clips| {
+                    builds += 1;
+                    test_bridge(world, clips)
+                },
+            );
+        }
+        assert_eq!(builds, 2, "новое поколение пересобирает мост, повтор — нет");
+    }
+
+    #[test]
+    fn preview_bridge_takes_models_from_the_viewport_cache_without_reading_files() {
+        // Регрессия: сборка моста не должна читать FBX с диска в UI-потоке.
+        let world = world_with(Some("speed = 1.0"));
+        let hero = world.handle("hero").unwrap();
+        let models = HashMap::from([("models/hero.fbx".to_owned(), Arc::new(walk_model()))]);
+        let assets = Assets::new("/nonexistent-rve-assets");
+        let mut clips = ClipCache::new();
+        let mut bridge =
+            project_preview_bridge(&world, &models, &assets, &mut clips).expect("модель в кэше");
+        assert!(bridge.has_animator(hero));
+        assert!(bridge.take_warnings().is_empty());
+    }
+
+    #[test]
+    fn preview_bridge_waits_while_a_model_is_still_loading() {
+        let world = world_with(Some("speed = 1.0"));
+        let assets = Assets::new("/nonexistent-rve-assets");
+        let mut clips = ClipCache::new();
+        assert!(
+            project_preview_bridge(&world, &HashMap::new(), &assets, &mut clips).is_none(),
+            "пока модели нет, мост не строится и предупреждений нет"
+        );
+        let mut editor = EditorAnimation::default();
+        let mut warnings = Vec::new();
+        let mut attempts = 0;
+        for _ in 0..2 {
+            editor.advance(&world, 0, 0.0, None, &mut warnings, |_, _| {
+                attempts += 1;
+                None
+            });
+        }
+        assert_eq!(attempts, 2, "сборка повторяется в следующих кадрах");
+        assert!(editor.bridge().is_none());
+        editor.advance(&world, 0, 0.0, None, &mut warnings, test_bridge);
+        assert!(editor.bridge().is_some());
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
