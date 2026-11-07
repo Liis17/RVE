@@ -183,6 +183,8 @@ impl Animator {
             .find(|playback| playback.motion == index)
         {
             Some(playback) if playback.target > 0.0 && !playback.finished => {
+                // Ручной вес мог поднять цель ниже 1: запуск возвращает полный вес.
+                playback.target = 1.0;
                 playback.looping = looping;
                 playback.then = then;
                 playback.fade = fade;
@@ -227,30 +229,34 @@ impl Animator {
         }
         let fade = check_fade(fade)?;
         let target = weight.clamp(0.0, 1.0);
-        match self
+        let position = match self
             .playbacks
-            .iter_mut()
-            .find(|playback| playback.motion == index)
+            .iter()
+            .position(|playback| playback.motion == index)
         {
-            Some(playback) => {
+            Some(position) => {
+                let playback = &mut self.playbacks[position];
                 playback.target = target;
                 playback.fade = fade;
+                position
             }
-            None => self.playbacks.push(Playback {
-                motion: index,
-                weight: 0.0,
-                target,
-                fade,
-                time: 0.0,
-                looping: self.default_looping,
-                then: None,
-                finished: false,
-            }),
-        }
+            None => {
+                self.playbacks.push(Playback {
+                    motion: index,
+                    weight: 0.0,
+                    target,
+                    fade,
+                    time: 0.0,
+                    looping: self.default_looping,
+                    then: None,
+                    finished: false,
+                });
+                self.playbacks.len() - 1
+            }
+        };
+        // Мгновенный вес меняет только это движение; чужие переходы продолжают идти.
         if fade <= 0.0 {
-            for playback in &mut self.playbacks {
-                playback.weight = playback.target;
-            }
+            self.playbacks[position].weight = target;
         }
         Ok(())
     }
@@ -633,6 +639,40 @@ mod tests {
         );
         animator.set_weight("b", 0.5, 0.0).unwrap();
         assert!((sampled_x(&animator) - (0.5 + 5.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn instant_manual_weight_keeps_other_crossfades_running() {
+        let mut animator = animator(true);
+        play(&mut animator, "a", 0.0);
+        play(&mut animator, "b", 1.0);
+        animator.advance(0.5);
+        assert!((animator.weight("a").unwrap() - 0.5).abs() < 1e-6);
+        animator.set_weight("b", 0.3, 0.0).unwrap();
+        assert!((animator.weight("b").unwrap() - 0.3).abs() < 1e-6, "мгновенный вес");
+        assert!(
+            (animator.weight("a").unwrap() - 0.5).abs() < 1e-6,
+            "чужой crossfade не снапается"
+        );
+        // Исходящее движение продолжает угасать с прежней скоростью: 0.5 - 0.25 / 1.0 s.
+        animator.advance(0.25);
+        assert!((animator.weight("a").unwrap() - 0.25).abs() < 1e-6, "переход продолжается");
+    }
+
+    #[test]
+    fn play_after_manual_weight_restores_full_target() {
+        let mut animator = animator(true);
+        play(&mut animator, "a", 0.0);
+        animator.set_weight("a", 0.5, 0.0).unwrap();
+        play(&mut animator, "a", 0.0);
+        assert_eq!(animator.weight("a"), Some(1.0));
+        animator.set_weight("a", 0.5, 1.0).unwrap();
+        play(&mut animator, "a", 1.0);
+        animator.advance(1.0);
+        assert!(
+            (animator.weight("a").unwrap() - 1.0).abs() < 1e-6,
+            "play возвращает цель 1 даже после ручного веса"
+        );
     }
 
     #[test]
