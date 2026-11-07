@@ -1,8 +1,6 @@
 //! Графический редактор игровых сцен и ресурсов RVE.
-
-/// Версия редактора, заданная в `Cargo.toml`.
-#[allow(dead_code)]
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+// Release-сборка на Windows запускается без отдельного окна консоли.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
 mod asset_watch;
@@ -31,6 +29,10 @@ use engine_window::{RedrawMode, WindowConfig};
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+/// Версия редактора из `Cargo.toml`.
+#[allow(dead_code)]
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const DEFAULT_WINDOW_SIZE: (u32, u32) = (1600, 900);
 

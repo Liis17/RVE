@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 engine-console = { path = "../engine-console" }
 engine-physics = { path = "../engine-physics" }
+engine-files = { path = "../engine-files" }
 engine-project = { path = "../engine-project" }
 engine-scene = { path = "../engine-scene" }
 glam.workspace = true

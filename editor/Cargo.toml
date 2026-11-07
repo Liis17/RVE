@@ -16,6 +16,7 @@ winit.workspace = true
 engine-console = { path = "../engine/engine-console" }
 engine-core = { path = "../engine/engine-core" }
 engine-assets = { path = "../engine/engine-assets" }
+engine-audio = { path = "../engine/engine-audio" }
 engine-physics = { path = "../engine/engine-physics" }
 engine-files = { path = "../engine/engine-files" }
 engine-platform = { path = "../engine/engine-platform" }

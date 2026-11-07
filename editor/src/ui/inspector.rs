@@ -1,6 +1,7 @@
 //! Панель Inspector: поля и компоненты выбранного объекта.
 
 use crate::assets_fs::AssetKind;
+use crate::icons;
 use crate::scene_edit::{
     Component, ComponentKind, OverrideField, default_environment, default_light,
 };
@@ -8,10 +9,11 @@ use crate::state::{Action, AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    AntiAliasing, CameraComponent, CharacterControllerComponent, ColliderComponent, ColliderShape,
-    EnvironmentComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode,
-    ParamSchema, ParamSpec, ParamValue, PointLightComponent, ProceduralSkyComponent,
-    RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform, SpotLightComponent,
+    AntiAliasing, AudioGroup, AudioSourceComponent, CameraComponent, CharacterControllerComponent,
+    ColliderComponent, ColliderShape, EnvironmentComponent, HeavyScript, LodGroup, LodLevel,
+    MAX_LOD_LEVELS, MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
+    ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform,
+    SpotLightComponent,
 };
 use std::collections::BTreeMap;
 
@@ -137,6 +139,9 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     }
     if let Some(light) = object.spot_light {
         show_spot_light(ui, state, id, light);
+    }
+    if let Some(audio) = &object.audio_source {
+        show_audio_source(ui, state, id, audio);
     }
     if let Some(environment) = &object.environment {
         show_environment(ui, state, id, environment);
@@ -311,7 +316,10 @@ fn show_transform(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObje
     let menu = component_menu(state, id, ComponentKind::Transform);
     let action = component_header(
         ui,
-        "Transform",
+        HeaderTitle {
+            text: "Transform",
+            icon: component_icon(state, ComponentKind::Transform),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -395,10 +403,22 @@ fn run_menu_action(state: &mut EditorState, id: &str, kind: ComponentKind, actio
     }
 }
 
-/// Заголовок компонента: кнопка удаления и контекстное меню Reset/Copy/Paste по щелчку ПКМ.
+/// Подпись заголовка компонента и иконка перед ней.
+#[derive(Clone, Copy)]
+struct HeaderTitle<'a> {
+    text: &'a str,
+    icon: Option<egui::TextureId>,
+}
+
+/// Загруженная иконка компонента; без рисунка или до загрузки — `None`.
+fn component_icon(state: &EditorState, kind: ComponentKind) -> Option<egui::TextureId> {
+    icons::component_icon(kind).and_then(|name| state.icons.get(name))
+}
+
+/// Заголовок компонента: иконка (если есть), кнопка удаления и контекстное меню Reset/Copy/Paste по щелчку ПКМ.
 fn component_header(
     ui: &mut egui::Ui,
-    title: &str,
+    title: HeaderTitle<'_>,
     salt: impl std::hash::Hash + std::fmt::Debug,
     mark: Mark,
     menu: Option<ComponentMenu>,
@@ -406,11 +426,19 @@ fn component_header(
     body: impl FnOnce(&mut egui::Ui),
 ) -> HeaderAction {
     let mut action = HeaderAction::None;
-    let id = ui.make_persistent_id(("component", title, salt));
+    let id = ui.make_persistent_id(("component", title.text, salt));
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
         .show_header(ui, |ui| {
+            if let Some(texture) = title.icon {
+                let size = ui.spacing().interact_size.y;
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    texture,
+                    egui::vec2(size, size),
+                )));
+            }
             let label = ui.add(
-                egui::Label::new(marked_text(title, mark.overridden)).sense(egui::Sense::click()),
+                egui::Label::new(marked_text(title.text, mark.overridden))
+                    .sense(egui::Sense::click()),
             );
             if let Some(menu) = menu {
                 label.context_menu(|ui| {
@@ -453,7 +481,10 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
     let menu = component_menu(state, id, ComponentKind::Camera);
     let action = component_header(
         ui,
-        "Camera",
+        HeaderTitle {
+            text: "Camera",
+            icon: component_icon(state, ComponentKind::Camera),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -592,7 +623,10 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     let menu = component_menu(state, id, ComponentKind::MeshRenderer);
     let action = component_header(
         ui,
-        "Mesh Renderer",
+        HeaderTitle {
+            text: "Mesh Renderer",
+            icon: component_icon(state, ComponentKind::MeshRenderer),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -909,7 +943,10 @@ fn show_lod_group(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObje
     let menu = component_menu(state, id, ComponentKind::LodGroup);
     let action = component_header(
         ui,
-        "LOD Group",
+        HeaderTitle {
+            text: "LOD Group",
+            icon: component_icon(state, ComponentKind::LodGroup),
+        },
         id,
         Mark {
             locked,
@@ -1049,7 +1086,10 @@ fn show_light(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) 
     let menu = component_menu(state, id, ComponentKind::DirectionalLight);
     let action = component_header(
         ui,
-        "Directional Light",
+        HeaderTitle {
+            text: "Directional Light",
+            icon: component_icon(state, ComponentKind::DirectionalLight),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -1118,7 +1158,10 @@ fn show_point_light(
     let field = OverrideField::PointLight;
     let action = component_header(
         ui,
-        "Point Light",
+        HeaderTitle {
+            text: "Point Light",
+            icon: component_icon(state, ComponentKind::PointLight),
+        },
         id,
         mark(state, id, field.clone()),
         Some(component_menu(state, id, ComponentKind::PointLight)),
@@ -1173,6 +1216,119 @@ fn show_point_light(
     run_menu_action(state, id, ComponentKind::PointLight, action);
 }
 
+fn show_audio_source(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    audio: &AudioSourceComponent,
+) {
+    let field = OverrideField::AudioSource;
+    let clips = state.assets_of_kind(AssetKind::Audio);
+    let mut clip_choice = None;
+    let action = component_header(
+        ui,
+        HeaderTitle {
+            text: "Audio Source",
+            icon: component_icon(state, ComponentKind::AudioSource),
+        },
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::AudioSource)),
+        true,
+        |ui| {
+            egui::Grid::new("audio_source")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    let mut value = audio.clone();
+                    ui.label("Clip");
+                    clip_choice = asset_picker(ui, "audio_clip", audio.clip.as_str(), &clips);
+                    ui.end_row();
+                    ui.label("Group");
+                    let group = egui::ComboBox::from_id_salt("audio_group")
+                        .selected_text(audio_group_label(value.group))
+                        .show_ui(ui, |ui| {
+                            for option in
+                                [AudioGroup::Music, AudioGroup::Effects, AudioGroup::Ambient]
+                            {
+                                ui.selectable_value(
+                                    &mut value.group,
+                                    option,
+                                    audio_group_label(option),
+                                );
+                            }
+                        })
+                        .response;
+                    ui.end_row();
+                    ui.label("Volume");
+                    let volume = ui.add(
+                        egui::DragValue::new(&mut value.volume)
+                            .speed(0.01)
+                            .range(0.0..=engine_scene::MAX_AUDIO_VOLUME),
+                    );
+                    ui.end_row();
+                    ui.label("Loop");
+                    let looping = ui.checkbox(&mut value.looping, "");
+                    ui.end_row();
+                    ui.label("Play on start");
+                    let play_on_start = ui.checkbox(&mut value.play_on_start, "");
+                    ui.end_row();
+                    ui.label("Spatial");
+                    let spatial = ui.checkbox(&mut value.spatial, "");
+                    ui.end_row();
+                    ui.label("Min distance");
+                    let min = ui.add(
+                        egui::DragValue::new(&mut value.min_distance)
+                            .speed(0.05)
+                            .range(f32::MIN_POSITIVE..=f32::MAX),
+                    );
+                    ui.end_row();
+                    ui.label("Max distance");
+                    let max = ui.add(
+                        egui::DragValue::new(&mut value.max_distance)
+                            .speed(0.05)
+                            .range(f32::MIN_POSITIVE..=f32::MAX),
+                    );
+                    ui.end_row();
+                    let response = group | volume | looping | play_on_start | spatial | min | max;
+                    commit(state, id, "audio_source", &response, |object| {
+                        object.audio_source = Some(value.clone());
+                    });
+                });
+        },
+    );
+    if let Some(path) = clip_choice
+        && let Some(clip) = parse_path(state, &path)
+    {
+        // set_component объявляет клип в [[assets]] сцены; прямая правка этого не делает.
+        state.edit_scene(|scene| {
+            scene.set_component(
+                id,
+                Component::AudioSource(AudioSourceComponent {
+                    clip: clip.clone(),
+                    ..audio.clone()
+                }),
+            )
+        });
+    }
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| scene.remove_audio_source(id));
+    }
+    run_menu_action(state, id, ComponentKind::AudioSource, action);
+}
+
+fn audio_group_label(group: AudioGroup) -> &'static str {
+    match group {
+        AudioGroup::Master => "Master",
+        AudioGroup::Music => "Music",
+        AudioGroup::Effects => "Effects",
+        AudioGroup::Ambient => "Ambient",
+    }
+}
+
 fn show_spot_light(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -1182,7 +1338,10 @@ fn show_spot_light(
     let field = OverrideField::SpotLight;
     let action = component_header(
         ui,
-        "Spot Light",
+        HeaderTitle {
+            text: "Spot Light",
+            icon: component_icon(state, ComponentKind::SpotLight),
+        },
         id,
         mark(state, id, field.clone()),
         Some(component_menu(state, id, ComponentKind::SpotLight)),
@@ -1341,7 +1500,10 @@ fn show_collider(
     let menu = component_menu(state, id, ComponentKind::Collider);
     let action = component_header(
         ui,
-        "Collider",
+        HeaderTitle {
+            text: "Collider",
+            icon: component_icon(state, ComponentKind::Collider),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -1456,7 +1618,10 @@ fn show_rigid_body(ui: &mut egui::Ui, state: &mut EditorState, id: &str, body: R
     let menu = component_menu(state, id, ComponentKind::RigidBody);
     let action = component_header(
         ui,
-        "Rigid Body",
+        HeaderTitle {
+            text: "Rigid Body",
+            icon: component_icon(state, ComponentKind::RigidBody),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -1538,7 +1703,10 @@ fn show_character_controller(
     let menu = component_menu(state, id, ComponentKind::CharacterController);
     let action = component_header(
         ui,
-        "Character Controller",
+        HeaderTitle {
+            text: "Character Controller",
+            icon: component_icon(state, ComponentKind::CharacterController),
+        },
         id,
         mark(state, id, field.clone()),
         Some(menu),
@@ -1611,7 +1779,10 @@ fn show_environment(
     let field = OverrideField::Environment;
     let action = component_header(
         ui,
-        "Environment",
+        HeaderTitle {
+            text: "Environment",
+            icon: component_icon(state, ComponentKind::Environment),
+        },
         id,
         mark(state, id, field.clone()),
         Some(component_menu(state, id, ComponentKind::Environment)),
@@ -1786,7 +1957,10 @@ fn show_lite_script(
     let mut reset = None;
     let action = component_header(
         ui,
-        &title,
+        HeaderTitle {
+            text: &title,
+            icon: None,
+        },
         (id, index),
         mark(state, id, field.clone()),
         None,
@@ -1851,7 +2025,10 @@ fn show_heavy_script(
     let mut reset = None;
     let action = component_header(
         ui,
-        &title,
+        HeaderTitle {
+            text: &title,
+            icon: None,
+        },
         (id, index),
         mark(state, id, field.clone()),
         None,
@@ -2198,6 +2375,26 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                     id,
                     Component::CharacterController(CharacterControllerComponent::default()),
                 )
+            });
+        }
+        if object.audio_source.is_none() {
+            ui.menu_button("Audio Source", |ui| {
+                let clips = state.assets_of_kind(AssetKind::Audio);
+                if clips.is_empty() {
+                    ui.label("Нет .wav или .ogg в проекте");
+                }
+                for clip in clips {
+                    if ui.button(&clip).clicked()
+                        && let Some(path) = parse_path(state, &clip)
+                    {
+                        state.edit_scene(|scene| {
+                            scene.set_component(
+                                id,
+                                Component::AudioSource(AudioSourceComponent::with_clip(path)),
+                            )
+                        });
+                    }
+                }
             });
         }
         if object.point_light.is_none() && ui.button("Point Light").clicked() {
