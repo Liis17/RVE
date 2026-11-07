@@ -51,6 +51,8 @@ pub struct AnimationBridge {
     order: Vec<ObjectHandle>,
     objects: HashMap<ObjectHandle, ObjectAnimation>,
     warnings: Vec<String>,
+    /// Уже переданные предупреждения: повтор одного и того же сообщения не попадает в журнал.
+    reported: HashSet<String>,
 }
 
 impl AnimationBridge {
@@ -202,7 +204,7 @@ impl AnimationBridge {
     }
 
     fn warn(&mut self, message: String) {
-        if self.warnings.len() < WARNING_LIMIT {
+        if self.warnings.len() < WARNING_LIMIT && self.reported.insert(message.clone()) {
             self.warnings.push(message);
         }
     }
@@ -527,6 +529,34 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("файл не найден"))
         );
+    }
+
+    #[test]
+    fn repeated_request_errors_are_reported_once_until_taken() {
+        let world = world("");
+        let mut bridge = build(&world);
+        let hero = world.handle("hero").unwrap();
+        bridge.take_warnings();
+        for _ in 0..3 {
+            bridge.apply([AnimationRequest::Play {
+                object: hero,
+                motion: "Missing".to_owned(),
+                fade: 0.0,
+                looping: None,
+                then: None,
+            }]);
+        }
+        let warnings = bridge.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Missing"), "{warnings:?}");
+        bridge.apply([AnimationRequest::Play {
+            object: hero,
+            motion: "Missing".to_owned(),
+            fade: 0.0,
+            looping: None,
+            then: None,
+        }]);
+        assert!(bridge.take_warnings().is_empty(), "повтор уже показан");
     }
 
     #[test]
