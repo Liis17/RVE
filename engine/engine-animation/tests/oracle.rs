@@ -233,3 +233,33 @@ fn clip_file_drives_bare_skin_like_the_model_own_stack() {
         );
     }
 }
+
+#[test]
+fn z_up_file_with_rotated_root_matches_ufbx_evaluation_over_time() {
+    // UpAxis=Z и поворот на root: ось и масштаб переводятся в Y-up, поэтому эталон должен совпасть.
+    let model = assets().load_model("/zup_skin.fbx").unwrap();
+    let skeleton = Skeleton::from_model(model.skeleton.as_ref().unwrap());
+    let clip = Clip::bind(&model.animations[0], &skeleton);
+    assert!(clip.unmatched().is_empty());
+    let scene = load_scene("zup_skin.fbx");
+    let stack = &scene.anim_stacks[0];
+    let body = &model.meshes[0];
+
+    let rest = oracle_positions(&scene, &stack.anim, 0.0, "Body");
+    let end = oracle_positions(&scene, &stack.anim, 1.0, "Body");
+    let moved = rest
+        .iter()
+        .zip(&end)
+        .map(|(a, b)| (*a - *b).length())
+        .fold(0.0_f32, f32::max);
+    assert!(moved > 0.5, "клип должен заметно двигать вершины: {moved}");
+
+    for time in TIMES {
+        let palettes = palettes_at(&clip, &skeleton, time);
+        assert_positions_close(
+            &skinned_positions(body, &palettes),
+            &oracle_positions(&scene, &stack.anim, time, "Body"),
+            &format!("zup Body t={time}"),
+        );
+    }
+}
