@@ -5,7 +5,10 @@ use std::ffi::c_void;
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 7;
+///
+/// Version 8 appends spawn, destroy, object-state and prefab callbacks after the v7 audio tail.
+/// It is a new number rather than v7 because v7 hosts already accept modules that end at audio.
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 8;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -741,6 +744,92 @@ pub type RveAudioVoiceFn = unsafe extern "C" fn(ctx: *mut c_void, voice: u64) ->
 pub type RveAudioGroupVolumeFn =
     unsafe extern "C" fn(ctx: *mut c_void, group: u32, volume: f32) -> u32;
 
+/// Object state code: the handle is dead, or it never named a live or pending object.
+/// Returned by `RveHost::object_state`. Appended in ABI v8.
+pub const RVE_OBJECT_DEAD: u32 = 0;
+/// Object state code: the object was spawned in this phase and is not in the world yet.
+pub const RVE_OBJECT_PENDING: u32 = 1;
+/// Object state code: the object is in the world.
+pub const RVE_OBJECT_ALIVE: u32 = 2;
+
+/// Prefab state code: the path is not in the project prefab list.
+/// Returned by `RveHost::prefab_state`. Appended in ABI v8.
+pub const RVE_PREFAB_UNKNOWN: u32 = 0;
+/// Prefab state code: a scene fast prefab, always resident.
+pub const RVE_PREFAB_RESIDENT: u32 = 1;
+/// Prefab state code: a heavy prefab that is not in memory.
+pub const RVE_PREFAB_UNLOADED: u32 = 2;
+/// Prefab state code: a heavy prefab whose load is in progress.
+pub const RVE_PREFAB_LOADING: u32 = 3;
+/// Prefab state code: a heavy prefab in memory.
+pub const RVE_PREFAB_LOADED: u32 = 4;
+/// Prefab state code: a heavy prefab whose unload is in progress.
+pub const RVE_PREFAB_UNLOADING: u32 = 5;
+/// Prefab state code: a heavy prefab whose load failed.
+pub const RVE_PREFAB_FAILED: u32 = 6;
+
+/// [`RveSpawnOptions::flags`] bit: `position` is set.
+pub const RVE_SPAWN_HAS_POSITION: u32 = 1 << 0;
+/// [`RveSpawnOptions::flags`] bit: `rotation_deg` is set.
+pub const RVE_SPAWN_HAS_ROTATION: u32 = 1 << 1;
+/// [`RveSpawnOptions::flags`] bit: `scale` is set.
+pub const RVE_SPAWN_HAS_SCALE: u32 = 1 << 2;
+/// [`RveSpawnOptions::flags`] bit: `velocity` is set; it applies only to a dynamic root.
+pub const RVE_SPAWN_HAS_VELOCITY: u32 = 1 << 3;
+/// [`RveSpawnOptions::flags`] bit: `parent` is set.
+pub const RVE_SPAWN_HAS_PARENT: u32 = 1 << 4;
+/// [`RveSpawnOptions::flags`] bit: `name` is set.
+pub const RVE_SPAWN_HAS_NAME: u32 = 1 << 5;
+/// [`RveSpawnOptions::flags`] bit: `id` is set.
+pub const RVE_SPAWN_HAS_ID: u32 = 1 << 6;
+/// Every known [`RveSpawnOptions::flags`] bit. The host refuses a spawn with any other bit set.
+pub const RVE_SPAWN_KNOWN_FLAGS: u32 = RVE_SPAWN_HAS_ID
+    | RVE_SPAWN_HAS_NAME
+    | RVE_SPAWN_HAS_PARENT
+    | RVE_SPAWN_HAS_VELOCITY
+    | RVE_SPAWN_HAS_SCALE
+    | RVE_SPAWN_HAS_ROTATION
+    | RVE_SPAWN_HAS_POSITION;
+
+/// Optional fields of one spawn request. Read only the fields whose presence bit is set in
+/// `flags`; the others may hold any value. Appended in ABI v8.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RveSpawnOptions {
+    /// `RVE_SPAWN_HAS_*` presence bits; unknown bits are refused.
+    pub flags: u32,
+    /// Local position of the new root.
+    pub position: [f32; 3],
+    /// Local Euler rotation of the new root in degrees.
+    pub rotation_deg: [f32; 3],
+    /// Local scale of the new root.
+    pub scale: [f32; 3],
+    /// Initial linear velocity of a dynamic root.
+    pub velocity: [f32; 3],
+    /// Handle of an existing live object that becomes the parent.
+    pub parent: u64,
+    /// Name of the new root.
+    pub name: RveStr,
+    /// Author id of the new root, `[A-Za-z0-9_-]{1,64}`.
+    pub id: RveStr,
+}
+
+/// Spawns a prefab by project virtual path (without a leading slash). Returns the pending handle,
+/// or zero when the host refuses. The options pointer may be null. Appended in ABI v8.
+pub type RveSpawnFn =
+    unsafe extern "C" fn(ctx: *mut c_void, prefab: RveStr, options: *const RveSpawnOptions) -> u64;
+/// Queues an object subtree for removal; a positive delay is in seconds. Returns `false` for a
+/// dead handle or a refused request. Appended in ABI v8.
+pub type RveDestroyObjectFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, delay: f32) -> bool;
+/// Returns one of the `RVE_OBJECT_*` state codes. Appended in ABI v8.
+pub type RveObjectStateFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
+/// Requests a heavy prefab load or unload by path; returns `false` when the host refuses.
+/// Appended in ABI v8.
+pub type RvePrefabRequestFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
+/// Returns one of the `RVE_PREFAB_*` state codes for a prefab path. Appended in ABI v8.
+pub type RvePrefabStateFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> u32;
+
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
 pub struct RveHost {
@@ -823,6 +912,14 @@ pub struct RveHost {
     pub audio_play_clip: Option<RveAudioPlayClipFn>,
     pub audio_stop_voice: Option<RveAudioVoiceFn>,
     pub audio_set_group_volume: Option<RveAudioGroupVolumeFn>,
+    /// Spawn, destroy, object-state and prefab callbacks appended in ABI v8; `None` marks an
+    /// unavailable callback.
+    pub spawn: Option<RveSpawnFn>,
+    pub destroy: Option<RveDestroyObjectFn>,
+    pub object_state: Option<RveObjectStateFn>,
+    pub prefab_load: Option<RvePrefabRequestFn>,
+    pub prefab_unload: Option<RvePrefabRequestFn>,
+    pub prefab_state: Option<RvePrefabStateFn>,
 }
 
 /// Guest factory callback.

@@ -1,5 +1,6 @@
 use crate::abi_string::read_abi_str;
 use crate::actions::ActionMutation;
+use crate::lifecycle::{ObjectState, PrefabRequest, PrefabStatus, SpawnArgs};
 use crate::lite::{
     CommandGeneration, EventQueue, LuaCommands, MAX_LOG_MESSAGE_BYTES, RegisteredCommandCallback,
     RegisteredLuaCommand,
@@ -34,6 +35,13 @@ use rve_sdk::abi::{
 use rve_sdk::abi::{
     RVE_AUDIO_GROUP_AMBIENT, RVE_AUDIO_GROUP_EFFECTS, RVE_AUDIO_GROUP_MASTER,
     RVE_AUDIO_GROUP_MUSIC, RveAudioParams,
+};
+use rve_sdk::abi::{
+    RVE_OBJECT_ALIVE, RVE_OBJECT_DEAD, RVE_OBJECT_PENDING, RVE_PREFAB_FAILED, RVE_PREFAB_LOADED,
+    RVE_PREFAB_LOADING, RVE_PREFAB_RESIDENT, RVE_PREFAB_UNKNOWN, RVE_PREFAB_UNLOADED,
+    RVE_PREFAB_UNLOADING, RVE_SPAWN_HAS_ID, RVE_SPAWN_HAS_NAME, RVE_SPAWN_HAS_PARENT,
+    RVE_SPAWN_HAS_POSITION, RVE_SPAWN_HAS_ROTATION, RVE_SPAWN_HAS_SCALE, RVE_SPAWN_HAS_VELOCITY,
+    RVE_SPAWN_KNOWN_FLAGS, RveSpawnOptions,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -193,6 +201,12 @@ impl<'a> AbiCallContext<'a> {
             audio_play_clip: Some(host_audio_play_clip),
             audio_stop_voice: Some(host_audio_stop_voice),
             audio_set_group_volume: Some(host_audio_set_group_volume),
+            spawn: Some(host_spawn),
+            destroy: Some(host_destroy),
+            object_state: Some(host_object_state),
+            prefab_load: Some(host_prefab_load),
+            prefab_unload: Some(host_prefab_unload),
+            prefab_state: Some(host_prefab_state),
         }
     }
 
@@ -1143,6 +1157,165 @@ unsafe extern "C" fn host_audio_set_group_volume(ctx: *mut c_void, group: u32, v
         });
         audio_result(context, result)
     })
+}
+
+/// Records a refused lifecycle request as a script error and returns the callback's fallback.
+/// The reason is also kept as the call's error, so a guest that returns `Error` without a message
+/// of its own still reports it.
+fn lifecycle_refusal<T>(context: &mut AbiCallContext<'_>, message: String, fallback: T) -> T {
+    context.events.borrow_mut().push(ScriptEvent {
+        level: ScriptEventLevel::Error,
+        source: context.source.to_owned(),
+        message: message.clone(),
+    });
+    context.error = Some(message);
+    fallback
+}
+
+/// Reads the optional fields of a spawn request. Unknown presence bits are refused before any
+/// field is read, so a newer guest cannot silently lose data.
+///
+/// # Safety
+/// `options` must be null or point to a readable `RveSpawnOptions`, and its strings must stay
+/// valid for the duration of the call.
+unsafe fn spawn_args(options: *const RveSpawnOptions) -> Result<SpawnArgs, String> {
+    let mut args = SpawnArgs::default();
+    if options.is_null() {
+        return Ok(args);
+    }
+    // SAFETY: the caller guarantees a readable options struct; it is copied before use.
+    let options = unsafe { *options };
+    let unknown = options.flags & !RVE_SPAWN_KNOWN_FLAGS;
+    if unknown != 0 {
+        return Err(format!("spawn received unknown option flags {unknown:#x}"));
+    }
+    let has = |bit: u32| options.flags & bit != 0;
+    if has(RVE_SPAWN_HAS_POSITION) {
+        args.options.position = Some(Vec3::from_array(options.position));
+    }
+    if has(RVE_SPAWN_HAS_ROTATION) {
+        args.options.rotation_deg = Some(Vec3::from_array(options.rotation_deg));
+    }
+    if has(RVE_SPAWN_HAS_SCALE) {
+        args.options.scale = Some(Vec3::from_array(options.scale));
+    }
+    if has(RVE_SPAWN_HAS_VELOCITY) {
+        args.velocity = Some(Vec3::from_array(options.velocity));
+    }
+    if has(RVE_SPAWN_HAS_PARENT) {
+        // The transaction checks that the parent is a live object.
+        let parent = ObjectHandle::from_abi(options.parent)
+            .ok_or_else(|| "spawn parent is not an object handle".to_owned())?;
+        args.options.parent = Some(parent);
+    }
+    if has(RVE_SPAWN_HAS_NAME) {
+        // SAFETY: the caller keeps the borrowed bytes readable for this call.
+        let name = unsafe { read_abi_str(options.name) }
+            .map_err(|_| "spawn name must be valid UTF-8".to_owned())?;
+        args.options.name = Some(name.to_owned());
+    }
+    if has(RVE_SPAWN_HAS_ID) {
+        // SAFETY: the caller keeps the borrowed bytes readable for this call.
+        let id = unsafe { read_abi_str(options.id) }
+            .map_err(|_| "spawn id must be valid UTF-8".to_owned())?;
+        args.options.id = Some(id.to_owned());
+    }
+    Ok(args)
+}
+
+unsafe extern "C" fn host_spawn(
+    ctx: *mut c_void,
+    prefab: RveStr,
+    options: *const RveSpawnOptions,
+) -> u64 {
+    guarded(ctx, 0, |context| {
+        // SAFETY: the guest passes a valid prefab string and options pointer for this call.
+        let result = unsafe { read_abi_str(prefab) }
+            .map_err(|_| "spawn received an invalid prefab path".to_owned())
+            .and_then(|prefab| {
+                // SAFETY: the options pointer is valid for this call, as checked above.
+                let args = unsafe { spawn_args(options) }?;
+                context.transaction.spawn(prefab, args)
+            });
+        match result {
+            // `to_abi` fails only for slot index u32::MAX; zero is never a valid handle.
+            Ok(handle) => handle.to_abi().unwrap_or(0),
+            Err(message) => lifecycle_refusal(context, message, 0),
+        }
+    })
+}
+
+unsafe extern "C" fn host_destroy(ctx: *mut c_void, object: u64, delay: f32) -> bool {
+    guarded(ctx, false, |context| {
+        // Pending handles are accepted: the transaction checks their generation and state.
+        let Some(handle) = ObjectHandle::from_abi(object) else {
+            return false;
+        };
+        match context.transaction.destroy(handle, f64::from(delay)) {
+            Ok(accepted) => accepted,
+            Err(message) => lifecycle_refusal(context, message, false),
+        }
+    })
+}
+
+unsafe extern "C" fn host_object_state(ctx: *mut c_void, object: u64) -> u32 {
+    guarded(ctx, RVE_OBJECT_DEAD, |context| {
+        // Unlike `object_from_abi_handle`, this also reports a pending handle.
+        let Some(handle) = ObjectHandle::from_abi(object) else {
+            return RVE_OBJECT_DEAD;
+        };
+        match context.transaction.object_state(handle) {
+            ObjectState::Alive => RVE_OBJECT_ALIVE,
+            ObjectState::Pending => RVE_OBJECT_PENDING,
+            ObjectState::Dead => RVE_OBJECT_DEAD,
+        }
+    })
+}
+
+fn request_prefab(ctx: *mut c_void, path: RveStr, request: fn(String) -> PrefabRequest) -> bool {
+    guarded(ctx, false, |context| {
+        // SAFETY: the guest passes a valid path string for this callback.
+        let result = match unsafe { read_abi_str(path) } {
+            Ok(path) => context.transaction.prefab_request(request(path.to_owned())),
+            Err(_) => Err("prefab path must be valid UTF-8".to_owned()),
+        };
+        match result {
+            Ok(()) => true,
+            Err(message) => lifecycle_refusal(context, message, false),
+        }
+    })
+}
+
+unsafe extern "C" fn host_prefab_load(ctx: *mut c_void, path: RveStr) -> bool {
+    request_prefab(ctx, path, PrefabRequest::Load)
+}
+
+unsafe extern "C" fn host_prefab_unload(ctx: *mut c_void, path: RveStr) -> bool {
+    request_prefab(ctx, path, PrefabRequest::Unload)
+}
+
+unsafe extern "C" fn host_prefab_state(ctx: *mut c_void, path: RveStr) -> u32 {
+    guarded(ctx, RVE_PREFAB_UNKNOWN, |context| {
+        // SAFETY: the guest passes a valid path string for this callback.
+        let Ok(path) = (unsafe { read_abi_str(path) }) else {
+            return RVE_PREFAB_UNKNOWN;
+        };
+        context
+            .transaction
+            .prefab_status(path)
+            .map_or(RVE_PREFAB_UNKNOWN, prefab_state_code)
+    })
+}
+
+fn prefab_state_code(status: PrefabStatus) -> u32 {
+    match status {
+        PrefabStatus::Resident => RVE_PREFAB_RESIDENT,
+        PrefabStatus::Unloaded => RVE_PREFAB_UNLOADED,
+        PrefabStatus::Loading => RVE_PREFAB_LOADING,
+        PrefabStatus::Loaded => RVE_PREFAB_LOADED,
+        PrefabStatus::Unloading => RVE_PREFAB_UNLOADING,
+        PrefabStatus::Failed => RVE_PREFAB_FAILED,
+    }
 }
 
 unsafe extern "C" fn host_register_command(
