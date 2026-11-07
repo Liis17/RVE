@@ -212,11 +212,12 @@ class PackageSelectionTests(unittest.TestCase):
 
         workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
         demo_condition = next(
-            line for line in workflow.splitlines() if "BUILD_DEMO_GAME: ${{" in line
+            line for line in workflow.splitlines() if "build_demo: ${{" in line
         )
         for name in ["rve-build", "engine-runtime", "rve-player", "engine-script", "rve-sdk"]:
-            self.assertIn(f"contains(needs.changes.outputs.packages, '{name}')", demo_condition)
-        self.assertIn("env.BUILD_DEMO_GAME == 'true'", workflow)
+            self.assertIn(f"contains(steps.packages.outputs.packages, '{name}')", demo_condition)
+        self.assertIn("if: ${{ needs.changes.outputs.build_demo == 'true' }}", workflow)
+        self.assertIn("needs: [changes, lint, test, demo]", workflow)
         workflow_lines = workflow.splitlines()
         feature_off_clippy = next(
             index for index, line in enumerate(workflow_lines)
