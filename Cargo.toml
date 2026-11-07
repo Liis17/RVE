@@ -40,3 +40,10 @@ ufbx = "=0.11.5"
 windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 winit = "=0.30.13"
 zstd = "=0.14.2"
+
+# Без оптимизаций кадр редактора в dev-сборке в десятки раз медленнее release.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
