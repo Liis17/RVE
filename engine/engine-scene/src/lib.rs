@@ -10,6 +10,9 @@ pub mod prefab;
 pub mod transform;
 pub mod world;
 
+/// Версия крейта из `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use audio::{
     AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
 };
@@ -20,7 +23,7 @@ pub use camera_settings::{
     ProjectionSettings, Tonemapper,
 };
 pub use document::{
-    CameraComponent, CharacterControllerComponent, ColliderComponent, ColliderShape,
+    CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent, ColliderShape,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup, LodLevel,
     MAX_LOD_LEVELS, MaterialAlphaMode, MaterialOverride, MeshRenderer, ParamValue,
     PointLightComponent, ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneAsset,

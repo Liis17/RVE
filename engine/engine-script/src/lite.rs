@@ -1743,8 +1743,69 @@ fn input_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
         "reset_bindings",
         reset_bindings_function(lua, active_call.clone())?,
     )?;
-    input.set("pressed_inputs", pressed_inputs_function(lua, active_call)?)?;
+    input.set(
+        "pressed_inputs",
+        pressed_inputs_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "set_cursor_visible",
+        set_cursor_visible_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "set_cursor_locked",
+        set_cursor_locked_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "cursor_visible",
+        cursor_visible_function(lua, active_call.clone())?,
+    )?;
+    input.set("cursor_locked", cursor_locked_function(lua, active_call)?)?;
     Ok(input)
+}
+
+fn set_cursor_visible_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, value: Value| {
+        let visible = lua_boolean(value, "rve.input.set_cursor_visible")?;
+        with_active_call(&active_call, |transaction| {
+            transaction
+                .set_cursor_visible(visible)
+                .map_err(LuaError::runtime)
+        })
+    })
+}
+
+fn set_cursor_locked_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, value: Value| {
+        let locked = lua_boolean(value, "rve.input.set_cursor_locked")?;
+        with_active_call(&active_call, |transaction| {
+            transaction
+                .set_cursor_locked(locked)
+                .map_err(LuaError::runtime)
+        })
+    })
+}
+
+fn cursor_visible_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, ()| {
+        with_active_call(&active_call, |transaction| Ok(transaction.cursor().visible))
+    })
+}
+
+fn cursor_locked_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, ()| {
+        with_active_call(&active_call, |transaction| Ok(transaction.cursor().locked))
+    })
+}
+
+/// mlua приводит любое значение к bool, поэтому API принимает только настоящий boolean.
+fn lua_boolean(value: Value, function: &str) -> mlua::Result<bool> {
+    match value {
+        Value::Boolean(value) => Ok(value),
+        other => Err(LuaError::runtime(format!(
+            "{function} expects a boolean, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 fn action_button_function(

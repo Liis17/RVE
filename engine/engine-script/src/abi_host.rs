@@ -27,9 +27,9 @@ use rve_sdk::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_MAX_BINDINGS, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR,
     RVE_LOG_INFO, RVE_LOG_WARN, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
     RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent, RveHost, RveParamEntry,
-    RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue,
-    RveValueData,
+    RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent, RveCursorState, RveHost,
+    RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime,
+    RveTransform, RveValue, RveValueData,
 };
 use rve_sdk::abi::{
     RVE_AUDIO_GROUP_AMBIENT, RVE_AUDIO_GROUP_EFFECTS, RVE_AUDIO_GROUP_MASTER,
@@ -193,6 +193,9 @@ impl<'a> AbiCallContext<'a> {
             audio_play_clip: Some(host_audio_play_clip),
             audio_stop_voice: Some(host_audio_stop_voice),
             audio_set_group_volume: Some(host_audio_set_group_volume),
+            cursor_state: Some(host_cursor_state),
+            set_cursor_visible: Some(host_set_cursor_visible),
+            set_cursor_locked: Some(host_set_cursor_locked),
         }
     }
 
@@ -1595,6 +1598,35 @@ unsafe extern "C" fn host_reset_bindings(ctx: *mut c_void) -> bool {
     })
 }
 
+unsafe extern "C" fn host_cursor_state(ctx: *mut c_void, out: *mut RveCursorState) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let cursor = context.transaction.cursor();
+        // SAFETY: output was checked and points to the guest's writable stack slot.
+        unsafe {
+            *out = RveCursorState {
+                visible: cursor.visible,
+                locked: cursor.locked,
+            };
+        }
+        true
+    })
+}
+
+unsafe extern "C" fn host_set_cursor_visible(ctx: *mut c_void, visible: bool) -> bool {
+    guarded(ctx, false, |context| {
+        context.transaction.set_cursor_visible(visible).is_ok()
+    })
+}
+
+unsafe extern "C" fn host_set_cursor_locked(ctx: *mut c_void, locked: bool) -> bool {
+    guarded(ctx, false, |context| {
+        context.transaction.set_cursor_locked(locked).is_ok()
+    })
+}
+
 fn host_input_vector(
     ctx: *mut c_void,
     out: *mut [f32; 2],
@@ -1772,7 +1804,7 @@ impl OwnedAbiParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ScriptInput;
+    use crate::types::{ScriptCursor, ScriptInput};
     use engine_scene::{SceneDocument, World};
     use rve_sdk::abi::RveCameraSettings;
 
@@ -1911,6 +1943,7 @@ mod tests {
                 crate::physics::PhysicsScriptState::default(),
             )),
             physics_phase_dt: None,
+            cursor: ScriptCursor::default(),
         });
         {
             let mut context =
@@ -1994,6 +2027,7 @@ mod tests {
                 crate::physics::PhysicsScriptState::default(),
             )),
             physics_phase_dt: None,
+            cursor: ScriptCursor::default(),
         });
         let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
         let host = context.host(ScriptTime::default());
@@ -2002,6 +2036,84 @@ mod tests {
         unsafe {
             assert!(!(host.set_camera_settings.unwrap())(host.ctx, 1, &settings));
             assert!(!(host.set_active_camera.unwrap())(host.ctx, 1));
+        }
+    }
+
+    #[test]
+    fn cursor_callbacks_stage_writes_and_read_pending_state_until_commit() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        transaction.begin(ScriptTransactionInit {
+            world: &world,
+            self_object: world.active_camera(),
+            source: "scene/camera/Probe",
+            writable: true,
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
+            queued_messages: (0, 0),
+            queued_audio: 0,
+            physics: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::physics::PhysicsScriptState::default(),
+            )),
+            physics_phase_dt: None,
+            cursor: ScriptCursor::default(),
+        });
+        {
+            let mut context =
+                AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+            let host = context.host(ScriptTime::default());
+            let mut state = RveCursorState {
+                visible: false,
+                locked: true,
+            };
+            // SAFETY: the host context and output slot remain live through each call.
+            unsafe {
+                assert!((host.cursor_state.unwrap())(host.ctx, &mut state));
+                assert!(state.visible && !state.locked);
+                assert!((host.set_cursor_visible.unwrap())(host.ctx, false));
+                assert!((host.set_cursor_locked.unwrap())(host.ctx, true));
+                assert!((host.cursor_state.unwrap())(host.ctx, &mut state));
+                assert!(!state.visible && state.locked);
+            }
+        }
+        let mut queued = Vec::new();
+        let mut queued_bytes = 0;
+        let mut audio = Vec::new();
+        transaction
+            .commit(
+                &mut world,
+                &mut queued,
+                &mut queued_bytes,
+                &events,
+                &mut audio,
+            )
+            .unwrap();
+        assert_eq!(
+            transaction.cursor(),
+            ScriptCursor {
+                visible: false,
+                locked: true,
+            }
+        );
+    }
+
+    #[test]
+    fn cursor_write_callbacks_fail_during_script_creation() {
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/Probe");
+        let host = context.host(ScriptTime::default());
+        // SAFETY: the host context remains live for the callbacks; no transaction was begun.
+        unsafe {
+            assert!(!(host.set_cursor_visible.unwrap())(host.ctx, false));
+            assert!(!(host.set_cursor_locked.unwrap())(host.ctx, true));
         }
     }
 }

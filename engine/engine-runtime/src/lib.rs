@@ -4,6 +4,7 @@ mod activation;
 mod cli;
 #[cfg(feature = "dev-console")]
 mod console;
+mod cursor;
 mod hardware;
 mod input;
 mod layout;
@@ -16,6 +17,7 @@ use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_
 use cli::{PlayerArgs, USAGE};
 #[cfg(feature = "dev-console")]
 use console::{CommandCatalogSnapshot, ConsoleUiSlot};
+use cursor::CursorControl;
 use engine_assets::{Assets, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::ConsoleBuffer;
@@ -44,6 +46,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sysinfo::{CpuRefreshKind, System};
+
+/// Версия крейта из `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SCRIPTS_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SCRIPTS_READY_GRACE: Duration = Duration::from_secs(2);
@@ -274,6 +279,7 @@ fn run_from_args(
     let (render_tx, render_rx) = flume::unbounded();
     let interrupt = ScriptInterruptHandle::new();
     let input = Arc::new(Mutex::new(input::InputAccumulator::default()));
+    let cursor = CursorControl::default();
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
     let script_thread = match start_scripts(
         &mut modules,
@@ -294,6 +300,7 @@ fn run_from_args(
             render_tx: render_tx.clone(),
             status: Arc::clone(&status),
             input: Arc::clone(&input),
+            cursor: cursor.clone(),
             physics_client: Some(physics_client),
             physics_initialization: Some(physics_initialization),
             audio: Some(audio_handle),
@@ -357,6 +364,7 @@ fn run_from_args(
             debug_view,
             render_assets,
             activation,
+            cursor,
             script_tx,
             render_tx,
             render_rx,

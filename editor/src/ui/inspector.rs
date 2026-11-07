@@ -542,6 +542,21 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
                 }
                 finish_edit(state, &response);
             });
+            egui::CollapsingHeader::new("Cursor")
+                .id_salt("camera_cursor")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let mut cursor = camera.cursor;
+                    let hide = ui
+                        .checkbox(&mut cursor.hide_on_start, "Hide on start")
+                        .on_hover_text(CAMERA_CURSOR_TIP);
+                    let lock = ui
+                        .checkbox(&mut cursor.lock_on_start, "Lock on start")
+                        .on_hover_text(CAMERA_CURSOR_TIP);
+                    if hide.changed() || lock.changed() {
+                        state.edit_scene(|scene| scene.set_camera_cursor(id, cursor));
+                    }
+                });
         },
     );
     if action == HeaderAction::Revert {
@@ -553,6 +568,8 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
     }
     run_menu_action(state, id, ComponentKind::Camera, action);
 }
+
+const CAMERA_CURSOR_TIP: &str = "Действует, если камера активна при старте сцены";
 
 const ANTI_ALIASING_OPTIONS: [(AntiAliasing, &str); 5] = [
     (AntiAliasing::Fxaa, "FXAA"),

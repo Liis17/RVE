@@ -18,5 +18,9 @@ pub use host::{
 pub use library::{ScriptLibrary, ScriptLibraryError};
 pub use rve_sdk::{Key, MouseButton};
 pub use types::{
-    ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
+    ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
+    ScriptTransform,
 };
+
+/// Версия крейта из `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,6 +1,7 @@
 //! Панель Scene: изображение сцены, камера редактора, выделение и гизмо.
 
 use super::game_view;
+use crate::play_cursor::MotionSource;
 use crate::state::{AssetDrag, EditorState, ViewCommand};
 use crate::viewport::camera::{Ray, ground_point, project_point, screen_ray};
 use crate::viewport::colliders::{ColliderWire, WireSource, WireStyle, source_wires};
@@ -134,6 +135,9 @@ pub(super) fn feed_play_pointer(
             input.smooth_scroll_delta,
         )
     });
+    // Дельту egui добавляем только если источник не raw: иначе счёт двойной.
+    let egui_motion =
+        state.play_cursor.motion_source(state.pointer_over_view()) == MotionSource::Egui;
     let Some(play) = &mut state.play else {
         return;
     };
@@ -143,7 +147,9 @@ pub(super) fn feed_play_pointer(
     {
         let local = (pointer - rect.min) * pixels_per_point;
         input.set_cursor(local.x, local.y);
-        input.add_mouse_delta(delta.x * pixels_per_point, delta.y * pixels_per_point);
+        if egui_motion {
+            input.add_mouse_delta(delta.x * pixels_per_point, delta.y * pixels_per_point);
+        }
         input.add_wheel(scroll.x, scroll.y);
     }
 }

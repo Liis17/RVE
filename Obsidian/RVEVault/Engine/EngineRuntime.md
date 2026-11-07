@@ -117,6 +117,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 | `engine/engine-runtime/src/pipeline.rs` | snapshots, script/render loops, fakeable backend и status guard |
 | `engine/engine-runtime/src/input.rs` | `InputAccumulator`, переходы состояния и кадровые input snapshots |
 | `engine/engine-runtime/src/player.rs` | `WindowHandler`, F8 debug-view control, renderer handoff и shutdown окна |
+| `engine/engine-runtime/src/cursor.rs` | `CursorControl`: состояние курсора скриптов и консоли, отправка в окно и отложенная отправка при подключении |
 | `engine/engine-runtime/src/console.rs` | UI snapshots, latest-only slot и интеграция console-команд с scripts thread |
 | `engine/rve-player/src/main.rs` | бинарный entry point |
 
@@ -138,6 +139,12 @@ Action evaluation выполняется внутри общего `engine-scrip
 поэтому сырые клавиши и действия используют один кадр событий. Потеря фокуса и
 Background сохраняют raw `released` edges и сбрасывают analog deltas; вместе с ними
 обнуляются mouse/wheel actions. См. [[Engine/EngineProject]] и [[Engine/EngineScript]].
+
+## Курсор игрока
+
+`engine/engine-runtime/src/cursor.rs` (`CursorControl`) передаёт в окно состояние курсора, которое задают скрипты. Поток скриптов переводит `ScriptCursor` в `engine_window::CursorState` без точки удержания, то есть удержание идёт в центре окна. Эффективное состояние — обычный курсор, пока открыта dev-консоль, иначе запрос скриптов. В окно уходит только изменившееся эффективное значение; запрос, записанный до подключения окна, отправляется при подключении. Отправка идёт вне замка данных, но под отдельным замком порядка, чтобы состояния приходили в том порядке, в котором менялись.
+
+Начальное состояние задаётся до `start` из флагов `[objects.camera.cursor]` активной камеры (`World::active_camera_cursor`). Флаги неактивных камер не применяются. После `start`, каждого `update` и выполненной консольной команды поток скриптов публикует курсор, если он изменился. Освобождение курсора при выходе и потере фокуса выполняет окно ([[Engine/EngineWindow]]).
 
 ## Developer console
 

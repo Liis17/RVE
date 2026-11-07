@@ -1,7 +1,7 @@
 use crate::actions::{ActionFrame, ActionMutation, ActionValue};
 use crate::lite::EventQueue;
 use crate::physics::PhysicsScriptState;
-use crate::types::{ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
+use crate::types::{ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
 use engine_physics::{
     BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
     QueryHit, Ray,
@@ -95,6 +95,8 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) queued_audio: usize,
     pub(crate) physics: Rc<RefCell<PhysicsScriptState>>,
     pub(crate) physics_phase_dt: Option<f32>,
+    /// Состояние курсора, применённое хостом до этого вызова.
+    pub(crate) cursor: ScriptCursor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +135,10 @@ pub(crate) struct ScriptTransaction {
     pending_collider_enabled: HashMap<BodyHandle, bool>,
     pending_pushes: HashMap<BodyHandle, PendingPush>,
     pending_action_mutations: Vec<ActionMutation>,
+    /// Курсор, применённый хостом; меняется только при успешном commit.
+    cursor: ScriptCursor,
+    pending_cursor_visible: Option<bool>,
+    pending_cursor_locked: Option<bool>,
     pending_audio: Vec<AudioRequest>,
     #[cfg(test)]
     peak_pending_bytes: usize,
@@ -170,6 +176,9 @@ impl Default for ScriptTransaction {
             pending_collider_enabled: HashMap::new(),
             pending_pushes: HashMap::new(),
             pending_action_mutations: Vec::with_capacity(2),
+            cursor: ScriptCursor::default(),
+            pending_cursor_visible: None,
+            pending_cursor_locked: None,
             pending_audio: Vec::new(),
             #[cfg(test)]
             peak_pending_bytes: 0,
@@ -209,6 +218,9 @@ impl ScriptTransaction {
         self.queued_audio = init.queued_audio;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
+        self.cursor = init.cursor;
+        self.pending_cursor_visible = None;
+        self.pending_cursor_locked = None;
         self.pending_audio.clear();
     }
 
@@ -241,6 +253,34 @@ impl ScriptTransaction {
     ) -> Result<Vec<String>, String> {
         self.action_frame().bindings(context, action, slot)
     }
+    /// Возвращает курсор с учётом изменений этого вызова, ещё не применённых при commit.
+    pub(crate) fn cursor(&self) -> ScriptCursor {
+        ScriptCursor {
+            visible: self.pending_cursor_visible.unwrap_or(self.cursor.visible),
+            locked: self.pending_cursor_locked.unwrap_or(self.cursor.locked),
+        }
+    }
+
+    pub(crate) fn set_cursor_visible(&mut self, visible: bool) -> Result<(), String> {
+        self.ensure_cursor_writable()?;
+        self.pending_cursor_visible = Some(visible);
+        Ok(())
+    }
+
+    pub(crate) fn set_cursor_locked(&mut self, locked: bool) -> Result<(), String> {
+        self.ensure_cursor_writable()?;
+        self.pending_cursor_locked = Some(locked);
+        Ok(())
+    }
+
+    fn ensure_cursor_writable(&self) -> Result<(), String> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err("cursor changes are unavailable during script creation".to_owned())
+        }
+    }
+
     pub(crate) fn stage_action_mutation(&mut self, mutation: ActionMutation) -> Result<(), String> {
         if !self.writable {
             return Err("input mutations are unavailable during script creation".to_owned());
@@ -819,6 +859,12 @@ impl ScriptTransaction {
             return Err("script produced a non-finite physics command".to_owned());
         }
 
+        if let Some(visible) = self.pending_cursor_visible.take() {
+            self.cursor.visible = visible;
+        }
+        if let Some(locked) = self.pending_cursor_locked.take() {
+            self.cursor.locked = locked;
+        }
         for (handle, transform) in self.pending_transforms.drain() {
             // Handles and all transforms were validated before applying any write.
             world
@@ -895,6 +941,8 @@ impl ScriptTransaction {
         self.queued_message_bytes = 0;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
+        self.pending_cursor_visible = None;
+        self.pending_cursor_locked = None;
         self.pending_audio.clear();
         self.world = std::ptr::null();
         self.action_frame = None;

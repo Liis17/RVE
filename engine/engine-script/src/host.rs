@@ -10,7 +10,8 @@ use crate::transaction::{
     MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction, ScriptTransactionInit,
 };
 use crate::types::{
-    ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
+    ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
+    ScriptTransform,
 };
 use engine_console::{CommandCatalog, CommandLine, CommandSpec};
 use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
@@ -165,6 +166,7 @@ pub struct ScriptHost {
     actions: InputActions,
     current_time: ScriptTime,
     physics: Rc<RefCell<PhysicsScriptState>>,
+    cursor: ScriptCursor,
 }
 
 #[derive(Clone, Copy)]
@@ -319,6 +321,7 @@ impl ScriptHost {
             actions,
             current_time: ScriptTime::default(),
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
+            cursor: ScriptCursor::default(),
         };
         let mut classes: HashMap<String, (Table, Option<ParamSchema>)> = HashMap::new();
 
@@ -347,6 +350,7 @@ impl ScriptHost {
                         queued_audio: host.audio_requests.len(),
                         physics: host.physics.clone(),
                         physics_phase_dt: None,
+                        cursor: host.cursor,
                     });
                     let _active_call = ActiveCallGuard::new(
                         &host.lua,
@@ -423,6 +427,7 @@ impl ScriptHost {
                         queued_audio: host.audio_requests.len(),
                         physics: host.physics.clone(),
                         physics_phase_dt: None,
+                        cursor: host.cursor,
                     });
                     let result = AbiScriptInstance::create(
                         descriptor,
@@ -475,6 +480,16 @@ impl ScriptHost {
     /// Replaces the input snapshot used by the next update and its lifecycle callbacks.
     pub fn set_input(&mut self, input: ScriptInput) {
         self.actions.set_input(input);
+    }
+
+    /// Returns the cursor state applied by the last successful script commit or `set_cursor`.
+    pub fn cursor(&self) -> ScriptCursor {
+        self.cursor
+    }
+
+    /// Sets the initial cursor state before scripts start, for example from the active camera.
+    pub fn set_cursor(&mut self, cursor: ScriptCursor) {
+        self.cursor = cursor;
     }
 
     /// Attaches the current immutable physics query snapshot and scene-body mapping.
@@ -627,6 +642,7 @@ impl ScriptHost {
             queued_audio: self.audio_requests.len(),
             physics: self.physics.clone(),
             physics_phase_dt: None,
+            cursor: self.cursor,
         });
         let transaction_ptr = &mut self.transaction as *mut ScriptTransaction;
         let result: Result<Option<String>, (String, bool)> = {
@@ -704,7 +720,10 @@ impl ScriptHost {
             &self.events,
             &mut self.audio_requests,
         ) {
-            Ok(mutations) => mutations,
+            Ok(mutations) => {
+                self.cursor = self.transaction.cursor();
+                mutations
+            }
             Err(message) => {
                 self.events.borrow_mut().push(ScriptEvent {
                     level: ScriptEventLevel::Error,
@@ -948,6 +967,7 @@ impl ScriptHost {
             commands,
             commands_generation,
             physics,
+            cursor,
             ..
         } = self;
         let instance = &mut instances[index];
@@ -969,6 +989,7 @@ impl ScriptHost {
                 Phase::Update(dt) => Some(dt),
                 _ => None,
             },
+            cursor: *cursor,
         });
         let transaction_ptr = transaction as *mut ScriptTransaction;
         let callback_result: Result<Option<ScriptTransform>, String> = match &mut instance.kind {
@@ -1126,6 +1147,8 @@ impl ScriptHost {
             (*transaction_ptr).commit(world, queued_messages, queued_bytes, events, audio_requests)
         } {
             Ok(mutations) => {
+                // SAFETY: commit returned, so no call-scoped borrow of the transaction remains.
+                *cursor = unsafe { (*transaction_ptr).cursor() };
                 actions.queue_mutations(mutations);
                 CallOutcome::Committed
             }

@@ -588,8 +588,10 @@ mod tests {
     }
 
     #[test]
-    fn sdk_marker_rejects_pre_v6_abi_versions() {
-        for abi_version in [3, 4, 5] {
+    fn sdk_marker_rejects_pre_current_abi_versions() {
+        for abi_version in
+            rve_sdk::abi::RVE_SCRIPT_ABI_MIN_VERSION..rve_sdk::abi::RVE_SCRIPT_ABI_VERSION
+        {
             let root = temp_dir("rve-sdk-legacy-abi");
             fs::write(
                 root.path().join("rve-sdk.toml"),
