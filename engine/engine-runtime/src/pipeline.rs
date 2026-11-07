@@ -74,7 +74,7 @@ pub(crate) struct FrameSnapshot {
     pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
     pub particles: Vec<ParticleEmitterFrame>,
-    /// ÐÐ³ÑÐ¾Ð²Ð¾Ðµ Ð²ÑÐµÐ¼Ñ ÑÐºÑÐ¸Ð¿ÑÐ¾Ð²Ð¾Ð³Ð¾ Ð¿Ð¾ÑÐ¾ÐºÐ° Ð½Ð° Ð¼Ð¾Ð¼ÐµÐ½Ñ ÑÐ½Ð¸Ð¼ÐºÐ°; Ð¾ÑÐ½Ð¾Ð²Ð° ÑÐ°Ð³Ð° ÑÐ¸Ð¼ÑÐ»ÑÑÐ¸Ð¸ ÑÐ°ÑÑÐ¸Ñ.
+    /// Игровое время скриптового потока на момент снимка; основа шага симуляции частиц.
     pub sim_time: f64,
     object_motion: HashMap<ObjectHandle, ObjectMotion>,
 }
@@ -112,7 +112,7 @@ pub(crate) enum EnvironmentCacheKey {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GpuSceneTable {
     pub by_object: HashMap<ObjectHandle, Vec<Vec<(MeshId, MaterialId)>>>,
-    /// Ð­Ð¼Ð¸ÑÑÐµÑÑ ÑÐ°ÑÑÐ¸Ñ Ð¿Ð¾ Ð¾Ð±ÑÐµÐºÑÐ°Ð¼ ÑÑÐµÐ½Ñ; ÑÐ¾Ð·Ð´Ð°ÑÑÑÑ Ð¿ÑÐ¸ Ð·Ð°Ð³ÑÑÐ·ÐºÐµ ÑÑÐµÐ½Ñ.
+    /// Эмиттеры частиц по объектам сцены; создаются при загрузке сцены.
     pub particles: HashMap<ObjectHandle, ParticleEmitterId>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
 }
@@ -325,7 +325,7 @@ pub(crate) struct VulkanBackend {
     debug_view: DebugView,
     current_environment: Option<(EnvironmentCacheKey, EnvironmentId)>,
     pipeline_cache_path: Option<std::path::PathBuf>,
-    /// ÐÐ³ÑÐ¾Ð²Ð¾Ðµ Ð²ÑÐµÐ¼Ñ Ð¿Ð¾ÑÐ»ÐµÐ´Ð½ÐµÐ³Ð¾ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ ÐºÐ°Ð´ÑÐ°: ÑÐ°Ð³ ÑÐ°ÑÑÐ¸Ñ ÑÑÐ¸ÑÐ°ÐµÑÑÑ Ð¾Ñ Ð½ÐµÐ³Ð¾.
+    /// Игровое время последнего отправленного кадра: шаг частиц считается от него.
     last_submitted_sim_time: Option<f64>,
     #[cfg(feature = "dev-console")]
     console_ui: Option<Arc<ConsoleUiSlot>>,
@@ -499,7 +499,7 @@ impl RenderBackend for VulkanBackend {
             .renderer
             .render_frame_with_outcome(&frame)
             .map_err(|error| error.to_string())?;
-        // Ð¡Ð¾ÑÑÐ¾ÑÐ½Ð¸Ðµ ÑÐ°ÑÑÐ¸Ñ ÑÑÐ¸ÑÐ°ÐµÑÑÑ Ð¿ÑÐ¾Ð´Ð²Ð¸Ð½ÑÑÑÐ¼ ÑÐ¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ ÐºÐ°Ð´ÑÐ°.
+        // Состояние частиц считается продвинутым только для отправленного кадра.
         if outcome.submitted {
             self.last_submitted_sim_time = Some(snapshot.sim_time);
         }
@@ -1300,8 +1300,8 @@ fn make_snapshot(
     })
 }
 
-/// Ð¨Ð°Ð³ ÑÐ¸Ð¼ÑÐ»ÑÑÐ¸Ð¸ ÑÐ°ÑÑÐ¸Ñ: ÑÐºÐ¾Ð»ÑÐºÐ¾ Ð¸Ð³ÑÐ¾Ð²Ð¾Ð³Ð¾ Ð²ÑÐµÐ¼ÐµÐ½Ð¸ Ð¿ÑÐ¾ÑÐ»Ð¾ Ñ Ð¿Ð¾ÑÐ»ÐµÐ´Ð½ÐµÐ³Ð¾ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ ÐºÐ°Ð´ÑÐ°.
-/// ÐÐµÑÐ²ÑÐ¹ ÐºÐ°Ð´Ñ ÑÐ°Ð³Ð° Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐ°ÐµÑ, ÑÑÐ¾Ð±Ñ Ð²ÑÐµÐ¼Ñ Ð·Ð°Ð³ÑÑÐ·ÐºÐ¸ Ð½Ðµ Ð¿ÑÐµÐ²ÑÐ°ÑÐ¸Ð»Ð¾ÑÑ Ð² ÑÐºÐ°ÑÐ¾Ðº.
+/// Шаг симуляции частиц: сколько игрового времени прошло с последнего отправленного кадра.
+/// Первый кадр шага не получает, чтобы время загрузки не превратилось в скачок.
 fn particle_step(sim_time: f64, last_submitted: Option<f64>) -> f32 {
     last_submitted.map_or(0.0, |last| (sim_time - last).max(0.0) as f32)
 }

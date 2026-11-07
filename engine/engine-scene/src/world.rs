@@ -148,7 +148,7 @@ pub struct MeshInstance {
     pub model: Mat4,
 }
 
-/// Ð­Ð¼Ð¸ÑÑÐµÑ ÑÐ°ÑÑÐ¸Ñ Ð¾Ð±ÑÐµÐºÑÐ° Ñ Ð¼Ð¸ÑÐ¾Ð²Ð¾Ð¹ Ð¼Ð°ÑÑÐ¸ÑÐµÐ¹ Ð½Ð° ÑÐµÐºÑÑÐ¸Ð¹ ÐºÐ°Ð´Ñ.
+/// Эмиттер частиц объекта с мировой матрицей на текущий кадр.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ParticleEmitterInstance {
     pub object: ObjectHandle,
@@ -164,7 +164,7 @@ pub struct SceneFrame {
     pub local_lights: Vec<LocalLightState>,
     pub environment: Option<EnvironmentState>,
     pub meshes: Vec<MeshInstance>,
-    /// Ð­Ð¼Ð¸ÑÑÐµÑÑ ÑÐ°ÑÑÐ¸Ñ Ð² Ð¿Ð¾ÑÑÐ´ÐºÐµ Ð¾Ð±ÑÐµÐºÑÐ¾Ð² ÑÑÐµÐ½Ñ.
+    /// Эмиттеры частиц в порядке объектов сцены.
     pub particle_emitters: Vec<ParticleEmitterInstance>,
 }
 
@@ -400,7 +400,7 @@ impl World {
         self.object(handle)?.audio_source.as_ref()
     }
 
-    /// Ð­Ð¼Ð¸ÑÑÐµÑ ÑÐ°ÑÑÐ¸Ñ Ð¾Ð±ÑÐµÐºÑÐ°, ÐµÑÐ»Ð¸ Ñ Ð½ÐµÐ³Ð¾ ÐµÑÑÑ `particle_emitter`.
+    /// Эмиттер частиц объекта, если у него есть `particle_emitter`.
     pub fn particle_emitter(&self, handle: ObjectHandle) -> Option<&ParticleEmitterComponent> {
         self.object(handle)?.particle_emitter.as_ref()
     }

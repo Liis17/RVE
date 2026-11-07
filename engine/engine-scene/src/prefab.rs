@@ -296,7 +296,7 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
         let target = object
             .particle_emitter
             .as_mut()
-            .ok_or("override particle_emitter: Ñ Ð¾Ð±ÑÐµÐºÑÐ° Ð½ÐµÑ particle_emitter")?;
+            .ok_or("override particle_emitter: у объекта нет particle_emitter")?;
         *target = emitter.clone();
     }
     if let Some(environment) = &change.environment {

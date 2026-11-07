@@ -173,7 +173,7 @@ impl Component {
             ComponentKind::AudioSource => Self::AudioSource(AudioSourceComponent::with_clip(
                 object.audio_source.as_ref()?.clip.clone(),
             )),
-            // Ð¢ÐµÐºÑÑÑÑÐ° ÑÐ¾ÑÑÐ°Ð½ÑÐµÑÑÑ Ð¿Ð¾ ÑÐ¾Ð¹ Ð¶Ðµ Ð¿ÑÐ¸ÑÐ¸Ð½Ðµ, ÑÑÐ¾ Ð¸ ÐºÐ»Ð¸Ð¿ Ð·Ð²ÑÐºÐ°.
+            // Текстура сохраняется по той же причине, что и клип звука.
             ComponentKind::ParticleEmitter => Self::ParticleEmitter(ParticleEmitterComponent {
                 texture: object.particle_emitter.as_ref()?.texture.clone(),
                 ..ParticleEmitterComponent::default()

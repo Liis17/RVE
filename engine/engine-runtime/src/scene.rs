@@ -35,7 +35,7 @@ pub(crate) struct PreparedRenderAssets {
     pub particles: Vec<ParticleObject>,
 }
 
-/// Ð­Ð¼Ð¸ÑÑÐµÑ ÑÐ°ÑÑÐ¸Ñ Ð¾Ð±ÑÐµÐºÑÐ°: Ð¿Ð°ÑÐ°Ð¼ÐµÑÑÑ ÑÑÐµÐ½Ñ Ð¸ Ð¿ÑÑÑ ÑÐµÐºÑÑÑÑÑ, ÑÐ¶Ðµ Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½Ð½Ð¾Ð¹ Ð² `textures`.
+/// Эмиттер частиц объекта: параметры сцены и путь текстуры, уже загруженной в `textures`.
 pub(crate) struct ParticleObject {
     pub object: ObjectHandle,
     pub emitter: ParticleEmitterComponent,
@@ -510,7 +510,7 @@ pub(crate) fn upload_scene(
         let texture = match &particle.texture {
             Some(path) => {
                 let data = assets.textures.get(path).ok_or(RenderError::InvalidState(
-                    "CPU-ÑÐµÐºÑÑÑÑÐ° ÑÐ°ÑÑÐ¸Ñ Ð¾ÑÑÑÑÑÑÐ²ÑÐµÑ Ð² ÑÐ°Ð±Ð»Ð¸ÑÐµ GPU-ÑÐµÑÑÑÑÐ¾Ð²",
+                    "CPU-текстура частиц отсутствует в таблице GPU-ресурсов",
                 ))?;
                 Some(get_or_insert_texture(
                     &mut texture_cache.scene,
@@ -534,7 +534,7 @@ pub(crate) fn upload_scene(
     Ok(table)
 }
 
-/// ÐÐµÑÐµÐ²Ð¾Ð´Ð¸Ñ ÐºÐ¾Ð¼Ð¿Ð¾Ð½ÐµÐ½Ñ ÑÑÐµÐ½Ñ Ð² Ð¾Ð¿Ð¸ÑÐ°Ð½Ð¸Ðµ ÑÐ¼Ð¸ÑÑÐµÑÐ° `engine-render`; Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° Ð´Ð¸Ð°Ð¿Ð°Ð·Ð¾Ð½Ð¾Ð² â Ð² engine-scene.
+/// Переводит компонент сцены в описание эмиттера `engine-render`; проверка диапазонов — в engine-scene.
 fn particle_emitter_desc(
     component: &ParticleEmitterComponent,
     texture: Option<TextureId>,

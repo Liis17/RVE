@@ -2900,7 +2900,7 @@ impl Renderer {
         let particle_pipelines = self.particle_pipelines();
         let mut particle_works = Vec::with_capacity(rendered.len());
         for entry in &rendered {
-            // ÐÐ¸Ð´ Ð±ÐµÐ· ÑÐµÐ»Ð¸ Ð½Ðµ Ð·Ð°Ð¿Ð¸ÑÑÐ²Ð°ÐµÑÑÑ: ÐµÐ¼Ñ Ð½Ðµ Ð¾ÑÐ´Ð°ÑÐ¼ Ð¿Ð»Ð°Ð½ Ð¸ Ð½Ðµ ÐºÐ¾Ð¼Ð¼Ð¸ÑÐ¸Ð¼ ÑÐ¾ÑÑÐ¾ÑÐ½Ð¸Ðµ.
+            // Вид без цели не записывается: ему не отдаём план и не коммитим состояние.
             let has_target = self
                 .viewports
                 .get(entry.0.0)
@@ -9708,7 +9708,7 @@ fn record_scene(
         ),
     );
     target.velocity_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-    // Ð§Ð°ÑÑÐ¸ÑÑ Ð¼Ð¾Ð³Ð»Ð¸ Ð¾ÑÑÐ°Ð²Ð¸ÑÑ depth Ð² read-only: Ð¸ÑÑÐ¾ÑÐ½Ð¸Ðº Ð±Ð°ÑÑÐµÑÐ° Ð·Ð°Ð²Ð¸ÑÐ¸Ñ Ð¾Ñ ÑÐµÐºÑÑÐµÐ³Ð¾ layout.
+    // Частицы могли оставить depth в read-only: источник барьера зависит от текущего layout.
     let depth_source = particle_depth_source_masks(target.depth_layout);
     pipeline_barrier(
         device,

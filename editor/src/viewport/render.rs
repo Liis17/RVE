@@ -799,7 +799,7 @@ impl SceneRenderer {
             overlay: &[],
             debug_view,
             reset_history: self.motion_history.reset_pending,
-            // Ð¡Ð¸Ð¼ÑÐ»Ð¸ÑÑÐµÑ Ð²Ð¸Ð´, ÐºÐ¾ÑÐ¾ÑÑÐ¹ Ð¿Ð¾ÐºÐ°Ð·ÑÐ²Ð°ÐµÑ Ð¸Ð³ÑÑ: Scene Ð² ÑÐµÐ´Ð°ÐºÑÐ¸ÑÐ¾Ð²Ð°Ð½Ð¸Ð¸, Game Ð²Ð¾ Ð²ÑÐµÐ¼Ñ Play.
+            // Симулирует вид, который показывает игру: Scene в редактировании, Game во время Play.
             particles: &self.particle_frames,
             particle_step: if with_grid != self.playing {
                 self.particle_step
