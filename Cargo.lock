@@ -2541,13 +2541,14 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "egui-winit",
  "egui_dock",
  "engine-assets",
  "engine-console",
+ "engine-core",
  "engine-files",
  "engine-physics",
  "engine-platform",

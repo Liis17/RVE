@@ -1,5 +1,9 @@
 //! Графический редактор игровых сцен и ресурсов RVE.
 
+/// Версия редактора, заданная в `Cargo.toml`.
+#[allow(dead_code)]
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod app;
 mod asset_watch;
 mod assets_fs;
@@ -14,6 +18,7 @@ mod layout;
 mod new_project;
 mod play;
 mod previews;
+mod profile;
 mod project;
 mod scene_edit;
 mod settings;

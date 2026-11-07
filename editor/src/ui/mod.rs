@@ -5,6 +5,7 @@ mod debug_view;
 pub mod game_view;
 pub mod hierarchy;
 pub mod inspector;
+pub mod profiler;
 pub mod project_panel;
 pub mod scene_view;
 pub mod toolbar;
