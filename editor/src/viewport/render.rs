@@ -28,6 +28,7 @@ use engine_scene::{
 };
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -150,6 +151,17 @@ struct EditorParticleEmitter {
     component: ParticleEmitterComponent,
     texture: Option<String>,
     texture_id: Option<TextureId>,
+}
+
+/// Создаёт значение через `create` и вставляет его в `entries` вместо прежнего. Возвращает прежнее значение,
+/// которое вызывающий уничтожает уже после успешного создания; при ошибке `entries` не меняется.
+fn replace_entry<K: Eq + Hash, V, E>(
+    entries: &mut HashMap<K, V>,
+    key: K,
+    create: impl FnOnce() -> Result<V, E>,
+) -> Result<Option<V>, E> {
+    let value = create()?;
+    Ok(entries.insert(key, value))
 }
 
 /// Переводит компонент сцены в описание эмиттера `engine-render`. Совпадает с сопоставлением в engine-runtime.
@@ -835,6 +847,8 @@ impl SceneRenderer {
         world: &World,
         frame: &SceneFrame,
     ) -> Result<(), RenderError> {
+        // Старые ссылки на эмиттеры могут уйти на замену; при ошибке кадр не должен их использовать.
+        self.particle_frames.clear();
         let now = Instant::now();
         self.particle_step = self
             .particle_clock
@@ -872,20 +886,24 @@ impl SceneRenderer {
                         || entry.texture_id != texture
                 });
             if stale {
-                if let Some(old) = self.particle_emitters.remove(&instance.object) {
+                // Новый эмиттер создаётся до уничтожения старого: при ошибке старый остаётся рабочим.
+                let previous = replace_entry(
+                    &mut self.particle_emitters,
+                    instance.object,
+                    || -> Result<EditorParticleEmitter, RenderError> {
+                        let id = renderer
+                            .create_particle_emitter(editor_particle_desc(component, texture))?;
+                        Ok(EditorParticleEmitter {
+                            id,
+                            component: component.clone(),
+                            texture: texture_path,
+                            texture_id: texture,
+                        })
+                    },
+                )?;
+                if let Some(old) = previous {
                     renderer.destroy_particle_emitter(old.id)?;
                 }
-                let id =
-                    renderer.create_particle_emitter(editor_particle_desc(component, texture))?;
-                self.particle_emitters.insert(
-                    instance.object,
-                    EditorParticleEmitter {
-                        id,
-                        component: component.clone(),
-                        texture: texture_path,
-                        texture_id: texture,
-                    },
-                );
             }
             if let Some(entry) = self.particle_emitters.get(&instance.object) {
                 frames.push(ParticleEmitterFrame {
@@ -2258,5 +2276,30 @@ range = 10
         history.begin_frame(main_camera, true);
         assert!(history.reset_pending);
         assert_eq!(history.previous_model(mesh), None);
+    }
+
+    #[test]
+    fn failed_particle_replacement_keeps_previous_entry() {
+        let mut entries = HashMap::from([(1u32, "old")]);
+        let result: Result<Option<&str>, &str> =
+            replace_entry(&mut entries, 1, || Err("create failed"));
+        assert_eq!(result, Err("create failed"));
+        assert_eq!(entries.get(&1), Some(&"old"));
+    }
+
+    #[test]
+    fn successful_particle_replacement_returns_previous_for_destruction() {
+        let mut entries = HashMap::from([(1u32, "old")]);
+        let previous = replace_entry::<_, _, ()>(&mut entries, 1, || Ok("new")).unwrap();
+        assert_eq!(previous, Some("old"));
+        assert_eq!(entries.get(&1), Some(&"new"));
+    }
+
+    #[test]
+    fn first_particle_creation_has_no_previous_entry() {
+        let mut entries = HashMap::new();
+        let previous = replace_entry::<u32, &str, ()>(&mut entries, 7, || Ok("new")).unwrap();
+        assert_eq!(previous, None);
+        assert_eq!(entries.get(&7), Some(&"new"));
     }
 }
