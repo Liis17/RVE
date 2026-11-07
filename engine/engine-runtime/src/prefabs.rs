@@ -785,13 +785,13 @@ pub(crate) fn load_prefab(
     };
     let path = VirtualPath::parse(&token.path)
         .map_err(|_| LoadError::Failed(format!("некорректный путь префаба {:?}", token.path)))?;
-    let template = load_prefab_template(resources, &path).map_err(&classify)?;
+    let template = load_prefab_template(resources, &path).map_err(classify)?;
     template
         .check_spawnable()
         .map_err(|error| LoadError::Failed(error.to_string()))?;
     let assets = Assets::with_resources(resources.clone());
     let prepared = prepare_template(resources, &assets, &token.path, &template, &interrupted)
-        .map_err(&classify)?;
+        .map_err(classify)?;
     if interrupted() {
         return Err(LoadError::Interrupted);
     }
