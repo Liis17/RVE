@@ -27,6 +27,8 @@ const LINE_GAP: f32 = 4.0;
 const SECTION_GAP: f32 = 10.0;
 const GRAPH_WIDTH: f32 = 240.0;
 const GRAPH_HEIGHT: f32 = 40.0;
+/// Зазор между столбцами профиля: CPU-фазы слева, GPU-проходы справа.
+const PROFILE_COLUMN_GAP: f32 = 24.0;
 
 const PANEL_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.6];
 const TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -383,25 +385,43 @@ fn build_panel(out: &mut Vec<OverlayVertex>, metrics: &Metrics, cpu_name: &str, 
     layout.text(gpu_name, TEXT_SCALE);
     layout.graph(&metrics.gpu, 100.0, GPU_COLOR);
 
-    layout.text("CPU phases, ms", TEXT_SCALE);
+    // Профиль в два столбца: иначе с одним столбцом панель выше окна 1280×720.
+    let top = layout.y;
+    let mut cpu = Layout {
+        out: &mut *layout.out,
+        left,
+        y: top,
+        right: left,
+    };
+    cpu.text("CPU phases, ms", TEXT_SCALE);
     for (row, label) in CPU_PHASE_LABELS.iter().enumerate() {
-        layout.text(
+        cpu.text(
             &profile_text(label, metrics.latest_profile[row]),
             TEXT_SCALE,
         );
     }
-    layout.text("GPU passes, ms", TEXT_SCALE);
+    let gpu_left = cpu.right + PROFILE_COLUMN_GAP;
+    let mut gpu = Layout {
+        out: &mut *cpu.out,
+        left: gpu_left,
+        y: top,
+        right: gpu_left,
+    };
+    gpu.text("GPU passes, ms", TEXT_SCALE);
     for (pass, label) in GpuPass::ALL.iter().map(|pass| pass.label()).enumerate() {
         let row = CPU_PHASE_LABELS.len() + pass;
-        layout.text(
+        gpu.text(
             &profile_text(label, metrics.latest_profile[row]),
             TEXT_SCALE,
         );
     }
-    layout.text(
+    gpu.text(
         &profile_text("total", metrics.latest_profile[GPU_TOTAL_ROW]),
         TEXT_SCALE,
     );
+    let (profile_bottom, profile_right) = (cpu.y.max(gpu.y), gpu.right.max(cpu.right));
+    layout.y = profile_bottom;
+    layout.right = layout.right.max(profile_right);
 
     let width = layout.right + PADDING - MARGIN;
     let height = layout.y - SECTION_GAP + PADDING - MARGIN;
@@ -748,6 +768,40 @@ mod tests {
         }
         // Фон полупрозрачный чёрный и рисуется первым.
         assert_eq!(vertices[0].color, [0.0, 0.0, 0.0, 0.6]);
+    }
+
+    #[test]
+    fn panel_fits_default_window_size() {
+        const DEFAULT_WINDOW: [f32; 2] = [1280.0, 720.0];
+        let start = Instant::now();
+        let mut metrics = Metrics::new(start);
+        for step in 1..=10 {
+            metrics.add_gpu_time(Duration::from_millis(step as u64));
+            metrics.sample(
+                start + SAMPLE_INTERVAL * step,
+                Some(u64::from(step) << 20),
+                Some(50.0),
+            );
+        }
+        let mut vertices = Vec::new();
+        build_panel(
+            &mut vertices,
+            &metrics,
+            &"C".repeat(MAX_NAME_CHARS),
+            &"G".repeat(MAX_NAME_CHARS),
+        );
+
+        let panel = quads(&vertices)[0];
+        assert!(
+            panel[1] + panel[3] <= DEFAULT_WINDOW[1] - MARGIN,
+            "нижняя граница панели {} выше окна",
+            panel[1] + panel[3]
+        );
+        assert!(
+            panel[0] + panel[2] <= DEFAULT_WINDOW[0] - MARGIN,
+            "правая граница панели {} шире окна",
+            panel[0] + panel[2]
+        );
     }
 
     #[test]
