@@ -521,6 +521,9 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.audio_source.is_some() {
         base.audio_source = outer.audio_source.clone();
     }
+    if outer.animator.is_some() {
+        base.animator = outer.animator.clone();
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -556,6 +559,7 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.rigid_body.is_none()
         && change.character_controller.is_none()
         && change.audio_source.is_none()
+        && change.animator.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -659,6 +663,11 @@ pub(crate) fn object_override(
     match (&base.audio_source, &edited.audio_source) {
         (None, None) => {}
         (Some(from), Some(to)) => change.audio_source = (to != from).then(|| to.clone()),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.animator, &edited.animator) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.animator = (to != from).then(|| to.clone()),
         _ => return Err(COMPONENTS.to_owned()),
     }
     if base.lite_scripts.len() != edited.lite_scripts.len()
@@ -806,6 +815,7 @@ pub enum OverrideField {
     RigidBody,
     CharacterController,
     AudioSource,
+    Animator,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -837,6 +847,7 @@ impl EditorScene {
             OverrideField::RigidBody => change.rigid_body.is_some(),
             OverrideField::CharacterController => change.character_controller.is_some(),
             OverrideField::AudioSource => change.audio_source.is_some(),
+            OverrideField::Animator => change.animator.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -880,6 +891,7 @@ impl EditorScene {
                     OverrideField::RigidBody => change.rigid_body = None,
                     OverrideField::CharacterController => change.character_controller = None,
                     OverrideField::AudioSource => change.audio_source = None,
+                    OverrideField::Animator => change.animator = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }
@@ -1008,6 +1020,9 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
     }
     if let Some(audio) = &change.audio_source {
         paths.push(audio.clip.clone());
+    }
+    if let Some(animator) = &change.animator {
+        paths.extend(animator.clips.iter().cloned());
     }
     paths
 }
@@ -1432,6 +1447,49 @@ mod tests {
             .unwrap();
         assert_eq!(audio.clip, path("/audio/hum.wav"));
         assert_eq!(audio.volume, 0.4);
+    }
+
+    #[test]
+    fn animator_prefab_override_replaces_the_component_registers_its_clips_and_reverts() {
+        let prefab = "[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anim/walk.fbx\"\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n[objects.animator]\nclips = [\"/anim/walk.fbx\"]\nspeed = 1.0\n";
+        let files = Files::with(&[("prefabs/hero.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/hero.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        scene
+            .edit_object("hero", None, |object| {
+                let animator = object.animator.as_mut().unwrap();
+                animator.speed = 2.0;
+                animator.clips.push(path("/anim/run.fbx"));
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(scene.is_overridden("hero", &OverrideField::Animator));
+        assert_eq!(
+            scene.object_override("hero").unwrap().animator,
+            scene.object("hero").unwrap().animator
+        );
+        assert!(
+            scene
+                .view()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/anim/run.fbx")),
+            "клип override объявляется в документе экземпляра"
+        );
+
+        scene
+            .revert_field("hero", &OverrideField::Animator)
+            .unwrap();
+        assert!(!scene.is_overridden("hero", &OverrideField::Animator));
+        let animator = scene.object("hero").unwrap().animator.clone().unwrap();
+        assert_eq!(animator.speed, 1.0);
+        assert_eq!(animator.clips, vec![path("/anim/walk.fbx")]);
     }
 
     #[test]

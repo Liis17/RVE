@@ -3,16 +3,20 @@
 use crate::asset_watch::AssetChanges;
 use crate::console::ConsoleLog;
 use crate::project::OpenProject;
+use crate::viewport::animation::{
+    AnimationPreview, EditorAnimation, PreviewStatus, project_preview_bridge,
+};
 use crate::viewport::model_loader::ModelLoader;
-use engine_assets::{Model, ModelAlphaMode};
+use engine_animation::AnimationBridge;
+use engine_assets::{Assets, Model, ModelAlphaMode};
 use engine_files::VirtualPath;
 use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, LocalLight, LocalLightShadow,
     LocalLightShadowMatrices, Material, MaterialId, MeshId, ProceduralSky, RenderError, Renderer,
-    SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex,
-    ViewSettings, ViewportId,
+    SHADOW_MAP_RESOLUTION, SkinBinding, SkinId, SkinVertex, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
@@ -34,6 +38,16 @@ const GRID_LINE_WIDTH: f32 = 0.02;
 struct GpuModel {
     meshes: Vec<(MeshId, Material, MaterialId)>,
     textures: Vec<TextureId>,
+    /// Меши созданы со скином: модель имеет скелет.
+    skinned: bool,
+}
+
+/// Экземпляры скиннинга объекта с `animator`: путь модели, её меши и по экземпляру на меш.
+/// Типы параметризованы, чтобы планирование синхронизации тестировалось без GPU.
+struct SkinnedObject<M = MeshId, S = SkinId> {
+    model: String,
+    mesh_ids: Vec<M>,
+    instances: Vec<S>,
 }
 
 /// GPU-ресурсы вьюпорта. Модели и текстуры кэшируются по virtual path; ошибка загрузки
@@ -54,6 +68,10 @@ pub struct SceneRenderer {
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
     motion_history: MotionHistory,
+    /// Скиннинг аниматоров сцены по объектам.
+    skins: HashMap<ObjectHandle, SkinnedObject>,
+    /// Мост редактора для превью и отпечаток его аниматоров.
+    animation: EditorAnimation,
 }
 
 #[derive(Default)]
@@ -153,6 +171,8 @@ impl SceneRenderer {
             scene_draws: Vec::new(),
             game_draws: Vec::new(),
             motion_history: MotionHistory::default(),
+            skins: HashMap::new(),
+            animation: EditorAnimation::default(),
         })
     }
 
@@ -169,6 +189,7 @@ impl SceneRenderer {
         self.model_dependencies.clear();
         self.failed_reloads.clear();
         self.failed_environment = None;
+        self.release_skins(renderer)?;
         for model in self.models.drain().filter_map(|(_, model)| model) {
             destroy_model(renderer, model)?;
         }
@@ -194,7 +215,12 @@ impl SceneRenderer {
         log: &mut ConsoleLog,
     ) -> Result<(), RenderError> {
         let mut active_environments = HashSet::new();
-        for (path, loaded) in loader.finished() {
+        let finished = loader.finished();
+        if !finished.is_empty() {
+            // Экземпляры ссылаются на меши, которые сейчас могут быть заменены: освобождаем их заранее.
+            self.release_skins(renderer)?;
+        }
+        for (path, loaded) in finished {
             let previous = self.models.remove(&path).flatten();
             let had_previous = previous.is_some();
             match loaded {
@@ -558,6 +584,7 @@ impl SceneRenderer {
     }
 
     /// Строит отдельные draw lists для Scene и Game; сетка добавляется только в Scene.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_draws(
         &mut self,
         renderer: &mut Renderer,
@@ -566,15 +593,19 @@ impl SceneRenderer {
         scene_eye: Vec3,
         game_eye: Vec3,
         grid_camera_distance: Option<f32>,
+        play_bridge: Option<&AnimationBridge>,
     ) -> Result<(), RenderError> {
         self.scene_draws.clear();
         self.game_draws.clear();
+        let palette_index = palette_indices(&self.skins, play_bridge.or(self.animation.bridge()));
         let used_object_materials = {
             let mut resources = DrawResources {
                 models: &self.models,
                 textures: &self.textures,
                 object_materials: &mut self.object_materials,
                 used_object_materials: HashSet::new(),
+                skins: &self.skins,
+                palette_index: &palette_index,
             };
             append_world_draws(
                 renderer,
@@ -641,6 +672,91 @@ impl SceneRenderer {
         Ok(())
     }
 
+    /// Освобождает все экземпляры скиннинга; вызывается перед заменой или сбросом моделей.
+    fn release_skins(&mut self, renderer: &mut Renderer) -> Result<(), RenderError> {
+        for (_, skin) in self.skins.drain() {
+            release_skin(renderer, skin)?;
+        }
+        Ok(())
+    }
+
+    /// Продвигает мост превью редактора, применяет превью выбранного объекта и синхронизирует
+    /// скиннинг. Во время Play время ведёт сессия, и этот метод не вызывается.
+    pub fn sync_animation(
+        &mut self,
+        renderer: &mut Renderer,
+        assets: &Assets,
+        world: &World,
+        preview: Option<(ObjectHandle, &mut AnimationPreview)>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), RenderError> {
+        let dt = self.animation.frame_seconds();
+        self.animation
+            .advance(world, dt, preview, warnings, |world| {
+                project_preview_bridge(world, assets)
+            });
+        self.sync_skins(renderer, world)
+    }
+
+    /// Сведения превью объекта для инспектора.
+    pub fn preview_status(&self, object: ObjectHandle, motion: Option<&str>) -> PreviewStatus {
+        self.animation.status(object, motion)
+    }
+
+    /// Приводит экземпляры скиннинга к аниматорам мира: объект с аниматором и скелетной моделью
+    /// получает экземпляр на каждую часть меша. Удаление аниматора или объекта, смена модели и
+    /// Undo/Redo проходят через это же планирование.
+    pub fn sync_skins(
+        &mut self,
+        renderer: &mut Renderer,
+        world: &World,
+    ) -> Result<(), RenderError> {
+        let mut wanted: HashMap<ObjectHandle, (String, Vec<MeshId>)> = HashMap::new();
+        for object in world.objects() {
+            let (Some(_), Some(mesh)) = (&object.animator, &object.mesh_renderer) else {
+                continue;
+            };
+            let path = mesh.model.as_str();
+            let Some(Some(model)) = self.models.get(path) else {
+                continue;
+            };
+            if !model.skinned {
+                continue;
+            }
+            let mesh_ids = model.meshes.iter().map(|(id, _, _)| *id).collect();
+            wanted.insert(object.handle, (path.to_owned(), mesh_ids));
+        }
+        let plan = plan_skin_sync(&self.skins, &wanted);
+        for object in plan.release {
+            if let Some(skin) = self.skins.remove(&object) {
+                release_skin(renderer, skin)?;
+            }
+        }
+        for object in plan.create {
+            let Some((model, mesh_ids)) = wanted.remove(&object) else {
+                continue;
+            };
+            let skin = create_skin(renderer, model, mesh_ids)?;
+            self.skins.insert(object, skin);
+        }
+        Ok(())
+    }
+
+    /// Палитры кадра в порядке, который использует `SkinBinding::palette`. Мост — активный
+    /// мост Play, иначе мост редактора.
+    pub fn joint_palette_refs<'b>(
+        &'b self,
+        play_bridge: Option<&'b AnimationBridge>,
+    ) -> Vec<&'b [[[f32; 4]; 4]]> {
+        let Some(bridge) = play_bridge.or(self.animation.bridge()) else {
+            return Vec::new();
+        };
+        palette_objects(&self.skins, bridge)
+            .into_iter()
+            .filter_map(|object| bridge.palette(object))
+            .collect()
+    }
+
     pub fn begin_motion_frame(&mut self, game_camera: ObjectHandle, playing: bool) {
         self.motion_history.begin_frame(game_camera, playing);
     }
@@ -663,13 +779,14 @@ impl SceneRenderer {
         scene_has_light: bool,
         environment_state: Option<&EnvironmentState>,
         shadow_cascades: &'a [[[f32; 4]; 4]],
+        joint_palettes: &'a [&'a [[[f32; 4]; 4]]],
         with_grid: bool,
         debug_view: DebugView,
     ) -> Frame<'a> {
         let light = frame_light(light, scene_has_light);
         let environment = self.frame_environment(environment_state);
         Frame {
-            joint_palettes: &[],
+            joint_palettes,
             clear_color: [
                 settings.render.clear_color[0],
                 settings.render.clear_color[1],
@@ -891,6 +1008,9 @@ struct DrawResources<'a> {
     textures: &'a HashMap<(String, TextureColorSpace), Option<TextureId>>,
     object_materials: &'a mut HashMap<(ObjectHandle, String, usize, usize), (Material, MaterialId)>,
     used_object_materials: HashSet<(ObjectHandle, String, usize, usize)>,
+    /// Экземпляры скиннинга и индексы палитр кадра по объекту.
+    skins: &'a HashMap<ObjectHandle, SkinnedObject>,
+    palette_index: &'a HashMap<ObjectHandle, u32>,
 }
 
 // Both viewports can reference the same model with different LOD textures in one frame.
@@ -1002,6 +1122,18 @@ fn append_world_draws(
                     }
                 }
             };
+            // Скиннинг применяется только к уровню 0: у аниматора LOD-группы нет.
+            let skin = (level == 0)
+                .then(|| {
+                    let object = resources.skins.get(&instance.object)?;
+                    let instance_id = *object.instances.get(mesh_index)?;
+                    let palette = *resources.palette_index.get(&instance.object)?;
+                    Some(SkinBinding {
+                        instance: instance_id,
+                        palette,
+                    })
+                })
+                .flatten();
             draws.push(DrawCommand {
                 mesh: *mesh_id,
                 material: Some(material_id),
@@ -1009,12 +1141,104 @@ fn append_world_draws(
                 previous_model: motion_history.previous_model(instance.object),
                 lod_level: u8::try_from(level).unwrap_or(u8::MAX),
                 casts_shadow: true,
-                skin: None,
+                skin,
             });
             motion_history.record_current(instance.object, instance.model.to_cols_array_2d());
         }
     }
     Ok(())
+}
+
+/// Объекты, у которых есть и экземпляры скиннинга, и палитра моста, по порядку handle.
+fn palette_objects<M, S>(
+    skins: &HashMap<ObjectHandle, SkinnedObject<M, S>>,
+    bridge: &AnimationBridge,
+) -> Vec<ObjectHandle> {
+    let mut objects: Vec<ObjectHandle> = skins
+        .keys()
+        .copied()
+        .filter(|object| bridge.palette(*object).is_some())
+        .collect();
+    objects.sort_by_key(|object| object.index());
+    objects
+}
+
+/// Индекс палитры каждого объекта: тот же порядок, что у `joint_palette_refs`.
+fn palette_indices<M, S>(
+    skins: &HashMap<ObjectHandle, SkinnedObject<M, S>>,
+    bridge: Option<&AnimationBridge>,
+) -> HashMap<ObjectHandle, u32> {
+    bridge.map_or_else(HashMap::new, |bridge| {
+        palette_objects(skins, bridge)
+            .into_iter()
+            .enumerate()
+            .map(|(index, object)| (object, index as u32))
+            .collect()
+    })
+}
+
+/// Создаёт по экземпляру скиннинга на каждую часть модели; при ошибке уже созданные освобождаются.
+fn create_skin(
+    renderer: &mut Renderer,
+    model: String,
+    mesh_ids: Vec<MeshId>,
+) -> Result<SkinnedObject, RenderError> {
+    let mut skin = SkinnedObject {
+        model,
+        mesh_ids,
+        instances: Vec::new(),
+    };
+    for index in 0..skin.mesh_ids.len() {
+        match renderer.create_skin_instance(skin.mesh_ids[index]) {
+            Ok(instance) => skin.instances.push(instance),
+            Err(error) => {
+                release_skin(renderer, skin)?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(skin)
+}
+
+fn release_skin(renderer: &mut Renderer, skin: SkinnedObject) -> Result<(), RenderError> {
+    for instance in skin.instances {
+        renderer.destroy_skin_instance(instance)?;
+    }
+    Ok(())
+}
+
+/// Что сделать с экземплярами скиннинга, чтобы они соответствовали аниматорам мира.
+#[derive(Debug, Default, PartialEq)]
+struct SkinSyncPlan {
+    /// Устаревшие экземпляры: аниматор или объект удалены, модель или набор мешей изменились.
+    release: Vec<ObjectHandle>,
+    /// Объекты, которым нужны новые экземпляры; сюда входят освобождённые.
+    create: Vec<ObjectHandle>,
+}
+
+/// Сравнивает экземпляры с желаемым состоянием. `current` — модель и меши уже созданных
+/// экземпляров, `wanted` — то же для объектов, которым нужен скиннинг.
+fn plan_skin_sync<M: PartialEq, S>(
+    current: &HashMap<ObjectHandle, SkinnedObject<M, S>>,
+    wanted: &HashMap<ObjectHandle, (String, Vec<M>)>,
+) -> SkinSyncPlan {
+    let mut release: Vec<ObjectHandle> = current
+        .iter()
+        .filter(|(object, skin)| {
+            wanted
+                .get(*object)
+                .is_none_or(|(model, mesh_ids)| *model != skin.model || *mesh_ids != skin.mesh_ids)
+        })
+        .map(|(object, _)| *object)
+        .collect();
+    release.sort_by_key(|object| object.index());
+    let mut create: Vec<ObjectHandle> = wanted
+        .keys()
+        .copied()
+        .filter(|object| !current.contains_key(object) || release.contains(object))
+        .collect();
+    create.sort_by_key(|object| object.index());
+    SkinSyncPlan { release, create }
 }
 
 fn destroy_model(renderer: &mut Renderer, model: GpuModel) -> Result<(), RenderError> {
@@ -1207,7 +1431,15 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
                     color: [1.0; 3],
                 })
                 .collect::<Vec<_>>();
-            let mesh_id = renderer.create_mesh(&vertices, &model_mesh.indices)?;
+            let mesh_id = match (&model_mesh.skin, model.skeleton.as_ref()) {
+                (Some(skin), Some(skeleton)) => renderer.create_skinned_mesh(
+                    &vertices,
+                    &skin_vertices(skin),
+                    &model_mesh.indices,
+                    skeleton.joints.len() as u32,
+                )?,
+                _ => renderer.create_mesh(&vertices, &model_mesh.indices)?,
+            };
             meshes.push((mesh_id, material, material_id));
         }
         Ok::<(), RenderError>(())
@@ -1224,7 +1456,22 @@ fn upload_model(renderer: &mut Renderer, model: &Model) -> Result<GpuModel, Rend
         }
         return Err(error);
     }
-    Ok(GpuModel { meshes, textures })
+    Ok(GpuModel {
+        meshes,
+        textures,
+        skinned: model.skeleton.is_some(),
+    })
+}
+
+fn skin_vertices(skin: &engine_assets::ModelSkin) -> Vec<SkinVertex> {
+    skin.joints
+        .iter()
+        .zip(&skin.weights)
+        .map(|(joints, weights)| SkinVertex {
+            joints: *joints,
+            weights: *weights,
+        })
+        .collect()
 }
 
 fn model_texture(
@@ -2062,5 +2309,132 @@ range = 10
         history.begin_frame(main_camera, true);
         assert!(history.reset_pending);
         assert_eq!(history.previous_model(mesh), None);
+    }
+
+    /// Два объекта с аниматором, использующие одну модель, и один без аниматора.
+    fn skin_world() -> World {
+        let text = "[[assets]]\npath = \"/models/hero.fbx\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n[objects.animator]\n[[objects]]\nid = \"guard\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n[objects.animator]\n[[objects]]\nid = \"prop\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n";
+        World::from_document(&engine_scene::SceneDocument::parse("scene.rvescene", text).unwrap())
+            .unwrap()
+    }
+
+    fn skin(model: &str, meshes: &[u32]) -> SkinnedObject<u32, u32> {
+        SkinnedObject {
+            model: model.to_owned(),
+            mesh_ids: meshes.to_vec(),
+            instances: meshes.iter().map(|mesh| mesh + 100).collect(),
+        }
+    }
+
+    fn wanted(
+        entries: &[(ObjectHandle, &str, &[u32])],
+    ) -> HashMap<ObjectHandle, (String, Vec<u32>)> {
+        entries
+            .iter()
+            .map(|(object, model, meshes)| (*object, ((*model).to_owned(), meshes.to_vec())))
+            .collect()
+    }
+
+    #[test]
+    fn skin_sync_keeps_matching_instances_and_creates_missing_ones() {
+        let world = skin_world();
+        let hero = world.handle("hero").unwrap();
+        let current = HashMap::from([(hero, skin("models/hero.fbx", &[1, 2]))]);
+        let same = wanted(&[(hero, "models/hero.fbx", &[1, 2])]);
+        assert_eq!(plan_skin_sync(&current, &same), SkinSyncPlan::default());
+        assert_eq!(
+            plan_skin_sync(
+                &HashMap::<ObjectHandle, SkinnedObject<u32, u32>>::new(),
+                &same
+            ),
+            SkinSyncPlan {
+                release: Vec::new(),
+                create: vec![hero],
+            },
+            "новый аниматор получает экземпляры"
+        );
+    }
+
+    #[test]
+    fn skin_sync_recreates_instances_when_the_model_or_its_parts_change() {
+        let world = skin_world();
+        let hero = world.handle("hero").unwrap();
+        let current = HashMap::from([(hero, skin("models/hero.fbx", &[1, 2]))]);
+        let other_model = plan_skin_sync(&current, &wanted(&[(hero, "models/other.fbx", &[1, 2])]));
+        assert_eq!(
+            other_model,
+            SkinSyncPlan {
+                release: vec![hero],
+                create: vec![hero],
+            }
+        );
+        let other_parts = plan_skin_sync(&current, &wanted(&[(hero, "models/hero.fbx", &[1, 3])]));
+        assert_eq!(other_parts, other_model);
+    }
+
+    #[test]
+    fn removed_animator_releases_only_its_instances_and_new_ones_follow_document_order() {
+        let world = skin_world();
+        let hero = world.handle("hero").unwrap();
+        let guard = world.handle("guard").unwrap();
+        let current = HashMap::from([
+            (hero, skin("models/hero.fbx", &[1])),
+            (guard, skin("models/hero.fbx", &[1])),
+        ]);
+        let only_guard = wanted(&[(guard, "models/hero.fbx", &[1])]);
+        assert_eq!(
+            plan_skin_sync(&current, &only_guard),
+            SkinSyncPlan {
+                release: vec![hero],
+                create: Vec::new(),
+            },
+            "у guard экземпляры остаются"
+        );
+        let both = wanted(&[
+            (guard, "models/hero.fbx", &[1]),
+            (hero, "models/hero.fbx", &[1]),
+        ]);
+        assert_eq!(
+            plan_skin_sync(
+                &HashMap::<ObjectHandle, SkinnedObject<u32, u32>>::new(),
+                &both
+            )
+            .create,
+            vec![hero, guard],
+            "порядок создания совпадает с порядком документа"
+        );
+    }
+
+    #[test]
+    fn palette_indices_follow_the_bridge_order_of_skinned_objects() {
+        let world = skin_world();
+        let hero = world.handle("hero").unwrap();
+        let guard = world.handle("guard").unwrap();
+        let bridge = AnimationBridge::build(
+            &world,
+            |_| {
+                Ok(std::sync::Arc::new(
+                    crate::viewport::animation::test_support::walk_model(),
+                ))
+            },
+            |_| Ok(std::sync::Arc::new(Vec::new())),
+        );
+        let skins = HashMap::from([
+            (guard, skin("models/hero.fbx", &[1])),
+            (hero, skin("models/hero.fbx", &[1])),
+        ]);
+        assert_eq!(
+            palette_indices(&skins, Some(&bridge)),
+            HashMap::from([(hero, 0), (guard, 1)])
+        );
+        assert!(
+            palette_indices(&skins, None).is_empty(),
+            "без моста палитр нет"
+        );
+        let hero_only = HashMap::from([(hero, skin("models/hero.fbx", &[1]))]);
+        assert_eq!(
+            palette_indices(&hero_only, Some(&bridge)),
+            HashMap::from([(hero, 0)])
+        );
     }
 }

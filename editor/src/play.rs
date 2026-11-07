@@ -1,5 +1,6 @@
 //! Play-режим: копия мира сцены и скрипты на главном потоке редактора.
 
+use engine_animation::{AnimationBridge, AnimationEvent};
 use engine_assets::Assets;
 use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
@@ -109,6 +110,8 @@ pub struct PlaySession {
     host: ScriptHost,
     physics: Option<PlayPhysics>,
     audio: Option<PlayAudio>,
+    /// Аниматоры мира Play: запросы скриптов, время и события `animation_finished`.
+    animation: AnimationBridge,
     watchdog: Watchdog,
     time_limit: Duration,
     paused: bool,
@@ -156,11 +159,13 @@ impl PlaySession {
             &PhysicsSettings::default(),
             SCRIPT_TIME_LIMIT,
             AudioConfig::default(),
+            AnimationBridge::default(),
         )
     }
 
-    /// Starts Play with project input and physics settings, CPU geometry for mesh colliders and
-    /// the audio configuration (ресурсы проекта и устройство вывода).
+    /// Starts Play with project input and physics settings, CPU geometry for mesh colliders,
+    /// the audio configuration (ресурсы проекта и устройство вывода) and the animation bridge
+    /// built from the same world.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_world_and_physics(
         document: &SceneDocument,
@@ -171,6 +176,7 @@ impl PlaySession {
         model_geometry: &[ModelGeometry],
         physics_settings: &PhysicsSettings,
         audio: AudioConfig,
+        animation: AnimationBridge,
     ) -> Result<Self, String> {
         Self::start_with_world_limit(
             document,
@@ -182,6 +188,7 @@ impl PlaySession {
             physics_settings,
             SCRIPT_TIME_LIMIT,
             audio,
+            animation,
         )
     }
 
@@ -248,6 +255,7 @@ impl PlaySession {
             &PhysicsSettings::default(),
             time_limit,
             AudioConfig::default(),
+            AnimationBridge::default(),
         )
     }
 
@@ -262,6 +270,7 @@ impl PlaySession {
         physics_settings: &PhysicsSettings,
         time_limit: Duration,
         audio: AudioConfig,
+        animation: AnimationBridge,
     ) -> Result<Self, String> {
         let mut sources = BTreeMap::new();
         for object in world.objects() {
@@ -310,6 +319,7 @@ impl PlaySession {
             host,
             physics: Some(physics),
             audio: Some(audio),
+            animation,
             watchdog,
             time_limit,
             paused: false,
@@ -322,6 +332,11 @@ impl PlaySession {
 
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
+    }
+
+    /// Мир и мост анимации для кадра: палитры берутся из моста, а скиннинг — из мира.
+    pub fn world_and_animation(&mut self) -> (&mut World, &AnimationBridge) {
+        (&mut self.world, &self.animation)
     }
 
     pub fn is_paused(&self) -> bool {
@@ -393,6 +408,15 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.update(&mut self.world, dt, time);
         self.watchdog.set_deadline(None);
+        // Порядок как в runtime: запросы скриптов, затем время; события уйдут в следующий update.
+        self.animation.apply(self.host.drain_animation_requests());
+        let finished = self.animation.advance(dt);
+        self.host.queue_animation_events(
+            &self.world,
+            finished.into_iter().map(|event| match event {
+                AnimationEvent::Finished { object, motion } => (object, motion),
+            }),
+        );
         if let Some(physics) = &mut self.physics {
             let mut commands = self.host.drain_physics_commands();
             commands.extend(
@@ -433,6 +457,11 @@ impl PlaySession {
         self.audio
             .as_mut()
             .map_or_else(Vec::new, |audio| audio.bridge.take_warnings())
+    }
+
+    /// Предупреждения анимации: клип или модель не загрузились, движение не найдено.
+    pub fn drain_animation_warnings(&mut self) -> Vec<String> {
+        self.animation.take_warnings()
     }
 
     /// Завершает скрипты вызовом `on_destroy` и возвращает последние события.
@@ -791,6 +820,84 @@ mass = 1.0
         drop(session);
     }
 
+    const ANIMATED_SCENE: &str = r#"
+[[assets]]
+path = "/models/hero.fbx"
+[[assets]]
+path = "/hero.lua"
+
+[[objects]]
+id = "camera"
+[objects.camera]
+
+[[objects]]
+id = "hero"
+[objects.mesh_renderer]
+model = "/models/hero.fbx"
+[objects.animator]
+looping = false
+[[objects.lite_scripts]]
+path = "/hero.lua"
+"#;
+
+    const ANIMATED_HERO: &str = r#"
+local Hero = {}
+function Hero:on_start()
+  rve.find("hero"):play_animation("Walk", { loop = false })
+end
+function Hero:on_message(sender, name, value)
+  rve.log_info(name .. ":" .. value)
+end
+return Hero
+"#;
+
+    #[test]
+    fn one_shot_animation_finish_reaches_the_script_as_a_message() {
+        let document = document(ANIMATED_SCENE);
+        let world = World::from_document(&document).unwrap();
+        let animation = AnimationBridge::build(
+            &world,
+            |_| {
+                Ok(std::sync::Arc::new(
+                    crate::viewport::animation::test_support::walk_model(),
+                ))
+            },
+            |_| Ok(std::sync::Arc::new(Vec::new())),
+        );
+        let mut session = PlaySession::start_with_world_limit(
+            &document,
+            world,
+            None,
+            &InputSettings::default(),
+            |_| Ok(ANIMATED_HERO.to_owned()),
+            &[],
+            &PhysicsSettings::default(),
+            SCRIPT_TIME_LIMIT,
+            AudioConfig::default(),
+            animation,
+        )
+        .unwrap();
+
+        // Первый шаг запускает on_start и клип; конец клипа приходит в шаге, где время прошло.
+        session.step(0.1).unwrap();
+        let hero = session.world.handle("hero").unwrap();
+        assert!(session.animation.has_animator(hero));
+        session.step(1.5).unwrap();
+        session.step(0.0).unwrap();
+        let messages: Vec<String> = session
+            .drain_events()
+            .into_iter()
+            .map(|event| event.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "animation_finished:Walk"),
+            "{messages:?}"
+        );
+        assert!(session.drain_animation_warnings().is_empty());
+    }
+
     #[test]
     fn stop_runs_on_destroy_and_reports_events() {
         let mut session = start(ROTATE).unwrap();
@@ -1031,6 +1138,7 @@ spatial = true
             &PhysicsSettings::default(),
             SCRIPT_TIME_LIMIT,
             audio,
+            AnimationBridge::default(),
         )
         .unwrap();
         let speaker = session.world_mut().handle("speaker").unwrap();
