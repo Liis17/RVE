@@ -2136,6 +2136,7 @@ impl Renderer {
             frame.particle_step,
             view_projection,
             frame.debug_view,
+            frame.camera.position,
         )?;
         let particle_pass = self.particle_pipelines().map(|pipelines| ParticlePass {
             works: &particle_works,
@@ -2900,6 +2901,7 @@ impl Renderer {
                 entry.1.particle_step,
                 multiply_4x4(entry.1.camera.projection, entry.1.camera.view),
                 entry.1.debug_view,
+                entry.1.camera.position,
             )?);
         }
         let mut gpu_layout = GpuProfileLayout::default();

@@ -1,0 +1,149 @@
+#version 450
+
+// Сортировка alpha-частиц назад-вперёд: bitonic-сеть по ключам глубины.
+//
+// Ключ — `0xFFFFFFFF - bits(view depth)`: по возрастанию первыми идут самые дальние.
+// Мёртвые и паддинг получают максимум и уходят в конец. Блок из BLOCK = 2·PARTICLE_LOCAL_SIZE
+// элементов сортируется в shared-памяти; стадии с большим шагом выполняются глобальными проходами.
+
+layout(local_size_x = PARTICLE_LOCAL_SIZE) in;
+
+layout(set = 0, binding = 0) uniform FrameUniforms {
+    mat4 view_projection;
+    mat4 inverse_view_projection;
+    mat4 shadow_view_projections[4];
+    vec4 light_direction;
+    vec4 light_color;
+    vec4 ambient_color;
+    vec4 shadow_params;
+    vec4 camera_position;
+    mat4 environment_rotation;
+    vec4 environment_params;
+    vec4 local_light_params;
+    mat4 view;
+    vec4 cluster_params;
+    mat4 previous_view_projection;
+    vec4 render_params;
+} frame;
+
+// Совпадает с ParticleGpu в particles.rs.
+struct Particle {
+    vec4 position_age;
+    vec4 velocity_life;
+    vec4 params;
+};
+
+layout(set = 1, binding = 1, std430) readonly buffer ParticleBuffer {
+    Particle particles[];
+} particle_buffer;
+
+layout(set = 1, binding = 2, std430) buffer SortBuffer {
+    uvec2 keys[];
+} sort_buffer;
+
+// Совпадает с SortPushGpu в particles.rs (32 байта).
+layout(push_constant) uniform SortPush {
+    uint mode;
+    uint k;
+    uint j;
+    uint count;
+    uint draw_first;
+    uint draw_count;
+    uint capacity;
+    uint padding;
+} push;
+
+const uint SORT_KEY_SENTINEL = 0xFFFFFFFFu;
+const uint MODE_KEYS = 0u;
+const uint MODE_LOCAL_SORT = 1u;
+const uint MODE_LOCAL_MERGE = 2u;
+const uint MODE_GLOBAL = 3u;
+const uint BLOCK = 2u * PARTICLE_LOCAL_SIZE;
+
+shared uvec2 tile[BLOCK];
+
+void write_keys(uint index) {
+    uint key = SORT_KEY_SENTINEL;
+    if (index < push.draw_count) {
+        uint slot = (push.draw_first + index) % push.capacity;
+        Particle particle = particle_buffer.particles[slot];
+        float age = particle.position_age.w;
+        if (age >= 0.0 && age < particle.velocity_life.w) {
+            vec3 position = particle.position_age.xyz;
+            float depth = -(frame.view[0][2] * position.x + frame.view[1][2] * position.y
+                + frame.view[2][2] * position.z + frame.view[3][2]);
+            key = 0xFFFFFFFFu - floatBitsToUint(max(depth, 0.0));
+        }
+    }
+    sort_buffer.keys[index] = uvec2(key, index);
+}
+
+// Сравнивает пару (i, l) внутри блока или глобально и меняет местами по направлению `ascending`.
+void compare_exchange(uint i, uint l, bool ascending, bool local_storage, uint base) {
+    uvec2 a = local_storage ? tile[i] : sort_buffer.keys[base + i];
+    uvec2 b = local_storage ? tile[l] : sort_buffer.keys[base + l];
+    bool swap_pair = ascending ? a.x > b.x : a.x < b.x;
+    if (swap_pair) {
+        if (local_storage) {
+            tile[i] = b;
+            tile[l] = a;
+        } else {
+            sort_buffer.keys[base + i] = b;
+            sort_buffer.keys[base + l] = a;
+        }
+    }
+}
+
+void local_block_sort(uint block_base, uint first_k, bool all_stages) {
+    uint lane = gl_LocalInvocationIndex;
+    for (uint e = 0u; e < 2u; ++e) {
+        uint local_index = 2u * lane + e;
+        uint global_index = block_base + local_index;
+        tile[local_index] = global_index < push.count
+            ? sort_buffer.keys[global_index]
+            : uvec2(SORT_KEY_SENTINEL, global_index);
+    }
+    barrier();
+    uint k_start = all_stages ? 2u : first_k;
+    uint k_end = all_stages ? BLOCK : first_k;
+    for (uint k = k_start; k <= k_end; k <<= 1u) {
+        uint j_start = all_stages ? (k >> 1u) : (BLOCK >> 1u);
+        for (uint j = j_start; j > 0u; j >>= 1u) {
+            // Каждый поток владеет одной парой: lane → (i, i + j).
+            uint i = 2u * j * (lane / j) + (lane % j);
+            uint l = i + j;
+            bool ascending = ((block_base + i) & k) == 0u;
+            compare_exchange(i, l, ascending, true, block_base);
+            barrier();
+        }
+    }
+    for (uint e = 0u; e < 2u; ++e) {
+        uint local_index = 2u * lane + e;
+        uint global_index = block_base + local_index;
+        if (global_index < push.count) {
+            sort_buffer.keys[global_index] = tile[local_index];
+        }
+    }
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (push.mode == MODE_KEYS) {
+        if (index < push.count) {
+            write_keys(index);
+        }
+    } else if (push.mode == MODE_LOCAL_SORT) {
+        local_block_sort(gl_WorkGroupID.x * BLOCK, 0u, true);
+    } else if (push.mode == MODE_LOCAL_MERGE) {
+        local_block_sort(gl_WorkGroupID.x * BLOCK, push.k, false);
+    } else if (push.mode == MODE_GLOBAL) {
+        // Пары (i, i + j) с i, у которого бит j равен нулю; одна пара на поток.
+        uint pair = index;
+        uint i = 2u * push.j * (pair / push.j) + (pair % push.j);
+        uint l = i + push.j;
+        if (l < push.count) {
+            bool ascending = (i & push.k) == 0u;
+            compare_exchange(i, l, ascending, false, 0u);
+        }
+    }
+}

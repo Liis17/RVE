@@ -6,8 +6,8 @@
 use crate::culling::Frustum;
 use crate::particles::{
     EmitterParamsGpu, MAX_PARTICLE_STEP, ParticleBlend, ParticleEmitterDesc, ParticleEmitterState,
-    ParticleSimOwners, ParticleStepPlan, SimPushGpu, SpawnBatch, SpawnPushGpu, StepInput,
-    emitter_params, motion_margin, shape_bounds, validate_desc,
+    ParticleSimOwners, ParticleStepPlan, SimPushGpu, SortPushGpu, SpawnBatch, SpawnPushGpu,
+    StepInput, emitter_params, motion_margin, shape_bounds, sort_count, sort_passes, validate_desc,
 };
 use crate::{
     DebugView, DeviceBuffer, GpuPass, HostBuffer, OFFSCREEN_FORMAT, OffscreenTarget,
@@ -27,6 +27,9 @@ const PARTICLE_VERTEX_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/particle.vert.spv"));
 const PARTICLE_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/particle.frag.spv"));
+const SORT_KEY_BYTES: u64 = 8;
+const PARTICLE_SORT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/particle_sort.comp.spv"));
 
 /// Размер одной частицы в SSBO: три vec4.
 const PARTICLE_GPU_SIZE: u64 = 48;
@@ -47,6 +50,8 @@ pub(crate) struct ParticleEmitter {
     /// Держит текстуру живой, пока её descriptor используется эмиттером.
     _texture: Arc<Texture>,
     pub(crate) particles: DeviceBuffer,
+    /// Ключи сортировки (alpha) или заглушка 8 байт (additive): binding 2 набора эмиттера.
+    _sort: DeviceBuffer,
     _params: HostBuffer,
     _pool: OwnedDescriptorPool,
     pub(crate) set: vk::DescriptorSet,
@@ -65,6 +70,8 @@ pub(crate) struct ParticleSystem {
     spawn_pipeline: Option<vk::Pipeline>,
     sim_pipeline: Option<vk::Pipeline>,
     additive_pipeline: Option<vk::Pipeline>,
+    alpha_pipeline: Option<vk::Pipeline>,
+    sort_pipeline: Option<vk::Pipeline>,
     frame: ParticleFrame,
 }
 
@@ -97,6 +104,10 @@ pub(crate) struct ParticleWork {
     draw_first: u32,
     draw_count: u32,
     blend: ParticleBlend,
+    /// Степень двойки для сортировки (alpha) и число ключей.
+    sort_count: u32,
+    /// Квадрат расстояния до центра bounds: alpha рисуется назад-вперёд между эмиттерами.
+    distance_sq: f32,
 }
 
 /// Хэндлы частиц, нужные записи вида.
@@ -105,6 +116,8 @@ pub(crate) struct ParticlePipelines {
     spawn: vk::Pipeline,
     sim: vk::Pipeline,
     additive: vk::Pipeline,
+    alpha: vk::Pipeline,
+    sort: vk::Pipeline,
     compute_layout: vk::PipelineLayout,
     graphics_layout: vk::PipelineLayout,
 }
@@ -121,6 +134,8 @@ impl ParticleSystem {
     pub(crate) fn destroy(&mut self, device: &ash::Device) {
         self.emitters.clear();
         for pipeline in [
+            self.alpha_pipeline.take(),
+            self.sort_pipeline.take(),
             self.additive_pipeline.take(),
             self.sim_pipeline.take(),
             self.spawn_pipeline.take(),
@@ -152,6 +167,7 @@ impl ParticleSystem {
         particle_step: f32,
         view_projection: [[f32; 4]; 4],
         debug_view: DebugView,
+        camera_position: [f32; 3],
     ) -> Result<Vec<ParticleWork>, RenderError> {
         if !particle_step.is_finite() || particle_step < 0.0 {
             return Err(RenderError::InvalidConfig(
@@ -198,6 +214,10 @@ impl ParticleSystem {
                     let (center, radius) = bounds.bounding_sphere();
                     frustum.intersects_sphere(center, radius)
                 });
+            let center = plan.bounds.unwrap_or(origin).bounding_sphere().0;
+            let distance_sq = (0..3)
+                .map(|axis| (center[axis] - camera_position[axis]).powi(2))
+                .sum::<f32>();
             if owner {
                 self.frame.working.insert(index, plan.next.clone());
                 self.frame.commits.push((index, plan.next.clone()));
@@ -222,6 +242,12 @@ impl ParticleSystem {
                 draw_first: plan.draw_first,
                 draw_count: plan.draw_count,
                 blend,
+                sort_count: if blend == ParticleBlend::Alpha {
+                    sort_count(plan.draw_count)
+                } else {
+                    0
+                },
+                distance_sq,
             });
         }
         Ok(works)
@@ -321,6 +347,21 @@ impl Renderer {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             size,
         )?;
+        let sort_size = if desc.blend == ParticleBlend::Alpha {
+            usize::try_from(u64::from(desc.capacity.next_power_of_two()) * SORT_KEY_BYTES).map_err(
+                |_| RenderError::InvalidConfig("буфер сортировки превышает адресное пространство"),
+            )?
+        } else {
+            usize::try_from(SORT_KEY_BYTES)
+                .map_err(|_| RenderError::InvalidConfig("заглушка сортировки"))?
+        };
+        let sort = DeviceBuffer::new(
+            instance,
+            device,
+            self.physical_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            sort_size,
+        )?;
         let params = emitter_params(&desc, desc.texture.is_some());
         let params_buffer = HostBuffer::new(
             instance,
@@ -335,7 +376,7 @@ impl Renderer {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1),
+                .descriptor_count(2),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(1),
@@ -369,6 +410,10 @@ impl Renderer {
             .buffer(particles.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
+        let sort_info = [vk::DescriptorBufferInfo::default()
+            .buffer(sort.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
         let image_info = [vk::DescriptorImageInfo::default()
             .image_view(texture.image.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
@@ -386,6 +431,11 @@ impl Renderer {
                 .buffer_info(&particle_info),
             vk::WriteDescriptorSet::default()
                 .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&sort_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
                 .dst_binding(3)
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .image_info(&image_info),
@@ -401,6 +451,7 @@ impl Renderer {
             desc,
             _texture: texture,
             particles,
+            _sort: sort,
             _params: params_buffer,
             _pool: pool,
             set,
@@ -425,6 +476,11 @@ impl Renderer {
                 ),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX),
@@ -483,6 +539,19 @@ impl Renderer {
             &device,
             cache,
             graphics_layout,
+            ParticleBlend::Additive,
+        )?);
+        self.particles.alpha_pipeline = Some(create_particle_graphics_pipeline(
+            &device,
+            cache,
+            graphics_layout,
+            ParticleBlend::Alpha,
+        )?);
+        self.particles.sort_pipeline = Some(create_compute_pipeline(
+            &device,
+            cache,
+            compute_layout,
+            PARTICLE_SORT_SHADER,
         )?);
         Ok(())
     }
@@ -518,6 +587,8 @@ impl Renderer {
             spawn: self.particles.spawn_pipeline?,
             sim: self.particles.sim_pipeline?,
             additive: self.particles.additive_pipeline?,
+            alpha: self.particles.alpha_pipeline?,
+            sort: self.particles.sort_pipeline?,
             compute_layout: self.particles.compute_layout?,
             graphics_layout: self.particles.graphics_layout?,
         })
@@ -528,6 +599,7 @@ fn create_particle_graphics_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
     layout: vk::PipelineLayout,
+    blend: ParticleBlend,
 ) -> Result<vk::Pipeline, RenderError> {
     let vertex_module = ShaderModule::new(device, PARTICLE_VERTEX_SHADER)?;
     let fragment_module = ShaderModule::new(device, PARTICLE_FRAGMENT_SHADER)?;
@@ -555,14 +627,29 @@ fn create_particle_graphics_pipeline(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
-    // Аддитивное смешивание: цвет складывается, альфа не меняется.
+    // Аддитивное смешивание: цвет складывается, альфа не меняется. Альфа-смешивание берёт
+    // непредумноженный цвет и альфу из фрагментного шейдера.
+    let (src_color, dst_color, src_alpha, dst_alpha) = match blend {
+        ParticleBlend::Additive => (
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::ONE,
+        ),
+        ParticleBlend::Alpha => (
+            vk::BlendFactor::SRC_ALPHA,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        ),
+    };
     let color_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
-        .src_color_blend_factor(vk::BlendFactor::ONE)
-        .dst_color_blend_factor(vk::BlendFactor::ONE)
+        .src_color_blend_factor(src_color)
+        .dst_color_blend_factor(dst_color)
         .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+        .src_alpha_blend_factor(src_alpha)
+        .dst_alpha_blend_factor(dst_alpha)
         .alpha_blend_op(vk::BlendOp::ADD)
         .color_write_mask(vk::ColorComponentFlags::RGBA)];
     let color_blend =
@@ -601,7 +688,7 @@ fn create_particle_graphics_pipeline(
         .ok_or(RenderError::InvalidState("particle pipeline не создан"))
 }
 
-/// Записывает частицы вида: spawn и sim владельца, затем аддитивные billboards.
+/// Записывает частицы вида: spawn и sim владельца, сортировка alpha, затем billboards.
 ///
 /// Вызывается после wireframe, когда HDR color в `COLOR_ATTACHMENT_OPTIMAL`.
 pub(crate) fn record_particles(
@@ -615,7 +702,9 @@ pub(crate) fn record_particles(
     if pass.works.is_empty() {
         return;
     }
-    let needs_compute = pass.works.iter().any(|work| work.owner);
+    let needs_compute = pass.works.iter().any(|work| {
+        work.owner || (work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Alpha)
+    });
     if needs_compute {
         // Предыдущие кадры и виды могли читать или писать общие буферы: барьер на всё.
         let barrier = vk::MemoryBarrier2::default()
@@ -651,68 +740,26 @@ pub(crate) fn record_particles(
         unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
     }
 
-    if needs_compute {
-        // SAFETY: frame set and particle sets are live; the pipeline layout matches both sets.
-        unsafe {
-            device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                pass.pipelines.spawn,
-            );
-        }
-        for work in pass.works.iter().filter(|work| work.owner) {
-            for spawn in &work.spawns {
-                let push = SpawnPushGpu {
-                    transform: work.transform,
-                    first_slot: spawn.first_slot,
-                    count: spawn.count,
-                    serial_low: spawn.first_serial as u32,
-                    serial_high: (spawn.first_serial >> 32) as u32,
-                    capacity: work.capacity,
-                    step: work.sim_step,
-                    fixed_age: match spawn.pre_age {
-                        crate::particles::PreAge::Fixed(age) => age,
-                        crate::particles::PreAge::Random => 0.0,
-                    },
-                    fixed_pre_age: u32::from(matches!(
-                        spawn.pre_age,
-                        crate::particles::PreAge::Fixed(_)
-                    )),
-                    seed: work.seed,
-                    padding: [0; 3],
-                };
-                record_compute(
-                    device,
-                    command_buffer,
-                    pass,
-                    work.set,
-                    pod_bytes(&push),
-                    spawn.count.div_ceil(crate::PARTICLE_COMPUTE_LOCAL_SIZE),
-                    pass.pipelines.spawn,
-                );
-            }
-        }
-        let barrier = vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .dst_access_mask(
-                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-            );
-        let barriers = [barrier];
-        let dependency = vk::DependencyInfo::default().memory_barriers(&barriers);
-        // SAFETY: orders spawn writes before the simulation reads them.
-        unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
-        for work in pass
-            .works
-            .iter()
-            .filter(|work| work.owner && work.sim_count > 0 && work.sim_step > 0.0)
-        {
-            let push = SimPushGpu {
-                step: work.sim_step,
-                draw_first: work.sim_first,
-                draw_count: work.sim_count,
+    for work in pass.works.iter().filter(|work| work.owner) {
+        for spawn in &work.spawns {
+            let push = SpawnPushGpu {
+                transform: work.transform,
+                first_slot: spawn.first_slot,
+                count: spawn.count,
+                serial_low: spawn.first_serial as u32,
+                serial_high: (spawn.first_serial >> 32) as u32,
                 capacity: work.capacity,
+                step: work.sim_step,
+                fixed_age: match spawn.pre_age {
+                    crate::particles::PreAge::Fixed(age) => age,
+                    crate::particles::PreAge::Random => 0.0,
+                },
+                fixed_pre_age: u32::from(matches!(
+                    spawn.pre_age,
+                    crate::particles::PreAge::Fixed(_)
+                )),
+                seed: work.seed,
+                padding: [0; 3],
             };
             record_compute(
                 device,
@@ -720,13 +767,47 @@ pub(crate) fn record_particles(
                 pass,
                 work.set,
                 pod_bytes(&push),
-                work.sim_count.div_ceil(crate::PARTICLE_COMPUTE_LOCAL_SIZE),
-                pass.pipelines.sim,
+                spawn.count.div_ceil(crate::PARTICLE_COMPUTE_LOCAL_SIZE),
+                pass.pipelines.spawn,
             );
         }
     }
+    compute_barrier(device, command_buffer);
+    for work in pass
+        .works
+        .iter()
+        .filter(|work| work.owner && work.sim_count > 0 && work.sim_step > 0.0)
+    {
+        let push = SimPushGpu {
+            step: work.sim_step,
+            draw_first: work.sim_first,
+            draw_count: work.sim_count,
+            capacity: work.capacity,
+        };
+        record_compute(
+            device,
+            command_buffer,
+            pass,
+            work.set,
+            pod_bytes(&push),
+            work.sim_count.div_ceil(crate::PARTICLE_COMPUTE_LOCAL_SIZE),
+            pass.pipelines.sim,
+        );
+    }
+    if needs_compute {
+        mark_pass(device, command_buffer, timestamps, GpuPass::Particles);
+    }
+    // Ключи alpha сортируются в каждом виде, где эмиттер рисуется: после симуляции.
+    compute_barrier(device, command_buffer);
+    for work in pass
+        .works
+        .iter()
+        .filter(|work| work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Alpha)
+    {
+        record_sort(device, command_buffer, pass, work);
+    }
 
-    // Публикуем результаты compute для вершинного и фрагментного чтения.
+    // Публикуем результаты симуляции и сортировки для вершинного и фрагментного чтения.
     let barrier = vk::MemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
         .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
@@ -739,25 +820,79 @@ pub(crate) fn record_particles(
     // SAFETY: the barrier publishes particle storage to vertex and fragment shaders.
     unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 
-    record_additive(device, command_buffer, target, render_extent, pass);
-    mark_pass(device, command_buffer, timestamps, GpuPass::Particles);
+    record_draws(device, command_buffer, target, render_extent, pass);
 }
 
-/// Аддитивные billboards всех видимых эмиттеров вида. Пустой список не начинает проход.
-fn record_additive(
+/// Барьер между compute-проходами частиц: запись storage-буферов → чтение и запись.
+fn compute_barrier(device: &ash::Device, command_buffer: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+        .dst_access_mask(
+            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        );
+    let barriers = [barrier];
+    let dependency = vk::DependencyInfo::default().memory_barriers(&barriers);
+    // SAFETY: orders the previous compute writes before the next compute stage.
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
+}
+
+/// Сортировка ключей alpha-эмиттера в этом виде: ключи, локальные блоки и глобальные шаги.
+fn record_sort(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    pass: &ParticlePass<'_>,
+    work: &ParticleWork,
+) {
+    for sort_pass in sort_passes(work.sort_count) {
+        let push = SortPushGpu {
+            mode: sort_pass.mode,
+            k: sort_pass.k,
+            j: sort_pass.j,
+            count: work.sort_count,
+            draw_first: work.draw_first,
+            draw_count: work.draw_count,
+            capacity: work.capacity,
+            padding: 0,
+        };
+        record_compute(
+            device,
+            command_buffer,
+            pass,
+            work.set,
+            pod_bytes(&push),
+            sort_pass.groups,
+            pass.pipelines.sort,
+        );
+        compute_barrier(device, command_buffer);
+    }
+}
+
+/// Billboards видимых эмиттеров вида: сначала аддитивные в порядке кадра, затем альфа от дальних.
+fn record_draws(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     target: &OffscreenTarget,
     render_extent: vk::Extent2D,
     pass: &ParticlePass<'_>,
 ) {
-    if !pass
+    let mut additive = Vec::new();
+    let mut alpha = Vec::new();
+    for work in pass
         .works
         .iter()
-        .any(|work| work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Additive)
+        .filter(|work| work.visible && work.draw_count > 0)
     {
+        match work.blend {
+            ParticleBlend::Additive => additive.push(work),
+            ParticleBlend::Alpha => alpha.push(work),
+        }
+    }
+    if additive.is_empty() && alpha.is_empty() {
         return;
     }
+    alpha.sort_by(|left, right| right.distance_sq.total_cmp(&left.distance_sq));
     let color_attachments = [vk::RenderingAttachmentInfo::default()
         .image_view(target.color.view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -773,11 +908,6 @@ fn record_additive(
     // SAFETY: the color attachment is in COLOR_ATTACHMENT_OPTIMAL and matches the pipeline's format.
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering_info);
-        device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            pass.pipelines.additive,
-        );
         device.cmd_set_viewport(command_buffer, 0, &[scene_viewport(render_extent)]);
         device.cmd_set_scissor(
             command_buffer,
@@ -788,15 +918,20 @@ fn record_additive(
             }],
         );
     }
-    for work in pass
-        .works
-        .iter()
-        .filter(|work| work.visible && work.draw_count > 0 && work.blend == ParticleBlend::Additive)
-    {
+    let draws = additive
+        .into_iter()
+        .map(|work| (work, pass.pipelines.additive, 0u32))
+        .chain(
+            alpha
+                .into_iter()
+                .map(|work| (work, pass.pipelines.alpha, 1u32)),
+        );
+    for (work, pipeline, sorted) in draws {
         let sets = [pass.frame_set, work.set];
-        let push = [work.draw_first, work.capacity, work.draw_count, 0u32];
-        // SAFETY: the frame set and emitter set match the graphics layout; the push range covers `push`.
+        let push = [work.draw_first, work.capacity, work.draw_count, sorted];
+        // SAFETY: frame and emitter sets match the graphics layout; the push range covers `push`.
         unsafe {
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,

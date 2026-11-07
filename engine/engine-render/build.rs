@@ -162,6 +162,12 @@ const SHADERS: &[ShaderBuild] = &[
         &[],
         "particle.frag.spv",
     ),
+    (
+        "particle_sort.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "particle_sort.comp.spv",
+    ),
 ];
 
 /// GLSL `barrier()` lowers to a barrier with subgroup scope, which naga validates only

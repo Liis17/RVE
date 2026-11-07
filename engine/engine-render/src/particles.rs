@@ -831,6 +831,96 @@ pub struct SpawnPushGpu {
     pub padding: [u32; 3],
 }
 
+/// Размер блока, который сортирует `particle_sort.comp` в shared-памяти: два элемента на поток.
+pub const SORT_BLOCK_SIZE: u32 = 128;
+
+/// Push constants сортировки (`particle_sort.comp`), 32 байта.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SortPushGpu {
+    /// 0 — ключи, 1 — локальная сортировка блока, 2 — локальное слияние стадии `k`, 3 — глобальный шаг `(k, j)`.
+    pub mode: u32,
+    pub k: u32,
+    pub j: u32,
+    /// Число ключей (степень двойки).
+    pub count: u32,
+    pub draw_first: u32,
+    pub draw_count: u32,
+    pub capacity: u32,
+    pub padding: u32,
+}
+
+/// Проход сортировки: режим, параметры стадии и число workgroup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SortPass {
+    pub mode: u32,
+    pub k: u32,
+    pub j: u32,
+    pub groups: u32,
+}
+
+/// Степень двойки для сортировки `draw_count` ключей (не меньше одного).
+pub fn sort_count(draw_count: u32) -> u32 {
+    draw_count.max(1).next_power_of_two()
+}
+
+/// Последовательность проходов bitonic-сети для `count` ключей (степень двойки, `count ≥ 1`).
+///
+/// Сначала ключи строятся, затем блоки сортируются в shared-памяти. Стадии `k > SORT_BLOCK_SIZE`
+/// выполняют глобальные шаги для `j ≥ SORT_BLOCK_SIZE` и локальное слияние для меньших `j`.
+pub fn sort_passes(count: u32) -> Vec<SortPass> {
+    debug_assert!(count.is_power_of_two());
+    let local = PARTICLE_SORT_THREADS;
+    let block_groups = count.div_ceil(SORT_BLOCK_SIZE);
+    let mut passes = vec![
+        SortPass {
+            mode: 0,
+            k: 0,
+            j: 0,
+            groups: count.div_ceil(local),
+        },
+        SortPass {
+            mode: 1,
+            k: 0,
+            j: 0,
+            groups: block_groups,
+        },
+    ];
+    let mut k = 2 * SORT_BLOCK_SIZE;
+    while k <= count {
+        let mut j = k / 2;
+        while j >= SORT_BLOCK_SIZE {
+            passes.push(SortPass {
+                mode: 3,
+                k,
+                j,
+                groups: (count / 2).div_ceil(local),
+            });
+            j /= 2;
+        }
+        passes.push(SortPass {
+            mode: 2,
+            k,
+            j: 0,
+            groups: block_groups,
+        });
+        k *= 2;
+    }
+    passes
+}
+
+/// Потоки в workgroup сортировки; совпадает с `PARTICLE_COMPUTE_LOCAL_SIZE`.
+const PARTICLE_SORT_THREADS: u32 = crate::PARTICLE_COMPUTE_LOCAL_SIZE;
+
+#[cfg(test)]
+/// Ключ сортировки назад-вперёд: по возрастанию первыми идут самые дальние. Мёртвые — максимум.
+pub fn sort_key(view_depth: f32, alive: bool) -> u32 {
+    if !alive {
+        return u32::MAX;
+    }
+    u32::MAX - view_depth.max(0.0).to_bits()
+}
+
 /// Push constants симуляции и отрисовки (диапазон слотов, dt и флаги).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1463,5 +1553,196 @@ mod tests {
         let plain = emitter_params(&ParticleEmitterDesc::default(), false);
         assert_eq!(plain.counts, [0, 0, 0, 0]);
         assert_eq!(plain.collision, [0.0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    /// CPU-эталон прохода сортировки; повторяет семантику `particle_sort.comp` для ключей (key, index).
+    fn apply_pass(keys: &mut [(u32, u32)], pass: SortPass) {
+        let count = keys.len();
+        let block = SORT_BLOCK_SIZE as usize;
+        let compare = |keys: &mut [(u32, u32)], i: usize, l: usize, ascending: bool| {
+            let out_of_order = if ascending {
+                keys[i].0 > keys[l].0
+            } else {
+                keys[i].0 < keys[l].0
+            };
+            if out_of_order {
+                keys.swap(i, l);
+            }
+        };
+        match pass.mode {
+            // Ключи строятся шейдером; в эталоне входные ключи заданы тестом.
+            0 => {}
+            1 | 2 => {
+                let k_values: Vec<u32> = if pass.mode == 1 {
+                    std::iter::successors(Some(2u32), |k| Some(k * 2))
+                        .take_while(|k| *k <= SORT_BLOCK_SIZE)
+                        .collect()
+                } else {
+                    vec![pass.k]
+                };
+                for base in (0..count).step_by(block) {
+                    for &k in &k_values {
+                        let mut j = if pass.mode == 1 {
+                            k / 2
+                        } else {
+                            SORT_BLOCK_SIZE / 2
+                        };
+                        while j >= 1 {
+                            for lane in 0..(block / 2) {
+                                let j = j as usize;
+                                let i = 2 * j * (lane / j) + (lane % j);
+                                let l = i + j;
+                                let ascending = ((base + i) as u32 & k) == 0;
+                                compare(keys, base + i, base + l, ascending);
+                            }
+                            j /= 2;
+                        }
+                    }
+                }
+            }
+            _ => {
+                let j = pass.j as usize;
+                for pair in 0..count / 2 {
+                    let i = 2 * j * (pair / j) + (pair % j);
+                    let l = i + j;
+                    if l < count {
+                        let ascending = (i as u32 & pass.k) == 0;
+                        compare(keys, i, l, ascending);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Прогоняет сеть по ключам; короткий вход дополняется сентинелами до блока, как в шейдере.
+    fn run_network(keys: &mut [(u32, u32)]) {
+        let live = keys.len();
+        let padded_len = live.max(SORT_BLOCK_SIZE as usize);
+        let mut padded = keys.to_vec();
+        padded.extend((live..padded_len).map(|index| (u32::MAX, index as u32)));
+        for pass in sort_passes(padded_len as u32).into_iter().skip(1) {
+            apply_pass(&mut padded, pass);
+        }
+        keys.copy_from_slice(&padded[..live]);
+    }
+
+    fn pseudo_random_keys(len: usize, seed: u32) -> Vec<(u32, u32)> {
+        let mut state = seed;
+        (0..len as u32)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state, index)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sort_count_rounds_up_to_power_of_two() {
+        assert_eq!(sort_count(0), 1);
+        assert_eq!(sort_count(1), 1);
+        assert_eq!(sort_count(5), 8);
+        assert_eq!(sort_count(256), 256);
+    }
+
+    #[test]
+    fn small_counts_need_only_key_and_block_passes() {
+        let modes: Vec<u32> = sort_passes(128).iter().map(|pass| pass.mode).collect();
+        assert_eq!(modes, [0, 1]);
+    }
+
+    #[test]
+    fn bitonic_schedule_has_global_then_merge_stages() {
+        let passes = sort_passes(256);
+        assert_eq!(
+            passes,
+            [
+                SortPass {
+                    mode: 0,
+                    k: 0,
+                    j: 0,
+                    groups: 4
+                },
+                SortPass {
+                    mode: 1,
+                    k: 0,
+                    j: 0,
+                    groups: 2
+                },
+                SortPass {
+                    mode: 3,
+                    k: 256,
+                    j: 128,
+                    groups: 2
+                },
+                SortPass {
+                    mode: 2,
+                    k: 256,
+                    j: 0,
+                    groups: 2
+                },
+            ]
+        );
+        let count_1024 = sort_passes(1024);
+        let globals = count_1024.iter().filter(|pass| pass.mode == 3).count();
+        let merges = count_1024.iter().filter(|pass| pass.mode == 2).count();
+        assert_eq!((globals, merges), (1 + 2 + 3, 3));
+    }
+
+    #[test]
+    fn reference_network_sorts_random_keys_for_each_size() {
+        for count in [2usize, 128, 256, 512, 1024] {
+            let mut keys = pseudo_random_keys(count, count as u32 * 7 + 1);
+            let before: Vec<u32> = {
+                let mut values: Vec<u32> = keys.iter().map(|(key, _)| *key).collect();
+                values.sort_unstable();
+                values
+            };
+            run_network(&mut keys);
+            assert!(
+                keys.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+                "count {count} is not sorted"
+            );
+            let mut after: Vec<u32> = keys.iter().map(|(key, _)| *key).collect();
+            after.sort_unstable();
+            assert_eq!(after, before, "count {count} lost or duplicated keys");
+        }
+    }
+
+    #[test]
+    fn padding_with_sentinels_keeps_live_keys_in_front() {
+        // Живые ключи — 37 штук из 64; паддинг (u32::MAX) должен оказаться в конце.
+        let live = 37;
+        let mut keys = pseudo_random_keys(64, 99);
+        for (index, key) in keys.iter_mut().enumerate() {
+            if index >= live {
+                *key = (u32::MAX, index as u32);
+            }
+        }
+        run_network(&mut keys);
+        assert!(keys[..live].iter().all(|(key, _)| *key != u32::MAX));
+        assert!(keys[live..].iter().all(|(key, _)| *key == u32::MAX));
+    }
+
+    #[test]
+    fn depth_keys_draw_far_before_near_and_dead_last() {
+        let far = sort_key(10.0, true);
+        let middle = sort_key(2.0, true);
+        let near = sort_key(0.5, true);
+        assert!(
+            far < middle && middle < near,
+            "far particles must sort first"
+        );
+        assert_eq!(sort_key(3.0, false), u32::MAX);
+        assert!(near < u32::MAX);
+        assert_eq!(
+            sort_key(-4.0, true),
+            sort_key(0.0, true),
+            "points behind the camera clamp to zero depth"
+        );
     }
 }

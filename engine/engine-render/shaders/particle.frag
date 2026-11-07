@@ -1,7 +1,8 @@
 #version 450
 
-layout(location = 0) in vec2 in_uv;
-layout(location = 1) in float in_life_fraction;
+layout(location = 0) in vec2 in_atlas_uv;
+layout(location = 1) in vec4 in_color;
+layout(location = 2) in vec2 in_quad_uv;
 
 layout(location = 0) out vec4 out_color;
 
@@ -26,12 +27,19 @@ layout(set = 1, binding = 3) uniform texture2D particle_image;
 layout(set = 1, binding = 4) uniform sampler particle_sampler;
 
 void main() {
-    vec2 centered = in_uv * 2.0 - 1.0;
+    vec2 centered = in_quad_uv * 2.0 - 1.0;
     float radial = 1.0 - smoothstep(0.0, 1.0, length(centered));
-    vec4 sample_value = vec4(1.0, 1.0, 1.0, radial);
+    vec4 texel = vec4(1.0, 1.0, 1.0, radial);
     if (emitter.counts.w == 1u) {
-        sample_value = texture(sampler2D(particle_image, particle_sampler), in_uv);
+        texel = texture(sampler2D(particle_image, particle_sampler), in_atlas_uv);
     }
-    // Аддитивное смешивание: blend ONE, ONE; цвет предумножен на альфу.
-    out_color = vec4(sample_value.rgb * sample_value.a, 0.0);
+    vec3 rgb = texel.rgb * in_color.rgb;
+    float alpha = texel.a * in_color.a;
+    if (emitter.counts.z == 1u) {
+        // Альфа-смешивание: blend SRC_ALPHA, ONE_MINUS_SRC_ALPHA.
+        out_color = vec4(rgb, alpha);
+    } else {
+        // Аддитивное смешивание: blend ONE, ONE; цвет предумножен на альфу.
+        out_color = vec4(rgb * alpha, 0.0);
+    }
 }

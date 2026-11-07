@@ -290,7 +290,7 @@ struct ResizeTest {
 
 /// Процедурный аддитивный фонтан над кубом для ручной проверки путя частиц.
 fn create_particle_emitters(renderer: &mut Renderer) -> Result<Vec<ParticleEmitterFrame>, String> {
-    let desc = ParticleEmitterDesc {
+    let fountain = ParticleEmitterDesc {
         capacity: 8192,
         blend: ParticleBlend::Additive,
         shape: ParticleShape::Cone {
@@ -305,14 +305,36 @@ fn create_particle_emitters(renderer: &mut Renderer) -> Result<Vec<ParticleEmitt
         drag: 0.3,
         ..ParticleEmitterDesc::default()
     };
-    let emitter = renderer
-        .create_particle_emitter(desc)
-        .map_err(|error| format!("ошибка создания эмиттера частиц: {error}"))?;
-    Ok(vec![ParticleEmitterFrame {
-        emitter,
-        transform: Mat4::from_translation(Vec3::new(0.0, 1.0, 0.0)).to_cols_array_2d(),
-        emitting: true,
-    }])
+    let smoke = ParticleEmitterDesc {
+        capacity: 2048,
+        blend: ParticleBlend::Alpha,
+        shape: ParticleShape::Box {
+            half_extents: [0.4, 0.1, 0.4],
+        },
+        rate: 120.0,
+        lifetime: [2.0, 3.0],
+        speed: [0.3, 0.6],
+        size: [0.6, 0.9],
+        gravity: [0.0, 0.4, 0.0],
+        drag: 0.5,
+        ..ParticleEmitterDesc::default()
+    };
+    [
+        (fountain, Vec3::new(0.0, 1.0, 0.0)),
+        (smoke, Vec3::new(-1.6, 0.5, 0.0)),
+    ]
+    .into_iter()
+    .map(|(desc, position)| {
+        let emitter = renderer
+            .create_particle_emitter(desc)
+            .map_err(|error| format!("ошибка создания эмиттера частиц: {error}"))?;
+        Ok(ParticleEmitterFrame {
+            emitter,
+            transform: Mat4::from_translation(position).to_cols_array_2d(),
+            emitting: true,
+        })
+    })
+    .collect()
 }
 
 struct Sandbox {
