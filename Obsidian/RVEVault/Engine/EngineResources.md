@@ -24,6 +24,8 @@ Virtual paths используют UTF-8, чувствительный к рег
 
 Удаление request отменяет ещё не завершённую работу. `shutdown` прекращает приём запросов, завершает queued requests и joins coordinator/workers; локальный системный read нельзя прервать до ближайшей границы чтения. Сохранённые handles после остановки возвращают `Stopped`.
 
+Workers завершаются закрытием общей очереди заданий, а не отдельным stop-каналом через `flume::Selector`: в flume 0.11.1 и 0.12.0 Selector может потерять пробуждение при двух каналах и оставить worker в ожидании, тогда `shutdown` висит на join. Регрессия покрыта тестом `shutdown_stops_workers_that_were_just_woken_by_jobs`. Другие крейты с тем же паттерном Selector (`engine-audio`, `engine-physics`, `engine-runtime` pipeline) этим исправлением не затронуты и на такой сбой не проверены.
+
 ## Источники
 
 | Файл | Значимые символы | Роль |
