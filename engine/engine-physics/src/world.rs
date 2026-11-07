@@ -65,6 +65,13 @@ pub struct BodyDesc {
     pub lock_rotation: bool,
 }
 
+/// Изменение набора тел, которое сервер применяет до команд шага.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BodyChange {
+    Insert { handle: BodyHandle, desc: BodyDesc },
+    Remove { handle: BodyHandle },
+}
+
 impl BodyDesc {
     pub fn new(kind: BodyKind, pose: Pose, collider: ColliderDesc) -> Self {
         Self {
@@ -88,6 +95,53 @@ impl BodyDesc {
 
     pub fn static_collider(shape: Shape, pose: Pose) -> Self {
         Self::new(BodyKind::Static, pose, ColliderDesc::new(shape))
+    }
+
+    /// Проверяет, что тело можно вставить. Клиент вызывает проверку до отправки `Insert`,
+    /// поэтому сервер получает только тела, которые способен создать.
+    pub fn validate(&self) -> Result<(), PhysicsWorldError> {
+        self.collider.shape.local_aabb()?;
+        if !self.collider.offset.is_finite()
+            || !self.mass.is_finite()
+            || !self.linear_damping.is_finite()
+            || !self.angular_damping.is_finite()
+            || !self.gravity_scale.is_finite()
+            || self.linear_damping < 0.0
+            || self.angular_damping < 0.0
+            || (self.kind == BodyKind::Dynamic && self.mass <= 0.0)
+            || (self.kind == BodyKind::Dynamic && matches!(self.collider.shape, Shape::TriMesh(_)))
+            || (self.character_controller && self.kind != BodyKind::Kinematic)
+        {
+            return Err(PhysicsWorldError::InvalidBody);
+        }
+        if !self.collider.friction.is_finite()
+            || self.collider.friction < 0.0
+            || !self.collider.restitution.is_finite()
+            || !(0.0..=1.0).contains(&self.collider.restitution)
+        {
+            return Err(PhysicsWorldError::InvalidMaterial);
+        }
+        Pose::new(self.pose.position, self.pose.rotation)?;
+        self.mass_terms()?;
+        Ok(())
+    }
+
+    /// Обратная масса, центр масс и обратный тензор инерции в локальных координатах.
+    fn mass_terms(&self) -> Result<(f32, Vec3, Mat3), PhysicsWorldError> {
+        if self.kind != BodyKind::Dynamic {
+            return Ok((0.0, Vec3::ZERO, Mat3::ZERO));
+        }
+        let properties = self.collider.shape.mass_properties(self.mass)?;
+        let center = self.collider.offset + properties.center_of_mass;
+        let inverse_inertia = if self.lock_rotation {
+            Mat3::ZERO
+        } else {
+            properties
+                .inertia
+                .try_inverse()
+                .ok_or(PhysicsWorldError::InvalidBody)?
+        };
+        Ok((1.0 / self.mass, center, inverse_inertia))
     }
 }
 
@@ -154,6 +208,7 @@ pub enum PhysicsWorldError {
     InvalidTimeStep,
     InvalidStepConfig,
     UnknownBody(BodyHandle),
+    DuplicateBody(BodyHandle),
     WrongBodyKind(BodyHandle),
 }
 
@@ -173,6 +228,9 @@ impl fmt::Display for PhysicsWorldError {
                 formatter.write_str("fixed_hz or max_substeps is out of range")
             }
             Self::UnknownBody(handle) => write!(formatter, "unknown physics body {}", handle.0),
+            Self::DuplicateBody(handle) => {
+                write!(formatter, "physics body {} already exists", handle.0)
+            }
             Self::WrongBodyKind(handle) => {
                 write!(formatter, "command is not valid for body {}", handle.0)
             }
@@ -385,26 +443,22 @@ impl PhysicsWorld {
     }
 
     pub fn insert_body(&mut self, desc: BodyDesc) -> Result<BodyHandle, PhysicsWorldError> {
-        validate_body_desc(&desc)?;
+        self.insert_body_with_handle(BodyHandle(self.next_body_id), desc)
+    }
+
+    /// Вставляет тело с заданным хендлом. Занятый хендл отказывает. После успеха `next_body_id`
+    /// становится больше хендла, поэтому `insert_body` не выдаст его повторно.
+    pub fn insert_body_with_handle(
+        &mut self,
+        handle: BodyHandle,
+        desc: BodyDesc,
+    ) -> Result<BodyHandle, PhysicsWorldError> {
+        if self.bodies.contains_key(&handle) {
+            return Err(PhysicsWorldError::DuplicateBody(handle));
+        }
+        desc.validate()?;
         let pose = Pose::new(desc.pose.position, desc.pose.rotation)?;
-        let (inverse_mass, center_of_mass_local, inverse_inertia_local) =
-            if desc.kind == BodyKind::Dynamic {
-                let properties = desc.collider.shape.mass_properties(desc.mass)?;
-                let center = desc.collider.offset + properties.center_of_mass;
-                let inverse_inertia = if desc.lock_rotation {
-                    Mat3::ZERO
-                } else {
-                    properties
-                        .inertia
-                        .try_inverse()
-                        .ok_or(PhysicsWorldError::InvalidBody)?
-                };
-                (1.0 / desc.mass, center, inverse_inertia)
-            } else {
-                (0.0, Vec3::ZERO, Mat3::ZERO)
-            };
-        let handle = BodyHandle(self.next_body_id);
-        self.next_body_id = self.next_body_id.wrapping_add(1).max(1);
+        let (inverse_mass, center_of_mass_local, inverse_inertia_local) = desc.mass_terms()?;
         self.bodies.insert(
             handle,
             Body {
@@ -426,6 +480,7 @@ impl PhysicsWorld {
                 kinematic_target: None,
             },
         );
+        self.next_body_id = self.next_body_id.max(handle.0.saturating_add(1));
         Ok(handle)
     }
 
@@ -803,34 +858,9 @@ fn is_moving_kinematic(body: &Body) -> bool {
             || body.angular_velocity.length_squared() > WAKE_SPEED_SQUARED)
 }
 
-fn validate_body_desc(desc: &BodyDesc) -> Result<(), PhysicsWorldError> {
-    desc.collider.shape.local_aabb()?;
-    if !desc.collider.offset.is_finite()
-        || !desc.mass.is_finite()
-        || !desc.linear_damping.is_finite()
-        || !desc.angular_damping.is_finite()
-        || !desc.gravity_scale.is_finite()
-        || desc.linear_damping < 0.0
-        || desc.angular_damping < 0.0
-        || (desc.kind == BodyKind::Dynamic && desc.mass <= 0.0)
-        || (desc.kind == BodyKind::Dynamic && matches!(desc.collider.shape, Shape::TriMesh(_)))
-        || (desc.character_controller && desc.kind != BodyKind::Kinematic)
-    {
-        return Err(PhysicsWorldError::InvalidBody);
-    }
-    if !desc.collider.friction.is_finite()
-        || desc.collider.friction < 0.0
-        || !desc.collider.restitution.is_finite()
-        || !(0.0..=1.0).contains(&desc.collider.restitution)
-    {
-        return Err(PhysicsWorldError::InvalidMaterial);
-    }
-    Pose::new(desc.pose.position, desc.pose.rotation)?;
-    Ok(())
-}
-
 impl PhysicsCommand {
-    fn body(&self) -> BodyHandle {
+    /// Тело, к которому относится команда.
+    pub fn body(&self) -> BodyHandle {
         match *self {
             Self::SetVelocity { body, .. }
             | Self::AddImpulse { body, .. }
@@ -912,13 +942,37 @@ impl StepDriver {
         dt: f32,
         commands: impl IntoIterator<Item = PhysicsCommand>,
     ) -> Result<StepResult, PhysicsWorldError> {
+        self.advance_step_with_changes(dt, std::iter::empty(), commands)
+    }
+
+    /// Applies body changes, then frame commands, then runs the capped fixed substeps. Exit events
+    /// of removed bodies are part of the returned step events. Removing an unknown body is ignored.
+    pub fn advance_step_with_changes(
+        &mut self,
+        dt: f32,
+        changes: impl IntoIterator<Item = BodyChange>,
+        commands: impl IntoIterator<Item = PhysicsCommand>,
+    ) -> Result<StepResult, PhysicsWorldError> {
         validate_nonnegative_dt(dt)?;
         self.world.skipped_pairs = 0;
+        let mut events = Vec::new();
+        for change in changes {
+            match change {
+                BodyChange::Insert { handle, desc } => {
+                    self.world.insert_body_with_handle(handle, desc)?;
+                }
+                BodyChange::Remove { handle } => match self.world.remove_body(handle) {
+                    Ok(exits) => events.extend(exits),
+                    Err(PhysicsWorldError::UnknownBody(_)) => {}
+                    Err(error) => return Err(error),
+                },
+            }
+        }
         for command in commands {
             self.world.apply_command(command, dt)?;
         }
 
-        let mut events = self.world.refresh_pairs()?;
+        events.extend(self.world.refresh_pairs()?);
         let accumulated = self.accumulator + dt as f64;
         let available = (accumulated / self.fixed_dt as f64).floor();
         let substeps = available.min(self.max_substeps as f64) as usize;
@@ -1014,8 +1068,8 @@ fn validate_positive_dt(dt: f32) -> Result<(), PhysicsWorldError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent, PhysicsWorld,
-        PhysicsWorldError, StepDriver,
+        BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent,
+        PhysicsWorld, PhysicsWorldError, StepDriver,
     };
     use crate::{Hull, Pose, Shape, TriMesh};
     use glam::{Quat, Vec3};
@@ -1980,5 +2034,184 @@ mod tests {
             origin_hull.abs_diff_eq(offset_hull, 1.0e-5),
             "origin={origin_hull:?}, offset={offset_hull:?}"
         );
+    }
+
+    fn ball_desc(y: f32) -> BodyDesc {
+        BodyDesc::dynamic(
+            Shape::sphere(0.5).unwrap(),
+            Pose::new(Vec3::new(0.0, y, 0.0), Quat::IDENTITY).unwrap(),
+            1.0,
+        )
+    }
+
+    fn involves(event: &PhysicsEvent, body: BodyHandle) -> bool {
+        match event {
+            PhysicsEvent::CollisionEnter { first, second, .. }
+            | PhysicsEvent::CollisionExit { first, second }
+            | PhysicsEvent::TriggerEnter { first, second }
+            | PhysicsEvent::TriggerExit { first, second } => *first == body || *second == body,
+        }
+    }
+
+    #[test]
+    fn insert_with_handle_rejects_occupied_handle_and_moves_next_id_past_it() {
+        let mut world = PhysicsWorld::default();
+        assert_eq!(
+            world.insert_body_with_handle(BodyHandle(5), floor_desc()),
+            Ok(BodyHandle(5))
+        );
+        assert_eq!(
+            world.insert_body_with_handle(BodyHandle(5), floor_desc()),
+            Err(PhysicsWorldError::DuplicateBody(BodyHandle(5)))
+        );
+        assert_eq!(world.insert_body(floor_desc()), Ok(BodyHandle(6)));
+    }
+
+    #[test]
+    fn invalid_insert_leaves_its_handle_and_the_next_id_untouched() {
+        let mut world = PhysicsWorld::default();
+        let mut invalid = ball_desc(0.0);
+        invalid.mass = 0.0;
+        assert_eq!(invalid.validate(), Err(PhysicsWorldError::InvalidBody));
+        assert_eq!(
+            world.insert_body_with_handle(BodyHandle(3), invalid),
+            Err(PhysicsWorldError::InvalidBody)
+        );
+        assert!(world.body_pose(BodyHandle(3)).is_none());
+        assert_eq!(world.insert_body(floor_desc()), Ok(BodyHandle(1)));
+    }
+
+    #[test]
+    fn inserted_body_falls_and_collides_with_the_floor_in_later_steps() {
+        let mut driver = StepDriver::new(PhysicsWorld::default(), 60, 8).unwrap();
+        driver.world_mut().insert_body(floor_desc()).unwrap();
+        let ball = BodyHandle(7);
+        let inserted = driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: ball,
+                    desc: ball_desc(1.0),
+                }],
+                [],
+            )
+            .unwrap();
+        assert!(driver.world().body_pose(ball).is_some());
+        assert_eq!(
+            count_events(&inserted.events, |event| involves(event, ball)),
+            0
+        );
+
+        let events = run_steps(&mut driver, 120);
+        assert_eq!(
+            count_events(&events, |event| matches!(
+                event,
+                PhysicsEvent::CollisionEnter { .. }
+            ) && involves(event, ball)),
+            1
+        );
+    }
+
+    #[test]
+    fn velocity_command_applies_to_body_inserted_in_the_same_step() {
+        let mut driver = StepDriver::new(PhysicsWorld::new(Vec3::ZERO).unwrap(), 60, 8).unwrap();
+        let handle = BodyHandle(4);
+        let desc = BodyDesc::dynamic(Shape::sphere(0.5).unwrap(), Pose::IDENTITY, 1.0);
+        driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert { handle, desc }],
+                [PhysicsCommand::SetVelocity {
+                    body: handle,
+                    velocity: Vec3::X,
+                }],
+            )
+            .unwrap();
+        let velocity = driver.world().body_velocity(handle).unwrap();
+        assert!(velocity.abs_diff_eq(Vec3::X, 1.0e-5), "{velocity:?}");
+    }
+
+    #[test]
+    fn removing_a_colliding_body_emits_collision_exit_and_unknown_removal_is_ignored() {
+        let mut driver = StepDriver::new(PhysicsWorld::default(), 60, 8).unwrap();
+        driver.world_mut().insert_body(floor_desc()).unwrap();
+        let ball = BodyHandle(7);
+        let inserted = driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: ball,
+                    desc: ball_desc(0.4),
+                }],
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            count_events(&inserted.events, |event| matches!(
+                event,
+                PhysicsEvent::CollisionEnter { .. }
+            ) && involves(event, ball)),
+            1
+        );
+
+        let removed = driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [
+                    BodyChange::Remove { handle: ball },
+                    BodyChange::Remove {
+                        handle: BodyHandle(99),
+                    },
+                ],
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            count_events(&removed.events, |event| matches!(
+                event,
+                PhysicsEvent::CollisionExit { .. }
+            ) && involves(event, ball)),
+            1
+        );
+        assert!(driver.world().body_pose(ball).is_none());
+    }
+
+    #[test]
+    fn removing_a_body_in_a_trigger_emits_trigger_exit() {
+        let mut driver = StepDriver::new(PhysicsWorld::new(Vec3::ZERO).unwrap(), 60, 8).unwrap();
+        let mut trigger = BodyDesc::static_collider(
+            Shape::sphere(1.0).unwrap(),
+            Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap(),
+        );
+        trigger.collider.trigger = true;
+        let trigger_body = driver.world_mut().insert_body(trigger).unwrap();
+        let ball = BodyHandle(9);
+        let entered = driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: ball,
+                    desc: ball_desc(0.0),
+                }],
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            count_events(&entered.events, |event| matches!(
+                event,
+                PhysicsEvent::TriggerEnter { .. }
+            ) && involves(event, ball)),
+            1
+        );
+
+        let exited = driver
+            .advance_step_with_changes(1.0 / 60.0, [BodyChange::Remove { handle: ball }], [])
+            .unwrap();
+        assert!(exited.events.iter().any(|event| matches!(
+            event,
+            PhysicsEvent::TriggerExit { first, second }
+                if (*first == ball && *second == trigger_body)
+                    || (*first == trigger_body && *second == ball)
+        )));
     }
 }

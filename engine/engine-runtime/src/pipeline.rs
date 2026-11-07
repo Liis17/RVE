@@ -3205,6 +3205,7 @@ return Move
                         sequence,
                         dt,
                         commands,
+                        ..
                     } => {
                         let has_teleport = commands.iter().any(|command| {
                             matches!(
