@@ -58,10 +58,10 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 
 - В `engine-core`, `engine-window` и `engine-render` проверяй публичный API и его использование в `engine/sandbox`.
 - Изменения `engine-window`, `engine-render`, `engine-platform`, `engine-scene`, `engine-audio`,
-  `engine-script`, `engine-resources`, `engine-project` и `engine-physics` проверяй также на
+  `engine-script`, `engine-resources`, `engine-project`, `engine-physics` и `engine-animation` проверяй также на
   потребителях `engine-runtime`/`rve-player` и `rve-build`, если они используют
   изменённый крейт. Прямые workspace-зависимости:
-  - `engine-runtime`: `engine-assets`, `engine-files`, `engine-audio`,
+  - `engine-runtime`: `engine-animation`, `engine-assets`, `engine-files`, `engine-audio`,
     `engine-neural`, `engine-network`, `engine-physics`, `engine-platform`,
     `engine-project`, `engine-render`, `engine-resources`, `engine-scene`,
     `engine-script`, `engine-window`, `engine-console`, `engine-ui`.
@@ -69,8 +69,9 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
     `engine-resources`, `engine-scene`.
   - `engine-script` (потребители `engine-runtime` и `rve-editor`): `engine-console`, `engine-files`, `engine-physics`, `engine-scene`, `rve-sdk`.
   - `engine-audio` (потребители `engine-runtime` и `rve-editor`): `engine-resources`, `engine-scene`, `cpal`, `lewton`, `flume`, `rtrb`, `log`.
+  - `engine-animation` (потребители `engine-runtime` и `rve-editor`): `engine-assets`, `engine-files`, `engine-scene`, `glam`.
   - `rve-player`: `engine-runtime`.
-  - `rve-editor`: `engine-assets`, `engine-files`, `engine-physics`, `engine-project`, `engine-render`,
+  - `rve-editor`: `engine-animation`, `engine-assets`, `engine-files`, `engine-physics`, `engine-project`, `engine-render`,
     `engine-audio`, `engine-resources`, `engine-scene`, `engine-script`, `engine-window`,
     `engine-console`, `engine-ui`.
 - При изменении `engine-platform` проверяй общий интерфейс, адаптеры `engine-platform-windows` и `engine-platform-macos` и вызовы из renderer.
