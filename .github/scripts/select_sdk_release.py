@@ -11,7 +11,7 @@ from affected_packages import affected_packages, changed_paths
 SDK_PACKAGES = {"rve-editor", "rve-build", "rve-player", "rve-sdk"}
 RELEASE_INPUTS = {
     "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml",
-    ".github/workflows/sdk-release.yml",
+    ".github/workflows/ci.yml",
     ".github/scripts/select_sdk_release.py",
     ".github/scripts/affected_packages.py",
     ".github/scripts/package_sdk_release.py",

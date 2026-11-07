@@ -182,18 +182,21 @@ Homebrew). Передай `--rust-toolchain` sysroot активной macOS tool
 `<project>/.rve/sdk/rve-sdk` перед сборкой. Без marker builder использует checkout:
 distribution player собирается в `build/player`, dev-player — в `build/player-dev`.
 
-Workflow `.github/workflows/sdk-release.yml` публикует Windows x64 дистрибутив
-`sdk-verified.zip` в GitHub Releases после подходящих push в `mommy`. Изменения
-редактора, builder, player, гостевого API и их транзитивных Cargo-зависимостей,
-общих настроек Cargo или самого конвейера публикации запускают сборку. Изменения
-документации, примеров и независимых инструментов её пропускают. Ручной запуск
-`SDK Release` из `mommy` принудительно собирает дистрибутив.
-Каждый коммит получает отдельный prerelease `sdk-<полный SHA>`; повторный запуск
-обновляет ZIP в том же релизе. Обычный latest release не меняется. Перед публикацией
-архив распаковывается во временный каталог, где из шаблона New Project собираются
-Rust-скрипты и готовый player при PATH только с системными каталогами Windows.
+Workflow `Rust CI` (`.github/workflows/ci.yml`) запускается на pull request в
+`son-croissant` и `mommy`, на push в `mommy` и вручную. Push в остальные ветки CI не
+запускает. Общая проверка `CI` требуется для merge в `mommy`.
+
+Job `release` в том же workflow публикует Windows x64 дистрибутив `sdk-verified.zip`
+как обычный GitHub Release с тегом `sdk-<полный SHA>` и отметкой latest. Он стартует
+только после успешной проверки `CI` при push в `mommy` или ручном запуске из `mommy`.
+Изменения редактора, builder, player, гостевого API и их транзитивных Cargo-зависимостей,
+общих настроек Cargo или самого workflow и скриптов запускают сборку. Изменения
+документации, примеров и независимых инструментов её пропускают. Повторный запуск на
+том же коммите заменяет ZIP в существующем релизе и снова делает его latest. Перед
+публикацией архив распаковывается во временный каталог, где из шаблона New Project
+собираются Rust-скрипты и готовый player при PATH только с системными каталогами Windows.
 Дополнительные секреты не нужны: публикация использует `GITHUB_TOKEN` с
-`contents: write` только в задании выпуска.
+`contents: write` только в job `release`.
 
 По умолчанию Cargo feature `dev-console` включена у `rve-player`, в том числе при
 `cargo build --release -p rve-player`. Для distribution-бинарника собирай с
