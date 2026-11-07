@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Point Light">
+  <g fill="none" stroke="#FFD54A" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <!-- bulb outline -->
+    <path d="M32 8C22.6 8 15 15.6 15 25c0 5.5 2.6 10.3 6.7 13.4 2.8 2.1 4.5 5.1 4.5 8.1V48h11.6v-1.5c0-3 1.7-6 4.5-8.1C46.4 35.3 49 30.5 49 25 49 15.6 41.4 8 32 8Z"/>
+    <!-- filament -->
+    <path d="M27 28l5 5 5-5"/>
+    <path d="M32 33v15"/>
+    <!-- socket -->
+    <path d="M24.5 53h15"/>
+    <path d="M25.5 58h13"/>
+  </g>
+</svg>

@@ -1,8 +1,9 @@
-//! Иконки панели Project и компонентов Inspector: растеризованы из `IconsPack` при сборке (`build.rs`).
+//! Иконки панелей Project и Hierarchy и компонентов Inspector: растеризованы из `IconsPack` при сборке (`build.rs`).
 
 use crate::assets_fs::AssetKind;
 use crate::scene_edit::ComponentKind;
 use engine_render::{RenderError, Renderer};
+use engine_scene::SceneObject;
 use engine_ui::render::UiBridge;
 use std::collections::HashMap;
 
@@ -42,7 +43,29 @@ pub fn component_icon(kind: ComponentKind) -> Option<&'static str> {
     match kind {
         ComponentKind::Transform => Some("rve-gizmo"),
         ComponentKind::Camera => Some("camera"),
+        ComponentKind::MeshRenderer => Some("mesh"),
+        ComponentKind::DirectionalLight => Some("directional-light"),
+        ComponentKind::PointLight => Some("point-light"),
+        ComponentKind::SpotLight => Some("spot-light"),
         _ => None,
+    }
+}
+
+/// Иконка строки Hierarchy по компонентам объекта. При нескольких компонентах
+/// побеждает первый: камера, свет (направленный, точечный, прожектор), Mesh Renderer.
+pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
+    if object.camera.is_some() {
+        Some("camera")
+    } else if object.directional_light.is_some() {
+        Some("directional-light")
+    } else if object.point_light.is_some() {
+        Some("point-light")
+    } else if object.spot_light.is_some() {
+        Some("spot-light")
+    } else if object.mesh_renderer.is_some() {
+        Some("cube")
+    } else {
+        None
     }
 }
 
@@ -82,7 +105,18 @@ impl IconCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene_edit::default_light;
+    use engine_files::VirtualPath;
+    use engine_scene::MeshRenderer;
     use std::path::Path;
+
+    fn mesh_renderer() -> MeshRenderer {
+        MeshRenderer {
+            model: VirtualPath::parse("/models/cube.fbx").unwrap(),
+            texture: None,
+            material: None,
+        }
+    }
 
     #[test]
     fn folder_icon_follows_git_settings_and_content_rules() {
@@ -108,23 +142,65 @@ mod tests {
     }
 
     #[test]
-    fn transform_camera_and_camera_settings_have_icons_in_the_generated_list() {
+    fn component_and_file_icons_are_in_the_generated_list() {
         assert_eq!(component_icon(ComponentKind::Transform), Some("rve-gizmo"));
         assert_eq!(component_icon(ComponentKind::Camera), Some("camera"));
-        assert_eq!(component_icon(ComponentKind::MeshRenderer), None);
+        assert_eq!(component_icon(ComponentKind::MeshRenderer), Some("mesh"));
+        assert_eq!(
+            component_icon(ComponentKind::DirectionalLight),
+            Some("directional-light")
+        );
+        assert_eq!(
+            component_icon(ComponentKind::PointLight),
+            Some("point-light")
+        );
+        assert_eq!(component_icon(ComponentKind::SpotLight), Some("spot-light"));
+        assert_eq!(component_icon(ComponentKind::Collider), None);
         assert_eq!(
             file_icon(AssetKind::CameraSettings),
             Some("camera-settings")
         );
         assert_eq!(file_icon(AssetKind::Scene), None);
-        for icon in [
-            component_icon(ComponentKind::Transform),
-            component_icon(ComponentKind::Camera),
-            file_icon(AssetKind::CameraSettings),
-        ] {
-            let icon = icon.unwrap();
+        let components = [
+            ComponentKind::Transform,
+            ComponentKind::Camera,
+            ComponentKind::MeshRenderer,
+            ComponentKind::LodGroup,
+            ComponentKind::DirectionalLight,
+            ComponentKind::PointLight,
+            ComponentKind::SpotLight,
+            ComponentKind::Environment,
+            ComponentKind::Collider,
+            ComponentKind::RigidBody,
+            ComponentKind::CharacterController,
+        ];
+        let icons = components
+            .into_iter()
+            .filter_map(component_icon)
+            .chain(file_icon(AssetKind::CameraSettings))
+            .chain(object_icon(&SceneObject {
+                mesh_renderer: Some(mesh_renderer()),
+                ..SceneObject::default()
+            }));
+        for icon in icons {
             assert!(SOURCES.iter().any(|source| source.name == icon), "{icon}");
         }
+    }
+
+    #[test]
+    fn object_icon_prefers_camera_then_lights_then_mesh() {
+        let mut object = SceneObject::default();
+        assert_eq!(object_icon(&object), None);
+        object.mesh_renderer = Some(mesh_renderer());
+        assert_eq!(object_icon(&object), Some("cube"));
+        object.spot_light = Some(Default::default());
+        assert_eq!(object_icon(&object), Some("spot-light"));
+        object.point_light = Some(Default::default());
+        assert_eq!(object_icon(&object), Some("point-light"));
+        object.directional_light = Some(default_light());
+        assert_eq!(object_icon(&object), Some("directional-light"));
+        object.camera = Some(Default::default());
+        assert_eq!(object_icon(&object), Some("camera"));
     }
 
     #[test]
