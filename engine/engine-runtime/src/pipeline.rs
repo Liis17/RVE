@@ -3227,7 +3227,8 @@ return Script
                 match request {
                     PhysicsRequest::Step { sequence, dt, .. } => {
                         physics_dt_tx.send(dt).unwrap();
-                        physics_reply_tx
+                        // Клиент может уже завершиться и уронить приёмник ответа: это не ошибка worker.
+                        if physics_reply_tx
                             .send(PhysicsReply::Step(PhysicsStepResult {
                                 sequence,
                                 substeps: 0,
@@ -3235,7 +3236,10 @@ return Script
                                 events: Vec::<PhysicsEvent>::new(),
                                 snapshot: Arc::clone(&snapshot),
                             }))
-                            .unwrap();
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     PhysicsRequest::Shutdown => break,
                     PhysicsRequest::Init(_) => panic!("preinitialized server received Init"),
@@ -3309,7 +3313,8 @@ return Script
         assert_eq!(render_rx.recv().unwrap(), RenderControl::Shutdown);
         modules.join_named(SCRIPTS_THREAD).unwrap();
         assert!(modules.shutdown().is_empty());
-        physics_stop_tx.send(PhysicsRequest::Shutdown).unwrap();
+        // Worker мог выйти раньше из-за закрытого приёмника ответа; тогда останавливать уже нечего.
+        let _ = physics_stop_tx.send(PhysicsRequest::Shutdown);
         physics_worker.join().unwrap();
     }
 
