@@ -621,16 +621,14 @@ impl ScriptTransaction {
             .map(|matrix| matrix.to_cols_array())
     }
 
+    /// Живой объект по ABI-значению; устаревший хендл даёт `None` даже после переиспользования слота.
     pub(crate) fn object_from_abi_handle(&self, handle: u64) -> Option<ObjectHandle> {
-        let index = usize::try_from(handle.checked_sub(1)?).ok()?;
-        self.world()?
-            .objects()
-            .get(index)
-            .map(|object| object.handle)
+        let handle = ObjectHandle::from_abi(handle)?;
+        self.world()?.is_alive(handle).then_some(handle)
     }
 
     pub(crate) fn abi_handle(&self, handle: ObjectHandle) -> Option<u64> {
-        u64::try_from(handle.index()).ok()?.checked_add(1)
+        handle.to_abi()
     }
 
     pub(crate) fn set_local_from_abi(&mut self, handle: u64, transform: ScriptTransform) -> bool {

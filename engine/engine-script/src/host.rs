@@ -1228,9 +1228,7 @@ impl Drop for ScriptHost {
 }
 
 fn abi_object_handle(handle: ObjectHandle) -> Option<u64> {
-    u64::try_from(handle.index())
-        .ok()
-        .and_then(|index| index.checked_add(1))
+    handle.to_abi()
 }
 
 /// Значения параметров экземпляра: по схеме скрипта, если она объявлена, иначе как в сцене.

@@ -1501,6 +1501,7 @@ fn ensure_asset(document: &mut SceneDocument, path: &VirtualPath) {
         document.assets.push(SceneAsset {
             path: path.clone(),
             archive: None,
+            max_instances: None,
         });
     }
 }

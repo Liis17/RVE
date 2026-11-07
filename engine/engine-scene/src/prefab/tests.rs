@@ -797,3 +797,90 @@ fn audio_source_prefab_override_replaces_the_whole_component_and_checks_its_clip
     let error = other.expand(&scene(&bad)).unwrap_err();
     assert!(error.message.contains("audio_source"), "{error}");
 }
+
+/// Шаблон spawn из набора префабов в памяти.
+fn load_template(library: &Library, path: &str) -> Result<PrefabTemplate, SceneError> {
+    let path = VirtualPath::parse(path).unwrap();
+    let mut read = |child: &VirtualPath| -> Result<String, String> {
+        library
+            .0
+            .get(child.as_str())
+            .cloned()
+            .ok_or_else(|| "не найден".to_owned())
+    };
+    PrefabTemplate::load(&path, &mut read)
+}
+
+#[test]
+fn spawn_template_rejects_camera_directional_light_and_environment() {
+    let environment = "[objects.environment]\n[objects.environment.procedural]\nzenith_color = [0.2, 0.3, 0.5]\nhorizon_color = [0.8, 0.7, 0.5]\nground_color = [0.1, 0.1, 0.1]\nsun_size_deg = 3.0\nsun_intensity = 2.0\n";
+    for (name, component) in [
+        ("camera", "[objects.camera]\n"),
+        ("directional_light", "[objects.directional_light]\n"),
+        ("environment", environment),
+    ] {
+        let text = format!(
+            "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"lamp\"\nparent = \"root\"\n{component}"
+        );
+        let library = Library::new(&[("prefabs/bullet.rveprefab", text.as_str())]);
+        let error = load_template(&library, "prefabs/bullet.rveprefab").unwrap_err();
+        assert!(error.message.contains(name), "{error}");
+        assert_eq!(error.object_id.as_deref(), Some("lamp"));
+    }
+}
+
+#[test]
+fn spawn_template_accepts_point_and_spot_lights() {
+    let library = Library::new(&[(
+        "prefabs/lamp.rveprefab",
+        "[[objects]]\nid = \"root\"\n[objects.point_light]\n[[objects]]\nid = \"bulb\"\nparent = \"root\"\n[objects.spot_light]\n",
+    )]);
+    let template = load_template(&library, "prefabs/lamp.rveprefab").unwrap();
+    assert_eq!(template.objects.len(), 2);
+}
+
+#[test]
+fn spawn_template_uses_local_ids_parents_and_order_for_nested_prefabs() {
+    let library = Library::new(&[
+        (
+            "prefabs/inner.rveprefab",
+            "[[objects]]\nid = \"core\"\n[[objects]]\nid = \"arm\"\nparent = \"core\"\n",
+        ),
+        (
+            "prefabs/outer.rveprefab",
+            "[[assets]]\npath = \"/prefabs/inner.rveprefab\"\n[[objects]]\nid = \"base\"\n\
+             [[instances]]\nid = \"door\"\nprefab = \"/prefabs/inner.rveprefab\"\nparent = \"base\"\n",
+        ),
+    ]);
+    let template = load_template(&library, "prefabs/outer.rveprefab").unwrap();
+    assert_eq!(template.stem(), "outer");
+    let ids = template
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["", "door", "door.arm"]);
+    assert_eq!(template.root, 0);
+    assert_eq!(template.parents, [None, Some(0), Some(1)]);
+    assert_eq!(template.order, [0, 1, 2]);
+    assert!(
+        template
+            .assets()
+            .iter()
+            .any(|asset| asset.path.as_str() == "prefabs/inner.rveprefab")
+    );
+}
+
+#[test]
+fn spawn_template_reports_missing_prefabs_and_dynamic_children() {
+    let empty = Library::new(&[]);
+    let error = load_template(&empty, "prefabs/gone.rveprefab").unwrap_err();
+    assert!(error.message.contains("не найден"), "{error}");
+
+    let library = Library::new(&[(
+        "prefabs/crate.rveprefab",
+        "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"child\"\nparent = \"root\"\n[objects.collider]\n[objects.rigid_body]\n",
+    )]);
+    let error = load_template(&library, "prefabs/crate.rveprefab").unwrap_err();
+    assert!(error.message.contains("корневым"), "{error}");
+}
