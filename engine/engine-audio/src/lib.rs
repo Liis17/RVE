@@ -186,7 +186,6 @@ impl Lanes {
             .iter()
             .position(|slot| slot.is_some_and(|lane| lane.voice == voice))
     }
-
 }
 
 /// Клиентский конец звуковой подсистемы. Клонируется; все методы не блокируют поток
@@ -416,7 +415,8 @@ impl AudioEngine {
             match output::open(mixer_rx, ended_tx, Arc::clone(&spatial)) {
                 Ok(output) => (Some(output), Some(mixer_tx)),
                 Err(error) => {
-                    let message = format!("звук отключён: {error}; игра продолжает работу без звука");
+                    let message =
+                        format!("звук отключён: {error}; игра продолжает работу без звука");
                     log::warn!("{message}");
                     let _ = events_tx.send(AudioEvent::Failed(message));
                     (None, None)
@@ -652,7 +652,12 @@ impl Core {
             .partition(|pending| pending.path == path);
         self.pending = waiting;
         for pending in ready {
-            self.start_voice(pending.voice, pending.lane, Arc::clone(&clip), pending.request);
+            self.start_voice(
+                pending.voice,
+                pending.lane,
+                Arc::clone(&clip),
+                pending.request,
+            );
         }
     }
 
@@ -750,9 +755,7 @@ fn decode_loop(jobs: Receiver<DecodeJob>, results: Sender<Decoded>, cancel: &Ato
 fn read_source(resources: Option<ResourceHandle>) -> ReadSource {
     match resources {
         Some(resources) => Box::new(move |path: &str| {
-            let mut stat = resources
-                .stat(path)
-                .map_err(|error| error.to_string())?;
+            let mut stat = resources.stat(path).map_err(|error| error.to_string())?;
             let size = move || match stat.try_receive() {
                 Ok(None) => None,
                 Ok(Some(stat)) => Some(Ok(stat.size)),

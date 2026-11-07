@@ -89,9 +89,7 @@ where
                     *sample = T::from_sample(*value);
                 }
             }
-            let CallbackState {
-                mixer, ended, ..
-            } = &mut state;
+            let CallbackState { mixer, ended, .. } = &mut state;
             mixer.drain_ended(|voice| ended.push(voice).is_ok());
         },
         |error| log::warn!("ошибка аудиопотока: {error}"),

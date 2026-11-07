@@ -962,10 +962,15 @@ spatial = true
         session.audio.as_ref().unwrap().handle.barrier().unwrap();
         let warnings = session.drain_audio_warnings();
         assert!(
-            warnings.iter().any(|message| message.contains("audio/hum.wav")),
+            warnings
+                .iter()
+                .any(|message| message.contains("audio/hum.wav")),
             "{warnings:?}"
         );
-        assert!(session.drain_audio_warnings().is_empty(), "предупреждение показывается один раз");
+        assert!(
+            session.drain_audio_warnings().is_empty(),
+            "предупреждение показывается один раз"
+        );
     }
 
     #[test]

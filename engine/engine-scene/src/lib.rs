@@ -10,7 +10,9 @@ pub mod prefab;
 pub mod transform;
 pub mod world;
 
-pub use audio::{AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId};
+pub use audio::{
+    AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
+};
 pub use light::ShadowSettings;
 
 pub use camera_settings::{

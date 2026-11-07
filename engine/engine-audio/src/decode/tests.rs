@@ -208,5 +208,8 @@ fn cancelled_ogg_decode_stops_before_the_first_packet() {
         Err(DecodeError::Cancelled)
     ));
     cancel.store(false, Ordering::Relaxed);
-    assert!(decode_ogg(OGG_FIXTURE, &cancel).is_ok(), "без отмены декодирование проходит");
+    assert!(
+        decode_ogg(OGG_FIXTURE, &cancel).is_ok(),
+        "без отмены декодирование проходит"
+    );
 }

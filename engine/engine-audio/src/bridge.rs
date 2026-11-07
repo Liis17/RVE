@@ -129,8 +129,7 @@ impl AudioBridge {
                     };
                     let result = match params.position {
                         Some(position) => {
-                            self.handle
-                                .play_at(voice, path.as_str(), request, position)
+                            self.handle.play_at(voice, path.as_str(), request, position)
                         }
                         None => self.handle.play(voice, path.as_str(), request),
                     };
@@ -179,7 +178,10 @@ impl AudioBridge {
         if result.is_ok() {
             self.sources.insert(object, voice);
         }
-        self.note(result, &format!("воспроизведение источника {}", audio.clip.as_str()));
+        self.note(
+            result,
+            &format!("воспроизведение источника {}", audio.clip.as_str()),
+        );
     }
 
     /// Останавливает голос. При отказе очереди голос остаётся в таблице и помечается отказом.

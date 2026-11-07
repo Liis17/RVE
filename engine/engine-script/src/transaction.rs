@@ -255,7 +255,9 @@ impl ScriptTransaction {
         if !self.writable {
             return Err("audio is unavailable during script creation".to_owned());
         }
-        if self.queued_audio.saturating_add(self.pending_audio.len()) >= MAX_AUDIO_REQUESTS_PER_FRAME {
+        if self.queued_audio.saturating_add(self.pending_audio.len())
+            >= MAX_AUDIO_REQUESTS_PER_FRAME
+        {
             return Err(format!(
                 "audio requests limit ({MAX_AUDIO_REQUESTS_PER_FRAME} per frame) reached"
             ));

@@ -284,7 +284,10 @@ fn rejected_stop_keeps_the_source_tracked_so_a_later_stop_reaches_its_voice() {
     rig.bridge
         .apply([AudioRequest::StopSource { object: shot }], &world);
     assert_eq!(rig.bridge.sources.get(&shot), Some(&voice(1)));
-    assert!(rig.handle.lane_of(voice(1)).is_some(), "голос продолжает занимать слот");
+    assert!(
+        rig.handle.lane_of(voice(1)).is_some(),
+        "голос продолжает занимать слот"
+    );
 
     rig.take();
     rig.bridge

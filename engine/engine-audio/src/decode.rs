@@ -40,7 +40,9 @@ impl Clip {
 pub enum DecodeError {
     Unsupported(String),
     Corrupt(String),
-    TooLarge { samples: u64 },
+    TooLarge {
+        samples: u64,
+    },
     /// Декодирование прервано: приложение завершает звуковой поток.
     Cancelled,
 }

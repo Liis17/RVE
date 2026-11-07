@@ -365,7 +365,8 @@ fn seqlock_read_gives_up_after_bounded_attempts_while_a_write_is_open() {
     let slot = SeqSlot::<3>::new();
     slot.store([1.0, 2.0, 3.0]);
     assert_eq!(slot.try_load(), Some([1.0, 2.0, 3.0]));
-    slot.seq.store(slot.seq.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    slot.seq
+        .store(slot.seq.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
     assert_eq!(slot.try_load(), None);
 }
 
@@ -374,7 +375,13 @@ fn an_open_emitter_write_keeps_the_voice_at_its_previous_position() {
     let spatial = Arc::new(Spatial::new());
     spatial.set_emitter(0, [0.0, 0.0, 5.0]);
     let mut mixer = Mixer::new(RATE, Arc::clone(&spatial));
-    play(&mut mixer, 1, 0, clip(RATE, 1, vec![1.0; 48_000]), spatial_request(true));
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 1, vec![1.0; 48_000]),
+        spatial_request(true),
+    );
     // Первый блок ещё нарастает от нуля; установившийся уровень — последний кадр.
     let before = render_mono(&mut mixer, 256);
 
@@ -384,7 +391,9 @@ fn an_open_emitter_write_keeps_the_voice_at_its_previous_position() {
     let during = render_mono(&mut mixer, 256);
 
     assert!(
-        during.iter().all(|value| (value - before[255]).abs() < 1e-6),
+        during
+            .iter()
+            .all(|value| (value - before[255]).abs() < 1e-6),
         "громкость и панорама прежние: {during:?}"
     );
 }
@@ -392,19 +401,38 @@ fn an_open_emitter_write_keeps_the_voice_at_its_previous_position() {
 #[test]
 fn stopped_voice_fades_out_without_a_jump_while_a_new_voice_starts_on_another_lane() {
     let mut mixer = mixer();
-    play(&mut mixer, 1, 0, clip(RATE, 1, vec![0.5; 4800]), request(false));
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 1, vec![0.5; 4800]),
+        request(false),
+    );
     let _ = render_mono(&mut mixer, 256);
     mixer.apply(MixerCommand::Stop { voice: voice(1) });
-    play(&mut mixer, 2, 1, clip(RATE, 1, vec![0.0; 4800]), request(false));
+    play(
+        &mut mixer,
+        2,
+        1,
+        clip(RATE, 1, vec![0.0; 4800]),
+        request(false),
+    );
 
     let out = render_mono(&mut mixer, 512);
     let fade = (FADE_SECONDS * RATE as f32).ceil() as usize;
-    assert!((out[0] - 0.5).abs() < 1e-6, "первый кадр без скачка: {}", out[0]);
+    assert!(
+        (out[0] - 0.5).abs() < 1e-6,
+        "первый кадр без скачка: {}",
+        out[0]
+    );
     let largest_step = out
         .windows(2)
         .map(|pair| (pair[0] - pair[1]).abs())
         .fold(0.0f32, f32::max);
-    assert!(largest_step <= 0.5 / fade as f32 + 1e-6, "шаг {largest_step}");
+    assert!(
+        largest_step <= 0.5 / fade as f32 + 1e-6,
+        "шаг {largest_step}"
+    );
     assert!(out[fade..].iter().all(|value| *value == 0.0));
     assert_eq!(drain(&mut mixer), vec![voice(1)]);
 }
@@ -412,13 +440,22 @@ fn stopped_voice_fades_out_without_a_jump_while_a_new_voice_starts_on_another_la
 #[test]
 fn device_output_stays_within_unit_range_and_non_finite_samples_become_silence() {
     let mut mixer = mixer();
-    play(&mut mixer, 1, 0, clip(RATE, 1, vec![1.0; 48_000]), request(true));
+    play(
+        &mut mixer,
+        1,
+        0,
+        clip(RATE, 1, vec![1.0; 48_000]),
+        request(true),
+    );
     mixer.apply(MixerCommand::SetVoiceVolume {
         voice: voice(1),
         volume: 4.0,
     });
     let loud = render_mono(&mut mixer, 512);
-    assert!(loud.iter().all(|value| (-1.0..=1.0).contains(value)), "{loud:?}");
+    assert!(
+        loud.iter().all(|value| (-1.0..=1.0).contains(value)),
+        "{loud:?}"
+    );
     assert_eq!(loud.last().copied(), Some(1.0));
 
     mixer.apply(MixerCommand::SetVoiceVolume {
