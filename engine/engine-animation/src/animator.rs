@@ -649,14 +649,20 @@ mod tests {
         animator.advance(0.5);
         assert!((animator.weight("a").unwrap() - 0.5).abs() < 1e-6);
         animator.set_weight("b", 0.3, 0.0).unwrap();
-        assert!((animator.weight("b").unwrap() - 0.3).abs() < 1e-6, "мгновенный вес");
+        assert!(
+            (animator.weight("b").unwrap() - 0.3).abs() < 1e-6,
+            "мгновенный вес"
+        );
         assert!(
             (animator.weight("a").unwrap() - 0.5).abs() < 1e-6,
             "чужой crossfade не снапается"
         );
         // Исходящее движение продолжает угасать с прежней скоростью: 0.5 - 0.25 / 1.0 s.
         animator.advance(0.25);
-        assert!((animator.weight("a").unwrap() - 0.25).abs() < 1e-6, "переход продолжается");
+        assert!(
+            (animator.weight("a").unwrap() - 0.25).abs() < 1e-6,
+            "переход продолжается"
+        );
     }
 
     #[test]
