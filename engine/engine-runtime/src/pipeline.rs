@@ -4,6 +4,10 @@ use crate::console::ConsoleUiSlot;
 use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
+use crate::prefabs::{
+    LoadedPrefab, LoaderRequest, PREFAB_UPLOAD_BUDGET, PrefabCpu, PrefabGpu, PrefabLoads,
+    PrefabReady, PrefabReply, PrefabToken, RenderResourceRequest,
+};
 use crate::scene::PreparedPrefabs;
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
@@ -30,14 +34,13 @@ use engine_scene::{
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
 use engine_script::{
-    ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary,
-    ScriptLoadOptions, ScriptTime, SpawnedObject,
+    PrefabRequest, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptLibrary,
+    ScriptLoadOptions, ScriptTime, SpawnedObject, WorldChanges,
 };
 #[cfg(feature = "dev-console")]
 use engine_ui::render::UiBridge;
 use flume::{Receiver, RecvTimeoutError, Selector, Sender, TryRecvError};
 use glam::{Mat3, Vec3};
-#[cfg(feature = "dev-console")]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -52,6 +55,9 @@ pub(crate) const SCRIPT_CALL_TIME_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub(crate) struct FrameSnapshot {
+    /// Номер снимка в цикле скриптов; растёт, пока есть отправки. По нему render thread понимает,
+    /// какие снимки ещё ссылаются на освобождаемый префаб.
+    pub sequence: u64,
     pub camera: Camera,
     pub active_camera: ObjectHandle,
     pub view: CameraSettings,
@@ -117,6 +123,8 @@ pub(crate) enum ScriptControl {
     Background(bool),
     #[cfg(feature = "dev-console")]
     Console(CommandLine),
+    /// Ответ загрузчика или render thread на загрузку тяжёлого префаба.
+    Prefab(PrefabReply),
     Shutdown,
 }
 
@@ -227,6 +235,13 @@ pub(crate) trait RenderBackend: Send {
         Ok(())
     }
     fn wait_idle(&mut self) {}
+    /// Ставит загруженные на CPU ресурсы тяжёлого префаба в очередь GPU-загрузки.
+    fn submit_prefab(&mut self, prefab: LoadedPrefab) -> Option<PrefabReply>;
+    /// Выполняет до `budget` шагов GPU-загрузки и возвращает завершённые префабы.
+    fn advance_prefab_uploads(&mut self, budget: usize) -> Vec<PrefabReply>;
+    fn has_pending_prefab_uploads(&self) -> bool;
+    /// Немедленно уничтожает GPU-ресурсы токена; вызывается, когда снимки ими не пользуются.
+    fn release_prefab(&mut self, token: &PrefabToken);
 }
 
 pub(crate) trait ExitRequester: Send + Sync {
@@ -257,6 +272,10 @@ pub(crate) struct ScriptThreadConfig {
     pub prefabs: PreparedPrefabs,
     /// Геометрия моделей для коллайдеров spawn-объектов.
     pub physics_geometry: Vec<ModelGeometry>,
+    /// Заявки загрузчика тяжёлых префабов.
+    pub prefab_loader: Sender<LoaderRequest>,
+    /// Заявки render thread: выгрузка тяжёлых префабов.
+    pub render_resources: Sender<RenderResourceRequest>,
     #[cfg(feature = "dev-console")]
     pub command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
 }
@@ -272,6 +291,8 @@ pub(crate) struct RenderThreadConfig {
     pub height: u32,
     pub frame_limit: Option<u64>,
     pub frame_rx: Receiver<Arc<FrameSnapshot>>,
+    /// Ресурсы тяжёлых префабов: загрузки от загрузчика и освобождения от скриптов.
+    pub resources: Receiver<RenderResourceRequest>,
     pub control_tx: Sender<RenderControl>,
     pub control_rx: Receiver<RenderControl>,
     pub script_tx: Sender<ScriptControl>,
@@ -290,6 +311,8 @@ pub(crate) enum ScriptStartupError {
 
 pub(crate) struct VulkanBackend {
     renderer: Renderer,
+    /// GPU-ресурсы тяжёлых префабов; `Renderer` выполняет создание и освобождение.
+    prefabs: PrefabGpu<Renderer>,
     debug_view: DebugView,
     current_environment: Option<(EnvironmentCacheKey, EnvironmentId)>,
     pipeline_cache_path: Option<std::path::PathBuf>,
@@ -314,6 +337,7 @@ impl VulkanBackend {
     ) -> Self {
         Self {
             renderer,
+            prefabs: PrefabGpu::default(),
             debug_view,
             current_environment: None,
             pipeline_cache_path,
@@ -401,6 +425,22 @@ impl VulkanBackend {
 impl RenderBackend for VulkanBackend {
     fn resize(&mut self, width: u32, height: u32) {
         self.renderer.resize(width, height);
+    }
+
+    fn submit_prefab(&mut self, prefab: LoadedPrefab) -> Option<PrefabReply> {
+        self.prefabs.submit(prefab)
+    }
+
+    fn advance_prefab_uploads(&mut self, budget: usize) -> Vec<PrefabReply> {
+        self.prefabs.advance(&mut self.renderer, budget)
+    }
+
+    fn has_pending_prefab_uploads(&self) -> bool {
+        self.prefabs.has_pending()
+    }
+
+    fn release_prefab(&mut self, token: &PrefabToken) {
+        self.prefabs.release(&mut self.renderer, token);
     }
 
     #[cfg(feature = "dev-console")]
@@ -691,6 +731,8 @@ fn scripts_thread(
         audio,
         prefabs,
         physics_geometry,
+        prefab_loader,
+        render_resources,
         ..
     } = config;
     let library = match load_script_library(
@@ -774,6 +816,8 @@ fn scripts_thread(
     let mut applied_background = false;
     #[cfg(feature = "dev-console")]
     let mut pending_console_commands = PendingConsoleCommands::default();
+    let mut prefab_loads = PrefabLoads::new(prefab_loader, render_resources);
+    let mut pending_prefab = VecDeque::new();
     let gpu_scene = loop {
         match control_rx.recv() {
             Ok(ScriptControl::Go(scene)) => break Some(scene),
@@ -784,6 +828,7 @@ fn scripts_thread(
             }
             #[cfg(feature = "dev-console")]
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
+            Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(reply),
         }
     };
     let Some(mut gpu_scene) = gpu_scene else {
@@ -818,6 +863,7 @@ fn scripts_thread(
         physics_sync.as_mut(),
         &mut spawn_physics,
         &mut gpu_scene,
+        &mut prefab_loads,
         audio.as_mut(),
     );
     #[cfg(feature = "dev-console")]
@@ -846,6 +892,10 @@ fn scripts_thread(
                         false
                     }
                     ScriptControl::Go(_) => false,
+                    ScriptControl::Prefab(reply) => {
+                        pending_prefab.push_back(reply);
+                        false
+                    }
                     #[cfg(feature = "dev-console")]
                     ScriptControl::Console(command) => {
                         pending_console_commands.push_back(command);
@@ -885,6 +935,7 @@ fn scripts_thread(
                 &mut pending_console_commands,
                 #[cfg(not(feature = "dev-console"))]
                 &mut (),
+                &mut pending_prefab,
             ) {
                 break;
             }
@@ -908,6 +959,7 @@ fn scripts_thread(
                         break;
                     }
                     Ok(ScriptControl::Background(false)) | Ok(ScriptControl::Go(_)) => {}
+                    Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(reply),
                     #[cfg(feature = "dev-console")]
                     Ok(ScriptControl::Console(command)) => {
                         pending_console_commands.push_back(command);
@@ -944,6 +996,7 @@ fn scripts_thread(
                 physics_sync.as_mut(),
                 &mut spawn_physics,
                 &mut gpu_scene,
+                &mut prefab_loads,
                 audio.as_mut(),
             );
             publish_command_catalog(
@@ -952,6 +1005,16 @@ fn scripts_thread(
                 &mut published_catalog_generation,
             );
         }
+        // Ответы префабов регистрируют шаблон и ставят отложенные spawn в очередь; их применяет
+        // ближайший `update`, поэтому обработка стоит прямо перед ним.
+        drain_prefab_replies(
+            &mut pending_prefab,
+            &mut scripts,
+            &mut world,
+            &mut gpu_scene,
+            &mut spawn_physics,
+            &mut prefab_loads,
+        );
         let input_frame = lock_input(&input).take_frame();
         scripts.set_input(input_frame);
         scripts.update(&mut world, dt, time);
@@ -965,6 +1028,7 @@ fn scripts_thread(
             physics_sync.as_mut(),
             &mut spawn_physics,
             &mut gpu_scene,
+            &mut prefab_loads,
             audio.as_mut(),
         );
         #[cfg(feature = "dev-console")]
@@ -1013,7 +1077,10 @@ fn scripts_thread(
             audio.sync_positions(&world);
         }
         let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene) {
-            Ok(snapshot) => Arc::new(snapshot),
+            Ok(mut snapshot) => {
+                snapshot.sequence = frame_number;
+                Arc::new(snapshot)
+            }
             Err(error) => {
                 status.record_failure(error);
                 break;
@@ -1028,8 +1095,9 @@ fn scripts_thread(
             &mut pending_console_commands,
             #[cfg(not(feature = "dev-console"))]
             &mut (),
+            &mut pending_prefab,
         ) {
-            SendOutcome::Sent => {}
+            SendOutcome::Sent => prefab_loads.set_last_sent_seq(frame_number),
             SendOutcome::Background => {
                 next_background_tick = clock.now().saturating_add(interval);
                 continue;
@@ -1113,10 +1181,47 @@ struct SpawnPhysics {
     shapes: ShapeCache,
     /// Геометрия моделей для коллайдеров мешей.
     geometry: Vec<ModelGeometry>,
+    /// Модели, добавленные тяжёлыми префабами, и число загруженных префабов на каждую. Модели
+    /// сцены сюда не входят и не удаляются.
+    heavy_users: HashMap<String, usize>,
     /// Вставки и удаления тел; уходят в `step_with_changes` ближайшего шага.
     changes: Vec<BodyChange>,
     /// Скорости, заданные при spawn; применяются сразу после вставки тела в том же шаге.
     velocities: Vec<PhysicsCommand>,
+}
+
+impl SpawnPhysics {
+    /// Добавляет геометрию тяжёлого префаба. Путь, уже занятый сценой или другим префабом,
+    /// не заменяется: содержимое одной модели одинаково.
+    fn add_heavy_geometry(&mut self, models: Vec<ModelGeometry>) {
+        for model in models {
+            if let Some(users) = self.heavy_users.get_mut(&model.path) {
+                *users += 1;
+                continue;
+            }
+            if self.geometry.iter().any(|known| known.path == model.path) {
+                continue;
+            }
+            self.heavy_users.insert(model.path.clone(), 1);
+            self.geometry.push(model);
+        }
+    }
+
+    /// Снимает ссылки выгруженного префаба. Модель уходит вместе с формами кэша, когда её больше
+    /// никто не использует.
+    fn remove_heavy_geometry(&mut self, paths: &[String]) {
+        for path in paths {
+            let Some(users) = self.heavy_users.get_mut(path) else {
+                continue;
+            };
+            *users -= 1;
+            if *users == 0 {
+                self.heavy_users.remove(path);
+                self.geometry.retain(|model| &model.path != path);
+                self.shapes.remove_model(path);
+            }
+        }
+    }
 }
 
 /// Применяет spawn и destroy, закоммиченные скриптами в фазе: обновляет GPU-таблицу, физику и
@@ -1128,12 +1233,43 @@ fn apply_world_changes(
     mut physics: Option<&mut PhysicsSceneSync>,
     spawn_physics: &mut SpawnPhysics,
     gpu_scene: &mut GpuSceneTable,
-    audio: Option<&mut engine_audio::AudioBridge>,
+    prefabs: &mut PrefabLoads,
+    mut audio: Option<&mut engine_audio::AudioBridge>,
 ) {
-    let changes = scripts.drain_world_changes();
-    if changes.spawned.is_empty() && changes.despawned.is_empty() {
-        return;
+    // Выгрузка может сразу запросить новую загрузку (отложенный spawn), поэтому заявки
+    // вычитываются, пока очередь не опустеет.
+    loop {
+        let changes = scripts.drain_world_changes();
+        if changes.spawned.is_empty()
+            && changes.despawned.is_empty()
+            && changes.prefab_requests.is_empty()
+        {
+            return;
+        }
+        apply_changes(
+            world,
+            scripts,
+            physics.as_deref_mut(),
+            spawn_physics,
+            gpu_scene,
+            prefabs,
+            audio.as_deref_mut(),
+            changes,
+        );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_changes(
+    world: &mut World,
+    scripts: &mut ScriptHost,
+    mut physics: Option<&mut PhysicsSceneSync>,
+    spawn_physics: &mut SpawnPhysics,
+    gpu_scene: &mut GpuSceneTable,
+    prefabs: &mut PrefabLoads,
+    audio: Option<&mut engine_audio::AudioBridge>,
+    changes: WorldChanges,
+) {
     let mut requests = Vec::new();
     for spawned in &changes.spawned {
         if let Some(templates) = gpu_scene.prefabs.get(&spawned.prefab) {
@@ -1203,8 +1339,92 @@ fn apply_world_changes(
                 }),
         );
     }
+    apply_prefab_requests(
+        world,
+        scripts,
+        spawn_physics,
+        gpu_scene,
+        prefabs,
+        &changes.prefab_requests,
+    );
     if let Some(audio) = audio {
         audio.apply(requests, world);
+    }
+}
+
+/// Загрузка и выгрузка тяжёлых префабов. Выгрузка снимает GPU-уровни и геометрию, отправляет
+/// освобождение и сообщает хосту, что ресурсы ушли.
+fn apply_prefab_requests(
+    world: &World,
+    scripts: &mut ScriptHost,
+    spawn_physics: &mut SpawnPhysics,
+    gpu_scene: &mut GpuSceneTable,
+    prefabs: &mut PrefabLoads,
+    requests: &[PrefabRequest],
+) {
+    for request in requests {
+        match request {
+            PrefabRequest::Load(path) => {
+                if let Err(error) = prefabs.start_load(path) {
+                    scripts.prefab_failed(world, path, &error);
+                }
+            }
+            PrefabRequest::Unload(path) => {
+                gpu_scene.prefabs.remove(path);
+                if let Some(slot) = prefabs.forget(path) {
+                    if let Some(geometry) = slot.geometry {
+                        spawn_physics.remove_heavy_geometry(&geometry);
+                    }
+                    prefabs.release(slot.token);
+                }
+                scripts.prefab_released(path);
+            }
+        }
+    }
+}
+
+/// Применяет ответы загрузки: регистрирует шаблон, добавляет его GPU-уровни и геометрию. Ответы
+/// со старым токеном освобождаются сразу: их ресурсы никто не использует.
+fn drain_prefab_replies(
+    pending: &mut VecDeque<PrefabReply>,
+    scripts: &mut ScriptHost,
+    world: &mut World,
+    gpu_scene: &mut GpuSceneTable,
+    spawn_physics: &mut SpawnPhysics,
+    prefabs: &mut PrefabLoads,
+) {
+    while let Some(reply) = pending.pop_front() {
+        match reply {
+            PrefabReply::Ready(ready) => {
+                let PrefabReady { token, gpu, cpu } = *ready;
+                if !prefabs.is_current(&token) {
+                    prefabs.release(token);
+                    continue;
+                }
+                let PrefabCpu {
+                    template,
+                    sources,
+                    geometry,
+                } = cpu;
+                if let Err(error) = scripts.register_prefab(world, &token.path, template, &sources)
+                {
+                    prefabs.forget(&token.path);
+                    scripts.prefab_failed(world, &token.path, &error.to_string());
+                    prefabs.release(token);
+                    continue;
+                }
+                let geometry_paths = geometry.iter().map(|model| model.path.clone()).collect();
+                spawn_physics.add_heavy_geometry(geometry);
+                gpu_scene.prefabs.insert(token.path.clone(), gpu);
+                prefabs.mark_ready(&token, geometry_paths);
+            }
+            PrefabReply::Failed { token, error } => {
+                if prefabs.is_current(&token) {
+                    prefabs.forget(&token.path);
+                    scripts.prefab_failed(world, &token.path, &error);
+                }
+            }
+        }
     }
 }
 
@@ -1358,6 +1578,7 @@ fn make_snapshot(
     let environment = resolve_environment_snapshot(scene.environment.as_ref(), gpu_scene)?;
     let (local_lights, local_light_shadows) = render_local_lights(&scene.local_lights);
     Ok(FrameSnapshot {
+        sequence: 0,
         camera: scene.camera,
         active_camera: world.active_camera(),
         view: scene.view,
@@ -1603,6 +1824,7 @@ fn send_snapshot(
     background: &mut bool,
     #[cfg(feature = "dev-console")] pending_console_commands: &mut PendingConsoleCommands,
     #[cfg(not(feature = "dev-console"))] _: &mut PendingConsoleCommands,
+    pending_prefab: &mut VecDeque<PrefabReply>,
 ) -> SendOutcome {
     loop {
         let selection = Selector::new()
@@ -1626,6 +1848,9 @@ fn send_snapshot(
                 pending_console_commands.push_back(command);
             }
             ScriptSelection::Control(Ok(ScriptControl::Go(_))) => {}
+            ScriptSelection::Control(Ok(ScriptControl::Prefab(reply))) => {
+                pending_prefab.push_back(reply);
+            }
         }
     }
 }
@@ -1637,6 +1862,7 @@ fn wait_background_tick(
     deadline: Duration,
     #[cfg(feature = "dev-console")] pending_console_commands: &mut PendingConsoleCommands,
     #[cfg(not(feature = "dev-console"))] _: &mut PendingConsoleCommands,
+    pending_prefab: &mut VecDeque<PrefabReply>,
 ) -> bool {
     while *background {
         let now = clock.now();
@@ -1653,6 +1879,7 @@ fn wait_background_tick(
             }
             #[cfg(feature = "dev-console")]
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
+            Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(reply),
             Ok(ScriptControl::Go(_)) | Err(RecvTimeoutError::Timeout) => {}
         }
     }
@@ -1682,6 +1909,7 @@ fn render_thread(config: RenderThreadConfig) {
         height,
         frame_limit,
         frame_rx,
+        resources,
         control_rx,
         script_tx,
         interrupt,
@@ -1697,6 +1925,7 @@ fn render_thread(config: RenderThreadConfig) {
             height,
             frame_limit,
             &frame_rx,
+            &resources,
             &control_rx,
             &script_tx,
         )
@@ -1752,14 +1981,23 @@ fn render_thread(config: RenderThreadConfig) {
 enum RenderSelection {
     Frame(Result<Arc<FrameSnapshot>, flume::RecvError>),
     Control(Result<RenderControl, flume::RecvError>),
+    Resource(Result<RenderResourceRequest, flume::RecvError>),
 }
 
+/// Освобождение префаба, которое ждёт, пока render thread обработает снимки с `seq ≥ last_seq`.
+struct PendingRelease {
+    token: PrefabToken,
+    last_seq: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_loop(
     backend: &mut dyn RenderBackend,
     mut width: u32,
     mut height: u32,
     frame_limit: Option<u64>,
     frame_rx: &Receiver<Arc<FrameSnapshot>>,
+    resources: &Receiver<RenderResourceRequest>,
     control_rx: &Receiver<RenderControl>,
     script_tx: &Sender<ScriptControl>,
 ) -> Result<(), String> {
@@ -1770,6 +2008,10 @@ fn render_loop(
     #[cfg(feature = "dev-console")]
     let mut debug_view_dirty = false;
     let mut latest_snapshot: Option<Arc<FrameSnapshot>> = None;
+    // Номер последнего снимка, принятого из канала кадров.
+    let mut taken_seq = 0_u64;
+    let mut releases: Vec<PendingRelease> = Vec::new();
+    let mut resources_open = true;
     #[cfg(feature = "dev-console")]
     let mut ui_frame = ConsoleUiFrame::default();
     #[cfg(feature = "dev-console")]
@@ -1806,6 +2048,28 @@ fn render_loop(
                 Ok(RenderControl::ConsoleUiChanged) => should_render = true,
                 Ok(RenderControl::Shutdown) | Err(TryRecvError::Disconnected) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
+            }
+        }
+
+        // Ресурсы префабов принимаются и на паузе: загрузка и освобождение не ждут новых снимков.
+        if resources_open {
+            loop {
+                match resources.try_recv() {
+                    Ok(request) => {
+                        handle_resource_request(backend, request, &mut releases, script_tx);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        resources_open = false;
+                        break;
+                    }
+                }
+            }
+        }
+        finish_releases(backend, &mut releases, taken_seq, &mut latest_snapshot);
+        if backend.has_pending_prefab_uploads() {
+            for reply in backend.advance_prefab_uploads(PREFAB_UPLOAD_BUDGET) {
+                send_prefab_reply(script_tx, reply);
             }
         }
 
@@ -1860,11 +2124,26 @@ fn render_loop(
             }
         }
 
-        match Selector::new()
+        let mut selector = Selector::new()
             .recv(frame_rx, RenderSelection::Frame)
-            .recv(control_rx, RenderSelection::Control)
-            .wait()
-        {
+            .recv(control_rx, RenderSelection::Control);
+        if resources_open {
+            selector = selector.recv(resources, RenderSelection::Resource);
+        }
+        // Пока загрузка не закончена, цикл не блокируется: следующая итерация продолжит её.
+        let selection = if backend.has_pending_prefab_uploads() {
+            selector.wait_timeout(Duration::ZERO).ok()
+        } else {
+            Some(selector.wait())
+        };
+        let Some(selection) = selection else {
+            continue;
+        };
+        match selection {
+            RenderSelection::Resource(Ok(request)) => {
+                handle_resource_request(backend, request, &mut releases, script_tx);
+            }
+            RenderSelection::Resource(Err(_)) => resources_open = false,
             RenderSelection::Control(Ok(RenderControl::Resize(new_width, new_height))) => {
                 width = new_width;
                 height = new_height;
@@ -1882,6 +2161,7 @@ fn render_loop(
             | RenderSelection::Control(Err(_))
             | RenderSelection::Frame(Err(_)) => return Ok(()),
             RenderSelection::Frame(Ok(snapshot)) => {
+                taken_seq = snapshot.sequence;
                 latest_snapshot = Some(snapshot);
                 let Some(snapshot) = latest_snapshot.as_mut() else {
                     continue;
@@ -1908,6 +2188,52 @@ fn render_loop(
             }
         }
     }
+}
+
+fn handle_resource_request(
+    backend: &mut dyn RenderBackend,
+    request: RenderResourceRequest,
+    releases: &mut Vec<PendingRelease>,
+    script_tx: &Sender<ScriptControl>,
+) {
+    match request {
+        RenderResourceRequest::Upload(prefab) => {
+            if let Some(reply) = backend.submit_prefab(*prefab) {
+                send_prefab_reply(script_tx, reply);
+            }
+        }
+        RenderResourceRequest::Release { token, last_seq } => {
+            releases.push(PendingRelease { token, last_seq });
+        }
+    }
+}
+
+/// Уничтожает GPU-ресурсы освобождённых префабов, когда render thread принял снимок с
+/// `seq ≥ last_seq`. Удерживаемый для перерисовки снимок с `seq ≤ last_seq` сбрасывается:
+/// он может ссылаться на уничтожаемые ресурсы.
+fn finish_releases(
+    backend: &mut dyn RenderBackend,
+    releases: &mut Vec<PendingRelease>,
+    taken_seq: u64,
+    latest: &mut Option<Arc<FrameSnapshot>>,
+) {
+    releases.retain(|release| {
+        if taken_seq < release.last_seq {
+            return true;
+        }
+        if latest
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.sequence <= release.last_seq)
+        {
+            *latest = None;
+        }
+        backend.release_prefab(&release.token);
+        false
+    });
+}
+
+fn send_prefab_reply(script_tx: &Sender<ScriptControl>, reply: PrefabReply) {
+    let _ = script_tx.send(ScriptControl::Prefab(reply));
 }
 
 fn render_snapshot(
@@ -1956,10 +2282,15 @@ mod tests {
         render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
         sync_input_background, wait_background_tick,
     };
+    use super::{SpawnPhysics, apply_world_changes, drain_prefab_replies};
     use super::{attach_prefab_levels, detach_objects};
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
+    use crate::prefabs::{
+        LoadedPrefab, LoaderRequest, PrefabCpu, PrefabLoads, PrefabReady, PrefabReply, PrefabToken,
+        RenderResourceRequest,
+    };
     use crate::scene::PreparedPrefabs;
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
@@ -1977,6 +2308,7 @@ mod tests {
     use engine_scene::camera::Camera;
     use engine_scene::world::LightState;
     use engine_scene::{LocalLightState, ObjectHandle, SceneDocument, World};
+    use engine_script::ScriptLoadOptions;
     use engine_script::{
         Key, ScriptEvent, ScriptEventLevel, ScriptHost, ScriptInterruptHandle, ScriptTime,
     };
@@ -2052,6 +2384,8 @@ return Input
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 physics_client: None,
                 physics_initialization: None,
                 audio: None,
@@ -2290,10 +2624,42 @@ distance=2.0
         console_slot: Option<Arc<ConsoleUiSlot>>,
         #[cfg(feature = "dev-console")]
         console_rendered: Option<mpsc::Sender<()>>,
+        /// Загрузки, принятые без GPU: готовы на следующем `advance` с пустыми уровнями.
+        prefab_uploads: VecDeque<LoadedPrefab>,
+        /// Куда сообщать об освобождении токенов: тест ждёт событие, а не опрашивает состояние.
+        released: Option<mpsc::Sender<PrefabToken>>,
     }
 
     impl RenderBackend for FakeBackend {
         fn resize(&mut self, _width: u32, _height: u32) {}
+
+        fn submit_prefab(&mut self, prefab: LoadedPrefab) -> Option<PrefabReply> {
+            self.prefab_uploads.push_back(prefab);
+            None
+        }
+
+        fn advance_prefab_uploads(&mut self, _budget: usize) -> Vec<PrefabReply> {
+            self.prefab_uploads
+                .drain(..)
+                .map(|prefab| {
+                    PrefabReply::Ready(Box::new(PrefabReady {
+                        token: prefab.token,
+                        gpu: Vec::new(),
+                        cpu: prefab.cpu,
+                    }))
+                })
+                .collect()
+        }
+
+        fn has_pending_prefab_uploads(&self) -> bool {
+            !self.prefab_uploads.is_empty()
+        }
+
+        fn release_prefab(&mut self, token: &PrefabToken) {
+            if let Some(released) = &self.released {
+                let _ = released.send(token.clone());
+            }
+        }
 
         fn render(
             &mut self,
@@ -2480,6 +2846,7 @@ distance=2.0
     fn empty_snapshot() -> FrameSnapshot {
         let active_camera = motion_test_handles().0;
         FrameSnapshot {
+            sequence: 0,
             camera: Camera {
                 position: Vec3::new(0.0, 0.0, 4.0),
                 target: Vec3::ZERO,
@@ -2520,6 +2887,7 @@ distance=2.0
         objects: &[(ObjectHandle, [[f32; 4]; 4])],
     ) -> FrameSnapshot {
         FrameSnapshot {
+            sequence: 0,
             camera: Camera {
                 position: Vec3::new(0.0, 0.0, 4.0),
                 target: Vec3::ZERO,
@@ -2839,6 +3207,8 @@ return Script
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -2915,6 +3285,7 @@ return Script
             Arc::new(empty_snapshot()),
             &mut false,
             &mut Default::default(),
+            &mut Default::default(),
         );
         assert!(matches!(result, super::SendOutcome::Shutdown));
         assert_eq!(frame_rx.len(), 1);
@@ -2933,6 +3304,7 @@ return Script
                 480,
                 None,
                 &frame_rx,
+                &flume::unbounded::<RenderResourceRequest>().1,
                 &control_rx,
                 &script_tx,
             )
@@ -2963,6 +3335,7 @@ return Script
                 480,
                 None,
                 &frame_rx,
+                &flume::unbounded::<RenderResourceRequest>().1,
                 &control_rx,
                 &script_tx,
             )
@@ -2997,6 +3370,7 @@ return Script
                 480,
                 None,
                 &frame_rx,
+                &flume::unbounded::<RenderResourceRequest>().1,
                 &control_rx,
                 &script_tx,
             )
@@ -3050,6 +3424,7 @@ return Script
                     clock_for_wait.as_ref(),
                     &mut background,
                     deadline,
+                    &mut Default::default(),
                     &mut Default::default(),
                 );
                 if !ticked || !background {
@@ -3141,6 +3516,8 @@ return Script
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: None,
                 interrupt: interrupt.clone(),
                 clock: Arc::new(FakeClock::default()),
@@ -3246,6 +3623,8 @@ return Script
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: Some(script_module()),
                 interrupt: ScriptInterruptHandle::new(),
                 clock: clock.clone(),
@@ -3351,6 +3730,8 @@ return Script
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -3466,6 +3847,8 @@ return Move
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -3635,6 +4018,8 @@ return Move
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -3713,6 +4098,8 @@ return Move
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: Some(input_probe_module()),
                 interrupt: ScriptInterruptHandle::new(),
                 clock: clock.clone(),
@@ -3813,6 +4200,7 @@ return Move
                 &control_rx,
                 Arc::new(empty_snapshot()),
                 &mut false,
+                &mut Default::default(),
                 &mut Default::default()
             ),
             super::SendOutcome::Disconnected
@@ -3837,6 +4225,7 @@ return Move
             height: 480,
             frame_limit: Some(2),
             frame_rx,
+            resources: flume::unbounded().1,
             control_tx: control_tx.clone(),
             control_rx,
             script_tx,
@@ -3884,6 +4273,7 @@ return Move
                 height: 480,
                 frame_limit: None,
                 frame_rx,
+                resources: flume::unbounded().1,
                 control_tx: control_tx.clone(),
                 control_rx,
                 script_tx,
@@ -3936,6 +4326,8 @@ return Move
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: None,
                 interrupt,
                 clock: Arc::new(FakeClock::default()),
@@ -3988,6 +4380,8 @@ return Move
                 scripts_library: Some(library),
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -4039,6 +4433,8 @@ return Move
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: Some(script_module()),
                 interrupt: interrupt.clone(),
                 clock: Arc::new(FakeClock::default()),
@@ -4107,6 +4503,8 @@ return Move
                 scripts_library: None,
                 prefabs: PreparedPrefabs::default(),
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(PanicClock),
@@ -4275,6 +4673,8 @@ return Move
                 audio: None,
                 prefabs,
                 physics_geometry: Vec::new(),
+                prefab_loader: flume::unbounded().0,
+                render_resources: flume::unbounded().0,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -4597,5 +4997,376 @@ return Gun
 
         detach_objects(&mut by_object, &[root]);
         assert!(by_object.is_empty());
+    }
+
+    const BALL_PATH: &str = "prefabs/ball.rveprefab";
+
+    /// Скрипт создаёт тяжёлый шар при старте.
+    const SPAWN_ON_START: &str = "local Gun = {}\nfunction Gun:on_start()\n  rve.spawn(\"prefabs/ball.rveprefab\", { id = \"ball\" })\nend\nreturn Gun\n";
+    /// Скрипт удаляет шар на втором кадре и создаёт его заново на третьем.
+    const SPAWN_AND_RESPAWN: &str = "local Gun = {}\nfunction Gun:on_start()\n  rve.spawn(\"prefabs/ball.rveprefab\", { id = \"ball\" })\nend\nfunction Gun:on_update(dt)\n  self.frames = (self.frames or 0) + 1\n  if self.frames == 2 then\n    rve.destroy(\"ball\")\n  elseif self.frames == 3 then\n    rve.prefabs.unload(\"prefabs/ball.rveprefab\")\n  elseif self.frames == 4 then\n    rve.spawn(\"prefabs/ball.rveprefab\", { id = \"ball\" })\n  end\nend\nreturn Gun\n";
+
+    fn heavy_ball_catalog() -> PrefabCatalog {
+        let mut catalog = PrefabCatalog::default();
+        catalog.insert(
+            BALL_PATH,
+            PrefabSpec {
+                kind: PrefabKind::Heavy,
+                max_instances: None,
+            },
+        );
+        catalog
+    }
+
+    fn heavy_ready(token: PrefabToken) -> PrefabReply {
+        PrefabReply::Ready(Box::new(PrefabReady {
+            token,
+            gpu: Vec::new(),
+            cpu: PrefabCpu {
+                template: prefab_template(BALL_PATH, BALL_PREFAB),
+                sources: BTreeMap::new(),
+                geometry: Vec::new(),
+            },
+        }))
+    }
+
+    /// Скрипты, PrefabLoads и мир без потоков: тест сам передаёт ответы и применяет изменения.
+    struct HeavyHarness {
+        world: World,
+        scripts: ScriptHost,
+        loads: PrefabLoads,
+        gpu: GpuSceneTable,
+        spawn_physics: SpawnPhysics,
+        pending: VecDeque<PrefabReply>,
+        loader_rx: flume::Receiver<LoaderRequest>,
+        render_rx: flume::Receiver<RenderResourceRequest>,
+        elapsed: f64,
+        frame: u64,
+    }
+
+    impl HeavyHarness {
+        fn new(script: &str) -> Self {
+            let world =
+                World::from_document(&SceneDocument::parse("spawn.rvescene", SPAWN_SCENE).unwrap())
+                    .unwrap();
+            let sources = BTreeMap::from([("gun.lua".to_owned(), script.to_owned())]);
+            let scripts = ScriptHost::load_with_options(
+                &world,
+                "spawn.rvescene",
+                &sources,
+                None,
+                ScriptLoadOptions {
+                    prefabs: heavy_ball_catalog(),
+                    ..ScriptLoadOptions::default()
+                },
+            )
+            .unwrap();
+            let (loader_tx, loader_rx) = flume::unbounded();
+            let (render_tx, render_rx) = flume::unbounded();
+            Self {
+                world,
+                scripts,
+                loads: PrefabLoads::new(loader_tx, render_tx),
+                gpu: GpuSceneTable::default(),
+                spawn_physics: SpawnPhysics::default(),
+                pending: VecDeque::new(),
+                loader_rx,
+                render_rx,
+                elapsed: 0.0,
+                frame: 0,
+            }
+        }
+
+        fn time(&self) -> engine_script::ScriptTime {
+            engine_script::ScriptTime {
+                elapsed: self.elapsed,
+                frame: self.frame,
+            }
+        }
+
+        fn apply(&mut self) {
+            apply_world_changes(
+                &mut self.world,
+                &mut self.scripts,
+                None,
+                &mut self.spawn_physics,
+                &mut self.gpu,
+                &mut self.loads,
+                None,
+            );
+        }
+
+        fn start(&mut self) {
+            let time = self.time();
+            self.scripts.start(&mut self.world, time);
+            self.apply();
+        }
+
+        fn reply(&mut self, reply: PrefabReply) {
+            self.pending.push_back(reply);
+            drain_prefab_replies(
+                &mut self.pending,
+                &mut self.scripts,
+                &mut self.world,
+                &mut self.gpu,
+                &mut self.spawn_physics,
+                &mut self.loads,
+            );
+        }
+
+        fn update(&mut self) {
+            self.frame += 1;
+            self.elapsed += 0.016;
+            let time = self.time();
+            self.scripts.update(&mut self.world, 0.016, time);
+            self.apply();
+        }
+
+        fn next_load(&self) -> PrefabToken {
+            match self.loader_rx.try_recv() {
+                Ok(LoaderRequest::Load(token)) => token,
+                _ => panic!("ожидалась заявка загрузки префаба"),
+            }
+        }
+
+        fn ball_alive(&self) -> bool {
+            self.world.object_by_id("ball").is_some()
+        }
+    }
+
+    #[test]
+    fn heavy_spawn_waits_for_its_load_and_materializes_once_ready() {
+        let mut harness = HeavyHarness::new(SPAWN_ON_START);
+        harness.start();
+        let token = harness.next_load();
+        assert_eq!(token.path, BALL_PATH);
+        assert!(!harness.ball_alive(), "spawn ждёт готовности префаба");
+
+        harness.reply(heavy_ready(token));
+        harness.update();
+        assert!(
+            harness.ball_alive(),
+            "после готовности отложенный spawn применён"
+        );
+    }
+
+    #[test]
+    fn failed_heavy_load_kills_its_pending_spawn_with_an_error() {
+        let mut harness = HeavyHarness::new(SPAWN_ON_START);
+        harness.start();
+        let token = harness.next_load();
+        harness.reply(PrefabReply::Failed {
+            token,
+            error: "файл не найден".to_owned(),
+        });
+        harness.update();
+        assert!(!harness.ball_alive());
+        let events = harness.scripts.drain_events();
+        assert!(
+            events.iter().any(|event| {
+                matches!(event.level, engine_script::ScriptEventLevel::Error)
+                    && event.message.contains("failed to load")
+            }),
+            "ожидалась ошибка загрузки: {events:?}"
+        );
+    }
+
+    #[test]
+    fn unload_then_respawn_uses_a_new_load_and_releases_only_the_old_token() {
+        let mut harness = HeavyHarness::new(SPAWN_AND_RESPAWN);
+        harness.loads.set_last_sent_seq(7);
+        harness.start();
+        let first = harness.next_load();
+        harness.reply(heavy_ready(first.clone()));
+        harness.update();
+        assert!(harness.ball_alive());
+
+        // Второй кадр удаляет последний экземпляр, третий явно выгружает префаб.
+        harness.update();
+        assert!(!harness.ball_alive());
+        harness.update();
+        match harness.render_rx.try_recv() {
+            Ok(RenderResourceRequest::Release { token, last_seq }) => {
+                assert_eq!(token, first);
+                assert_eq!(last_seq, 7);
+            }
+            _ => panic!("выгрузка должна освободить старый токен"),
+        }
+
+        // Четвёртый кадр создаёт шар заново: новая загрузка получает новый load_id.
+        harness.update();
+        let second = harness.next_load();
+        assert!(second.load_id > first.load_id);
+        assert!(
+            harness.render_rx.try_recv().is_err(),
+            "новая загрузка не должна освобождать ресурсы"
+        );
+        harness.reply(heavy_ready(second));
+        harness.update();
+        assert!(harness.ball_alive());
+    }
+
+    #[test]
+    fn ready_with_a_stale_load_id_is_released_immediately() {
+        let mut harness = HeavyHarness::new(SPAWN_ON_START);
+        harness.start();
+        let current = harness.next_load();
+        let stale = PrefabToken {
+            path: BALL_PATH.to_owned(),
+            load_id: current.load_id + 100,
+        };
+        harness.reply(heavy_ready(stale.clone()));
+        match harness.render_rx.try_recv() {
+            Ok(RenderResourceRequest::Release { token, .. }) => assert_eq!(token, stale),
+            _ => panic!("устаревшая загрузка должна освобождаться сразу"),
+        }
+        assert!(!harness.ball_alive());
+        harness.reply(heavy_ready(current));
+        harness.update();
+        assert!(harness.ball_alive());
+    }
+
+    /// Рендер с пустым FakeBackend: снимки, паузу и ресурсы можно отправлять напрямую.
+    struct RenderHarness {
+        frames: flume::Sender<Arc<FrameSnapshot>>,
+        controls: flume::Sender<RenderControl>,
+        resources: flume::Sender<RenderResourceRequest>,
+        scripts: flume::Receiver<ScriptControl>,
+        released: mpsc::Receiver<PrefabToken>,
+        renders: Arc<AtomicUsize>,
+        worker: std::thread::JoinHandle<Result<(), String>>,
+    }
+
+    fn start_render_harness() -> RenderHarness {
+        let (frame_tx, frame_rx) = flume::bounded(1);
+        let (control_tx, control_rx) = flume::unbounded();
+        let (script_tx, script_rx) = flume::unbounded();
+        let (resource_tx, resource_rx) = flume::unbounded();
+        let (released_tx, released_rx) = mpsc::channel();
+        let renders = Arc::new(AtomicUsize::new(0));
+        let mut backend = FakeBackend {
+            shared_renders: Some(Arc::clone(&renders)),
+            released: Some(released_tx),
+            ..FakeBackend::default()
+        };
+        let worker = std::thread::spawn(move || {
+            render_loop(
+                &mut backend,
+                640,
+                480,
+                None,
+                &frame_rx,
+                &resource_rx,
+                &control_rx,
+                &script_tx,
+            )
+        });
+        RenderHarness {
+            frames: frame_tx,
+            controls: control_tx,
+            resources: resource_tx,
+            scripts: script_rx,
+            released: released_rx,
+            renders,
+            worker,
+        }
+    }
+
+    fn render_token(load_id: u64) -> PrefabToken {
+        PrefabToken {
+            path: BALL_PATH.to_owned(),
+            load_id,
+        }
+    }
+
+    #[test]
+    fn paused_render_releases_a_prefab_without_new_snapshots() {
+        let render = start_render_harness();
+        let mut snapshot = empty_snapshot();
+        snapshot.sequence = 3;
+        render.frames.send(Arc::new(snapshot)).unwrap();
+        render.controls.send(RenderControl::Occluded(true)).unwrap();
+        assert!(matches!(
+            render.scripts.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ScriptControl::Background(true)
+        ));
+
+        render
+            .resources
+            .send(RenderResourceRequest::Release {
+                token: render_token(1),
+                last_seq: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            render
+                .released
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            render_token(1)
+        );
+        render.controls.send(RenderControl::Shutdown).unwrap();
+        assert!(render.worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn release_waits_until_the_snapshot_that_may_reference_it_is_handled() {
+        let render = start_render_harness();
+        render
+            .resources
+            .send(RenderResourceRequest::Release {
+                token: render_token(1),
+                last_seq: 5,
+            })
+            .unwrap();
+        for sequence in [4, 5] {
+            let mut snapshot = empty_snapshot();
+            snapshot.sequence = sequence;
+            render.frames.send(Arc::new(snapshot)).unwrap();
+        }
+        assert_eq!(
+            render
+                .released
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            render_token(1)
+        );
+        // Освобождение наступает только после того, как снимок 5 отрисован.
+        assert_eq!(render.renders.load(Ordering::SeqCst), 2);
+        render.controls.send(RenderControl::Shutdown).unwrap();
+        assert!(render.worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn prefab_upload_completes_while_the_render_is_paused() {
+        let render = start_render_harness();
+        render.controls.send(RenderControl::Occluded(true)).unwrap();
+        assert!(matches!(
+            render.scripts.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ScriptControl::Background(true)
+        ));
+        let prefab = LoadedPrefab {
+            token: render_token(1),
+            cpu: PrefabCpu {
+                template: prefab_template(BALL_PATH, BALL_PREFAB),
+                sources: BTreeMap::new(),
+                geometry: Vec::new(),
+            },
+            models: HashMap::new(),
+            textures: HashMap::new(),
+            levels: Vec::new(),
+        };
+        render
+            .resources
+            .send(RenderResourceRequest::Upload(Box::new(prefab)))
+            .unwrap();
+        match render.scripts.recv_timeout(Duration::from_secs(1)).unwrap() {
+            ScriptControl::Prefab(PrefabReply::Ready(ready)) => {
+                assert_eq!(ready.token, render_token(1));
+            }
+            other => panic!("ожидался готовый префаб на паузе: {other:?}"),
+        }
+        render.controls.send(RenderControl::Shutdown).unwrap();
+        assert!(render.worker.join().unwrap().is_ok());
     }
 }

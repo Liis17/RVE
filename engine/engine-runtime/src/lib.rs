@@ -10,6 +10,7 @@ mod layout;
 mod module_host;
 mod pipeline;
 mod player;
+mod prefabs;
 mod scene;
 
 use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_or_activate};
@@ -20,24 +21,27 @@ use engine_assets::{Assets, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::ConsoleBuffer;
 use engine_console::install_logger;
+use engine_files::VirtualPath;
 use engine_physics::{
     PhysicsClient, PhysicsInitialization, PhysicsRequest, PhysicsServer, StepDriver,
 };
 use engine_platform::{Acquire, ActivationError, InstanceLock, activate_running_instance};
-use engine_project::{BootstrapConfig, ProjectSettings};
+use engine_project::{BootstrapConfig, PrefabCatalogFile, ProjectSettings};
 use engine_render::{DebugView, probe_devices};
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
-use engine_script::ScriptInterruptHandle;
+use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec, ScriptInterruptHandle};
 use engine_window::{RedrawMode, WindowConfig, WindowIcon};
 use hardware::hardware_issues;
 use layout::{
-    Layout, ProjectSettingsLocation, normalize_layout_path, normalize_scripts_path, release_root,
+    Layout, PrefabCatalogLocation, ProjectSettingsLocation, normalize_layout_path,
+    normalize_scripts_path, release_root,
 };
 use module_host::ModuleHost;
 use pipeline::{
     Clock, MonotonicClock, RuntimeStatus, SCRIPTS_THREAD, ScriptStartupError, ScriptThreadConfig,
     start_scripts,
 };
+use prefabs::{RenderResourceRequest, start_prefab_loader};
 use scene::{PreparedScene, load_scene};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -162,6 +166,10 @@ fn run_from_args(
         Ok(project) => project,
         Err(error) => return fail(2, format!("ошибка проекта: {error}")),
     };
+    let prefab_list = match load_prefab_catalog(&layout.prefab_catalog, &resource_handle) {
+        Ok(list) => list,
+        Err(error) => return fail(2, format!("ошибка списка префабов: {error}")),
+    };
     let fsr_library = layout.fsr_library_path(project.runtime.fsr_library.as_deref());
     let dlss_library = layout.dlss_library_path(project.runtime.dlss_library.as_deref());
 
@@ -233,10 +241,13 @@ fn run_from_args(
         Some(path) => path.to_owned(),
         None => return fail(2, "в проекте не указана стартовая сцена"),
     };
-    let prepared = match load_scene(&resource_handle, &assets, &scene_path) {
+    let mut prepared = match load_scene(&resource_handle, &assets, &scene_path) {
         Ok(prepared) => prepared,
         Err(error) => return fail(2, format!("ошибка загрузки сцены: {error}")),
     };
+    if let Err(error) = add_heavy_prefabs(&mut prepared.prefabs.catalog, &prefab_list) {
+        return fail(2, format!("ошибка списка префабов: {error}"));
+    }
     let physics_geometry = prepared.physics_geometry();
     let (physics_driver, physics_bindings) =
         match prepared.build_physics(&physics_geometry, &project.physics) {
@@ -278,6 +289,24 @@ fn run_from_args(
     let (script_tx, script_rx) = flume::unbounded();
     let (frame_tx, frame_rx) = flume::bounded(1);
     let (render_tx, render_rx) = flume::unbounded();
+    let (resource_tx, resource_rx) = flume::unbounded::<RenderResourceRequest>();
+    let (prefab_loader_tx, prefab_loader_stopped_rx) = match start_prefab_loader(
+        &mut modules,
+        resource_handle.clone(),
+        script_tx.clone(),
+        resource_tx.clone(),
+    ) {
+        Ok(started) => started,
+        Err(error) => {
+            for error in modules.shutdown() {
+                log::error!("Ошибка остановки модуля: {error}");
+            }
+            return fail(
+                1,
+                format!("не удалось запустить загрузчик префабов: {error}"),
+            );
+        }
+    };
     let interrupt = ScriptInterruptHandle::new();
     let input = Arc::new(Mutex::new(input::InputAccumulator::default()));
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
@@ -305,6 +334,8 @@ fn run_from_args(
             audio: Some(audio_handle),
             prefabs,
             physics_geometry,
+            prefab_loader: prefab_loader_tx,
+            render_resources: resource_tx.clone(),
             #[cfg(feature = "dev-console")]
             command_catalog: Arc::clone(&command_catalog),
         },
@@ -369,6 +400,8 @@ fn run_from_args(
             render_tx,
             render_rx,
             frame_rx,
+            resources: resource_rx,
+            prefab_loader_stopped_rx,
             script_stopped_rx: script_thread.stopped,
             interrupt,
             status: Arc::clone(&status),
@@ -395,6 +428,47 @@ fn run_from_args(
     }
     drop(instance_lock.take());
     ExitCode::from(code)
+}
+
+/// Читает список тяжёлых префабов. Отсутствующий файл dev-проекта — пустой список; в release
+/// ресурс всегда есть, поэтому его отсутствие тоже ошибка.
+fn load_prefab_catalog(
+    location: &PrefabCatalogLocation,
+    resources: &ResourceHandle,
+) -> Result<PrefabCatalogFile, String> {
+    match location {
+        PrefabCatalogLocation::File(path) => PrefabCatalogFile::load(path),
+        PrefabCatalogLocation::Resource(path) => {
+            let bytes = resources
+                .read_all(path)
+                .map_err(|error| format!("{path}: {error}"))?
+                .wait()
+                .map_err(|error| format!("{path}: {error}"))?;
+            let contents = String::from_utf8(bytes)
+                .map_err(|error| format!("{path}: список префабов должен быть UTF-8: {error}"))?;
+            PrefabCatalogFile::parse(&contents).map_err(|error| format!("{path}: {error}"))
+        }
+    }
+}
+
+/// Добавляет тяжёлые префабы списка проекта в каталог сцены. Путь, который сцена уже объявила
+/// быстрым, остаётся быстрым: его запись сцены приоритетнее.
+fn add_heavy_prefabs(catalog: &mut PrefabCatalog, list: &PrefabCatalogFile) -> Result<(), String> {
+    for entry in &list.prefabs {
+        let path = VirtualPath::parse(&entry.path)
+            .map_err(|_| format!("некорректный путь префаба {:?}", entry.path))?;
+        if catalog.get(path.as_str()).is_some() {
+            continue;
+        }
+        catalog.insert(
+            path.as_str(),
+            PrefabSpec {
+                kind: PrefabKind::Heavy,
+                max_instances: entry.max_instances,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn load_project_settings(
@@ -573,12 +647,14 @@ fn fail(code: u8, message: impl AsRef<str>) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_project_settings, scripts_ready_result, wait_scripts_ready,
-        wait_scripts_ready_after_timeout,
+        add_heavy_prefabs, load_prefab_catalog, load_project_settings, scripts_ready_result,
+        wait_scripts_ready, wait_scripts_ready_after_timeout,
     };
-    use crate::layout::ProjectSettingsLocation;
+    use crate::layout::{PrefabCatalogLocation, ProjectSettingsLocation};
     use crate::pipeline::ScriptStartupError;
+    use engine_project::PrefabCatalogFile;
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
+    use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -729,6 +805,72 @@ mod tests {
         assert!(message.contains("не подтвердил запуск за"));
         assert!(interrupt.is_interrupted());
         assert!(timed_out);
+    }
+
+    #[test]
+    fn fast_prefab_of_the_scene_keeps_its_spec_when_the_project_list_repeats_it() {
+        let mut catalog = PrefabCatalog::default();
+        catalog.insert(
+            "prefabs/fast.rveprefab",
+            PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances: Some(4),
+            },
+        );
+        let list = PrefabCatalogFile::parse(
+            "[[prefabs]]\npath = \"/prefabs/fast.rveprefab\"\nmax_instances = 9\n\
+             [[prefabs]]\npath = \"/prefabs/house.rveprefab\"\nmax_instances = 2\n",
+        )
+        .unwrap();
+        add_heavy_prefabs(&mut catalog, &list).unwrap();
+        assert_eq!(
+            catalog.get("prefabs/fast.rveprefab"),
+            Some(PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances: Some(4),
+            })
+        );
+        assert_eq!(
+            catalog.get("prefabs/house.rveprefab"),
+            Some(PrefabSpec {
+                kind: PrefabKind::Heavy,
+                max_instances: Some(2),
+            })
+        );
+    }
+
+    #[test]
+    fn release_prefab_list_is_read_through_resources_and_bad_format_names_the_file() {
+        let root =
+            std::env::temp_dir().join(format!("rve-runtime-prefab-list-{}", std::process::id()));
+        fs::create_dir_all(root.join("rve")).unwrap();
+        let mut resources = ResourceSystem::start(ResourceConfig {
+            root: root.clone(),
+            source_mode: SourceMode::Loose,
+            ..ResourceConfig::default()
+        })
+        .unwrap();
+        let location = PrefabCatalogLocation::Resource("/rve/prefabs.toml");
+
+        fs::write(
+            root.join("rve/prefabs.toml"),
+            "[[prefabs]]\npath = \"/prefabs/a.txt\"\n",
+        )
+        .unwrap();
+        let error = load_prefab_catalog(&location, &resources.handle()).unwrap_err();
+        assert!(error.contains("/rve/prefabs.toml"), "{error}");
+
+        fs::write(
+            root.join("rve/prefabs.toml"),
+            "[[prefabs]]\npath = \"/prefabs/a.rveprefab\"\nmax_instances = 3\n",
+        )
+        .unwrap();
+        let list = load_prefab_catalog(&location, &resources.handle()).unwrap();
+        assert_eq!(list.prefabs.len(), 1);
+        assert_eq!(list.prefabs[0].max_instances, Some(3));
+
+        resources.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -62,21 +62,7 @@ impl PreparedScene {
         self.render_assets
             .models
             .iter()
-            .map(|(path, model)| ModelGeometry {
-                path: path.clone(),
-                meshes: model
-                    .meshes
-                    .iter()
-                    .map(|mesh| PhysicsModelMesh {
-                        positions: mesh
-                            .vertices
-                            .iter()
-                            .map(|vertex| Vec3::from_array(vertex.position))
-                            .collect(),
-                        indices: mesh.indices.clone(),
-                    })
-                    .collect(),
-            })
+            .map(|(path, model)| model_geometry(path, model))
             .collect()
     }
 
@@ -404,27 +390,27 @@ impl RenderAssetSet {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum MaterialTextureSource {
+pub(crate) enum MaterialTextureSource {
     Model(usize),
     Scene(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct ResolvedMaterial {
-    base_color: [f32; 3],
-    metallic: f32,
-    roughness: f32,
-    emissive: [f32; 3],
-    opacity: f32,
-    alpha_mode: AlphaMode,
-    double_sided: bool,
-    base_color_texture: Option<MaterialTextureSource>,
-    metallic_roughness_texture: Option<MaterialTextureSource>,
-    normal_texture: Option<MaterialTextureSource>,
-    emissive_texture: Option<MaterialTextureSource>,
-    occlusion_texture: Option<MaterialTextureSource>,
-    normal_scale: f32,
-    occlusion_strength: f32,
+pub(crate) struct ResolvedMaterial {
+    pub(crate) base_color: [f32; 3],
+    pub(crate) metallic: f32,
+    pub(crate) roughness: f32,
+    pub(crate) emissive: [f32; 3],
+    pub(crate) opacity: f32,
+    pub(crate) alpha_mode: AlphaMode,
+    pub(crate) double_sided: bool,
+    pub(crate) base_color_texture: Option<MaterialTextureSource>,
+    pub(crate) metallic_roughness_texture: Option<MaterialTextureSource>,
+    pub(crate) normal_texture: Option<MaterialTextureSource>,
+    pub(crate) emissive_texture: Option<MaterialTextureSource>,
+    pub(crate) occlusion_texture: Option<MaterialTextureSource>,
+    pub(crate) normal_scale: f32,
+    pub(crate) occlusion_strength: f32,
 }
 
 struct GpuTextureCache<T> {
@@ -458,7 +444,7 @@ where
     Ok(texture)
 }
 
-fn resolve_material(
+pub(crate) fn resolve_material(
     model: &ModelMaterial,
     replacement_texture: Option<&str>,
     override_material: Option<&MaterialOverride>,
@@ -537,6 +523,96 @@ fn read_utf8(resources: &ResourceHandle, path: &str) -> Result<String, String> {
         .wait()
         .map_err(|error| format!("{path}: {error}"))?;
     String::from_utf8(bytes).map_err(|error| format!("{path}: исходник должен быть UTF-8: {error}"))
+}
+
+/// Геометрия модели для коллайдеров мешей; одинакова для сцены и для тяжёлых префабов.
+pub(crate) fn model_geometry(path: &str, model: &Model) -> ModelGeometry {
+    ModelGeometry {
+        path: path.to_owned(),
+        meshes: model
+            .meshes
+            .iter()
+            .map(|mesh| PhysicsModelMesh {
+                positions: mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| Vec3::from_array(vertex.position))
+                    .collect(),
+                indices: mesh.indices.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Шаблон префаба, прочитанный через ресурсы; ошибки чтения и разбора остаются текстом.
+pub(crate) fn load_prefab_template(
+    resources: &ResourceHandle,
+    path: &VirtualPath,
+) -> Result<PrefabTemplate, String> {
+    PrefabTemplate::load(path, &mut |child: &VirtualPath| {
+        read_utf8(resources, &format!("/{}", child.as_str()))
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// CPU-ресурсы шаблона тяжёлого префаба: то же, что для объектов сцены.
+pub(crate) struct PreparedTemplate {
+    pub models: HashMap<String, Model>,
+    pub textures: HashMap<String, TextureData>,
+    /// Элемент `i` относится к объекту шаблона `i`; `None` — у объекта нет меша.
+    pub levels: Vec<Option<ObjectModel>>,
+    pub sources: BTreeMap<String, String>,
+}
+
+/// Готовит модели, текстуры и Lua-исходники шаблона. `stop` проверяется перед каждым объектом,
+/// моделью и исходником: прерванная подготовка возвращает ошибку, а не частичный результат.
+pub(crate) fn prepare_template(
+    resources: &ResourceHandle,
+    assets: &Assets,
+    label: &str,
+    template: &PrefabTemplate,
+    stop: &dyn Fn() -> bool,
+) -> Result<PreparedTemplate, String> {
+    const STOPPED: &str = "подготовка префаба прервана";
+    let mut set = RenderAssetSet::default();
+    let mut levels = Vec::with_capacity(template.objects().len());
+    for object in template.objects() {
+        if stop() {
+            return Err(STOPPED.to_owned());
+        }
+        let parts = ObjectParts {
+            environment: object.environment.as_ref(),
+            mesh_renderer: object.mesh_renderer.as_ref(),
+            lod_group: object.lod_group.as_ref(),
+            lite_scripts: &object.lite_scripts,
+        };
+        let model = set.add_object(assets, label, parts, &mut |path: &str| {
+            if stop() {
+                return Err(STOPPED.to_owned());
+            }
+            assets.load_model(path).map_err(|error| error.to_string())
+        })?;
+        levels.push(model);
+    }
+    let RenderAssetSet {
+        models,
+        textures,
+        environments: _,
+        lite_paths,
+    } = set;
+    let mut sources = BTreeMap::new();
+    for path in lite_paths {
+        if stop() {
+            return Err(STOPPED.to_owned());
+        }
+        sources.insert(path.clone(), read_utf8(resources, &path)?);
+    }
+    Ok(PreparedTemplate {
+        models,
+        textures,
+        levels,
+        sources,
+    })
 }
 
 pub(crate) fn upload_scene(
