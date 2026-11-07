@@ -1548,6 +1548,11 @@ fn render_scene_frame(
             .profile
             .record_frame(&profile, gpu.scene.viewport, gpu.scene.game_viewport);
     }
+    if let Some(project) = state.project.as_ref() {
+        state
+            .profile
+            .record_resources(std::time::Instant::now(), project.resource_stats());
+    }
     result
 }
 

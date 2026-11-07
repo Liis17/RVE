@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Align2, Color32, Context, Rect, RichText, Sense, Ui, Vec2, Window};
-use engine_core::profile::{ProfileReport, StatSummary};
+use engine_core::profile::{ProfileReport, ProfileValue, StatSummary};
 
 const BAR_WIDTH: f32 = 96.0;
 const BAR_HEIGHT: f32 = 8.0;
 
 /// Рисует отчёт: заголовок группы, строка на метку и полоса среднего относительно максимума отчёта.
+/// Счётчики и одиночные значения занимают колонку последнего значения.
 pub fn show(ui: &mut Ui, report: &ProfileReport) {
     let scale = report_scale(report);
     for group in &report.groups {
@@ -18,19 +19,31 @@ pub fn show(ui: &mut Ui, report: &ProfileReport) {
             .num_columns(5)
             .spacing([12.0, 2.0])
             .show(ui, |ui| {
-                for header in ["metric", "last, ms", "avg, ms", "max, ms", "avg / max"] {
+                for header in [
+                    "metric",
+                    "last, ms / count",
+                    "avg, ms",
+                    "max, ms",
+                    "avg / max",
+                ] {
                     ui.label(RichText::new(header).weak());
                 }
                 ui.end_row();
                 for row in &group.rows {
                     ui.label(row.label);
-                    match row.summary {
-                        Some(summary) => show_summary(ui, summary, scale),
-                        None => {
+                    match row.value {
+                        ProfileValue::Timing(summary) => show_summary(ui, summary, scale),
+                        ProfileValue::Single(value) => {
+                            ui.monospace(format_ms(value));
+                            show_empty_cells(ui, 3);
+                        }
+                        ProfileValue::Count(value) => {
+                            ui.monospace(value.to_string());
+                            show_empty_cells(ui, 3);
+                        }
+                        ProfileValue::Missing => {
                             ui.label("n/a");
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
+                            show_empty_cells(ui, 3);
                         }
                     }
                     ui.end_row();
@@ -66,14 +79,23 @@ fn show_summary(ui: &mut Ui, summary: StatSummary, scale: Duration) {
         .rect_filled(filled, 2.0, Color32::from_rgb(90, 160, 220));
 }
 
+fn show_empty_cells(ui: &mut Ui, count: usize) {
+    for _ in 0..count {
+        ui.label("");
+    }
+}
+
 /// Самое большое максимальное значение отчёта; общая шкала для полос строк.
 fn report_scale(report: &ProfileReport) -> Duration {
     report
         .groups
         .iter()
         .flat_map(|group| group.rows.iter())
-        .filter_map(|row| row.summary)
-        .map(|summary| summary.max)
+        .filter_map(|row| match row.value {
+            ProfileValue::Timing(summary) => Some(summary.max),
+            ProfileValue::Single(value) => Some(value),
+            ProfileValue::Count(_) | ProfileValue::Missing => None,
+        })
         .max()
         .unwrap_or(Duration::ZERO)
 }

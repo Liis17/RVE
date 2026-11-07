@@ -9,6 +9,9 @@ use crate::pipeline::{
     ExitRequester, FrameSnapshot, RENDER_THREAD, RenderControl, RenderThreadConfig, RuntimeStatus,
     SCRIPTS_THREAD, ScriptControl, VulkanBackend, start_render,
 };
+use crate::profiling::StartupProfile;
+#[cfg(feature = "dev-console")]
+use crate::profiling::profile_command_lines;
 use crate::scene::{PreparedRenderAssets, upload_scene};
 #[cfg(feature = "dev-console")]
 use egui::{Context, Rect, ViewportId};
@@ -18,6 +21,7 @@ use egui_winit::State as EguiWinitState;
 use engine_console::{CommandLine, ConsoleBuffer, ConsoleLevel, ConsoleLine, parse_command_line};
 use engine_project::BootstrapPresentMode;
 use engine_render::{DebugView, PresentMode, Renderer, RendererConfig, UpscalerConfig};
+use engine_resources::ResourceHandle;
 use engine_script::ScriptInterruptHandle;
 #[cfg(feature = "dev-console")]
 use engine_ui::console::ConsoleOverlay;
@@ -62,6 +66,8 @@ pub(crate) struct PlayerConfig {
     pub script_stopped_rx: std::sync::mpsc::Receiver<()>,
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
+    pub resources: ResourceHandle,
+    pub startup: StartupProfile,
     pub input: Arc<Mutex<InputAccumulator>>,
     #[cfg(feature = "dev-console")]
     pub console_buffer: Arc<Mutex<ConsoleBuffer>>,
@@ -93,6 +99,8 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         script_stopped_rx,
         interrupt,
         status,
+        resources,
+        startup,
         input,
         #[cfg(feature = "dev-console")]
         console_buffer,
@@ -126,6 +134,8 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         script_stopped_rx,
         interrupt,
         status: Arc::clone(&status),
+        resources,
+        startup,
         render_stopped_rx: None,
         close_deadline: None,
         window_exit: None,
@@ -188,6 +198,8 @@ struct PlayerWindow<'a> {
     script_stopped_rx: std::sync::mpsc::Receiver<()>,
     interrupt: ScriptInterruptHandle,
     status: Arc<RuntimeStatus>,
+    resources: ResourceHandle,
+    startup: StartupProfile,
     render_stopped_rx: Option<Receiver<()>>,
     close_deadline: Option<Instant>,
     window_exit: Option<Arc<dyn ExitRequester>>,
@@ -499,24 +511,8 @@ impl PlayerWindow<'_> {
                     push_console_line(&self.console_buffer, ConsoleLevel::Error, "console", error);
                     return;
                 }
-                let reports = self.status.profile.reports();
-                if reports.is_empty() {
-                    push_console_line(
-                        &self.console_buffer,
-                        ConsoleLevel::Info,
-                        "profile",
-                        "данных профайлера ещё нет",
-                    );
-                }
-                for (_, report) in reports {
-                    for line in report.to_string().lines() {
-                        push_console_line(
-                            &self.console_buffer,
-                            ConsoleLevel::Info,
-                            "profile",
-                            line,
-                        );
-                    }
+                for line in profile_command_lines(&self.status.profile.reports()) {
+                    push_console_line(&self.console_buffer, ConsoleLevel::Info, "profile", line);
                 }
             }
             "help" => {
@@ -732,6 +728,7 @@ impl WindowHandler for PlayerWindow<'_> {
             lock_input(&self.input).console_open(false, self.window_focused);
         }
         let size = window.inner_size();
+        let phase_started = Instant::now();
         let mut renderer = match Renderer::new(
             Arc::clone(&window),
             size.width,
@@ -759,14 +756,18 @@ impl WindowHandler for PlayerWindow<'_> {
             Ok(renderer) => renderer,
             Err(error) => return self.fail_init(format!("ошибка renderer: {error}")),
         };
+        self.startup.record("renderer", phase_started.elapsed());
         #[cfg(feature = "dev-console")]
         {
             self.wireframe_supported = renderer.capabilities().wireframe;
         }
+        let phase_started = Instant::now();
         let gpu_scene = match upload_scene(&mut renderer, &self.render_assets) {
             Ok(scene) => scene,
             Err(error) => return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}")),
         };
+        self.startup.record("GPU upload", phase_started.elapsed());
+        self.startup.publish(&self.status.profile);
         let Some(frame_rx) = self.frame_rx.take() else {
             return self.fail_init("канал кадров отсутствует при запуске рендера");
         };
@@ -792,6 +793,7 @@ impl WindowHandler for PlayerWindow<'_> {
                 script_tx: self.script_tx.clone(),
                 interrupt: self.interrupt.clone(),
                 status: Arc::clone(&self.status),
+                resources: Some(self.resources.clone()),
                 stopped_tx: render_stopped_tx,
                 exit: window_exit,
             },

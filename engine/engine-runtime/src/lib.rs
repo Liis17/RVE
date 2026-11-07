@@ -358,7 +358,6 @@ fn run_from_args(
         redraw: RedrawMode::OnDemand,
     };
     startup.record("scripts ready", phase_started.elapsed());
-    startup.publish(&status.profile);
     let code = player::run_window(
         player::PlayerConfig {
             window: config,
@@ -381,6 +380,8 @@ fn run_from_args(
             script_stopped_rx: script_thread.stopped,
             interrupt,
             status: Arc::clone(&status),
+            resources: resource_handle.clone(),
+            startup,
             input,
             #[cfg(feature = "dev-console")]
             console_buffer,

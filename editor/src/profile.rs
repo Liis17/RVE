@@ -1,13 +1,16 @@
 //! Замеры редактора для вкладки Profiler: CPU-фазы renderer, GPU по видам Scene и Game и шаг Play.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use engine_core::profile::{ProfileGroup, ProfileReport, ProfileRow, RollingStat};
+use engine_core::profile::{ProfileGroup, ProfileReport, ProfileRow, ProfileValue, RollingStat};
 use engine_render::{FrameProfile, GpuPass, GpuViewTimings, ProfiledView, ViewportId};
+use engine_resources::{ResourceSampler, ResourceStats};
 use engine_script::ScriptUpdateProfile;
 
 /// Число последних кадров и шагов, по которым вкладка считает last, avg и max.
 const WINDOW: usize = 240;
+/// Период снимка статистики ресурсов; совпадает с публикацией в runtime.
+const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 const CPU_LABELS: [&str; 7] = [
     "prepare",
     "fence wait",
@@ -43,6 +46,8 @@ pub struct EditorProfile {
     scene: Vec<RollingStat>,
     game: Vec<RollingStat>,
     play: Vec<RollingStat>,
+    resources: ResourceSampler,
+    next_resource_sample: Option<Instant>,
 }
 
 impl Default for EditorProfile {
@@ -52,6 +57,8 @@ impl Default for EditorProfile {
             scene: windows(GpuPass::COUNT + 1),
             game: windows(GpuPass::COUNT + 1),
             play: windows(PLAY_LABELS.len()),
+            resources: ResourceSampler::default(),
+            next_resource_sample: None,
         }
     }
 }
@@ -90,6 +97,15 @@ impl EditorProfile {
         );
     }
 
+    /// Снимает статистику запросов ресурсов не чаще [`RESOURCE_SAMPLE_INTERVAL`].
+    pub fn record_resources(&mut self, now: Instant, stats: ResourceStats) {
+        if self.next_resource_sample.is_some_and(|next| now < next) {
+            return;
+        }
+        self.next_resource_sample = Some(now + RESOURCE_SAMPLE_INTERVAL);
+        self.resources.sample(stats);
+    }
+
     /// Записывает фазы шага Play.
     pub fn record_play(&mut self, step: PlayStep) {
         let script = step.script;
@@ -120,6 +136,7 @@ impl EditorProfile {
                 group("GPU Scene", &gpu_labels, &self.scene),
                 group("GPU Game", &gpu_labels, &self.game),
                 group("Play", &PLAY_LABELS, &self.play),
+                self.resources.profile_group(),
             ],
         }
     }
@@ -170,12 +187,9 @@ fn group(name: &'static str, labels: &[&'static str], windows: &[RollingStat]) -
         rows: labels
             .iter()
             .zip(windows)
-            .map(|(&label, window)| {
-                let summary = window.summary();
-                ProfileRow {
-                    label,
-                    summary: (summary.samples > 0).then_some(summary),
-                }
+            .map(|(&label, window)| ProfileRow {
+                label,
+                value: ProfileValue::from_summary(window.summary()),
             })
             .collect(),
     }
@@ -183,9 +197,11 @@ fn group(name: &'static str, labels: &[&'static str], windows: &[RollingStat]) -
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorProfile, PlayStep, record_gpu, windows};
+    use super::{EditorProfile, PlayStep, RESOURCE_SAMPLE_INTERVAL, record_gpu, windows};
+    use engine_core::profile::{ProfileReport, ProfileValue};
     use engine_render::{GpuPass, GpuViewTimings, ProfiledView};
-    use std::time::Duration;
+    use engine_resources::ResourceStats;
+    use std::time::{Duration, Instant};
 
     const SCENE: u8 = 1;
     const GAME: u8 = 2;
@@ -211,6 +227,17 @@ mod tests {
         windows(GpuPass::COUNT + 1)
     }
 
+    fn row_value(report: &ProfileReport, group: &str, label: &str) -> Option<ProfileValue> {
+        report
+            .groups
+            .iter()
+            .find(|candidate| candidate.name == group)?
+            .rows
+            .iter()
+            .find(|row| row.label == label)
+            .map(|row| row.value)
+    }
+
     fn row_samples(
         report: &engine_core::profile::ProfileReport,
         group: &str,
@@ -222,9 +249,11 @@ mod tests {
             .find(|candidate| candidate.name == group)?
             .rows
             .iter()
-            .find(|row| row.label == label)?
-            .summary
-            .map(|summary| summary.samples)
+            .find(|row| row.label == label)
+            .and_then(|row| match row.value {
+                ProfileValue::Timing(summary) => Some(summary.samples),
+                _ => None,
+            })
     }
 
     #[test]
@@ -246,10 +275,38 @@ mod tests {
     }
 
     #[test]
-    fn report_lists_renderer_gpu_views_and_play_groups_in_order() {
+    fn report_lists_renderer_gpu_views_play_and_resources_in_order() {
         let report = EditorProfile::default().report();
         let names: Vec<&str> = report.groups.iter().map(|group| group.name).collect();
-        assert_eq!(names, ["Renderer CPU", "GPU Scene", "GPU Game", "Play"]);
+        assert_eq!(
+            names,
+            ["Renderer CPU", "GPU Scene", "GPU Game", "Play", "Resources"]
+        );
+    }
+
+    #[test]
+    fn resource_stats_are_sampled_at_most_once_per_interval() {
+        let mut profile = EditorProfile::default();
+        let start = Instant::now();
+        let stats = |completed| ResourceStats {
+            completed,
+            ..ResourceStats::default()
+        };
+
+        profile.record_resources(start, stats(1));
+        profile.record_resources(start + ms(100), stats(4));
+        assert_eq!(
+            row_value(&profile.report(), "Resources", "completed / interval"),
+            Some(ProfileValue::Missing),
+            "второй снимок раньше интервала не должен фиксировать дельту"
+        );
+
+        profile.record_resources(start + RESOURCE_SAMPLE_INTERVAL, stats(6));
+        assert_eq!(
+            row_value(&profile.report(), "Resources", "completed / interval"),
+            Some(ProfileValue::Count(5)),
+            "дельта считается от последнего принятого снимка"
+        );
     }
 
     #[test]

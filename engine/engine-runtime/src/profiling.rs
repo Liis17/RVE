@@ -5,15 +5,17 @@
 //! с частотой показа, а не на горячем пути.
 
 use engine_core::profile::{
-    ProfileBoard, ProfileGroup, ProfileReport, ProfileRow, RollingStat, StatSummary,
+    ProfileBoard, ProfileGroup, ProfileReport, ProfileRow, ProfileValue, RollingStat, StatSummary,
 };
 use engine_render::{FrameProfile, GpuPass};
+use engine_resources::{ResourceHandle, ResourceSampler};
 use engine_script::ScriptUpdateProfile;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) const SOURCE_SCRIPTS: &str = "scripts";
 pub(crate) const SOURCE_RENDER: &str = "render";
+pub(crate) const SOURCE_RESOURCES: &str = "resources";
 pub(crate) const SOURCE_STARTUP: &str = "startup";
 
 /// Число последних замеров, по которым считаются last, avg и max.
@@ -113,6 +115,12 @@ pub(crate) fn render_groups() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
+/// Источник статистики ресурсов: снимок берётся вместе с окнами фаз и публикуется отдельным отчётом.
+struct ResourceFeed {
+    handle: ResourceHandle,
+    sampler: ResourceSampler,
+}
+
 struct PhaseGroup {
     title: &'static str,
     labels: Vec<&'static str>,
@@ -127,6 +135,7 @@ pub(crate) struct PhaseWindow {
     board: Arc<ProfileBoard>,
     groups: Vec<PhaseGroup>,
     next_publish: Option<Instant>,
+    resources: Option<ResourceFeed>,
 }
 
 impl PhaseWindow {
@@ -153,7 +162,17 @@ impl PhaseWindow {
             board,
             groups,
             next_publish: None,
+            resources: None,
         }
+    }
+
+    /// Добавляет статистику запросов ресурсов: она публикуется в [`SOURCE_RESOURCES`] при каждой публикации окон.
+    pub(crate) fn with_resources(mut self, handle: Option<ResourceHandle>) -> Self {
+        self.resources = handle.map(|handle| ResourceFeed {
+            handle,
+            sampler: ResourceSampler::default(),
+        });
+        self
     }
 
     /// Записывает замер метки `phase` группы `group`.
@@ -183,6 +202,15 @@ impl PhaseWindow {
         self.next_publish = Some(now + PUBLISH_INTERVAL);
         self.retire_untouched();
         self.board.publish(self.source, self.report());
+        if let Some(resources) = &mut self.resources {
+            resources.sampler.sample(resources.handle.stats());
+            self.board.publish(
+                SOURCE_RESOURCES,
+                ProfileReport {
+                    groups: vec![resources.sampler.profile_group()],
+                },
+            );
+        }
     }
 
     /// Сбрасывает окна меток, которых не было в интервале, и начинает новый интервал.
@@ -209,12 +237,9 @@ impl PhaseWindow {
                         .labels
                         .iter()
                         .zip(&group.stats)
-                        .map(|(&label, stat)| {
-                            let summary = stat.summary();
-                            ProfileRow {
-                                label,
-                                summary: (summary.samples > 0).then_some(summary),
-                            }
+                        .map(|(&label, stat)| ProfileRow {
+                            label,
+                            value: ProfileValue::from_summary(stat.summary()),
                         })
                         .collect(),
                 })
@@ -284,12 +309,12 @@ impl StartupProfile {
             .iter()
             .map(|&(label, elapsed)| ProfileRow {
                 label,
-                summary: Some(StatSummary::once(elapsed)),
+                value: ProfileValue::Timing(StatSummary::once(elapsed)),
             })
             .collect();
         rows.push(ProfileRow {
             label: "total",
-            summary: Some(StatSummary::once(total)),
+            value: ProfileValue::Timing(StatSummary::once(total)),
         });
         board.publish(
             SOURCE_STARTUP,
@@ -301,6 +326,24 @@ impl StartupProfile {
             },
         );
     }
+}
+
+/// Строки команды `profile`: отчёты всех источников подряд или подсказка, если данных ещё нет.
+#[cfg(any(feature = "dev-console", test))]
+pub(crate) fn profile_command_lines(reports: &[(&'static str, Arc<ProfileReport>)]) -> Vec<String> {
+    if reports.is_empty() {
+        return vec!["данных профайлера ещё нет".to_owned()];
+    }
+    reports
+        .iter()
+        .flat_map(|(_, report)| {
+            report
+                .to_string()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Пишет опубликованный отчёт старта в лог одной записью. Пустой отчёт ничего не пишет.
@@ -328,7 +371,10 @@ mod tests {
             .rows
             .iter()
             .find(|row| row.label == label)
-            .and_then(|row| row.summary)
+            .and_then(|row| match row.value {
+                ProfileValue::Timing(summary) => Some(summary),
+                _ => None,
+            })
     }
 
     #[test]
@@ -344,6 +390,33 @@ mod tests {
 
         window.publish_if_due(start + PUBLISH_INTERVAL);
         assert!(!Arc::ptr_eq(&first, &board.reports()[0].1));
+    }
+
+    #[test]
+    fn resource_stats_are_published_with_each_phase_interval() {
+        let resources =
+            engine_resources::ResourceSystem::start(engine_resources::ResourceConfig::default())
+                .unwrap();
+        let board = Arc::new(ProfileBoard::new(&[SOURCE_RENDER, SOURCE_RESOURCES]));
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::clone(&board), render_groups())
+            .with_resources(Some(resources.handle()));
+        let start = Instant::now();
+
+        window.publish_if_due(start);
+        window.publish_if_due(start + PUBLISH_INTERVAL);
+
+        let reports = board.reports();
+        let (_, report) = reports
+            .iter()
+            .find(|(source, _)| *source == SOURCE_RESOURCES)
+            .expect("статистика ресурсов опубликована вместе с окнами фаз");
+        assert_eq!(report.groups[0].name, "Resources");
+        let completed = report.groups[0]
+            .rows
+            .iter()
+            .find(|row| row.label == "completed / interval")
+            .map(|row| row.value);
+        assert_eq!(completed, Some(ProfileValue::Count(0)));
     }
 
     #[test]
@@ -448,19 +521,50 @@ mod tests {
     }
 
     #[test]
+    fn profile_command_lists_every_published_group() {
+        let board = ProfileBoard::new(&[SOURCE_STARTUP, SOURCE_RENDER]);
+        let mut startup = StartupProfile::default();
+        startup.record("scene load", ms(1));
+        startup.publish(&board);
+        let mut window = PhaseWindow::new(SOURCE_RENDER, Arc::new(board), render_groups());
+        window.record(render_phase::RENDERER, render_phase::PREPARE, ms(2));
+        window.publish_if_due(Instant::now());
+        let board = window.board().clone();
+
+        let lines = profile_command_lines(&board.reports());
+
+        assert!(lines.iter().any(|line| line == "Startup"));
+        assert!(lines.iter().any(|line| line == "Renderer CPU"));
+        assert!(lines.iter().any(|line| line.contains("scene load")));
+        assert!(lines.iter().any(|line| line.contains("total")));
+        assert!(lines.iter().any(|line| line.contains("prepare")));
+    }
+
+    #[test]
+    fn profile_command_without_reports_says_there_is_no_data_yet() {
+        let board = ProfileBoard::new(&[SOURCE_STARTUP]);
+
+        assert_eq!(
+            profile_command_lines(&board.reports()),
+            ["данных профайлера ещё нет"]
+        );
+    }
+
+    #[test]
     fn startup_report_lists_phases_in_order_and_ends_with_total() {
         let board = ProfileBoard::new(&[SOURCE_STARTUP]);
         let mut startup = StartupProfile::default();
-        startup.record("settings", ms(1));
-        startup.record("scene", ms(3));
+        startup.record("scene load", ms(1));
+        startup.record("renderer", ms(2));
+        startup.record("GPU upload", ms(3));
 
         startup.publish(&board);
 
         let reports = board.reports();
         let report = &reports[0].1;
         let labels: Vec<&str> = report.groups[0].rows.iter().map(|row| row.label).collect();
-        assert_eq!(labels, ["settings", "scene", "total"]);
-        assert_eq!(row(report, 0, "total"), Some(StatSummary::once(ms(4))));
-        assert!(report.to_string().contains("4.000 ms"));
+        assert_eq!(labels, ["scene load", "renderer", "GPU upload", "total"]);
+        assert_eq!(row(report, 0, "total"), Some(StatSummary::once(ms(6))));
+        assert!(report.to_string().contains("6.000 ms"));
     }
 }

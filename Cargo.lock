@@ -751,6 +751,7 @@ dependencies = [
 name = "engine-resources"
 version = "0.2.0"
 dependencies = [
+ "engine-core",
  "engine-files",
  "engine-pak",
  "flume",

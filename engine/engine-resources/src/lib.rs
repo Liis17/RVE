@@ -7,9 +7,11 @@
 //! waited on explicitly by startup and legacy code.
 
 mod error;
+mod sampler;
 mod service;
 
 pub use error::{ResourceError, ResourceErrorKind};
+pub use sampler::ResourceSampler;
 pub use service::{
     ResourceHandle, ResourceRequest, ResourceStat, ResourceStats, ResourceSystem, TimingTotals,
 };

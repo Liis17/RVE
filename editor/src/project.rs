@@ -5,7 +5,7 @@ use crate::scene_edit::PrefabLoader;
 use engine_assets::Assets;
 use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, ProjectSettings};
-use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem, SourceMode};
+use engine_resources::{ResourceConfig, ResourceHandle, ResourceStats, ResourceSystem, SourceMode};
 use engine_scene::world::ObjectHandle;
 use engine_scene::{CameraSettings, SceneDocument, SceneError, World};
 use std::cell::RefCell;
@@ -118,6 +118,11 @@ impl OpenProject {
             camera_settings: RefCell::default(),
             resources,
         })
+    }
+
+    /// Снимок статистики запросов ресурсов проекта для вкладки Profiler.
+    pub fn resource_stats(&self) -> ResourceStats {
+        self.resources.handle().stats()
     }
 
     /// Читает текстовый ресурс, например исходник Lua или файл сцены.

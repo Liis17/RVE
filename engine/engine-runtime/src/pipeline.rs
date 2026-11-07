@@ -5,9 +5,9 @@ use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use crate::profiling::{
-    PhaseWindow, SOURCE_RENDER, SOURCE_SCRIPTS, SOURCE_STARTUP, log_startup_profile,
-    record_frame_profile, record_update_profile, render_groups, render_phase, script_phase,
-    scripts_groups,
+    PhaseWindow, SOURCE_RENDER, SOURCE_RESOURCES, SOURCE_SCRIPTS, SOURCE_STARTUP,
+    log_startup_profile, record_frame_profile, record_update_profile, render_groups, render_phase,
+    script_phase, scripts_groups,
 };
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
@@ -23,6 +23,7 @@ use engine_render::{
 };
 #[cfg(feature = "dev-console")]
 use engine_render::{UiImage, UiPrimitive, UiVertex, ViewportId};
+use engine_resources::ResourceHandle;
 use engine_scene::camera::Camera;
 use engine_scene::light::{
     cascade_view_projections, point_shadow_view_projections, spot_shadow_view_projection,
@@ -152,6 +153,7 @@ impl Default for RuntimeStatus {
             profile: Arc::new(ProfileBoard::new(&[
                 SOURCE_SCRIPTS,
                 SOURCE_RENDER,
+                SOURCE_RESOURCES,
                 SOURCE_STARTUP,
             ])),
         }
@@ -295,6 +297,8 @@ pub(crate) struct RenderThreadConfig {
     pub script_tx: Sender<ScriptControl>,
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
+    /// Источник статистики ресурсов для профайлера; `None` оставляет источник пустым.
+    pub resources: Option<ResourceHandle>,
     pub stopped_tx: Sender<()>,
     pub exit: Arc<dyn ExitRequester>,
 }
@@ -1562,12 +1566,14 @@ fn render_thread(config: RenderThreadConfig) {
         script_tx,
         interrupt,
         status,
+        resources,
         stopped_tx,
         exit,
         ..
     } = config;
     let mut profiler =
-        PhaseWindow::new(SOURCE_RENDER, Arc::clone(&status.profile), render_groups());
+        PhaseWindow::new(SOURCE_RENDER, Arc::clone(&status.profile), render_groups())
+            .with_resources(resources);
     let result = catch_unwind(AssertUnwindSafe(|| {
         render_loop(
             &mut *backend,
@@ -1873,6 +1879,7 @@ mod tests {
     use engine_console::CommandLine;
     use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
     use engine_core::profile::ProfileBoard;
+    use engine_core::profile::ProfileValue;
     use engine_physics::{
         PhysicsClient, PhysicsCommand, PhysicsEvent, PhysicsInitialization, PhysicsReply,
         PhysicsRequest, PhysicsSceneDesc, PhysicsSceneSync, PhysicsServer, PhysicsStepResult,
@@ -2924,8 +2931,11 @@ return Script
 
         assert!(result.is_ok());
         let report = window.report();
-        let frame_wait = report.groups[render_phase::LOOP].rows[render_phase::FRAME_WAIT].summary;
-        assert_eq!(frame_wait.map(|summary| summary.samples), Some(1));
+        let frame_wait = report.groups[render_phase::LOOP].rows[render_phase::FRAME_WAIT].value;
+        assert!(matches!(
+            frame_wait,
+            ProfileValue::Timing(summary) if summary.samples == 1
+        ));
     }
 
     #[test]
@@ -3836,6 +3846,7 @@ return Move
             script_tx,
             interrupt: interrupt.clone(),
             status: Arc::clone(&status),
+            resources: None,
             stopped_tx,
             exit: Arc::new(FakeExit(exit_tx)),
         });
@@ -3883,6 +3894,7 @@ return Move
                 script_tx,
                 interrupt: ScriptInterruptHandle::new(),
                 status: Arc::clone(&status),
+                resources: None,
                 stopped_tx,
                 exit: Arc::new(FakeExit(exit_tx)),
             });

@@ -105,11 +105,35 @@ pub struct ProfileGroup {
     pub rows: Vec<ProfileRow>,
 }
 
-/// Одна строка отчёта. `None` означает, что значения нет в этом кадре.
+/// Одна строка отчёта: метка и значение.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileRow {
     pub label: &'static str,
-    pub summary: Option<StatSummary>,
+    pub value: ProfileValue,
+}
+
+/// Значение строки отчёта.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileValue {
+    /// Значения нет в последнем интервале или кадре; показывается как `n/a`.
+    Missing,
+    /// Итоги окна измерений: last, avg, max и число замеров.
+    Timing(StatSummary),
+    /// Одна длительность, например среднее за интервал или максимум с запуска.
+    Single(Duration),
+    /// Счётчик, например число завершённых запросов или байты за интервал.
+    Count(u64),
+}
+
+impl ProfileValue {
+    /// Итоги окна, если в нём есть замеры; пустое окно даёт [`ProfileValue::Missing`].
+    pub fn from_summary(summary: StatSummary) -> Self {
+        if summary.samples > 0 {
+            Self::Timing(summary)
+        } else {
+            Self::Missing
+        }
+    }
 }
 
 impl fmt::Display for ProfileReport {
@@ -117,8 +141,8 @@ impl fmt::Display for ProfileReport {
         for group in &self.groups {
             writeln!(f, "{}", group.name)?;
             for row in &group.rows {
-                match row.summary {
-                    Some(s) => writeln!(
+                match row.value {
+                    ProfileValue::Timing(s) => writeln!(
                         f,
                         "  {:<28} last {:>9.3} ms  avg {:>9.3} ms  max {:>9.3} ms  n={}",
                         row.label,
@@ -127,7 +151,11 @@ impl fmt::Display for ProfileReport {
                         millis(s.max),
                         s.samples,
                     )?,
-                    None => writeln!(f, "  {:<28} n/a", row.label)?,
+                    ProfileValue::Single(value) => {
+                        writeln!(f, "  {:<28} {:>9.3} ms", row.label, millis(value))?
+                    }
+                    ProfileValue::Count(value) => writeln!(f, "  {:<28} {value}", row.label)?,
+                    ProfileValue::Missing => writeln!(f, "  {:<28} n/a", row.label)?,
                 }
             }
         }
@@ -195,7 +223,10 @@ fn lock(slot: &Mutex<Option<Arc<ProfileReport>>>) -> MutexGuard<'_, Option<Arc<P
 
 #[cfg(test)]
 mod tests {
-    use super::{ProfileBoard, ProfileGroup, ProfileReport, ProfileRow, RollingStat, StatSummary};
+    use super::{
+        ProfileBoard, ProfileGroup, ProfileReport, ProfileRow, ProfileValue, RollingStat,
+        StatSummary,
+    };
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
@@ -210,7 +241,7 @@ mod tests {
                 name: "Group",
                 rows: vec![ProfileRow {
                     label,
-                    summary: Some(StatSummary::once(ms(value))),
+                    value: ProfileValue::Timing(StatSummary::once(ms(value))),
                 }],
             }],
         }
@@ -303,11 +334,15 @@ mod tests {
                 rows: vec![
                     ProfileRow {
                         label: "Opaque",
-                        summary: Some(StatSummary::once(ms(2))),
+                        value: ProfileValue::Timing(StatSummary::once(ms(2))),
                     },
                     ProfileRow {
                         label: "Wireframe",
-                        summary: None,
+                        value: ProfileValue::Missing,
+                    },
+                    ProfileRow {
+                        label: "completed",
+                        value: ProfileValue::Count(7),
                     },
                 ],
             }],
@@ -318,6 +353,7 @@ mod tests {
         assert!(text.contains("Opaque"));
         assert!(text.contains("2.000 ms"));
         assert!(text.contains("Wireframe") && text.contains("n/a"));
+        assert!(text.contains("completed") && text.contains(" 7"));
     }
 
     #[test]
@@ -388,8 +424,8 @@ mod tests {
         assert_eq!(reports[0].1.groups[0].rows[0].label, "update");
         assert_eq!(reports[1].1.groups[0].rows[0].label, "frame");
         assert_eq!(
-            reports[1].1.groups[0].rows[0].summary,
-            Some(StatSummary::once(ms(99)))
+            reports[1].1.groups[0].rows[0].value,
+            ProfileValue::Timing(StatSummary::once(ms(99)))
         );
     }
 
