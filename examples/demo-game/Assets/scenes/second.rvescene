@@ -64,7 +64,7 @@ model = "/models/props-cube.fbx"
 id = "worm"
 name = "Worm"
 [objects.transform]
-position = [2.0, 0.0, -1.0]
+position = [2.8, 0.0, -1.0]
 [objects.mesh_renderer]
 model = "/models/worm.fbx"
 [objects.animator]
