@@ -899,6 +899,51 @@ return Hero
     }
 
     #[test]
+    fn demo_worm_curl_finishes_into_wiggle_and_its_script_hears_it() {
+        // Ассеты и скрипт берутся из examples/demo-game: тест следит за работоспособностью демо.
+        let root = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/demo-game"
+        ));
+        let project = crate::project::OpenProject::open(root).unwrap();
+        const SCENE: &str = "[[assets]]\npath = \"/models/worm.fbx\"\n[[assets]]\npath = \"/anims/worm_curl.fbx\"\n[[assets]]\npath = \"/scripts/worm.lua\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"worm\"\n[objects.mesh_renderer]\nmodel = \"/models/worm.fbx\"\n[objects.animator]\nclips = [\"/anims/worm_curl.fbx\"]\nplay_on_start = false\n[[objects.lite_scripts]]\npath = \"/scripts/worm.lua\"\n";
+        let document = SceneDocument::parse("worm.rvescene", SCENE).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let animation = crate::viewport::animation::project_bridge(&world, &project.assets);
+        let mut session = PlaySession::start_with_world_and_physics(
+            &document,
+            world,
+            None,
+            &project.settings.input,
+            |path| project.read_text(path),
+            &[],
+            &project.settings.physics,
+            AudioConfig::default(),
+            animation,
+        )
+        .unwrap();
+
+        // Разовый клип длится 1 с; за 1.5 с он заканчивается и переходит в цикл Wiggle.
+        for _ in 0..30 {
+            session.step(0.05).unwrap();
+        }
+        let messages: Vec<String> = session
+            .drain_events()
+            .into_iter()
+            .map(|event| event.message)
+            .collect();
+        assert!(
+            messages.contains(&"Worm: curl, then Wiggle".to_owned()),
+            "{messages:?}"
+        );
+        assert!(
+            messages.contains(&"Worm: worm_curl finished".to_owned()),
+            "{messages:?}"
+        );
+        assert!(session.drain_animation_warnings().is_empty());
+    }
+
+    #[test]
     fn stop_runs_on_destroy_and_reports_events() {
         let mut session = start(ROTATE).unwrap();
         session.step(0.1).unwrap();
