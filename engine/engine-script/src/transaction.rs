@@ -6,7 +6,9 @@ use engine_physics::{
     BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
     QueryHit, Ray,
 };
-use engine_scene::{AudioRequest, CameraSettings, LocalTransform, ObjectHandle, ParamValue, World};
+use engine_scene::{
+    AnimationRequest, AudioRequest, CameraSettings, LocalTransform, ObjectHandle, ParamValue, World,
+};
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,6 +18,8 @@ use std::sync::{Arc, OnceLock};
 pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
 /// Звуковых запросов за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
 pub(crate) const MAX_AUDIO_REQUESTS_PER_FRAME: usize = 256;
+/// Запросов аниматора за кадр, включая уже зафиксированные скриптами.
+pub(crate) const MAX_ANIMATION_REQUESTS_PER_FRAME: usize = 256;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_DEPTH: usize = 16;
 pub(crate) const MAX_MESSAGE_ELEMENTS: usize = 1024;
@@ -84,6 +88,37 @@ pub(crate) struct PendingMessage {
     estimated_size: usize,
 }
 
+impl PendingMessage {
+    /// Системное сообщение движка от объекта `sender_id`, например `animation_finished`.
+    pub(crate) fn engine_message(
+        sender_id: String,
+        target: MessageTarget,
+        name: &str,
+        value: ParamValue,
+    ) -> Self {
+        let value_size = match &value {
+            ParamValue::String(text) => text.len(),
+            _ => 0,
+        };
+        let estimated_size = sender_id
+            .len()
+            .saturating_add(name.len())
+            .saturating_add(value_size);
+        Self {
+            sender_id,
+            target,
+            name: name.to_owned(),
+            value,
+            estimated_size,
+        }
+    }
+
+    /// Оценка размера сообщения, которую учитывает очередь кадра.
+    pub(crate) fn size(&self) -> usize {
+        self.estimated_size
+    }
+}
+
 pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) world: &'a World,
     pub(crate) self_object: ObjectHandle,
@@ -93,6 +128,7 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) queued_messages: (usize, usize),
     /// Звуковые запросы, уже зафиксированные в этом кадре.
     pub(crate) queued_audio: usize,
+    pub(crate) queued_animation: usize,
     pub(crate) physics: Rc<RefCell<PhysicsScriptState>>,
     pub(crate) physics_phase_dt: Option<f32>,
     /// Состояние курсора, применённое хостом до этого вызова.
@@ -126,6 +162,7 @@ pub(crate) struct ScriptTransaction {
     queued_message_count: usize,
     queued_message_bytes: usize,
     queued_audio: usize,
+    queued_animation: usize,
     overflowed_messages: usize,
     action_frame: Option<Arc<ActionFrame>>,
     physics: Rc<RefCell<PhysicsScriptState>>,
@@ -140,6 +177,7 @@ pub(crate) struct ScriptTransaction {
     pending_cursor_visible: Option<bool>,
     pending_cursor_locked: Option<bool>,
     pending_audio: Vec<AudioRequest>,
+    pending_animation: Vec<AnimationRequest>,
     #[cfg(test)]
     peak_pending_bytes: usize,
 }
@@ -167,6 +205,7 @@ impl Default for ScriptTransaction {
             queued_message_count: 0,
             queued_message_bytes: 0,
             queued_audio: 0,
+            queued_animation: 0,
             overflowed_messages: 0,
             action_frame: None,
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
@@ -180,6 +219,7 @@ impl Default for ScriptTransaction {
             pending_cursor_visible: None,
             pending_cursor_locked: None,
             pending_audio: Vec::new(),
+            pending_animation: Vec::new(),
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
@@ -216,12 +256,14 @@ impl ScriptTransaction {
         self.queued_message_count = init.queued_messages.0;
         self.queued_message_bytes = init.queued_messages.1;
         self.queued_audio = init.queued_audio;
+        self.queued_animation = init.queued_animation;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
         self.cursor = init.cursor;
         self.pending_cursor_visible = None;
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
+        self.pending_animation.clear();
     }
 
     pub(crate) fn writable(&self) -> bool {
@@ -309,6 +351,28 @@ impl ScriptTransaction {
     pub(crate) fn has_audio_source(&self, handle: ObjectHandle) -> bool {
         self.world()
             .is_some_and(|world| world.audio_source(handle).is_some())
+    }
+
+    pub(crate) fn stage_animation(&mut self, request: AnimationRequest) -> Result<(), String> {
+        if !self.writable {
+            return Err("animation is unavailable during script creation".to_owned());
+        }
+        if self
+            .queued_animation
+            .saturating_add(self.pending_animation.len())
+            >= MAX_ANIMATION_REQUESTS_PER_FRAME
+        {
+            return Err(format!(
+                "animation requests limit ({MAX_ANIMATION_REQUESTS_PER_FRAME} per frame) reached"
+            ));
+        }
+        self.pending_animation.push(request);
+        Ok(())
+    }
+
+    pub(crate) fn has_animator(&self, handle: ObjectHandle) -> bool {
+        self.world()
+            .is_some_and(|world| world.animator(handle).is_some())
     }
 
     pub(crate) fn physics_raycast(
@@ -777,6 +841,7 @@ impl ScriptTransaction {
         queued_bytes: &mut usize,
         events: &EventQueue,
         audio: &mut Vec<AudioRequest>,
+        animation: &mut Vec<AnimationRequest>,
     ) -> Result<Vec<ActionMutation>, String> {
         let transforms_are_finite = self.pending_transforms.values().all(|transform| {
             transform
@@ -921,6 +986,7 @@ impl ScriptTransaction {
         self.pending_bytes = 0;
         self.overflowed_messages = 0;
         audio.append(&mut self.pending_audio);
+        animation.append(&mut self.pending_animation);
         self.world = std::ptr::null();
         self.action_frame = None;
         Ok(std::mem::take(&mut self.pending_action_mutations))
@@ -944,6 +1010,7 @@ impl ScriptTransaction {
         self.pending_cursor_visible = None;
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
+        self.pending_animation.clear();
         self.world = std::ptr::null();
         self.action_frame = None;
     }

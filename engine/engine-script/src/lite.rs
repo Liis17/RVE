@@ -11,8 +11,8 @@ use engine_files::VirtualPath;
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
-    AntiAliasing, AudioGroup, AudioRequest, CameraSettings, ClipParams, ObjectHandle, ParamKind,
-    ParamSchema, ParamSpec, ParamValue, Tonemapper, VoiceId,
+    AnimationRequest, AntiAliasing, AudioGroup, AudioRequest, CameraSettings, ClipParams,
+    ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue, Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use mlua::chunk::ChunkMode;
@@ -1078,6 +1078,7 @@ fn object_table(
         })?,
     )?;
     add_audio_object_api(lua, &object, handle, active_call.clone())?;
+    add_animation_object_api(lua, &object, handle, active_call.clone())?;
     add_physics_object_api(lua, &object, handle, active_call)?;
     Ok(object)
 }
@@ -1135,6 +1136,261 @@ fn add_audio_object_api(
         })?,
     )?;
     Ok(())
+}
+
+/// Методы аниматора объекта: `play_animation`, `set_animation_weight`, `set_animation_parameter`,
+/// `set_animation_speed` и `stop_animation`. Без `animator` каждый метод возвращает ошибку.
+fn add_animation_object_api(
+    lua: &Lua,
+    object: &Table,
+    handle: ObjectHandle,
+    active_call: ActiveCall,
+) -> mlua::Result<()> {
+    let play_active = active_call.clone();
+    object.set(
+        "play_animation",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let (motion, options) = animation_motion_arguments(arguments, "object.play_animation")?;
+            with_active_call(&play_active, |transaction| {
+                require_animator(transaction, handle, "object.play_animation")?;
+                transaction
+                    .stage_animation(AnimationRequest::Play {
+                        object: handle,
+                        motion: motion.clone(),
+                        fade: options.fade,
+                        looping: options.looping,
+                        then: options.then.clone(),
+                    })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let weight_active = active_call.clone();
+    object.set(
+        "set_animation_weight",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let values = animation_values(arguments, "object.set_animation_weight")?;
+            let motion = animation_name(values.first(), "object.set_animation_weight")?;
+            let weight = animation_number(values.get(1), "object.set_animation_weight", "weight")?;
+            let fade = optional_fade(values.get(2), "object.set_animation_weight")?;
+            with_active_call(&weight_active, |transaction| {
+                require_animator(transaction, handle, "object.set_animation_weight")?;
+                transaction
+                    .stage_animation(AnimationRequest::SetWeight {
+                        object: handle,
+                        motion,
+                        weight,
+                        fade,
+                    })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let parameter_active = active_call.clone();
+    object.set(
+        "set_animation_parameter",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let values = animation_values(arguments, "object.set_animation_parameter")?;
+            let name = animation_name(values.first(), "object.set_animation_parameter")?;
+            let value = animation_number(values.get(1), "object.set_animation_parameter", "value")?;
+            with_active_call(&parameter_active, |transaction| {
+                require_animator(transaction, handle, "object.set_animation_parameter")?;
+                transaction
+                    .stage_animation(AnimationRequest::SetParameter {
+                        object: handle,
+                        name,
+                        value,
+                    })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let speed_active = active_call.clone();
+    object.set(
+        "set_animation_speed",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let values = animation_values(arguments, "object.set_animation_speed")?;
+            let speed = animation_number(values.first(), "object.set_animation_speed", "speed")?;
+            if speed < 0.0 {
+                return Err(LuaError::runtime(
+                    "object.set_animation_speed speed must not be negative",
+                ));
+            }
+            with_active_call(&speed_active, |transaction| {
+                require_animator(transaction, handle, "object.set_animation_speed")?;
+                transaction
+                    .stage_animation(AnimationRequest::SetSpeed {
+                        object: handle,
+                        speed,
+                    })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    object.set(
+        "stop_animation",
+        lua.create_function(move |_, arguments: MultiValue| {
+            animation_values(arguments, "object.stop_animation")?;
+            with_active_call(&active_call, |transaction| {
+                require_animator(transaction, handle, "object.stop_animation")?;
+                transaction
+                    .stage_animation(AnimationRequest::Stop { object: handle })
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    Ok(())
+}
+
+/// Аргументы без `self`: `obj:method(...)` передаёт таблицу объекта первой. Ни один первый
+/// параметр методов аниматора не является таблицей, поэтому ведущая таблица всегда считается `self`.
+fn animation_values(arguments: MultiValue, name: &str) -> mlua::Result<Vec<Value>> {
+    let mut values: Vec<Value> = arguments.into_iter().collect();
+    if matches!(values.first(), Some(Value::Table(_))) {
+        values.remove(0);
+    }
+    if values.len() > 4 {
+        return Err(LuaError::runtime(format!(
+            "{name} received too many arguments"
+        )));
+    }
+    Ok(values)
+}
+
+fn animation_name(value: Option<&Value>, name: &str) -> mlua::Result<String> {
+    match value {
+        Some(Value::String(text)) => {
+            let text = text.to_str()?.to_owned();
+            if text.is_empty() {
+                Err(LuaError::runtime(format!("{name} name must not be empty")))
+            } else {
+                Ok(text)
+            }
+        }
+        _ => Err(LuaError::runtime(format!(
+            "{name} expects a motion name string"
+        ))),
+    }
+}
+
+fn animation_number(value: Option<&Value>, name: &str, field: &str) -> mlua::Result<f32> {
+    let number = match value {
+        Some(Value::Integer(value)) => *value as f64,
+        Some(Value::Number(value)) => *value,
+        _ => {
+            return Err(LuaError::runtime(format!(
+                "{name} expects a numeric {field}"
+            )));
+        }
+    };
+    let converted = number as f32;
+    if !number.is_finite() || !converted.is_finite() {
+        return Err(LuaError::runtime(format!("{name} {field} must be finite")));
+    }
+    Ok(converted)
+}
+
+fn optional_fade(value: Option<&Value>, name: &str) -> mlua::Result<f32> {
+    match value {
+        None | Some(Value::Nil) => Ok(0.0),
+        other => {
+            let fade = animation_number(other, name, "fade")?;
+            if fade < 0.0 {
+                return Err(LuaError::runtime(format!(
+                    "{name} fade must not be negative"
+                )));
+            }
+            Ok(fade)
+        }
+    }
+}
+
+/// Разобранные параметры `play_animation`.
+struct LuaPlayOptions {
+    fade: f32,
+    looping: Option<bool>,
+    then: Option<String>,
+}
+
+/// Разбирает `motion` и необязательную таблицу `{fade=, loop=, ["then"]=}`.
+fn animation_motion_arguments(
+    arguments: MultiValue,
+    name: &str,
+) -> mlua::Result<(String, LuaPlayOptions)> {
+    let values = animation_values(arguments, name)?;
+    let motion = animation_name(values.first(), name)?;
+    let table = match values.get(1) {
+        None | Some(Value::Nil) => {
+            return Ok((
+                motion,
+                LuaPlayOptions {
+                    fade: 0.0,
+                    looping: None,
+                    then: None,
+                },
+            ));
+        }
+        Some(Value::Table(table)) => table.clone(),
+        Some(_) => {
+            return Err(LuaError::runtime(format!("{name} options must be a table")));
+        }
+    };
+    for pair in table.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let known = match &key {
+            Value::String(key) => matches!(key.to_str()?.as_ref(), "fade" | "loop" | "then"),
+            _ => false,
+        };
+        if !known {
+            return Err(LuaError::runtime(format!(
+                "{name} received an unknown option"
+            )));
+        }
+    }
+    let fade_value = table.get::<Value>("fade")?;
+    let fade = optional_fade(Some(&fade_value), name)?;
+    let looping = match table.get::<Value>("loop")? {
+        Value::Nil => None,
+        Value::Boolean(value) => Some(value),
+        _ => {
+            return Err(LuaError::runtime(format!("{name} loop must be a boolean")));
+        }
+    };
+    let then = match table.get::<Value>("then")? {
+        Value::Nil => None,
+        Value::String(text) => Some(text.to_str()?.to_owned()),
+        _ => {
+            return Err(LuaError::runtime(format!(
+                "{name} then must be a motion name string"
+            )));
+        }
+    };
+    Ok((
+        motion,
+        LuaPlayOptions {
+            fade,
+            looping,
+            then,
+        },
+    ))
+}
+
+fn require_animator(
+    transaction: &ScriptTransaction,
+    handle: ObjectHandle,
+    name: &str,
+) -> mlua::Result<()> {
+    if transaction.has_animator(handle) {
+        Ok(())
+    } else {
+        Err(LuaError::runtime(format!(
+            "{name} requires an animator component"
+        )))
+    }
 }
 
 fn require_audio_source(

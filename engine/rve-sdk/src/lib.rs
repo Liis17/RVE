@@ -602,6 +602,166 @@ impl Context<'_> {
     }
 }
 
+/// Animation operation failure in guest code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimationError {
+    /// The host predates ABI v9 and provides no animation callbacks.
+    Unavailable,
+    /// The host refused the request; the reason is reported in the host's script events.
+    Rejected,
+    /// A fade, weight, parameter or speed is not finite, or a fade or speed is negative.
+    InvalidInput,
+}
+
+impl std::fmt::Display for AnimationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "animation callback is unavailable in this host",
+            Self::Rejected => "animation operation was rejected by the host",
+            Self::InvalidInput => "animation input must be finite and valid",
+        })
+    }
+}
+
+impl std::error::Error for AnimationError {}
+
+/// Options for [`Object::play_animation`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlayAnimationOptions<'a> {
+    /// Crossfade duration in seconds; zero switches at once.
+    pub fade: f32,
+    /// `None` keeps the component's default loop setting.
+    pub looping: Option<bool>,
+    /// Motion that starts when this one finishes.
+    pub then: Option<&'a str>,
+}
+
+fn animation_status(status: u32) -> Result<(), AnimationError> {
+    if status == abi::RveStatus::Ok as u32 {
+        Ok(())
+    } else {
+        Err(AnimationError::Rejected)
+    }
+}
+
+fn non_negative_finite(value: f32) -> Result<f32, AnimationError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(AnimationError::InvalidInput)
+    }
+}
+
+fn finite(value: f32) -> Result<f32, AnimationError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(AnimationError::InvalidInput)
+    }
+}
+
+impl Object {
+    /// Starts `motion` on this object's `animator` with a crossfade and optional loop and `then`.
+    pub fn play_animation(
+        &self,
+        ctx: &mut Context<'_>,
+        motion: &str,
+        options: PlayAnimationOptions<'_>,
+    ) -> Result<(), AnimationError> {
+        let fade = non_negative_finite(options.fade)?;
+        let callback = ctx.host.animation_play.ok_or(AnimationError::Unavailable)?;
+        let params = abi::RvePlayAnimationParams {
+            fade,
+            looping: match options.looping {
+                None => -1,
+                Some(false) => 0,
+                Some(true) => 1,
+            },
+            then: abi::RveStr::from_str_ref(options.then.unwrap_or("")),
+        };
+        // SAFETY: the host callback, the motion string and the params stay valid during this callback.
+        animation_status(unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                abi::RveStr::from_str_ref(motion),
+                &params,
+            )
+        })
+    }
+
+    /// Sets the manual weight of one motion; the other motions keep their weights.
+    pub fn set_animation_weight(
+        &self,
+        ctx: &mut Context<'_>,
+        motion: &str,
+        weight: f32,
+        fade: f32,
+    ) -> Result<(), AnimationError> {
+        let weight = finite(weight)?;
+        let fade = non_negative_finite(fade)?;
+        let callback = ctx
+            .host
+            .animation_set_weight
+            .ok_or(AnimationError::Unavailable)?;
+        // SAFETY: the host callback and the motion string stay valid during this callback.
+        animation_status(unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                abi::RveStr::from_str_ref(motion),
+                weight,
+                fade,
+            )
+        })
+    }
+
+    /// Sets one blend tree parameter on this object's animator.
+    pub fn set_animation_parameter(
+        &self,
+        ctx: &mut Context<'_>,
+        name: &str,
+        value: f32,
+    ) -> Result<(), AnimationError> {
+        let value = finite(value)?;
+        let callback = ctx
+            .host
+            .animation_set_parameter
+            .ok_or(AnimationError::Unavailable)?;
+        // SAFETY: the host callback and the parameter name stay valid during this callback.
+        animation_status(unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                abi::RveStr::from_str_ref(name),
+                value,
+            )
+        })
+    }
+
+    /// Sets the speed of this object's animator; zero freezes all motions.
+    pub fn set_animation_speed(
+        &self,
+        ctx: &mut Context<'_>,
+        speed: f32,
+    ) -> Result<(), AnimationError> {
+        let speed = non_negative_finite(speed)?;
+        let callback = ctx
+            .host
+            .animation_set_speed
+            .ok_or(AnimationError::Unavailable)?;
+        // SAFETY: the host callback stays valid during this callback.
+        animation_status(unsafe { callback(ctx.host.ctx, self.handle, speed) })
+    }
+
+    /// Stops every motion of this object's animator at once.
+    pub fn stop_animation(&self, ctx: &mut Context<'_>) -> Result<(), AnimationError> {
+        let callback = ctx.host.animation_stop.ok_or(AnimationError::Unavailable)?;
+        // SAFETY: the host callback stays valid during this callback.
+        animation_status(unsafe { callback(ctx.host.ctx, self.handle) })
+    }
+}
+
 /// Copyable handle to a scene object. It remains stable while its scene is loaded and may be
 /// stored in a script struct. Every operation on it requires the current callback's `Context`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -16,8 +16,9 @@ use engine_files::VirtualPath;
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
-    AntiAliasing, AudioGroup, AudioRequest, CameraColorSettings, CameraRenderSettings,
-    CameraSettings, ClipParams, ObjectHandle, ParamValue, ProjectionSettings, Tonemapper, VoiceId,
+    AnimationRequest, AntiAliasing, AudioGroup, AudioRequest, CameraColorSettings,
+    CameraRenderSettings, CameraSettings, ClipParams, ObjectHandle, ParamValue, ProjectionSettings,
+    Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use rve_sdk::PhysicalInput;
@@ -33,7 +34,7 @@ use rve_sdk::abi::{
 };
 use rve_sdk::abi::{
     RVE_AUDIO_GROUP_AMBIENT, RVE_AUDIO_GROUP_EFFECTS, RVE_AUDIO_GROUP_MASTER,
-    RVE_AUDIO_GROUP_MUSIC, RveAudioParams,
+    RVE_AUDIO_GROUP_MUSIC, RveAudioParams, RvePlayAnimationParams,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -196,6 +197,11 @@ impl<'a> AbiCallContext<'a> {
             cursor_state: Some(host_cursor_state),
             set_cursor_visible: Some(host_set_cursor_visible),
             set_cursor_locked: Some(host_set_cursor_locked),
+            animation_play: Some(host_animation_play),
+            animation_set_weight: Some(host_animation_set_weight),
+            animation_set_parameter: Some(host_animation_set_parameter),
+            animation_set_speed: Some(host_animation_set_speed),
+            animation_stop: Some(host_animation_stop),
         }
     }
 
@@ -1001,6 +1007,38 @@ fn audio_source_object(
     Ok(handle)
 }
 
+/// Объект с аниматором: без компонента вызов отклоняется, как у аудио.
+fn animator_object(
+    context: &AbiCallContext<'_>,
+    object: u64,
+    name: &str,
+) -> Result<ObjectHandle, String> {
+    let handle = context
+        .transaction
+        .object_from_abi_handle(object)
+        .ok_or_else(|| format!("{name} received an unknown object handle"))?;
+    if !context.transaction.has_animator(handle) {
+        return Err(format!("{name} requires an animator component"));
+    }
+    Ok(handle)
+}
+
+fn animation_finite(value: f32, name: &str) -> Result<f32, String> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be finite"))
+    }
+}
+
+fn animation_non_negative(value: f32, name: &str) -> Result<f32, String> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be finite and not negative"))
+    }
+}
+
 fn audio_volume(volume: f32) -> Result<f32, String> {
     if volume.is_finite() && (0.0..=engine_scene::MAX_AUDIO_VOLUME).contains(&volume) {
         Ok(volume)
@@ -1133,6 +1171,151 @@ unsafe extern "C" fn host_audio_stop_voice(ctx: *mut c_void, voice: u64) -> u32 
                     .stage_audio(AudioRequest::StopVoice { voice })
             });
         audio_result(context, result)
+    })
+}
+
+fn animation_result(context: &mut AbiCallContext<'_>, result: Result<(), String>) -> u32 {
+    match result {
+        Ok(()) => RveStatus::Ok as u32,
+        Err(message) => {
+            context.events.borrow_mut().push(ScriptEvent {
+                level: ScriptEventLevel::Error,
+                source: context.source.to_owned(),
+                message: message.clone(),
+            });
+            context.error = Some(message);
+            RveStatus::Error as u32
+        }
+    }
+}
+
+unsafe extern "C" fn host_animation_play(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    params: *const RvePlayAnimationParams,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = stage_animation_play(context, object, motion, params);
+        animation_result(context, result)
+    })
+}
+
+fn stage_animation_play(
+    context: &mut AbiCallContext<'_>,
+    object: u64,
+    motion: RveStr,
+    params: *const RvePlayAnimationParams,
+) -> Result<(), String> {
+    if params.is_null() {
+        return Err("play_animation received a null pointer".to_owned());
+    }
+    // SAFETY: the guest passes a valid params pointer for this synchronous callback.
+    let params = unsafe { *params };
+    let handle = animator_object(context, object, "play_animation")?;
+    // SAFETY: the guest keeps the motion string alive for this synchronous callback.
+    let motion = unsafe { read_abi_str(motion) }
+        .map_err(|_| "play_animation received an invalid motion name".to_owned())?;
+    if motion.is_empty() {
+        return Err("play_animation motion name must not be empty".to_owned());
+    }
+    let fade = animation_non_negative(params.fade, "play_animation fade")?;
+    let looping = match params.looping {
+        -1 => None,
+        0 => Some(false),
+        1 => Some(true),
+        _ => return Err("play_animation loop must be -1, 0 or 1".to_owned()),
+    };
+    // SAFETY: the guest keeps the optional `then` string alive for this synchronous callback.
+    let then = unsafe { read_abi_str(params.then) }
+        .map_err(|_| "play_animation received an invalid then name".to_owned())?;
+    let then = (!then.is_empty()).then(|| then.to_owned());
+    context.transaction.stage_animation(AnimationRequest::Play {
+        object: handle,
+        motion: motion.to_owned(),
+        fade,
+        looping,
+        then,
+    })
+}
+
+unsafe extern "C" fn host_animation_set_weight(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    weight: f32,
+    fade: f32,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = (|| {
+            let handle = animator_object(context, object, "set_animation_weight")?;
+            // SAFETY: the guest keeps the motion string alive for this synchronous callback.
+            let motion = unsafe { read_abi_str(motion) }
+                .map_err(|_| "set_animation_weight received an invalid motion name".to_owned())?;
+            let weight = animation_finite(weight, "set_animation_weight weight")?;
+            let fade = animation_non_negative(fade, "set_animation_weight fade")?;
+            context
+                .transaction
+                .stage_animation(AnimationRequest::SetWeight {
+                    object: handle,
+                    motion: motion.to_owned(),
+                    weight,
+                    fade,
+                })
+        })();
+        animation_result(context, result)
+    })
+}
+
+unsafe extern "C" fn host_animation_set_parameter(
+    ctx: *mut c_void,
+    object: u64,
+    name: RveStr,
+    value: f32,
+) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = (|| {
+            let handle = animator_object(context, object, "set_animation_parameter")?;
+            // SAFETY: the guest keeps the parameter name alive for this synchronous callback.
+            let name = unsafe { read_abi_str(name) }
+                .map_err(|_| "set_animation_parameter received an invalid name".to_owned())?;
+            let value = animation_finite(value, "set_animation_parameter value")?;
+            context
+                .transaction
+                .stage_animation(AnimationRequest::SetParameter {
+                    object: handle,
+                    name: name.to_owned(),
+                    value,
+                })
+        })();
+        animation_result(context, result)
+    })
+}
+
+unsafe extern "C" fn host_animation_set_speed(ctx: *mut c_void, object: u64, speed: f32) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = (|| {
+            let handle = animator_object(context, object, "set_animation_speed")?;
+            let speed = animation_non_negative(speed, "set_animation_speed speed")?;
+            context
+                .transaction
+                .stage_animation(AnimationRequest::SetSpeed {
+                    object: handle,
+                    speed,
+                })
+        })();
+        animation_result(context, result)
+    })
+}
+
+unsafe extern "C" fn host_animation_stop(ctx: *mut c_void, object: u64) -> u32 {
+    guarded(ctx, RveStatus::Error as u32, |context| {
+        let result = animator_object(context, object, "stop_animation").and_then(|handle| {
+            context
+                .transaction
+                .stage_animation(AnimationRequest::Stop { object: handle })
+        });
+        animation_result(context, result)
     })
 }
 
@@ -1939,6 +2122,7 @@ mod tests {
             ),
             queued_messages: (0, 0),
             queued_audio: 0,
+            queued_animation: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -2023,6 +2207,7 @@ mod tests {
             ),
             queued_messages: (0, 0),
             queued_audio: 0,
+            queued_animation: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -2059,6 +2244,7 @@ mod tests {
             ),
             queued_messages: (0, 0),
             queued_audio: 0,
+            queued_animation: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -2093,6 +2279,7 @@ mod tests {
                 &mut queued_bytes,
                 &events,
                 &mut audio,
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(
