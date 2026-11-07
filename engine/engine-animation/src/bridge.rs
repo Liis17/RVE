@@ -62,7 +62,7 @@ impl AnimationBridge {
     pub fn build(
         world: &World,
         mut load_model: impl FnMut(&VirtualPath) -> Result<Arc<Model>, String>,
-        mut load_clips: impl FnMut(&VirtualPath) -> Result<Vec<ModelAnimation>, String>,
+        mut load_clips: impl FnMut(&VirtualPath) -> Result<Arc<Vec<ModelAnimation>>, String>,
     ) -> Self {
         let mut bridge = Self::default();
         let mut models: HashMap<String, Result<Arc<Model>, String>> = HashMap::new();
@@ -80,7 +80,7 @@ impl AnimationBridge {
             for path in &animator.clips {
                 let loaded = clip_files
                     .entry(path.as_str().to_owned())
-                    .or_insert_with(|| load_clips(path).map(Arc::new))
+                    .or_insert_with(|| load_clips(path))
                     .clone();
                 match loaded {
                     Ok(animations) => clips.push(animations),
@@ -394,7 +394,7 @@ mod tests {
 
     fn build(world: &World) -> AnimationBridge {
         let model = Arc::new(walk_model());
-        AnimationBridge::build(world, |_| Ok(model.clone()), |_| Ok(Vec::new()))
+        AnimationBridge::build(world, |_| Ok(model.clone()), |_| Ok(Arc::new(Vec::new())))
     }
 
     /// X-компонента переноса единственной палитры.
@@ -491,7 +491,8 @@ mod tests {
             skeleton: None,
             ..walk_model()
         });
-        let mut bridge = AnimationBridge::build(&world, |_| Ok(model.clone()), |_| Ok(Vec::new()));
+        let mut bridge =
+            AnimationBridge::build(&world, |_| Ok(model.clone()), |_| Ok(Arc::new(Vec::new())));
         let hero = world.handle("hero").unwrap();
         assert!(bridge.palette(hero).is_none());
         let warnings = bridge.take_warnings();
@@ -509,7 +510,7 @@ mod tests {
         let mut bridge = AnimationBridge::build(
             &world,
             |_| Err("файл не найден".to_owned()),
-            |_| Ok(Vec::new()),
+            |_| Ok(Arc::new(Vec::new())),
         );
         let hero = world.handle("hero").unwrap();
         assert!(!bridge.has_animator(hero));

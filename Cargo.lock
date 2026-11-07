@@ -857,10 +857,11 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "egui",
  "egui-winit",
+ "engine-animation",
  "engine-assets",
  "engine-audio",
  "engine-console",

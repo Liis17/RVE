@@ -736,7 +736,11 @@ impl WindowHandler for PlayerWindow<'_> {
             return self.fail_init(format!("не удалось запустить поток рендера: {error}"));
         }
         self.render_started = true;
-        if self.script_tx.send(ScriptControl::Go(gpu_scene)).is_err() {
+        if self
+            .script_tx
+            .send(ScriptControl::Go(Box::new(gpu_scene)))
+            .is_err()
+        {
             self.status
                 .record_failure("поток скриптов завершился до запуска сцены");
             let _ = self.render_tx.send(RenderControl::Shutdown);

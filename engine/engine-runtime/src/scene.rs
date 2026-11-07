@@ -1,13 +1,15 @@
 use crate::pipeline::GpuSceneTable;
-use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, TextureData};
+use engine_assets::{
+    Assets, Model, ModelAlphaMode, ModelAnimation, ModelMaterial, ModelSkin, TextureData,
+};
 use engine_files::VirtualPath;
 use engine_physics::{
     ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsSceneBinding, PhysicsSceneDesc, StepDriver,
 };
 use engine_project::PhysicsSettings;
 use engine_render::{
-    AlphaMode, EnvironmentSource, Material, MaterialId, RenderError, Renderer, TextureColorSpace,
-    TextureId, Vertex,
+    AlphaMode, EnvironmentSource, Material, MaterialId, RenderError, Renderer, SkinVertex,
+    TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::CameraSettings;
@@ -15,7 +17,7 @@ use engine_scene::{
     MaterialAlphaMode, MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand,
 };
 use glam::Vec3;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -23,12 +25,16 @@ pub(crate) struct ObjectModel {
     pub object: ObjectHandle,
     pub levels: Vec<(String, Option<String>)>,
     pub material: Option<MaterialOverride>,
+    /// Объект имеет `animator`: его модель получает скиннинг, если у модели есть скелет.
+    pub animated: bool,
 }
 
 pub(crate) struct PreparedRenderAssets {
     pub models: HashMap<String, Model>,
     pub textures: HashMap<String, TextureData>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
+    /// Клипы из `animator.clips`, по виртуальному пути файла.
+    pub clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
     pub objects: Vec<ObjectModel>,
 }
 
@@ -157,6 +163,7 @@ fn prepare_scene_with_model_loader(
     let mut models = HashMap::new();
     let mut textures = HashMap::new();
     let mut environments = HashMap::new();
+    let mut clips = HashMap::<String, Arc<Vec<ModelAnimation>>>::new();
     let mut objects = Vec::new();
     let mut lite_paths = std::collections::BTreeSet::new();
 
@@ -238,10 +245,25 @@ fn prepare_scene_with_model_loader(
                 object: object.handle,
                 levels,
                 material,
+                animated: object.animator.is_some(),
             });
         }
         for script in &object.lite_scripts {
             lite_paths.insert(script.path.as_str().to_owned());
+        }
+    }
+
+    for object in world.objects() {
+        let Some(animator) = &object.animator else {
+            continue;
+        };
+        for path in &animator.clips {
+            if !clips.contains_key(path.as_str()) {
+                let animations = assets
+                    .load_animations(&format!("/{}", path.as_str()))
+                    .map_err(|error| format!("{scene_path}: {error}"))?;
+                clips.insert(path.as_str().to_owned(), Arc::new(animations));
+            }
         }
     }
 
@@ -258,6 +280,7 @@ fn prepare_scene_with_model_loader(
             models,
             textures,
             environments,
+            clips,
             objects,
         },
     })
@@ -405,8 +428,15 @@ pub(crate) fn upload_scene(
 ) -> Result<GpuSceneTable, RenderError> {
     let mut gpu_models: HashMap<String, Vec<(engine_render::MeshId, MaterialId)>> = HashMap::new();
     let mut texture_cache = GpuTextureCache::<TextureId>::default();
+    // Модели, которые анимирует хотя бы один объект, загружаются со скином.
+    let animated = animated_model_paths(assets);
 
     for (path, model) in &assets.models {
+        let skinned = animated.contains(path.as_str()) && model.skeleton.is_some();
+        let joint_count = model
+            .skeleton
+            .as_ref()
+            .map_or(0, |skeleton| skeleton.joints.len() as u32);
         let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
         for mesh in &model.meshes {
             let vertices = mesh
@@ -419,7 +449,15 @@ pub(crate) fn upload_scene(
                     color: [1.0; 3],
                 })
                 .collect::<Vec<_>>();
-            let mesh_id = renderer.create_mesh(&vertices, &mesh.indices)?;
+            let mesh_id = match &mesh.skin {
+                Some(skin) if skinned => renderer.create_skinned_mesh(
+                    &vertices,
+                    &skin_vertices(skin),
+                    &mesh.indices,
+                    joint_count,
+                )?,
+                _ => renderer.create_mesh(&vertices, &mesh.indices)?,
+            };
             let resolved = resolve_material(&mesh.material, None, None);
             let material_id = upload_resolved_material(
                 renderer,
@@ -436,8 +474,23 @@ pub(crate) fn upload_scene(
 
     let mut table = GpuSceneTable {
         environments: assets.environments.clone(),
+        animation_clips: assets.clips.clone(),
         ..GpuSceneTable::default()
     };
+    for path in &animated {
+        // Мосту нужны скелет и клипы; вершины остаются только в GPU-таблице.
+        if let Some(model) = assets.models.get(*path) {
+            table.animation_models.insert(
+                (*path).to_owned(),
+                Arc::new(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    skeleton: model.skeleton.clone(),
+                    animations: model.animations.clone(),
+                }),
+            );
+        }
+    }
     for object in &assets.objects {
         let mut levels = Vec::with_capacity(object.levels.len());
         for (model_path, replacement_texture) in &object.levels {
@@ -472,9 +525,45 @@ pub(crate) fn upload_scene(
             }
             levels.push(draws);
         }
+        if object.animated
+            && let Some((model_path, _)) = object.levels.first()
+            && assets
+                .models
+                .get(model_path)
+                .is_some_and(|model| model.skeleton.is_some())
+        {
+            // Экземпляр skinning на каждую часть уровня 0: выходные вершины живут отдельно.
+            let mut instances = Vec::with_capacity(levels[0].len());
+            for (mesh_id, _) in &levels[0] {
+                instances.push(renderer.create_skin_instance(*mesh_id)?);
+            }
+            table.skin_instances.insert(object.object, instances);
+        }
         table.by_object.insert(object.object, levels);
     }
     Ok(table)
+}
+
+/// Пути моделей уровня 0 у объектов с `animator`.
+fn animated_model_paths(assets: &PreparedRenderAssets) -> HashSet<&str> {
+    assets
+        .objects
+        .iter()
+        .filter(|object| object.animated)
+        .filter_map(|object| object.levels.first())
+        .map(|(path, _)| path.as_str())
+        .collect()
+}
+
+fn skin_vertices(skin: &ModelSkin) -> Vec<SkinVertex> {
+    skin.joints
+        .iter()
+        .zip(&skin.weights)
+        .map(|(joints, weights)| SkinVertex {
+            joints: *joints,
+            weights: *weights,
+        })
+        .collect()
 }
 
 fn upload_resolved_material(

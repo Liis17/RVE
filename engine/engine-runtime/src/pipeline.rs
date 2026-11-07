@@ -5,6 +5,8 @@ use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::cursor::CursorControl;
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
+use engine_animation::{AnimationBridge, AnimationEvent};
+use engine_assets::{Model, ModelAnimation};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
 use engine_physics::{
@@ -16,6 +18,7 @@ use engine_render::{
     LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId, ProceduralSky, Renderer,
     SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
 };
+use engine_render::{SkinBinding, SkinId};
 #[cfg(feature = "dev-console")]
 use engine_render::{UiImage, UiPrimitive, UiVertex, ViewportId};
 use engine_scene::camera::Camera;
@@ -60,6 +63,8 @@ pub(crate) struct FrameSnapshot {
     pub local_light_shadows: Vec<LocalLightShadow>,
     pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
+    /// Палитры skinning кадра; draw ссылается на них по индексу в `SkinBinding::palette`.
+    pub joint_palettes: Vec<Vec<[[f32; 4]; 4]>>,
     object_motion: HashMap<ObjectHandle, ObjectMotion>,
 }
 
@@ -97,6 +102,12 @@ pub(crate) enum EnvironmentCacheKey {
 pub(crate) struct GpuSceneTable {
     pub by_object: HashMap<ObjectHandle, Vec<Vec<(MeshId, MaterialId)>>>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
+    /// Скелеты и анимации моделей для моста анимации; вершины сюда не входят.
+    pub animation_models: HashMap<String, Arc<Model>>,
+    /// Клипы `animator.clips` по виртуальному пути файла.
+    pub animation_clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
+    /// Экземпляры skinning по объекту: по одному на часть меша уровня 0.
+    pub skin_instances: HashMap<ObjectHandle, Vec<SkinId>>,
 }
 
 type FrameLighting = (
@@ -107,7 +118,7 @@ type FrameLighting = (
 
 #[derive(Debug)]
 pub(crate) enum ScriptControl {
-    Go(GpuSceneTable),
+    Go(Box<GpuSceneTable>),
     Background(bool),
     #[cfg(feature = "dev-console")]
     Console(CommandLine),
@@ -406,8 +417,9 @@ impl RenderBackend for VulkanBackend {
         height: u32,
     ) -> Result<FrameOutcome, String> {
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
+        let joint_palettes = palette_refs(snapshot);
         let frame = Frame {
-            joint_palettes: &[],
+            joint_palettes: &joint_palettes,
             clear_color: [
                 snapshot.view.render.clear_color[0],
                 snapshot.view.render.clear_color[1],
@@ -512,8 +524,9 @@ impl RenderBackend for VulkanBackend {
         };
 
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
+        let joint_palettes = palette_refs(snapshot);
         let scene = Frame {
-            joint_palettes: &[],
+            joint_palettes: &joint_palettes,
             clear_color: [
                 snapshot.view.render.clear_color[0],
                 snapshot.view.render.clear_color[1],
@@ -755,7 +768,7 @@ fn scripts_thread(
     let mut pending_console_commands = PendingConsoleCommands::default();
     let gpu_scene = loop {
         match control_rx.recv() {
-            Ok(ScriptControl::Go(scene)) => break Some(scene),
+            Ok(ScriptControl::Go(scene)) => break Some(*scene),
             Ok(ScriptControl::Shutdown) | Err(_) => break None,
             Ok(ScriptControl::Background(value)) => {
                 background = value;
@@ -791,6 +804,8 @@ fn scripts_thread(
         audio.start(&world);
         audio.apply(scripts.drain_audio_requests(), &world);
     }
+    let mut animation = build_animation(&world, &gpu_scene);
+    animation.apply(scripts.drain_animation_requests());
     #[cfg(feature = "dev-console")]
     let mut published_catalog_generation = u64::MAX;
     #[cfg(feature = "dev-console")]
@@ -924,6 +939,15 @@ fn scripts_thread(
         if let Some(audio) = audio.as_mut() {
             audio.apply(scripts.drain_audio_requests(), &world);
         }
+        animation.apply(scripts.drain_animation_requests());
+        let finished = animation.advance(dt);
+        scripts.queue_animation_events(
+            &world,
+            finished.into_iter().map(|event| match event {
+                AnimationEvent::Finished { object, motion } => (object, motion),
+            }),
+        );
+        log_animation_warnings(&mut animation);
         #[cfg(feature = "dev-console")]
         publish_command_catalog(
             &scripts,
@@ -967,7 +991,7 @@ fn scripts_thread(
         if let Some(audio) = audio.as_mut() {
             audio.sync_positions(&world);
         }
-        let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene) {
+        let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene, &animation) {
             Ok(snapshot) => Arc::new(snapshot),
             Err(error) => {
                 status.record_failure(error);
@@ -1122,8 +1146,10 @@ fn make_snapshot(
     scene: engine_scene::SceneFrame,
     world: &World,
     gpu_scene: &GpuSceneTable,
+    animation: &AnimationBridge,
 ) -> Result<FrameSnapshot, String> {
     let mut draws = Vec::new();
+    let mut joint_palettes = Vec::new();
     let camera_position = scene.camera.position;
     let mut object_motion = HashMap::new();
     for instance in scene.meshes {
@@ -1137,7 +1163,22 @@ fn make_snapshot(
         };
         let model = instance.model.to_cols_array_2d();
         let draw_start = draws.len();
-        for (mesh, material) in meshes {
+        // Анимируемый объект рисуется экземплярами skinning, пока у моста есть палитра;
+        // иначе — bind-pose мешем без скиннинга.
+        let palette = gpu_scene
+            .skin_instances
+            .get(&instance.object)
+            .zip(animation.palette(instance.object))
+            .map(|(instances, palette)| {
+                joint_palettes.push(palette.to_vec());
+                (instances, (joint_palettes.len() - 1) as u32)
+            });
+        for (index, (mesh, material)) in meshes.iter().enumerate() {
+            let skin = palette.and_then(|(instances, palette)| {
+                instances
+                    .get(index)
+                    .map(|&instance| SkinBinding { instance, palette })
+            });
             draws.push(DrawCommand {
                 mesh: *mesh,
                 material: Some(*material),
@@ -1145,7 +1186,7 @@ fn make_snapshot(
                 previous_model: None,
                 lod_level,
                 casts_shadow: true,
-                skin: None,
+                skin,
             });
         }
         if draw_start != draws.len() {
@@ -1170,8 +1211,43 @@ fn make_snapshot(
         local_light_shadows,
         environment,
         draws,
+        joint_palettes,
         object_motion,
     })
+}
+
+/// Палитры кадра как срезы для `Frame::joint_palettes`.
+fn palette_refs(snapshot: &FrameSnapshot) -> Vec<&[[[f32; 4]; 4]]> {
+    snapshot.joint_palettes.iter().map(Vec::as_slice).collect()
+}
+
+/// Мост анимации для потока скриптов: модели и клипы берутся из GPU-таблицы.
+fn build_animation(world: &World, gpu_scene: &GpuSceneTable) -> AnimationBridge {
+    let mut animation = AnimationBridge::build(
+        world,
+        |path| {
+            gpu_scene
+                .animation_models
+                .get(path.as_str())
+                .cloned()
+                .ok_or_else(|| format!("модель {} не подготовлена для анимации", path.as_str()))
+        },
+        |path| {
+            gpu_scene
+                .animation_clips
+                .get(path.as_str())
+                .cloned()
+                .ok_or_else(|| format!("клип {} не загружен", path.as_str()))
+        },
+    );
+    log_animation_warnings(&mut animation);
+    animation
+}
+
+fn log_animation_warnings(animation: &mut AnimationBridge) {
+    for warning in animation.take_warnings() {
+        log::warn!("[animation] {warning}");
+    }
 }
 
 fn render_local_lights(states: &[LocalLightState]) -> (Vec<LocalLight>, Vec<LocalLightShadow>) {
@@ -1788,6 +1864,7 @@ mod tests {
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
     use crate::pipeline::start_scripts;
+    use engine_animation::AnimationBridge;
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
     use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
@@ -1896,9 +1973,7 @@ return Input
         )
         .unwrap();
         thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         let snapshot = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(snapshot.camera.position.x, 9.0);
 
@@ -2321,6 +2396,7 @@ distance=2.0
             local_light_shadows: Vec::new(),
             environment: None,
             draws: Vec::<DrawCommand>::new(),
+            joint_palettes: Vec::new(),
             object_motion: HashMap::new(),
         }
     }
@@ -2360,6 +2436,7 @@ distance=2.0
             local_lights: Vec::new(),
             local_light_shadows: Vec::new(),
             environment: None,
+            joint_palettes: Vec::new(),
             draws: Vec::new(),
             object_motion: objects
                 .iter()
@@ -2508,7 +2585,13 @@ range = 10
             .set_camera_settings(world.active_camera(), settings)
             .unwrap();
         let (frame, _) = world.build_frame();
-        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default()).unwrap();
+        let snapshot = make_snapshot(
+            frame,
+            &world,
+            &GpuSceneTable::default(),
+            &AnimationBridge::default(),
+        )
+        .unwrap();
         assert_eq!(snapshot.view, settings);
     }
 
@@ -2522,7 +2605,15 @@ range = 10
         let mut world = World::from_document(&document).unwrap();
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty());
-        assert!(make_snapshot(frame.clone(), &world, &GpuSceneTable::default(),).is_err());
+        assert!(
+            make_snapshot(
+                frame.clone(),
+                &world,
+                &GpuSceneTable::default(),
+                &AnimationBridge::default()
+            )
+            .is_err()
+        );
 
         let source = Arc::new(EnvironmentSource::Equirect {
             width: 2,
@@ -2533,7 +2624,7 @@ range = 10
             environments: HashMap::from([("environment/sky.hdr".to_owned(), source)]),
             ..GpuSceneTable::default()
         };
-        let snapshot = make_snapshot(frame, &world, &scene).unwrap();
+        let snapshot = make_snapshot(frame, &world, &scene, &AnimationBridge::default()).unwrap();
         let environment = snapshot.environment.unwrap();
         assert_eq!(
             environment.key,
@@ -2606,7 +2697,13 @@ return Script
 
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty());
-        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default()).unwrap();
+        let snapshot = make_snapshot(
+            frame,
+            &world,
+            &GpuSceneTable::default(),
+            &AnimationBridge::default(),
+        )
+        .unwrap();
         assert_eq!(snapshot.view.color.exposure_ev, 2.5);
         assert!(host.drain_events().is_empty());
     }
@@ -2687,9 +2784,7 @@ return Script
                 args: Vec::new(),
             }))
             .unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
 
         let _frame = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let catalog = catalog.lock().unwrap();
@@ -2991,9 +3086,7 @@ return Script
             .unwrap()
             .unwrap();
         interrupt.interrupt();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
 
         script_thread
             .stopped
@@ -3096,9 +3189,7 @@ return Script
             .unwrap();
         script_tx.send(ScriptControl::Background(false)).unwrap();
         script_tx.send(ScriptControl::Background(true)).unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
 
         waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(frame_rx.try_recv().is_err());
@@ -3194,9 +3285,7 @@ return Script
         )
         .unwrap();
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         let frame = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!((frame.camera.position.x - 3.0).abs() < 1.0e-5);
 
@@ -3307,9 +3396,7 @@ return Move
         )
         .unwrap();
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
 
         let (dt, has_teleport) = step_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(dt, 0.0);
@@ -3475,9 +3562,7 @@ return Move
         )
         .unwrap();
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         script_thread
             .stopped
@@ -3555,9 +3640,7 @@ return Move
             .unwrap();
 
         script_tx.send(ScriptControl::Background(true)).unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         clock.advance(Duration::from_secs(1));
         script_tx.send(ScriptControl::Background(true)).unwrap();
@@ -3873,9 +3956,7 @@ return Move
         .unwrap();
 
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         script_tx.send(ScriptControl::Shutdown).unwrap();
         script_thread
@@ -3940,9 +4021,7 @@ return Move
         .unwrap();
 
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(GpuSceneTable::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         assert_eq!(
             render_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             RenderControl::Shutdown
