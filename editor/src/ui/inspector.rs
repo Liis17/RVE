@@ -1227,7 +1227,10 @@ fn show_audio_source(
     let mut clip_choice = None;
     let action = component_header(
         ui,
-        "Audio Source",
+        HeaderTitle {
+            text: "Audio Source",
+            icon: component_icon(state, ComponentKind::AudioSource),
+        },
         id,
         mark(state, id, field.clone()),
         Some(component_menu(state, id, ComponentKind::AudioSource)),

@@ -73,6 +73,7 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         collider,
         rigid_body,
         character_controller,
+        audio_source,
         lite_scripts,
         heavy_scripts,
     } = object;
@@ -91,6 +92,7 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         && collider.is_none()
         && rigid_body.is_none()
         && character_controller.is_none()
+        && audio_source.is_none()
         && lite_scripts.is_empty()
         && heavy_scripts.is_empty()
     {
@@ -205,6 +207,7 @@ mod tests {
             ComponentKind::Collider,
             ComponentKind::RigidBody,
             ComponentKind::CharacterController,
+            ComponentKind::AudioSource,
         ];
         let icons = components
             .into_iter()
@@ -234,6 +237,13 @@ mod tests {
             ..empty.clone()
         };
         assert_eq!(object_icon(&with_collider), None);
+        let with_audio = SceneObject {
+            audio_source: Some(engine_scene::AudioSourceComponent::with_clip(
+                VirtualPath::parse("/audio/jump.wav").unwrap(),
+            )),
+            ..empty.clone()
+        };
+        assert_eq!(object_icon(&with_audio), None);
         let with_script = SceneObject {
             lite_scripts: vec![engine_scene::LiteScript {
                 path: VirtualPath::parse("/scripts/spin.lua").unwrap(),
