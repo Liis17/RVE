@@ -41,7 +41,7 @@ class SDKReleaseSelectionTests(unittest.TestCase):
             ["Obsidian/RVEVault/Architecture.md"],
             ["examples/demo-game/Assets/scenes/demo.rvescene"],
             ["engine/sandbox/src/main.rs"], ["tools/rvepak/src/main.rs"],
-            [".github/workflows/ci.yml"], [".github/scripts/test_sdk_release.py"],
+            [".github/scripts/test_sdk_release.py"],
             ["tools/unrelated.py"], [".gitignore"],
         ]:
             with self.subTest(paths=paths):
@@ -50,7 +50,7 @@ class SDKReleaseSelectionTests(unittest.TestCase):
     def test_shared_build_and_release_inputs_release(self):
         for path in [
             "Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-toolchain.toml",
-            ".github/workflows/sdk-release.yml", ".github/scripts/select_sdk_release.py",
+            ".github/workflows/ci.yml", ".github/scripts/select_sdk_release.py",
             ".github/scripts/affected_packages.py", ".github/scripts/package_sdk_release.py",
         ]:
             with self.subTest(path=path):

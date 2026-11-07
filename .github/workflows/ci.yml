@@ -1,13 +1,18 @@
 name: Rust CI
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
+    branches: [son-croissant, mommy]
+  push:
+    branches: [mommy]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -17,12 +22,13 @@ jobs:
     outputs:
       has_changes: ${{ steps.packages.outputs.has_changes }}
       packages: ${{ steps.packages.outputs.packages }}
+      build_sdk: ${{ steps.sdk.outputs.build_sdk }}
     steps:
       - name: Check out repository and comparison history
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-      - name: Test package selection
+      - name: Test package and release selection
         run: python3 -B -m unittest discover -s .github/scripts -v
       - name: Create build directory
         run: mkdir -p build
@@ -30,6 +36,10 @@ jobs:
         id: packages
         working-directory: build
         run: python3 -B ../.github/scripts/affected_packages.py
+      - name: Select SDK release
+        id: sdk
+        working-directory: build
+        run: python3 -B ../.github/scripts/select_sdk_release.py
 
   checks:
     name: Checks (${{ matrix.os }})
@@ -61,6 +71,10 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Select Rust stable
         run: rustup default stable
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> build"
       - name: Check formatting
         working-directory: build
         run: |
@@ -134,3 +148,66 @@ jobs:
             test "$HAS_CHANGES" = "false"
             test "$CHECKS_RESULT" = "skipped"
           fi
+
+  release:
+    name: Build and publish Windows x64 SDK
+    needs: [changes, ci]
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/mommy' && needs.changes.outputs.build_sdk == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    concurrency:
+      group: sdk-release-${{ github.sha }}
+      cancel-in-progress: false
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: build
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.x"
+      - name: Create build directory
+        working-directory: .
+        run: New-Item -ItemType Directory -Force build
+      - name: Install host and bundled Rust toolchains
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable-x86_64-pc-windows-msvc
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ". -> build"
+          key: sdk-release
+      - name: Build full SDK with bundled GNU toolchain
+        run: |
+          $toolchain = rustup run stable-x86_64-pc-windows-gnu rustc --print sysroot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo run --release -p rve-build --locked -- sdk --output sdk-verified --rust-toolchain $toolchain
+      - name: Archive and verify SDK without system Rust
+        run: python -B ../.github/scripts/package_sdk_release.py sdk-verified sdk-verified.zip
+      - name: Publish verified ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          $tag = "sdk-$env:RELEASE_SHA"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag sdk-verified.zip --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $tag --prerelease=false --latest
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            gh release create $tag sdk-verified.zip --target $env:RELEASE_SHA --title "RVE SDK Windows x64 ($($env:RELEASE_SHA.Substring(0, 12)))" --latest --notes "Autonomous Windows x64 editor, players, guest SDK and Rust GNU toolchain. Scripts and Build Player verified with system-only PATH. Commit: $env:RELEASE_SHA"
+          }
