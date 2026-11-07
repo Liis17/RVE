@@ -5,7 +5,7 @@ use std::ffi::c_void;
 /// Oldest script ABI version accepted by the host.
 pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Stable script ABI version. Any incompatible ABI layout change requires a version increase.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 6;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 7;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -644,6 +644,19 @@ pub type RveActionBindingFn = unsafe extern "C" fn(
 /// Stages restoration of the project input bindings. Appended in ABI v5.
 pub type RveResetBindingsFn = unsafe extern "C" fn(ctx: *mut c_void) -> bool;
 
+/// Cursor state copied to a guest-provided output slot. Appended in ABI v7.
+#[repr(C)]
+pub struct RveCursorState {
+    pub visible: bool,
+    pub locked: bool,
+}
+
+/// Copies the cursor state applied by the host. Appended in ABI v7.
+pub type RveCursorStateFn =
+    unsafe extern "C" fn(ctx: *mut c_void, out: *mut RveCursorState) -> bool;
+/// Stages a cursor visibility or lock change. Appended in ABI v7.
+pub type RveSetCursorFn = unsafe extern "C" fn(ctx: *mut c_void, value: bool) -> bool;
+
 pub const RVE_COLLISION_ENTER: u32 = 0;
 pub const RVE_COLLISION_EXIT: u32 = 1;
 pub const RVE_TRIGGER_ENTER: u32 = 2;
@@ -775,6 +788,12 @@ pub struct RveHost {
     pub is_grounded: Option<RvePhysicsBoolFn>,
     pub set_collider_enabled: Option<RvePhysicsSetBoolFn>,
     pub is_collider_enabled: Option<RvePhysicsBoolFn>,
+    /// Copies the cursor state applied by the host; appended in ABI v7.
+    pub cursor_state: Option<RveCursorStateFn>,
+    /// Stages cursor visibility; appended in ABI v7.
+    pub set_cursor_visible: Option<RveSetCursorFn>,
+    /// Stages cursor locking; appended in ABI v7.
+    pub set_cursor_locked: Option<RveSetCursorFn>,
 }
 
 /// Guest factory callback.

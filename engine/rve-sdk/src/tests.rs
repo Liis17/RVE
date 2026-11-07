@@ -1,9 +1,9 @@
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
     RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveCharacterMoveResult, RveHeader, RveHost, RveModule, RveParamEntry,
-    RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue,
-    RveValueData,
+    RveCameraSettings, RveCharacterMoveResult, RveCursorState, RveHeader, RveHost, RveModule,
+    RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime,
+    RveTransform, RveValue, RveValueData,
 };
 use crate::{
     AntiAliasing, CameraSettings, ConsoleLevel, Context, Key, MouseButton, Params, Script,
@@ -202,6 +202,8 @@ struct HostState {
     physics_velocity: [f32; 3],
     physics_enabled: bool,
     physics_vectors: Vec<(u64, [f32; 3])>,
+    cursor_visible: bool,
+    cursor_locked: bool,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -371,6 +373,34 @@ unsafe extern "C" fn wheel_delta(ctx: *mut c_void, out: *mut [f32; 2]) -> bool {
     unsafe { input_vector(ctx, out, |state| state.wheel) }
 }
 
+unsafe extern "C" fn cursor_state(ctx: *mut c_void, out: *mut RveCursorState) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: test host points to a live HostState during the guest call.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    // SAFETY: output was checked and points to the guest's writable stack slot.
+    unsafe {
+        *out = RveCursorState {
+            visible: state.cursor_visible,
+            locked: state.cursor_locked,
+        };
+    }
+    true
+}
+
+unsafe extern "C" fn set_cursor_visible(ctx: *mut c_void, value: bool) -> bool {
+    // SAFETY: test host points to a live HostState during the guest call.
+    unsafe { (&mut *ctx.cast::<HostState>()).cursor_visible = value };
+    true
+}
+
+unsafe extern "C" fn set_cursor_locked(ctx: *mut c_void, value: bool) -> bool {
+    // SAFETY: test host points to a live HostState during the guest call.
+    unsafe { (&mut *ctx.cast::<HostState>()).cursor_locked = value };
+    true
+}
+
 unsafe extern "C" fn get_camera_settings(
     ctx: *mut c_void,
     object: u64,
@@ -457,6 +487,9 @@ fn host(state: &mut HostState) -> RveHost {
         is_grounded: None,
         set_collider_enabled: None,
         is_collider_enabled: None,
+        cursor_state: Some(cursor_state),
+        set_cursor_visible: Some(set_cursor_visible),
+        set_cursor_locked: Some(set_cursor_locked),
     }
 }
 
@@ -1311,7 +1344,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 6);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 7);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -1353,4 +1386,48 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveHost, raycast),
         offset_of!(RveHost, reset_bindings) + size_of::<Option<crate::abi::RveResetBindingsFn>>()
     );
+    assert_eq!(
+        offset_of!(RveHost, cursor_state),
+        offset_of!(RveHost, is_collider_enabled)
+            + size_of::<Option<crate::abi::RvePhysicsBoolFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_cursor_visible),
+        offset_of!(RveHost, cursor_state) + size_of::<Option<crate::abi::RveCursorStateFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_cursor_locked),
+        offset_of!(RveHost, set_cursor_visible) + size_of::<Option<crate::abi::RveSetCursorFn>>()
+    );
+}
+
+#[test]
+fn sdk_cursor_api_reads_applied_state_and_stages_changes() {
+    let mut state = HostState {
+        cursor_visible: false,
+        cursor_locked: true,
+        ..HostState::default()
+    };
+    let host = host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    assert_eq!(context.input().cursor_visible(), Some(false));
+    assert_eq!(context.input().cursor_locked(), Some(true));
+    assert!(context.set_cursor_visible(true));
+    assert!(context.set_cursor_locked(false));
+    assert!(state.cursor_visible);
+    assert!(!state.cursor_locked);
+}
+
+#[test]
+fn sdk_cursor_api_reports_unavailable_callbacks_before_abi_v7() {
+    let mut state = HostState::default();
+    let mut host = host(&mut state);
+    host.cursor_state = None;
+    host.set_cursor_visible = None;
+    host.set_cursor_locked = None;
+    let mut context = Context::new(&host).unwrap();
+    assert_eq!(context.input().cursor_visible(), None);
+    assert_eq!(context.input().cursor_locked(), None);
+    assert!(!context.set_cursor_visible(false));
+    assert!(!context.set_cursor_locked(true));
 }

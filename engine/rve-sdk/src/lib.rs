@@ -5,6 +5,9 @@
 
 pub mod abi;
 
+/// Версия крейта из `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use abi::{Key, MouseButton, PhysicalInput};
 use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
@@ -586,6 +589,20 @@ impl<'a> Context<'a> {
         unsafe { callback(self.host.ctx, RveStr::from_str_ref(name)) }
     }
 
+    /// Stages cursor visibility for this callback. Returns false when the host lacks ABI v7 support.
+    pub fn set_cursor_visible(&mut self, visible: bool) -> bool {
+        self.host
+            .set_cursor_visible
+            .is_some_and(|callback| unsafe { callback(self.host.ctx, visible) })
+    }
+
+    /// Stages cursor locking for this callback. Returns false when the host lacks ABI v7 support.
+    pub fn set_cursor_locked(&mut self, locked: bool) -> bool {
+        self.host
+            .set_cursor_locked
+            .is_some_and(|callback| unsafe { callback(self.host.ctx, locked) })
+    }
+
     /// Replaces one action binding slot. Returns false when unavailable or invalid.
     pub fn rebind(
         &mut self,
@@ -802,6 +819,26 @@ impl Input<'_> {
     /// Returns whether a mouse button became released in this frame.
     pub fn mouse_released(&self, button: MouseButton) -> bool {
         self.mouse_button_state(button) & abi::RVE_INPUT_RELEASED != 0
+    }
+
+    /// Returns whether the cursor is visible, or `None` when the host predates ABI v7.
+    pub fn cursor_visible(&self) -> Option<bool> {
+        self.cursor_state().map(|state| state.visible)
+    }
+
+    /// Returns whether the cursor is locked, or `None` when the host predates ABI v7.
+    pub fn cursor_locked(&self) -> Option<bool> {
+        self.cursor_state().map(|state| state.locked)
+    }
+
+    fn cursor_state(&self) -> Option<abi::RveCursorState> {
+        let callback = self.host.cursor_state?;
+        let mut state = abi::RveCursorState {
+            visible: true,
+            locked: false,
+        };
+        // SAFETY: the host pointer and output slot remain valid during this script callback.
+        unsafe { callback(self.host.ctx, &mut state) }.then_some(state)
     }
 
     /// Returns the cursor position in physical window pixels.

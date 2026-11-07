@@ -6,6 +6,7 @@ use crate::build::{BuildJob, ScriptGeneration, ScriptsJob};
 use crate::console::ConsoleLog;
 use crate::icons::IconCache;
 use crate::play::PlaySession;
+use crate::play_cursor::PlayCursor;
 use crate::previews::PreviewCache;
 use crate::project::OpenProject;
 use crate::scene_edit::{Component, EditorScene, NewObject};
@@ -186,6 +187,8 @@ pub struct EditorState {
     pub scene_view: SceneViewInfo,
     pub game_viewport_texture: Option<egui::TextureId>,
     pub game_view: SceneViewInfo,
+    /// Захват курсора панелью Game во время Play.
+    pub play_cursor: PlayCursor,
     /// Optional renderer features used to filter the debug-view controls.
     pub wireframe_supported: bool,
     /// Id камеры вкладки Game; панель заменяет отсутствующую камеру первой в документе.
@@ -252,6 +255,7 @@ impl EditorState {
             scene_view: SceneViewInfo::default(),
             game_viewport_texture: None,
             game_view: SceneViewInfo::default(),
+            play_cursor: PlayCursor::default(),
             wireframe_supported: false,
             game_camera: None,
             pending_frame: None,

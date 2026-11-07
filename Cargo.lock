@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine-files",
  "glam",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine-console",
  "engine-physics",
@@ -820,8 +820,9 @@ dependencies = [
 
 [[package]]
 name = "engine-window"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "log",
  "winit",
 ]
 
@@ -2539,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -2578,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "rve-sdk"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "rvepak"

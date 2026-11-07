@@ -624,6 +624,26 @@ pub struct CameraComponent {
     #[serde(default, with = "option_virtual_path_serde")]
     pub settings: Option<VirtualPath>,
     pub active: bool,
+    /// Состояние курсора при старте сцены; действует, только если камера активна.
+    #[serde(default, skip_serializing_if = "CameraCursor::is_default")]
+    pub cursor: CameraCursor,
+}
+
+/// Начальное состояние курсора, которое камера задаёт при старте сцены.
+///
+/// Флаги независимы: `hide_on_start` только скрывает курсор, `lock_on_start` только
+/// удерживает его в окне. Значения по умолчанию не записываются в сцену.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CameraCursor {
+    pub hide_on_start: bool,
+    pub lock_on_start: bool,
+}
+
+impl CameraCursor {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Экземпляр FBX, необязательная замена base-color PNG и override материала.
@@ -2866,6 +2886,46 @@ sun_intensity=4.0
         );
         let error = SceneDocument::parse("two-environments.rvescene", &two).unwrap_err();
         assert!(error.message.contains("не более одного environment"));
+    }
+
+    #[test]
+    fn camera_cursor_defaults_to_false_for_existing_scenes() {
+        let document = parse(VALID).unwrap();
+        let camera = document.objects[0].camera.as_ref().unwrap();
+        assert_eq!(camera.cursor, super::CameraCursor::default());
+        assert!(!camera.cursor.hide_on_start);
+        assert!(!camera.cursor.lock_on_start);
+    }
+
+    #[test]
+    fn camera_cursor_flags_round_trip_and_default_table_is_not_written() {
+        let scene = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[objects.camera.cursor]
+hide_on_start = true
+lock_on_start = true
+"#;
+        let document = parse(scene).unwrap();
+        let cursor = document.objects[0].camera.as_ref().unwrap().cursor;
+        assert!(cursor.hide_on_start && cursor.lock_on_start);
+        let written = document.to_toml().unwrap();
+        assert!(written.contains("[objects.camera.cursor]"), "{written}");
+        let reparsed = parse(&written).unwrap();
+        assert_eq!(reparsed.objects[0].camera.as_ref().unwrap().cursor, cursor);
+
+        let mut default_cursor = document;
+        default_cursor.objects[0].camera.as_mut().unwrap().cursor = Default::default();
+        let written = default_cursor.to_toml().unwrap();
+        assert!(!written.contains("cursor"), "{written}");
+    }
+
+    #[test]
+    fn camera_cursor_rejects_unknown_fields() {
+        let scene = format!("{VALID}\n[objects.camera.cursor]\nunknown = true\n");
+        assert!(parse(&scene).is_err());
     }
 
     #[test]

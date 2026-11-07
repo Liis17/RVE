@@ -153,9 +153,9 @@ local move_x, move_y = rve.input.vector("Move")
 включить автономную сборку Rust-скриптов. Для CI без сборки guest-кода можно явно
 передать `--no-rust-toolchain`.
 
-Guest API использует ABI v6; host продолжает загружать библиотеки ABI v3, v4 и v5.
+Guest API использует ABI v7; host продолжает загружать библиотеки ABI v3, v4, v5 и v6.
 Переносимый SDK marker требует точного совпадения ABI, поэтому комплект с marker
-v5 нужно пересобрать командой `rve-build sdk`. Builder автоматически синхронизирует
+v6 нужно пересобрать командой `rve-build sdk`. Builder автоматически синхронизирует
 SDK в `<project>/.rve/sdk` перед сборкой проектных Rust scripts.
 
 На Windows подготовь минимальную GNU toolchain через rustup и передай её sysroot:
