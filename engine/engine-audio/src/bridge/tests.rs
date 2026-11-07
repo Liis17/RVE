@@ -158,6 +158,7 @@ fn emitter_follows_the_world_matrix_of_the_source() {
     let moved = world(&SCENE.replace("position = [3.0, 0.0, 0.0]", "position = [5.0, 0.0, 0.0]"));
     rig.bridge.sync_positions(&moved);
     assert_eq!(rig.handle.spatial().emitter(lane), [5.0, 0.0, 0.0]);
+    assert_eq!(rig.bridge.emitter_of(speaker), Some([5.0, 0.0, 0.0]));
 }
 
 #[test]

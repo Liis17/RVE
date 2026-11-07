@@ -112,6 +112,22 @@ pub struct AudioSourceComponent {
     pub max_distance: f32,
 }
 
+impl AudioSourceComponent {
+    /// Источник с настройками по умолчанию для клипа; редактор использует его при добавлении.
+    pub fn with_clip(clip: VirtualPath) -> Self {
+        Self {
+            clip,
+            group: AudioGroup::default(),
+            volume: default_volume(),
+            looping: false,
+            play_on_start: false,
+            spatial: false,
+            min_distance: default_min_distance(),
+            max_distance: default_max_distance(),
+        }
+    }
+}
+
 fn default_volume() -> f32 {
     1.0
 }

@@ -963,6 +963,10 @@ impl EditorApp {
                 |path| project.read_text(path),
                 &model_geometry,
                 &project.settings.physics,
+                engine_audio::AudioConfig {
+                    resources: Some(project.resource_handle()),
+                    output: true,
+                },
             )
         })();
         match result {

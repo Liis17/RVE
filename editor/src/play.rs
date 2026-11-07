@@ -1,6 +1,7 @@
 //! Play-режим: копия мира сцены и скрипты на главном потоке редактора.
 
 use engine_assets::Assets;
+use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
 use engine_physics::{
     ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsClient, PhysicsInitialization,
@@ -107,6 +108,7 @@ pub struct PlaySession {
     world: World,
     host: ScriptHost,
     physics: Option<PlayPhysics>,
+    audio: Option<PlayAudio>,
     watchdog: Watchdog,
     time_limit: Duration,
     paused: bool,
@@ -153,10 +155,13 @@ impl PlaySession {
             &[],
             &PhysicsSettings::default(),
             SCRIPT_TIME_LIMIT,
+            AudioConfig::default(),
         )
     }
 
-    /// Starts Play with project input and physics settings and CPU geometry for mesh colliders.
+    /// Starts Play with project input and physics settings, CPU geometry for mesh colliders and
+    /// the audio configuration (ресурсы проекта и устройство вывода).
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_world_and_physics(
         document: &SceneDocument,
         world: World,
@@ -165,6 +170,7 @@ impl PlaySession {
         read_source: impl FnMut(&str) -> Result<String, String>,
         model_geometry: &[ModelGeometry],
         physics_settings: &PhysicsSettings,
+        audio: AudioConfig,
     ) -> Result<Self, String> {
         Self::start_with_world_limit(
             document,
@@ -175,6 +181,7 @@ impl PlaySession {
             model_geometry,
             physics_settings,
             SCRIPT_TIME_LIMIT,
+            audio,
         )
     }
 
@@ -240,6 +247,7 @@ impl PlaySession {
             &[],
             &PhysicsSettings::default(),
             time_limit,
+            AudioConfig::default(),
         )
     }
 
@@ -253,6 +261,7 @@ impl PlaySession {
         model_geometry: &[ModelGeometry],
         physics_settings: &PhysicsSettings,
         time_limit: Duration,
+        audio: AudioConfig,
     ) -> Result<Self, String> {
         let mut sources = BTreeMap::new();
         for object in world.objects() {
@@ -291,10 +300,13 @@ impl PlaySession {
         let (driver, bindings) = desc.build().map_err(|error| error.to_string())?;
         let (physics, initial_snapshot) = PlayPhysics::start(&world, driver, bindings)?;
         host.set_physics_snapshot(initial_snapshot, physics.sync.bindings());
+        let mut audio = PlayAudio::start(audio)?;
+        audio.bridge.start(&world);
         Ok(Self {
             world,
             host,
             physics: Some(physics),
+            audio: Some(audio),
             watchdog,
             time_limit,
             paused: false,
@@ -314,9 +326,14 @@ impl PlaySession {
     }
 
     /// Пауза не накапливает время: первый кадр после неё получает обычный шаг.
+    /// Звук на паузе замолкает; позиции и запуски в это время не обрабатываются.
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
         self.last_tick = Instant::now();
+        if let Some(audio) = &self.audio {
+            // Поток звука уже остановлен, если команда не принята; тишина тогда не нужна.
+            let _ = audio.handle.set_paused(paused);
+        }
     }
 
     /// Вводит состояние кнопок и клавиш для следующего обновления.
@@ -381,6 +398,14 @@ impl PlaySession {
                 .step(dt, commands)
                 .map_err(|error| error.to_string())?;
         }
+        if let Some(audio) = &mut self.audio {
+            audio
+                .bridge
+                .apply(self.host.drain_audio_requests(), &self.world);
+            // Редактор не вызывает build_frame, поэтому матрицы пересчитываются здесь.
+            self.world.recalculate_world_matrices();
+            audio.bridge.sync_positions(&self.world);
+        }
         Ok(())
     }
 
@@ -408,6 +433,9 @@ impl PlaySession {
         {
             events.push(physics_error_event(error));
         }
+        if let Some(mut audio) = self.audio.take() {
+            audio.shutdown();
+        }
         events
     }
 }
@@ -416,6 +444,41 @@ impl Drop for PlaySession {
     fn drop(&mut self) {
         if let Some(mut physics) = self.physics.take() {
             let _ = physics.shutdown();
+        }
+        if let Some(mut audio) = self.audio.take() {
+            audio.shutdown();
+        }
+    }
+}
+
+/// Звук Play: поток `rve-audio` и мост, который отдаёт ему запросы скриптов и позиции.
+struct PlayAudio {
+    bridge: AudioBridge,
+    handle: AudioHandle,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PlayAudio {
+    fn start(config: AudioConfig) -> Result<Self, String> {
+        let (engine, handle) = AudioEngine::new(config);
+        let thread = std::thread::Builder::new()
+            .name("rve-audio".to_owned())
+            .spawn(move || engine.run())
+            .map_err(|error| format!("не удалось запустить поток звука: {error}"))?;
+        Ok(Self {
+            bridge: AudioBridge::new(handle.clone()),
+            handle,
+            thread: Some(thread),
+        })
+    }
+
+    /// Глушит звук, останавливает поток и ждёт его завершения. Повторный вызов безвреден.
+    fn shutdown(&mut self) {
+        // Ошибки здесь означают лишь, что поток уже остановлен.
+        let _ = self.handle.stop_all();
+        self.handle.shutdown();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -864,5 +927,50 @@ return S
         let event = session.drain_events().pop().unwrap();
         assert_eq!(event.level, engine_script::ScriptEventLevel::Warn);
         assert_eq!(event.message, "hello");
+    }
+
+    const AUDIO_SCENE: &str = r#"
+[[assets]]
+path = "/audio/hum.wav"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "speaker"
+[objects.transform]
+position = [3.0, 0.0, 0.0]
+[objects.audio_source]
+clip = "/audio/hum.wav"
+looping = true
+play_on_start = true
+spatial = true
+"#;
+
+    #[test]
+    fn play_audio_follows_a_moved_source_without_build_frame() {
+        let mut session =
+            PlaySession::start(&document(AUDIO_SCENE), None, |_| Ok(String::new())).unwrap();
+        let speaker = session.world_mut().handle("speaker").unwrap();
+        session.tick().unwrap();
+        let bridge = &session.audio.as_ref().unwrap().bridge;
+        assert_eq!(bridge.emitter_of(speaker), Some([3.0, 0.0, 0.0]));
+
+        let world = session.world_mut();
+        let mut transform = *world.local_transform(speaker).unwrap();
+        transform.position.x = 5.0;
+        world.set_local_transform(speaker, transform).unwrap();
+        session.tick().unwrap();
+        let bridge = &session.audio.as_ref().unwrap().bridge;
+        assert_eq!(bridge.emitter_of(speaker), Some([5.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn play_pause_and_stop_drive_the_audio_thread_without_hanging() {
+        let mut session =
+            PlaySession::start(&document(AUDIO_SCENE), None, |_| Ok(String::new())).unwrap();
+        session.set_paused(true);
+        session.set_paused(false);
+        // Stop ждёт завершения потока звука; если он не остановится, тест зависнет.
+        assert!(session.stop().is_empty());
     }
 }

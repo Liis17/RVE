@@ -2723,6 +2723,7 @@ dependencies = [
  "egui-winit",
  "egui_dock",
  "engine-assets",
+ "engine-audio",
  "engine-console",
  "engine-files",
  "engine-physics",

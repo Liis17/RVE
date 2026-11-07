@@ -22,6 +22,8 @@ pub struct AudioBridge {
     sources: HashMap<ObjectHandle, VoiceId>,
     /// Громкость, заданная `set_sound_volume`; применяется к текущему и следующим запускам.
     volumes: HashMap<ObjectHandle, f32>,
+    /// Позиции излучателей, переданные звуковому потоку в последнем `sync_positions`.
+    emitters: HashMap<ObjectHandle, [f32; 3]>,
 }
 
 impl AudioBridge {
@@ -31,6 +33,7 @@ impl AudioBridge {
             declared: HashSet::new(),
             sources: HashMap::new(),
             volumes: HashMap::new(),
+            emitters: HashMap::new(),
         }
     }
 
@@ -184,16 +187,24 @@ impl AudioBridge {
                     let position = matrix.w_axis.truncate();
                     if position.is_finite() {
                         self.handle.set_emitter(voice, position.to_array());
+                        self.emitters.insert(object, position.to_array());
                     }
                 }
                 None => stale.push(object),
             }
         }
         for object in stale {
+            self.emitters.remove(&object);
             if let Some(voice) = self.sources.remove(&object) {
                 report(self.handle.stop(voice), "остановка исчезнувшего источника");
             }
         }
+    }
+
+    /// Последняя позиция излучателя, переданная звуковому потоку. Нужна отладке и тестам Play,
+    /// которые не должны зависеть от момента обработки команд потоком.
+    pub fn emitter_of(&self, object: ObjectHandle) -> Option<[f32; 3]> {
+        self.emitters.get(&object).copied()
     }
 
     fn poll_events(&mut self) {
