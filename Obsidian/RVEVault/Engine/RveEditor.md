@@ -39,6 +39,7 @@ Parent: [[Index]]
 |---|---|
 | CLI | `rve-editor [--project <dir>] [--scripts <library>]`. Без `--project` показывается стартовый экран. Если `--scripts` задан, эта ABI-библиотека заменяет autobuild; иначе проект с `heavy_scripts` собирается при открытии и перед Play |
 | Коды завершения | 0 — успех; 2 — неверные аргументы, настройки проекта или `bootstrap.rves`; 1 — ошибка окна или renderer |
+| Консоль Windows | Release-сборка использует подсистему `windows`, как `rve-player`: окно консоли не открывается, а stderr ошибок CLI и запуска при старте из терминала не виден; коды завершения сохраняются. Debug-сборка остаётся консольной. Дочерние процессы сборки запускаются с `CREATE_NO_WINDOW` |
 | Окно | Размер из `bootstrap.rves` проекта, иначе 1600×900; заголовок содержит проект, сцену и признак несохранённых правок |
 | Раскладка проекта | Как dev-запуск player: `project.rveproject`, `bootstrap.rves`, `Assets/`; ресурсы читаются в `SourceMode::Loose`. `AssetWatcher` автоматически наблюдает за `Assets/`. Камеры читают общие `.camerasettings` по объявленным scene asset paths |
 | Настройки пользователя | `rve-editor/settings.json` в каталоге настроек ОС (`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` или `~/.config`): до 10 недавних проектов, раскладка egui_dock и режим `scroll_navigation` (Auto/Trackpad/Mouse). Пишется при открытии проекта и выходе; повреждённое поле или раскладка с повторяющимися панелями заменяются значением по умолчанию с предупреждением в Console |

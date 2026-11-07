@@ -1,4 +1,6 @@
 //! Графический редактор игровых сцен и ресурсов RVE.
+// Release-сборка на Windows запускается без отдельного окна консоли.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
 mod asset_watch;
