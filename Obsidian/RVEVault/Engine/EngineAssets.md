@@ -11,6 +11,8 @@ Parent: [[Index]]
 | Файл | Значимый символ | Роль |
 |---|---|---|
 | `engine/engine-assets/src/lib.rs` | `ASSETS_DIR`, `Assets`, `Model`, `ModelMesh`, `ModelMaterial`, `ModelVertex`, `TextureData`, `HdrImageData`, `AssetError`, `decode_png`, `decode_hdr` | Пути ресурсов, загрузка FBX через ufbx, PNG через png и Radiance HDR RGBE |
+| `engine/engine-assets/src/skin.rs` | `ModelSkeleton`, `ModelNode`, `ModelJoint`, `ModelSkin`, `ModelInheritMode`, `ModelTransform`, `influences` | Скелет, веса вершин, inherit modes и rigid-привязка частей |
+| `engine/engine-assets/src/animation.rs` | `ModelAnimation`, `ModelTrack`, `ModelKey`, `bake_clip_file` | Клипы: TRS-ключи узлов по именам, запечённые из stacks ufbx |
 | `engine/engine-assets/Cargo.toml` | `engine-resources`, `ufbx`, `png` | Чтение и stat ресурсов, разбор FBX и PNG; Radiance RGBE декодируется встроенным кодом без новой зависимости |
 
 ## Публичные контракты
@@ -23,7 +25,11 @@ Parent: [[Index]]
 | `Assets::load_texture(&self, asset_path) -> Result<TextureData, AssetError>` | Требует расширение `.png` (регистр не важен), читает resource bytes и декодирует их |
 | `Assets::load_hdr(&self, asset_path) -> Result<HdrImageData, AssetError>` | Требует расширение `.hdr` (регистр не важен), использует тот же loose/packed resource source и декодирует Radiance RGBE |
 | `Assets::load_model(&self, asset_path) -> Result<Model, AssetError>` | Требует расширение `.fbx`, читает FBX в память и загружает используемые FBX-текстуры PNG |
-| `Assets::model_dependencies(&self, asset_path) -> Result<Vec<String>, AssetError>` | Возвращает уникальные внешние PNG как ведущие `/` virtual paths в порядке base-color, normal, roughness, metallic, emissive, occlusion и opacity. Проверяет кандидаты через общий с `load_model` resolver и `stat` того же loose/packed источника, не читая и не декодируя PNG. Embedded-текстуры и metallic/roughness-карты классических шейдеров пропускаются; отсутствующая внешняя текстура даёт тот же `MissingTexture` |
+| `Assets::model_dependencies(&self, asset_path) -> Result<Vec<String>, AssetError>` | Возвращает уникальные внешние PNG как ведущие `/` virtual paths в порядке base-color, normal, roughness, metallic, emissive, occlusion и opacity. Проверяет кандидаты через общий с `load_model` resolver и `stat` того же loose/packed источника, не читая и не декодируя PNG. Embedded-текстуры и metallic/roughness-карты классических шейдеров пропускаются; отсутствующая внешняя текстура даёт тот же `MissingTexture`. FBX без треугольников, но с анимационными stacks (клип-only файл), возвращает пустой список; сборка вызывает эту функцию для каждого объявленного FBX |
+| `Assets::load_animations(&self, asset_path) -> Result<Vec<ModelAnimation>, AssetError>` | Требует расширение `.fbx` и хотя бы один анимационный stack, иначе `Decode`. Имя клипа — stem файла, если stack один; иначе `stem:stack`. Ключи запекаются через `bake_anim` |
+| `Model::skeleton: Option<ModelSkeleton>` | Узлы (имя, родитель, `rest` TRS, `inherit_mode`, `inherit_scale_node`) в порядке родитель-первым и `joints` (индекс узла и `inverse_bind` по столбцам). Один узел может быть joint несколько раз с разными `inverse_bind` |
+| `ModelMesh::skin: Option<ModelSkin>` | Для каждой вершины по четыре `joints` и `weights`, выровненные по `vertices`. Веса берутся по control point, поэтому развёрнутые грани одной вершины получают одинаковые веса. Нормализуются четыре крупнейших веса; вершина без положительных весов привязывается к узлу меша с весом 1 |
+| `Model::animations: Vec<ModelAnimation>` | Клипы из stacks самой модели: `name`, `duration`, `tracks` (узел по имени и ключи translation/rotation/scale) |
 | `decode_png(bytes) -> Result<TextureData, String>` | Любой цветовой тип и глубина PNG → RGBA8: палитра раскрывается, 16 бит усекаются до старшего байта, серый и RGB получают непрозрачную альфу. Предел памяти декодера — 512 МиБ |
 | `decode_hdr(bytes) -> Result<HdrImageData, String>` | Принимает `#?RADIANCE`/`#?RGBE`, `FORMAT=32-bit_rle_rgbe` и resolution только `-Y height +X width`. Декодирует flat RGBE и Radiance new-style scanline RLE в линейный RGB `f32`; ограничивает размеры, пиксельные буферы и промежуточные аллокации бюджетом 512 МиБ и проверяет переполнения до выделения памяти |
 | `HdrImageData` | `width`, `height`, `rgb: Vec<f32>`; три линейных неотрицательных канала на пиксель, scanlines сверху вниз. Другие orientations/форматы HDR отвергаются как `AssetError::Decode` |
@@ -35,6 +41,10 @@ Parent: [[Index]]
 | `AssetError` | `InvalidPath`, `UnsupportedFormat` (не то расширение), `Io` (ошибка чтения, в том числе отсутствие файла), `Decode` (повреждённый PNG или FBX, модель без треугольников) и `MissingTexture` со списком проверенных путей; реализует `Display` и `Error` |
 
 ## Загрузка FBX
+
+- Скелет и skin: кость — узел ufbx кластера; `inverse_bind = cluster.geometry_to_bone × inverse(geometry_to_world файла)`, потому что вершины уже переведены в пространство модели через `geometry_to_world`. Одна кость может встречаться несколько раз, по одному joint на кластер.
+- Клипы: каждый `AnimStack` запекается через `ufbx::bake_anim` в локальные TRS-ключи узлов. Ключи ограничены бюджетом памяти, как PNG и HDR.
+- Клип-only FBX (`load_animations`) не содержит обязательных мешей; сопоставление с костями модели выполняет [[Engine/EngineAnimation]].
 
 - ufbx разбирает FBX через `load_memory` с virtual filename модели и приводит сцену к осям +X вправо, +Y вверх, +Z вперёд и к метрам (`target_axes`, `target_unit_meters = 1`, `SpaceConversion::ModifyGeometry`). Внешнее чтение ufbx отключено; все файлы запрашиваются через `ResourceHandle`, а CPU-разбор выполняется вызывающим потоком до окна. Отсутствующие нормали ufbx генерирует сам.
 - Обходятся все узлы с мешем. Позиции переводятся матрицей `geometry_to_world` узла, нормали — `matrix_for_normals` от неё, а затем нормализуются; у вырожденных нормалей результат `[0, 1, 0]`. При отрицательном determinant `geometry_to_world` порядок индексов каждого треугольника разворачивается, чтобы сохранить совпадение winding с преобразованными нормалями.
@@ -58,6 +68,7 @@ Parent: [[Index]]
 ## Ограничения
 
 - Поддерживаются FBX и PNG для моделей/текстур и Radiance RGBE `.hdr` для environment. Другие форматы моделей и изображений, а также встроенные в FBX не-PNG изображения дают ошибку.
-- Анимации, скиннинг, камеры и источники света из FBX игнорируются; читается только статическая геометрия в позе файла.
+- Из FBX читаются скелет, веса, TRS-клипы узлов и геометрия. Камеры и источники света из FBX по-прежнему игнорируются; морф-таргеты не поддерживаются.
+- Части модели со скелетом, не привязанные к костям, получают rigid-привязку к своему узлу (вес 1, `inverse_bind = inverse(node_to_world)`), поэтому узлы без skin (например, оружие в руке) анимируются клипом. Модели без скелета и клипов загружаются прежним путём.
 - Поддерживаются base color, metallic-roughness, tangent-space normal, emissive, occlusion и opacity для описанных выше ufbx map fields; остальные PBR-свойства, bump и normal-map mip filtering не реализованы. Alpha mask не выводится из FBX: загрузчик задаёт Opaque или Blend, а cutoff mask задаётся сценой.
 - Загрузка синхронная и без кэша между вызовами.
