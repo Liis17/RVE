@@ -109,6 +109,12 @@ impl SkinHistory {
     }
 }
 
+/// Номер отправленного вызова. План skinning задаёт свой номер; без него номер всё равно растёт,
+/// иначе предыдущая поза экземпляра переносилась бы через вызов без skinning.
+pub(crate) fn submitted_call(last_submitted: u64, plan_call: Option<u64>) -> u64 {
+    plan_call.unwrap_or(last_submitted + 1)
+}
+
 /// Один compute-dispatch на экземпляр за вызов.
 pub(crate) struct SkinDispatch {
     pub instance: SkinId,
@@ -234,13 +240,20 @@ impl Renderer {
         let instance = self.instance()?.clone();
         let device = self.device()?.clone();
         let physical_device = self.physical_device;
-        let buffer = HostBuffer::new(
+        let buffer = match HostBuffer::new(
             &instance,
             &device,
             physical_device,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             &skin_bytes,
-        )?;
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                // Меш без весов бесполезен для skinning: освобождаем его, чтобы ошибка не оставляла ресурс.
+                let _ = self.destroy_mesh(mesh);
+                return Err(error);
+            }
+        };
         let buffers = self
             .meshes
             .get_mut(mesh.0)
@@ -522,18 +535,20 @@ impl Renderer {
         }))
     }
 
-    /// Фиксирует кольцо и номер вызова после успешной отправки.
-    pub(crate) fn commit_skin(&mut self, plan: &SkinPlan) {
-        for dispatch in &plan.dispatches {
-            if let Some(state) = self
-                .skin_instances
-                .get_mut(dispatch.instance.0)
-                .and_then(Option::as_mut)
-            {
-                state.history.commit(dispatch.step, plan.call);
+    /// Фиксирует кольцо и номер вызова после успешной отправки; вызов без skinning тоже получает номер.
+    pub(crate) fn commit_skin(&mut self, plan: Option<&SkinPlan>) {
+        if let Some(plan) = plan {
+            for dispatch in &plan.dispatches {
+                if let Some(state) = self
+                    .skin_instances
+                    .get_mut(dispatch.instance.0)
+                    .and_then(Option::as_mut)
+                {
+                    state.history.commit(dispatch.step, plan.call);
+                }
             }
         }
-        self.skin_call_serial = plan.call;
+        self.skin_call_serial = submitted_call(self.skin_call_serial, plan.map(|plan| plan.call));
     }
 
     /// Запись skinning доступна через [`record_skin`]; здесь — выбор пайплайна.
@@ -723,6 +738,35 @@ mod tests {
                 previous: None
             }
         );
+    }
+
+    #[test]
+    fn call_without_skinning_breaks_the_previous_pose_chain() {
+        // Регрессия: вызов без skinning не менял номер, и следующий вызов брал позу из более раннего кадра.
+        let mut history = SkinHistory::default();
+        // Возвращает номер последнего отправленного вызова, как `Renderer::commit_skin`.
+        let submit = |history: &mut SkinHistory, serial: u64, with_skin: bool| {
+            let call = serial + 1;
+            let plan = with_skin.then(|| history.plan(serial, false));
+            if let Some(step) = plan {
+                history.commit(step, call);
+            }
+            submitted_call(serial, plan.map(|_| call))
+        };
+        let serial = submit(&mut history, 0, true);
+        let serial = submit(&mut history, serial, false);
+        assert_eq!(serial, 2);
+        assert_eq!(history.plan(serial, false).previous, None);
+        // Третий вызов пишет копию 1 без предыдущей позы; следующий вызов получит её как предыдущую.
+        let serial = submit(&mut history, serial, true);
+        assert_eq!(history.plan(serial, false).previous, Some(1));
+    }
+
+    #[test]
+    fn submitted_call_advances_without_a_plan() {
+        assert_eq!(submitted_call(0, None), 1);
+        assert_eq!(submitted_call(4, None), 5);
+        assert_eq!(submitted_call(4, Some(5)), 5);
     }
 
     #[test]

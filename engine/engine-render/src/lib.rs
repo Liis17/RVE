@@ -3219,9 +3219,7 @@ impl Renderer {
             )));
         }
         self.record_frame_submission(frame_slot);
-        if let Some(plan) = skin {
-            self.commit_skin(plan);
-        }
+        self.commit_skin(skin);
         self.shadow_layout = shadow_layout;
         self.local_shadow_layout = local_shadow_layout;
         self.commit_temporal_submissions(temporal_submissions);
@@ -5920,6 +5918,8 @@ impl Drop for Renderer {
         #[cfg(all(windows, feature = "dlss"))]
         self.dlss_api.take();
         self.ui_textures.clear();
+        // Экземпляры skinning владеют пулами наборов и буферами; освобождаем их до layout и device.
+        self.skin_instances.clear();
         self.meshes.clear();
         self.materials.clear();
         self.textures.clear();
