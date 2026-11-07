@@ -9,6 +9,7 @@ use crate::play::PlaySession;
 use crate::play_cursor::PlayCursor;
 use crate::previews::PreviewCache;
 use crate::project::OpenProject;
+use crate::project_prefabs::ProjectPrefabs;
 use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::camera::{EditorCamera, View};
 use crate::viewport::colliders::ColliderCache;
@@ -137,6 +138,8 @@ pub struct FrameParts<'a> {
 
 pub struct EditorState {
     pub project: Option<OpenProject>,
+    /// Открытый в подокне «Project Prefabs» список тяжёлых префабов; хранится с несохранёнными правками.
+    pub project_prefabs: Option<ProjectPrefabs>,
     pub scene: Option<EditorScene>,
     pub log: ConsoleLog,
     pub tool: GizmoTool,
@@ -217,6 +220,7 @@ impl EditorState {
     pub fn new(scripts_path: Option<PathBuf>) -> Self {
         Self {
             project: None,
+            project_prefabs: None,
             scene: None,
             log: ConsoleLog::default(),
             tool: GizmoTool::Move,

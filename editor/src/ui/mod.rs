@@ -6,6 +6,8 @@ pub mod game_view;
 pub mod hierarchy;
 pub mod inspector;
 pub mod project_panel;
+pub mod project_prefabs;
+pub mod scene_assets;
 pub mod scene_view;
 pub mod toolbar;
 
@@ -13,7 +15,7 @@ pub mod toolbar;
 mod tests;
 
 use crate::layout::{EditorTabs, Tab};
-use crate::state::{Action, EditorState};
+use crate::state::{Action, AssetDrag, EditorState};
 use egui_dock::{DockArea, DockState, Style};
 
 /// Строит весь интерфейс кадра.
@@ -211,6 +213,71 @@ fn show_apply_prompt(ctx: &egui::Context, state: &mut EditorState) {
             }
         });
     });
+}
+
+/// Текстовое поле, которое отдаёт значение только при уходе фокуса или Enter: промежуточный
+/// текст не попадает в документ. Пока фокуса нет, поле показывает текущее значение.
+pub(crate) fn committed_text_field(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    current: &str,
+    hint: &str,
+    width: f32,
+) -> Option<String> {
+    let mut text = ui
+        .ctx()
+        .data(|data| data.get_temp::<String>(id))
+        .unwrap_or_else(|| current.to_owned());
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .hint_text(hint)
+            .desired_width(width),
+    );
+    let committed = response.lost_focus().then(|| text.clone());
+    if response.has_focus() {
+        ui.ctx().data_mut(|data| data.insert_temp(id, text));
+    } else {
+        ui.ctx().data_mut(|data| data.remove::<String>(id));
+    }
+    committed
+}
+
+/// Разбор лимита экземпляров: пустой текст — без лимита, иначе целое число. Ноль отклоняет
+/// валидация документа, поэтому здесь он проходит.
+pub(crate) fn parse_max_instances(text: &str) -> Result<Option<u32>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("max_instances: ожидается целое число, получено {text:?}"))
+}
+
+/// Полоса, принимающая `.rveprefab`, перетащенный из Project. Возвращает путь относительно
+/// `Assets` при отпускании; тип ресурса проверяет модель, которая получит путь.
+pub(crate) fn prefab_drop_zone(ui: &mut egui::Ui, text: &str) -> Option<String> {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    let stroke = if response.dnd_hover_payload::<AssetDrag>().is_some() {
+        ui.visuals().selection.stroke
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
+    let color = ui.visuals().text_color();
+    let painter = ui.painter();
+    painter.rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(12.0),
+        color,
+    );
+    response
+        .dnd_release_payload::<AssetDrag>()
+        .map(|asset| asset.0.clone())
 }
 
 /// Список недавних проектов. Отсутствующие проекты помечены и недоступны;

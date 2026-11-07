@@ -18,6 +18,7 @@ mod play;
 mod play_cursor;
 mod previews;
 mod project;
+mod project_prefabs;
 mod scene_edit;
 mod settings;
 mod state;

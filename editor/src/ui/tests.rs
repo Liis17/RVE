@@ -1649,3 +1649,129 @@ fn folder_tree_labels_render_without_an_icon_cache() {
         position_of(&texts, label);
     }
 }
+
+/// Кадр панели Scene Assets. Без рамки, как `Harness::panel`: иначе координаты надписей не
+/// совпадут с местом, куда `Harness::click` доставляет щелчок.
+fn scene_assets_frame(harness: &mut Harness, events: Vec<Event>) -> Vec<(String, Pos2)> {
+    let input = harness.input(events);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| scene_assets::show(ui, state));
+    });
+    output.textures_delta.clear();
+    texts(&output.shapes)
+}
+
+fn scene_prefab_paths(harness: &Harness) -> Vec<String> {
+    harness
+        .scene()
+        .document()
+        .assets
+        .iter()
+        .map(|asset| asset.path.as_str().to_owned())
+        .collect()
+}
+
+#[test]
+fn scene_assets_remove_only_prefabs_without_an_instance() {
+    let mut harness = Harness::new();
+    let prefab = "[[objects]]\nid = \"frame\"\n";
+    let loader: crate::scene_edit::PrefabLoader = std::rc::Rc::new(move |path| {
+        engine_scene::SceneDocument::parse_prefab(format!("/{}", path.as_str()), prefab)
+    });
+    harness.scene_mut().set_prefab_loader(loader).unwrap();
+    harness
+        .scene_mut()
+        .create_object(
+            &NewObject::Prefab(
+                VirtualPath::parse("/prefabs/door.rveprefab").unwrap(),
+                [0.0; 3],
+            ),
+            None,
+        )
+        .unwrap();
+    harness
+        .scene_mut()
+        .add_scene_prefab(VirtualPath::parse("/prefabs/bullet.rveprefab").unwrap())
+        .unwrap();
+
+    let texts = scene_assets_frame(&mut harness, Vec::new());
+    position_of(&texts, "/prefabs/door.rveprefab");
+    position_of(&texts, "используется экземпляром");
+    position_of(&texts, "не используется");
+    // Строки идут в порядке ресурсов сцены: сначала дверь (есть экземпляр), затем пуля.
+    let removes: Vec<Pos2> = texts
+        .iter()
+        .filter(|(text, _)| text == "Remove")
+        .map(|(_, at)| *at)
+        .collect();
+    assert_eq!(removes.len(), 2);
+
+    harness.click(removes[0], scene_assets::show);
+    assert_eq!(
+        scene_prefab_paths(&harness),
+        ["prefabs/door.rveprefab", "prefabs/bullet.rveprefab"]
+    );
+    harness.click(removes[1], scene_assets::show);
+    assert_eq!(scene_prefab_paths(&harness), ["prefabs/door.rveprefab"]);
+    assert!(harness.scene().can_undo());
+}
+
+#[test]
+fn dropping_assets_on_scene_assets_adds_only_prefabs() {
+    let mut harness = Harness::new();
+    let texts = scene_assets_frame(&mut harness, Vec::new());
+    let zone = position_of(&texts, "Перетащите сюда .rveprefab из Project");
+    scene_assets_frame(&mut harness, vec![Event::PointerMoved(zone)]);
+
+    egui::DragAndDrop::set_payload(&harness.ctx, AssetDrag("models/a.fbx".to_owned()));
+    scene_assets_frame(
+        &mut harness,
+        vec![button(zone, PointerButton::Primary, false)],
+    );
+    assert!(scene_prefab_paths(&harness).is_empty());
+    assert_eq!(harness.state.log.entries().count(), 1);
+
+    egui::DragAndDrop::set_payload(
+        &harness.ctx,
+        AssetDrag("prefabs/bullet.rveprefab".to_owned()),
+    );
+    scene_assets_frame(
+        &mut harness,
+        vec![button(zone, PointerButton::Primary, false)],
+    );
+    assert_eq!(scene_prefab_paths(&harness), ["prefabs/bullet.rveprefab"]);
+}
+
+#[test]
+fn project_prefabs_panel_loads_the_project_list_on_first_show() {
+    let mut harness = Harness::new();
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+    harness.state.project = Some(OpenProject::open(Path::new(dir)).unwrap());
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| project_prefabs::show(ui, state));
+    });
+    output.textures_delta.clear();
+    let texts = texts(&output.shapes);
+    position_of(&texts, "Add Prefab");
+    position_of(&texts, "Save");
+    position_of(&texts, "Reload");
+    let project_root = harness.state.project.as_ref().unwrap().root.clone();
+    assert_eq!(
+        harness.state.project_prefabs.as_ref().unwrap().root(),
+        project_root
+    );
+    assert!(
+        harness
+            .state
+            .project_prefabs
+            .as_ref()
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+}
