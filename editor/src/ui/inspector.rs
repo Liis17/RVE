@@ -9,10 +9,11 @@ use crate::state::{Action, AssetDrag, EditorState};
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    AntiAliasing, CameraComponent, CharacterControllerComponent, ColliderComponent, ColliderShape,
-    EnvironmentComponent, HeavyScript, LodGroup, LodLevel, MAX_LOD_LEVELS, MaterialAlphaMode,
-    ParamSchema, ParamSpec, ParamValue, PointLightComponent, ProceduralSkyComponent,
-    RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform, SpotLightComponent,
+    AntiAliasing, AudioGroup, AudioSourceComponent, CameraComponent, CharacterControllerComponent,
+    ColliderComponent, ColliderShape, EnvironmentComponent, HeavyScript, LodGroup, LodLevel,
+    MAX_LOD_LEVELS, MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
+    ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform,
+    SpotLightComponent,
 };
 use std::collections::BTreeMap;
 
@@ -138,6 +139,9 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     }
     if let Some(light) = object.spot_light {
         show_spot_light(ui, state, id, light);
+    }
+    if let Some(audio) = &object.audio_source {
+        show_audio_source(ui, state, id, audio);
     }
     if let Some(environment) = &object.environment {
         show_environment(ui, state, id, environment);
@@ -1212,6 +1216,116 @@ fn show_point_light(
     run_menu_action(state, id, ComponentKind::PointLight, action);
 }
 
+fn show_audio_source(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    audio: &AudioSourceComponent,
+) {
+    let field = OverrideField::AudioSource;
+    let clips = state.assets_of_kind(AssetKind::Audio);
+    let mut clip_choice = None;
+    let action = component_header(
+        ui,
+        "Audio Source",
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::AudioSource)),
+        true,
+        |ui| {
+            egui::Grid::new("audio_source")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    let mut value = audio.clone();
+                    ui.label("Clip");
+                    clip_choice = asset_picker(ui, "audio_clip", audio.clip.as_str(), &clips);
+                    ui.end_row();
+                    ui.label("Group");
+                    let group = egui::ComboBox::from_id_salt("audio_group")
+                        .selected_text(audio_group_label(value.group))
+                        .show_ui(ui, |ui| {
+                            for option in
+                                [AudioGroup::Music, AudioGroup::Effects, AudioGroup::Ambient]
+                            {
+                                ui.selectable_value(
+                                    &mut value.group,
+                                    option,
+                                    audio_group_label(option),
+                                );
+                            }
+                        })
+                        .response;
+                    ui.end_row();
+                    ui.label("Volume");
+                    let volume = ui.add(
+                        egui::DragValue::new(&mut value.volume)
+                            .speed(0.01)
+                            .range(0.0..=engine_scene::MAX_AUDIO_VOLUME),
+                    );
+                    ui.end_row();
+                    ui.label("Loop");
+                    let looping = ui.checkbox(&mut value.looping, "");
+                    ui.end_row();
+                    ui.label("Play on start");
+                    let play_on_start = ui.checkbox(&mut value.play_on_start, "");
+                    ui.end_row();
+                    ui.label("Spatial");
+                    let spatial = ui.checkbox(&mut value.spatial, "");
+                    ui.end_row();
+                    ui.label("Min distance");
+                    let min = ui.add(
+                        egui::DragValue::new(&mut value.min_distance)
+                            .speed(0.05)
+                            .range(f32::MIN_POSITIVE..=f32::MAX),
+                    );
+                    ui.end_row();
+                    ui.label("Max distance");
+                    let max = ui.add(
+                        egui::DragValue::new(&mut value.max_distance)
+                            .speed(0.05)
+                            .range(f32::MIN_POSITIVE..=f32::MAX),
+                    );
+                    ui.end_row();
+                    let response = group | volume | looping | play_on_start | spatial | min | max;
+                    commit(state, id, "audio_source", &response, |object| {
+                        object.audio_source = Some(value.clone());
+                    });
+                });
+        },
+    );
+    if let Some(path) = clip_choice
+        && let Some(clip) = parse_path(state, &path)
+    {
+        // set_component объявляет клип в [[assets]] сцены; прямая правка этого не делает.
+        state.edit_scene(|scene| {
+            scene.set_component(
+                id,
+                Component::AudioSource(AudioSourceComponent {
+                    clip: clip.clone(),
+                    ..audio.clone()
+                }),
+            )
+        });
+    }
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| scene.remove_audio_source(id));
+    }
+    run_menu_action(state, id, ComponentKind::AudioSource, action);
+}
+
+fn audio_group_label(group: AudioGroup) -> &'static str {
+    match group {
+        AudioGroup::Master => "Master",
+        AudioGroup::Music => "Music",
+        AudioGroup::Effects => "Effects",
+        AudioGroup::Ambient => "Ambient",
+    }
+}
+
 fn show_spot_light(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -2258,6 +2372,26 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                     id,
                     Component::CharacterController(CharacterControllerComponent::default()),
                 )
+            });
+        }
+        if object.audio_source.is_none() {
+            ui.menu_button("Audio Source", |ui| {
+                let clips = state.assets_of_kind(AssetKind::Audio);
+                if clips.is_empty() {
+                    ui.label("Нет .wav или .ogg в проекте");
+                }
+                for clip in clips {
+                    if ui.button(&clip).clicked()
+                        && let Some(path) = parse_path(state, &clip)
+                    {
+                        state.edit_scene(|scene| {
+                            scene.set_component(
+                                id,
+                                Component::AudioSource(AudioSourceComponent::with_clip(path)),
+                            )
+                        });
+                    }
+                }
             });
         }
         if object.point_light.is_none() && ui.button("Point Light").clicked() {

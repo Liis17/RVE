@@ -160,6 +160,7 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
         AssetKind::Model => "FBX",
         AssetKind::Texture => "PNG",
         AssetKind::Hdr => "HDR",
+        AssetKind::Audio => "AUDIO",
         AssetKind::Script => "LUA",
         AssetKind::Other => "FILE",
     }

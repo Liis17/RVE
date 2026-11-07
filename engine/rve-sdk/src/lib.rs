@@ -439,6 +439,166 @@ impl std::fmt::Display for PhysicsError {
 
 impl std::error::Error for PhysicsError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioError {
+    /// The host predates ABI v7 and provides no audio callbacks.
+    Unavailable,
+    /// The host refused the request; the reason is reported in the host's script events.
+    Rejected,
+    /// A volume or position is not finite, or a volume is outside `0.0..=MAX_AUDIO_VOLUME`.
+    InvalidInput,
+}
+
+impl std::fmt::Display for AudioError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "audio callback is unavailable in this host",
+            Self::Rejected => "audio operation was rejected by the host",
+            Self::InvalidInput => "audio input must be finite and valid",
+        })
+    }
+}
+
+impl std::error::Error for AudioError {}
+
+/// Mixer group for clips and group volume changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioGroup {
+    Master,
+    Music,
+    Effects,
+    Ambient,
+}
+
+impl AudioGroup {
+    fn code(self) -> u32 {
+        match self {
+            Self::Master => abi::RVE_AUDIO_GROUP_MASTER,
+            Self::Music => abi::RVE_AUDIO_GROUP_MUSIC,
+            Self::Effects => abi::RVE_AUDIO_GROUP_EFFECTS,
+            Self::Ambient => abi::RVE_AUDIO_GROUP_AMBIENT,
+        }
+    }
+}
+
+/// Options for [`Context::play_clip`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipOptions {
+    pub group: AudioGroup,
+    pub volume: f32,
+    pub looping: bool,
+    /// Makes the clip spatial around this point; `None` plays it without position.
+    pub position: Option<[f32; 3]>,
+}
+
+impl Default for ClipOptions {
+    fn default() -> Self {
+        Self {
+            group: AudioGroup::Effects,
+            volume: 1.0,
+            looping: false,
+            position: None,
+        }
+    }
+}
+
+fn audio_status(status: u32) -> Result<(), AudioError> {
+    if status == abi::RveStatus::Ok as u32 {
+        Ok(())
+    } else {
+        Err(AudioError::Rejected)
+    }
+}
+
+/// Наибольшая громкость (×4). Совпадает с `engine_scene::MAX_AUDIO_VOLUME`: rve-sdk не зависит от
+/// engine-scene, поэтому константа повторяется здесь.
+pub const MAX_AUDIO_VOLUME: f32 = 4.0;
+
+fn audio_volume(volume: f32) -> Result<f32, AudioError> {
+    if volume.is_finite() && (0.0..=MAX_AUDIO_VOLUME).contains(&volume) {
+        Ok(volume)
+    } else {
+        Err(AudioError::InvalidInput)
+    }
+}
+
+impl Object {
+    /// Starts this object's `audio_source` clip.
+    pub fn play_sound(&self, ctx: &mut Context<'_>) -> Result<(), AudioError> {
+        let callback = ctx.host.audio_play_source.ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this guest callback.
+        audio_status(unsafe { callback(ctx.host.ctx, self.handle) })
+    }
+
+    /// Stops this object's current `audio_source` voice.
+    pub fn stop_sound(&self, ctx: &mut Context<'_>) -> Result<(), AudioError> {
+        let callback = ctx.host.audio_stop_source.ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this guest callback.
+        audio_status(unsafe { callback(ctx.host.ctx, self.handle) })
+    }
+
+    /// Sets the volume of this object's current voice and of its next starts.
+    pub fn set_sound_volume(&self, ctx: &mut Context<'_>, volume: f32) -> Result<(), AudioError> {
+        let volume = audio_volume(volume)?;
+        let callback = ctx
+            .host
+            .audio_set_source_volume
+            .ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this guest callback.
+        audio_status(unsafe { callback(ctx.host.ctx, self.handle, volume) })
+    }
+}
+
+impl Context<'_> {
+    /// Starts a clip by virtual path (`.wav` or `.ogg`, declared in the scene's `[[assets]]`) and
+    /// returns its voice id, which can later be passed to [`Context::stop_voice`].
+    pub fn play_clip(&mut self, path: &str, options: ClipOptions) -> Result<u64, AudioError> {
+        let volume = audio_volume(options.volume)?;
+        let position = match options.position {
+            Some(position) if position.iter().all(|axis| axis.is_finite()) => position,
+            Some(_) => return Err(AudioError::InvalidInput),
+            None => [0.0; 3],
+        };
+        let callback = self.host.audio_play_clip.ok_or(AudioError::Unavailable)?;
+        let params = abi::RveAudioParams {
+            group: options.group.code(),
+            volume,
+            looping: options.looping,
+            has_position: options.position.is_some(),
+            position,
+        };
+        let mut voice = 0;
+        // SAFETY: path, params and output storage remain valid during this script call.
+        audio_status(unsafe {
+            callback(
+                self.host.ctx,
+                abi::RveStr::from_str_ref(path),
+                &params,
+                &mut voice,
+            )
+        })?;
+        Ok(voice)
+    }
+
+    /// Stops one voice returned by [`Context::play_clip`]. Unknown ids are ignored by the host.
+    pub fn stop_voice(&mut self, voice: u64) -> Result<(), AudioError> {
+        let callback = self.host.audio_stop_voice.ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this script call.
+        audio_status(unsafe { callback(self.host.ctx, voice) })
+    }
+
+    /// Sets one mixer group's volume; `Master` multiplies every group.
+    pub fn set_group_volume(&mut self, group: AudioGroup, volume: f32) -> Result<(), AudioError> {
+        let volume = audio_volume(volume)?;
+        let callback = self
+            .host
+            .audio_set_group_volume
+            .ok_or(AudioError::Unavailable)?;
+        // SAFETY: host callback is valid during this script call.
+        audio_status(unsafe { callback(self.host.ctx, group.code(), volume) })
+    }
+}
+
 /// Copyable handle to a scene object. It remains stable while its scene is loaded and may be
 /// stored in a script struct. Every operation on it requires the current callback's `Context`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,6 +1,7 @@
 //! Runtime-данные сцены и подготовка кадра без зависимости от renderer.
 
 use crate::CameraSettings;
+use crate::audio::AudioSourceComponent;
 use crate::camera::Camera;
 use crate::document::{
     CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
@@ -9,6 +10,7 @@ use crate::document::{
     camera_from_matrix, light_direction_from_matrix,
 };
 use crate::light::ShadowSettings;
+use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -84,6 +86,7 @@ pub struct WorldObject {
     pub collider: Option<ColliderComponent>,
     pub rigid_body: Option<RigidBodyComponent>,
     pub character_controller: Option<CharacterControllerComponent>,
+    pub audio_source: Option<AudioSourceComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
 }
@@ -174,6 +177,7 @@ pub struct SceneWarning {
 #[derive(Clone, Debug)]
 pub struct World {
     source_label: String,
+    asset_paths: Vec<VirtualPath>,
     objects: Vec<WorldObject>,
     indices_by_id: HashMap<String, ObjectHandle>,
     topological_order: Vec<ObjectHandle>,
@@ -241,6 +245,11 @@ impl World {
         let object_count = objects.len();
         let mut world = Self {
             source_label: document.source_label().to_owned(),
+            asset_paths: document
+                .assets
+                .iter()
+                .map(|asset| asset.path.clone())
+                .collect(),
             world_matrices,
             world_rotations,
             objects,
@@ -373,6 +382,16 @@ impl World {
         object.camera.as_ref()?;
         let settings = object.camera_settings.unwrap_or_default();
         camera_from_matrix(self.world_matrix(handle)?, settings)
+    }
+
+    /// Звуковой источник объекта, если у него есть `audio_source`.
+    pub fn audio_source(&self, handle: ObjectHandle) -> Option<&AudioSourceComponent> {
+        self.object(handle)?.audio_source.as_ref()
+    }
+
+    /// Пути `[[assets]]` сцены в порядке документа.
+    pub fn asset_paths(&self) -> &[VirtualPath] {
+        &self.asset_paths
     }
 
     /// Настройки камеры; `None`, если объект не содержит Camera component.
@@ -621,6 +640,7 @@ fn world_object(
         collider: object.collider,
         rigid_body: object.rigid_body,
         character_controller: object.character_controller,
+        audio_source: object.audio_source.clone(),
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
     }
