@@ -30,7 +30,7 @@ Lua и Rust-скрипты работают с физикой через [[Engin
 
 ## Демонстрация
 
-`examples/demo-game/Assets/scenes/physics.rvescene` — первая включённая сцена `project.rveproject`, поэтому она стартовая. Сцена содержит пол из triangle mesh, стены, ступени высотой 0.2 м (проходимая) и 0.6 м (блокирующая), пологую рампу 20° и крутой склон 60°, четыре dynamic-ящика, четыре монеты-триггера и игрока с `character_controller` из `player.lua`. Тест `demo_game_scenes_load_and_build_physics_without_gpu` в `engine-runtime` загружает сцены демо, проверяет компиляцию их скриптов и строит `PhysicsSceneDesc` без GPU. Коллайдеры `box` демо используют `half_extents = [1, 1, 1]`, потому что FBX-куб занимает `[-1, 1]`, а размер задаётся масштабом.
+`examples/demo-game/Assets/scenes/physics.rvescene` — первая включённая сцена `project.rveproject`, поэтому она стартовая. Сцена содержит пол из triangle mesh, стены, ступени высотой 0.2 м (проходимая) и 0.6 м (блокирующая), пологую рампу 20° и крутой склон 60°, четыре dynamic-ящика, четыре монеты-триггера и игрока с `character_controller` из `player.lua`. Камера игрока стреляет через `shooter.lua`: пули — dynamic-сферы радиусом 0.05 м из быстрого префаба `bullet.rveprefab`, их скорость задаётся при spawn. Тест `demo_game_scenes_load_and_build_physics_without_gpu` в `engine-runtime` загружает сцены демо, проверяет компиляцию их скриптов и строит `PhysicsSceneDesc` без GPU; соседний тест проверяет регистрацию быстрых префабов демо. Коллайдеры `box` демо используют `half_extents = [1, 1, 1]`, потому что FBX-куб занимает `[-1, 1]`, а размер задаётся масштабом.
 
 ## Ограничения v1
 

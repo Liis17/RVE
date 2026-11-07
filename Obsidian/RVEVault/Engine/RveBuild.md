@@ -254,11 +254,14 @@ MoltenVK (Apache-2.0).
 
 ## Пример и ограничения
 
-`examples/demo-game/` содержит две включённые сцены, общую FBX-модель с внешней
+`examples/demo-game/` содержит три включённые сцены (`physics`, `main`, `second`), общую FBX-модель с внешней
 текстурой, явный архив `props`, Lua lite script и отдельный `HeavyScripts` crate,
 который зависит от `rve-sdk`, собирается как `cdylib` и экспортирует Rust-скрипт
 `Bobber`. Draft-сцена отключена, а лишний файл проверяет исключение неиспользуемых
-ресурсов. CI собирает проект без графического запуска; фактический Vulkan runtime
+ресурсов. Сцена `physics` объявляет быстрые префабы пули и следа (`bullet.rveprefab`,
+`bullet_hole.rveprefab` с `max_instances = 100`): они попадают в архив `scene-physics`.
+`prefabs.rveprefabs` добавляет тяжёлую `tower.rveprefab`, которую не использует ни одна
+сцена, поэтому она лежит в `shared`. CI собирает проект без графического запуска; фактический Vulkan runtime
 требует совместимое устройство.
 
 Исходники: `tools/rve-build/src/main.rs`, `cli.rs`, `error.rs`, `project.rs`,

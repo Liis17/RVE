@@ -189,6 +189,7 @@ path = "/prefabs/rock.rveprefab"
 - `engine-runtime` использует `BootstrapConfig` и `ProjectSettings`; бинарник
   `rve-player` получает их поведение через runtime.
 - `rve-build` проверяет обе конфигурации, сцены и связанные ресурсы перед сборкой.
+- `rve-editor` читает и сохраняет `prefabs.rveprefabs` в подокне «Префабы проекта» ([[Engine/RveEditor#Префабы]]).
 
 Формат `.rvescene` описан в [[Engine/EngineScene]], пути и layout player — в
 [[Engine/EngineRuntime]] и [[Engine/RveBuild]].
