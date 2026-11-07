@@ -3821,6 +3821,78 @@ return Move
         drop((frame_tx, control_tx));
     }
 
+    /// Backend для проверки порядка завершения: записывает `release_scene`, `wait_idle` и drop.
+    struct TeardownBackend {
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl RenderBackend for TeardownBackend {
+        fn resize(&mut self, _width: u32, _height: u32) {}
+
+        fn render(
+            &mut self,
+            _snapshot: &FrameSnapshot,
+            _width: u32,
+            _height: u32,
+        ) -> Result<FrameOutcome, String> {
+            Ok(FrameOutcome {
+                status: FrameStatus::Presented,
+                submitted: true,
+            })
+        }
+
+        fn release_scene(&mut self) {
+            self.log.lock().unwrap().push("release_scene");
+        }
+
+        fn wait_idle(&mut self) {
+            self.log.lock().unwrap().push("wait_idle");
+        }
+    }
+
+    impl Drop for TeardownBackend {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push("drop");
+        }
+    }
+
+    #[test]
+    fn render_thread_releases_scene_once_before_waiting_and_dropping_backend() {
+        // Регрессия: ресурсы сцены освобождаются один раз, до wait_idle и уничтожения backend.
+        let teardown = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (frame_tx, frame_rx) = flume::unbounded();
+        let (control_tx, control_rx) = flume::unbounded();
+        let (script_tx, _script_rx) = flume::unbounded();
+        let (stopped_tx, stopped_rx) = flume::bounded(1);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let status = Arc::new(RuntimeStatus::default());
+        frame_tx.send(Arc::new(empty_snapshot())).unwrap();
+        render_thread(RenderThreadConfig {
+            backend: Box::new(TeardownBackend {
+                log: Arc::clone(&teardown),
+            }),
+            width: 640,
+            height: 480,
+            frame_limit: Some(1),
+            frame_rx,
+            control_tx: control_tx.clone(),
+            control_rx,
+            script_tx,
+            interrupt: ScriptInterruptHandle::new(),
+            status: Arc::clone(&status),
+            stopped_tx,
+            exit: Arc::new(FakeExit(exit_tx)),
+        });
+        stopped_rx.recv().unwrap();
+        exit_rx.recv().unwrap();
+        assert_eq!(status.exit_code(), 0);
+        assert_eq!(
+            *teardown.lock().unwrap(),
+            ["release_scene", "wait_idle", "drop"]
+        );
+        drop((frame_tx, control_tx));
+    }
+
     #[test]
     fn render_guard_catches_panics_and_errors_before_marking_stopped_and_exiting() {
         for backend in [
