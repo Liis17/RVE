@@ -2,6 +2,7 @@
 
 use engine_scene::camera::Camera;
 use glam::{Mat4, Vec3};
+use std::f32::consts::{FRAC_PI_2, PI};
 
 const MIN_DISTANCE: f32 = 0.05;
 /// Меньшая сфера занимает на экране единицы пикселей, и её легко не заметить.
@@ -11,6 +12,19 @@ const MAX_PITCH: f32 = 1.54;
 const ORBIT_RADIANS_PER_POINT: f32 = 0.006;
 const ZOOM_PER_WHEEL_POINT: f32 = 0.0025;
 const FOV_NARROW: f32 = std::f32::consts::FRAC_PI_3;
+
+/// Стандартный вид Scene. Глаз камеры находится на стороне, которую назван вид:
+/// `Front` смотрит вдоль -Z (движок: вперёд — -Z, глаз на +Z), `Right` — вдоль -X.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Front,
+    Back,
+    Right,
+    Left,
+    /// Экранный верх направлен в -Z, то есть от вида `Front`.
+    Top,
+    Bottom,
+}
 
 /// Камера, вращающаяся вокруг цели. Горизонт всегда остаётся горизонтальным.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -116,6 +130,43 @@ impl EditorCamera {
         self.target = center;
         let half_fov = FOV_NARROW * 0.5;
         self.distance = (radius.max(0.05) / half_fov.sin() * 1.2).clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    /// Ставит стандартный вид; цель и расстояние сохраняются.
+    pub fn set_view(&mut self, view: View) {
+        (self.yaw, self.pitch) = match view {
+            View::Front => (0.0, 0.0),
+            View::Back => (PI, 0.0),
+            View::Right => (FRAC_PI_2, 0.0),
+            View::Left => (-FRAC_PI_2, 0.0),
+            View::Top => (0.0, MAX_PITCH),
+            View::Bottom => (0.0, -MAX_PITCH),
+        };
+    }
+
+    /// Смещает глаз вокруг цели на шаг: положительный `yaw` уводит глаз вправо (к +X при виде `Front`),
+    /// положительный `pitch` поднимает его.
+    pub fn rotate_by(&mut self, yaw: f32, pitch: f32) {
+        self.yaw += yaw;
+        self.pitch = (self.pitch + pitch).clamp(-MAX_PITCH, MAX_PITCH);
+    }
+
+    /// Смотрит с противоположной стороны: глаз переносится через цель.
+    pub fn opposite(&mut self) {
+        self.yaw += PI;
+        self.pitch = -self.pitch;
+    }
+
+    /// Ставит глаз в `position` и направляет взгляд по `forward`, расстояние сохраняется.
+    /// Нулевой `forward` ничего не меняет.
+    pub fn align_to(&mut self, position: Vec3, forward: Vec3) {
+        let Some(forward) = forward.try_normalize() else {
+            return;
+        };
+        let back = -forward;
+        self.pitch = back.y.clamp(-1.0, 1.0).asin().clamp(-MAX_PITCH, MAX_PITCH);
+        self.yaw = back.x.atan2(back.z);
+        self.target = position - self.back() * self.distance;
     }
 }
 
@@ -304,6 +355,29 @@ mod tests {
     }
 
     #[test]
+    fn focus_keeps_the_whole_sphere_in_landscape_portrait_and_square_views() {
+        let center = Vec3::new(4.0, 1.0, -2.0);
+        let radius = 3.0;
+        for (width, height) in [(1280, 720), (720, 1280), (800, 800)] {
+            let mut camera = EditorCamera::default();
+            camera.focus(center, radius);
+            let view_projection = camera.camera().view_projection(width, height);
+            // Равномерно разложенные точки на поверхности сферы.
+            for index in 0..256 {
+                let y = 1.0 - 2.0 * (index as f32 + 0.5) / 256.0;
+                let ring = (1.0 - y * y).sqrt();
+                let angle = index as f32 * 2.399_963;
+                let point = center + radius * Vec3::new(ring * angle.cos(), y, ring * angle.sin());
+                let [u, v] = project_point(view_projection, point).expect("точка перед камерой");
+                assert!(
+                    (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v),
+                    "{width}x{height}: точка сферы вне кадра ({u}, {v})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn center_ray_points_at_the_target() {
         let camera = EditorCamera::default();
         let view_projection = camera.camera().view_projection(800, 600);
@@ -333,5 +407,81 @@ mod tests {
         let view_projection = camera.camera().view_projection(800, 600);
         let behind = camera.eye() + (camera.eye() - camera.target);
         assert_eq!(project_point(view_projection, behind), None);
+    }
+
+    #[test]
+    fn standard_views_put_the_eye_on_the_named_side_and_keep_target_and_distance() {
+        let original = EditorCamera {
+            target: Vec3::new(1.0, 2.0, 3.0),
+            distance: 4.0,
+            ..EditorCamera::default()
+        };
+        let side = |view| {
+            let mut camera = original;
+            camera.set_view(view);
+            assert_eq!(camera.target, original.target);
+            assert_eq!(camera.distance, original.distance);
+            (camera.eye() - camera.target) / camera.distance
+        };
+        assert_near(side(View::Front), Vec3::Z);
+        assert_near(side(View::Back), -Vec3::Z);
+        assert_near(side(View::Right), Vec3::X);
+        assert_near(side(View::Left), -Vec3::X);
+        assert!(side(View::Top).y > 0.999);
+        assert!(side(View::Bottom).y < -0.999);
+        // Вид сверху: экранный верх уходит в -Z, как у Front с поднятым глазом.
+        let mut top = original;
+        top.set_view(View::Top);
+        assert!(top.up().z < -0.999);
+    }
+
+    #[test]
+    fn rotate_steps_move_the_eye_around_the_target_and_clamp_pitch() {
+        let mut camera = EditorCamera {
+            yaw: 0.0,
+            pitch: 0.0,
+            ..EditorCamera::default()
+        };
+        let target = camera.target;
+        let distance = camera.distance;
+        camera.rotate_by(-PI / 12.0, 0.0);
+        assert!(camera.eye().x < -1.0);
+        assert_near(camera.target, target);
+        assert!((camera.eye().distance(target) - distance).abs() < 1e-3);
+        camera.rotate_by(0.0, 10.0);
+        assert_eq!(camera.pitch, MAX_PITCH);
+        camera.rotate_by(0.0, -20.0);
+        assert_eq!(camera.pitch, -MAX_PITCH);
+    }
+
+    #[test]
+    fn opposite_view_mirrors_the_eye_through_the_target() {
+        let mut camera = EditorCamera {
+            yaw: 0.7,
+            pitch: 0.3,
+            ..EditorCamera::default()
+        };
+        let target = camera.target;
+        let eye = camera.eye();
+        camera.opposite();
+        assert_eq!(camera.target, target);
+        assert_near(camera.eye(), target * 2.0 - eye);
+    }
+
+    #[test]
+    fn align_to_puts_the_eye_at_the_position_and_looks_along_forward() {
+        let mut camera = EditorCamera::default();
+        let distance = camera.distance;
+        let position = Vec3::new(2.0, 3.0, -4.0);
+        let forward = Vec3::new(1.0, -2.0, 3.0).normalize();
+        camera.align_to(position, forward);
+        assert_near(camera.eye(), position);
+        assert_near((camera.target - camera.eye()).normalize(), forward);
+        assert_near(camera.target, position + forward * distance);
+        assert_eq!(camera.distance, distance);
+
+        let before = camera;
+        camera.align_to(position, Vec3::ZERO);
+        assert_eq!(camera, before);
     }
 }

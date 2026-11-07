@@ -35,6 +35,10 @@ flume.workspace = true
 [dev-dependencies]
 rve-sdk = { path = "../engine/rve-sdk" }
 
+[build-dependencies]
+# Растеризация иконок из IconsPack на этапе сборки; в рантайм-бинарь не попадает.
+resvg = { version = "=0.49.0", default-features = false }
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

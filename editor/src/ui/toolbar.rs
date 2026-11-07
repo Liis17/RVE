@@ -17,6 +17,8 @@ const REDO_SHIFT: KeyboardShortcut =
 const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
 
 pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
+    // Команды numpad забираются всегда: при модальном окне или вводе текста они отбрасываются.
+    let view_commands = std::mem::take(&mut state.view_commands);
     // Модальное окно перекрывает указатель, но не клавиатуру: правки за ним запрещены.
     if state.unsaved_prompt.is_some()
         || state.project_dialog.is_some()
@@ -45,6 +47,9 @@ pub fn handle_shortcuts(ctx: &egui::Context, state: &mut EditorState) {
         || ctx.input(|input| input.pointer.secondary_down())
     {
         return;
+    }
+    for command in view_commands {
+        scene_view::apply_view_command(state, command);
     }
     if ctx.input_mut(|input| input.consume_shortcut(&DUPLICATE)) {
         duplicate_selection(state);
@@ -101,8 +106,8 @@ pub fn rename_selection(state: &mut EditorState) {
         .as_ref()
         .and_then(|scene| scene.selected_object())
         .map(|object| (object.id.clone(), object.display_name().to_owned()));
-    if let Some(rename) = selected {
-        state.hierarchy_rename = Some(rename);
+    if let Some((id, text)) = selected {
+        state.begin_hierarchy_rename(id, text);
     }
 }
 

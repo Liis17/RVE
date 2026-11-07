@@ -18,6 +18,11 @@ use egui_dock::{DockArea, DockState, Style};
 
 /// Строит весь интерфейс кадра.
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab>) {
+    // Видимость и наведение панелей известны только с прошлого кадра: сброс ниже их стирает.
+    // В Play numpad-команды Scene действуют, лишь если Scene показана и курсор не над Game.
+    if state.is_playing() && (!state.scene_view.visible || state.game_view.hovered) {
+        state.view_commands.clear();
+    }
     state.scene_view.visible = false;
     state.scene_view.hovered = false;
     state.scene_view.rect = None;

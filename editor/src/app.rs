@@ -8,9 +8,11 @@ use crate::play::PlaySession;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
 use crate::settings::{SettingsStore, UserSettings};
-use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt};
+use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt, ViewCommand};
 use crate::ui;
+use crate::ui::game_view;
 use crate::ui::scene_view::bounding_sphere;
+use crate::viewport::camera::View;
 use crate::viewport::render::{SceneRenderer, render_local_lights};
 use egui_dock::DockState;
 use engine_console::{
@@ -29,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use winit::event::ElementState;
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
 /// Цвет окна за панелями; всё окно закрыто UI, поэтому заметен только при первом кадре.
 const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
@@ -41,6 +43,8 @@ const BUILD_POLL: Duration = Duration::from_millis(50);
 pub struct EditorApp {
     state: EditorState,
     control_click: bool,
+    /// Модификаторы из `ModifiersChanged`: numpad-команды Scene различаются по Ctrl.
+    modifiers: ModifiersState,
     dock: DockState<Tab>,
     /// Файл настроек пользователя; `None`, если каталог настроек ОС неизвестен.
     settings: Option<SettingsStore>,
@@ -91,6 +95,7 @@ impl EditorApp {
         Self {
             state,
             control_click: false,
+            modifiers: ModifiersState::empty(),
             dock,
             settings,
             initial_project: project,
@@ -962,8 +967,7 @@ impl EditorApp {
         })();
         match result {
             Ok(session) => {
-                self.state.play = Some(session);
-                self.state.gizmo_drag = None;
+                self.state.enter_play(session);
                 self.state.log.info("Play");
             }
             Err(error) => self.state.log.error(error),
@@ -1140,6 +1144,9 @@ impl EditorApp {
         self.state
             .previews
             .upload(&mut gpu.renderer, &mut self.bridge, &mut self.state.log)?;
+        self.state
+            .icons
+            .upload(&mut gpu.renderer, &mut self.bridge)?;
         if self.state.viewport_texture.is_none() {
             self.state.viewport_texture = Some(self.bridge.register_viewport(gpu.scene.viewport));
         }
@@ -1394,10 +1401,7 @@ fn render_scene_frame(
                 ),
             );
         }
-        let game_camera_handle = game_camera_id
-            .and_then(|id| parts.world.handle(&id))
-            .filter(|handle| parts.world.camera_of(*handle).is_some())
-            .unwrap_or_else(|| parts.world.active_camera());
+        let game_camera_handle = game_view::camera_handle(parts.world, game_camera_id.as_deref());
         let game_camera = parts
             .world
             .camera_of(game_camera_handle)
@@ -1631,6 +1635,25 @@ impl WindowHandler for EditorApp {
             }
             return;
         }
+        if let WindowEvent::ModifiersChanged(modifiers) = event {
+            self.modifiers = modifiers.state();
+        }
+        // Numpad приходит в egui как обычные цифры и точка, поэтому событие не прерывается:
+        // текстовое поле получает его как раньше, а команда камеры отбрасывается в обработке горячих клавиш.
+        if let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = event
+            && let PhysicalKey::Code(code) = event.physical_key
+            && let Some(command) = numpad_command(code, self.modifiers.control_key())
+            && event.state == ElementState::Pressed
+            && (!event.repeat || command.repeats())
+            && !*is_synthetic
+        {
+            self.state.view_commands.push(command);
+            window.request_redraw();
+        }
         if let WindowEvent::DroppedFile(path) = event
             && self.state.project.is_some()
         {
@@ -1784,10 +1807,75 @@ impl WindowHandler for EditorApp {
     }
 }
 
+/// Шаг вращения numpad: 15°.
+const NUMPAD_ROTATE_STEP: f32 = std::f32::consts::PI / 12.0;
+
+/// Раскладка numpad камеры Scene как в Blender. Ctrl переворачивает виды 1, 3 и 7,
+/// остальным клавишам с Ctrl команды не назначены.
+fn numpad_command(code: KeyCode, ctrl: bool) -> Option<ViewCommand> {
+    let look =
+        |plain: View, with_ctrl: View| ViewCommand::Look(if ctrl { with_ctrl } else { plain });
+    let rotate = |yaw: f32, pitch: f32| ViewCommand::Rotate { yaw, pitch };
+    match code {
+        KeyCode::Numpad1 => Some(look(View::Front, View::Back)),
+        KeyCode::Numpad3 => Some(look(View::Right, View::Left)),
+        KeyCode::Numpad7 => Some(look(View::Top, View::Bottom)),
+        _ if ctrl => None,
+        KeyCode::NumpadDecimal => Some(ViewCommand::Frame),
+        KeyCode::Numpad0 => Some(ViewCommand::AlignToGame),
+        KeyCode::Numpad9 => Some(ViewCommand::Opposite),
+        // Глаз уходит в сторону клавиши: 8 — вверх, 4 — влево от зрителя.
+        KeyCode::Numpad8 => Some(rotate(0.0, NUMPAD_ROTATE_STEP)),
+        KeyCode::Numpad2 => Some(rotate(0.0, -NUMPAD_ROTATE_STEP)),
+        KeyCode::Numpad4 => Some(rotate(-NUMPAD_ROTATE_STEP, 0.0)),
+        KeyCode::Numpad6 => Some(rotate(NUMPAD_ROTATE_STEP, 0.0)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui::{Event, Key, Modifiers, RawInput, Rect, pos2, vec2};
+
+    #[test]
+    fn numpad_keys_map_to_scene_commands_and_ctrl_flips_the_front_views() {
+        assert_eq!(
+            numpad_command(KeyCode::Numpad1, false),
+            Some(ViewCommand::Look(View::Front))
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad1, true),
+            Some(ViewCommand::Look(View::Back))
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad3, true),
+            Some(ViewCommand::Look(View::Left))
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad7, true),
+            Some(ViewCommand::Look(View::Bottom))
+        );
+        assert_eq!(
+            numpad_command(KeyCode::NumpadDecimal, false),
+            Some(ViewCommand::Frame)
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad0, false),
+            Some(ViewCommand::AlignToGame)
+        );
+        assert_eq!(
+            numpad_command(KeyCode::Numpad4, false),
+            Some(ViewCommand::Rotate {
+                yaw: -NUMPAD_ROTATE_STEP,
+                pitch: 0.0
+            })
+        );
+        assert_eq!(numpad_command(KeyCode::Numpad4, true), None);
+        assert_eq!(numpad_command(KeyCode::Digit4, false), None);
+        assert!(numpad_command(KeyCode::Numpad8, false).is_some_and(ViewCommand::repeats));
+        assert!(!ViewCommand::Frame.repeats());
+    }
     use engine_scene::SceneDocument;
 
     fn console_frame(

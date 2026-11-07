@@ -4,11 +4,12 @@ use crate::asset_watch::AssetChanges;
 use crate::assets_fs::{AssetEntry, AssetKind};
 use crate::build::{BuildJob, ScriptGeneration, ScriptsJob};
 use crate::console::ConsoleLog;
+use crate::icons::IconCache;
 use crate::play::PlaySession;
 use crate::previews::PreviewCache;
 use crate::project::OpenProject;
 use crate::scene_edit::{Component, EditorScene, NewObject};
-use crate::viewport::camera::EditorCamera;
+use crate::viewport::camera::{EditorCamera, View};
 use crate::viewport::colliders::ColliderCache;
 use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use crate::viewport::model_loader::ModelLoader;
@@ -84,6 +85,29 @@ pub struct UnsavedPrompt {
 #[derive(Clone, Debug)]
 pub struct AssetDrag(pub String);
 
+/// Команда numpad для камеры Scene. Копится между кадрами и применяется в начале кадра.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ViewCommand {
+    /// Навести камеру на выделенный объект.
+    Frame,
+    Look(View),
+    /// Шаг вращения глаза вокруг цели, в радианах.
+    Rotate {
+        yaw: f32,
+        pitch: f32,
+    },
+    Opposite,
+    /// Камера редактора принимает положение и направление камеры вкладки Game.
+    AlignToGame,
+}
+
+impl ViewCommand {
+    /// Повтор клавиши (удержание) допустим только для шагов вращения.
+    pub fn repeats(self) -> bool {
+        matches!(self, Self::Rotate { .. })
+    }
+}
+
 /// Сведения о панели Scene за текущий кадр.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SceneViewInfo {
@@ -118,6 +142,8 @@ pub struct EditorState {
     pub space: GizmoSpace,
     pub snap: SnapSettings,
     pub camera: EditorCamera,
+    /// Команды numpad для камеры Scene, ожидающие применения в начале кадра.
+    pub view_commands: Vec<ViewCommand>,
     pub scroll_navigation: crate::gestures::ScrollNavigation,
     pub last_wheel_trackpad: bool,
     pub smart_zoom: bool,
@@ -141,6 +167,8 @@ pub struct EditorState {
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
     pub new_project_dialog: Option<crate::new_project::NewProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
+    /// Текстовому полю переименования ещё нужно передать фокус; снимается после первого запроса.
+    pub hierarchy_rename_focus: bool,
     /// В прошлом кадре фокус был в текстовом поле: Esc этого кадра закрывает поле,
     /// а не снимает выделение.
     pub text_focused_last_frame: bool,
@@ -152,6 +180,8 @@ pub struct EditorState {
     /// Компонент, скопированный в Inspector для вставки в объекты.
     pub component_clipboard: Option<Component>,
     pub previews: PreviewCache,
+    /// Иконки папок для плиток панели Project.
+    pub icons: IconCache,
     pub viewport_texture: Option<egui::TextureId>,
     pub scene_view: SceneViewInfo,
     pub game_viewport_texture: Option<egui::TextureId>,
@@ -190,6 +220,7 @@ impl EditorState {
             space: GizmoSpace::Global,
             snap: SnapSettings::default(),
             camera: EditorCamera::default(),
+            view_commands: Vec::new(),
             scroll_navigation: Default::default(),
             last_wheel_trackpad: false,
             smart_zoom: false,
@@ -209,12 +240,14 @@ impl EditorState {
             project_dialog: None,
             new_project_dialog: None,
             hierarchy_rename: None,
+            hierarchy_rename_focus: false,
             text_focused_last_frame: false,
             console_open: false,
             hierarchy_filter: String::new(),
             project_filter: String::new(),
             component_clipboard: None,
             previews: PreviewCache::default(),
+            icons: IconCache::default(),
             viewport_texture: None,
             scene_view: SceneViewInfo::default(),
             game_viewport_texture: None,
@@ -236,6 +269,20 @@ impl EditorState {
 
     pub fn is_playing(&self) -> bool {
         self.play.is_some()
+    }
+
+    /// Начинает переименование в Hierarchy; поле получит фокус один раз при отрисовке.
+    pub fn begin_hierarchy_rename(&mut self, id: String, text: String) {
+        self.hierarchy_rename = Some((id, text));
+        self.hierarchy_rename_focus = true;
+    }
+
+    /// Переход в Play-режим: активное переименование в Hierarchy отменяется.
+    pub fn enter_play(&mut self, session: PlaySession) {
+        self.play = Some(session);
+        self.gizmo_drag = None;
+        self.hierarchy_rename = None;
+        self.hierarchy_rename_focus = false;
     }
 
     /// Курсор над изображением сцены: ввод Play-режима относится к игре.

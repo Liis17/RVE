@@ -1,6 +1,7 @@
 //! Панель Scene: изображение сцены, камера редактора, выделение и гизмо.
 
-use crate::state::{AssetDrag, EditorState};
+use super::game_view;
+use crate::state::{AssetDrag, EditorState, ViewCommand};
 use crate::viewport::camera::{Ray, ground_point, project_point, screen_ray};
 use crate::viewport::colliders::{ColliderWire, WireSource, WireStyle, source_wires};
 use crate::viewport::gizmo::{DragTarget, GizmoDrag, GizmoTool, gizmo_axes};
@@ -699,6 +700,33 @@ pub fn focus_selection(state: &mut EditorState) {
         None => (matrix.w_axis.truncate(), 1.0),
     };
     state.camera.focus(center, radius);
+}
+
+/// Применяет команду numpad к камере Scene; отбор по режиму и вводу делает `ui::show`.
+pub fn apply_view_command(state: &mut EditorState, command: ViewCommand) {
+    match command {
+        ViewCommand::Frame => focus_selection(state),
+        ViewCommand::Look(view) => state.camera.set_view(view),
+        ViewCommand::Rotate { yaw, pitch } => state.camera.rotate_by(yaw, pitch),
+        ViewCommand::Opposite => state.camera.opposite(),
+        ViewCommand::AlignToGame => align_to_game_camera(state),
+    }
+}
+
+/// Ставит камеру Scene на место камеры Game; без камеры в мире ничего не делает.
+fn align_to_game_camera(state: &mut EditorState) {
+    let selected = state.game_camera.clone();
+    let Some(world) = state.world_mut() else {
+        return;
+    };
+    world.recalculate_world_matrices();
+    let handle = game_view::camera_handle(world, selected.as_deref());
+    let Some(camera) = world.camera_of(handle) else {
+        return;
+    };
+    state
+        .camera
+        .align_to(camera.position, camera.target - camera.position);
 }
 
 /// Мировая сфера вокруг границ модели, размещённой матрицей `matrix`.
