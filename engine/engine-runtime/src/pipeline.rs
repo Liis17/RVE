@@ -702,6 +702,7 @@ fn scripts_thread(
             interrupt: interrupt.clone(),
             call_time_limit: Some(SCRIPT_CALL_TIME_LIMIT),
             input: input_settings,
+            prefabs: Default::default(),
         },
     ) {
         Ok(scripts) => scripts,

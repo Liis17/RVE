@@ -1,10 +1,14 @@
 //! Lightweight Lua and ABI-loaded Rust scripts for scene objects.
 
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod abi_host;
 mod abi_string;
 mod actions;
 mod host;
 mod library;
+mod lifecycle;
 mod lite;
 mod physics;
 mod transaction;
@@ -16,6 +20,9 @@ pub use host::{
     lite_properties,
 };
 pub use library::{ScriptLibrary, ScriptLibraryError};
+pub use lifecycle::{
+    PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, PrefabStatus, SpawnedObject, WorldChanges,
+};
 pub use rve_sdk::{Key, MouseButton};
 pub use types::{
     ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,

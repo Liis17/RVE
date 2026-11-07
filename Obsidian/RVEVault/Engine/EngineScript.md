@@ -49,6 +49,18 @@ Lua `rve.find(id)` возвращает `nil` или объект с `id`, `name
 
 Lua API `rve.console.write(text, level?)` создаёт `ScriptEvent`; уровень по умолчанию `info`, допустимы `info`/`log`, `warning`/`warn` и `error`, неизвестный уровень даёт Lua error. `rve.console.register(name, callback, description?)` и `unregister(name)` доступны только внутри callback скрипта. Имя должно соответствовать `[a-z_][a-z0-9_.]{0,63}`; `help`/`clear` зарезервированы, имя команды глобально уникально. Команда принадлежит зарегистрировавшему её экземпляру; callback получает массив строковых аргументов, а возвращённая строка выводится как Info. См. [[Engine/EngineConsole]].
 
+## Создание и удаление объектов
+
+- `spawn` и `destroy` (и запросы загрузки префабов) входят в транзакцию callback: при ошибке callback откатываются. Они запрещены в `create`, в top-level chunk, в `on_destroy` при удалении хостом и после `ScriptHost::destroy`. Удаление поддерева, вызванное применением заявок, тоже не разрешает новые spawn и destroy.
+- `spawn` резервирует корень сразу и возвращает pending-объект: `find` его не видит, `is_alive` ложно, `is_pending` истинно, `send` принимается. Явный id проверяется на коллизию с живыми объектами, pending-объектами транзакции и хоста. Откат освобождает резерв с увеличением поколения, поэтому сохранённый хендл не оживает на чужом объекте.
+- Заявки применяются в конце фазы `start`, `update` и `execute_command` в порядке commit: объекты попадают в `World`, создаются экземпляры, `on_start` выполняется в начале следующего `update` до сообщений, затем участвует в `on_update` этого же кадра. Ошибка любого шага применения откатывает весь spawn и пишет Error.
+- `destroy` удаляет поддерево. Без задержки удаление выполняется в конце фазы после spawn, с задержкой — по `ScriptTime.elapsed`, и побеждает более ранний срок. Запущенные экземпляры получают `on_destroy` до удаления, их команды консоли снимаются. Поддерево с активной камерой не удаляется, пишется Error.
+- `max_instances` считает только корни spawn. При превышении удаляется самый старый корень с `on_destroy`. Лимиты: 4096 spawn-объектов за кадр и 4096 заявок в очереди; превышение даёт Error и отказ.
+- Тяжёлый префаб без загрузки: spawn запускает загрузку, объект остаётся pending. `ScriptHost::register_prefab` завершает ожидающие spawn, `prefab_failed` делает их мёртвыми с Error. Выгрузка откладывается до последнего экземпляра и ожидающих spawn, после чего хост запрашивает `Unload`; `prefab_released` возвращает префаб в `unloaded`. Состояния: `resident` (быстрый), `unloaded`, `loading`, `loaded`, `unloading`, `failed`.
+- `drain_world_changes` отдаёт `spawned` (корень, все объекты поддерева, номер регистрации шаблона, начальная скорость корня), `despawned` (включая потомков) и запросы загрузки. Внутри одной фазы `spawned` идёт раньше `despawned`.
+- Мёртвый объект: чтение даёт `nil`, запись — `false`, Warn выдаётся один раз на пару «экземпляр + объект». Физические события с удалённым `other` доставляются выжившему; привязка удалённого тела живёт до следующего результата шага физики.
+- Id spawn-объекта без явного `id` известен только после применения, поэтому у pending-объекта `object.id` равен `nil`.
+
 ## Физика скриптов
 
 Физический контекст необязателен. Runtime и editor Play подключают immutable snapshot и bindings до `on_start`, передают результаты и события перед update и забирают committed команды после него. Вне этих интеграций вызывающий код может использовать те же `ScriptHost` hooks напрямую; host не создаёт и не шагает `PhysicsWorld`.
@@ -75,4 +87,4 @@ Runtime error Lua, panic ABI-скрипта или не конечная тра�
 
 ## Источники
 
-`engine/engine-script/src/host.rs`, `engine/engine-script/src/actions.rs`, `engine/engine-script/src/transaction.rs`, `engine/engine-script/src/library.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/types.rs`, `engine/rve-sdk/Cargo.toml`.
+`engine/engine-script/src/host.rs`, `engine/engine-script/src/actions.rs`, `engine/engine-script/src/transaction.rs`, `engine/engine-script/src/lifecycle.rs`, `engine/engine-script/src/library.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/types.rs`, `engine/rve-sdk/Cargo.toml`.

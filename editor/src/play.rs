@@ -285,6 +285,7 @@ impl PlaySession {
                 interrupt,
                 call_time_limit: None,
                 input: input_settings.clone(),
+                prefabs: Default::default(),
             },
         )
         .map_err(|error| error.to_string())?;

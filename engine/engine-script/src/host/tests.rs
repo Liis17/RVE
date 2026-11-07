@@ -2996,6 +2996,7 @@ return Neighbor
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
             input: Default::default(),
+            prefabs: Default::default(),
         },
     )
     .unwrap();
@@ -3090,8 +3091,8 @@ return Neighbor
                 && event.message.contains("Lua call exceeded time limit"))
     );
     assert!(!events.iter().any(|event| event.message == "lookup escaped"));
-    assert!(!host.instances[0].enabled);
-    assert!(host.instances[1].enabled);
+    assert!(!host.instances[0].as_ref().expect("instance").enabled);
+    assert!(host.instances[1].as_ref().expect("instance").enabled);
     host.update(&mut world, 0.1, ScriptTime::default());
     assert!(
         host.drain_events()
@@ -3154,8 +3155,8 @@ return Neighbor
         Err(crate::CommandError::Failed(message)) if message.contains("Lua call exceeded time limit")));
     assert!(host.command_catalog().get("loop").is_none());
     assert!(host.command_catalog().get("other").is_none());
-    assert!(!host.instances[0].enabled);
-    assert!(host.instances[1].enabled);
+    assert!(!host.instances[0].as_ref().expect("instance").enabled);
+    assert!(host.instances[1].as_ref().expect("instance").enabled);
     assert!(matches!(
         host.execute_command(&mut world, &command),
         Err(crate::CommandError::Unknown(_))
@@ -3190,6 +3191,7 @@ return Script
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
             input: Default::default(),
+            prefabs: Default::default(),
         },
     )
     .unwrap();
@@ -3219,6 +3221,7 @@ fn lua_call_deadline_applies_to_top_level_chunks_and_is_optional() {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
             input: Default::default(),
+            prefabs: Default::default(),
         },
     );
     assert!(matches!(
@@ -3246,6 +3249,7 @@ return Script
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: None,
             input: Default::default(),
+            prefabs: Default::default(),
         },
     )
     .unwrap();

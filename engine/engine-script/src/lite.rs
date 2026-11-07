@@ -1,4 +1,5 @@
 use crate::actions::{ActionMutation, ActionValue};
+use crate::lifecycle::{ObjectState, PrefabRequest, SpawnArgs};
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
     ScriptTransaction,
@@ -268,6 +269,7 @@ pub(crate) fn create_lua(
     lua.set_memory_limit(LUA_MEMORY_LIMIT_BYTES)?;
     call_deadline.install_sparse_hook(&lua)?;
 
+    create_object_handles(&lua)?;
     let globals = lua.globals();
     globals.set("dofile", Value::Nil)?;
     globals.set("loadfile", Value::Nil)?;
@@ -385,6 +387,9 @@ pub(crate) fn create_lua(
         "active_camera",
         active_camera_function(&lua, active_call.clone())?,
     )?;
+    rve.set("spawn", spawn_function(&lua, active_call.clone())?)?;
+    rve.set("destroy", destroy_function(&lua, active_call.clone())?)?;
+    rve.set("prefabs", prefabs_table(&lua, active_call.clone())?)?;
     rve.set("send", send_function(&lua, active_call.clone())?)?;
     rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
     rve.set("audio", audio_table(&lua, active_call.clone())?)?;
@@ -689,10 +694,7 @@ impl LuaInstance {
         event: LitePhysicsEvent,
     ) -> mlua::Result<()> {
         let other_data = with_active_call(active_call, |transaction| {
-            Ok(transaction
-                .object_id(event.other)
-                .zip(transaction.object_name(event.other))
-                .map(|(id, name)| (id.to_owned(), name.to_owned())))
+            Ok(transaction.object_identity(event.other))
         })?;
         let Some((id, name)) = other_data else {
             return Err(LuaError::runtime(
@@ -874,6 +876,43 @@ fn with_active_call<T>(
     callback(unsafe { &mut *transaction })
 }
 
+/// Ключ реестра Lua с таблицей «объект → хендл»; ключи слабые, поэтому записи уходят вместе с объектами.
+const OBJECT_HANDLES_KEY: &str = "rve.object_handles";
+
+fn create_object_handles(lua: &Lua) -> mlua::Result<()> {
+    let handles = lua.create_table()?;
+    let mode = lua.create_table()?;
+    mode.set("__mode", "k")?;
+    handles.set_metatable(Some(mode))?;
+    lua.set_named_registry_value(OBJECT_HANDLES_KEY, handles)
+}
+
+fn register_object_handle(lua: &Lua, object: &Table, handle: ObjectHandle) -> mlua::Result<()> {
+    let value = handle
+        .to_abi()
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| LuaError::runtime("object handle cannot be represented in Lua"))?;
+    let handles: Table = lua.named_registry_value(OBJECT_HANDLES_KEY)?;
+    handles.raw_set(object.clone(), value)
+}
+
+/// Хендл объекта, который вернул `rve.find`, `rve.spawn` или методы объекта.
+fn object_handle_of(lua: &Lua, object: &Table) -> mlua::Result<Option<ObjectHandle>> {
+    let handles: Table = lua.named_registry_value(OBJECT_HANDLES_KEY)?;
+    Ok(match handles.raw_get::<Value>(object.clone())? {
+        Value::Integer(value) => u64::try_from(value).ok().and_then(ObjectHandle::from_abi),
+        _ => None,
+    })
+}
+
+/// Живой ли объект для метода. Мёртвый объект пишет Warn один раз на пару «экземпляр + объект»;
+/// вызывающий отвечает `nil` для чтения и `false` для записи.
+fn object_alive(active_call: &ActiveCall, handle: ObjectHandle) -> mlua::Result<bool> {
+    with_active_call(active_call, |transaction| {
+        Ok(transaction.object_access(handle) == ObjectState::Alive)
+    })
+}
+
 fn find_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
     lua.create_function(move |lua, id: String| {
         let found = with_active_call(&active_call, |transaction| {
@@ -891,7 +930,7 @@ fn find_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
         Ok(Some(object_table(
             lua,
             handle,
-            id,
+            Some(id),
             name,
             active_call.clone(),
         )?))
@@ -915,35 +954,43 @@ fn active_camera_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Fu
         Ok(Some(object_table(
             lua,
             handle,
-            id,
+            Some(id),
             name,
             active_call.clone(),
         )?))
     })
 }
 
+/// Таблица объекта. `id` равен `None`, если у объекта без явного id ещё нет имени в мире
+/// (pending spawn). Методы захватывают хендл, поэтому устаревшая таблица не попадает на чужой объект.
 fn object_table(
     lua: &Lua,
     handle: ObjectHandle,
-    id: String,
+    id: Option<String>,
     name: String,
     active_call: ActiveCall,
 ) -> mlua::Result<Table> {
     let object = lua.create_table()?;
     object.set("id", id)?;
     object.set("name", name)?;
-    object.raw_set("_rve_handle", handle.index() as i64 + 1)?;
+    register_object_handle(lua, &object, handle)?;
 
     let get_active = active_call.clone();
     object.set(
         "get_transform",
         lua.create_function(move |lua, _arguments: MultiValue| {
+            if !object_alive(&get_active, handle)? {
+                return Ok(Value::Nil);
+            }
             let transform = with_active_call(&get_active, |transaction| {
                 Ok(transaction.local_transform(handle))
             })?;
-            transform
-                .map(|value| lua.create_userdata(TransformUserData { value }))
-                .transpose()
+            match transform {
+                Some(value) => Ok(Value::UserData(
+                    lua.create_userdata(TransformUserData { value })?,
+                )),
+                None => Ok(Value::Nil),
+            }
         })?,
     )?;
 
@@ -963,22 +1010,20 @@ fn object_table(
                 ));
             };
             let transform = value.borrow::<TransformUserData>()?.value;
-            let (writable, accepted) = with_active_call(&set_active, |transaction| {
-                Ok((
-                    transaction.writable(),
-                    transaction.set_local_transform(handle, transform),
-                ))
+            let (writable, state, accepted) = with_active_call(&set_active, |transaction| {
+                let state = transaction.object_access(handle);
+                let accepted = state == ObjectState::Alive
+                    && transaction.set_local_transform(handle, transform);
+                Ok((transaction.writable(), state, accepted))
             })?;
             if accepted {
-                Ok(())
-            } else if writable {
-                Err(LuaError::runtime(
-                    "object.set_transform target object no longer exists",
-                ))
-            } else {
+                Ok(true)
+            } else if state == ObjectState::Alive && !writable {
                 Err(LuaError::runtime(
                     "object.set_transform is unavailable during script creation",
                 ))
+            } else {
+                Ok(false)
             }
         })?,
     )?;
@@ -987,12 +1032,16 @@ fn object_table(
     object.set(
         "get_camera_settings",
         lua.create_function(move |lua, _arguments: MultiValue| {
+            if !object_alive(&camera_settings_active, handle)? {
+                return Ok(Value::Nil);
+            }
             let settings = with_active_call(&camera_settings_active, |transaction| {
                 Ok(transaction.camera_settings(handle))
             })?;
-            settings
-                .map(|settings| camera_settings_table(lua, settings))
-                .transpose()
+            match settings {
+                Some(settings) => Ok(Value::Table(camera_settings_table(lua, settings)?)),
+                None => Ok(Value::Nil),
+            }
         })?,
     )?;
 
@@ -1015,6 +1064,9 @@ fn object_table(
                     "object.set_camera_settings expects one settings table",
                 ));
             }
+            if !object_alive(&set_camera_settings_active, handle)? {
+                return Ok(false);
+            }
             let (writable, mut settings) =
                 with_active_call(&set_camera_settings_active, |transaction| {
                     Ok((transaction.writable(), transaction.camera_settings(handle)))
@@ -1033,13 +1085,7 @@ fn object_table(
             let accepted = with_active_call(&set_camera_settings_active, |transaction| {
                 Ok(transaction.set_camera_settings(handle, settings))
             })?;
-            if accepted {
-                Ok(())
-            } else {
-                Err(LuaError::runtime(
-                    "object.set_camera_settings target object no longer exists",
-                ))
-            }
+            Ok(accepted)
         })?,
     )?;
 
@@ -1047,6 +1093,9 @@ fn object_table(
     object.set(
         "activate_camera",
         lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&activate_camera_active, handle)? {
+                return Ok(false);
+            }
             let (writable, accepted) = with_active_call(&activate_camera_active, |transaction| {
                 Ok((
                     transaction.writable(),
@@ -1054,7 +1103,7 @@ fn object_table(
                 ))
             })?;
             if accepted {
-                Ok(())
+                Ok(true)
             } else if writable {
                 Err(LuaError::runtime(
                     "object.activate_camera target object has no camera",
@@ -1071,15 +1120,69 @@ fn object_table(
     object.set(
         "world_matrix",
         lua.create_function(move |lua, _arguments: MultiValue| {
+            if !object_alive(&matrix_active, handle)? {
+                return Ok(Value::Nil);
+            }
             let matrix = with_active_call(&matrix_active, |transaction| {
                 Ok(transaction.world_matrix(handle))
             })?;
-            matrix.map(|matrix| matrix_table(lua, matrix)).transpose()
+            match matrix {
+                Some(matrix) => Ok(Value::Table(matrix_table(lua, matrix)?)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    let destroy_active = active_call.clone();
+    object.set(
+        "destroy",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let delay = delay_argument(arguments, "object.destroy")?;
+            with_active_call(&destroy_active, |transaction| {
+                transaction
+                    .destroy(handle, delay)
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let alive_active = active_call.clone();
+    object.set(
+        "is_alive",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&alive_active, |transaction| {
+                Ok(transaction.object_state(handle) == ObjectState::Alive)
+            })
+        })?,
+    )?;
+
+    let pending_active = active_call.clone();
+    object.set(
+        "is_pending",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&pending_active, |transaction| {
+                Ok(transaction.object_state(handle) == ObjectState::Pending)
+            })
         })?,
     )?;
     add_audio_object_api(lua, &object, handle, active_call.clone())?;
     add_physics_object_api(lua, &object, handle, active_call)?;
     Ok(object)
+}
+
+/// Задержка `destroy`: необязательный `self` и необязательное число; по умолчанию 0.
+fn delay_argument(arguments: MultiValue, name: &str) -> mlua::Result<f64> {
+    let mut arguments = arguments.into_iter();
+    let mut value = arguments.next();
+    if matches!(value, Some(Value::Table(_))) {
+        value = arguments.next();
+    }
+    match value {
+        None | Some(Value::Nil) => Ok(0.0),
+        Some(Value::Integer(delay)) => Ok(delay as f64),
+        Some(Value::Number(delay)) => Ok(delay),
+        Some(_) => Err(LuaError::runtime(format!("{name} delay must be a number"))),
+    }
 }
 
 fn add_audio_object_api(
@@ -1092,6 +1195,9 @@ fn add_audio_object_api(
     object.set(
         "play_sound",
         lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&play_active, handle)? {
+                return Ok(false);
+            }
             with_active_call(&play_active, |transaction| {
                 require_audio_source(transaction, handle, "object.play_sound")?;
                 let voice = VoiceId::allocate();
@@ -1100,7 +1206,8 @@ fn add_audio_object_api(
                         object: handle,
                         voice,
                     })
-                    .map_err(LuaError::runtime)
+                    .map_err(LuaError::runtime)?;
+                Ok(true)
             })
         })?,
     )?;
@@ -1109,11 +1216,15 @@ fn add_audio_object_api(
     object.set(
         "stop_sound",
         lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&stop_active, handle)? {
+                return Ok(false);
+            }
             with_active_call(&stop_active, |transaction| {
                 require_audio_source(transaction, handle, "object.stop_sound")?;
                 transaction
                     .stage_audio(AudioRequest::StopSource { object: handle })
-                    .map_err(LuaError::runtime)
+                    .map_err(LuaError::runtime)?;
+                Ok(true)
             })
         })?,
     )?;
@@ -1123,6 +1234,9 @@ fn add_audio_object_api(
         lua.create_function(move |_, arguments: MultiValue| {
             let value = method_argument(arguments, "object.set_sound_volume")?;
             let volume = audio_volume(&value, "object.set_sound_volume")?;
+            if !object_alive(&active_call, handle)? {
+                return Ok(false);
+            }
             with_active_call(&active_call, |transaction| {
                 require_audio_source(transaction, handle, "object.set_sound_volume")?;
                 transaction
@@ -1130,11 +1244,144 @@ fn add_audio_object_api(
                         object: handle,
                         volume,
                     })
-                    .map_err(LuaError::runtime)
+                    .map_err(LuaError::runtime)?;
+                Ok(true)
             })
         })?,
     )?;
     Ok(())
+}
+
+/// `rve.spawn(path, opts?)`: резервирует объект и возвращает его таблицу (pending до применения).
+fn spawn_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |lua, (path, options): (String, Option<Table>)| {
+        let args = spawn_args(lua, options.as_ref(), &active_call)?;
+        let handle = with_active_call(&active_call, |transaction| {
+            transaction.spawn(&path, args).map_err(LuaError::runtime)
+        })?;
+        let (id, name) = with_active_call(&active_call, |transaction| {
+            Ok(transaction
+                .object_identity(handle)
+                .unwrap_or((None, String::new())))
+        })?;
+        object_table(lua, handle, id, name, active_call.clone())
+    })
+}
+
+fn spawn_args(
+    lua: &Lua,
+    options: Option<&Table>,
+    active_call: &ActiveCall,
+) -> mlua::Result<SpawnArgs> {
+    let mut args = SpawnArgs::default();
+    let Some(options) = options else {
+        return Ok(args);
+    };
+    args.options.position = optional_vector(options, "position")?;
+    args.options.rotation_deg = optional_vector(options, "rotation")?;
+    args.options.scale = optional_vector(options, "scale")?;
+    args.velocity = optional_vector(options, "velocity")?;
+    args.options.name = optional_string(options, "name")?;
+    args.options.id = optional_string(options, "id")?;
+    args.options.parent = match options.get::<Value>("parent")? {
+        Value::Nil => None,
+        Value::Table(object) => Some(object_handle_of(lua, &object)?.ok_or_else(|| {
+            LuaError::runtime("spawn parent must be an object returned by rve.find or rve.spawn")
+        })?),
+        Value::String(id) => {
+            let id = id.to_str()?.to_owned();
+            let handle =
+                with_active_call(active_call, |transaction| Ok(transaction.handle_by_id(&id)))?;
+            Some(
+                handle.ok_or_else(|| {
+                    LuaError::runtime(format!("spawn parent {id:?} does not exist"))
+                })?,
+            )
+        }
+        _ => return Err(LuaError::runtime("spawn parent must be an object or an id")),
+    };
+    Ok(args)
+}
+
+fn optional_vector(table: &Table, key: &str) -> mlua::Result<Option<Vec3>> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Table(vector) => Ok(Some(Vec3::from_array(read_vector(&vector, key)?))),
+        _ => Err(LuaError::runtime(format!(
+            "spawn {key} must be a vector table"
+        ))),
+    }
+}
+
+fn optional_string(table: &Table, key: &str) -> mlua::Result<Option<String>> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::String(value) => Ok(Some(value.to_str()?.to_owned())),
+        _ => Err(LuaError::runtime(format!("spawn {key} must be a string"))),
+    }
+}
+
+/// `rve.destroy(obj_or_id, delay?)`: удаление поддерева. Неизвестный id даёт `false`.
+fn destroy_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |lua, (target, delay): (Value, Option<f64>)| {
+        let handle = match target {
+            Value::Table(object) => object_handle_of(lua, &object)?,
+            Value::String(id) => {
+                let id = id.to_str()?.to_owned();
+                with_active_call(&active_call, |transaction| {
+                    Ok(transaction.handle_by_any_id(&id))
+                })?
+            }
+            _ => {
+                return Err(LuaError::runtime(
+                    "rve.destroy expects an object or an object id",
+                ));
+            }
+        };
+        let Some(handle) = handle else {
+            return Ok(false);
+        };
+        let delay = delay.unwrap_or(0.0);
+        with_active_call(&active_call, |transaction| {
+            transaction
+                .destroy(handle, delay)
+                .map_err(LuaError::runtime)
+        })
+    })
+}
+
+/// `rve.prefabs.load/unload/state`: загрузка тяжёлых префабов и их состояние.
+fn prefabs_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let prefabs = lua.create_table()?;
+    for (name, load) in [("load", true), ("unload", false)] {
+        let active = active_call.clone();
+        prefabs.set(
+            name,
+            lua.create_function(move |_, path: String| {
+                let request = if load {
+                    PrefabRequest::Load(path)
+                } else {
+                    PrefabRequest::Unload(path)
+                };
+                with_active_call(&active, |transaction| {
+                    transaction
+                        .prefab_request(request)
+                        .map_err(LuaError::runtime)
+                })
+            })?,
+        )?;
+    }
+    prefabs.set(
+        "state",
+        lua.create_function(move |_, path: String| {
+            with_active_call(&active_call, |transaction| {
+                Ok(transaction
+                    .prefab_status(&path)
+                    .map(|status| status.as_str().to_owned()))
+            })
+        })?,
+    )?;
+    Ok(prefabs)
 }
 
 fn require_audio_source(
@@ -1269,10 +1516,13 @@ fn add_physics_object_api(
     object.set(
         "get_velocity",
         lua.create_function(move |lua, _arguments: MultiValue| {
+            if !object_alive(&get_active, handle)? {
+                return Ok(Value::Nil);
+            }
             let velocity = with_active_call(&get_active, |transaction| {
                 transaction.body_velocity(handle).map_err(LuaError::runtime)
             })?;
-            vector_table(lua, velocity.to_array())
+            Ok(Value::Table(vector_table(lua, velocity.to_array())?))
         })?,
     )?;
 
@@ -1292,6 +1542,9 @@ fn add_physics_object_api(
                     )));
                 };
                 let vector = Vec3::from_array(read_vector(&vector, name)?);
+                if !object_alive(&set_active, handle)? {
+                    return Ok(false);
+                }
                 with_active_call(&set_active, |transaction| {
                     let result = if setter {
                         transaction.set_body_velocity(handle, vector)
@@ -1300,7 +1553,8 @@ fn add_physics_object_api(
                     } else {
                         transaction.add_body_force(handle, vector)
                     };
-                    result.map_err(LuaError::runtime)
+                    result.map_err(LuaError::runtime)?;
+                    Ok(true)
                 })
             })?,
         )?;
@@ -1317,6 +1571,9 @@ fn add_physics_object_api(
                 ));
             };
             let displacement = Vec3::from_array(read_vector(&displacement, "displacement")?);
+            if !object_alive(&move_active, handle)? {
+                return Ok(Value::Nil);
+            }
             let result = with_active_call(&move_active, |transaction| {
                 transaction
                     .move_character(handle, displacement)
@@ -1325,7 +1582,7 @@ fn add_physics_object_api(
             let result_table = lua.create_table()?;
             result_table.set("grounded", result.grounded)?;
             result_table.set("collided", !result.hits.is_empty())?;
-            Ok(result_table)
+            Ok(Value::Table(result_table))
         })?,
     )?;
 
@@ -1333,6 +1590,9 @@ fn add_physics_object_api(
     object.set(
         "is_grounded",
         lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&grounded_active, handle)? {
+                return Ok(false);
+            }
             with_active_call(&grounded_active, |transaction| {
                 transaction.is_grounded(handle).map_err(LuaError::runtime)
             })
@@ -1349,10 +1609,14 @@ fn add_physics_object_api(
                     "object.set_collider_enabled expects a boolean",
                 ));
             };
+            if !object_alive(&enabled_active, handle)? {
+                return Ok(false);
+            }
             with_active_call(&enabled_active, |transaction| {
                 transaction
                     .set_collider_enabled(handle, enabled)
-                    .map_err(LuaError::runtime)
+                    .map_err(LuaError::runtime)?;
+                Ok(true)
             })
         })?,
     )?;
@@ -1361,11 +1625,15 @@ fn add_physics_object_api(
     object.set(
         "is_collider_enabled",
         lua.create_function(move |_, _arguments: MultiValue| {
-            with_active_call(&is_enabled_active, |transaction| {
+            if !object_alive(&is_enabled_active, handle)? {
+                return Ok(Value::Nil);
+            }
+            let enabled = with_active_call(&is_enabled_active, |transaction| {
                 transaction
                     .collider_enabled(handle)
                     .map_err(LuaError::runtime)
-            })
+            })?;
+            Ok(Value::Boolean(enabled))
         })?,
     )?;
     Ok(())
@@ -1426,12 +1694,7 @@ fn physics_raycast_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<
             let hit = with_active_call(&active_call, |transaction| {
                 let ignore = ignore
                     .as_deref()
-                    .map(|id| {
-                        transaction
-                            .handle_by_id(id)
-                            .ok_or_else(|| LuaError::runtime("opts.ignore object no longer exists"))
-                    })
-                    .transpose()?;
+                    .and_then(|id| transaction.handle_by_id(id));
                 transaction
                     .physics_raycast(ray, include_triggers, ignore)
                     .map_err(LuaError::runtime)
@@ -1444,10 +1707,7 @@ fn physics_raycast_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<
                 let Some(handle) = transaction.physics_object(hit.body) else {
                     return Ok(None);
                 };
-                let Some(id) = transaction.object_id(handle).map(str::to_owned) else {
-                    return Ok(None);
-                };
-                let Some(name) = transaction.object_name(handle).map(str::to_owned) else {
+                let Some((id, name)) = transaction.object_identity(handle) else {
                     return Ok(None);
                 };
                 object_table(lua, handle, id, name, active_call.clone()).map(Some)

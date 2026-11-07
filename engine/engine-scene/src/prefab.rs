@@ -504,6 +504,11 @@ impl PrefabTemplate {
         &self.assets
     }
 
+    /// Объекты шаблона с id относительно корня; корень — объект без `parent`.
+    pub fn objects(&self) -> &[SceneObject] {
+        &self.objects
+    }
+
     /// Имя файла префаба без расширения: основа для генерируемых id.
     pub(crate) fn stem(&self) -> &str {
         &self.stem

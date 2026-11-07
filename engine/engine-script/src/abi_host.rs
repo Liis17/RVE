@@ -1911,6 +1911,11 @@ mod tests {
                 crate::physics::PhysicsScriptState::default(),
             )),
             physics_phase_dt: None,
+            lifecycle: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::lifecycle::Lifecycle::default(),
+            )),
+            lifecycle_writes: true,
+            instance_serial: 0,
         });
         {
             let mut context =
@@ -1994,6 +1999,11 @@ mod tests {
                 crate::physics::PhysicsScriptState::default(),
             )),
             physics_phase_dt: None,
+            lifecycle: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::lifecycle::Lifecycle::default(),
+            )),
+            lifecycle_writes: true,
+            instance_serial: 0,
         });
         let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
         let host = context.host(ScriptTime::default());
