@@ -33,6 +33,10 @@ Virtual paths используют UTF-8, чувствительный к рег
 | `engine/engine-resources/src/error.rs` | `ResourceError`, `ResourceErrorKind` | Типизированные ошибки запросов, бюджета, архивов, реестра и loose paths |
 | `engine/engine-resources/src/service/tests.rs` | unit tests, recording reader | Startup modes, ranges/codecs, concurrency, shutdown и budgets |
 
+## Статистика
+
+`ResourceHandle::stats() -> ResourceStats` возвращает снимок счётчиков сервиса: `completed`, `failed`, `cancelled` (учитывает worker при ответе), `bytes` успешных `read_all` и `read_range`, `in_flight` — запросы, которые потребитель ещё не получил. `queue` и `read` — `TimingTotals` с числом замеров, суммой и максимумом времени от постановки до взятия worker'ом и времени выполнения. Поля читаются по отдельности, поэтому снимок во время работы может расходиться между полями.
+
 ## Зависимости и интеграция
 
 Крейт зависит от `engine-files` для virtual paths и positional reads, `engine-pak` для discovery, каталога и декодирования архивов, а также bounded async-capable channel `flume`. Он не добавляет глобальный runtime, scheduler, asset cache или format decoder. `ResourceHandle::root` возвращает закреплённый корень для совместимого `Assets::root()` API.
