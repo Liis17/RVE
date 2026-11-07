@@ -18,7 +18,7 @@ pub use bridge::AudioBridge;
 pub use decode::{Clip, DecodeError};
 pub use mixer::{Distances, PlayRequest};
 
-use decode::decode;
+use decode::{MAX_CLIP_FILE_BYTES, decode};
 use engine_resources::{ResourceHandle, ResourceRequest};
 use engine_scene::{AudioGroup, VoiceId};
 use flume::{Receiver, Selector, Sender, TrySendError};
@@ -706,13 +706,60 @@ fn decode_loop(jobs: Receiver<DecodeJob>, results: Sender<Decoded>, cancel: &Ato
 fn read_source(resources: Option<ResourceHandle>) -> ReadSource {
     match resources {
         Some(resources) => Box::new(move |path: &str| {
-            resources
-                .read_all(path)
-                .map(poll_request)
-                .map_err(|error| error.to_string())
+            let mut stat = resources
+                .stat(path)
+                .map_err(|error| error.to_string())?;
+            let size = move || match stat.try_receive() {
+                Ok(None) => None,
+                Ok(Some(stat)) => Some(Ok(stat.size)),
+                Err(error) => Some(Err(error.to_string())),
+            };
+            let reader = resources.clone();
+            let path = path.to_owned();
+            let read = move || {
+                reader
+                    .read_all(&path)
+                    .map(poll_request)
+                    .map_err(|error| error.to_string())
+            };
+            Ok(guarded_read(size, read))
         }),
         None => Box::new(|_path: &str| Err("ресурсы проекта не подключены".to_owned())),
     }
+}
+
+/// Чтение клипа в два шага: сначала размер, затем байты. Файл больше [`MAX_CLIP_FILE_BYTES`]
+/// отклоняется до чтения, чтобы не держать в памяти заведомо отвергаемые байты.
+fn guarded_read(
+    mut size: impl FnMut() -> Option<Result<u64, String>> + 'static,
+    start_read: impl FnOnce() -> Result<ReadPoll, String> + 'static,
+) -> ReadPoll {
+    let mut start_read = Some(start_read);
+    let mut read: Option<ReadPoll> = None;
+    Box::new(move || {
+        if let Some(poll) = read.as_mut() {
+            return poll();
+        }
+        let size = match size() {
+            None => return None,
+            Some(Err(message)) => return Some(Err(message)),
+            Some(Ok(size)) => size,
+        };
+        if size > MAX_CLIP_FILE_BYTES {
+            return Some(Err(format!(
+                "файл {size} байт больше лимита {MAX_CLIP_FILE_BYTES} байт"
+            )));
+        }
+        // Чтение стартует один раз: после этого ветка `read` выше обрабатывает все опросы.
+        let start = start_read.take()?;
+        match start() {
+            Ok(poll) => {
+                read = Some(poll);
+                None
+            }
+            Err(message) => Some(Err(message)),
+        }
+    })
 }
 
 fn poll_request(mut request: ResourceRequest<Vec<u8>>) -> ReadPoll {

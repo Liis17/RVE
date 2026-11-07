@@ -418,6 +418,42 @@ fn ended_voice_frees_its_lane_and_reports_the_event() {
 }
 
 #[test]
+fn oversized_file_is_rejected_before_its_bytes_are_read() {
+    let started = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&started);
+    let mut poll = guarded_read(
+        || Some(Ok(MAX_CLIP_FILE_BYTES + 1)),
+        move || {
+            flag.store(true, AtomicOrdering::Relaxed);
+            Ok(Box::new(|| None) as ReadPoll)
+        },
+    );
+    assert!(matches!(poll(), Some(Err(message)) if message.contains("лимита")));
+    assert!(!started.load(AtomicOrdering::Relaxed));
+}
+
+#[test]
+fn file_within_the_limit_is_read_once_its_size_is_known() {
+    let mut size_pending = true;
+    let mut poll = guarded_read(
+        move || {
+            if size_pending {
+                size_pending = false;
+                None
+            } else {
+                Some(Ok(4))
+            }
+        },
+        move || {
+            Ok(Box::new(|| Some(Ok(vec![1u8, 2, 3, 4]))) as ReadPoll)
+        },
+    );
+    assert!(poll().is_none(), "размер ещё не получен");
+    assert!(poll().is_none(), "чтение начато, байт пока нет");
+    assert_eq!(poll(), Some(Ok(vec![1u8, 2, 3, 4])));
+}
+
+#[test]
 fn preload_starts_one_read_per_path() {
     let mut h = Harness::new();
     h.handle

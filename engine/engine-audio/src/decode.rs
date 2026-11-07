@@ -2,22 +2,26 @@
 //!
 //! Поддерживаются моно и стерео. Декодированный клип ограничен [`MAX_CLIP_SAMPLES`]:
 //! для WAV размер проверяется по заголовку до аллокации, для Ogg — по мере декодирования.
+//! Сэмплы пишутся сразу в итоговый `Vec`; клип в кеше хранится за `Arc`, поэтому копии нет.
 
 use lewton::inside_ogg::OggStreamReader;
 use std::fmt;
 use std::io::Cursor;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Наибольший декодированный клип в сэмплах f32 (256 МБ).
 pub const MAX_CLIP_SAMPLES: usize = 64 * 1024 * 1024;
+
+/// Наибольший файл клипа, который читается целиком. Сэмплы занимают 4 байта, поэтому файл больше
+/// этого размера не уложится в [`MAX_CLIP_SAMPLES`] даже как 32-битный float.
+pub const MAX_CLIP_FILE_BYTES: u64 = (MAX_CLIP_SAMPLES * std::mem::size_of::<f32>()) as u64;
 
 /// Декодированный клип; `samples` — interleaved, `channels` — 1 или 2.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Clip {
     pub sample_rate: u32,
     pub channels: u16,
-    pub samples: Arc<[f32]>,
+    pub samples: Vec<f32>,
 }
 
 impl Clip {
@@ -172,7 +176,7 @@ fn read_data(data: &[u8], format: WavFormat) -> Result<Clip, DecodeError> {
     Ok(Clip {
         sample_rate: format.sample_rate,
         channels: format.channels,
-        samples: Arc::from(out),
+        samples: out,
     })
 }
 
@@ -240,10 +244,12 @@ pub fn decode_ogg(bytes: &[u8], cancel: &AtomicBool) -> Result<Clip, DecodeError
             }
         }
     }
+    // Буфер рос по пакетам и мог получить запас ёмкости; клип в кеше держит его весь век.
+    out.shrink_to_fit();
     Ok(Clip {
         sample_rate,
         channels,
-        samples: Arc::from(out),
+        samples: out,
     })
 }
 

@@ -6,7 +6,7 @@ fn clip(rate: u32, channels: u16, samples: Vec<f32>) -> Arc<Clip> {
     Arc::new(Clip {
         sample_rate: rate,
         channels,
-        samples: Arc::from(samples),
+        samples,
     })
 }
 
