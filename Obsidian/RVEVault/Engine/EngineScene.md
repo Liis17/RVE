@@ -129,3 +129,9 @@ Parent: [[Index]]
 ## Зависимости и размещение
 
 `engine-scene` зависит от glam, engine-files, serde и toml. `engine-render` не зависит от него и не принимает типы glam; runtime и скрипты также не являются зависимостями сцены. `engine-runtime` загружает `.rvescene` в `World` для `rve-player`; sandbox сохраняет собственную процедурную демонстрационную сцену. Поток загрузки игры описан в [[Engine/EngineRuntime]].
+
+## Эмиттер частиц
+
+Компонент `[objects.particle_emitter]` описан в `engine-scene/src/particles.rs`. Вложенные таблицы: `shape` (внутренне тегированный enum `point`, `sphere`, `cone`, `box`), `flipbook`, `collision`, массивы `bursts`, `color_over_life` (до четырёх ключей, альфа в [0, 1]) и `size_over_life`. Неизвестные поля отклоняются на каждом уровне. Пустые опциональные таблицы не сериализуются, поэтому сцены без частиц не меняются. Ёмкость проверяется по blend: `MAX_ADDITIVE_PARTICLE_CAPACITY = 262144`, `MAX_ALPHA_PARTICLE_CAPACITY = 65536`. Константы совпадают с `engine-render`, согласованность проверяет тест в engine-runtime. Текстура обязана быть PNG, объявленным в `[[assets]]`.
+
+Контракты: `SceneObject.particle_emitter` и `WorldObject.particle_emitter` (accessor `World::particle_emitter`); `PrefabChange.particle_emitter` (override заменяет компонент целиком); `SceneFrame.particle_emitters: Vec<ParticleEmitterInstance { object, model }>` в порядке объектов сцены. Симуляции здесь нет: шаги и отрисовка — в [[Engine/EngineRuntime]] и [[Engine/EngineRender]].

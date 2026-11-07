@@ -172,3 +172,8 @@ game input не попадает в snapshot скрипта; при закрыт
 Overlay создаётся по требованию и освобождает managed textures при закрытии и teardown;
 без открытого UI остаётся обычный `render_frame` путь. Подробный контракт —
 [[Engine/EngineConsole]].
+
+## GPU-частицы
+
+- Загрузка: `prepare_scene` кладёт PNG эмиттера в `PreparedRenderAssets.textures` и `PreparedRenderAssets.particles`. `upload_scene` создаёт sRGB-текстуру и эмиттер через `create_particle_emitter`; результат попадает в `GpuSceneTable.particles` (объект → `ParticleEmitterId`). Сопоставление компонента с `ParticleEmitterDesc` выполняет локальная функция `particle_emitter_desc`, она покрыта тестами.
+- Время: поток скриптов копит `sim_time` по `dt` и кладёт его в `FrameSnapshot.sim_time`; `make_snapshot` заполняет `FrameSnapshot.particles`. Render-поток считает `particle_step = sim_time − last_submitted_sim_time`; первый кадр получает шаг 0. `last_submitted_sim_time` обновляется только при `FrameOutcome.submitted`, поэтому неотправленный снимок не продвигает симуляцию. Консольный кадр частиц не содержит.
