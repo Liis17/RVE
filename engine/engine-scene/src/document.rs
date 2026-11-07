@@ -1,6 +1,7 @@
 //! TOML-документы сцен и их проверенная схема, независимая от renderer.
 
 use crate::CameraSettings;
+use crate::audio::{AudioSourceComponent, validate_audio_source};
 use crate::prefab::PrefabInstance;
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
@@ -260,6 +261,9 @@ impl SceneDocument {
                 environment_count += 1;
                 validate_environment(source, &object.id, &asset_paths, environment)?;
             }
+            if let Some(audio) = &object.audio_source {
+                validate_audio_source(source, &object.id, &asset_paths, audio)?;
+            }
             if let Some(mesh) = &object.mesh_renderer {
                 require_asset_path(source, &object.id, &asset_paths, &mesh.model, "модель")?;
                 require_extension(source, &object.id, &mesh.model, "fbx", "модель")?;
@@ -480,6 +484,8 @@ pub struct SceneObject {
     pub rigid_body: Option<RigidBodyComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character_controller: Option<CharacterControllerComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_source: Option<AudioSourceComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]

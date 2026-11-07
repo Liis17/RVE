@@ -22,6 +22,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EnginePhysics]] | Геометрия, столкновения, solver и fixed-step physics world |
 | [[Engine/EngineScene]] | Формат сцен `.rvescene`, runtime-граф `World`, камеры, трансформации и свет |
 | [[Engine/EngineScript]] | Lua host и ABI-загрузка Rust-скриптов, lifecycle и отмена Lua |
+| [[Engine/EngineAudio]] | Звук: декодирование WAV/Ogg, микшер на `cpal`, мост сцены и Play |
 | [[Engine/EngineConsole]] | Ограниченный буфер лога, команды и общий egui developer console |
 | [[Engine/RveSdk]] | C ABI и гостевой API для игровых Rust-скриптов в `cdylib` |
 | [[Engine/EngineRuntime]] | Runtime игры: layout проекта, потоки сцены, скриптов и рендера, завершение и коды выхода |
@@ -29,7 +30,7 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |
 | [[Engine/RveEditor]] | Графический редактор сцен на egui: панели, правки с undo, вьюпорт и Play |
 
-Пустые модули `engine-audio`, `engine-network` и `engine-neural` описаны в [[Architecture]]; отдельных заметок для них нет.
+Пустые модули `engine-network` и `engine-neural` описаны в [[Architecture]]; отдельных заметок для них нет.
 
 ## Обновление памяти
 

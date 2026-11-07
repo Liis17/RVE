@@ -120,6 +120,11 @@ impl OpenProject {
         })
     }
 
+    /// Ресурсы проекта для звуковой подсистемы Play.
+    pub fn resource_handle(&self) -> ResourceHandle {
+        self.resources.handle()
+    }
+
     /// Читает текстовый ресурс, например исходник Lua или файл сцены.
     pub fn read_text(&self, path: &str) -> Result<String, String> {
         let bytes = self

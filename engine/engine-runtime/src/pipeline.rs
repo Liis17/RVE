@@ -244,6 +244,8 @@ pub(crate) struct ScriptThreadConfig {
     pub input: Arc<Mutex<InputAccumulator>>,
     pub physics_client: Option<PhysicsClient>,
     pub physics_initialization: Option<PhysicsInitialization>,
+    /// Sound subsystem handle; `None` disables audio for this scripts thread.
+    pub audio: Option<engine_audio::AudioHandle>,
     #[cfg(feature = "dev-console")]
     pub command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
 }
@@ -675,6 +677,7 @@ fn scripts_thread(
         command_catalog,
         physics_client,
         physics_initialization,
+        audio,
         ..
     } = config;
     let library = match load_script_library(
@@ -773,6 +776,13 @@ fn scripts_thread(
     };
     scripts.start(&mut world, start_time);
     print_script_events(scripts.drain_events());
+    let mut audio = audio.map(engine_audio::AudioBridge::new);
+    if let Some(audio) = audio.as_mut() {
+        // Матрицы до первого кадра не посчитаны; play_on_start берёт позиции из них.
+        world.recalculate_world_matrices();
+        audio.start(&world);
+        audio.apply(scripts.drain_audio_requests(), &world);
+    }
     #[cfg(feature = "dev-console")]
     let mut published_catalog_generation = u64::MAX;
     #[cfg(feature = "dev-console")]
@@ -901,6 +911,9 @@ fn scripts_thread(
         scripts.set_input(input_frame);
         scripts.update(&mut world, dt, time);
         print_script_events(scripts.drain_events());
+        if let Some(audio) = audio.as_mut() {
+            audio.apply(scripts.drain_audio_requests(), &world);
+        }
         #[cfg(feature = "dev-console")]
         publish_command_catalog(
             &scripts,
@@ -940,6 +953,9 @@ fn scripts_thread(
                 warning.object_id,
                 warning.message
             );
+        }
+        if let Some(audio) = audio.as_mut() {
+            audio.sync_positions(&world);
         }
         let snapshot = match make_snapshot(scene_frame, &world, &gpu_scene) {
             Ok(snapshot) => Arc::new(snapshot),
@@ -1824,6 +1840,7 @@ return Input
                 scripts_library: None,
                 physics_client: None,
                 physics_initialization: None,
+                audio: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
@@ -2618,6 +2635,7 @@ return Script
                 input: test_input(),
                 physics_client: None,
                 physics_initialization: None,
+                audio: None,
                 command_catalog: Arc::clone(&catalog),
             },
         )
@@ -2920,6 +2938,7 @@ return Script
                     physics_reply_rx,
                 )),
                 physics_initialization: Some(initialization),
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3019,6 +3038,7 @@ return Script
                     physics_reply_rx,
                 )),
                 physics_initialization: Some(initialization),
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3120,6 +3140,7 @@ return Script
                     physics_reply_rx,
                 )),
                 physics_initialization: Some(initialization),
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3231,6 +3252,7 @@ return Move
                     physics_reply_rx,
                 )),
                 physics_initialization: Some(initialization),
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3397,6 +3419,7 @@ return Move
                     physics_reply_rx,
                 )),
                 physics_initialization: Some(initialization),
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3469,6 +3492,7 @@ return Move
                 input: Arc::clone(&input),
                 physics_client: None,
                 physics_initialization: None,
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3689,6 +3713,7 @@ return Move
                 input: test_input(),
                 physics_client: None,
                 physics_initialization: None,
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3738,6 +3763,7 @@ return Move
                 input: test_input(),
                 physics_client: None,
                 physics_initialization: None,
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3786,6 +3812,7 @@ return Move
                 input: test_input(),
                 physics_client: None,
                 physics_initialization: None,
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },
@@ -3851,6 +3878,7 @@ return Move
                 input: test_input(),
                 physics_client: None,
                 physics_initialization: None,
+                audio: None,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },

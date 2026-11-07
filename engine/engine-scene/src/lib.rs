@@ -1,5 +1,6 @@
 //! Формат сцен `.rvescene`, runtime-граф `World` и математика камеры, трансформаций и света.
 
+pub mod audio;
 pub mod camera;
 pub mod camera_settings;
 pub mod document;
@@ -9,6 +10,9 @@ pub mod prefab;
 pub mod transform;
 pub mod world;
 
+pub use audio::{
+    AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
+};
 pub use light::ShadowSettings;
 
 pub use camera_settings::{

@@ -10,6 +10,7 @@ function Player:on_start()
   self.vertical_speed = 0.0
   self.grounded = false
   self.coins = 0
+  rve.audio.set_group_volume("ambient", 0.8)
 end
 
 function Player:on_update(dt)
@@ -27,6 +28,7 @@ function Player:on_update(dt)
 
   if self.grounded and rve.input.key_pressed("Space") then
     self.vertical_speed = self.params.jump_speed
+    rve.audio.play("/audio/jump.wav", { group = "effects" })
   end
   self.vertical_speed = self.vertical_speed - self.params.gravity * dt
 
