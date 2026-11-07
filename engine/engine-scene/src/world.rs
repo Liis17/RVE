@@ -1,6 +1,7 @@
 //! Runtime-данные сцены и подготовка кадра без зависимости от renderer.
 
 use crate::CameraSettings;
+use crate::animation::AnimatorComponent;
 use crate::audio::AudioSourceComponent;
 use crate::camera::Camera;
 use crate::document::{
@@ -87,6 +88,7 @@ pub struct WorldObject {
     pub rigid_body: Option<RigidBodyComponent>,
     pub character_controller: Option<CharacterControllerComponent>,
     pub audio_source: Option<AudioSourceComponent>,
+    pub animator: Option<AnimatorComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
 }
@@ -389,6 +391,11 @@ impl World {
         self.object(handle)?.audio_source.as_ref()
     }
 
+    /// Аниматор объекта, если у него есть `animator`.
+    pub fn animator(&self, handle: ObjectHandle) -> Option<&AnimatorComponent> {
+        self.object(handle)?.animator.as_ref()
+    }
+
     /// Пути `[[assets]]` сцены в порядке документа.
     pub fn asset_paths(&self) -> &[VirtualPath] {
         &self.asset_paths
@@ -649,6 +656,7 @@ fn world_object(
         rigid_body: object.rigid_body,
         character_controller: object.character_controller,
         audio_source: object.audio_source.clone(),
+        animator: object.animator.clone(),
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
     }

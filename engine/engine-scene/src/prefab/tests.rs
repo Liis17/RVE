@@ -797,3 +797,41 @@ fn audio_source_prefab_override_replaces_the_whole_component_and_checks_its_clip
     let error = other.expand(&scene(&bad)).unwrap_err();
     assert!(error.message.contains("audio_source"), "{error}");
 }
+
+#[test]
+fn animator_prefab_override_replaces_the_whole_component_and_checks_its_clips() {
+    let prefab = "[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anims/run.fbx\"\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n[objects.animator]\nclips = [\"/anims/run.fbx\"]\nlooping = true\nspeed = 1.5\n";
+    let library = Library::new(&[("prefabs/hero.rveprefab", prefab)]);
+    let assets = "[[assets]]\npath = \"/prefabs/hero.rveprefab\"\n[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anims/run.fbx\"\n[[assets]]\npath = \"/anims/jump.fbx\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n[[instances.overrides]]\ntarget = \"hero\"\nanimator = {{ looping = false, clips = [\"/anims/jump.fbx\"] }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let animator = object(&expanded, "h").animator.clone().unwrap();
+    assert!(!animator.looping);
+    assert_eq!(
+        animator.speed, 1.0,
+        "замена не сохраняет унаследованную скорость"
+    );
+    assert_eq!(animator.clips[0].as_str(), "anims/jump.fbx");
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(object(&kept, "h").animator.as_ref().unwrap().speed, 1.5);
+
+    let undeclared = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"h\"\nprefab = \"/prefabs/hero.rveprefab\"\n[[instances.overrides]]\ntarget = \"hero\"\nanimator = {{ clips = [\"/anims/missing.fbx\"] }}\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &undeclared).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\nanimator = {{ looping = false }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("animator"), "{error}");
+}

@@ -1,5 +1,6 @@
 //! Формат сцен `.rvescene`, runtime-граф `World` и математика камеры, трансформаций и света.
 
+pub mod animation;
 pub mod audio;
 pub mod camera;
 pub mod camera_settings;
@@ -13,6 +14,9 @@ pub mod world;
 /// Версия крейта из `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub use animation::{
+    AnimationRequest, AnimatorComponent, BlendTree, BlendTreePoint, MAX_BLEND_TREE_POINTS,
+};
 pub use audio::{
     AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
 };
