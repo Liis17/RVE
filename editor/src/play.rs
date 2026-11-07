@@ -975,8 +975,41 @@ spatial = true
 
     #[test]
     fn play_audio_follows_a_moved_source_without_build_frame() {
-        let mut session =
-            PlaySession::start(&document(AUDIO_SCENE), None, |_| Ok(String::new())).unwrap();
+        // Позиция отслеживается только у живого голоса: без читаемого клипа он завершается сразу.
+        // Поэтому клип зациклен и читается из временного каталога ресурсов.
+        let parent = std::env::temp_dir().join(format!("rve-play-audio-{}", std::process::id()));
+        let assets = parent.join("Assets");
+        std::fs::create_dir_all(assets.join("audio")).unwrap();
+        std::fs::write(
+            assets.join("audio").join("tone.ogg"),
+            include_bytes!("../../engine/engine-audio/tests/fixtures/tone_mono_22050.ogg"),
+        )
+        .unwrap();
+        let mut resources =
+            engine_resources::ResourceSystem::start(engine_resources::ResourceConfig {
+                root: assets,
+                source_mode: engine_resources::SourceMode::Loose,
+                ..engine_resources::ResourceConfig::default()
+            })
+            .unwrap();
+        let scene = document(&AUDIO_SCENE.replace("hum.wav", "tone.ogg"));
+        let world = World::from_document(&scene).unwrap();
+        let audio = AudioConfig {
+            resources: Some(resources.handle()),
+            output: false,
+        };
+        let mut session = PlaySession::start_with_world_limit(
+            &scene,
+            world,
+            None,
+            &InputSettings::default(),
+            |_| Ok(String::new()),
+            &[],
+            &PhysicsSettings::default(),
+            SCRIPT_TIME_LIMIT,
+            audio,
+        )
+        .unwrap();
         let speaker = session.world_mut().handle("speaker").unwrap();
         session.tick().unwrap();
         let bridge = &session.audio.as_ref().unwrap().bridge;
@@ -989,6 +1022,10 @@ spatial = true
         session.tick().unwrap();
         let bridge = &session.audio.as_ref().unwrap().bridge;
         assert_eq!(bridge.emitter_of(speaker), Some([5.0, 0.0, 0.0]));
+
+        drop(session);
+        resources.shutdown().unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
