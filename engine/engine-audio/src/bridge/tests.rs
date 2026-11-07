@@ -258,3 +258,39 @@ fn stop_source_and_group_volume_reach_the_handle() {
     );
     assert!(rig.bridge.sources.is_empty());
 }
+
+#[test]
+fn rejected_stop_keeps_the_source_tracked_so_a_later_stop_reaches_its_voice() {
+    let mut rig = Rig::new();
+    let world = world(SCENE);
+    let shot = world.handle("shot").unwrap();
+    rig.bridge.apply([play_source(shot, voice(1))], &world);
+    rig.take();
+
+    for _ in 0..crate::COMMAND_CAPACITY {
+        rig.handle.preload(Vec::new()).unwrap();
+    }
+    rig.bridge
+        .apply([AudioRequest::StopSource { object: shot }], &world);
+    assert_eq!(rig.bridge.sources.get(&shot), Some(&voice(1)));
+    assert!(rig.handle.lane_of(voice(1)).is_some(), "голос продолжает занимать слот");
+
+    rig.take();
+    rig.bridge
+        .apply([AudioRequest::StopSource { object: shot }], &world);
+    assert!(matches!(rig.take().as_slice(), [Command::Stop(stopped)] if *stopped == voice(1)));
+    assert!(rig.bridge.sources.is_empty());
+}
+
+#[test]
+fn looping_source_plays_again_after_its_voice_is_reported_ended() {
+    let mut rig = Rig::new();
+    let world = world(SCENE);
+    let speaker = world.handle("speaker").unwrap();
+    rig.bridge.apply([play_source(speaker, voice(1))], &world);
+    rig.take();
+    rig.events.send(AudioEvent::VoiceEnded(voice(1))).unwrap();
+
+    rig.bridge.apply([play_source(speaker, voice(2))], &world);
+    assert!(matches!(rig.take().as_slice(), [Command::Play { voice: v, .. }] if *v == voice(2)));
+}

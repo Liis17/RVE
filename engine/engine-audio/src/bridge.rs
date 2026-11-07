@@ -24,6 +24,10 @@ pub struct AudioBridge {
     volumes: HashMap<ObjectHandle, f32>,
     /// Позиции излучателей, переданные звуковому потоку в последнем `sync_positions`.
     emitters: HashMap<ObjectHandle, [f32; 3]>,
+    /// Команды, которые очередь звука отклонила за текущий вызов; сворачиваются в одно предупреждение.
+    rejected: Vec<String>,
+    /// Пути вне `[[assets]]`, о которых уже предупреждали: предупреждение один раз на путь.
+    undeclared_warned: HashSet<String>,
 }
 
 impl AudioBridge {
@@ -34,6 +38,8 @@ impl AudioBridge {
             sources: HashMap::new(),
             volumes: HashMap::new(),
             emitters: HashMap::new(),
+            rejected: Vec::new(),
+            undeclared_warned: HashSet::new(),
         }
     }
 
@@ -81,17 +87,17 @@ impl AudioBridge {
                     self.play_source(object, voice, world)
                 }
                 AudioRequest::StopSource { object } => {
-                    if let Some(voice) = self.sources.remove(&object) {
-                        report(self.handle.stop(voice), "остановка источника");
+                    if let Some(&voice) = self.sources.get(&object)
+                        && self.stop_voice(voice, "остановка источника")
+                    {
+                        self.sources.remove(&object);
                     }
                 }
                 AudioRequest::SetSourceVolume { object, volume } => {
                     self.volumes.insert(object, volume);
                     if let Some(&voice) = self.sources.get(&object) {
-                        report(
-                            self.handle.set_voice_volume(voice, volume),
-                            "громкость источника",
-                        );
+                        let result = self.handle.set_voice_volume(voice, volume);
+                        self.note(result, "громкость источника");
                     }
                 }
                 AudioRequest::PlayClip {
@@ -99,7 +105,9 @@ impl AudioBridge {
                     path,
                     params,
                 } => {
-                    if !self.declared.contains(path.as_str()) {
+                    if !self.declared.contains(path.as_str())
+                        && self.undeclared_warned.insert(path.as_str().to_owned())
+                    {
                         log::warn!(
                             "клип /{} не объявлен в [[assets]]: в release он не будет упакован",
                             path.as_str()
@@ -111,26 +119,24 @@ impl AudioBridge {
                         looping: params.looping,
                         spatial: params.position.map(|_| SCRIPT_DISTANCES),
                     };
-                    match self.handle.play(voice, path.as_str(), request) {
-                        Ok(()) => {
-                            if let Some(position) = params.position {
-                                self.handle.set_emitter(voice, position);
-                            }
-                        }
-                        Err(error) => log::warn!("воспроизведение /{}: {error}", path.as_str()),
+                    let result = self.handle.play(voice, path.as_str(), request);
+                    if result.is_ok()
+                        && let Some(position) = params.position
+                    {
+                        self.handle.set_emitter(voice, position);
                     }
+                    self.note(result, &format!("воспроизведение /{}", path.as_str()));
                 }
                 AudioRequest::StopVoice { voice } => {
-                    report(self.handle.stop(voice), "остановка голоса");
+                    self.stop_voice(voice, "остановка голоса");
                 }
                 AudioRequest::SetGroupVolume { group, volume } => {
-                    report(
-                        self.handle.set_group_volume(group, volume),
-                        "громкость группы",
-                    );
+                    let result = self.handle.set_group_volume(group, volume);
+                    self.note(result, "громкость группы");
                 }
             }
         }
+        self.flush_rejected();
     }
 
     fn play_source(&mut self, object: ObjectHandle, voice: VoiceId, world: &World) {
@@ -142,7 +148,10 @@ impl AudioBridge {
             if audio.looping {
                 return;
             }
-            report(self.handle.stop(current), "перезапуск источника");
+            // Старый голос остаётся в таблице, пока не остановлен: иначе два голоса звучали бы разом.
+            if !self.stop_voice(current, "перезапуск источника") {
+                return;
+            }
             self.sources.remove(&object);
         }
         let volume = self.volumes.get(&object).copied().unwrap_or(audio.volume);
@@ -152,12 +161,37 @@ impl AudioBridge {
             looping: audio.looping,
             spatial: spatial_distances(audio),
         };
-        match self.handle.play(voice, audio.clip.as_str(), request) {
-            Ok(()) => {
-                self.sources.insert(object, voice);
-            }
-            Err(error) => log::warn!("воспроизведение источника {}: {error}", audio.clip.as_str()),
+        let result = self.handle.play(voice, audio.clip.as_str(), request);
+        if result.is_ok() {
+            self.sources.insert(object, voice);
         }
+        self.note(result, &format!("воспроизведение источника {}", audio.clip.as_str()));
+    }
+
+    /// Останавливает голос. При отказе очереди голос остаётся в таблице и помечается отказом.
+    fn stop_voice(&mut self, voice: VoiceId, action: &str) -> bool {
+        let result = self.handle.stop(voice);
+        let stopped = result.is_ok();
+        self.note(result, action);
+        stopped
+    }
+
+    /// Запоминает отказ очереди; предупреждение выводится одно на вызов `apply`/`sync_positions`.
+    fn note(&mut self, result: Result<(), AudioError>, action: &str) {
+        if let Err(error) = result {
+            self.rejected.push(format!("{action}: {error}"));
+        }
+    }
+
+    fn flush_rejected(&mut self) {
+        let Some(first) = self.rejected.first() else {
+            return;
+        };
+        log::warn!(
+            "звуковых команд отклонено: {}; первая: {first}",
+            self.rejected.len()
+        );
+        self.rejected.clear();
     }
 
     /// Пишет позиции излучателей и слушателя по мировым матрицам. Исчезнувший объект останавливается.
@@ -195,10 +229,13 @@ impl AudioBridge {
         }
         for object in stale {
             self.emitters.remove(&object);
-            if let Some(voice) = self.sources.remove(&object) {
-                report(self.handle.stop(voice), "остановка исчезнувшего источника");
+            if let Some(&voice) = self.sources.get(&object)
+                && self.stop_voice(voice, "остановка исчезнувшего источника")
+            {
+                self.sources.remove(&object);
             }
         }
+        self.flush_rejected();
     }
 
     /// Последняя позиция излучателя, переданная звуковому потоку. Нужна отладке и тестам Play,
@@ -220,12 +257,6 @@ fn spatial_distances(audio: &AudioSourceComponent) -> Option<Distances> {
         min: audio.min_distance,
         max: audio.max_distance,
     })
-}
-
-fn report(result: Result<(), AudioError>, action: &str) {
-    if let Err(error) = result {
-        log::warn!("{action}: {error}");
-    }
 }
 
 #[cfg(test)]
