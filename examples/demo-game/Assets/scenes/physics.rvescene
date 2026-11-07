@@ -8,6 +8,9 @@ path = "/cameras/default.camerasettings"
 path = "/scripts/player.lua"
 
 [[assets]]
+path = "/audio/jump.wav"
+
+[[assets]]
 path = "/scripts/coin.lua"
 
 # Модель shared-cube.fbx занимает диапазон [-1, 1] по каждой оси, поэтому коллайдеры

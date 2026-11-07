@@ -57,7 +57,7 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
 Перед завершением задачи определяй компоненты, которые могут зависеть от изменений.
 
 - В `engine-core`, `engine-window` и `engine-render` проверяй публичный API и его использование в `engine/sandbox`.
-- Изменения `engine-window`, `engine-render`, `engine-platform`, `engine-scene`,
+- Изменения `engine-window`, `engine-render`, `engine-platform`, `engine-scene`, `engine-audio`,
   `engine-script`, `engine-resources`, `engine-project` и `engine-physics` проверяй также на
   потребителях `engine-runtime`/`rve-player` и `rve-build`, если они используют
   изменённый крейт. Прямые workspace-зависимости:
@@ -67,10 +67,11 @@ Vault: `Obsidian/RVEVault` — память о текущем устройств
     `engine-script`, `engine-window`, `engine-console`, `engine-ui`.
   - `rve-build`: `engine-assets`, `engine-files`, `engine-pak`, `engine-project`,
     `engine-resources`, `engine-scene`.
-  - `engine-script` (потребители `engine-runtime` и `rve-editor`): `engine-console`, `engine-physics`, `engine-scene`, `rve-sdk`.
+  - `engine-script` (потребители `engine-runtime` и `rve-editor`): `engine-console`, `engine-files`, `engine-physics`, `engine-scene`, `rve-sdk`.
+  - `engine-audio` (потребители `engine-runtime` и `rve-editor`): `engine-resources`, `engine-scene`, `cpal`, `lewton`, `flume`, `log`.
   - `rve-player`: `engine-runtime`.
   - `rve-editor`: `engine-assets`, `engine-files`, `engine-physics`, `engine-project`, `engine-render`,
-    `engine-resources`, `engine-scene`, `engine-script`, `engine-window`,
+    `engine-audio`, `engine-resources`, `engine-scene`, `engine-script`, `engine-window`,
     `engine-console`, `engine-ui`.
 - При изменении `engine-platform` проверяй общий интерфейс, адаптеры `engine-platform-windows` и `engine-platform-macos` и вызовы из renderer.
 - Контракты: учитывай `WindowHandler`, `WindowConfig`, `RendererConfig`, `FrameStatus`, ошибки библиотек, CLI sandbox и коды завершения. При их изменении проверяй производителей и потребителей.
