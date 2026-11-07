@@ -36,8 +36,8 @@ rve-sdk = { path = "../.rve/sdk/rve-sdk" }
 Синхронизация обновляет изменённые файлы, сохраняет mtime совпадающих и удаляет
 исходники API, которые исчезли из установленной версии.
 
-SDK marker рядом с переносимым `rve-build` фиксирует точный ABI. Marker ABI v5
-несовместим с builder/player ABI v6: пересоздай переносимый комплект командой
+SDK marker рядом с переносимым `rve-build` фиксирует точный ABI. Marker ABI v6
+несовместим с builder/player ABI v7: пересоздай переносимый комплект командой
 `rve-build sdk`. Для проектов builder синхронизирует текущий SDK в `.rve/sdk`
 перед сборкой Rust scripts.
 
@@ -96,7 +96,7 @@ Cursor — физические пиксели окна; до первого `Cu
 
 Если callback меняет и `Context.transform`, и собственную трансформацию через `Object::set_transform`, конечное изменившееся поле `Context.transform` перекрывает запись handle. Если поле осталось равным начальному значению, применяется запись через handle. Матрица мира остаётся снимком фазы: локальная запись не пересчитывает её внутри вызова или до следующей фазы. Полный lifecycle и расписание сообщений описаны в [[Engine/EngineScript]].
 
-Звуковой API гостя: `Object::play_sound`, `stop_sound`, `set_sound_volume` и `Context::play_clip(path, ClipOptions)`, `stop_voice`, `set_group_volume`. `play_clip` возвращает id голоса. Ошибки — `AudioError`: `Unavailable` для хоста без audio callbacks (ABI до v7), `Rejected` при отказе хоста, `InvalidInput` для неконечных значений и отрицательной громкости. Клип объявляется в `[[assets]]` сцены, см. [[Engine/EngineAudio]].
+Звуковой API гостя: `Object::play_sound`, `stop_sound`, `set_sound_volume` и `Context::play_clip(path, ClipOptions)`, `stop_voice`, `set_group_volume`. `play_clip` возвращает id голоса. Ошибки — `AudioError`: `Unavailable` для хоста без audio callbacks (ABI до v7), `Rejected` при отказе хоста, `InvalidInput` для неконечных значений и громкости вне `0..=4` (`MAX_AUDIO_VOLUME`, совпадает с `engine_scene::MAX_AUDIO_VOLUME`). Клип объявляется в `[[assets]]` сцены, см. [[Engine/EngineAudio]].
 
 ## Источники
 

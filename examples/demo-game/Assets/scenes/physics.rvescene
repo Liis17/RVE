@@ -11,6 +11,9 @@ path = "/scripts/player.lua"
 path = "/audio/jump.wav"
 
 [[assets]]
+path = "/audio/hum.wav"
+
+[[assets]]
 path = "/scripts/coin.lua"
 
 # Модель shared-cube.fbx занимает диапазон [-1, 1] по каждой оси, поэтому коллайдеры
@@ -309,3 +312,18 @@ position = [0.0, 0.6, 3.5]
 rotation = [-8.0, 0.0, 0.0]
 [objects.camera]
 settings = "/cameras/default.camerasettings"
+
+[[objects]]
+id = "ambient-hum"
+name = "Ambient Hum"
+[objects.transform]
+position = [0.0, 1.0, 0.0]
+[objects.audio_source]
+clip = "/audio/hum.wav"
+group = "ambient"
+volume = 0.6
+looping = true
+play_on_start = true
+spatial = true
+min_distance = 2.0
+max_distance = 25.0

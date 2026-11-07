@@ -384,7 +384,6 @@ impl World {
         camera_from_matrix(self.world_matrix(handle)?, settings)
     }
 
-    /// Настройки камеры; `None`, если объект не содержит Camera component.
     /// Звуковой источник объекта, если у него есть `audio_source`.
     pub fn audio_source(&self, handle: ObjectHandle) -> Option<&AudioSourceComponent> {
         self.object(handle)?.audio_source.as_ref()
@@ -395,6 +394,7 @@ impl World {
         &self.asset_paths
     }
 
+    /// Настройки камеры; `None`, если объект не содержит Camera component.
     pub fn camera_settings(&self, handle: ObjectHandle) -> Option<&CameraSettings> {
         self.object(handle)?.camera.as_ref()?;
         self.object(handle)?.camera_settings.as_ref()

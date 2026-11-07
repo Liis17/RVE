@@ -128,7 +128,7 @@ Render thread выбирает между snapshots и resize/occlusion/shutdown
 - Передаёт окно через [[Engine/EngineWindow]], общую Vulkan-работу через [[Engine/EngineRender]] и платформенную подготовку, диалог и singleton API через [[Engine/EnginePlatform]].
 - Pipeline cache приложения использует sanitized `ProjectSettings.name` под пользовательским каталогом кэша; renderer получает bytes до создания и сохраняет данные до Drop в render thread.
 - Renderer создаётся на главном потоке в `init`, затем передаётся render thread. Менять зависимости и поведение upstream-крейтов для runtime не требуется.
-- Поток `rve-audio` запускает звуковой движок с ресурсами проекта и устройством вывода; без устройства звук отключается с предупреждением, игра продолжается. Scripts thread связывает звук с кадром: `AudioBridge::start` после `start` скриптов, `apply` запросов после `update`, `sync_positions` после `build_frame`; в background-режиме позиции не обновляются. См. [[Engine/EngineAudio]].
+- Поток `rve-audio` запускает звуковой движок с ресурсами проекта и устройством вывода; без устройства звук отключается с предупреждением, игра продолжается. Scripts thread связывает звук с кадром: `AudioBridge::start` после пересчёта матриц и `start` скриптов, `apply` запросов после `update`, `sync_positions` после `build_frame`; в background-режиме позиции не обновляются. См. [[Engine/EngineAudio]].
 - Потоки `rve-network` и `rve-neural` запускаются как отдельные управляемые потоки без доменной работы. `rve-physics` выполняет шаги физики, см. [[Engine/EnginePhysics]].
 
 ## Игровые действия ввода
