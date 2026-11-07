@@ -48,6 +48,7 @@ pub fn component_icon(kind: ComponentKind) -> Option<&'static str> {
         ComponentKind::PointLight => Some("point-light"),
         ComponentKind::SpotLight => Some("spot-light"),
         ComponentKind::Collider => Some("collider"),
+        ComponentKind::AudioSource => Some("audio-component"),
         _ => None,
     }
 }
@@ -189,6 +190,10 @@ mod tests {
         );
         assert_eq!(component_icon(ComponentKind::SpotLight), Some("spot-light"));
         assert_eq!(component_icon(ComponentKind::Collider), Some("collider"));
+        assert_eq!(
+            component_icon(ComponentKind::AudioSource),
+            Some("audio-component")
+        );
         assert_eq!(component_icon(ComponentKind::RigidBody), None);
         assert_eq!(
             file_icon(AssetKind::CameraSettings),
