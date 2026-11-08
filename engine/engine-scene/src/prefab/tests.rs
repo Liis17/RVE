@@ -835,3 +835,213 @@ fn animator_prefab_override_replaces_the_whole_component_and_checks_its_clips() 
     let error = other.expand(&scene(&bad)).unwrap_err();
     assert!(error.message.contains("animator"), "{error}");
 }
+
+fn load_template(library: &Library, path: &str) -> Result<PrefabTemplate, SceneError> {
+    let path = VirtualPath::parse(path).unwrap();
+    let mut read = |child: &VirtualPath| -> Result<String, String> {
+        library
+            .0
+            .get(child.as_str())
+            .cloned()
+            .ok_or_else(|| "не найден".to_owned())
+    };
+    PrefabTemplate::load(&path, &mut read)
+}
+
+#[test]
+fn max_instances_from_nested_prefab_assets_never_reaches_the_scene() {
+    let inner = "[[objects]]\nid = \"core\"\n";
+    let outer = "[[assets]]\npath = \"/prefabs/inner.rveprefab\"\nmax_instances = 5\n[[objects]]\nid = \"base\"\n[[instances]]\nid = \"door\"\nprefab = \"/prefabs/inner.rveprefab\"\nparent = \"base\"\n";
+    let library = Library::new(&[
+        ("prefabs/inner.rveprefab", inner),
+        ("prefabs/outer.rveprefab", outer),
+    ]);
+    let instances = "[[instances]]\nid = \"x\"\nprefab = \"/prefabs/outer.rveprefab\"\n";
+    let max_instances = |expanded: &Expansion, path: &str| {
+        expanded
+            .document
+            .assets
+            .iter()
+            .find(|asset| asset.path.as_str() == path)
+            .and_then(|asset| asset.max_instances)
+    };
+
+    // Лимит внешнего префаба задан сценой, лимит вложенного в префабе не переносится.
+    let declared = "[[assets]]\npath = \"/prefabs/outer.rveprefab\"\nmax_instances = 2\n";
+    let expanded = library
+        .expand(&scene(&format!("{declared}{CAMERA}{instances}")))
+        .unwrap();
+    assert_eq!(max_instances(&expanded, "prefabs/outer.rveprefab"), Some(2));
+    assert_eq!(max_instances(&expanded, "prefabs/inner.rveprefab"), None);
+    assert!(
+        expanded
+            .document
+            .assets
+            .iter()
+            .any(|asset| asset.path.as_str() == "prefabs/inner.rveprefab")
+    );
+
+    // Собственная запись сцены остаётся при слиянии с вложенным префабом.
+    let declared = "[[assets]]\npath = \"/prefabs/outer.rveprefab\"\nmax_instances = 2\n[[assets]]\npath = \"/prefabs/inner.rveprefab\"\nmax_instances = 7\n";
+    let expanded = library
+        .expand(&scene(&format!("{declared}{CAMERA}{instances}")))
+        .unwrap();
+    assert_eq!(max_instances(&expanded, "prefabs/inner.rveprefab"), Some(7));
+}
+
+#[test]
+fn particle_emitter_prefab_override_replaces_the_whole_component_and_checks_texture() {
+    let prefab =
+        "[[objects]]\nid = \"fx\"\n[objects.particle_emitter]\ncapacity = 512\nrate = 40.0\n";
+    let library = Library::new(&[("prefabs/fx.rveprefab", prefab)]);
+    let assets =
+        "[[assets]]\npath = \"/prefabs/fx.rveprefab\"\n[[assets]]\npath = \"/fx/smoke.png\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spark\"\nprefab = \"/prefabs/fx.rveprefab\"\n[[instances.overrides]]\ntarget = \"fx\"\nparticle_emitter = {{ blend = \"alpha\", texture = \"/fx/smoke.png\" }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let emitter = object(&expanded, "spark").particle_emitter.clone().unwrap();
+    assert_eq!(emitter.blend, crate::particles::ParticleBlendMode::Alpha);
+    assert_eq!(
+        emitter.rate, 10.0,
+        "replacement must not keep inherited fields"
+    );
+    assert_eq!(emitter.capacity, 256);
+    assert_eq!(
+        emitter.texture.as_ref().map(|path| path.as_str()),
+        Some("fx/smoke.png")
+    );
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"spark\"\nprefab = \"/prefabs/fx.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "spark")
+            .particle_emitter
+            .as_ref()
+            .unwrap()
+            .capacity,
+        512
+    );
+
+    let undeclared = format!(
+        "{CAMERA}[[objects]]\nid = \"fx\"\n[objects.particle_emitter]\ntexture = \"/fx/smoke.png\"\n"
+    );
+    let error = SceneDocument::parse("scene.rvescene", &undeclared).unwrap_err();
+    assert!(error.message.contains("[[assets]]"), "{error}");
+
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let other = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let bad = format!(
+        "{assets}{CAMERA}[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\nparticle_emitter = {{ rate = 5.0 }}\n"
+    );
+    let error = other.expand(&scene(&bad)).unwrap_err();
+    assert!(error.message.contains("particle_emitter"), "{error}");
+}
+
+#[test]
+fn prefab_with_environment_loads_as_a_template_and_only_spawn_is_refused() {
+    let environment = "[objects.environment]\n[objects.environment.procedural]\nzenith_color = [0.2, 0.3, 0.5]\nhorizon_color = [0.8, 0.7, 0.5]\nground_color = [0.1, 0.1, 0.1]\nsun_size_deg = 3.0\nsun_intensity = 2.0\n";
+    let text = format!("[[objects]]\nid = \"sky\"\n{environment}");
+    let library = Library::new(&[("prefabs/sky.rveprefab", text.as_str())]);
+    let template = load_template(&library, "prefabs/sky.rveprefab").unwrap();
+    assert_eq!(template.objects().len(), 1);
+    assert!(template.check_spawnable().is_err());
+}
+
+#[test]
+fn spawn_template_accepts_point_and_spot_lights() {
+    let library = Library::new(&[(
+        "prefabs/lamp.rveprefab",
+        "[[objects]]\nid = \"root\"\n[objects.point_light]\n[[objects]]\nid = \"bulb\"\nparent = \"root\"\n[objects.spot_light]\n",
+    )]);
+    let template = load_template(&library, "prefabs/lamp.rveprefab").unwrap();
+    assert_eq!(template.objects.len(), 2);
+}
+
+#[test]
+fn spawn_template_rejects_camera_directional_light_and_environment() {
+    let environment = "[objects.environment]\n[objects.environment.procedural]\nzenith_color = [0.2, 0.3, 0.5]\nhorizon_color = [0.8, 0.7, 0.5]\nground_color = [0.1, 0.1, 0.1]\nsun_size_deg = 3.0\nsun_intensity = 2.0\n";
+    for (name, component) in [
+        ("camera", "[objects.camera]\n"),
+        ("directional_light", "[objects.directional_light]\n"),
+        ("environment", environment),
+    ] {
+        let text = format!(
+            "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"lamp\"\nparent = \"root\"\n{component}"
+        );
+        let library = Library::new(&[("prefabs/bullet.rveprefab", text.as_str())]);
+        let template = load_template(&library, "prefabs/bullet.rveprefab").unwrap();
+        let error = template.check_spawnable().unwrap_err();
+        assert!(error.message.contains(name), "{error}");
+        assert_eq!(error.object_id.as_deref(), Some("lamp"));
+    }
+}
+
+#[test]
+fn spawn_template_reports_missing_prefabs_and_dynamic_children() {
+    let empty = Library::new(&[]);
+    let error = load_template(&empty, "prefabs/gone.rveprefab").unwrap_err();
+    assert!(error.message.contains("не найден"), "{error}");
+
+    let library = Library::new(&[(
+        "prefabs/crate.rveprefab",
+        "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"child\"\nparent = \"root\"\n[objects.collider]\n[objects.rigid_body]\n",
+    )]);
+    let error = load_template(&library, "prefabs/crate.rveprefab").unwrap_err();
+    assert!(error.message.contains("корневым"), "{error}");
+}
+
+#[test]
+fn spawn_template_uses_local_ids_parents_and_order_for_nested_prefabs() {
+    let library = Library::new(&[
+        (
+            "prefabs/inner.rveprefab",
+            "[[objects]]\nid = \"core\"\n[[objects]]\nid = \"arm\"\nparent = \"core\"\n",
+        ),
+        (
+            "prefabs/outer.rveprefab",
+            "[[assets]]\npath = \"/prefabs/inner.rveprefab\"\n[[objects]]\nid = \"base\"\n\
+             [[instances]]\nid = \"door\"\nprefab = \"/prefabs/inner.rveprefab\"\nparent = \"base\"\n",
+        ),
+    ]);
+    let template = load_template(&library, "prefabs/outer.rveprefab").unwrap();
+    assert_eq!(template.stem(), "outer");
+    let ids = template
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["", "door", "door.arm"]);
+    assert_eq!(template.root, 0);
+    assert_eq!(template.parents, [None, Some(0), Some(1)]);
+    assert_eq!(template.order, [0, 1, 2]);
+    assert!(
+        template
+            .assets()
+            .iter()
+            .any(|asset| asset.path.as_str() == "prefabs/inner.rveprefab")
+    );
+}
+
+#[test]
+fn spawnable_template_passes_check_and_structural_errors_still_fail_load() {
+    let library = Library::new(&[(
+        "prefabs/ball.rveprefab",
+        "[[objects]]\nid = \"root\"\n[objects.collider]\n[objects.rigid_body]\nkind = \"dynamic\"\n",
+    )]);
+    assert!(
+        load_template(&library, "prefabs/ball.rveprefab")
+            .unwrap()
+            .check_spawnable()
+            .is_ok()
+    );
+    // Не читается — ошибка загрузки, а не отказ spawn.
+    assert!(load_template(&library, "prefabs/gone.rveprefab").is_err());
+    let broken = Library::new(&[(
+        "prefabs/bad.rveprefab",
+        "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"child\"\nparent = \"missing\"\n",
+    )]);
+    assert!(load_template(&broken, "prefabs/bad.rveprefab").is_err());
+}

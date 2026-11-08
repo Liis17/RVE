@@ -10,6 +10,7 @@ use crate::play_cursor::PlayCursor;
 use crate::previews::PreviewCache;
 use crate::profile::EditorProfile;
 use crate::project::OpenProject;
+use crate::project_prefabs::ProjectPrefabs;
 use crate::scene_edit::{Component, EditorScene, NewObject};
 use crate::viewport::animation::{AnimationPreview, PreviewStatus};
 use crate::viewport::camera::{EditorCamera, View};
@@ -147,6 +148,8 @@ pub struct FrameParts<'a> {
 
 pub struct EditorState {
     pub project: Option<OpenProject>,
+    /// Открытый в подокне «Project Prefabs» список тяжёлых префабов; хранится с несохранёнными правками.
+    pub project_prefabs: Option<ProjectPrefabs>,
     pub scene: Option<EditorScene>,
     pub log: ConsoleLog,
     pub profile: EditorProfile,
@@ -232,6 +235,7 @@ impl EditorState {
     pub fn new(scripts_path: Option<PathBuf>) -> Self {
         Self {
             project: None,
+            project_prefabs: None,
             scene: None,
             log: ConsoleLog::default(),
             profile: EditorProfile::default(),
@@ -466,6 +470,29 @@ impl EditorState {
         self.hierarchy_rename = None;
         self.game_camera = None;
         self.pending_frame = None;
+    }
+
+    /// Список тяжёлых префабов относится к проекту, который открыт сейчас: при открытии другого
+    /// проекта несохранённые правки прошлого списка не переносятся.
+    pub fn project_replaced(&mut self) {
+        self.project_prefabs = None;
+    }
+
+    /// Есть ли несохранённые правки сцены или списка тяжёлых префабов.
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.scene.as_ref().is_some_and(EditorScene::is_dirty)
+            || self
+                .project_prefabs
+                .as_ref()
+                .is_some_and(ProjectPrefabs::is_dirty)
+    }
+
+    /// Сохраняет список тяжёлых префабов, если в нём есть правки; без правок файл не трогается.
+    pub fn save_project_prefabs(&mut self) -> Result<(), String> {
+        match self.project_prefabs.as_mut() {
+            Some(prefabs) if prefabs.is_dirty() => prefabs.save(),
+            _ => Ok(()),
+        }
     }
 
     /// Выполняет правку сцены и пишет ошибку в консоль; в Play-режиме документ не меняется.
@@ -1029,5 +1056,44 @@ settings = "/cameras/problem.camerasettings"
 
         state.scripts_path = Some(PathBuf::from("manual.dll"));
         assert!(state.request_play());
+    }
+
+    #[test]
+    fn unsaved_project_prefab_list_counts_until_it_is_saved() {
+        let temp = TempProject::new(None);
+        let mut state = EditorState::new(None);
+        state.project = Some(OpenProject::open(&temp.0).unwrap());
+        state.project_prefabs = Some(ProjectPrefabs::open(&temp.0));
+        assert!(!state.has_unsaved_changes());
+
+        state
+            .project_prefabs
+            .as_mut()
+            .unwrap()
+            .add("prefabs/crate.rveprefab")
+            .unwrap();
+        assert!(state.has_unsaved_changes());
+        state.save_project_prefabs().unwrap();
+        assert!(!state.has_unsaved_changes());
+        assert_eq!(ProjectPrefabs::open(&temp.0).entries().len(), 1);
+    }
+
+    #[test]
+    fn opening_another_project_drops_unsaved_prefab_list_edits() {
+        let temp = TempProject::new(None);
+        let mut state = EditorState::new(None);
+        state.project_prefabs = Some(ProjectPrefabs::open(&temp.0));
+        state
+            .project_prefabs
+            .as_mut()
+            .unwrap()
+            .add("prefabs/crate.rveprefab")
+            .unwrap();
+        assert!(state.has_unsaved_changes());
+
+        state.project_replaced();
+        assert!(state.project_prefabs.is_none());
+        assert!(!state.has_unsaved_changes());
+        assert!(ProjectPrefabs::open(&temp.0).entries().is_empty());
     }
 }

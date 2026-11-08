@@ -1188,6 +1188,35 @@ fn shutdown_wakes_pending_work_rejects_retained_handles_and_joins_workers() {
 }
 
 #[test]
+fn shutdown_stops_workers_that_were_just_woken_by_jobs() {
+    // Regression: a worker woken by a job that another worker took first could
+    // lose its stop signal, so `shutdown` blocked forever on that worker's join.
+    const ROUNDS: usize = 2000;
+    for round in 0..ROUNDS {
+        let root = TempDirectory::new();
+        let backend = Backend::Loose(root.path().to_path_buf());
+        let system = injected_system(root.path(), backend, 4, 8, 1024 * 1024);
+        let handle = system.handle();
+        let requests: Vec<_> = (0..round % 5 + 1)
+            .map(|index| handle.stat(format!("missing-{index}.bin")).unwrap())
+            .collect();
+        drop(handle);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut system = system;
+            let _ = done_tx.send(system.shutdown());
+        });
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                panic!("round {round}: shutdown did not finish, a worker missed its stop")
+            });
+        assert!(result.is_ok());
+        drop(requests);
+    }
+}
+
+#[test]
 fn injected_worker_thread_panic_completes_the_request_and_releases_memory() {
     let root = TempDirectory::new();
     let mut system = loose_system(root.path());

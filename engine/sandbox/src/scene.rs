@@ -17,6 +17,7 @@ pub enum Scene {
     Shadows,
     Materials,
     Clustered,
+    Particles,
 }
 
 const SHADOWS_CAMERA: OrbitCamera = OrbitCamera {
@@ -56,6 +57,7 @@ impl Scene {
             "shadows" => Some(Self::Shadows),
             "materials" => Some(Self::Materials),
             "clustered" => Some(Self::Clustered),
+            "particles" => Some(Self::Particles),
             _ => None,
         }
     }
@@ -63,7 +65,7 @@ impl Scene {
     pub fn mesh(self) -> (Vec<Vertex>, Vec<u32>) {
         match self {
             Self::Triangle => (TRIANGLE_VERTICES.to_vec(), TRIANGLE_INDICES.to_vec()),
-            Self::Cube | Self::Shadows | Self::Clustered => cube_mesh(),
+            Self::Cube | Self::Shadows | Self::Clustered | Self::Particles => cube_mesh(),
             Self::Materials => uv_sphere_mesh(Vec3::ZERO, 1.0),
         }
     }
@@ -72,7 +74,9 @@ impl Scene {
     pub fn texture(self) -> Option<TextureData> {
         match self {
             Self::Triangle => None,
-            Self::Cube | Self::Shadows | Self::Clustered => Some(checker_texture()),
+            Self::Cube | Self::Shadows | Self::Clustered | Self::Particles => {
+                Some(checker_texture())
+            }
             Self::Materials => None,
         }
     }
@@ -87,7 +91,7 @@ impl Scene {
         match self {
             Self::Triangle => triangle_view_projection(width, height),
             Self::Cube => cube_view_projection(width, height),
-            Self::Shadows | Self::Materials | Self::Clustered => self
+            Self::Shadows | Self::Materials | Self::Clustered | Self::Particles => self
                 .camera_at(elapsed, settings)
                 .expect("lit sandbox scenes have a camera")
                 .view_projection(width, height),
@@ -97,7 +101,7 @@ impl Scene {
     pub fn camera_at(self, elapsed: f32, settings: CameraSettings) -> Option<Camera> {
         match self {
             Self::Triangle | Self::Cube => None,
-            Self::Shadows => Some(
+            Self::Shadows | Self::Particles => Some(
                 OrbitCamera {
                     fov_narrow: settings.projection.fov_deg.to_radians(),
                     near: settings.projection.near,
@@ -119,7 +123,7 @@ impl Scene {
         match self {
             Self::Triangle => Mat4::from_rotation_z(elapsed),
             Self::Cube => cube_model(elapsed),
-            Self::Shadows | Self::Clustered => Mat4::from_rotation_z(elapsed),
+            Self::Shadows | Self::Clustered | Self::Particles => Mat4::from_rotation_z(elapsed),
             Self::Materials => Mat4::IDENTITY,
         }
     }
@@ -448,6 +452,7 @@ mod tests {
         assert_eq!(Scene::parse("shadows"), Some(Scene::Shadows));
         assert_eq!(Scene::parse("materials"), Some(Scene::Materials));
         assert_eq!(Scene::parse("clustered"), Some(Scene::Clustered));
+        assert_eq!(Scene::parse("particles"), Some(Scene::Particles));
         assert_eq!(Scene::parse("Cube"), None);
         assert_eq!(Scene::parse(""), None);
         assert_eq!(Scene::default(), Scene::Shadows);

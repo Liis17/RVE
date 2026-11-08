@@ -3,7 +3,8 @@
 use crate::CameraSettings;
 use crate::animation::{AnimatorComponent, validate_animator};
 use crate::audio::{AudioSourceComponent, validate_audio_source};
-use crate::prefab::PrefabInstance;
+use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
+use crate::prefab::{PREFAB_EXTENSION, PrefabInstance};
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -163,6 +164,22 @@ impl SceneDocument {
                     format!("некорректное имя архива {archive:?}"),
                 ));
             }
+            if let Some(max_instances) = asset.max_instances {
+                let is_prefab = Path::new(asset.path.as_str())
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(PREFAB_EXTENSION));
+                if !is_prefab || max_instances == 0 {
+                    return Err(SceneError::new(
+                        source,
+                        None,
+                        format!(
+                            "max_instances ресурса /{} допустим только для .{PREFAB_EXTENSION} и должен быть больше 0",
+                            asset.path.as_str()
+                        ),
+                    ));
+                }
+            }
         }
 
         let mut object_indices = HashMap::with_capacity(self.objects.len());
@@ -267,6 +284,9 @@ impl SceneDocument {
             }
             if let Some(animator) = &object.animator {
                 validate_animator(source, object, &asset_paths, animator)?;
+            }
+            if let Some(emitter) = &object.particle_emitter {
+                validate_particle_emitter(source, &object.id, &asset_paths, emitter)?;
             }
             if let Some(mesh) = &object.mesh_renderer {
                 require_asset_path(source, &object.id, &asset_paths, &mesh.model, "модель")?;
@@ -455,6 +475,9 @@ pub struct SceneAsset {
     pub path: VirtualPath,
     #[serde(default)]
     pub archive: Option<String>,
+    /// Лимит живых spawn-экземпляров; допустим только для `.rveprefab` и больше нуля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<u32>,
 }
 
 /// Объект сцены в порядке документа.
@@ -492,6 +515,7 @@ pub struct SceneObject {
     pub audio_source: Option<AudioSourceComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub animator: Option<AnimatorComponent>,
+    pub particle_emitter: Option<ParticleEmitterComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]
@@ -672,6 +696,23 @@ pub struct MeshRenderer {
     pub texture: Option<VirtualPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<MaterialOverride>,
+}
+
+/// Модель, геометрия которой нужна мешевому коллайдеру: `model` меш-рендерера, если форма
+/// коллайдера — выпуклый или треугольный меш. Одинакова для сцены, префабов и редактора.
+pub fn mesh_collider_model(
+    collider: Option<ColliderComponent>,
+    mesh: Option<&MeshRenderer>,
+) -> Option<&str> {
+    let collider = collider?;
+    if matches!(
+        collider.shape,
+        ColliderShape::ConvexMesh | ColliderShape::TriangleMesh
+    ) {
+        Some(mesh?.model.as_str())
+    } else {
+        None
+    }
 }
 
 pub const MAX_LOD_LEVELS: usize = 6;
@@ -2951,5 +2992,44 @@ lock_on_start = true
         );
         let error = SceneDocument::parse("missing-environment.rvescene", &missing).unwrap_err();
         assert!(error.message.contains("отсутствует в [[assets]]"));
+    }
+
+    #[test]
+    fn max_instances_round_trips_for_prefab_assets_and_stays_absent_otherwise() {
+        let input = format!(
+            "[[assets]]\npath = \"/prefabs/bullet.rveprefab\"\nmax_instances = 100\n[[assets]]\npath = \"/models/crate.fbx\"\n{VALID}"
+        );
+        let document = parse(&input).unwrap();
+        assert_eq!(document.assets[0].max_instances, Some(100));
+        assert_eq!(document.assets[1].max_instances, None);
+        let text = document.to_toml().unwrap();
+        assert!(text.contains("max_instances = 100"), "{text}");
+        assert_eq!(parse(&text).unwrap().assets, document.assets);
+
+        let plain = parse(&format!(
+            "[[assets]]\npath = \"/models/crate.fbx\"\n{VALID}"
+        ))
+        .unwrap()
+        .to_toml()
+        .unwrap();
+        assert!(!plain.contains("max_instances"), "{plain}");
+        assert_eq!(parse(&plain).unwrap().to_toml().unwrap(), plain);
+    }
+
+    #[test]
+    fn max_instances_requires_a_prefab_and_a_positive_value() {
+        for asset in [
+            "path = \"/models/crate.fbx\"\nmax_instances = 3",
+            "path = \"/prefabs/bullet.rveprefab\"\nmax_instances = 0",
+        ] {
+            let error = parse(&format!("[[assets]]\n{asset}\n{VALID}")).unwrap_err();
+            assert!(error.message.contains("max_instances"), "{error}");
+        }
+        assert!(
+            parse(&format!(
+                "[[assets]]\npath = \"/prefabs/bullet.rveprefab\"\nmax_instances = -1\n{VALID}"
+            ))
+            .is_err()
+        );
     }
 }

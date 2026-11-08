@@ -146,6 +146,9 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     if let Some(animator) = &object.animator {
         show_animator(ui, state, id, animator);
     }
+    if let Some(emitter) = &object.particle_emitter {
+        show_particle_emitter(ui, state, id, emitter);
+    }
     if let Some(environment) = &object.environment {
         show_environment(ui, state, id, environment);
     }
@@ -1586,6 +1589,311 @@ fn show_audio_source(
     run_menu_action(state, id, ComponentKind::AudioSource, action);
 }
 
+fn show_particle_emitter(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    emitter: &engine_scene::ParticleEmitterComponent,
+) {
+    let field = OverrideField::ParticleEmitter;
+    let textures = state.assets_of_kind(AssetKind::Texture);
+    let mut texture_choice = None;
+    let action = component_header(
+        ui,
+        HeaderTitle {
+            text: "Particle Emitter",
+            icon: component_icon(state, ComponentKind::ParticleEmitter),
+        },
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::ParticleEmitter)),
+        true,
+        |ui| {
+            egui::Grid::new("particle_emitter")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    let mut value = emitter.clone();
+                    let mut responses = Vec::new();
+                    ui.label("Blend");
+                    responses.push(
+                        egui::ComboBox::from_id_salt("particle_blend")
+                            .selected_text(particle_blend_label(value.blend))
+                            .show_ui(ui, |ui| {
+                                for option in [
+                                    engine_scene::ParticleBlendMode::Additive,
+                                    engine_scene::ParticleBlendMode::Alpha,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut value.blend,
+                                        option,
+                                        particle_blend_label(option),
+                                    );
+                                }
+                            })
+                            .response,
+                    );
+                    ui.end_row();
+                    ui.label("Texture");
+                    texture_choice = asset_picker(
+                        ui,
+                        "particle_texture",
+                        value.texture.as_ref().map_or("", |path| path.as_str()),
+                        &textures,
+                    );
+                    ui.end_row();
+                    ui.label("Capacity");
+                    responses.push(
+                        ui.add(
+                            egui::DragValue::new(&mut value.capacity)
+                                .range(1..=engine_scene::MAX_ADDITIVE_PARTICLE_CAPACITY),
+                        ),
+                    );
+                    ui.end_row();
+                    ui.label("Rate");
+                    responses.push(
+                        ui.add(
+                            egui::DragValue::new(&mut value.rate)
+                                .speed(0.5)
+                                .range(0.0..=f32::MAX),
+                        ),
+                    );
+                    ui.end_row();
+                    ui.label("Duration");
+                    responses.push(
+                        ui.add(
+                            egui::DragValue::new(&mut value.duration)
+                                .speed(0.05)
+                                .range(0.001..=f32::MAX),
+                        ),
+                    );
+                    ui.end_row();
+                    ui.label("Loop");
+                    responses.push(ui.checkbox(&mut value.looping, ""));
+                    ui.end_row();
+                    responses.push(range_row(ui, "Lifetime", &mut value.lifetime, 0.05));
+                    responses.push(range_row(ui, "Speed", &mut value.speed, 0.05));
+                    responses.push(range_row(ui, "Size", &mut value.size, 0.01));
+                    responses.push(range_row(ui, "Rotation", &mut value.rotation, 0.05));
+                    responses.push(range_row(
+                        ui,
+                        "Angular velocity",
+                        &mut value.angular_velocity,
+                        0.05,
+                    ));
+                    ui.label("Gravity");
+                    ui.horizontal(|ui| {
+                        for axis in &mut value.gravity {
+                            responses.push(ui.add(egui::DragValue::new(axis).speed(0.05)));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Drag");
+                    responses.push(
+                        ui.add(
+                            egui::DragValue::new(&mut value.drag)
+                                .speed(0.01)
+                                .range(0.0..=f32::MAX),
+                        ),
+                    );
+                    ui.end_row();
+                    ui.label("Soft distance");
+                    responses.push(
+                        ui.add(
+                            egui::DragValue::new(&mut value.soft_distance)
+                                .speed(0.01)
+                                .range(0.0..=f32::MAX),
+                        ),
+                    );
+                    ui.end_row();
+                    ui.label("Shape");
+                    responses.push(
+                        egui::ComboBox::from_id_salt("particle_shape")
+                            .selected_text(particle_shape_label(&value.shape))
+                            .show_ui(ui, |ui| {
+                                for option in particle_shape_options() {
+                                    let label = particle_shape_label(&option);
+                                    if ui
+                                        .selectable_label(
+                                            particle_shape_label(&value.shape) == label,
+                                            label,
+                                        )
+                                        .clicked()
+                                    {
+                                        value.shape = option;
+                                    }
+                                }
+                            })
+                            .response,
+                    );
+                    ui.end_row();
+                    match &mut value.shape {
+                        engine_scene::ParticleShapeComponent::Point {} => {}
+                        engine_scene::ParticleShapeComponent::Sphere { radius } => {
+                            ui.label("Radius");
+                            responses.push(ui.add(egui::DragValue::new(radius).speed(0.01)));
+                            ui.end_row();
+                        }
+                        engine_scene::ParticleShapeComponent::Cone { angle, radius } => {
+                            ui.label("Angle");
+                            responses.push(
+                                ui.add(
+                                    egui::DragValue::new(angle)
+                                        .speed(0.01)
+                                        .range(0.0..=std::f32::consts::FRAC_PI_2),
+                                ),
+                            );
+                            ui.end_row();
+                            ui.label("Radius");
+                            responses.push(ui.add(egui::DragValue::new(radius).speed(0.01)));
+                            ui.end_row();
+                        }
+                        engine_scene::ParticleShapeComponent::Box { half_extents } => {
+                            ui.label("Half extents");
+                            ui.horizontal(|ui| {
+                                for axis in half_extents.iter_mut() {
+                                    responses.push(
+                                        ui.add(
+                                            egui::DragValue::new(axis)
+                                                .speed(0.01)
+                                                .range(0.0..=f32::MAX),
+                                        ),
+                                    );
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    }
+                    ui.label("Flipbook");
+                    ui.horizontal(|ui| {
+                        responses.push(
+                            ui.add(egui::DragValue::new(&mut value.flipbook.columns).range(1..=16)),
+                        );
+                        responses.push(
+                            ui.add(egui::DragValue::new(&mut value.flipbook.rows).range(1..=16)),
+                        );
+                        responses.push(
+                            ui.add(
+                                egui::DragValue::new(&mut value.flipbook.frames_per_second)
+                                    .speed(0.1)
+                                    .range(0.0..=f32::MAX),
+                            ),
+                        );
+                    });
+                    ui.end_row();
+                    let mut collision_enabled = value.collision.is_some();
+                    ui.label("Collision");
+                    responses.push(ui.checkbox(&mut collision_enabled, ""));
+                    ui.end_row();
+                    if collision_enabled {
+                        let collision = value.collision.get_or_insert_with(Default::default);
+                        ui.label("Restitution");
+                        responses.push(
+                            ui.add(
+                                egui::DragValue::new(&mut collision.restitution)
+                                    .speed(0.01)
+                                    .range(0.0..=1.0),
+                            ),
+                        );
+                        ui.end_row();
+                        ui.label("Friction");
+                        responses.push(
+                            ui.add(
+                                egui::DragValue::new(&mut collision.friction)
+                                    .speed(0.01)
+                                    .range(0.0..=1.0),
+                            ),
+                        );
+                        ui.end_row();
+                        ui.label("Thickness");
+                        responses.push(
+                            ui.add(
+                                egui::DragValue::new(&mut collision.thickness)
+                                    .speed(0.005)
+                                    .range(0.0..=f32::MAX),
+                            ),
+                        );
+                        ui.end_row();
+                    } else {
+                        value.collision = None;
+                    }
+                    let response = responses
+                        .into_iter()
+                        .reduce(|left, right| left | right)
+                        .expect("particle emitter has fields");
+                    commit(state, id, "particle_emitter", &response, |object| {
+                        object.particle_emitter = Some(value.clone());
+                    });
+                });
+        },
+    );
+    if let Some(path) = texture_choice
+        && let Some(texture) = parse_path(state, &path)
+    {
+        // set_component объявляет текстуру в [[assets]] сцены; прямая правка этого не делает.
+        state.edit_scene(|scene| {
+            scene.set_component(
+                id,
+                Component::ParticleEmitter(engine_scene::ParticleEmitterComponent {
+                    texture: Some(texture.clone()),
+                    ..emitter.clone()
+                }),
+            )
+        });
+    }
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| scene.remove_particle_emitter(id));
+    }
+    run_menu_action(state, id, ComponentKind::ParticleEmitter, action);
+}
+
+/// Строка диапазона `[min, max]` в сетке инспектора.
+fn range_row(ui: &mut egui::Ui, label: &str, range: &mut [f32; 2], speed: f64) -> egui::Response {
+    ui.label(label);
+    let response = ui
+        .horizontal(|ui| {
+            let low = ui.add(egui::DragValue::new(&mut range[0]).speed(speed));
+            let high = ui.add(egui::DragValue::new(&mut range[1]).speed(speed));
+            low | high
+        })
+        .inner;
+    ui.end_row();
+    response
+}
+
+fn particle_blend_label(blend: engine_scene::ParticleBlendMode) -> &'static str {
+    match blend {
+        engine_scene::ParticleBlendMode::Additive => "Additive",
+        engine_scene::ParticleBlendMode::Alpha => "Alpha",
+    }
+}
+
+fn particle_shape_options() -> [engine_scene::ParticleShapeComponent; 4] {
+    [
+        engine_scene::ParticleShapeComponent::Point {},
+        engine_scene::ParticleShapeComponent::Sphere { radius: 0.5 },
+        engine_scene::ParticleShapeComponent::Cone {
+            angle: 0.3,
+            radius: 0.1,
+        },
+        engine_scene::ParticleShapeComponent::Box {
+            half_extents: [0.5; 3],
+        },
+    ]
+}
+
+fn particle_shape_label(shape: &engine_scene::ParticleShapeComponent) -> &'static str {
+    match shape {
+        engine_scene::ParticleShapeComponent::Point {} => "Point",
+        engine_scene::ParticleShapeComponent::Sphere { .. } => "Sphere",
+        engine_scene::ParticleShapeComponent::Cone { .. } => "Cone",
+        engine_scene::ParticleShapeComponent::Box { .. } => "Box",
+    }
+}
+
 fn audio_group_label(group: AudioGroup) -> &'static str {
     match group {
         AudioGroup::Master => "Master",
@@ -2640,6 +2948,14 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                 scene.set_component(
                     id,
                     Component::CharacterController(CharacterControllerComponent::default()),
+                )
+            });
+        }
+        if object.particle_emitter.is_none() && ui.button("Particle Emitter").clicked() {
+            state.edit_scene(|scene| {
+                scene.set_component(
+                    id,
+                    Component::ParticleEmitter(engine_scene::ParticleEmitterComponent::default()),
                 )
             });
         }

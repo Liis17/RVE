@@ -524,6 +524,9 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.animator.is_some() {
         base.animator = outer.animator.clone();
     }
+    if outer.particle_emitter.is_some() {
+        base.particle_emitter = outer.particle_emitter.clone();
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -560,6 +563,7 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.character_controller.is_none()
         && change.audio_source.is_none()
         && change.animator.is_none()
+        && change.particle_emitter.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -668,6 +672,13 @@ pub(crate) fn object_override(
     match (&base.animator, &edited.animator) {
         (None, None) => {}
         (Some(from), Some(to)) => change.animator = (to != from).then(|| to.clone()),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (&base.particle_emitter, &edited.particle_emitter) {
+        (None, None) => {}
+        (Some(from), Some(to)) => {
+            change.particle_emitter = (to != from).then(|| to.clone());
+        }
         _ => return Err(COMPONENTS.to_owned()),
     }
     if base.lite_scripts.len() != edited.lite_scripts.len()
@@ -816,6 +827,7 @@ pub enum OverrideField {
     CharacterController,
     AudioSource,
     Animator,
+    ParticleEmitter,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -848,6 +860,7 @@ impl EditorScene {
             OverrideField::CharacterController => change.character_controller.is_some(),
             OverrideField::AudioSource => change.audio_source.is_some(),
             OverrideField::Animator => change.animator.is_some(),
+            OverrideField::ParticleEmitter => change.particle_emitter.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -892,6 +905,7 @@ impl EditorScene {
                     OverrideField::CharacterController => change.character_controller = None,
                     OverrideField::AudioSource => change.audio_source = None,
                     OverrideField::Animator => change.animator = None,
+                    OverrideField::ParticleEmitter => change.particle_emitter = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }
@@ -961,6 +975,7 @@ impl EditorScene {
                 prefab.assets.push(engine_scene::SceneAsset {
                     path: asset,
                     archive,
+                    max_instances: None,
                 });
             }
         }
@@ -1023,6 +1038,13 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
     }
     if let Some(animator) = &change.animator {
         paths.extend(animator.clips.iter().cloned());
+    }
+    if let Some(texture) = change
+        .particle_emitter
+        .as_ref()
+        .and_then(|emitter| emitter.texture.clone())
+    {
+        paths.push(texture);
     }
     paths
 }
@@ -2116,5 +2138,55 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn particle_emitter_prefab_override_diffs_the_whole_component_and_reverts() {
+        let prefab =
+            "[[objects]]\nid = \"fx\"\n[objects.particle_emitter]\ncapacity = 128\nrate = 20.0\n";
+        let files = Files::with(&[("prefabs/fx.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/fx.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        scene
+            .edit_object("fx", None, |object| {
+                let emitter = object.particle_emitter.as_mut().unwrap();
+                emitter.rate = 60.0;
+                emitter.texture = Some(path("/fx/smoke.png"));
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(scene.is_overridden("fx", &OverrideField::ParticleEmitter));
+        let change = scene.object_override("fx").unwrap();
+        assert_eq!(
+            change.particle_emitter,
+            scene.object("fx").unwrap().particle_emitter
+        );
+        assert!(
+            scene
+                .view()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/fx/smoke.png")),
+            "override texture must be declared in the instance document"
+        );
+
+        scene
+            .revert_field("fx", &OverrideField::ParticleEmitter)
+            .unwrap();
+        assert!(!scene.is_overridden("fx", &OverrideField::ParticleEmitter));
+        let emitter = scene
+            .object("fx")
+            .unwrap()
+            .particle_emitter
+            .clone()
+            .unwrap();
+        assert_eq!(emitter.rate, 20.0);
+        assert_eq!(emitter.capacity, 128);
     }
 }

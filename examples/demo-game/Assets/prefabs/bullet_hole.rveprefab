@@ -1,0 +1,16 @@
+[[assets]]
+path = "/models/shared-cube.fbx"
+
+# След попадания: тонкий тёмный блок без физики. Толщина по Z равна 2 × 0.004 м; скрипт пули
+# смещает центр на полтолщины от поверхности, поэтому след лежит на ней.
+[[objects]]
+id = "hole"
+name = "Bullet Hole"
+[objects.transform]
+scale = [0.04, 0.04, 0.004]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.mesh_renderer.material]
+base_color = [0.05, 0.05, 0.05]
+metallic = 0.0
+roughness = 0.8

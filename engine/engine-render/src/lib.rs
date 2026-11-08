@@ -30,6 +30,17 @@ use ui::{
 
 mod clusters;
 mod culling;
+mod particle_gpu;
+mod particles;
+
+use particle_gpu::{
+    ParticleEmitter, ParticlePass, ParticleSystem, particle_depth_source_masks, record_particles,
+};
+pub use particles::{
+    MAX_ADDITIVE_PARTICLE_CAPACITY, MAX_ALPHA_PARTICLE_CAPACITY, MAX_PARTICLE_CURVE_KEYS,
+    MAX_PARTICLE_STEP, ParticleBlend, ParticleBurst, ParticleCollision, ParticleColorKey,
+    ParticleEmitterDesc, ParticleFlipbook, ParticleShape, ParticleSizeKey,
+};
 #[cfg(any(test, all(windows, feature = "dlss")))]
 mod dlss;
 #[allow(dead_code)]
@@ -306,6 +317,20 @@ impl Default for DirectionalLight {
     }
 }
 
+/// Идентификатор GPU-эмиттера частиц, выдаётся `Renderer::create_particle_emitter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ParticleEmitterId(usize);
+
+/// Эмиттер, который вид показывает в кадре.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParticleEmitterFrame {
+    pub emitter: ParticleEmitterId,
+    /// Мировая матрица эмиттера (столбцы).
+    pub transform: [[f32; 4]; 4],
+    /// Рождение новых частиц; симуляция продолжается и при `false`.
+    pub emitting: bool,
+}
+
 /// Camera matrices and world-space position for one rendered view.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameCamera {
@@ -355,6 +380,10 @@ pub struct Frame<'a> {
     pub view: ViewSettings,
     /// Discards temporal history for this view before rendering it.
     pub reset_history: bool,
+    /// Эмиттеры частиц, которые показывает вид. Симулирует первый записанный вид с `particle_step > 0`.
+    pub particles: &'a [ParticleEmitterFrame],
+    /// Шаг симуляции частиц в секундах; 0 — только отрисовка. Значения больше `MAX_PARTICLE_STEP` обрезаются.
+    pub particle_step: f32,
 }
 
 /// Настройки масштабирования и обработки цвета одного вида.
@@ -749,6 +778,8 @@ pub enum GpuPass {
     Transparent,
     /// Отладочный wireframe.
     Wireframe,
+    /// Частицы: spawn, симуляция и аддитивные billboards.
+    Particles,
     /// TAA, FSR или DLSS; отсутствует, если временное сглаживание выключено.
     TemporalResolve,
     /// Tonemap до вывода на swapchain.
@@ -757,7 +788,7 @@ pub enum GpuPass {
 
 impl GpuPass {
     /// Число проходов, для которых записываются границы.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     /// Все проходы в порядке выполнения.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Clusters,
@@ -767,6 +798,7 @@ impl GpuPass {
         Self::Skybox,
         Self::Transparent,
         Self::Wireframe,
+        Self::Particles,
         Self::TemporalResolve,
         Self::Tonemap,
     ];
@@ -781,6 +813,7 @@ impl GpuPass {
             Self::Skybox => "Skybox",
             Self::Transparent => "Transparent",
             Self::Wireframe => "Wireframe",
+            Self::Particles => "Particles",
             Self::TemporalResolve => "Temporal resolve",
             Self::Tonemap => "Tonemap",
         }
@@ -1048,6 +1081,7 @@ pub struct Renderer {
     retired_swapchains: RetiredSwapchains<SwapchainBundle>,
     pending_swapchain_drop: Option<SwapchainBundle>,
     frames: Vec<FrameResources>,
+    particles: ParticleSystem,
     frame_slot: usize,
     submission_generation: u64,
     swapchain_generation: u64,
@@ -1167,6 +1201,7 @@ impl Renderer {
             ui_textures: Vec::new(),
             viewports: Vec::new(),
             screen_temporal: TemporalView::default(),
+            particles: ParticleSystem::default(),
             retired: RetireQueue::new(FRAMES_IN_FLIGHT),
             retired_swapchains: RetiredSwapchains::new(FRAMES_IN_FLIGHT),
             pending_swapchain_drop: None,
@@ -1769,6 +1804,7 @@ impl Renderer {
         frame: &Frame<'_>,
     ) -> Result<FrameOutcome, RenderError> {
         let prepare_started = Instant::now();
+        self.begin_particle_frame();
         if self.frame_slots_lost {
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
@@ -2087,6 +2123,7 @@ impl Renderer {
                 render_extent,
                 output_extent,
                 taa_set_layout,
+                self.particles.depth_layout()?,
             )?;
             write_image_set(
                 &device,
@@ -2159,6 +2196,19 @@ impl Renderer {
         let swapchain_extent = swapchain.extent;
         let render_finished = swapchain.render_finished[image_index];
         let output_is_srgb = is_srgb_format(self.surface_format.format);
+        let view_projection = multiply_4x4(frame.camera.projection, frame.camera.view);
+        let particle_works = self.particles.plan_view(
+            frame.particles,
+            frame.particle_step,
+            view_projection,
+            frame.debug_view,
+            frame.camera.position,
+        )?;
+        let particle_pass = self.particle_pipelines().map(|pipelines| ParticlePass {
+            works: &particle_works,
+            pipelines,
+            frame_set,
+        });
         let record_started = Instant::now();
         let recorded = (|| {
             let shadow = ShadowPass {
@@ -2203,6 +2253,7 @@ impl Renderer {
                 debug_view: frame.debug_view,
                 timestamps: screen_marks,
                 view,
+                particles: particle_pass,
             };
             let frame_resources = &mut self.frames[frame_slot];
             let overlay = match (&frame_resources.overlay_buffer.buffer, overlay_resources) {
@@ -2374,6 +2425,12 @@ impl Renderer {
             local_shadow_layout,
             skin: skin_plan.as_ref(),
         });
+        let particles_submitted = match &submitted {
+            Ok(outcome) => outcome.submitted,
+            Err(SubmitAndPresentError::BeforeSubmit(_)) => false,
+            Err(SubmitAndPresentError::AfterSubmit(_)) => true,
+        };
+        self.commit_particle_frame(particles_submitted);
         self.pending_frame_profile = Some(FrameProfile { cpu, gpu });
         match submitted {
             Ok(outcome) => Ok(outcome),
@@ -2410,6 +2467,7 @@ impl Renderer {
         clear: [f32; 4],
     ) -> Result<FrameOutcome, RenderError> {
         let prepare_started = Instant::now();
+        self.begin_particle_frame();
         if self.frame_slots_lost {
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
@@ -2660,6 +2718,7 @@ impl Renderer {
         let target_resources = ViewportTargetResources {
             image_set_layout,
             taa_set_layout,
+            particle_depth_layout: self.particles.depth_layout()?,
             image_sampler: self
                 .ui_sampler
                 .ok_or(RenderError::InvalidState("UI sampler отсутствует"))?,
@@ -2909,6 +2968,28 @@ impl Renderer {
         let swapchain_extent = swapchain.extent;
         let render_finished = swapchain.render_finished[image_index];
 
+        let particle_pipelines = self.particle_pipelines();
+        let mut particle_works = Vec::with_capacity(rendered.len());
+        for entry in &rendered {
+            // Вид без цели не записывается: ему не отдаём план и не коммитим состояние.
+            let has_target = self
+                .viewports
+                .get(entry.0.0)
+                .and_then(Option::as_ref)
+                .and_then(|viewport| viewport.targets.get(frame_slot))
+                .is_some_and(Option::is_some);
+            if !has_target {
+                particle_works.push(Vec::new());
+                continue;
+            }
+            particle_works.push(self.particles.plan_view(
+                entry.1.particles,
+                entry.1.particle_step,
+                multiply_4x4(entry.1.camera.projection, entry.1.camera.view),
+                entry.1.debug_view,
+                entry.1.camera.position,
+            )?);
+        }
         let mut gpu_layout = GpuProfileLayout::default();
         let scene_passes = rendered
             .iter()
@@ -2979,6 +3060,11 @@ impl Renderer {
                                     .map(|first| GpuMarks { pool, first })
                             }),
                             view: effective_view_settings(frame.view, frame.debug_view),
+                            particles: particle_pipelines.map(|pipelines| ParticlePass {
+                                works: &particle_works[index],
+                                pipelines,
+                                frame_set: *frame_set,
+                            }),
                         },
                         *tonemap_set,
                         *output_set,
@@ -3256,6 +3342,12 @@ impl Renderer {
             local_shadow_layout,
             skin: skin_plan.as_ref(),
         });
+        let particles_submitted = match &submitted {
+            Ok(outcome) => outcome.submitted,
+            Err(SubmitAndPresentError::BeforeSubmit(_)) => false,
+            Err(SubmitAndPresentError::AfterSubmit(_)) => true,
+        };
+        self.commit_particle_frame(particles_submitted);
         self.pending_frame_profile = Some(FrameProfile { cpu, gpu });
         match submitted {
             Ok(outcome) => Ok(outcome),
@@ -3836,6 +3928,7 @@ impl Renderer {
         self.create_descriptor_resources()?;
         self.create_cluster_pipeline()?;
         self.create_skin_pipeline()?;
+        self.create_particle_pipelines()?;
         self.create_environment_resources()?;
         self.create_default_environment()?;
         self.create_mesh_pipeline()?;
@@ -6130,6 +6223,10 @@ impl Drop for Renderer {
         self.ui_textures.clear();
         // Экземпляры skinning владеют пулами наборов и буферами; освобождаем их до layout и device.
         self.skin_instances.clear();
+        // Эмиттеры частиц держат буферы, наборы и текстуры; освобождаем их до мешей и device.
+        if let Some(device) = self.device.as_ref() {
+            self.particles.destroy(device);
+        }
         self.meshes.clear();
         self.materials.clear();
         self.textures.clear();
@@ -6546,6 +6643,9 @@ fn inspect_device(
     .optimal_tiling_features;
     let mut reasons = evaluation.reasons;
     reasons.extend(cluster_device_limit_reasons(&properties.limits));
+    reasons.extend(particle_gpu::particle_device_limit_reasons(
+        &properties.limits,
+    ));
     reasons.extend(texture_format_reasons(srgb_features, linear_features));
     reasons.extend(shadow_image_device_reasons(instance, physical_device));
     reasons.extend(velocity_image_device_reasons(instance, physical_device));
@@ -7131,6 +7231,9 @@ struct OffscreenTarget {
     layout: vk::ImageLayout,
     velocity_layout: vk::ImageLayout,
     depth_layout: vk::ImageLayout,
+    /// Набор с depth для проходов частиц; пул освобождается вместе с целью.
+    _depth_pool: OwnedDescriptorPool,
+    depth_set: vk::DescriptorSet,
 }
 
 impl OffscreenTarget {
@@ -7139,7 +7242,18 @@ impl OffscreenTarget {
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         extent: vk::Extent2D,
+        depth_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
+        let depth = DeviceImage::new(
+            instance,
+            device,
+            physical_device,
+            extent,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            depth_subresource_range(),
+        )?;
+        let (depth_pool, depth_set) = allocate_depth_set(device, depth_set_layout, depth.view)?;
         Ok(Self {
             color: DeviceImage::new(
                 instance,
@@ -7159,20 +7273,52 @@ impl OffscreenTarget {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 color_subresource_range(),
             )?,
-            depth: DeviceImage::new(
-                instance,
-                device,
-                physical_device,
-                extent,
-                DEPTH_FORMAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                depth_subresource_range(),
-            )?,
+            depth,
             layout: vk::ImageLayout::UNDEFINED,
             velocity_layout: vk::ImageLayout::UNDEFINED,
             depth_layout: vk::ImageLayout::UNDEFINED,
+            _depth_pool: depth_pool,
+            depth_set,
         })
     }
+}
+
+/// Набор с depth изображением вида (binding 0, DEPTH_STENCIL_READ_ONLY_OPTIMAL) для проходов частиц.
+/// Пул принадлежит цели и освобождается вместе с ней.
+fn allocate_depth_set(
+    device: &ash::Device,
+    layout: vk::DescriptorSetLayout,
+    depth_view: vk::ImageView,
+) -> Result<(OwnedDescriptorPool, vk::DescriptorSet), RenderError> {
+    let pool_sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::SAMPLED_IMAGE)
+        .descriptor_count(1)];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(1)
+        .pool_sizes(&pool_sizes);
+    let pool = OwnedDescriptorPool::new(device, &pool_info)?;
+    let layouts = [layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool.handle)
+        .set_layouts(&layouts);
+    // SAFETY: the pool was sized for exactly one set of this layout.
+    let set = unsafe { device.allocate_descriptor_sets(&allocate_info) }?
+        .into_iter()
+        .next()
+        .ok_or(RenderError::InvalidState(
+            "не создан набор depth для частиц",
+        ))?;
+    let image_info = [vk::DescriptorImageInfo::default()
+        .image_view(depth_view)
+        .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+        .image_info(&image_info)];
+    // SAFETY: the write targets the sampled-image binding of the freshly allocated set.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    Ok((pool, set))
 }
 
 struct FrameTarget {
@@ -7193,8 +7339,15 @@ impl FrameTarget {
         render_extent: vk::Extent2D,
         output_extent: vk::Extent2D,
         taa_set_layout: vk::DescriptorSetLayout,
+        particle_depth_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
-        let scene = OffscreenTarget::new(instance, device, physical_device, render_extent)?;
+        let scene = OffscreenTarget::new(
+            instance,
+            device,
+            physical_device,
+            render_extent,
+            particle_depth_layout,
+        )?;
         let ldr = DeviceImage::new(
             instance,
             device,
@@ -7326,6 +7479,7 @@ fn write_local_light_descriptor(
 /// Общие объекты renderer, нужные каждой цели viewport.
 struct ViewportTargetResources {
     image_set_layout: vk::DescriptorSetLayout,
+    particle_depth_layout: vk::DescriptorSetLayout,
     taa_set_layout: vk::DescriptorSetLayout,
     image_sampler: vk::Sampler,
     post_sampler: vk::Sampler,
@@ -7525,7 +7679,13 @@ impl ViewportTarget {
         render_extent: vk::Extent2D,
         resources: &ViewportTargetResources,
     ) -> Result<Self, RenderError> {
-        let scene = OffscreenTarget::new(instance, device, physical_device, render_extent)?;
+        let scene = OffscreenTarget::new(
+            instance,
+            device,
+            physical_device,
+            render_extent,
+            resources.particle_depth_layout,
+        )?;
         let ldr = DeviceImage::new(
             instance,
             device,
@@ -8063,6 +8223,7 @@ enum RetiredResource {
     DlssView(#[allow(dead_code)] Box<DlssView>),
     Environment(#[allow(dead_code)] Box<GpuEnvironment>),
     SkinInstance(#[allow(dead_code)] Box<skin::SkinInstance>),
+    ParticleEmitter(#[allow(dead_code)] Box<ParticleEmitter>),
 }
 
 struct OwnedDescriptorPool {
@@ -9674,6 +9835,16 @@ fn record_scene(
         record_wireframe(device, command_buffer, target, render_extent, scene);
         mark_pass(device, command_buffer, scene.timestamps, GpuPass::Wireframe);
     }
+    if let Some(particles) = &scene.particles {
+        record_particles(
+            device,
+            command_buffer,
+            target,
+            render_extent,
+            particles,
+            scene.timestamps,
+        );
+    }
     pipeline_barrier(
         device,
         command_buffer,
@@ -9689,16 +9860,17 @@ fn record_scene(
         ),
     );
     target.velocity_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    // Частицы могли оставить depth в read-only: источник барьера зависит от текущего layout.
+    let depth_source = particle_depth_source_masks(target.depth_layout);
     pipeline_barrier(
         device,
         command_buffer,
         image_layout_barrier(
             target.depth.image,
-            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            target.depth_layout,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            depth_source.0,
+            depth_source.1,
             offscreen_sampled_stages(),
             vk::AccessFlags2::SHADER_SAMPLED_READ,
             depth_subresource_range(),
@@ -9947,6 +10119,7 @@ struct ScenePass<'a> {
     timestamps: Option<GpuMarks>,
     debug_view: DebugView,
     view: ViewSettings,
+    particles: Option<ParticlePass<'a>>,
 }
 
 /// Depth-only shadow pass. It shares the frame set and model transforms with the scene pass.
@@ -14761,6 +14934,8 @@ mod tests {
             projection[0][0] = if aspect >= 1.0 { 1.0 / aspect } else { 1.0 };
             projection[1][1] = if aspect < 1.0 { aspect } else { 1.0 };
             let frame = Frame {
+                particles: &[],
+                particle_step: 0.0,
                 clear_color: [0.0; 4],
                 camera: FrameCamera {
                     view: IDENTITY_MATRIX,
@@ -15766,6 +15941,8 @@ mod tests {
         };
         let cascades = [matrix(17.0), matrix(33.0), matrix(49.0), matrix(65.0)];
         let frame = Frame {
+            particles: &[],
+            particle_step: 0.0,
             clear_color: [0.0; 4],
             camera: FrameCamera {
                 view: IDENTITY,
@@ -15850,6 +16027,8 @@ mod tests {
         state.submitted(first);
         let plan = state.plan(key, current, false);
         let frame = Frame {
+            particles: &[],
+            particle_step: 0.0,
             clear_color: [0.0; 4],
             camera: FrameCamera {
                 view: IDENTITY,
@@ -15901,6 +16080,8 @@ mod tests {
             assert!(
                 matches!(
                     frame_uniform_bytes(&Frame {
+                        particles: &[],
+                        particle_step: 0.0,
                         clear_color: [0.0; 4],
                         camera: FrameCamera {
                             view: IDENTITY,
@@ -15930,6 +16111,8 @@ mod tests {
         invalid[2][1] = f32::NAN;
         let invalid_cascades = [invalid];
         let frame = Frame {
+            particles: &[],
+            particle_step: 0.0,
             clear_color: [0.0; 4],
             camera: FrameCamera {
                 view: IDENTITY,
@@ -15959,6 +16142,8 @@ mod tests {
     fn frame_uniforms_reject_more_than_four_shadow_cascades() {
         let too_many = [IDENTITY; 5];
         let frame = Frame {
+            particles: &[],
+            particle_step: 0.0,
             clear_color: [0.0; 4],
             camera: FrameCamera {
                 view: IDENTITY,
@@ -16430,7 +16615,7 @@ mod tests {
 
     #[test]
     fn view_timings_split_ticks_between_recorded_boundaries() {
-        // Начало, затем граница после каждого из девяти проходов в порядке выполнения.
+        // Начало, затем граница после каждого из десяти проходов в порядке выполнения.
         let marks = [
             Some(100),
             Some(110),
@@ -16440,6 +16625,7 @@ mod tests {
             Some(160),
             Some(175),
             Some(190),
+            Some(195),
             Some(200),
             Some(215),
         ];
@@ -16456,7 +16642,8 @@ mod tests {
                 Some(ns(10)),
                 Some(ns(15)),
                 Some(ns(15)),
-                Some(ns(10)),
+                Some(ns(5)),
+                Some(ns(5)),
                 Some(ns(15)),
             ]
         );
@@ -16623,7 +16810,7 @@ mod tests {
 
     #[test]
     fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
-        assert_eq!(TIMESTAMP_QUERY_COUNT, 42);
+        assert_eq!(TIMESTAMP_QUERY_COUNT, 46);
         let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
         let mut layout = GpuProfileLayout::default();
         for index in 0..MAX_PROFILED_VIEWS {

@@ -5,7 +5,7 @@
 
 pub mod abi;
 
-/// Версия крейта из `Cargo.toml`.
+/// Version of this SDK crate, as declared in its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use abi::{Key, MouseButton, PhysicalInput};
@@ -602,10 +602,222 @@ impl Context<'_> {
     }
 }
 
+/// Optional settings for [`Context::spawn`]. Unset fields keep the prefab's own values.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpawnOptions {
+    position: Option<[f32; 3]>,
+    rotation_deg: Option<[f32; 3]>,
+    scale: Option<[f32; 3]>,
+    velocity: Option<[f32; 3]>,
+    parent: Option<Object>,
+    name: Option<String>,
+    id: Option<String>,
+}
+
+impl SpawnOptions {
+    /// Creates options with every field unset.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the new root's local position.
+    pub fn position(mut self, value: [f32; 3]) -> Self {
+        self.position = Some(value);
+        self
+    }
+
+    /// Sets the new root's local Euler rotation in degrees.
+    pub fn rotation_deg(mut self, value: [f32; 3]) -> Self {
+        self.rotation_deg = Some(value);
+        self
+    }
+
+    /// Sets the new root's local scale.
+    pub fn scale(mut self, value: [f32; 3]) -> Self {
+        self.scale = Some(value);
+        self
+    }
+
+    /// Sets the initial velocity. The host applies it only to a dynamic root.
+    pub fn velocity(mut self, value: [f32; 3]) -> Self {
+        self.velocity = Some(value);
+        self
+    }
+
+    /// Makes the new root a child of `parent`, which must be a live object.
+    pub fn parent(mut self, parent: Object) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    /// Sets the new root's display name.
+    pub fn name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_owned());
+        self
+    }
+
+    /// Sets the new root's scene id, `[A-Za-z0-9_-]{1,64}`. The host refuses an id in use.
+    pub fn id(mut self, id: &str) -> Self {
+        self.id = Some(id.to_owned());
+        self
+    }
+
+    /// Builds the ABI struct. Its strings borrow from `self` and are valid for one host call.
+    fn to_abi(&self) -> abi::RveSpawnOptions {
+        let mut options = abi::RveSpawnOptions {
+            flags: 0,
+            position: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: [0.0; 3],
+            velocity: [0.0; 3],
+            parent: 0,
+            name: abi::RveStr::empty(),
+            id: abi::RveStr::empty(),
+        };
+        if let Some(value) = self.position {
+            options.flags |= abi::RVE_SPAWN_HAS_POSITION;
+            options.position = value;
+        }
+        if let Some(value) = self.rotation_deg {
+            options.flags |= abi::RVE_SPAWN_HAS_ROTATION;
+            options.rotation_deg = value;
+        }
+        if let Some(value) = self.scale {
+            options.flags |= abi::RVE_SPAWN_HAS_SCALE;
+            options.scale = value;
+        }
+        if let Some(value) = self.velocity {
+            options.flags |= abi::RVE_SPAWN_HAS_VELOCITY;
+            options.velocity = value;
+        }
+        if let Some(parent) = self.parent {
+            options.flags |= abi::RVE_SPAWN_HAS_PARENT;
+            options.parent = parent.handle;
+        }
+        if let Some(name) = &self.name {
+            options.flags |= abi::RVE_SPAWN_HAS_NAME;
+            options.name = abi::RveStr::from_str_ref(name);
+        }
+        if let Some(id) = &self.id {
+            options.flags |= abi::RVE_SPAWN_HAS_ID;
+            options.id = abi::RveStr::from_str_ref(id);
+        }
+        options
+    }
+}
+
+/// Heavy-prefab state reported by [`Prefabs::state`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefabState {
+    /// The path is not in the project's prefab list.
+    Unknown,
+    /// A fast prefab of the scene; it is always in memory.
+    Resident,
+    /// A heavy prefab that is not in memory.
+    Unloaded,
+    /// A heavy prefab whose load is in progress.
+    Loading,
+    /// A heavy prefab in memory.
+    Loaded,
+    /// A heavy prefab whose unload is in progress.
+    Unloading,
+    /// A heavy prefab whose load failed.
+    Failed,
+    /// The host predates ABI v9 and provides no prefab callbacks.
+    Unavailable,
+}
+
+impl PrefabState {
+    fn from_abi(code: u32) -> Self {
+        match code {
+            abi::RVE_PREFAB_RESIDENT => Self::Resident,
+            abi::RVE_PREFAB_UNLOADED => Self::Unloaded,
+            abi::RVE_PREFAB_LOADING => Self::Loading,
+            abi::RVE_PREFAB_LOADED => Self::Loaded,
+            abi::RVE_PREFAB_UNLOADING => Self::Unloading,
+            abi::RVE_PREFAB_FAILED => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Heavy-prefab loading and state, from [`Context::prefabs`]. Load and unload requests take
+/// effect when the current phase ends; [`Prefabs::state`] reports what the host knows now.
+#[derive(Clone, Copy)]
+pub struct Prefabs<'a> {
+    host: &'a RveHost,
+}
+
+impl Prefabs<'_> {
+    /// Requests a heavy prefab load. Returns `false` for an unknown path, a refused request, or a
+    /// host without ABI v9.
+    pub fn load(&self, path: &str) -> bool {
+        self.request(self.host.prefab_load, path)
+    }
+
+    /// Requests a heavy prefab unload once its last instance and pending spawns are gone.
+    /// Returns `false` for an unknown path, a refused request, or a host without ABI v9.
+    pub fn unload(&self, path: &str) -> bool {
+        self.request(self.host.prefab_unload, path)
+    }
+
+    /// Returns the prefab's state.
+    pub fn state(&self, path: &str) -> PrefabState {
+        let Some(callback) = self.host.prefab_state else {
+            return PrefabState::Unavailable;
+        };
+        // SAFETY: the host callback and borrowed path are valid during this guest call.
+        let code = unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(path)) };
+        PrefabState::from_abi(code)
+    }
+
+    fn request(&self, callback: Option<abi::RvePrefabRequestFn>, path: &str) -> bool {
+        let Some(callback) = callback else {
+            return false;
+        };
+        // SAFETY: the host callback and borrowed path are valid during this guest call.
+        unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(path)) }
+    }
+}
+
+impl Context<'_> {
+    /// Spawns a prefab by its project path without a leading slash, for example
+    /// `prefabs/bullet.rveprefab`, and returns its pending object.
+    ///
+    /// The object enters the world when the current phase ends. Its `on_start` runs at the next
+    /// update, before messages. `None` means the host refused the request (the reason is in the
+    /// script events), an option is not finite, or the host predates ABI v9.
+    pub fn spawn(&mut self, prefab: &str, options: &SpawnOptions) -> Option<Object> {
+        let callback = self.host.spawn?;
+        let finite = [
+            options.position,
+            options.rotation_deg,
+            options.scale,
+            options.velocity,
+        ]
+        .into_iter()
+        .flatten()
+        .all(finite_vector);
+        if !finite {
+            return None;
+        }
+        let options = options.to_abi();
+        // SAFETY: the prefab path and the options, with their borrowed strings, outlive this call.
+        let handle =
+            unsafe { callback(self.host.ctx, abi::RveStr::from_str_ref(prefab), &options) };
+        (handle != 0).then_some(Object { handle })
+    }
+
+    /// Returns the heavy-prefab API for this call.
+    pub fn prefabs(&self) -> Prefabs<'_> {
+        Prefabs { host: self.host }
+    }
+}
+
 /// Animation operation failure in guest code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnimationError {
-    /// The host predates ABI v9 and provides no animation callbacks.
+    /// The host predates ABI v10 and provides no animation callbacks.
     Unavailable,
     /// The host refused the request; the reason is reported in the host's script events.
     Rejected,
@@ -767,6 +979,42 @@ impl Object {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Object {
     handle: u64,
+}
+
+impl Object {
+    /// Queues this object's subtree for removal, including a pending object from [`Context::spawn`].
+    ///
+    /// A zero delay removes it at the end of the current phase. A positive delay is measured on
+    /// the script clock; when several destroys target the same object, the earliest due time wins.
+    /// Returns `false` for a dead object, a refused request, a negative or non-finite delay, or a
+    /// host without ABI v9.
+    pub fn destroy(&self, ctx: &mut Context<'_>, delay: f32) -> bool {
+        if !delay.is_finite() || delay < 0.0 {
+            return false;
+        }
+        let Some(callback) = ctx.host.destroy else {
+            return false;
+        };
+        // SAFETY: the host callback is valid during this guest call.
+        unsafe { callback(ctx.host.ctx, self.handle, delay) }
+    }
+
+    /// Returns `true` while the object is in the world.
+    pub fn is_alive(&self, ctx: &Context<'_>) -> bool {
+        self.state_code(ctx) == Some(abi::RVE_OBJECT_ALIVE)
+    }
+
+    /// Returns `true` from [`Context::spawn`] until the phase that applies the spawn ends.
+    pub fn is_pending(&self, ctx: &Context<'_>) -> bool {
+        self.state_code(ctx) == Some(abi::RVE_OBJECT_PENDING)
+    }
+
+    /// Returns the host's state code, or `None` when the host predates ABI v9.
+    fn state_code(&self, ctx: &Context<'_>) -> Option<u32> {
+        let callback = ctx.host.object_state?;
+        // SAFETY: the host callback is valid during this guest call.
+        Some(unsafe { callback(ctx.host.ctx, self.handle) })
+    }
 }
 
 impl<'a> Context<'a> {

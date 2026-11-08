@@ -7,21 +7,156 @@ use crate::camera::Camera;
 use crate::document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup,
-    PointLightComponent, RigidBodyComponent, SceneDocument, SceneError, SceneObject,
-    SpotLightComponent, camera_from_matrix, light_direction_from_matrix,
+    PointLightComponent, RigidBodyComponent, RigidBodyKind, SceneDocument, SceneError, SceneObject,
+    SpotLightComponent, camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
 };
 use crate::light::ShadowSettings;
+use crate::particles::ParticleEmitterComponent;
+use crate::prefab::{MAX_EXPANDED_ID_BYTES, PrefabTemplate};
 use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Стабильный индекс объекта в порядке документа, принадлежащий [`World`].
+/// Наибольшее поколение слота. Слот, поколение которого исчерпано, больше не переиспользуется.
+pub const MAX_GENERATION: u32 = i32::MAX as u32;
+/// Наибольшее число живых объектов в одном мире.
+pub const MAX_LIVE_OBJECTS: usize = 65_535;
+
+/// Хендл объекта мира: индекс слота и поколение. Освобождение слота увеличивает поколение,
+/// поэтому старый хендл перестаёт быть живым даже после переиспользования слота.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ObjectHandle(usize);
+pub struct ObjectHandle {
+    index: u32,
+    generation: u32,
+}
 
 impl ObjectHandle {
     pub fn index(self) -> usize {
-        self.0
+        self.index as usize
+    }
+
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+
+    /// ABI-значение `(generation << 32) | (index + 1)`. Ноль в ABI означает «нет объекта».
+    /// `None`, если `index + 1` не помещается в 32 бита.
+    pub fn to_abi(self) -> Option<u64> {
+        let slot = self.index.checked_add(1)?;
+        Some((u64::from(self.generation) << 32) | u64::from(slot))
+    }
+
+    /// Декодирует ABI-значение. Ноль и поколение больше [`MAX_GENERATION`] не дают хендла.
+    /// Живость объекта проверяет [`World::is_alive`].
+    pub fn from_abi(value: u64) -> Option<Self> {
+        let slot = (value & u64::from(u32::MAX)) as u32;
+        let generation = (value >> 32) as u32;
+        if slot == 0 || generation > MAX_GENERATION {
+            return None;
+        }
+        Some(Self {
+            index: slot - 1,
+            generation,
+        })
+    }
+}
+
+/// Хендл объекта документа: поколение 0, индекс — позиция в документе.
+fn document_handle(index: usize) -> ObjectHandle {
+    ObjectHandle {
+        index: u32::try_from(index).expect("индекс объекта помещается в u32"),
+        generation: 0,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotState {
+    /// Слот свободен или выведен из обращения (исчерпано поколение).
+    Vacant,
+    /// Слот зарезервирован под объект, которого ещё нет в мире.
+    Reserved,
+    /// Слот занят живым объектом с этим плотным индексом.
+    Live(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    generation: u32,
+    state: SlotState,
+}
+
+/// Таблица слотов: свободные слоты переиспользуются, исчерпанные выводятся из обращения.
+#[derive(Clone, Debug, Default)]
+struct SlotTable {
+    slots: Vec<Slot>,
+    free: Vec<u32>,
+}
+
+impl SlotTable {
+    fn for_document(object_count: usize) -> Self {
+        Self {
+            slots: (0..object_count)
+                .map(|index| Slot {
+                    generation: 0,
+                    state: SlotState::Live(index),
+                })
+                .collect(),
+            free: Vec::new(),
+        }
+    }
+
+    fn reserve(&mut self) -> ObjectHandle {
+        let index = match self.free.pop() {
+            Some(index) => index,
+            None => {
+                self.slots.push(Slot {
+                    generation: 0,
+                    state: SlotState::Vacant,
+                });
+                u32::try_from(self.slots.len() - 1).expect("слоты объектов помещаются в u32")
+            }
+        };
+        let slot = &mut self.slots[index as usize];
+        slot.state = SlotState::Reserved;
+        ObjectHandle {
+            index,
+            generation: slot.generation,
+        }
+    }
+
+    /// Слот, если хендл относится к его текущему поколению.
+    fn slot(&self, handle: ObjectHandle) -> Option<&Slot> {
+        self.slots
+            .get(handle.index as usize)
+            .filter(|slot| slot.generation == handle.generation)
+    }
+
+    fn live_index(&self, handle: ObjectHandle) -> Option<usize> {
+        match self.slot(handle)?.state {
+            SlotState::Live(index) => Some(index),
+            SlotState::Vacant | SlotState::Reserved => None,
+        }
+    }
+
+    fn is_reserved(&self, handle: ObjectHandle) -> bool {
+        self.slot(handle)
+            .is_some_and(|slot| slot.state == SlotState::Reserved)
+    }
+
+    /// Переводит зарезервированный слот в живое состояние с плотным индексом `index`.
+    fn set_live(&mut self, handle: ObjectHandle, index: usize) {
+        self.slots[handle.index as usize].state = SlotState::Live(index);
+    }
+
+    /// Освобождает слот. Поколение растёт; если оно исчерпано, слот больше не используется.
+    fn vacate(&mut self, index: u32) {
+        let slot = &mut self.slots[index as usize];
+        slot.state = SlotState::Vacant;
+        if slot.generation < MAX_GENERATION {
+            slot.generation += 1;
+            self.free.push(index);
+        }
     }
 }
 
@@ -89,6 +224,7 @@ pub struct WorldObject {
     pub character_controller: Option<CharacterControllerComponent>,
     pub audio_source: Option<AudioSourceComponent>,
     pub animator: Option<AnimatorComponent>,
+    pub particle_emitter: Option<ParticleEmitterComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
 }
@@ -148,6 +284,13 @@ pub struct MeshInstance {
     pub model: Mat4,
 }
 
+/// Эмиттер частиц объекта с мировой матрицей на текущий кадр.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParticleEmitterInstance {
+    pub object: ObjectHandle,
+    pub model: Mat4,
+}
+
 /// Данные мирового пространства для отрисовки одного кадра сцены.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneFrame {
@@ -157,6 +300,8 @@ pub struct SceneFrame {
     pub local_lights: Vec<LocalLightState>,
     pub environment: Option<EnvironmentState>,
     pub meshes: Vec<MeshInstance>,
+    /// Эмиттеры частиц в порядке объектов сцены.
+    pub particle_emitters: Vec<ParticleEmitterInstance>,
 }
 
 /// Текущий источник окружения, мировая ориентация владельца и направление солнечного света.
@@ -175,14 +320,35 @@ pub struct SceneWarning {
     pub message: String,
 }
 
+/// Параметры spawn: переопределяют transform и имя корня, задают родителя и id.
+/// Неуказанные поля берутся из префаба.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpawnOptions {
+    pub position: Option<Vec3>,
+    pub rotation_deg: Option<Vec3>,
+    pub scale: Option<Vec3>,
+    pub parent: Option<ObjectHandle>,
+    pub name: Option<String>,
+    /// Авторский id корня `[A-Za-z0-9_-]{1,64}`; без него генерируется `<stem>@<serial>`,
+    /// дети получают `<корень>.<id>`.
+    pub id: Option<String>,
+}
+
 /// Runtime-граф сцены без зависимостей от renderer и script runtime.
+///
+/// Хендлы объектов проверяются по поколению. Объекты документа имеют поколение 0.
+/// `objects()` содержит только живые объекты: при удалении порядок сохраняется,
+/// новые объекты дописываются в конец.
 #[derive(Clone, Debug)]
 pub struct World {
     source_label: String,
     asset_paths: Vec<VirtualPath>,
+    /// Слоты и поколения. Резервирование меняет их через `&self`.
+    slots: RefCell<SlotTable>,
     objects: Vec<WorldObject>,
     indices_by_id: HashMap<String, ObjectHandle>,
-    topological_order: Vec<ObjectHandle>,
+    /// Плотные индексы в порядке «родитель раньше потомка».
+    topological_order: Vec<usize>,
     world_matrices: Vec<Mat4>,
     world_rotations: Vec<Quat>,
     active_camera: ObjectHandle,
@@ -191,6 +357,8 @@ pub struct World {
     last_valid_local_lights: Vec<LastValidLocalLights>,
     last_valid_environment: Option<EnvironmentState>,
     invalid_basis_reported: HashSet<ObjectHandle>,
+    /// Номер для генерации id `<stem>@<serial>`.
+    spawn_serial: u64,
 }
 
 impl World {
@@ -219,12 +387,12 @@ impl World {
             .objects
             .iter()
             .enumerate()
-            .map(|(index, object)| (object.id.clone(), ObjectHandle(index)))
+            .map(|(index, object)| (object.id.clone(), document_handle(index)))
             .collect::<HashMap<_, _>>();
         let mut objects = Vec::with_capacity(document.objects.len());
         for (index, object) in document.objects.iter().enumerate() {
             objects.push(world_object(
-                ObjectHandle(index),
+                document_handle(index),
                 object,
                 object.parent.as_ref().map(|parent| indices_by_id[parent]),
             ));
@@ -235,7 +403,7 @@ impl World {
             .collect::<Vec<_>>();
         let parents = objects
             .iter()
-            .map(|object| object.parent.map(|parent| parent.0))
+            .map(|object| object.parent.map(|parent| parent.index()))
             .collect::<Vec<_>>();
         let object_ids = objects
             .iter()
@@ -245,6 +413,17 @@ impl World {
             calculate_world_matrices(&transforms, &parents, &object_ids, document.source_label())?;
         let world_rotations = calculate_world_rotations(&transforms, &parents, &order);
         let object_count = objects.len();
+        let active_index = document
+            .objects
+            .iter()
+            .position(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
+            .or_else(|| {
+                document
+                    .objects
+                    .iter()
+                    .position(|object| object.camera.is_some())
+            })
+            .expect("SceneDocument validation requires a camera");
         let mut world = Self {
             source_label: document.source_label().to_owned(),
             asset_paths: document
@@ -254,26 +433,17 @@ impl World {
                 .collect(),
             world_matrices,
             world_rotations,
+            active_camera: objects[active_index].handle,
             objects,
             indices_by_id,
-            topological_order: order.into_iter().map(ObjectHandle).collect(),
-            active_camera: document
-                .objects
-                .iter()
-                .position(|object| object.camera.as_ref().is_some_and(|camera| camera.active))
-                .or_else(|| {
-                    document
-                        .objects
-                        .iter()
-                        .position(|object| object.camera.is_some())
-                })
-                .map(ObjectHandle)
-                .expect("SceneDocument validation requires a camera"),
+            slots: RefCell::new(SlotTable::for_document(object_count)),
+            topological_order: order,
             last_valid_camera: None,
             last_valid_light: LightState::default(),
             last_valid_local_lights: vec![LastValidLocalLights::default(); object_count],
             invalid_basis_reported: HashSet::new(),
             last_valid_environment: None,
+            spawn_serial: 0,
         };
         let _ = world.build_frame();
         Ok(world)
@@ -287,8 +457,38 @@ impl World {
         self.indices_by_id.get(id).copied()
     }
 
+    /// Плотный индекс живого объекта; `None` для устаревшего, зарезервированного или чужого хендла.
+    fn dense(&self, handle: ObjectHandle) -> Option<usize> {
+        self.slots.borrow().live_index(handle)
+    }
+
+    /// Живой объект с этим хендлом (проверяется поколение).
+    pub fn is_alive(&self, handle: ObjectHandle) -> bool {
+        self.dense(handle).is_some()
+    }
+
+    /// Хендл зарезервирован и ждёт [`World::spawn`] или [`World::release_reservation`].
+    pub fn is_reserved(&self, handle: ObjectHandle) -> bool {
+        self.slots.borrow().is_reserved(handle)
+    }
+
+    /// Резервирует слот под будущий объект. Хендл не живёт, пока его не примет `spawn`.
+    pub fn reserve_object(&self) -> ObjectHandle {
+        self.slots.borrow_mut().reserve()
+    }
+
+    /// Освобождает резерв и увеличивает поколение. `false`, если хендл не зарезервирован.
+    pub fn release_reservation(&self, handle: ObjectHandle) -> bool {
+        let mut slots = self.slots.borrow_mut();
+        if !slots.is_reserved(handle) {
+            return false;
+        }
+        slots.vacate(handle.index);
+        true
+    }
+
     pub fn object(&self, handle: ObjectHandle) -> Option<&WorldObject> {
-        self.objects.get(handle.0)
+        self.dense(handle).map(|index| &self.objects[index])
     }
 
     pub fn object_by_id(&self, id: &str) -> Option<&WorldObject> {
@@ -301,7 +501,7 @@ impl World {
 
     /// Returns the cached world rotation independent of scale, including zero scale.
     pub fn world_rotation(&self, handle: ObjectHandle) -> Option<Quat> {
-        self.world_rotations.get(handle.0).copied()
+        self.world_rotations.get(self.dense(handle)?).copied()
     }
 
     /// Заменяет локальную трансформацию объекта, сохраняя углы Эйлера в градусах.
@@ -310,15 +510,19 @@ impl World {
         handle: ObjectHandle,
         transform: LocalTransform,
     ) -> Result<(), SceneError> {
-        let Some(object) = self.objects.get_mut(handle.0) else {
-            return Err(SceneError::new(
+        let index = self.live_index_or_error(handle)?;
+        self.objects[index].transform = transform;
+        Ok(())
+    }
+
+    fn live_index_or_error(&self, handle: ObjectHandle) -> Result<usize, SceneError> {
+        self.dense(handle).ok_or_else(|| {
+            SceneError::new(
                 &self.source_label,
                 None,
-                format!("неизвестный handle объекта {}", handle.0),
-            ));
-        };
-        object.transform = transform;
-        Ok(())
+                format!("неизвестный handle объекта {}", handle.index()),
+            )
+        })
     }
 
     /// Sets world pose on a root object while preserving its local scale.
@@ -341,13 +545,8 @@ impl World {
             ));
         }
 
-        let Some(object) = self.objects.get_mut(handle.0) else {
-            return Err(SceneError::new(
-                &self.source_label,
-                None,
-                format!("неизвестный handle объекта {}", handle.0),
-            ));
-        };
+        let index = self.live_index_or_error(handle)?;
+        let object = &mut self.objects[index];
         if object.parent.is_some() {
             return Err(SceneError::new(
                 &self.source_label,
@@ -365,16 +564,16 @@ impl World {
     }
 
     pub fn world_matrix(&self, handle: ObjectHandle) -> Option<Mat4> {
-        self.world_matrices.get(handle.0).copied()
+        self.world_matrices.get(self.dense(handle)?).copied()
     }
 
     /// Выбирает уровень по расстоянию до мировой позиции объекта.
     pub fn lod_level(&self, handle: ObjectHandle, eye: Vec3) -> Option<usize> {
-        let object = self.object(handle)?;
-        let Some(group) = &object.lod_group else {
+        let index = self.dense(handle)?;
+        let Some(group) = &self.objects[index].lod_group else {
             return Some(0);
         };
-        let position = self.world_matrices.get(handle.0)?.w_axis.truncate();
+        let position = self.world_matrices[index].w_axis.truncate();
         group.level_for_distance(eye.distance(position))
     }
 
@@ -394,6 +593,10 @@ impl World {
     /// Аниматор объекта, если у него есть `animator`.
     pub fn animator(&self, handle: ObjectHandle) -> Option<&AnimatorComponent> {
         self.object(handle)?.animator.as_ref()
+    }
+    /// Эмиттер частиц объекта, если у него есть `particle_emitter`.
+    pub fn particle_emitter(&self, handle: ObjectHandle) -> Option<&ParticleEmitterComponent> {
+        self.object(handle)?.particle_emitter.as_ref()
     }
 
     /// Пути `[[assets]]` сцены в порядке документа.
@@ -417,13 +620,8 @@ impl World {
             let object_id = self.object(handle).map(|object| object.id.as_str());
             SceneError::new(&self.source_label, object_id, error.message)
         })?;
-        let Some(object) = self.objects.get_mut(handle.0) else {
-            return Err(SceneError::new(
-                &self.source_label,
-                None,
-                format!("неизвестный handle объекта {}", handle.0),
-            ));
-        };
+        let index = self.live_index_or_error(handle)?;
+        let object = &mut self.objects[index];
         if object.camera.is_none() {
             return Err(SceneError::new(
                 &self.source_label,
@@ -450,13 +648,8 @@ impl World {
 
     /// Назначает активной существующую камеру.
     pub fn set_active_camera(&mut self, handle: ObjectHandle) -> Result<(), SceneError> {
-        let Some(object) = self.object(handle) else {
-            return Err(SceneError::new(
-                &self.source_label,
-                None,
-                format!("неизвестный handle объекта {}", handle.0),
-            ));
-        };
+        let index = self.live_index_or_error(handle)?;
+        let object = &self.objects[index];
         if object.camera.is_none() {
             return Err(SceneError::new(
                 &self.source_label,
@@ -470,18 +663,30 @@ impl World {
 
     /// Пересчитывает мировые матрицы в порядке от родителя к потомкам.
     pub fn recalculate_world_matrices(&mut self) {
-        for handle in &self.topological_order {
-            let object = &self.objects[handle.0];
-            let local = object.transform.matrix();
-            let parent = object.parent.map(|parent| parent.0);
-            self.world_matrices[handle.0] =
-                compose_world_matrix(local, parent, &self.world_matrices);
-            let local_rotation = rotation_quat(object.transform);
-            self.world_rotations[handle.0] = match parent {
-                Some(parent) => (self.world_rotations[parent] * local_rotation).normalize(),
-                None => local_rotation,
-            };
+        for position in 0..self.topological_order.len() {
+            let index = self.topological_order[position];
+            let parent = self.parent_index(index);
+            self.update_world_transform(index, parent);
         }
+    }
+
+    /// Плотный индекс родителя объекта с плотным индексом `index`.
+    fn parent_index(&self, index: usize) -> Option<usize> {
+        self.objects[index]
+            .parent
+            .and_then(|parent| self.dense(parent))
+    }
+
+    /// Пересчитывает мировую матрицу и вращение объекта; родитель уже должен быть пересчитан.
+    fn update_world_transform(&mut self, index: usize, parent: Option<usize>) {
+        let transform = self.objects[index].transform;
+        let local = transform.matrix();
+        self.world_matrices[index] = compose_world_matrix(local, parent, &self.world_matrices);
+        let local_rotation = rotation_quat(transform);
+        self.world_rotations[index] = match parent {
+            Some(parent) => (self.world_rotations[parent] * local_rotation).normalize(),
+            None => local_rotation,
+        };
     }
 
     /// Строит кадр и возвращает первые предупреждения о невалидных базисах.
@@ -496,7 +701,7 @@ impl World {
 
         for index in 0..self.objects.len() {
             let matrix = self.world_matrices[index];
-            let camera_settings = (self.active_camera.0 == index)
+            let camera_settings = (self.active_camera == self.objects[index].handle)
                 .then(|| self.objects[index].camera_settings.unwrap_or_default());
             let light_settings = self.objects[index].directional_light;
             let point_settings = self.objects[index].point_light;
@@ -507,7 +712,7 @@ impl World {
                     camera_state = Some(state);
                     self.last_valid_camera = Some(state);
                 } else {
-                    self.warn_invalid_basis(ObjectHandle(index), "камеры", &mut warnings);
+                    self.warn_invalid_basis(index, "камеры", &mut warnings);
                 }
             }
             if let Some(settings) = light_settings {
@@ -516,11 +721,7 @@ impl World {
                     light = value;
                     self.last_valid_light = value;
                 } else {
-                    self.warn_invalid_basis(
-                        ObjectHandle(index),
-                        "направленного света",
-                        &mut warnings,
-                    );
+                    self.warn_invalid_basis(index, "направленного света", &mut warnings);
                 }
             }
             if let Some(settings) = point_settings {
@@ -533,7 +734,7 @@ impl World {
                         shadows: settings.shadows,
                     });
                 } else {
-                    self.warn_invalid_basis(ObjectHandle(index), "точечного света", &mut warnings);
+                    self.warn_invalid_basis(index, "точечного света", &mut warnings);
                 }
             } else {
                 self.last_valid_local_lights[index].point = None;
@@ -554,7 +755,7 @@ impl World {
                         shadows: settings.shadows,
                     });
                 } else {
-                    self.warn_invalid_basis(ObjectHandle(index), "spot света", &mut warnings);
+                    self.warn_invalid_basis(index, "spot света", &mut warnings);
                 }
             } else {
                 self.last_valid_local_lights[index].spot = None;
@@ -573,10 +774,21 @@ impl World {
         let meshes = self
             .objects
             .iter()
-            .filter(|object| object.mesh_renderer.is_some())
-            .map(|object| MeshInstance {
+            .enumerate()
+            .filter(|(_, object)| object.mesh_renderer.is_some())
+            .map(|(index, object)| MeshInstance {
                 object: object.handle,
-                model: self.world_matrices[object.handle.0],
+                model: self.world_matrices[index],
+            })
+            .collect();
+        let particle_emitters = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| object.particle_emitter.is_some())
+            .map(|(index, object)| ParticleEmitterInstance {
+                object: object.handle,
+                model: self.world_matrices[index],
             })
             .collect();
         let has_light = self
@@ -592,7 +804,7 @@ impl World {
             let rotation = self.world_rotations[index];
             let length_squared = rotation.length_squared();
             if !rotation.is_finite() || !length_squared.is_finite() || length_squared <= 1e-12 {
-                self.warn_invalid_basis(ObjectHandle(index), "environment", &mut warnings);
+                self.warn_invalid_basis(index, "environment", &mut warnings);
                 return self.last_valid_environment.clone();
             }
             let state = EnvironmentState {
@@ -612,6 +824,7 @@ impl World {
                 local_lights,
                 environment,
                 meshes,
+                particle_emitters,
             },
             warnings,
         )
@@ -619,18 +832,344 @@ impl World {
 
     fn warn_invalid_basis(
         &mut self,
-        handle: ObjectHandle,
+        index: usize,
         component: &str,
         warnings: &mut Vec<SceneWarning>,
     ) {
-        if self.invalid_basis_reported.insert(handle) {
+        let object = &self.objects[index];
+        if self.invalid_basis_reported.insert(object.handle) {
             warnings.push(SceneWarning {
                 source: self.source_label.clone(),
-                object_id: self.objects[handle.0].id.clone(),
+                object_id: object.id.clone(),
                 message: format!("невалидный базис {component}"),
             });
         }
     }
+}
+
+impl World {
+    /// Создаёт объекты шаблона на зарезервированных хендлах, по одному на объект шаблона
+    /// в его порядке; возвращает эти хендлы. При отказе резервы освобождаются, мир не меняется.
+    ///
+    /// Явный id проверяется по формату `[A-Za-z0-9_-]{1,64}` и на коллизию с живыми объектами;
+    /// раскрытые id не длиннее 255 байт. Сгенерированный id занимает первый свободный номер.
+    /// Резервы без id проверяет вызывающая сторона: `World` их не знает.
+    pub fn spawn(
+        &mut self,
+        reserved: Vec<ObjectHandle>,
+        template: &PrefabTemplate,
+        options: SpawnOptions,
+    ) -> Result<Vec<ObjectHandle>, SceneError> {
+        let (root_id, serial) = match &options.id {
+            Some(id) => (id.clone(), None),
+            None => {
+                let serial = self.free_generated_serial(template);
+                (format!("{}@{serial}", template.stem()), Some(serial))
+            }
+        };
+        let ids = match self.check_spawn(&reserved, template, &options, &root_id) {
+            Ok(ids) => ids,
+            Err(error) => {
+                for handle in reserved {
+                    self.release_reservation(handle);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(serial) = serial {
+            self.spawn_serial = serial + 1;
+        }
+        self.insert_spawned(&reserved, template, options, ids);
+        Ok(reserved)
+    }
+
+    /// Первый номер `<stem>@<serial>`, при котором ни корень, ни дети не заняты живыми объектами.
+    /// Занятые номера пропускаются, поэтому автоидентификатор не блокируется чужим id.
+    fn free_generated_serial(&self, template: &PrefabTemplate) -> u64 {
+        (self.spawn_serial..)
+            .find(|serial| {
+                let root_id = format!("{}@{serial}", template.stem());
+                spawned_ids(&root_id, template)
+                    .iter()
+                    .all(|id| !self.indices_by_id.contains_key(id))
+            })
+            .expect("номера генерируемых id не исчерпаны")
+    }
+
+    fn check_spawn(
+        &self,
+        reserved: &[ObjectHandle],
+        template: &PrefabTemplate,
+        options: &SpawnOptions,
+        root_id: &str,
+    ) -> Result<Vec<String>, SceneError> {
+        template.check_spawnable()?;
+        let source = &self.source_label;
+        if let Some(id) = &options.id
+            && !valid_ascii_name(id, true)
+        {
+            return Err(SceneError::new(
+                source,
+                Some(id.as_str()),
+                "id spawn-объекта должен соответствовать [A-Za-z0-9_-]{1,64}",
+            ));
+        }
+        if reserved.len() != template.objects.len() {
+            return Err(SceneError::new(
+                source,
+                Some(root_id),
+                format!(
+                    "для префаба нужно {} резервов, получено {}",
+                    template.objects.len(),
+                    reserved.len()
+                ),
+            ));
+        }
+        let mut distinct = HashSet::with_capacity(reserved.len());
+        if !reserved
+            .iter()
+            .all(|&handle| self.is_reserved(handle) && distinct.insert(handle))
+        {
+            return Err(SceneError::new(
+                source,
+                Some(root_id),
+                "резерв не активен или повторяется",
+            ));
+        }
+        if self.objects.len() + reserved.len() > MAX_LIVE_OBJECTS {
+            return Err(SceneError::new(
+                source,
+                Some(root_id),
+                format!("превышен лимит живых объектов {MAX_LIVE_OBJECTS}"),
+            ));
+        }
+        if [options.position, options.rotation_deg, options.scale]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+        {
+            return Err(SceneError::new(
+                source,
+                Some(root_id),
+                "transform spawn-объекта должен содержать конечные числа",
+            ));
+        }
+        if let Some(parent) = options.parent {
+            if !self.is_alive(parent) {
+                return Err(SceneError::new(
+                    source,
+                    Some(root_id),
+                    "родитель spawn-объекта не существует",
+                ));
+            }
+            let root = &template.objects[template.root];
+            let dynamic = root
+                .rigid_body
+                .as_ref()
+                .is_some_and(|body| matches!(body.kind, RigidBodyKind::Dynamic));
+            if dynamic || root.character_controller.is_some() {
+                return Err(SceneError::new(
+                    source,
+                    Some(root_id),
+                    "dynamic rigid_body и character_controller spawn-объекта допускаются только без родителя",
+                ));
+            }
+        }
+        let ids = spawned_ids(root_id, template);
+        if let Some(id) = ids.iter().find(|id| id.len() > MAX_EXPANDED_ID_BYTES) {
+            return Err(SceneError::new(
+                source,
+                Some(id.as_str()),
+                format!("раскрытый id длиннее {MAX_EXPANDED_ID_BYTES} байт"),
+            ));
+        }
+        {
+            let mut seen = HashSet::with_capacity(ids.len());
+            for id in &ids {
+                if self.indices_by_id.contains_key(id) || !seen.insert(id.as_str()) {
+                    return Err(SceneError::new(
+                        source,
+                        Some(id.as_str()),
+                        "id объекта уже используется",
+                    ));
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Добавляет объекты в конец плотных массивов и пересчитывает их матрицы.
+    /// Проверки уже пройдены, поэтому метод не возвращает ошибок.
+    fn insert_spawned(
+        &mut self,
+        reserved: &[ObjectHandle],
+        template: &PrefabTemplate,
+        options: SpawnOptions,
+        ids: Vec<String>,
+    ) {
+        let base = self.objects.len();
+        for (local, object) in template.objects.iter().enumerate() {
+            let handle = reserved[local];
+            let mut scene_object = object.clone();
+            scene_object.id = ids[local].clone();
+            let parent = match template.parents[local] {
+                Some(parent) => Some(reserved[parent]),
+                None => options.parent,
+            };
+            let is_root = local == template.root;
+            if is_root && let Some(name) = &options.name {
+                scene_object.name = Some(name.clone());
+            }
+            let mut spawned = world_object(handle, &scene_object, parent);
+            if is_root {
+                let transform = &mut spawned.transform;
+                transform.position = options.position.unwrap_or(transform.position);
+                transform.rotation_deg = options.rotation_deg.unwrap_or(transform.rotation_deg);
+                transform.scale = options.scale.unwrap_or(transform.scale);
+            }
+            self.objects.push(spawned);
+            self.world_matrices.push(Mat4::IDENTITY);
+            self.world_rotations.push(Quat::IDENTITY);
+            self.last_valid_local_lights
+                .push(LastValidLocalLights::default());
+            self.indices_by_id.insert(ids[local].clone(), handle);
+            self.slots.borrow_mut().set_live(handle, base + local);
+        }
+        for &local in &template.order {
+            self.topological_order.push(base + local);
+        }
+        for &local in &template.order {
+            let index = base + local;
+            let parent = self.parent_index(index);
+            self.update_world_transform(index, parent);
+        }
+    }
+
+    /// Живые объекты поддеревьев `roots`, включая сами корни, в порядке «родитель раньше потомка».
+    /// Хендлы, которые не живы, пропускаются. Один проход по порядку топологии: потомок попадает
+    /// в результат, если его родитель уже отмечен.
+    pub fn subtree(&self, roots: &[ObjectHandle]) -> Vec<ObjectHandle> {
+        let mut marked = vec![false; self.objects.len()];
+        for &handle in roots {
+            if let Some(index) = self.dense(handle) {
+                marked[index] = true;
+            }
+        }
+        let mut result = Vec::new();
+        for &index in &self.topological_order {
+            if marked[index]
+                || self
+                    .parent_index(index)
+                    .is_some_and(|parent| marked[parent])
+            {
+                marked[index] = true;
+                result.push(self.objects[index].handle);
+            }
+        }
+        result
+    }
+
+    /// Удаляет поддеревья хендлов. Возвращает удалённые хендлы: дети раньше родителей.
+    ///
+    /// Отказывает, если хендл не жив или в поддереве находится активная камера; при отказе
+    /// мир не меняется. Плотные массивы уплотняются за один проход.
+    pub fn despawn_many(
+        &mut self,
+        handles: &[ObjectHandle],
+    ) -> Result<Vec<ObjectHandle>, SceneError> {
+        let mut removed = vec![false; self.objects.len()];
+        for &handle in handles {
+            removed[self.live_index_or_error(handle)?] = true;
+        }
+        for &index in &self.topological_order {
+            if let Some(parent) = self.parent_index(index)
+                && removed[parent]
+            {
+                removed[index] = true;
+            }
+        }
+        for (object, &gone) in self.objects.iter().zip(&removed) {
+            if gone && object.handle == self.active_camera {
+                return Err(SceneError::new(
+                    &self.source_label,
+                    Some(&object.id),
+                    "активную камеру нельзя удалить",
+                ));
+            }
+        }
+
+        let removed_handles = self
+            .topological_order
+            .iter()
+            .rev()
+            .filter(|&&index| removed[index])
+            .map(|&index| self.objects[index].handle)
+            .collect::<Vec<_>>();
+        let mut new_index = vec![usize::MAX; removed.len()];
+        let mut kept = 0;
+        {
+            let mut slots = self.slots.borrow_mut();
+            for (index, object) in self.objects.iter().enumerate() {
+                if removed[index] {
+                    slots.vacate(object.handle.index);
+                } else {
+                    slots.set_live(object.handle, kept);
+                    new_index[index] = kept;
+                    kept += 1;
+                }
+            }
+        }
+        for (object, &gone) in self.objects.iter().zip(&removed) {
+            if !gone {
+                continue;
+            }
+            self.indices_by_id.remove(&object.id);
+            self.invalid_basis_reported.remove(&object.handle);
+            if object.directional_light.is_some() {
+                self.last_valid_light = LightState::default();
+            }
+            if object.environment.is_some() {
+                self.last_valid_environment = None;
+            }
+        }
+        retain_unmarked(&mut self.objects, &removed);
+        retain_unmarked(&mut self.world_matrices, &removed);
+        retain_unmarked(&mut self.world_rotations, &removed);
+        retain_unmarked(&mut self.last_valid_local_lights, &removed);
+        let order = self
+            .topological_order
+            .iter()
+            .filter(|&&index| !removed[index])
+            .map(|&index| new_index[index])
+            .collect();
+        self.topological_order = order;
+        Ok(removed_handles)
+    }
+}
+
+/// Id объектов шаблона после spawn в порядке шаблона: корень — `root_id`, дети — `<корень>.<id>`.
+fn spawned_ids(root_id: &str, template: &PrefabTemplate) -> Vec<String> {
+    template
+        .objects
+        .iter()
+        .map(|object| {
+            if object.id.is_empty() {
+                root_id.to_owned()
+            } else {
+                format!("{root_id}.{}", object.id)
+            }
+        })
+        .collect()
+}
+
+/// Убирает элементы с отмеченными индексами, сохраняя порядок остальных.
+fn retain_unmarked<T>(values: &mut Vec<T>, removed: &[bool]) {
+    let mut index = 0;
+    values.retain(|_| {
+        let keep = !removed[index];
+        index += 1;
+        keep
+    });
 }
 
 fn world_object(
@@ -657,6 +1196,7 @@ fn world_object(
         character_controller: object.character_controller,
         audio_source: object.audio_source.clone(),
         animator: object.animator.clone(),
+        particle_emitter: object.particle_emitter.clone(),
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
     }
@@ -698,7 +1238,7 @@ fn rotation_quat(transform: LocalTransform) -> Quat {
     Quat::from_euler(EulerRot::YXZ, rotation.y, rotation.x, rotation.z).normalize()
 }
 
-fn topological_order(
+pub(crate) fn topological_order(
     parents: &[Option<usize>],
     object_ids: &[&str],
     source: &str,
@@ -761,8 +1301,11 @@ fn local_light_position_from_matrix(matrix: Mat4) -> Option<[f32; 3]> {
 }
 
 #[cfg(test)]
+mod spawn_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{LocalTransform, ObjectHandle, World};
+    use super::{LocalTransform, ObjectHandle, World, document_handle};
     use crate::{SceneDocument, light::ShadowSettings};
     use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 
@@ -937,8 +1480,8 @@ parent="rig"
         );
         let mut world = World::from_document(&parse(&scene)).unwrap();
         let (frame, _) = world.build_frame();
-        assert_eq!(world.objects()[0].handle, ObjectHandle(0));
-        assert_eq!(world.objects()[1].handle, ObjectHandle(1));
+        assert_eq!(world.objects()[0].handle, document_handle(0));
+        assert_eq!(world.objects()[1].handle, document_handle(1));
         assert_eq!(frame.meshes.len(), 1);
         assert_eq!(frame.meshes[0].object.index(), 1);
         assert_eq!(frame.meshes[0].model, Mat4::from_scale(Vec3::ZERO));
@@ -1193,10 +1736,23 @@ id="second"
         let defaults = crate::CameraSettings::default();
         assert!(world.set_active_camera(mesh).is_err());
         assert!(world.set_camera_settings(mesh, defaults).is_err());
-        assert!(world.set_active_camera(ObjectHandle(99)).is_err());
         assert!(
             world
-                .set_camera_settings(ObjectHandle(99), defaults)
+                .set_active_camera(ObjectHandle {
+                    index: 99,
+                    generation: 0
+                })
+                .is_err()
+        );
+        assert!(
+            world
+                .set_camera_settings(
+                    ObjectHandle {
+                        index: 99,
+                        generation: 0
+                    },
+                    defaults
+                )
                 .is_err()
         );
         assert!(
@@ -1355,5 +1911,58 @@ lock_on_start = true
         let cursor = world.active_camera_cursor();
         assert!(!cursor.hide_on_start);
         assert!(cursor.lock_on_start);
+    }
+}
+
+#[cfg(test)]
+mod particle_tests {
+    use super::{ObjectHandle, World};
+    use crate::SceneDocument;
+    use crate::particles::ParticleEmitterComponent;
+
+    const SCENE: &str = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+
+[[objects]]
+id = "plain"
+[objects.transform]
+position = [1.0, 0.0, 0.0]
+
+[[objects]]
+id = "fx"
+[objects.transform]
+position = [0.0, 2.0, 0.0]
+[objects.particle_emitter]
+capacity = 64
+rate = 5.0
+"#;
+
+    fn handle_of(world: &World, id: &str) -> ObjectHandle {
+        world
+            .objects()
+            .iter()
+            .find(|object| object.id == id)
+            .map(|object| object.handle)
+            .expect("object exists")
+    }
+
+    #[test]
+    fn world_exposes_emitters_and_frame_lists_only_their_objects() {
+        let document = SceneDocument::parse("particles.rvescene", SCENE).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let fx = handle_of(&world, "fx");
+        let plain = handle_of(&world, "plain");
+        let emitter: &ParticleEmitterComponent = world.particle_emitter(fx).expect("emitter");
+        assert_eq!(emitter.capacity, 64);
+        assert!(world.particle_emitter(plain).is_none());
+
+        let (frame, _) = world.build_frame();
+        assert_eq!(frame.particle_emitters.len(), 1);
+        let instance = frame.particle_emitters[0];
+        assert_eq!(instance.object, fx);
+        let translation = instance.model.w_axis.truncate();
+        assert!((translation - glam::Vec3::new(0.0, 2.0, 0.0)).length() < 1e-5);
     }
 }

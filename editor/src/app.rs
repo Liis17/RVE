@@ -4,7 +4,7 @@ use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
-use crate::play::PlaySession;
+use crate::play::{PlayPrefabs, PlaySession};
 use crate::play_cursor;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
@@ -20,6 +20,7 @@ use engine_console::{
     CommandCatalog, ConsoleBuffer, ConsoleLevel, ConsoleLine, install_logger, parse_command_line,
 };
 use engine_files::VirtualPath;
+use engine_project::{PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile};
 use engine_render::{
     FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
 };
@@ -190,6 +191,7 @@ impl EditorApp {
                     project.root.clone(),
                 );
                 self.state.project = Some(project);
+                self.state.project_replaced();
                 self.save_settings();
                 self.state.current_folder.clear();
                 self.reset_project_assets();
@@ -537,8 +539,7 @@ impl EditorApp {
 
     /// Спрашивает о несохранённых изменениях перед действием, отбрасывающим сцену.
     fn run_guarded(&mut self, action: Action) {
-        let dirty = self.state.scene.as_ref().is_some_and(EditorScene::is_dirty);
-        if dirty {
+        if self.state.has_unsaved_changes() {
             self.state.unsaved_prompt = Some(UnsavedPrompt { then: action });
         } else {
             self.run_confirmed(action);
@@ -935,16 +936,37 @@ impl EditorApp {
                 .error("Play недоступен для префаба: откройте сцену");
             return;
         }
-        let needs_library = scene
-            .view()
-            .objects
-            .iter()
-            .any(|object| !object.heavy_scripts.is_empty());
+        let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
+            return;
+        };
+        let heavy = match PrefabCatalogFile::load(project.root.join(PREFAB_CATALOG_FILE_NAME)) {
+            Ok(heavy) => heavy,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
+        let (prefabs, warnings) = PlayPrefabs::load(
+            scene.view(),
+            &mut |path| project.read_text(path),
+            scene.instanced_prefabs(),
+            &heavy,
+        );
+        let prefabs = prefabs.with_resources(project.resource_handle());
+        let needs_library = prefabs.has_heavy_scripts()
+            || scene
+                .view()
+                .objects
+                .iter()
+                .any(|object| !object.heavy_scripts.is_empty());
+        for warning in warnings {
+            self.state.log.push(LogLevel::Warn, warning);
+        }
         if needs_library && self.state.library.is_none() {
             if self.state.scripts_path.is_none() {
-                self.state
-                    .log
-                    .error("В сцене есть Rust-скрипты, но библиотека не загружена");
+                self.state.log.error(
+                    "В сцене или тяжёлых префабах есть Rust-скрипты, но библиотека не загружена",
+                );
                 return;
             }
             if !self.load_manual_library() {
@@ -958,7 +980,8 @@ impl EditorApp {
             let mut world =
                 World::from_document(scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
-            let model_geometry = PlaySession::load_model_geometry(&world, &project.assets)?;
+            let model_geometry =
+                PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
             let animation = crate::viewport::animation::project_bridge(&world, &project.assets);
             PlaySession::start_with_world_and_physics(
                 scene.view(),
@@ -966,7 +989,8 @@ impl EditorApp {
                 self.state.library.as_ref(),
                 &project.settings.input,
                 |path| project.read_text(path),
-                &model_geometry,
+                prefabs,
+                model_geometry,
                 &project.settings.physics,
                 engine_audio::AudioConfig {
                     resources: Some(project.resource_handle()),
@@ -1093,7 +1117,10 @@ impl EditorApp {
                 }
                 Action::SaveThen(then) => {
                     if self.save(false) {
-                        self.run_confirmed(*then);
+                        match self.state.save_project_prefabs() {
+                            Ok(()) => self.run_confirmed(*then),
+                            Err(error) => self.state.log.error(error),
+                        }
                     }
                 }
                 Action::ApplyToPrefab(id) => {

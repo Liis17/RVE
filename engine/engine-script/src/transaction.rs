@@ -1,4 +1,9 @@
 use crate::actions::{ActionFrame, ActionMutation, ActionValue};
+use crate::lifecycle::{
+    DestroyRequest, Lifecycle, MAX_SPAWN_NAME_BYTES, MAX_SPAWNED_OBJECTS_PER_FRAME, ObjectState,
+    PrefabKind, PrefabRequest, PrefabStatus, SpawnArgs, SpawnRequest, prefab_display, prefab_key,
+    valid_spawn_id,
+};
 use crate::lite::EventQueue;
 use crate::physics::PhysicsScriptState;
 use crate::types::{ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
@@ -121,7 +126,8 @@ impl PendingMessage {
 
 pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) world: &'a World,
-    pub(crate) self_object: ObjectHandle,
+    /// Объект, чей скрипт выполняется; `None` для top-level chunk, у которого объекта нет.
+    pub(crate) self_object: Option<ObjectHandle>,
     pub(crate) source: &'a str,
     pub(crate) writable: bool,
     pub(crate) actions: Arc<ActionFrame>,
@@ -131,8 +137,23 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) queued_animation: usize,
     pub(crate) physics: Rc<RefCell<PhysicsScriptState>>,
     pub(crate) physics_phase_dt: Option<f32>,
+    pub(crate) lifecycle: Rc<RefCell<Lifecycle>>,
+    /// `false` в `create`, в `destroy` и на удалении поддерева: spawn и destroy запрещены.
+    pub(crate) lifecycle_writes: bool,
+    /// Серийный номер экземпляра, который выполняет вызов; нужен для предупреждений.
+    pub(crate) instance_serial: u64,
     /// Состояние курсора, применённое хостом до этого вызова.
     pub(crate) cursor: ScriptCursor,
+}
+
+/// Результат разбора хендла объекта в вызове ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AbiObject {
+    /// Значение не декодируется как хендл: это ошибка вызова.
+    Malformed,
+    /// Объект мёртв или ещё pending: вызов ничего не делает и не считается ошибкой.
+    Unavailable,
+    Alive(ObjectHandle),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,6 +199,17 @@ pub(crate) struct ScriptTransaction {
     pending_cursor_locked: Option<bool>,
     pending_audio: Vec<AudioRequest>,
     pending_animation: Vec<AnimationRequest>,
+    lifecycle: Rc<RefCell<Lifecycle>>,
+    lifecycle_writes: bool,
+    instance_serial: u64,
+    /// Резервы корней, созданных в этом вызове; при откате освобождаются.
+    pending_spawns: Vec<SpawnRequest>,
+    pending_destroys: Vec<DestroyRequest>,
+    pending_prefab_requests: Vec<PrefabRequest>,
+    /// Явные id spawn-объектов этого вызова: проверка коллизий внутри одного callback.
+    pending_ids: HashMap<String, ObjectHandle>,
+    /// Предупреждения о мёртвых объектах; в журнал попадают только при коммите.
+    pending_dead_warnings: Vec<(ObjectHandle, String)>,
     #[cfg(test)]
     peak_pending_bytes: usize,
 }
@@ -220,6 +252,14 @@ impl Default for ScriptTransaction {
             pending_cursor_locked: None,
             pending_audio: Vec::new(),
             pending_animation: Vec::new(),
+            lifecycle: Rc::new(RefCell::new(Lifecycle::default())),
+            lifecycle_writes: false,
+            instance_serial: 0,
+            pending_spawns: Vec::new(),
+            pending_destroys: Vec::new(),
+            pending_prefab_requests: Vec::new(),
+            pending_ids: HashMap::new(),
+            pending_dead_warnings: Vec::new(),
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
@@ -236,7 +276,7 @@ impl ScriptTransaction {
 
     pub(crate) fn begin(&mut self, init: ScriptTransactionInit<'_>) {
         self.world = init.world;
-        self.self_object = Some(init.self_object);
+        self.self_object = init.self_object;
         self.writable = init.writable;
         self.action_frame = Some(init.actions);
         self.physics = init.physics;
@@ -264,6 +304,14 @@ impl ScriptTransaction {
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
         self.pending_animation.clear();
+        self.lifecycle = init.lifecycle;
+        self.lifecycle_writes = init.lifecycle_writes;
+        self.instance_serial = init.instance_serial;
+        self.pending_spawns.clear();
+        self.pending_destroys.clear();
+        self.pending_prefab_requests.clear();
+        self.pending_ids.clear();
+        self.pending_dead_warnings.clear();
     }
 
     pub(crate) fn writable(&self) -> bool {
@@ -420,7 +468,10 @@ impl ScriptTransaction {
     }
 
     pub(crate) fn physics_object(&self, body: BodyHandle) -> Option<ObjectHandle> {
-        self.physics.borrow().object(body)
+        self.physics
+            .borrow()
+            .object(body)
+            .or_else(|| self.lifecycle.borrow().retired_body(body))
     }
 
     pub(crate) fn body_velocity(&self, object: ObjectHandle) -> Result<Vec3, String> {
@@ -639,6 +690,219 @@ impl ScriptTransaction {
         self.world()?.handle(id)
     }
 
+    /// Живой объект или pending-объект с явным id. Используют `send` и `rve.destroy`;
+    /// `find` видит только живые объекты.
+    pub(crate) fn handle_by_any_id(&self, id: &str) -> Option<ObjectHandle> {
+        self.handle_by_id(id)
+            .or_else(|| self.pending_ids.get(id).copied())
+            .or_else(|| self.lifecycle.borrow().pending_ids.get(id).copied())
+    }
+
+    /// Живой, pending (зарезервированный) или мёртвый объект.
+    pub(crate) fn object_state(&self, handle: ObjectHandle) -> ObjectState {
+        match self.world() {
+            Some(world) if world.is_alive(handle) => ObjectState::Alive,
+            Some(world) if world.is_reserved(handle) => ObjectState::Pending,
+            _ => ObjectState::Dead,
+        }
+    }
+
+    /// Состояние для методов объекта. Мёртвый объект даёт Warn один раз на пару «экземпляр + объект».
+    pub(crate) fn object_access(&mut self, handle: ObjectHandle) -> ObjectState {
+        let state = self.object_state(handle);
+        if state == ObjectState::Dead {
+            self.warn_dead(handle);
+        }
+        state
+    }
+
+    fn warn_dead(&mut self, handle: ObjectHandle) {
+        if self
+            .lifecycle
+            .borrow()
+            .has_warned(self.instance_serial, handle)
+            || self
+                .pending_dead_warnings
+                .iter()
+                .any(|(pending, _)| *pending == handle)
+        {
+            return;
+        }
+        let name = self
+            .lifecycle
+            .borrow()
+            .retired(handle)
+            .map(|retired| retired.id.clone())
+            .unwrap_or_else(|| format!("#{}", handle.index()));
+        self.pending_dead_warnings
+            .push((handle, format!("script used a destroyed object {name:?}")));
+    }
+
+    /// Идентичность объекта для Lua и событий: id (для объекта без явного id в pending он неизвестен) и имя.
+    /// Мёртвый объект имеет идентичность, пока жива его физическая привязка.
+    pub(crate) fn object_identity(&self, handle: ObjectHandle) -> Option<(Option<String>, String)> {
+        let world = self.world()?;
+        if let Some(object) = world.object(handle) {
+            return Some((Some(object.id.clone()), object.name.clone()));
+        }
+        if world.is_reserved(handle) {
+            if let Some(request) = self.pending_spawns.iter().find(|r| r.root == handle) {
+                return Some(spawn_identity(request));
+            }
+            let lifecycle = self.lifecycle.borrow();
+            return lifecycle.pending_spawn(handle).map(spawn_identity);
+        }
+        let lifecycle = self.lifecycle.borrow();
+        lifecycle
+            .retired(handle)
+            .map(|retired| (Some(retired.id.clone()), retired.name.clone()))
+    }
+
+    /// Резервирует корень spawn-объекта и ставит заявку до коммита. Id и параметры проверяются сразу.
+    pub(crate) fn spawn(&mut self, prefab: &str, args: SpawnArgs) -> Result<ObjectHandle, String> {
+        if !self.writable {
+            return Err("spawn is unavailable during script creation".to_owned());
+        }
+        if !self.lifecycle_writes {
+            return Err("spawn is unavailable during destroy callbacks".to_owned());
+        }
+        let prefab = prefab_key(prefab)?;
+        let world = self
+            .world()
+            .ok_or_else(|| "spawn is only available during script calls".to_owned())?;
+        {
+            let lifecycle = self.lifecycle.borrow();
+            let slot = lifecycle.prefabs.get(&prefab).ok_or_else(|| {
+                format!(
+                    "prefab {:?} is not in the project prefab list",
+                    prefab_display(&prefab)
+                )
+            })?;
+            if slot.status == PrefabStatus::Failed {
+                return Err(format!(
+                    "prefab {:?} failed to load",
+                    prefab_display(&prefab)
+                ));
+            }
+            if slot.kind == PrefabKind::Fast && slot.template.is_none() {
+                return Err(format!(
+                    "prefab {:?} is not registered",
+                    prefab_display(&prefab)
+                ));
+            }
+            if lifecycle.queued.len() + lifecycle.waiting.len() + self.pending_spawns.len()
+                >= MAX_SPAWNED_OBJECTS_PER_FRAME
+            {
+                return Err(format!(
+                    "spawn requests limit ({MAX_SPAWNED_OBJECTS_PER_FRAME} per frame) reached"
+                ));
+            }
+        }
+        let options = &args.options;
+        if [options.position, options.rotation_deg, options.scale]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+            || args.velocity.is_some_and(|value| !value.is_finite())
+        {
+            return Err("spawn transform and velocity must be finite".to_owned());
+        }
+        if let Some(parent) = options.parent
+            && !world.is_alive(parent)
+        {
+            return Err("spawn parent must be an existing object".to_owned());
+        }
+        if options
+            .name
+            .as_ref()
+            .is_some_and(|name| name.len() > MAX_SPAWN_NAME_BYTES)
+        {
+            return Err(format!(
+                "spawn name must be at most {MAX_SPAWN_NAME_BYTES} bytes"
+            ));
+        }
+        if let Some(id) = &options.id {
+            if !valid_spawn_id(id) {
+                return Err(format!("spawn id {id:?} must match [A-Za-z0-9_-]{{1,64}}"));
+            }
+            if world.handle(id).is_some()
+                || self.pending_ids.contains_key(id)
+                || self.lifecycle.borrow().pending_ids.contains_key(id)
+            {
+                return Err(format!("object id {id:?} is already used"));
+            }
+        }
+        let root = world.reserve_object();
+        if let Some(id) = &args.options.id {
+            self.pending_ids.insert(id.clone(), root);
+        }
+        self.pending_spawns.push(SpawnRequest {
+            seq: 0,
+            root,
+            prefab,
+            args,
+            source: self.source.clone(),
+        });
+        Ok(root)
+    }
+
+    /// Ставит удаление поддерева. `Ok(false)` — объект уже удалён; ничего не ставится.
+    pub(crate) fn destroy(&mut self, handle: ObjectHandle, delay: f64) -> Result<bool, String> {
+        if !self.writable {
+            return Err("destroy is unavailable during script creation".to_owned());
+        }
+        if !self.lifecycle_writes {
+            return Err("destroy is unavailable during destroy callbacks".to_owned());
+        }
+        if !delay.is_finite() || delay < 0.0 {
+            return Err("destroy delay must be a finite nonnegative number".to_owned());
+        }
+        if self.object_access(handle) == ObjectState::Dead {
+            return Ok(false);
+        }
+        let due = (delay > 0.0).then(|| self.lifecycle.borrow().now + delay);
+        self.pending_destroys.push(DestroyRequest { handle, due });
+        Ok(true)
+    }
+
+    /// Заявка загрузки или выгрузки; применяется при коммите. Быстрые префабы не грузятся.
+    pub(crate) fn prefab_request(&mut self, request: PrefabRequest) -> Result<(), String> {
+        if !self.writable {
+            return Err("prefab loading is unavailable during script creation".to_owned());
+        }
+        let request = match request {
+            PrefabRequest::Load(path) => PrefabRequest::Load(prefab_key(&path)?),
+            PrefabRequest::Unload(path) => PrefabRequest::Unload(prefab_key(&path)?),
+        };
+        let path = match &request {
+            PrefabRequest::Load(path) | PrefabRequest::Unload(path) => path.clone(),
+        };
+        let heavy = {
+            let lifecycle = self.lifecycle.borrow();
+            let slot = lifecycle.prefabs.get(&path).ok_or_else(|| {
+                format!(
+                    "prefab {:?} is not in the project prefab list",
+                    prefab_display(&path)
+                )
+            })?;
+            slot.kind == PrefabKind::Heavy
+        };
+        if heavy {
+            self.pending_prefab_requests.push(request);
+        }
+        Ok(())
+    }
+
+    /// Состояние префаба по зафиксированным данным; `None` — путь не в списке проекта или некорректен.
+    pub(crate) fn prefab_status(&self, path: &str) -> Option<PrefabStatus> {
+        let key = prefab_key(path).ok()?;
+        self.lifecycle
+            .borrow()
+            .prefabs
+            .get(&key)
+            .map(|slot| slot.status)
+    }
+
     pub(crate) fn object_id(&self, handle: ObjectHandle) -> Option<&str> {
         self.world()?
             .object(handle)
@@ -725,16 +989,29 @@ impl ScriptTransaction {
             .map(|matrix| matrix.to_cols_array())
     }
 
-    pub(crate) fn object_from_abi_handle(&self, handle: u64) -> Option<ObjectHandle> {
-        let index = usize::try_from(handle.checked_sub(1)?).ok()?;
-        self.world()?
-            .objects()
-            .get(index)
-            .map(|object| object.handle)
+    /// Разбирает ABI-значение и проверяет объект. Мёртвый и pending-объект дают `Unavailable`:
+    /// вызов ничего не делает, а Warn пишется один раз на пару «экземпляр + объект».
+    pub(crate) fn abi_object(&mut self, handle: u64) -> AbiObject {
+        let Some(handle) = ObjectHandle::from_abi(handle) else {
+            return AbiObject::Malformed;
+        };
+        match self.object_access(handle) {
+            ObjectState::Alive => AbiObject::Alive(handle),
+            ObjectState::Pending | ObjectState::Dead => AbiObject::Unavailable,
+        }
+    }
+
+    /// Живой объект по ABI-значению без сообщений; устаревший хендл даёт `None` даже после
+    /// переиспользования слота. Мёртвый объект пишет Warn, как и [`Self::abi_object`].
+    pub(crate) fn object_from_abi_handle(&mut self, handle: u64) -> Option<ObjectHandle> {
+        match self.abi_object(handle) {
+            AbiObject::Alive(handle) => Some(handle),
+            AbiObject::Malformed | AbiObject::Unavailable => None,
+        }
     }
 
     pub(crate) fn abi_handle(&self, handle: ObjectHandle) -> Option<u64> {
-        u64::try_from(handle.index()).ok()?.checked_add(1)
+        handle.to_abi()
     }
 
     pub(crate) fn set_local_from_abi(&mut self, handle: u64, transform: ScriptTransform) -> bool {
@@ -767,7 +1044,7 @@ impl ScriptTransaction {
             return Err(QueueMessageError::ReadOnly);
         }
         let target = self
-            .handle_by_id(target_id)
+            .handle_by_any_id(target_id)
             .ok_or(QueueMessageError::UnknownTarget)?;
         self.push_message(MessageTarget::Object(target), name, value, value_size)
     }
@@ -930,6 +1207,7 @@ impl ScriptTransaction {
         if let Some(locked) = self.pending_cursor_locked.take() {
             self.cursor.locked = locked;
         }
+        self.commit_lifecycle(events);
         for (handle, transform) in self.pending_transforms.drain() {
             // Handles and all transforms were validated before applying any write.
             world
@@ -992,7 +1270,51 @@ impl ScriptTransaction {
         Ok(std::mem::take(&mut self.pending_action_mutations))
     }
 
+    /// Коммит заявок spawn, destroy, загрузки и предупреждений. Вызывается после всех проверок.
+    fn commit_lifecycle(&mut self, events: &EventQueue) {
+        {
+            let mut lifecycle = self.lifecycle.borrow_mut();
+            for mut request in self.pending_spawns.drain(..) {
+                request.seq = lifecycle.next_seq();
+                lifecycle.queued.push_back(request);
+            }
+            for (id, handle) in self.pending_ids.drain() {
+                lifecycle.pending_ids.insert(id, handle);
+            }
+            lifecycle.destroys.append(&mut self.pending_destroys);
+            for request in self.pending_prefab_requests.drain(..) {
+                lifecycle.apply_prefab_request(request);
+            }
+        }
+        for (handle, message) in self.pending_dead_warnings.drain(..) {
+            if self
+                .lifecycle
+                .borrow_mut()
+                .mark_warned(self.instance_serial, handle)
+            {
+                events.borrow_mut().push(ScriptEvent {
+                    level: ScriptEventLevel::Warn,
+                    source: self.source.clone(),
+                    message,
+                });
+            }
+        }
+    }
+
     pub(crate) fn discard(&mut self) {
+        if !self.world.is_null() {
+            // SAFETY: `world` is the live reference from `begin`, cleared only below; releasing a
+            // reservation needs just a shared borrow and touches no other state of the world.
+            let world = unsafe { &*self.world };
+            for request in self.pending_spawns.drain(..) {
+                world.release_reservation(request.root);
+            }
+        }
+        self.pending_spawns.clear();
+        self.pending_destroys.clear();
+        self.pending_prefab_requests.clear();
+        self.pending_ids.clear();
+        self.pending_dead_warnings.clear();
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
         self.pending_active_camera = None;
@@ -1061,4 +1383,12 @@ fn local_transform(transform: ScriptTransform) -> LocalTransform {
         rotation_deg: transform.rotation.into(),
         scale: transform.scale.into(),
     }
+}
+
+/// Идентичность заявки до её применения: явный id (если задан) и имя (если задано).
+fn spawn_identity(request: &SpawnRequest) -> (Option<String>, String) {
+    (
+        request.args.options.id.clone(),
+        request.args.options.name.clone().unwrap_or_default(),
+    )
 }

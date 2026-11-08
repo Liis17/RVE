@@ -209,6 +209,16 @@ struct HostState {
     /// Status returned by every audio callback; zero is `RveStatus::Ok`.
     audio_status: u32,
     next_voice: u64,
+    /// Spawn, destroy, object-state and prefab calls in guest order.
+    lifecycle_calls: Vec<String>,
+    /// Handle returned by every spawn callback; zero is a refusal.
+    spawn_handle: u64,
+    /// Result of every destroy and prefab request callback.
+    lifecycle_accepts: bool,
+    /// Code returned by the object-state callback.
+    object_state_code: u32,
+    /// Code returned by the prefab-state callback.
+    prefab_state_code: u32,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -501,6 +511,12 @@ fn host(state: &mut HostState) -> RveHost {
         cursor_state: Some(cursor_state),
         set_cursor_visible: Some(set_cursor_visible),
         set_cursor_locked: Some(set_cursor_locked),
+        spawn: None,
+        destroy: None,
+        object_state: None,
+        prefab_load: None,
+        prefab_unload: None,
+        prefab_state: None,
         animation_play: None,
         animation_set_weight: None,
         animation_set_parameter: None,
@@ -1002,6 +1018,359 @@ fn audio_callbacks_and_params_keep_the_v7_layout() {
         offset_of!(RveHost, audio_set_group_volume),
         offset_of!(RveHost, audio_stop_voice) + size_of::<Option<crate::abi::RveAudioVoiceFn>>()
     );
+}
+
+fn present<T>(flags: u32, bit: u32, value: T) -> Option<T> {
+    (flags & bit != 0).then_some(value)
+}
+
+/// Renders the spawn options as the guest-visible fields, so tests can compare the whole request.
+fn describe_spawn(prefab: &str, options: Option<crate::abi::RveSpawnOptions>) -> String {
+    let Some(options) = options else {
+        return format!("spawn:{prefab}:null");
+    };
+    let flags = options.flags;
+    // SAFETY: the test host receives strings that the guest keeps alive for this call.
+    let name = present(flags, crate::abi::RVE_SPAWN_HAS_NAME, options.name)
+        .map(|value| unsafe { value.to_str() }.unwrap().to_owned());
+    let id = present(flags, crate::abi::RVE_SPAWN_HAS_ID, options.id)
+        .map(|value| unsafe { value.to_str() }.unwrap().to_owned());
+    format!(
+        "spawn:{prefab}:flags={flags:#x}:position={:?}:rotation={:?}:scale={:?}:velocity={:?}:parent={:?}:name={name:?}:id={id:?}",
+        present(flags, crate::abi::RVE_SPAWN_HAS_POSITION, options.position),
+        present(
+            flags,
+            crate::abi::RVE_SPAWN_HAS_ROTATION,
+            options.rotation_deg
+        ),
+        present(flags, crate::abi::RVE_SPAWN_HAS_SCALE, options.scale),
+        present(flags, crate::abi::RVE_SPAWN_HAS_VELOCITY, options.velocity),
+        present(flags, crate::abi::RVE_SPAWN_HAS_PARENT, options.parent),
+    )
+}
+
+unsafe extern "C" fn spawn_object(
+    ctx: *mut c_void,
+    prefab: RveStr,
+    options: *const crate::abi::RveSpawnOptions,
+) -> u64 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a valid prefab string for this callback.
+    let prefab = unsafe { prefab.to_str() }.unwrap();
+    // SAFETY: the guest passes either null or a readable options struct.
+    let options = unsafe { options.as_ref() }.copied();
+    state.lifecycle_calls.push(describe_spawn(prefab, options));
+    state.spawn_handle
+}
+
+unsafe extern "C" fn destroy_object(ctx: *mut c_void, object: u64, delay: f32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state
+        .lifecycle_calls
+        .push(format!("destroy:{object}:{delay}"));
+    state.lifecycle_accepts
+}
+
+unsafe extern "C" fn object_state(ctx: *mut c_void, object: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.lifecycle_calls.push(format!("state:{object}"));
+    state.object_state_code
+}
+
+unsafe extern "C" fn prefab_load(ctx: *mut c_void, path: RveStr) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a valid path string for this callback.
+    let path = unsafe { path.to_str() }.unwrap();
+    state.lifecycle_calls.push(format!("load:{path}"));
+    state.lifecycle_accepts
+}
+
+unsafe extern "C" fn prefab_unload(ctx: *mut c_void, path: RveStr) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a valid path string for this callback.
+    let path = unsafe { path.to_str() }.unwrap();
+    state.lifecycle_calls.push(format!("unload:{path}"));
+    state.lifecycle_accepts
+}
+
+unsafe extern "C" fn prefab_state(ctx: *mut c_void, path: RveStr) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a valid path string for this callback.
+    let path = unsafe { path.to_str() }.unwrap();
+    state.lifecycle_calls.push(format!("prefab_state:{path}"));
+    state.prefab_state_code
+}
+
+fn lifecycle_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.spawn = Some(spawn_object);
+    host.destroy = Some(destroy_object);
+    host.object_state = Some(object_state);
+    host.prefab_load = Some(prefab_load);
+    host.prefab_unload = Some(prefab_unload);
+    host.prefab_state = Some(prefab_state);
+    host
+}
+
+#[test]
+fn sdk_spawn_api_forwards_present_fields_and_returns_the_pending_object() {
+    let mut state = HostState {
+        spawn_handle: 42,
+        ..HostState::default()
+    };
+    let host = lifecycle_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let camera = context.find("camera").unwrap();
+    let options = crate::SpawnOptions::new()
+        .position([1.0, 2.0, 3.0])
+        .rotation_deg([0.0, 90.0, 0.0])
+        .scale([2.0; 3])
+        .velocity([0.0, 5.0, 0.0])
+        .parent(camera)
+        .name("Bolt")
+        .id("bolt_1");
+    let bolt = context
+        .spawn("prefabs/bolt.rveprefab", &options)
+        .expect("host returned a pending handle");
+    assert_eq!(bolt.handle, 42);
+    assert_eq!(
+        state.lifecycle_calls.last().unwrap(),
+        &format!(
+            "spawn:prefabs/bolt.rveprefab:flags=0x7f:position=Some([1.0, 2.0, 3.0]):rotation=Some([0.0, 90.0, 0.0]):scale=Some([2.0, 2.0, 2.0]):velocity=Some([0.0, 5.0, 0.0]):parent=Some({}):name=Some(\"Bolt\"):id=Some(\"bolt_1\")",
+            camera.handle
+        )
+    );
+
+    // Unset fields are not presented to the host; the request is a no-op for the prefab's values.
+    context.spawn("prefabs/bolt.rveprefab", &crate::SpawnOptions::new());
+    assert_eq!(
+        state.lifecycle_calls.last().unwrap(),
+        "spawn:prefabs/bolt.rveprefab:flags=0x0:position=None:rotation=None:scale=None:velocity=None:parent=None:name=None:id=None"
+    );
+}
+
+#[test]
+fn sdk_spawn_api_returns_none_for_refusals_and_non_finite_options() {
+    let mut state = HostState::default();
+    let host = lifecycle_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    assert!(
+        context
+            .spawn("prefabs/bolt.rveprefab", &crate::SpawnOptions::new())
+            .is_none(),
+        "a zero handle is a refusal"
+    );
+    let calls = state.lifecycle_calls.len();
+    let non_finite = crate::SpawnOptions::new().position([f32::NAN, 0.0, 0.0]);
+    assert!(
+        context
+            .spawn("prefabs/bolt.rveprefab", &non_finite)
+            .is_none()
+    );
+    let infinite = crate::SpawnOptions::new().velocity([0.0, f32::INFINITY, 0.0]);
+    assert!(context.spawn("prefabs/bolt.rveprefab", &infinite).is_none());
+    assert_eq!(
+        state.lifecycle_calls.len(),
+        calls,
+        "non-finite options never reach the host"
+    );
+}
+
+#[test]
+fn sdk_object_lifecycle_api_forwards_destroy_and_state_codes() {
+    let mut state = HostState {
+        lifecycle_accepts: true,
+        object_state_code: crate::abi::RVE_OBJECT_ALIVE,
+        ..HostState::default()
+    };
+    let host = lifecycle_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    assert!(object.destroy(&mut context, 1.5));
+    assert!(object.is_alive(&context));
+    assert!(!object.is_pending(&context));
+    for delay in [f32::NAN, f32::INFINITY, -0.5] {
+        assert!(!object.destroy(&mut context, delay), "delay {delay}");
+    }
+    assert_eq!(
+        state.lifecycle_calls,
+        [
+            format!("destroy:{}:1.5", object.handle),
+            format!("state:{}", object.handle),
+            format!("state:{}", object.handle),
+        ],
+        "invalid delays never reach the host"
+    );
+
+    state.object_state_code = crate::abi::RVE_OBJECT_PENDING;
+    assert!(object.is_pending(&context));
+    assert!(!object.is_alive(&context));
+    state.object_state_code = crate::abi::RVE_OBJECT_DEAD;
+    assert!(!object.is_pending(&context));
+    assert!(!object.is_alive(&context));
+
+    state.lifecycle_accepts = false;
+    assert!(!object.destroy(&mut context, 0.0), "the host refused it");
+}
+
+#[test]
+fn sdk_prefab_api_forwards_requests_and_maps_every_state_code() {
+    let mut state = HostState {
+        lifecycle_accepts: true,
+        ..HostState::default()
+    };
+    let host = lifecycle_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let prefabs = context.prefabs();
+    assert!(prefabs.load("prefabs/heavy.rveprefab"));
+    assert!(prefabs.unload("prefabs/heavy.rveprefab"));
+
+    let expected = [
+        (crate::abi::RVE_PREFAB_UNKNOWN, crate::PrefabState::Unknown),
+        (
+            crate::abi::RVE_PREFAB_RESIDENT,
+            crate::PrefabState::Resident,
+        ),
+        (
+            crate::abi::RVE_PREFAB_UNLOADED,
+            crate::PrefabState::Unloaded,
+        ),
+        (crate::abi::RVE_PREFAB_LOADING, crate::PrefabState::Loading),
+        (crate::abi::RVE_PREFAB_LOADED, crate::PrefabState::Loaded),
+        (
+            crate::abi::RVE_PREFAB_UNLOADING,
+            crate::PrefabState::Unloading,
+        ),
+        (crate::abi::RVE_PREFAB_FAILED, crate::PrefabState::Failed),
+        (99, crate::PrefabState::Unknown),
+    ];
+    for (code, state_value) in expected {
+        // The host state lives behind a raw pointer; updating it between calls is the test's job.
+        let host_state = unsafe { &mut *host.ctx.cast::<HostState>() };
+        host_state.prefab_state_code = code;
+        assert_eq!(
+            prefabs.state("prefabs/heavy.rveprefab"),
+            state_value,
+            "code {code}"
+        );
+    }
+    assert_eq!(
+        state.lifecycle_calls.last().unwrap(),
+        "prefab_state:prefabs/heavy.rveprefab"
+    );
+    assert_eq!(state.lifecycle_calls[0], "load:prefabs/heavy.rveprefab");
+    assert_eq!(state.lifecycle_calls[1], "unload:prefabs/heavy.rveprefab");
+
+    state.lifecycle_accepts = false;
+    assert!(!prefabs.load("prefabs/heavy.rveprefab"));
+}
+
+#[test]
+fn sdk_lifecycle_api_reports_missing_callbacks_without_calling_the_host() {
+    let mut state = HostState::default();
+    let host = self::host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    assert!(
+        context
+            .spawn("prefabs/bolt.rveprefab", &crate::SpawnOptions::new())
+            .is_none()
+    );
+    assert!(!object.destroy(&mut context, 0.0));
+    assert!(!object.is_alive(&context));
+    assert!(!object.is_pending(&context));
+    let prefabs = context.prefabs();
+    assert!(!prefabs.load("prefabs/heavy.rveprefab"));
+    assert!(!prefabs.unload("prefabs/heavy.rveprefab"));
+    assert_eq!(
+        prefabs.state("prefabs/heavy.rveprefab"),
+        crate::PrefabState::Unavailable
+    );
+    assert!(state.lifecycle_calls.is_empty());
+}
+
+#[test]
+fn lifecycle_callbacks_and_spawn_options_keep_the_v9_layout() {
+    use crate::abi::RveSpawnOptions;
+    use std::mem::{align_of, offset_of, size_of};
+    assert_eq!(size_of::<RveSpawnOptions>(), 96);
+    assert_eq!(align_of::<RveSpawnOptions>(), 8);
+    assert_eq!(offset_of!(RveSpawnOptions, flags), 0);
+    assert_eq!(offset_of!(RveSpawnOptions, position), 4);
+    assert_eq!(offset_of!(RveSpawnOptions, rotation_deg), 16);
+    assert_eq!(offset_of!(RveSpawnOptions, scale), 28);
+    assert_eq!(offset_of!(RveSpawnOptions, velocity), 40);
+    assert_eq!(offset_of!(RveSpawnOptions, parent), 56);
+    assert_eq!(offset_of!(RveSpawnOptions, name), 64);
+    assert_eq!(offset_of!(RveSpawnOptions, id), 80);
+
+    assert_eq!(
+        offset_of!(RveHost, spawn),
+        offset_of!(RveHost, set_cursor_locked) + size_of::<Option<crate::abi::RveSetCursorFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, destroy),
+        offset_of!(RveHost, spawn) + size_of::<Option<crate::abi::RveSpawnFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, object_state),
+        offset_of!(RveHost, destroy) + size_of::<Option<crate::abi::RveDestroyObjectFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, prefab_load),
+        offset_of!(RveHost, object_state) + size_of::<Option<crate::abi::RveObjectStateFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, prefab_unload),
+        offset_of!(RveHost, prefab_load) + size_of::<Option<crate::abi::RvePrefabRequestFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, prefab_state),
+        offset_of!(RveHost, prefab_unload) + size_of::<Option<crate::abi::RvePrefabRequestFn>>()
+    );
+
+    use crate::abi::{
+        RVE_OBJECT_ALIVE, RVE_OBJECT_DEAD, RVE_OBJECT_PENDING, RVE_PREFAB_FAILED,
+        RVE_PREFAB_LOADED, RVE_PREFAB_LOADING, RVE_PREFAB_RESIDENT, RVE_PREFAB_UNKNOWN,
+        RVE_PREFAB_UNLOADED, RVE_PREFAB_UNLOADING, RVE_SPAWN_HAS_ID, RVE_SPAWN_HAS_NAME,
+        RVE_SPAWN_HAS_PARENT, RVE_SPAWN_HAS_POSITION, RVE_SPAWN_HAS_ROTATION, RVE_SPAWN_HAS_SCALE,
+        RVE_SPAWN_HAS_VELOCITY, RVE_SPAWN_KNOWN_FLAGS,
+    };
+    assert_eq!(
+        [RVE_OBJECT_DEAD, RVE_OBJECT_PENDING, RVE_OBJECT_ALIVE],
+        [0, 1, 2]
+    );
+    assert_eq!(
+        [
+            RVE_PREFAB_UNKNOWN,
+            RVE_PREFAB_RESIDENT,
+            RVE_PREFAB_UNLOADED,
+            RVE_PREFAB_LOADING,
+            RVE_PREFAB_LOADED,
+            RVE_PREFAB_UNLOADING,
+            RVE_PREFAB_FAILED,
+        ],
+        [0, 1, 2, 3, 4, 5, 6]
+    );
+    let flags = [
+        RVE_SPAWN_HAS_POSITION,
+        RVE_SPAWN_HAS_ROTATION,
+        RVE_SPAWN_HAS_SCALE,
+        RVE_SPAWN_HAS_VELOCITY,
+        RVE_SPAWN_HAS_PARENT,
+        RVE_SPAWN_HAS_NAME,
+        RVE_SPAWN_HAS_ID,
+    ];
+    for (index, flag) in flags.into_iter().enumerate() {
+        assert_eq!(flag, 1 << index);
+    }
+    assert_eq!(RVE_SPAWN_KNOWN_FLAGS, 0x7f);
 }
 
 #[test]
@@ -1535,7 +1904,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 9);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 10);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -1798,12 +2167,12 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
     assert_eq!(offset_of!(RvePlayAnimationParams, then), 8);
     assert_eq!(
         offset_of!(RveHost, animation_play),
-        offset_of!(RveHost, set_cursor_locked) + size_of::<Option<crate::abi::RveSetCursorFn>>()
+        offset_of!(RveHost, prefab_state) + size_of::<Option<crate::abi::RvePrefabStateFn>>()
     );
     assert_eq!(
         offset_of!(RveHost, animation_stop),
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 9);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 10);
 }

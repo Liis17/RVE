@@ -5,9 +5,10 @@ use engine_scene::document::MaterialOverride;
 use engine_scene::{
     AnimatorComponent, AudioSourceComponent, CameraComponent, CameraCursor,
     CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
-    EnvironmentComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin, PointLightComponent,
-    PrefabInstance, PrefabOverride, ProceduralSkyComponent, RigidBodyComponent, SceneAsset,
-    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
+    EnvironmentComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin,
+    ParticleEmitterComponent, PointLightComponent, PrefabInstance, PrefabOverride,
+    ProceduralSkyComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform, SpotLightComponent,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -86,6 +87,7 @@ pub enum ComponentKind {
     CharacterController,
     AudioSource,
     Animator,
+    ParticleEmitter,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -104,6 +106,7 @@ pub enum Component {
     CharacterController(CharacterControllerComponent),
     AudioSource(AudioSourceComponent),
     Animator(AnimatorComponent),
+    ParticleEmitter(ParticleEmitterComponent),
 }
 
 impl Component {
@@ -122,6 +125,7 @@ impl Component {
             Self::CharacterController(_) => ComponentKind::CharacterController,
             Self::AudioSource(_) => ComponentKind::AudioSource,
             Self::Animator(_) => ComponentKind::Animator,
+            Self::ParticleEmitter(_) => ComponentKind::ParticleEmitter,
         }
     }
 
@@ -143,6 +147,9 @@ impl Component {
             }
             ComponentKind::AudioSource => Self::AudioSource(object.audio_source.clone()?),
             ComponentKind::Animator => Self::Animator(object.animator.clone()?),
+            ComponentKind::ParticleEmitter => {
+                Self::ParticleEmitter(object.particle_emitter.clone()?)
+            }
         })
     }
 
@@ -179,6 +186,11 @@ impl Component {
                     ..AnimatorComponent::new()
                 })
             }
+            // Текстура сохраняется по той же причине, что и клип звука.
+            ComponentKind::ParticleEmitter => Self::ParticleEmitter(ParticleEmitterComponent {
+                texture: object.particle_emitter.as_ref()?.texture.clone(),
+                ..ParticleEmitterComponent::default()
+            }),
         })
     }
 
@@ -201,6 +213,7 @@ impl Component {
             Self::CharacterController(value) => object.character_controller = Some(value),
             Self::AudioSource(value) => object.audio_source = Some(value),
             Self::Animator(value) => object.animator = Some(value),
+            Self::ParticleEmitter(value) => object.particle_emitter = Some(value),
         }
     }
 }
@@ -294,6 +307,11 @@ impl EditorScene {
     /// Происхождение объекта экземпляра; `None` — собственный объект документа.
     pub fn origin(&self, id: &str) -> Option<&ObjectOrigin> {
         self.expansion.origins.get(id)
+    }
+
+    /// Файлы префабов, раскрытые экземплярами этого документа, включая вложенные.
+    pub fn instanced_prefabs(&self) -> &[VirtualPath] {
+        &self.expansion.prefabs
     }
 
     /// Авторский экземпляр префаба по id.
@@ -1158,6 +1176,74 @@ impl EditorScene {
         })
     }
 
+    /// Добавляет `.rveprefab` в ресурсы сцены: только такие префабы спавнятся быстро.
+    pub fn add_scene_prefab(&mut self, path: VirtualPath) -> Result<(), String> {
+        require_prefab_path(&path)?;
+        self.edit(None, |document| {
+            if document.assets.iter().any(|asset| asset.path == path) {
+                return Err(format!("/{} уже есть в ресурсах сцены", path.as_str()));
+            }
+            document.assets.push(SceneAsset {
+                path,
+                archive: None,
+                max_instances: None,
+            });
+            Ok(())
+        })
+    }
+
+    /// Удаляет `.rveprefab` из ресурсов сцены. Префаб, на который есть экземпляр, не удаляется.
+    pub fn remove_scene_prefab(&mut self, path: &VirtualPath) -> Result<(), String> {
+        require_prefab_path(path)?;
+        if self
+            .document
+            .instances
+            .iter()
+            .any(|instance| &instance.prefab == path)
+        {
+            return Err(format!(
+                "/{} используется экземпляром: сначала удалите экземпляр",
+                path.as_str()
+            ));
+        }
+        self.edit(None, |document| {
+            let index = scene_asset_index(document, path)?;
+            document.assets.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Задаёт архив ресурса `.rveprefab`; имя проверяет [`SceneDocument::validate`].
+    pub fn set_scene_prefab_archive(
+        &mut self,
+        path: &VirtualPath,
+        archive: Option<String>,
+    ) -> Result<(), String> {
+        self.edit_scene_prefab(path, |asset| asset.archive = archive)
+    }
+
+    /// Задаёт лимит экземпляров ресурса `.rveprefab`; ноль отклоняет валидация документа.
+    pub fn set_scene_prefab_max_instances(
+        &mut self,
+        path: &VirtualPath,
+        max_instances: Option<u32>,
+    ) -> Result<(), String> {
+        self.edit_scene_prefab(path, |asset| asset.max_instances = max_instances)
+    }
+
+    fn edit_scene_prefab(
+        &mut self,
+        path: &VirtualPath,
+        change: impl FnOnce(&mut SceneAsset),
+    ) -> Result<(), String> {
+        require_prefab_path(path)?;
+        self.edit(None, |document| {
+            let index = scene_asset_index(document, path)?;
+            change(&mut document.assets[index]);
+            Ok(())
+        })
+    }
+
     /// Заменяет scene material override; текстуры добавляются в список ресурсов сцены.
     /// Override без заданных полей удаляется.
     pub fn set_material(
@@ -1236,6 +1322,13 @@ impl EditorScene {
     pub fn remove_animator(&mut self, id: &str) -> Result<(), String> {
         self.edit_object(id, None, |object| {
             object.animator = None;
+            Ok(())
+        })
+    }
+    /// Удаляет эмиттер частиц объекта.
+    pub fn remove_particle_emitter(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.particle_emitter = None;
             Ok(())
         })
     }
@@ -1464,6 +1557,13 @@ fn register_object_assets(
             ensure_asset(document, clip);
         }
     }
+    if let Some(texture) = object
+        .particle_emitter
+        .as_ref()
+        .and_then(|emitter| emitter.texture.as_ref())
+    {
+        ensure_asset(document, texture);
+    }
     for script in &object.lite_scripts {
         ensure_asset(document, &script.path);
     }
@@ -1539,8 +1639,25 @@ fn ensure_asset(document: &mut SceneDocument, path: &VirtualPath) {
         document.assets.push(SceneAsset {
             path: path.clone(),
             archive: None,
+            max_instances: None,
         });
     }
+}
+
+fn require_prefab_path(path: &VirtualPath) -> Result<(), String> {
+    if is_prefab_path(path) {
+        Ok(())
+    } else {
+        Err(format!("/{}: ожидается ресурс .rveprefab", path.as_str()))
+    }
+}
+
+fn scene_asset_index(document: &SceneDocument, path: &VirtualPath) -> Result<usize, String> {
+    document
+        .assets
+        .iter()
+        .position(|asset| &asset.path == path)
+        .ok_or_else(|| format!("/{} нет в ресурсах сцены", path.as_str()))
 }
 
 fn parse_lod_path(id: &str, value: &str, field: &str) -> Result<VirtualPath, String> {
@@ -2575,6 +2692,59 @@ mod tests {
     }
 
     #[test]
+    fn particle_emitter_adds_registers_texture_and_undoes_removal() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let texture = VirtualPath::parse("fx/smoke.png").unwrap();
+        let emitter = engine_scene::ParticleEmitterComponent {
+            texture: Some(texture.clone()),
+            ..engine_scene::ParticleEmitterComponent::default()
+        };
+        scene
+            .set_component(&id, Component::ParticleEmitter(emitter.clone()))
+            .unwrap();
+        assert_eq!(
+            scene.object(&id).unwrap().particle_emitter.as_ref(),
+            Some(&emitter)
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == texture),
+            "texture must be declared in [[assets]]"
+        );
+
+        let reset =
+            Component::reset(scene.object(&id).unwrap(), ComponentKind::ParticleEmitter).unwrap();
+        scene.set_component(&id, reset).unwrap();
+        let kept = scene.object(&id).unwrap().particle_emitter.clone().unwrap();
+        assert_eq!(
+            kept.texture,
+            Some(texture.clone()),
+            "reset keeps the texture"
+        );
+        assert_eq!(
+            kept.capacity,
+            engine_scene::ParticleEmitterComponent::default().capacity
+        );
+
+        scene.remove_particle_emitter(&id).unwrap();
+        assert!(scene.object(&id).unwrap().particle_emitter.is_none());
+        assert!(scene.undo());
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .particle_emitter
+                .as_ref()
+                .map(|value| value.capacity),
+            Some(kept.capacity)
+        );
+    }
+
+    #[test]
     fn pasting_an_invalid_component_is_rolled_back() {
         let mut scene = scene();
         let id = scene.create_object(&NewObject::Empty, None).unwrap();
@@ -2860,6 +3030,114 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    fn prefab_loader(prefab: &'static str) -> PrefabLoader {
+        Rc::new(move |path| SceneDocument::parse_prefab(format!("/{}", path.as_str()), prefab))
+    }
+
+    #[test]
+    fn scene_prefab_assets_add_and_remove_as_undoable_steps() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        assert_eq!(scene.document().assets.len(), 1);
+        assert!(scene.add_scene_prefab(bullet.clone()).is_err());
+        assert!(scene.add_scene_prefab(path("/models/a.fbx")).is_err());
+        assert_eq!(scene.document().assets.len(), 1);
+
+        scene.remove_scene_prefab(&bullet).unwrap();
+        assert!(scene.document().assets.is_empty());
+        assert!(scene.remove_scene_prefab(&bullet).is_err());
+        assert!(scene.remove_scene_prefab(&path("/models/a.fbx")).is_err());
+
+        assert!(scene.undo());
+        assert_eq!(scene.document().assets[0].path, bullet);
+        assert!(scene.redo());
+        assert!(scene.document().assets.is_empty());
+    }
+
+    #[test]
+    fn scene_prefab_used_by_an_instance_cannot_be_removed() {
+        let mut scene = scene();
+        scene
+            .set_prefab_loader(prefab_loader("[[objects]]\nid = \"frame\"\n"))
+            .unwrap();
+        let door = path("/prefabs/door.rveprefab");
+        scene
+            .create_object(&NewObject::Prefab(door.clone(), [0.0; 3]), None)
+            .unwrap();
+        let revision = scene.revision();
+
+        assert!(scene.remove_scene_prefab(&door).is_err());
+        assert_eq!(scene.revision(), revision);
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == door)
+        );
+    }
+
+    #[test]
+    fn scene_prefab_archive_and_max_instances_are_validated_and_undoable() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        let asset = |scene: &EditorScene| scene.document().assets[0].clone();
+
+        scene
+            .set_scene_prefab_archive(&bullet, Some("weapons".to_owned()))
+            .unwrap();
+        scene
+            .set_scene_prefab_max_instances(&bullet, Some(100))
+            .unwrap();
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert_eq!(asset(&scene).max_instances, Some(100));
+
+        for archive in ["shared", "base", "bad name"] {
+            let archive = Some(archive.to_owned());
+            assert!(scene.set_scene_prefab_archive(&bullet, archive).is_err());
+        }
+        assert!(
+            scene
+                .set_scene_prefab_max_instances(&bullet, Some(0))
+                .is_err()
+        );
+        assert!(
+            scene
+                .set_scene_prefab_max_instances(&path("/models/a.fbx"), Some(1))
+                .is_err()
+        );
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert_eq!(asset(&scene).max_instances, Some(100));
+
+        assert!(scene.undo());
+        assert_eq!(asset(&scene).max_instances, None);
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert!(scene.undo());
+        assert_eq!(asset(&scene).archive, None);
+        assert!(scene.redo());
+        assert!(scene.redo());
+        assert_eq!(asset(&scene).max_instances, Some(100));
+    }
+
+    #[test]
+    fn scene_prefab_assets_serialize_without_extra_fields() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        let text = scene.document().to_toml().unwrap();
+        assert!(!text.contains("archive"), "{text}");
+        assert!(!text.contains("max_instances"), "{text}");
+
+        scene
+            .set_scene_prefab_max_instances(&bullet, Some(7))
+            .unwrap();
+        let text = scene.document().to_toml().unwrap();
+        assert!(text.contains("max_instances = 7"), "{text}");
+        assert!(!text.contains("archive"), "{text}");
     }
 
     struct TempDir(std::path::PathBuf);

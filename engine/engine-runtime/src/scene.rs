@@ -8,21 +8,27 @@ use engine_physics::{
 };
 use engine_project::PhysicsSettings;
 use engine_render::{
-    AlphaMode, EnvironmentSource, Material, MaterialId, RenderError, Renderer, SkinVertex,
-    TextureColorSpace, TextureId, Vertex,
+    AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, ParticleBlend, ParticleBurst,
+    ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook, ParticleShape,
+    ParticleSizeKey, RenderError, Renderer, SkinVertex, TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::CameraSettings;
+use engine_scene::prefab::PREFAB_EXTENSION;
 use engine_scene::{
-    MaterialAlphaMode, MaterialOverride, ObjectHandle, SceneDocument, SceneError, World, expand,
+    AnimatorComponent, EnvironmentComponent, LiteScript, LodGroup, MaterialAlphaMode,
+    MaterialOverride, MeshRenderer, ObjectHandle, ParticleBlendMode, ParticleEmitterComponent,
+    ParticleShapeComponent, PrefabTemplate, SceneDocument, SceneError, World, expand,
 };
+use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
 use glam::Vec3;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
+use std::path::Path;
 use std::sync::Arc;
 
+/// Ресурсы одного объекта с мешом: уровни LOD (модель и текстура) и замена материала.
 pub(crate) struct ObjectModel {
-    pub object: ObjectHandle,
     pub levels: Vec<(String, Option<String>)>,
     pub material: Option<MaterialOverride>,
     /// Объект имеет `animator`: его модель получает скиннинг, если у модели есть скелет.
@@ -35,7 +41,28 @@ pub(crate) struct PreparedRenderAssets {
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
     /// Клипы из `animator.clips`, по виртуальному пути файла.
     pub clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
-    pub objects: Vec<ObjectModel>,
+    /// Объекты сцены с мешами и их хендлы.
+    pub objects: Vec<(ObjectHandle, ObjectModel)>,
+    /// Быстрые префабы по пути. Элемент `i` относится к объекту шаблона `i`; `None` — у объекта
+    /// нет меша.
+    pub prefabs: BTreeMap<String, Vec<Option<ObjectModel>>>,
+    /// Эмиттеры частиц объектов сцены; создаются при загрузке сцены.
+    pub particles: Vec<(ObjectHandle, ParticleSource)>,
+    /// Эмиттеры быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
+    pub prefab_particles: BTreeMap<String, Vec<Option<ParticleSource>>>,
+}
+
+/// Эмиттер частиц объекта: параметры сцены и путь текстуры, уже загруженной в `textures`.
+pub(crate) struct ParticleSource {
+    pub emitter: ParticleEmitterComponent,
+    pub texture: Option<String>,
+}
+
+/// Быстрые префабы сцены: шаблоны для регистрации в скриптах и лимиты создания.
+#[derive(Default)]
+pub(crate) struct PreparedPrefabs {
+    pub templates: BTreeMap<String, Arc<PrefabTemplate>>,
+    pub catalog: PrefabCatalog,
 }
 
 pub(crate) struct PreparedScene {
@@ -43,36 +70,28 @@ pub(crate) struct PreparedScene {
     pub name: String,
     pub sources: BTreeMap<String, String>,
     pub render_assets: PreparedRenderAssets,
+    pub prefabs: PreparedPrefabs,
 }
 
 impl PreparedScene {
-    pub(crate) fn build_physics(
-        &self,
-        settings: &PhysicsSettings,
-    ) -> Result<(StepDriver, Vec<PhysicsSceneBinding>), String> {
-        let model_geometry = self
-            .render_assets
+    /// Геометрия моделей для коллайдеров мешей. Её используют и построение физики сцены, и
+    /// вставка тел spawn-объектов, поэтому строится она один раз.
+    pub(crate) fn physics_geometry(&self) -> Vec<ModelGeometry> {
+        self.render_assets
             .models
             .iter()
-            .map(|(path, model)| ModelGeometry {
-                path: path.clone(),
-                meshes: model
-                    .meshes
-                    .iter()
-                    .map(|mesh| PhysicsModelMesh {
-                        positions: mesh
-                            .vertices
-                            .iter()
-                            .map(|vertex| Vec3::from_array(vertex.position))
-                            .collect(),
-                        indices: mesh.indices.clone(),
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
+            .map(|(path, model)| model_geometry(path, model))
+            .collect()
+    }
+
+    pub(crate) fn build_physics(
+        &self,
+        geometry: &[ModelGeometry],
+        settings: &PhysicsSettings,
+    ) -> Result<(StepDriver, Vec<PhysicsSceneBinding>), String> {
         PhysicsSceneDesc::from_world(
             &self.world,
-            &model_geometry,
+            geometry,
             Vec3::from_array(settings.gravity),
             settings.fixed_hz,
             settings.max_substeps as usize,
@@ -92,8 +111,68 @@ pub(crate) fn load_scene(
         SceneDocument::parse(scene_path, &contents).map_err(|error| error.to_string())?;
     let expansion = expand(&document, &mut |path| load_prefab(resources, path))
         .map_err(|error| error.to_string())?;
-    let world = World::from_document(&expansion.document).map_err(|error| error.to_string())?;
-    prepare_scene(resources, assets, scene_path, world)
+    let instanced = expansion.prefabs;
+    let mut expanded = expansion.document;
+    let prefabs = load_fast_prefabs(resources, &mut expanded, &instanced)?;
+    let world = World::from_document(&expanded).map_err(|error| error.to_string())?;
+    prepare_scene(resources, assets, scene_path, world, prefabs)
+}
+
+/// Раскрывает каждый `.rveprefab` из `[[assets]]` сцены в шаблон для spawn. Ассеты шаблонов
+/// добавляются в список ассетов сцены: звук и сборка видят их так же, как ассеты сцены.
+///
+/// Префаб с камерой, светом или окружением не регистрируется для spawn, но это не ошибка
+/// загрузки: он может быть экземпляром сцены. Если такой префаб объявлен только в `[[assets]]`,
+/// пишется один Warn. Ошибки чтения и разбора шаблона остаются ошибками загрузки.
+fn load_fast_prefabs(
+    resources: &ResourceHandle,
+    document: &mut SceneDocument,
+    instanced: &[VirtualPath],
+) -> Result<PreparedPrefabs, String> {
+    let fast = document
+        .assets
+        .iter()
+        .filter(|asset| is_prefab_path(&asset.path))
+        .map(|asset| (asset.path.clone(), asset.max_instances))
+        .collect::<Vec<_>>();
+    let mut prefabs = PreparedPrefabs::default();
+    for (path, max_instances) in fast {
+        let template = PrefabTemplate::load(&path, &mut |child: &VirtualPath| {
+            read_utf8(resources, &format!("/{}", child.as_str()))
+        })
+        .map_err(|error| error.to_string())?;
+        if let Err(error) = template.check_spawnable() {
+            if !instanced.contains(&path) {
+                log::warn!(
+                    "префаб {} объявлен в [[assets]], не используется экземплярами и не может быть заспавнен: {error}",
+                    path.as_str()
+                );
+            }
+            continue;
+        }
+        for asset in template.assets() {
+            if !document.assets.iter().any(|known| known.path == asset.path) {
+                document.assets.push(asset.clone());
+            }
+        }
+        prefabs.catalog.insert(
+            path.as_str(),
+            PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances,
+            },
+        );
+        prefabs
+            .templates
+            .insert(path.as_str().to_owned(), Arc::new(template));
+    }
+    Ok(prefabs)
+}
+
+fn is_prefab_path(path: &VirtualPath) -> bool {
+    Path::new(path.as_str())
+        .extension()
+        .is_some_and(|extension| extension == PREFAB_EXTENSION)
 }
 
 /// Префаб читается через тот же `ResourceHandle`, что и сцена, поэтому dev и release
@@ -116,10 +195,32 @@ fn prepare_scene(
     assets: &Assets,
     scene_path: &str,
     world: World,
+    prefabs: PreparedPrefabs,
 ) -> Result<PreparedScene, String> {
-    prepare_scene_with_model_loader(resources, assets, scene_path, world, |path| {
+    prepare_scene_with_model_loader(resources, assets, scene_path, world, prefabs, |path| {
         assets.load_model(path).map_err(|error| error.to_string())
     })
+}
+
+/// Ресурсы объектов сцены и шаблонов префабов, собранные за один проход. Модели и текстуры
+/// общие: объект сцены и префаб с одним FBX загружают его один раз.
+#[derive(Default)]
+struct RenderAssetSet {
+    models: HashMap<String, Model>,
+    textures: HashMap<String, TextureData>,
+    environments: HashMap<String, Arc<EnvironmentSource>>,
+    clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
+    lite_paths: BTreeSet<String>,
+}
+
+/// Компоненты объекта, из которых готовятся его ресурсы. Одинаковы для объекта мира и для
+/// объекта шаблона префаба.
+struct ObjectParts<'a> {
+    environment: Option<&'a EnvironmentComponent>,
+    mesh_renderer: Option<&'a MeshRenderer>,
+    lod_group: Option<&'a LodGroup>,
+    animator: Option<&'a AnimatorComponent>,
+    lite_scripts: &'a [LiteScript],
 }
 
 fn prepare_scene_with_model_loader(
@@ -127,6 +228,7 @@ fn prepare_scene_with_model_loader(
     assets: &Assets,
     scene_path: &str,
     mut world: World,
+    prefabs: PreparedPrefabs,
     mut load_model: impl FnMut(&str) -> Result<Model, String>,
 ) -> Result<PreparedScene, String> {
     let camera_settings = world
@@ -160,21 +262,97 @@ fn prepare_scene_with_model_loader(
             .map_err(|error| error.to_string())?;
     }
 
-    let mut models = HashMap::new();
-    let mut textures = HashMap::new();
-    let mut environments = HashMap::new();
-    let mut clips = HashMap::<String, Arc<Vec<ModelAnimation>>>::new();
+    let mut set = RenderAssetSet::default();
     let mut objects = Vec::new();
-    let mut lite_paths = std::collections::BTreeSet::new();
-
+    let mut particles = Vec::new();
     for object in world.objects() {
-        if let Some(path) = object
+        let parts = ObjectParts {
+            environment: object.environment.as_ref(),
+            mesh_renderer: object.mesh_renderer.as_ref(),
+            lod_group: object.lod_group.as_ref(),
+            animator: object.animator.as_ref(),
+            lite_scripts: &object.lite_scripts,
+        };
+        if let Some(model) = set.add_object(assets, scene_path, parts, &mut load_model)? {
+            objects.push((object.handle, model));
+        }
+        if let Some(source) =
+            set.add_particle(assets, scene_path, object.particle_emitter.as_ref())?
+        {
+            particles.push((object.handle, source));
+        }
+    }
+    let mut prefab_objects = BTreeMap::new();
+    let mut prefab_particles = BTreeMap::new();
+    for (path, template) in &prefabs.templates {
+        warn_unsupported_prefab_animators(path, template);
+        let mut levels = Vec::with_capacity(template.objects().len());
+        let mut emitters = Vec::with_capacity(template.objects().len());
+        for object in template.objects() {
+            let parts = ObjectParts {
+                environment: object.environment.as_ref(),
+                mesh_renderer: object.mesh_renderer.as_ref(),
+                lod_group: object.lod_group.as_ref(),
+                animator: None,
+                lite_scripts: &object.lite_scripts,
+            };
+            levels.push(set.add_object(assets, scene_path, parts, &mut load_model)?);
+            emitters.push(set.add_particle(
+                assets,
+                scene_path,
+                object.particle_emitter.as_ref(),
+            )?);
+        }
+        prefab_objects.insert(path.clone(), levels);
+        prefab_particles.insert(path.clone(), emitters);
+    }
+
+    let RenderAssetSet {
+        models,
+        textures,
+        environments,
+        clips,
+        lite_paths,
+    } = set;
+    let mut sources = BTreeMap::new();
+    for path in lite_paths {
+        sources.insert(path.clone(), read_utf8(resources, &path)?);
+    }
+
+    Ok(PreparedScene {
+        world,
+        name: scene_path.to_owned(),
+        sources,
+        render_assets: PreparedRenderAssets {
+            models,
+            textures,
+            environments,
+            clips,
+            objects,
+            prefabs: prefab_objects,
+            particles,
+            prefab_particles,
+        },
+        prefabs,
+    })
+}
+
+impl RenderAssetSet {
+    /// Готовит ресурсы одного объекта: HDR-окружение, модели уровней LOD, текстуры материалов и
+    /// Lua-исходники. Возвращает модель только для объекта с мешом.
+    fn add_object(
+        &mut self,
+        assets: &Assets,
+        scene_path: &str,
+        parts: ObjectParts<'_>,
+        load_model: &mut impl FnMut(&str) -> Result<Model, String>,
+    ) -> Result<Option<ObjectModel>, String> {
+        if let Some(path) = parts
             .environment
-            .as_ref()
             .and_then(|environment| environment.hdr.as_ref())
         {
             let key = path.as_str().to_owned();
-            if let std::collections::hash_map::Entry::Vacant(entry) = environments.entry(key) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.environments.entry(key) {
                 let image = assets
                     .load_hdr(entry.key())
                     .map_err(|error| format!("{scene_path}: {error}"))?;
@@ -185,12 +363,24 @@ fn prepare_scene_with_model_loader(
                 }));
             }
         }
-        if let Some(mesh) = &object.mesh_renderer {
+        if let Some(animator) = parts.animator {
+            for path in &animator.clips {
+                if !self.clips.contains_key(path.as_str()) {
+                    let animations = assets
+                        .load_animations(&format!("/{}", path.as_str()))
+                        .map_err(|error| format!("{scene_path}: {error}"))?;
+                    self.clips
+                        .insert(path.as_str().to_owned(), Arc::new(animations));
+                }
+            }
+        }
+        let mut model_object = None;
+        if let Some(mesh) = parts.mesh_renderer {
             let mut levels = vec![(
                 mesh.model.as_str().to_owned(),
                 mesh.texture.as_ref().map(|path| path.as_str().to_owned()),
             )];
-            if let Some(group) = &object.lod_group {
+            if let Some(group) = parts.lod_group {
                 for level in &group.levels {
                     let model_path = VirtualPath::parse(&level.model)
                         .map_err(|error| format!("{scene_path}: {error}"))?
@@ -212,10 +402,10 @@ fn prepare_scene_with_model_loader(
             }
             let material = mesh.material.clone();
             for (model_path, _) in &levels {
-                if !models.contains_key(model_path) {
+                if !self.models.contains_key(model_path) {
                     let model =
                         load_model(model_path).map_err(|error| format!("{scene_path}: {error}"))?;
-                    models.insert(model_path.clone(), model);
+                    self.models.insert(model_path.clone(), model);
                 }
             }
             let scene_texture_paths = levels
@@ -234,80 +424,78 @@ fn prepare_scene_with_model_loader(
                 }))
                 .collect::<Vec<_>>();
             for path in scene_texture_paths {
-                if let std::collections::hash_map::Entry::Vacant(entry) = textures.entry(path) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = self.textures.entry(path)
+                {
                     let texture = assets
                         .load_texture(entry.key())
                         .map_err(|error| format!("{scene_path}: {error}"))?;
                     entry.insert(texture);
                 }
             }
-            objects.push(ObjectModel {
-                object: object.handle,
+            model_object = Some(ObjectModel {
                 levels,
                 material,
-                animated: object.animator.is_some(),
+                animated: parts.animator.is_some(),
             });
         }
-        for script in &object.lite_scripts {
-            lite_paths.insert(script.path.as_str().to_owned());
+        for script in parts.lite_scripts {
+            self.lite_paths.insert(script.path.as_str().to_owned());
         }
+        Ok(model_object)
     }
 
-    for object in world.objects() {
-        let Some(animator) = &object.animator else {
-            continue;
+    /// Загружает текстуру эмиттера частиц объекта, если он есть.
+    fn add_particle(
+        &mut self,
+        assets: &Assets,
+        scene_path: &str,
+        emitter: Option<&ParticleEmitterComponent>,
+    ) -> Result<Option<ParticleSource>, String> {
+        let Some(emitter) = emitter else {
+            return Ok(None);
         };
-        for path in &animator.clips {
-            if !clips.contains_key(path.as_str()) {
-                let animations = assets
-                    .load_animations(&format!("/{}", path.as_str()))
-                    .map_err(|error| format!("{scene_path}: {error}"))?;
-                clips.insert(path.as_str().to_owned(), Arc::new(animations));
-            }
+        let texture = emitter
+            .texture
+            .as_ref()
+            .map(|path| path.as_str().to_owned());
+        if let Some(path) = &texture
+            && let std::collections::hash_map::Entry::Vacant(entry) =
+                self.textures.entry(path.clone())
+        {
+            let data = assets
+                .load_texture(entry.key())
+                .map_err(|error| format!("{scene_path}: {error}"))?;
+            entry.insert(data);
         }
+        Ok(Some(ParticleSource {
+            emitter: emitter.clone(),
+            texture,
+        }))
     }
-
-    let mut sources = BTreeMap::new();
-    for path in lite_paths {
-        sources.insert(path.clone(), read_utf8(resources, &path)?);
-    }
-
-    Ok(PreparedScene {
-        world,
-        name: scene_path.to_owned(),
-        sources,
-        render_assets: PreparedRenderAssets {
-            models,
-            textures,
-            environments,
-            clips,
-            objects,
-        },
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum MaterialTextureSource {
+pub(crate) enum MaterialTextureSource {
     Model(usize),
     Scene(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct ResolvedMaterial {
-    base_color: [f32; 3],
-    metallic: f32,
-    roughness: f32,
-    emissive: [f32; 3],
-    opacity: f32,
-    alpha_mode: AlphaMode,
-    double_sided: bool,
-    base_color_texture: Option<MaterialTextureSource>,
-    metallic_roughness_texture: Option<MaterialTextureSource>,
-    normal_texture: Option<MaterialTextureSource>,
-    emissive_texture: Option<MaterialTextureSource>,
-    occlusion_texture: Option<MaterialTextureSource>,
-    normal_scale: f32,
-    occlusion_strength: f32,
+pub(crate) struct ResolvedMaterial {
+    pub(crate) base_color: [f32; 3],
+    pub(crate) metallic: f32,
+    pub(crate) roughness: f32,
+    pub(crate) emissive: [f32; 3],
+    pub(crate) opacity: f32,
+    pub(crate) alpha_mode: AlphaMode,
+    pub(crate) double_sided: bool,
+    pub(crate) base_color_texture: Option<MaterialTextureSource>,
+    pub(crate) metallic_roughness_texture: Option<MaterialTextureSource>,
+    pub(crate) normal_texture: Option<MaterialTextureSource>,
+    pub(crate) emissive_texture: Option<MaterialTextureSource>,
+    pub(crate) occlusion_texture: Option<MaterialTextureSource>,
+    pub(crate) normal_scale: f32,
+    pub(crate) occlusion_strength: f32,
 }
 
 struct GpuTextureCache<T> {
@@ -341,7 +529,7 @@ where
     Ok(texture)
 }
 
-fn resolve_material(
+pub(crate) fn resolve_material(
     model: &ModelMaterial,
     replacement_texture: Option<&str>,
     override_material: Option<&MaterialOverride>,
@@ -422,13 +610,125 @@ fn read_utf8(resources: &ResourceHandle, path: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|error| format!("{path}: исходник должен быть UTF-8: {error}"))
 }
 
+/// Геометрия модели для коллайдеров мешей; одинакова для сцены и для тяжёлых префабов.
+pub(crate) fn model_geometry(path: &str, model: &Model) -> ModelGeometry {
+    ModelGeometry {
+        path: path.to_owned(),
+        meshes: model
+            .meshes
+            .iter()
+            .map(|mesh| PhysicsModelMesh {
+                positions: mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| Vec3::from_array(vertex.position))
+                    .collect(),
+                indices: mesh.indices.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Шаблон префаба, прочитанный через ресурсы; ошибки чтения и разбора остаются текстом.
+pub(crate) fn load_prefab_template(
+    resources: &ResourceHandle,
+    path: &VirtualPath,
+) -> Result<PrefabTemplate, String> {
+    PrefabTemplate::load(path, &mut |child: &VirtualPath| {
+        read_utf8(resources, &format!("/{}", child.as_str()))
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// CPU-ресурсы шаблона тяжёлого префаба: то же, что для объектов сцены.
+pub(crate) struct PreparedTemplate {
+    pub models: HashMap<String, Model>,
+    pub textures: HashMap<String, TextureData>,
+    /// Элемент `i` относится к объекту шаблона `i`; `None` — у объекта нет меша.
+    pub levels: Vec<Option<ObjectModel>>,
+    /// Эмиттеры объектов шаблона; элемент `i` относится к объекту `i`.
+    pub particles: Vec<Option<ParticleSource>>,
+    pub sources: BTreeMap<String, String>,
+}
+
+/// Заспавненные объекты пока не получают анимацию: аниматор шаблона не готовится, и предупреждение
+/// выводится один раз на шаблон при его подготовке.
+fn warn_unsupported_prefab_animators(path: &str, template: &PrefabTemplate) {
+    if template
+        .objects()
+        .iter()
+        .any(|object| object.animator.is_some())
+    {
+        log::warn!(
+            "[animation] {path}: аниматор объектов префаба не поддерживается при спавне; объекты рисуются без анимации"
+        );
+    }
+}
+
+/// Готовит модели, текстуры и Lua-исходники шаблона. `stop` проверяется перед каждым объектом,
+/// моделью и исходником: прерванная подготовка возвращает ошибку, а не частичный результат.
+pub(crate) fn prepare_template(
+    resources: &ResourceHandle,
+    assets: &Assets,
+    label: &str,
+    template: &PrefabTemplate,
+    stop: &dyn Fn() -> bool,
+) -> Result<PreparedTemplate, String> {
+    const STOPPED: &str = "подготовка префаба прервана";
+    warn_unsupported_prefab_animators(label, template);
+    let mut set = RenderAssetSet::default();
+    let mut levels = Vec::with_capacity(template.objects().len());
+    let mut particles = Vec::with_capacity(template.objects().len());
+    for object in template.objects() {
+        if stop() {
+            return Err(STOPPED.to_owned());
+        }
+        let parts = ObjectParts {
+            environment: object.environment.as_ref(),
+            mesh_renderer: object.mesh_renderer.as_ref(),
+            lod_group: object.lod_group.as_ref(),
+            animator: None,
+            lite_scripts: &object.lite_scripts,
+        };
+        let model = set.add_object(assets, label, parts, &mut |path: &str| {
+            if stop() {
+                return Err(STOPPED.to_owned());
+            }
+            assets.load_model(path).map_err(|error| error.to_string())
+        })?;
+        levels.push(model);
+        particles.push(set.add_particle(assets, label, object.particle_emitter.as_ref())?);
+    }
+    let RenderAssetSet {
+        models,
+        textures,
+        environments: _,
+        clips: _,
+        lite_paths,
+    } = set;
+    let mut sources = BTreeMap::new();
+    for path in lite_paths {
+        if stop() {
+            return Err(STOPPED.to_owned());
+        }
+        sources.insert(path.clone(), read_utf8(resources, &path)?);
+    }
+    Ok(PreparedTemplate {
+        models,
+        textures,
+        levels,
+        particles,
+        sources,
+    })
+}
+
 pub(crate) fn upload_scene(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
 ) -> Result<GpuSceneTable, RenderError> {
-    let mut gpu_models: HashMap<String, Vec<(engine_render::MeshId, MaterialId)>> = HashMap::new();
+    let mut gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = HashMap::new();
     let mut texture_cache = GpuTextureCache::<TextureId>::default();
-    // Модели, которые анимирует хотя бы один объект, загружаются со скином.
+    // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
     let animated = animated_model_paths(assets);
 
     for (path, model) in &assets.models {
@@ -491,40 +791,9 @@ pub(crate) fn upload_scene(
             );
         }
     }
-    for object in &assets.objects {
-        let mut levels = Vec::with_capacity(object.levels.len());
-        for (model_path, replacement_texture) in &object.levels {
-            let model_meshes = gpu_models.get(model_path).ok_or({
-                RenderError::InvalidState("CPU-модель отсутствует в таблице GPU-ресурсов")
-            })?;
-            if object.material.is_none() && replacement_texture.is_none() {
-                levels.push(model_meshes.clone());
-                continue;
-            }
-            let model = assets.models.get(model_path).ok_or({
-                RenderError::InvalidState(
-                    "CPU-модель отсутствует в таблице подготовленных ресурсов",
-                )
-            })?;
-            let mut draws = Vec::with_capacity(model_meshes.len());
-            for (source_mesh, (mesh_id, _)) in model.meshes.iter().zip(model_meshes) {
-                let resolved = resolve_material(
-                    &source_mesh.material,
-                    replacement_texture.as_deref(),
-                    object.material.as_ref(),
-                );
-                let material_id = upload_resolved_material(
-                    renderer,
-                    &resolved,
-                    model_path,
-                    model,
-                    &assets.textures,
-                    &mut texture_cache,
-                )?;
-                draws.push((*mesh_id, material_id));
-            }
-            levels.push(draws);
-        }
+    for (handle, object) in &assets.objects {
+        let levels =
+            upload_object_levels(renderer, assets, &gpu_models, &mut texture_cache, object)?;
         if object.animated
             && let Some((model_path, _)) = object.levels.first()
             && let Some(skeleton) = assets
@@ -537,21 +806,50 @@ pub(crate) fn upload_scene(
             for (mesh_id, _) in &levels[0] {
                 instances.push(renderer.create_skin_instance(*mesh_id)?);
             }
-            table.skin_instances.insert(object.object, instances);
+            table.skin_instances.insert(*handle, instances);
             table
                 .joint_counts
-                .insert(object.object, skeleton.joints.len() as u32);
+                .insert(*handle, skeleton.joints.len() as u32);
         }
-        table.by_object.insert(object.object, levels);
+        table.by_object.insert(*handle, levels);
+    }
+    for (path, objects) in &assets.prefabs {
+        let mut templates = Vec::with_capacity(objects.len());
+        for object in objects {
+            templates.push(match object {
+                Some(object) => {
+                    upload_object_levels(renderer, assets, &gpu_models, &mut texture_cache, object)?
+                }
+                None => Vec::new(),
+            });
+        }
+        table.prefabs.insert(path.clone(), templates);
+    }
+    for (handle, source) in &assets.particles {
+        let desc = particle_desc(renderer, assets, &mut texture_cache, source)?;
+        table
+            .particles
+            .insert(*handle, renderer.create_particle_emitter(desc)?);
+    }
+    for (path, sources) in &assets.prefab_particles {
+        let mut descs = Vec::with_capacity(sources.len());
+        for source in sources {
+            descs.push(match source {
+                Some(source) => Some(particle_desc(renderer, assets, &mut texture_cache, source)?),
+                None => None,
+            });
+        }
+        table.particle_templates.insert(path.clone(), descs);
     }
     Ok(table)
 }
 
-/// Пути моделей уровня 0 у объектов с `animator`.
+/// Пути моделей уровня 0 у объектов сцены с `animator`.
 fn animated_model_paths(assets: &PreparedRenderAssets) -> HashSet<&str> {
     assets
         .objects
         .iter()
+        .map(|(_, object)| object)
         .filter(|object| object.animated)
         .filter_map(|object| object.levels.first())
         .map(|(path, _)| path.as_str())
@@ -567,6 +865,146 @@ fn skin_vertices(skin: &ModelSkin) -> Vec<SkinVertex> {
             weights: *weights,
         })
         .collect()
+}
+
+/// Описание эмиттера с GPU-текстурой; текстура кэшируется вместе с текстурами сцены.
+fn particle_desc(
+    renderer: &mut Renderer,
+    assets: &PreparedRenderAssets,
+    texture_cache: &mut GpuTextureCache<TextureId>,
+    source: &ParticleSource,
+) -> Result<ParticleEmitterDesc, RenderError> {
+    let texture = match &source.texture {
+        Some(path) => {
+            let data = assets.textures.get(path).ok_or(RenderError::InvalidState(
+                "CPU-текстура частиц отсутствует в таблице GPU-ресурсов",
+            ))?;
+            Some(get_or_insert_texture(
+                &mut texture_cache.scene,
+                (path.clone(), TextureColorSpace::Srgb),
+                || {
+                    renderer.create_texture_with_color_space(
+                        data.width,
+                        data.height,
+                        &data.rgba,
+                        TextureColorSpace::Srgb,
+                    )
+                },
+            )?)
+        }
+        None => None,
+    };
+    Ok(particle_emitter_desc(&source.emitter, texture))
+}
+
+/// Переводит компонент сцены в описание эмиттера `engine-render`; проверка диапазонов — в engine-scene.
+pub(crate) fn particle_emitter_desc(
+    component: &ParticleEmitterComponent,
+    texture: Option<TextureId>,
+) -> ParticleEmitterDesc {
+    ParticleEmitterDesc {
+        capacity: component.capacity,
+        blend: match component.blend {
+            ParticleBlendMode::Additive => ParticleBlend::Additive,
+            ParticleBlendMode::Alpha => ParticleBlend::Alpha,
+        },
+        shape: match component.shape {
+            ParticleShapeComponent::Point {} => ParticleShape::Point,
+            ParticleShapeComponent::Sphere { radius } => ParticleShape::Sphere { radius },
+            ParticleShapeComponent::Cone { angle, radius } => ParticleShape::Cone { angle, radius },
+            ParticleShapeComponent::Box { half_extents } => ParticleShape::Box { half_extents },
+        },
+        rate: component.rate,
+        bursts: component
+            .bursts
+            .iter()
+            .map(|burst| ParticleBurst {
+                time: burst.time,
+                count: burst.count,
+            })
+            .collect(),
+        duration: component.duration,
+        looping: component.looping,
+        lifetime: component.lifetime,
+        speed: component.speed,
+        size: component.size,
+        rotation: component.rotation,
+        angular_velocity: component.angular_velocity,
+        gravity: component.gravity,
+        drag: component.drag,
+        color_over_life: component
+            .color_over_life
+            .iter()
+            .map(|key| ParticleColorKey {
+                time: key.time,
+                color: key.color,
+            })
+            .collect(),
+        size_over_life: component
+            .size_over_life
+            .iter()
+            .map(|key| ParticleSizeKey {
+                time: key.time,
+                size: key.size,
+            })
+            .collect(),
+        texture,
+        flipbook: ParticleFlipbook {
+            columns: component.flipbook.columns,
+            rows: component.flipbook.rows,
+            frames_per_second: component.flipbook.frames_per_second,
+        },
+        soft_distance: component.soft_distance,
+        collision: component.collision.map(|collision| ParticleCollision {
+            restitution: collision.restitution,
+            friction: collision.friction,
+            thickness: collision.thickness,
+        }),
+        seed: component.seed,
+    }
+}
+
+/// Уровни LOD объекта. Без замены материала и текстуры переиспользуются меши модели; иначе для
+/// каждой части создаётся материал с заменами.
+fn upload_object_levels(
+    renderer: &mut Renderer,
+    assets: &PreparedRenderAssets,
+    gpu_models: &HashMap<String, Vec<(MeshId, MaterialId)>>,
+    texture_cache: &mut GpuTextureCache<TextureId>,
+    object: &ObjectModel,
+) -> Result<Vec<Vec<(MeshId, MaterialId)>>, RenderError> {
+    let mut levels = Vec::with_capacity(object.levels.len());
+    for (model_path, replacement_texture) in &object.levels {
+        let model_meshes = gpu_models.get(model_path).ok_or({
+            RenderError::InvalidState("CPU-модель отсутствует в таблице GPU-ресурсов")
+        })?;
+        if object.material.is_none() && replacement_texture.is_none() {
+            levels.push(model_meshes.clone());
+            continue;
+        }
+        let model = assets.models.get(model_path).ok_or({
+            RenderError::InvalidState("CPU-модель отсутствует в таблице подготовленных ресурсов")
+        })?;
+        let mut draws = Vec::with_capacity(model_meshes.len());
+        for (source_mesh, (mesh_id, _)) in model.meshes.iter().zip(model_meshes) {
+            let resolved = resolve_material(
+                &source_mesh.material,
+                replacement_texture.as_deref(),
+                object.material.as_ref(),
+            );
+            let material_id = upload_resolved_material(
+                renderer,
+                &resolved,
+                model_path,
+                model,
+                &assets.textures,
+                texture_cache,
+            )?;
+            draws.push((*mesh_id, material_id));
+        }
+        levels.push(draws);
+    }
+    Ok(levels)
 }
 
 fn upload_resolved_material(
@@ -690,7 +1128,7 @@ fn upload_material_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuTextureCache, MaterialTextureSource, get_or_insert_texture, load_scene,
+        GpuTextureCache, MaterialTextureSource, PreparedPrefabs, get_or_insert_texture, load_scene,
         prepare_scene_with_model_loader, resolve_material,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
@@ -699,10 +1137,16 @@ mod tests {
     use engine_project::PhysicsSettings;
     use engine_render::{AlphaMode, EnvironmentSource, TextureColorSpace};
     use engine_resources::{ResourceConfig, ResourceSystem, SourceMode};
-    use engine_scene::{MaterialAlphaMode, MaterialOverride, SceneDocument, World};
+    use engine_scene::{MaterialAlphaMode, MaterialOverride, PrefabTemplate, SceneDocument, World};
+    use engine_script::{
+        Key, MouseButton, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, ScriptEventLevel,
+        ScriptHost, ScriptInput, ScriptLoadOptions, ScriptTime,
+    };
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -819,8 +1263,9 @@ id = "camera"
         )
         .unwrap();
 
+        let geometry = prepared.physics_geometry();
         let error = prepared
-            .build_physics(&PhysicsSettings::default())
+            .build_physics(&geometry, &PhysicsSettings::default())
             .err()
             .expect("zero-scale collider should fail physics prebuild");
         assert!(error.contains("scale"), "{error}");
@@ -841,8 +1286,9 @@ id = "camera"
         ] {
             let prepared = load_scene(&handle, &resources.assets, scene)
                 .unwrap_or_else(|error| panic!("{scene}: {error}"));
+            let geometry = prepared.physics_geometry();
             prepared
-                .build_physics(&PhysicsSettings::default())
+                .build_physics(&geometry, &PhysicsSettings::default())
                 .unwrap_or_else(|error| panic!("{scene}: {error}"));
         }
 
@@ -854,7 +1300,10 @@ id = "camera"
             None,
         )
         .unwrap_or_else(|error| panic!("physics scripts: {error}"));
-        let (_, bindings) = prepared.build_physics(&PhysicsSettings::default()).unwrap();
+        let geometry = prepared.physics_geometry();
+        let (_, bindings) = prepared
+            .build_physics(&geometry, &PhysicsSettings::default())
+            .unwrap();
         // 10 статических коллайдеров, 4 монеты-триггера, 4 ящика и 1 персонаж.
         assert_eq!(bindings.len(), 19);
         assert_eq!(
@@ -870,6 +1319,144 @@ id = "camera"
                 .filter(|binding| binding.character_controller.is_some())
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn demo_game_fast_prefabs_register_for_spawning_and_their_scripts_load() {
+        let assets = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/demo-game/Assets"
+        ));
+        let resources = LooseResources::new(assets);
+        let handle = resources.system.handle();
+        let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+
+        for path in ["prefabs/bullet.rveprefab", "prefabs/bullet_hole.rveprefab"] {
+            assert!(prepared.prefabs.templates.contains_key(path), "{path}");
+        }
+        let hole = prepared
+            .prefabs
+            .catalog
+            .get("prefabs/bullet_hole.rveprefab")
+            .unwrap();
+        assert_eq!(hole.kind, PrefabKind::Fast);
+        assert_eq!(hole.max_instances, Some(100));
+        let bullet = prepared
+            .prefabs
+            .catalog
+            .get("prefabs/bullet.rveprefab")
+            .unwrap();
+        assert_eq!(bullet.max_instances, None);
+        // Тяжёлый префаб не входит в быстрые: он грузится по rve.prefabs.load.
+        assert!(
+            prepared
+                .prefabs
+                .catalog
+                .get("prefabs/tower.rveprefab")
+                .is_none()
+        );
+
+        // Регистрация компилирует Lua пули и проверяет её params до старта сцены.
+        ScriptHost::load_with_options(
+            &prepared.world,
+            "/scenes/physics.rvescene",
+            &prepared.sources,
+            None,
+            ScriptLoadOptions {
+                prefabs: prepared.prefabs.catalog.clone(),
+                ..ScriptLoadOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("demo prefab scripts: {error}"));
+    }
+
+    /// Стрельба и башня демо-игры как в runtime: быстрые префабы регистрируются у хоста, тяжёлые
+    /// приходят из `prefabs.rveprefabs`, действия — из `project.rveproject`. Столкновение пули не
+    /// моделируется: его проверяет тест скрипта пули в engine-script.
+    #[test]
+    fn demo_game_shooter_spawns_bullets_and_requests_the_tower_prefab() {
+        let demo = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/demo-game"
+        ));
+        let resources = LooseResources::new(&demo.join("Assets"));
+        let handle = resources.system.handle();
+        let mut prepared =
+            load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        let project = engine_project::ProjectSettings::parse(
+            &fs::read_to_string(demo.join("project.rveproject")).unwrap(),
+        )
+        .unwrap();
+        let heavy =
+            engine_project::PrefabCatalogFile::load(demo.join("prefabs.rveprefabs")).unwrap();
+        crate::add_heavy_prefabs(&mut prepared.prefabs.catalog, &heavy).unwrap();
+        let mut host = ScriptHost::load_with_options(
+            &prepared.world,
+            &prepared.name,
+            &prepared.sources,
+            None,
+            ScriptLoadOptions {
+                input: project.input,
+                prefabs: prepared.prefabs.catalog.clone(),
+                ..ScriptLoadOptions::default()
+            },
+        )
+        .unwrap();
+        for (path, template) in &prepared.prefabs.templates {
+            host.register_prefab(
+                &prepared.world,
+                path,
+                Arc::clone(template),
+                &prepared.sources,
+            )
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+        // Контроллер игрока читает физику, поэтому снимок и привязки строятся как при старте runtime.
+        let geometry = prepared.physics_geometry();
+        let (driver, bindings) = prepared.build_physics(&geometry, &project.physics).unwrap();
+        let initialization =
+            engine_physics::PhysicsInitialization::from_prebuilt(&driver, bindings).unwrap();
+        let sync = engine_physics::PhysicsSceneSync::new(&prepared.world, initialization.bindings)
+            .unwrap();
+        host.set_physics_snapshot(initialization.result.snapshot, sync.bindings());
+        let errors = |host: &mut ScriptHost| -> Vec<String> {
+            host.drain_events()
+                .into_iter()
+                .filter(|event| event.level == ScriptEventLevel::Error)
+                .map(|event| event.message)
+                .collect()
+        };
+        let time = |frame: u64| ScriptTime {
+            elapsed: frame as f64 / 60.0,
+            frame,
+        };
+
+        // Кнопка fire из проекта: пуля вылетает из камеры, объект получает id `bullet@N`.
+        let mut fire = ScriptInput::default();
+        fire.set_mouse_button(MouseButton::Left, true);
+        host.set_input(fire);
+        host.update(&mut prepared.world, 1.0 / 60.0, time(1));
+        let fired = errors(&mut host);
+        assert!(fired.is_empty(), "{fired:?}");
+        let bullets = prepared
+            .world
+            .objects()
+            .iter()
+            .filter(|object| object.id.starts_with("bullet@"))
+            .count();
+        assert_eq!(bullets, 1);
+
+        // Кнопка spawn_heavy из проекта: башня запрашивает загрузку тяжёлого префаба.
+        let mut tower = ScriptInput::default();
+        tower.set_key(Key::T, true);
+        host.set_input(tower);
+        host.update(&mut prepared.world, 1.0 / 60.0, time(2));
+        let towers = errors(&mut host);
+        assert!(towers.is_empty(), "{towers:?}");
+        assert_eq!(
+            host.drain_world_changes().prefab_requests,
+            [PrefabRequest::Load("prefabs/tower.rveprefab".to_owned())]
         );
     }
 
@@ -934,16 +1521,12 @@ id = "camera"
     }
 
     #[test]
-    fn load_scene_prepares_hdr_environment_assets_introduced_by_prefabs() {
+    fn load_scene_prepares_hdr_environment_assets_of_scene_objects() {
         let project = TempProject::new();
         let scene_text = format!(
-            "[[assets]]\npath = \"/prefabs/sky.rveprefab\"\n{CAMERA_SCENE}\n[[instances]]\nid = \"sky\"\nprefab = \"/prefabs/sky.rveprefab\"\n"
+            "[[assets]]\npath = \"/environment/sky.hdr\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"sky\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n"
         );
         project.write("scene.rvescene", scene_text.as_bytes());
-        project.write(
-            "prefabs/sky.rveprefab",
-            b"[[assets]]\npath = \"/environment/sky.hdr\"\n[[objects]]\nid = \"environment\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n",
-        );
         project.write(
             "environment/sky.hdr",
             b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n\x80\x80\x80\x81\x40\x60\x80\x82",
@@ -1099,6 +1682,7 @@ id = "camera"
             &resources.assets,
             "scene.rvescene",
             world,
+            PreparedPrefabs::default(),
             |path| {
                 assert_eq!(path, "models/quad.fbx");
                 load_count.set(load_count.get() + 1);
@@ -1136,6 +1720,7 @@ id = "camera"
             &resources.assets,
             "scene.rvescene",
             world,
+            PreparedPrefabs::default(),
             |path| {
                 loaded_paths.push(path.to_owned());
                 Ok(Model {
@@ -1151,14 +1736,14 @@ id = "camera"
         assert_eq!(loaded_paths, ["models/base.fbx", "models/lod.fbx"]);
         assert_eq!(prepared.render_assets.models.len(), 2);
         assert_eq!(
-            prepared.render_assets.objects[0].levels,
+            prepared.render_assets.objects[0].1.levels,
             [
                 ("models/base.fbx".to_owned(), None),
                 ("models/lod.fbx".to_owned(), None),
             ]
         );
         assert_eq!(
-            prepared.render_assets.objects[1].levels,
+            prepared.render_assets.objects[1].1.levels,
             [("models/lod.fbx".to_owned(), None)]
         );
     }
@@ -1323,5 +1908,405 @@ id = "camera"
         assert_eq!(scene_srgb, scene_srgb_reused);
         assert_ne!(scene_srgb, scene_linear);
         assert_eq!(uploads.get(), 4);
+    }
+
+    const SPAWN_BALL_PREFAB: &[u8] = b"[[assets]]\npath = \"/sounds/pop.wav\"\n[[objects]]\nid = \"root\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.1\n[objects.rigid_body]\nkind = \"dynamic\"\n";
+
+    #[test]
+    fn load_scene_prepares_fast_prefabs_listed_in_assets_without_instances() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!(
+                "[[assets]]\npath = \"/prefabs/ball.rveprefab\"\nmax_instances = 8\n{CAMERA_SCENE}"
+            )
+            .as_bytes(),
+        );
+        project.write("prefabs/ball.rveprefab", SPAWN_BALL_PREFAB);
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+
+        let path = "prefabs/ball.rveprefab";
+        assert_eq!(
+            prepared.prefabs.catalog.get(path),
+            Some(PrefabSpec {
+                kind: PrefabKind::Fast,
+                max_instances: Some(8),
+            })
+        );
+        assert!(prepared.prefabs.templates.contains_key(path));
+        assert!(prepared.world.handle("root").is_none());
+        assert_eq!(prepared.render_assets.prefabs[path].len(), 1);
+        assert!(prepared.render_assets.prefabs[path][0].is_none());
+        assert!(
+            prepared
+                .world
+                .asset_paths()
+                .iter()
+                .any(|asset| asset.as_str() == "sounds/pop.wav"),
+            "ассеты шаблона должны стать ассетами сцены"
+        );
+        assert!(prepared.sources.is_empty());
+    }
+
+    #[test]
+    fn load_scene_skips_a_declared_prefab_with_a_camera_without_failing() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!("[[assets]]\npath = \"/prefabs/eye.rveprefab\"\n{CAMERA_SCENE}").as_bytes(),
+        );
+        project.write(
+            "prefabs/eye.rveprefab",
+            b"[[objects]]\nid = \"eye\"\n[objects.camera]\n",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        assert!(
+            prepared
+                .prefabs
+                .catalog
+                .get("prefabs/eye.rveprefab")
+                .is_none()
+        );
+        assert!(
+            !prepared
+                .prefabs
+                .templates
+                .contains_key("prefabs/eye.rveprefab")
+        );
+    }
+
+    #[test]
+    fn load_scene_reports_a_declared_prefab_that_does_not_parse() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!("[[assets]]\npath = \"/prefabs/broken.rveprefab\"\n{CAMERA_SCENE}").as_bytes(),
+        );
+        project.write(
+            "prefabs/broken.rveprefab",
+            b"[[objects]]\nid = \"a\"\nparent = \"missing\"\n",
+        );
+        let resources = LooseResources::new(project.root());
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("broken.rveprefab"), "{error}");
+    }
+
+    /// Префаб с окружением не регистрируется для spawn. Экземпляр с таким префабом грузится, а
+    /// spawn того же пути из скрипта даёт ошибку вызова, а не ошибку загрузки сцены.
+    #[test]
+    fn unspawnable_prefab_is_not_registered_and_spawning_its_path_is_a_script_error() {
+        let project = TempProject::new();
+        project.write(
+            "scene.rvescene",
+            format!(
+                "[[assets]]\npath = \"/prefabs/sky.rveprefab\"\n[[assets]]\npath = \"/gun.lua\"\n{CAMERA_SCENE}[[objects]]\nid = \"gun\"\n[[objects.lite_scripts]]\npath = \"/gun.lua\"\n"
+            )
+            .as_bytes(),
+        );
+        project.write("prefabs/sky.rveprefab", SKY_PREFAB);
+        project.write("gun.lua", GUN_SPAWNS_SKY);
+        let resources = LooseResources::new(project.root());
+        let mut prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let path = "prefabs/sky.rveprefab";
+        assert!(prepared.prefabs.catalog.get(path).is_none());
+        assert!(!prepared.prefabs.templates.contains_key(path));
+
+        let mut host = ScriptHost::load_with_options(
+            &prepared.world,
+            &prepared.name,
+            &prepared.sources,
+            None,
+            ScriptLoadOptions {
+                prefabs: prepared.prefabs.catalog.clone(),
+                ..ScriptLoadOptions::default()
+            },
+        )
+        .unwrap();
+        host.update(
+            &mut prepared.world,
+            0.1,
+            ScriptTime {
+                elapsed: 0.0,
+                frame: 1,
+            },
+        );
+        let errors = host
+            .drain_events()
+            .into_iter()
+            .filter(|event| event.level == ScriptEventLevel::Error)
+            .map(|event| event.message)
+            .collect::<Vec<_>>();
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("is not in the project prefab list")),
+            "{errors:?}"
+        );
+        assert!(prepared.world.handle("sky").is_none());
+    }
+
+    const SKY_PREFAB: &[u8] = b"[[objects]]\nid = \"sky\"\n[objects.environment]\n[objects.environment.procedural]\nzenith_color = [0.2, 0.3, 0.5]\nhorizon_color = [0.8, 0.7, 0.5]\nground_color = [0.1, 0.1, 0.1]\nsun_size_deg = 3.0\nsun_intensity = 2.0\n";
+    const GUN_SPAWNS_SKY: &[u8] = b"local Gun = {}\nfunction Gun:on_update(dt)\n  rve.spawn(\"prefabs/sky.rveprefab\", { id = \"sky\" })\nend\nreturn Gun\n";
+
+    /// Префаб с окружением, который одновременно объявлен в `[[assets]]` и использован экземпляром,
+    /// грузится: окружение попадает в сцену, а сам префаб не регистрируется для spawn.
+    #[test]
+    fn load_scene_prepares_hdr_environment_assets_introduced_by_prefab_instances() {
+        let project = TempProject::new();
+        let scene_text = format!(
+            "[[assets]]\npath = \"/prefabs/sky.rveprefab\"\n{CAMERA_SCENE}\n[[instances]]\nid = \"sky\"\nprefab = \"/prefabs/sky.rveprefab\"\n"
+        );
+        project.write("scene.rvescene", scene_text.as_bytes());
+        project.write(
+            "prefabs/sky.rveprefab",
+            b"[[assets]]\npath = \"/environment/sky.hdr\"\n[[objects]]\nid = \"environment\"\n[objects.environment]\nhdr = \"/environment/sky.hdr\"\n",
+        );
+        project.write(
+            "environment/sky.hdr",
+            b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n\x80\x80\x80\x81\x40\x60\x80\x82",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let EnvironmentSource::Equirect { width, height, rgb } = prepared
+            .render_assets
+            .environments
+            .get("environment/sky.hdr")
+            .unwrap()
+            .as_ref()
+        else {
+            panic!("HDR environment should be prepared as an equirectangular image");
+        };
+        assert_eq!((*width, *height), (2, 1));
+        assert_eq!(rgb.len(), 6);
+        assert!(
+            prepared
+                .world
+                .object_by_id("sky")
+                .unwrap()
+                .environment
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn prefab_templates_prepare_their_mesh_levels_with_the_scene_model_loader() {
+        let prefab_path = "prefabs/ball.rveprefab";
+        let template = PrefabTemplate::load(
+            &VirtualPath::parse(prefab_path).unwrap(),
+            &mut |_| {
+                Ok(
+                    "[[assets]]\npath = \"/models/quad.fbx\"\n[[objects]]\nid = \"root\"\n[objects.mesh_renderer]\nmodel = \"models/quad.fbx\"\n[[objects]]\nid = \"empty\"\nparent = \"root\"\n"
+                        .to_owned(),
+                )
+            },
+        )
+        .unwrap();
+        let prefabs = PreparedPrefabs {
+            templates: BTreeMap::from([(prefab_path.to_owned(), Arc::new(template))]),
+            catalog: PrefabCatalog::default(),
+        };
+        let project = TempProject::new();
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", CAMERA_SCENE).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let loaded_paths = std::cell::RefCell::new(Vec::new());
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            prefabs,
+            |path| {
+                loaded_paths.borrow_mut().push(path.to_owned());
+                Ok(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(loaded_paths.borrow().as_slice(), ["models/quad.fbx"]);
+        let levels = &prepared.render_assets.prefabs[prefab_path];
+        assert_eq!(levels.len(), 2);
+        assert_eq!(
+            levels[0].as_ref().unwrap().levels,
+            [("models/quad.fbx".to_owned(), None)]
+        );
+        assert!(levels[1].is_none());
+    }
+
+    #[test]
+    fn prefab_animators_are_not_prepared_because_spawned_animators_are_unsupported() {
+        // Регрессия: аниматор шаблона не загружает клипы и не получает скиннинг, поэтому
+        // отсутствующий клип не валит подготовку сцены.
+        let prefab_path = "prefabs/hero.rveprefab";
+        let template = PrefabTemplate::load(
+            &VirtualPath::parse(prefab_path).unwrap(),
+            &mut |_| {
+                Ok(
+                    "[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anims/missing.fbx\"\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"models/hero.fbx\"\n[objects.animator]\nclips = [\"/anims/missing.fbx\"]\n"
+                        .to_owned(),
+                )
+            },
+        )
+        .unwrap();
+        let prefabs = PreparedPrefabs {
+            templates: BTreeMap::from([(prefab_path.to_owned(), Arc::new(template))]),
+            catalog: PrefabCatalog::default(),
+        };
+        let project = TempProject::new();
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", CAMERA_SCENE).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            prefabs,
+            |_| {
+                Ok(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(prepared.render_assets.clips.is_empty());
+        let levels = &prepared.render_assets.prefabs[prefab_path];
+        assert!(!levels[0].as_ref().unwrap().animated);
+    }
+}
+
+#[cfg(test)]
+mod particle_mapping_tests {
+    use super::particle_emitter_desc;
+    use engine_render::{
+        MAX_ADDITIVE_PARTICLE_CAPACITY as RENDER_ADDITIVE,
+        MAX_ALPHA_PARTICLE_CAPACITY as RENDER_ALPHA, ParticleBlend, ParticleShape,
+    };
+    use engine_scene::{
+        MAX_ADDITIVE_PARTICLE_CAPACITY as SCENE_ADDITIVE,
+        MAX_ALPHA_PARTICLE_CAPACITY as SCENE_ALPHA, ParticleBlendMode, ParticleBurstComponent,
+        ParticleCollisionComponent, ParticleColorKeyComponent, ParticleEmitterComponent,
+        ParticleShapeComponent,
+    };
+
+    #[test]
+    fn capacity_limits_match_between_scene_and_render() {
+        assert_eq!(SCENE_ADDITIVE, RENDER_ADDITIVE);
+        assert_eq!(SCENE_ALPHA, RENDER_ALPHA);
+    }
+
+    #[test]
+    fn component_maps_every_field_into_render_description() {
+        let component = ParticleEmitterComponent {
+            capacity: 1024,
+            blend: ParticleBlendMode::Alpha,
+            shape: ParticleShapeComponent::Cone {
+                angle: 0.3,
+                radius: 0.5,
+            },
+            rate: 45.0,
+            bursts: vec![ParticleBurstComponent {
+                time: 0.2,
+                count: 9,
+            }],
+            duration: 2.0,
+            looping: false,
+            lifetime: [1.0, 3.0],
+            speed: [0.5, 1.5],
+            size: [0.2, 0.4],
+            rotation: [0.0, 1.0],
+            angular_velocity: [-1.0, 1.0],
+            gravity: [0.0, -9.8, 0.0],
+            drag: 0.25,
+            color_over_life: vec![ParticleColorKeyComponent {
+                time: 0.0,
+                color: [1.0, 0.5, 0.0, 1.0],
+            }],
+            size_over_life: Vec::new(),
+            texture: None,
+            flipbook: engine_scene::ParticleFlipbookComponent {
+                columns: 4,
+                rows: 2,
+                frames_per_second: 6.0,
+            },
+            soft_distance: 0.75,
+            collision: Some(ParticleCollisionComponent {
+                restitution: 0.3,
+                friction: 0.1,
+                thickness: 0.05,
+            }),
+            seed: 42,
+        };
+        let texture = None;
+        let desc = particle_emitter_desc(&component, texture);
+        assert_eq!(desc.capacity, 1024);
+        assert_eq!(desc.blend, ParticleBlend::Alpha);
+        assert_eq!(
+            desc.shape,
+            ParticleShape::Cone {
+                angle: 0.3,
+                radius: 0.5
+            }
+        );
+        assert_eq!(desc.bursts.len(), 1);
+        assert_eq!(desc.bursts[0].count, 9);
+        assert!(!desc.looping);
+        assert_eq!(desc.lifetime, [1.0, 3.0]);
+        assert_eq!(desc.color_over_life[0].color, [1.0, 0.5, 0.0, 1.0]);
+        assert_eq!(desc.flipbook.columns, 4);
+        assert_eq!(desc.flipbook.frames_per_second, 6.0);
+        assert_eq!(desc.soft_distance, 0.75);
+        assert_eq!(
+            desc.collision.map(|collision| collision.restitution),
+            Some(0.3)
+        );
+        assert_eq!(desc.seed, 42);
+        assert_eq!(desc.texture, texture);
+    }
+
+    #[test]
+    fn point_shape_without_texture_maps_to_procedural_point() {
+        let desc = particle_emitter_desc(&ParticleEmitterComponent::default(), None);
+        assert_eq!(desc.shape, ParticleShape::Point);
+        assert_eq!(desc.blend, ParticleBlend::Additive);
+        assert!(desc.collision.is_none());
+        assert!(desc.texture.is_none());
     }
 }

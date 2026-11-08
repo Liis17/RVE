@@ -1,0 +1,174 @@
+#version 450
+
+layout(local_size_x = PARTICLE_LOCAL_SIZE) in;
+
+layout(set = 0, binding = 0) uniform FrameUniforms {
+    mat4 view_projection;
+    mat4 inverse_view_projection;
+    mat4 shadow_view_projections[4];
+    vec4 light_direction;
+    vec4 light_color;
+    vec4 ambient_color;
+    vec4 shadow_params;
+    vec4 camera_position;
+    mat4 environment_rotation;
+    vec4 environment_params;
+    vec4 local_light_params;
+    mat4 view;
+    vec4 cluster_params;
+    mat4 previous_view_projection;
+    vec4 render_params;
+} frame;
+
+// Параметры эмиттера; совпадает с EmitterParamsGpu в particles.rs.
+layout(set = 1, binding = 0, std140) uniform EmitterParams {
+    vec4 shape;
+    vec4 box_extents;
+    vec4 lifetime_speed;
+    vec4 size_rotation;
+    vec4 angular_drag;
+    vec4 gravity;
+    vec4 color_times;
+    vec4 color_values[4];
+    vec4 size_times;
+    vec4 size_values;
+    vec4 flipbook;
+    vec4 collision;
+    uvec4 counts;
+} emitter;
+
+// Совпадает с ParticleGpu в particles.rs: три vec4.
+struct Particle {
+    vec4 position_age;
+    vec4 velocity_life;
+    vec4 params;
+};
+
+layout(set = 1, binding = 1, std430) buffer ParticleBuffer {
+    Particle particles[];
+} particle_buffer;
+
+// Depth буфер вида-владельца в DEPTH_STENCIL_READ_ONLY_OPTIMAL.
+layout(set = 2, binding = 0) uniform texture2D scene_depth;
+
+// Совпадает с SimPushGpu в particles.rs (32 байта).
+layout(push_constant) uniform SimPush {
+    float step;
+    uint draw_first;
+    uint draw_count;
+    uint capacity;
+    float render_width;
+    float render_height;
+    uint padding0;
+    uint padding1;
+} push;
+
+// Мировая позиция поверхности по пикселю и значению depth.
+vec3 surface_position(ivec2 pixel, float depth) {
+    vec2 ndc = vec2((float(pixel.x) + 0.5) / push.render_width * 2.0 - 1.0,
+        1.0 - (float(pixel.y) + 0.5) / push.render_height * 2.0);
+    vec4 world = frame.inverse_view_projection * vec4(ndc, depth, 1.0);
+    return world.xyz / world.w;
+}
+
+// Нормаль поверхности, повёрнутая к камере; `false`, если соседних данных недостаточно.
+bool surface_normal(ivec2 pixel, float depth, vec3 center, out vec3 normal) {
+    ivec2 max_pixel = ivec2(push.render_width, push.render_height) - ivec2(1);
+    ivec2 right_pixel = min(pixel + ivec2(1, 0), max_pixel);
+    ivec2 down_pixel = min(pixel + ivec2(0, 1), max_pixel);
+    float right_depth = texelFetch(scene_depth, right_pixel, 0).r;
+    float down_depth = texelFetch(scene_depth, down_pixel, 0).r;
+    if (right_depth >= 1.0 || down_depth >= 1.0) {
+        return false;
+    }
+    vec3 right = surface_position(right_pixel, right_depth) - center;
+    vec3 down = surface_position(down_pixel, down_depth) - center;
+    vec3 candidate = cross(right, down);
+    float length_squared = dot(candidate, candidate);
+    if (length_squared < 1e-12) {
+        return false;
+    }
+    normal = candidate * inversesqrt(length_squared);
+    if (dot(normal, frame.camera_position.xyz - center) < 0.0) {
+        normal = -normal;
+    }
+    return true;
+}
+
+// Допуск глубины как доля view-глубины частицы. Ошибка D32 со стандартным Z растёт примерно как z²/near;
+// 0.2% покрывает её для near = 0.1 примерно до 1 км. Больший допуск втягивал бы частицы за тонкие окклюдеры.
+const float COLLISION_DEPTH_TOLERANCE = 0.002;
+
+// Столкновение с видимой геометрией: выталкивание по нормали и отражение скорости.
+// Частица, которая глубже `max_travel + tolerance` под поверхностью, не могла прийти спереди за один шаг
+// с учётом шума восстановления глубины: она за окклюдером, и вытягивать её на видимую сторону нельзя.
+// Толщина входит в `max_penetration` и в `penetration`, поэтому окно по высоте равно `-(max_travel + tolerance)`
+// независимо от толщины; толщина задаёт только величину выталкивания.
+void collide(inout vec3 position, inout vec3 velocity, float max_travel) {
+    vec4 clip = frame.view_projection * vec4(position, 1.0);
+    if (clip.w <= 0.0) {
+        return;
+    }
+    vec3 ndc = clip.xyz / clip.w;
+    if (abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+        return;
+    }
+    ivec2 pixel = ivec2(
+        clamp((ndc.x * 0.5 + 0.5) * push.render_width, 0.0, push.render_width - 1.0),
+        clamp((0.5 - ndc.y * 0.5) * push.render_height, 0.0, push.render_height - 1.0));
+    float depth = texelFetch(scene_depth, pixel, 0).r;
+    if (depth >= 1.0) {
+        return;
+    }
+    vec3 surface = surface_position(pixel, depth);
+    vec3 normal;
+    if (!surface_normal(pixel, depth, surface, normal)) {
+        return;
+    }
+    float height = dot(position - surface, normal);
+    float tolerance = COLLISION_DEPTH_TOLERANCE * clip.w;
+    float max_penetration = emitter.collision.z + max_travel + tolerance;
+    float penetration = emitter.collision.z - height;
+    if (penetration > max_penetration) {
+        return;
+    }
+    if (penetration <= 0.0) {
+        return;
+    }
+    float restitution = emitter.collision.x;
+    float friction = emitter.collision.y;
+    float normal_speed = dot(velocity, normal);
+    vec3 tangential = velocity - normal_speed * normal;
+    if (normal_speed < 0.0) {
+        velocity = tangential * (1.0 - friction) - restitution * normal_speed * normal;
+    }
+    position += normal * penetration;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.draw_count) {
+        return;
+    }
+    uint slot = (push.draw_first + index) % push.capacity;
+    Particle particle = particle_buffer.particles[slot];
+    float age = particle.position_age.w;
+    float lifetime = particle.velocity_life.w;
+    if (age >= lifetime) {
+        return;
+    }
+    float step = push.step;
+    vec3 velocity = particle.velocity_life.xyz;
+    velocity += emitter.gravity.xyz * step;
+    velocity *= max(0.0, 1.0 - emitter.angular_drag.z * step);
+    float max_travel = length(velocity) * step;
+    vec3 position = particle.position_age.xyz + velocity * step;
+    if (emitter.collision.w > 0.5) {
+        collide(position, velocity, max_travel);
+    }
+    particle.position_age.xyz = position;
+    particle.position_age.w = age + step;
+    particle.velocity_life.xyz = velocity;
+    particle.params.y += particle.params.z * step;
+    particle_buffer.particles[slot] = particle;
+}

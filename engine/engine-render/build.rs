@@ -16,6 +16,7 @@ const MAX_LOCAL_SHADOW_LAYERS: usize = 32;
 const LOCAL_SHADOW_MAP_RESOLUTION: u32 = 1024;
 const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = 64;
 const SKIN_COMPUTE_LOCAL_SIZE: u32 = 64;
+const PARTICLE_COMPUTE_LOCAL_SIZE: u32 = 64;
 
 type ShaderBuild = (
     &'static str,
@@ -144,7 +145,67 @@ const SHADERS: &[ShaderBuild] = &[
         &[],
         "skybox.frag.spv",
     ),
+    (
+        "particle_spawn.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "particle_spawn.comp.spv",
+    ),
+    (
+        "particle_sim.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "particle_sim.comp.spv",
+    ),
+    (
+        "particle.vert",
+        naga::ShaderStage::Vertex,
+        &[],
+        "particle.vert.spv",
+    ),
+    (
+        "particle.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "particle.frag.spv",
+    ),
+    (
+        "particle_sort.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "particle_sort.comp.spv",
+    ),
 ];
+
+/// GLSL `barrier()` lowers to a barrier with subgroup scope, which naga validates only
+/// with subgroup capabilities. Renderer shaders need just workgroup synchronisation,
+/// so the subgroup bit is removed before validation.
+fn drop_subgroup_barriers(block: &mut naga::Block) {
+    for statement in block.iter_mut() {
+        match statement {
+            naga::Statement::ControlBarrier(barrier) | naga::Statement::MemoryBarrier(barrier) => {
+                barrier.remove(naga::Barrier::SUB_GROUP);
+            }
+            naga::Statement::Block(inner) => drop_subgroup_barriers(inner),
+            naga::Statement::If { accept, reject, .. } => {
+                drop_subgroup_barriers(accept);
+                drop_subgroup_barriers(reject);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    drop_subgroup_barriers(&mut case.body);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                drop_subgroup_barriers(body);
+                drop_subgroup_barriers(continuing);
+            }
+            _ => {}
+        }
+    }
+}
 
 fn main() {
     if env::var_os("CARGO_FEATURE_DLSS").is_some() {
@@ -188,7 +249,9 @@ fn main() {
              /// Resolution of each shared point or spot shadow layer.\n\
              pub const LOCAL_SHADOW_MAP_RESOLUTION: u32 = {LOCAL_SHADOW_MAP_RESOLUTION};\n\
              pub const CLUSTER_COMPUTE_LOCAL_SIZE: u32 = {CLUSTER_COMPUTE_LOCAL_SIZE};\n\
-             pub const CLUSTER_COUNT: usize = {cluster_count};\n"
+             pub const CLUSTER_COUNT: usize = {cluster_count};\n\
+             /// Размер workgroup compute-шейдеров частиц (spawn и sim).\n\
+             pub const PARTICLE_COMPUTE_LOCAL_SIZE: u32 = {PARTICLE_COMPUTE_LOCAL_SIZE};\n"
         ),
     )
     .expect("не удалось записать constants renderer");
@@ -239,6 +302,12 @@ fn main() {
                 SKIN_COMPUTE_LOCAL_SIZE.to_string(),
             );
         }
+        if name.starts_with("particle_") && name.ends_with(".comp") {
+            shader_options.defines.insert(
+                "PARTICLE_LOCAL_SIZE".to_owned(),
+                PARTICLE_COMPUTE_LOCAL_SIZE.to_string(),
+            );
+        }
         if name == "cluster.comp" {
             shader_options.defines.insert(
                 "MAX_RENDERED_LIGHTS".to_owned(),
@@ -249,11 +318,17 @@ fn main() {
                 CLUSTER_COMPUTE_LOCAL_SIZE.to_string(),
             );
         }
-        let module = frontend
+        let mut module = frontend
             .parse(&shader_options, &source)
             .unwrap_or_else(|error| {
                 panic!("{name}: {}", error.emit_to_string(&source));
             });
+        for entry_point in &mut module.entry_points {
+            drop_subgroup_barriers(&mut entry_point.function.body);
+        }
+        for (_, function) in module.functions.iter_mut() {
+            drop_subgroup_barriers(&mut function.body);
+        }
         let info = Validator::new(ValidationFlags::all(), Capabilities::IMMEDIATES)
             .validate(&module)
             .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(&source)));

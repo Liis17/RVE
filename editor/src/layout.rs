@@ -13,17 +13,23 @@ pub enum Tab {
     Inspector,
     Project,
     Console,
+    /// Подокно `.rveprefab` в `[[assets]]` сцены.
+    SceneAssets,
+    /// Подокно списка тяжёлых префабов `prefabs.rveprefabs` проекта.
+    ProjectPrefabs,
     Profiler,
 }
 
 impl Tab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
         Self::Inspector,
         Self::Project,
         Self::Console,
+        Self::SceneAssets,
+        Self::ProjectPrefabs,
         Self::Profiler,
     ];
 
@@ -35,6 +41,8 @@ impl Tab {
             Self::Inspector => "Inspector",
             Self::Project => "Project",
             Self::Console => "Console",
+            Self::SceneAssets => "Scene Assets",
+            Self::ProjectPrefabs => "Project Prefabs",
             Self::Profiler => "Profiler",
         }
     }
@@ -78,6 +86,8 @@ impl TabViewer for EditorTabs<'_> {
             Tab::Inspector => ui::inspector::show(ui, self.state),
             Tab::Project => ui::project_panel::show(ui, self.state),
             Tab::Console => ui::console::show(ui, self.state),
+            Tab::SceneAssets => ui::scene_assets::show(ui, self.state),
+            Tab::ProjectPrefabs => ui::project_prefabs::show(ui, self.state),
             Tab::Profiler => ui::profiler::show(ui, self.state),
         }
     }
@@ -105,7 +115,10 @@ mod tests {
                 .iter_all_tabs()
                 .filter(|(_, open)| **open == tab)
                 .count();
-            assert_eq!(count, 1, "{tab:?}");
+            // Подокна Scene Assets и Project Prefabs открываются из меню Window.
+            let optional = matches!(tab, Tab::SceneAssets | Tab::ProjectPrefabs);
+            let expected = usize::from(!optional);
+            assert_eq!(count, expected, "{tab:?}");
         }
         assert!(!is_open(&dock, Tab::Profiler));
     }
