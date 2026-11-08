@@ -126,6 +126,9 @@ impl UiSystem {
         let screen_changed = screen_px != self.screen;
         self.screen = screen_px;
         self.refresh_layouts(screen_changed);
+        if screen_changed {
+            self.paint_dirty = true;
+        }
 
         let mut events = Vec::new();
         self.apply_default_focus(&mut events);
@@ -187,6 +190,18 @@ impl UiSystem {
         self.refresh_layouts(false);
         self.sanitize(&mut events);
         claims.text_focused = self.focused_is_input_field();
+        // Тесселяция нужна только при изменении видимого состояния: события, ввод или повтор.
+        let touched = !events.is_empty()
+            || input.primary_pressed
+            || input.primary_down
+            || input.primary_released
+            || input.wheel != Vec2::ZERO
+            || !input.actions.is_empty()
+            || !input.text.is_empty()
+            || input.held.is_some();
+        if touched {
+            self.paint_dirty = true;
+        }
         UiUpdate { events, claims }
     }
 
@@ -240,6 +255,7 @@ impl UiSystem {
         if self.focus == next {
             return;
         }
+        self.paint_dirty = true;
         if let Some(old) = self.focus.take() {
             if let Ok(canvas) = self.canvas_mut(old.canvas)
                 && canvas.popup == Some(old.index())
@@ -258,12 +274,15 @@ impl UiSystem {
     fn apply_default_focus(&mut self, events: &mut Vec<UiEvent>) {
         for canvas_handle in self.canvases_top_down() {
             let target = {
+                if !self
+                    .canvas_ref(canvas_handle)
+                    .is_ok_and(|canvas| canvas.default_focus_pending)
+                {
+                    continue;
+                }
                 let Ok(canvas) = self.canvas_mut(canvas_handle) else {
                     continue;
                 };
-                if !canvas.default_focus_pending {
-                    continue;
-                }
                 canvas.default_focus_pending = false;
                 canvas
                     .document

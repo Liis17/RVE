@@ -5,6 +5,7 @@ pub mod document;
 pub mod events;
 pub mod input;
 pub mod layout;
+pub mod paint;
 pub mod system;
 
 /// Версия крейта для проверки совместимости документов и ABI вызывающей стороны.

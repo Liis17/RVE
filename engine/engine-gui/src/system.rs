@@ -10,6 +10,7 @@ use crate::layout::{
     Layout, canvas_scale, canvas_size, layout as compute_layout, max_scroll, resolve_rect,
 };
 use epaint::Vec2;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -102,6 +103,14 @@ pub struct UiSystem {
     free: Vec<u32>,
     pub(crate) sequence: u64,
     pub(crate) screen: Vec2,
+    /// Шрифты по каноническому пути ассета: байты нужны для пересоздания epaint.
+    pub(crate) font_data: BTreeMap<String, Vec<u8>>,
+    pub(crate) fonts: Option<epaint::text::Fonts>,
+    /// Размеры картинок по пути: нужны для 9-slice и пропорций.
+    pub(crate) images: BTreeMap<String, [u32; 2]>,
+    pub(crate) atlas: Arc<crate::paint::FontAtlas>,
+    pub(crate) paint_dirty: bool,
+    pub(crate) last_paint: Option<crate::paint::UiPaint>,
     pub(crate) hover: Option<UiElementHandle>,
     pub(crate) press: Option<crate::input::Hit>,
     pub(crate) drag_last: Vec2,
@@ -144,6 +153,7 @@ impl UiSystem {
         };
         refresh_layout(&mut canvas, self.screen);
         self.slots[index as usize].canvas = Some(canvas);
+        self.paint_dirty = true;
         UiCanvasHandle { index, generation }
     }
 
@@ -156,6 +166,7 @@ impl UiSystem {
         slot.canvas = None;
         slot.generation = slot.generation.wrapping_add(1);
         self.free.push(canvas.index);
+        self.paint_dirty = true;
         Ok(events)
     }
 
@@ -460,6 +471,7 @@ impl UiSystem {
     /// Сбрасывает наведение, нажатие и фокус (потеря фокуса окна, открытие консоли).
     /// Уже поглощённые нажатия остаются скрытыми до отпускания — это решает [`crate::capture`].
     pub fn reset_interaction(&mut self) -> Vec<UiEvent> {
+        self.paint_dirty = true;
         let mut events = Vec::new();
         self.clear_interaction(&mut events);
         events
@@ -512,6 +524,7 @@ impl UiSystem {
         &mut self,
         canvas: UiCanvasHandle,
     ) -> Result<&mut UiCanvas, UiSystemError> {
+        self.paint_dirty = true;
         self.slots
             .get_mut(canvas.index as usize)
             .filter(|slot| slot.generation == canvas.generation)
