@@ -52,6 +52,7 @@ const LINEAR_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 /// egui хранит значения в гамма-пространстве, поэтому они читаются без перевода; шейдер сам
 /// переводит результат для sRGB-swapchain, и смешивание в этом случае идёт в линейном пространстве.
 const UI_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
 /// Resolution of each layer in the shared directional shadow map.
 pub const SHADOW_MAP_RESOLUTION: u32 = 2048;
 const SHADOW_CASCADE_COUNT: usize = 4;
@@ -101,8 +102,14 @@ const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const TAA_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const PIPELINE_CACHE_HEADER_SIZE: usize = size_of::<vk::PipelineCacheHeaderVersionOne>();
-/// Два timestamp на слот кадра: перед cluster compute и после tonemap pass.
-const TIMESTAMP_QUERY_COUNT: u32 = 2;
+/// Максимум видов с GPU-границами за кадр: основной экран или viewport редактора.
+pub const MAX_PROFILED_VIEWS: usize = 4;
+/// Запросы одного вида: начало и граница после каждого прохода `GpuPass`.
+const VIEW_QUERY_COUNT: u32 = GpuPass::COUNT as u32 + 1;
+/// Первый запрос вывода на swapchain: начало и конец Output+UI.
+const OUTPUT_QUERY_FIRST: u32 = MAX_PROFILED_VIEWS as u32 * VIEW_QUERY_COUNT;
+/// Все запросы пула слота кадра.
+const TIMESTAMP_QUERY_COUNT: u32 = OUTPUT_QUERY_FIRST + 2;
 const WHITE_SRGB_TEXTURE: usize = 0;
 const WHITE_LINEAR_TEXTURE: usize = 1;
 const FLAT_NORMAL_TEXTURE: usize = 2;
@@ -702,6 +709,7 @@ struct AcquiredFrameSubmission<'a> {
     acquire_suboptimal: bool,
     wait_stage: vk::PipelineStageFlags2,
     timestamps_written: bool,
+    timings: &'a mut RenderCpuTimings,
     temporal_submissions: &'a [TemporalSubmission],
     shadow_layout: vk::ImageLayout,
     local_shadow_layout: vk::ImageLayout,
@@ -722,6 +730,118 @@ pub struct FrameOutcome {
     pub status: FrameStatus,
     /// True after `vkQueueSubmit2` succeeds, including a later out-of-date present.
     pub submitted: bool,
+}
+
+/// Проход, границы которого записываются в GPU-профайлер; порядок совпадает с выполнением в кадре.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuPass {
+    /// Compute кластеризации света.
+    Clusters,
+    /// Каскады directional shadow.
+    ShadowDirectional,
+    /// Локальные теневые слои.
+    ShadowLocal,
+    /// Непрозрачные и маскированные меши.
+    Opaque,
+    /// Skybox.
+    Skybox,
+    /// Полупрозрачные меши.
+    Transparent,
+    /// Отладочный wireframe.
+    Wireframe,
+    /// TAA, FSR или DLSS; отсутствует, если временное сглаживание выключено.
+    TemporalResolve,
+    /// Tonemap до вывода на swapchain.
+    Tonemap,
+}
+
+impl GpuPass {
+    /// Число проходов, для которых записываются границы.
+    pub const COUNT: usize = 9;
+    /// Все проходы в порядке выполнения.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Clusters,
+        Self::ShadowDirectional,
+        Self::ShadowLocal,
+        Self::Opaque,
+        Self::Skybox,
+        Self::Transparent,
+        Self::Wireframe,
+        Self::TemporalResolve,
+        Self::Tonemap,
+    ];
+
+    /// Короткое имя для отчётов.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Clusters => "Clusters",
+            Self::ShadowDirectional => "Shadow directional",
+            Self::ShadowLocal => "Shadow local",
+            Self::Opaque => "Opaque",
+            Self::Skybox => "Skybox",
+            Self::Transparent => "Transparent",
+            Self::Wireframe => "Wireframe",
+            Self::TemporalResolve => "Temporal resolve",
+            Self::Tonemap => "Tonemap",
+        }
+    }
+}
+
+/// Вид, которому принадлежат GPU-границы: основной экран или viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfiledView {
+    Screen,
+    Viewport(ViewportId),
+}
+
+/// CPU-фазы одного вызова `render_frame*`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderCpuTimings {
+    /// От начала вызова до ожидания fence: проверки, подготовка кадра и окружения.
+    pub prepare: Duration,
+    pub fence_wait: Duration,
+    /// Опрос и отправка загрузок ресурсов.
+    pub uploads: Duration,
+    pub acquire: Duration,
+    /// Запись command buffer.
+    pub record: Duration,
+    /// Сброс fence и `vkQueueSubmit2`.
+    pub submit: Duration,
+    /// `vkQueuePresentKHR`.
+    pub present: Duration,
+}
+
+/// GPU-время одного вида. `passes[pass as usize]` — `None`, если проход не выполнялся в кадре.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuViewTimings {
+    pub key: ProfiledView,
+    pub passes: [Option<Duration>; GpuPass::COUNT],
+    /// От начала вида до последней записанной границы. Сумма `passes` совпадает с ним
+    /// с округлением до наносекунды на каждый проход.
+    pub total: Duration,
+}
+
+/// GPU-время кадра: виды в порядке записи и вывод на swapchain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuFrameTimings {
+    pub views: [Option<GpuViewTimings>; MAX_PROFILED_VIEWS],
+    /// Вывод на swapchain (Output и UI). В `total` видов не входит.
+    pub output_ui: Option<Duration>,
+}
+
+impl GpuFrameTimings {
+    /// Total первого записанного вида: основного экрана или первого viewport.
+    fn first_view_total(&self) -> Option<Duration> {
+        self.views[0].map(|view| view.total)
+    }
+}
+
+/// Профиль последнего вызова `render_frame*`. GPU-часть прочитана в начале вызова
+/// из прошлой отправки того же слота, поэтому относится к более раннему кадру.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameProfile {
+    pub cpu: RenderCpuTimings,
+    pub gpu: Option<GpuFrameTimings>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -887,6 +1007,8 @@ pub struct Renderer {
     /// Наносекунд на один тик timestamp.
     timestamp_period: f32,
     pending_gpu_time: Option<Duration>,
+    /// Профиль последнего вызова render; забирается через `take_frame_profile`.
+    pending_frame_profile: Option<FrameProfile>,
     texture_sampler_anisotropy: Option<f32>,
     frame_set_layout: Option<vk::DescriptorSetLayout>,
     material_set_layout: Option<vk::DescriptorSetLayout>,
@@ -1012,6 +1134,7 @@ impl Renderer {
             timestamp_valid_bits: 0,
             timestamp_period: 0.0,
             pending_gpu_time: None,
+            pending_frame_profile: None,
             texture_sampler_anisotropy: None,
             frame_set_layout: None,
             material_set_layout: None,
@@ -1160,13 +1283,23 @@ impl Renderer {
         unsafe { self.device()?.get_pipeline_cache_data(cache) }.map_err(RenderError::from)
     }
 
-    /// Забирает GPU-время clustered compute, shadow, scene и tonemap последнего завершённого кадра.
+    /// Забирает GPU-время последнего завершённого кадра: total первого записанного вида
+    /// (основного экрана или первого viewport).
     ///
     /// Каждое измерение возвращается один раз; `None` — нового измерения нет
-    /// или очередь не поддерживает timestamp queries. Вывод в окно и оверлей
-    /// не учитываются: они ждут готовности swapchain image.
+    /// или очередь не поддерживает timestamp queries. Вывод на swapchain в total не входит.
+    /// Ожидание acquire может попасть в первый color-проход (обычно Opaque), а не в вывод:
+    /// submit ждёт `image_available` на стадии `COLOR_ATTACHMENT_OUTPUT`. См. [`FrameProfile`].
     pub fn take_gpu_frame_time(&mut self) -> Option<Duration> {
         self.pending_gpu_time.take()
+    }
+
+    /// Забирает профиль последнего вызова `render_frame*`: CPU-фазы этого вызова и GPU-границы.
+    ///
+    /// GPU-часть относится к прошлой отправке того же слота и отстаёт от CPU-части
+    /// на число кадров в полёте. Неизъятый профиль заменяется следующим вызовом.
+    pub fn take_frame_profile(&mut self) -> Option<FrameProfile> {
+        self.pending_frame_profile.take()
     }
 
     /// Отмечает физический размер клиентской области как изменённый.
@@ -1635,6 +1768,7 @@ impl Renderer {
         &mut self,
         frame: &Frame<'_>,
     ) -> Result<FrameOutcome, RenderError> {
+        let prepare_started = Instant::now();
         if self.frame_slots_lost {
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
@@ -1689,9 +1823,20 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?
             .fence;
         // SAFETY: this fence belongs to the frame slot and its prior submission is finished before reuse.
+        let prepare = prepare_started.elapsed();
+        let fence_started = Instant::now();
         unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        let fence_wait = fence_started.elapsed();
+        let uploads_started = Instant::now();
         self.poll_uploads()?;
         self.flush_uploads()?;
+        let uploads = uploads_started.elapsed();
+        let mut cpu = RenderCpuTimings {
+            prepare,
+            fence_wait,
+            uploads,
+            ..RenderCpuTimings::default()
+        };
         self.retired.slot_completed(frame_slot);
         self.retired_swapchains
             .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
@@ -1796,16 +1941,28 @@ impl Renderer {
         let image_available = frame_resources.image_available;
         let command_buffer = frame_resources.command_buffer;
 
-        if let Some(gpu_time) = frame_resources.read_gpu_time(
+        let gpu = frame_resources.read_gpu_timings(
             &device,
             self.timestamp_valid_bits,
             self.timestamp_period,
-        )? {
-            self.pending_gpu_time = Some(gpu_time);
+        )?;
+        if let Some(total) = gpu.and_then(|gpu| gpu.first_view_total()) {
+            self.pending_gpu_time = Some(total);
         }
         // Fence слота дождались, поэтому GPU больше не читает вершины оверлея этого слота.
         frame_resources.write_overlay(&instance, &device, self.physical_device, frame.overlay)?;
         let timestamps = frame_resources.timestamps;
+        let mut gpu_layout = GpuProfileLayout::default();
+        let screen_marks = timestamps.and_then(|pool| {
+            gpu_layout
+                .add_view(ProfiledView::Screen)
+                .map(|first| GpuMarks { pool, first })
+        });
+        let output_marks = timestamps.map(|pool| GpuMarks {
+            pool,
+            first: OUTPUT_QUERY_FIRST,
+        });
+        frame_resources.gpu_layout = gpu_layout;
         let frame_uniforms =
             self.frame_uniforms
                 .get_mut(frame_slot)
@@ -1970,6 +2127,7 @@ impl Renderer {
             tonemap_source,
             post_sampler,
         );
+        let acquire_started = Instant::now();
         let acquired = match acquire_image(
             &swapchain_loader,
             swapchain_handle,
@@ -1977,7 +2135,10 @@ impl Renderer {
             swapchain_image_count,
             &mut self.swapchain_dirty,
         ) {
-            Ok(acquired) => acquired,
+            Ok(acquired) => {
+                cpu.acquire = acquire_started.elapsed();
+                acquired
+            }
             Err(AcquireImageError::BeforeAcquire(error)) => return Err(error),
             Err(AcquireImageError::AfterAcquire(error)) => {
                 self.screen_temporal.state.missed();
@@ -1998,6 +2159,7 @@ impl Renderer {
         let swapchain_extent = swapchain.extent;
         let render_finished = swapchain.render_finished[image_index];
         let output_is_srgb = is_srgb_format(self.surface_format.format);
+        let record_started = Instant::now();
         let recorded = (|| {
             let shadow = ShadowPass {
                 pipeline: shadow_pipeline,
@@ -2039,7 +2201,7 @@ impl Renderer {
                 camera_position: frame.camera.position,
                 clear_color: frame.clear_color,
                 debug_view: frame.debug_view,
-                timestamps,
+                timestamps: screen_marks,
                 view,
             };
             let frame_resources = &mut self.frames[frame_slot];
@@ -2130,9 +2292,11 @@ impl Renderer {
                 overlay.as_ref(),
                 temporal_record,
                 skin_record,
+                output_marks,
             )?;
             Ok((temporal_outcome, shadow_layout, local_shadow_layout))
         })();
+        cpu.record = record_started.elapsed();
         let (temporal_outcome, shadow_layout, local_shadow_layout) = match recorded {
             Ok(recorded) => recorded,
             Err(error) => {
@@ -2190,7 +2354,7 @@ impl Renderer {
                 .is_some_and(|outcome| outcome.used_dlss),
             submitted_at,
         }];
-        match self.submit_and_present(AcquiredFrameSubmission {
+        let submitted = self.submit_and_present(AcquiredFrameSubmission {
             device: &device,
             swapchain_loader: &swapchain_loader,
             queue,
@@ -2204,11 +2368,14 @@ impl Renderer {
             acquire_suboptimal,
             wait_stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             timestamps_written: timestamps.is_some(),
+            timings: &mut cpu,
             temporal_submissions: &temporal_submissions,
             shadow_layout,
             local_shadow_layout,
             skin: skin_plan.as_ref(),
-        }) {
+        });
+        self.pending_frame_profile = Some(FrameProfile { cpu, gpu });
+        match submitted {
             Ok(outcome) => Ok(outcome),
             Err(SubmitAndPresentError::BeforeSubmit(error)) => {
                 self.screen_temporal.state.missed();
@@ -2242,6 +2409,7 @@ impl Renderer {
         ui: &[UiPrimitive<'_>],
         clear: [f32; 4],
     ) -> Result<FrameOutcome, RenderError> {
+        let prepare_started = Instant::now();
         if self.frame_slots_lost {
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
@@ -2317,9 +2485,20 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?
             .fence;
         // SAFETY: this fence belongs to the frame slot and its prior submission is finished before reuse.
+        let prepare = prepare_started.elapsed();
+        let fence_started = Instant::now();
         unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        let fence_wait = fence_started.elapsed();
+        let uploads_started = Instant::now();
         self.poll_uploads()?;
         self.flush_uploads()?;
+        let uploads = uploads_started.elapsed();
+        let mut cpu = RenderCpuTimings {
+            prepare,
+            fence_wait,
+            uploads,
+            ..RenderCpuTimings::default()
+        };
         self.retired.slot_completed(frame_slot);
         self.retired_swapchains
             .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
@@ -2451,12 +2630,13 @@ impl Renderer {
             .get_mut(frame_slot)
             .ok_or(RenderError::InvalidState("нет ресурсов текущего кадра"))?;
         let command_buffer = frame_resources.command_buffer;
-        if let Some(gpu_time) = frame_resources.read_gpu_time(
+        let gpu = frame_resources.read_gpu_timings(
             &device,
             self.timestamp_valid_bits,
             self.timestamp_period,
-        )? {
-            self.pending_gpu_time = Some(gpu_time);
+        )?;
+        if let Some(total) = gpu.and_then(|gpu| gpu.first_view_total()) {
+            self.pending_gpu_time = Some(total);
         }
         // Fence слота дождались, поэтому GPU больше не читает буферы этого слота.
         frame_resources.ui_vertices.write(
@@ -2584,6 +2764,10 @@ impl Renderer {
             }
         }
         let slot_timestamps = frame_resources.timestamps;
+        let output_marks = slot_timestamps.map(|pool| GpuMarks {
+            pool,
+            first: OUTPUT_QUERY_FIRST,
+        });
         let framebuffer_is_srgb = is_srgb_format(self.surface_format.format);
         let physical_device = self.physical_device;
         let mut rendered = Vec::with_capacity(scenes.len());
@@ -2694,6 +2878,7 @@ impl Renderer {
             draws.push((*draw, set, image_is_linear));
         }
 
+        let acquire_started = Instant::now();
         let acquired = match acquire_image(
             &swapchain_loader,
             swapchain_handle,
@@ -2701,7 +2886,10 @@ impl Renderer {
             swapchain_image_count,
             &mut self.swapchain_dirty,
         ) {
-            Ok(acquired) => acquired,
+            Ok(acquired) => {
+                cpu.acquire = acquire_started.elapsed();
+                acquired
+            }
             Err(AcquireImageError::BeforeAcquire(error)) => return Err(error),
             Err(AcquireImageError::AfterAcquire(error)) => {
                 self.miss_all_temporal_views();
@@ -2721,6 +2909,7 @@ impl Renderer {
         let swapchain_extent = swapchain.extent;
         let render_finished = swapchain.render_finished[image_index];
 
+        let mut gpu_layout = GpuProfileLayout::default();
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -2784,7 +2973,11 @@ impl Renderer {
                             camera_position: frame.camera.position,
                             clear_color: frame.clear_color,
                             debug_view: frame.debug_view,
-                            timestamps: slot_timestamps.filter(|_| index == 0),
+                            timestamps: slot_timestamps.and_then(|pool| {
+                                gpu_layout
+                                    .add_view(ProfiledView::Viewport(*viewport))
+                                    .map(|first| GpuMarks { pool, first })
+                            }),
                             view: effective_view_settings(frame.view, frame.debug_view),
                         },
                         *tonemap_set,
@@ -2795,7 +2988,8 @@ impl Renderer {
                 },
             )
             .collect::<Vec<_>>();
-        let timestamps = !scene_passes.is_empty() && slot_timestamps.is_some();
+        self.frames[frame_slot].gpu_layout = gpu_layout;
+        let timestamps = slot_timestamps.is_some();
         let ui_pass = UiPass {
             pipeline: ui_pipeline,
             pipeline_layout: ui_pipeline_layout,
@@ -2815,8 +3009,9 @@ impl Renderer {
             clear,
         };
 
+        let record_started = Instant::now();
         let recorded = (|| {
-            begin_command_buffer(&device, command_buffer)?;
+            begin_command_buffer(&device, command_buffer, slot_timestamps)?;
             if let Some(record) = skin_record {
                 skin::record_skin(&device, command_buffer, record);
             }
@@ -3014,6 +3209,9 @@ impl Renderer {
                     viewport.temporal.dlss_error = Some(error.clone());
                 }
             }
+            if let Some(marks) = output_marks {
+                marks.write(&device, command_buffer, 0);
+            }
             record_ui(
                 &device,
                 command_buffer,
@@ -3021,10 +3219,14 @@ impl Renderer {
                 swapchain_extent,
                 &ui_pass,
             );
+            if let Some(marks) = output_marks {
+                marks.write(&device, command_buffer, 1);
+            }
             // SAFETY: command recording is complete before the command buffer is submitted.
             unsafe { device.end_command_buffer(command_buffer) }?;
             Ok((temporal_submissions, shadow_layout, local_shadow_layout))
         })();
+        cpu.record = record_started.elapsed();
         let (temporal_submissions, shadow_layout, local_shadow_layout) = match recorded {
             Ok(recorded) => recorded,
             Err(error) => {
@@ -3034,7 +3236,7 @@ impl Renderer {
             }
         };
 
-        match self.submit_and_present(AcquiredFrameSubmission {
+        let submitted = self.submit_and_present(AcquiredFrameSubmission {
             device: &device,
             swapchain_loader: &swapchain_loader,
             queue,
@@ -3048,11 +3250,14 @@ impl Renderer {
             acquire_suboptimal,
             wait_stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             timestamps_written: timestamps,
+            timings: &mut cpu,
             temporal_submissions: &temporal_submissions,
             shadow_layout,
             local_shadow_layout,
             skin: skin_plan.as_ref(),
-        }) {
+        });
+        self.pending_frame_profile = Some(FrameProfile { cpu, gpu });
+        match submitted {
             Ok(outcome) => Ok(outcome),
             Err(SubmitAndPresentError::BeforeSubmit(error)) => {
                 self.miss_temporal_submissions(&temporal_submissions);
@@ -3184,11 +3389,13 @@ impl Renderer {
             acquire_suboptimal,
             wait_stage,
             timestamps_written,
+            timings,
             temporal_submissions,
             shadow_layout,
             local_shadow_layout,
             skin,
         } = acquired;
+        let submit_started = Instant::now();
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
         // SAFETY: эта точка — непосредственно перед submit, которому принадлежит fence.
         if let Err(error) = unsafe { device.reset_fences(&[fence]) } {
@@ -3218,6 +3425,7 @@ impl Renderer {
                 error,
             )));
         }
+        timings.submit = submit_started.elapsed();
         self.record_frame_submission(frame_slot);
         self.commit_skin(skin);
         self.shadow_layout = shadow_layout;
@@ -3234,7 +3442,9 @@ impl Renderer {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
         // SAFETY: present waits on the semaphore signaled by the preceding queue submission.
+        let present_started = Instant::now();
         let present_result = unsafe { swapchain_loader.queue_present(queue, &present_info) };
+        timings.present = present_started.elapsed();
         self.frame_slot = (self.frame_slot + 1) % self.frames.len();
         match present_result {
             Ok(present_suboptimal) => {
@@ -6742,10 +6952,12 @@ struct FrameResources {
     overlay_buffer: GrowingBuffer,
     ui_vertices: GrowingBuffer,
     ui_indices: GrowingBuffer,
-    /// Timestamp до clustering и после tonemap; `None`, если очередь их не поддерживает.
+    /// Пул границ GPU-проходов слота; `None`, если очередь не поддерживает timestamp queries.
     timestamps: Option<vk::QueryPool>,
-    /// Timestamp записаны и отправлены, но ещё не прочитаны.
+    /// Границы записаны и отправлены, но ещё не прочитаны.
     timestamps_pending: bool,
+    /// Виды последнего записанного кадра слота; нужны для разбора прочитанных границ.
+    gpu_layout: GpuProfileLayout,
     /// Последняя успешная отправка этого слота; начальный signaled fence не имеет поколения.
     submission_generation: u64,
     /// Палитры skinning этого слота; растут до следующей степени двойки.
@@ -6771,6 +6983,7 @@ impl FrameResources {
             ui_indices: GrowingBuffer::default(),
             timestamps: None,
             timestamps_pending: false,
+            gpu_layout: GpuProfileLayout::default(),
             submission_generation: 0,
             skin_palettes: GrowingBuffer::default(),
         };
@@ -6790,30 +7003,36 @@ impl FrameResources {
         Ok(frame)
     }
 
-    /// Читает clustered compute, shadow, scene и tonemap время прошлой отправки этого слота.
+    /// Читает границы прошлой отправки этого слота и разбирает их по видам.
     ///
-    /// Вызывается после ожидания fence слота.
-    fn read_gpu_time(
+    /// Вызывается после ожидания fence слота. `NOT_READY` не отменяет чтение: доступность
+    /// задаётся для каждого запроса, поэтому невыполненные проходы дают `None`.
+    fn read_gpu_timings(
         &mut self,
         device: &ash::Device,
         valid_bits: u32,
         period: f32,
-    ) -> Result<Option<Duration>, RenderError> {
+    ) -> Result<Option<GpuFrameTimings>, RenderError> {
         let Some(pool) = self.timestamps.filter(|_| self.timestamps_pending) else {
             return Ok(None);
         };
         self.timestamps_pending = false;
-        let mut ticks = [0_u64; TIMESTAMP_QUERY_COUNT as usize];
-        // SAFETY: both queries were reset and written by a submission whose fence was waited.
+        // Для каждого запроса Vulkan пишет значение и флаг доступности: шаг буфера — 16 байт.
+        let mut results = [[0_u64; 2]; TIMESTAMP_QUERY_COUNT as usize];
+        // SAFETY: the pool was written by a submission whose fence was waited, and the buffer length equals its query count.
         match unsafe {
-            device.get_query_pool_results(pool, 0, &mut ticks, vk::QueryResultFlags::TYPE_64)
+            device.get_query_pool_results(
+                pool,
+                0,
+                &mut results,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
+            )
         } {
-            Ok(()) => Ok(Some(timestamp_duration(
-                ticks[0], ticks[1], valid_bits, period,
-            ))),
-            Err(vk::Result::NOT_READY) => Ok(None),
-            Err(error) => Err(RenderError::Vulkan(error)),
+            Ok(()) | Err(vk::Result::NOT_READY) => {}
+            Err(error) => return Err(RenderError::Vulkan(error)),
         }
+        let queries = available_timestamps(&results);
+        Ok(Some(self.gpu_layout.decode(&queries, valid_bits, period)))
     }
 
     /// Копирует вершины оверлея в буфер слота, увеличивая его при нехватке места.
@@ -8405,7 +8624,7 @@ fn record_temporal_resolve_and_tonemap(
     output_extent: vk::Extent2D,
     view: ViewSettings,
     debug_view: DebugView,
-    timestamps: Option<vk::QueryPool>,
+    timestamps: Option<GpuMarks>,
     tonemap_pipeline: vk::Pipeline,
     post_pipeline_layout: vk::PipelineLayout,
     taa_set: vk::DescriptorSet,
@@ -8515,6 +8734,7 @@ fn record_temporal_resolve_and_tonemap(
             ));
         }
     };
+    mark_pass(device, command_buffer, timestamps, GpuPass::TemporalResolve);
     write_image_set(device, tonemap_set, source.view, post_sampler);
     record_tonemap_pass(
         device,
@@ -8905,8 +9125,9 @@ fn record_frame(
     overlay: Option<&OverlayPass>,
     temporal: Option<TemporalResolveRecord<'_>>,
     skin: Option<skin::SkinRecord<'_>>,
+    output_marks: Option<GpuMarks>,
 ) -> Result<Option<TemporalResolveOutcome>, RenderError> {
-    begin_command_buffer(device, command_buffer)?;
+    begin_command_buffer(device, command_buffer, output_marks.map(|marks| marks.pool))?;
     if let Some(record) = skin {
         skin::record_skin(device, command_buffer, record);
     }
@@ -8964,6 +9185,9 @@ fn record_frame(
     let output_source_extent = temporal_outcome
         .as_ref()
         .map_or(target.render_extent, |outcome| outcome.output_extent);
+    if let Some(marks) = output_marks {
+        marks.write(device, command_buffer, 0);
+    }
     record_output_pass(
         device,
         command_buffer,
@@ -8980,6 +9204,9 @@ fn record_frame(
         overlay,
         false,
     );
+    if let Some(marks) = output_marks {
+        marks.write(device, command_buffer, 1);
+    }
     // SAFETY: command recording is complete before the command buffer is submitted.
     unsafe { device.end_command_buffer(command_buffer) }?;
     Ok(temporal_outcome)
@@ -8988,6 +9215,7 @@ fn record_frame(
 fn begin_command_buffer(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
+    timestamps: Option<vk::QueryPool>,
 ) -> Result<(), RenderError> {
     // SAFETY: this frame's command buffer is no longer in flight because its fence was waited.
     unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty()) }?;
@@ -8995,6 +9223,11 @@ fn begin_command_buffer(
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     // SAFETY: the command buffer was reset and belongs to the renderer's graphics command pool.
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }?;
+    if let Some(pool) = timestamps {
+        // Все запросы пула сбрасываются до первого вида; reset выполняется вне rendering.
+        // SAFETY: the fence was waited, so no earlier submission still uses these queries.
+        unsafe { device.cmd_reset_query_pool(command_buffer, pool, 0, TIMESTAMP_QUERY_COUNT) };
+    }
     Ok(())
 }
 
@@ -9012,19 +9245,9 @@ fn record_scene(
     shadow: &ShadowPass<'_>,
     scene: &ScenePass<'_>,
 ) {
-    if let Some(pool) = scene.timestamps {
-        // SAFETY: the slot fence was waited, so these queries are not in use; reset happens outside rendering.
-        unsafe { device.cmd_reset_query_pool(command_buffer, pool, 0, TIMESTAMP_QUERY_COUNT) };
-        // GPU time starts before clustering and runs through tonemapping; it does not wait for the preceding frame.
-        // SAFETY: query zero was reset above and this timestamp precedes the compute dispatch.
-        unsafe {
-            device.cmd_write_timestamp2(
-                command_buffer,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                pool,
-                0,
-            );
-        }
+    if let Some(marks) = scene.timestamps {
+        // Начало GPU-времени вида: граница стоит до clustering.
+        marks.write(device, command_buffer, 0);
     }
     // Every invocation writes one fixed cluster record; zero-light frames also reset every count.
     // SAFETY: the frame set binds live light, cluster-output, bounds, and frame-uniform buffers.
@@ -9049,6 +9272,7 @@ fn record_scene(
             1,
         );
     }
+    mark_pass(device, command_buffer, scene.timestamps, GpuPass::Clusters);
     let cluster_barrier = vk::MemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
         .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
@@ -9197,12 +9421,27 @@ fn record_scene(
         *shadow_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 
+    if !shadow.shadow_cascades.is_empty() {
+        mark_pass(
+            device,
+            command_buffer,
+            scene.timestamps,
+            GpuPass::ShadowDirectional,
+        );
+    }
     record_local_shadow_layers(
         device,
         command_buffer,
         local_shadow_image,
         local_shadow_layout,
         shadow,
+    );
+    // Граница ставится всегда: очистка слоёв относится к проходу, даже если локальных источников нет.
+    mark_pass(
+        device,
+        command_buffer,
+        scene.timestamps,
+        GpuPass::ShadowLocal,
     );
 
     let clear_color = if scene.debug_view == DebugView::Overdraw {
@@ -9264,6 +9503,7 @@ fn record_scene(
     );
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
+    mark_pass(device, command_buffer, scene.timestamps, GpuPass::Opaque);
     if scene.skybox && scene.debug_view != DebugView::Overdraw {
         pipeline_barrier(
             device,
@@ -9338,6 +9578,7 @@ fn record_scene(
         record_skybox(device, command_buffer, render_extent, scene);
         // SAFETY: this matches the preceding dynamic-rendering begin call.
         unsafe { device.cmd_end_rendering(command_buffer) };
+        mark_pass(device, command_buffer, scene.timestamps, GpuPass::Skybox);
     }
     if scene.debug_view != DebugView::Overdraw && has_transparent_draws(scene) {
         let color_to_blend = vk::ImageMemoryBarrier2::default()
@@ -9422,9 +9663,16 @@ fn record_scene(
         );
         // SAFETY: this matches the preceding transparent cmd_begin_rendering call.
         unsafe { device.cmd_end_rendering(command_buffer) };
+        mark_pass(
+            device,
+            command_buffer,
+            scene.timestamps,
+            GpuPass::Transparent,
+        );
     }
     if scene.debug_view == DebugView::Wireframe {
         record_wireframe(device, command_buffer, target, render_extent, scene);
+        mark_pass(device, command_buffer, scene.timestamps, GpuPass::Wireframe);
     }
     pipeline_barrier(
         device,
@@ -9696,7 +9944,7 @@ struct ScenePass<'a> {
     temporal_plan: TemporalPlan,
     camera_position: [f32; 3],
     clear_color: [f32; 4],
-    timestamps: Option<vk::QueryPool>,
+    timestamps: Option<GpuMarks>,
     debug_view: DebugView,
     view: ViewSettings,
 }
@@ -10071,7 +10319,7 @@ fn record_tonemap_pass(
     pipeline_layout: vk::PipelineLayout,
     view: ViewSettings,
     debug_view: DebugView,
-    timestamps: Option<vk::QueryPool>,
+    timestamps: Option<GpuMarks>,
 ) {
     if source_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
         let (source_stage, source_access) = match source_layout {
@@ -10157,18 +10405,7 @@ fn record_tonemap_pass(
         device.cmd_draw(command_buffer, 3, 1, 0, 0);
         device.cmd_end_rendering(command_buffer);
     }
-    if let Some(pool) = timestamps {
-        // End GPU timing after tone mapping and before any swapchain-dependent output work.
-        // SAFETY: the query was reset by record_scene and this pass follows its scene rendering.
-        unsafe {
-            device.cmd_write_timestamp2(
-                command_buffer,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                pool,
-                1,
-            );
-        }
-    }
+    mark_pass(device, command_buffer, timestamps, GpuPass::Tonemap);
     let sampled = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
         .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -12007,6 +12244,114 @@ fn validate_overlay(vertices: &[OverlayVertex]) -> Result<(), RenderError> {
     Ok(())
 }
 
+/// Запросы одного вида или вывода в пуле слота: `first` — начало, далее границы проходов.
+#[derive(Clone, Copy)]
+struct GpuMarks {
+    pool: vk::QueryPool,
+    first: u32,
+}
+
+impl GpuMarks {
+    /// Пишет граничный timestamp `first + query` с стадией `ALL_COMMANDS`.
+    /// Вызывать только вне `cmd_begin_rendering`…`cmd_end_rendering`.
+    fn write(self, device: &ash::Device, command_buffer: vk::CommandBuffer, query: u32) {
+        // SAFETY: the slot pool was reset when this command buffer began, and the index lies in this view's range.
+        unsafe {
+            device.cmd_write_timestamp2(
+                command_buffer,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                self.pool,
+                self.first + query,
+            );
+        }
+    }
+}
+
+/// Записывает границу после прохода `pass`, если вид его выполняет.
+fn mark_pass(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    marks: Option<GpuMarks>,
+    pass: GpuPass,
+) {
+    if let Some(marks) = marks {
+        marks.write(device, command_buffer, 1 + pass as u32);
+    }
+}
+
+/// Виды слота в порядке записи; индекс вида задаёт диапазон его запросов.
+#[derive(Clone, Copy, Debug, Default)]
+struct GpuProfileLayout {
+    views: [Option<ProfiledView>; MAX_PROFILED_VIEWS],
+    count: usize,
+}
+
+impl GpuProfileLayout {
+    /// Выделяет запросы следующему виду; `None`, если лимит видов кадра исчерпан.
+    fn add_view(&mut self, view: ProfiledView) -> Option<u32> {
+        if self.count == MAX_PROFILED_VIEWS {
+            return None;
+        }
+        self.views[self.count] = Some(view);
+        let first = self.count as u32 * VIEW_QUERY_COUNT;
+        self.count += 1;
+        Some(first)
+    }
+
+    /// Разбирает прочитанные запросы слота. `None` — запрос не записан в кадр или не готов.
+    fn decode(&self, queries: &[Option<u64>], valid_bits: u32, period_ns: f32) -> GpuFrameTimings {
+        let mut timings = GpuFrameTimings::default();
+        for (index, view) in self.views[..self.count].iter().enumerate() {
+            let Some(view) = *view else {
+                continue;
+            };
+            let first = index * VIEW_QUERY_COUNT as usize;
+            let marks = &queries[first..first + VIEW_QUERY_COUNT as usize];
+            timings.views[index] = decode_view(view, marks, valid_bits, period_ns);
+        }
+        let output = OUTPUT_QUERY_FIRST as usize;
+        timings.output_ui = decode_output(&queries[output..output + 2], valid_bits, period_ns);
+        timings
+    }
+}
+
+/// Разбирает границы вида: `marks[0]` — начало, `marks[1 + pass]` — граница после прохода.
+/// Пропущенная граница означает, что проход не выполнялся: его время попадает в следующий записанный.
+fn decode_view(
+    view: ProfiledView,
+    marks: &[Option<u64>],
+    valid_bits: u32,
+    period_ns: f32,
+) -> Option<GpuViewTimings> {
+    let start = marks[0]?;
+    let mut passes = [None; GpuPass::COUNT];
+    let mut previous = start;
+    for (pass, mark) in passes.iter_mut().zip(&marks[1..]) {
+        if let Some(tick) = *mark {
+            *pass = Some(timestamp_duration(previous, tick, valid_bits, period_ns));
+            previous = tick;
+        }
+    }
+    Some(GpuViewTimings {
+        key: view,
+        passes,
+        total: timestamp_duration(start, previous, valid_bits, period_ns),
+    })
+}
+
+/// Разбирает границы вывода на swapchain: начало и конец.
+fn decode_output(marks: &[Option<u64>], valid_bits: u32, period_ns: f32) -> Option<Duration> {
+    Some(timestamp_duration(
+        marks[0]?, marks[1]?, valid_bits, period_ns,
+    ))
+}
+
+/// Разбирает результаты `TYPE_64 | WITH_AVAILABILITY`: на запрос значение и флаг доступности.
+/// Недоступный запрос даёт `None`, даже если в буфере осталось значение прошлой записи.
+fn available_timestamps<const N: usize>(results: &[[u64; 2]; N]) -> [Option<u64>; N] {
+    results.map(|[tick, available]| (available != 0).then_some(tick))
+}
+
 /// Длительность между timestamp с учётом значащих бит и переполнения счётчика.
 fn timestamp_duration(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> Duration {
     let mask = if valid_bits >= 64 {
@@ -13133,7 +13478,11 @@ mod tests {
         validate_mesh, validate_overlay, validate_pipeline_cache, validate_render_scale,
         validate_texture, validate_view_settings, vertex_bytes,
     };
-    use super::{LocalShadowKind, SelectedLocalLight};
+    use super::{
+        GpuPass, GpuProfileLayout, GpuViewTimings, LocalShadowKind, MAX_PROFILED_VIEWS,
+        OUTPUT_QUERY_FIRST, ProfiledView, SelectedLocalLight, TIMESTAMP_QUERY_COUNT,
+        VIEW_QUERY_COUNT, ViewportId, available_timestamps, decode_output, decode_view,
+    };
     use ash::vk;
     use std::time::{Duration, Instant};
     use std::{
@@ -16069,6 +16418,226 @@ mod tests {
             .map(|chunk| f32::from_ne_bytes(*chunk))
             .collect::<Vec<_>>();
         assert_eq!(floats, [1.0, 2.0, 0.25, 0.5, 0.75, 1.0]);
+    }
+
+    fn ns(value: u64) -> Duration {
+        Duration::from_nanos(value)
+    }
+
+    fn passes_sum(view: &GpuViewTimings) -> Duration {
+        view.passes.iter().flatten().sum()
+    }
+
+    #[test]
+    fn view_timings_split_ticks_between_recorded_boundaries() {
+        // Начало, затем граница после каждого из девяти проходов в порядке выполнения.
+        let marks = [
+            Some(100),
+            Some(110),
+            Some(125),
+            Some(140),
+            Some(150),
+            Some(160),
+            Some(175),
+            Some(190),
+            Some(200),
+            Some(215),
+        ];
+        let view = decode_view(ProfiledView::Screen, &marks, 64, 1.0).unwrap();
+
+        assert_eq!(view.key, ProfiledView::Screen);
+        assert_eq!(
+            view.passes,
+            [
+                Some(ns(10)),
+                Some(ns(15)),
+                Some(ns(15)),
+                Some(ns(10)),
+                Some(ns(10)),
+                Some(ns(15)),
+                Some(ns(15)),
+                Some(ns(10)),
+                Some(ns(15)),
+            ]
+        );
+        assert_eq!(view.total, ns(115));
+        assert_eq!(passes_sum(&view), view.total);
+    }
+
+    #[test]
+    fn view_timings_skip_unexecuted_passes_and_keep_sum() {
+        // ShadowDirectional и Wireframe не выполнялись: их границ в кадре нет.
+        let marks = [
+            Some(100),
+            Some(110),
+            None,
+            Some(140),
+            Some(150),
+            Some(160),
+            Some(175),
+            None,
+            Some(200),
+            Some(215),
+        ];
+        let view = decode_view(ProfiledView::Screen, &marks, 64, 1.0).unwrap();
+
+        assert_eq!(view.passes[0], Some(ns(10)));
+        assert_eq!(view.passes[1], None);
+        assert_eq!(
+            view.passes[2],
+            Some(ns(30)),
+            "ShadowLocal считается от Clusters"
+        );
+        assert_eq!(view.passes[6], None);
+        assert_eq!(
+            view.passes[7],
+            Some(ns(25)),
+            "TemporalResolve считается от Transparent"
+        );
+        assert_eq!(view.total, ns(115));
+        assert_eq!(passes_sum(&view), view.total);
+    }
+
+    #[test]
+    fn view_timings_are_absent_without_start_boundary() {
+        let marks = [
+            None,
+            Some(110),
+            Some(125),
+            Some(140),
+            Some(150),
+            Some(160),
+            Some(175),
+            Some(190),
+            Some(200),
+            Some(215),
+        ];
+        assert_eq!(decode_view(ProfiledView::Screen, &marks, 64, 1.0), None);
+    }
+
+    #[test]
+    fn view_timings_handle_counter_wrap_within_valid_bits() {
+        // Счётчик на 36 бит переполняется между началом и первым проходом.
+        let max = (1_u64 << 36) - 1;
+        let marks = [
+            Some(max - 9),
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(20),
+        ];
+        let view = decode_view(ProfiledView::Screen, &marks, 36, 1.0).unwrap();
+
+        assert_eq!(view.passes[0], Some(ns(15)));
+        assert_eq!(view.passes[8], Some(ns(15)));
+        assert_eq!(view.total, ns(30));
+        assert_eq!(passes_sum(&view), view.total);
+    }
+
+    #[test]
+    fn output_timings_need_both_boundaries() {
+        assert_eq!(decode_output(&[Some(10), Some(35)], 64, 2.0), Some(ns(50)));
+        assert_eq!(decode_output(&[Some(10), None], 64, 1.0), None);
+        assert_eq!(decode_output(&[None, Some(35)], 64, 1.0), None);
+    }
+
+    #[test]
+    fn unavailable_timestamps_are_absent_even_with_stale_values() {
+        // Значение 99 осталось в буфере от прошлой записи и не должно попасть в разбор.
+        let results = [[10, 1], [99, 0], [30, 1]];
+
+        assert_eq!(available_timestamps(&results), [Some(10), None, Some(30)]);
+    }
+
+    #[test]
+    fn all_unavailable_timestamps_are_absent() {
+        assert_eq!(
+            available_timestamps(&[[10, 0], [20, 0], [0, 0]]),
+            [None, None, None]
+        );
+    }
+
+    #[test]
+    fn available_timestamps_keep_every_tick_including_zero() {
+        assert_eq!(
+            available_timestamps(&[[1, 1], [0, 1], [3, 7]]),
+            [Some(1), Some(0), Some(3)]
+        );
+    }
+
+    #[test]
+    fn layout_decodes_each_view_with_the_keys_it_recorded() {
+        let mut layout = GpuProfileLayout::default();
+        let recorded = [3, 1, 7, 2].map(|id| ProfiledView::Viewport(ViewportId(id)));
+        for (index, view) in recorded.into_iter().enumerate() {
+            assert_eq!(layout.add_view(view), Some(index as u32 * VIEW_QUERY_COUNT));
+        }
+        assert_eq!(
+            layout.add_view(ProfiledView::Screen),
+            None,
+            "пятый вид не профилируется"
+        );
+
+        let mut queries = [None; TIMESTAMP_QUERY_COUNT as usize];
+        for index in 0..MAX_PROFILED_VIEWS {
+            let first = index * VIEW_QUERY_COUNT as usize;
+            queries[first] = Some(0);
+            queries[first + GpuPass::COUNT] = Some(10 * (index as u64 + 1));
+        }
+        let timings = layout.decode(&queries, 64, 1.0);
+
+        for (index, view) in recorded.into_iter().enumerate() {
+            let timing = timings.views[index].expect("вид записан в кадр");
+            assert_eq!(timing.key, view);
+            assert_eq!(timing.total, ns(10 * (index as u64 + 1)));
+        }
+        assert_eq!(timings.output_ui, None);
+        assert_eq!(timings.first_view_total(), Some(ns(10)));
+    }
+
+    #[test]
+    fn layout_keeps_keys_of_the_frame_after_viewport_set_changes() {
+        // Набор viewport сменился: в кадре записан один вид, ключ берётся из записи этого кадра.
+        let mut layout = GpuProfileLayout::default();
+        assert_eq!(
+            layout.add_view(ProfiledView::Viewport(ViewportId(5))),
+            Some(0)
+        );
+        let mut queries = [None; TIMESTAMP_QUERY_COUNT as usize];
+        queries[0] = Some(0);
+        queries[GpuPass::COUNT] = Some(40);
+
+        let timings = layout.decode(&queries, 64, 1.0);
+
+        assert_eq!(
+            timings.views[0].map(|view| view.key),
+            Some(ProfiledView::Viewport(ViewportId(5)))
+        );
+        assert_eq!(timings.views[1], None);
+    }
+
+    #[test]
+    fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
+        assert_eq!(TIMESTAMP_QUERY_COUNT, 42);
+        let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
+        let mut layout = GpuProfileLayout::default();
+        for index in 0..MAX_PROFILED_VIEWS {
+            let first = layout
+                .add_view(ProfiledView::Viewport(ViewportId(index)))
+                .unwrap();
+            for query in first..first + VIEW_QUERY_COUNT {
+                assert!(owner[query as usize].replace(index).is_none());
+            }
+        }
+        for query in OUTPUT_QUERY_FIRST..TIMESTAMP_QUERY_COUNT {
+            assert!(owner[query as usize].replace(MAX_PROFILED_VIEWS).is_none());
+        }
+        assert!(owner.iter().all(Option::is_some));
     }
 
     #[test]

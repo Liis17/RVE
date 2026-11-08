@@ -17,6 +17,7 @@ mod new_project;
 mod play;
 mod play_cursor;
 mod previews;
+mod profile;
 mod project;
 mod scene_edit;
 mod settings;
