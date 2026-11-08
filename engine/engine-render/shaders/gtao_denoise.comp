@@ -1,0 +1,50 @@
+#version 450
+
+// Двусторонний фильтр 5x5 для сырого AO: веса по пространственной близости и по разности
+// линейной глубины, чтобы не размывать AO через силуэты.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D depth_image;
+layout(set = 0, binding = 1) uniform texture2D raw_ao_image;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D ao_output;
+
+layout(push_constant) uniform PushConstants {
+    // x — near; y — far; z, w — размер цели.
+    vec4 near_far_size;
+} push_constants;
+
+float linear_depth(float depth) {
+    float near = push_constants.near_far_size.x;
+    float far = push_constants.near_far_size.y;
+    return near * far / (far - depth * (far - near));
+}
+
+void main() {
+    ivec2 size = ivec2(push_constants.near_far_size.zw);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+    float center_depth = texelFetch(depth_image, pixel, 0).r;
+    if (center_depth >= 0.99999) {
+        imageStore(ao_output, pixel, vec4(1.0));
+        return;
+    }
+    float center_z = linear_depth(center_depth);
+    float total = 0.0;
+    float weight_sum = 0.0;
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            ivec2 sample_pixel = clamp(pixel + ivec2(x, y), ivec2(0), size - 1);
+            float sample_depth_value = texelFetch(depth_image, sample_pixel, 0).r;
+            float sample_z = linear_depth(sample_depth_value);
+            float spatial = exp(-float(x * x + y * y) * 0.25);
+            float depth_weight = exp(-abs(sample_z - center_z) * 8.0 / max(center_z, 1e-3));
+            float weight = spatial * depth_weight;
+            total += texelFetch(raw_ao_image, sample_pixel, 0).r * weight;
+            weight_sum += weight;
+        }
+    }
+    imageStore(ao_output, pixel, vec4(total / max(weight_sum, 1e-6), 0.0, 0.0, 1.0));
+}

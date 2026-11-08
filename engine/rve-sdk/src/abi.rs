@@ -9,11 +9,13 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 8 appends cursor callbacks after the v7 audio tail.
 /// Version 9 appends spawn, destroy, object-state and prefab callbacks after the v8 cursor tail.
 /// Version 10 appends animation callbacks after the v9 prefab tail.
-/// Version 11 appends network callbacks after the v10 animation tail and the net event callback
+/// Version 11 appends gamepad state and rumble callbacks after the v10 animation tail.
+/// Version 12 appends post-process callbacks after the v11 gamepad tail.
+/// Version 13 appends network callbacks after the v12 post-process tail and the net event callback
 /// after the v6 collision tail of the descriptor.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 11;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 13;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -46,6 +48,8 @@ pub const RVE_ACTION_AXIS: u32 = 1;
 pub const RVE_ACTION_VECTOR2: u32 = 2;
 /// Maximum number of physical inputs in one binding slot.
 pub const RVE_INPUT_MAX_BINDINGS: usize = 16;
+/// Number of gamepad slots, numbered 1..=4 in script names and 0 for the aggregate.
+pub const RVE_GAMEPAD_SLOTS: usize = 4;
 
 /// Stable key codes shared by the host ABI and the Rust guest API.
 #[repr(u32)]
@@ -271,18 +275,184 @@ impl MouseButton {
     }
 }
 
-/// A physical keyboard key or mouse button used by project input bindings.
+/// Stable gamepad button codes shared by the host ABI and the Rust guest API.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GamepadButton {
+    South = 0,
+    East = 1,
+    West = 2,
+    North = 3,
+    LeftBumper = 4,
+    RightBumper = 5,
+    LeftTrigger = 6,
+    RightTrigger = 7,
+    Select = 8,
+    Start = 9,
+    Mode = 10,
+    LeftStick = 11,
+    RightStick = 12,
+    DPadUp = 13,
+    DPadDown = 14,
+    DPadLeft = 15,
+    DPadRight = 16,
+}
+
+impl GamepadButton {
+    /// Every button in ABI code order.
+    pub const ALL: [Self; 17] = [
+        Self::South,
+        Self::East,
+        Self::West,
+        Self::North,
+        Self::LeftBumper,
+        Self::RightBumper,
+        Self::LeftTrigger,
+        Self::RightTrigger,
+        Self::Select,
+        Self::Start,
+        Self::Mode,
+        Self::LeftStick,
+        Self::RightStick,
+        Self::DPadUp,
+        Self::DPadDown,
+        Self::DPadLeft,
+        Self::DPadRight,
+    ];
+
+    /// Converts an API name to a gamepad button.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|button| button.name() == name)
+    }
+
+    /// Converts a stable ABI gamepad-button code to a button when it is supported.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::South),
+            1 => Some(Self::East),
+            2 => Some(Self::West),
+            3 => Some(Self::North),
+            4 => Some(Self::LeftBumper),
+            5 => Some(Self::RightBumper),
+            6 => Some(Self::LeftTrigger),
+            7 => Some(Self::RightTrigger),
+            8 => Some(Self::Select),
+            9 => Some(Self::Start),
+            10 => Some(Self::Mode),
+            11 => Some(Self::LeftStick),
+            12 => Some(Self::RightStick),
+            13 => Some(Self::DPadUp),
+            14 => Some(Self::DPadDown),
+            15 => Some(Self::DPadLeft),
+            16 => Some(Self::DPadRight),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable button name without the `Gamepad` prefix.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::South => "South",
+            Self::East => "East",
+            Self::West => "West",
+            Self::North => "North",
+            Self::LeftBumper => "LeftBumper",
+            Self::RightBumper => "RightBumper",
+            Self::LeftTrigger => "LeftTrigger",
+            Self::RightTrigger => "RightTrigger",
+            Self::Select => "Select",
+            Self::Start => "Start",
+            Self::Mode => "Mode",
+            Self::LeftStick => "LeftStick",
+            Self::RightStick => "RightStick",
+            Self::DPadUp => "DPadUp",
+            Self::DPadDown => "DPadDown",
+            Self::DPadLeft => "DPadLeft",
+            Self::DPadRight => "DPadRight",
+        }
+    }
+}
+
+/// Stable gamepad analog-axis codes shared by the host ABI and the Rust guest API.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GamepadAxis {
+    LeftX = 0,
+    LeftY = 1,
+    RightX = 2,
+    RightY = 3,
+    LeftTrigger = 4,
+    RightTrigger = 5,
+}
+
+impl GamepadAxis {
+    /// Converts an API name to a gamepad axis.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "LeftX" => Some(Self::LeftX),
+            "LeftY" => Some(Self::LeftY),
+            "RightX" => Some(Self::RightX),
+            "RightY" => Some(Self::RightY),
+            "LeftTrigger" => Some(Self::LeftTrigger),
+            "RightTrigger" => Some(Self::RightTrigger),
+            _ => None,
+        }
+    }
+
+    /// Converts a stable ABI gamepad-axis code to an axis when it is supported.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::LeftX),
+            1 => Some(Self::LeftY),
+            2 => Some(Self::RightX),
+            3 => Some(Self::RightY),
+            4 => Some(Self::LeftTrigger),
+            5 => Some(Self::RightTrigger),
+            _ => None,
+        }
+    }
+}
+
+/// Splits `Gamepad[N].<Name>` into its optional slot (1..=4, `None` for any gamepad) and the
+/// trailing name. Returns `None` for other strings and for slots outside 1..=4.
+pub fn split_gamepad_name(name: &str) -> Option<(Option<u8>, &str)> {
+    let rest = name.strip_prefix("Gamepad")?;
+    let (pad, tail) = rest.split_once('.')?;
+    let pad = match pad {
+        "" => None,
+        digits if digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+            let pad = digits.parse::<u8>().ok()?;
+            if !(1..=RVE_GAMEPAD_SLOTS as u8).contains(&pad) {
+                return None;
+            }
+            Some(pad)
+        }
+        _ => return None,
+    };
+    Some((pad, tail))
+}
+
+/// A physical keyboard key, mouse button, or gamepad button used by project input bindings.
+///
+/// `GamepadButton.pad` is `None` for any gamepad (`Gamepad.South`) or `Some(1..=4)` for one
+/// slot (`Gamepad2.South`).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PhysicalInput {
     Key(Key),
     MouseButton(MouseButton),
+    GamepadButton {
+        pad: Option<u8>,
+        button: GamepadButton,
+    },
 }
 
 impl PhysicalInput {
-    /// Parses a stable key name or a `Mouse.<Button>` name.
+    /// Parses a stable key name, a `Mouse.<Button>` name, or a `Gamepad[N].<Button>` name.
     pub fn from_name(name: &str) -> Option<Self> {
         if let Some(button) = name.strip_prefix("Mouse.") {
             MouseButton::from_name(button).map(Self::MouseButton)
+        } else if let Some((pad, button)) = split_gamepad_name(name) {
+            GamepadButton::from_name(button).map(|button| Self::GamepadButton { pad, button })
         } else {
             Key::from_name(name).map(Self::Key)
         }
@@ -293,6 +463,11 @@ impl PhysicalInput {
         match self {
             Self::Key(key) => format!("{key:?}"),
             Self::MouseButton(button) => format!("Mouse.{button:?}"),
+            Self::GamepadButton { pad: None, button } => format!("Gamepad.{}", button.name()),
+            Self::GamepadButton {
+                pad: Some(pad),
+                button,
+            } => format!("Gamepad{pad}.{}", button.name()),
         }
     }
 }
@@ -571,6 +746,142 @@ impl Default for RveCameraSettings {
         }
     }
 }
+
+/// Exposure source code for [`RvePostProcessSettings::exposure_mode`].
+pub const RVE_EXPOSURE_MODE_MANUAL: u32 = 0;
+/// Exposure source code for [`RvePostProcessSettings::exposure_mode`].
+pub const RVE_EXPOSURE_MODE_AUTO: u32 = 1;
+/// Ambient occlusion quality code for [`RvePostProcessSettings::ao_quality`].
+pub const RVE_AO_QUALITY_LOW: u32 = 0;
+/// Ambient occlusion quality code for [`RvePostProcessSettings::ao_quality`].
+pub const RVE_AO_QUALITY_MEDIUM: u32 = 1;
+/// Ambient occlusion quality code for [`RvePostProcessSettings::ao_quality`].
+pub const RVE_AO_QUALITY_HIGH: u32 = 2;
+
+/// Complete post-process settings of one camera, flattened for the C ABI.
+///
+/// Boolean fields use `0` and `1`. Enum fields use the stable `RVE_*` codes above and
+/// `RVE_TONEMAPPER_*`. Appended in ABI v12; [`RveCameraSettings`] keeps its v2 layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RvePostProcessSettings {
+    pub exposure_enabled: u32,
+    pub exposure_mode: u32,
+    pub exposure_ev: f32,
+    pub exposure_min_ev: f32,
+    pub exposure_max_ev: f32,
+    pub exposure_speed_up: f32,
+    pub exposure_speed_down: f32,
+    pub exposure_low_percent: f32,
+    pub exposure_high_percent: f32,
+    pub tonemapping_enabled: u32,
+    pub tonemapper: u32,
+    pub bloom_enabled: u32,
+    pub bloom_intensity: f32,
+    pub bloom_threshold: f32,
+    pub bloom_knee: f32,
+    pub bloom_scatter: f32,
+    pub bloom_tint: [f32; 3],
+    pub ao_enabled: u32,
+    pub ao_radius: f32,
+    pub ao_intensity: f32,
+    pub ao_falloff: f32,
+    pub ao_quality: u32,
+    pub grading_enabled: u32,
+    pub grading_temperature: f32,
+    pub grading_tint: f32,
+    pub grading_contrast: f32,
+    pub grading_saturation: f32,
+    pub grading_lift: [f32; 3],
+    pub grading_gamma: [f32; 3],
+    pub grading_gain: [f32; 3],
+    pub vignette_enabled: u32,
+    pub vignette_intensity: f32,
+    pub vignette_smoothness: f32,
+    pub vignette_roundness: f32,
+    pub vignette_color: [f32; 3],
+    pub aberration_enabled: u32,
+    pub aberration_intensity: f32,
+    pub grain_enabled: u32,
+    pub grain_intensity: f32,
+    pub grain_response: f32,
+    pub dof_enabled: u32,
+    pub dof_focus_distance: f32,
+    pub dof_aperture: f32,
+    pub dof_focal_length_mm: f32,
+    pub dof_max_blur_px: f32,
+    pub motion_enabled: u32,
+    pub motion_shutter_angle_deg: f32,
+    pub motion_samples: u32,
+    pub motion_max_blur_px: f32,
+}
+
+impl Default for RvePostProcessSettings {
+    /// Совпадает со значениями по умолчанию движка: все эффекты выключены, EV 0, ACES.
+    fn default() -> Self {
+        Self {
+            exposure_enabled: 1,
+            exposure_mode: RVE_EXPOSURE_MODE_MANUAL,
+            exposure_ev: 0.0,
+            exposure_min_ev: -6.0,
+            exposure_max_ev: 6.0,
+            exposure_speed_up: 3.0,
+            exposure_speed_down: 1.0,
+            exposure_low_percent: 10.0,
+            exposure_high_percent: 90.0,
+            tonemapping_enabled: 1,
+            tonemapper: RVE_TONEMAPPER_ACES,
+            bloom_enabled: 0,
+            bloom_intensity: 0.5,
+            bloom_threshold: 1.0,
+            bloom_knee: 0.5,
+            bloom_scatter: 0.7,
+            bloom_tint: [1.0; 3],
+            ao_enabled: 0,
+            ao_radius: 0.5,
+            ao_intensity: 1.0,
+            ao_falloff: 0.6,
+            ao_quality: RVE_AO_QUALITY_MEDIUM,
+            grading_enabled: 0,
+            grading_temperature: 0.0,
+            grading_tint: 0.0,
+            grading_contrast: 1.0,
+            grading_saturation: 1.0,
+            grading_lift: [0.0; 3],
+            grading_gamma: [1.0; 3],
+            grading_gain: [1.0; 3],
+            vignette_enabled: 0,
+            vignette_intensity: 0.4,
+            vignette_smoothness: 0.5,
+            vignette_roundness: 1.0,
+            vignette_color: [0.0; 3],
+            aberration_enabled: 0,
+            aberration_intensity: 0.3,
+            grain_enabled: 0,
+            grain_intensity: 0.3,
+            grain_response: 0.8,
+            dof_enabled: 0,
+            dof_focus_distance: 10.0,
+            dof_aperture: 2.8,
+            dof_focal_length_mm: 50.0,
+            dof_max_blur_px: 16.0,
+            motion_enabled: 0,
+            motion_shutter_angle_deg: 180.0,
+            motion_samples: 12,
+            motion_max_blur_px: 32.0,
+        }
+    }
+}
+
+/// Copies one object's post-process settings to a guest-provided output. Appended in ABI v12.
+pub type RveGetPostProcessFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut RvePostProcessSettings) -> bool;
+/// Stages one object's post-process settings. Appended in ABI v12.
+pub type RveSetPostProcessFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    settings: *const RvePostProcessSettings,
+) -> bool;
 
 /// Host callback that copies a guest error string for the duration of the call.
 pub type RveSetErrorFn = unsafe extern "C" fn(ctx: *mut c_void, message: RveStr);
@@ -883,6 +1194,32 @@ pub type RveAnimationSetSpeedFn =
 /// Stops every motion of one animated object; returns `RveStatus` as a `u32`. Appended in ABI v10.
 pub type RveAnimationStopFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
 
+/// Gamepad snapshot copied by [`RveGamepadStateFn`]. Button bits use [`GamepadButton`] codes and
+/// axes use [`GamepadAxis`] codes. Appended in ABI v11.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveGamepadState {
+    /// Non-zero when the slot (or any slot, for the aggregate) has a connected gamepad.
+    pub connected: u32,
+    /// Button bits held now.
+    pub down: u32,
+    /// Button bits that became held since the previous script update.
+    pub pressed: u32,
+    /// Button bits that became released since the previous script update.
+    pub released: u32,
+    /// Analog axis values in [`GamepadAxis`] code order.
+    pub axes: [f32; 6],
+}
+
+/// Copies one gamepad snapshot. `pad` is 0 for the aggregate of all slots or 1..=4 for one slot.
+/// Returns `false` and zeroes `out` for any other slot. Appended in ABI v11.
+pub type RveGamepadStateFn =
+    unsafe extern "C" fn(ctx: *mut c_void, pad: u32, out: *mut RveGamepadState) -> bool;
+
+/// Queues one rumble request for `pad` (0 for every connected gamepad, 1..=4 for one slot).
+/// Appended in ABI v11.
+pub type RveGamepadRumbleFn =
+    unsafe extern "C" fn(ctx: *mut c_void, pad: u32, strong: f32, weak: f32, seconds: f32) -> bool;
 /// Network mode code returned by [`RveHost::net_mode`]: no network.
 pub const RVE_NET_MODE_OFFLINE: u32 = 0;
 /// Network mode code: listen server, which also has a local client.
@@ -1057,7 +1394,14 @@ pub struct RveHost {
     pub animation_set_parameter: Option<RveAnimationSetParameterFn>,
     pub animation_set_speed: Option<RveAnimationSetSpeedFn>,
     pub animation_stop: Option<RveAnimationStopFn>,
-    /// Network callbacks appended in ABI v11; `None` marks an unavailable callback.
+    /// Gamepad state and rumble callbacks appended in ABI v11; `None` marks an unavailable callback.
+    pub gamepad_state: Option<RveGamepadStateFn>,
+    pub gamepad_rumble: Option<RveGamepadRumbleFn>,
+    /// Copies one camera's post-process settings; appended in ABI v12.
+    pub get_post_process: Option<RveGetPostProcessFn>,
+    /// Stages one camera's post-process settings; appended in ABI v12.
+    pub set_post_process: Option<RveSetPostProcessFn>,
+    /// Network callbacks appended in ABI v13; `None` marks an unavailable callback.
     pub net_mode: Option<RveNetModeFn>,
     pub net_local_peer: Option<RveNetLocalPeerFn>,
     pub net_peers: Option<RveNetPeersFn>,
@@ -1204,7 +1548,7 @@ pub struct RveNetEvent {
     pub reason: RveStr,
 }
 
-/// One exported guest script implementation in ABI version 6 through 10.
+/// One exported guest script implementation in ABI version 6 through 12.
 #[repr(C)]
 pub struct RveScriptDescV6 {
     pub name: RveStr,
@@ -1221,7 +1565,7 @@ pub struct RveScriptDescV6 {
     pub collision: Option<RveCollisionFn>,
 }
 
-/// One exported guest script implementation in ABI version 11.
+/// One exported guest script implementation in ABI version 13.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -1235,7 +1579,7 @@ pub struct RveScriptDesc {
     pub param_count: usize,
     pub command: Option<RveCommandFn>,
     pub collision: Option<RveCollisionFn>,
-    /// Optional network event callback appended in ABI v11.
+    /// Optional network event callback appended in ABI v13.
     pub net_event: Option<RveNetEventFn>,
 }
 
@@ -1319,9 +1663,11 @@ unsafe impl Sync for RveModule {}
 mod tests {
     use super::{
         Key, MouseButton, PhysicalInput, RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR,
-        RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES,
-        RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RveCameraSettings, RveGetCameraSettingsFn,
-        RveHost,
+        RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA, RVE_AO_QUALITY_HIGH,
+        RVE_EXPOSURE_MODE_AUTO, RVE_EXPOSURE_MODE_MANUAL, RVE_SCRIPT_ABI_VERSION,
+        RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE, RveAnimationStopFn,
+        RveCameraSettings, RveGamepadRumbleFn, RveGamepadStateFn, RveGetCameraSettingsFn,
+        RveGetPostProcessFn, RveHost, RvePostProcessSettings,
     };
 
     #[test]
@@ -1436,5 +1782,57 @@ mod tests {
             std::mem::size_of::<Option<RveGetCameraSettingsFn>>(),
             std::mem::size_of::<RveGetCameraSettingsFn>()
         );
+    }
+
+    #[test]
+    fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 13);
+        assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
+        assert_eq!(RVE_AO_QUALITY_HIGH, 2);
+        assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);
+        assert_eq!(
+            std::mem::offset_of!(RvePostProcessSettings, exposure_enabled),
+            0
+        );
+        assert_eq!(std::mem::offset_of!(RvePostProcessSettings, exposure_ev), 8);
+        assert_eq!(std::mem::offset_of!(RvePostProcessSettings, tonemapper), 40);
+        assert_eq!(std::mem::offset_of!(RvePostProcessSettings, bloom_tint), 64);
+        assert_eq!(
+            std::mem::offset_of!(RvePostProcessSettings, motion_samples),
+            228
+        );
+        assert_eq!(std::mem::size_of::<RvePostProcessSettings>(), 236);
+        assert_eq!(
+            std::mem::offset_of!(RveHost, gamepad_state),
+            std::mem::offset_of!(RveHost, animation_stop)
+                + std::mem::size_of::<Option<RveAnimationStopFn>>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(RveHost, gamepad_rumble),
+            std::mem::offset_of!(RveHost, gamepad_state)
+                + std::mem::size_of::<Option<RveGamepadStateFn>>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(RveHost, get_post_process),
+            std::mem::offset_of!(RveHost, gamepad_rumble)
+                + std::mem::size_of::<Option<RveGamepadRumbleFn>>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(RveHost, set_post_process),
+            std::mem::offset_of!(RveHost, get_post_process)
+                + std::mem::size_of::<Option<RveGetPostProcessFn>>()
+        );
+        // Camera settings keep the v2 layout: post-process data never changes it.
+        assert_eq!(std::mem::size_of::<RveCameraSettings>(), 40);
+    }
+
+    #[test]
+    fn post_process_defaults_match_engine_defaults() {
+        let defaults = RvePostProcessSettings::default();
+        assert_eq!(defaults.exposure_enabled, 1);
+        assert_eq!(defaults.exposure_mode, RVE_EXPOSURE_MODE_MANUAL);
+        assert_eq!(defaults.tonemapper, RVE_TONEMAPPER_ACES);
+        assert_eq!(defaults.bloom_enabled, 0);
+        assert_eq!(defaults.motion_samples, 12);
     }
 }

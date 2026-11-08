@@ -147,6 +147,7 @@ scripts thread: ScriptHost ─▶ NetworkBridge ─▶ NetworkHandle ─▶ rve-
 
 ## Интеграция с runtime и редактором
 
+- Сетевые callbacks гостя входят в ABI v13: хвост `RveHost` идёт после post-process (v12) и gamepad (v11) callbacks, а `net_event` добавлен в конец `RveScriptDesc`. Модули v6–v12 не получают сетевых событий. Контракт — в [[Engine/RveSdk]].
 - `NetworkBridge::attach` регистрирует сетевые id объектов сцены. Повтор id или `tick_hz` равный нулю — ошибка запуска.
 - `WorldSink` — установка режима и участников, сетевых id объектов, spawn и despawn, постановка событий скриптам, забор счётчиков ошибок пиров. Реализации: `engine-runtime` (`ScriptNetSink`) и редактор (`PlayNetwork`). Обе работают через `ScriptHost::spawn_external`, `despawn_external` и `queue_network_events`, поэтому путь объектов и событий совпадает со скриптовым.
 - Разрыв соединения клиента с сервером переводит мост в `Offline`: объекты остаются последними известными, процесс продолжает работать.

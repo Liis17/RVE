@@ -13,13 +13,13 @@ use engine_render::{
     ParticleSizeKey, RenderError, Renderer, SkinVertex, TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
-use engine_scene::CameraSettings;
 use engine_scene::prefab::PREFAB_EXTENSION;
 use engine_scene::{
     AnimatorComponent, EnvironmentComponent, LiteScript, LodGroup, MaterialAlphaMode,
     MaterialOverride, MeshRenderer, ObjectHandle, ParticleBlendMode, ParticleEmitterComponent,
     ParticleShapeComponent, PrefabTemplate, SceneDocument, SceneError, World, expand,
 };
+use engine_scene::{CameraSettings, PostProcessSettings, resolve_post_process};
 use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
 use glam::Vec3;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -117,7 +117,12 @@ pub(crate) fn load_scene(
     let mut expanded = expansion.document;
     let scene_hash = engine_network::replication::scene_hash(&expanded);
     let prefabs = load_fast_prefabs(resources, &mut expanded, &instanced)?;
-    let world = World::from_document(&expanded).map_err(|error| error.to_string())?;
+    let mut world = World::from_document(&expanded).map_err(|error| error.to_string())?;
+    world
+        .resolve_physics_materials(&mut |path: &VirtualPath| {
+            read_utf8(resources, &format!("/{}", path.as_str()))
+        })
+        .map_err(|error| error.to_string())?;
     prepare_scene(resources, assets, scene_path, world, prefabs, scene_hash)
 }
 
@@ -140,10 +145,7 @@ fn load_fast_prefabs(
         .collect::<Vec<_>>();
     let mut prefabs = PreparedPrefabs::default();
     for (path, max_instances) in fast {
-        let template = PrefabTemplate::load(&path, &mut |child: &VirtualPath| {
-            read_utf8(resources, &format!("/{}", child.as_str()))
-        })
-        .map_err(|error| error.to_string())?;
+        let template = load_prefab_template(resources, &path)?;
         if let Err(error) = template.check_spawnable() {
             if !instanced.contains(&path) {
                 log::warn!(
@@ -242,24 +244,30 @@ fn prepare_scene_with_model_loader(
     scene_hash: [u8; 32],
     mut load_model: impl FnMut(&str) -> Result<Model, String>,
 ) -> Result<PreparedScene, String> {
-    let camera_settings = world
+    // Пути файлов камер собираются до изменения мира; каждый файл читается один раз.
+    let cameras = world
         .objects()
         .iter()
         .filter_map(|object| {
+            let camera = object.camera.as_ref()?;
             Some((
                 object.handle,
-                object
-                    .camera
-                    .as_ref()?
+                camera
                     .settings
-                    .as_ref()?
-                    .as_str()
-                    .to_owned(),
+                    .as_ref()
+                    .map(|path| path.as_str().to_owned()),
+                camera
+                    .post_process
+                    .as_ref()
+                    .map(|path| path.as_str().to_owned()),
             ))
         })
         .collect::<Vec<_>>();
     let mut loaded_settings = HashMap::<String, CameraSettings>::new();
-    for (_, path) in &camera_settings {
+    for path in cameras
+        .iter()
+        .filter_map(|(_, settings, _)| settings.as_ref())
+    {
         if !loaded_settings.contains_key(path) {
             let source = read_utf8(resources, path)?;
             let settings =
@@ -267,9 +275,28 @@ fn prepare_scene_with_model_loader(
             loaded_settings.insert(path.clone(), settings);
         }
     }
-    for (handle, path) in camera_settings {
+    let mut loaded_post_process = HashMap::<String, PostProcessSettings>::new();
+    for path in cameras.iter().filter_map(|(_, _, post)| post.as_ref()) {
+        if !loaded_post_process.contains_key(path) {
+            let source = read_utf8(resources, path)?;
+            let settings =
+                PostProcessSettings::parse(path, &source).map_err(|error| error.to_string())?;
+            loaded_post_process.insert(path.clone(), settings);
+        }
+    }
+    for (handle, settings_path, _) in &cameras {
+        if let Some(path) = settings_path {
+            world
+                .set_camera_settings(*handle, loaded_settings[path])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for (handle, _, post_path) in &cameras {
+        // Файл постобработки побеждает; без него действует устаревший блок [color].
+        let camera_settings = world.camera_settings(*handle).copied().unwrap_or_default();
+        let post_file = post_path.as_ref().map(|path| &loaded_post_process[path]);
         world
-            .set_camera_settings(handle, loaded_settings[&path])
+            .set_post_process(*handle, resolve_post_process(&camera_settings, post_file))
             .map_err(|error| error.to_string())?;
     }
 
@@ -641,15 +668,22 @@ pub(crate) fn model_geometry(path: &str, model: &Model) -> ModelGeometry {
     }
 }
 
-/// Шаблон префаба, прочитанный через ресурсы; ошибки чтения и разбора остаются текстом.
+/// Шаблон префаба, прочитанный через ресурсы, с разрешёнными физическими материалами; ошибки
+/// чтения и разбора остаются текстом.
 pub(crate) fn load_prefab_template(
     resources: &ResourceHandle,
     path: &VirtualPath,
 ) -> Result<PrefabTemplate, String> {
-    PrefabTemplate::load(path, &mut |child: &VirtualPath| {
+    let mut template = PrefabTemplate::load(path, &mut |child: &VirtualPath| {
         read_utf8(resources, &format!("/{}", child.as_str()))
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    template
+        .resolve_physics_materials(&mut |child: &VirtualPath| {
+            read_utf8(resources, &format!("/{}", child.as_str()))
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(template)
 }
 
 /// CPU-ресурсы шаблона тяжёлого префаба: то же, что для объектов сцены.
@@ -1305,6 +1339,14 @@ id = "camera"
         }
 
         let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        let resolved = |id: &str| {
+            prepared
+                .world
+                .object_by_id(id)
+                .and_then(|object| object.collider.as_ref()?.resolved_material)
+        };
+        assert_eq!(resolved("ice-pad").map(|m| m.static_friction), Some(0.05));
+        assert_eq!(resolved("rubber-ball").map(|m| m.bounciness), Some(0.9));
         engine_script::ScriptHost::load(
             &prepared.world,
             "/scenes/physics.rvescene",
@@ -1316,14 +1358,15 @@ id = "camera"
         let (_, bindings) = prepared
             .build_physics(&geometry, &PhysicsSettings::default())
             .unwrap();
-        // 10 статических коллайдеров, 4 монеты-триггера, 4 ящика и 1 персонаж.
-        assert_eq!(bindings.len(), 19);
+        // 11 статических коллайдеров (с ледяной площадкой), 4 монеты-триггера, 4 ящика, ящик на льду,
+        // мяч и 1 персонаж.
+        assert_eq!(bindings.len(), 22);
         assert_eq!(
             bindings
                 .iter()
                 .filter(|binding| binding.kind == BodyKind::Dynamic)
                 .count(),
-            4
+            6
         );
         assert_eq!(
             bindings
@@ -1604,6 +1647,62 @@ id = "camera"
         assert!(error.contains("scene.rvescene"));
     }
 
+    fn physics_material_scene() -> String {
+        format!(
+            "[[assets]]\npath = \"/materials/ice.rvephysmat\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\nmaterial = \"/materials/ice.rvephysmat\"\n"
+        )
+    }
+
+    #[test]
+    fn load_scene_resolves_collider_physics_materials_from_assets() {
+        let project = TempProject::new();
+        project.write("scene.rvescene", physics_material_scene().as_bytes());
+        project.write(
+            "materials/ice.rvephysmat",
+            b"static_friction = 0.05\nbounciness = 0.9\n",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let collider = prepared
+            .world
+            .object_by_id("ball")
+            .and_then(|object| object.collider.as_ref())
+            .unwrap();
+        let resolved = collider.resolved_material.unwrap();
+        assert_eq!(resolved.static_friction, 0.05);
+        assert_eq!(resolved.bounciness, 0.9);
+    }
+
+    #[test]
+    fn load_scene_rejects_a_missing_or_invalid_physics_material() {
+        let project = TempProject::new();
+        project.write("scene.rvescene", physics_material_scene().as_bytes());
+        let resources = LooseResources::new(project.root());
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("materials/ice.rvephysmat"), "{error}");
+
+        project.write("materials/ice.rvephysmat", b"static_friction = -1.0\n");
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("static_friction"), "{error}");
+    }
+
     #[test]
     fn load_scene_rejects_a_missing_camera_settings_asset() {
         let project = TempProject::new();
@@ -1674,6 +1773,83 @@ id = "camera"
                 42.0
             );
             assert_eq!(world.camera_settings(handle).unwrap().projection.near, 0.2);
+        }
+    }
+
+    fn post_process_scene(second_camera: bool) -> String {
+        let second = if second_camera {
+            "\n[[objects]]\nid = \"second\"\n[objects.camera]\npost_process = \"/post/shared.postprocess\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "[[assets]]\npath = \"/post/shared.postprocess\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\nactive = true\npost_process = \"/post/shared.postprocess\"\n{second}"
+        )
+    }
+
+    #[test]
+    fn cameras_sharing_a_postprocess_asset_receive_its_settings_and_legacy_color_is_the_fallback() {
+        let project = TempProject::new();
+        project.write("scene.rvescene", post_process_scene(true).as_bytes());
+        project.write(
+            "post/shared.postprocess",
+            b"[bloom]\nenabled = true\nintensity = 2.0\n",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        for id in ["camera", "second"] {
+            let handle = prepared.world.handle(id).unwrap();
+            let post = prepared.world.post_process(handle).unwrap();
+            assert!(post.bloom.enabled);
+            assert_eq!(post.bloom.intensity, 2.0);
+        }
+
+        // Камера без файла постобработки берёт exposure из устаревшего блока [color].
+        let legacy = TempProject::new();
+        legacy.write("scene.rvescene", camera_settings_scene(false).as_bytes());
+        legacy.write(
+            "cameras/shared.camerasettings",
+            b"[color]\nexposure_ev = 1.5\ntonemapper = \"none\"\n",
+        );
+        let resources = LooseResources::new(legacy.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let handle = prepared.world.handle("camera").unwrap();
+        let post = prepared.world.post_process(handle).unwrap();
+        assert_eq!(post.exposure.ev, 1.5);
+        assert_eq!(post.tonemapping.tonemapper, engine_scene::Tonemapper::None);
+    }
+
+    #[test]
+    fn postprocess_file_errors_name_the_file() {
+        for (bytes, expected) in [
+            (&[0xff_u8, 0xfe][..], "not utf-8"),
+            (&b"[bloom\nintensity = 2"[..], "bloom"),
+        ] {
+            let project = TempProject::new();
+            project.write("scene.rvescene", post_process_scene(false).as_bytes());
+            project.write("post/shared.postprocess", bytes);
+            let resources = LooseResources::new(project.root());
+            let error = load_scene(
+                &resources.system.handle(),
+                &resources.assets,
+                "scene.rvescene",
+            )
+            .err()
+            .unwrap();
+            assert!(
+                error.contains("post/shared.postprocess"),
+                "{error} ({expected})"
+            );
         }
     }
 

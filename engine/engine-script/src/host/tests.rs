@@ -2,7 +2,8 @@ use super::{
     ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions, ScriptUpdateProfile,
 };
 use crate::{
-    Key, MouseButton, ScriptCursor, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime,
+    Key, MouseButton, RumbleRequest, ScriptCursor, ScriptEventLevel, ScriptInput, ScriptLibrary,
+    ScriptTime,
 };
 use engine_console::CommandLine;
 use engine_physics::{
@@ -71,6 +72,7 @@ fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn action_settings() -> InputSettings {
     InputSettings {
+        gamepad: Default::default(),
         default_context: Some("game".to_owned()),
         contexts: BTreeMap::from([
             (
@@ -4010,9 +4012,12 @@ return Script
     let primary_settings = world.camera_settings(primary).unwrap();
     assert_eq!(primary_settings.projection.fov_deg, 72.0);
     assert_eq!(primary_settings.render.clear_color, [0.2, 0.3, 0.4]);
-    assert_eq!(primary_settings.color.exposure_ev, 1.5);
+    assert_eq!(primary_settings.color.unwrap_or_default().exposure_ev, 1.5);
     let secondary_settings = world.camera_settings(secondary).unwrap();
-    assert_eq!(secondary_settings.color.exposure_ev, -2.0);
+    assert_eq!(
+        secondary_settings.color.unwrap_or_default().exposure_ev,
+        -2.0
+    );
 }
 
 #[test]
@@ -4096,7 +4101,12 @@ return Script
     assert_eq!(world.local_transform(primary).unwrap().position.x, 0.0);
     assert_eq!(world.active_camera(), primary);
     assert_eq!(
-        world.camera_settings(primary).unwrap().color.exposure_ev,
+        world
+            .camera_settings(primary)
+            .unwrap()
+            .color
+            .unwrap_or_default()
+            .exposure_ev,
         0.0
     );
     assert!(host.drain_events().iter().any(|event| {
@@ -4118,7 +4128,12 @@ fn lua_camera_writes_are_rejected_during_creation() {
         );
         assert_eq!(world.active_camera(), handle);
         assert_eq!(
-            world.camera_settings(handle).unwrap().color.exposure_ev,
+            world
+                .camera_settings(handle)
+                .unwrap()
+                .color
+                .unwrap_or_default()
+                .exposure_ev,
             0.0
         );
     }
@@ -5077,5 +5092,285 @@ return Cursor
             visible: false,
             locked: true,
         }
+    );
+}
+
+fn post_process_script_result(body: &str) -> (World, Vec<crate::ScriptEvent>) {
+    let mut world = two_cameras_with_lite_script();
+    let source =
+        format!("local Script = {{}}\nfunction Script:on_update() {body} end\nreturn Script");
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("camera.lua", source.as_str())]),
+        None,
+    )
+    .unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    (world, events)
+}
+
+#[test]
+fn lua_post_process_reads_defaults_and_applies_partial_nested_tables() {
+    let (world, events) = post_process_script_result(
+        r#"
+  local camera = rve.find("camera")
+  local before = camera:get_post_process()
+  assert(before.bloom.enabled == false and before.bloom.threshold == 1)
+  assert(before.exposure.ev == 0 and before.exposure.mode == "manual")
+  assert(before.tonemapping.tonemapper == "aces")
+  assert(camera:set_post_process({ bloom = { enabled = true, intensity = 2.0 }, exposure = { ev = 1.5 } }))
+  local pending = camera:get_post_process()
+  assert(pending.bloom.enabled and pending.bloom.intensity == 2.0 and pending.exposure.ev == 1.5)
+  assert(pending.bloom.threshold == 1)
+"#,
+    );
+    assert!(events.is_empty(), "unexpected script events: {events:?}");
+    let camera = world.handle("camera").unwrap();
+    let post = world.post_process(camera).unwrap();
+    assert!(post.bloom.enabled);
+    assert_eq!(post.bloom.intensity, 2.0);
+    assert_eq!(post.exposure.ev, 1.5);
+    assert!(
+        !world
+            .post_process(world.handle("second").unwrap())
+            .unwrap()
+            .bloom
+            .enabled
+    );
+}
+
+#[test]
+fn lua_post_process_and_legacy_color_proxy_apply_in_call_order() {
+    let (world, events) = post_process_script_result(
+        r#"
+  local camera = rve.find("camera")
+  camera:set_post_process({ exposure = { ev = 3 } })
+  camera:set_camera_settings({ color = { exposure_ev = 1 } })
+"#,
+    );
+    assert!(events.is_empty(), "unexpected script events: {events:?}");
+    let camera = world.handle("camera").unwrap();
+    assert_eq!(world.post_process(camera).unwrap().exposure.ev, 1.0);
+
+    let (world, events) = post_process_script_result(
+        r#"
+  local camera = rve.find("camera")
+  camera:set_camera_settings({ color = { exposure_ev = 1 } })
+  camera:set_post_process({ exposure = { ev = 3 } })
+"#,
+    );
+    assert!(events.is_empty(), "unexpected script events: {events:?}");
+    let camera = world.handle("camera").unwrap();
+    assert_eq!(world.post_process(camera).unwrap().exposure.ev, 3.0);
+}
+
+#[test]
+fn lua_legacy_color_round_trip_does_not_overwrite_post_process_file_values() {
+    let mut world = two_cameras_with_lite_script();
+    let camera = world.handle("camera").unwrap();
+    let mut file = engine_scene::PostProcessSettings::default();
+    file.exposure.ev = -1.25;
+    file.tonemapping.tonemapper = engine_scene::Tonemapper::Neutral;
+    world.set_post_process(camera, file).unwrap();
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local camera = rve.find("camera")
+  local settings = camera:get_camera_settings()
+  settings.projection.fov_deg = 75
+  camera:set_camera_settings(settings)
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("camera.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().is_empty());
+    assert_eq!(
+        world.camera_settings(camera).unwrap().projection.fov_deg,
+        75.0
+    );
+    assert_eq!(world.post_process(camera).unwrap().exposure.ev, -1.25);
+    assert_eq!(
+        world.post_process(camera).unwrap().tonemapping.tonemapper,
+        engine_scene::Tonemapper::Neutral
+    );
+}
+
+#[test]
+fn lua_post_process_rejects_unknown_fields_wrong_types_and_invalid_ranges() {
+    for (label, body, expected) in [
+        (
+            "unknown section",
+            r#"rve.find("camera"):set_post_process({ unknown = {} })"#,
+            "unknown post process field",
+        ),
+        (
+            "unknown bloom field",
+            r#"rve.find("camera"):set_post_process({ bloom = { glow = 1 } })"#,
+            "unknown bloom field",
+        ),
+        (
+            "wrong type",
+            r#"rve.find("camera"):set_post_process({ bloom = { enabled = 1 } })"#,
+            "enabled must be a boolean",
+        ),
+        (
+            "bad enum",
+            r#"rve.find("camera"):set_post_process({ tonemapping = { tonemapper = "filmic" } })"#,
+            "tonemapper must be",
+        ),
+        (
+            "range",
+            r#"rve.find("camera"):set_post_process({ bloom = { intensity = -1 } })"#,
+            "bloom.intensity",
+        ),
+        (
+            "non-camera",
+            r#"rve.find("plain"):set_post_process({})"#,
+            "has no camera",
+        ),
+    ] {
+        let (world, events) = post_process_script_result(body);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == ScriptEventLevel::Error
+                    && event.message.contains(expected)),
+            "{label} did not report {expected:?}: {events:?}"
+        );
+        let camera = world.handle("camera").unwrap();
+        assert_eq!(
+            world.post_process(camera),
+            Some(&engine_scene::PostProcessSettings::default()),
+            "{label}"
+        );
+    }
+}
+
+fn gamepad_lite_world(source: &str) -> (World, BTreeMap<String, String>) {
+    let world = one_camera(
+        r#"
+[[assets]]
+path = "/gamepad.lua"
+[[objects.lite_scripts]]
+path = "/gamepad.lua"
+"#,
+    );
+    (world, sources(&[("gamepad.lua", source)]))
+}
+
+#[test]
+fn lua_gamepad_api_reads_slots_and_queues_normalized_rumble() {
+    let (mut world, sources) = gamepad_lite_world(
+        r#"
+local Input = {}
+function Input:on_update()
+  local pressed = rve.input.pressed_inputs()
+  local x, y = rve.input.gamepad_stick("Right", 2)
+  if #pressed == 1 and pressed[1] == "Gamepad2.South"
+      and rve.input.gamepad_down("South", 2)
+      and rve.input.gamepad_pressed("South")
+      and not rve.input.gamepad_down("East", 1)
+      and rve.input.gamepad_connected(2) and not rve.input.gamepad_connected(3)
+      and rve.input.gamepad_axis("LeftX", 2) == 0.5
+      and x == 0.25 and y == -0.5 then
+    rve.input.gamepad_rumble(0 / 0, math.huge, -1, 2)
+    rve.input.gamepad_rumble(0.5, 0.25, 9)
+    rve.log_info("gamepad snapshot")
+  else
+    error("gamepad snapshot mismatch")
+  end
+end
+return Input
+"#,
+    );
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+    let mut input = ScriptInput::default();
+    input.set_pad(1, true, 1, [0.5, 0.0, 0.25, -0.5, 0.0, 0.0]);
+    host.set_input(input);
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "gamepad snapshot"
+    }));
+    assert_eq!(
+        host.take_rumble_requests(),
+        vec![
+            RumbleRequest {
+                pad: 2,
+                strong: 0.0,
+                weak: 0.0,
+                seconds: 0.0,
+            },
+            RumbleRequest {
+                pad: 0,
+                strong: 0.5,
+                weak: 0.25,
+                seconds: 5.0,
+            },
+        ]
+    );
+    assert!(host.take_rumble_requests().is_empty());
+}
+
+#[test]
+fn lua_gamepad_arguments_are_validated_with_script_errors() {
+    let (mut world, sources) = gamepad_lite_world(
+        r#"
+local Input = {}
+function Input:on_update()
+  rve.input.gamepad_down("Unknown")
+end
+function Input:on_start()
+  rve.input.gamepad_axis("LeftX", 5)
+end
+return Input
+"#,
+    );
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event.message.contains("pad must be an integer from 0 to 4")
+    }));
+}
+
+#[test]
+fn lua_rumble_is_rolled_back_when_the_callback_fails() {
+    let (mut world, sources) = gamepad_lite_world(
+        r#"
+local Input = {}
+function Input:on_update()
+  rve.input.gamepad_rumble(1, 1, 1)
+  error("boom")
+end
+return Input
+"#,
+    );
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.take_rumble_requests().is_empty());
+}
+
+#[test]
+fn lua_rumble_is_unavailable_during_script_creation() {
+    let world = one_camera(
+        "[[assets]]\npath = \"/rumble.lua\"\n[[objects.lite_scripts]]\npath = \"/rumble.lua\"\n",
+    );
+    let result = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[(
+            "rumble.lua",
+            r#"rve.input.gamepad_rumble(1, 1, 1); return {}"#,
+        )]),
+        None,
+    );
+    assert!(
+        matches!(result, Err(ScriptLoadError::Lite { message, .. }) if message.contains("rumble is unavailable during script creation"))
     );
 }

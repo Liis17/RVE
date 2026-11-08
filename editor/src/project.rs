@@ -7,7 +7,10 @@ use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceStats, ResourceSystem, SourceMode};
 use engine_scene::world::ObjectHandle;
-use engine_scene::{CameraSettings, SceneDocument, SceneError, World};
+use engine_scene::{
+    CameraSettings, PhysicsMaterialSettings, PostProcessSettings, SceneDocument, SceneError, World,
+    resolve_post_process,
+};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,6 +25,8 @@ pub struct OpenProject {
     pub assets: Assets,
     prefabs: Rc<PrefabCache>,
     camera_settings: RefCell<HashMap<String, CameraSettings>>,
+    /// Последние валидные `.postprocess`: при ошибке превью сохраняется прежняя постобработка.
+    post_process: RefCell<HashMap<String, PostProcessSettings>>,
     resources: ResourceSystem,
 }
 
@@ -116,6 +121,7 @@ impl OpenProject {
             assets,
             prefabs,
             camera_settings: RefCell::default(),
+            post_process: RefCell::default(),
             resources,
         })
     }
@@ -164,6 +170,72 @@ impl OpenProject {
         Ok(())
     }
 
+    /// Последние валидные настройки `.postprocess`, загруженные редактором.
+    pub fn cached_post_process(&self, path: &str) -> Option<PostProcessSettings> {
+        self.post_process.borrow().get(path).copied()
+    }
+
+    /// Сохраняет `.postprocess` без создания неназначенного файла.
+    pub fn save_post_process(
+        &self,
+        path: &VirtualPath,
+        settings: &PostProcessSettings,
+    ) -> Result<(), String> {
+        if !path.as_str().to_ascii_lowercase().ends_with(".postprocess") {
+            return Err(format!("{path}: ожидается ресурс .postprocess"));
+        }
+        settings.validate().map_err(|error| error.to_string())?;
+        let file = self
+            .assets_dir
+            .resolve(path.as_str())
+            .map_err(|error| format!("{path}: {error}"))?;
+        if !file.is_file() {
+            return Err(format!("{path}: файл постобработки не найден"));
+        }
+        let source = settings.to_toml().map_err(|error| error.to_string())?;
+        std::fs::write(file, source).map_err(|error| format!("{path}: {error}"))?;
+        self.post_process
+            .borrow_mut()
+            .insert(path.as_str().to_owned(), *settings);
+        Ok(())
+    }
+
+    /// Сохраняет правки `.rvephysmat`; файл, которого нет в проекте, не создаётся.
+    pub fn save_physics_material(
+        &self,
+        path: &VirtualPath,
+        settings: &PhysicsMaterialSettings,
+    ) -> Result<(), String> {
+        if !path.as_str().to_ascii_lowercase().ends_with(".rvephysmat") {
+            return Err(format!("{path}: ожидается ресурс .rvephysmat"));
+        }
+        settings.validate().map_err(|error| error.to_string())?;
+        let file = self
+            .assets_dir
+            .resolve(path.as_str())
+            .map_err(|error| format!("{path}: {error}"))?;
+        if !file.is_file() {
+            return Err(format!("{path}: файл физического материала не найден"));
+        }
+        let source = settings.to_toml().map_err(|error| error.to_string())?;
+        std::fs::write(file, source).map_err(|error| format!("{path}: {error}"))
+    }
+
+    /// Создаёт `.rvephysmat` со значениями по умолчанию в папке `folder`; возвращает его путь.
+    pub fn create_physics_material(&self, folder: &str, name: &str) -> Result<String, String> {
+        let name = if name.to_ascii_lowercase().ends_with(".rvephysmat") {
+            name.to_owned()
+        } else {
+            format!("{name}.rvephysmat")
+        };
+        let source = PhysicsMaterialSettings::default()
+            .to_toml()
+            .map_err(|error| error.to_string())?;
+        self.assets_dir
+            .create_file(folder, &name, &source)
+            .map_err(|error| format!("{name}: {error}"))
+    }
+
     /// Загрузчик префабов проекта для [`crate::scene_edit::EditorScene`].
     pub fn prefab_loader(&self) -> PrefabLoader {
         let cache = Rc::clone(&self.prefabs);
@@ -193,11 +265,22 @@ impl OpenProject {
         self.prefabs.restore(previous);
     }
 
-    /// Загружает общие `.camerasettings` файлы и назначает их камерам мира.
+    /// Загружает `.rvephysmat` коллайдеров мира для Play. Ошибка чтения или разбора прерывает
+    /// запуск, как и ошибка `.camerasettings`.
+    pub fn apply_physics_materials(&self, world: &mut World) -> Result<(), String> {
+        world
+            .resolve_physics_materials(&mut |path: &VirtualPath| self.read_text(path.as_str()))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Загружает общие `.camerasettings` и `.postprocess` файлы и назначает их камерам мира.
+    ///
+    /// Постобработка каждой камеры разрешается по тем же правилам, что и в runtime: файл побеждает,
+    /// без него действует устаревший блок `[color]`.
     pub fn apply_camera_settings(&self, world: &mut World) -> Result<(), String> {
         let cameras = camera_paths(world);
         let mut settings_by_path = BTreeMap::new();
-        for (_, path) in &cameras {
+        for path in cameras.iter().filter_map(|camera| camera.settings.as_ref()) {
             if !settings_by_path.contains_key(path) {
                 let source = self.read_text(path)?;
                 let settings =
@@ -205,21 +288,52 @@ impl OpenProject {
                 settings_by_path.insert(path.clone(), settings);
             }
         }
-        for (handle, path) in cameras {
+        let mut post_by_path = BTreeMap::new();
+        for path in cameras
+            .iter()
+            .filter_map(|camera| camera.post_process.as_ref())
+        {
+            if !post_by_path.contains_key(path) {
+                let source = self.read_text(path)?;
+                let settings =
+                    PostProcessSettings::parse(path, &source).map_err(|error| error.to_string())?;
+                post_by_path.insert(path.clone(), settings);
+            }
+        }
+        for camera in &cameras {
+            if let Some(path) = &camera.settings {
+                world
+                    .set_camera_settings(camera.handle, settings_by_path[path])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        for camera in &cameras {
+            let settings = world
+                .camera_settings(camera.handle)
+                .copied()
+                .unwrap_or_default();
+            let post = camera.post_process.as_ref().map(|path| post_by_path[path]);
             world
-                .set_camera_settings(handle, settings_by_path[&path])
+                .set_post_process(
+                    camera.handle,
+                    resolve_post_process(&settings, post.as_ref()),
+                )
                 .map_err(|error| error.to_string())?;
         }
         self.camera_settings.borrow_mut().extend(settings_by_path);
+        self.post_process.borrow_mut().extend(post_by_path);
         Ok(())
     }
 
-    /// Применяет последние валидные настройки камер для мира редактора.
+    /// Применяет последние валидные настройки камер и постобработки для мира редактора.
+    ///
+    /// Ошибка разбора файла возвращается в списке, а камера сохраняет прежние значения.
     pub fn apply_camera_settings_preview(&self, world: &mut World) -> Vec<String> {
         let cameras = camera_paths(world);
         let mut settings_by_path = BTreeMap::new();
+        let mut post_by_path = BTreeMap::new();
         let mut errors = Vec::new();
-        for (_, path) in &cameras {
+        for path in cameras.iter().filter_map(|camera| camera.settings.as_ref()) {
             if settings_by_path.contains_key(path) {
                 continue;
             }
@@ -241,10 +355,46 @@ impl OpenProject {
                 }
             }
         }
-        for (handle, path) in cameras {
-            if let Some(settings) = settings_by_path.get(&path) {
-                let _ = world.set_camera_settings(handle, *settings);
+        for path in cameras
+            .iter()
+            .filter_map(|camera| camera.post_process.as_ref())
+        {
+            if post_by_path.contains_key(path) {
+                continue;
             }
+            let settings = self.read_text(path).and_then(|source| {
+                PostProcessSettings::parse(path, &source).map_err(|error| error.to_string())
+            });
+            match settings {
+                Ok(settings) => {
+                    post_by_path.insert(path.clone(), settings);
+                    self.post_process
+                        .borrow_mut()
+                        .insert(path.clone(), settings);
+                }
+                Err(error) => {
+                    errors.push(error);
+                    if let Some(settings) = self.post_process.borrow().get(path).copied() {
+                        post_by_path.insert(path.clone(), settings);
+                    }
+                }
+            }
+        }
+        for camera in &cameras {
+            if let Some(path) = &camera.settings
+                && let Some(settings) = settings_by_path.get(path)
+            {
+                let _ = world.set_camera_settings(camera.handle, *settings);
+            }
+            let settings = world
+                .camera_settings(camera.handle)
+                .copied()
+                .unwrap_or_default();
+            let post = camera
+                .post_process
+                .as_ref()
+                .and_then(|path| post_by_path.get(path));
+            let _ = world.set_post_process(camera.handle, resolve_post_process(&settings, post));
         }
         errors
     }
@@ -270,21 +420,30 @@ pub fn read_resource_text(handle: &ResourceHandle, path: &str) -> Result<String,
     String::from_utf8(bytes).map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))
 }
 
-fn camera_paths(world: &World) -> Vec<(ObjectHandle, String)> {
+/// Пути файлов одной камеры мира.
+struct CameraPaths {
+    handle: ObjectHandle,
+    settings: Option<String>,
+    post_process: Option<String>,
+}
+
+fn camera_paths(world: &World) -> Vec<CameraPaths> {
     world
         .objects()
         .iter()
         .filter_map(|object| {
-            Some((
-                object.handle,
-                object
-                    .camera
-                    .as_ref()?
+            let camera = object.camera.as_ref()?;
+            Some(CameraPaths {
+                handle: object.handle,
+                settings: camera
                     .settings
-                    .as_ref()?
-                    .as_str()
-                    .to_owned(),
-            ))
+                    .as_ref()
+                    .map(|path| path.as_str().to_owned()),
+                post_process: camera
+                    .post_process
+                    .as_ref()
+                    .map(|path| path.as_str().to_owned()),
+            })
         })
         .collect()
 }
@@ -494,6 +653,24 @@ mod tests {
     }
 
     #[test]
+    fn demo_main_scene_applies_its_postprocess_asset() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/demo-game");
+        let project = OpenProject::open(Path::new(dir)).unwrap();
+        let path = "scenes/main.rvescene";
+        let source = project.read_text(path).unwrap();
+        let document = SceneDocument::parse(path, &source).unwrap();
+        let loader = project.prefab_loader();
+        let expanded = engine_scene::expand(&document, &mut |prefab| loader(prefab))
+            .unwrap()
+            .document;
+        let mut world = World::from_document(&expanded).unwrap();
+        project.apply_camera_settings(&mut world).unwrap();
+        let post = *world.post_process(world.active_camera()).unwrap();
+        assert!(post.bloom.enabled);
+        assert!(post.ambient_occlusion.enabled);
+    }
+
+    #[test]
     fn camera_settings_asset_is_loaded_into_the_editor_world() {
         let temp = TempProject::new(Some(SETTINGS), true);
         fs::create_dir_all(temp.0.join("Assets/cameras")).unwrap();
@@ -569,6 +746,62 @@ mod tests {
         let restored = project.prefab_loader()(&path).unwrap();
         assert_eq!(restored.objects[0].id, "old");
         assert_eq!(scene.view().objects.len(), 3);
+    }
+
+    #[test]
+    fn physics_material_asset_is_created_loaded_and_saved_with_validation() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        let project = OpenProject::open(&temp.0).unwrap();
+        let created = project.create_physics_material("", "ice").unwrap();
+        assert_eq!(created, "ice.rvephysmat");
+        assert!(project.create_physics_material("", "ice").is_err());
+
+        let path = VirtualPath::parse("ice.rvephysmat").unwrap();
+        let mut settings = PhysicsMaterialSettings {
+            static_friction: 0.05,
+            friction_combine: engine_scene::CombineMode::Multiply,
+            ..PhysicsMaterialSettings::default()
+        };
+        project.save_physics_material(&path, &settings).unwrap();
+        let saved = PhysicsMaterialSettings::parse(
+            path.to_string(),
+            &fs::read_to_string(temp.0.join("Assets/ice.rvephysmat")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved, settings);
+
+        settings.bounciness = 2.0;
+        assert!(project.save_physics_material(&path, &settings).is_err());
+        let missing = VirtualPath::parse("missing.rvephysmat").unwrap();
+        assert!(
+            project
+                .save_physics_material(&missing, &PhysicsMaterialSettings::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn collider_physics_material_is_loaded_into_the_editor_world() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        fs::create_dir_all(temp.0.join("Assets/materials")).unwrap();
+        fs::write(
+            temp.0.join("Assets/materials/ice.rvephysmat"),
+            "static_friction = 0.05\nbounciness = 0.9\n",
+        )
+        .unwrap();
+        let source = "[[assets]]\npath = \"/materials/ice.rvephysmat\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\nmaterial = \"/materials/ice.rvephysmat\"\n";
+        let document = SceneDocument::parse("scene.rvescene", source).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let project = OpenProject::open(&temp.0).unwrap();
+        project.apply_physics_materials(&mut world).unwrap();
+
+        let collider = world
+            .object_by_id("ball")
+            .unwrap()
+            .collider
+            .as_ref()
+            .unwrap();
+        assert_eq!(collider.resolved_material.unwrap().static_friction, 0.05);
     }
 
     #[test]

@@ -447,6 +447,7 @@ fn run_from_args(
             } else {
                 project.runtime.background_tick_hz
             },
+            gamepad_devices: !headless,
             control_tx: script_tx.clone(),
             control_rx: script_rx,
             frame_tx,

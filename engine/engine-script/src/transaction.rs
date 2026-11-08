@@ -6,7 +6,9 @@ use crate::lifecycle::{
 use crate::lite::EventQueue;
 use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
 use crate::physics::PhysicsScriptState;
-use crate::types::{ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
+use crate::types::{
+    RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
+};
 use engine_physics::{
     BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
     QueryHit, Ray,
@@ -14,7 +16,7 @@ use engine_physics::{
 use engine_scene::{
     AnimationRequest, AudioRequest, CameraSettings, LocalTransform, MAX_MESSAGE_DEPTH,
     MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetMode, NetRequest, NetTarget, ObjectHandle,
-    ParamValue, PeerId, SERVER_PEER_ID, World,
+    ParamValue, PeerId, PostProcessSettings, SERVER_PEER_ID, World,
 };
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
@@ -27,6 +29,8 @@ pub(crate) const MAX_MESSAGES_PER_FRAME: usize = 4096;
 pub(crate) const MAX_AUDIO_REQUESTS_PER_FRAME: usize = 256;
 /// Запросов аниматора за кадр, включая уже зафиксированные скриптами.
 pub(crate) const MAX_ANIMATION_REQUESTS_PER_FRAME: usize = 256;
+/// Запросов вибрации за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
+pub(crate) const MAX_RUMBLE_REQUESTS_PER_FRAME: usize = 256;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_NAME_BYTES: usize = 256;
 pub(crate) const MAX_MESSAGE_TARGET_ID_BYTES: usize = 256;
@@ -133,6 +137,8 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) queued_messages: (usize, usize),
     /// Звуковые запросы, уже зафиксированные в этом кадре.
     pub(crate) queued_audio: usize,
+    /// Запросы вибрации, уже зафиксированные в этом кадре.
+    pub(crate) queued_rumble: usize,
     pub(crate) queued_animation: usize,
     pub(crate) physics: Rc<RefCell<PhysicsScriptState>>,
     pub(crate) physics_phase_dt: Option<f32>,
@@ -179,6 +185,7 @@ pub(crate) struct ScriptTransaction {
     source: String,
     pending_transforms: HashMap<ObjectHandle, LocalTransform>,
     pending_camera_settings: HashMap<ObjectHandle, CameraSettings>,
+    pending_post_process: HashMap<ObjectHandle, PostProcessSettings>,
     pending_active_camera: Option<ObjectHandle>,
     pending_messages: Vec<PendingMessage>,
     pending_warnings: Vec<String>,
@@ -186,6 +193,7 @@ pub(crate) struct ScriptTransaction {
     queued_message_count: usize,
     queued_message_bytes: usize,
     queued_audio: usize,
+    queued_rumble: usize,
     queued_animation: usize,
     overflowed_messages: usize,
     action_frame: Option<Arc<ActionFrame>>,
@@ -201,6 +209,7 @@ pub(crate) struct ScriptTransaction {
     pending_cursor_visible: Option<bool>,
     pending_cursor_locked: Option<bool>,
     pending_audio: Vec<AudioRequest>,
+    pending_rumble: Vec<RumbleRequest>,
     pending_animation: Vec<AnimationRequest>,
     net: Rc<RefCell<NetScriptState>>,
     queued_net: usize,
@@ -236,6 +245,7 @@ impl Default for ScriptTransaction {
             source: String::new(),
             pending_transforms: HashMap::with_capacity(8),
             pending_camera_settings: HashMap::with_capacity(2),
+            pending_post_process: HashMap::with_capacity(2),
             pending_active_camera: None,
             pending_messages: Vec::with_capacity(16),
             pending_warnings: Vec::new(),
@@ -243,6 +253,7 @@ impl Default for ScriptTransaction {
             queued_message_count: 0,
             queued_message_bytes: 0,
             queued_audio: 0,
+            queued_rumble: 0,
             queued_animation: 0,
             overflowed_messages: 0,
             action_frame: None,
@@ -257,6 +268,7 @@ impl Default for ScriptTransaction {
             pending_cursor_visible: None,
             pending_cursor_locked: None,
             pending_audio: Vec::new(),
+            pending_rumble: Vec::new(),
             pending_animation: Vec::new(),
             net: Rc::new(RefCell::new(NetScriptState::default())),
             queued_net: 0,
@@ -294,6 +306,7 @@ impl ScriptTransaction {
         self.source.push_str(init.source);
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
+        self.pending_post_process.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
         self.pending_warnings.clear();
@@ -305,6 +318,7 @@ impl ScriptTransaction {
         self.queued_message_count = init.queued_messages.0;
         self.queued_message_bytes = init.queued_messages.1;
         self.queued_audio = init.queued_audio;
+        self.queued_rumble = init.queued_rumble;
         self.queued_animation = init.queued_animation;
         self.overflowed_messages = 0;
         self.pending_action_mutations.clear();
@@ -312,6 +326,7 @@ impl ScriptTransaction {
         self.pending_cursor_visible = None;
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
+        self.pending_rumble.clear();
         self.pending_animation.clear();
         self.net = init.net;
         self.queued_net = init.queued_net;
@@ -405,6 +420,22 @@ impl ScriptTransaction {
             ));
         }
         self.pending_audio.push(request);
+        Ok(())
+    }
+
+    /// Ставит запрос вибрации до коммита. Как и звук, он отбрасывается вместе с отказавшим вызовом.
+    pub(crate) fn stage_rumble(&mut self, request: RumbleRequest) -> Result<(), String> {
+        if !self.writable {
+            return Err("rumble is unavailable during script creation".to_owned());
+        }
+        if self.queued_rumble.saturating_add(self.pending_rumble.len())
+            >= MAX_RUMBLE_REQUESTS_PER_FRAME
+        {
+            return Err(format!(
+                "rumble requests limit ({MAX_RUMBLE_REQUESTS_PER_FRAME} per frame) reached"
+            ));
+        }
+        self.pending_rumble.push(request);
         Ok(())
     }
 
@@ -1054,16 +1085,65 @@ impl ScriptTransaction {
         handle: ObjectHandle,
         settings: CameraSettings,
     ) -> bool {
-        if !self.writable
-            || self
-                .world()
-                .and_then(|world| world.object(handle))
-                .is_none_or(|object| object.camera.is_none())
-        {
+        if !self.writable || !self.is_camera(handle) {
             return false;
+        }
+        // Устаревший блок [color] — прокси к эффективной постобработке камеры. Изменение
+        // сравнивается с текущим эффективным значением (с учётом уже поставленной в очередь
+        // копии), поэтому запись без изменений не затирает `.postprocess`, а порядок вызовов с
+        // set_post_process сохраняется: обе операции обновляют одну и ту же очередь.
+        if let Some(color) = settings.color
+            && let Some(mut post) = self.post_process(handle)
+        {
+            let exposure_changed = color.exposure_ev != post.exposure.ev;
+            let tonemapper_changed = color.tonemapper != post.tonemapping.tonemapper;
+            if exposure_changed || tonemapper_changed {
+                if exposure_changed {
+                    post.exposure.ev = color.exposure_ev;
+                }
+                if tonemapper_changed {
+                    post.tonemapping.tonemapper = color.tonemapper;
+                }
+                self.pending_post_process.insert(handle, post);
+            }
         }
         self.pending_camera_settings.insert(handle, settings);
         true
+    }
+
+    /// Постобработка камеры с учётом уже поставленных в очередь изменений.
+    pub(crate) fn post_process(&self, handle: ObjectHandle) -> Option<PostProcessSettings> {
+        self.pending_post_process
+            .get(&handle)
+            .copied()
+            .or_else(|| self.world()?.post_process(handle).copied())
+    }
+
+    pub(crate) fn set_post_process(
+        &mut self,
+        handle: ObjectHandle,
+        settings: PostProcessSettings,
+    ) -> bool {
+        if !self.writable || !self.is_camera(handle) {
+            return false;
+        }
+        self.pending_post_process.insert(handle, settings);
+        true
+    }
+
+    pub(crate) fn set_post_process_from_abi(
+        &mut self,
+        handle: u64,
+        settings: PostProcessSettings,
+    ) -> bool {
+        self.object_from_abi_handle(handle)
+            .is_some_and(|handle| self.set_post_process(handle, settings))
+    }
+
+    fn is_camera(&self, handle: ObjectHandle) -> bool {
+        self.world()
+            .and_then(|world| world.object(handle))
+            .is_some_and(|object| object.camera.is_some())
     }
 
     pub(crate) fn active_camera(&self) -> Option<ObjectHandle> {
@@ -1222,6 +1302,7 @@ impl ScriptTransaction {
         audio: &mut Vec<AudioRequest>,
         animation: &mut Vec<AnimationRequest>,
         net: &mut Vec<NetRequest>,
+        rumble: &mut Vec<RumbleRequest>,
     ) -> Result<Vec<ActionMutation>, String> {
         let transforms_are_finite = self.pending_transforms.values().all(|transform| {
             transform
@@ -1274,6 +1355,27 @@ impl ScriptTransaction {
             self.discard();
             return Err("script wrote camera settings for an object without a camera".to_owned());
         }
+        if let Some(error) = self
+            .pending_post_process
+            .values()
+            .find_map(|settings| settings.validate().err())
+        {
+            self.discard();
+            return Err(format!(
+                "script produced invalid post process settings: {error}"
+            ));
+        }
+        let post_process_target_valid = self.pending_post_process.keys().all(|handle| {
+            world
+                .object(*handle)
+                .is_some_and(|object| object.camera.is_some())
+        });
+        if !post_process_target_valid {
+            self.discard();
+            return Err(
+                "script wrote post process settings for an object without a camera".to_owned(),
+            );
+        }
         if !active_camera_target_valid {
             self.discard();
             return Err("script selected an object without a camera as active".to_owned());
@@ -1322,6 +1424,11 @@ impl ScriptTransaction {
                 .set_camera_settings(handle, settings)
                 .expect("validated camera settings target remains present during commit");
         }
+        for (handle, settings) in self.pending_post_process.drain() {
+            world
+                .set_post_process(handle, settings)
+                .expect("validated post process target remains present during commit");
+        }
         if let Some(handle) = self.pending_active_camera.take() {
             world
                 .set_active_camera(handle)
@@ -1369,6 +1476,7 @@ impl ScriptTransaction {
         audio.append(&mut self.pending_audio);
         animation.append(&mut self.pending_animation);
         net.append(&mut self.pending_net);
+        rumble.append(&mut self.pending_rumble);
         self.world = std::ptr::null();
         self.action_frame = None;
         Ok(std::mem::take(&mut self.pending_action_mutations))
@@ -1421,6 +1529,7 @@ impl ScriptTransaction {
         self.pending_dead_warnings.clear();
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
+        self.pending_post_process.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
         self.pending_warnings.clear();
@@ -1436,6 +1545,7 @@ impl ScriptTransaction {
         self.pending_cursor_visible = None;
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
+        self.pending_rumble.clear();
         self.pending_animation.clear();
         self.pending_net.clear();
         self.world = std::ptr::null();

@@ -4,7 +4,7 @@ use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
-use crate::play::{PlayPrefabs, PlaySession};
+use crate::play::{PlayPrefabs, PlaySession, editor_gamepads, gamepad_tuning};
 use crate::play_cursor;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
@@ -42,6 +42,8 @@ const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
 const PREVIEW_POLL: Duration = Duration::from_millis(30);
 /// Как часто забирать вывод идущей сборки.
 const BUILD_POLL: Duration = Duration::from_millis(50);
+/// Как часто дренировать очередь геймпадов вне Play: без этого события копятся до следующего Play.
+const IDLE_GAMEPAD_POLL: Duration = Duration::from_secs(1);
 
 pub struct EditorApp {
     state: EditorState,
@@ -383,13 +385,11 @@ impl EditorApp {
 
         let camera_settings_changed = changes.rescan
             || changes.camera_settings_paths().next().is_some()
+            || changes.post_process_paths().next().is_some()
             || self.state.scene.as_ref().is_some_and(|scene| {
                 scene.view().assets.iter().any(|asset| {
-                    asset
-                        .path
-                        .as_str()
-                        .to_ascii_lowercase()
-                        .ends_with(".camerasettings")
+                    let lower = asset.path.as_str().to_ascii_lowercase();
+                    (lower.ends_with(".camerasettings") || lower.ends_with(".postprocess"))
                         && changes.contains_path_or_parent(&asset.path)
                 })
             });
@@ -1006,10 +1006,13 @@ impl EditorApp {
             }
         };
         let network_summary = network.as_ref().map(|plan| plan.summary.clone());
+        let tuning = gamepad_tuning(&project.settings.input.gamepad);
+        editor_gamepads(&mut self.state.gamepads, tuning).begin_session(tuning);
         let result: Result<PlaySession, String> = (|| {
             let mut world =
                 World::from_document(scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
+            project.apply_physics_materials(&mut world)?;
             let model_geometry =
                 PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
             let animation = crate::viewport::animation::project_bridge(&world, &project.assets);
@@ -1071,6 +1074,7 @@ impl EditorApp {
     fn stop_play(&mut self) {
         self.state.pending_play = false;
         if let Some(session) = self.state.play.take() {
+            self.state.end_play_gamepads();
             let events = session.stop();
             self.state.log.push_script_events(events);
             self.state.log.info("Stop");
@@ -1302,7 +1306,13 @@ impl EditorApp {
         if let Some(latency) = self.latency.as_ref() {
             latency.marker(frame_id, LatencyMarker::InputSample);
         }
-        let play_error = self.state.play.as_mut().and_then(|play| play.tick().err());
+        let pads_accepted = self.window_focused && !self.state.console_open;
+        let play_error = self.state.play.as_mut().and_then(|play| {
+            if let Some(gamepads) = self.state.gamepads.as_mut() {
+                play.poll_gamepads(gamepads, pads_accepted);
+            }
+            play.tick().err()
+        });
         if play_error.is_none()
             && let Some(play) = self.state.play.as_ref()
             && !play.is_paused()
@@ -1312,6 +1322,7 @@ impl EditorApp {
         if let Some(error) = play_error {
             self.state.log.error(error);
             if let Some(session) = self.state.play.take() {
+                self.state.end_play_gamepads();
                 self.state.log.push_script_events(session.stop());
                 self.state.log.info("Stop");
             }
@@ -1549,7 +1560,15 @@ fn render_scene_frame(
     let pending_frame = state.pending_frame.take();
     // Модель ещё разбирается в фоне: наведение камеры ждёт её готовности.
     let mut still_loading = None;
-    let (scene_frame, game_camera, game_settings, game_camera_handle, has_light, frame_target) = {
+    let (
+        scene_frame,
+        game_camera,
+        game_settings,
+        game_post,
+        game_camera_handle,
+        has_light,
+        frame_target,
+    ) = {
         let Some(mut parts) = state.frame_parts() else {
             return render_ui_only(&mut gpu.renderer, ui, &[]);
         };
@@ -1582,6 +1601,11 @@ fn render_scene_frame(
             .camera_settings(game_camera_handle)
             .copied()
             .unwrap_or_default();
+        let game_post = parts
+            .world
+            .post_process(game_camera_handle)
+            .copied()
+            .unwrap_or_default();
         let has_light = parts
             .world
             .objects()
@@ -1605,6 +1629,7 @@ fn render_scene_frame(
             scene_frame,
             game_camera,
             game_settings,
+            game_post,
             game_camera_handle,
             has_light,
             frame_target,
@@ -1625,6 +1650,11 @@ fn render_scene_frame(
         scene_frame.view
     } else {
         CameraSettings::default()
+    };
+    let scene_post = if playing {
+        scene_frame.post_process
+    } else {
+        engine_scene::PostProcessSettings::default()
     };
     let Some(parts) = state.frame_parts() else {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
@@ -1666,6 +1696,7 @@ fn render_scene_frame(
             width,
             height,
             scene_settings,
+            scene_post,
             &scene_frame.light,
             &local_lights,
             &local_light_shadows,
@@ -1683,6 +1714,7 @@ fn render_scene_frame(
             width,
             height,
             game_settings,
+            game_post,
             &scene_frame.light,
             &local_lights,
             &local_light_shadows,
@@ -1898,6 +1930,12 @@ impl WindowHandler for EditorApp {
             self.apply_asset_changes(changes);
             window.request_redraw();
         }
+        // Вне Play очередь геймпадов дренируется без доставки в скрипты; в Play опрос идёт в кадре.
+        if self.state.play.is_none()
+            && let Some(gamepads) = self.state.gamepads.as_mut()
+        {
+            gamepads.discard_events();
+        }
         if self.exit {
             return false;
         }
@@ -1931,11 +1969,14 @@ impl WindowHandler for EditorApp {
             .scripts_job
             .is_some()
             .then(|| Instant::now() + BUILD_POLL);
+        let idle_pads = (self.state.play.is_none() && self.state.gamepads.is_some())
+            .then(|| Instant::now() + IDLE_GAMEPAD_POLL);
         [
             self.repaint_at,
             preview,
             build,
             scripts,
+            idle_pads,
             self.autosave_deadline(),
             self.asset_changes.deadline(),
         ]

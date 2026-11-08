@@ -21,6 +21,7 @@ use crate::viewport::model_loader::ModelLoader;
 use engine_animation::AnimationBridge;
 use engine_assets::Model;
 use engine_files::VirtualPath;
+use engine_input::GilrsBackend;
 use engine_render::DebugView;
 use engine_scene::{AntiAliasing, CameraSettings, World};
 use engine_script::{ParamSchema, ScriptInterruptHandle, ScriptLibrary};
@@ -165,6 +166,8 @@ pub struct EditorState {
     pub smart_zoom: bool,
     pub gizmo_drag: Option<GizmoDrag>,
     pub play: Option<PlaySession>,
+    /// The editor's gamepad backend, created by the first Play and kept across Play sessions.
+    pub gamepads: Option<GilrsBackend>,
     pub scripts_path: Option<PathBuf>,
     /// Недавние проекты из настроек пользователя, последний открытый — первым.
     pub recent_projects: Vec<PathBuf>,
@@ -183,6 +186,8 @@ pub struct EditorState {
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
+    /// `.rvephysmat`, открытый панелью полей Project.
+    pub physics_material_edit: Option<crate::ui::project_panel::PhysicsMaterialEdit>,
     pub new_project_dialog: Option<crate::new_project::NewProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
     /// Текстовому полю переименования ещё нужно передать фокус; снимается после первого запроса.
@@ -252,6 +257,7 @@ impl EditorState {
             smart_zoom: false,
             gizmo_drag: None,
             play: None,
+            gamepads: None,
             scripts_path,
             recent_projects: Vec::new(),
             library: None,
@@ -265,6 +271,7 @@ impl EditorState {
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_dialog: None,
+            physics_material_edit: None,
             new_project_dialog: None,
             hierarchy_rename: None,
             hierarchy_rename_focus: false,
@@ -313,6 +320,14 @@ impl EditorState {
         self.gizmo_drag = None;
         self.hierarchy_rename = None;
         self.hierarchy_rename_focus = false;
+    }
+
+    /// Конец Play-сессии для геймпадов: вибрация останавливается, пады читаются как отпущенные.
+    /// Сам backend остаётся открытым для следующей сессии.
+    pub fn end_play_gamepads(&mut self) {
+        if let Some(gamepads) = self.gamepads.as_mut() {
+            gamepads.end_session();
+        }
     }
 
     /// Курсор над изображением сцены: ввод Play-режима относится к игре.
@@ -404,6 +419,49 @@ impl EditorState {
             animation_status: &mut self.animation_status,
             selected,
         })
+    }
+
+    /// Сохраняет правку `.postprocess` и обновляет все камеры, которые используют этот файл.
+    pub fn save_post_process(
+        &mut self,
+        path: &engine_files::VirtualPath,
+        settings: engine_scene::PostProcessSettings,
+    ) -> bool {
+        if self.is_playing() {
+            return false;
+        }
+        let Some(project) = self.project.as_ref() else {
+            self.log.error("проект не открыт");
+            return false;
+        };
+        if let Err(error) = project.save_post_process(path, &settings) {
+            self.log.error(error);
+            return false;
+        }
+        let handles = self
+            .world_mut()
+            .map(|world| {
+                world
+                    .objects()
+                    .iter()
+                    .filter(|object| {
+                        object
+                            .camera
+                            .as_ref()
+                            .and_then(|camera| camera.post_process.as_ref())
+                            == Some(path)
+                    })
+                    .map(|object| object.handle)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(world) = self.world_mut() {
+            for handle in handles {
+                let _ = world.set_post_process(handle, settings);
+            }
+        }
+        self.log.info(format!("Сохранена постобработка {path}"));
+        true
     }
 
     pub fn camera_settings_for(&mut self, id: &str) -> Option<CameraSettings> {

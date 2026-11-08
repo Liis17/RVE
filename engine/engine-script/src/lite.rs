@@ -5,16 +5,18 @@ use crate::transaction::{
     ScriptTransaction,
 };
 use crate::types::{
-    ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
+    RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
+    ScriptTransform,
 };
 use engine_console::CommandSpec;
 use engine_files::VirtualPath;
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
-    AnimationRequest, AntiAliasing, AudioGroup, AudioRequest, CameraSettings, ClipParams, NetEvent,
-    NetMode, NetTarget, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue, PeerId,
-    Tonemapper, VoiceId,
+    AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AudioGroup, AudioRequest,
+    CameraSettings, ClipParams, ExposureMode, NetEvent, NetMode, NetTarget, ObjectHandle,
+    ParamKind, ParamSchema, ParamSpec, ParamValue, PeerId, PostProcessSettings, Tonemapper,
+    VoiceId,
 };
 use glam::Vec3;
 use mlua::chunk::ChunkMode;
@@ -22,8 +24,8 @@ use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, RegistryKey,
     StdLib, Table, UserData, UserDataFields, Value, VmState,
 };
-use rve_sdk::abi::RVE_INPUT_MAX_BINDINGS;
-use rve_sdk::{Key, MouseButton, PhysicalInput};
+use rve_sdk::abi::{RVE_GAMEPAD_SLOTS, RVE_INPUT_MAX_BINDINGS, RveGamepadState};
+use rve_sdk::{GamepadAxis, GamepadButton, Key, MouseButton, PhysicalInput};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1068,10 +1070,14 @@ fn object_table(
                 return Ok(Value::Nil);
             }
             let settings = with_active_call(&camera_settings_active, |transaction| {
-                Ok(transaction.camera_settings(handle))
+                Ok(transaction
+                    .camera_settings(handle)
+                    .zip(transaction.post_process(handle)))
             })?;
             match settings {
-                Some(settings) => Ok(Value::Table(camera_settings_table(lua, settings)?)),
+                Some((settings, post)) => {
+                    Ok(Value::Table(camera_settings_table(lua, settings, post)?))
+                }
                 None => Ok(Value::Nil),
             }
         })?,
@@ -1116,6 +1122,69 @@ fn object_table(
             apply_camera_settings_table(&settings_table, &mut settings)?;
             let accepted = with_active_call(&set_camera_settings_active, |transaction| {
                 Ok(transaction.set_camera_settings(handle, settings))
+            })?;
+            Ok(accepted)
+        })?,
+    )?;
+
+    let get_post_process_active = active_call.clone();
+    object.set(
+        "get_post_process",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            if !object_alive(&get_post_process_active, handle)? {
+                return Ok(Value::Nil);
+            }
+            let settings = with_active_call(&get_post_process_active, |transaction| {
+                Ok(transaction.post_process(handle))
+            })?;
+            match settings {
+                Some(settings) => Ok(Value::Table(post_process_table(lua, settings)?)),
+                None => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    let set_post_process_active = active_call.clone();
+    object.set(
+        "set_post_process",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let mut arguments = arguments.into_iter();
+            let settings_table = match arguments.next() {
+                Some(Value::Table(_)) => arguments.next(),
+                value => value,
+            };
+            let Some(Value::Table(settings_table)) = settings_table else {
+                return Err(LuaError::runtime(
+                    "object.set_post_process expects a partial post process table",
+                ));
+            };
+            if arguments.next().is_some() {
+                return Err(LuaError::runtime(
+                    "object.set_post_process expects one post process table",
+                ));
+            }
+            if !object_alive(&set_post_process_active, handle)? {
+                return Ok(false);
+            }
+            let (writable, current) = with_active_call(&set_post_process_active, |transaction| {
+                Ok((transaction.writable(), transaction.post_process(handle)))
+            })?;
+            let Some(mut settings) = current else {
+                return Err(LuaError::runtime(
+                    "object.set_post_process target object has no camera",
+                ));
+            };
+            if !writable {
+                return Err(LuaError::runtime(
+                    "object.set_post_process is unavailable during script creation",
+                ));
+            }
+            apply_post_process_table(&settings_table, &mut settings)?;
+            settings
+                .validate()
+                .map_err(|error| LuaError::runtime(error.to_string()))?;
+            let accepted = with_active_call(&set_post_process_active, |transaction| {
+                Ok(transaction.set_post_process(handle, settings))
             })?;
             Ok(accepted)
         })?,
@@ -2296,7 +2365,436 @@ fn physics_raycast_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<
     )
 }
 
-fn camera_settings_table(lua: &Lua, settings: CameraSettings) -> mlua::Result<Table> {
+/// Таблица постобработки для `object:get_post_process()`; секции вложены по эффектам.
+fn post_process_table(lua: &Lua, settings: PostProcessSettings) -> mlua::Result<Table> {
+    let result = lua.create_table()?;
+
+    let exposure = lua.create_table()?;
+    exposure.set("enabled", settings.exposure.enabled)?;
+    exposure.set(
+        "mode",
+        match settings.exposure.mode {
+            ExposureMode::Manual => "manual",
+            ExposureMode::Auto => "auto",
+        },
+    )?;
+    exposure.set("ev", settings.exposure.ev as f64)?;
+    exposure.set("min_ev", settings.exposure.min_ev as f64)?;
+    exposure.set("max_ev", settings.exposure.max_ev as f64)?;
+    exposure.set("speed_up", settings.exposure.speed_up as f64)?;
+    exposure.set("speed_down", settings.exposure.speed_down as f64)?;
+    exposure.set("low_percent", settings.exposure.low_percent as f64)?;
+    exposure.set("high_percent", settings.exposure.high_percent as f64)?;
+    result.set("exposure", exposure)?;
+
+    let tonemapping = lua.create_table()?;
+    tonemapping.set("enabled", settings.tonemapping.enabled)?;
+    tonemapping.set(
+        "tonemapper",
+        tonemapper_name(settings.tonemapping.tonemapper),
+    )?;
+    result.set("tonemapping", tonemapping)?;
+
+    let bloom = lua.create_table()?;
+    bloom.set("enabled", settings.bloom.enabled)?;
+    bloom.set("intensity", settings.bloom.intensity as f64)?;
+    bloom.set("threshold", settings.bloom.threshold as f64)?;
+    bloom.set("knee", settings.bloom.knee as f64)?;
+    bloom.set("scatter", settings.bloom.scatter as f64)?;
+    bloom.set("tint", number_array3_table(lua, settings.bloom.tint)?)?;
+    result.set("bloom", bloom)?;
+
+    let ao = lua.create_table()?;
+    ao.set("enabled", settings.ambient_occlusion.enabled)?;
+    ao.set("radius", settings.ambient_occlusion.radius as f64)?;
+    ao.set("intensity", settings.ambient_occlusion.intensity as f64)?;
+    ao.set("falloff", settings.ambient_occlusion.falloff as f64)?;
+    ao.set(
+        "quality",
+        match settings.ambient_occlusion.quality {
+            AmbientOcclusionQuality::Low => "low",
+            AmbientOcclusionQuality::Medium => "medium",
+            AmbientOcclusionQuality::High => "high",
+        },
+    )?;
+    result.set("ambient_occlusion", ao)?;
+
+    let grading = lua.create_table()?;
+    grading.set("enabled", settings.color_grading.enabled)?;
+    grading.set("temperature", settings.color_grading.temperature as f64)?;
+    grading.set("tint", settings.color_grading.tint as f64)?;
+    grading.set("contrast", settings.color_grading.contrast as f64)?;
+    grading.set("saturation", settings.color_grading.saturation as f64)?;
+    grading.set(
+        "lift",
+        number_array3_table(lua, settings.color_grading.lift)?,
+    )?;
+    grading.set(
+        "gamma",
+        number_array3_table(lua, settings.color_grading.gamma)?,
+    )?;
+    grading.set(
+        "gain",
+        number_array3_table(lua, settings.color_grading.gain)?,
+    )?;
+    result.set("color_grading", grading)?;
+
+    let vignette = lua.create_table()?;
+    vignette.set("enabled", settings.vignette.enabled)?;
+    vignette.set("intensity", settings.vignette.intensity as f64)?;
+    vignette.set("smoothness", settings.vignette.smoothness as f64)?;
+    vignette.set("roundness", settings.vignette.roundness as f64)?;
+    vignette.set("color", number_array3_table(lua, settings.vignette.color)?)?;
+    result.set("vignette", vignette)?;
+
+    let aberration = lua.create_table()?;
+    aberration.set("enabled", settings.chromatic_aberration.enabled)?;
+    aberration.set("intensity", settings.chromatic_aberration.intensity as f64)?;
+    result.set("chromatic_aberration", aberration)?;
+
+    let grain = lua.create_table()?;
+    grain.set("enabled", settings.film_grain.enabled)?;
+    grain.set("intensity", settings.film_grain.intensity as f64)?;
+    grain.set("response", settings.film_grain.response as f64)?;
+    result.set("film_grain", grain)?;
+
+    let dof = lua.create_table()?;
+    dof.set("enabled", settings.depth_of_field.enabled)?;
+    dof.set(
+        "focus_distance",
+        settings.depth_of_field.focus_distance as f64,
+    )?;
+    dof.set("aperture", settings.depth_of_field.aperture as f64)?;
+    dof.set(
+        "focal_length_mm",
+        settings.depth_of_field.focal_length_mm as f64,
+    )?;
+    dof.set("max_blur_px", settings.depth_of_field.max_blur_px as f64)?;
+    result.set("depth_of_field", dof)?;
+
+    let motion = lua.create_table()?;
+    motion.set("enabled", settings.motion_blur.enabled)?;
+    motion.set(
+        "shutter_angle_deg",
+        settings.motion_blur.shutter_angle_deg as f64,
+    )?;
+    motion.set("samples", settings.motion_blur.samples)?;
+    motion.set("max_blur_px", settings.motion_blur.max_blur_px as f64)?;
+    result.set("motion_blur", motion)?;
+    Ok(result)
+}
+
+fn tonemapper_name(tonemapper: Tonemapper) -> &'static str {
+    match tonemapper {
+        Tonemapper::Aces => "aces",
+        Tonemapper::Neutral => "neutral",
+        Tonemapper::None => "none",
+    }
+}
+
+fn number_array3_table(lua: &Lua, values: [f32; 3]) -> mlua::Result<Table> {
+    let table = lua.create_table_with_capacity(3, 0)?;
+    for (index, value) in values.into_iter().enumerate() {
+        table.raw_set(index + 1, value as f64)?;
+    }
+    Ok(table)
+}
+
+/// Применяет частичную таблицу постобработки. Неизвестные поля и секции, а также неверные
+/// типы дают ошибку до записи; диапазоны проверяет `validate` при установке.
+fn apply_post_process_table(table: &Table, settings: &mut PostProcessSettings) -> mlua::Result<()> {
+    ensure_known_fields(
+        table,
+        &[
+            "exposure",
+            "tonemapping",
+            "bloom",
+            "ambient_occlusion",
+            "color_grading",
+            "vignette",
+            "chromatic_aberration",
+            "film_grain",
+            "depth_of_field",
+            "motion_blur",
+        ],
+        "post process",
+    )?;
+    if let Some(section) = post_process_section(
+        table,
+        "exposure",
+        &[
+            "enabled",
+            "mode",
+            "ev",
+            "min_ev",
+            "max_ev",
+            "speed_up",
+            "speed_down",
+            "low_percent",
+            "high_percent",
+        ],
+    )? {
+        optional_bool(&section, "enabled", &mut settings.exposure.enabled)?;
+        if let Some(mode) = optional_text(&section, "mode")? {
+            settings.exposure.mode = match mode.as_str() {
+                "manual" => ExposureMode::Manual,
+                "auto" => ExposureMode::Auto,
+                _ => {
+                    return Err(LuaError::runtime(
+                        "exposure.mode must be \"manual\" or \"auto\"",
+                    ));
+                }
+            };
+        }
+        set_optional_number(&section, "ev", &mut settings.exposure.ev)?;
+        set_optional_number(&section, "min_ev", &mut settings.exposure.min_ev)?;
+        set_optional_number(&section, "max_ev", &mut settings.exposure.max_ev)?;
+        set_optional_number(&section, "speed_up", &mut settings.exposure.speed_up)?;
+        set_optional_number(&section, "speed_down", &mut settings.exposure.speed_down)?;
+        set_optional_number(&section, "low_percent", &mut settings.exposure.low_percent)?;
+        set_optional_number(
+            &section,
+            "high_percent",
+            &mut settings.exposure.high_percent,
+        )?;
+    }
+    if let Some(section) = post_process_section(table, "tonemapping", &["enabled", "tonemapper"])? {
+        optional_bool(&section, "enabled", &mut settings.tonemapping.enabled)?;
+        if let Some(name) = optional_text(&section, "tonemapper")? {
+            settings.tonemapping.tonemapper = match name.as_str() {
+                "aces" => Tonemapper::Aces,
+                "neutral" => Tonemapper::Neutral,
+                "none" => Tonemapper::None,
+                _ => {
+                    return Err(LuaError::runtime(
+                        "tonemapping.tonemapper must be \"aces\", \"neutral\", or \"none\"",
+                    ));
+                }
+            };
+        }
+    }
+    if let Some(section) = post_process_section(
+        table,
+        "bloom",
+        &[
+            "enabled",
+            "intensity",
+            "threshold",
+            "knee",
+            "scatter",
+            "tint",
+        ],
+    )? {
+        optional_bool(&section, "enabled", &mut settings.bloom.enabled)?;
+        set_optional_number(&section, "intensity", &mut settings.bloom.intensity)?;
+        set_optional_number(&section, "threshold", &mut settings.bloom.threshold)?;
+        set_optional_number(&section, "knee", &mut settings.bloom.knee)?;
+        set_optional_number(&section, "scatter", &mut settings.bloom.scatter)?;
+        optional_array3(&section, "tint", &mut settings.bloom.tint)?;
+    }
+    if let Some(section) = post_process_section(
+        table,
+        "ambient_occlusion",
+        &["enabled", "radius", "intensity", "falloff", "quality"],
+    )? {
+        optional_bool(&section, "enabled", &mut settings.ambient_occlusion.enabled)?;
+        set_optional_number(&section, "radius", &mut settings.ambient_occlusion.radius)?;
+        set_optional_number(
+            &section,
+            "intensity",
+            &mut settings.ambient_occlusion.intensity,
+        )?;
+        set_optional_number(&section, "falloff", &mut settings.ambient_occlusion.falloff)?;
+        if let Some(quality) = optional_text(&section, "quality")? {
+            settings.ambient_occlusion.quality = match quality.as_str() {
+                "low" => AmbientOcclusionQuality::Low,
+                "medium" => AmbientOcclusionQuality::Medium,
+                "high" => AmbientOcclusionQuality::High,
+                _ => {
+                    return Err(LuaError::runtime(
+                        "ambient_occlusion.quality must be \"low\", \"medium\", or \"high\"",
+                    ));
+                }
+            };
+        }
+    }
+    if let Some(section) = post_process_section(
+        table,
+        "color_grading",
+        &[
+            "enabled",
+            "temperature",
+            "tint",
+            "contrast",
+            "saturation",
+            "lift",
+            "gamma",
+            "gain",
+        ],
+    )? {
+        optional_bool(&section, "enabled", &mut settings.color_grading.enabled)?;
+        set_optional_number(
+            &section,
+            "temperature",
+            &mut settings.color_grading.temperature,
+        )?;
+        set_optional_number(&section, "tint", &mut settings.color_grading.tint)?;
+        set_optional_number(&section, "contrast", &mut settings.color_grading.contrast)?;
+        set_optional_number(
+            &section,
+            "saturation",
+            &mut settings.color_grading.saturation,
+        )?;
+        optional_array3(&section, "lift", &mut settings.color_grading.lift)?;
+        optional_array3(&section, "gamma", &mut settings.color_grading.gamma)?;
+        optional_array3(&section, "gain", &mut settings.color_grading.gain)?;
+    }
+    if let Some(section) = post_process_section(
+        table,
+        "vignette",
+        &["enabled", "intensity", "smoothness", "roundness", "color"],
+    )? {
+        optional_bool(&section, "enabled", &mut settings.vignette.enabled)?;
+        set_optional_number(&section, "intensity", &mut settings.vignette.intensity)?;
+        set_optional_number(&section, "smoothness", &mut settings.vignette.smoothness)?;
+        set_optional_number(&section, "roundness", &mut settings.vignette.roundness)?;
+        optional_array3(&section, "color", &mut settings.vignette.color)?;
+    }
+    if let Some(section) =
+        post_process_section(table, "chromatic_aberration", &["enabled", "intensity"])?
+    {
+        optional_bool(
+            &section,
+            "enabled",
+            &mut settings.chromatic_aberration.enabled,
+        )?;
+        set_optional_number(
+            &section,
+            "intensity",
+            &mut settings.chromatic_aberration.intensity,
+        )?;
+    }
+    if let Some(section) =
+        post_process_section(table, "film_grain", &["enabled", "intensity", "response"])?
+    {
+        optional_bool(&section, "enabled", &mut settings.film_grain.enabled)?;
+        set_optional_number(&section, "intensity", &mut settings.film_grain.intensity)?;
+        set_optional_number(&section, "response", &mut settings.film_grain.response)?;
+    }
+    if let Some(section) = post_process_section(
+        table,
+        "depth_of_field",
+        &[
+            "enabled",
+            "focus_distance",
+            "aperture",
+            "focal_length_mm",
+            "max_blur_px",
+        ],
+    )? {
+        optional_bool(&section, "enabled", &mut settings.depth_of_field.enabled)?;
+        set_optional_number(
+            &section,
+            "focus_distance",
+            &mut settings.depth_of_field.focus_distance,
+        )?;
+        set_optional_number(&section, "aperture", &mut settings.depth_of_field.aperture)?;
+        set_optional_number(
+            &section,
+            "focal_length_mm",
+            &mut settings.depth_of_field.focal_length_mm,
+        )?;
+        set_optional_number(
+            &section,
+            "max_blur_px",
+            &mut settings.depth_of_field.max_blur_px,
+        )?;
+    }
+    if let Some(section) = post_process_section(
+        table,
+        "motion_blur",
+        &["enabled", "shutter_angle_deg", "samples", "max_blur_px"],
+    )? {
+        optional_bool(&section, "enabled", &mut settings.motion_blur.enabled)?;
+        set_optional_number(
+            &section,
+            "shutter_angle_deg",
+            &mut settings.motion_blur.shutter_angle_deg,
+        )?;
+        optional_samples(&section, "samples", &mut settings.motion_blur.samples)?;
+        set_optional_number(
+            &section,
+            "max_blur_px",
+            &mut settings.motion_blur.max_blur_px,
+        )?;
+    }
+    Ok(())
+}
+
+/// Возвращает вложенную секцию с проверкой полей; `nil` означает «не менять».
+fn post_process_section(
+    table: &Table,
+    name: &str,
+    allowed: &[&str],
+) -> mlua::Result<Option<Table>> {
+    match table.get::<Value>(name)? {
+        Value::Nil => Ok(None),
+        Value::Table(section) => {
+            ensure_known_fields(&section, allowed, name)?;
+            Ok(Some(section))
+        }
+        _ => Err(LuaError::runtime(format!(
+            "post process.{name} must be a table"
+        ))),
+    }
+}
+
+fn optional_bool(table: &Table, key: &str, destination: &mut bool) -> mlua::Result<()> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(()),
+        Value::Boolean(value) => {
+            *destination = value;
+            Ok(())
+        }
+        _ => Err(LuaError::runtime(format!("{key} must be a boolean"))),
+    }
+}
+
+fn optional_text(table: &Table, key: &str) -> mlua::Result<Option<String>> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::String(value) => Ok(Some(value.to_str()?.to_owned())),
+        _ => Err(LuaError::runtime(format!("{key} must be a string"))),
+    }
+}
+
+fn optional_array3(table: &Table, key: &str, destination: &mut [f32; 3]) -> mlua::Result<()> {
+    if matches!(table.get::<Value>(key)?, Value::Nil) {
+        return Ok(());
+    }
+    *destination = read_number_array3(table, key)?;
+    Ok(())
+}
+
+fn optional_samples(table: &Table, key: &str, destination: &mut u32) -> mlua::Result<()> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(()),
+        Value::Integer(value) => {
+            *destination = u32::try_from(value)
+                .map_err(|_| LuaError::runtime(format!("{key} must be a non-negative integer")))?;
+            Ok(())
+        }
+        _ => Err(LuaError::runtime(format!("{key} must be an integer"))),
+    }
+}
+
+/// Таблица камеры для `object:get_camera_settings()`. Блок `color` — устаревший прокси: exposure и
+/// tonemapper читаются из эффективной постобработки камеры.
+fn camera_settings_table(
+    lua: &Lua,
+    settings: CameraSettings,
+    post: PostProcessSettings,
+) -> mlua::Result<Table> {
     let result = lua.create_table()?;
     let projection = lua.create_table()?;
     projection.set("fov_deg", settings.projection.fov_deg as f64)?;
@@ -2324,10 +2822,10 @@ fn camera_settings_table(lua: &Lua, settings: CameraSettings) -> mlua::Result<Ta
     result.set("render", render)?;
 
     let color = lua.create_table()?;
-    color.set("exposure_ev", settings.color.exposure_ev as f64)?;
+    color.set("exposure_ev", post.exposure.ev as f64)?;
     color.set(
         "tonemapper",
-        match settings.color.tonemapper {
+        match post.tonemapping.tonemapper {
             Tonemapper::Aces => "aces",
             Tonemapper::Neutral => "neutral",
             Tonemapper::None => "none",
@@ -2384,9 +2882,10 @@ fn apply_camera_settings_table(table: &Table, settings: &mut CameraSettings) -> 
     }
     if let Value::Table(color) = table.get::<Value>("color")? {
         ensure_known_fields(&color, &["exposure_ev", "tonemapper"], "color")?;
-        set_optional_number(&color, "exposure_ev", &mut settings.color.exposure_ev)?;
+        let mut color_settings = settings.color.unwrap_or_default();
+        set_optional_number(&color, "exposure_ev", &mut color_settings.exposure_ev)?;
         if let Value::String(value) = color.get::<Value>("tonemapper")? {
-            settings.color.tonemapper = match value.to_str()?.as_ref() {
+            color_settings.tonemapper = match value.to_str()?.as_ref() {
                 "aces" => Tonemapper::Aces,
                 "neutral" => Tonemapper::Neutral,
                 "none" => Tonemapper::None,
@@ -2399,6 +2898,7 @@ fn apply_camera_settings_table(table: &Table, settings: &mut CameraSettings) -> 
         } else if !matches!(color.get::<Value>("tonemapper")?, Value::Nil) {
             return Err(LuaError::runtime("color.tonemapper must be a string"));
         }
+        settings.color = Some(color_settings);
     } else if !matches!(table.get::<Value>("color")?, Value::Nil) {
         return Err(LuaError::runtime("camera settings.color must be a table"));
     }
@@ -2591,8 +3091,136 @@ fn input_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
         "cursor_visible",
         cursor_visible_function(lua, active_call.clone())?,
     )?;
-    input.set("cursor_locked", cursor_locked_function(lua, active_call)?)?;
+    input.set(
+        "cursor_locked",
+        cursor_locked_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "gamepad_down",
+        gamepad_button_function(
+            lua,
+            active_call.clone(),
+            "rve.input.gamepad_down",
+            |state| state.down,
+        )?,
+    )?;
+    input.set(
+        "gamepad_pressed",
+        gamepad_button_function(
+            lua,
+            active_call.clone(),
+            "rve.input.gamepad_pressed",
+            |state| state.pressed,
+        )?,
+    )?;
+    input.set(
+        "gamepad_released",
+        gamepad_button_function(
+            lua,
+            active_call.clone(),
+            "rve.input.gamepad_released",
+            |state| state.released,
+        )?,
+    )?;
+    input.set(
+        "gamepad_axis",
+        gamepad_axis_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "gamepad_stick",
+        gamepad_stick_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "gamepad_connected",
+        gamepad_connected_function(lua, active_call.clone())?,
+    )?;
+    input.set("gamepad_rumble", gamepad_rumble_function(lua, active_call)?)?;
     Ok(input)
+}
+
+/// Reads an optional Lua pad argument: nil or 0 is every slot, 1..=4 is one slot.
+fn gamepad_pad_arg(pad: Option<i64>, function: &str) -> mlua::Result<u32> {
+    match pad {
+        None => Ok(0),
+        Some(pad) if (0..=4).contains(&pad) => Ok(pad as u32),
+        Some(_) => Err(LuaError::runtime(format!(
+            "{function} pad must be an integer from 0 to 4"
+        ))),
+    }
+}
+
+fn gamepad_button_function(
+    lua: &Lua,
+    active_call: ActiveCall,
+    function: &'static str,
+    field: fn(&RveGamepadState) -> u32,
+) -> mlua::Result<Function> {
+    lua.create_function(move |_, (name, pad): (LuaString, Option<i64>)| {
+        let name = name.to_str()?;
+        let button = GamepadButton::from_name(name.as_ref())
+            .ok_or_else(|| LuaError::runtime(format!("unknown gamepad button {name:?}")))?;
+        let pad = gamepad_pad_arg(pad, function)?;
+        with_active_call(&active_call, |transaction| {
+            let state = transaction.input().gamepad_state(pad).unwrap_or_default();
+            Ok(field(&state) & (1 << button as u32) != 0)
+        })
+    })
+}
+
+fn gamepad_axis_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, (name, pad): (LuaString, Option<i64>)| {
+        let name = name.to_str()?;
+        let axis = GamepadAxis::from_name(name.as_ref())
+            .ok_or_else(|| LuaError::runtime(format!("unknown gamepad axis {name:?}")))?;
+        let pad = gamepad_pad_arg(pad, "rve.input.gamepad_axis")?;
+        with_active_call(&active_call, |transaction| {
+            let state = transaction.input().gamepad_state(pad).unwrap_or_default();
+            Ok(state.axes[axis as usize])
+        })
+    })
+}
+
+fn gamepad_stick_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, (side, pad): (LuaString, Option<i64>)| {
+        let side = side.to_str()?;
+        let (x, y) = match side.as_ref() {
+            "Left" => (GamepadAxis::LeftX, GamepadAxis::LeftY),
+            "Right" => (GamepadAxis::RightX, GamepadAxis::RightY),
+            _ => {
+                return Err(LuaError::runtime(format!(
+                    "unknown gamepad stick {side:?}, expected \"Left\" or \"Right\""
+                )));
+            }
+        };
+        let pad = gamepad_pad_arg(pad, "rve.input.gamepad_stick")?;
+        with_active_call(&active_call, |transaction| {
+            let state = transaction.input().gamepad_state(pad).unwrap_or_default();
+            Ok((state.axes[x as usize], state.axes[y as usize]))
+        })
+    })
+}
+
+fn gamepad_connected_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, pad: Option<i64>| {
+        let pad = gamepad_pad_arg(pad, "rve.input.gamepad_connected")?;
+        with_active_call(&active_call, |transaction| {
+            let state = transaction.input().gamepad_state(pad).unwrap_or_default();
+            Ok(state.connected != 0)
+        })
+    })
+}
+
+fn gamepad_rumble_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(
+        move |_, (strong, weak, seconds, pad): (f32, f32, f32, Option<i64>)| {
+            let pad = gamepad_pad_arg(pad, "rve.input.gamepad_rumble")?;
+            let request = RumbleRequest::new(pad, strong, weak, seconds)
+                .ok_or_else(|| LuaError::runtime("rve.input.gamepad_rumble pad is invalid"))?;
+            with_active_call(&active_call, |transaction| {
+                transaction.stage_rumble(request).map_err(LuaError::runtime)
+            })
+        },
+    )
 }
 
 fn set_cursor_visible_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
@@ -2768,6 +3396,16 @@ fn pressed_inputs_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<F
                 };
                 if transaction.input().mouse_pressed(button) {
                     inputs.push(format!("Mouse.{button:?}"));
+                }
+            }
+            for pad in 1..=RVE_GAMEPAD_SLOTS as u32 {
+                let Some(state) = transaction.input().gamepad_state(pad) else {
+                    continue;
+                };
+                for button in GamepadButton::ALL {
+                    if state.pressed & (1 << button as u32) != 0 {
+                        inputs.push(format!("Gamepad{pad}.{}", button.name()));
+                    }
                 }
             }
             let result = lua.create_table_with_capacity(inputs.len(), 0)?;

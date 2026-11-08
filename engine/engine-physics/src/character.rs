@@ -882,7 +882,8 @@ mod tests {
             Pose::new(Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
             2.0,
         );
-        dynamic.collider.friction = 0.0;
+        dynamic.collider.material.static_friction = 0.0;
+        dynamic.collider.material.dynamic_friction = 0.0;
         let dynamic_handle = world.insert_body(dynamic).unwrap();
         let snapshot = world.query_snapshot().unwrap();
         let result = controller(0.0, 45.0, 0.0)

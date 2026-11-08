@@ -66,6 +66,11 @@ impl AssetChanges {
         self.paths_with_extension("camerasettings")
     }
 
+    /// Файлы постобработки камер; их изменение пересобирает edit-world как `.camerasettings`.
+    pub fn post_process_paths(&self) -> impl Iterator<Item = &VirtualPath> {
+        self.paths_with_extension("postprocess")
+    }
+
     /// Проверяет точное совпадение или событие каталога-родителя.
     pub fn contains_path_or_parent(&self, path: &VirtualPath) -> bool {
         self.paths.iter().any(|changed| {
@@ -534,9 +539,13 @@ mod tests {
         result
             .paths
             .insert(VirtualPath::parse("default.CAMERAsettings").unwrap());
+        result
+            .paths
+            .insert(VirtualPath::parse("look.PostProcess").unwrap());
         assert_eq!(result.fbx_paths().count(), 1);
         assert_eq!(result.png_paths().count(), 1);
         assert_eq!(result.camera_settings_paths().count(), 1);
+        assert_eq!(result.post_process_paths().count(), 1);
     }
 
     #[test]

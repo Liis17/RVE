@@ -237,6 +237,27 @@ impl Script for AudioRejected {
     }
 }
 
+struct RumbleProbe {
+    panic_after: bool,
+}
+
+fn rumble_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(RumbleProbe {
+        panic_after: matches!(params.get("panic_after"), Some(Value::Bool(true))),
+    }))
+}
+
+impl Script for RumbleProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let input = ctx.input();
+        let accepted = (0..300).filter(|_| input.rumble(1, 0.5, 0.25, 0.1)).count();
+        ctx.log_info(format!("rumble accepted {accepted}"));
+        if self.panic_after {
+            panic!("rumble panic");
+        }
+    }
+}
+
 fn input_actions_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(InputActionsProbe(0)))
 }
@@ -744,6 +765,7 @@ fn sdk_module() -> &'static RveModule {
         "PhysicsProbe" => physics_probe_factory,
         "AudioProbe" => audio_probe_factory,
         "AudioRejected" => audio_rejected_factory,
+        "RumbleProbe" => rumble_probe_factory,
         "InputActionsProbe" => input_actions_probe_factory,
         "SpawnDriver" => spawn_driver_factory,
         "BoltProbe" => bolt_probe_factory,
@@ -766,6 +788,7 @@ fn library() -> crate::ScriptLibrary {
 
 fn input_action_settings() -> InputSettings {
     InputSettings {
+        gamepad: Default::default(),
         default_context: Some("game".to_owned()),
         contexts: BTreeMap::from([
             (
@@ -1321,7 +1344,7 @@ name = "AudioRejected"
     assert_eq!(host.drain_audio_requests().len(), 1);
 }
 
-/// Таблица версий 6–10 в layout `RveScriptDescV6`, построенная из дескрипторов `sdk_module`.
+/// Таблица версий 6–12 в layout `RveScriptDescV6`, построенная из дескрипторов `sdk_module`.
 fn v6_module(abi_version: u32) -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
@@ -1356,9 +1379,90 @@ fn v6_module(abi_version: u32) -> &'static RveModule {
 }
 
 #[test]
-fn abi_v6_to_v10_modules_load_without_net_callbacks_and_skip_net_events() {
+fn abi_v11_rumble_requests_are_capped_per_frame_and_keep_guest_order() {
     let _lock = test_lock();
-    for abi_version in 6..=10 {
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "RumbleProbe"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.starts_with("rumble requests limit")),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "rumble accepted 256")
+    );
+    let rumble = host.take_rumble_requests();
+    assert_eq!(rumble.len(), 256);
+    assert!(rumble.iter().all(|request| request.pad == 1));
+}
+
+#[test]
+fn abi_v11_rumble_is_rolled_back_when_the_guest_panics() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "RumbleProbe"
+params = { panic_after = true }
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message.contains("rumble panic"))
+    );
+    assert!(host.take_rumble_requests().is_empty());
+}
+
+#[test]
+fn abi_v6_to_v8_modules_load_on_the_v9_host() {
+    let _lock = test_lock();
+    for abi_version in [6, 7, 8] {
+        let module = v6_module(abi_version);
+        // SAFETY: the module and its descriptor table live for the whole test process.
+        let library =
+            unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+        let mut world = scripted_world("Probe", r#"{ label = "v6" }"#);
+        let mut host = load_host(&world, &library);
+        host.start(
+            &mut world,
+            ScriptTime {
+                elapsed: 3.5,
+                frame: 17,
+            },
+        );
+        assert!(
+            message_list(&mut host)
+                .iter()
+                .any(|message| message == "start:v6"),
+            "guest ABI v{abi_version} runs on the v9 host"
+        );
+    }
+}
+
+#[test]
+fn abi_v6_to_v12_modules_load_without_net_callbacks_and_skip_net_events() {
+    let _lock = test_lock();
+    for abi_version in 6..=12 {
         let module = v6_module(abi_version);
         // SAFETY: the module and its descriptor table live for the whole test process.
         let library =
@@ -1396,6 +1500,52 @@ fn abi_v6_to_v10_modules_load_without_net_callbacks_and_skip_net_events() {
             "guest ABI v{abi_version} skips net events silently"
         );
     }
+}
+
+#[test]
+fn abi_v10_modules_load_on_the_v13_host() {
+    let _lock = test_lock();
+    let module = v6_module(10);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v10" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v10"),
+        "guest ABI v10 runs on the v13 host"
+    );
+}
+
+#[test]
+fn abi_v11_modules_load_on_the_v13_host() {
+    let _lock = test_lock();
+    let module = v6_module(11);
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v11" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v11"),
+        "guest ABI v11 runs on the v13 host"
+    );
 }
 
 fn v3_probe_module() -> &'static RveModule {
@@ -1663,10 +1813,10 @@ id = "second"
                 clear_color: [0.2, 0.3, 0.4],
                 anti_aliasing: engine_scene::AntiAliasing::None,
             },
-            color: engine_scene::CameraColorSettings {
+            color: Some(engine_scene::CameraColorSettings {
                 exposure_ev: 2.0,
                 tonemapper: engine_scene::Tonemapper::Neutral,
-            },
+            }),
         }
     );
     assert!(host.drain_events().is_empty());
@@ -3386,7 +3536,7 @@ fn abi_spawn_refuses_unknown_option_flags_and_bad_parents() {
     assert!(host.drain_world_changes().spawned.is_empty());
 }
 
-/// Гость ABI v11: читает сеть на старте, пишет запросы и откликается на сетевые события.
+/// Гость ABI v13: читает сеть на старте, пишет запросы и откликается на сетевые события.
 struct NetGuest;
 
 impl Script for NetGuest {
@@ -3461,7 +3611,7 @@ params = {}
 }
 
 #[test]
-fn abi_v11_net_guest_reads_state_and_stages_requests_through_the_sdk() {
+fn abi_v13_net_guest_reads_state_and_stages_requests_through_the_sdk() {
     let _lock = test_lock();
     let library =
         unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(net_module())) }.unwrap();
@@ -3550,7 +3700,7 @@ fn abi_v11_net_guest_reads_state_and_stages_requests_through_the_sdk() {
 }
 
 #[test]
-fn abi_v11_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
+fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
     let _lock = test_lock();
     let library =
         unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(net_module())) }.unwrap();

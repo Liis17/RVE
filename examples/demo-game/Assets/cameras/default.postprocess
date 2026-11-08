@@ -1,0 +1,23 @@
+[exposure]
+enabled = true
+mode = "manual"
+ev = 0.0
+
+[tonemapping]
+enabled = true
+tonemapper = "aces"
+
+[bloom]
+enabled = true
+intensity = 0.25
+threshold = 1.0
+knee = 0.5
+scatter = 0.7
+tint = [1.0, 1.0, 1.0]
+
+[ambient_occlusion]
+enabled = true
+radius = 0.5
+intensity = 1.0
+falloff = 0.5
+quality = "medium"

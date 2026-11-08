@@ -1,6 +1,6 @@
 [package]
 name = "rve-editor"
-version = "0.8.0"
+version = "0.11.0"
 edition.workspace = true
 license.workspace = true
 
@@ -21,6 +21,7 @@ engine-audio = { path = "../engine/engine-audio" }
 engine-physics = { path = "../engine/engine-physics" }
 engine-files = { path = "../engine/engine-files" }
 engine-network = { path = "../engine/engine-network" }
+engine-input = { path = "../engine/engine-input" }
 engine-platform = { path = "../engine/engine-platform" }
 engine-ui = { path = "../engine/engine-ui" }
 engine-project = { path = "../engine/engine-project" }

@@ -7,13 +7,15 @@ layout(set = 0, binding = 0) uniform texture2D source_image;
 layout(set = 0, binding = 1) uniform sampler source_sampler;
 
 layout(push_constant) uniform PushConstants {
-    // xy — обратный размер источника; z — bilinear вместо FXAA; w — sRGB target.
-    vec4 params;
+    // source: xy — обратный размер источника; z — bilinear вместо FXAA; w — sRGB target.
+    vec4 source;
+    // grain: x — интенсивность зерна; y — response; z — сид кадра.
+    vec4 grain;
 } push_constants;
 
 vec4 sample_source(vec2 uv) {
     vec2 image_size = vec2(textureSize(sampler2D(source_image, source_sampler), 0));
-    vec2 content_extent = 1.0 / push_constants.params.xy;
+    vec2 content_extent = 1.0 / push_constants.source.xy;
     vec2 minimum_uv = 0.5 / image_size;
     vec2 maximum_uv = max((content_extent - 0.5) / image_size, minimum_uv);
     return textureLod(
@@ -42,7 +44,7 @@ vec3 perceptual_rgb_at(vec2 uv) {
 }
 
 vec3 fxaa(vec2 uv) {
-    vec2 pixel = push_constants.params.xy;
+    vec2 pixel = push_constants.source.xy;
     vec2 north_west = uv + pixel * vec2(-1.0, -1.0);
     vec2 north = uv + pixel * vec2(0.0, -1.0);
     vec2 north_east = uv + pixel * vec2(1.0, -1.0);
@@ -134,21 +136,46 @@ vec3 fxaa(vec2 uv) {
     return perceptual_rgb_at(uv + normal * offset * (use_a ? -1.0 : 1.0));
 }
 
+// Хэш по координате пикселя и сиду кадра: детерминированное зерно без состояния.
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Зерно добавляется в display-пространстве; response сильнее всего в средних тонах.
+vec3 apply_grain(vec3 display) {
+    float luma = dot(display, vec3(0.2126, 0.7152, 0.0722));
+    float weight = mix(1.0, 4.0 * luma * (1.0 - luma), push_constants.grain.y);
+    float seed = push_constants.grain.z;
+    float noise = hash12(gl_FragCoord.xy + vec2(seed, seed * 0.618));
+    return clamp(display + (noise - 0.5) * push_constants.grain.x * weight, 0.0, 1.0);
+}
+
 void main() {
-    vec2 source_extent = 1.0 / push_constants.params.xy;
+    vec2 source_extent = 1.0 / push_constants.source.xy;
     vec2 source_scale = source_extent / vec2(textureSize(
         sampler2D(source_image, source_sampler), 0
     ));
     vec2 source_uv = in_uv * source_scale;
     vec3 linear_color;
-    if (push_constants.params.z > 0.5) {
+    if (push_constants.source.z > 0.5) {
         linear_color = sample_source(source_uv).rgb;
     } else {
         vec3 filtered_srgb = clamp(fxaa(source_uv), 0.0, 1.0);
         linear_color = srgb_to_linear(filtered_srgb);
     }
-    if (push_constants.params.w < 0.5) {
-        linear_color = linear_to_srgb(clamp(linear_color, 0.0, 1.0));
+    bool grain_enabled = push_constants.grain.x > 0.0;
+    if (push_constants.source.w < 0.5) {
+        vec3 display = linear_to_srgb(clamp(linear_color, 0.0, 1.0));
+        if (grain_enabled) {
+            display = apply_grain(display);
+        }
+        out_color = vec4(display, 1.0);
+    } else {
+        if (grain_enabled) {
+            linear_color = srgb_to_linear(apply_grain(linear_to_srgb(clamp(linear_color, 0.0, 1.0))));
+        }
+        out_color = vec4(linear_color, 1.0);
     }
-    out_color = vec4(linear_color, 1.0);
 }

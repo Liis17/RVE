@@ -34,6 +34,7 @@ pub fn folder_icon(name: &str, has_children: bool) -> &'static str {
 pub fn file_icon(kind: AssetKind) -> Option<&'static str> {
     match kind {
         AssetKind::CameraSettings => Some("camera-settings"),
+        AssetKind::PostProcess => Some("camera-settings"),
         _ => None,
     }
 }

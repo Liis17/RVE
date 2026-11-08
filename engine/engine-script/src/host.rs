@@ -20,8 +20,8 @@ use crate::transaction::{
     ScriptTransaction, ScriptTransactionInit,
 };
 use crate::types::{
-    ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
-    ScriptTransform,
+    RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams,
+    ScriptTime, ScriptTransform,
 };
 use engine_console::{CommandCatalog, CommandLine, CommandSpec};
 use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
@@ -196,6 +196,7 @@ pub struct ScriptHost {
     queued_bytes: usize,
     audio_requests: Vec<AudioRequest>,
     animation_requests: Vec<AnimationRequest>,
+    rumble_requests: Vec<RumbleRequest>,
     delivery_messages: Vec<PendingMessage>,
     lua_time: Table,
     call_deadline: lite::CallDeadline,
@@ -417,6 +418,7 @@ impl ScriptHost {
             queued_bytes: 0,
             audio_requests: Vec::new(),
             animation_requests: Vec::new(),
+            rumble_requests: Vec::new(),
             delivery_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             lua_time: lua_state.time,
             call_deadline: lua_state.call_deadline,
@@ -461,6 +463,7 @@ impl ScriptHost {
                         actions: host.actions.frame(),
                         queued_messages: (host.queued_messages.len(), host.queued_bytes),
                         queued_audio: host.audio_requests.len(),
+                        queued_rumble: host.rumble_requests.len(),
                         queued_animation: host.animation_requests.len(),
                         physics: host.physics.clone(),
                         net: host.net.clone(),
@@ -556,6 +559,7 @@ impl ScriptHost {
                         actions: host.actions.frame(),
                         queued_messages: (host.queued_messages.len(), host.queued_bytes),
                         queued_audio: host.audio_requests.len(),
+                        queued_rumble: host.rumble_requests.len(),
                         queued_animation: host.animation_requests.len(),
                         physics: host.physics.clone(),
                         net: host.net.clone(),
@@ -1084,6 +1088,11 @@ impl ScriptHost {
         }
     }
 
+    /// Takes gamepad rumble requests committed by scripts since the previous drain, in commit order.
+    pub fn take_rumble_requests(&mut self) -> Vec<RumbleRequest> {
+        std::mem::take(&mut self.rumble_requests)
+    }
+
     /// Queues `animation_finished` messages for the next update, before script messages of
     /// that frame. The sender is the animated object; the value is the motion name.
     pub fn queue_animation_events(
@@ -1198,6 +1207,7 @@ impl ScriptHost {
             actions: self.actions.frame(),
             queued_messages: (self.queued_messages.len(), self.queued_bytes),
             queued_audio: self.audio_requests.len(),
+            queued_rumble: self.rumble_requests.len(),
             queued_animation: self.animation_requests.len(),
             physics: self.physics.clone(),
             net: self.net.clone(),
@@ -1287,6 +1297,7 @@ impl ScriptHost {
             &mut self.audio_requests,
             &mut self.animation_requests,
             &mut self.net_requests,
+            &mut self.rumble_requests,
         ) {
             Ok(mutations) => {
                 self.cursor = self.transaction.cursor();
@@ -1713,6 +1724,7 @@ impl ScriptHost {
             queued_bytes,
             audio_requests,
             animation_requests,
+            rumble_requests,
             lua,
             interrupt,
             commands,
@@ -1740,6 +1752,7 @@ impl ScriptHost {
             actions: actions.frame(),
             queued_messages: (queued_messages.len(), *queued_bytes),
             queued_audio: audio_requests.len(),
+            queued_rumble: rumble_requests.len(),
             queued_animation: animation_requests.len(),
             physics: physics.clone(),
             net: net.clone(),
@@ -1926,6 +1939,7 @@ impl ScriptHost {
                 audio_requests,
                 animation_requests,
                 net_requests,
+                rumble_requests,
             )
         } {
             Ok(mutations) => {
@@ -2219,6 +2233,7 @@ impl ScriptHost {
                     actions: self.actions.frame(),
                     queued_messages: (self.queued_messages.len(), self.queued_bytes),
                     queued_audio: self.audio_requests.len(),
+                    queued_rumble: self.rumble_requests.len(),
                     queued_animation: self.animation_requests.len(),
                     physics: self.physics.clone(),
                     net: self.net.clone(),
@@ -2532,6 +2547,7 @@ impl ScriptHost {
             actions: self.actions.frame(),
             queued_messages: (self.queued_messages.len(), self.queued_bytes),
             queued_audio: self.audio_requests.len(),
+            queued_rumble: self.rumble_requests.len(),
             queued_animation: self.animation_requests.len(),
             physics: self.physics.clone(),
             net: self.net.clone(),

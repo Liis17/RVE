@@ -3,6 +3,8 @@
 use crate::assets_fs::{AssetEntry, AssetKind};
 use crate::icons::{file_icon, folder_icon};
 use crate::state::{Action, AssetDrag, EditorState};
+use engine_files::VirtualPath;
+use engine_scene::{CombineMode, PhysicsMaterialSettings};
 
 const TILE_SIZE: f32 = 88.0;
 
@@ -12,6 +14,7 @@ pub enum ProjectDialog {
     NewFolder { name: String },
     Rename { path: String, name: String },
     Delete { path: String, is_dir: bool },
+    NewPhysicsMaterial { name: String },
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -19,6 +22,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         if ui.button("New Folder").clicked() {
             state.project_dialog = Some(ProjectDialog::NewFolder {
                 name: String::new(),
+            });
+        }
+        if ui.button("New Physics Material").clicked() {
+            state.project_dialog = Some(ProjectDialog::NewPhysicsMaterial {
+                name: "New Physics Material".to_owned(),
             });
         }
         if ui.button("Import…").clicked() {
@@ -55,6 +63,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                 state.asset_tree = tree;
             });
         });
+    if state.physics_material_edit.is_some() {
+        egui::Panel::bottom("physics_material").show(ui, |ui| {
+            show_physics_material_fields(ui, state);
+        });
+    }
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink(false)
@@ -157,6 +170,8 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
         AssetKind::Scene => "SCENE",
         AssetKind::Prefab => "PREFAB",
         AssetKind::CameraSettings => "CAMERA",
+        AssetKind::PostProcess => "POST",
+        AssetKind::PhysicsMaterial => "MATERIAL",
         AssetKind::Model => "FBX",
         AssetKind::Texture => "PNG",
         AssetKind::Hdr => "HDR",
@@ -238,6 +253,12 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
         );
     }
     let response = response.on_hover_text(&entry.path);
+    if response.clicked()
+        && !entry.is_dir
+        && AssetKind::of(&entry.path) == AssetKind::PhysicsMaterial
+    {
+        open_physics_material(state, &entry.path);
+    }
     if response.double_clicked() {
         if entry.is_dir {
             state.current_folder = entry.path.clone();
@@ -281,6 +302,10 @@ pub fn show_dialog(ctx: &egui::Context, state: &mut EditorState) {
                 ui.heading("New Folder");
                 ui.text_edit_singleline(name).request_focus();
             }
+            ProjectDialog::NewPhysicsMaterial { name } => {
+                ui.heading("New Physics Material");
+                ui.text_edit_singleline(name).request_focus();
+            }
             ProjectDialog::Rename { name, .. } => {
                 ui.heading("Rename");
                 ui.text_edit_singleline(name).request_focus();
@@ -322,6 +347,16 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
     let Some(project) = state.project.as_ref() else {
         return;
     };
+    if let ProjectDialog::NewPhysicsMaterial { name } = dialog {
+        match project.create_physics_material(&state.current_folder, name) {
+            Ok(path) => {
+                state.log.info(format!("Создан физический материал {path}"));
+                state.action(Action::RefreshTree);
+            }
+            Err(error) => state.log.error(error),
+        }
+        return;
+    }
     let assets = &project.assets_dir;
     let result = match dialog {
         ProjectDialog::NewFolder { name } => assets
@@ -330,6 +365,7 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
         ProjectDialog::Rename { path, name } => assets
             .rename(path, name)
             .map(|target| format!("{path} переименован в {target}")),
+        ProjectDialog::NewPhysicsMaterial { .. } => return,
         ProjectDialog::Delete { path, .. } => {
             assets.remove(path).map(|()| format!("Удалён {path}"))
         }
@@ -340,6 +376,115 @@ fn run_dialog(state: &mut EditorState, dialog: &ProjectDialog) {
             state.action(Action::RefreshTree);
         }
         Err(error) => state.log.error(error.to_string()),
+    }
+}
+
+/// `.rvephysmat`, открытый панелью полей: значения записываются в файл при каждом изменении.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhysicsMaterialEdit {
+    pub path: String,
+    pub settings: PhysicsMaterialSettings,
+}
+
+fn open_physics_material(state: &mut EditorState, path: &str) {
+    let Some(project) = state.project.as_ref() else {
+        return;
+    };
+    let settings = project.read_text(path).and_then(|source| {
+        PhysicsMaterialSettings::parse(path, &source).map_err(|error| error.to_string())
+    });
+    match settings {
+        Ok(settings) => {
+            state.physics_material_edit = Some(PhysicsMaterialEdit {
+                path: path.to_owned(),
+                settings,
+            });
+        }
+        Err(error) => state.log.error(error),
+    }
+}
+
+/// Панель полей выбранного `.rvephysmat`; изменение сразу сохраняется в файл.
+fn show_physics_material_fields(ui: &mut egui::Ui, state: &mut EditorState) {
+    let Some(mut edit) = state.physics_material_edit.take() else {
+        return;
+    };
+    let mut changed = false;
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.strong(format!("Physics Material {}", edit.path));
+        close = ui.button("Close").clicked();
+    });
+    egui::Grid::new("physics_material_fields")
+        .num_columns(2)
+        .show(ui, |ui| {
+            changed |= field_drag(
+                ui,
+                "Static Friction",
+                &mut edit.settings.static_friction,
+                0.0..=f32::MAX,
+            );
+            changed |= field_drag(
+                ui,
+                "Dynamic Friction",
+                &mut edit.settings.dynamic_friction,
+                0.0..=f32::MAX,
+            );
+            changed |= field_drag(ui, "Bounciness", &mut edit.settings.bounciness, 0.0..=1.0);
+            changed |= combine_row(ui, "Friction Combine", &mut edit.settings.friction_combine);
+            changed |= combine_row(ui, "Bounce Combine", &mut edit.settings.bounce_combine);
+        });
+    if changed
+        && let Some(project) = state.project.as_ref()
+        && let Ok(path) = VirtualPath::parse(&edit.path)
+        && let Err(error) = project.save_physics_material(&path, &edit.settings)
+    {
+        state.log.error(error);
+    }
+    if !close {
+        state.physics_material_edit = Some(edit);
+    }
+}
+
+fn field_drag(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    ui.label(label);
+    let changed = ui
+        .add(egui::DragValue::new(value).speed(0.01).range(range))
+        .changed();
+    ui.end_row();
+    changed
+}
+
+fn combine_row(ui: &mut egui::Ui, label: &str, mode: &mut CombineMode) -> bool {
+    ui.label(label);
+    let before = *mode;
+    egui::ComboBox::from_id_salt(label)
+        .selected_text(combine_label(*mode))
+        .show_ui(ui, |ui| {
+            for option in [
+                CombineMode::Average,
+                CombineMode::Minimum,
+                CombineMode::Multiply,
+                CombineMode::Maximum,
+            ] {
+                ui.selectable_value(mode, option, combine_label(option));
+            }
+        });
+    ui.end_row();
+    *mode != before
+}
+
+fn combine_label(mode: CombineMode) -> &'static str {
+    match mode {
+        CombineMode::Average => "Average",
+        CombineMode::Minimum => "Minimum",
+        CombineMode::Multiply => "Multiply",
+        CombineMode::Maximum => "Maximum",
     }
 }
 

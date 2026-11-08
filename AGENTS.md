@@ -22,6 +22,7 @@ Obsidian/RVEVault/Engine/EngineAssets.md — Ресурсы: FBX и PNG из ass
 Obsidian/RVEVault/Engine/EnginePhysics.md — Геометрия, solver, fixed-step мир, character controller и протокол rve-physics
 Obsidian/RVEVault/Engine/EngineScript.md — Lua и Rust-скрипты сцен
 Obsidian/RVEVault/Engine/EngineNetwork.md — Сетевой модуль: протокол, шифрование, репликация и мост к миру
+Obsidian/RVEVault/Engine/EngineInput.md — Геймпады: gilrs-бэкенд, перевод событий, слоты 1..4, фокусный гейт и вибрация
 Obsidian/RVEVault/Engine/EngineConsole.md — Буфер лога, команды и общий egui developer console
 Obsidian/RVEVault/Engine/RveSdk.md — C ABI и гостевой API Rust-скриптов
 Obsidian/RVEVault/Engine/EngineRuntime.md — Игровой runtime и player
@@ -54,11 +55,11 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
 
 - В engine-core, engine-window и engine-render проверяй публичный API и его использование в engine/sandbox.
 - Изменения engine-window, engine-render, engine-platform, engine-scene, engine-audio,
-  engine-script, engine-resources, engine-project, engine-physics, engine-network и engine-animation проверяй также на
+  engine-script, engine-resources, engine-project, engine-physics, engine-input, engine-network и engine-animation проверяй также на
   потребителях engine-runtime/rve-player и rve-build, если они используют
   изменённый крейт. Прямые workspace-зависимости:
   - engine-runtime: engine-animation, engine-assets, engine-files, engine-audio,
-    engine-neural, engine-network, engine-physics, engine-platform,
+    engine-neural, engine-network, engine-input, engine-physics, engine-platform,
     engine-project, engine-render, engine-resources, engine-scene,
     engine-script, engine-window, engine-console, engine-ui.
   - rve-build: engine-assets, engine-files, engine-pak, engine-project,
@@ -68,9 +69,10 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
   - engine-animation (потребители engine-runtime и rve-editor): engine-assets, engine-files, engine-scene, glam.
   - engine-network (потребители engine-runtime и rve-editor): engine-scene, blake3, chacha20poly1305, ed25519-dalek,
     x25519-dalek, getrandom, zeroize, flume, glam, log. От скриптов, runtime, renderer и окна не зависит.
+  - engine-input (потребители engine-runtime и rve-editor): gilrs, log, rve-sdk.
   - rve-player: engine-runtime.
   - rve-server: engine-runtime (headless-путь без окна и renderer).
-  - rve-editor: engine-animation, engine-assets, engine-files, engine-network, engine-physics, engine-project, engine-render,
+  - rve-editor: engine-animation, engine-assets, engine-files, engine-input, engine-network, engine-physics, engine-project, engine-render,
     engine-audio, engine-resources, engine-scene, engine-script, engine-window,
     engine-console, engine-ui.
 - При изменении engine-platform проверяй общий интерфейс, адаптеры engine-platform-windows и engine-platform-macos и вызовы из renderer.

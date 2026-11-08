@@ -7,7 +7,7 @@ use engine_project::{
 use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
-use engine_scene::CameraSettings;
+use engine_scene::{CameraSettings, PhysicsMaterialSettings, PostProcessSettings};
 use engine_scene::{
     ParamSchema, ParamValue, PrefabTemplate, SceneAsset, SceneDocument, SceneError, SceneObject,
     expand,
@@ -404,6 +404,34 @@ fn record_asset(
             ))
         })?;
         CameraSettings::parse(format!("/{path}"), &source)
+            .map_err(|error| BuildError::input(error.to_string()))?;
+    }
+
+    if extension_is(path.as_str(), "postprocess") {
+        let bytes = sources
+            .handle
+            .read_all(format!("/{path}"))
+            .and_then(|request| request.wait())
+            .map_err(|error| resource_error(&format!("постобработка /{path}"), error))?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            BuildError::input(format!("постобработка /{path} должна быть UTF-8: {error}"))
+        })?;
+        PostProcessSettings::parse(format!("/{path}"), &source)
+            .map_err(|error| BuildError::input(error.to_string()))?;
+    }
+
+    if extension_is(path.as_str(), "rvephysmat") {
+        let bytes = sources
+            .handle
+            .read_all(format!("/{path}"))
+            .and_then(|request| request.wait())
+            .map_err(|error| resource_error(&format!("физический материал /{path}"), error))?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            BuildError::input(format!(
+                "физический материал /{path} должен быть UTF-8: {error}"
+            ))
+        })?;
+        PhysicsMaterialSettings::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(error.to_string()))?;
     }
 
@@ -1090,6 +1118,39 @@ mod prefab_tests {
 
     fn path(value: &str) -> VirtualPath {
         VirtualPath::parse(value).unwrap()
+    }
+
+    #[test]
+    fn physics_materials_are_validated_and_packed_with_their_scene() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-physics-material").unwrap();
+        fs::write(
+            root.path().join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/scenes/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("bootstrap.rves"), "").unwrap();
+        write(
+            root.path(),
+            "scenes/main.rvescene",
+            &format!(
+                "[[assets]]\npath = \"/materials/ice.rvephysmat\"\n{CAMERA}[[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\nmaterial = \"/materials/ice.rvephysmat\"\n"
+            ),
+        );
+        write(
+            root.path(),
+            "materials/ice.rvephysmat",
+            "static_friction = 0.05\n",
+        );
+        let build = prepare_project(root.path()).unwrap();
+        assert!(build.files.contains_key(&path("/materials/ice.rvephysmat")));
+
+        write(
+            root.path(),
+            "materials/ice.rvephysmat",
+            "static_friction = -1.0\n",
+        );
+        let error = prepare_project(root.path()).unwrap_err();
+        assert!(error.to_string().contains("static_friction"), "{error}");
     }
 
     #[test]

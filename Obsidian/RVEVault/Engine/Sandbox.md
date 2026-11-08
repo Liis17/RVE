@@ -27,6 +27,7 @@ Parent: [[Index]]
 | `--frames N` | Выход после N вызовов презентации со статусом `Presented`; N — положительный `u64` |
 | `--render-scale S` | Масштаб render resolution; конечное число в `(0, 1]`, передаётся в `Frame::view` |
 | `--camera-settings /путь.camerasettings` | Загружает TOML-настройки проекции и вывода из assets; требует расширение `.camerasettings` |
+| `--post-process /путь.postprocess` | Загружает настройки постобработки из assets; требует расширение `.postprocess`, см. [[EnginePostProcess]] |
 | `--resize-test` | Запускает сценарий изменения размера и сворачивания/восстановления |
 | `--scene triangle\|cube\|shadows\|materials\|clustered` | Демонстрационная сцена; по умолчанию `shadows` |
 | `--model /путь.fbx` | Модель FBX из `assets`; сочетание допустимо со сценами `cube`, `shadows` и `materials`, но не с `triangle` |

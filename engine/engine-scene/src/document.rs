@@ -8,6 +8,7 @@ use crate::network::{
     validate_scene_net_ids,
 };
 use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
+use crate::physics_material::PhysicsMaterialSettings;
 use crate::prefab::{PREFAB_EXTENSION, PrefabInstance};
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
@@ -269,6 +270,38 @@ impl SceneDocument {
                         "настройки камеры",
                     )?;
                 }
+                if let Some(post_process) = &camera.post_process {
+                    require_asset_path(
+                        source,
+                        &object.id,
+                        &asset_paths,
+                        post_process,
+                        "постобработка камеры",
+                    )?;
+                    require_extension(
+                        source,
+                        &object.id,
+                        post_process,
+                        "postprocess",
+                        "постобработка камеры",
+                    )?;
+                }
+            }
+            if let Some(material) = object.collider.as_ref().and_then(|c| c.material.as_ref()) {
+                require_asset_path(
+                    source,
+                    &object.id,
+                    &asset_paths,
+                    material,
+                    "физический материал",
+                )?;
+                require_extension(
+                    source,
+                    &object.id,
+                    material,
+                    "rvephysmat",
+                    "физический материал",
+                )?;
             }
             if let Some(light) = &object.directional_light {
                 light_count += 1;
@@ -552,8 +585,9 @@ pub enum ColliderShape {
     TriangleMesh,
 }
 
-/// Collider geometry and contact material settings.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Collider geometry and contact material settings. Непустой `material` заменяет инлайн-поля
+/// `friction` и `restitution`; `resolved_material` заполняет загрузчик из `.rvephysmat`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ColliderComponent {
     pub shape: ColliderShape,
@@ -564,6 +598,10 @@ pub struct ColliderComponent {
     pub trigger: bool,
     pub friction: f32,
     pub restitution: f32,
+    #[serde(with = "option_virtual_path_serde")]
+    pub material: Option<VirtualPath>,
+    #[serde(skip)]
+    pub resolved_material: Option<PhysicsMaterialSettings>,
 }
 
 impl Default for ColliderComponent {
@@ -577,6 +615,8 @@ impl Default for ColliderComponent {
             trigger: false,
             friction: 0.5,
             restitution: 0.0,
+            material: None,
+            resolved_material: None,
         }
     }
 }
@@ -671,6 +711,9 @@ impl Default for SceneTransform {
 pub struct CameraComponent {
     #[serde(default, with = "option_virtual_path_serde")]
     pub settings: Option<VirtualPath>,
+    /// Файл `.postprocess`; без него используется постобработка по умолчанию.
+    #[serde(default, with = "option_virtual_path_serde")]
+    pub post_process: Option<VirtualPath>,
     pub active: bool,
     /// Состояние курсора при старте сцены; действует, только если камера активна.
     #[serde(default, skip_serializing_if = "CameraCursor::is_default")]
@@ -1143,6 +1186,7 @@ fn validate_physics_components(source: &str, object: &SceneObject) -> Result<(),
         if body.kind == RigidBodyKind::Dynamic
             && object
                 .collider
+                .as_ref()
                 .is_some_and(|collider| collider.shape == ColliderShape::TriangleMesh)
         {
             return Err(SceneError::new(
@@ -1468,12 +1512,26 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                 );
             }
         }
+        if let Some(collider) = object.get("collider").and_then(toml::Value::as_table) {
+            paths.extend(
+                collider
+                    .get("material")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| (object_id, "collider.material", path)),
+            );
+        }
         if let Some(camera) = object.get("camera").and_then(toml::Value::as_table) {
             paths.extend(
                 camera
                     .get("settings")
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, "camera.settings", path)),
+            );
+            paths.extend(
+                camera
+                    .get("post_process")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| (object_id, "camera.post_process", path)),
             );
         }
         if let Some(environment) = object.get("environment").and_then(toml::Value::as_table) {
@@ -2188,6 +2246,49 @@ scale=[1.0,1.0,0.0]
     }
 
     #[test]
+    fn collider_material_must_be_an_asset_with_rvephysmat_extension() {
+        let missing = format!(
+            "{VALID}\n[[objects]]\nid=\"ball\"\n[objects.collider]\nmaterial=\"/materials/ice.rvephysmat\"\n"
+        );
+        error(&missing, "отсутствует в [[assets]]");
+        let wrong_extension = format!(
+            "[[assets]]\npath=\"/materials/ice.toml\"\n{VALID}\n[[objects]]\nid=\"ball\"\n[objects.collider]\nmaterial=\"/materials/ice.toml\"\n"
+        );
+        error(&wrong_extension, "расширение .rvephysmat");
+        let valid = format!(
+            "[[assets]]\npath=\"/materials/ice.rvephysmat\"\n{VALID}\n[[objects]]\nid=\"ball\"\n[objects.collider]\nfriction=0.2\nrestitution=0.8\nmaterial=\"/materials/ice.rvephysmat\"\n"
+        );
+        let document = parse(&valid).unwrap();
+        let collider = document
+            .objects
+            .iter()
+            .find(|object| object.id == "ball")
+            .and_then(|object| object.collider.as_ref())
+            .unwrap();
+        assert_eq!(
+            collider.material.as_ref().map(|path| path.as_str()),
+            Some("materials/ice.rvephysmat")
+        );
+        assert!(collider.resolved_material.is_none());
+    }
+
+    #[test]
+    fn scene_documents_without_collider_material_keep_inline_friction_values() {
+        let input = format!(
+            "{VALID}\n[[objects]]\nid=\"ball\"\n[objects.collider]\nfriction=0.2\nrestitution=0.8\n"
+        );
+        let document = parse(&input).unwrap();
+        let collider = document
+            .objects
+            .iter()
+            .find(|object| object.id == "ball")
+            .and_then(|object| object.collider.as_ref())
+            .unwrap();
+        assert!(collider.material.is_none());
+        assert_eq!((collider.friction, collider.restitution), (0.2, 0.8));
+    }
+
+    #[test]
     fn component_paths_must_be_assets_with_expected_case_insensitive_extensions() {
         let missing = format!(
             "{VALID}\n[[objects]]\nid=\"mesh\"\n[objects.mesh_renderer]\nmodel=\"/models/a.fbx\"\n"
@@ -2226,6 +2327,40 @@ scale=[1.0,1.0,0.0]
             )
         );
         assert!(parse(&good).is_ok());
+    }
+
+    #[test]
+    fn camera_post_process_must_be_a_declared_postprocess_asset() {
+        let rejects = |input: &str, expected: &str| {
+            let message = parse(input).unwrap_err().to_string();
+            assert!(message.contains(expected), "{message}");
+        };
+        let with_post_process = |path: &str| {
+            VALID.replace(
+                "[objects.camera]",
+                &format!("[objects.camera]\npost_process=\"{path}\""),
+            )
+        };
+        rejects(
+            &with_post_process("/post/default.postprocess"),
+            "отсутствует в [[assets]]",
+        );
+        let wrong_extension = format!(
+            "[[assets]]\npath=\"/post/default.toml\"\n{}",
+            with_post_process("/post/default.toml")
+        );
+        rejects(&wrong_extension, "расширение .postprocess");
+        let good = format!(
+            "[[assets]]\npath=\"/post/Default.POSTprocess\"\n{}",
+            with_post_process("/post/Default.POSTprocess")
+        );
+        let document = parse(&good).unwrap();
+        assert!(
+            document.objects[0]
+                .camera
+                .as_ref()
+                .is_some_and(|camera| camera.post_process.is_some())
+        );
     }
 
     #[test]
