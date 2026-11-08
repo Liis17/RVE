@@ -4,7 +4,7 @@ use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
-use crate::play::{PlayPrefabs, PlaySession};
+use crate::play::{PlayPrefabs, PlaySession, editor_gamepads, gamepad_tuning};
 use crate::play_cursor;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
@@ -976,6 +976,8 @@ impl EditorApp {
         let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
             return;
         };
+        let tuning = gamepad_tuning(&project.settings.input.gamepad);
+        editor_gamepads(&mut self.state.gamepads, tuning).begin_session(tuning);
         let result = (|| {
             let mut world =
                 World::from_document(scene.view()).map_err(|error| error.to_string())?;
@@ -1034,6 +1036,7 @@ impl EditorApp {
     fn stop_play(&mut self) {
         self.state.pending_play = false;
         if let Some(session) = self.state.play.take() {
+            self.state.end_play_gamepads();
             let events = session.stop();
             self.state.log.push_script_events(events);
             self.state.log.info("Stop");
@@ -1252,7 +1255,9 @@ impl EditorApp {
 
         let pads_accepted = self.window_focused && !self.state.console_open;
         let play_error = self.state.play.as_mut().and_then(|play| {
-            play.poll_gamepads(pads_accepted);
+            if let Some(gamepads) = self.state.gamepads.as_mut() {
+                play.poll_gamepads(gamepads, pads_accepted);
+            }
             play.tick().err()
         });
         if play_error.is_none()
@@ -1264,6 +1269,7 @@ impl EditorApp {
         if let Some(error) = play_error {
             self.state.log.error(error);
             if let Some(session) = self.state.play.take() {
+                self.state.end_play_gamepads();
                 self.state.log.push_script_events(session.stop());
                 self.state.log.info("Stop");
             }
