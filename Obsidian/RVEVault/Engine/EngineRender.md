@@ -11,11 +11,12 @@ Parent: [[Index]]
 | Файл | Значимый символ | Роль |
 |---|---|---|
 | `engine/engine-render/src/lib.rs`, `engine/engine-render/src/environment.rs` | `RendererConfig`, `Capabilities`, `DeviceReport`, `probe_devices`, `RenderError`, `FrameStatus`, `FrameOutcome`, `Renderer`, `EnvironmentSource`, `ProceduralSky`, `EnvironmentId`, `LocalLight`, `LocalLightShadow`, `LocalLightShadowMatrices`, `FrameCamera`, `FrameEnvironment`, `Frame`, ресурсы и UI-типы | Публичный контракт renderer, headless-проверка Vulkan-устройств, IBL и реализация Vulkan-пути |
+| engine/engine-render/src/surface_shader.rs | SurfaceShaderSource, compile_surface_shader | Runtime compile пользовательского surface GLSL в SPIR-V с naga и диагностикой строки исходника |
 | `engine/engine-render/src/culling.rs` | `LocalBounds`, `Frustum`, `back_to_front_order` | Pure math для frustum culling и стабильной сортировки blend draws по центру мирового AABB, без glam и GPU |
 | `engine/engine-render/src/clusters.rs`, `engine/engine-render/shaders/cluster.comp` | inverse-projection bounds, CPU geometry mirror, `ClusterBounds`, `GpuLocalLight`, cluster compute shader | Формирует per-camera view-space AABBs для сетки 16×9×24 и проверяет пересечения локальных источников без atomics |
 | `engine/engine-render/src/fsr.rs` | `FfxApi`, FFX C ABI descriptors и dispatch assembly | Динамически загружает официальный FSR Vulkan loader на Windows; проверяет ABI layout и собирает HDR/depth/velocity/exposure inputs |
 | `engine/engine-render/src/dlss.rs` | NGX Vulkan discovery, resource ABI, modes и runtime calls | Windows-only NGX bindings; required extensions добавляются до создания Vulkan instance/device, per-view DLSS feature получает HDR/depth/velocity/jitter/exposure и пишет storage output |
-| `engine/engine-render/shaders/mesh.vert`, `engine/engine-render/shaders/mesh.frag` | push constants с `model`, `normal_from_model`, `previous_model` и draw params; `FrameUniforms`, local-light SSBO и shadow descriptors, `MaterialUniforms`, PBR maps | GLSL-шейдеры мешей: общий Cook-Torrance GGX, PCF-тени, производная TBN-база, velocity из unjittered current/previous clip coordinates, texture LOD bias и варианты opaque/mask/blend |
+| engine/engine-render/shaders/mesh.vert, engine/engine-render/shaders/mesh.frag | push constants с model, normal_from_model, previous_model и draw params; FrameUniforms, local-light SSBO и shadow descriptors, MaterialUniforms, PBR maps и Surface insertion point | Встроенный Cook-Torrance GGX path и общий шаблон пользовательского surface(inout Surface); перенос формулы в surface не меняет результат встроенного Lit shader |
 | `engine/engine-render/shaders/wireframe.frag` | фиксированный цвет wire overlay | Отдельный `LINE` pipeline поверх сцены, создаваемый только при поддержке `fillModeNonSolid` |
 | `engine/engine-render/shaders/equirect_to_cube.comp`, `sky.comp`, `irradiance.comp`, `prefilter.comp` | compute bake для Radiance panorama и процедурного неба, diffuse irradiance и GGX specular mip chain | Преобразование equirectangular/celestial inputs в cubemap и свёртка IBL |
 | `engine/engine-render/shaders/skybox.vert`, `skybox.frag` | fullscreen triangle, inverse view-projection и environment cubemap | Skybox после opaque и до transparent draws; depth test `LESS_OR_EQUAL`, запись глубины выключена |
@@ -24,9 +25,9 @@ Parent: [[Index]]
 | `engine/engine-render/shaders/shadow.vert`, `engine/engine-render/shaders/shadow.frag` | `light_view_projection`, `model`, UV и alpha-mask material descriptor | Shadow pass отбрасывает mask texels по тому же base-color alpha и cutoff; blend материалы пропускаются |
 | `engine/engine-render/shaders/overlay.vert`, `engine/engine-render/shaders/overlay.frag` | push constant `target_size` | 2D-оверлей: пиксели окна → NDC, цвет вершины с альфой |
 | `engine/engine-render/src/ui.rs`, `engine/engine-render/shaders/ui.vert`, `engine/engine-render/shaders/ui.frag` | `UiVertex`, `UiPrimitive`, `UiImage`, `RetireQueue`, `RetiredSwapchains`, UI shader | Преобразование геометрии и текстур интерфейса в triangle list и swapchain pass |
-| `engine/engine-render/build.rs` | `SHADERS` | Компиляция GLSL в SPIR-V через naga в `OUT_DIR`; renderer встраивает результат через `include_bytes!` |
+| engine/engine-render/build.rs | SHADERS | Компиляция встроенного GLSL в SPIR-V через naga в OUT_DIR; runtime shader compilation находится в src/surface_shader.rs |
 | `engine/engine-render/Cargo.toml`, `engine/engine-render/build.rs` | feature `dlss`, `RVE_DLSS_SDK` | Windows x64 MSVC DLSS feature связывается с `nvsdk_ngx_s.lib`; runtime SDK DLL не хранится в репозитории |
-| `engine/engine-render/Cargo.toml` | `ash`, `libloading`, `engine-platform`, `raw-window-handle`, build-зависимость `naga` | Vulkan bindings, динамический FSR loader, платформенная интеграция, оконные handles без зависимости от winit и сборка шейдеров |
+| engine/engine-render/Cargo.toml | ash, libloading, engine-platform, raw-window-handle, naga | Vulkan bindings, динамический FSR loader, platform integration, raw window handles и naga для build/runtime GLSL |
 
 ## Публичные контракты
 
@@ -52,7 +53,9 @@ Parent: [[Index]]
 | `Renderer::create_texture(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<TextureId, RenderError>` | Совместимый sRGB RGBA8 API. Принимает строки сверху вниз: ровно `width × height × 4` байт, размеры от 1 до `maxImageDimension2D`; записывает mip 0 в upload batch и строит полную mip-цепочку blit-ами GPU |
 | `Renderer::create_texture_with_color_space(&mut self, width, height, rgba, color_space) -> Result<TextureId, RenderError>` | Записывает RGBA8 заданного пространства в upload batch. Обе текстуры формируют полную mip-цепочку, используют общий линейный sampler и живут до `destroy_texture` или уничтожения renderer |
 | `AlphaMode` | `Opaque`, `Mask { cutoff }` (конечный cutoff в `[0, 1]`) или `Blend`; blend draws сортируются по расстоянию от камеры к центру мирового AABB, порядок равных дистанций сохраняет исходный порядок |
-| `Material`, `MaterialId`, `Renderer::create_material(&Material) -> Result<MaterialId, RenderError>` | Материал содержит линейные `base_color`, emissive HDR RGB, `metallic`, `roughness`, `opacity` и `occlusion_strength`, alpha mode и `double_sided` (по умолчанию `false`). Факторы проверяются на конечность и допустимый диапазон; texture IDs покрывают base-color, metallic-roughness, normal, emissive и occlusion, их цветовое пространство должно совпадать с типом карты. Uniform занимает 64 байта, четыре std140 vec4. Материал неизменяем, пока существует |
+| `Material`, `MaterialId`, `Renderer::create_material(&Material) -> Result<MaterialId, RenderError>` | Материал содержит линейные `base_color`, emissive HDR RGB, `metallic`, `roughness`, `opacity` и `occlusion_strength`, alpha mode и `double_sided` (по умолчанию `false`). Факторы проверяются на конечность и допустимый диапазон; texture IDs покрывают base-color, metallic-roughness, normal, emissive и occlusion, их цветовое пространство должно совпадать с типом карты. Uniform занимает 64 байта, четыре std140 vec4. Материал неизменяем, пока существует  Дополнительно материал содержит shader: Option<ShaderId>, 16 vec4 user_values и 8 user_textures. Renderer проверяет shader/material ids, schema slots и пользовательские texture color spaces. |
+| Renderer::create_surface_shader(&SurfaceShaderSource) -> Result<ShaderId, RenderError> | Компилирует opaque/mask/blend SPIR-V и создаёт четыре pipeline variants: opaque, opaque-after-prepass, mask и blend. Частично созданные pipeline/shader ресурсы освобождаются при ошибке |
+| Renderer::destroy_surface_shader(ShaderId) | Отказывает с InvalidShader, пока shader ссылается хотя бы один живой material; сначала надо уничтожить все такие materials |
 | `Renderer::destroy_mesh`, `Renderer::destroy_texture`, `Renderer::destroy_material` | Удаляют ресурс отложенно: GPU-объекты остаются до завершения кадровых слотов; mesh и texture также ждут свой upload serial. Id не используются повторно; встроенные default ресурсы нельзя удалить |
 | `DrawCommand` | `skin: Option<SkinBinding { instance: SkinId, palette: u32 }>` — draw рисует выходной буфер экземпляра вместо исходного меша; `mesh: MeshId`, `material: Option<MaterialId>` (`None` — встроенный белый dielectric материал с metallic 0 и roughness 1), `model` по столбцам, optional `previous_model` (отсутствует — совпадает с `model`), `lod_level` и `casts_shadow` — участие меша в shadow map |
 | `DirectionalLight` | `direction` — направление лучей в мировом пространстве (конечное и ненулевое, длина не важна), `color` и `ambient` в линейном RGB. `Default`: лучи `[0.4, -0.7, -0.6]` (свет сверху слева со стороны камеры, смотрящей вдоль -Z), белый цвет, ambient 0.15 |
@@ -78,7 +81,7 @@ Parent: [[Index]]
 | `FrameStatus::Presented` | `queue_present` вернул успех, в том числе при suboptimal; это не подтверждение фактического сканирования кадра монитором |
 | `FrameStatus::Skipped` | Нулевой размер, пересоздание swapchain, `OUT_OF_DATE` или `TIMEOUT`/`NOT_READY` от acquire, либо `OUT_OF_DATE` от present без успешной презентации |
 | `Renderer::render_frame_with_outcome` и `render_frame_with_ui_outcome` | Расширенные варианты render API возвращают `FrameOutcome { status, submitted }`; `submitted` истинно после успешного `vkQueueSubmit2`, даже если `queue_present` затем сообщил `OUT_OF_DATE`. Это позволяет runtime продвигать temporal model history только для кадров, действительно отправленных в очередь. Исходные `render_frame` и `render_frame_with_ui` сохраняют контракт `FrameStatus` |
-| `RenderError` | Варианты `InvalidConfig`, `Loader`, `Handle`, `Vulkan`, `Unsupported`, `NoSuitableDevice`, `InvalidState`, `InvalidMesh`, `InvalidTexture` и `InvalidMaterial` (неверные факторы или ID материала/текстуры, либо несовместимое цветовое пространство). Нулевой свет или неконечная shadow-матрица дают `InvalidConfig`; реализует `Display` и `Error` |
+| RenderError | Варианты InvalidConfig, Loader, Handle, Vulkan, Unsupported, NoSuitableDevice, InvalidState, InvalidMesh, InvalidTexture, InvalidMaterial, InvalidShader и InvalidEnvironment. InvalidShader покрывает compile, shader id/layout и удаление shader, на который ещё ссылается material; реализует Display и Error |
 
 ## Skinning
 
@@ -94,7 +97,7 @@ Parent: [[Index]]
 
 ## Зависимости и взаимодействия
 
-- Использует ash 0.38.0 и raw-window-handle 0.6.2; naga 30.0.1 — только build-зависимость. naga 30.0.1 не собирает `glsl-in` без `wgsl-in` или `spv-in`, поэтому в `Cargo.toml` дополнительно включена `wgsl-in`. [[Engine/EnginePlatform]] предоставляет загрузку Vulkan, требования платформы и surface через ash-window 0.13.0.
+- Использует ash 0.38.0 и raw-window-handle 0.6.2; naga 30.0.1 — build-зависимость для встроенных shaders и runtime-зависимость для Surface GLSL. naga 30.0.1 не собирает `glsl-in` без `wgsl-in` или `spv-in`, поэтому в `Cargo.toml` дополнительно включена `wgsl-in`. [[Engine/EnginePlatform]] предоставляет загрузку Vulkan, требования платформы и surface через ash-window 0.13.0.
 - Используется в [[Engine/Sandbox]] и [[Engine/RveEditor]], которые передают `Arc<Window>` из [[Engine/EngineWindow]]. Renderer получает UI-треугольники без зависимости от egui; редактор переводит egui output и управляет scene viewport-ами.
 - `engine-render` намеренно не зависит от winit; это проверяется командой `cargo tree -p engine-render`.
 
@@ -143,13 +146,15 @@ Parent: [[Index]]
 
 - Vulkan 1.3, dynamic rendering и synchronization2 — утверждённый минимальный уровень API.
 - Render/output resolution разделены, а output pass принимает FSR, NGX DLSS или TAA output; API renderer остаётся независим от winit.
-- GLSL компилируется naga в `build.rs` по выбору пользователя: сборке не нужны Vulkan SDK и `glslc`, ошибки шейдеров видны при `cargo build`. Naga 30 компилирует `std430` runtime-array SSBO mesh shader, compute shaders, `textureCube` и storage images `rgba16f`; fallback для SSBO не требуется.
+- Встроенные GLSL shaders компилируются naga в build.rs, а user Surface GLSL — через naga runtime API; Vulkan SDK и glslc не нужны. Для runtime source injection порядок строго helpers → property defines → user surface → #undef → generated main. Naga 30 компилирует std430 runtime-array SSBO mesh shader, compute shaders, textureCube и storage images rgba16f; fallback для SSBO не требуется.
 - Дополнительные расширения задаются в `RendererConfig` до создания instance/device по утверждённому требованию для будущих интеграций.
 - `raw-window-handle` позволяет renderer принимать окно без прямой зависимости от winit; `Arc` удерживает окно живым до уничтожения surface. Это подтверждённый контракт владения.
 - Оверлей рисуется поверх swapchain после FXAA и upscaling, а не в HDR offscreen-target: при `render_scale < 1` текст иначе размывался бы масштабированием. Renderer принимает только готовые треугольники; шрифт, раскладка и метрики остаются в приложении ([[Engine/Sandbox]]).
 - Загрузка GPU для `--debug-overlay` считается по Vulkan timestamps от начала clustered compute до конца tonemap, а не по счётчикам ОС: так выбрал пользователь, чтобы не добавлять платформенный код. Значение отражает только работу этого приложения.
 
 Для кластеризации видимых локальных источников `view` камеры должен быть жёстким аффинным преобразованием (вращение/отражение и перенос, без масштаба или shear). Иначе renderer возвращает `InvalidConfig` до упаковки SSBO. Кадры без видимых локальных источников сохраняют поддержку clip-space проекций, включая треугольник sandbox; при непригодной для Z-кластеров проекции используются пустые bounds.
+
+Пользовательская GLSL body вставляется после generated texture helpers и property defines, затем до встроенного main снимаются #undef; так property names не подменяют renderer code после пользовательской функции. Custom shader выбирается по (ShaderId, alpha mode, draw pass); wireframe и overdraw используют встроенный pipeline. Полная схема .rveshader описана в [[Engine/EngineMaterials]].
 
 ## GPU-частицы
 
