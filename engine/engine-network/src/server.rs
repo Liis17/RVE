@@ -1,11 +1,12 @@
 //! Сервер: рукопожатие с cookie, полуоткрытые сессии и слоты подключений. Ввода-вывода нет.
 //!
 //! Слот `max_clients` занимается только после первого аутентифицированного пакета клиента
-//! с верным доказательством пароля. Полуоткрытые сессии ограничены общим числом и числом на адрес
-//! и сбрасываются по таймауту, поэтому повтор записанного Confirm слот не занимает.
+//! с верным доказательством пароля. Полуоткрытые сессии ограничены общим числом и числом на IP-адрес
+//! и сбрасываются по таймауту, поэтому повтор записанного Confirm слот не занимает. Новые Confirm
+//! с одного IP-адреса ограничены по частоте, а адрес с серией неудачных входов временно отклоняется.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use engine_scene::network::{PeerId, SERVER_PEER_ID};
@@ -13,23 +14,37 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{
     EphemeralKey, Password, ServerIdentity, Session, Transcript, ct_eq, derive_keys, password_hash,
-    password_proof, random_bytes, transcript_hash,
+    password_proof, random_bytes, reject_session, transcript_hash,
 };
 use crate::handshake::{
     HANDSHAKE_TIMEOUT, Hello, accept_datagram, cookie_datagram, cookie_valid, make_cookie,
     parse_confirm, reject_datagram,
 };
 use crate::link::{
-    Link, OP_AUTH, OP_DISCONNECT, OP_FRAMES, disconnect_body, parse_disconnect, welcome_body,
+    AUTH_BODY, Link, OP_AUTH, OP_DISCONNECT, OP_FRAMES, disconnect_body, parse_disconnect,
+    welcome_body,
 };
-use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM};
+use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM, SEQ_LEN, TAG_LEN};
 use crate::{Channel, NetError, NetworkEvent, Output};
 
 /// Наибольшее число клиентов на сервере.
 pub const MAX_CLIENTS: usize = 64;
 const MAX_HALF_OPEN: usize = 256;
-const MAX_HALF_OPEN_PER_ADDR: usize = 4;
-const AUTH_BODY: usize = 1 + 32;
+/// Полуоткрытые сессии с одного IP-адреса. Считаются по адресу, а не по порту.
+pub(crate) const MAX_HALF_OPEN_PER_IP: usize = 4;
+/// Запас новых Confirm с одного IP-адреса и скорость пополнения в секунду.
+const CONFIRM_BURST: u32 = 8;
+const CONFIRM_PER_SEC: f64 = 1.0;
+/// Наибольшее число адресов, которые сервер помнит одновременно (частота Confirm и отказы входа).
+const MAX_TRACKED_IPS: usize = 1024;
+/// Число неудачных входов подряд, после которого адрес временно отклоняется.
+pub(crate) const AUTH_FAILURE_LIMIT: u32 = 5;
+const AUTH_BACKOFF_MAX: Duration = Duration::from_secs(60);
+const PASSWORD_REJECT: &str = "не удалось проверить пароль";
+/// Размер датаграммы с попыткой входа: по нему опознаётся неудачный Auth.
+const AUTH_DATAGRAM: usize = HEADER_LEN + SEQ_LEN + AUTH_BODY + TAG_LEN;
+/// Доказательство пароля в теле Auth идёт сразу за операцией.
+const PROOF_RANGE: std::ops::Range<usize> = 1..33;
 
 /// Настройки сервера.
 pub struct ServerConfig {
@@ -45,10 +60,66 @@ pub struct ServerConfig {
 struct HalfOpen {
     addr: SocketAddr,
     client_public: [u8; 32],
+    /// Сессия с ключами от пароля: открывает Auth.
     session: Session,
+    /// Сессия отказа: ключи не зависят от пароля, поэтому клиент прочтёт отказ без него.
+    reject: Session,
     transcript: [u8; 32],
     accept: Vec<u8>,
     expires: Instant,
+}
+
+/// Запас новых Confirm одного адреса: пополняется, но не больше `CONFIRM_BURST`.
+#[derive(Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    updated: Instant,
+}
+
+impl Bucket {
+    fn available(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
+        (self.tokens + elapsed * CONFIRM_PER_SEC).min(f64::from(CONFIRM_BURST))
+    }
+}
+
+/// Ограничение частоты новых Confirm по IP-адресу. Таблица ограничена: когда она полна, новые
+/// адреса отклоняются, пока в ней не освободятся записи с полным запасом.
+#[derive(Default)]
+struct ConfirmLimiter {
+    buckets: HashMap<IpAddr, Bucket>,
+}
+
+impl ConfirmLimiter {
+    fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let full = f64::from(CONFIRM_BURST);
+        if !self.buckets.contains_key(&ip) && self.buckets.len() >= MAX_TRACKED_IPS {
+            self.buckets
+                .retain(|_, bucket| bucket.available(now) < full);
+            if self.buckets.len() >= MAX_TRACKED_IPS {
+                return false;
+            }
+        }
+        let bucket = self.buckets.entry(ip).or_insert(Bucket {
+            tokens: full,
+            updated: now,
+        });
+        let available = bucket.available(now);
+        let allowed = available >= 1.0;
+        let tokens = if allowed { available - 1.0 } else { available };
+        *bucket = Bucket {
+            tokens,
+            updated: now,
+        };
+        allowed
+    }
+}
+
+/// Неудачные входы одного адреса и время временного отказа.
+#[derive(Default, Clone, Copy)]
+struct AuthRecord {
+    failures: u32,
+    blocked_until: Option<Instant>,
 }
 
 /// Машина состояний сервера.
@@ -64,6 +135,8 @@ pub struct Server {
     halves: HashMap<u32, HalfOpen>,
     links: HashMap<u32, Link>,
     next_peer: PeerId,
+    confirms: ConfirmLimiter,
+    auth_failures: HashMap<IpAddr, AuthRecord>,
 }
 
 impl Server {
@@ -89,6 +162,8 @@ impl Server {
             halves: HashMap::new(),
             links: HashMap::new(),
             next_peer: SERVER_PEER_ID + 1,
+            confirms: ConfirmLimiter::default(),
+            auth_failures: HashMap::new(),
         })
     }
 
@@ -111,6 +186,15 @@ impl Server {
     pub fn update(&mut self, now: Instant) -> Output {
         let mut out = Output::default();
         self.halves.retain(|_, half| half.expires > now);
+        // Участник с переполненной очередью надёжных сообщений отключается с причиной.
+        let faulted: Vec<(u32, &'static str)> = self
+            .links
+            .iter()
+            .filter_map(|(conn_id, link)| link.fault().map(|reason| (*conn_id, reason)))
+            .collect();
+        for (conn_id, reason) in faulted {
+            self.close(conn_id, reason, true, &mut out);
+        }
         let timed_out: Vec<u32> = self
             .links
             .iter()
@@ -132,7 +216,8 @@ impl Server {
         out
     }
 
-    /// Ставит сообщение в очередь одного участника.
+    /// Ставит сообщение в очередь одного участника. При переполнении надёжной очереди участник
+    /// отключается в следующем `update` с причиной; сама ошибка возвращается сразу.
     pub fn send(&mut self, peer: PeerId, channel: Channel, bytes: &[u8]) -> Result<(), NetError> {
         let conn_id = self.conn_of(peer).ok_or(NetError::UnknownPeer)?;
         match self.links.get_mut(&conn_id) {
@@ -141,17 +226,31 @@ impl Server {
         }
     }
 
-    /// Ставит сообщение всем участникам. Возвращает первую ошибку, но остальным очередь не отменяет.
+    /// Ставит сообщение всем участникам. Медленный участник с переполненной надёжной очередью
+    /// отключается, остальные получают сообщение.
     pub fn broadcast(&mut self, channel: Channel, bytes: &[u8]) -> Result<(), NetError> {
         let mut result = Ok(());
         for link in self.links.values_mut() {
-            if let Err(err) = link.enqueue(channel, bytes)
-                && result.is_ok()
-            {
-                result = Err(err);
+            match link.enqueue(channel, bytes) {
+                Ok(()) => {}
+                // Переполнение надёжной очереди отключает этого участника; остальным сообщение уйдёт.
+                Err(NetError::QueueFull) if channel.is_reliable() => {}
+                Err(err) => {
+                    if result.is_ok() {
+                        result = Err(err);
+                    }
+                }
             }
         }
         result
+    }
+
+    /// Вызывается, пока приложение не забирает события: молчание пиров тогда вызвано нами,
+    /// поэтому таймаут соединений не идёт.
+    pub fn hold_timeouts(&mut self, now: Instant) {
+        for link in self.links.values_mut() {
+            link.hold(now);
+        }
     }
 
     /// Отключает участника и сообщает ему причину.
@@ -234,17 +333,22 @@ impl Server {
             out.datagrams.push((from, half.accept.clone()));
             return;
         }
-        let per_addr = self
+        // Лимиты считаются по IP-адресу: иначе один хост открывает их по одному разу на каждый порт.
+        let per_ip = self
             .halves
             .values()
-            .filter(|half| half.addr == from)
+            .filter(|half| half.addr.ip() == from.ip())
             .count();
-        if self.halves.len() >= MAX_HALF_OPEN || per_addr >= MAX_HALF_OPEN_PER_ADDR {
+        if self.halves.len() >= MAX_HALF_OPEN || per_ip >= MAX_HALF_OPEN_PER_IP {
+            return;
+        }
+        if !self.confirms.allow(from.ip(), now) {
             return;
         }
         match self.open_half(from, &hello, now) {
             Ok(accept) => out.datagrams.push((from, accept)),
-            Err(err) => log::warn!("рукопожатие с {from} не начато: {err}"),
+            // Вырожденный ключ присылает сбойный или злонамеренный клиент; это не ошибка сервера.
+            Err(err) => log::debug!("рукопожатие с {from} не начато: {err}"),
         }
     }
 
@@ -271,6 +375,7 @@ impl Server {
             conn_id,
         });
         let keys = derive_keys(&shared, &transcript, &password_hash(self.password.as_ref()));
+        let reject = reject_session(&shared, &transcript);
         let signature = self.identity.sign(&transcript);
         let accept = accept_datagram(conn_id, &server_public, &identity_public, &signature);
         let session = Session::new(&keys.server_to_client, &keys.client_to_server);
@@ -280,6 +385,7 @@ impl Server {
                 addr,
                 client_public: hello.client_public,
                 session,
+                reject,
                 transcript,
                 accept: accept.clone(),
                 expires: now + HANDSHAKE_TIMEOUT,
@@ -321,6 +427,20 @@ impl Server {
             self.on_link_body(conn_id, seq, &body, now, out);
             return;
         }
+        self.on_half_data(from, conn_id, bytes, now, out);
+    }
+
+    fn on_half_data(
+        &mut self,
+        from: SocketAddr,
+        conn_id: u32,
+        bytes: &[u8],
+        now: Instant,
+        out: &mut Output,
+    ) {
+        if self.auth_blocked(from.ip(), now) {
+            return;
+        }
         let Some(half) = self.halves.get_mut(&conn_id) else {
             return;
         };
@@ -329,41 +449,67 @@ impl Server {
         }
         let Some((_, body)) = half.session.open(bytes) else {
             // Ключи производные от пароля: неверный пароль проявляется как ошибка расшифровки.
-            // Reject не подписан и отправляется только до аутентификации.
-            out.datagrams
-                .push((from, reject_datagram("не удалось проверить пароль")));
+            // Отказ шифруется ключом рукопожатия, его не подделать. Он отправляется, только если запрос
+            // не короче отказа, и рукопожатие после него закрывается: сервер не усиливает чужой трафик
+            // и не отвечает на один и тот же запрос дважды.
+            let reply = half.reject.seal(conn_id, &disconnect_body(PASSWORD_REJECT));
+            if let Some((_, datagram)) = reply
+                && bytes.len() >= datagram.len()
+            {
+                self.halves.remove(&conn_id);
+                out.datagrams.push((from, datagram));
+                if bytes.len() == AUTH_DATAGRAM {
+                    self.record_auth_failure(from.ip(), now);
+                }
+            }
             return;
         };
         let Some(mut half) = self.halves.remove(&conn_id) else {
             return;
         };
         if body.first() != Some(&OP_AUTH) || body.len() != AUTH_BODY {
-            self.reject_half(from, conn_id, &mut half, "нарушение протокола", out);
+            reject_half(from, conn_id, &mut half, "нарушение протокола", out);
             return;
         }
         let expected = password_proof(self.password.as_ref(), &half.transcript);
-        if !ct_eq(&body[1..], &expected) {
-            self.reject_half(from, conn_id, &mut half, "неверный пароль", out);
+        if !ct_eq(&body[PROOF_RANGE], &expected) {
+            self.record_auth_failure(from.ip(), now);
+            reject_half(from, conn_id, &mut half, "неверный пароль", out);
             return;
         }
         // Номера участников не переиспользуются: исчерпание u32 равносильно заполненному серверу.
         if self.links.len() >= self.max_clients || self.next_peer == PeerId::MAX {
-            self.reject_half(from, conn_id, &mut half, "сервер заполнен", out);
+            reject_half(from, conn_id, &mut half, "сервер заполнен", out);
             return;
         }
+        self.auth_failures.remove(&from.ip());
         self.promote(conn_id, half, now, out);
     }
 
-    fn reject_half(
-        &self,
-        from: SocketAddr,
-        conn_id: u32,
-        half: &mut HalfOpen,
-        reason: &str,
-        out: &mut Output,
-    ) {
-        if let Some((_, datagram)) = half.session.seal(conn_id, &disconnect_body(reason)) {
-            out.datagrams.push((from, datagram));
+    /// Адрес временно отклонён после серии неудачных входов.
+    fn auth_blocked(&self, ip: IpAddr, now: Instant) -> bool {
+        self.auth_failures
+            .get(&ip)
+            .and_then(|record| record.blocked_until)
+            .is_some_and(|until| now < until)
+    }
+
+    /// Учитывает неудачный вход. С `AUTH_FAILURE_LIMIT` попытки подряд адрес отклоняется на срок,
+    /// который растёт вдвое с каждой следующей неудачей и ограничен `AUTH_BACKOFF_MAX`.
+    fn record_auth_failure(&mut self, ip: IpAddr, now: Instant) {
+        if !self.auth_failures.contains_key(&ip) && self.auth_failures.len() >= MAX_TRACKED_IPS {
+            self.auth_failures
+                .retain(|_, record| record.blocked_until.is_some_and(|until| until > now));
+            if self.auth_failures.len() >= MAX_TRACKED_IPS {
+                return;
+            }
+        }
+        let record = self.auth_failures.entry(ip).or_default();
+        record.failures = record.failures.saturating_add(1);
+        if record.failures >= AUTH_FAILURE_LIMIT {
+            let steps = (record.failures - AUTH_FAILURE_LIMIT).min(16);
+            let backoff = Duration::from_secs(1u64 << steps).min(AUTH_BACKOFF_MAX);
+            record.blocked_until = Some(now + backoff);
         }
     }
 
@@ -427,9 +573,56 @@ impl Server {
     }
 }
 
+/// Отказ на рукопожатии, которое прошло расшифровку: шифруется ключом отказа, не паролем.
+fn reject_half(
+    from: SocketAddr,
+    conn_id: u32,
+    half: &mut HalfOpen,
+    reason: &str,
+    out: &mut Output,
+) {
+    if let Some((_, datagram)) = half.reject.seal(conn_id, &disconnect_body(reason)) {
+        out.datagrams.push((from, datagram));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirm_limiter_allows_a_burst_then_refills_per_address() {
+        let mut limiter = ConfirmLimiter::default();
+        let now = Instant::now();
+        let ip: IpAddr = [127, 0, 0, 1].into();
+        let burst = (0..CONFIRM_BURST)
+            .filter(|_| limiter.allow(ip, now))
+            .count();
+        assert_eq!(burst, CONFIRM_BURST as usize);
+        assert!(!limiter.allow(ip, now), "запас исчерпан");
+        let other: IpAddr = [127, 0, 0, 2].into();
+        assert!(limiter.allow(other, now), "у другого адреса свой запас");
+        assert!(
+            limiter.allow(ip, now + Duration::from_secs(1)),
+            "запас пополнился"
+        );
+    }
+
+    #[test]
+    fn confirm_limiter_table_is_bounded() {
+        let mut limiter = ConfirmLimiter::default();
+        let now = Instant::now();
+        for index in 0..MAX_TRACKED_IPS {
+            let ip = IpAddr::from([10, 0, (index >> 8) as u8, index as u8]);
+            assert!(limiter.allow(ip, now));
+        }
+        assert!(!limiter.allow([10, 1, 0, 0].into(), now), "таблица полна");
+        let later = now + Duration::from_secs(10);
+        assert!(
+            limiter.allow([10, 1, 0, 0].into(), later),
+            "полные записи освобождают место"
+        );
+    }
 
     #[test]
     fn max_clients_must_be_within_the_documented_range() {

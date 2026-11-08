@@ -10,15 +10,23 @@ use std::time::{Duration, Instant};
 
 use crate::codec::Reader;
 use crate::packet::{FRAGMENT_PAYLOAD, MAX_MESSAGE_BYTES};
-use crate::{Channel, NetError};
+use crate::{Channel, NetError, check_message_size};
 
 const CHANNELS: usize = 4;
 /// Размер кадра без полезной нагрузки: канал, номер, фрагмент, число фрагментов, длина.
 pub(crate) const FRAME_HEADER: usize = 1 + 4 + 2 + 2 + 2;
 /// Наибольшее число неподтверждённых пакетов с надёжными кадрами.
 const MAX_INFLIGHT: usize = 64;
-/// Суммарный объём кадров в очередях одного пира.
+/// Объём надёжных кадров в полёте. Остаётся внутри буфера приёма пира (2 MiB).
+const MAX_INFLIGHT_BYTES: usize = 256 * 1024;
+/// Суммарный объём надёжных кадров в очередях одного пира.
 const MAX_QUEUED_BYTES: usize = 512 * 1024;
+/// Объём ненадёжных кадров в очередях. При переполнении вытесняются самые старые кадры.
+const MAX_SOFT_QUEUED_BYTES: usize = 256 * 1024;
+/// Насколько новый надёжный кадр канала может опережать старейший неподтверждённый кадр того же канала.
+/// 1024 кадра по ~1 KB укладываются в буфер приёма пира, поэтому честный пир не переполняет его
+/// даже при долгой потере одного кадра.
+const MAX_SEQ_GAP: i32 = 1024;
 /// Насколько далеко вперёд приёмник принимает кадры канала. Окно широкое: при потере одного пакета
 /// отправитель продолжает слать мелкие сообщения, и их число за время повтора велико. Память ограничивает
 /// `MAX_BUFFERED_BYTES`, а не число кадров.
@@ -33,6 +41,8 @@ const BURST_BYTES: f64 = 64.0 * 1024.0;
 const INITIAL_RTO: Duration = Duration::from_millis(300);
 const MIN_RTO: Duration = Duration::from_millis(50);
 const MAX_RTO: Duration = Duration::from_secs(2);
+/// Потолок показателя экспоненциального роста RTO при подряд идущих таймаутах.
+const MAX_RTO_BACKOFF: u32 = 6;
 /// Пакет считается потерянным, если три более новых пакета уже подтверждены.
 const REORDER_THRESHOLD: u64 = 3;
 /// Маска подтверждений охватывает 64 предыдущих пакета.
@@ -90,6 +100,8 @@ impl Frame {
 struct InFlight {
     sent_at: Instant,
     frames: Vec<Frame>,
+    /// Занятый объём кадров с учётом заголовков: учитывается в `inflight_bytes`.
+    bytes: usize,
 }
 
 /// Входящий поток одного канала.
@@ -108,14 +120,20 @@ struct Inbound {
 /// Состояние надёжности одного соединения.
 pub(crate) struct Reliability {
     queues: [VecDeque<Frame>; CHANNELS],
-    queued_bytes: usize,
+    /// Байты надёжных кадров в очередях.
+    queued_reliable: usize,
+    /// Байты ненадёжных кадров в очередях; отдельный бюджет не даёт им вытеснить надёжные.
+    queued_soft: usize,
     next_seq: [u32; CHANNELS],
     inflight: BTreeMap<u64, InFlight>,
+    inflight_bytes: usize,
     largest_received: Option<u64>,
     received_bits: u64,
     ack_needed: bool,
     srtt: Option<Duration>,
     rttvar: Duration,
+    /// Число подряд идущих таймаутов без подтверждений: множитель RTO как степень двойки.
+    rto_backoff: u32,
     inbound: [Inbound; CHANNELS],
     buffered_bytes: usize,
     tokens: f64,
@@ -126,14 +144,17 @@ impl Reliability {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
             queues: std::array::from_fn(|_| VecDeque::new()),
-            queued_bytes: 0,
+            queued_reliable: 0,
+            queued_soft: 0,
             next_seq: [0; CHANNELS],
             inflight: BTreeMap::new(),
+            inflight_bytes: 0,
             largest_received: None,
             received_bits: 0,
             ack_needed: false,
             srtt: None,
             rttvar: Duration::ZERO,
+            rto_backoff: 0,
             inbound: std::array::from_fn(|_| Inbound::default()),
             buffered_bytes: 0,
             tokens: BURST_BYTES,
@@ -142,21 +163,20 @@ impl Reliability {
     }
 
     /// Ставит сообщение в очередь канала, разбивая его на фрагменты.
+    /// Надёжное сообщение при переполнении очереди отклоняется (`QueueFull`), ненадёжное
+    /// вытесняет самые старые ненадёжные кадры и никогда не отказывает.
     pub(crate) fn enqueue(&mut self, channel: Channel, bytes: &[u8]) -> Result<(), NetError> {
-        if bytes.len() > MAX_MESSAGE_BYTES {
-            return Err(NetError::MessageTooLarge {
-                size: bytes.len(),
-                limit: MAX_MESSAGE_BYTES,
-            });
-        }
-        if !channel.is_reliable() && bytes.len() > FRAGMENT_PAYLOAD {
-            return Err(NetError::MessageTooLarge {
-                size: bytes.len(),
-                limit: FRAGMENT_PAYLOAD,
-            });
-        }
-        if self.queued_bytes + bytes.len() > MAX_QUEUED_BYTES {
-            return Err(NetError::QueueFull);
+        check_message_size(channel, bytes.len())?;
+        if channel.is_reliable() {
+            if self.queued_reliable + bytes.len() > MAX_QUEUED_BYTES {
+                return Err(NetError::QueueFull);
+            }
+        } else {
+            while self.queued_soft + bytes.len() > MAX_SOFT_QUEUED_BYTES {
+                if !self.evict_soft() {
+                    break;
+                }
+            }
         }
         let parts: Vec<&[u8]> = if bytes.is_empty() {
             vec![bytes]
@@ -175,37 +195,80 @@ impl Reliability {
                 count,
                 payload: part.to_vec(),
             });
-            self.queued_bytes += part.len();
+            *self.queued_counter(channel) += part.len();
         }
         Ok(())
     }
 
-    /// Можно ли отправить ещё один пакет с надёжными кадрами.
+    /// Удаляет самый старый ненадёжный кадр из очередей. Сначала состояния, потом ненадёжные.
+    fn evict_soft(&mut self) -> bool {
+        for slot in [Channel::State.index(), Channel::Unreliable.index()] {
+            if let Some(frame) = self.queues[slot].pop_front() {
+                self.queued_soft -= frame.payload.len();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn queued_counter(&mut self, channel: Channel) -> &mut usize {
+        if channel.is_reliable() {
+            &mut self.queued_reliable
+        } else {
+            &mut self.queued_soft
+        }
+    }
+
+    /// Можно ли отправить ещё один пакет с надёжными кадрами: ограничены число пакетов и объём в полёте.
     pub(crate) fn can_send(&self) -> bool {
-        self.inflight.len() < MAX_INFLIGHT
+        self.inflight.len() < MAX_INFLIGHT && self.inflight_bytes < MAX_INFLIGHT_BYTES
     }
 
     /// Забирает кадры в порядке приоритета каналов, не больше `room` байт.
+    /// Надёжный кадр не уходит дальше `MAX_SEQ_GAP` от старейшего неподтверждённого кадра своего канала.
     pub(crate) fn take_frames(&mut self, room: usize) -> Vec<Frame> {
+        let mut oldest = self.oldest_unacked();
         let mut taken = Vec::new();
         let mut used = 0;
-        for queue in &mut self.queues {
-            while let Some(size) = queue
-                .front()
-                .map(|frame| FRAME_HEADER + frame.payload.len())
-            {
-                if used + size > room {
+        // Освобождённые байты по группам: надёжные и ненадёжные.
+        let mut dequeued = [0usize; 2];
+        for (slot, queue) in self.queues.iter_mut().enumerate() {
+            while let Some(frame) = queue.front() {
+                let size = FRAME_HEADER + frame.payload.len();
+                if used + size > room
+                    || (frame.channel.is_reliable() && beyond_gap(frame.seq, oldest[slot]))
+                {
                     break;
                 }
                 let Some(frame) = queue.pop_front() else {
                     break;
                 };
                 used += size;
-                self.queued_bytes -= frame.payload.len();
+                dequeued[usize::from(!frame.channel.is_reliable())] += frame.payload.len();
+                // Кадры этой партии станут неподтверждёнными: самый старый из них задаёт базу отставания.
+                if frame.channel.is_reliable() {
+                    oldest[slot].get_or_insert(frame.seq);
+                }
                 taken.push(frame);
             }
         }
+        self.queued_reliable -= dequeued[0];
+        self.queued_soft -= dequeued[1];
         taken
+    }
+
+    /// Старейший неподтверждённый надёжный кадр каждого канала: по нему ограничивается отставание.
+    fn oldest_unacked(&self) -> [Option<u32>; CHANNELS] {
+        let mut oldest: [Option<u32>; CHANNELS] = [None; CHANNELS];
+        for flight in self.inflight.values() {
+            for frame in &flight.frames {
+                let slot = &mut oldest[frame.channel.index()];
+                if slot.is_none_or(|current| (frame.seq.wrapping_sub(current) as i32) < 0) {
+                    *slot = Some(frame.seq);
+                }
+            }
+        }
+        oldest
     }
 
     /// Запоминает надёжные кадры отправленного пакета до подтверждения.
@@ -214,15 +277,29 @@ impl Reliability {
             .into_iter()
             .filter(|frame| frame.channel.is_reliable())
             .collect();
-        if !reliable.is_empty() {
-            self.inflight.insert(
-                seq,
-                InFlight {
-                    sent_at: now,
-                    frames: reliable,
-                },
-            );
+        if reliable.is_empty() {
+            return;
         }
+        let bytes = reliable
+            .iter()
+            .map(|frame| FRAME_HEADER + frame.payload.len())
+            .sum();
+        self.inflight_bytes += bytes;
+        self.inflight.insert(
+            seq,
+            InFlight {
+                sent_at: now,
+                frames: reliable,
+                bytes,
+            },
+        );
+    }
+
+    /// Снимает пакет с учёта полёта и возвращает его кадры.
+    fn take_flight(&mut self, seq: u64) -> Option<InFlight> {
+        let flight = self.inflight.remove(&seq)?;
+        self.inflight_bytes -= flight.bytes;
+        Some(flight)
     }
 
     /// Переотправляет кадры пакетов, у которых истёк RTO.
@@ -234,6 +311,9 @@ impl Reliability {
             .filter(|(_, flight)| now.saturating_duration_since(flight.sent_at) >= rto)
             .map(|(seq, _)| *seq)
             .collect();
+        if !expired.is_empty() {
+            self.rto_backoff = (self.rto_backoff + 1).min(MAX_RTO_BACKOFF);
+        }
         self.requeue_packets(&expired);
     }
 
@@ -245,8 +325,12 @@ impl Reliability {
             .filter(|(seq, _)| acked_by(largest, bits, **seq))
             .map(|(seq, _)| *seq)
             .collect();
+        if !acked.is_empty() {
+            // Подтверждение пошло: сеть отвечает, поэтому RTO возвращается к базовому значению.
+            self.rto_backoff = 0;
+        }
         for seq in acked {
-            if let Some(flight) = self.inflight.remove(&seq)
+            if let Some(flight) = self.take_flight(seq)
                 && seq == largest
             {
                 self.sample_rtt(now.saturating_duration_since(flight.sent_at));
@@ -261,13 +345,13 @@ impl Reliability {
     fn requeue_packets(&mut self, packets: &[u64]) {
         let mut lost = Vec::new();
         for seq in packets {
-            if let Some(flight) = self.inflight.remove(seq) {
+            if let Some(flight) = self.take_flight(*seq) {
                 lost.extend(flight.frames);
             }
         }
         lost.sort_by_key(|frame| (frame.channel.index(), frame.seq));
         for frame in lost.into_iter().rev() {
-            self.queued_bytes += frame.payload.len();
+            *self.queued_counter(frame.channel) += frame.payload.len();
             self.queues[frame.channel.index()].push_front(frame);
         }
     }
@@ -286,11 +370,13 @@ impl Reliability {
         }
     }
 
+    /// Базовый RTO по RTT, умноженный на 2^`rto_backoff` и ограниченный `MAX_RTO`.
     fn rto(&self) -> Duration {
-        match self.srtt {
+        let base = match self.srtt {
             None => INITIAL_RTO,
             Some(srtt) => (srtt + self.rttvar * 4).clamp(MIN_RTO, MAX_RTO),
-        }
+        };
+        (base * (1u32 << self.rto_backoff)).min(MAX_RTO)
     }
 
     /// Отмечает принятый пакет. Пакет с кадрами требует подтверждения.
@@ -372,10 +458,12 @@ impl Reliability {
     ) -> Result<(), &'static str> {
         let slot = frame.channel.index();
         let expected = self.inbound[slot].expected;
-        if frame.seq < expected {
+        // Разность с учётом переполнения u32: отрицательная означает уже доставленный кадр.
+        let ahead = frame.seq.wrapping_sub(expected) as i32;
+        if ahead < 0 {
             return Ok(());
         }
-        if frame.seq - expected >= REORDER_WINDOW {
+        if ahead as u32 >= REORDER_WINDOW {
             return Err("переполнено окно приёма");
         }
         if self.inbound[slot].pending.contains_key(&frame.seq) {
@@ -416,6 +504,12 @@ impl Reliability {
     pub(crate) fn spend(&mut self, bytes: usize) {
         self.tokens -= bytes as f64;
     }
+}
+
+/// Опережает ли надёжный кадр `seq` старейший неподтверждённый кадр `oldest` больше допустимого.
+/// Кадры старее `oldest` (requeue потерянных) разрешены: их и нужно переотправить.
+fn beyond_gap(seq: u32, oldest: Option<u32>) -> bool {
+    oldest.is_some_and(|oldest| (seq.wrapping_sub(oldest) as i32) >= MAX_SEQ_GAP)
 }
 
 fn acked_by(largest: u64, bits: u64, seq: u64) -> bool {
@@ -659,18 +753,194 @@ mod tests {
     }
 
     #[test]
-    fn queue_is_bounded_and_reports_queue_full() {
+    fn reliable_queue_is_bounded_and_reports_queue_full() {
         let mut rel = Reliability::new(Instant::now());
         let chunk = vec![0u8; FRAGMENT_PAYLOAD];
         let mut accepted = 0;
-        while rel.enqueue(Channel::State, &chunk).is_ok() {
+        while rel.enqueue(Channel::Reliable, &chunk).is_ok() {
             accepted += 1;
         }
         assert_eq!(accepted, MAX_QUEUED_BYTES / FRAGMENT_PAYLOAD);
         assert_eq!(
-            rel.enqueue(Channel::State, &chunk),
+            rel.enqueue(Channel::Reliable, &chunk),
             Err(NetError::QueueFull)
         );
+    }
+
+    /// Состояния не отказывают при переполнении: вытесняются самые старые кадры.
+    #[test]
+    fn state_queue_evicts_stale_frames_instead_of_refusing() {
+        let mut rel = Reliability::new(Instant::now());
+        let chunk = vec![0u8; FRAGMENT_PAYLOAD];
+        for _ in 0..(MAX_SOFT_QUEUED_BYTES / FRAGMENT_PAYLOAD) * 2 {
+            rel.enqueue(Channel::State, &chunk)
+                .expect("состояния не отказывают");
+        }
+        assert!(rel.queued_soft <= MAX_SOFT_QUEUED_BYTES);
+        let frames = rel.take_frames(usize::MAX);
+        assert!(frames.first().is_some_and(|frame| frame.seq > 0));
+    }
+
+    /// Заполненная очередь состояний не мешает надёжным сообщениям.
+    #[test]
+    fn soft_flood_leaves_the_reliable_budget_untouched() {
+        let mut rel = Reliability::new(Instant::now());
+        let chunk = vec![0u8; FRAGMENT_PAYLOAD];
+        for _ in 0..1_000 {
+            rel.enqueue(Channel::State, &chunk).unwrap();
+        }
+        assert!(rel.enqueue(Channel::Reliable, b"control").is_ok());
+        assert_eq!(rel.queued_reliable, b"control".len());
+    }
+
+    /// Регрессия: сравнение номеров через переполнение u32 (после 2^32 кадров).
+    #[test]
+    fn wrapped_sequence_numbers_keep_frames_in_order() {
+        let mut rel = Reliability::new(Instant::now());
+        rel.inbound[Channel::Reliable.index()].expected = u32::MAX - 1;
+        let mut out = Vec::new();
+        rel.receive(frame(Channel::Reliable, u32::MAX - 1, 0, 1, b"a"), &mut out)
+            .unwrap();
+        // Кадр 0 опережает MAX, поэтому ждёт кадр MAX и не теряется.
+        rel.receive(frame(Channel::Reliable, 0, 0, 1, b"c"), &mut out)
+            .unwrap();
+        assert_eq!(out.len(), 1, "кадр 0 ждёт кадр MAX");
+        rel.receive(frame(Channel::Reliable, u32::MAX, 0, 1, b"b"), &mut out)
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                (Channel::Reliable, b"a".to_vec()),
+                (Channel::Reliable, b"b".to_vec()),
+                (Channel::Reliable, b"c".to_vec()),
+            ]
+        );
+    }
+
+    /// Отправитель не уходит дальше `MAX_SEQ_GAP` от старейшего неподтверждённого кадра.
+    #[test]
+    fn sender_stops_far_ahead_of_the_oldest_unacknowledged_frame() {
+        let start = Instant::now();
+        let mut rel = Reliability::new(start);
+        for _ in 0..4_000 {
+            rel.enqueue(Channel::Reliable, &[0u8; 100]).unwrap();
+        }
+        let mut max_seq = 0;
+        for packet in 0..200u64 {
+            if !rel.can_send() {
+                break;
+            }
+            let frames = rel.take_frames(usize::MAX);
+            for frame in &frames {
+                max_seq = max_seq.max(frame.seq);
+            }
+            rel.record_sent(packet, start, frames);
+        }
+        assert!(
+            max_seq < MAX_SEQ_GAP as u32,
+            "кадры не уходят дальше {MAX_SEQ_GAP} от неподтверждённого"
+        );
+    }
+
+    /// Надёжные кадры в полёте ограничены по байтам, а не только по числу пакетов.
+    #[test]
+    fn frames_in_flight_are_bounded_by_bytes() {
+        let start = Instant::now();
+        let mut rel = Reliability::new(start);
+        // 300 кадров по ~1 KB: 303 KB в полёте, выше лимита 256 KB.
+        for _ in 0..300 {
+            rel.enqueue(Channel::Reliable, &[0u8; FRAGMENT_PAYLOAD])
+                .unwrap();
+        }
+        let frames = rel.take_frames(usize::MAX);
+        rel.record_sent(0, start, frames);
+        assert!(!rel.can_send(), "объём в полёте превышен");
+    }
+
+    /// RTO растёт при подряд идущих таймаутах и возвращается к базовому значению после подтверждения.
+    #[test]
+    fn rto_doubles_on_consecutive_timeouts_and_resets_on_ack() {
+        let start = Instant::now();
+        let mut rel = Reliability::new(start);
+        rel.enqueue(Channel::Rpc, b"rpc").unwrap();
+        let frames = rel.take_frames(usize::MAX);
+        rel.record_sent(0, start, frames);
+        rel.on_timers(start + INITIAL_RTO);
+        assert_eq!(rel.rto(), INITIAL_RTO * 2);
+
+        let later = start + INITIAL_RTO;
+        let frames = rel.take_frames(usize::MAX);
+        rel.record_sent(1, later, frames);
+        rel.on_timers(later + INITIAL_RTO * 2);
+        assert_eq!(rel.rto(), INITIAL_RTO * 4);
+
+        let retry_at = later + INITIAL_RTO * 2;
+        let frames = rel.take_frames(usize::MAX);
+        rel.record_sent(2, retry_at, frames);
+        rel.on_ack(retry_at + Duration::from_millis(10), 2, 0);
+        assert_eq!(rel.rto_backoff, 0);
+    }
+
+    /// Регрессия: долгая потеря одного кадра при большом потоке не переполняет буфер честного пира.
+    #[test]
+    fn long_loss_of_one_frame_does_not_overflow_the_receiver() {
+        let start = Instant::now();
+        let mut sender = Reliability::new(start);
+        let mut receiver = Reliability::new(start);
+        let total: u32 = 4_000;
+        let lost_until = start + Duration::from_secs(20);
+        let mut queued = 0u32;
+        let mut packet = 0u64;
+        let mut delivered: Vec<u32> = Vec::new();
+        let mut now = start;
+        while delivered.len() < total as usize && now < start + Duration::from_secs(600) {
+            while queued < total {
+                let mut message = vec![0u8; FRAGMENT_PAYLOAD];
+                message[..4].copy_from_slice(&queued.to_be_bytes());
+                if sender.enqueue(Channel::Reliable, &message).is_err() {
+                    break;
+                }
+                queued += 1;
+            }
+            sender.on_timers(now);
+            sender.refill(now);
+            while sender.can_send() {
+                let frames = sender.take_frames(sender.tokens().min(1_100));
+                if frames.is_empty() {
+                    break;
+                }
+                let size: usize = frames
+                    .iter()
+                    .map(|frame| FRAME_HEADER + frame.payload.len())
+                    .sum();
+                sender.spend(size);
+                let lost = now < lost_until
+                    && frames
+                        .iter()
+                        .any(|frame| frame.channel == Channel::Reliable && frame.seq == 0);
+                sender.record_sent(packet, now, frames.clone());
+                if !lost {
+                    receiver.note_received(packet, true);
+                    for frame in frames {
+                        let mut out = Vec::new();
+                        receiver
+                            .receive(frame, &mut out)
+                            .expect("честный пир не закрыт");
+                        delivered.extend(
+                            out.into_iter().map(|(_, bytes)| {
+                                u32::from_be_bytes(bytes[..4].try_into().unwrap())
+                            }),
+                        );
+                    }
+                }
+                packet += 1;
+            }
+            if let Some((largest, bits)) = receiver.ack_fields() {
+                sender.on_ack(now, largest, bits);
+            }
+            now += Duration::from_millis(10);
+        }
+        assert_eq!(delivered, (0..total).collect::<Vec<_>>());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Клиент: рукопожатие с закреплением отпечатка сервера, затем соединение. Ввода-вывода нет.
 //!
 //! Пароль и Auth уходят только после проверки подписи сервера и отпечатка. Без закреплённого
-//! отпечатка клиент подключается, только если `insecure_no_pin` задан явно.
+//! отпечатка клиент подключается, только если `insecure_no_pin` задан явно. Отказ сервера без
+//! подписи не доверяется: на этапе Auth он игнорируется, на раннем этапе показывается при таймауте.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use engine_scene::network::{PeerId, SERVER_PEER_ID};
 
 use crate::crypto::{
     EphemeralKey, Password, Session, Transcript, ct_eq, derive_keys, fingerprint_of, password_hash,
-    password_proof, random_bytes, transcript_hash, verify_accept,
+    password_proof, random_bytes, reject_session, transcript_hash, verify_accept,
 };
 use crate::handshake::{
     ACCEPT_BODY, COOKIE_BODY, HANDSHAKE_RESEND, HANDSHAKE_TIMEOUT, Hello, confirm_datagram,
@@ -56,6 +57,10 @@ struct Handshake {
     cookie: [u8; COOKIE_BODY],
     conn_id: u32,
     session: Option<Session>,
+    /// Сессия отказа: открывает зашифрованный отказ сервера на этапе Auth без пароля.
+    reject: Option<Session>,
+    /// Последний неподписанный отказ на раннем этапе: показывается, если рукопожатие не состоится.
+    last_reject: Option<String>,
     auth: Vec<u8>,
 }
 
@@ -116,6 +121,8 @@ impl Client {
                 cookie: [0; COOKIE_BODY],
                 conn_id: 0,
                 session: None,
+                reject: None,
+                last_reject: None,
                 auth: Vec::new(),
             })),
             local_peer: None,
@@ -156,7 +163,14 @@ impl Client {
         self.state = match state {
             State::Handshake(hs) => self.resend_or_timeout(hs, now, &mut out),
             State::Connected(mut link) => {
-                if link.timed_out(now) {
+                if let Some(reason) = link.fault() {
+                    // Переполнена очередь надёжных сообщений: сообщаем серверу причину и закрываемся.
+                    if let Some(datagram) = link.seal(&disconnect_body(reason)) {
+                        out.datagrams.push((self.settings.server, datagram));
+                    }
+                    disconnected(reason, &mut out);
+                    State::Closed
+                } else if link.timed_out(now) {
                     disconnected("таймаут соединения", &mut out);
                     State::Closed
                 } else {
@@ -172,6 +186,13 @@ impl Client {
             State::Closed => State::Closed,
         };
         out
+    }
+
+    /// Вызывается, пока приложение не забирает события: таймаут соединения тогда не идёт.
+    pub fn hold_timeouts(&mut self, now: Instant) {
+        if let State::Connected(link) = &mut self.state {
+            link.hold(now);
+        }
     }
 
     /// Ставит сообщение серверу.
@@ -196,7 +217,12 @@ impl Client {
 
     fn resend_or_timeout(&self, mut hs: Box<Handshake>, now: Instant, out: &mut Output) -> State {
         if now.saturating_duration_since(hs.started) >= HANDSHAKE_TIMEOUT {
-            disconnected("таймаут подключения", out);
+            // Неподписанный отказ мог подделать посредник, поэтому его причина — только пояснение к таймауту.
+            let reason = hs
+                .last_reject
+                .take()
+                .unwrap_or_else(|| "таймаут подключения".to_owned());
+            disconnected(&reason, out);
             return State::Closed;
         }
         let due = hs
@@ -235,7 +261,12 @@ impl Client {
                 accept_reply(&self.settings, &mut hs, header.conn_id, body, now)
             }
             (Stage::Auth, Kind::Data) => return self.on_welcome(hs, datagram, now, out),
-            (_, Kind::Reject) => Err(parse_reject(body)),
+            // Настоящий отказ на этапе Auth зашифрован и приходит как Data; обычный Reject подделывается.
+            (Stage::Auth, Kind::Reject) => Ok(None),
+            (_, Kind::Reject) => {
+                hs.last_reject = Some(parse_reject(body));
+                Ok(None)
+            }
             _ => Ok(None),
         };
         match reply {
@@ -262,7 +293,14 @@ impl Client {
             return State::Handshake(hs);
         };
         let Some((_, body)) = session.open(datagram) else {
-            return State::Handshake(hs);
+            // Отказ сервера шифруется ключом без пароля: неверный пароль не мешает его прочитать.
+            return match hs.reject.as_mut().and_then(|reject| reject.open(datagram)) {
+                Some((_, body)) if body.first() == Some(&OP_DISCONNECT) => {
+                    disconnected(&parse_disconnect(&body[1..]), out);
+                    State::Closed
+                }
+                _ => State::Handshake(hs),
+            };
         };
         if let Some(peer) = parse_welcome(&body) {
             self.local_peer = Some(peer);
@@ -351,11 +389,6 @@ fn accept_reply(
     let Some((server_public, identity, signature)) = parse_accept(body) else {
         return Ok(None);
     };
-    if let Some(pin) = settings.fingerprint
-        && !ct_eq(&fingerprint_of(&identity), &pin)
-    {
-        return Err("отпечаток ключа сервера не совпадает".into());
-    }
     let transcript = transcript_hash(&Transcript {
         protocol_id: &hs.hello.protocol_id,
         scene_hash: &hs.hello.scene_hash,
@@ -365,8 +398,15 @@ fn accept_reply(
         identity_public: &identity,
         conn_id,
     });
+    // Сначала подпись: подделанный или чужой Accept игнорируется и не сбивает рукопожатие.
     if !verify_accept(&identity, &transcript, &signature) {
-        return Err("подпись сервера не проверена".into());
+        return Ok(None);
+    }
+    // Ошибка отпечатка выдаётся только для подписанного ответа: это уже настоящий сервер с другим ключом.
+    if let Some(pin) = settings.fingerprint
+        && !ct_eq(&fingerprint_of(&identity), &pin)
+    {
+        return Err("отпечаток ключа сервера не совпадает".into());
     }
     let Some(shared) = hs.ephemeral.agree(&server_public) else {
         return Err("вырожденный ключ сервера".into());
@@ -384,6 +424,7 @@ fn accept_reply(
     };
     hs.conn_id = conn_id;
     hs.session = Some(session);
+    hs.reject = Some(reject_session(&shared, &transcript));
     hs.auth = auth;
     hs.stage = Stage::Auth;
     hs.sent_at = Some(now);
@@ -477,6 +518,66 @@ mod tests {
             vec![NetworkEvent::Disconnected {
                 peer: SERVER_PEER_ID,
                 reason: "выход".into()
+            }]
+        );
+    }
+
+    /// Accept с неверной подписью (например, подделанный посредником) не сбивает рукопожатие.
+    #[test]
+    fn forged_accept_without_a_valid_signature_is_ignored() {
+        use crate::handshake::accept_datagram;
+
+        let identity = crate::ServerIdentity::ephemeral().unwrap();
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some(identity.fingerprint()), false), now).unwrap();
+        let State::Handshake(hs) = &mut client.state else {
+            panic!("клиент должен быть в рукопожатии");
+        };
+        hs.stage = Stage::Confirm;
+        let forged = accept_datagram(7, &[9; 32], &identity.public_key(), &[1; 64]);
+        let out = client.handle_datagram(server, &forged, now);
+        assert!(out.events.is_empty(), "подделка не разрывает соединение");
+        assert!(out.datagrams.is_empty(), "пароль не отправлен");
+        assert!(matches!(
+            &client.state,
+            State::Handshake(hs) if hs.stage == Stage::Confirm
+        ));
+    }
+
+    /// Неподписанный отказ на этапе Auth игнорируется: его может подделать посредник.
+    #[test]
+    fn plain_reject_is_ignored_during_auth() {
+        use crate::handshake::reject_datagram;
+
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        let State::Handshake(hs) = &mut client.state else {
+            panic!("клиент должен быть в рукопожатии");
+        };
+        hs.stage = Stage::Auth;
+        let out = client.handle_datagram(server, &reject_datagram("подделка"), now);
+        assert!(out.events.is_empty(), "подделанный отказ не применяется");
+        assert!(matches!(&client.state, State::Handshake(_)));
+    }
+
+    /// Неподписанный отказ на раннем этапе запоминается и показывается, когда рукопожатие истекает.
+    #[test]
+    fn early_plain_reject_becomes_the_timeout_reason() {
+        use crate::handshake::reject_datagram;
+
+        let server = SocketAddr::from(([127, 0, 0, 1], 7777));
+        let now = Instant::now();
+        let mut client = Client::new(config(Some([3; 32]), false), now).unwrap();
+        let out = client.handle_datagram(server, &reject_datagram("протокол не совпадает"), now);
+        assert!(out.events.is_empty(), "обрыв откладывается до таймаута");
+        let out = client.update(now + HANDSHAKE_TIMEOUT);
+        assert_eq!(
+            out.events,
+            vec![NetworkEvent::Disconnected {
+                peer: SERVER_PEER_ID,
+                reason: "протокол не совпадает".into()
             }]
         );
     }

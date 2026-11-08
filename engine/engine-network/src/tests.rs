@@ -8,7 +8,12 @@ use engine_scene::network::PeerId;
 
 use crate::crypto::EphemeralKey;
 use crate::handshake::{COOKIE_BODY, Hello, confirm_datagram, hello_datagram};
-use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM};
+use crate::link::AUTH_BODY;
+use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM, SEQ_LEN, TAG_LEN};
+use crate::server::{AUTH_FAILURE_LIMIT, MAX_HALF_OPEN_PER_IP};
+
+/// Размер датаграммы с попыткой входа на сервере.
+const AUTH_DATAGRAM: usize = HEADER_LEN + SEQ_LEN + AUTH_BODY + TAG_LEN;
 use crate::{
     Channel, Client, ClientConfig, DatagramSocket, Faults, MemoryEndpoint, MemoryNetwork, NetError,
     NetworkEvent, Output, Password, Server, ServerConfig, ServerIdentity,
@@ -380,7 +385,7 @@ fn replayed_confirm_from_a_connected_client_takes_no_slot() {
 
 #[test]
 fn half_open_sessions_are_limited_per_address() {
-    // Лимит полуоткрытых сессий на один адрес (см. `server::MAX_HALF_OPEN_PER_ADDR`).
+    // Лимит полуоткрытых сессий на один IP-адрес (см. `server::MAX_HALF_OPEN_PER_IP`).
     let mut server = server_only(8);
     let now = Instant::now();
     let addr = client_addr(0);
@@ -626,4 +631,221 @@ fn feed(world: &mut World, client_side: SocketAddr, datagram: &[u8]) {
     let _ = world.clients[0]
         .client
         .handle_datagram(server_addr(), datagram, world.now);
+}
+
+/// Датаграмма `Data` нужной длины: заголовок и мусор вместо шифротекста.
+fn data_datagram(conn_id: u32, len: usize) -> Vec<u8> {
+    let mut datagram = Vec::new();
+    Header {
+        kind: Kind::Data,
+        conn_id,
+    }
+    .encode(&mut datagram);
+    datagram.resize(len, 0x5a);
+    datagram
+}
+
+/// Проводит рукопожатие клиента с сервером без продвижения времени. Возвращает причины отключения клиента.
+fn attempt(
+    server: &mut Server,
+    client: &mut Client,
+    from: SocketAddr,
+    now: Instant,
+) -> Vec<String> {
+    let mut to_server: Vec<Vec<u8>> = client
+        .update(now)
+        .datagrams
+        .into_iter()
+        .map(|(_, datagram)| datagram)
+        .collect();
+    let mut reasons = Vec::new();
+    for _ in 0..16 {
+        if to_server.is_empty() {
+            break;
+        }
+        let mut to_client = Vec::new();
+        for datagram in to_server.drain(..) {
+            let out = server.handle_datagram(from, &datagram, now);
+            to_client.extend(out.datagrams.into_iter().map(|(_, bytes)| bytes));
+        }
+        for datagram in to_client {
+            let out = client.handle_datagram(server_addr(), &datagram, now);
+            reasons.extend(disconnect_reasons(&out.events));
+            to_server.extend(out.datagrams.into_iter().map(|(_, bytes)| bytes));
+        }
+    }
+    reasons
+}
+
+/// Регрессия: полуоткрытые сессии считаются по IP-адресу, а не по порту.
+#[test]
+fn half_open_sessions_are_limited_per_ip_address_not_per_port() {
+    let mut server = server_only(8);
+    let now = Instant::now();
+    let mut accepted = 0;
+    for index in 0..6 {
+        let addr = client_addr(index);
+        let hello = fresh_hello();
+        let cookie = cookie_from(&server.handle_datagram(addr, &hello_datagram(&hello), now));
+        let out = server.handle_datagram(addr, &confirm_datagram(&cookie, &hello), now);
+        accepted += out.datagrams.len();
+    }
+    assert_eq!(accepted, MAX_HALF_OPEN_PER_IP);
+}
+
+/// Посторонний пакет полуоткрытой сессии получает отказ только если не короче его и только один раз.
+#[test]
+fn forged_packets_get_at_most_one_reject_and_only_when_not_shorter() {
+    let mut server = server_only(4);
+    let now = Instant::now();
+    let addr = client_addr(0);
+    let hello = fresh_hello();
+    let cookie = cookie_from(&server.handle_datagram(addr, &hello_datagram(&hello), now));
+    let out = server.handle_datagram(addr, &confirm_datagram(&cookie, &hello), now);
+    let (_, accept) = out.datagrams.first().expect("Accept");
+    let conn_id = Header::decode(accept).unwrap().conn_id;
+
+    let short = data_datagram(conn_id, 40);
+    assert!(
+        server
+            .handle_datagram(addr, &short, now)
+            .datagrams
+            .is_empty(),
+        "короткий запрос без ответа"
+    );
+
+    let long = data_datagram(conn_id, AUTH_DATAGRAM);
+    let reply = server.handle_datagram(addr, &long, now).datagrams;
+    assert_eq!(reply.len(), 1, "отказ на длинный запрос");
+    assert!(reply[0].1.len() <= long.len(), "ответ не длиннее запроса");
+    assert!(
+        server
+            .handle_datagram(addr, &long, now)
+            .datagrams
+            .is_empty(),
+        "второго ответа нет"
+    );
+}
+
+/// Серия неудачных входов с одного адреса приводит к временному отказу; после срока вход снова возможен.
+#[test]
+fn repeated_wrong_passwords_from_one_address_are_refused_for_a_while() {
+    let identity = ServerIdentity::ephemeral().unwrap();
+    let fingerprint = identity.fingerprint();
+    let now = Instant::now();
+    let mut server = Server::new(
+        ServerConfig {
+            protocol_id: PROTOCOL,
+            scene_hash: SCENE,
+            max_clients: 2,
+            password: Some(Password::new("верный")),
+            timeout: TIMEOUT,
+        },
+        identity,
+        now,
+    )
+    .unwrap();
+    let from = client_addr(0);
+    let mut try_wrong = |at: Instant| {
+        let mut client = Client::new(
+            ClientConfig {
+                protocol_id: PROTOCOL,
+                scene_hash: SCENE,
+                server: server_addr(),
+                fingerprint: Some(fingerprint),
+                insecure_no_pin: false,
+                password: Some(Password::new("неверный")),
+                timeout: TIMEOUT,
+            },
+            at,
+        )
+        .unwrap();
+        attempt(&mut server, &mut client, from, at)
+    };
+    for _ in 0..AUTH_FAILURE_LIMIT {
+        assert_eq!(try_wrong(now), vec!["не удалось проверить пароль"]);
+    }
+    assert!(
+        try_wrong(now).is_empty(),
+        "после серии неудач адрес временно отклонён"
+    );
+    assert_eq!(
+        try_wrong(now + Duration::from_secs(2)),
+        vec!["не удалось проверить пароль"],
+        "срок отказа истёк"
+    );
+}
+
+/// Переполнение надёжной очереди отключает медленного пира с причиной, а не теряет сообщения молча.
+#[test]
+fn reliable_queue_overflow_disconnects_the_slow_peer_with_a_reason() {
+    let mut world = connected_world(17);
+    let peer = world.clients[0].client.local_peer().unwrap();
+    let chunk = vec![0u8; 1000];
+    let mut error = None;
+    while error.is_none() {
+        error = world.server.send(peer, Channel::Reliable, &chunk).err();
+    }
+    assert_eq!(error, Some(NetError::QueueFull));
+    let out = world.server.update(world.now);
+    assert_eq!(
+        disconnect_reasons(&out.events),
+        vec!["очередь отправки переполнена"]
+    );
+    world.route_server(out);
+    assert!(world.run_until(200, |w| {
+        !disconnect_reasons(&w.clients[0].events).is_empty()
+    }));
+    assert_eq!(
+        disconnect_reasons(&world.clients[0].events),
+        vec!["очередь отправки переполнена"]
+    );
+}
+
+/// Поток состояний заполняет только свою очередь: надёжные сообщения при этом проходят.
+#[test]
+fn state_flood_does_not_block_reliable_messages() {
+    let mut world = connected_world(18);
+    let peer = world.clients[0].client.local_peer().unwrap();
+    let chunk = vec![7u8; 1000];
+    for _ in 0..2_000 {
+        world
+            .server
+            .send(peer, Channel::State, &chunk)
+            .expect("состояния не отказывают");
+    }
+    world
+        .server
+        .send(peer, Channel::Reliable, b"control")
+        .unwrap();
+    assert!(world.run_until(3_000, |w| {
+        messages(&w.clients[0].events).contains(&(Channel::Reliable, b"control".to_vec()))
+    }));
+}
+
+/// Широковещание: медленный пир отключается, остальные получают сообщение.
+#[test]
+fn broadcast_disconnects_a_slow_peer_and_still_reaches_the_others() {
+    let mut world = World::new(4, None, Faults::default(), 19);
+    let fingerprint = world.fingerprint;
+    let slow = world.add_client(None, Some(fingerprint), PROTOCOL);
+    let fast = world.add_client(None, Some(fingerprint), PROTOCOL);
+    assert!(world.connect(slow));
+    assert!(world.connect(fast));
+    let slow_peer = world.clients[slow].client.local_peer().unwrap();
+    let chunk = vec![0u8; 1000];
+    while world
+        .server
+        .send(slow_peer, Channel::Reliable, &chunk)
+        .is_ok()
+    {}
+    world.server.broadcast(Channel::Reliable, b"all").unwrap();
+    let out = world.server.update(world.now);
+    world.route_server(out);
+    assert!(world.run_until(500, |w| {
+        messages(&w.clients[fast].events).contains(&(Channel::Reliable, b"all".to_vec()))
+    }));
+    assert!(world.run_until(500, |w| {
+        !disconnect_reasons(&w.clients[slow].events).is_empty()
+    }));
 }

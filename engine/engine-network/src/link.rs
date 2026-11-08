@@ -28,6 +28,11 @@ const MAX_REASON: usize = 256;
 /// Всё, что занимает место в датаграмме до кадров: заголовок, номер, тег, операция, флаги, подтверждение, число кадров.
 const FRAMES_OVERHEAD: usize = HEADER_LEN + SEQ_LEN + TAG_LEN + 1 + 1 + 8 + 8 + 1;
 const TRUNCATED: &str = "усечённый пакет";
+/// Тело Auth фиксированной длины: операция, доказательство пароля и заполнение нулями.
+/// Длина не меньше наибольшего отказа, поэтому сервер не отвечает на короткий запрос длиннее него.
+pub(crate) const AUTH_BODY: usize = 300;
+/// Причина отключения, когда очередь надёжных сообщений одного пира переполнена.
+pub(crate) const QUEUE_OVERFLOW: &str = "очередь отправки переполнена";
 
 /// Соединение с одним пиром: сессия, надёжность и таймеры.
 pub(crate) struct Link {
@@ -39,6 +44,8 @@ pub(crate) struct Link {
     last_recv: Instant,
     last_send: Instant,
     timeout: Duration,
+    /// Причина, по которой соединение нужно закрыть (переполнена очередь надёжных сообщений).
+    fault: Option<&'static str>,
 }
 
 impl Link {
@@ -59,7 +66,18 @@ impl Link {
             last_recv: now,
             last_send: now,
             timeout,
+            fault: None,
         }
+    }
+
+    /// Причина закрытия, если соединение нужно разорвать.
+    pub(crate) fn fault(&self) -> Option<&'static str> {
+        self.fault
+    }
+
+    /// Сдвигает отсчёт таймаута. Вызывается, пока приложение не забирает события.
+    pub(crate) fn hold(&mut self, now: Instant) {
+        self.last_recv = now;
     }
 
     /// Шифрует служебное тело (Welcome, Disconnect) без очереди и подтверждений.
@@ -80,8 +98,14 @@ impl Link {
         now.saturating_duration_since(self.last_recv) >= self.timeout
     }
 
+    /// Ставит сообщение в очередь. Переполнение надёжной очереди помечает соединение на закрытие:
+    /// молча терять надёжные сообщения нельзя.
     pub(crate) fn enqueue(&mut self, channel: Channel, bytes: &[u8]) -> Result<(), NetError> {
-        self.rel.enqueue(channel, bytes)
+        let result = self.rel.enqueue(channel, bytes);
+        if channel.is_reliable() && matches!(result, Err(NetError::QueueFull)) {
+            self.fault.get_or_insert(QUEUE_OVERFLOW);
+        }
+        result
     }
 
     /// Обрабатывает тело `OP_FRAMES`. Ошибка означает нарушение протокола пиром.
@@ -170,6 +194,7 @@ fn frames_body(ack: Option<(u64, u64)>, frames: &[Frame]) -> Vec<u8> {
 pub(crate) fn auth_body(proof: &[u8; 32]) -> Vec<u8> {
     let mut body = vec![OP_AUTH];
     body.extend_from_slice(proof);
+    body.resize(AUTH_BODY, 0);
     body
 }
 
@@ -232,5 +257,43 @@ mod tests {
         let body = frames_body(None, &[]);
         assert_eq!(body.len(), 19);
         assert_eq!(HEADER_LEN + SEQ_LEN + TAG_LEN + body.len(), FRAMES_OVERHEAD);
+    }
+
+    #[test]
+    fn auth_body_has_fixed_length_and_any_reject_fits_in_it() {
+        assert_eq!(auth_body(&[7; 32]).len(), AUTH_BODY);
+        let longest = "я".repeat(MAX_REASON);
+        assert!(disconnect_body(&longest).len() <= AUTH_BODY);
+    }
+
+    #[test]
+    fn queue_overflow_of_reliable_messages_marks_the_link_for_closing() {
+        let mut link = Link::new(
+            1,
+            "127.0.0.1:9".parse().unwrap(),
+            1,
+            Session::new(&[1; 32], &[2; 32]),
+            Instant::now(),
+            Duration::from_secs(1),
+        );
+        let chunk = vec![0u8; 1000];
+        while link.enqueue(Channel::Reliable, &chunk).is_ok() {}
+        assert_eq!(link.fault(), Some(QUEUE_OVERFLOW));
+    }
+
+    #[test]
+    fn overflow_of_unreliable_messages_does_not_close_the_link() {
+        let mut link = Link::new(
+            1,
+            "127.0.0.1:9".parse().unwrap(),
+            1,
+            Session::new(&[1; 32], &[2; 32]),
+            Instant::now(),
+            Duration::from_secs(1),
+        );
+        for _ in 0..1_000 {
+            link.enqueue(Channel::State, &[0u8; 1000]).unwrap();
+        }
+        assert_eq!(link.fault(), None);
     }
 }

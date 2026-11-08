@@ -57,6 +57,7 @@ impl ServerIdentity {
     pub fn load_or_create(path: &Path) -> Result<Self, NetError> {
         match std::fs::read(path) {
             Ok(mut bytes) => {
+                warn_if_shared(path);
                 let result = Self::from_seed_bytes(path, &bytes);
                 bytes.zeroize();
                 result
@@ -66,23 +67,14 @@ impl ServerIdentity {
         }
     }
 
+    /// Создаёт ключ и публикует его атомарно: частично записанный файл не появляется под именем ключа.
     fn create(path: &Path) -> Result<Self, NetError> {
         let mut seed = random_bytes::<32>()?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let written = options
-            .open(path)
-            .and_then(|mut file| file.write_all(&seed));
-        let result = match written {
+        let result = match publish_new_file(path, &seed) {
             Ok(()) => Ok(Self {
                 signing: SigningKey::from_bytes(&seed),
             }),
-            // Файл появился между проверкой и созданием: читаем его.
+            // Файл появился между проверкой и публикацией: используем его.
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 seed.zeroize();
                 return Self::load_or_create(path);
@@ -129,6 +121,56 @@ fn file_error(path: &Path, err: &std::io::Error) -> NetError {
     NetError::Config(format!("ключ сервера {}: {err}", path.display()))
 }
 
+/// Пишет ключ во временный файл рядом с `path` и публикует его под именем `path` без перезаписи
+/// (hard link). Временный файл удаляется в любом случае, поэтому частичная запись не остаётся на диске.
+fn publish_new_file(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(|err| std::io::Error::other(format!("{err}")))?;
+    let name = path.file_name().map_or_else(
+        || "server.key".into(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", to_hex(&suffix)));
+    let result = write_new_file(&temp, seed).and_then(|()| std::fs::hard_link(&temp, path));
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
+fn write_new_file(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(seed)?;
+    file.sync_all()
+}
+
+/// Предупреждает, если к файлу ключа имеют доступ другие пользователи (только Unix).
+#[cfg(unix)]
+fn warn_if_shared(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path)
+        && has_group_or_world_access(metadata.permissions().mode())
+    {
+        log::warn!(
+            "файл ключа сервера {} доступен другим пользователям; рекомендуется режим 0600",
+            path.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_shared(_path: &Path) {}
+
+#[cfg(unix)]
+fn has_group_or_world_access(mode: u32) -> bool {
+    mode & 0o077 != 0
+}
+
 /// Отпечаток открытого ключа.
 pub(crate) fn fingerprint_of(public: &[u8; 32]) -> [u8; 32] {
     *blake3::hash(public).as_bytes()
@@ -155,7 +197,10 @@ pub(crate) struct EphemeralKey(StaticSecret);
 
 impl EphemeralKey {
     pub(crate) fn random() -> Result<Self, NetError> {
-        Ok(Self(StaticSecret::from(random_bytes::<32>()?)))
+        let mut bytes = random_bytes::<32>()?;
+        let secret = StaticSecret::from(bytes);
+        bytes.zeroize();
+        Ok(Self(secret))
     }
 
     pub(crate) fn public(&self) -> [u8; 32] {
@@ -243,6 +288,16 @@ pub(crate) fn password_proof(password: Option<&Password>, transcript: &[u8; 32])
     }
 }
 
+/// Сессия отказа до аутентификации по паролю. Ключ зависит только от общего секрета и транскрипта,
+/// поэтому клиент проверяет отказ сервера без пароля, а подделать его без общего секрета нельзя.
+pub(crate) fn reject_session(shared: &[u8; 32], transcript: &[u8; 32]) -> Session {
+    let mut material = Zeroizing::new([0u8; 64]);
+    material[..32].copy_from_slice(shared);
+    material[32..].copy_from_slice(transcript);
+    let key = Zeroizing::new(blake3::derive_key("RVE net v1 reject", &material[..]));
+    Session::new(&key, &key)
+}
+
 /// Направленные ключи сессии: клиент→сервер и сервер→клиент.
 pub(crate) struct SessionKeys {
     pub client_to_server: Zeroizing<[u8; 32]>,
@@ -281,8 +336,8 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new(send_key: &[u8; 32], recv_key: &[u8; 32]) -> Self {
         Self {
-            send: ChaCha20Poly1305::new(&Key::from(*send_key)),
-            recv: ChaCha20Poly1305::new(&Key::from(*recv_key)),
+            send: cipher(send_key),
+            recv: cipher(recv_key),
             next_seq: 0,
             replay: ReplayWindow::default(),
         }
@@ -338,6 +393,14 @@ impl Session {
         // Окно обновляется только после проверки подписи тега.
         self.replay.accept(seq).then_some((seq, body))
     }
+}
+
+/// Шифр с копией ключа, которая обнуляется сразу после передачи в шифр.
+fn cipher(key: &[u8; 32]) -> ChaCha20Poly1305 {
+    let mut copy = *key;
+    let cipher = ChaCha20Poly1305::new(&Key::from(copy));
+    copy.zeroize();
+    cipher
 }
 
 fn nonce(seq: u64) -> Nonce {
@@ -567,5 +630,70 @@ mod tests {
             Err(NetError::Config(_))
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rve-net-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn key_publication_never_overwrites_and_leaves_no_temp_file() {
+        let dir = scratch_dir("publish");
+        let path = dir.join("server.key");
+        std::fs::write(&path, b"existing").unwrap();
+        let err = publish_new_file(&path, &[7u8; 32]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        assert_eq!(entries(&dir), vec!["server.key".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn created_key_is_the_only_file_and_is_private() {
+        let dir = scratch_dir("create");
+        let path = dir.join("server.key");
+        let created = ServerIdentity::load_or_create(&path).unwrap();
+        assert_eq!(entries(&dir), vec!["server.key".to_owned()]);
+        assert_eq!(
+            ServerIdentity::load_or_create(&path).unwrap().public_key(),
+            created.public_key()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_or_world_access_to_the_key_is_detected() {
+        assert!(!has_group_or_world_access(0o100600));
+        assert!(has_group_or_world_access(0o100640), "группа");
+        assert!(has_group_or_world_access(0o100604), "остальные");
+    }
+
+    #[test]
+    fn reject_session_depends_on_shared_secret_and_transcript_only() {
+        let mut ours = reject_session(&[1u8; 32], &[2u8; 32]);
+        let mut same = reject_session(&[1u8; 32], &[2u8; 32]);
+        let (_, datagram) = ours.seal(5, b"no").unwrap();
+        assert!(same.open(&datagram).is_some());
+        let mut other = reject_session(&[1u8; 32], &[3u8; 32]);
+        assert!(other.open(&datagram).is_none(), "другой транскрипт");
     }
 }

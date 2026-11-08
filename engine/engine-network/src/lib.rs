@@ -23,6 +23,8 @@ use std::net::SocketAddr;
 
 use engine_scene::network::PeerId;
 
+use crate::packet::{FRAGMENT_PAYLOAD, MAX_MESSAGE_BYTES};
+
 pub use client::{Client, ClientConfig};
 pub use crypto::{Password, ServerIdentity};
 pub use engine::{NetRole, NetworkConfig, NetworkEngine, NetworkHandle};
@@ -59,6 +61,20 @@ impl Channel {
 
     pub(crate) fn is_reliable(self) -> bool {
         matches!(self, Self::Reliable | Self::Rpc)
+    }
+}
+
+/// Проверяет размер сообщения до постановки в очередь: надёжные — до 64 KiB, ненадёжные — один кадр.
+pub(crate) fn check_message_size(channel: Channel, size: usize) -> Result<(), NetError> {
+    let limit = if channel.is_reliable() {
+        MAX_MESSAGE_BYTES
+    } else {
+        FRAGMENT_PAYLOAD
+    };
+    if size > limit {
+        Err(NetError::MessageTooLarge { size, limit })
+    } else {
+        Ok(())
     }
 }
 

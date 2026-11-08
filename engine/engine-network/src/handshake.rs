@@ -7,7 +7,7 @@
 //! - Accept, 128 байт: server_public[32] ‖ identity_public[32] ‖ signature[64].
 //! - Reject: длина[1] ‖ причина в UTF-8. Не подписан: отправляется только до аутентификации.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::codec::Reader;
@@ -148,7 +148,17 @@ pub(crate) fn parse_reject(body: &[u8]) -> String {
 
 fn cookie_mac(secret: &[u8; 32], addr: SocketAddr, time_ms: u64, hello_body: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_keyed(secret);
-    hasher.update(addr.to_string().as_bytes());
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            hasher.update(&[4]);
+            hasher.update(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            hasher.update(&[6]);
+            hasher.update(&ip.octets());
+        }
+    }
+    hasher.update(&addr.port().to_be_bytes());
     hasher.update(&time_ms.to_be_bytes());
     hasher.update(blake3::hash(hello_body).as_bytes());
     *hasher.finalize().as_bytes()

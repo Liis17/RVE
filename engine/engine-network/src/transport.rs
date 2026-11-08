@@ -22,23 +22,40 @@ pub trait DatagramSocket: Send {
 /// Что делать с ошибкой приёма.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecvAction {
-    /// Ошибка относится к одной датаграмме или таймауту; приём продолжается.
+    /// Ошибка относится к одной датаграмме, таймауту или временному состоянию сети; приём продолжается.
     Ignore,
-    /// Сокет не пригоден; поток останавливается.
-    Fatal,
+    /// Неожиданная ошибка сокета. Поток продолжает работу, но серия таких ошибок подряд его останавливает.
+    Unexpected,
 }
 
-/// Классифицирует ошибку приёма. ICMP-сброс (`ConnectionReset`, на Windows `WSAECONNRESET`)
-/// относится к чужой датаграмме, поэтому не останавливает сокет.
+/// Код ENOBUFS (нехватка буферов ядра) на текущей платформе, если он известен.
+const ENOBUFS: Option<i32> = if cfg!(windows) {
+    Some(10055)
+} else if cfg!(target_os = "linux") {
+    Some(105)
+} else if cfg!(any(target_os = "macos", target_os = "ios")) {
+    Some(55)
+} else {
+    None
+};
+
+/// Классифицирует ошибку приёма. ICMP-сброс (`ConnectionReset`, на Windows `WSAECONNRESET`
+/// и `WSAENETRESET`) относится к чужой датаграмме; ENOBUFS проходит, когда буферы освободятся.
 pub(crate) fn classify_recv_error(kind: io::ErrorKind, os_code: Option<i32>) -> RecvAction {
     const WSAECONNRESET: i32 = 10054;
+    const WSAENETRESET: i32 = 10052;
     match kind {
         io::ErrorKind::WouldBlock
         | io::ErrorKind::TimedOut
         | io::ErrorKind::Interrupted
         | io::ErrorKind::ConnectionReset => RecvAction::Ignore,
-        _ if os_code == Some(WSAECONNRESET) => RecvAction::Ignore,
-        _ => RecvAction::Fatal,
+        _ if os_code.is_some_and(|code| {
+            matches!(code, WSAECONNRESET | WSAENETRESET) || Some(code) == ENOBUFS
+        }) =>
+        {
+            RecvAction::Ignore
+        }
+        _ => RecvAction::Unexpected,
     }
 }
 
@@ -74,7 +91,7 @@ impl DatagramSocket for UdpTransport {
             Ok(_) => Ok(None),
             Err(err) => match classify_recv_error(err.kind(), err.raw_os_error()) {
                 RecvAction::Ignore => Ok(None),
-                RecvAction::Fatal => Err(err),
+                RecvAction::Unexpected => Err(err),
             },
         }
     }
@@ -200,7 +217,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timeouts_and_resets_are_ignored_while_other_errors_stop_the_socket() {
+    fn timeouts_and_network_resets_are_ignored_while_other_errors_are_unexpected() {
         assert_eq!(
             classify_recv_error(io::ErrorKind::WouldBlock, None),
             RecvAction::Ignore
@@ -218,12 +235,24 @@ mod tests {
             RecvAction::Ignore
         );
         assert_eq!(
+            classify_recv_error(io::ErrorKind::Other, Some(10052)),
+            RecvAction::Ignore,
+            "WSAENETRESET"
+        );
+        if let Some(code) = ENOBUFS {
+            assert_eq!(
+                classify_recv_error(io::ErrorKind::Other, Some(code)),
+                RecvAction::Ignore,
+                "ENOBUFS"
+            );
+        }
+        assert_eq!(
             classify_recv_error(io::ErrorKind::PermissionDenied, None),
-            RecvAction::Fatal
+            RecvAction::Unexpected
         );
         assert_eq!(
             classify_recv_error(io::ErrorKind::Other, Some(10013)),
-            RecvAction::Fatal
+            RecvAction::Unexpected
         );
     }
 
