@@ -107,12 +107,15 @@ fn validate_sdk_manifest(manifest: &SdkManifest) -> Result<(), BuildError> {
     Ok(())
 }
 
-fn player_filename(flavor: player::PlayerFlavor) -> &'static str {
+/// Имя исполняемого файла варианта player или сервера рядом с rve-build и в release-раскладке.
+pub(crate) fn player_filename(flavor: player::PlayerFlavor) -> &'static str {
     match (cfg!(windows), flavor) {
         (true, player::PlayerFlavor::Distribution) => "rve-player.exe",
         (true, player::PlayerFlavor::Dev) => "rve-player-dev.exe",
+        (true, player::PlayerFlavor::Server) => "rve-server.exe",
         (false, player::PlayerFlavor::Distribution) => "rve-player",
         (false, player::PlayerFlavor::Dev) => "rve-player-dev",
+        (false, player::PlayerFlavor::Server) => "rve-server",
     }
 }
 
@@ -163,6 +166,7 @@ pub(crate) fn build_sdk(
     )?;
     let rve_player = checkout_player_for_sdk(location)?;
     let rve_player_dev = player::build_sdk_binary("rve-player", false, dlss_enabled)?;
+    let rve_server = player::build_sdk_binary("rve-server", true, false)?;
     let rve_editor = player::build_sdk_binary("rve-editor", false, false)?;
     let rve_build = player::build_sdk_binary("rve-build", false, false)?;
 
@@ -221,6 +225,7 @@ pub(crate) fn build_sdk(
             rve_build: &rve_build,
             rve_player: &rve_player,
             rve_player_dev: &rve_player_dev,
+            rve_server: &rve_server,
             rve_sdk: &root.join("engine/rve-sdk"),
             engine_version: env!("CARGO_PKG_VERSION"),
             abi_version: rve_sdk::abi::RVE_SCRIPT_ABI_VERSION,
@@ -256,6 +261,7 @@ struct SdkSources<'a> {
     rve_build: &'a Path,
     rve_player: &'a Path,
     rve_player_dev: &'a Path,
+    rve_server: &'a Path,
     rve_sdk: &'a Path,
     engine_version: &'a str,
     abi_version: u32,
@@ -277,6 +283,10 @@ fn assemble_sdk_layout(staging: &Path, sources: &SdkSources<'_>) -> Result<(), B
     player::copy_file(
         sources.rve_player_dev,
         &staging.join(player_filename(player::PlayerFlavor::Dev)),
+    )?;
+    player::copy_file(
+        sources.rve_server,
+        &staging.join(player_filename(player::PlayerFlavor::Server)),
     )?;
 
     let sdk_directory = staging.join("rve-sdk");
@@ -419,6 +429,10 @@ mod tests {
         player_filename(PlayerFlavor::Dev)
     }
 
+    fn server_name() -> &'static str {
+        player_filename(PlayerFlavor::Server)
+    }
+
     fn build_name() -> &'static str {
         if cfg!(windows) {
             "rve-build.exe"
@@ -510,6 +524,34 @@ mod tests {
         fs::write(&executable, b"dev player").unwrap();
 
         let found = locate_player_in(root.path(), PlayerFlavor::Dev, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap();
+        assert!(
+            matches!(found, PlayerLocation::Sdk { executable: path, .. } if path == executable)
+        );
+    }
+
+    #[test]
+    fn sdk_location_selects_the_server_and_asks_to_rebuild_an_sdk_without_it() {
+        let root = temp_dir("rve-sdk-server");
+        fs::write(
+            root.path().join("rve-sdk.toml"),
+            sdk_marker(rve_sdk::abi::RVE_SCRIPT_ABI_VERSION, &current_target()),
+        )
+        .unwrap();
+        let error = locate_player_in(root.path(), PlayerFlavor::Server, |_| {
+            panic!("checkout must not be used")
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("повторно соберите SDK"),
+            "{error}"
+        );
+
+        let executable = root.path().join(player_filename(PlayerFlavor::Server));
+        fs::write(&executable, b"server").unwrap();
+        let found = locate_player_in(root.path(), PlayerFlavor::Server, |_| {
             panic!("checkout must not be used")
         })
         .unwrap();
@@ -654,6 +696,7 @@ mod tests {
         fs::write(source.join("rve-build"), b"build binary").unwrap();
         fs::write(source.join("rve-player"), b"player binary").unwrap();
         fs::write(source.join("rve-player-dev"), b"dev player binary").unwrap();
+        fs::write(source.join("rve-server"), b"server binary").unwrap();
         fs::write(
             sdk_source.join("Cargo.toml"),
             b"[package]\nname = \"rve-sdk\"\n",
@@ -698,6 +741,7 @@ mod tests {
         let rve_build = source.join("rve-build");
         let rve_player = source.join("rve-player");
         let rve_player_dev = source.join("rve-player-dev");
+        let rve_server = source.join("rve-server");
         let target = current_target();
         assemble_sdk_layout(
             &staging,
@@ -707,6 +751,7 @@ mod tests {
                 rve_build: &rve_build,
                 rve_player: &rve_player,
                 rve_player_dev: &rve_player_dev,
+                rve_server: &rve_server,
                 rve_sdk: &sdk_source,
                 engine_version: "0.1.0-test",
                 abi_version: 42,
@@ -727,6 +772,10 @@ mod tests {
         assert_eq!(
             fs::read(staging.join(dev_player_name())).unwrap(),
             b"dev player binary"
+        );
+        assert_eq!(
+            fs::read(staging.join(server_name())).unwrap(),
+            b"server binary"
         );
         assert_eq!(
             fs::read(staging.join("rve-sdk/Cargo.toml")).unwrap(),

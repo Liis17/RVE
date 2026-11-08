@@ -20,6 +20,8 @@ use std::process::{Command, Stdio};
 pub(crate) enum PlayerFlavor {
     Distribution,
     Dev,
+    /// Выделенный сервер `rve-server`: release без функций, без DLSS.
+    Server,
 }
 
 impl PlayerFlavor {
@@ -27,16 +29,25 @@ impl PlayerFlavor {
         match self {
             Self::Distribution => "player",
             Self::Dev => "player-dev",
+            Self::Server => "server",
+        }
+    }
+
+    /// Пакет Cargo, который собирает этот вариант.
+    pub(crate) fn package(self) -> &'static str {
+        match self {
+            Self::Server => "rve-server",
+            Self::Distribution | Self::Dev => "rve-player",
         }
     }
 
     fn cargo_arguments(self, dlss: bool) -> Vec<&'static str> {
         let mut arguments = vec!["build"];
-        if self == Self::Distribution {
+        if self != Self::Dev {
             arguments.push("--release");
         }
-        arguments.extend(["--locked", "-p", "rve-player"]);
-        if self == Self::Distribution {
+        arguments.extend(["--locked", "-p", self.package()]);
+        if self != Self::Dev {
             arguments.push("--no-default-features");
         }
         if dlss {
@@ -69,6 +80,7 @@ pub(crate) fn build_distribution(
     )?;
     #[cfg(not(windows))]
     let executable = locate_player(PlayerFlavor::Distribution, false)?;
+    let server_executable = locate_player(PlayerFlavor::Server, false)?;
 
     let output_parent = output.parent().ok_or_else(|| {
         BuildError::input(format!(
@@ -134,6 +146,13 @@ pub(crate) fn build_distribution(
 
     let output_binary = binary_dir.join(&executable_name);
     copy_file(&executable, &output_binary)?;
+    // Сервер лежит рядом с Engine (Windows) или рядом с `.app` (macOS), а не внутри бандла: без окна.
+    copy_file(
+        &server_executable,
+        &staging
+            .path()
+            .join(sdk::player_filename(PlayerFlavor::Server)),
+    )?;
     #[cfg(windows)]
     if let Some(icon_path) = &project.icon {
         let source = project
@@ -593,7 +612,7 @@ fn locate_player(flavor: PlayerFlavor, dlss: bool) -> Result<PathBuf, BuildError
             executable,
             manifest,
         } => {
-            println!("rve-player: prebuilt (SDK)");
+            println!("{}: prebuilt (SDK)", flavor.package());
             println!("rve-sdk engine version: {}", manifest.engine_version);
             Ok(executable)
         }
@@ -634,6 +653,7 @@ pub(crate) fn build_checkout_player(
     let root = repo_root()?;
     let target_dir = normalize_build_path(&checkout_player_target_dir(&root, flavor))?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let package = flavor.package();
     let stdout = run_cargo(
         Command::new(cargo)
             .args(flavor.cargo_arguments(dlss))
@@ -642,16 +662,19 @@ pub(crate) fn build_checkout_player(
         match flavor {
             PlayerFlavor::Distribution => "сборка distribution rve-player",
             PlayerFlavor::Dev => "сборка dev rve-player",
+            PlayerFlavor::Server => "сборка rve-server",
         },
         CargoFailure::Operational,
     )?;
-    let artifact = parse_cargo_output(&stdout, "rve-player", "bin", None)
-        .map_err(|message| BuildError::operational(format!("сборка rve-player: {message}")))?;
+    let artifact = parse_cargo_output(&stdout, package, "bin", None)
+        .map_err(|message| BuildError::operational(format!("сборка {package}: {message}")))?;
     let executable = artifact.executable.ok_or_else(|| {
-        BuildError::operational("cargo не сообщил executable для бинарника rve-player")
+        BuildError::operational(format!(
+            "cargo не сообщил executable для бинарника {package}"
+        ))
     })?;
     println!(
-        "rve-player: {}",
+        "{package}: {}",
         if artifact.fresh {
             "up to date"
         } else {
@@ -659,7 +682,7 @@ pub(crate) fn build_checkout_player(
         }
     );
     normalize_build_path(&executable)
-        .map_err(|error| BuildError::operational(format!("сборка rve-player: {error}")))
+        .map_err(|error| BuildError::operational(format!("сборка {package}: {error}")))
 }
 
 pub(crate) fn build_sdk_binary(
@@ -1272,6 +1295,37 @@ mod tests {
             checkout_player_target_dir(root, PlayerFlavor::Dev),
             root.join("build/player-dev")
         );
+        assert_eq!(
+            PlayerFlavor::Server.cargo_arguments(false),
+            [
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "rve-server",
+                "--no-default-features",
+                "--message-format=json",
+            ]
+        );
+        assert_eq!(
+            checkout_player_target_dir(root, PlayerFlavor::Server),
+            root.join("build/server")
+        );
+    }
+
+    #[test]
+    fn network_settings_survive_the_project_toml_written_for_release() {
+        // Релиз пишет project.toml через to_toml: сетевые настройки должны вернуться без изменений.
+        let settings = ProjectSettings::parse(
+            "id = \"net\"\nname = \"Net\"\nversion = \"1\"\n[[scenes]]\npath = \"scene.rvescene\"\n[network]\nenabled = true\nport = 9100\nmax_clients = 16\ntick_hz = 20\ntimeout_ms = 5000\n",
+        )
+        .unwrap();
+        let written = settings.to_toml().unwrap();
+        assert!(written.contains("[network]"), "{written}");
+        let reread = ProjectSettings::parse(&written).unwrap();
+        assert_eq!(reread.network, settings.network);
+        assert!(reread.network.enabled);
+        assert_eq!(reread.network.port, 9100);
     }
 
     fn sample_project(project_dir: &Path, heavy_scripts: Option<&str>) -> ProjectBuild {
