@@ -8,6 +8,7 @@ pub mod document;
 pub mod light;
 pub mod params;
 pub mod particles;
+pub mod physics_material;
 pub mod prefab;
 pub mod transform;
 pub mod world;
@@ -28,6 +29,7 @@ pub use particles::{
     ParticleEmitterComponent, ParticleFlipbookComponent, ParticleShapeComponent,
     ParticleSizeKeyComponent,
 };
+pub use physics_material::{CombineMode, PhysicsMaterialError, PhysicsMaterialSettings};
 
 pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,

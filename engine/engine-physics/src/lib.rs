@@ -8,6 +8,7 @@ pub mod bvh;
 pub mod character;
 mod error;
 pub mod hull;
+mod material;
 pub mod narrow;
 pub mod query;
 pub mod ray;
@@ -28,6 +29,7 @@ pub use character::{
 };
 pub use error::GeometryError;
 pub use hull::{Hull, MAX_HULL_INPUT_POINTS, MAX_HULL_ITERATIONS, MAX_HULL_VERTICES, Plane};
+pub use material::{CombineMode, CombinedMaterial, PhysicsMaterial, combine_materials};
 pub use narrow::{
     ContactManifold, ContactPoint, DistanceResult, EPA_MAX_FACES, EPA_MAX_ITERATIONS,
     GJK_MAX_ITERATIONS, MAX_MANIFOLD_POINTS, MAX_MESH_CANDIDATES, ManifoldCache, NarrowphaseError,

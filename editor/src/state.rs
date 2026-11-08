@@ -183,6 +183,8 @@ pub struct EditorState {
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
+    /// `.rvephysmat`, открытый панелью полей Project.
+    pub physics_material_edit: Option<crate::ui::project_panel::PhysicsMaterialEdit>,
     pub new_project_dialog: Option<crate::new_project::NewProjectDialog>,
     pub hierarchy_rename: Option<(String, String)>,
     /// Текстовому полю переименования ещё нужно передать фокус; снимается после первого запроса.
@@ -265,6 +267,7 @@ impl EditorState {
             asset_tree: Vec::new(),
             current_folder: String::new(),
             project_dialog: None,
+            physics_material_edit: None,
             new_project_dialog: None,
             hierarchy_rename: None,
             hierarchy_rename_focus: false,

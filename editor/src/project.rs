@@ -7,7 +7,7 @@ use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceStats, ResourceSystem, SourceMode};
 use engine_scene::world::ObjectHandle;
-use engine_scene::{CameraSettings, SceneDocument, SceneError, World};
+use engine_scene::{CameraSettings, PhysicsMaterialSettings, SceneDocument, SceneError, World};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -164,6 +164,42 @@ impl OpenProject {
         Ok(())
     }
 
+    /// Сохраняет правки `.rvephysmat`; файл, которого нет в проекте, не создаётся.
+    pub fn save_physics_material(
+        &self,
+        path: &VirtualPath,
+        settings: &PhysicsMaterialSettings,
+    ) -> Result<(), String> {
+        if !path.as_str().to_ascii_lowercase().ends_with(".rvephysmat") {
+            return Err(format!("{path}: ожидается ресурс .rvephysmat"));
+        }
+        settings.validate().map_err(|error| error.to_string())?;
+        let file = self
+            .assets_dir
+            .resolve(path.as_str())
+            .map_err(|error| format!("{path}: {error}"))?;
+        if !file.is_file() {
+            return Err(format!("{path}: файл физического материала не найден"));
+        }
+        let source = settings.to_toml().map_err(|error| error.to_string())?;
+        std::fs::write(file, source).map_err(|error| format!("{path}: {error}"))
+    }
+
+    /// Создаёт `.rvephysmat` со значениями по умолчанию в папке `folder`; возвращает его путь.
+    pub fn create_physics_material(&self, folder: &str, name: &str) -> Result<String, String> {
+        let name = if name.to_ascii_lowercase().ends_with(".rvephysmat") {
+            name.to_owned()
+        } else {
+            format!("{name}.rvephysmat")
+        };
+        let source = PhysicsMaterialSettings::default()
+            .to_toml()
+            .map_err(|error| error.to_string())?;
+        self.assets_dir
+            .create_file(folder, &name, &source)
+            .map_err(|error| format!("{name}: {error}"))
+    }
+
     /// Загрузчик префабов проекта для [`crate::scene_edit::EditorScene`].
     pub fn prefab_loader(&self) -> PrefabLoader {
         let cache = Rc::clone(&self.prefabs);
@@ -191,6 +227,14 @@ impl OpenProject {
     /// Возвращает прежние документы, если раскрытие сцены после обновления не удалось.
     pub fn restore_prefabs(&self, previous: HashMap<VirtualPath, SceneDocument>) {
         self.prefabs.restore(previous);
+    }
+
+    /// Загружает `.rvephysmat` коллайдеров мира для Play. Ошибка чтения или разбора прерывает
+    /// запуск, как и ошибка `.camerasettings`.
+    pub fn apply_physics_materials(&self, world: &mut World) -> Result<(), String> {
+        world
+            .resolve_physics_materials(&mut |path: &VirtualPath| self.read_text(path.as_str()))
+            .map_err(|error| error.to_string())
     }
 
     /// Загружает общие `.camerasettings` файлы и назначает их камерам мира.
@@ -569,6 +613,62 @@ mod tests {
         let restored = project.prefab_loader()(&path).unwrap();
         assert_eq!(restored.objects[0].id, "old");
         assert_eq!(scene.view().objects.len(), 3);
+    }
+
+    #[test]
+    fn physics_material_asset_is_created_loaded_and_saved_with_validation() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        let project = OpenProject::open(&temp.0).unwrap();
+        let created = project.create_physics_material("", "ice").unwrap();
+        assert_eq!(created, "ice.rvephysmat");
+        assert!(project.create_physics_material("", "ice").is_err());
+
+        let path = VirtualPath::parse("ice.rvephysmat").unwrap();
+        let mut settings = PhysicsMaterialSettings {
+            static_friction: 0.05,
+            friction_combine: engine_scene::CombineMode::Multiply,
+            ..PhysicsMaterialSettings::default()
+        };
+        project.save_physics_material(&path, &settings).unwrap();
+        let saved = PhysicsMaterialSettings::parse(
+            path.to_string(),
+            &fs::read_to_string(temp.0.join("Assets/ice.rvephysmat")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved, settings);
+
+        settings.bounciness = 2.0;
+        assert!(project.save_physics_material(&path, &settings).is_err());
+        let missing = VirtualPath::parse("missing.rvephysmat").unwrap();
+        assert!(
+            project
+                .save_physics_material(&missing, &PhysicsMaterialSettings::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn collider_physics_material_is_loaded_into_the_editor_world() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        fs::create_dir_all(temp.0.join("Assets/materials")).unwrap();
+        fs::write(
+            temp.0.join("Assets/materials/ice.rvephysmat"),
+            "static_friction = 0.05\nbounciness = 0.9\n",
+        )
+        .unwrap();
+        let source = "[[assets]]\npath = \"/materials/ice.rvephysmat\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\nmaterial = \"/materials/ice.rvephysmat\"\n";
+        let document = SceneDocument::parse("scene.rvescene", source).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let project = OpenProject::open(&temp.0).unwrap();
+        project.apply_physics_materials(&mut world).unwrap();
+
+        let collider = world
+            .object_by_id("ball")
+            .unwrap()
+            .collider
+            .as_ref()
+            .unwrap();
+        assert_eq!(collider.resolved_material.unwrap().static_friction, 0.05);
     }
 
     #[test]

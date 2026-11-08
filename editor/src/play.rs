@@ -154,9 +154,16 @@ impl PlayPrefabs {
             .filter(|asset| is_prefab_path(asset.path.as_str()))
         {
             let path = asset.path.as_str();
-            let template = match PrefabTemplate::load(&asset.path, &mut |child: &VirtualPath| {
+            let loaded = PrefabTemplate::load(&asset.path, &mut |child: &VirtualPath| {
                 read_text(&format!("/{}", child.as_str()))
-            }) {
+            })
+            .and_then(|mut template| {
+                template.resolve_physics_materials(&mut |child: &VirtualPath| {
+                    read_text(&format!("/{}", child.as_str()))
+                })?;
+                Ok(template)
+            });
+            let template = match loaded {
                 Ok(template) => template,
                 Err(error) => {
                     warnings.push(format!("префаб /{path} пропущен: {error}"));
@@ -424,10 +431,15 @@ fn load_heavy_prefab(
     let interrupted = || stop.load(Ordering::Acquire);
     let prefab_path =
         VirtualPath::parse(path).map_err(|_| format!("некорректный путь префаба {path:?}"))?;
-    let template = PrefabTemplate::load(&prefab_path, &mut |child: &VirtualPath| {
+    let mut template = PrefabTemplate::load(&prefab_path, &mut |child: &VirtualPath| {
         read_resource_text(resources, &format!("/{}", child.as_str()))
     })
     .map_err(|error| error.to_string())?;
+    template
+        .resolve_physics_materials(&mut |child: &VirtualPath| {
+            read_resource_text(resources, &format!("/{}", child.as_str()))
+        })
+        .map_err(|error| error.to_string())?;
     template
         .check_spawnable()
         .map_err(|error| error.to_string())?;
@@ -585,7 +597,7 @@ impl PlaySession {
             .objects()
             .iter()
             .filter_map(|object| {
-                mesh_collider_model(object.collider, object.mesh_renderer.as_ref())
+                mesh_collider_model(object.collider.clone(), object.mesh_renderer.as_ref())
             })
             .chain(
                 prefabs

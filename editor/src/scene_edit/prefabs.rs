@@ -510,7 +510,7 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
         base.environment = outer.environment.clone();
     }
     if outer.collider.is_some() {
-        base.collider = outer.collider;
+        base.collider = outer.collider.clone();
     }
     if outer.rigid_body.is_some() {
         base.rigid_body = outer.rigid_body;
@@ -649,7 +649,7 @@ pub(crate) fn object_override(
         (Some(from), Some(to)) => change.environment = (to != from).then(|| to.clone()),
         _ => return Err(COMPONENTS.to_owned()),
     }
-    match (base.collider, edited.collider) {
+    match (base.collider.clone(), edited.collider.clone()) {
         (None, None) => {}
         (Some(from), Some(to)) => change.collider = (to != from).then_some(to),
         _ => return Err(COMPONENTS.to_owned()),
@@ -1615,7 +1615,13 @@ mod tests {
             .revert_field("crate", &OverrideField::Collider)
             .unwrap();
         assert_eq!(
-            scene.object("crate").unwrap().collider.unwrap().friction,
+            scene
+                .object("crate")
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .friction,
             0.5
         );
         assert!(scene.object_override("crate").is_none());
@@ -1664,7 +1670,7 @@ mod tests {
             ..PrefabOverride::default()
         };
         merge_override(&mut base, &outer);
-        assert_eq!(base.collider.unwrap().friction, 0.2);
+        assert_eq!(base.collider.as_ref().unwrap().friction, 0.2);
         assert_eq!(base.rigid_body.unwrap().kind, RigidBodyKind::Kinematic);
 
         let replacement = PrefabOverride {
@@ -1676,7 +1682,7 @@ mod tests {
             ..PrefabOverride::default()
         };
         merge_override(&mut base, &replacement);
-        assert_eq!(base.collider.unwrap().friction, 0.8);
+        assert_eq!(base.collider.as_ref().unwrap().friction, 0.8);
     }
 
     #[test]
