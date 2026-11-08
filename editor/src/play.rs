@@ -19,7 +19,10 @@ use engine_project::{GamepadSettings, InputSettings, PhysicsSettings, PrefabCata
 use engine_resources::ResourceHandle;
 use engine_scene::document::mesh_collider_model;
 use engine_scene::prefab::PREFAB_EXTENSION;
-use engine_scene::{AudioRequest, ObjectHandle, PrefabTemplate, SceneDocument, VoiceId, World};
+use engine_scene::{
+    AudioRequest, ObjectHandle, PrefabTemplate, SceneDocument, VoiceId, World,
+    activity_audio_requests,
+};
 use engine_script::{
     CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, RumbleRequest,
     ScriptCursor, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
@@ -930,7 +933,12 @@ impl PlaySession {
     /// синхронизации поз, поэтому новые тела не телепортируются. Выгрузка может сразу запросить
     /// новую загрузку (отложенный spawn), поэтому заявки вычитываются, пока очередь не опустеет.
     fn apply_world_changes(&mut self) {
-        self.apply_activity_changes();
+        let activity_requests = self.apply_activity_changes();
+        if let Some(audio) = &mut self.audio
+            && !activity_requests.is_empty()
+        {
+            audio.bridge.apply(activity_requests, &self.world);
+        }
         loop {
             let WorldChanges {
                 spawned,
@@ -952,12 +960,13 @@ impl PlaySession {
         }
     }
 
-    /// Переключает тела и звук объектов с изменившейся действующей активностью, как в `rve-runtime`:
-    /// тела неактивных объектов удаляются, тела активированных создаются заново, звук останавливается.
-    fn apply_activity_changes(&mut self) {
+    /// Переключает тела объектов с изменившейся действующей активностью, как в `rve-runtime`:
+    /// тела неактивных объектов удаляются, тела активированных создаются заново. Возвращает заявки
+    /// звука: источники неактивных объектов останавливаются, у показанных запускаются `play_on_start`.
+    fn apply_activity_changes(&mut self) -> Vec<AudioRequest> {
         let changed = self.world.take_activity_changes();
         if changed.is_empty() {
-            return;
+            return Vec::new();
         }
         let (hidden, shown): (Vec<ObjectHandle>, Vec<ObjectHandle>) = changed
             .into_iter()
@@ -971,7 +980,8 @@ impl PlaySession {
                 .map(|binding| binding.object)
                 .collect();
             let unbound: Vec<ObjectHandle> = shown
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|object| self.world.is_alive(*object) && !bound.contains(object))
                 .collect();
             if !unbound.is_empty() {
@@ -988,14 +998,7 @@ impl PlaySession {
                 }
             }
         }
-        if let Some(audio) = &mut self.audio {
-            audio.bridge.apply(
-                hidden
-                    .iter()
-                    .map(|&object| AudioRequest::StopSource { object }),
-                &self.world,
-            );
-        }
+        activity_audio_requests(&self.world, &hidden, &shown)
     }
 
     /// Вставляет тела spawn-объектов и удаляет тела уничтоженных. Отказ физики откатывает spawn;
@@ -1419,6 +1422,33 @@ function Rotate:on_destroy()
 end
 return Rotate
 "#;
+
+    #[test]
+    fn hiding_stops_the_object_sound_and_showing_restarts_its_play_on_start_source() {
+        const SPEAKER: &str = "[[assets]]\npath = \"/audio/hum.wav\"\n\
+            [[objects]]\nid = \"camera\"\n[objects.camera]\n\
+            [[objects]]\nid = \"ball\"\n[objects.audio_source]\n\
+            clip = \"/audio/hum.wav\"\nplay_on_start = true\n";
+        let mut session = PlaySession::start(&document(SPEAKER), None, |_| {
+            Err("scripts are not used".to_owned())
+        })
+        .unwrap();
+        let ball = session.world.handle("ball").unwrap();
+
+        session.world.set_active(ball, false).unwrap();
+        let hidden = session.apply_activity_changes();
+        assert!(
+            matches!(hidden.as_slice(), [AudioRequest::StopSource { object }] if *object == ball),
+            "{hidden:?}"
+        );
+
+        session.world.set_active(ball, true).unwrap();
+        let shown = session.apply_activity_changes();
+        assert!(
+            matches!(shown.as_slice(), [AudioRequest::PlaySource { object, .. }] if *object == ball),
+            "{shown:?}"
+        );
+    }
 
     fn document(source: &str) -> SceneDocument {
         SceneDocument::parse("scene", source).unwrap()

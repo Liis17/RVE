@@ -434,25 +434,32 @@ impl World {
             calculate_world_matrices(&transforms, &parents, &object_ids, document.source_label())?;
         let world_rotations = calculate_world_rotations(&transforms, &parents, &order);
         let object_count = objects.len();
-        // Предпочитаем камеру, помеченную активной и действующую в иерархии.
-        let active_index = document
-            .objects
-            .iter()
-            .position(|object| {
-                object.active && object.camera.as_ref().is_some_and(|camera| camera.active)
+        // Предпочитаем камеру, помеченную активной и действующую в иерархии: объект и все его
+        // предки активны.
+        let hierarchy_active = |index: usize| {
+            let mut current = Some(index);
+            while let Some(index) = current {
+                if !document.objects[index].active {
+                    return false;
+                }
+                current = parents[index];
+            }
+            true
+        };
+        let active_index = (0..object_count)
+            .find(|&index| {
+                hierarchy_active(index)
+                    && document.objects[index]
+                        .camera
+                        .as_ref()
+                        .is_some_and(|camera| camera.active)
             })
             .or_else(|| {
-                document
-                    .objects
-                    .iter()
-                    .position(|object| object.active && object.camera.is_some())
+                (0..object_count).find(|&index| {
+                    hierarchy_active(index) && document.objects[index].camera.is_some()
+                })
             })
-            .or_else(|| {
-                document
-                    .objects
-                    .iter()
-                    .position(|object| object.camera.is_some())
-            })
+            .or_else(|| (0..object_count).find(|&index| document.objects[index].camera.is_some()))
             .expect("SceneDocument validation requires a camera");
         let mut world = Self {
             source_label: document.source_label().to_owned(),

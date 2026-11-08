@@ -1143,7 +1143,12 @@ impl StepDriver {
             }
         }
         for command in commands {
-            self.world.apply_command(command, dt)?;
+            match self.world.apply_command(command, dt) {
+                Ok(()) => {}
+                // Тело могло быть удалено в этом же шаге (деактивация или уничтожение) раньше команды.
+                Err(PhysicsWorldError::UnknownBody(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
 
         events.extend(self.world.refresh_pairs()?);
@@ -2547,6 +2552,52 @@ mod tests {
                 if (*first == ball && *second == trigger_body)
                     || (*first == trigger_body && *second == ball)
         )));
+    }
+
+    #[test]
+    fn commands_for_removed_bodies_are_ignored_in_the_same_and_later_steps() {
+        let mut driver = StepDriver::new(PhysicsWorld::new(Vec3::ZERO).unwrap(), 60, 8).unwrap();
+        let ball = BodyHandle(9);
+        driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: ball,
+                    desc: ball_desc(0.0),
+                }],
+                [],
+            )
+            .unwrap();
+
+        let result = driver.advance_step_with_changes(
+            1.0 / 60.0,
+            [BodyChange::Remove { handle: ball }],
+            [
+                PhysicsCommand::AddImpulse {
+                    body: ball,
+                    impulse: Vec3::Y,
+                    point: None,
+                },
+                PhysicsCommand::SetVelocity {
+                    body: ball,
+                    velocity: Vec3::X,
+                },
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(driver.world().body_pose(ball).is_none());
+
+        // Команда, отправленная уже после удаления (стейл-хендл), тоже не роняет шаг.
+        let later = driver.advance_step_with_changes(
+            1.0 / 60.0,
+            [],
+            [PhysicsCommand::AddImpulse {
+                body: ball,
+                impulse: Vec3::Y,
+                point: None,
+            }],
+        );
+        assert!(later.is_ok(), "{:?}", later.err());
     }
 
     /// Квад 4×4 в плоскости y = 0 из двух треугольников; диагональ проходит через x = z.

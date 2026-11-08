@@ -375,3 +375,13 @@ fn document_rejects_invalid_tags_and_layers() {
     let bad_layer = "[[objects]]\nid = \"camera\"\nlayer = 32\n[objects.camera]\n";
     assert!(SceneDocument::parse("bad.rvescene", bad_layer).is_err());
 }
+
+#[test]
+fn initial_active_camera_is_not_taken_from_a_hidden_subtree() {
+    let scene = world(
+        "[[objects]]\nid = \"rig\"\nactive = false\n\
+         [[objects]]\nid = \"hidden_cam\"\nparent = \"rig\"\n[objects.camera]\nactive = true\n\
+         [[objects]]\nid = \"main\"\n[objects.camera]\n",
+    );
+    assert_eq!(scene.active_camera(), handle(&scene, "main"));
+}

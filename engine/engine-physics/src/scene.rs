@@ -282,7 +282,7 @@ impl PhysicsSceneSync {
     }
 
     /// Создаёт тела для объектов мира по хендлам, например после `World::spawn`. Объекты без
-    /// коллайдера и character controller пропускаются. Все проверки выполняются до изменения
+    /// коллайдера и character controller пропускаются, как и объекты, неактивные в иерархии. Все проверки выполняются до изменения
     /// привязок: при ошибке состояние не меняется.
     pub fn insert_objects(
         &mut self,
@@ -303,6 +303,10 @@ impl PhysicsSceneSync {
             let scene_object = world
                 .object(object)
                 .ok_or(PhysicsSceneSyncError::MissingObject(object))?;
+            // Тело неактивного объекта создаётся при активации, как и при загрузке сцены.
+            if world.active_in_hierarchy(object) != Some(true) {
+                continue;
+            }
             let Some(body) = scene_body(world, scene_object, &models, cache)? else {
                 continue;
             };
@@ -1258,6 +1262,31 @@ mod tests {
             BodyChange::Insert { handle, desc } => (*handle, desc),
             other => panic!("expected an insertion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inserted_objects_inactive_in_the_hierarchy_get_no_body_until_activated() {
+        let mut scene = world(&format!(
+            "{CAMERA}\n[[objects]]\nid='hidden'\nactive=false\n[objects.collider]\n\
+             [[objects]]\nid='hidden_child'\nparent='hidden'\n[objects.collider]\n"
+        ));
+        let hidden = scene.handle("hidden").unwrap();
+        let hidden_child = scene.handle("hidden_child").unwrap();
+        let mut sync = PhysicsSceneSync::new(&scene, Vec::new()).unwrap();
+        let mut cache = ShapeCache::default();
+
+        let changes = sync
+            .insert_objects(&scene, &[hidden, hidden_child], &[], &mut cache)
+            .unwrap();
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(sync.bindings().is_empty());
+
+        scene.set_active(hidden, true).unwrap();
+        let changes = sync
+            .insert_objects(&scene, &[hidden, hidden_child], &[], &mut cache)
+            .unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(sync.bindings().len(), 2);
     }
 
     #[test]

@@ -45,6 +45,7 @@ use engine_scene::light::{
 use engine_scene::{
     AntiAliasing, AudioRequest, CameraSettings, EnvironmentState, LightState, LocalLightState,
     ObjectHandle, PostProcessSettings, PrefabTemplate, Tonemapper, VoiceId, World,
+    activity_audio_requests,
 };
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
@@ -1613,18 +1614,18 @@ impl SpawnPhysics {
     }
 }
 
-/// Переключает тела и звук объектов, у которых изменилась действующая активность: тела неактивных
-/// объектов удаляются, тела активированных создаются заново, источники звука неактивных
-/// объектов останавливаются. Тела вставляются и удаляются до `sync_world_commands`, как и spawn.
+/// Переключает тела объектов, у которых изменилась действующая активность: тела неактивных
+/// объектов удаляются, тела активированных создаются заново. Возвращает заявки звука: источники
+/// неактивных объектов останавливаются, у показанных запускаются `play_on_start`. Тела вставляются
+/// и удаляются до `sync_world_commands`, как и spawn.
 fn apply_activity_changes(
     world: &mut World,
     physics: Option<&mut PhysicsSceneSync>,
     spawn_physics: &mut SpawnPhysics,
-    audio: Option<&mut engine_audio::AudioBridge>,
-) {
+) -> Vec<AudioRequest> {
     let changed = world.take_activity_changes();
     if changed.is_empty() {
-        return;
+        return Vec::new();
     }
     let (hidden, shown): (Vec<ObjectHandle>, Vec<ObjectHandle>) = changed
         .into_iter()
@@ -1655,14 +1656,7 @@ fn apply_activity_changes(
             }
         }
     }
-    if let Some(audio) = audio {
-        audio.apply(
-            hidden
-                .iter()
-                .map(|&object| AudioRequest::StopSource { object }),
-            world,
-        );
-    }
+    activity_audio_requests(world, &hidden, &shown)
 }
 
 /// Применяет spawn и destroy, закоммиченные скриптами в фазе: обновляет GPU-таблицу, физику и
@@ -1677,12 +1671,12 @@ fn apply_world_changes(
     prefabs: &mut PrefabLoads,
     mut audio: Option<&mut engine_audio::AudioBridge>,
 ) -> Vec<SpawnedRoot> {
-    apply_activity_changes(
-        world,
-        physics.as_deref_mut(),
-        spawn_physics,
-        audio.as_deref_mut(),
-    );
+    let activity_requests = apply_activity_changes(world, physics.as_deref_mut(), spawn_physics);
+    if let Some(audio) = audio.as_deref_mut()
+        && !activity_requests.is_empty()
+    {
+        audio.apply(activity_requests, world);
+    }
     let mut roots = Vec::new();
     // Выгрузка может сразу запросить новую загрузку (отложенный spawn), поэтому заявки
     // вычитываются, пока очередь не опустеет.
@@ -7177,5 +7171,74 @@ mod post_process_mapping_tests {
         );
         assert_eq!(mapped.exposure.mode, engine_render::ExposureMode::Auto);
         assert_eq!(mapped.exposure.ev, -0.5);
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use engine_scene::SceneDocument;
+
+    const SPEAKER_SCENE: &str = "[[assets]]\npath = \"/audio/hum.wav\"\n\
+        [[objects]]\nid = \"camera\"\n[objects.camera]\n\
+        [[objects]]\nid = \"ball\"\n[objects.collider]\n\
+        [objects.audio_source]\nclip = \"/audio/hum.wav\"\nplay_on_start = true\n";
+
+    #[test]
+    fn hiding_removes_body_and_sound_and_showing_recreates_body_and_restarts_sound() {
+        let document = SceneDocument::parse("activity.rvescene", SPEAKER_SCENE).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let ball = world.handle("ball").unwrap();
+        let mut sync = PhysicsSceneSync::new(&world, Vec::new()).unwrap();
+        let mut spawn = SpawnPhysics::default();
+        let inserted = sync
+            .insert_objects(&world, &[ball], &spawn.geometry, &mut spawn.shapes)
+            .unwrap();
+        assert_eq!(inserted.len(), 1);
+        let body = sync.bindings()[0].body;
+
+        world.set_active(ball, false).unwrap();
+        let hidden = apply_activity_changes(&mut world, Some(&mut sync), &mut spawn);
+        assert!(
+            matches!(hidden.as_slice(), [AudioRequest::StopSource { object }] if *object == ball),
+            "{hidden:?}"
+        );
+        assert_eq!(spawn.changes, [BodyChange::Remove { handle: body }]);
+        assert!(sync.bindings().is_empty());
+
+        spawn.changes.clear();
+        world.set_active(ball, true).unwrap();
+        let shown = apply_activity_changes(&mut world, Some(&mut sync), &mut spawn);
+        assert!(
+            matches!(shown.as_slice(), [AudioRequest::PlaySource { object, .. }] if *object == ball),
+            "{shown:?}"
+        );
+        assert!(
+            matches!(spawn.changes.as_slice(), [BodyChange::Insert { .. }]),
+            "{:?}",
+            spawn.changes
+        );
+        assert_eq!(sync.bindings().len(), 1);
+    }
+
+    #[test]
+    fn destroying_an_inactive_object_removes_no_body_and_is_not_double_removed() {
+        let document = SceneDocument::parse("activity.rvescene", SPEAKER_SCENE).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let ball = world.handle("ball").unwrap();
+        let mut sync = PhysicsSceneSync::new(&world, Vec::new()).unwrap();
+        let mut spawn = SpawnPhysics::default();
+        sync.insert_objects(&world, &[ball], &spawn.geometry, &mut spawn.shapes)
+            .unwrap();
+        let body = sync.bindings()[0].body;
+
+        world.set_active(ball, false).unwrap();
+        apply_activity_changes(&mut world, Some(&mut sync), &mut spawn);
+        spawn.changes.clear();
+        world.despawn_many(&[ball]).unwrap();
+        let removed = sync.remove_objects(&[ball]);
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(spawn.changes.is_empty());
+        assert_eq!(sync.object_for_body(body), Some(ball));
     }
 }
