@@ -43,6 +43,32 @@ float sample_depth(ivec2 pixel) {
     return texelFetch(depth_image, clamp(pixel, ivec2(0), limit), 0).r;
 }
 
+// Наибольший косинус угла горизонта с нормалью вдоль одной стороны слайса; 0 — горизонта нет.
+float horizon_cosine(ivec2 pixel, vec2 direction, float radius_px, vec3 center, vec3 normal,
+                     float radius, float falloff, int steps) {
+    float best = 0.0;
+    for (int step = 1; step <= steps; step++) {
+        float t = float(step) / float(steps);
+        ivec2 sample_pixel = pixel + ivec2(round(direction * radius_px * t));
+        if (sample_pixel == pixel) {
+            continue;
+        }
+        float sample_depth_value = sample_depth(sample_pixel);
+        if (sample_depth_value >= 0.99999) {
+            continue;
+        }
+        vec3 offset = view_position(sample_pixel, sample_depth_value) - center;
+        float distance_to_sample = length(offset);
+        if (distance_to_sample < 1e-5 || distance_to_sample > radius) {
+            continue;
+        }
+        float cosine = dot(offset / distance_to_sample, normal);
+        float weight = 1.0 - smoothstep(falloff, 1.0, distance_to_sample / radius);
+        best = max(best, cosine * weight);
+    }
+    return best;
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= int(target_size().x) || pixel.y >= int(target_size().y)) {
@@ -81,27 +107,10 @@ void main() {
     for (int slice = 0; slice < slices; slice++) {
         float angle = (float(slice) + noise) * 3.14159265 / float(slices);
         vec2 direction = vec2(cos(angle), sin(angle));
-        float best = 0.0;
-        for (int step = 1; step <= steps; step++) {
-            float t = float(step) / float(steps);
-            ivec2 sample_pixel = pixel + ivec2(round(direction * radius_px * t));
-            if (sample_pixel == pixel) {
-                continue;
-            }
-            float sample_depth_value = sample_depth(sample_pixel);
-            if (sample_depth_value >= 0.99999) {
-                continue;
-            }
-            vec3 offset = view_position(sample_pixel, sample_depth_value) - center;
-            float distance_to_sample = length(offset);
-            if (distance_to_sample < 1e-5 || distance_to_sample > radius) {
-                continue;
-            }
-            float cosine = dot(offset / distance_to_sample, normal);
-            float weight = 1.0 - smoothstep(falloff, 1.0, distance_to_sample / radius);
-            best = max(best, cosine * weight);
-        }
-        visibility += 1.0 - best;
+        // Слайс — прямая через пиксель: горизонт ищется с обеих сторон, иначе открытость смещена.
+        float best_forward = horizon_cosine(pixel, direction, radius_px, center, normal, radius, falloff, steps);
+        float best_backward = horizon_cosine(pixel, -direction, radius_px, center, normal, radius, falloff, steps);
+        visibility += 0.5 * ((1.0 - best_forward) + (1.0 - best_backward));
     }
     float average = visibility / float(max(slices, 1));
     float ao = clamp(1.0 - (1.0 - average) * intensity, 0.0, 1.0);

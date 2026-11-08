@@ -2039,6 +2039,10 @@ impl Renderer {
         let queue = self.queue;
         let taa_set_layout = self.taa_set_layout()?;
         let bloom_layout = self.texture_set_layout()?;
+        let bloom_prefilter_layout = self
+            .bloom_pipelines
+            .ok_or(RenderError::InvalidState("bloom pipelines отсутствуют"))?
+            .prefilter_set_layout();
         let ao_layout = self
             .ao_pipelines
             .ok_or(RenderError::InvalidState("ao pipelines отсутствуют"))?
@@ -2249,6 +2253,7 @@ impl Renderer {
                 target.render_extent,
                 post_frame.plan.bloom_mips,
                 bloom_layout,
+                bloom_prefilter_layout,
                 post_sampler,
             )?);
         }
@@ -2857,6 +2862,10 @@ impl Renderer {
         let queue = self.queue;
         let image_set_layout = self.texture_set_layout()?;
         let post_set_layout = self.post_set_layout()?;
+        let bloom_prefilter_layout = self
+            .bloom_pipelines
+            .ok_or(RenderError::InvalidState("bloom pipelines отсутствуют"))?
+            .prefilter_set_layout();
         let exposure_set_layout = self
             .exposure_pipelines
             .ok_or(RenderError::InvalidState("exposure pipelines отсутствуют"))?
@@ -3130,6 +3139,7 @@ impl Renderer {
                     target.render_extent,
                     post_frame.plan.bloom_mips,
                     target_resources.image_set_layout,
+                    bloom_prefilter_layout,
                     target_resources.post_sampler,
                 )?);
             }
@@ -3459,6 +3469,7 @@ impl Renderer {
                         pass.post.plan.bloom_mips,
                         target_resources.post_sampler,
                         &pass.view.post,
+                        view_exposure,
                     ),
                     exposure_buffer,
                 };
@@ -9878,6 +9889,7 @@ fn record_frame(
             scene.post.plan.bloom_mips,
             post_sampler,
             &view.post,
+            exposure,
         ),
         exposure_buffer,
     };

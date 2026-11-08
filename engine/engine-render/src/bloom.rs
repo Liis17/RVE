@@ -3,6 +3,7 @@
 //! (см. `tonemap.frag`). Уровни и наборы дескрипторов живут в кадровом слоте цели и
 //! пересоздаются вместе с ней.
 
+use super::exposure::{EXPOSURE_BUFFER_SIZE, ViewExposure};
 use super::{
     DeviceImage, GpuMarks, GpuPass, OFFSCREEN_FORMAT, OwnedDescriptorPool, PostProcess,
     RenderError, color_subresource_range, create_post_pipeline, float_bytes, image_layout_barrier,
@@ -24,6 +25,9 @@ pub(crate) const BLOOM_PUSH_CONSTANTS_SIZE: usize = 32;
 #[derive(Clone, Copy)]
 pub(crate) struct BloomPipelines {
     layout: vk::PipelineLayout,
+    /// Prefilter читает буфер экспозиции вида, поэтому у него свой набор и layout.
+    prefilter_set_layout: vk::DescriptorSetLayout,
+    prefilter_layout: vk::PipelineLayout,
     prefilter: vk::Pipeline,
     downsample: vk::Pipeline,
     upsample: vk::Pipeline,
@@ -35,27 +39,42 @@ impl BloomPipelines {
         cache: vk::PipelineCache,
         set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
-        let set_layouts = [set_layout];
         let push_constant_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(BLOOM_PUSH_CONSTANTS_SIZE as u32)];
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(&push_constant_ranges);
-        // SAFETY: the set layout and 32-byte fragment range match the bloom shaders.
-        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
+        let layout = create_bloom_layout(device, &[set_layout], &push_constant_ranges)?;
+        let prefilter_set_layout = match create_prefilter_set_layout(device) {
+            Ok(prefilter_set_layout) => prefilter_set_layout,
+            Err(error) => {
+                // SAFETY: the layout was created above and no pipeline references it.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+                return Err(error);
+            }
+        };
+        let prefilter_layout =
+            match create_bloom_layout(device, &[prefilter_set_layout], &push_constant_ranges) {
+                Ok(prefilter_layout) => prefilter_layout,
+                Err(error) => {
+                    // SAFETY: nothing references these layouts yet.
+                    unsafe {
+                        device.destroy_descriptor_set_layout(prefilter_set_layout, None);
+                        device.destroy_pipeline_layout(layout, None);
+                    }
+                    return Err(error);
+                }
+            };
         let mut created = Vec::with_capacity(3);
         let result = (|| -> Result<(), RenderError> {
-            for (shader, additive) in [
-                (BLOOM_PREFILTER_SHADER, false),
-                (BLOOM_DOWNSAMPLE_SHADER, false),
-                (BLOOM_UPSAMPLE_SHADER, true),
+            for (shader, additive, pipeline_layout) in [
+                (BLOOM_PREFILTER_SHADER, false, prefilter_layout),
+                (BLOOM_DOWNSAMPLE_SHADER, false, layout),
+                (BLOOM_UPSAMPLE_SHADER, true, layout),
             ] {
                 created.push(create_post_pipeline(
                     device,
                     cache,
-                    layout,
+                    pipeline_layout,
                     OFFSCREEN_FORMAT,
                     shader,
                     additive,
@@ -68,16 +87,27 @@ impl BloomPipelines {
                 // SAFETY: the partially created pipelines belong to this device and are unused.
                 unsafe { device.destroy_pipeline(pipeline, None) };
             }
-            // SAFETY: the layout was created above and no pipeline references it.
-            unsafe { device.destroy_pipeline_layout(layout, None) };
+            // SAFETY: no pipeline references the layouts after the cleanup above.
+            unsafe {
+                device.destroy_pipeline_layout(prefilter_layout, None);
+                device.destroy_pipeline_layout(layout, None);
+                device.destroy_descriptor_set_layout(prefilter_set_layout, None);
+            }
             return Err(error);
         }
         Ok(Self {
             layout,
+            prefilter_set_layout,
+            prefilter_layout,
             prefilter: created[0],
             downsample: created[1],
             upsample: created[2],
         })
+    }
+
+    /// Layout набора prefilter: цепочка bloom создаёт наборы этого layout для первого прохода.
+    pub(crate) fn prefilter_set_layout(&self) -> vk::DescriptorSetLayout {
+        self.prefilter_set_layout
     }
 
     /// Освобождает пайплайны и layout; вызывается после ожидания простоя устройства.
@@ -87,9 +117,50 @@ impl BloomPipelines {
             device.destroy_pipeline(self.prefilter, None);
             device.destroy_pipeline(self.downsample, None);
             device.destroy_pipeline(self.upsample, None);
+            device.destroy_pipeline_layout(self.prefilter_layout, None);
             device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.prefilter_set_layout, None);
         }
     }
+}
+
+/// Layout bloom-проходов: наборы дескрипторов и push constants fragment-стадии.
+fn create_bloom_layout(
+    device: &ash::Device,
+    set_layouts: &[vk::DescriptorSetLayout],
+    push_constant_ranges: &[vk::PushConstantRange],
+) -> Result<vk::PipelineLayout, RenderError> {
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(set_layouts)
+        .push_constant_ranges(push_constant_ranges);
+    // SAFETY: the set layouts and the 32-byte fragment range match the bloom shaders.
+    Ok(unsafe { device.create_pipeline_layout(&layout_info, None) }?)
+}
+
+/// Набор prefilter: HDR-источник и sampler (binding 0, 1) и буфер экспозиции вида (binding 2).
+fn create_prefilter_set_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout, RenderError> {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+    ];
+    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    // SAFETY: the bindings match the bloom prefilter shader.
+    Ok(unsafe { device.create_descriptor_set_layout(&info, None) }?)
 }
 
 /// Значения push constants bloom-прохода prefilter; остальные проходы используют только размер.
@@ -132,6 +203,7 @@ pub(crate) struct BloomChain {
 
 /// Уровни, которые bloom строит для разрешения рендера; ноль уровней не создаёт цепочку.
 impl BloomChain {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         instance: &ash::Instance,
         device: &ash::Device,
@@ -139,6 +211,7 @@ impl BloomChain {
         render_extent: vk::Extent2D,
         levels: u32,
         set_layout: vk::DescriptorSetLayout,
+        prefilter_set_layout: vk::DescriptorSetLayout,
         sampler: vk::Sampler,
     ) -> Result<Self, RenderError> {
         let level_count = levels.max(1) as usize;
@@ -168,12 +241,17 @@ impl BloomChain {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(set_count as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(set_count as u32)
             .pool_sizes(&pool_sizes);
         let pool = OwnedDescriptorPool::new(device, &pool_info)?;
-        let set_layouts = vec![set_layout; set_count];
+        // Первый набор — prefilter, остальные читают уровни цепочки.
+        let mut set_layouts = vec![set_layout; set_count];
+        set_layouts[0] = prefilter_set_layout;
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool.handle)
             .set_layouts(&set_layouts);
@@ -212,6 +290,9 @@ pub(crate) struct BloomRecord<'a> {
     pub(crate) pipelines: BloomPipelines,
     pub(crate) sampler: vk::Sampler,
     pub(crate) push: BloomPush,
+    /// Буфер экспозиции вида; prefilter читает из него adapted EV, если кадр адаптирует экспозицию.
+    pub(crate) exposure_buffer: vk::Buffer,
+    pub(crate) adaptive: bool,
 }
 
 /// Собирает запись bloom, если эффект запланирован и цепочка для цели создана.
@@ -221,6 +302,7 @@ pub(crate) fn bloom_record<'a>(
     bloom_levels: u32,
     sampler: vk::Sampler,
     post: &PostProcess,
+    exposure: ViewExposure,
 ) -> Option<BloomRecord<'a>> {
     match (chain, pipelines) {
         (Some(chain), Some(pipelines)) if bloom_levels > 0 => Some(BloomRecord {
@@ -228,9 +310,43 @@ pub(crate) fn bloom_record<'a>(
             pipelines,
             sampler,
             push: BloomPush::from_post(post),
+            exposure_buffer: exposure.buffer,
+            adaptive: exposure.adaptation.is_some(),
         }),
         _ => None,
     }
+}
+
+/// Push constants prefilter: порог, колено, EV вида, флаг адаптации и `intensity * tint`.
+///
+/// Флаг адаптации говорит шейдеру прибавить adapted EV из буфера, как composite в auto-режиме;
+/// порог сравнивается с той же экспонированной яркостью, что и в composite.
+pub(crate) fn prefilter_push_words(push: BloomPush, adaptive: bool) -> [f32; 8] {
+    [
+        push.threshold,
+        push.knee,
+        push.exposure_ev,
+        f32::from(u8::from(adaptive)),
+        push.tint_intensity[0],
+        push.tint_intensity[1],
+        push.tint_intensity[2],
+        0.0,
+    ]
+}
+
+/// Привязывает буфер экспозиции вида к binding 2 набора prefilter.
+fn write_prefilter_exposure(device: &ash::Device, set: vk::DescriptorSet, buffer: vk::Buffer) {
+    let buffer_info = [vk::DescriptorBufferInfo::default()
+        .buffer(buffer)
+        .offset(0)
+        .range(EXPOSURE_BUFFER_SIZE as u64)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(2)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&buffer_info)];
+    // SAFETY: the set and buffer are alive and the set is not used by in-flight work.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
 
 /// Переводит изображение в `SHADER_READ_ONLY_OPTIMAL` для чтения проходами постобработки.
@@ -279,21 +395,16 @@ pub(crate) fn record_bloom(
         pipelines,
         sampler,
         push,
+        exposure_buffer,
+        adaptive,
     } = record;
     write_image_set(device, chain.prefilter_set, source.view, sampler);
+    write_prefilter_exposure(device, chain.prefilter_set, exposure_buffer);
     let level_count = chain.levels.len();
     let layout = pipelines.layout;
 
-    let prefilter_push = float_bytes::<BLOOM_PUSH_CONSTANTS_SIZE>(&[
-        push.threshold,
-        push.knee,
-        push.exposure_ev,
-        0.0,
-        push.tint_intensity[0],
-        push.tint_intensity[1],
-        push.tint_intensity[2],
-        0.0,
-    ]);
+    let prefilter_push =
+        float_bytes::<BLOOM_PUSH_CONSTANTS_SIZE>(&prefilter_push_words(push, adaptive));
     to_attachment(device, command_buffer, chain, 0);
     draw_fullscreen(
         device,
@@ -302,7 +413,7 @@ pub(crate) fn record_bloom(
         chain.extents[0],
         false,
         pipelines.prefilter,
-        layout,
+        pipelines.prefilter_layout,
         chain.prefilter_set,
         &prefilter_push,
     );
@@ -491,53 +602,32 @@ pub(crate) fn draw_fullscreen(
 mod tests {
     use super::*;
 
-    /// Prefilter в CPU-форме шейдера: возвращает цвет до экспозиции. Экспозиция влияет только на
-    /// порог, поэтому одинаковый цвет при разных EV даёт разный вклад, но не разный цвет.
-    fn prefilter(
-        color: [f32; 3],
-        threshold: f32,
-        knee: f32,
-        exposure_ev: f32,
-        tint: [f32; 3],
-    ) -> [f32; 3] {
-        let exposure = exposure_ev.exp2();
-        let luminance = (color[0] * exposure) * 0.2126
-            + (color[1] * exposure) * 0.7152
-            + (color[2] * exposure) * 0.0722;
-        let knee = knee.max(1e-4);
-        let mut soft = (luminance - (threshold - knee)).clamp(0.0, 2.0 * knee);
-        soft = soft * soft * (0.25 / knee);
-        let contribution = soft.max(luminance - threshold).max(0.0) / luminance.max(1e-4);
-        [
-            color[0] * contribution * tint[0],
-            color[1] * contribution * tint[1],
-            color[2] * contribution * tint[2],
-        ]
+    #[test]
+    fn prefilter_push_words_keep_manual_ev_separate_from_adaptation_flag() {
+        let push = BloomPush {
+            threshold: 1.0,
+            knee: 0.5,
+            exposure_ev: -2.0,
+            tint_intensity: [0.5, 1.0, 2.0],
+            scatter: 0.0,
+        };
+        let manual = prefilter_push_words(push, false);
+        assert_eq!(manual[2], -2.0);
+        assert_eq!(manual[3], 0.0);
+        let adaptive = prefilter_push_words(push, true);
+        assert_eq!(adaptive[2], -2.0);
+        assert_eq!(adaptive[3], 1.0);
+        assert_eq!([adaptive[0], adaptive[1]], [1.0, 0.5]);
+        assert_eq!(&adaptive[4..7], &[0.5, 1.0, 2.0]);
     }
 
     #[test]
-    fn prefilter_stores_colour_without_exposure_and_thresholds_exposed_luminance() {
-        let bright = [4.0, 4.0, 4.0];
-        // EV 0: яркость 4 проходит порог 2 с вкладом (4 - 2) / 4, колено нулевое.
-        let unexposed = prefilter(bright, 2.0, 0.0, 0.0, [1.0; 3]);
-        assert!((unexposed[0] - 2.0).abs() < 1e-3, "{unexposed:?}");
-        // EV +1: экспонированная яркость 8, вклад (8 - 2) / 8; сохранённый цвет всё равно 4 * вклад.
-        let exposed = prefilter(bright, 2.0, 0.0, 1.0, [1.0; 3]);
-        assert!((exposed[0] - 3.0).abs() < 1e-3, "{exposed:?}");
-    }
-
-    #[test]
-    fn prefilter_drops_dark_pixels_below_the_knee() {
-        assert_eq!(prefilter([0.1; 3], 1.0, 0.5, 0.0, [1.0; 3]), [0.0; 3]);
-    }
-
-    #[test]
-    fn prefilter_tint_and_intensity_scale_output_linearly() {
-        let base = prefilter([3.0; 3], 1.0, 0.0, 0.0, [1.0; 3]);
-        let tinted = prefilter([3.0; 3], 1.0, 0.0, 0.0, [2.0, 0.5, 1.0]);
-        assert!((tinted[0] - 2.0 * base[0]).abs() < 1e-5);
-        assert!((tinted[1] - 0.5 * base[1]).abs() < 1e-5);
-        assert!((tinted[2] - base[2]).abs() < 1e-5);
+    fn prefilter_push_words_fill_the_declared_push_range() {
+        let push = BloomPush::from_post(&PostProcess::default());
+        assert_eq!(
+            prefilter_push_words(push, true).len() * size_of::<f32>(),
+            BLOOM_PUSH_CONSTANTS_SIZE
+        );
     }
 
     #[test]
