@@ -13,9 +13,10 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 12 appends post-process callbacks after the v11 gamepad tail.
 /// Version 13 appends network callbacks after the v12 post-process tail and the net event callback
 /// after the v6 collision tail of the descriptor.
+/// Version 14 adds parameter kinds and an argument string to parameter descriptors.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 13;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 14;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -482,6 +483,10 @@ pub const RVE_VALUE_FLOAT: u32 = 2;
 pub const RVE_VALUE_STR: u32 = 3;
 /// Value tag for a borrowed array of values.
 pub const RVE_VALUE_ARRAY: u32 = 4;
+/// Value tag for a world object handle.
+pub const RVE_VALUE_OBJECT: u32 = 5;
+/// Value tag for a borrowed asset path string.
+pub const RVE_VALUE_ASSET: u32 = 6;
 
 /// Informational log severity.
 pub const RVE_LOG_INFO: u32 = 0;
@@ -573,6 +578,8 @@ pub union RveValueData {
     pub string: RveStr,
     /// Array payload selected by [`RVE_VALUE_ARRAY`].
     pub array: RveArray,
+    /// Object handle payload selected by [`RVE_VALUE_OBJECT`].
+    pub object: u64,
 }
 
 /// A tagged value crossing the script ABI.
@@ -639,6 +646,34 @@ impl RveValue {
                     ptr: values.as_ptr(),
                     len: values.len(),
                 },
+            },
+        }
+    }
+
+    /// Creates a world object handle value. Zero represents an absent optional object.
+    pub const fn object(handle: u64) -> Self {
+        Self {
+            tag: RVE_VALUE_OBJECT,
+            data: RveValueData { object: handle },
+        }
+    }
+
+    /// Creates a borrowed asset path value.
+    pub fn asset(value: &str) -> Self {
+        Self {
+            tag: RVE_VALUE_ASSET,
+            data: RveValueData {
+                string: RveStr::from_str_ref(value),
+            },
+        }
+    }
+
+    /// Creates a process-lifetime asset path value usable in constant tables.
+    pub const fn static_asset(value: &'static str) -> Self {
+        Self {
+            tag: RVE_VALUE_ASSET,
+            data: RveValueData {
+                string: RveStr::from_static(value),
             },
         }
     }
@@ -1490,7 +1525,7 @@ pub struct RveScriptDescV3 {
     /// Releases one successfully created instance.
     pub drop: RveDropFn,
     /// Declared parameters in declaration order; null only when `param_count` is zero.
-    pub params: *const RveParamDesc,
+    pub params: *const RveParamDescV13,
     /// Number of parameter descriptors. Zero means the script declares no schema.
     pub param_count: usize,
 }
@@ -1517,7 +1552,7 @@ pub struct RveScriptDescV4 {
     /// Releases one successfully created instance.
     pub drop: RveDropFn,
     /// Declared parameters in declaration order; null only when `param_count` is zero.
-    pub params: *const RveParamDesc,
+    pub params: *const RveParamDescV13,
     /// Number of parameter descriptors. Zero means the script declares no schema.
     pub param_count: usize,
     /// Optional callback for console commands registered by this script.
@@ -1558,7 +1593,7 @@ pub struct RveScriptDescV6 {
     pub message: RveMessageFn,
     pub destroy: RveDestroyFn,
     pub drop: RveDropFn,
-    pub params: *const RveParamDesc,
+    pub params: *const RveParamDescV13,
     pub param_count: usize,
     pub command: Option<RveCommandFn>,
     /// Optional collision and trigger callback appended in ABI v6.
@@ -1566,6 +1601,23 @@ pub struct RveScriptDescV6 {
 }
 
 /// One exported guest script implementation in ABI version 13.
+#[repr(C)]
+pub struct RveScriptDescV13 {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDescV13,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    pub net_event: Option<RveNetEventFn>,
+}
+
+/// One exported guest script implementation in ABI version 14.
 #[repr(C)]
 pub struct RveScriptDesc {
     pub name: RveStr,
@@ -1593,16 +1645,28 @@ pub const RVE_PARAM_FLOAT: u32 = 2;
 pub const RVE_PARAM_STRING: u32 = 3;
 /// Parameter kind: array of three floating-point numbers.
 pub const RVE_PARAM_VEC3: u32 = 4;
+/// Parameter kind: object reference.
+pub const RVE_PARAM_OBJECT: u32 = 5;
+/// Parameter kind: component-constrained object reference.
+pub const RVE_PARAM_COMPONENT: u32 = 6;
+/// Parameter kind: asset path with optional extension constraint.
+pub const RVE_PARAM_ASSET: u32 = 7;
+/// Parameter kind: string from a fixed set of values.
+pub const RVE_PARAM_ENUM: u32 = 8;
+/// Parameter kind: RGB color in `[0, 1]`.
+pub const RVE_PARAM_COLOR: u32 = 9;
+/// Parameter kind: array of values described recursively by `argument`.
+pub const RVE_PARAM_ARRAY: u32 = 10;
 
 /// [`RveParamDesc::flags`] bit: `min` is set.
 pub const RVE_PARAM_HAS_MIN: u32 = 1;
 /// [`RveParamDesc::flags`] bit: `max` is set.
 pub const RVE_PARAM_HAS_MAX: u32 = 2;
 
-/// One declared script parameter. All pointers refer to process-lifetime data.
+/// ABI v13 parameter descriptor retained for loading older modules.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct RveParamDesc {
+pub struct RveParamDescV13 {
     /// Parameter name in the `[A-Za-z_][A-Za-z0-9_]*` format, at most 64 bytes.
     pub name: RveStr,
     /// One of the `RVE_PARAM_*` kinds.
@@ -1617,6 +1681,21 @@ pub struct RveParamDesc {
     pub flags: u32,
     /// Optional UTF-8 label for editors; empty means none.
     pub label: RveStr,
+}
+
+/// One declared script parameter. All pointers refer to process-lifetime data.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RveParamDesc {
+    pub name: RveStr,
+    pub kind: u32,
+    pub default: RveValue,
+    pub min: f64,
+    pub max: f64,
+    pub flags: u32,
+    pub label: RveStr,
+    /// Component name, asset extension, enum values, or nested array kind; empty when unused.
+    pub argument: RveStr,
 }
 
 /// Static script table returned from `rve_script_module`.
@@ -1652,10 +1731,12 @@ unsafe impl Sync for RveValueData {}
 unsafe impl Sync for RveValue {}
 unsafe impl Sync for RveParamEntry {}
 unsafe impl Sync for RveParamDesc {}
+unsafe impl Sync for RveParamDescV13 {}
 unsafe impl Sync for RveScriptDescV1 {}
 unsafe impl Sync for RveScriptDescV3 {}
 unsafe impl Sync for RveScriptDescV4 {}
 unsafe impl Sync for RveScriptDescV6 {}
+unsafe impl Sync for RveScriptDescV13 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 
@@ -1786,7 +1867,7 @@ mod tests {
 
     #[test]
     fn post_process_settings_are_c_layout_and_appended_to_host_in_v12() {
-        assert_eq!(RVE_SCRIPT_ABI_VERSION, 13);
+        assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
         assert_eq!(RVE_EXPOSURE_MODE_AUTO, 1);
         assert_eq!(RVE_AO_QUALITY_HIGH, 2);
         assert_eq!(std::mem::align_of::<RvePostProcessSettings>(), 4);

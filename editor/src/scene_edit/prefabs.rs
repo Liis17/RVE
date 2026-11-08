@@ -1,8 +1,8 @@
 //! Команды над экземплярами префабов: размещение, создание, Unpack и правка через overrides.
 
 use super::{
-    EditorScene, ensure_asset, expand_document_with, file_stem, rename_reference, subtree_ids,
-    unique_id,
+    EditorScene, ensure_asset, ensure_param_assets, expand_document_with, file_stem,
+    remap_document_script_refs, remap_object_script_refs, rename_reference, subtree_ids, unique_id,
 };
 use engine_files::VirtualPath;
 use engine_scene::{
@@ -107,6 +107,7 @@ impl EditorScene {
             for parent in parents {
                 *parent = parent.take().map(mapped);
             }
+            remap_document_script_refs(document, |reference| mapped(reference.to_owned()));
             ensure_asset(document, prefab);
             document.instances.push(PrefabInstance {
                 id: id.to_owned(),
@@ -201,6 +202,9 @@ impl EditorScene {
             |parent: Option<String>| parent.map(|parent| rename_reference(&renamed, parent));
         for object in &mut objects {
             object.parent = remap(object.parent.take());
+            remap_object_script_refs(object, |reference| {
+                rename_reference(&renamed, reference.to_owned())
+            });
             object.id = renamed[&object.id].clone();
         }
         for inner in &mut nested {
@@ -249,6 +253,7 @@ impl EditorScene {
             for parent in parents {
                 *parent = parent.take().map(outside);
             }
+            remap_document_script_refs(document, |reference| outside(reference.to_owned()));
             for asset in assets {
                 if !document
                     .assets
@@ -303,11 +308,23 @@ impl EditorScene {
             }
         }
         let assets = override_paths(&diff);
+        let param_assets = edited
+            .lite_scripts
+            .iter()
+            .flat_map(|script| script.params.values().cloned())
+            .chain(
+                edited
+                    .heavy_scripts
+                    .iter()
+                    .flat_map(|script| script.params.values().cloned()),
+            )
+            .collect::<Vec<_>>();
         self.edit(coalesce, |document| {
             // Ресурсы override объявляются в документе экземпляра.
             for path in &assets {
                 ensure_asset(document, path);
             }
+            ensure_param_assets(document, param_assets);
             let instance = document
                 .instances
                 .iter_mut()
@@ -1083,7 +1100,7 @@ mod tests {
         RigidBodyComponent, RigidBodyKind, SceneDocument, SceneError, SceneTransform, World,
     };
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::rc::Rc;
 
     /// Файлы префабов в памяти: тест может «записать» новый префаб.
@@ -1819,6 +1836,55 @@ mod tests {
             scene.object("params").unwrap().lite_scripts[0].params["speed"],
             ParamValue::Int(30)
         );
+    }
+
+    #[test]
+    fn prefab_script_asset_refs_with_the_same_key_are_all_registered() {
+        let prefab = r#"
+[[assets]]
+path = "/scripts/a.lua"
+[[assets]]
+path = "/scripts/b.lua"
+[[objects]]
+id = "root"
+[[objects.lite_scripts]]
+path = "/scripts/a.lua"
+params = { model = { asset = "/models/base-a.fbx" } }
+[[objects.lite_scripts]]
+path = "/scripts/b.lua"
+params = { model = { asset = "/models/base-b.fbx" } }
+"#;
+        let files = Files::with(&[("prefabs/models.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/models.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+
+        scene
+            .edit_object("models", None, |object| {
+                object.lite_scripts[0].params.insert(
+                    "model".to_owned(),
+                    ParamValue::Asset(path("/models/new-a.fbx")),
+                );
+                object.lite_scripts[1].params.insert(
+                    "model".to_owned(),
+                    ParamValue::Asset(path("/models/new-b.fbx")),
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let assets = scene
+            .document()
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<HashSet<_>>();
+        assert!(assets.contains("models/new-a.fbx"));
+        assert!(assets.contains("models/new-b.fbx"));
     }
 
     #[test]

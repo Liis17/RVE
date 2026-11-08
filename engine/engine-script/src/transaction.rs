@@ -35,6 +35,12 @@ pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_NAME_BYTES: usize = 256;
 pub(crate) const MAX_MESSAGE_TARGET_ID_BYTES: usize = 256;
 
+#[derive(Clone)]
+pub(crate) struct ScriptObjectRef {
+    pub(crate) handle: ObjectHandle,
+    pub(crate) name: String,
+}
+
 pub(crate) struct MessageValueBudget {
     elements: usize,
     string_bytes: usize,

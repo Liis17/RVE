@@ -92,6 +92,10 @@ pub struct UnsavedPrompt {
 #[derive(Clone, Debug)]
 pub struct AssetDrag(pub String);
 
+/// Перетаскиваемый объект из Hierarchy.
+#[derive(Clone, Debug)]
+pub struct ObjectDrag(pub String);
+
 /// Команда numpad для камеры Scene. Копится между кадрами и применяется в начале кадра.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ViewCommand {
@@ -185,6 +189,8 @@ pub struct EditorState {
     pub recovery_prompt: Option<RecoveryPrompt>,
     pub asset_tree: Vec<AssetEntry>,
     pub current_folder: String,
+    /// Ресурс, на который перешёл Inspector.
+    pub project_selection: Option<String>,
     pub project_dialog: Option<crate::ui::project_panel::ProjectDialog>,
     /// `.rvephysmat`, открытый панелью полей Project.
     pub physics_material_edit: Option<crate::ui::project_panel::PhysicsMaterialEdit>,
@@ -270,6 +276,7 @@ impl EditorState {
             recovery_prompt: None,
             asset_tree: Vec::new(),
             current_folder: String::new(),
+            project_selection: None,
             project_dialog: None,
             physics_material_edit: None,
             new_project_dialog: None,

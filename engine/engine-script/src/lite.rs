@@ -2,7 +2,7 @@ use crate::actions::{ActionMutation, ActionValue};
 use crate::lifecycle::{ObjectState, PrefabRequest, SpawnArgs};
 use crate::transaction::{
     MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget, QueueMessageError,
-    ScriptTransaction,
+    ScriptObjectRef, ScriptTransaction,
 };
 use crate::types::{
     RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
@@ -13,10 +13,10 @@ use engine_files::VirtualPath;
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
-    AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AudioGroup, AudioRequest,
-    CameraSettings, ClipParams, ExposureMode, NetEvent, NetMode, NetTarget, ObjectHandle,
-    ParamKind, ParamSchema, ParamSpec, ParamValue, PeerId, PostProcessSettings, Tonemapper,
-    VoiceId,
+    AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AssetKind, AudioGroup, AudioRequest,
+    CameraSettings, ClipParams, ComponentKind, ExposureMode, NetEvent, NetMode, NetTarget,
+    ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue, PeerId, PostProcessSettings,
+    Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use mlua::chunk::ChunkMode;
@@ -532,24 +532,25 @@ fn property_spec(name: String, entry: &Table) -> Result<ParamSpec, String> {
             Value::String(key)
                 if matches!(
                     key.as_bytes().as_ref(),
-                    b"name" | b"type" | b"default" | b"min" | b"max" | b"label"
+                    b"name"
+                        | b"type"
+                        | b"default"
+                        | b"min"
+                        | b"max"
+                        | b"label"
+                        | b"component"
+                        | b"script"
+                        | b"asset"
+                        | b"values"
+                        | b"of"
                 ) =>
             {
                 Ok(())
             }
-            _ => Err(LuaError::runtime(
-                "unknown field; expected type, default, min, max or label",
-            )),
+            _ => Err(LuaError::runtime("unknown field in script parameter")),
         })
         .map_err(|error| context(&error.to_string()))?;
-    let kind = match entry.get::<Value>("type") {
-        Ok(Value::String(kind)) => kind
-            .to_str()
-            .ok()
-            .and_then(|kind| ParamKind::parse(&kind))
-            .ok_or_else(|| context("type must be bool, int, float, string or vec3"))?,
-        _ => return Err(context("type must be a string")),
-    };
+    let kind = property_kind(entry).map_err(|message| context(&message))?;
     let default = match entry.get::<Value>("default") {
         Ok(Value::Nil) => kind.zero(),
         Ok(value) => lua_param_value(value).map_err(|error| context(&error.to_string()))?,
@@ -581,6 +582,118 @@ fn property_spec(name: String, entry: &Table) -> Result<ParamSpec, String> {
     })
 }
 
+fn property_kind(entry: &Table) -> Result<ParamKind, String> {
+    let kind = match entry.get::<Value>("type") {
+        Ok(Value::String(kind)) => kind
+            .to_str()
+            .map_err(|_| "type must be UTF-8".to_owned())?
+            .to_owned(),
+        _ => return Err("type must be a string".to_owned()),
+    };
+    let allowed = match kind.as_str() {
+        "component" => &["component", "script"][..],
+        "asset" => &["asset"][..],
+        "enum" => &["values"][..],
+        "array" => &["of"][..],
+        _ => &[][..],
+    };
+    entry
+        .for_each::<Value, Value>(|key, _| match key {
+            Value::String(key)
+                if matches!(
+                    key.as_bytes().as_ref(),
+                    b"name" | b"type" | b"default" | b"min" | b"max" | b"label"
+                ) || allowed
+                    .iter()
+                    .any(|field| key.as_bytes() == field.as_bytes()) =>
+            {
+                Ok(())
+            }
+            _ => Err(LuaError::runtime("field does not match parameter type")),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(match kind.as_str() {
+        "component" => {
+            let component = entry.get::<Value>("component").ok();
+            let script = entry.get::<Value>("script").ok();
+            match (component, script) {
+                (Some(Value::String(component)), None | Some(Value::Nil)) => {
+                    let component = component
+                        .to_str()
+                        .map_err(|_| "component must be UTF-8".to_owned())?;
+                    ComponentKind::parse(&component)
+                        .map(ParamKind::Component)
+                        .ok_or_else(|| format!("unknown component {component:?}"))?
+                }
+                (None | Some(Value::Nil), Some(Value::String(script))) => {
+                    let script = script
+                        .to_str()
+                        .map_err(|_| "script must be UTF-8".to_owned())?;
+                    if script.is_empty() {
+                        return Err("script component reference must not be empty".to_owned());
+                    }
+                    ParamKind::Component(ComponentKind::Script(script.to_owned()))
+                }
+                _ => return Err("component requires exactly one of component or script".to_owned()),
+            }
+        }
+        "asset" => match entry.get::<Value>("asset") {
+            Ok(Value::Nil) => ParamKind::Asset(None),
+            Ok(Value::String(asset)) => {
+                let asset = asset
+                    .to_str()
+                    .map_err(|_| "asset kind must be UTF-8".to_owned())?;
+                ParamKind::Asset(Some(
+                    AssetKind::parse(&asset)
+                        .ok_or_else(|| format!("unknown asset kind {asset:?}"))?,
+                ))
+            }
+            _ => return Err("asset must be a string".to_owned()),
+        },
+        "enum" => {
+            let values = match entry.get::<Value>("values") {
+                Ok(Value::Table(values)) => values,
+                _ => return Err("enum requires a values array".to_owned()),
+            };
+            let mut items = Vec::new();
+            values
+                .for_each::<Value, Value>(|key, value| {
+                    let Some(index) = sequence_index(key) else {
+                        return Err(LuaError::runtime("enum values must be a sequence"));
+                    };
+                    let Value::String(value) = value else {
+                        return Err(LuaError::runtime("enum values must be strings"));
+                    };
+                    let value = value
+                        .to_str()
+                        .map_err(|_| LuaError::runtime("enum values must be UTF-8"))?
+                        .to_owned();
+                    items.push((index, value));
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())?;
+            items.sort_by_key(|(index, _)| *index);
+            if items
+                .iter()
+                .enumerate()
+                .any(|(index, (key, _))| *key != index + 1)
+            {
+                return Err("enum values must have consecutive indices 1..n".to_owned());
+            }
+            ParamKind::Enum(items.into_iter().map(|(_, value)| value).collect())
+        }
+        "array" => {
+            let of = match entry.get::<Value>("of") {
+                Ok(Value::Table(of)) => of,
+                _ => return Err("array requires an of table".to_owned()),
+            };
+            ParamKind::Array(Box::new(property_kind(&of)?))
+        }
+        primitive => ParamKind::parse(primitive)
+            .ok_or_else(|| format!("unknown parameter type {primitive:?}"))?,
+    })
+}
+
 /// Схема параметров lite-скрипта без создания экземпляров: chunk выполняется в отдельном
 /// Lua с теми же ограничениями, что и при загрузке сцены. API движка (`rve.find` и др.)
 /// на верхнем уровне chunk недоступен, как и при загрузке.
@@ -606,6 +719,16 @@ pub(crate) struct LuaInstance {
     class: Table,
     instance: Table,
     transform: mlua::AnyUserData,
+    active_call: ActiveCall,
+}
+
+pub(crate) struct LuaInstanceInit<'a> {
+    pub(crate) object_id: &'a str,
+    pub(crate) object_name: &'a str,
+    pub(crate) params: &'a ScriptParams,
+    pub(crate) transform: ScriptTransform,
+    pub(crate) object_refs: &'a std::collections::HashMap<String, ScriptObjectRef>,
+    pub(crate) object_handle: ObjectHandle,
 }
 
 pub(crate) struct LitePhysicsEvent {
@@ -620,16 +743,20 @@ impl LuaInstance {
     pub(crate) fn new(
         lua: &Lua,
         class: Table,
-        object_id: &str,
-        object_name: &str,
-        params: &ScriptParams,
-        transform: ScriptTransform,
+        init: LuaInstanceInit<'_>,
+        active_call: ActiveCall,
     ) -> mlua::Result<Self> {
-        let params = params_table(lua, params)?;
-        let object = lua.create_table()?;
-        object.set("id", object_id)?;
-        object.set("name", object_name)?;
-        let transform = lua.create_userdata(TransformUserData { value: transform })?;
+        let params = params_table(lua, init.params, init.object_refs, active_call.clone())?;
+        let object = object_table(
+            lua,
+            init.object_handle,
+            Some(init.object_id.to_owned()),
+            init.object_name.to_owned(),
+            active_call.clone(),
+        )?;
+        let transform = lua.create_userdata(TransformUserData {
+            value: init.transform,
+        })?;
 
         let instance = lua.create_table()?;
         instance.set("params", params)?;
@@ -643,6 +770,7 @@ impl LuaInstance {
             class,
             instance,
             transform,
+            active_call,
         })
     }
 
@@ -686,7 +814,7 @@ impl LuaInstance {
                 self.instance.clone(),
                 sender,
                 name,
-                param_value(lua, value)?,
+                param_value(lua, value, &self.active_call, None)?,
             ),
         )
     }
@@ -708,7 +836,7 @@ impl LuaInstance {
                     self.instance.clone(),
                     *peer,
                     name.as_str(),
-                    param_value(lua, value)?,
+                    param_value(lua, value, &self.active_call, None)?,
                 ),
             ),
             NetEvent::PeerConnected { peer } => {
@@ -1375,7 +1503,7 @@ fn add_net_object_api(
     let send_active = active_call;
     object.set(
         "net_send",
-        lua.create_function(move |_, arguments: MultiValue| {
+        lua.create_function(move |lua, arguments: MultiValue| {
             let mut values = net_method_arguments(arguments, "object.net_send", 3, 4)?;
             let options = if values.len() == 4 {
                 values.pop()
@@ -1388,7 +1516,7 @@ fn add_net_object_api(
             let name = lua_name_value(name, "object.net_send")?;
             let target = lua_net_target(target)?;
             let reliable = lua_reliable(lua_options(options)?.as_ref(), "object.net_send")?;
-            let (value, _) = lua_param_value_with_size(value)?;
+            let (value, _) = lua_message_param_value_with_size(lua, &send_active, value)?;
             if !object_alive(&send_active, handle)? {
                 return Ok(());
             }
@@ -1509,11 +1637,11 @@ fn net_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
     net.set(
         "send",
         lua.create_function(
-            move |_, (target, name, value, options): (Value, LuaString, Value, Option<Table>)| {
+            move |lua, (target, name, value, options): (Value, LuaString, Value, Option<Table>)| {
                 let target = lua_net_target(target)?;
                 let reliable = lua_reliable(options.as_ref(), "rve.net.send")?;
                 let name = lua_message_name(name)?;
-                let (value, _) = lua_param_value_with_size(value)?;
+                let (value, _) = lua_message_param_value_with_size(lua, &active_call, value)?;
                 with_active_call(&active_call, |transaction| {
                     transaction
                         .send_net(None, &name, value.clone(), target, reliable)
@@ -2982,10 +3110,10 @@ fn matrix_table(lua: &Lua, matrix: [f32; 16]) -> mlua::Result<Table> {
 
 fn send_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
     lua.create_function(
-        move |_, (target, name, value): (LuaString, LuaString, Value)| {
+        move |lua, (target, name, value): (LuaString, LuaString, Value)| {
             let target = lua_message_target(target)?;
             let name = lua_message_name(name)?;
-            let (value, value_size) = lua_param_value_with_size(value)?;
+            let (value, value_size) = lua_message_param_value_with_size(lua, &active_call, value)?;
             with_active_call(&active_call, |transaction| {
                 transaction
                     .send(&target, &name, value, value_size)
@@ -2997,9 +3125,9 @@ fn send_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
 }
 
 fn broadcast_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
-    lua.create_function(move |_, (name, value): (LuaString, Value)| {
+    lua.create_function(move |lua, (name, value): (LuaString, Value)| {
         let name = lua_message_name(name)?;
-        let (value, value_size) = lua_param_value_with_size(value)?;
+        let (value, value_size) = lua_message_param_value_with_size(lua, &active_call, value)?;
         with_active_call(&active_call, |transaction| {
             transaction
                 .broadcast(&name, value, value_size)
@@ -3550,7 +3678,17 @@ fn lua_param_value(value: Value) -> mlua::Result<ParamValue> {
 
 fn lua_param_value_with_size(value: Value) -> mlua::Result<(ParamValue, usize)> {
     let mut budget = MessageValueBudget::new();
-    let value = lua_param_value_inner(value, 0, &mut budget)?;
+    let value = lua_param_value_inner(value, 0, &mut budget, None, None)?;
+    Ok((value, budget.estimated_size()))
+}
+
+fn lua_message_param_value_with_size(
+    lua: &Lua,
+    active_call: &ActiveCall,
+    value: Value,
+) -> mlua::Result<(ParamValue, usize)> {
+    let mut budget = MessageValueBudget::new();
+    let value = lua_param_value_inner(value, 0, &mut budget, Some(lua), Some(active_call))?;
     Ok((value, budget.estimated_size()))
 }
 
@@ -3558,6 +3696,8 @@ fn lua_param_value_inner(
     value: Value,
     depth: usize,
     budget: &mut MessageValueBudget,
+    lua: Option<&Lua>,
+    active_call: Option<&ActiveCall>,
 ) -> mlua::Result<ParamValue> {
     budget.enter(depth).map_err(LuaError::runtime)?;
 
@@ -3576,6 +3716,16 @@ fn lua_param_value_inner(
                 .map_err(|_| LuaError::runtime("message strings must contain valid UTF-8"))
         }
         Value::Table(table) => {
+            if let (Some(lua), Some(active_call)) = (lua, active_call)
+                && let Some(handle) = object_handle_of(lua, &table)?
+            {
+                let id = with_active_call(active_call, |transaction| {
+                    Ok(transaction.object_id(handle).map(str::to_owned))
+                })?
+                .ok_or_else(|| LuaError::runtime("message object reference is no longer valid"))?;
+                budget.add_string(id.len()).map_err(LuaError::runtime)?;
+                return Ok(ParamValue::Object(id));
+            }
             let mut entries = Vec::new();
             table.for_each::<Value, Value>(|key, value| {
                 let Some(index) = sequence_index(key) else {
@@ -3603,12 +3753,12 @@ fn lua_param_value_inner(
             }
             entries
                 .into_iter()
-                .map(|(_, value)| lua_param_value_inner(value, depth + 1, budget))
+                .map(|(_, value)| lua_param_value_inner(value, depth + 1, budget, lua, active_call))
                 .collect::<mlua::Result<Vec<_>>>()
                 .map(ParamValue::Array)
         }
         _ => Err(LuaError::runtime(
-            "message values must be booleans, integers, finite numbers, UTF-8 strings, or sequence tables",
+            "message values must be booleans, integers, finite numbers, UTF-8 strings, object references, or sequence tables",
         )),
     }
 }
@@ -3685,24 +3835,65 @@ fn restricted_gc_function(lua: &Lua) -> mlua::Result<Function> {
     })
 }
 
-fn params_table(lua: &Lua, params: &ScriptParams) -> mlua::Result<Table> {
+fn params_table(
+    lua: &Lua,
+    params: &ScriptParams,
+    object_refs: &std::collections::HashMap<String, ScriptObjectRef>,
+    active_call: ActiveCall,
+) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     for (name, value) in params {
-        table.set(name.as_str(), param_value(lua, value)?)?;
+        table.set(
+            name.as_str(),
+            param_value(lua, value, &active_call, Some(object_refs))?,
+        )?;
     }
     Ok(table)
 }
 
-fn param_value(lua: &Lua, value: &ParamValue) -> mlua::Result<Value> {
+fn param_value(
+    lua: &Lua,
+    value: &ParamValue,
+    active_call: &ActiveCall,
+    object_refs: Option<&std::collections::HashMap<String, ScriptObjectRef>>,
+) -> mlua::Result<Value> {
     match value {
         ParamValue::Bool(value) => Ok(Value::Boolean(*value)),
         ParamValue::Int(value) => Ok(Value::Integer(*value)),
         ParamValue::Float(value) => Ok(Value::Number(*value)),
         ParamValue::String(value) => Ok(Value::String(lua.create_string(value)?)),
+        ParamValue::Asset(value) => Ok(Value::String(lua.create_string(value.as_str())?)),
+        ParamValue::Object(id) if id.is_empty() => Ok(Value::Nil),
+        ParamValue::Object(id) => {
+            let reference = if let Some(reference) = object_refs.and_then(|refs| refs.get(id)) {
+                Some((reference.handle, Some(id.clone()), reference.name.clone()))
+            } else {
+                with_active_call(active_call, |transaction| {
+                    Ok(transaction.handle_by_id(id).and_then(|handle| {
+                        transaction
+                            .object_identity(handle)
+                            .map(|(object_id, name)| (handle, object_id, name))
+                    }))
+                })?
+            };
+            let Some((handle, object_id, name)) = reference else {
+                return Ok(Value::Nil);
+            };
+            Ok(Value::Table(object_table(
+                lua,
+                handle,
+                object_id,
+                name,
+                active_call.clone(),
+            )?))
+        }
         ParamValue::Array(values) => {
             let table = lua.create_table()?;
             for (index, value) in values.iter().enumerate() {
-                table.set(index + 1, param_value(lua, value)?)?;
+                table.set(
+                    index + 1,
+                    param_value(lua, value, active_call, object_refs)?,
+                )?;
             }
             Ok(Value::Table(table))
         }
@@ -3773,6 +3964,58 @@ mod tests {
     fn convert(source: &str) -> mlua::Result<ParamValue> {
         let lua = Lua::new();
         lua_param_value(lua.load(source).eval::<Value>()?)
+    }
+
+    #[test]
+    fn lua_properties_parse_reference_asset_enum_color_and_array_kinds() {
+        let source = r#"return {
+            properties = {
+                target = { type = "component", component = "rigid_body" },
+                script = { type = "component", script = "scripts/actor.lua" },
+                model = { type = "asset", asset = "model" },
+                mode = { type = "enum", values = { "idle", "run" }, default = "run" },
+                tint = { type = "color", default = { 0.1, 0.2, 0.3 } },
+                weights = { type = "array", of = { type = "float" }, default = { 1, 2.5 } },
+            },
+        }"#;
+        let schema = properties("refs.lua", source, Arc::new(AtomicBool::new(false)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            schema
+                .specs()
+                .iter()
+                .map(|spec| spec.kind.clone())
+                .collect::<Vec<_>>(),
+            [
+                ParamKind::Enum(vec!["idle".into(), "run".into()]),
+                ParamKind::Asset(Some(AssetKind::Model)),
+                ParamKind::Component(ComponentKind::Script("scripts/actor.lua".into())),
+                ParamKind::Component(ComponentKind::RigidBody),
+                ParamKind::Color,
+                ParamKind::Array(Box::new(ParamKind::Float)),
+            ]
+        );
+        assert_eq!(
+            schema.resolve(&Default::default()).unwrap()["mode"],
+            ParamValue::String("run".into())
+        );
+    }
+
+    #[test]
+    fn lua_properties_reject_bad_reference_and_collection_schemas() {
+        for property in [
+            r#"{ type = "component", component = "missing" }"#,
+            r#"{ type = "asset", asset = "missing" }"#,
+            r#"{ type = "enum", values = {} }"#,
+            r#"{ type = "array", of = { type = "unknown" } }"#,
+        ] {
+            let source = format!("return {{ properties = {{ value = {property} }} }}");
+            assert!(
+                properties("bad.lua", &source, Arc::new(AtomicBool::new(false))).is_err(),
+                "accepted {property}"
+            );
+        }
     }
 
     #[test]

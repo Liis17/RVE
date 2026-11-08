@@ -3,6 +3,7 @@
 //! Глубина, число элементов и суммарный размер строк проверяются до выделения памяти и до
 //! рекурсивного спуска. Поэтому вражеские данные не вызывают переполнения стека или нехватки памяти.
 
+use engine_files::VirtualPath;
 use engine_scene::ParamValue;
 use engine_scene::network::{MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES};
 
@@ -13,6 +14,8 @@ const TAG_INT: u8 = 1;
 const TAG_FLOAT: u8 = 2;
 const TAG_STRING: u8 = 3;
 const TAG_ARRAY: u8 = 4;
+const TAG_OBJECT: u8 = 5;
+const TAG_ASSET: u8 = 6;
 
 /// Кодирует значение в конец `out`. Значение, нарушающее лимиты, отклоняется целиком.
 pub fn encode_value(value: &ParamValue, out: &mut Vec<u8>) -> Result<(), NetError> {
@@ -87,6 +90,19 @@ fn encode_node(
             push_len(out, text.len())?;
             out.extend_from_slice(text.as_bytes());
         }
+        ParamValue::Object(id) => {
+            budget.string(id.len())?;
+            out.push(TAG_OBJECT);
+            push_len(out, id.len())?;
+            out.extend_from_slice(id.as_bytes());
+        }
+        ParamValue::Asset(path) => {
+            let path = path.as_str();
+            budget.string(path.len())?;
+            out.push(TAG_ASSET);
+            push_len(out, path.len())?;
+            out.extend_from_slice(path.as_bytes());
+        }
         ParamValue::Array(items) => {
             if depth >= MAX_MESSAGE_DEPTH {
                 return Err(invalid(format!(
@@ -109,7 +125,8 @@ fn decode_node(
     budget: &mut Budget,
 ) -> Result<ParamValue, NetError> {
     budget.element()?;
-    match reader.u8().ok_or_else(truncated)? {
+    let tag = reader.u8().ok_or_else(truncated)?;
+    match tag {
         TAG_BOOL => match reader.u8().ok_or_else(truncated)? {
             0 => Ok(ParamValue::Bool(false)),
             1 => Ok(ParamValue::Bool(true)),
@@ -133,6 +150,19 @@ fn decode_node(
             let bytes = reader.take(len).ok_or_else(truncated)?;
             let text = std::str::from_utf8(bytes).map_err(|_| invalid("строка не в UTF-8"))?;
             Ok(ParamValue::String(text.to_owned()))
+        }
+        TAG_OBJECT | TAG_ASSET => {
+            let len = read_len(reader)?;
+            budget.string(len)?;
+            let bytes = reader.take(len).ok_or_else(truncated)?;
+            let text = std::str::from_utf8(bytes).map_err(|_| invalid("строка не в UTF-8"))?;
+            if tag == TAG_OBJECT {
+                Ok(ParamValue::Object(text.to_owned()))
+            } else {
+                VirtualPath::parse(text)
+                    .map(ParamValue::Asset)
+                    .map_err(|_| invalid("некорректный путь ресурса"))
+            }
         }
         TAG_ARRAY => {
             if depth >= MAX_MESSAGE_DEPTH {
@@ -247,6 +277,8 @@ mod tests {
             ParamValue::Int(-42),
             ParamValue::Float(1.5),
             ParamValue::String("привет".into()),
+            ParamValue::Object("target".into()),
+            ParamValue::Asset(VirtualPath::parse("models/target.fbx").unwrap()),
             ParamValue::Array(vec![ParamValue::Int(7)]),
         ]);
         assert_eq!(round_trip(&value), value);

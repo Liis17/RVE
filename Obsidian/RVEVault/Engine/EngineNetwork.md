@@ -6,14 +6,14 @@ Parent: [[Index]]
 
 `engine-network` — сетевой модуль RVE: собственный протокол поверх `std::net::UdpSocket` с шифрованием и модель «клиент–сервер» (listen-server внутри игрового процесса или выделенный `rve-server`). Крейт не знает о Lua, Rust-скриптах, окне и renderer: мир он меняет только через трейт `WorldSink`, который реализуют `engine-runtime` и `rve-editor`. Компоненты объектов и общие типы (`NetId`, `NetMode`, `NetRequest`, `NetEvent`, лимиты значений) лежат в `engine-scene` ([[Engine/EngineScene]]), поэтому `engine-script` не зависит от сети.
 
-Зависимости: `engine-scene`, `blake3`, `chacha20poly1305`, `x25519-dalek`, `ed25519-dalek`, `getrandom`, `zeroize`, `flume`, `glam`, `log`. Версии закреплены в корневом `Cargo.toml` (см. стек в [[Architecture]]). Потребители: `engine-runtime` (`rve-player` и `rve-server`) и `rve-editor` (Play Host/Client).
+Зависимости: `engine-scene`, `engine-files`, `blake3`, `chacha20poly1305`, `x25519-dalek`, `ed25519-dalek`, `getrandom`, `zeroize`, `flume`, `glam`, `log`. Версии закреплены в корневом `Cargo.toml` (см. стек в [[Architecture]]). Потребители: `engine-runtime` (`rve-player` и `rve-server`) и `rve-editor` (Play Host/Client).
 
 ## Источники
 
 | Файл | Значимые символы | Роль |
 |---|---|---|
 | `engine/engine-network/src/lib.rs` | `protocol_id`, `Channel`, `NetworkEvent`, `Output` | Идентификатор протокола, каналы доставки и события для приложения |
-| `engine/engine-network/src/packet.rs` | `MAGIC`, `MAX_DATAGRAM`, `Kind`, `Header` | Открытый заголовок и размеры датаграмм |
+| `engine/engine-network/src/packet.rs` | `MAGIC`, `WIRE_VERSION`, `MAX_DATAGRAM`, `Kind`, `Header` | Открытый заголовок и размеры датаграмм; версия wire формата |
 | `engine/engine-network/src/handshake.rs` | `Hello`, `make_cookie`, `cookie_valid`, `parse_confirm` | Форматы рукопожатия и stateless cookie |
 | `engine/engine-network/src/crypto.rs` | `ServerIdentity`, `Password`, `derive_keys`, `password_proof`, `Session`, `ReplayWindow` | Ключи сервера, KDF, пароль, AEAD и окно повторов |
 | `engine/engine-network/src/server.rs` | `Server`, `ServerConfig`, `MAX_CLIENTS`, `ConfirmLimiter` | Сервер: полуоткрытые сессии, лимиты, блокировка адресов после неудачных входов |
@@ -137,6 +137,7 @@ scripts thread: ScriptHost ─▶ NetworkBridge ─▶ NetworkHandle ─▶ rve-
 
 - `rve.net.send` и `obj:net_send` ставят сообщение. На клиенте адресат только сервер. Сервер адресует всех (`All`), сервер (`Server`) или конкретного участника; для `All` и `Server` событие доставляется и локально.
 - Надёжные RPC идут по каналу `Rpc`, ненадёжные — по `Unreliable`.
+- Значения RPC используют `ParamValue` и передают object refs как object id, asset refs как virtual path; кодек wire version 2 добавляет этим значениям отдельные теги. Старый wire version 1 не совместим.
 - RPC, адресованный объекту, которого нет или который удалён, не доставляется никому: принимающая сторона пишет отладочную запись и отбрасывает сообщение, а не передаёт его как сообщение без объекта.
 - С клиента серверу допустимы только состояние владельца, RPC и запрос ресинхронизации. Прочие серверные сообщения от клиента считаются ошибкой участника.
 
@@ -147,7 +148,7 @@ scripts thread: ScriptHost ─▶ NetworkBridge ─▶ NetworkHandle ─▶ rve-
 
 ## Интеграция с runtime и редактором
 
-- Сетевые callbacks гостя входят в ABI v13: хвост `RveHost` идёт после post-process (v12) и gamepad (v11) callbacks, а `net_event` добавлен в конец `RveScriptDesc`. Модули v6–v12 не получают сетевых событий. Контракт — в [[Engine/RveSdk]].
+- Сетевые callbacks гостя входят в ABI v13: хвост `RveHost` идёт после post-process (v12) и gamepad (v11) callbacks, а `net_event` добавлен в конец `RveScriptDesc`. ABI v14 сохраняет этот хвост и расширяет формат параметров и значений; модули v6–v12 не получают сетевых событий. Контракт — в [[Engine/RveSdk]].
 - `NetworkBridge::attach` регистрирует сетевые id объектов сцены. Повтор id или `tick_hz` равный нулю — ошибка запуска.
 - `WorldSink` — установка режима и участников, сетевых id объектов, spawn и despawn, постановка событий скриптам, забор счётчиков ошибок пиров. Реализации: `engine-runtime` (`ScriptNetSink`) и редактор (`PlayNetwork`). Обе работают через `ScriptHost::spawn_external`, `despawn_external` и `queue_network_events`, поэтому путь объектов и событий совпадает со скриптовым.
 - Разрыв соединения клиента с сервером переводит мост в `Offline`: объекты остаются последними известными, процесс продолжает работать.

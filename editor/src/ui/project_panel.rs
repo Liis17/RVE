@@ -192,6 +192,14 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
         if response.hovered() {
             painter.rect_filled(rect, 4.0, visuals.bg_fill);
         }
+        if state.project_selection.as_deref() == Some(entry.path.as_str()) {
+            painter.rect_stroke(
+                rect,
+                4.0,
+                ui.visuals().selection.stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
         let image_rect = egui::Rect::from_min_size(
             rect.min + egui::vec2(16.0, 4.0),
             egui::vec2(TILE_SIZE - 32.0, TILE_SIZE - 32.0),
@@ -258,6 +266,9 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
         && AssetKind::of(&entry.path) == AssetKind::PhysicsMaterial
     {
         open_physics_material(state, &entry.path);
+    }
+    if response.clicked() && !entry.is_dir {
+        state.project_selection = Some(entry.path.clone());
     }
     if response.double_clicked() {
         if entry.is_dir {

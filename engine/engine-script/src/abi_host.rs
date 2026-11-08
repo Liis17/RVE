@@ -9,7 +9,7 @@ use crate::lite::{
 use crate::transaction::ScriptTransactionInit;
 use crate::transaction::{
     AbiObject, MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget,
-    QueueMessageError, ScriptTransaction,
+    QueueMessageError, ScriptObjectRef, ScriptTransaction,
 };
 use crate::types::{RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_console::CommandSpec;
@@ -32,10 +32,11 @@ use rve_sdk::abi::{
     RVE_NET_EVENT_PEER_DISCONNECTED, RVE_NET_INVALID_INPUT, RVE_NET_MODE_CLIENT, RVE_NET_MODE_HOST,
     RVE_NET_MODE_OFFLINE, RVE_NET_MODE_SERVER, RVE_NET_OK, RVE_NET_REJECTED, RVE_NET_TARGET_ALL,
     RVE_NET_TARGET_PEER, RVE_NET_TARGET_SERVER, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
-    RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT,
-    RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent,
-    RveCursorState, RveGamepadState, RveHost, RveNetEvent, RveParamEntry, RveParams, RveRaycastHit,
-    RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_ASSET, RVE_VALUE_BOOL, RVE_VALUE_FLOAT,
+    RVE_VALUE_INT, RVE_VALUE_OBJECT, RVE_VALUE_STR, RveArray, RveCameraSettings,
+    RveCharacterMoveResult, RveCollisionEvent, RveCursorState, RveGamepadState, RveHost,
+    RveNetEvent, RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr,
+    RveTime, RveTransform, RveValue, RveValueData,
 };
 use rve_sdk::abi::{
     RVE_AO_QUALITY_HIGH, RVE_AO_QUALITY_LOW, RVE_AO_QUALITY_MEDIUM, RVE_AUDIO_GROUP_AMBIENT,
@@ -284,9 +285,10 @@ impl AbiScriptInstance {
     pub(crate) fn create(
         descriptor: &'static RveScriptDesc,
         params: &BTreeMap<String, ParamValue>,
+        object_refs: &std::collections::HashMap<String, ScriptObjectRef>,
         call: AbiScriptCall<'_>,
     ) -> Result<Self, String> {
-        let params = OwnedAbiParams::new(params);
+        let params = OwnedAbiParams::new(params, object_refs);
         let mut context =
             AbiCallContext::new(call.self_object, call.transaction, call.events, call.source);
         let mut instance = std::ptr::null_mut();
@@ -368,7 +370,8 @@ impl AbiScriptInstance {
         value: &ParamValue,
         call: AbiScriptCall<'_>,
     ) -> Result<(), String> {
-        let value = OwnedAbiValue::new(value);
+        let object_refs = message_object_refs(value, call.transaction)?;
+        let value = OwnedAbiValue::new(value, &object_refs);
         let sender = RveStr::from_str_ref(sender);
         let name = RveStr::from_str_ref(name);
         let command_access = AbiCommandAccess {
@@ -415,7 +418,10 @@ impl AbiScriptInstance {
                 *peer,
                 RveStr::from_str_ref(name),
                 RveStr::empty(),
-                Some(OwnedAbiValue::new(value)),
+                Some(OwnedAbiValue::new(
+                    value,
+                    &message_object_refs(value, call.transaction)?,
+                )),
             ),
             NetEvent::PeerConnected { peer } => (
                 RVE_NET_EVENT_PEER_CONNECTED,
@@ -2011,7 +2017,12 @@ unsafe extern "C" fn host_send(
             }
         };
         // SAFETY: `value` is provided by the guest for the duration of this ABI callback.
-        let (value, value_size) = match unsafe { read_message_value(value) } {
+        let (value, value_size) = match unsafe {
+            read_message_value_with_objects(value, |handle| {
+                ObjectHandle::from_abi(handle)
+                    .and_then(|handle| context.transaction.object_id(handle).map(str::to_owned))
+            })
+        } {
             Ok(value) => value,
             Err(error) => {
                 context.error = Some(error);
@@ -2059,7 +2070,12 @@ unsafe extern "C" fn host_broadcast(
             }
         };
         // SAFETY: `value` is provided by the guest for the duration of this ABI callback.
-        let (value, value_size) = match unsafe { read_message_value(value) } {
+        let (value, value_size) = match unsafe {
+            read_message_value_with_objects(value, |handle| {
+                ObjectHandle::from_abi(handle)
+                    .and_then(|handle| context.transaction.object_id(handle).map(str::to_owned))
+            })
+        } {
             Ok(value) => value,
             Err(error) => {
                 context.error = Some(error);
@@ -2196,7 +2212,12 @@ fn net_send_request(
         }
     };
     // SAFETY: `value` is provided by the guest for the duration of this ABI callback.
-    let (value, _) = match unsafe { read_message_value(value) } {
+    let (value, _) = match unsafe {
+        read_message_value_with_objects(value, |handle| {
+            ObjectHandle::from_abi(handle)
+                .and_then(|handle| context.transaction.object_id(handle).map(str::to_owned))
+        })
+    } {
         Ok(value) => value,
         Err(error) => return net_result(context, Err(error), true),
     };
@@ -2600,12 +2621,20 @@ fn host_input_vector(
 pub(crate) unsafe fn read_message_value(
     value: *const RveValue,
 ) -> Result<(ParamValue, usize), String> {
+    // Messages without a world context can carry only ordinary scalar and array values.
+    unsafe { read_message_value_with_objects(value, |_| None) }
+}
+
+pub(crate) unsafe fn read_message_value_with_objects(
+    value: *const RveValue,
+    mut object_id: impl FnMut(u64) -> Option<String>,
+) -> Result<(ParamValue, usize), String> {
     if value.is_null() {
         return Err("null message value".to_owned());
     }
     // SAFETY: the guest passes the value pointer for the duration of this host callback.
     let mut budget = MessageValueBudget::new();
-    let value = unsafe { read_message_value_inner(*value, 0, &mut budget) }?;
+    let value = unsafe { read_message_value_inner(*value, 0, &mut budget, &mut object_id) }?;
     Ok((value, budget.estimated_size()))
 }
 
@@ -2613,6 +2642,7 @@ unsafe fn read_message_value_inner(
     value: RveValue,
     depth: usize,
     budget: &mut MessageValueBudget,
+    object_id: &mut impl FnMut(u64) -> Option<String>,
 ) -> Result<ParamValue, String> {
     budget.enter(depth).map_err(str::to_owned)?;
     match value.tag {
@@ -2626,12 +2656,27 @@ unsafe fn read_message_value_inner(
                 Err("message numbers must be finite".to_owned())
             }
         }
-        RVE_VALUE_STR => {
+        RVE_VALUE_STR | RVE_VALUE_ASSET => {
             let string = unsafe { value.data.string };
             budget.add_string(string.len).map_err(str::to_owned)?;
             let string = unsafe { read_abi_str(string) }
                 .map_err(|error| format!("message string is invalid: {error:?}"))?;
-            Ok(ParamValue::String(string.to_owned()))
+            if value.tag == RVE_VALUE_ASSET {
+                if string.is_empty() {
+                    return Ok(ParamValue::String(String::new()));
+                }
+                VirtualPath::parse(string)
+                    .map(ParamValue::Asset)
+                    .map_err(|error| format!("message asset path is invalid: {error}"))
+            } else {
+                Ok(ParamValue::String(string.to_owned()))
+            }
+        }
+        RVE_VALUE_OBJECT => {
+            let handle = unsafe { value.data.object };
+            object_id(handle)
+                .map(ParamValue::Object)
+                .ok_or_else(|| format!("message object handle {handle} is not alive"))
         }
         RVE_VALUE_ARRAY => {
             let array = unsafe { value.data.array };
@@ -2647,7 +2692,9 @@ unsafe fn read_message_value_inner(
             let values = unsafe { std::slice::from_raw_parts(array.ptr, array.len) };
             let mut owned = Vec::with_capacity(array.len);
             for value in values.iter().copied() {
-                owned.push(unsafe { read_message_value_inner(value, depth + 1, budget) }?);
+                owned.push(unsafe {
+                    read_message_value_inner(value, depth + 1, budget, object_id)
+                }?);
             }
             Ok(ParamValue::Array(owned))
         }
@@ -2662,8 +2709,46 @@ struct OwnedAbiValue {
     _array: Vec<RveValue>,
 }
 
+fn message_object_refs(
+    value: &ParamValue,
+    transaction: &ScriptTransaction,
+) -> Result<std::collections::HashMap<String, ScriptObjectRef>, String> {
+    fn visit(
+        value: &ParamValue,
+        transaction: &ScriptTransaction,
+        references: &mut std::collections::HashMap<String, ScriptObjectRef>,
+    ) -> Result<(), String> {
+        match value {
+            ParamValue::Object(id) if !id.is_empty() => {
+                let handle = transaction
+                    .handle_by_id(id)
+                    .ok_or_else(|| format!("message object reference {id:?} is missing"))?;
+                let name = transaction
+                    .object_name(handle)
+                    .ok_or_else(|| format!("message object reference {id:?} is missing"))?
+                    .to_owned();
+                references.insert(id.clone(), ScriptObjectRef { handle, name });
+            }
+            ParamValue::Array(values) => {
+                for value in values {
+                    visit(value, transaction, references)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut references = std::collections::HashMap::new();
+    visit(value, transaction, &mut references)?;
+    Ok(references)
+}
+
 impl OwnedAbiValue {
-    fn new(value: &ParamValue) -> Self {
+    fn new(
+        value: &ParamValue,
+        object_refs: &std::collections::HashMap<String, ScriptObjectRef>,
+    ) -> Self {
         match value {
             ParamValue::Bool(value) => Self::leaf(RveValue {
                 tag: rve_sdk::abi::RVE_VALUE_BOOL,
@@ -2692,8 +2777,36 @@ impl OwnedAbiValue {
                     _array: Vec::new(),
                 }
             }
+            ParamValue::Asset(path) => {
+                let value = path.as_str().to_owned();
+                let abi_value = RveValue {
+                    tag: RVE_VALUE_ASSET,
+                    data: RveValueData {
+                        string: RveStr::from_str_ref(&value),
+                    },
+                };
+                Self {
+                    value: abi_value,
+                    _string: Some(value),
+                    _children: Vec::new(),
+                    _array: Vec::new(),
+                }
+            }
+            ParamValue::Object(id) => {
+                let handle = object_refs
+                    .get(id)
+                    .and_then(|reference| reference.handle.to_abi())
+                    .unwrap_or_default();
+                Self::leaf(RveValue {
+                    tag: RVE_VALUE_OBJECT,
+                    data: RveValueData { object: handle },
+                })
+            }
             ParamValue::Array(values) => {
-                let children = values.iter().map(Self::new).collect::<Vec<_>>();
+                let children = values
+                    .iter()
+                    .map(|value| Self::new(value, object_refs))
+                    .collect::<Vec<_>>();
                 let array = children.iter().map(|child| child.value).collect::<Vec<_>>();
                 let value = RveValue {
                     tag: rve_sdk::abi::RVE_VALUE_ARRAY,
@@ -2732,9 +2845,15 @@ struct OwnedAbiParams {
 }
 
 impl OwnedAbiParams {
-    fn new(params: &BTreeMap<String, ParamValue>) -> Self {
+    fn new(
+        params: &BTreeMap<String, ParamValue>,
+        object_refs: &std::collections::HashMap<String, ScriptObjectRef>,
+    ) -> Self {
         let keys = params.keys().cloned().collect::<Vec<_>>();
-        let values = params.values().map(OwnedAbiValue::new).collect::<Vec<_>>();
+        let values = params
+            .values()
+            .map(|value| OwnedAbiValue::new(value, object_refs))
+            .collect::<Vec<_>>();
         let entries = keys
             .iter()
             .zip(&values)

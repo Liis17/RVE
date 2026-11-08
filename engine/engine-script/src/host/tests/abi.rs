@@ -12,13 +12,13 @@ use engine_scene::{
 };
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
-    RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParams, RveScriptDesc,
-    RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6, RveSpawnOptions, RveStatus,
-    RveStr, RveTransform, RveUpdateFn, RveValue,
+    RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParamDescV13, RveParams,
+    RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6,
+    RveScriptDescV13, RveSpawnOptions, RveStatus, RveStr, RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
-    NetTarget, Params, PhysicalInput, Script, Tonemapper, Value,
+    NetTarget, Object, Params, PhysicalInput, Script, Tonemapper, Value,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -50,6 +50,11 @@ struct Probe {
 struct InputProbe;
 struct PhysicsProbe;
 struct InputActionsProbe(u8);
+struct ReferenceProbe {
+    target: Object,
+    camera: Object,
+}
+struct ReferenceReceiver;
 
 struct CameraControl {
     panic_update: bool,
@@ -65,6 +70,45 @@ fn camera_control_factory(params: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(CameraControl {
         panic_update: matches!(params.get("panic_update"), Some(Value::Bool(true))),
     }))
+}
+
+fn reference_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    let Some(Value::Object(target)) = params.get("target") else {
+        return Err("target parameter is not an object handle".to_owned());
+    };
+    let Some(Value::Object(camera)) = params.get("camera") else {
+        return Err("camera parameter is not an object handle".to_owned());
+    };
+    Ok(Box::new(ReferenceProbe {
+        target: *target,
+        camera: *camera,
+    }))
+}
+
+fn reference_receiver_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ReferenceReceiver))
+}
+
+impl Script for ReferenceProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        assert_eq!(self.target.id(ctx).as_deref(), Some("target"));
+        assert_eq!(self.target.name(ctx).as_deref(), Some("Target Camera"));
+        assert_eq!(self.camera.id(ctx).as_deref(), Some("target"));
+        assert_eq!(ctx.object().id(ctx).as_deref(), Some("camera"));
+        assert!(ctx.send("target", "object", &Value::Object(ctx.object())));
+    }
+}
+
+impl Script for ReferenceReceiver {
+    fn on_message(&mut self, ctx: &mut rve_sdk::Context<'_>, _: &str, name: &str, value: &Value) {
+        if name == "object" {
+            let Value::Object(object) = value else {
+                panic!("object message was not decoded as a handle");
+            };
+            assert_eq!(object.id(ctx).as_deref(), Some("camera"));
+            ctx.log_info("ABI object message received");
+        }
+    }
 }
 
 impl Script for CameraControl {
@@ -775,6 +819,11 @@ fn sdk_module() -> &'static RveModule {
         "CameraControl" => camera_control_factory,
         "AbiConsoleCommand" => abi_console_command_factory,
         "AbiConsoleForeign" => abi_console_foreign_factory,
+        "ReferenceProbe" => reference_probe_factory {
+            target: Option<Object> = None,
+            camera: component(camera) = None,
+        },
+        "ReferenceReceiver" => reference_receiver_factory,
     }
 }
 
@@ -975,7 +1024,7 @@ fn command_probe_module(abi_version: u32) -> &'static RveModule {
         message: probe.message,
         destroy: probe.destroy,
         drop: probe.drop,
-        params: probe.params,
+        params: probe.params.cast(),
         param_count: probe.param_count,
         command: probe.command,
     };
@@ -1344,7 +1393,43 @@ name = "AudioRejected"
     assert_eq!(host.drain_audio_requests().len(), 1);
 }
 
-/// Таблица версий 6–12 в layout `RveScriptDescV6`, построенная из дескрипторов `sdk_module`.
+/// Copies the pre-v14 parameter prefix into a process-lifetime table.
+///
+/// Scripts that declare v14-only parameter kinds are omitted from legacy fixtures.
+fn legacy_params(descriptor: &RveScriptDesc) -> Option<(*const RveParamDescV13, usize)> {
+    if descriptor.param_count == 0 {
+        return Some((std::ptr::null(), 0));
+    }
+    if descriptor.params.is_null() {
+        return None;
+    }
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor and parameter table.
+    let current = unsafe { std::slice::from_raw_parts(descriptor.params, descriptor.param_count) };
+    if current
+        .iter()
+        .any(|param| param.kind > rve_sdk::abi::RVE_PARAM_VEC3)
+    {
+        return None;
+    }
+    let legacy = Box::leak(
+        current
+            .iter()
+            .map(|param| RveParamDescV13 {
+                name: param.name,
+                kind: param.kind,
+                default: param.default,
+                min: param.min,
+                max: param.max,
+                flags: param.flags,
+                label: param.label,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Some((legacy.as_ptr(), legacy.len()))
+}
+
+/// Table for ABI versions 6–12 in the `RveScriptDescV6` layout.
 fn v6_module(abi_version: u32) -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
@@ -1352,18 +1437,21 @@ fn v6_module(abi_version: u32) -> &'static RveModule {
     let legacy: &'static [RveScriptDescV6] = Box::leak(
         descriptors
             .iter()
-            .map(|descriptor| RveScriptDescV6 {
-                name: descriptor.name,
-                create: descriptor.create,
-                start: descriptor.start,
-                update: descriptor.update,
-                message: descriptor.message,
-                destroy: descriptor.destroy,
-                drop: descriptor.drop,
-                params: descriptor.params,
-                param_count: descriptor.param_count,
-                command: descriptor.command,
-                collision: descriptor.collision,
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some(RveScriptDescV6 {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params,
+                    param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                })
             })
             .collect::<Vec<_>>()
             .into_boxed_slice(),
@@ -1371,6 +1459,44 @@ fn v6_module(abi_version: u32) -> &'static RveModule {
     Box::leak(Box::new(RveModule {
         header: RveHeader {
             abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+/// Table for ABI v13 with its original script and parameter descriptor layouts.
+fn v13_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV13] = Box::leak(
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let (params, param_count) = legacy_params(descriptor)?;
+                Some(RveScriptDescV13 {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: params.cast(),
+                    param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 13,
             header_size: std::mem::size_of::<RveHeader>() as u32,
         },
         scripts: legacy.as_ptr().cast(),
@@ -1503,7 +1629,7 @@ fn abi_v6_to_v12_modules_load_without_net_callbacks_and_skip_net_events() {
 }
 
 #[test]
-fn abi_v10_modules_load_on_the_v13_host() {
+fn abi_v10_modules_load_on_the_v14_host() {
     let _lock = test_lock();
     let module = v6_module(10);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1521,12 +1647,12 @@ fn abi_v10_modules_load_on_the_v13_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v10"),
-        "guest ABI v10 runs on the v13 host"
+        "guest ABI v10 runs on the v14 host"
     );
 }
 
 #[test]
-fn abi_v11_modules_load_on_the_v13_host() {
+fn abi_v11_modules_load_on_the_v14_host() {
     let _lock = test_lock();
     let module = v6_module(11);
     // SAFETY: the module and its descriptor table live for the whole test process.
@@ -1544,7 +1670,30 @@ fn abi_v11_modules_load_on_the_v13_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v11"),
-        "guest ABI v11 runs on the v13 host"
+        "guest ABI v11 runs on the v14 host"
+    );
+}
+
+#[test]
+fn abi_v13_modules_load_on_the_v14_host() {
+    let _lock = test_lock();
+    let module = v13_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v13" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v13"),
+        "guest ABI v13 runs on the v14 host"
     );
 }
 
@@ -1563,7 +1712,7 @@ fn v3_probe_module() -> &'static RveModule {
         message: probe.message,
         destroy: probe.destroy,
         drop: probe.drop,
-        params: probe.params,
+        params: probe.params.cast(),
         param_count: probe.param_count,
     }]));
     Box::leak(Box::new(RveModule {
@@ -1593,7 +1742,7 @@ fn v4_sdk_module() -> &'static RveModule {
         message: command.message,
         destroy: command.destroy,
         drop: command.drop,
-        params: command.params,
+        params: command.params.cast(),
         param_count: command.param_count,
         command: command.command,
     }]));
@@ -3069,6 +3218,43 @@ fn heavy_defaults_are_filled_and_scene_values_coerced_before_create() {
 }
 
 #[test]
+fn abi_object_and_component_params_are_resolved_to_handles_before_create() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+active = true
+[[objects.heavy_scripts]]
+name = "ReferenceProbe"
+params = { target = { object = "target" }, camera = { object = "target" } }
+[[objects]]
+id = "target"
+name = "Target Camera"
+[objects.camera]
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+"#,
+    );
+    let library = library();
+    let mut host = load_host(&world, &library);
+
+    host.start(&mut world, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error)
+    );
+    assert!(events.iter().any(|event| {
+        event.message == "ABI object message received" && event.level == ScriptEventLevel::Info
+    }));
+}
+
+#[test]
 fn heavy_params_that_violate_the_schema_fail_loading() {
     let library = typed_library();
     for params in ["{ speed = 11.0 }", "{ enabled = 1 }", "{ unknown = 1 }"] {
@@ -3115,6 +3301,7 @@ fn malformed_parameter_tables_are_rejected() {
             max: 0.0,
             flags,
             label: RveStr::empty(),
+            argument: RveStr::empty(),
         }
     }
     static BAD_UTF8: [u8; 1] = [0xff];

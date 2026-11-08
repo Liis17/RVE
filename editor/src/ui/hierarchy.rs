@@ -2,7 +2,7 @@
 
 use crate::icons::{IconCache, object_icon};
 use crate::scene_edit::{EditorScene, NewObject};
-use crate::state::{Action, AssetDrag, EditorState};
+use crate::state::{Action, AssetDrag, EditorState, ObjectDrag};
 use crate::ui::scene_view;
 use engine_scene::SceneObject;
 use std::collections::{HashMap, HashSet};
@@ -18,10 +18,6 @@ fn row_name(object: &SceneObject) -> &str {
         None => object.id.rsplit('.').next().unwrap_or(&object.id),
     }
 }
-
-/// Перетаскиваемый объект иерархии.
-#[derive(Clone, Debug)]
-struct ObjectDrag(String);
 
 /// Изменения, собранные при обходе дерева и применяемые после него.
 enum Command {

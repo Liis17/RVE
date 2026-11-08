@@ -13,7 +13,7 @@ use crate::prefab::{PREFAB_EXTENSION, PrefabInstance};
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::ser::SerializeSeq;
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -213,6 +213,9 @@ impl SceneDocument {
             }
         }
         crate::prefab::validate_instances(self, &asset_paths, &object_indices)?;
+        if self.kind == DocumentKind::Prefab {
+            validate_prefab_object_refs(self, &object_indices)?;
+        }
         let local_only = !self.instances.is_empty();
         if self.kind == DocumentKind::Prefab {
             let roots = self
@@ -506,6 +509,71 @@ impl SceneDocument {
         }
         Ok(())
     }
+}
+
+fn validate_prefab_object_refs(
+    document: &SceneDocument,
+    object_indices: &HashMap<&str, usize>,
+) -> Result<(), SceneError> {
+    let instance_ids = document
+        .instances
+        .iter()
+        .map(|instance| instance.id.as_str())
+        .collect::<HashSet<_>>();
+    let valid_ref = |reference: &str| {
+        object_indices.contains_key(reference)
+            || reference.split_once('.').is_some_and(|(instance, local)| {
+                !local.is_empty() && instance_ids.contains(instance)
+            })
+    };
+    let validate_params = |owner: &str, params: &BTreeMap<String, ParamValue>| {
+        fn refs<'a>(value: &'a ParamValue, output: &mut Vec<&'a str>) {
+            match value {
+                ParamValue::Object(id) if !id.is_empty() => output.push(id),
+                ParamValue::Array(values) => {
+                    for value in values {
+                        refs(value, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut references = Vec::new();
+        for value in params.values() {
+            refs(value, &mut references);
+        }
+        if let Some(reference) = references
+            .into_iter()
+            .find(|reference| !valid_ref(reference))
+        {
+            Err(SceneError::new(
+                document.source_label(),
+                Some(owner),
+                format!("ссылка на объект {reference:?} выходит за пределы префаба"),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    for object in &document.objects {
+        for script in &object.lite_scripts {
+            validate_params(&object.id, &script.params)?;
+        }
+        for script in &object.heavy_scripts {
+            validate_params(&object.id, &script.params)?;
+        }
+    }
+    for instance in &document.instances {
+        for change in &instance.overrides {
+            for params in &change.lite_params {
+                validate_params(&instance.id, &params.params)?;
+            }
+            for params in &change.heavy_params {
+                validate_params(&instance.id, &params.params)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Ресурс, объявленный для включения в архив сцены.
@@ -971,6 +1039,10 @@ pub enum ParamValue {
     Float(f64),
     String(String),
     Array(Vec<ParamValue>),
+    /// Scene object id, serialized as `{ object = "id" }`.
+    Object(String),
+    /// Asset virtual path, serialized as `{ asset = "path" }`.
+    Asset(VirtualPath),
 }
 
 impl Serialize for ParamValue {
@@ -983,6 +1055,16 @@ impl Serialize for ParamValue {
             Self::Int(value) => serializer.serialize_i64(*value),
             Self::Float(value) => serializer.serialize_f64(*value),
             Self::String(value) => serializer.serialize_str(value),
+            Self::Object(value) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("object", value)?;
+                map.end()
+            }
+            Self::Asset(value) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("asset", value.as_str())?;
+                map.end()
+            }
             Self::Array(values) => {
                 let mut sequence = serializer.serialize_seq(Some(values.len()))?;
                 for value in values {
@@ -1005,9 +1087,8 @@ impl<'de> Deserialize<'de> for ParamValue {
             type Value = ParamValue;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(
-                    "логическое значение, целое число, вещественное число, строка или массив таких значений",
-                )
+                formatter
+                    .write_str("логическое значение, число, строка, массив или ссылка object/asset")
             }
 
             fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
@@ -1050,13 +1131,28 @@ impl<'de> Deserialize<'de> for ParamValue {
                 Ok(ParamValue::Array(values))
             }
 
-            fn visit_map<A>(self, _map: A) -> Result<Self::Value, A::Error>
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                Err(de::Error::custom(
-                    "вложенные таблицы параметров и даты/время TOML не поддерживаются",
-                ))
+                let Some(key) = map.next_key::<String>()? else {
+                    return Err(de::Error::custom("таблица параметра не может быть пустой"));
+                };
+                let value = map.next_value::<String>()?;
+                if map.next_key::<String>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "ссылка параметра должна содержать только один ключ",
+                    ));
+                }
+                match key.as_str() {
+                    "object" => Ok(ParamValue::Object(value)),
+                    "asset" => VirtualPath::parse(&value)
+                        .map(ParamValue::Asset)
+                        .map_err(de::Error::custom),
+                    _ => Err(de::Error::custom(
+                        "таблица параметра должна содержать только object или asset",
+                    )),
+                }
             }
         }
 
@@ -2954,20 +3050,45 @@ push_strength = 2.0
         let nested_table = format!(
             "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{nested={{value=1}}}}\n[[assets]]\npath=\"/s.lua\"\n"
         );
-        let nested_table_error = parse(&nested_table).unwrap_err();
-        assert!(
-            nested_table_error
-                .message
-                .contains("вложенные таблицы параметров")
-        );
+        assert!(parse(&nested_table).is_err());
         let date = format!(
             "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{date=1979-05-27}}\n[[assets]]\npath=\"/s.lua\"\n"
         );
         let date_error = parse(&date).unwrap_err();
         assert!(
-            date_error.message.contains("даты/время TOML"),
+            date_error.message.contains("object или asset"),
             "{date_error}"
         );
+    }
+
+    #[test]
+    fn object_and_asset_parameter_references_round_trip_and_reject_foreign_tables() {
+        let input = format!(
+            "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{target={{object=\"hero\"}}, texture={{asset=\"textures/hero.png\"}}}}\n[[assets]]\npath=\"/s.lua\"\n"
+        );
+        let document = parse(&input).unwrap();
+        let params = &document.objects[0].lite_scripts[0].params;
+        assert_eq!(params["target"], ParamValue::Object("hero".into()));
+        assert_eq!(
+            params["texture"],
+            ParamValue::Asset(VirtualPath::parse("textures/hero.png").unwrap())
+        );
+        let serialized = document.to_toml().unwrap();
+        let round_trip = parse(&serialized).unwrap();
+        assert_eq!(
+            round_trip.objects[0].lite_scripts[0].params, *params,
+            "{serialized}"
+        );
+        for foreign in [
+            "other=\"hero\"",
+            "object=\"hero\", asset=\"x.png\"",
+            "object=1",
+        ] {
+            let input = format!(
+                "{VALID}\n[[objects.lite_scripts]]\npath=\"/s.lua\"\nparams={{target={{{foreign}}}}}\n[[assets]]\npath=\"/s.lua\"\n"
+            );
+            assert!(parse(&input).is_err(), "accepted {foreign}");
+        }
     }
 
     #[test]

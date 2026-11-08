@@ -1,6 +1,7 @@
 //! Файловые операции над каталогом ресурсов проекта. Все пути остаются внутри `Assets/`.
 
 use engine_files::VirtualPath;
+pub use engine_scene::AssetKind;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,45 +15,6 @@ pub struct AssetEntry {
     pub is_dir: bool,
     /// Содержимое папки; папки идут первыми, внутри групп — по имени.
     pub children: Vec<AssetEntry>,
-}
-
-/// Вид ресурса, определяемый по расширению файла.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AssetKind {
-    Scene,
-    Prefab,
-    CameraSettings,
-    PostProcess,
-    PhysicsMaterial,
-    Model,
-    Texture,
-    Hdr,
-    Audio,
-    Script,
-    Other,
-}
-
-impl AssetKind {
-    pub fn of(path: &str) -> Self {
-        let extension = path
-            .rsplit('/')
-            .next()
-            .and_then(|name| name.rsplit_once('.'))
-            .map(|(_, extension)| extension.to_ascii_lowercase());
-        match extension.as_deref() {
-            Some("rvescene") => Self::Scene,
-            Some("rveprefab") => Self::Prefab,
-            Some("camerasettings") => Self::CameraSettings,
-            Some("postprocess") => Self::PostProcess,
-            Some("rvephysmat") => Self::PhysicsMaterial,
-            Some("fbx") => Self::Model,
-            Some("png") => Self::Texture,
-            Some("hdr") => Self::Hdr,
-            Some("wav" | "ogg") => Self::Audio,
-            Some("lua") => Self::Script,
-            _ => Self::Other,
-        }
-    }
 }
 
 /// Каталог ресурсов проекта.

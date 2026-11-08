@@ -17,6 +17,7 @@ Parent: [[Index]]
 | `engine/engine-scene/src/physics_material.rs` | `PhysicsMaterialSettings`, `CombineMode` | Физический материал коллайдера для `.rvephysmat`: трение покоя и скольжения, отскок, правила совмещения; загрузка разрешённого значения в объект |
 | `engine/engine-scene/src/light.rs` | `sun_direction`, `OrbitingSun`, `ShadowSettings`, `cascade_view_projections`, `point_shadow_view_projections`, `spot_shadow_view_projection` | Направление света, camera-relative каскады и Vulkan-depth матрицы point/spot shadow views без зависимости от renderer |
 | `engine/engine-scene/src/document.rs` | `SceneDocument`, компоненты, `ParamValue`, `SceneError` | Схема `.rvescene`, TOML-сериализация и проверка документов, ссылок и базисов |
+| `engine/engine-scene/src/asset_kind.rs` | `AssetKind` | Общая классификация ассетов по расширению для схем скриптов, редактора, сборщика и runtime |
 | `engine/engine-scene/src/prefab.rs` | `PrefabInstance`, `PrefabOverride`, `expand`, `Expansion`, `PrefabTemplate` | Экземпляры префабов, component overrides, раскрытие в плоский документ и шаблон spawn-префаба |
 | `engine/engine-scene/src/params.rs` | `ParamSchema`, `ParamSpec`, `ParamKind` | Схема параметров скрипта и разрешение значений экземпляра |
 | `engine/engine-scene/src/world.rs` | `ObjectHandle`, `World`, `WorldObject`, `SpawnOptions`, `SceneFrame`, `EnvironmentState`, `SceneWarning` | Хендлы с поколениями, runtime-объекты, spawn/despawn, топологический порядок, мировые матрицы и кэш мировых вращений, источник/ориентация окружения и данные кадра |
@@ -43,7 +44,7 @@ Parent: [[Index]]
 - У направленного света значения по умолчанию: `color = [1, 1, 1]`, `ambient = [0.15, 0.15, 0.15]`, `shadows = false`, `shadow_distance = 100`, `shadow_cascades = 4`. Цвет и ambient должны быть конечными и иметь компоненты `>= 0`; дистанция теней конечна и строго положительна, число каскадов — от 1 до 4. Удалённые `shadow_center` и `shadow_radius` считаются неизвестными полями.
 - `point_light` и `spot_light` разрешены на одном объекте и на любом числе объектов независимо от единственного directional light. Их defaults: белый цвет, интенсивность 1, range 10 и `shadows = false`; у spot также `inner_angle_deg = 20`, `outer_angle_deg = 30`. Цвет и интенсивность конечны и неотрицательны, range конечен и положителен; spot требует `0 < inner <= outer <= 90`. Неизвестные поля запрещены. `shadows = true` запрашивает локальные тени. `point_shadow_view_projections` строит шесть квадратных 90° view-projection матриц с глубиной Vulkan `[0, 1]` в порядке `+X, -X, +Y, -Y, +Z, -Z`; `spot_shadow_view_projection` строит перспективу из позиции, направления, внешнего угла и range. Near plane равен `min(range × 0.01, 0.05)`; при finite range `< 0.001` свет остаётся активным, но матрица не создаётся, поэтому renderer его не затеняет. Перспектива 180° сингулярна: spot с внешним углом 90° сохраняет исходный световой конус, а shadow coverage ограничивается конечным FOV `π − 0.01` (примерно 179.43°). Невалидный базис или матрица отключает только тень этого источника; его освещение сохраняется.
 - `lite_scripts` содержат путь `.lua` к объявленному asset. У `heavy_scripts` поле `name` соответствует `[A-Za-z0-9_]{1,64}`. У каждого скрипта поле `params` — таблица ключей и значений.
-- `ParamValue` принимает bool, целое число диапазона `i64`, конечное вещественное число, строку и массивы этих значений, включая массивы смешанных типов. Вложенные таблицы и TOML-даты/время не поддерживаются; ошибка разбора сообщает об этом по-русски. Вещественные числа внутри массивов также должны быть конечными.
+- `ParamValue` принимает bool, целое число диапазона `i64`, конечное вещественное число, строку, массивы и ссылки `{ object = "id" }` / `{ asset = "path" }`. В массиве допустимы обычные значения и ссылки. Таблицы с другими ключами и TOML-даты/время отклоняются. Пустая ссылка задаётся отсутствующим ключом параметра и получает значение none из схемы.
 
 ## Префабы
 
@@ -68,6 +69,8 @@ Parent: [[Index]]
 - `mesh_renderer` — `model`/`texture` заменяются, все поля `material` (факторы, alpha mode/cutoff, двусторонность и карты) сливаются по отдельности;
 - `camera`, `directional_light`, `point_light`, `spot_light`, `environment`, `collider`, `rigid_body`, `character_controller` — заменяются целиком;
 - `lite_params` по пути скрипта и `heavy_params` по имени — слияние ключей.
+
+Ссылки `ParamValue::Object` внутри префаба указывают только на объекты этого префаба; ссылка на внешний объект отклоняется. При раскрытии ссылка получает итоговый id экземпляра, а при `World::spawn` ссылки на объекты шаблона переназначаются на созданные id.
 
 Ограничения overrides:
 - компоненты не добавляются и не удаляются: override отсутствующего компонента или несуществующий `target` — ошибка;
@@ -101,7 +104,8 @@ Parent: [[Index]]
 
 `engine/engine-scene/src/params.rs` (`ParamSchema`, `ParamSpec`, `ParamKind`) описывает параметры, которые объявляет сам скрипт. Сцена хранит только заданные значения; документ схему не знает и не проверяет её.
 
-- Типы `ParamKind`: `bool`, `int`, `float`, `string`, `vec3`. `vec3` хранится в сцене массивом из трёх чисел.
+- Типы `ParamKind`: `bool`, `int`, `float`, `string`, `vec3`, `object`, `component`, `asset`, `enum`, `color` и `array`. Object/component значения хранят id объекта; asset — virtual path. `component` задаёт компонент сцены либо скрипт; `asset` может ограничивать расширение. `enum` требует непустые уникальные строки, `color` — RGB из трёх чисел в `[0, 1]`, `array` рекурсивно проверяет элементы по вложенному типу. `vec3` хранится массивом из трёх чисел.
+- Lua объявляет их как `{ type = "object" }`, `{ type = "component", component = "rigid_body" }` или `{ type = "component", script = "scripts/actor.lua" }`, `{ type = "asset", asset = "model" }`, `{ type = "enum", values = { "idle", "run" } }`, `{ type = "color" }` и `{ type = "array", of = { type = "float" } }`. Допустимые расширения ассетов берёт общий `AssetKind`.
 - `ParamSchema::new` сохраняет порядок объявлений. Он проверяет:
   - имена — идентификаторы `[A-Za-z_][A-Za-z0-9_]*` до 64 байт без повторов;
   - `min`/`max` — только у `int`/`float`, конечные, `min <= max`;
@@ -111,6 +115,7 @@ Parent: [[Index]]
   - целое число приводится к `float` и к компонентам `vec3`;
   - проверяются тип и диапазон;
   - необъявленный ключ — ошибка, чтобы опечатка в сцене не терялась молча.
+- Проверка типа и расширения выполняется схемой; существование object/component ссылок runtime проверяет после создания `World`. Отсутствующий объект или компонент — ошибка загрузки скрипта.
 - Скрипт без схемы получает `params` сцены без проверок. Где схема берётся и когда применяется — [[Engine/EngineScript]].
 
 ## Звуковой источник

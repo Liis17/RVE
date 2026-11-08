@@ -503,13 +503,25 @@ impl PrefabTemplate {
         let objects = expanded
             .objects
             .iter()
-            .map(|object| SceneObject {
-                id: local_id(&object.id).to_owned(),
-                parent: object
-                    .parent
-                    .as_deref()
-                    .map(|parent| local_id(parent).to_owned()),
-                ..object.clone()
+            .map(|object| {
+                let mut object = SceneObject {
+                    id: local_id(&object.id).to_owned(),
+                    parent: object
+                        .parent
+                        .as_deref()
+                        .map(|parent| local_id(parent).to_owned()),
+                    ..object.clone()
+                };
+                remap_object_param_refs(&mut object, |reference| {
+                    reference
+                        .strip_prefix(TEMPLATE_INSTANCE)
+                        .and_then(|rest| rest.strip_prefix('.'))
+                        .map(|local| format!("__template.{local}"))
+                        .or_else(|| {
+                            (reference == TEMPLATE_INSTANCE).then(|| "__template".to_owned())
+                        })
+                });
+                object
             })
             .collect();
         let stem = Path::new(path.as_str())
@@ -792,9 +804,18 @@ impl Expander<'_, '_> {
                         .map_err(|message| SceneError::new(source, Some(&instance.id), message))?;
                 }
             }
+            let local_ids = local
+                .iter()
+                .map(|object| object.id.clone())
+                .collect::<HashSet<_>>();
             for mut object in local {
                 let target = object.id.clone();
                 let is_root = target == prefab.root;
+                remap_object_param_refs(&mut object, |reference| {
+                    local_ids
+                        .contains(reference)
+                        .then(|| map_id(&instance.id, &prefab.root, reference))
+                });
                 object.id = map_id(&instance.id, &prefab.root, &target);
                 if is_root {
                     object.parent = instance.parent.clone();
@@ -900,6 +921,41 @@ impl Expander<'_, '_> {
         });
         self.cache.insert(path.clone(), Rc::clone(&prefab));
         Ok(prefab)
+    }
+}
+
+fn remap_object_param_refs(
+    object: &mut SceneObject,
+    mut remap: impl FnMut(&str) -> Option<String>,
+) {
+    fn remap_params(
+        params: &mut BTreeMap<String, crate::ParamValue>,
+        remap: &mut impl FnMut(&str) -> Option<String>,
+    ) {
+        fn visit(value: &mut crate::ParamValue, remap: &mut impl FnMut(&str) -> Option<String>) {
+            match value {
+                crate::ParamValue::Object(id) if !id.is_empty() => {
+                    if let Some(mapped) = remap(id) {
+                        *id = mapped;
+                    }
+                }
+                crate::ParamValue::Array(values) => {
+                    for value in values {
+                        visit(value, remap);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for value in params.values_mut() {
+            visit(value, remap);
+        }
+    }
+    for script in &mut object.lite_scripts {
+        remap_params(&mut script.params, &mut remap);
+    }
+    for script in &mut object.heavy_scripts {
+        remap_params(&mut script.params, &mut remap);
     }
 }
 
