@@ -23,7 +23,6 @@ pub(crate) fn solve(
     bodies: &mut BTreeMap<BodyHandle, Body>,
     pairs: &mut BTreeMap<PairKey, ActivePair>,
     manifolds: &mut ManifoldCache,
-    _dt: f32,
 ) {
     let constraints = build_constraints(bodies, pairs);
     warm_start(bodies, pairs, &constraints);
@@ -33,7 +32,6 @@ pub(crate) fn solve(
             solve_friction(bodies, pairs, constraint);
         }
     }
-    positional_correction(bodies, pairs);
     for (key, pair) in pairs.iter() {
         if pair.kind == PairKind::Collision
             && let Some(manifold) = &pair.manifold
@@ -172,7 +170,8 @@ fn solve_friction(
     }
 }
 
-fn positional_correction(
+/// Смещает позы на проникновение сверх `POSITIONAL_SLOP`; скорости не меняет.
+pub(crate) fn correct_positions(
     bodies: &mut BTreeMap<BodyHandle, Body>,
     pairs: &BTreeMap<PairKey, ActivePair>,
 ) {

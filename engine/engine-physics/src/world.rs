@@ -339,14 +339,20 @@ impl Body {
         self.collider.shape.aabb(self.collider_pose())
     }
 
-    fn integrate_dynamic(&mut self, gravity: Vec3, dt: f32) {
+    fn integrate_velocity(&mut self, gravity: Vec3, dt: f32) {
         if self.kind != BodyKind::Dynamic || self.sleeping {
             return;
         }
         self.linear_velocity += gravity * (self.gravity_scale * dt);
         self.linear_velocity *= (-self.linear_damping * dt).exp();
         self.angular_velocity *= (-self.angular_damping * dt).exp();
+    }
 
+    /// Двигает позу по скорости, уже решённой солвером; вызывается после контактов.
+    fn integrate_position(&mut self, dt: f32) {
+        if self.kind != BodyKind::Dynamic || self.sleeping {
+            return;
+        }
         let center = self.center_of_mass_world() + self.linear_velocity * dt;
         let angular_speed = self.angular_velocity.length();
         let rotation = if angular_speed > f32::MIN_POSITIVE {
@@ -568,8 +574,10 @@ impl PhysicsWorld {
         dt: f32,
         remaining_substeps: usize,
     ) -> Result<Vec<PhysicsEvent>, PhysicsWorldError> {
+        // Semi-implicit порядок: скорости, контакты и импульсы, затем позы, затем позиционная
+        // коррекция. Покоящееся тело не проседает на g·dt² до решения контактов.
         for body in self.bodies.values_mut() {
-            body.integrate_dynamic(self.gravity, dt);
+            body.integrate_velocity(self.gravity, dt);
             body.advance_kinematic(dt, remaining_substeps);
         }
         let events = self.refresh_pairs()?;
@@ -577,8 +585,11 @@ impl PhysicsWorld {
             &mut self.bodies,
             &mut self.active_pairs,
             &mut self.manifolds,
-            dt,
         );
+        for body in self.bodies.values_mut() {
+            body.integrate_position(dt);
+        }
+        crate::solver::correct_positions(&mut self.bodies, &self.active_pairs);
         self.update_sleep(dt);
         Ok(events)
     }
@@ -2243,6 +2254,33 @@ mod tests {
             ))
             .unwrap();
         (StepDriver::new(world, hz, 8).unwrap(), body)
+    }
+
+    #[test]
+    fn resting_box_penetration_stays_within_one_centimeter_at_common_rates() {
+        for hz in [30_u32, 60, 120] {
+            for floor in [diagonal_mesh_floor_desc(), floor_desc()] {
+                let mut world = PhysicsWorld::default();
+                world.insert_body(floor).unwrap();
+                let body = world
+                    .insert_body(BodyDesc::dynamic(
+                        box_shape(0.5),
+                        Pose::new(Vec3::new(0.0, 0.7, 0.0), Quat::IDENTITY).unwrap(),
+                        1.0,
+                    ))
+                    .unwrap();
+                let mut driver = StepDriver::new(world, hz, 8).unwrap();
+                for _ in 0..(5 * hz) {
+                    driver.advance_step(1.0 / hz as f32, []).unwrap();
+                }
+                // Верх обоих полов в y = 0, нижняя грань ящика в y = center - 0.5.
+                let penetration = 0.5 - driver.world().body_pose(body).unwrap().position.y;
+                assert!(
+                    penetration.abs() <= 0.01,
+                    "hz {hz}: steady penetration {penetration}"
+                );
+            }
+        }
     }
 
     #[test]
