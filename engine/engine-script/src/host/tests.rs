@@ -2,7 +2,8 @@ use super::{
     ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions, ScriptUpdateProfile,
 };
 use crate::{
-    Key, MouseButton, ScriptCursor, ScriptEventLevel, ScriptInput, ScriptLibrary, ScriptTime,
+    Key, MouseButton, RumbleRequest, ScriptCursor, ScriptEventLevel, ScriptInput, ScriptLibrary,
+    ScriptTime,
 };
 use engine_console::CommandLine;
 use engine_physics::{
@@ -71,6 +72,7 @@ fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn action_settings() -> InputSettings {
     InputSettings {
+        gamepad: Default::default(),
         default_context: Some("game".to_owned()),
         contexts: BTreeMap::from([
             (
@@ -5077,5 +5079,130 @@ return Cursor
             visible: false,
             locked: true,
         }
+    );
+}
+
+fn gamepad_lite_world(source: &str) -> (World, BTreeMap<String, String>) {
+    let world = one_camera(
+        r#"
+[[assets]]
+path = "/gamepad.lua"
+[[objects.lite_scripts]]
+path = "/gamepad.lua"
+"#,
+    );
+    (world, sources(&[("gamepad.lua", source)]))
+}
+
+#[test]
+fn lua_gamepad_api_reads_slots_and_queues_normalized_rumble() {
+    let (mut world, sources) = gamepad_lite_world(
+        r#"
+local Input = {}
+function Input:on_update()
+  local pressed = rve.input.pressed_inputs()
+  local x, y = rve.input.gamepad_stick("Right", 2)
+  if #pressed == 1 and pressed[1] == "Gamepad2.South"
+      and rve.input.gamepad_down("South", 2)
+      and rve.input.gamepad_pressed("South")
+      and not rve.input.gamepad_down("East", 1)
+      and rve.input.gamepad_connected(2) and not rve.input.gamepad_connected(3)
+      and rve.input.gamepad_axis("LeftX", 2) == 0.5
+      and x == 0.25 and y == -0.5 then
+    rve.input.gamepad_rumble(0 / 0, math.huge, -1, 2)
+    rve.input.gamepad_rumble(0.5, 0.25, 9)
+    rve.log_info("gamepad snapshot")
+  else
+    error("gamepad snapshot mismatch")
+  end
+end
+return Input
+"#,
+    );
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+    let mut input = ScriptInput::default();
+    input.set_pad(1, true, 1, [0.5, 0.0, 0.25, -0.5, 0.0, 0.0]);
+    host.set_input(input);
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Info && event.message == "gamepad snapshot"
+    }));
+    assert_eq!(
+        host.take_rumble_requests(),
+        vec![
+            RumbleRequest {
+                pad: 2,
+                strong: 0.0,
+                weak: 0.0,
+                seconds: 0.0,
+            },
+            RumbleRequest {
+                pad: 0,
+                strong: 0.5,
+                weak: 0.25,
+                seconds: 5.0,
+            },
+        ]
+    );
+    assert!(host.take_rumble_requests().is_empty());
+}
+
+#[test]
+fn lua_gamepad_arguments_are_validated_with_script_errors() {
+    let (mut world, sources) = gamepad_lite_world(
+        r#"
+local Input = {}
+function Input:on_update()
+  rve.input.gamepad_down("Unknown")
+end
+function Input:on_start()
+  rve.input.gamepad_axis("LeftX", 5)
+end
+return Input
+"#,
+    );
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+    host.start(&mut world, ScriptTime::default());
+    let events = host.drain_events();
+    assert!(events.iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event.message.contains("pad must be an integer from 0 to 4")
+    }));
+}
+
+#[test]
+fn lua_rumble_is_rolled_back_when_the_callback_fails() {
+    let (mut world, sources) = gamepad_lite_world(
+        r#"
+local Input = {}
+function Input:on_update()
+  rve.input.gamepad_rumble(1, 1, 1)
+  error("boom")
+end
+return Input
+"#,
+    );
+    let mut host = ScriptHost::load(&world, "scene", &sources, None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.take_rumble_requests().is_empty());
+}
+
+#[test]
+fn lua_rumble_is_unavailable_during_script_creation() {
+    let world = one_camera(
+        "[[assets]]\npath = \"/rumble.lua\"\n[[objects.lite_scripts]]\npath = \"/rumble.lua\"\n",
+    );
+    let result = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[(
+            "rumble.lua",
+            r#"rve.input.gamepad_rumble(1, 1, 1); return {}"#,
+        )]),
+        None,
+    );
+    assert!(
+        matches!(result, Err(ScriptLoadError::Lite { message, .. }) if message.contains("rumble is unavailable during script creation"))
     );
 }

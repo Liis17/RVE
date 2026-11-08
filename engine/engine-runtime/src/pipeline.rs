@@ -978,6 +978,7 @@ fn scripts_thread(
             return;
         }
     };
+    let pad_tuning = gamepad_tuning(&input_settings.gamepad);
     let mut scripts = match ScriptHost::load_with_options(
         &world,
         &scene_name,
@@ -1118,6 +1119,10 @@ fn scripts_thread(
         &command_catalog,
         &mut published_catalog_generation,
     );
+    #[cfg(test)]
+    let mut gamepads = engine_input::GilrsBackend::without_devices(pad_tuning);
+    #[cfg(not(test))]
+    let mut gamepads = engine_input::GilrsBackend::new(pad_tuning);
     let interval = Duration::from_secs_f64(1.0 / background_tick_hz.max(1) as f64);
     let now = clock.now();
     let mut next_background_tick =
@@ -1295,10 +1300,26 @@ fn scripts_thread(
         if let Some(latency) = reflex {
             latency.marker(frame_number, LatencyMarker::InputSample);
         }
-        let input_frame = lock_input(&input).take_frame();
+        gamepads.poll();
+        let (input_frame, accepting_input) = {
+            let mut accumulator = lock_input(&input);
+            let accepting = accumulator.set_pads(&gamepads.snapshot());
+            (accumulator.take_frame(), accepting)
+        };
+        if !accepting_input {
+            gamepads.stop_rumble();
+        }
         scripts.set_input(input_frame);
         let update_started = Instant::now();
         scripts.update(&mut world, dt, time);
+        let rumble = scripts.take_rumble_requests();
+        if accepting_input {
+            gamepads.rumble_frame(
+                rumble
+                    .iter()
+                    .map(|request| (request.pad, request.strong, request.weak, request.seconds)),
+            );
+        }
         publish_script_cursor(&scripts, &cursor, &mut published_cursor);
         timings.record(
             script_phase::LOOP,
@@ -1457,6 +1478,13 @@ fn scripts_thread(
         &mut published_catalog_generation,
     );
     let _ = render_tx.send(RenderControl::Shutdown);
+}
+
+fn gamepad_tuning(settings: &engine_project::GamepadSettings) -> engine_input::GamepadTuning {
+    engine_input::GamepadTuning {
+        stick_deadzone: settings.stick_deadzone,
+        trigger_threshold: settings.trigger_threshold,
+    }
 }
 
 fn sync_input_background(
@@ -3034,6 +3062,7 @@ return Input
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
                 input_settings: InputSettings {
+                    gamepad: Default::default(),
                     default_context: Some("game".to_owned()),
                     contexts: BTreeMap::from([(
                         "game".to_owned(),

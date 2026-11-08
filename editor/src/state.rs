@@ -20,6 +20,7 @@ use crate::viewport::model_loader::ModelLoader;
 use engine_animation::AnimationBridge;
 use engine_assets::Model;
 use engine_files::VirtualPath;
+use engine_input::GilrsBackend;
 use engine_render::DebugView;
 use engine_scene::{AntiAliasing, CameraSettings, World};
 use engine_script::{ParamSchema, ScriptInterruptHandle, ScriptLibrary};
@@ -164,6 +165,8 @@ pub struct EditorState {
     pub smart_zoom: bool,
     pub gizmo_drag: Option<GizmoDrag>,
     pub play: Option<PlaySession>,
+    /// The editor's gamepad backend, created by the first Play and kept across Play sessions.
+    pub gamepads: Option<GilrsBackend>,
     pub scripts_path: Option<PathBuf>,
     /// Недавние проекты из настроек пользователя, последний открытый — первым.
     pub recent_projects: Vec<PathBuf>,
@@ -249,6 +252,7 @@ impl EditorState {
             smart_zoom: false,
             gizmo_drag: None,
             play: None,
+            gamepads: None,
             scripts_path,
             recent_projects: Vec::new(),
             library: None,
@@ -309,6 +313,14 @@ impl EditorState {
         self.gizmo_drag = None;
         self.hierarchy_rename = None;
         self.hierarchy_rename_focus = false;
+    }
+
+    /// Конец Play-сессии для геймпадов: вибрация останавливается, пады читаются как отпущенные.
+    /// Сам backend остаётся открытым для следующей сессии.
+    pub fn end_play_gamepads(&mut self) {
+        if let Some(gamepads) = self.gamepads.as_mut() {
+            gamepads.end_session();
+        }
     }
 
     /// Курсор над изображением сцены: ввод Play-режима относится к игре.

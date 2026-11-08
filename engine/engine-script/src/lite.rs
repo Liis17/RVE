@@ -5,7 +5,8 @@ use crate::transaction::{
     ScriptTransaction,
 };
 use crate::types::{
-    ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime, ScriptTransform,
+    RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
+    ScriptTransform,
 };
 use engine_console::CommandSpec;
 use engine_files::VirtualPath;
@@ -21,8 +22,8 @@ use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, LuaString, MultiValue, RegistryKey,
     StdLib, Table, UserData, UserDataFields, Value, VmState,
 };
-use rve_sdk::abi::RVE_INPUT_MAX_BINDINGS;
-use rve_sdk::{Key, MouseButton, PhysicalInput};
+use rve_sdk::abi::{RVE_GAMEPAD_SLOTS, RVE_INPUT_MAX_BINDINGS, RveGamepadState};
+use rve_sdk::{GamepadAxis, GamepadButton, Key, MouseButton, PhysicalInput};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -2273,8 +2274,136 @@ fn input_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
         "cursor_visible",
         cursor_visible_function(lua, active_call.clone())?,
     )?;
-    input.set("cursor_locked", cursor_locked_function(lua, active_call)?)?;
+    input.set(
+        "cursor_locked",
+        cursor_locked_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "gamepad_down",
+        gamepad_button_function(
+            lua,
+            active_call.clone(),
+            "rve.input.gamepad_down",
+            |state| state.down,
+        )?,
+    )?;
+    input.set(
+        "gamepad_pressed",
+        gamepad_button_function(
+            lua,
+            active_call.clone(),
+            "rve.input.gamepad_pressed",
+            |state| state.pressed,
+        )?,
+    )?;
+    input.set(
+        "gamepad_released",
+        gamepad_button_function(
+            lua,
+            active_call.clone(),
+            "rve.input.gamepad_released",
+            |state| state.released,
+        )?,
+    )?;
+    input.set(
+        "gamepad_axis",
+        gamepad_axis_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "gamepad_stick",
+        gamepad_stick_function(lua, active_call.clone())?,
+    )?;
+    input.set(
+        "gamepad_connected",
+        gamepad_connected_function(lua, active_call.clone())?,
+    )?;
+    input.set("gamepad_rumble", gamepad_rumble_function(lua, active_call)?)?;
     Ok(input)
+}
+
+/// Reads an optional Lua pad argument: nil or 0 is every slot, 1..=4 is one slot.
+fn gamepad_pad_arg(pad: Option<i64>, function: &str) -> mlua::Result<u32> {
+    match pad {
+        None => Ok(0),
+        Some(pad) if (0..=4).contains(&pad) => Ok(pad as u32),
+        Some(_) => Err(LuaError::runtime(format!(
+            "{function} pad must be an integer from 0 to 4"
+        ))),
+    }
+}
+
+fn gamepad_button_function(
+    lua: &Lua,
+    active_call: ActiveCall,
+    function: &'static str,
+    field: fn(&RveGamepadState) -> u32,
+) -> mlua::Result<Function> {
+    lua.create_function(move |_, (name, pad): (LuaString, Option<i64>)| {
+        let name = name.to_str()?;
+        let button = GamepadButton::from_name(name.as_ref())
+            .ok_or_else(|| LuaError::runtime(format!("unknown gamepad button {name:?}")))?;
+        let pad = gamepad_pad_arg(pad, function)?;
+        with_active_call(&active_call, |transaction| {
+            let state = transaction.input().gamepad_state(pad).unwrap_or_default();
+            Ok(field(&state) & (1 << button as u32) != 0)
+        })
+    })
+}
+
+fn gamepad_axis_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, (name, pad): (LuaString, Option<i64>)| {
+        let name = name.to_str()?;
+        let axis = GamepadAxis::from_name(name.as_ref())
+            .ok_or_else(|| LuaError::runtime(format!("unknown gamepad axis {name:?}")))?;
+        let pad = gamepad_pad_arg(pad, "rve.input.gamepad_axis")?;
+        with_active_call(&active_call, |transaction| {
+            let state = transaction.input().gamepad_state(pad).unwrap_or_default();
+            Ok(state.axes[axis as usize])
+        })
+    })
+}
+
+fn gamepad_stick_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, (side, pad): (LuaString, Option<i64>)| {
+        let side = side.to_str()?;
+        let (x, y) = match side.as_ref() {
+            "Left" => (GamepadAxis::LeftX, GamepadAxis::LeftY),
+            "Right" => (GamepadAxis::RightX, GamepadAxis::RightY),
+            _ => {
+                return Err(LuaError::runtime(format!(
+                    "unknown gamepad stick {side:?}, expected \"Left\" or \"Right\""
+                )));
+            }
+        };
+        let pad = gamepad_pad_arg(pad, "rve.input.gamepad_stick")?;
+        with_active_call(&active_call, |transaction| {
+            let state = transaction.input().gamepad_state(pad).unwrap_or_default();
+            Ok((state.axes[x as usize], state.axes[y as usize]))
+        })
+    })
+}
+
+fn gamepad_connected_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(move |_, pad: Option<i64>| {
+        let pad = gamepad_pad_arg(pad, "rve.input.gamepad_connected")?;
+        with_active_call(&active_call, |transaction| {
+            let state = transaction.input().gamepad_state(pad).unwrap_or_default();
+            Ok(state.connected != 0)
+        })
+    })
+}
+
+fn gamepad_rumble_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
+    lua.create_function(
+        move |_, (strong, weak, seconds, pad): (f32, f32, f32, Option<i64>)| {
+            let pad = gamepad_pad_arg(pad, "rve.input.gamepad_rumble")?;
+            let request = RumbleRequest::new(pad, strong, weak, seconds)
+                .ok_or_else(|| LuaError::runtime("rve.input.gamepad_rumble pad is invalid"))?;
+            with_active_call(&active_call, |transaction| {
+                transaction.stage_rumble(request).map_err(LuaError::runtime)
+            })
+        },
+    )
 }
 
 fn set_cursor_visible_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Function> {
@@ -2450,6 +2579,16 @@ fn pressed_inputs_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<F
                 };
                 if transaction.input().mouse_pressed(button) {
                     inputs.push(format!("Mouse.{button:?}"));
+                }
+            }
+            for pad in 1..=RVE_GAMEPAD_SLOTS as u32 {
+                let Some(state) = transaction.input().gamepad_state(pad) else {
+                    continue;
+                };
+                for button in GamepadButton::ALL {
+                    if state.pressed & (1 << button as u32) != 0 {
+                        inputs.push(format!("Gamepad{pad}.{}", button.name()));
+                    }
                 }
             }
             let result = lua.create_table_with_capacity(inputs.len(), 0)?;

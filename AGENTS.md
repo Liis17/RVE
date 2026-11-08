@@ -21,6 +21,7 @@ Obsidian/RVEVault/Engine/EngineResources.md — Фоновое чтение loos
 Obsidian/RVEVault/Engine/EngineAssets.md — Ресурсы: FBX и PNG из assets
 Obsidian/RVEVault/Engine/EnginePhysics.md — Геометрия, solver, fixed-step мир, character controller и протокол rve-physics
 Obsidian/RVEVault/Engine/EngineScript.md — Lua и Rust-скрипты сцен
+Obsidian/RVEVault/Engine/EngineInput.md — Геймпады: gilrs-бэкенд, перевод событий, слоты 1..4, фокусный гейт и вибрация
 Obsidian/RVEVault/Engine/EngineConsole.md — Буфер лога, команды и общий egui developer console
 Obsidian/RVEVault/Engine/RveSdk.md — C ABI и гостевой API Rust-скриптов
 Obsidian/RVEVault/Engine/EngineRuntime.md — Игровой runtime и player
@@ -57,7 +58,7 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
   потребителях engine-runtime/rve-player и rve-build, если они используют
   изменённый крейт. Прямые workspace-зависимости:
   - engine-runtime: engine-animation, engine-assets, engine-files, engine-audio,
-    engine-neural, engine-network, engine-physics, engine-platform,
+    engine-neural, engine-network, engine-input, engine-physics, engine-platform,
     engine-project, engine-render, engine-resources, engine-scene,
     engine-script, engine-window, engine-console, engine-ui.
   - rve-build: engine-assets, engine-files, engine-pak, engine-project,
@@ -66,7 +67,7 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
   - engine-audio (потребители engine-runtime и rve-editor): engine-resources, engine-scene, cpal, lewton, flume, rtrb, log.
   - engine-animation (потребители engine-runtime и rve-editor): engine-assets, engine-files, engine-scene, glam.
   - rve-player: engine-runtime.
-  - rve-editor: engine-animation, engine-assets, engine-files, engine-physics, engine-project, engine-render,
+  - rve-editor: engine-animation, engine-assets, engine-files, engine-input, engine-physics, engine-project, engine-render,
     engine-audio, engine-resources, engine-scene, engine-script, engine-window,
     engine-console, engine-ui.
 - При изменении engine-platform проверяй общий интерфейс, адаптеры engine-platform-windows и engine-platform-macos и вызовы из renderer.

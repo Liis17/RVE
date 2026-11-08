@@ -1,13 +1,13 @@
 use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
     RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams,
-    RveCameraSettings, RveCharacterMoveResult, RveCursorState, RveHeader, RveHost, RveModule,
-    RveParamEntry, RveParams, RvePlayAnimationParams, RveRaycastHit, RveScriptDesc, RveStatus,
-    RveStr, RveTime, RveTransform, RveValue, RveValueData,
+    RveCameraSettings, RveCharacterMoveResult, RveCursorState, RveGamepadState, RveHeader, RveHost,
+    RveModule, RveParamEntry, RveParams, RvePlayAnimationParams, RveRaycastHit, RveScriptDesc,
+    RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use crate::{
-    AntiAliasing, CameraSettings, ConsoleLevel, Context, Key, MouseButton, Params, Script,
-    Tonemapper, Value,
+    AntiAliasing, CameraSettings, ConsoleLevel, Context, GamepadAxis, GamepadButton, GamepadState,
+    GamepadStick, Key, MouseButton, Params, PhysicalInput, Script, Tonemapper, Value,
 };
 use std::ffi::c_void;
 
@@ -219,6 +219,12 @@ struct HostState {
     object_state_code: u32,
     /// Code returned by the prefab-state callback.
     prefab_state_code: u32,
+    /// Gamepad snapshots indexed by pad: 0 is the aggregate, 1..=4 are slots.
+    gamepads: [RveGamepadState; 5],
+    /// Rumble requests in guest order: pad, strong, weak, seconds.
+    rumble_calls: Vec<(u32, f32, f32, f32)>,
+    /// Result of every rumble callback.
+    rumble_accepts: bool,
 }
 
 unsafe extern "C" fn set_error(ctx: *mut c_void, message: RveStr) {
@@ -522,6 +528,8 @@ fn host(state: &mut HostState) -> RveHost {
         animation_set_parameter: None,
         animation_set_speed: None,
         animation_stop: None,
+        gamepad_state: None,
+        gamepad_rumble: None,
     }
 }
 
@@ -1904,7 +1912,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 10);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 11);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2174,5 +2182,177 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 10);
+}
+
+#[test]
+fn gamepad_callbacks_and_state_keep_the_v11_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<RveGamepadState>(), 40);
+    assert_eq!(offset_of!(RveGamepadState, axes), 16);
+    assert_eq!(
+        offset_of!(RveHost, gamepad_state),
+        offset_of!(RveHost, animation_stop) + size_of::<Option<crate::abi::RveAnimationStopFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, gamepad_rumble),
+        offset_of!(RveHost, gamepad_state) + size_of::<Option<crate::abi::RveGamepadStateFn>>()
+    );
+    assert_eq!(
+        size_of::<Option<crate::abi::RveGamepadRumbleFn>>(),
+        size_of::<crate::abi::RveGamepadRumbleFn>()
+    );
+}
+
+#[test]
+fn gamepad_physical_input_names_round_trip_and_reject_invalid_slots() {
+    for name in ["Gamepad.South", "Gamepad3.LeftBumper", "Gamepad4.DPadRight"] {
+        let input = PhysicalInput::from_name(name).unwrap();
+        assert_eq!(input.name(), name);
+    }
+    assert_eq!(
+        PhysicalInput::from_name("Gamepad2.Start"),
+        Some(PhysicalInput::GamepadButton {
+            pad: Some(2),
+            button: GamepadButton::Start,
+        })
+    );
+    for name in [
+        "Gamepad0.South",
+        "Gamepad5.South",
+        "Gamepad+1.South",
+        "GamepadX.South",
+        "Gamepad.Unknown",
+        "Gamepad.South.Extra",
+        "Gamepad1",
+        "Gamepad",
+    ] {
+        assert_eq!(PhysicalInput::from_name(name), None, "{name}");
+    }
+    assert_eq!(GamepadButton::ALL.len(), 17);
+    for (code, button) in GamepadButton::ALL.into_iter().enumerate() {
+        assert_eq!(button as u32, code as u32);
+        assert_eq!(GamepadButton::from_code(code as u32), Some(button));
+    }
+    assert_eq!(GamepadButton::from_code(17), None);
+    assert_eq!(
+        crate::abi::split_gamepad_name("Gamepad2.LeftStick"),
+        Some((Some(2), "LeftStick"))
+    );
+    assert_eq!(
+        crate::abi::split_gamepad_name("Gamepad.RightTrigger"),
+        Some((None, "RightTrigger"))
+    );
+    assert_eq!(crate::abi::split_gamepad_name("Gamepad5.South"), None);
+    assert_eq!(crate::abi::split_gamepad_name("Mouse.Left"), None);
+    assert_eq!(
+        GamepadAxis::from_name("RightTrigger"),
+        Some(GamepadAxis::RightTrigger)
+    );
+    assert_eq!(GamepadAxis::from_name("Trigger"), None);
+}
+
+unsafe extern "C" fn gamepad_state(ctx: *mut c_void, pad: u32, out: *mut RveGamepadState) -> bool {
+    // SAFETY: test host points to a live HostState and the output slot is valid during the call.
+    let state = unsafe { &*ctx.cast::<HostState>() };
+    let Some(snapshot) = state.gamepads.get(pad as usize) else {
+        // SAFETY: the guest passes a valid output slot for this call.
+        unsafe { *out = RveGamepadState::default() };
+        return false;
+    };
+    // SAFETY: the guest passes a valid output slot for this call.
+    unsafe { *out = *snapshot };
+    true
+}
+
+unsafe extern "C" fn gamepad_rumble(
+    ctx: *mut c_void,
+    pad: u32,
+    strong: f32,
+    weak: f32,
+    seconds: f32,
+) -> bool {
+    // SAFETY: test host points to a live HostState for the guest call.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.rumble_calls.push((pad, strong, weak, seconds));
+    state.rumble_accepts
+}
+
+fn gamepad_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.gamepad_state = Some(gamepad_state);
+    host.gamepad_rumble = Some(gamepad_rumble);
+    host
+}
+
+#[test]
+fn guest_gamepad_wrapper_reads_slot_and_aggregate_snapshots() {
+    let mut state = HostState::default();
+    state.gamepads[2] = RveGamepadState {
+        connected: 1,
+        down: 1 << GamepadButton::South as u32,
+        pressed: 1 << GamepadButton::East as u32,
+        released: 0,
+        axes: [0.5, -0.25, 0.0, 0.0, 0.75, 0.0],
+    };
+    let host = gamepad_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let input = context.input();
+
+    let pad = input.gamepad(2);
+    assert!(pad.connected());
+    assert!(pad.down(GamepadButton::South));
+    assert!(pad.pressed(GamepadButton::East));
+    assert!(!pad.released(GamepadButton::East));
+    assert_eq!(pad.axis(GamepadAxis::LeftX), 0.5);
+    assert_eq!(pad.axis(GamepadAxis::LeftTrigger), 0.75);
+    assert_eq!(pad.stick(GamepadStick::Left), [0.5, -0.25]);
+    assert!(!input.gamepad(1).connected());
+    assert!(!input.gamepad(5).connected());
+    assert_eq!(input.gamepad(5), GamepadState::default());
+}
+
+#[test]
+fn guest_gamepad_rumble_forwards_requests_and_reports_host_refusal() {
+    let mut state = HostState {
+        rumble_accepts: true,
+        ..HostState::default()
+    };
+    let host = gamepad_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    assert!(context.input().rumble(0, 0.5, 1.0, 0.25));
+    assert_eq!(state.rumble_calls, vec![(0, 0.5, 1.0, 0.25)]);
+
+    state.rumble_accepts = false;
+    let host = gamepad_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    assert!(!context.input().rumble(3, 1.0, 1.0, 1.0));
+    assert_eq!(state.rumble_calls.last(), Some(&(3, 1.0, 1.0, 1.0)));
+}
+
+#[test]
+fn guest_gamepad_api_is_unavailable_for_hosts_without_v11_callbacks() {
+    let mut state = HostState {
+        rumble_accepts: true,
+        ..HostState::default()
+    };
+    let host = host(&mut state);
+    let context = Context::new(&host).unwrap();
+    assert_eq!(context.input().gamepad(1), GamepadState::default());
+    assert!(!context.input().rumble(1, 1.0, 1.0, 1.0));
+    assert!(context.input().pressed_inputs().is_empty());
+}
+
+#[test]
+fn pressed_inputs_list_gamepad_slots_in_order_with_concrete_names() {
+    let mut state = HostState::default();
+    state.gamepads[1].connected = 1;
+    state.gamepads[1].pressed = 1 << GamepadButton::South as u32;
+    state.gamepads[3].connected = 1;
+    state.gamepads[3].pressed = 1 << GamepadButton::DPadUp as u32;
+    let host = gamepad_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    assert_eq!(
+        context.input().pressed_inputs(),
+        vec!["Gamepad1.South".to_owned(), "Gamepad3.DPadUp".to_owned()]
+    );
 }

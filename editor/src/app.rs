@@ -4,7 +4,7 @@ use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
-use crate::play::{PlayPrefabs, PlaySession};
+use crate::play::{PlayPrefabs, PlaySession, editor_gamepads, gamepad_tuning};
 use crate::play_cursor;
 use crate::project::OpenProject;
 use crate::scene_edit::EditorScene;
@@ -42,6 +42,8 @@ const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
 const PREVIEW_POLL: Duration = Duration::from_millis(30);
 /// Как часто забирать вывод идущей сборки.
 const BUILD_POLL: Duration = Duration::from_millis(50);
+/// Как часто дренировать очередь геймпадов вне Play: без этого события копятся до следующего Play.
+const IDLE_GAMEPAD_POLL: Duration = Duration::from_secs(1);
 
 pub struct EditorApp {
     state: EditorState,
@@ -993,6 +995,8 @@ impl EditorApp {
         let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
             return;
         };
+        let tuning = gamepad_tuning(&project.settings.input.gamepad);
+        editor_gamepads(&mut self.state.gamepads, tuning).begin_session(tuning);
         let result = (|| {
             let mut world =
                 World::from_document(scene.view()).map_err(|error| error.to_string())?;
@@ -1051,6 +1055,7 @@ impl EditorApp {
     fn stop_play(&mut self) {
         self.state.pending_play = false;
         if let Some(session) = self.state.play.take() {
+            self.state.end_play_gamepads();
             let events = session.stop();
             self.state.log.push_script_events(events);
             self.state.log.info("Stop");
@@ -1282,7 +1287,13 @@ impl EditorApp {
         if let Some(latency) = self.latency.as_ref() {
             latency.marker(frame_id, LatencyMarker::InputSample);
         }
-        let play_error = self.state.play.as_mut().and_then(|play| play.tick().err());
+        let pads_accepted = self.window_focused && !self.state.console_open;
+        let play_error = self.state.play.as_mut().and_then(|play| {
+            if let Some(gamepads) = self.state.gamepads.as_mut() {
+                play.poll_gamepads(gamepads, pads_accepted);
+            }
+            play.tick().err()
+        });
         if play_error.is_none()
             && let Some(play) = self.state.play.as_ref()
             && !play.is_paused()
@@ -1292,6 +1303,7 @@ impl EditorApp {
         if let Some(error) = play_error {
             self.state.log.error(error);
             if let Some(session) = self.state.play.take() {
+                self.state.end_play_gamepads();
                 self.state.log.push_script_events(session.stop());
                 self.state.log.info("Stop");
             }
@@ -1878,6 +1890,12 @@ impl WindowHandler for EditorApp {
             self.apply_asset_changes(changes);
             window.request_redraw();
         }
+        // Вне Play очередь геймпадов дренируется без доставки в скрипты; в Play опрос идёт в кадре.
+        if self.state.play.is_none()
+            && let Some(gamepads) = self.state.gamepads.as_mut()
+        {
+            gamepads.discard_events();
+        }
         if self.exit {
             return false;
         }
@@ -1911,11 +1929,14 @@ impl WindowHandler for EditorApp {
             .scripts_job
             .is_some()
             .then(|| Instant::now() + BUILD_POLL);
+        let idle_pads = (self.state.play.is_none() && self.state.gamepads.is_some())
+            .then(|| Instant::now() + IDLE_GAMEPAD_POLL);
         [
             self.repaint_at,
             preview,
             build,
             scripts,
+            idle_pads,
             self.autosave_deadline(),
             self.asset_changes.deadline(),
         ]
