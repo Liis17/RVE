@@ -3,7 +3,7 @@
 `tools/rve-build` собирает игровой релиз из каталога проекта или запускает его в
 dev-режиме. Инструмент является внешним crate workspace и зависит от
 `engine-project`, `engine-scene`, `engine-assets`, `engine-resources`, `engine-pak`,
-`engine-files` и `engine-script`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
+`engine-files`, `engine-script` и `rve-sdk`. Форматы настроек проекта описаны в [[Engine/EngineProject]].
 Подробности runtime layout проекта и релиза находятся в
 [[Engine/EngineRuntime]], формат сцены — в [[Engine/EngineScene]], а формат архива и
 реестр — в [[Engine/EnginePak]].
@@ -87,7 +87,7 @@ directional_light, environment) сборщик для них не проверя
 `Engine/bootstrap.rves`, а наборы архивов из `Assets/` корня релиза (см.
 [[Engine/EngineRuntime]]).
 
-На Windows корень релиза — сам output: executable, `Engine/` и `Assets/` лежат рядом.
+На Windows корень релиза — сам output: executable, `Engine/` и `Assets/` лежат рядом. Выделенный сервер `rve-server` кладётся рядом с `Engine/`, на macOS — рядом с `.app`, а не внутрь бандла; это сборка без окна и без dev-console (`--no-default-features`).
 На macOS output содержит `<player>.app`: executable в `Contents/MacOS`, `Engine/` и
 `Assets/` в `Contents/Resources`, `Contents/Info.plist` генерирует
 `platform::info_plist` (`CFBundleIdentifier` = `rve.game.<id>` с заменой `_` на `-`,
@@ -139,6 +139,8 @@ Dev-player использует библиотеку из проекта. При
 Cargo `compiler-artifact`; вывод сообщает `rebuilt` или `up to date` по полю `fresh`
 этого артефакта.
 
+Выделенный сервер `rve-server` собирается тем же механизмом командой `cargo build --release --locked -p rve-server --no-default-features` в `build/server`. Сборка без dev-console и DLSS; при сборке SDK он копируется как соседний executable `rve-server` (`rve-server.exe` на Windows).
+
 С маркером используется SDK-режим: `rve-sdk.toml` разбирается как TOML и содержит
 `engine_version`, `abi_version`, `target` и `dlss_enabled`. Последнее поле по
 умолчанию false для старых SDK и отражает DLSS feature prebuilt player. Маркер
@@ -158,11 +160,11 @@ SDK-режим не обращается к `CARGO_MANIFEST_DIR` и исходн
 содержать `bin/cargo` и `bin/rustc` (на Windows `.exe`) и целиком копируется в
 `toolchain/`. `--no-rust-toolchain` предназначен для CI и пакетов без autobuild.
 
-Команда пересобирает release editor, builder и оба player; distribution player без
+Команда пересобирает release editor, builder, оба player и `rve-server`; distribution player без
 console. Пути executable берутся из Cargo JSON. Кэши изолированы в `build/sdk-player`
 и `build/sdk-tools`. На Windows каждому Cargo build передаётся явный target вместе
 с `-C target-feature=+crt-static`, поэтому флаг не затрагивает host proc macros.
-SDK содержит четыре executable, marker, гостевой `rve-sdk/Cargo.toml` и `src/**`.
+SDK содержит пять executable (builder, editor, `rve-player`, `rve-player-dev` и `rve-server`), marker, гостевой `rve-sdk/Cargo.toml` и `src/**`.
 На macOS они находятся в `RVE Editor.app/Contents/MacOS`, Vulkan loader/MoltenVK
 и ICD — в `Contents/Resources/Engine`. Публикация атомарная без замены output.
 

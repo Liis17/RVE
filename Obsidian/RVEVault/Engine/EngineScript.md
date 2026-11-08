@@ -68,6 +68,21 @@ Lua API `rve.console.write(text, level?)` создаёт `ScriptEvent`; уров
 - Pending-объект в Lua имеет `id` только при явном `id` в опциях. Автоматический id `<префаб>@<serial>` становится известен после применения: через `find` или через объект.
 - Rust ABI v9 использует те же правила: `spawn`, `destroy` и загрузка префабов — транзакционные callbacks. Animation-callbacks ABI v10 (`animation_play`, `animation_set_weight`, `animation_set_parameter`, `animation_set_speed`, `animation_stop`) следуют тем же правилам: отказ хоста возвращает `RveStatus` с Error-событием. Отказ host возвращает `0` или `false` и пишет Error-событие с причиной. `object_state` видит pending-хендл, `find` его не находит. Контракт — в [[Engine/RveSdk]].
 
+## Сетевой API
+
+Сетевые вызовы ставятся в транзакцию и применяются мостом [[Engine/EngineNetwork]]. В режиме `Offline` запросы не ставятся и ошибки нет; `is_server()` и `has_authority()` при этом истинны, `is_client()` ложно.
+
+- `rve.net`: `mode()` возвращает `offline`, `host`, `server` или `client`; `is_server()` истинно для offline, host и server; `is_client()` — для host и client; `local_peer()` и `peers()` возвращают номера участников. `rve.net.send(target, name, value, {reliable=true})`: target — `"server"`, `"all"` или номер участника. На клиенте допустим только сервер, иначе ошибка Lua.
+- Методы объекта: `net_id()`, `net_owner()`, `is_owner()`, `has_authority()`, `set_net_owner(peer)` и `net_send(name, value, target, options?)`. `set_net_owner` работает только на сервере и требует `network_identity`. `net_send` доставляет сообщение экземплярам того же объекта на другой стороне.
+- `has_authority()` на сервере и в offline истинно для всех объектов. На клиенте истинно только для объекта с `authority = owner`, владельцем которого он является. Объект без `network_identity` локален, и authority у него есть всегда.
+- Callbacks экземпляра: `on_net_message(self, peer, name, value)`, `on_peer_connected(self, peer)` и `on_peer_disconnected(self, peer, reason)`. Сообщение, адресованное объекту, получает только его экземпляр; сообщение без объекта — все экземпляры с callback. Подключение и отключение приходят всем экземплярам с callback.
+- События доставляются в начале update после physics events, каждое отдельной транзакцией. Запросы `rve.net`, методов объекта и `set_net_owner` применяются мостом после `update`.
+- Ошибка net-callback откатывает его транзакцию, пишет Error (не больше восьми записей в секунду на источник) и **не отключает экземпляр**. Если событие пришло от удалённого участника, ошибка увеличивает счётчик этого участника; мост отключает его при 32 ошибках за 10 с ([[Engine/EngineNetwork]]).
+- Входящий поток ограничен по участнику за update: 256 сообщений и 512 KiB. Сверх лимита сообщения отбрасываются, предупреждение выводится один раз на участника. Сообщение с именем длиннее 256 байт или значением вне лимитов сообщения считается ошибкой участника.
+- Лимиты значений сообщения (глубина 16, 1024 элемента, 64 KiB строк) берутся из `engine-scene`. За кадр скрипты ставят не больше 4096 сетевых запросов.
+- Для моста `ScriptHost` даёт публичный внешний API: `spawn_external` (явный id, те же проверки и откат, что у `rve.spawn`, но применяется до возврата; отказ возвращает `Err`), `despawn_external`, `queue_network_events`, `drain_network_requests`, `drain_peer_faults`, `set_network_state`, `set_object_net` и `clear_object_net`.
+- Клиент не может создать локально префаб, в котором есть объекты с `network_identity`: такой spawn — ошибка скрипта. Такие объекты приходят только от сервера.
+
 ## Физика скриптов
 
 Физический контекст необязателен. Runtime и editor Play подключают immutable snapshot и bindings до `on_start`, передают результаты и события перед update и забирают committed команды после него. Вне этих интеграций вызывающий код может использовать те же `ScriptHost` hooks напрямую; host не создаёт и не шагает `PhysicsWorld`.
@@ -98,4 +113,4 @@ Runtime error Lua, panic ABI-скрипта или не конечная тра�
 
 ## Источники
 
-`engine/engine-script/src/host.rs`, `engine/engine-script/src/actions.rs`, `engine/engine-script/src/transaction.rs`, `engine/engine-script/src/lifecycle.rs`, `engine/engine-script/src/library.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/types.rs`, `engine/rve-sdk/Cargo.toml`.
+`engine/engine-script/src/host.rs`, `engine/engine-script/src/actions.rs`, `engine/engine-script/src/transaction.rs`, `engine/engine-script/src/lifecycle.rs`, `engine/engine-script/src/library.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/types.rs`, `engine/engine-script/src/net.rs`, `engine/rve-sdk/Cargo.toml`.

@@ -73,7 +73,7 @@ Dev-player с developer console циклически меняет поддерж
 
 Затем выполняется проверка hardware requirements: подходящее устройство Vulkan, RAM и число логических CPU. Ошибка `probe_devices`, отсутствие подходящего устройства или недостаток ресурсов выводятся в stderr и системный диалог; код выхода 3. CPU-загрузка сцены идёт до окна: `SceneDocument` раскрывается через `engine_scene::expand` (префабы читаются через тот же `ResourceHandle`, поэтому dev и release загружают их одинаково; формат — [[Engine/EngineScene#Префабы]]), раскрытый документ строит `World`, каждый уникальный asset `.camerasettings` читается и проверяется один раз и назначается камерам, FBX базовой модели и всех LOD levels кэшируются по пути, объявленные PNG для замены base-color, текстур уровней и `MaterialOverride` загружаются как ресурсы, а HDR environment читаются через `Assets::load_hdr` в CPU `EnvironmentSource`. `mesh.texture` заменяет только base-color map; заданные поля `mesh.material` меняют соответствующие factors, alpha mode/cutoff и карты; emissive texture загружается sRGB, occlusion — Linear, пропущенные поля сохраняют материал FBX. Lite-файлы читаются как UTF-8 через `ResourceHandle`.
 
-`ModuleHost` начинает владеть потоками при их первом старте. Он запускает `rve-audio`, `rve-physics`, `rve-network` и `rve-neural`, затем загрузчик тяжёлых префабов `rve-prefabs` ([[#Тяжёлые префабы]]) и именованный поток `rve-scripts`. На этом потоке runtime сначала загружает `ScriptLibrary` (если задан путь), затем создаёт `ScriptHost::load_with_options` с библиотекой и `ScriptLoadOptions`: sticky `ScriptInterruptHandle` и лимит 5 секунд на каждый Lua call, включая top-level chunk. После загрузки поток сообщает `Ready` до создания окна. Ожидание readiness ограничено 30 секундами; при timeout runtime устанавливает interrupt и ждёт ещё 2 секунды. Если ответа всё ещё нет, runtime возвращает код 1 и отсоединяет `rve-scripts` перед `ModuleHost::shutdown`; load error сохраняет код 2, а ошибка запуска потока или паника — код 1. `ScriptLibrary` намеренно не выгружает динамический модуль.
+`ModuleHost` начинает владеть потоками при их первом старте. Он запускает `rve-audio`, `rve-physics` и `rve-neural`, а при сетевых флагах также `rve-network` ([[#Сеть и rve-server]]), затем загрузчик тяжёлых префабов `rve-prefabs` ([[#Тяжёлые префабы]]) и именованный поток `rve-scripts`. На этом потоке runtime сначала загружает `ScriptLibrary` (если задан путь), затем создаёт `ScriptHost::load_with_options` с библиотекой и `ScriptLoadOptions`: sticky `ScriptInterruptHandle` и лимит 5 секунд на каждый Lua call, включая top-level chunk. После загрузки поток сообщает `Ready` до создания окна. Ожидание readiness ограничено 30 секундами; при timeout runtime устанавливает interrupt и ждёт ещё 2 секунды. Если ответа всё ещё нет, runtime возвращает код 1 и отсоединяет `rve-scripts` перед `ModuleHost::shutdown`; load error сохраняет код 2, а ошибка запуска потока или паника — код 1. `ScriptLibrary` намеренно не выгружает динамический модуль.
 
 После загрузки CPU-моделей, но до запуска модулей и создания окна, `PreparedScene::build_physics` строит `PhysicsSceneDesc` по `ProjectSettings.physics` и геометрии уже загруженных базовых FBX-мешей. Hull/BVH и `StepDriver` строятся один раз; ошибка формы или геометрии возвращается с кодом 2 до окна. Runtime заранее формирует sequence 0 с immutable `QuerySnapshot`, затем запускает `PhysicsServer::run_preinitialized` как `rve-physics` в `ModuleHost`. `ScriptThreadConfig` передаёт клиент и initialization в `rve-scripts`; `ScriptHost` получает snapshot и body bindings до `Ready` и до `on_start`. Stop-handler physics thread отправляет Shutdown, а `ModuleHost` join-ит его в обратном порядке запуска при штатном закрытии и ошибках старта.
 
@@ -130,6 +130,26 @@ Scripts thread регистрирует каждый быстрый шаблон
 - Render thread перед `render_frame*` вызывает `set_latency_frame(snapshot.sequence)` в `VulkanBackend::render`.
 - Без handle (Reflex выключен или не поддержан) цикл работает как прежде. Тесты: `reflex_sleep_and_markers_run_in_order_for_the_submitted_sequence`, `reflex_is_not_called_while_scripts_run_in_background`, `scripts_produce_frames_without_a_reflex_handle` (`pipeline.rs`).
 
+## Сеть и rve-server
+
+Сетевой режим включается флагами `rve-player` и `rve-server`. Без флагов мост не создаётся, поток `rve-network` не запускается, и поведение прежнее. Контракт протокола и моста — [[Engine/EngineNetwork]].
+
+- `rve-player`: `--host` запускает listen-server с портом из `[network].port`; `--host-addr <addr:port>` задаёт адрес прослушивания. `--connect <addr:port>` требует `--server-fingerprint <hex>` или `--insecure-no-pin`. `--host` и `--connect` взаимоисключающие. `--server-key` допустим только с хостом, `--password-file` — с хостом или клиентом.
+- `rve-server` (`engine/rve-server`) использует тот же разбор аргументов. Адрес прослушивания задаёт `--bind`, сервер всегда работает как хост. Флаги клиента и `--debug-view` недоступны.
+- Сетевой флаг при `[network].enabled = false` в `project.rveproject` даёт код 2. Ошибка bind и ошибка запуска потока — код 1. Ошибка запуска сетевого моста на потоке скриптов тоже даёт код 1.
+- Пароль берётся из `--password-file` или переменной `RVE_NET_PASSWORD` (контракт — [[Engine/EngineNetwork]]).
+- Два `rve-player` на одной машине требуют `AllowMultipleInstances=true` в bootstrap: singleton lock по `ProjectSettings.id` берёт только player с окном.
+
+Мост подключается до `ScriptHost::start` на потоке скриптов: `on_start` уже видит режим сети. Реализация `WorldSink` — `ScriptNetSink` в `engine/engine-runtime/src/net.rs`; шаги моста вызываются вокруг `update` и применения spawn и despawn (`pipeline.rs`).
+
+### Headless-путь `run_server`
+
+- Окна, renderer, проверка Vulkan-устройства, звуковой вывод (`AudioConfig.output = false`) и instance lock не используются. Проверка требований касается только RAM и CPU. Ошибки уходят в stderr без системного диалога, код выхода 3.
+- Скрипты работают фоновым тиком с частотой `[network].tick_hz` вместо `background_tick_hz`. Снимки для renderer не строятся.
+- Вместо render thread работает ответчик ресурсов (`engine/engine-runtime/src/headless.rs`). Он подтверждает загрузку тяжёлых префабов пустыми данными, чтобы `PrefabReply::Ready` приходил и не было зависания. Это проверяется тестом.
+- Остановка: `--frames N` (число тиков скриптов), строка `quit` на stdin (штатный `Shutdown` без прерывания вызовов), фатальная ошибка потока или Ctrl+C. Ctrl+C завершает процесс без `on_destroy`.
+- Каталог ресурсов: на macOS, если рядом с исполняемым файлом есть `.app` с `Contents/Resources/Engine`, используется он (`server_release_root`); иначе каталог исполняемого файла.
+
 ## Завершение и ошибки
 
 `close_requested` посылает Shutdown scripts и render и задаёт дедлайн закрытия через 2 секунды. При выходе `cleanup` сначала останавливает загрузчик `rve-prefabs` через `ModuleHost::stop_named` и ждёт его не дольше 2 секунд; при timeout поток отсоединяется с предупреждением, и код выхода не меняется: штатное закрытие не считается ошибкой, код 1 даёт только паника потока при `join`. Только после этого останавливается render. `next_wakeup` учитывает этот дедлайн и вне dev-console, а при открытой консоли выбирает более ранний момент repaint или закрытия. Render дожидается Vulkan через уничтожение renderer на своём потоке, помечает `RenderStopped` и вызывает `WindowProxy::request_exit`. Если дедлайн истёк, пока render ещё работает, `update` записывает `поток рендера не завершился после закрытия окна` и завершает оконный цикл. В `exiting` render join-ится только после `RenderStopped`; иначе главный поток ждёт до дедлайна закрытия (ноль времени, если он уже истёк; до 2 секунд при другом выходе), затем при timeout отсоединяет render handle и выставляет код 1. Затем scripts ждут до 2 секунд; после interrupt выполняется ещё одно ограниченное ожидание до 2 секунд, а при timeout поток отсоединяется без `join` и код выхода становится 1. `ModuleHost` останавливает и join-ит оставшиеся модули в обратном порядке; паника потока или stop-handler становится ошибкой запуска/завершения. После этого останавливается `ResourceSystem` и освобождается `InstanceLock`.
@@ -149,7 +169,10 @@ Scripts thread регистрирует каждый быстрый шаблон
 | Файл | Ответственность |
 |---|---|
 | `engine/engine-runtime/src/lib.rs` | `run_player`, layout startup, resources, project lock, hardware check и lifecycle модулей; передача project input settings scripts thread |
-| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames`, dev-only `--debug-view` и usage |
+| `engine/engine-runtime/src/cli.rs` | `--project`, `--scripts`, `--frames`, dev-only `--debug-view`, сетевые флаги `--host`/`--connect` и `--bind` для `rve-server`, usage |
+| `engine/engine-runtime/src/net.rs` | `prepare`, `ScriptNetSink`, `attach`, `tick` | Сетевой план из флагов и проекта, сетевой поток и мост на потоке скриптов |
+| `engine/engine-runtime/src/headless.rs` | `run_resource_responder`, `spawn_quit_listener` | Headless-путь `rve-server`: ответчик ресурсов и команда `quit` |
+| `engine/rve-server/src/main.rs` | — | Бинарник выделенного сервера, вызывает `run_server` |
 | `engine/engine-runtime/src/layout.rs` | release/dev пути и выбор ABI-библиотеки |
 | `engine/engine-runtime/src/activation.rs` | `PendingActivation` и single-instance handshake |
 | `engine/engine-runtime/src/hardware.rs` | чистое решение по device/RAM/CPU требованиям |
@@ -171,7 +194,8 @@ Scripts thread регистрирует каждый быстрый шаблон
 - Pipeline cache приложения использует sanitized `ProjectSettings.name` под пользовательским каталогом кэша; renderer получает bytes до создания и сохраняет данные до Drop в render thread.
 - Renderer создаётся на главном потоке в `init`, затем передаётся render thread. Менять зависимости и поведение upstream-крейтов для runtime не требуется.
 - Поток `rve-audio` запускает звуковой движок с ресурсами проекта и устройством вывода; без устройства звук отключается с предупреждением, игра продолжается. Scripts thread связывает звук с кадром: `AudioBridge::start` после пересчёта матриц и `start` скриптов, `apply` запросов после `update`, `sync_positions` после `build_frame`; в background-режиме позиции не обновляются. См. [[Engine/EngineAudio]].
-- Потоки `rve-network` и `rve-neural` запускаются как отдельные управляемые потоки без доменной работы. `rve-physics` выполняет шаги физики, см. [[Engine/EnginePhysics]].
+- `rve-neural` — управляемый поток без доменной работы. `rve-network` существует только при сетевых флагах и описан в [[Engine/EngineNetwork]]. `rve-physics` выполняет шаги физики, см. [[Engine/EnginePhysics]].
+- Использует `engine-network` для сетевого потока и моста; sandbox сеть не использует.
 
 ## Игровые действия ввода
 

@@ -23,6 +23,7 @@ Parent: [[Index]]
 | `editor/src/autosave.rs` | `AutosaveStore` | Копии несохранённых сцен и их восстановление |
 | `editor/src/assets_fs.rs` | `AssetsDir` | Файловые операции в `Assets/` с проверкой путей |
 | `editor/src/asset_watch.rs` | `AssetWatcher`, `AssetChanges`, `ChangeBatch` | Watcher `Assets/`, классификация путей, debounce и выборочная обработка изменений |
+| `editor/src/play_network.rs` | `PlayNetwork`, `PlayNetworkForm`, `PlayNetworkPlan`, `PlayNetworkMode` | Сетевой Play: выбор Offline/Host/Client, проверка полей и мост к миру сессии |
 | `editor/src/project.rs` | `OpenProject` | Настройки проекта и ресурсы в режиме loose; сохранение назначенных `.camerasettings` |
 | `editor/src/new_project.rs` | `create_project` | Встроенный starter template и атомарное создание нового проекта |
 | `editor/src/previews.rs` | `PreviewCache` | Фоновое декодирование PNG/Radiance HDR, tone mapping HDR thumbnails и LRU-кэш UI-текстур |
@@ -156,6 +157,16 @@ shortcuts W/E/R. `help` и `clear` работают всегда. Остальн
 - Скрытие курсора внутри панели делает egui: при активном захвате, скрытом скриптом курсоре и указателе над Game кадр получает `CursorIcon::None`. Запрос в окно всегда несёт `visible: true`, поэтому не перебивает это скрытие.
 - Источник дельты мыши: при захвате с удержанием (`captured && locked`) и указателе над Scene или Game скрипты получают raw-дельту `DeviceEvent::MouseMotion` через `EditorApp::mouse_motion`, а дельта egui над Game и Scene не добавляется, чтобы не было двойного счёта. Выбор источника один для обоих путей (`PlayCursor::motion_source`), поэтому двойной счёт исключён по построению. Во всех остальных случаях, включая скрытый, но не заблокированный курсор, действует дельта egui над панелью в физических пикселях. Единицы различаются: raw-дельта — точки на macOS (с системным ускорением) и mickeys без ускорения на Windows, как в player; дельта egui — физические пиксели.
 - Stop, пауза, выход из Play и потеря фокуса окна делают условие ложным, и окно получает обычное состояние.
+
+## Сеть в Play
+
+- Компоненты `network_identity` и `network_transform` добавляются и удаляются в Inspector (значки `network-identity` и `network-transform`). Правки идут тем же путём, что у остальных компонентов: проверка `SceneDocument::validate`, undo и prefab overrides. Удаление `network_identity` уносит и `network_transform`.
+- Меню `Network: <режим>` в строке инструментов доступно только вне работающей сессии. Режимы — `Offline`, `Host` (порт, по умолчанию `[network].port` проекта) и `Client` (адрес, отпечаток 64 hex-символа или флаг «Insecure: no pin», пароль). `Host` и `Client` недоступны, пока `[network].enabled` выключен, и подсказка указывает на эту настройку.
+- `PlayNetwork` (`editor/src/play_network.rs`) владеет сетевым потоком, мостом и `WorldSink` сессии, как `PlayAudio`. Мост вызывается в тех же точках шага, что и в runtime: `receive` до `update`, `apply` и `tick` после него. Stop отправляет отключения и дожидается завершения потока.
+- Host генерирует эфемерный ключ сервера и выводит его отпечаток в Console. Клиент вводит этот отпечаток либо подключается с флагом «no pin».
+- Пароль живёт только в полях формы и сессии. В настройки редактора, layout и проект он не записывается и в отладочный вывод не попадает.
+- Пауза Play пропускает шаг сети целиком: мост не получает и не отправляет сообщения. Поток `rve-network` при этом продолжает работать, поэтому таймауты пиров могут сработать во время паузы.
+- Хэш сцены для проверки версии считается от текущего документа редактора, возможно несохранённого (см. [[Engine/EngineNetwork]]).
 
 ## Аниматор и превью
 
