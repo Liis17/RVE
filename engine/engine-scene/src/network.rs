@@ -135,9 +135,9 @@ pub struct NetworkIdentityComponent {
 }
 
 const DEFAULT_SEND_RATE_HZ: u32 = 20;
-const MAX_SEND_RATE_HZ: u32 = 60;
+pub const MAX_SEND_RATE_HZ: u32 = 60;
 const DEFAULT_INTERPOLATION_DELAY_MS: u32 = 100;
-const MAX_INTERPOLATION_DELAY_MS: u32 = 1000;
+pub const MAX_INTERPOLATION_DELAY_MS: u32 = 1000;
 const DEFAULT_SNAP_DISTANCE: f32 = 5.0;
 
 /// Синхронизация локальной трансформации объекта: `[objects.network_transform]`.

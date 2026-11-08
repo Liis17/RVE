@@ -24,9 +24,9 @@ pub use audio::{
 };
 pub use light::ShadowSettings;
 pub use network::{
-    MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetAuthority, NetEvent,
-    NetId, NetMode, NetRequest, NetTarget, NetworkIdentityComponent, NetworkTransformComponent,
-    PeerId, SERVER_PEER_ID, scene_net_id,
+    MAX_INTERPOLATION_DELAY_MS, MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES,
+    MAX_SEND_RATE_HZ, NetAuthority, NetEvent, NetId, NetMode, NetRequest, NetTarget,
+    NetworkIdentityComponent, NetworkTransformComponent, PeerId, SERVER_PEER_ID, scene_net_id,
 };
 pub use particles::{
     MAX_ADDITIVE_PARTICLE_CAPACITY, MAX_ALPHA_PARTICLE_CAPACITY, ParticleBlendMode,
