@@ -1037,10 +1037,14 @@ fn object_table(
                 return Ok(Value::Nil);
             }
             let settings = with_active_call(&camera_settings_active, |transaction| {
-                Ok(transaction.camera_settings(handle))
+                Ok(transaction
+                    .camera_settings(handle)
+                    .zip(transaction.post_process(handle)))
             })?;
             match settings {
-                Some(settings) => Ok(Value::Table(camera_settings_table(lua, settings)?)),
+                Some((settings, post)) => {
+                    Ok(Value::Table(camera_settings_table(lua, settings, post)?))
+                }
                 None => Ok(Value::Nil),
             }
         })?,
@@ -2465,7 +2469,13 @@ fn optional_samples(table: &Table, key: &str, destination: &mut u32) -> mlua::Re
     }
 }
 
-fn camera_settings_table(lua: &Lua, settings: CameraSettings) -> mlua::Result<Table> {
+/// Таблица камеры для `object:get_camera_settings()`. Блок `color` — устаревший прокси: exposure и
+/// tonemapper читаются из эффективной постобработки камеры.
+fn camera_settings_table(
+    lua: &Lua,
+    settings: CameraSettings,
+    post: PostProcessSettings,
+) -> mlua::Result<Table> {
     let result = lua.create_table()?;
     let projection = lua.create_table()?;
     projection.set("fov_deg", settings.projection.fov_deg as f64)?;
@@ -2492,12 +2502,11 @@ fn camera_settings_table(lua: &Lua, settings: CameraSettings) -> mlua::Result<Ta
     )?;
     result.set("render", render)?;
 
-    let color_settings = settings.color.unwrap_or_default();
     let color = lua.create_table()?;
-    color.set("exposure_ev", color_settings.exposure_ev as f64)?;
+    color.set("exposure_ev", post.exposure.ev as f64)?;
     color.set(
         "tonemapper",
-        match color_settings.tonemapper {
+        match post.tonemapping.tonemapper {
             Tonemapper::Aces => "aces",
             Tonemapper::Neutral => "neutral",
             Tonemapper::None => "none",

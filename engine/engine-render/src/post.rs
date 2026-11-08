@@ -578,15 +578,6 @@ pub fn composite_params(
 
 /// Число бинов гистограммы экспозиции (совпадает с exposure_histogram.wgsl).
 pub const EXPOSURE_BINS: usize = 256;
-/// Диапазон log2-яркости гистограммы и log2 средней серой нужны только CPU-зеркалам ниже,
-/// которые проверяют формулы шейдеров; сами шейдеры хранят эти значения у себя.
-#[cfg(test)]
-const EXPOSURE_MIN_LOG2: f32 = -10.0;
-#[cfg(test)]
-const EXPOSURE_MAX_LOG2: f32 = 4.0;
-#[cfg(test)]
-const EXPOSURE_KEY_LOG2: f32 = -2.473_931_2;
-
 /// Push constants усредняющего прохода экспозиции: тайминг и диапазон адаптации.
 /// Раскладка: timing = (dt, скорость роста, скорость падения, snap); range = (min, max, low, high).
 #[repr(C)]
@@ -630,62 +621,6 @@ pub fn exposure_average_params(
     }
 }
 
-/// CPU-зеркало `exposure_average.comp`: целевой EV по средней log2-яркости между перцентилями.
-/// Пустая гистограмма даёт средний серый, то есть 0 EV до ограничения диапазона.
-#[cfg(test)]
-fn target_exposure(
-    histogram: &[u32; EXPOSURE_BINS],
-    low_fraction: f32,
-    high_fraction: f32,
-    min_ev: f32,
-    max_ev: f32,
-) -> f32 {
-    let total: f64 = histogram.iter().map(|count| f64::from(*count)).sum();
-    let low = total * f64::from(low_fraction);
-    let high = total * f64::from(high_fraction);
-    let mut before = 0.0_f64;
-    let mut weight_sum = 0.0_f64;
-    let mut weighted_log = 0.0_f64;
-    let bin_width = f64::from(EXPOSURE_MAX_LOG2 - EXPOSURE_MIN_LOG2) / EXPOSURE_BINS as f64;
-    for (index, count) in histogram.iter().enumerate() {
-        let after = before + f64::from(*count);
-        let weight = (after.min(high) - before.max(low)).max(0.0);
-        let bin_log = f64::from(EXPOSURE_MIN_LOG2) + (index as f64 + 0.5) * bin_width;
-        weight_sum += weight;
-        weighted_log += weight * bin_log;
-        before = after;
-    }
-    let average_log = if weight_sum > 0.0 {
-        weighted_log / weight_sum
-    } else {
-        f64::from(EXPOSURE_KEY_LOG2)
-    };
-    (f64::from(EXPOSURE_KEY_LOG2) - average_log).clamp(f64::from(min_ev), f64::from(max_ev)) as f32
-}
-
-/// CPU-зеркало адаптации из `exposure_average.comp`: экспоненциальное приближение к цели.
-/// Скорость роста применяется, когда цель выше текущего EV, иначе — скорость падения.
-#[cfg(test)]
-fn adapt_exposure(
-    current: f32,
-    target: f32,
-    frame_delta_ms: f32,
-    speed_up: f32,
-    speed_down: f32,
-    snap: bool,
-) -> f32 {
-    if snap {
-        return target;
-    }
-    let speed = if target > current {
-        speed_up
-    } else {
-        speed_down
-    };
-    let alpha = 1.0 - (-(frame_delta_ms.max(0.0) / 1000.0) * speed).exp();
-    current + (target - current) * alpha
-}
-
 /// Высота полнокадрового сенсора в метрах: CoC переводится в пиксели по этой высоте.
 const SENSOR_HEIGHT_M: f32 = 0.024;
 
@@ -709,19 +644,6 @@ pub fn motion_parameters(motion: &MotionBlur) -> [f32; 4] {
         motion.samples as f32,
         0.0,
     ]
-}
-
-/// CPU-зеркало `dof.frag`: радиус размытия в пикселях для линейной глубины `z`.
-#[cfg(test)]
-fn coc_radius_px(z: f32, parameters: [f32; 4]) -> f32 {
-    let [focus, scale, max_px, _] = parameters;
-    (scale * (z - focus).abs() / z.max(1e-4)).min(max_px)
-}
-
-/// CPU-зеркало линеаризации глубины из `dof.frag` для стандартной проекции Vulkan `[0, 1]`.
-#[cfg(test)]
-fn linear_depth(depth: f32, near: f32, far: f32) -> f32 {
-    near * far / (far - depth * (far - near))
 }
 
 /// Число направлений и шагов поиска горизонта для качества AO.
@@ -1033,69 +955,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_histogram_targets_the_middle_grey_exposure() {
-        let histogram = [0_u32; EXPOSURE_BINS];
-        assert_eq!(target_exposure(&histogram, 0.1, 0.9, -16.0, 16.0), 0.0);
-    }
-
-    #[test]
-    fn target_follows_the_average_log_luminance_and_respects_the_range() {
-        // Все пиксели в одном бине около log2 яркости 1.0: цель приводит её к среднему серому.
-        let mut histogram = [0_u32; EXPOSURE_BINS];
-        let bin = ((1.0 - EXPOSURE_MIN_LOG2) / (EXPOSURE_MAX_LOG2 - EXPOSURE_MIN_LOG2)
-            * EXPOSURE_BINS as f32) as usize;
-        histogram[bin] = 1000;
-        let target = target_exposure(&histogram, 0.1, 0.9, -16.0, 16.0);
-        assert!(
-            (target - (EXPOSURE_KEY_LOG2 - 1.0)).abs() < 0.05,
-            "{target}"
-        );
-        assert_eq!(target_exposure(&histogram, 0.1, 0.9, -0.5, 16.0), -0.5);
-    }
-
-    #[test]
-    fn percentiles_ignore_samples_outside_the_requested_window() {
-        // Половина пикселей очень тёмные, половина очень яркие; окно 50–100 берёт только яркие.
-        let mut histogram = [0_u32; EXPOSURE_BINS];
-        histogram[0] = 1000;
-        histogram[EXPOSURE_BINS - 1] = 1000;
-        let bright_only = target_exposure(&histogram, 0.5, 1.0, -16.0, 16.0);
-        let bright_expected = target_exposure(
-            &{
-                let mut only = [0_u32; EXPOSURE_BINS];
-                only[EXPOSURE_BINS - 1] = 1000;
-                only
-            },
-            0.0,
-            1.0,
-            -16.0,
-            16.0,
-        );
-        assert!(
-            (bright_only - bright_expected).abs() < 0.05,
-            "{bright_only} vs {bright_expected}"
-        );
-    }
-
-    #[test]
-    fn adaptation_snaps_on_request_and_holds_without_elapsed_time() {
-        assert_eq!(adapt_exposure(0.0, 2.0, 16.0, 3.0, 1.0, true), 2.0);
-        assert_eq!(adapt_exposure(0.5, 2.0, 0.0, 3.0, 1.0, false), 0.5);
-    }
-
-    #[test]
-    fn adaptation_brightening_is_faster_than_darkening_and_never_overshoots() {
-        let up = adapt_exposure(0.0, 2.0, 100.0, 3.0, 1.0, false) - 0.0;
-        let down = 0.0 - adapt_exposure(0.0, -2.0, 100.0, 3.0, 1.0, false);
-        assert!(up > down, "up {up} down {down}");
-        let after_long_time = adapt_exposure(0.0, 2.0, 60_000.0, 3.0, 1.0, false);
-        assert!(
-            after_long_time <= 2.0 && after_long_time > 1.99,
-            "{after_long_time}"
-        );
-    }
-
-    #[test]
     fn average_params_convert_percentages_and_mark_snap() {
         let exposure = Exposure {
             speed_up: 2.5,
@@ -1133,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn circle_of_confusion_is_zero_at_focus_and_grows_with_distance_up_to_the_cap() {
+    fn dof_parameters_pack_focus_cap_and_a_zero_reserve() {
         let dof = DepthOfField {
             enabled: true,
             focus_distance: 10.0,
@@ -1141,44 +1000,33 @@ mod tests {
             ..DepthOfField::default()
         };
         let parameters = dof_parameters(&dof, 1080.0);
-        assert!(coc_radius_px(10.0, parameters).abs() < 1e-4);
-        let near = coc_radius_px(5.0, parameters);
-        let far = coc_radius_px(20.0, parameters);
-        assert!(near > 0.0 && far > 0.0, "{near} {far}");
-        assert!(coc_radius_px(10_000.0, parameters) <= 20.0 + 1e-4);
-        // Вдвое выше разрешение — вдвое больше пиксельный радиус.
-        let doubled = dof_parameters(&dof, 2160.0);
-        assert!((coc_radius_px(5.0, doubled) - 2.0 * near).abs() < 1e-3);
+        assert_eq!(parameters[0], 10.0);
+        assert_eq!(parameters[2], 20.0);
+        assert_eq!(parameters[3], 0.0);
+        assert!(parameters[1] > 0.0);
     }
 
     #[test]
-    fn wider_aperture_and_longer_focal_length_increase_blur() {
+    fn dof_scale_follows_image_height_aperture_and_focal_length() {
         let base_dof = DepthOfField {
             focus_distance: 10.0,
             max_blur_px: 1e6,
             ..DepthOfField::default()
         };
-        let base = coc_radius_px(4.0, dof_parameters(&base_dof, 1080.0));
+        let base = dof_parameters(&base_dof, 1080.0)[1];
+        // Вдвое выше разрешение — вдвое больший масштаб в пикселях.
+        assert!((dof_parameters(&base_dof, 2160.0)[1] - 2.0 * base).abs() < 1e-3 * base);
+        // Вдвое меньшее число диафрагмы — вдвое больший масштаб.
         let wider = DepthOfField {
             aperture: base_dof.aperture / 2.0,
             ..base_dof
         };
-        assert!(coc_radius_px(4.0, dof_parameters(&wider, 1080.0)) > base);
+        assert!((dof_parameters(&wider, 1080.0)[1] - 2.0 * base).abs() < 1e-3 * base);
         let longer = DepthOfField {
             focal_length_mm: base_dof.focal_length_mm * 2.0,
             ..base_dof
         };
-        assert!(coc_radius_px(4.0, dof_parameters(&longer, 1080.0)) > base);
-    }
-
-    #[test]
-    fn linear_depth_inverts_the_standard_vulkan_projection() {
-        let (near, far) = (0.1_f32, 1000.0_f32);
-        for z in [0.5_f32, 4.0, 250.0] {
-            // Стандартная проекция [0, 1]: depth = far * (z - near) / (z * (far - near)).
-            let depth = far * (z - near) / (z * (far - near));
-            assert!((linear_depth(depth, near, far) - z).abs() / z < 1e-4, "{z}");
-        }
+        assert!(dof_parameters(&longer, 1080.0)[1] > base);
     }
 
     #[test]

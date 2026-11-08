@@ -960,20 +960,16 @@ impl ScriptTransaction {
         if !self.writable || !self.is_camera(handle) {
             return false;
         }
-        // Устаревший блок [color] — прокси к постобработке. Пишутся только поля, которые
-        // изменились относительно текущих настроек камеры: иначе чтение и запись без изменений
-        // затёрли бы значения из `.postprocess`. Порядок вызовов сохраняется, потому что обе
-        // операции обновляют одну и ту же копию постобработки в очереди.
-        if let Some(color) = settings.color {
-            let current = self
-                .camera_settings(handle)
-                .and_then(|current| current.color)
-                .unwrap_or_default();
-            let exposure_changed = color.exposure_ev != current.exposure_ev;
-            let tonemapper_changed = color.tonemapper != current.tonemapper;
-            if (exposure_changed || tonemapper_changed)
-                && let Some(mut post) = self.post_process(handle)
-            {
+        // Устаревший блок [color] — прокси к эффективной постобработке камеры. Изменение
+        // сравнивается с текущим эффективным значением (с учётом уже поставленной в очередь
+        // копии), поэтому запись без изменений не затирает `.postprocess`, а порядок вызовов с
+        // set_post_process сохраняется: обе операции обновляют одну и ту же очередь.
+        if let Some(color) = settings.color
+            && let Some(mut post) = self.post_process(handle)
+        {
+            let exposure_changed = color.exposure_ev != post.exposure.ev;
+            let tonemapper_changed = color.tonemapper != post.tonemapping.tonemapper;
+            if exposure_changed || tonemapper_changed {
                 if exposure_changed {
                     post.exposure.ev = color.exposure_ev;
                 }

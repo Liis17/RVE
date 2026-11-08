@@ -692,8 +692,11 @@ unsafe extern "C" fn host_get_camera_settings(
         let Some(settings) = context.transaction.camera_settings(handle) else {
             return false;
         };
+        let Some(post) = context.transaction.post_process(handle) else {
+            return false;
+        };
         // SAFETY: output was checked and points to the guest's writable stack slot.
-        unsafe { *out = camera_settings_to_abi(settings) };
+        unsafe { *out = camera_settings_to_abi(settings, post) };
         true
     })
 }
@@ -1669,15 +1672,19 @@ unsafe extern "C" fn host_unregister_command(ctx: *mut c_void, name: RveStr) -> 
     })
 }
 
-fn camera_settings_to_abi(settings: CameraSettings) -> RveCameraSettings {
-    let color = settings.color.unwrap_or_default();
+/// Прокси устаревшего `[color]` для `get_camera_settings`: exposure и tonemapper берутся из
+/// эффективной постобработки камеры, а не из блока `[color]` файла `.camerasettings`.
+fn camera_settings_to_abi(
+    settings: CameraSettings,
+    post: PostProcessSettings,
+) -> RveCameraSettings {
     RveCameraSettings {
         fov_deg: settings.projection.fov_deg,
         near: settings.projection.near,
         far: settings.projection.far,
         render_scale: settings.render.render_scale,
         clear_color: settings.render.clear_color,
-        exposure_ev: color.exposure_ev,
+        exposure_ev: post.exposure.ev,
         anti_aliasing: match settings.render.anti_aliasing {
             AntiAliasing::Fxaa => RVE_ANTI_ALIASING_FXAA,
             AntiAliasing::None => RVE_ANTI_ALIASING_NONE,
@@ -1685,7 +1692,7 @@ fn camera_settings_to_abi(settings: CameraSettings) -> RveCameraSettings {
             AntiAliasing::Fsr => RVE_ANTI_ALIASING_FSR,
             AntiAliasing::Dlss => RVE_ANTI_ALIASING_DLSS,
         },
-        tonemapper: match color.tonemapper {
+        tonemapper: match post.tonemapping.tonemapper {
             Tonemapper::Aces => RVE_TONEMAPPER_ACES,
             Tonemapper::Neutral => RVE_TONEMAPPER_NEUTRAL,
             Tonemapper::None => RVE_TONEMAPPER_NONE,
@@ -2592,6 +2599,85 @@ mod tests {
         }
         drop(context);
         assert!(transaction.post_process(world.active_camera()).is_some());
+    }
+
+    #[test]
+    fn legacy_color_proxies_read_and_write_the_effective_post_process_in_call_order() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let camera = world.active_camera();
+        let mut file_post = PostProcessSettings::default();
+        file_post.exposure.ev = 2.0;
+        world.set_post_process(camera, file_post).unwrap();
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        transaction.begin(ScriptTransactionInit {
+            world: &world,
+            self_object: Some(camera),
+            source: "scene/camera/Probe",
+            writable: true,
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
+            queued_messages: (0, 0),
+            queued_audio: 0,
+            queued_animation: 0,
+            physics: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::physics::PhysicsScriptState::default(),
+            )),
+            physics_phase_dt: None,
+            lifecycle: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::lifecycle::Lifecycle::default(),
+            )),
+            lifecycle_writes: true,
+            instance_serial: 0,
+            cursor: ScriptCursor::default(),
+        });
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+        let host = context.host(ScriptTime::default());
+        let get = host.get_camera_settings.unwrap();
+        let set_camera = host.set_camera_settings.unwrap();
+        let set_post = host.set_post_process.unwrap();
+        let camera_handle = 1;
+        let read_exposure = || {
+            let mut actual = RveCameraSettings::default();
+            // SAFETY: the host context and output slot remain live through the call.
+            unsafe { assert!(get(host.ctx, camera_handle, &mut actual)) };
+            actual.exposure_ev
+        };
+        // Legacy get берёт EV из .postprocess, а не из пустого [color].
+        assert_eq!(read_exposure(), 2.0);
+
+        // Legacy set меняет эффективную экспозицию, а не только устаревший блок.
+        let legacy_zero = RveCameraSettings {
+            exposure_ev: 0.0,
+            ..RveCameraSettings::default()
+        };
+        // SAFETY: the settings pointer remains live through the call.
+        unsafe { assert!(set_camera(host.ctx, camera_handle, &legacy_zero)) };
+        assert_eq!(read_exposure(), 0.0);
+
+        // Порядок: set_post_process после legacy set побеждает, поскольку пишет ту же копию.
+        let mut later = post_process_to_abi(PostProcessSettings::default());
+        later.exposure_ev = 3.0;
+        // SAFETY: the post process pointer remains live through the call.
+        unsafe { assert!(set_post(host.ctx, camera_handle, &later)) };
+        assert_eq!(read_exposure(), 3.0);
+
+        // Порядок: legacy set после set_post_process побеждает.
+        // SAFETY: the settings pointer remains live through the call.
+        let legacy_one = RveCameraSettings {
+            exposure_ev: 1.0,
+            ..RveCameraSettings::default()
+        };
+        unsafe { assert!(set_camera(host.ctx, camera_handle, &legacy_one)) };
+        assert_eq!(read_exposure(), 1.0);
+        drop(context);
+        assert_eq!(transaction.post_process(camera).unwrap().exposure.ev, 1.0);
     }
 
     #[test]
