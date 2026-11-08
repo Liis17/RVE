@@ -351,3 +351,278 @@ mod tests {
         assert_eq!(error, "RVE_NET_PASSWORD: пароль пуст");
     }
 }
+
+#[cfg(test)]
+mod flow_tests {
+    //! Порядок кадра как в `pipeline.rs`: сеть, скрипты, запросы, мировые изменения, шаг сети.
+    //! Сообщения ходят в памяти, но байты кодируются как в сети. Сокет и рукопожатие проверяют
+    //! тесты engine-network.
+
+    use super::ScriptNetSink;
+    use engine_files::VirtualPath;
+    use engine_network::{
+        BridgeConfig, Channel, NetError, NetLink, NetworkBridge, NetworkEvent, SpawnedRoot,
+    };
+    use engine_scene::network::{NetMode, NetTarget, PeerId, SERVER_PEER_ID};
+    use engine_scene::{PrefabTemplate, SceneDocument, World};
+    use engine_script::{
+        PrefabCatalog, PrefabKind, PrefabSpec, ScriptHost, ScriptLoadOptions, ScriptTime,
+    };
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const CLIENT: PeerId = 1;
+    const PREFAB: &str = "prefabs/crate.rveprefab";
+    const PREFAB_TEXT: &str = "[[objects]]\nid = \"root\"\n[objects.network_identity]\n";
+    const SCENE: &str = "[[assets]]\npath = \"/player.lua\"\n\
+[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+[[objects]]\nid = \"player\"\n[[objects.lite_scripts]]\npath = \"/player.lua\"\n";
+    /// Один скрипт на обоих участниках: сервер спавнит, шлёт сообщение и через кадр удаляет объект.
+    const PLAYER: &str = r#"
+local Script = {}
+local frames = 0
+function Script:on_update(dt)
+  frames = frames + 1
+  if rve.net.is_server() then
+    if frames == 1 then
+      rve.spawn("prefabs/crate.rveprefab", { id = "crate" })
+      rve.net.send("all", "hello", 7)
+    elseif frames == 5 then
+      rve.destroy("crate")
+    end
+  end
+end
+function Script:on_net_message(peer, name, value)
+  rve.log_info("net " .. peer .. " " .. name)
+end
+return Script
+"#;
+
+    /// Очереди участников: сервер читает `server`, клиент — `client`.
+    #[derive(Default)]
+    struct Wire {
+        server: Vec<NetworkEvent>,
+        client: Vec<NetworkEvent>,
+    }
+
+    struct ServerLink(Rc<RefCell<Wire>>);
+    struct ClientLink(Rc<RefCell<Wire>>);
+
+    impl NetLink for ServerLink {
+        fn send(&self, target: NetTarget, channel: Channel, bytes: &[u8]) -> Result<(), NetError> {
+            if matches!(target, NetTarget::All | NetTarget::Peer(CLIENT)) {
+                self.0.borrow_mut().client.push(NetworkEvent::Message {
+                    peer: SERVER_PEER_ID,
+                    channel,
+                    bytes: bytes.to_vec(),
+                });
+            }
+            Ok(())
+        }
+
+        fn disconnect(&self, _peer: PeerId, _reason: &str) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn poll_events(&self) -> Vec<NetworkEvent> {
+            std::mem::take(&mut self.0.borrow_mut().server)
+        }
+    }
+
+    impl NetLink for ClientLink {
+        fn send(&self, target: NetTarget, channel: Channel, bytes: &[u8]) -> Result<(), NetError> {
+            if target == NetTarget::Server {
+                self.0.borrow_mut().server.push(NetworkEvent::Message {
+                    peer: CLIENT,
+                    channel,
+                    bytes: bytes.to_vec(),
+                });
+            }
+            Ok(())
+        }
+
+        fn disconnect(&self, _peer: PeerId, _reason: &str) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn poll_events(&self) -> Vec<NetworkEvent> {
+            std::mem::take(&mut self.0.borrow_mut().client)
+        }
+    }
+
+    fn prefab_template() -> Arc<PrefabTemplate> {
+        let path = VirtualPath::parse(PREFAB).unwrap();
+        let mut read = |_: &VirtualPath| -> Result<String, String> { Ok(PREFAB_TEXT.to_owned()) };
+        Arc::new(PrefabTemplate::load(&path, &mut read).unwrap())
+    }
+
+    /// Участник: мир, скрипты и мост. Кадр — тот же порядок вызовов, что в `pipeline.rs`.
+    struct Node<L: NetLink> {
+        bridge: NetworkBridge<L>,
+        world: World,
+        scripts: ScriptHost,
+        frame: u64,
+        base: Instant,
+    }
+
+    impl<L: NetLink> Node<L> {
+        fn new(link: L, mode: NetMode, base: Instant) -> Self {
+            let document = SceneDocument::parse("test.rvescene", SCENE).unwrap();
+            let mut world = World::from_document(&document).unwrap();
+            let sources = BTreeMap::from([("player.lua".to_owned(), PLAYER.to_owned())]);
+            let mut prefabs = PrefabCatalog::default();
+            prefabs.insert(
+                PREFAB,
+                PrefabSpec {
+                    kind: PrefabKind::Fast,
+                    max_instances: None,
+                },
+            );
+            let mut scripts = ScriptHost::load_with_options(
+                &world,
+                "scene",
+                &sources,
+                None,
+                ScriptLoadOptions {
+                    prefabs,
+                    ..ScriptLoadOptions::default()
+                },
+            )
+            .unwrap();
+            scripts
+                .register_prefab(&world, PREFAB, prefab_template(), &BTreeMap::new())
+                .unwrap();
+            // Мост подключается до старта скриптов, как в `pipeline.rs`: `on_start` видит режим сети.
+            let bridge = NetworkBridge::attach(
+                link,
+                BridgeConfig { mode, tick_hz: 30 },
+                &mut world,
+                &mut ScriptNetSink::new(&mut scripts),
+                base,
+            )
+            .unwrap();
+            scripts.start(
+                &mut world,
+                ScriptTime {
+                    elapsed: 0.0,
+                    frame: 0,
+                },
+            );
+            Self {
+                bridge,
+                world,
+                scripts,
+                frame: 0,
+                base,
+            }
+        }
+
+        fn frame(&mut self) {
+            self.frame += 1;
+            let now = self.base + Duration::from_millis(16 * self.frame);
+            let time = ScriptTime {
+                elapsed: self.frame as f64 / 60.0,
+                frame: self.frame,
+            };
+            self.bridge.receive(
+                &mut self.world,
+                &mut ScriptNetSink::new(&mut self.scripts),
+                now,
+            );
+            self.scripts.update(&mut self.world, 1.0 / 60.0, time);
+            let requests = self.scripts.drain_network_requests();
+            self.bridge.apply(
+                requests,
+                &mut self.world,
+                &mut ScriptNetSink::new(&mut self.scripts),
+            );
+            // Мировые изменения физики, GPU и аудио здесь не нужны: spawn и despawn уже выполнил хост.
+            let roots: Vec<SpawnedRoot> = self
+                .scripts
+                .drain_world_changes()
+                .spawned
+                .into_iter()
+                .map(|spawned| SpawnedRoot {
+                    handle: spawned.handle,
+                    prefab: spawned.prefab,
+                })
+                .collect();
+            self.bridge.tick(
+                &mut self.world,
+                &mut ScriptNetSink::new(&mut self.scripts),
+                &roots,
+                now,
+            );
+        }
+    }
+
+    struct Session {
+        server: Node<ServerLink>,
+        client: Node<ClientLink>,
+        /// Строки журнала клиентских скриптов по порядку.
+        logs: Vec<String>,
+    }
+
+    impl Session {
+        fn new() -> Self {
+            let wire = Rc::new(RefCell::new(Wire::default()));
+            {
+                let mut wire = wire.borrow_mut();
+                wire.server.push(NetworkEvent::Connected { peer: CLIENT });
+                wire.client.push(NetworkEvent::LocalPeer { peer: CLIENT });
+                wire.client.push(NetworkEvent::Connected {
+                    peer: SERVER_PEER_ID,
+                });
+            }
+            let base = Instant::now();
+            Self {
+                server: Node::new(ServerLink(wire.clone()), NetMode::Server, base),
+                client: Node::new(ClientLink(wire), NetMode::Client, base),
+                logs: Vec::new(),
+            }
+        }
+
+        fn run(&mut self, frames: usize) {
+            for _ in 0..frames {
+                self.server.frame();
+                self.client.frame();
+                let events = self.client.scripts.drain_events();
+                self.logs
+                    .extend(events.into_iter().map(|event| event.message));
+            }
+        }
+
+        fn client_has_crate(&self) -> bool {
+            self.client
+                .world
+                .objects()
+                .iter()
+                .any(|object| object.id.ends_with("-crate"))
+        }
+    }
+
+    #[test]
+    fn spawn_message_and_despawn_flow_through_the_script_host_and_the_bridge() {
+        let mut session = Session::new();
+        session.run(3);
+        assert!(
+            session.client_has_crate(),
+            "серверный spawn создан у клиента"
+        );
+        assert!(
+            session.logs.iter().any(|line| line == "net 0 hello"),
+            "{:?}",
+            session.logs
+        );
+
+        session.run(6);
+        assert!(
+            !session.client_has_crate(),
+            "серверный despawn дошёл до клиента"
+        );
+        assert!(session.server.world.handle("crate").is_none());
+    }
+}
