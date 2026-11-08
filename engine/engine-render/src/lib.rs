@@ -1132,6 +1132,8 @@ pub struct Renderer {
     post_descriptor_pool: Option<vk::DescriptorPool>,
     frame_uniforms: Vec<FrameUniforms>,
     sampler: Option<vk::Sampler>,
+    /// Нулевой user-UBO, общий для материалов без шейдера; живёт, пока есть материалы, и уходит с renderer.
+    builtin_user_uniform: Option<Arc<HostBuffer>>,
     post_sampler: Option<vk::Sampler>,
     shadow_sampler: Option<vk::Sampler>,
     environment_sampler: Option<vk::Sampler>,
@@ -1274,6 +1276,7 @@ impl Renderer {
             post_descriptor_pool: None,
             frame_uniforms: Vec::new(),
             sampler: None,
+            builtin_user_uniform: None,
             post_sampler: None,
             shadow_sampler: None,
             environment_sampler: None,
@@ -4772,6 +4775,14 @@ impl Renderer {
             .max_lod(0.0);
         // SAFETY: the post sampler uses core linear filtering and clamp-to-edge addressing.
         self.post_sampler = Some(unsafe { device.create_sampler(&post_sampler_info, None) }?);
+        let builtin_user_uniform = HostBuffer::new(
+            self.instance()?,
+            &device,
+            self.physical_device,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &user_material_uniform_bytes(&Material::default()),
+        )?;
+        self.builtin_user_uniform = Some(Arc::new(builtin_user_uniform));
 
         let shadow_image = self
             .shadow_image
@@ -5821,13 +5832,16 @@ impl Renderer {
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &material_uniform_bytes(material),
         )?;
-        let user_uniform_buffer = HostBuffer::new(
-            self.instance()?,
-            device,
-            self.physical_device,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            &user_material_uniform_bytes(material),
-        )?;
+        let user_uniform_buffer = match &self.builtin_user_uniform {
+            Some(shared) if uses_shared_user_uniform(material) => Arc::clone(shared),
+            _ => Arc::new(HostBuffer::new(
+                self.instance()?,
+                device,
+                self.physical_device,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                &user_material_uniform_bytes(material),
+            )?),
+        };
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
@@ -7191,6 +7205,7 @@ impl Drop for Renderer {
         }
         self.meshes.clear();
         self.materials.clear();
+        self.builtin_user_uniform.take();
         self.surface_shaders.clear();
         self.textures.clear();
         if let Some(device) = self.device.as_ref() {
@@ -13071,7 +13086,7 @@ struct GpuMaterial {
     set: vk::DescriptorSet,
     double_sided: bool,
     _uniform_buffer: HostBuffer,
-    _user_uniform_buffer: HostBuffer,
+    _user_uniform_buffer: Arc<HostBuffer>,
     _textures: [Arc<Texture>; 5],
     _user_textures: [Arc<Texture>; 8],
     alpha_mode: AlphaMode,
@@ -13898,6 +13913,11 @@ fn material_uniform_bytes(material: &Material) -> [u8; MATERIAL_UNIFORMS_SIZE] {
         alpha_mode,
         material.occlusion_strength,
     ])
+}
+
+/// Материал без шейдера с нулевыми user-значениями читает общий нулевой буфер вместо собственного.
+fn uses_shared_user_uniform(material: &Material) -> bool {
+    material.shader.is_none() && material.user_values == [[0.0; 4]; 16]
 }
 
 fn user_material_uniform_bytes(material: &Material) -> [u8; USER_MATERIAL_UNIFORMS_SIZE] {
@@ -17310,6 +17330,20 @@ mod tests {
             floats(&super::user_material_uniform_bytes(&Material::default())),
             [0.0; 64]
         );
+    }
+
+    #[test]
+    fn only_builtin_materials_with_zero_user_values_share_the_user_uniform() {
+        let builtin = Material::default();
+        assert!(super::uses_shared_user_uniform(&builtin));
+        let mut with_values = Material::default();
+        with_values.user_values[0] = [0.5, 0.0, 0.0, 0.0];
+        assert!(!super::uses_shared_user_uniform(&with_values));
+        let custom = Material {
+            shader: Some(super::ShaderId(0)),
+            ..Material::default()
+        };
+        assert!(!super::uses_shared_user_uniform(&custom));
     }
 
     #[test]

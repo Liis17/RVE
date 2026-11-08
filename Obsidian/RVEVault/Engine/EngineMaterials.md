@@ -22,7 +22,7 @@ engine-scene задаёт форматы .rvemat и .rveshader без завис
 
 Файл — строгий TOML-документ с необязательным shader, alpha_mode (opaque, mask, blend), alpha_cutoff (конечный [0, 1], default 0.5), double_sided (default false) и таблицей [properties]. Без shader применяется встроенная Lit schema renderer. Значения свойств — конечное число, массив из 2–4 конечных чисел либо строка с canonical virtual path. Некорректные TOML, диапазоны и virtual paths дают MaterialAssetError с путём и, когда доступно, строкой.
 
-Встроенная Lit schema предоставляет base_color, metallic, roughness, emissive, opacity, normal_scale, occlusion_strength и карты base_color_texture, metallic_roughness_texture, normal_texture, emissive_texture, occlusion_texture. Цветовые данные используют sRGB, карты параметров — linear. Для выбранной schema отсутствующее или несовместимое значение получает объявленный default и предупреждение; ключи, которых нет в schema, сохраняются при редактировании, но не влияют на результат и тоже предупреждаются.
+Встроенная Lit schema предоставляет base_color, metallic, roughness, emissive, opacity, normal_scale, occlusion_strength и карты base_color_texture, metallic_roughness_texture, normal_texture, emissive_texture, occlusion_texture. Цветовые данные используют sRGB, карты параметров — linear. Для выбранной schema отсутствующее значение получает объявленный default без предупреждения, несовместимое — default и предупреждение; ключи, которых нет в schema, сохраняются при редактировании, но не влияют на результат и тоже предупреждаются.
 
 При назначении слота Lit .rvemat задаёт материал вместо FBX material этой части. Затем применяется MeshRenderer.texture как замена base-color, затем заданные поля legacy MeshRenderer.material. Если слот пуст, сохраняется FBX material и тот же texture/override порядок. Пользовательский shader применяет только объявленные properties; legacy MeshRenderer.texture и MeshRenderer.material к нему не применяются.
 
@@ -36,9 +36,9 @@ MaterialAsset::dependencies() возвращает уникальные пути
 - type — float, vec2, vec3, vec4, color или texture; default, min и max задают default и диапазон чисел;
 - texture property может задавать color_space (srgb/linear), fallback (white/black/normal) и путь default texture.
 
-Поддерживаются до 16 числовых и 8 texture properties. Их независимые слоты назначаются в порядке объявления. Имена проверяются на дубли, зарезервированные идентификаторы и GLSL validity; texture-specific поля запрещены у числовых свойств.
+Поддерживаются до 16 числовых и 8 texture properties. Их независимые слоты назначаются в порядке объявления. Имена проверяются на дубли, зарезервированные идентификаторы и GLSL validity; texture-specific поля запрещены у числовых свойств. Числовое свойство становится макросом, поэтому его имя не может совпадать с полем Surface, глобальным именем шаблона или встроенной функцией GLSL и не может начинаться с `sample_` (список в `is_macro_conflict`, `engine/engine-scene/src/shader_asset.rs`).
 
-GLSL body определяет void surface(inout Surface s). Surface несёт albedo, emissive, metallic, roughness, opacity, normal, occlusion, uv и position; renderer предоставляет объявленные числовые имена как макросы и функцию sample_<name>(uv) для texture properties. Naga собирает фрагмент в порядке helpers → defines → surface body → #undef → main, чтобы макросы не затрагивали встроенный main. Встроенная Lit реализация после выделения этой точки сохраняет прежнюю формулу и результат.
+GLSL body определяет void surface(inout Surface s). Surface несёт albedo, emissive, metallic, roughness, opacity, normal, occlusion, uv и position; renderer предоставляет объявленные числовые имена как макросы, а для texture properties — функцию sample_<name>(uv); текстура макроса не создаёт, поэтому её имя может совпадать с полем Surface (например, `albedo`). Naga собирает фрагмент в порядке helpers → defines → surface body → #undef → main, чтобы макросы не затрагивали встроенный main. Встроенная Lit реализация после выделения этой точки сохраняет прежнюю формулу и результат.
 
 ## Renderer и время жизни
 

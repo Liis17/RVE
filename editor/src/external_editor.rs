@@ -3,7 +3,7 @@
 use crate::project::OpenProject;
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +51,18 @@ pub fn text_editor_command(path: &Path) -> Command {
     command
 }
 
+/// Сообщение для журнала, если редактор завершился с ошибкой или ожидание его процесса не удалось.
+fn exit_message(path: &Path, result: std::io::Result<ExitStatus>) -> Option<String> {
+    match result {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(format!(
+            "{}: внешний редактор завершился с ошибкой: {status}",
+            path.display()
+        )),
+        Err(error) => Some(format!("{}: {error}", path.display())),
+    }
+}
+
 #[derive(Default)]
 pub struct ExternalEditor {
     sender: Option<Sender<String>>,
@@ -79,8 +91,8 @@ impl ExternalEditor {
         self.sender = Some(sender.clone());
         self.receiver = Some(receiver);
         std::thread::spawn(move || {
-            if let Err(error) = child.wait() {
-                let _ = sender.send(format!("{}: {error}", path.display()));
+            if let Some(message) = exit_message(&path, child.wait()) {
+                let _ = sender.send(message);
             }
         });
     }
@@ -113,5 +125,16 @@ mod tests {
         let other = command_spec(path, EditorPlatform::Other);
         assert_eq!(other.program, "xdg-open");
         assert_eq!(other.args, ["/tmp/a file.rveshader"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_editor_exit_is_reported_and_clean_exit_is_silent() {
+        use std::os::unix::process::ExitStatusExt;
+        let path = Path::new("/a.rveshader");
+        assert_eq!(exit_message(path, Ok(ExitStatus::from_raw(0))), None);
+        let message = exit_message(path, Ok(ExitStatus::from_raw(1 << 8))).unwrap();
+        assert!(message.starts_with("/a.rveshader:"), "{message}");
+        assert!(message.contains("завершился с ошибкой"), "{message}");
     }
 }

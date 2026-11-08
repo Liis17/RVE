@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "ash",
  "engine-platform",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "egui",
  "egui-winit",

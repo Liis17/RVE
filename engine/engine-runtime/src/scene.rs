@@ -653,7 +653,8 @@ impl<T> Default for GpuTextureCache<T> {
     }
 }
 
-fn get_or_insert_texture<K, T>(
+/// Возвращает GPU-ресурс из кэша или создаёт его один раз.
+fn get_or_insert_gpu<K, T>(
     cache: &mut HashMap<K, T>,
     key: K,
     create: impl FnOnce() -> Result<T, RenderError>,
@@ -1066,6 +1067,7 @@ pub(crate) fn upload_scene(
     let mut gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = HashMap::new();
     let mut texture_cache = GpuTextureCache::<TextureId>::default();
     let mut shader_cache = HashMap::<String, Result<ShaderId, String>>::new();
+    let mut material_cache = HashMap::<String, MaterialId>::new();
     let mut error_material = None;
     // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
     let animated = animated_model_paths(assets);
@@ -1105,6 +1107,7 @@ pub(crate) fn upload_scene(
                 model,
                 &assets.textures,
                 &mut texture_cache,
+                &mut material_cache,
                 None,
             )?;
             gpu_meshes.push((mesh_id, material_id));
@@ -1138,6 +1141,7 @@ pub(crate) fn upload_scene(
             &gpu_models,
             &mut texture_cache,
             &mut shader_cache,
+            &mut material_cache,
             &mut error_material,
             object,
         )?;
@@ -1170,6 +1174,7 @@ pub(crate) fn upload_scene(
                     &gpu_models,
                     &mut texture_cache,
                     &mut shader_cache,
+                    &mut material_cache,
                     &mut error_material,
                     object,
                 )?,
@@ -1232,7 +1237,7 @@ fn particle_desc(
             let data = assets.textures.get(path).ok_or(RenderError::InvalidState(
                 "CPU-текстура частиц отсутствует в таблице GPU-ресурсов",
             ))?;
-            Some(get_or_insert_texture(
+            Some(get_or_insert_gpu(
                 &mut texture_cache.scene,
                 (path.clone(), TextureColorSpace::Srgb),
                 || {
@@ -1318,13 +1323,15 @@ pub(crate) fn particle_emitter_desc(
 }
 
 /// Уровни LOD объекта. Без замены материала и текстуры переиспользуются меши модели; иначе для
-/// каждой части создаётся материал с заменами.
+/// каждой части берётся материал с заменами, одинаковые материалы создаются один раз.
+#[allow(clippy::too_many_arguments)]
 fn upload_object_levels(
     renderer: &mut Renderer,
     assets: &PreparedRenderAssets,
     gpu_models: &HashMap<String, Vec<(MeshId, MaterialId)>>,
     texture_cache: &mut GpuTextureCache<TextureId>,
     shader_cache: &mut HashMap<String, Result<ShaderId, String>>,
+    material_cache: &mut HashMap<String, MaterialId>,
     error_material: &mut Option<MaterialId>,
     object: &ObjectModel,
 ) -> Result<Vec<Vec<(MeshId, MaterialId)>>, RenderError> {
@@ -1367,6 +1374,7 @@ fn upload_object_levels(
                     model,
                     texture_cache,
                     shader_cache,
+                    material_cache,
                     error_material,
                 )?,
                 None => {
@@ -1382,6 +1390,7 @@ fn upload_object_levels(
                         model,
                         &assets.textures,
                         texture_cache,
+                        material_cache,
                         None,
                     )?
                 }
@@ -1393,6 +1402,9 @@ fn upload_object_levels(
     Ok(levels)
 }
 
+/// Создаёт GPU-материал или возвращает уже созданный для тех же входных данных. Материалы живут
+/// до завершения рендера вместе со сценой, поэтому кэш владения не меняет.
+#[allow(clippy::too_many_arguments)]
 fn upload_resolved_material(
     renderer: &mut Renderer,
     resolved: &ResolvedMaterial,
@@ -1400,8 +1412,13 @@ fn upload_resolved_material(
     model: &Model,
     scene_texture_data: &HashMap<String, TextureData>,
     texture_cache: &mut GpuTextureCache<TextureId>,
+    material_cache: &mut HashMap<String, MaterialId>,
     shader: Option<ShaderId>,
 ) -> Result<MaterialId, RenderError> {
+    let key = material_cache_key(model_path, resolved);
+    if let Some(&material) = material_cache.get(&key) {
+        return Ok(material);
+    }
     let base_color_texture = upload_material_texture(
         renderer,
         resolved.base_color_texture.as_ref(),
@@ -1457,20 +1474,16 @@ fn upload_resolved_material(
                 source.path
             ))
         })?;
-        user_textures[slot] = Some(get_or_insert_texture(
-            &mut texture_cache.scene,
-            key,
-            || {
-                renderer.create_texture_with_color_space(
-                    data.width,
-                    data.height,
-                    &data.rgba,
-                    source.color_space,
-                )
-            },
-        )?);
+        user_textures[slot] = Some(get_or_insert_gpu(&mut texture_cache.scene, key, || {
+            renderer.create_texture_with_color_space(
+                data.width,
+                data.height,
+                &data.rgba,
+                source.color_space,
+            )
+        })?);
     }
-    renderer.create_material(&Material {
+    let material = renderer.create_material(&Material {
         shader,
         user_values: resolved.user_values,
         user_textures,
@@ -1488,7 +1501,20 @@ fn upload_resolved_material(
         occlusion_texture,
         normal_scale: resolved.normal_scale,
         occlusion_strength: resolved.occlusion_strength,
-    })
+    })?;
+    material_cache.insert(key, material);
+    Ok(material)
+}
+
+/// Ключ дедупликации GPU-материала: всё, что меняет результат, кроме исходника шейдера, который
+/// однозначно задаётся `shader_path`. Текстуры модели адресуются индексом внутри модели,
+/// поэтому путь модели входит в ключ.
+fn material_cache_key(model_path: &str, resolved: &ResolvedMaterial) -> String {
+    let without_source = ResolvedMaterial {
+        shader_source: None,
+        ..resolved.clone()
+    };
+    format!("{model_path}\n{without_source:?}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1503,6 +1529,7 @@ fn upload_material_slot(
     model: &Model,
     texture_cache: &mut GpuTextureCache<TextureId>,
     shader_cache: &mut HashMap<String, Result<ShaderId, String>>,
+    material_cache: &mut HashMap<String, MaterialId>,
     error_material: &mut Option<MaterialId>,
 ) -> Result<MaterialId, RenderError> {
     let resolved = assets
@@ -1566,6 +1593,7 @@ fn upload_material_slot(
         model,
         &assets.textures,
         texture_cache,
+        material_cache,
         shader,
     ) {
         Ok(material) => Ok(material),
@@ -1611,7 +1639,7 @@ fn upload_material_texture(
                     "модель {model_path:?} ссылается на отсутствующую текстуру {index}"
                 ))
             })?;
-            get_or_insert_texture(&mut texture_cache.model, key, || {
+            get_or_insert_gpu(&mut texture_cache.model, key, || {
                 renderer.create_texture_with_color_space(
                     texture.width,
                     texture.height,
@@ -1625,7 +1653,7 @@ fn upload_material_texture(
             let texture = scene_texture_data.get(path).ok_or({
                 RenderError::InvalidState("CPU-текстура отсутствует в таблице GPU-ресурсов")
             })?;
-            get_or_insert_texture(&mut texture_cache.scene, key, || {
+            get_or_insert_gpu(&mut texture_cache.scene, key, || {
                 renderer.create_texture_with_color_space(
                     texture.width,
                     texture.height,
@@ -1641,8 +1669,9 @@ fn upload_material_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuTextureCache, MaterialTextureSource, PreparedPrefabs, get_or_insert_texture, load_scene,
-        prepare_scene_with_model_loader, resolve_material, resolve_material_asset,
+        GpuTextureCache, MaterialTextureSource, PreparedPrefabs, get_or_insert_gpu, load_scene,
+        material_cache_key, prepare_scene_with_model_loader, resolve_material,
+        resolve_material_asset,
     };
     use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial};
     use engine_files::VirtualPath;
@@ -2606,22 +2635,44 @@ id = "camera"
     }
 
     #[test]
+    fn material_cache_key_matches_equal_inputs_and_separates_model_textures_and_shaders() {
+        let model = ModelMaterial {
+            base_color_texture: Some(0),
+            ..ModelMaterial::default()
+        };
+        let resolved = resolve_material(&model, None, None);
+        let key = material_cache_key("models/a.fbx", &resolved);
+        assert_eq!(
+            key,
+            material_cache_key("models/a.fbx", &resolve_material(&model, None, None))
+        );
+        // Индекс текстуры модели имеет смысл только внутри своей модели.
+        assert_ne!(key, material_cache_key("models/b.fbx", &resolved));
+        let mut shaded = resolved.clone();
+        shaded.shader_path = Some("/shaders/water.rveshader".to_owned());
+        assert_ne!(key, material_cache_key("models/a.fbx", &shaded));
+        let mut other_values = resolved.clone();
+        other_values.user_values[0] = [0.5, 0.0, 0.0, 0.0];
+        assert_ne!(key, material_cache_key("models/a.fbx", &other_values));
+    }
+
+    #[test]
     fn gpu_texture_cache_reuses_uploads_per_source_and_color_space() {
         let mut cache = GpuTextureCache::<u32>::default();
         let uploads = Cell::new(0_u32);
 
         let model_srgb_key = ("models/a.fbx".to_owned(), 0, TextureColorSpace::Srgb);
-        let model_srgb = get_or_insert_texture(&mut cache.model, model_srgb_key.clone(), || {
+        let model_srgb = get_or_insert_gpu(&mut cache.model, model_srgb_key.clone(), || {
             uploads.set(uploads.get() + 1);
             Ok(uploads.get())
         })
         .unwrap();
-        let model_srgb_reused = get_or_insert_texture(&mut cache.model, model_srgb_key, || {
+        let model_srgb_reused = get_or_insert_gpu(&mut cache.model, model_srgb_key, || {
             uploads.set(uploads.get() + 1);
             Ok(uploads.get())
         })
         .unwrap();
-        let model_linear = get_or_insert_texture(
+        let model_linear = get_or_insert_gpu(
             &mut cache.model,
             ("models/a.fbx".to_owned(), 0, TextureColorSpace::Linear),
             || {
@@ -2634,17 +2685,17 @@ id = "camera"
         assert_ne!(model_srgb, model_linear);
 
         let scene_srgb_key = ("textures/shared.png".to_owned(), TextureColorSpace::Srgb);
-        let scene_srgb = get_or_insert_texture(&mut cache.scene, scene_srgb_key.clone(), || {
+        let scene_srgb = get_or_insert_gpu(&mut cache.scene, scene_srgb_key.clone(), || {
             uploads.set(uploads.get() + 1);
             Ok(uploads.get())
         })
         .unwrap();
-        let scene_srgb_reused = get_or_insert_texture(&mut cache.scene, scene_srgb_key, || {
+        let scene_srgb_reused = get_or_insert_gpu(&mut cache.scene, scene_srgb_key, || {
             uploads.set(uploads.get() + 1);
             Ok(uploads.get())
         })
         .unwrap();
-        let scene_linear = get_or_insert_texture(
+        let scene_linear = get_or_insert_gpu(
             &mut cache.scene,
             ("textures/shared.png".to_owned(), TextureColorSpace::Linear),
             || {
