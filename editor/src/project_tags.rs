@@ -15,9 +15,6 @@ pub struct TagsLayersDraft {
     layers: Vec<String>,
     saved_tags: Vec<String>,
     saved_layers: Vec<String>,
-    /// Текст файла, который черновик видел при открытии или последнем сохранении. Нужен, чтобы
-    /// не затереть правки, сделанные вне редактора.
-    disk_text: Option<String>,
     /// Причина последнего неудачного сохранения; сбрасывается при следующем сохранении или откате.
     pub error: Option<String>,
 }
@@ -31,7 +28,6 @@ impl TagsLayersDraft {
             layers: settings.layers.names.clone(),
             saved_tags: settings.tags.names.clone(),
             saved_layers: settings.layers.names.clone(),
-            disk_text: std::fs::read_to_string(root.join(PROJECT_FILE)).ok(),
             error: None,
         }
     }
@@ -78,7 +74,7 @@ impl TagsLayersDraft {
     }
 
     /// Проверяет черновик и записывает `project.rveproject` через временный файл. Если файл
-    /// изменён вне редактора после открытия или последнего сохранения, запись отменяется.
+    /// расходится с `settings` (правка вне редактора), запись отменяется.
     /// Возвращает новые настройки проекта. Файл пишется заново, поэтому комментарии не сохраняются.
     pub fn save(&mut self, settings: &ProjectSettings) -> Result<ProjectSettings, String> {
         let mut next = settings.clone();
@@ -88,22 +84,23 @@ impl TagsLayersDraft {
             .to_toml()
             .inspect_err(|error| self.error = Some(error.clone()))?;
         let path = self.root.join(PROJECT_FILE);
-        self.ensure_unchanged(&path)
+        self.ensure_unchanged(&path, settings)
             .inspect_err(|error| self.error = Some(error.clone()))?;
         write_atomically(&path, &text).map_err(|error| {
             let message = format!("{PROJECT_FILE}: {error}");
             self.error = Some(message.clone());
             message
         })?;
-        self.disk_text = Some(text);
         self.saved_tags = self.tags.clone();
         self.saved_layers = self.layers.clone();
         self.error = None;
         Ok(next)
     }
 
-    fn ensure_unchanged(&self, path: &Path) -> Result<(), String> {
-        if std::fs::read_to_string(path).ok() == self.disk_text {
+    /// Файл на диске разбирается в те же настройки, что у редактора. Расхождение означает правку
+    /// вне редактора, в том числе сделанную до открытия вкладки.
+    fn ensure_unchanged(&self, path: &Path, settings: &ProjectSettings) -> Result<(), String> {
+        if ProjectSettings::load(path).as_ref() == Ok(settings) {
             return Ok(());
         }
         Err(format!(
@@ -205,7 +202,7 @@ mod tests {
         std::fs::write(&path, PROJECT).unwrap();
         let mut draft = TagsLayersDraft::open(&temp.0, &settings());
         draft.tags_mut().push("Player".to_owned());
-        let edited = format!("# edited by hand\n{PROJECT}");
+        let edited = PROJECT.replace("name = \"Demo\"", "name = \"Edited\"");
         std::fs::write(&path, &edited).unwrap();
 
         let error = draft.save(&settings()).unwrap_err();
@@ -222,13 +219,28 @@ mod tests {
         std::fs::write(&path, PROJECT).unwrap();
         let mut draft = TagsLayersDraft::open(&temp.0, &settings());
         draft.tags_mut().push("Player".to_owned());
-        draft.save(&settings()).unwrap();
+        let saved = draft.save(&settings()).unwrap();
         draft.tags_mut().push("Enemy".to_owned());
-        draft.save(&settings()).unwrap();
+        draft.save(&saved).unwrap();
 
         let reloaded = ProjectSettings::load(&path).unwrap();
         assert_eq!(reloaded.tags.names, ["Player", "Enemy"]);
         assert!(!temp.0.join(format!("{PROJECT_FILE}.tmp")).exists());
+    }
+
+    #[test]
+    fn a_change_made_before_the_draft_was_opened_is_refused() {
+        let temp = TempProject::new("before-open");
+        let path = temp.0.join(PROJECT_FILE);
+        let loaded = settings();
+        let edited = PROJECT.replace("name = \"Demo\"", "name = \"Edited\"");
+        std::fs::write(&path, &edited).unwrap();
+        let mut draft = TagsLayersDraft::open(&temp.0, &loaded);
+        draft.tags_mut().push("Player".to_owned());
+
+        let error = draft.save(&loaded).unwrap_err();
+        assert!(error.contains("изменён вне редактора"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
     }
 
     #[test]
