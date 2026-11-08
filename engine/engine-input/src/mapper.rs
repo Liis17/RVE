@@ -4,7 +4,7 @@
 use crate::translate::MapperEvent;
 use rve_sdk::abi::RVE_GAMEPAD_SLOTS;
 use rve_sdk::{GamepadAxis, GamepadButton};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Number of gamepad slots, numbered 1..=4 in scripts.
 pub const SLOT_COUNT: usize = RVE_GAMEPAD_SLOTS;
@@ -46,6 +46,9 @@ const TRIGGER_AXES: [GamepadAxis; 2] = [GamepadAxis::LeftTrigger, GamepadAxis::R
 struct RawPad {
     connected: bool,
     buttons: u32,
+    /// Buttons pressed since the last snapshot, so a press shorter than one frame still reaches
+    /// scripts. Cleared by [`GamepadMapper::snapshot`].
+    latched: u32,
     axes: [f32; 6],
 }
 
@@ -55,6 +58,8 @@ pub struct GamepadMapper {
     tuning: GamepadTuning,
     slots: [RawPad; SLOT_COUNT],
     slot_of_id: HashMap<usize, usize>,
+    /// Pads refused because every slot was taken. Each is reported once until it disconnects.
+    rejected: HashSet<usize>,
 }
 
 impl GamepadMapper {
@@ -63,7 +68,15 @@ impl GamepadMapper {
             tuning,
             slots: [RawPad::default(); SLOT_COUNT],
             slot_of_id: HashMap::new(),
+            rejected: HashSet::new(),
         }
+    }
+
+    /// Forgets every pad, slot and refused id. The tuning stays.
+    pub fn reset(&mut self) {
+        self.slots = [RawPad::default(); SLOT_COUNT];
+        self.slot_of_id.clear();
+        self.rejected.clear();
     }
 
     /// Applies one translated event from backend pad `id` and returns the slot it changed.
@@ -72,38 +85,50 @@ impl GamepadMapper {
         match event {
             MapperEvent::Connected => self.connect(id),
             MapperEvent::Disconnected => {
+                self.rejected.remove(&id);
                 let slot = self.slot_of_id.remove(&id)?;
                 self.slots[slot] = RawPad::default();
                 Some(slot)
             }
             MapperEvent::Button { button, pressed } => {
                 let slot = self.slot_for(id)?;
-                set_bit(&mut self.slots[slot].buttons, button, pressed);
+                press(&mut self.slots[slot], button, pressed);
                 Some(slot)
             }
             MapperEvent::Axis { axis, value } => {
                 let slot = self.slot_for(id)?;
-                self.slots[slot].axes[axis as usize] = value;
+                let raw = &mut self.slots[slot];
+                raw.axes[axis as usize] = value;
+                if let Some(button) = trigger_button(axis)
+                    && value > self.tuning.trigger_threshold
+                {
+                    set_bit(&mut raw.latched, button, true);
+                }
                 Some(slot)
             }
             MapperEvent::DPad { horizontal, value } => {
                 let slot = self.slot_for(id)?;
-                let raw = &mut self.slots[slot].buttons;
+                let raw = &mut self.slots[slot];
                 if horizontal {
-                    set_bit(raw, GamepadButton::DPadLeft, value < -0.5);
-                    set_bit(raw, GamepadButton::DPadRight, value > 0.5);
+                    press(raw, GamepadButton::DPadLeft, value < -0.5);
+                    press(raw, GamepadButton::DPadRight, value > 0.5);
                 } else {
-                    set_bit(raw, GamepadButton::DPadDown, value < -0.5);
-                    set_bit(raw, GamepadButton::DPadUp, value > 0.5);
+                    press(raw, GamepadButton::DPadDown, value < -0.5);
+                    press(raw, GamepadButton::DPadUp, value > 0.5);
                 }
                 Some(slot)
             }
         }
     }
 
-    /// Builds the processed state of every slot.
-    pub fn snapshot(&self) -> GamepadSnapshot {
-        self.slots.map(|raw| self.process(raw))
+    /// Builds the processed state of every slot, then clears the button latches: a press that
+    /// happened since the previous snapshot is reported once, even if it was already released.
+    pub fn snapshot(&mut self) -> GamepadSnapshot {
+        let snapshot = self.slots.map(|raw| self.process(raw));
+        for raw in &mut self.slots {
+            raw.latched = 0;
+        }
+        snapshot
     }
 
     /// Returns the backend pad id that currently owns `slot`.
@@ -118,9 +143,12 @@ impl GamepadMapper {
             return Some(*slot);
         }
         let Some(slot) = self.slots.iter().position(|raw| !raw.connected) else {
-            log::warn!("gamepad {id} ignored: all {SLOT_COUNT} gamepad slots are in use");
+            if self.rejected.insert(id) {
+                log::warn!("gamepad {id} ignored: all {SLOT_COUNT} gamepad slots are in use");
+            }
             return None;
         };
+        self.rejected.remove(&id);
         self.slots[slot] = RawPad {
             connected: true,
             ..RawPad::default()
@@ -137,7 +165,7 @@ impl GamepadMapper {
     }
 
     fn process(&self, raw: RawPad) -> PadSnapshot {
-        let mut buttons = raw.buttons;
+        let mut buttons = raw.buttons | raw.latched;
         for (axis, button) in TRIGGER_AXES
             .into_iter()
             .zip([GamepadButton::LeftTrigger, GamepadButton::RightTrigger])
@@ -171,6 +199,22 @@ impl GamepadMapper {
             buttons,
             axes,
         }
+    }
+}
+
+/// Sets a digital button from a press or release. A press also latches the button.
+fn press(raw: &mut RawPad, button: GamepadButton, pressed: bool) {
+    set_bit(&mut raw.buttons, button, pressed);
+    if pressed {
+        set_bit(&mut raw.latched, button, true);
+    }
+}
+
+fn trigger_button(axis: GamepadAxis) -> Option<GamepadButton> {
+    match axis {
+        GamepadAxis::LeftTrigger => Some(GamepadButton::LeftTrigger),
+        GamepadAxis::RightTrigger => Some(GamepadButton::RightTrigger),
+        _ => None,
     }
 }
 
@@ -380,5 +424,60 @@ mod tests {
             },
         );
         assert_eq!(mapper.snapshot()[0].buttons & left, 0);
+    }
+
+    #[test]
+    fn tap_between_two_snapshots_is_reported_once_then_released() {
+        let mut mapper = mapper();
+        connect(&mut mapper, 1);
+        mapper.handle(
+            1,
+            MapperEvent::Button {
+                button: GamepadButton::South,
+                pressed: true,
+            },
+        );
+        mapper.handle(
+            1,
+            MapperEvent::Button {
+                button: GamepadButton::South,
+                pressed: false,
+            },
+        );
+        assert_eq!(mapper.snapshot()[0].buttons, SOUTH);
+        assert_eq!(mapper.snapshot()[0].buttons, 0);
+    }
+
+    #[test]
+    fn trigger_tap_above_threshold_is_latched_until_the_next_snapshot() {
+        let mut mapper = mapper();
+        connect(&mut mapper, 1);
+        let trigger_bit = 1_u32 << GamepadButton::LeftTrigger as u32;
+        for value in [0.9, 0.0] {
+            mapper.handle(
+                1,
+                MapperEvent::Axis {
+                    axis: GamepadAxis::LeftTrigger,
+                    value,
+                },
+            );
+        }
+        assert_ne!(mapper.snapshot()[0].buttons & trigger_bit, 0);
+        assert_eq!(mapper.snapshot()[0].buttons & trigger_bit, 0);
+    }
+
+    #[test]
+    fn refused_fifth_pad_is_remembered_once_until_it_disconnects() {
+        let mut mapper = mapper();
+        for id in 0..SLOT_COUNT {
+            connect(&mut mapper, id);
+        }
+        assert_eq!(connect(&mut mapper, 99), None);
+        assert_eq!(connect(&mut mapper, 99), None);
+        assert_eq!(mapper.rejected.len(), 1);
+        assert!(mapper.rejected.contains(&99));
+
+        mapper.handle(99, MapperEvent::Disconnected);
+        assert!(mapper.rejected.is_empty());
     }
 }

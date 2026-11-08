@@ -2,8 +2,8 @@
 
 use crate::mapper::{GamepadMapper, GamepadSnapshot, GamepadTuning, SLOT_COUNT};
 use crate::translate::{MapperEvent, translate};
-use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Replay, Ticks};
-use gilrs::{GamepadId, Gilrs};
+use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
+use gilrs::{GamepadId, Gilrs, GilrsBuilder};
 
 /// Owns the `gilrs` context. Create it on the thread that polls it: the runtime and the editor
 /// each keep one instance and call [`GilrsBackend::poll`] once per update.
@@ -15,27 +15,19 @@ pub struct GilrsBackend {
 }
 
 impl GilrsBackend {
-    /// Opens `gilrs`. If it fails, logs a warning and runs with no gamepads: snapshots stay empty
-    /// and rumble does nothing.
+    /// Opens `gilrs` without its default filters: the dead zone and the D-pad conversion are done
+    /// by [`GamepadMapper`], so `[input.gamepad]` is the only dead zone. If opening fails, logs a
+    /// warning and runs with no gamepads: snapshots stay empty and rumble does nothing.
     pub fn new(tuning: GamepadTuning) -> Self {
-        let mut mapper = GamepadMapper::new(tuning);
-        let gilrs = match Gilrs::new() {
+        let mut backend = Self::without_devices(tuning);
+        match GilrsBuilder::new().with_default_filters(false).build() {
             Ok(gilrs) => {
-                for (id, _) in gilrs.gamepads() {
-                    mapper.handle(usize::from(id), MapperEvent::Connected);
-                }
-                Some(gilrs)
+                backend.gilrs = Some(gilrs);
+                backend.register_connected();
             }
-            Err(error) => {
-                log::warn!("gamepad input is unavailable: {error}");
-                None
-            }
-        };
-        Self {
-            gilrs,
-            mapper,
-            effects: Vec::new(),
+            Err(error) => log::warn!("gamepad input is unavailable: {error}"),
         }
+        backend
     }
 
     /// Creates a backend without `gilrs`, for tests and hosts that must not touch devices. Its
@@ -46,6 +38,23 @@ impl GilrsBackend {
             mapper: GamepadMapper::new(tuning),
             effects: Vec::new(),
         }
+    }
+
+    /// Prepares the backend for a new Play session: discards queued events and pad state, applies
+    /// `tuning`, and registers the pads that are already connected.
+    pub fn begin_session(&mut self, tuning: GamepadTuning) {
+        self.effects.clear();
+        if let Some(gilrs) = self.gilrs.as_mut() {
+            while gilrs.next_event().is_some() {}
+        }
+        self.mapper = GamepadMapper::new(tuning);
+        self.register_connected();
+    }
+
+    /// Ends a Play session: stops rumble and releases every pad. The `gilrs` context stays open.
+    pub fn end_session(&mut self) {
+        self.stop_rumble();
+        self.mapper.reset();
     }
 
     /// Drains pending backend events without blocking.
@@ -60,8 +69,8 @@ impl GilrsBackend {
         }
     }
 
-    /// Returns the processed state of every slot.
-    pub fn snapshot(&self) -> GamepadSnapshot {
+    /// Returns the processed state of every slot and clears the button latches.
+    pub fn snapshot(&mut self) -> GamepadSnapshot {
         self.mapper.snapshot()
     }
 
@@ -109,10 +118,48 @@ impl GilrsBackend {
         }
     }
 
+    /// Delivers one frame's rumble requests as `(pad, strong, weak, seconds)` in script order.
+    /// Only the last request for each slot is played; pad 0 covers every slot.
+    pub fn rumble_frame(&mut self, requests: impl IntoIterator<Item = (u8, f32, f32, f32)>) {
+        for (index, request) in latest_per_slot(requests).into_iter().enumerate() {
+            if let Some((strong, weak, seconds)) = request {
+                self.rumble(index as u8 + 1, strong, weak, seconds);
+            }
+        }
+    }
+
     /// Stops every rumble effect, for example on focus loss or when Play stops.
     pub fn stop_rumble(&mut self) {
         self.effects.clear();
     }
+
+    /// Assigns slots to pads that gilrs already reports as connected. gilrs sends no `Connected`
+    /// event for them, so this is the only way they reach the mapper.
+    fn register_connected(&mut self) {
+        let Some(gilrs) = self.gilrs.as_ref() else {
+            return;
+        };
+        for (id, _) in gilrs.gamepads() {
+            self.mapper.handle(usize::from(id), MapperEvent::Connected);
+        }
+    }
+}
+
+/// Keeps the last request for each slot, in order. Pad 0 sets every slot; a pad outside 0..=4 is
+/// ignored. A zero request is kept, so its slot still stops the previous effect.
+fn latest_per_slot(
+    requests: impl IntoIterator<Item = (u8, f32, f32, f32)>,
+) -> [Option<(f32, f32, f32)>; SLOT_COUNT] {
+    let mut latest = [None; SLOT_COUNT];
+    for (pad, strong, weak, seconds) in requests {
+        let request = Some((strong, weak, seconds));
+        match usize::from(pad) {
+            0 => latest = [request; SLOT_COUNT],
+            slot @ 1..=SLOT_COUNT => latest[slot - 1] = request,
+            _ => {}
+        }
+    }
+    latest
 }
 
 fn build_effect(
@@ -142,6 +189,70 @@ fn build_effect(
             scheduling: replay,
             envelope: Default::default(),
         })
+        // gilrs repeats an effect forever by default; the effect must end after its duration.
+        .repeat(Repeat::For(Ticks::from_ms(duration_ms)))
         .gamepads(&[gamepad])
         .finish(gilrs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mapper::PadSnapshot;
+    use crate::translate::MapperEvent;
+    use rve_sdk::GamepadButton;
+
+    const SOUTH: u32 = 1 << GamepadButton::South as u32;
+
+    #[test]
+    fn later_pad_zero_request_replaces_every_earlier_slot_request() {
+        let latest = latest_per_slot([(2, 1.0, 1.0, 1.0), (0, 0.5, 0.25, 0.5)]);
+        assert_eq!(latest, [Some((0.5, 0.25, 0.5)); SLOT_COUNT]);
+    }
+
+    #[test]
+    fn slot_request_after_pad_zero_overrides_only_its_slot() {
+        let latest = latest_per_slot([(0, 0.5, 0.5, 1.0), (3, 1.0, 0.0, 2.0)]);
+        assert_eq!(
+            latest,
+            [
+                Some((0.5, 0.5, 1.0)),
+                Some((0.5, 0.5, 1.0)),
+                Some((1.0, 0.0, 2.0)),
+                Some((0.5, 0.5, 1.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_request_is_kept_so_its_slot_stops_the_previous_effect() {
+        let latest = latest_per_slot([(1, 1.0, 1.0, 1.0), (1, 0.0, 0.0, 0.0)]);
+        assert_eq!(latest[0], Some((0.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn pads_outside_the_slot_range_are_ignored() {
+        assert_eq!(latest_per_slot([(5, 1.0, 1.0, 1.0)]), [None; SLOT_COUNT]);
+    }
+
+    #[test]
+    fn ending_a_session_releases_pads_and_a_new_session_starts_clean() {
+        let mut backend = GilrsBackend::without_devices(GamepadTuning::default());
+        backend.mapper.handle(7, MapperEvent::Connected);
+        backend.mapper.handle(
+            7,
+            MapperEvent::Button {
+                button: GamepadButton::South,
+                pressed: true,
+            },
+        );
+        assert_eq!(backend.snapshot()[0].buttons, SOUTH);
+
+        backend.end_session();
+        assert_eq!(backend.snapshot(), [PadSnapshot::default(); SLOT_COUNT]);
+
+        backend.mapper.handle(7, MapperEvent::Connected);
+        backend.begin_session(GamepadTuning::default());
+        assert!(backend.snapshot().iter().all(|pad| !pad.connected));
+    }
 }
