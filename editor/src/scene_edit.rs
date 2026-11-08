@@ -171,6 +171,7 @@ impl Component {
                 model: object.mesh_renderer.as_ref()?.model.clone(),
                 texture: None,
                 material: None,
+                materials: Vec::new(),
             }),
             ComponentKind::LodGroup => return None,
             ComponentKind::DirectionalLight => Self::DirectionalLight(default_light()),
@@ -617,6 +618,7 @@ impl EditorScene {
                         model: path.clone(),
                         texture: None,
                         material: None,
+                        materials: Vec::new(),
                     });
                 }
             }
@@ -1130,14 +1132,14 @@ impl EditorScene {
                 ensure_asset(document, texture);
             }
             let object = find_object_mut(document, id)?;
-            let material = object
-                .mesh_renderer
-                .as_ref()
-                .and_then(|mesh| mesh.material.clone());
+            let previous = object.mesh_renderer.as_ref();
+            let material = previous.and_then(|mesh| mesh.material.clone());
+            let materials = previous.map_or_else(Vec::new, |mesh| mesh.materials.clone());
             object.mesh_renderer = Some(MeshRenderer {
                 model,
                 texture,
                 material,
+                materials,
             });
             Ok(())
         })

@@ -14,6 +14,7 @@ use crate::document::{
     require_asset_path, require_extension, valid_ascii_name, validate_environment,
     validate_material_override, virtual_path_serde,
 };
+use crate::material_slots_serde;
 use crate::network::{
     NetworkIdentityComponent, NetworkTransformComponent, validate_network_transform,
 };
@@ -127,6 +128,12 @@ pub struct MeshRendererOverride {
     pub texture: Option<VirtualPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<MaterialOverride>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "material_slots_serde::optional"
+    )]
+    pub materials: Option<Vec<Option<VirtualPath>>>,
 }
 
 /// Слияние `params` lite-скриптов с этим путём по ключам.
@@ -246,6 +253,9 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
                 .material
                 .get_or_insert_with(MaterialOverride::default);
             merge_material(merged, material);
+        }
+        if let Some(materials) = &mesh.materials {
+            target.materials = materials.clone();
         }
     }
     if let Some(camera) = &change.camera {
@@ -664,6 +674,22 @@ pub(crate) fn validate_instances(
                 if let Some(texture) = &mesh.texture {
                     require_asset_path(source, id, assets, texture, "текстура override")?;
                     require_extension(source, id, texture, "png", "текстура override")?;
+                }
+                for material in mesh.materials.iter().flatten().flatten() {
+                    require_asset_path(
+                        source,
+                        id,
+                        assets,
+                        material,
+                        "материал части меша override",
+                    )?;
+                    require_extension(
+                        source,
+                        id,
+                        material,
+                        "rvemat",
+                        "материал части меша override",
+                    )?;
                 }
                 if let Some(material) = &mesh.material {
                     validate_material_override(source, id, assets, material)?;

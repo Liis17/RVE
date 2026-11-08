@@ -2454,6 +2454,7 @@ id = "camera"
             model: VirtualPath::parse("/models/base.fbx").unwrap(),
             texture: Some(VirtualPath::parse("/textures/base.png").unwrap()),
             material: None,
+            materials: Vec::new(),
         };
         let group = LodGroup {
             levels: vec![

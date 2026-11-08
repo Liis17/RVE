@@ -39,6 +39,8 @@ const DOOR: &str = r#"
 [[assets]]
 path = "/models/door.fbx"
 [[assets]]
+path = "/materials/frame.rvemat"
+[[assets]]
 path = "/scripts/rotate.lua"
 [[objects]]
 id = "frame"
@@ -47,6 +49,7 @@ name = "Frame"
 position = [0.0, 0.0, 0.0]
 [objects.mesh_renderer]
 model = "/models/door.fbx"
+materials = ["", "/materials/frame.rvemat"]
 [objects.mesh_renderer.material]
 metallic = 0.2
 roughness = 0.4
@@ -65,7 +68,7 @@ params = { speed = 10.0, axis = "y" }
 
 fn door_scene(instance_body: &str) -> String {
     format!(
-        "[[assets]]\npath = \"/prefabs/door.rveprefab\"\n[[assets]]\npath = \"/textures/gold.png\"\n[[assets]]\npath = \"/models/gold.fbx\"\n{CAMERA}[[objects]]\nid = \"room\"\n[[instances]]\nid = \"door1\"\nprefab = \"/prefabs/door.rveprefab\"\n{instance_body}"
+        "[[assets]]\npath = \"/prefabs/door.rveprefab\"\n[[assets]]\npath = \"/textures/gold.png\"\n[[assets]]\npath = \"/models/gold.fbx\"\n[[assets]]\npath = \"/materials/gold.rvemat\"\n{CAMERA}[[objects]]\nid = \"room\"\n[[instances]]\nid = \"door1\"\nprefab = \"/prefabs/door.rveprefab\"\n{instance_body}"
     )
 }
 
@@ -159,7 +162,7 @@ fn overrides_change_only_the_given_fields() {
 target = "handle"
 name = "Gold handle"
 transform = { position = [0.1, 1.0, 0.0] }
-mesh_renderer = { model = "/models/gold.fbx", texture = "/textures/gold.png" }
+mesh_renderer = { model = "/models/gold.fbx", texture = "/textures/gold.png", materials = ["", "/materials/gold.rvemat"] }
 lite_params = [{ path = "/scripts/rotate.lua", params = { speed = 90.0 } }]
 [[instances.overrides]]
 target = "frame"
@@ -174,6 +177,12 @@ mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opaci
     let mesh = handle.mesh_renderer.as_ref().unwrap();
     assert_eq!(mesh.model.as_str(), "models/gold.fbx");
     assert_eq!(mesh.texture.as_ref().unwrap().as_str(), "textures/gold.png");
+    assert_eq!(mesh.materials.len(), 2);
+    assert!(mesh.materials[0].is_none());
+    assert_eq!(
+        mesh.materials[1].as_ref().unwrap().as_str(),
+        "materials/gold.rvemat"
+    );
     let params = &handle.lite_scripts[0].params;
     assert_eq!(params["speed"], ParamValue::Float(90.0));
     assert_eq!(params["axis"], ParamValue::String("y".into()));
@@ -192,6 +201,22 @@ mesh_renderer = { material = { metallic = 0.9, emissive = [1.5, 0.2, 0.0], opaci
     assert_eq!(material.alpha_cutoff, Some(0.25));
     assert_eq!(material.occlusion_strength, Some(0.7));
     assert_eq!(material.double_sided, Some(false));
+}
+
+#[test]
+fn material_slot_override_requires_a_declared_rvemat_asset() {
+    let missing = door_scene(
+        "[[instances.overrides]]\ntarget = \"handle\"\nmesh_renderer = { materials = [\"/materials/missing.rvemat\"] }\n",
+    );
+    let error = SceneDocument::parse("scene.rvescene", &missing).unwrap_err();
+    assert!(error.message.contains("отсутствует в [[assets]]"));
+
+    let wrong_extension = door_scene(
+        "[[instances.overrides]]\ntarget = \"handle\"\nmesh_renderer = { materials = [\"/materials/gold.toml\"] }\n",
+    )
+    .replace("/materials/gold.rvemat", "/materials/gold.toml");
+    let error = SceneDocument::parse("scene.rvescene", &wrong_extension).unwrap_err();
+    assert!(error.message.contains("расширение .rvemat"));
 }
 
 #[test]

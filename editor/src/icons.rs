@@ -161,6 +161,7 @@ mod tests {
             model: VirtualPath::parse("/models/cube.fbx").unwrap(),
             texture: None,
             material: None,
+            materials: Vec::new(),
         }
     }
 
