@@ -16,8 +16,10 @@ const BOX_AXIS_EPSILON: f32 = 1.0e-6;
 const CONTACT_NORMAL_THRESHOLD: f32 = 0.8;
 /// Минимальное косинус-выравнивание нормали грани и направления контакта для многоточечного manifold.
 const FACE_ALIGNMENT: f32 = 0.98;
-/// Допуск плоскости грани и границ треугольника; точки внутри допуска остаются в manifold.
+/// Минимальный допуск плоскости грани и границ треугольника; точки внутри допуска остаются в manifold.
 const FACE_PLANE_TOLERANCE: f32 = 1.0e-4;
+/// Доля размера формы; допуск грани берёт максимум из неё и `FACE_PLANE_TOLERANCE`.
+const FACE_RELATIVE_TOLERANCE: f32 = 1.0e-4;
 
 struct ConvexFace {
     /// Внешняя нормаль грани в мировых координатах.
@@ -890,14 +892,15 @@ fn triangle_face_contacts(
     } else {
         area_normal
     };
+    let tolerance = face_tolerance(convex);
     let mut contacts = Vec::new();
     for (index, &vertex) in face.vertices.iter().enumerate() {
         let penetration = (vertex - triangle[0]).dot(normal);
-        if penetration < -FACE_PLANE_TOLERANCE || penetration > depth + FACE_PLANE_TOLERANCE {
+        if penetration < -tolerance || penetration > depth + tolerance {
             continue;
         }
         let projected = vertex - normal * penetration;
-        if !point_in_triangle(projected, triangle, area_normal) {
+        if !point_in_triangle(projected, triangle, area_normal, tolerance) {
             continue;
         }
         contacts.push(contact_point(
@@ -910,19 +913,30 @@ fn triangle_face_contacts(
     (!contacts.is_empty()).then_some((normal, contacts))
 }
 
-fn point_in_triangle(point: Vec3, triangle: [Vec3; 3], unit_normal: Vec3) -> bool {
+fn point_in_triangle(point: Vec3, triangle: [Vec3; 3], unit_normal: Vec3, tolerance: f32) -> bool {
     (0..3).all(|index| {
         let start = triangle[index];
         let edge = triangle[(index + 1) % 3] - start;
         let edge_length = edge.length();
         edge_length <= f32::MIN_POSITIVE
-            || edge.cross(point - start).dot(unit_normal) / edge_length >= -FACE_PLANE_TOLERANCE
+            || edge.cross(point - start).dot(unit_normal) / edge_length >= -tolerance
     })
 }
 
+/// Допуск граней формы: не меньше `FACE_PLANE_TOLERANCE` и пропорционален её размеру, чтобы
+/// крупные хуллы не теряли вершины грани из-за округления поз.
+fn face_tolerance(shape: &Shape) -> f32 {
+    let extent = shape
+        .local_aabb()
+        .map_or(0.0, |aabb| (aabb.max - aabb.min).max_element());
+    FACE_PLANE_TOLERANCE.max(FACE_RELATIVE_TOLERANCE * extent)
+}
+
 /// Грань выпуклой формы, внешняя нормаль которой выровнена с `direction` не хуже `FACE_ALIGNMENT`.
+/// Капсула даёт грань-отрезок (два конца), если отрезок лежит в плоскости грани в пределах допуска.
 fn convex_face(shape: &Shape, pose: Pose, direction: Vec3) -> Option<ConvexFace> {
     let direction = direction.try_normalize()?;
+    let tolerance = face_tolerance(shape);
     let (normal, alignment, vertices) = match shape {
         Shape::Box { half_extents } => {
             let axes = box_axes(pose);
@@ -956,12 +970,21 @@ fn convex_face(shape: &Shape, pose: Pose, direction: Vec3) -> Option<ConvexFace>
                 .vertices()
                 .iter()
                 .map(|&vertex| pose.position + pose.rotation * vertex)
-                .filter(|vertex| (*vertex - point).dot(normal).abs() <= FACE_PLANE_TOLERANCE)
+                .filter(|vertex| (*vertex - point).dot(normal).abs() <= tolerance)
                 .collect();
             if vertices.len() < 3 {
                 return None;
             }
             (normal, alignment, sort_face_vertices(vertices, normal))
+        }
+        Shape::Capsule { radius, height } => {
+            let half_axis = (pose.rotation * Vec3::Y) * (*height * 0.5);
+            let ends = [pose.position - half_axis, pose.position + half_axis];
+            if (ends[0].dot(direction) - ends[1].dot(direction)).abs() > tolerance {
+                return None;
+            }
+            let vertices = ends.iter().map(|&end| end + direction * *radius).collect();
+            (direction, 1.0, vertices)
         }
         _ => return None,
     };
@@ -1008,7 +1031,13 @@ fn convex_pair_manifold(
     ) else {
         return single;
     };
-    let reference_is_a = face_a.alignment >= face_b.alignment;
+    let tolerance = face_tolerance(shape_a).max(face_tolerance(shape_b));
+    // Опорная грань — многоугольник: отрезок капсулы может быть только инцидентным.
+    let reference_is_a = match (face_a.vertices.len() >= 3, face_b.vertices.len() >= 3) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => face_a.alignment >= face_b.alignment,
+    };
     let (reference, incident) = if reference_is_a {
         (&face_a, &face_b)
     } else {
@@ -1027,7 +1056,7 @@ fn convex_pair_manifold(
         if (center - start).dot(inward) < 0.0 {
             inward = -inward;
         }
-        polygon = clip_polygon_to_face(polygon, start, -inward, 0.0, FACE_PLANE_TOLERANCE);
+        polygon = clip_polygon_to_face(polygon, start, -inward, 0.0, tolerance);
         if polygon.is_empty() {
             return single;
         }
@@ -1036,7 +1065,7 @@ fn convex_pair_manifold(
     let mut contacts = Vec::new();
     for point in polygon {
         let signed = (point - reference.vertices[0]).dot(reference_normal);
-        if signed > FACE_PLANE_TOLERANCE {
+        if signed > tolerance {
             continue;
         }
         let projected = point - reference_normal * signed;
@@ -1057,7 +1086,7 @@ fn convex_pair_manifold(
     };
     ContactManifold {
         normal,
-        contacts: reduce_contacts(contacts, FACE_PLANE_TOLERANCE),
+        contacts: reduce_contacts(contacts, tolerance),
     }
 }
 
@@ -2503,6 +2532,63 @@ mod tests {
             assert!(
                 (0.0045..=0.0055).contains(&contact.penetration),
                 "{contact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn box_resting_on_large_hull_face_away_from_origin_keeps_its_face() {
+        // Хулл 100 м с верхней гранью в y = 0, повёрнутый и сдвинутый: округление поз не должно
+        // терять вершины грани.
+        let points: Vec<Vec3> = (0..8)
+            .map(|index| {
+                Vec3::new(
+                    if index & 1 == 0 { -50.0 } else { 50.0 },
+                    if index & 2 == 0 { -50.0 } else { 50.0 },
+                    if index & 4 == 0 { -50.0 } else { 50.0 },
+                )
+            })
+            .collect();
+        let floor = Shape::ConvexHull(Arc::new(Hull::from_points(&points).unwrap()));
+        let floor_pose = Pose::new(
+            Vec3::new(1234.5, -50.0, -777.7),
+            Quat::from_rotation_y(0.37),
+        )
+        .unwrap();
+        let manifold = collide(
+            &Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+            Pose::new(Vec3::new(1234.5, 0.495, -777.7), Quat::IDENTITY).unwrap(),
+            &floor,
+            floor_pose,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(manifold.contacts.len() >= 3, "{manifold:?}");
+        assert!(manifold.normal.dot(-Vec3::Y) > 0.999, "{manifold:?}");
+    }
+
+    #[test]
+    fn capsule_lying_on_box_top_gets_contacts_at_both_ends() {
+        let manifold = collide(
+            &Shape::cuboid(Vec3::splat(1.0)).unwrap(),
+            Pose::IDENTITY,
+            &Shape::capsule(0.25, 1.0).unwrap(),
+            Pose::new(
+                Vec3::new(0.0, 1.0 + 0.25 - 0.002, 0.0),
+                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(manifold.contacts.len(), 2, "{manifold:?}");
+        for end_x in [-0.5, 0.5] {
+            assert!(
+                manifold
+                    .contacts
+                    .iter()
+                    .any(|contact| (contact.point_b.x - end_x).abs() < 1.0e-3),
+                "no contact at the capsule end x = {end_x}: {manifold:?}"
             );
         }
     }

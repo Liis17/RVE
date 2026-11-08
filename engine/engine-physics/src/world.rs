@@ -3056,4 +3056,65 @@ mod tests {
         assert!(peak_speed < SLEEP_LINEAR_SPEED, "peak speed {peak_speed}");
         assert!(peak_drift < 1.0e-3, "horizontal drift {peak_drift}");
     }
+
+    #[test]
+    fn capsule_lying_on_mesh_floor_rests_on_its_two_ends_without_rolling() {
+        let mut world = PhysicsWorld::default();
+        world.insert_body(diagonal_mesh_floor_desc()).unwrap();
+        let radius = 0.25;
+        let capsule = world
+            .insert_body(BodyDesc::dynamic(
+                Shape::capsule(radius, 1.0).unwrap(),
+                Pose::new(
+                    Vec3::new(0.0, radius - 0.002, 0.0),
+                    Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                )
+                .unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        let mut peak_speed = 0.0_f32;
+        let mut peak_spin = 0.0_f32;
+        let mut peak_drift = 0.0_f32;
+        for frame in 0..=60 {
+            driver.advance_step(1.0 / 60.0, []).unwrap();
+            if frame < 30 {
+                continue;
+            }
+            if driver.world().body_is_sleeping(capsule) == Some(false) {
+                peak_speed =
+                    peak_speed.max(driver.world().body_velocity(capsule).unwrap().length());
+                peak_spin = peak_spin.max(
+                    driver
+                        .world()
+                        .body_angular_velocity(capsule)
+                        .unwrap()
+                        .length(),
+                );
+            }
+            let pose = driver.world().body_pose(capsule).unwrap();
+            peak_drift = peak_drift.max(pose.position.x.abs().max(pose.position.z.abs()));
+        }
+        // Контакты лежат на концах отрезка капсулы: x = ±0.5 при половине длины 0.5.
+        let points: Vec<Vec3> = driver
+            .world()
+            .active_pairs
+            .values()
+            .filter_map(|pair| pair.manifold.as_ref())
+            .flat_map(|manifold| manifold.contacts.iter().map(|contact| contact.point_a))
+            .collect();
+        assert_eq!(points.len(), 2, "capsule contact points {points:?}");
+        for end_x in [-0.5, 0.5] {
+            assert!(
+                points
+                    .iter()
+                    .any(|point| (point.x - end_x).abs() < 0.01 && point.z.abs() < 0.01),
+                "no contact at the capsule end x = {end_x}: {points:?}"
+            );
+        }
+        assert!(peak_speed < SLEEP_LINEAR_SPEED, "peak speed {peak_speed}");
+        assert!(peak_spin < SLEEP_ANGULAR_SPEED, "peak spin {peak_spin}");
+        assert!(peak_drift < 1.0e-3, "horizontal drift {peak_drift}");
+    }
 }
