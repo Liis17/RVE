@@ -6,7 +6,9 @@ use crate::lifecycle::{
 };
 use crate::lite::EventQueue;
 use crate::physics::PhysicsScriptState;
-use crate::types::{ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
+use crate::types::{
+    RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
+};
 use engine_physics::{
     BodyHandle, BodyKind, CharacterHit, CharacterMoveResult, PhysicsCommand, Pose, QueryFilter,
     QueryHit, Ray,
@@ -198,6 +200,7 @@ pub(crate) struct ScriptTransaction {
     pending_cursor_visible: Option<bool>,
     pending_cursor_locked: Option<bool>,
     pending_audio: Vec<AudioRequest>,
+    pending_rumble: Vec<RumbleRequest>,
     pending_animation: Vec<AnimationRequest>,
     lifecycle: Rc<RefCell<Lifecycle>>,
     lifecycle_writes: bool,
@@ -251,6 +254,7 @@ impl Default for ScriptTransaction {
             pending_cursor_visible: None,
             pending_cursor_locked: None,
             pending_audio: Vec::new(),
+            pending_rumble: Vec::new(),
             pending_animation: Vec::new(),
             lifecycle: Rc::new(RefCell::new(Lifecycle::default())),
             lifecycle_writes: false,
@@ -303,6 +307,7 @@ impl ScriptTransaction {
         self.pending_cursor_visible = None;
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
+        self.pending_rumble.clear();
         self.pending_animation.clear();
         self.lifecycle = init.lifecycle;
         self.lifecycle_writes = init.lifecycle_writes;
@@ -393,6 +398,15 @@ impl ScriptTransaction {
             ));
         }
         self.pending_audio.push(request);
+        Ok(())
+    }
+
+    /// Ставит запрос вибрации до коммита. Как и звук, он отбрасывается вместе с отказавшим вызовом.
+    pub(crate) fn stage_rumble(&mut self, request: RumbleRequest) -> Result<(), String> {
+        if !self.writable {
+            return Err("rumble is unavailable during script creation".to_owned());
+        }
+        self.pending_rumble.push(request);
         Ok(())
     }
 
@@ -1111,6 +1125,7 @@ impl ScriptTransaction {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit(
         &mut self,
         world: &mut World,
@@ -1119,6 +1134,7 @@ impl ScriptTransaction {
         events: &EventQueue,
         audio: &mut Vec<AudioRequest>,
         animation: &mut Vec<AnimationRequest>,
+        rumble: &mut Vec<RumbleRequest>,
     ) -> Result<Vec<ActionMutation>, String> {
         let transforms_are_finite = self.pending_transforms.values().all(|transform| {
             transform
@@ -1265,6 +1281,7 @@ impl ScriptTransaction {
         self.overflowed_messages = 0;
         audio.append(&mut self.pending_audio);
         animation.append(&mut self.pending_animation);
+        rumble.append(&mut self.pending_rumble);
         self.world = std::ptr::null();
         self.action_frame = None;
         Ok(std::mem::take(&mut self.pending_action_mutations))
@@ -1332,6 +1349,7 @@ impl ScriptTransaction {
         self.pending_cursor_visible = None;
         self.pending_cursor_locked = None;
         self.pending_audio.clear();
+        self.pending_rumble.clear();
         self.pending_animation.clear();
         self.world = std::ptr::null();
         self.action_frame = None;

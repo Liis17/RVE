@@ -11,7 +11,7 @@ use crate::transaction::{
     AbiObject, MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_TARGET_ID_BYTES, MessageValueBudget,
     QueueMessageError, ScriptTransaction,
 };
-use crate::types::{ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
+use crate::types::{RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptTime, ScriptTransform};
 use engine_console::CommandSpec;
 use engine_files::VirtualPath;
 use engine_physics::Ray;
@@ -29,8 +29,8 @@ use rve_sdk::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_MAX_BINDINGS, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR,
     RVE_LOG_INFO, RVE_LOG_WARN, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
     RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent, RveCursorState, RveHost,
-    RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime,
+    RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent, RveCursorState, RveGamepadState,
+    RveHost, RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime,
     RveTransform, RveValue, RveValueData,
 };
 use rve_sdk::abi::{
@@ -216,8 +216,8 @@ impl<'a> AbiCallContext<'a> {
             animation_set_parameter: Some(host_animation_set_parameter),
             animation_set_speed: Some(host_animation_set_speed),
             animation_stop: Some(host_animation_stop),
-            gamepad_state: None,
-            gamepad_rumble: None,
+            gamepad_state: Some(host_gamepad_state),
+            gamepad_rumble: Some(host_gamepad_rumble),
         }
     }
 
@@ -2014,6 +2014,37 @@ unsafe extern "C" fn host_set_cursor_locked(ctx: *mut c_void, locked: bool) -> b
     })
 }
 
+unsafe extern "C" fn host_gamepad_state(
+    ctx: *mut c_void,
+    pad: u32,
+    out: *mut RveGamepadState,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let state = context.transaction.input().gamepad_state(pad);
+        // SAFETY: output was checked and points to the guest's writable stack slot.
+        unsafe { *out = state.unwrap_or_default() };
+        state.is_some()
+    })
+}
+
+unsafe extern "C" fn host_gamepad_rumble(
+    ctx: *mut c_void,
+    pad: u32,
+    strong: f32,
+    weak: f32,
+    seconds: f32,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let result = RumbleRequest::new(pad, strong, weak, seconds)
+            .ok_or_else(|| format!("gamepad slot must be 0 or from 1 to 4, got {pad}"))
+            .and_then(|request| context.transaction.stage_rumble(request));
+        audio_result(context, result) == RveStatus::Ok as u32
+    })
+}
+
 fn host_input_vector(
     ctx: *mut c_void,
     out: *mut [f32; 2],
@@ -2498,6 +2529,7 @@ mod tests {
                 &mut queued_bytes,
                 &events,
                 &mut audio,
+                &mut Vec::new(),
                 &mut Vec::new(),
             )
             .unwrap();

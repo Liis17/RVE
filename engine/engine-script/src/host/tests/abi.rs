@@ -1356,6 +1356,37 @@ fn abi_v6_to_v8_modules_load_on_the_v9_host() {
     }
 }
 
+#[test]
+fn abi_v10_modules_load_on_the_v11_host() {
+    let _lock = test_lock();
+    let current = sdk_module();
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 10,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: current.scripts,
+        script_count: current.script_count,
+    }));
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v10" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v10"),
+        "guest ABI v10 runs on the v11 host"
+    );
+}
+
 fn v3_probe_module() -> &'static RveModule {
     let current = sdk_module();
     // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
