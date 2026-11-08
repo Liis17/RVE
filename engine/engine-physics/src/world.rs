@@ -2877,4 +2877,47 @@ mod tests {
         assert!(peak_spin < SLEEP_ANGULAR_SPEED, "peak spin {peak_spin}");
         assert!(peak_drift < 1.0e-3, "horizontal drift {peak_drift}");
     }
+
+    #[test]
+    fn box_on_hull_floor_rests_without_jitter_or_drift() {
+        let mut world = PhysicsWorld::default();
+        let points: Vec<Vec3> = (0..8)
+            .map(|index| {
+                Vec3::new(
+                    if index & 1 == 0 { -2.0 } else { 2.0 },
+                    if index & 2 == 0 { -2.0 } else { 2.0 },
+                    if index & 4 == 0 { -2.0 } else { 2.0 },
+                )
+            })
+            .collect();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::ConvexHull(Arc::new(Hull::from_points(&points).unwrap())),
+                Pose::new(Vec3::new(0.0, -2.0, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let body = world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.5),
+                Pose::new(Vec3::new(0.0, 0.7, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        let mut peak_speed = 0.0_f32;
+        let mut peak_drift = 0.0_f32;
+        for frame in 0..=60 {
+            driver.advance_step(1.0 / 60.0, []).unwrap();
+            if frame < 30 {
+                continue;
+            }
+            if driver.world().body_is_sleeping(body) == Some(false) {
+                peak_speed = peak_speed.max(driver.world().body_velocity(body).unwrap().length());
+            }
+            let pose = driver.world().body_pose(body).unwrap();
+            peak_drift = peak_drift.max(pose.position.x.abs().max(pose.position.z.abs()));
+        }
+        assert!(peak_speed < SLEEP_LINEAR_SPEED, "peak speed {peak_speed}");
+        assert!(peak_drift < 1.0e-3, "horizontal drift {peak_drift}");
+    }
 }
