@@ -54,7 +54,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EngineResources]] — фоновый доступ к loose files и RVEPAK через ограниченный worker pool.
 - `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG/Radiance HDR в память CPU, без зависимости от renderer.
-- [[Engine/EngineScene]] — форматы `.rvescene` и `.camerasettings`, их проверка и runtime-граф `World` с множеством камер, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
+- [[Engine/EngineScene]] — форматы `.rvescene`, `.camerasettings` и `.rvephysmat`, их проверка и runtime-граф `World` с множеством камер, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
 - [[Engine/EngineAnimation]] — скелетная анимация без GPU и без файлов: позы, клипы по именам костей, crossfade, blend tree, разовые клипы с переходом, палитры skinning и мост `AnimationBridge` между `World` и аниматорами объектов.
 - [[Engine/EngineScript]] — Lua host и загрузчик ABI-библиотеки Rust-скриптов; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
 - [[Engine/EngineConsole]] — общий лог, буфер, парсер/каталог команд и egui developer-console overlay; `engine-console` не зависит от окна/GPU, `engine-ui` адаптирует egui к UI pass.
