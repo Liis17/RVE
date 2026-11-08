@@ -810,7 +810,10 @@ pub struct CharacterControllerComponent {
     pub use_gravity: bool,
     #[serde(default = "one_f32", skip_serializing_if = "is_one")]
     pub gravity_scale: f32,
-    #[serde(default = "default_jump_height", skip_serializing_if = "is_default_jump_height")]
+    #[serde(
+        default = "default_jump_height",
+        skip_serializing_if = "is_default_jump_height"
+    )]
     pub jump_height: f32,
 }
 

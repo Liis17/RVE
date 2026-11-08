@@ -289,6 +289,7 @@ impl CharacterController {
         let filter = QueryFilter {
             ignore: Some(body),
             include_triggers: false,
+            ..QueryFilter::default()
         };
 
         for _ in 0..CHARACTER_MOVE_ITERATIONS {
@@ -348,6 +349,7 @@ impl CharacterController {
         let filter = QueryFilter {
             ignore: Some(body),
             include_triggers: false,
+            ..QueryFilter::default()
         };
         let up = Vec3::Y * self.step_height;
         if snapshot
@@ -429,6 +431,7 @@ impl CharacterController {
         let filter = QueryFilter {
             ignore: Some(body),
             include_triggers: false,
+            ..QueryFilter::default()
         };
         let Some(hit) =
             snapshot.shape_cast_with_overrides(shape, pose, down, self.skin, filter, overrides)?

@@ -11,8 +11,8 @@ use glam::{Mat3, Vec3};
 use crate::character::{CharacterController, CharacterError};
 use crate::hull::Hull;
 use crate::world::{
-    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsWorld,
-    PhysicsWorldError, StepDriver,
+    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PHYSICS_LAYER_COUNT, PhysicsCommand,
+    PhysicsWorld, PhysicsWorldError, StepDriver,
 };
 use crate::{CombineMode, GeometryError, PhysicsMaterial, Pose, Shape, TriMesh};
 
@@ -44,6 +44,8 @@ pub struct PhysicsSceneDesc {
     pub fixed_hz: u32,
     pub max_substeps: usize,
     pub bodies: Vec<PhysicsSceneBody>,
+    /// Маски слоёв из настроек проекта; по умолчанию все пары слоёв разрешены.
+    pub collision_matrix: [u32; PHYSICS_LAYER_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -163,11 +165,13 @@ impl PhysicsSceneDesc {
             fixed_hz,
             max_substeps,
             bodies,
+            collision_matrix: [u32::MAX; PHYSICS_LAYER_COUNT],
         })
     }
 
     pub fn build(self) -> Result<(StepDriver, Vec<PhysicsSceneBinding>), PhysicsSceneError> {
         let mut world = PhysicsWorld::new(self.gravity)?;
+        world.set_collision_matrix(self.collision_matrix);
         let mut bindings = Vec::with_capacity(self.bodies.len());
         for scene_body in self.bodies {
             let kind = scene_body.desc.kind;
@@ -634,6 +638,7 @@ fn scene_body(
             ColliderDesc::new(shape),
         );
         desc.character_controller = true;
+        desc.layer = u32::from(object.layer);
         return Ok(Some(PhysicsSceneBody {
             object: object.handle,
             desc,
@@ -663,6 +668,7 @@ fn scene_body(
     collider_desc.trigger = collider.trigger;
     collider_desc.material = material;
     let mut desc = BodyDesc::new(kind, transform.pose, collider_desc);
+    desc.layer = u32::from(object.layer);
     apply_rigid_body(&mut desc, rigid_body);
     Ok(Some(PhysicsSceneBody {
         object: object.handle,

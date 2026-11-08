@@ -51,6 +51,6 @@ pub use thread::{
     PhysicsRequest, PhysicsServer, PhysicsServerError, PhysicsStepResult,
 };
 pub use world::{
-    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent,
-    PhysicsWorld, PhysicsWorldError, StepDriver, StepResult,
+    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PHYSICS_LAYER_COUNT, PhysicsCommand,
+    PhysicsEvent, PhysicsWorld, PhysicsWorldError, PrimitiveShape, StepDriver, StepResult,
 };

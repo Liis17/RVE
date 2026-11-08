@@ -3,8 +3,8 @@ use std::fmt;
 use glam::Vec3;
 
 use crate::broad::MAX_BROADPHASE_ITEMS;
-use crate::narrow::{MAX_MESH_CANDIDATES, convex_triangle_distance};
-use crate::ray::{Ray, raycast};
+use crate::narrow::{MAX_MESH_CANDIDATES, collide, convex_triangle_distance};
+use crate::ray::{Ray, RayHit, raycast};
 use crate::world::{BodyHandle, BodyKind};
 use crate::{Aabb, DistanceResult, GeometryError, NarrowphaseError, Pose, Shape, TriMesh};
 
@@ -14,10 +14,22 @@ pub const MAX_SHAPE_CAST_ITERATIONS: usize = 32;
 /// float не должно растягивать каждую итерацию на доли 1e-9 до исчерпания лимита.
 const CAST_DISTANCE_TOLERANCE: f32 = 1.0e-5;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryFilter {
     pub ignore: Option<BodyHandle>,
     pub include_triggers: bool,
+    /// Битовая маска слоёв: коллайдер со слоем `n` участвует, если бит `n` установлен.
+    pub layer_mask: u32,
+}
+
+impl Default for QueryFilter {
+    fn default() -> Self {
+        Self {
+            ignore: None,
+            include_triggers: false,
+            layer_mask: u32::MAX,
+        }
+    }
 }
 
 /// Additional body exclusions and enabled-state overrides applied over a snapshot.
@@ -64,6 +76,7 @@ pub enum QueryError {
     CandidateLimit,
     ShapeCastIterationLimit,
     NonConvexCast,
+    NonConvexShape,
     InvalidCast,
 }
 
@@ -77,6 +90,7 @@ impl fmt::Display for QueryError {
                 formatter.write_str("shape cast iteration limit exceeded")
             }
             Self::NonConvexCast => formatter.write_str("shape casts require a convex shape"),
+            Self::NonConvexShape => formatter.write_str("overlap queries require a convex shape"),
             Self::InvalidCast => formatter.write_str("shape cast input is invalid"),
         }
     }
@@ -100,6 +114,8 @@ impl From<NarrowphaseError> for QueryError {
 pub struct QuerySnapshot {
     colliders: Vec<QueryCollider>,
     x_order: Vec<usize>,
+    /// Активные пары триггера с хотя бы одним trigger-коллайдером; порядок по хендлам.
+    trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
 }
 
 #[derive(Clone)]
@@ -113,6 +129,7 @@ pub(crate) struct QueryCollider {
     pub(crate) body_kind: BodyKind,
     pub(crate) body_velocity: Vec3,
     pub(crate) mass: f32,
+    pub(crate) layer: u32,
 }
 
 pub(crate) struct QueryColliderDesc {
@@ -124,6 +141,7 @@ pub(crate) struct QueryColliderDesc {
     pub(crate) body_kind: BodyKind,
     pub(crate) body_velocity: Vec3,
     pub(crate) mass: f32,
+    pub(crate) layer: u32,
 }
 
 impl QueryCollider {
@@ -138,12 +156,53 @@ impl QueryCollider {
             body_kind: desc.body_kind,
             body_velocity: desc.body_velocity,
             mass: desc.mass,
+            layer: desc.layer,
         })
+    }
+
+    fn ray_hit(&self, ray: &Ray, hit: RayHit) -> QueryHit {
+        let fraction = if ray.max_distance > 0.0 {
+            hit.distance / ray.max_distance
+        } else {
+            0.0
+        };
+        QueryHit {
+            body: self.body,
+            point: hit.point,
+            normal: hit.normal,
+            distance: hit.distance,
+            fraction,
+            triangle_index: hit.triangle_index,
+            body_kind: self.body_kind,
+            body_velocity: self.body_velocity,
+            mass: self.mass,
+            trigger: self.trigger,
+        }
     }
 }
 
+fn validate_ray(ray: &Ray) -> Result<(), QueryError> {
+    if !ray.origin.is_finite()
+        || !ray.direction.is_finite()
+        || !ray.max_distance.is_finite()
+        || ray.max_distance < 0.0
+        || (ray.direction.length_squared() - 1.0).abs() > 1.0e-4
+    {
+        return Err(GeometryError::InvalidRay.into());
+    }
+    Ok(())
+}
+
+fn ray_bounds(ray: &Ray) -> Result<Aabb, QueryError> {
+    let end = ray.point_at(ray.max_distance);
+    Ok(Aabb::from_points(&[ray.origin, end])?)
+}
+
 impl QuerySnapshot {
-    pub(crate) fn from_colliders(colliders: Vec<QueryCollider>) -> Result<Self, QueryError> {
+    pub(crate) fn from_colliders(
+        colliders: Vec<QueryCollider>,
+        trigger_pairs: Vec<(BodyHandle, BodyHandle)>,
+    ) -> Result<Self, QueryError> {
         if colliders.len() > MAX_QUERY_CANDIDATES {
             return Err(QueryError::CandidateLimit);
         }
@@ -156,7 +215,16 @@ impl QuerySnapshot {
                 .total_cmp(&colliders[right].bounds.min.x)
                 .then_with(|| colliders[left].body.cmp(&colliders[right].body))
         });
-        Ok(Self { colliders, x_order })
+        Ok(Self {
+            colliders,
+            x_order,
+            trigger_pairs,
+        })
+    }
+
+    /// Активные trigger-пары на момент снимка, по возрастанию ключа пары.
+    pub fn trigger_pairs(&self) -> &[(BodyHandle, BodyHandle)] {
+        &self.trigger_pairs
     }
 
     pub fn raycast(&self, ray: &Ray, filter: QueryFilter) -> Result<Option<QueryHit>, QueryError> {
@@ -181,16 +249,8 @@ impl QuerySnapshot {
         excluded: &[BodyHandle],
         enabled_overrides: &[(BodyHandle, bool)],
     ) -> Result<Option<QueryHit>, QueryError> {
-        if !ray.origin.is_finite()
-            || !ray.direction.is_finite()
-            || !ray.max_distance.is_finite()
-            || ray.max_distance < 0.0
-            || (ray.direction.length_squared() - 1.0).abs() > 1.0e-4
-        {
-            return Err(GeometryError::InvalidRay.into());
-        }
-        let end = ray.point_at(ray.max_distance);
-        let broad_bounds = Aabb::from_points(&[ray.origin, end])?;
+        validate_ray(ray)?;
+        let broad_bounds = ray_bounds(ray)?;
         let mut closest = None;
         let overrides = QueryOverrides {
             excluded,
@@ -201,28 +261,61 @@ impl QuerySnapshot {
             let Some(hit) = raycast(ray, &collider.shape, collider.pose)? else {
                 continue;
             };
-            let fraction = if ray.max_distance > 0.0 {
-                hit.distance / ray.max_distance
-            } else {
-                0.0
-            };
-            let candidate = QueryHit {
-                body: collider.body,
-                point: hit.point,
-                normal: hit.normal,
-                distance: hit.distance,
-                fraction,
-                triangle_index: hit.triangle_index,
-                body_kind: collider.body_kind,
-                body_velocity: collider.body_velocity,
-                mass: collider.mass,
-                trigger: collider.trigger,
-            };
+            let candidate = collider.ray_hit(ray, hit);
             if closest.is_none_or(|old: QueryHit| query_hit_precedes(candidate, old)) {
                 closest = Some(candidate);
             }
         }
         Ok(closest)
+    }
+
+    /// Первые попадания луча по всем подходящим коллайдерам, по возрастанию расстояния.
+    pub fn raycast_all(
+        &self,
+        ray: &Ray,
+        filter: QueryFilter,
+        overrides: QueryOverrides<'_>,
+    ) -> Result<Vec<QueryHit>, QueryError> {
+        validate_ray(ray)?;
+        let broad_bounds = ray_bounds(ray)?;
+        let mut hits = Vec::new();
+        for index in self.candidates(broad_bounds, filter, overrides)? {
+            let collider = &self.colliders[index];
+            if let Some(hit) = raycast(ray, &collider.shape, collider.pose)? {
+                hits.push(collider.ray_hit(ray, hit));
+            }
+        }
+        hits.sort_by(|left, right| {
+            left.distance
+                .total_cmp(&right.distance)
+                .then_with(|| left.body.cmp(&right.body))
+        });
+        Ok(hits)
+    }
+
+    /// Коллайдеры, пересекающиеся с выпуклой формой в позе `pose`; результат по возрастанию
+    /// хендла тела. Trigger-коллайдеры входят только при `filter.include_triggers`.
+    pub fn overlap(
+        &self,
+        shape: &Shape,
+        pose: Pose,
+        filter: QueryFilter,
+        overrides: QueryOverrides<'_>,
+    ) -> Result<Vec<BodyHandle>, QueryError> {
+        if matches!(shape, Shape::TriMesh(_)) {
+            return Err(QueryError::NonConvexShape);
+        }
+        let pose = Pose::new(pose.position, pose.rotation)?;
+        let bounds = shape.aabb(pose)?;
+        let mut bodies = Vec::new();
+        for index in self.candidates(bounds, filter, overrides)? {
+            let collider = &self.colliders[index];
+            if collide(shape, pose, &collider.shape, collider.pose)?.is_some() {
+                bodies.push(collider.body);
+            }
+        }
+        bodies.sort_unstable();
+        Ok(bodies)
     }
 
     pub fn shape_cast(
@@ -361,6 +454,7 @@ impl QuerySnapshot {
                 && filter.ignore != Some(collider.body)
                 && !overrides.excluded.contains(&collider.body)
                 && (filter.include_triggers || !collider.trigger)
+                && (filter.layer_mask >> collider.layer) & 1 != 0
             {
                 if candidates.len() == MAX_QUERY_CANDIDATES {
                     return Err(QueryError::CandidateLimit);
@@ -547,6 +641,7 @@ mod tests {
                 QueryFilter {
                     ignore: None,
                     include_triggers: true,
+                    ..QueryFilter::default()
                 },
             )
             .unwrap()
@@ -558,6 +653,7 @@ mod tests {
                 QueryFilter {
                     ignore: Some(wall),
                     include_triggers: false,
+                    ..QueryFilter::default()
                 },
             )
             .unwrap();

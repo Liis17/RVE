@@ -10,6 +10,8 @@ use crate::narrow::{ManifoldCache, PairKey, collide};
 use crate::query::{QueryCollider, QueryColliderDesc, QueryError, QuerySnapshot};
 use crate::{Aabb, BroadPhaseError, ContactManifold, GeometryError, NarrowphaseError, Pose, Shape};
 
+/// Число слоёв столкновений; слой тела — индекс в диапазоне `0..PHYSICS_LAYER_COUNT`.
+pub const PHYSICS_LAYER_COUNT: usize = 32;
 pub const SOLVER_ITERATIONS: usize = 10;
 pub const SLEEP_LINEAR_SPEED: f32 = 0.05;
 pub const SLEEP_ANGULAR_SPEED: f32 = 0.05;
@@ -62,6 +64,8 @@ pub struct BodyDesc {
     pub angular_damping: f32,
     pub gravity_scale: f32,
     pub lock_rotation: bool,
+    /// Слой столкновений `0..PHYSICS_LAYER_COUNT`; пара тел фильтруется матрицей мира.
+    pub layer: u32,
 }
 
 /// Изменение набора тел, которое сервер применяет до команд шага.
@@ -83,6 +87,7 @@ impl BodyDesc {
             angular_damping: 0.05,
             gravity_scale: 1.0,
             lock_rotation: false,
+            layer: 0,
         }
     }
 
@@ -110,6 +115,7 @@ impl BodyDesc {
             || (self.kind == BodyKind::Dynamic && self.mass <= 0.0)
             || (self.kind == BodyKind::Dynamic && matches!(self.collider.shape, Shape::TriMesh(_)))
             || (self.character_controller && self.kind != BodyKind::Kinematic)
+            || self.layer as usize >= PHYSICS_LAYER_COUNT
         {
             return Err(PhysicsWorldError::InvalidBody);
         }
@@ -119,23 +125,57 @@ impl BodyDesc {
         Ok(())
     }
 
-    /// Обратная масса, центр масс и обратный тензор инерции в локальных координатах.
     fn mass_terms(&self) -> Result<(f32, Vec3, Mat3), PhysicsWorldError> {
-        if self.kind != BodyKind::Dynamic {
-            return Ok((0.0, Vec3::ZERO, Mat3::ZERO));
-        }
-        let properties = self.collider.shape.mass_properties(self.mass)?;
-        let center = self.collider.offset + properties.center_of_mass;
-        let inverse_inertia = if self.lock_rotation {
-            Mat3::ZERO
-        } else {
-            properties
-                .inertia
-                .try_inverse()
-                .ok_or(PhysicsWorldError::InvalidBody)?
-        };
-        Ok((1.0 / self.mass, center, inverse_inertia))
+        mass_terms(self.kind, &self.collider, self.mass, self.lock_rotation)
     }
+}
+
+/// Обратная масса, центр масс и обратный тензор инерции в локальных координатах.
+fn mass_terms(
+    kind: BodyKind,
+    collider: &ColliderDesc,
+    mass: f32,
+    lock_rotation: bool,
+) -> Result<(f32, Vec3, Mat3), PhysicsWorldError> {
+    if kind != BodyKind::Dynamic {
+        return Ok((0.0, Vec3::ZERO, Mat3::ZERO));
+    }
+    let properties = collider.shape.mass_properties(mass)?;
+    let center = collider.offset + properties.center_of_mass;
+    let inverse_inertia = if lock_rotation {
+        Mat3::ZERO
+    } else {
+        properties
+            .inertia
+            .try_inverse()
+            .ok_or(PhysicsWorldError::InvalidBody)?
+    };
+    Ok((1.0 / mass, center, inverse_inertia))
+}
+
+/// Примитивная форма для команды смены коллайдера. Размеры уже запечены по масштабу объекта
+/// вызывающей стороной, поэтому команда `Copy` и не содержит mesh.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PrimitiveShape {
+    Box { half_extents: Vec3 },
+    Sphere { radius: f32 },
+    Capsule { radius: f32, height: f32 },
+}
+
+impl PrimitiveShape {
+    pub fn to_shape(self) -> Result<Shape, GeometryError> {
+        match self {
+            Self::Box { half_extents } => Shape::cuboid(half_extents),
+            Self::Sphere { radius } => Shape::sphere(radius),
+            Self::Capsule { radius, height } => Shape::capsule(radius, height),
+        }
+    }
+}
+
+/// Пара тел сталкивается, только если каждый из слоёв разрешает другой.
+pub(crate) fn layers_collide(matrix: &[u32; PHYSICS_LAYER_COUNT], first: u32, second: u32) -> bool {
+    let (first, second) = (first as usize, second as usize);
+    (matrix[first] >> second) & 1 != 0 && (matrix[second] >> first) & 1 != 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -165,6 +205,29 @@ pub enum PhysicsCommand {
     KinematicTarget {
         body: BodyHandle,
         pose: Pose,
+    },
+    /// Заменяет форму и смещение коллайдера; масса пересчитывается по новой форме.
+    SetCollider {
+        body: BodyHandle,
+        shape: PrimitiveShape,
+        offset: Vec3,
+    },
+    SetTrigger {
+        body: BodyHandle,
+        trigger: bool,
+    },
+    SetBodyProperties {
+        body: BodyHandle,
+        kind: BodyKind,
+        mass: f32,
+        linear_damping: f32,
+        angular_damping: f32,
+        gravity_scale: f32,
+        lock_rotation: bool,
+    },
+    SetLayer {
+        body: BodyHandle,
+        layer: u32,
     },
 }
 
@@ -280,6 +343,10 @@ pub(crate) struct Body {
     pub(crate) sleeping: bool,
     pub(crate) sleep_time: f32,
     pub(crate) kinematic_target: Option<Pose>,
+    pub(crate) layer: u32,
+    /// Масса и lock_rotation нужны для пересчёта инерции при смене формы или свойств.
+    mass: f32,
+    lock_rotation: bool,
     /// Кэш AABB коллайдера; сбрасывается вместе с изменением позы.
     aabb: Option<Aabb>,
     /// Поза менялась с последнего отчёта `StepResult.poses`.
@@ -292,6 +359,12 @@ impl Body {
     pub(crate) fn mark_pose_changed(&mut self) {
         self.aabb = None;
         self.pose_reported = true;
+        self.pending_refresh = true;
+    }
+
+    /// Форма, смещение, trigger или слой изменились: пары пересчитываются, AABB — заново.
+    fn mark_collider_changed(&mut self) {
+        self.aabb = None;
         self.pending_refresh = true;
     }
 
@@ -449,6 +522,8 @@ pub struct PhysicsWorld {
     manifolds: ManifoldCache,
     next_body_id: u64,
     skipped_pairs: usize,
+    /// Маска слоёв для каждого слоя; по умолчанию все пары разрешены.
+    collision_matrix: [u32; PHYSICS_LAYER_COUNT],
 }
 
 impl Default for PhysicsWorld {
@@ -469,7 +544,13 @@ impl PhysicsWorld {
             manifolds: ManifoldCache::default(),
             next_body_id: 1,
             skipped_pairs: 0,
+            collision_matrix: [u32::MAX; PHYSICS_LAYER_COUNT],
         })
+    }
+
+    /// Задаёт маски слоёв до вставки тел; пары, запрещённые матрицей, не создаются.
+    pub fn set_collision_matrix(&mut self, masks: [u32; PHYSICS_LAYER_COUNT]) {
+        self.collision_matrix = masks;
     }
 
     pub fn insert_body(&mut self, desc: BodyDesc) -> Result<BodyHandle, PhysicsWorldError> {
@@ -505,6 +586,9 @@ impl PhysicsWorld {
                 linear_damping: desc.linear_damping,
                 angular_damping: desc.angular_damping,
                 gravity_scale: desc.gravity_scale,
+                layer: desc.layer,
+                mass: desc.mass,
+                lock_rotation: desc.lock_rotation,
                 sleeping: false,
                 sleep_time: 0.0,
                 kinematic_target: None,
@@ -569,10 +653,20 @@ impl PhysicsWorld {
                     } else {
                         0.0
                     },
+                    layer: body.layer,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Arc::new(QuerySnapshot::from_colliders(colliders)?))
+        let trigger_pairs = self
+            .active_pairs
+            .iter()
+            .filter(|(_, pair)| pair.kind == PairKind::Trigger)
+            .map(|(key, _)| (BodyHandle(key.first), BodyHandle(key.second)))
+            .collect();
+        Ok(Arc::new(QuerySnapshot::from_colliders(
+            colliders,
+            trigger_pairs,
+        )?))
     }
 
     pub fn body_velocity(&self, handle: BodyHandle) -> Option<Vec3> {
@@ -684,6 +778,7 @@ impl PhysicsWorld {
                 body.collider.clone(),
                 body.kind,
                 body.collider_pose(),
+                body.layer,
             ));
         }
         for body in self.bodies.values_mut() {
@@ -699,8 +794,11 @@ impl PhysicsWorld {
             }
         }
         for candidate in candidates {
-            let (handle_a, collider_a, kind_a, pose_a) = &proxies[candidate.first];
-            let (handle_b, collider_b, kind_b, pose_b) = &proxies[candidate.second];
+            let (handle_a, collider_a, kind_a, pose_a, layer_a) = &proxies[candidate.first];
+            let (handle_b, collider_b, kind_b, pose_b, layer_b) = &proxies[candidate.second];
+            if !layers_collide(&self.collision_matrix, *layer_a, *layer_b) {
+                continue;
+            }
             if collider_a.trigger && collider_b.trigger {
                 continue;
             }
@@ -944,6 +1042,92 @@ impl PhysicsWorld {
                     .expect("body was checked")
                     .kinematic_target = Some(pose);
             }
+            PhysicsCommand::SetCollider { shape, offset, .. } => {
+                if !offset.is_finite() {
+                    return Err(PhysicsWorldError::InvalidBody);
+                }
+                let collider = ColliderDesc {
+                    shape: shape.to_shape()?,
+                    offset,
+                    ..body.collider.clone()
+                };
+                let (inverse_mass, center_of_mass_local, inverse_inertia_local) =
+                    mass_terms(body.kind, &collider, body.mass, body.lock_rotation)?;
+                self.wake_neighbors(handle);
+                self.wake_body(handle);
+                let body = self.bodies.get_mut(&handle).expect("body was checked");
+                body.collider = collider;
+                body.inverse_mass = inverse_mass;
+                body.center_of_mass_local = center_of_mass_local;
+                body.inverse_inertia_local = inverse_inertia_local;
+                body.mark_collider_changed();
+            }
+            PhysicsCommand::SetTrigger { trigger, .. } => {
+                if body.collider.trigger != trigger {
+                    self.wake_neighbors(handle);
+                    self.wake_body(handle);
+                    let body = self.bodies.get_mut(&handle).expect("body was checked");
+                    body.collider.trigger = trigger;
+                    body.mark_collider_changed();
+                }
+            }
+            PhysicsCommand::SetLayer { layer, .. } => {
+                if layer as usize >= PHYSICS_LAYER_COUNT {
+                    return Err(PhysicsWorldError::InvalidBody);
+                }
+                if body.layer != layer {
+                    self.wake_neighbors(handle);
+                    self.wake_body(handle);
+                    let body = self.bodies.get_mut(&handle).expect("body was checked");
+                    body.layer = layer;
+                    body.mark_collider_changed();
+                }
+            }
+            PhysicsCommand::SetBodyProperties {
+                kind,
+                mass,
+                linear_damping,
+                angular_damping,
+                gravity_scale,
+                lock_rotation,
+                ..
+            } => {
+                let finite = mass.is_finite()
+                    && linear_damping.is_finite()
+                    && angular_damping.is_finite()
+                    && gravity_scale.is_finite();
+                if !finite
+                    || linear_damping < 0.0
+                    || angular_damping < 0.0
+                    || (body.character_controller && kind != BodyKind::Kinematic)
+                    || (kind == BodyKind::Dynamic
+                        && (mass <= 0.0 || matches!(body.collider.shape, Shape::TriMesh(_))))
+                {
+                    return Err(PhysicsWorldError::InvalidBody);
+                }
+                let (inverse_mass, center_of_mass_local, inverse_inertia_local) =
+                    mass_terms(kind, &body.collider, mass, lock_rotation)?;
+                self.wake_neighbors(handle);
+                self.wake_body(handle);
+                let body = self.bodies.get_mut(&handle).expect("body was checked");
+                body.kind = kind;
+                body.mass = mass;
+                body.lock_rotation = lock_rotation;
+                body.linear_damping = linear_damping;
+                body.angular_damping = angular_damping;
+                body.gravity_scale = gravity_scale;
+                body.inverse_mass = inverse_mass;
+                body.center_of_mass_local = center_of_mass_local;
+                body.inverse_inertia_local = inverse_inertia_local;
+                if kind != BodyKind::Kinematic {
+                    body.kinematic_target = None;
+                }
+                if kind != BodyKind::Dynamic {
+                    body.linear_velocity = Vec3::ZERO;
+                    body.angular_velocity = Vec3::ZERO;
+                }
+                body.mark_collider_changed();
+            }
         }
         Ok(())
     }
@@ -1039,7 +1223,11 @@ impl PhysicsCommand {
             | Self::AddForce { body, .. }
             | Self::Teleport { body, .. }
             | Self::SetColliderEnabled { body, .. }
-            | Self::KinematicTarget { body, .. } => body,
+            | Self::KinematicTarget { body, .. }
+            | Self::SetCollider { body, .. }
+            | Self::SetTrigger { body, .. }
+            | Self::SetBodyProperties { body, .. }
+            | Self::SetLayer { body, .. } => body,
         }
     }
 }
@@ -3167,5 +3355,378 @@ mod tests {
         assert!(peak_speed < SLEEP_LINEAR_SPEED, "peak speed {peak_speed}");
         assert!(peak_spin < SLEEP_ANGULAR_SPEED, "peak spin {peak_spin}");
         assert!(peak_drift < 1.0e-3, "horizontal drift {peak_drift}");
+    }
+}
+
+#[cfg(test)]
+mod script_physics_tests {
+    use super::*;
+    use crate::query::{QueryFilter, QueryOverrides};
+    use crate::ray::Ray;
+
+    fn ball_at(x: f32, radius: f32, layer: u32) -> BodyDesc {
+        let mut desc = BodyDesc::dynamic(
+            Shape::sphere(radius).unwrap(),
+            Pose::new(Vec3::new(x, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+            1.0,
+        );
+        desc.layer = layer;
+        desc
+    }
+
+    fn wall_at(x: f32, radius: f32, layer: u32) -> BodyDesc {
+        let mut desc = BodyDesc::static_collider(
+            Shape::sphere(radius).unwrap(),
+            Pose::new(Vec3::new(x, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+        );
+        desc.layer = layer;
+        desc
+    }
+
+    fn count(events: &[PhysicsEvent], matches: impl Fn(&PhysicsEvent) -> bool) -> usize {
+        events.iter().filter(|event| matches(event)).count()
+    }
+
+    fn is_pair(event: &PhysicsEvent, a: BodyHandle, b: BodyHandle) -> bool {
+        let pair = |first: &BodyHandle, second: &BodyHandle| {
+            (*first == a && *second == b) || (*first == b && *second == a)
+        };
+        match event {
+            PhysicsEvent::CollisionEnter { first, second, .. }
+            | PhysicsEvent::CollisionExit { first, second }
+            | PhysicsEvent::TriggerEnter { first, second }
+            | PhysicsEvent::TriggerExit { first, second } => pair(first, second),
+        }
+    }
+
+    fn collision_enter(event: &PhysicsEvent) -> bool {
+        matches!(event, PhysicsEvent::CollisionEnter { .. })
+    }
+
+    fn collision_exit(event: &PhysicsEvent) -> bool {
+        matches!(event, PhysicsEvent::CollisionExit { .. })
+    }
+
+    fn trigger_enter(event: &PhysicsEvent) -> bool {
+        matches!(event, PhysicsEvent::TriggerEnter { .. })
+    }
+
+    fn trigger_exit(event: &PhysicsEvent) -> bool {
+        matches!(event, PhysicsEvent::TriggerExit { .. })
+    }
+
+    fn dynamic_props(kind: BodyKind, mass: f32) -> PhysicsCommand {
+        PhysicsCommand::SetBodyProperties {
+            body: BodyHandle(1),
+            kind,
+            mass,
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+            gravity_scale: 1.0,
+            lock_rotation: false,
+        }
+    }
+
+    #[test]
+    fn trigger_toggle_exits_collision_and_enters_trigger_pair_and_back() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let wall = world.insert_body(wall_at(0.0, 1.0, 0)).unwrap();
+        let ball = world.insert_body(ball_at(1.2, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        let first = driver.advance_step(0.0, []).unwrap();
+        assert_eq!(count(&first.events, collision_enter), 1);
+
+        let to_trigger = driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetTrigger {
+                    body: wall,
+                    trigger: true,
+                }],
+            )
+            .unwrap();
+        assert_eq!(count(&to_trigger.events, collision_exit), 1);
+        assert_eq!(count(&to_trigger.events, trigger_enter), 1);
+        assert!(
+            to_trigger
+                .events
+                .iter()
+                .all(|event| is_pair(event, wall, ball))
+        );
+
+        let back = driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetTrigger {
+                    body: wall,
+                    trigger: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(count(&back.events, trigger_exit), 1);
+        assert_eq!(count(&back.events, collision_enter), 1);
+    }
+
+    #[test]
+    fn collider_resize_enters_and_exits_contact_pair_on_next_refresh() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        world.insert_body(wall_at(0.0, 1.0, 0)).unwrap();
+        let ball = world.insert_body(ball_at(2.0, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        assert!(driver.advance_step(0.0, []).unwrap().events.is_empty());
+
+        let grow = driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetCollider {
+                    body: ball,
+                    shape: PrimitiveShape::Sphere { radius: 1.5 },
+                    offset: Vec3::ZERO,
+                }],
+            )
+            .unwrap();
+        assert_eq!(count(&grow.events, collision_enter), 1);
+
+        let shrink = driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetCollider {
+                    body: ball,
+                    shape: PrimitiveShape::Sphere { radius: 0.5 },
+                    offset: Vec3::ZERO,
+                }],
+            )
+            .unwrap();
+        assert_eq!(count(&shrink.events, collision_exit), 1);
+    }
+
+    #[test]
+    fn static_collider_resize_refreshes_pairs_with_dynamic_bodies() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let wall = world.insert_body(wall_at(0.0, 1.0, 0)).unwrap();
+        world.insert_body(ball_at(2.0, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        assert!(driver.advance_step(0.0, []).unwrap().events.is_empty());
+
+        let grown = driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetCollider {
+                    body: wall,
+                    shape: PrimitiveShape::Sphere { radius: 2.0 },
+                    offset: Vec3::ZERO,
+                }],
+            )
+            .unwrap();
+        assert_eq!(count(&grown.events, collision_enter), 1);
+    }
+
+    #[test]
+    fn collision_matrix_disables_pairs_and_set_layer_restores_them() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut masks = [u32::MAX; PHYSICS_LAYER_COUNT];
+        masks[0] = 1 << 0;
+        masks[1] = 1 << 1;
+        world.set_collision_matrix(masks);
+        world.insert_body(ball_at(0.0, 0.5, 0)).unwrap();
+        let other = world.insert_body(ball_at(0.5, 0.5, 1)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        assert!(driver.advance_step(0.0, []).unwrap().events.is_empty());
+
+        let moved = driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::SetLayer {
+                    body: other,
+                    layer: 0,
+                }],
+            )
+            .unwrap();
+        assert_eq!(count(&moved.events, collision_enter), 1);
+    }
+
+    #[test]
+    fn collision_matrix_also_filters_trigger_pairs() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut masks = [u32::MAX; PHYSICS_LAYER_COUNT];
+        masks[0] = 1 << 0;
+        masks[1] = 1 << 1;
+        world.set_collision_matrix(masks);
+        let mut trigger = wall_at(0.0, 1.0, 1);
+        trigger.collider.trigger = true;
+        world.insert_body(trigger).unwrap();
+        world.insert_body(ball_at(0.5, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        let result = driver.advance_step(0.0, []).unwrap();
+        assert_eq!(count(&result.events, trigger_enter), 0);
+        assert!(
+            driver
+                .world()
+                .query_snapshot()
+                .unwrap()
+                .trigger_pairs()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshot_lists_active_trigger_pairs_until_they_separate() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let mut trigger = wall_at(0.0, 1.0, 0);
+        trigger.collider.trigger = true;
+        let trigger = world.insert_body(trigger).unwrap();
+        let ball = world.insert_body(ball_at(0.5, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        driver.advance_step(0.0, []).unwrap();
+
+        let inside = driver.world().query_snapshot().unwrap();
+        let pairs = inside.trigger_pairs();
+        assert_eq!(pairs.len(), 1);
+        assert!(is_pair(
+            &PhysicsEvent::TriggerEnter {
+                first: pairs[0].0,
+                second: pairs[0].1
+            },
+            trigger,
+            ball
+        ));
+
+        let moved = driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::Teleport {
+                    body: ball,
+                    pose: Pose::new(Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(count(&moved.events, trigger_exit), 1);
+        assert!(
+            driver
+                .world()
+                .query_snapshot()
+                .unwrap()
+                .trigger_pairs()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn overlap_respects_layer_mask_triggers_and_ignore_lists() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let near = world.insert_body(ball_at(0.0, 0.5, 0)).unwrap();
+        let mut trigger = wall_at(0.0, 0.5, 0);
+        trigger.collider.trigger = true;
+        let trigger = world.insert_body(trigger).unwrap();
+        let far_layer = world.insert_body(wall_at(0.0, 0.5, 3)).unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let sphere = Shape::sphere(0.6).unwrap();
+        let pose = Pose::new(Vec3::ZERO, Quat::IDENTITY).unwrap();
+        let overlap = |filter: QueryFilter, excluded: &[BodyHandle]| {
+            snapshot
+                .overlap(
+                    &sphere,
+                    pose,
+                    filter,
+                    QueryOverrides {
+                        excluded,
+                        enabled: &[],
+                    },
+                )
+                .unwrap()
+        };
+
+        assert_eq!(overlap(QueryFilter::default(), &[]), vec![near, far_layer]);
+        let with_triggers = QueryFilter {
+            include_triggers: true,
+            ..QueryFilter::default()
+        };
+        assert_eq!(overlap(with_triggers, &[]), vec![near, trigger, far_layer]);
+        let without_layer_three = QueryFilter {
+            layer_mask: !(1 << 3),
+            ..QueryFilter::default()
+        };
+        assert_eq!(overlap(without_layer_three, &[]), vec![near]);
+        let ignore_near = QueryFilter {
+            ignore: Some(near),
+            ..QueryFilter::default()
+        };
+        assert_eq!(overlap(ignore_near, &[]), vec![far_layer]);
+        assert_eq!(overlap(QueryFilter::default(), &[far_layer]), vec![near]);
+    }
+
+    #[test]
+    fn raycast_all_returns_every_hit_in_distance_order_and_honours_layers() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let first = world.insert_body(wall_at(0.0, 0.5, 0)).unwrap();
+        let second = world.insert_body(wall_at(3.0, 0.5, 3)).unwrap();
+        let third = world.insert_body(wall_at(6.0, 0.5, 0)).unwrap();
+        let snapshot = world.query_snapshot().unwrap();
+        let ray = Ray {
+            origin: Vec3::new(-5.0, 0.0, 0.0),
+            direction: Vec3::X,
+            max_distance: 20.0,
+        };
+        let hits = |filter: QueryFilter| {
+            snapshot
+                .raycast_all(&ray, filter, QueryOverrides::default())
+                .unwrap()
+                .iter()
+                .map(|hit| hit.body)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(hits(QueryFilter::default()), vec![first, second, third]);
+        let no_layer_three = QueryFilter {
+            layer_mask: !(1 << 3),
+            ..QueryFilter::default()
+        };
+        assert_eq!(hits(no_layer_three), vec![first, third]);
+        let distances: Vec<f32> = snapshot
+            .raycast_all(&ray, QueryFilter::default(), QueryOverrides::default())
+            .unwrap()
+            .iter()
+            .map(|hit| hit.distance)
+            .collect();
+        assert_eq!(distances, vec![4.5, 7.5, 10.5]);
+    }
+
+    #[test]
+    fn set_body_properties_changes_kind_and_mass_and_rejects_invalid_dynamic_mass() {
+        let mut world = PhysicsWorld::new(Vec3::ZERO).unwrap();
+        let ball = world.insert_body(ball_at(0.0, 0.5, 0)).unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+
+        driver
+            .advance_step(0.0, [dynamic_props(BodyKind::Dynamic, 4.0)])
+            .unwrap();
+        let state = driver
+            .world()
+            .query_snapshot()
+            .unwrap()
+            .body_state(ball)
+            .unwrap();
+        assert_eq!(state.body_kind, BodyKind::Dynamic);
+        assert!((state.mass - 4.0).abs() < 1.0e-5);
+
+        driver
+            .advance_step(0.0, [dynamic_props(BodyKind::Static, 4.0)])
+            .unwrap();
+        let state = driver
+            .world()
+            .query_snapshot()
+            .unwrap()
+            .body_state(ball)
+            .unwrap();
+        assert_eq!(state.body_kind, BodyKind::Static);
+        assert_eq!(state.mass, 0.0);
+
+        assert!(
+            driver
+                .advance_step(0.0, [dynamic_props(BodyKind::Dynamic, 0.0)])
+                .is_err()
+        );
     }
 }
