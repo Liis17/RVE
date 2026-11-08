@@ -3600,9 +3600,13 @@ impl Renderer {
         let ao_pipelines = self.ao_pipelines;
         let opaque_equal_pipeline = self.opaque_equal_pipeline;
         let prepass_pipeline = self.prepass_pipeline;
+        // Только viewport с запросами: без захвата внешний список остаётся пустым и не выделяет память.
         let capture_tickets_by_viewport = rendered
             .iter()
-            .map(|entry| (entry.0, self.queued_capture_tickets(entry.0)))
+            .filter_map(|entry| {
+                let tickets = self.queued_capture_tickets(entry.0);
+                (!tickets.is_empty()).then_some((entry.0, tickets))
+            })
             .collect::<Vec<_>>();
         let scene_passes = rendered
             .iter()
@@ -4196,10 +4200,17 @@ impl Renderer {
     }
 
     fn poll_captures(&mut self, only_slot: Option<usize>) {
+        // Без отправленных копий нет ни fence для опроса, ни клона device.
+        if !self
+            .captures
+            .iter()
+            .any(|capture| matches!(capture.state, CaptureState::Submitted(_)))
+        {
+            return;
+        }
         let Some(device) = self.device.as_ref().cloned() else {
             return;
         };
-        let fences: Vec<_> = self.frames.iter().map(|frame| frame.fence).collect();
         for index in 0..self.captures.len() {
             let frame_slot = match &self.captures[index].state {
                 CaptureState::Submitted(submission) => submission.frame_slot,
@@ -4208,7 +4219,7 @@ impl Renderer {
             if only_slot.is_some_and(|only_slot| only_slot != frame_slot) {
                 continue;
             }
-            let Some(fence) = fences.get(frame_slot).copied() else {
+            let Some(fence) = self.frames.get(frame_slot).map(|frame| frame.fence) else {
                 if let CaptureState::Submitted(submission) = &mut self.captures[index].state {
                     submission.completion =
                         CaptureCompletion::Failed("capture frame slot is missing");
