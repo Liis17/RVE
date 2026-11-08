@@ -588,3 +588,41 @@ fn despawning_an_active_object_runs_on_disable_before_on_destroy() {
     );
     assert!(world.handle("prop").is_none());
 }
+
+const SPIN_AND_POSE: &str = r#"
+local Script = {}
+function Script:on_start()
+  self.transform.rotation = { x = 0, y = 45, z = 0 }
+  rve.log("solo:" .. tostring(rve.find("solo"):set_world_rotation({ x = 0, y = 90, z = 0 })))
+  rve.log("tag:" .. tostring(self.object:set_tag("spin")))
+end
+return Script
+"#;
+
+#[test]
+fn own_transform_write_with_unrelated_pose_and_tag_commits_together() {
+    let mut world = pose_world("[1.0, 1.0, 1.0]");
+    let kid = world.handle("kid").unwrap();
+    let solo = world.handle("solo").unwrap();
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("pose.lua", SPIN_AND_POSE)]),
+        None,
+    )
+    .unwrap();
+    host.start(&mut world, frame());
+
+    assert_eq!(event_messages(&mut host), ["solo:true", "tag:true"]);
+    let spin = world.world_rotation_deg(kid).unwrap();
+    assert!(
+        spin.distance(glam::Vec3::new(0.0, 45.0, 0.0)) < 1e-3,
+        "{spin:?}"
+    );
+    let rotation = world.world_rotation_deg(solo).unwrap();
+    assert!(
+        rotation.distance(glam::Vec3::new(0.0, 90.0, 0.0)) < 1e-3,
+        "{rotation:?}"
+    );
+    assert_eq!(world.tag(kid), Some("spin"));
+}

@@ -1094,22 +1094,21 @@ impl ScriptTransaction {
     /// Проверяет заявки до записи в мир: любая отказавшая заявка отбрасывает весь вызов.
     ///
     /// Тег, слой и мировая поза проверяются на текущем мире без копии, если вызов не меняет
-    /// активность, родителя и камеру, не задаёт трансформы и не двигает предка другой позы того же
-    /// вызова: тогда каждая проверка видит те же предки, что и запись. Во всех остальных случаях
-    /// заявки применяются к копии мира в том же порядке, что и коммит.
+    /// активность, родителя и камеру и каждая проверка видит тех же предков, что и запись (см.
+    /// `pose_edits_are_local`). Во всех остальных случаях заявки применяются к копии мира в том же
+    /// порядке, что и коммит. Собственные трансформы объектов от этого не зависят.
     fn probe_edits(&self, world: &World) -> Result<(), String> {
         if self.pending_edits.is_empty() && self.pending_active_camera.is_none() {
             return Ok(());
         }
-        let local_only = self.pending_transforms.is_empty()
-            && self.pending_active_camera.is_none()
+        let local_only = self.pending_active_camera.is_none()
             && self.pending_edits.iter().all(|edit| {
                 !matches!(
                     edit,
                     ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
                 )
             })
-            && self.pose_edits_are_independent(world);
+            && self.pose_edits_are_local(world);
         if !local_only {
             let mut probe = world.clone();
             return self.apply_world_writes(&mut probe);
@@ -1138,7 +1137,10 @@ impl ScriptTransaction {
     }
 
     /// Ни один объект позы не является предком другого объекта позы в этом вызове.
-    fn pose_edits_are_independent(&self, world: &World) -> bool {
+    /// Поза объекта зависит от мировых матриц предков, но не от его собственного трансформа. Поэтому
+    /// проверка на текущем мире точна, если ни один предок позируемого объекта не получил в этом
+    /// вызове трансформ и не является позируемым сам.
+    fn pose_edits_are_local(&self, world: &World) -> bool {
         let posed = self
             .pending_edits
             .iter()
@@ -1151,7 +1153,7 @@ impl ScriptTransaction {
         posed.iter().all(|&handle| {
             let mut ancestor = world.object(handle).and_then(|object| object.parent);
             while let Some(current) = ancestor {
-                if posed.contains(&current) {
+                if posed.contains(&current) || self.pending_transforms.contains_key(&current) {
                     return false;
                 }
                 ancestor = world.object(current).and_then(|object| object.parent);
