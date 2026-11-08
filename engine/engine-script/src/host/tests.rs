@@ -41,6 +41,98 @@ name = "Camera object"
     ))
 }
 
+#[test]
+fn lua_screen_shader_api_reads_queues_and_commits_camera_slots() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/fx/vhs.glsl"
+[[assets]]
+path = "/camera.lua"
+[[objects]]
+id = "camera"
+name = "Primary"
+[objects.camera]
+active = true
+[[objects.camera.screen_shaders]]
+shader = "/fx/vhs.glsl"
+stage = "after_post"
+params = [0.5]
+[[objects.lite_scripts]]
+path = "/camera.lua"
+[[objects]]
+id = "plain"
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local camera = rve.find("camera")
+  assert(camera:screen_shader_count() == 1)
+  local slot = camera:screen_shader(1)
+  assert(slot.enabled == true and math.abs(slot.params[1] - 0.5) < 0.0001 and slot.params[2] == 0)
+  assert(camera:screen_shader(2) == nil)
+  assert(rve.find("plain"):screen_shader_count() == nil)
+  assert(camera:set_screen_shader(1, { enabled = false, params = { 0.25, 0.75 } }) == true)
+  local pending = camera:screen_shader(1)
+  assert(pending.enabled == false and pending.params[2] == 0.75 and pending.params[3] == 0)
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("camera.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        !host
+            .drain_events()
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error),
+        "экранные шейдеры читаются и ставятся в очередь без ошибок"
+    );
+    let shader = &world
+        .screen_shaders(world.handle("camera").unwrap())
+        .unwrap()[0];
+    assert!(!shader.enabled);
+    assert_eq!(shader.params[..2], [0.25, 0.75]);
+    assert!(shader.params[2..].iter().all(|value| *value == 0.0));
+    assert_eq!(shader.shader.as_str(), "fx/vhs.glsl");
+}
+
+#[test]
+fn lua_screen_shader_slot_errors_disable_the_instance_without_commit() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/camera.lua"
+[[objects]]
+id = "camera"
+name = "Primary"
+[objects.camera]
+active = true
+[[objects.lite_scripts]]
+path = "/camera.lua"
+"#,
+    );
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  rve.find("camera"):set_screen_shader(1, { enabled = false })
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("camera.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().iter().any(|event| {
+        event.level == ScriptEventLevel::Error
+            && event.message.contains("no such screen shader slot")
+    }));
+    assert_eq!(
+        world.screen_shaders(world.handle("camera").unwrap()),
+        Some(&[][..])
+    );
+}
+
 fn two_cameras_with_lite_script() -> World {
     world(
         r#"

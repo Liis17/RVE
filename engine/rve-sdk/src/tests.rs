@@ -550,6 +550,9 @@ fn host(state: &mut HostState) -> RveHost {
         net_object_has_authority: None,
         net_object_set_owner: None,
         net_object_send: None,
+        screen_shader_count: None,
+        get_screen_shader: None,
+        set_screen_shader: None,
     }
 }
 
@@ -1932,7 +1935,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 13);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2202,7 +2205,29 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 13);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+}
+
+#[test]
+fn screen_shader_callbacks_are_appended_in_v14() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, screen_shader_count),
+        offset_of!(RveHost, net_object_send) + size_of::<Option<crate::abi::RveNetObjectSendFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, get_screen_shader),
+        offset_of!(RveHost, screen_shader_count)
+            + size_of::<Option<crate::abi::RveScreenShaderCountFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, set_screen_shader),
+        offset_of!(RveHost, get_screen_shader)
+            + size_of::<Option<crate::abi::RveGetScreenShaderFn>>()
+    );
+    assert_eq!(size_of::<crate::abi::RveScreenShaderState>(), 68);
+    assert_eq!(offset_of!(crate::abi::RveScreenShaderState, params), 4);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
 }
 
 #[test]
@@ -2222,7 +2247,7 @@ fn network_callbacks_and_descriptor_keep_the_v13_layout() {
         size_of::<crate::abi::RveScriptDesc>(),
         size_of::<crate::abi::RveScriptDescV6>() + size_of::<Option<crate::abi::RveNetEventFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 13);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
 }
 
 unsafe extern "C" fn net_mode(ctx: *mut c_void) -> u32 {
