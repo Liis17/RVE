@@ -94,6 +94,8 @@ pub(crate) struct FrameSnapshot {
     pub particles: Vec<ParticleSnapshot>,
     /// Игровое время скриптового потока на момент снимка; основа шага симуляции частиц.
     pub sim_time: f64,
+    /// Экранные шейдеры вида: включённые проходы камеры и время сцены.
+    pub screen_shaders: engine_render::ScreenShaders,
     object_motion: HashMap<ObjectHandle, ObjectMotion>,
 }
 
@@ -155,12 +157,19 @@ pub(crate) struct GpuSceneTable {
     pub skin_instances: HashMap<ObjectHandle, Vec<SkinId>>,
     /// Число костей модели объекта с экземплярами skinning; палитра моста должна иметь ту же длину.
     pub joint_counts: HashMap<ObjectHandle, u32>,
+    /// Экранные шейдеры камер по пути `.glsl`; создаются при загрузке сцены и освобождаются с ней.
+    pub screen_shaders: HashMap<String, engine_render::ScreenShaderId>,
 }
 
 impl GpuSceneTable {
     /// Все экземпляры skinning сцены; рендер освобождает их при завершении.
     pub(crate) fn skin_instance_ids(&self) -> Vec<SkinId> {
         self.skin_instances.values().flatten().copied().collect()
+    }
+
+    /// Экранные шейдеры сцены; рендер освобождает их при выгрузке.
+    pub(crate) fn screen_shader_ids(&self) -> Vec<engine_render::ScreenShaderId> {
+        self.screen_shaders.values().copied().collect()
     }
 }
 
@@ -451,6 +460,7 @@ pub(crate) struct VulkanBackend {
     console_viewport: Option<(ViewportId, u32, u32)>,
     /// Экземпляры skinning сцены, которые освобождаются в `release_scene`.
     scene_skin_instances: Vec<SkinId>,
+    scene_screen_shaders: Vec<engine_render::ScreenShaderId>,
 }
 
 #[cfg(feature = "dev-console")]
@@ -480,6 +490,7 @@ impl VulkanBackend {
             #[cfg(feature = "dev-console")]
             console_viewport: None,
             scene_skin_instances: Vec::new(),
+            scene_screen_shaders: Vec::new(),
         }
     }
 
@@ -495,6 +506,14 @@ impl VulkanBackend {
     #[cfg(feature = "dev-console")]
     pub fn with_console(mut self, console_ui: Arc<ConsoleUiSlot>) -> Self {
         self.console_ui = Some(console_ui);
+        self
+    }
+
+    pub fn with_scene_screen_shaders(
+        mut self,
+        shaders: Vec<engine_render::ScreenShaderId>,
+    ) -> Self {
+        self.scene_screen_shaders = shaders;
         self
     }
 
@@ -698,7 +717,7 @@ impl RenderBackend for VulkanBackend {
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 post: render_post_process(&snapshot.post_process),
-                screen_shaders: engine_render::ScreenShaders::default(),
+                screen_shaders: snapshot.screen_shaders,
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -726,6 +745,11 @@ impl RenderBackend for VulkanBackend {
         for instance in self.scene_skin_instances.drain(..) {
             if let Err(error) = self.renderer.destroy_skin_instance(instance) {
                 eprintln!("failed to release skin instance: {error}");
+            }
+        }
+        for shader in self.scene_screen_shaders.drain(..) {
+            if let Err(error) = self.renderer.destroy_screen_shader(shader) {
+                eprintln!("failed to release screen shader: {error}");
             }
         }
     }
@@ -817,7 +841,7 @@ impl RenderBackend for VulkanBackend {
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 post: render_post_process(&snapshot.post_process),
-                screen_shaders: engine_render::ScreenShaders::default(),
+                screen_shaders: snapshot.screen_shaders,
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -1443,6 +1467,7 @@ fn scripts_thread(
         let made =
             make_snapshot(scene_frame, &world, &gpu_scene, &animation).map(|mut snapshot| {
                 snapshot.sim_time = sim_time;
+                snapshot.screen_shaders.time = sim_time as f32;
                 snapshot
             });
         timings.record(
@@ -1949,6 +1974,59 @@ impl MotionHistory {
     }
 }
 
+/// Включённые проходы камеры, для которых создан GPU-шейдер, в порядке файла сцены. Шейдер без
+/// созданного ресурса (ошибка загрузки) пропускается; остальные сохраняют порядок и стадию.
+fn enabled_screen_passes<T: Copy>(
+    shaders: &[engine_scene::ScreenShaderRef],
+    ids: &HashMap<String, T>,
+) -> [Option<(
+    T,
+    engine_render::ScreenShaderStage,
+    [f32; engine_render::SCREEN_SHADER_PARAM_COUNT],
+)>; engine_render::SCREEN_SHADER_MAX_PASSES] {
+    let mut passes = [None; engine_render::SCREEN_SHADER_MAX_PASSES];
+    let known = shaders
+        .iter()
+        .filter(|shader| shader.enabled)
+        .filter_map(|shader| Some((ids.get(shader.shader.as_str())?, shader)));
+    for (slot, (id, shader)) in known.take(passes.len()).enumerate() {
+        let mut params = [0.0_f32; engine_render::SCREEN_SHADER_PARAM_COUNT];
+        for (value, parameter) in params.iter_mut().zip(&shader.params) {
+            *value = *parameter;
+        }
+        let stage = match shader.stage {
+            engine_scene::ScreenShaderStage::BeforePost => {
+                engine_render::ScreenShaderStage::BeforePost
+            }
+            engine_scene::ScreenShaderStage::AfterPost => {
+                engine_render::ScreenShaderStage::AfterPost
+            }
+        };
+        passes[slot] = Some((*id, stage, params));
+    }
+    passes
+}
+
+/// Экранные шейдеры вида для кадра; время задаёт вызывающий код.
+pub(crate) fn screen_shader_view(
+    shaders: &[engine_scene::ScreenShaderRef],
+    ids: &HashMap<String, engine_render::ScreenShaderId>,
+) -> engine_render::ScreenShaders {
+    let mut view = engine_render::ScreenShaders::default();
+    for (target, pass) in view
+        .passes
+        .iter_mut()
+        .zip(enabled_screen_passes(shaders, ids))
+    {
+        *target = pass.map(|(shader, stage, params)| engine_render::ScreenShaderPass {
+            shader,
+            stage,
+            params,
+        });
+    }
+    view
+}
+
 fn make_snapshot(
     scene: engine_scene::SceneFrame,
     world: &World,
@@ -2022,6 +2100,7 @@ fn make_snapshot(
         active_camera: world.active_camera(),
         view: scene.view,
         post_process: scene.post_process,
+        screen_shaders: screen_shader_view(&scene.screen_shaders, &gpu_scene.screen_shaders),
         reset_history: false,
         light: scene.light,
         local_lights,
@@ -3706,6 +3785,7 @@ distance=2.0
             active_camera,
             view: CameraSettings::default(),
             post_process: engine_scene::PostProcessSettings::default(),
+            screen_shaders: engine_render::ScreenShaders::default(),
             reset_history: false,
             light: LightState::default(),
             local_lights: Vec::new(),
@@ -3751,6 +3831,7 @@ distance=2.0
             active_camera,
             view: CameraSettings::default(),
             post_process: engine_scene::PostProcessSettings::default(),
+            screen_shaders: engine_render::ScreenShaders::default(),
             reset_history: false,
             light: LightState::default(),
             local_lights: Vec::new(),
@@ -7076,6 +7157,78 @@ mod particle_emitter_tests {
         assert_eq!(log, vec![8]);
         apply(&mut table, &mut log, ParticleRequest::Destroy(vec![a]));
         assert_eq!(log, vec![8], "повторное уничтожение не трогает эмиттер");
+    }
+}
+
+#[cfg(test)]
+mod screen_shader_selection_tests {
+    use super::*;
+    use engine_files::VirtualPath;
+    use engine_scene::ScreenShaderStage as SceneStage;
+
+    fn shader(
+        path: &str,
+        stage: SceneStage,
+        enabled: bool,
+        params: &[f32],
+    ) -> engine_scene::ScreenShaderRef {
+        engine_scene::ScreenShaderRef {
+            shader: VirtualPath::parse(path).unwrap(),
+            stage,
+            enabled,
+            params: params.to_vec(),
+        }
+    }
+
+    #[test]
+    fn enabled_passes_keep_file_order_stage_and_padded_parameters() {
+        let shaders = [
+            shader("fx/vhs.glsl", SceneStage::AfterPost, true, &[0.7, 0.3]),
+            shader("fx/off.glsl", SceneStage::BeforePost, false, &[1.0]),
+            shader("fx/failed.glsl", SceneStage::BeforePost, true, &[]),
+            shader("fx/color.glsl", SceneStage::BeforePost, true, &[]),
+        ];
+        let ids = HashMap::from([
+            ("fx/vhs.glsl".to_owned(), 1_u32),
+            ("fx/off.glsl".to_owned(), 3),
+            ("fx/color.glsl".to_owned(), 2),
+        ]);
+        let [first, second, third, fourth] = enabled_screen_passes(&shaders, &ids);
+        let (id, stage, params) = first.expect("первый включённый проход");
+        assert_eq!(
+            (id, stage),
+            (1, engine_render::ScreenShaderStage::AfterPost)
+        );
+        assert_eq!(params[..2], [0.7, 0.3]);
+        assert!(params[2..].iter().all(|value| *value == 0.0));
+        assert_eq!(
+            second.map(|(id, stage, _)| (id, stage)),
+            Some((2, engine_render::ScreenShaderStage::BeforePost)),
+            "выключенный и не созданный шейдеры пропущены"
+        );
+        assert!(third.is_none() && fourth.is_none());
+    }
+
+    #[test]
+    fn selection_keeps_at_most_four_passes() {
+        let shaders: Vec<_> = (0..5)
+            .map(|index| {
+                shader(
+                    &format!("fx/{index}.glsl"),
+                    SceneStage::AfterPost,
+                    true,
+                    &[],
+                )
+            })
+            .collect();
+        let ids: HashMap<String, u32> = (0..5)
+            .map(|index| (format!("fx/{index}.glsl"), index))
+            .collect();
+        let passes = enabled_screen_passes(&shaders, &ids);
+        assert_eq!(
+            passes.iter().flatten().count(),
+            engine_render::SCREEN_SHADER_MAX_PASSES
+        );
     }
 }
 
