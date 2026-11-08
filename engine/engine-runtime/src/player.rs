@@ -21,8 +21,10 @@ use egui::{Context, Rect, ViewportId};
 use egui_winit::State as EguiWinitState;
 #[cfg(feature = "dev-console")]
 use engine_console::{CommandLine, ConsoleBuffer, ConsoleLevel, ConsoleLine, parse_command_line};
-use engine_project::BootstrapPresentMode;
-use engine_render::{DebugView, PresentMode, Renderer, RendererConfig, UpscalerConfig};
+use engine_project::{BootstrapPresentMode, BootstrapReflexMode};
+use engine_render::{
+    DebugView, LowLatencyMode, PresentMode, Renderer, RendererConfig, UpscalerConfig,
+};
 use engine_resources::ResourceHandle;
 use engine_script::ScriptInterruptHandle;
 #[cfg(feature = "dev-console")]
@@ -51,6 +53,7 @@ impl ExitRequester for WindowExit {
 pub(crate) struct PlayerConfig {
     pub window: WindowConfig,
     pub present_mode: Option<BootstrapPresentMode>,
+    pub reflex: Option<BootstrapReflexMode>,
     pub pipeline_cache_path: Option<PathBuf>,
     pub fsr_library: Option<PathBuf>,
     pub dlss_library: Option<PathBuf>,
@@ -87,6 +90,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
     let PlayerConfig {
         window,
         present_mode,
+        reflex,
         pipeline_cache_path,
         fsr_library,
         dlss_library,
@@ -126,6 +130,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         #[cfg(feature = "dev-console")]
         f8_down: false,
         present_mode,
+        reflex,
         pipeline_cache_path,
         fsr_library,
         dlss_library,
@@ -193,6 +198,7 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
 struct PlayerWindow<'a> {
     frame_limit: Option<u64>,
     present_mode: Option<BootstrapPresentMode>,
+    reflex: Option<BootstrapReflexMode>,
     pipeline_cache_path: Option<PathBuf>,
     fsr_library: Option<PathBuf>,
     dlss_library: Option<PathBuf>,
@@ -800,6 +806,14 @@ impl WindowHandler for PlayerWindow<'_> {
                         BootstrapPresentMode::Immediate => PresentMode::Immediate,
                     })
                     .unwrap_or_default(),
+                low_latency: self
+                    .reflex
+                    .map(|mode| match mode {
+                        BootstrapReflexMode::Off => LowLatencyMode::Off,
+                        BootstrapReflexMode::On => LowLatencyMode::On,
+                        BootstrapReflexMode::Boost => LowLatencyMode::Boost,
+                    })
+                    .unwrap_or_default(),
                 pipeline_cache: self.pipeline_cache.clone(),
                 upscalers: UpscalerConfig {
                     fsr_library: self.fsr_library.clone(),
@@ -815,6 +829,7 @@ impl WindowHandler for PlayerWindow<'_> {
             Err(error) => return self.fail_init(format!("ошибка renderer: {error}")),
         };
         self.startup.record("renderer", phase_started.elapsed());
+        let latency = renderer.latency_handle();
         #[cfg(feature = "dev-console")]
         {
             self.wireframe_supported = renderer.capabilities().wireframe;
@@ -865,6 +880,17 @@ impl WindowHandler for PlayerWindow<'_> {
             return self.fail_init(format!("не удалось запустить поток рендера: {error}"));
         }
         self.render_started = true;
+        if let Some(latency) = latency
+            && self
+                .script_tx
+                .send(ScriptControl::Latency(Arc::new(latency)))
+                .is_err()
+        {
+            self.status
+                .record_failure("поток скриптов завершился до запуска сцены");
+            let _ = self.render_tx.send(RenderControl::Shutdown);
+            return false;
+        }
         if self
             .script_tx
             .send(ScriptControl::Go(Box::new(gpu_scene)))
