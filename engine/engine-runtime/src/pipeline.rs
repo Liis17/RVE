@@ -2986,6 +2986,7 @@ return Input
                 cursor: CursorControl::default(),
                 sources: BTreeMap::from([("input.lua".to_owned(), script.to_owned())]),
                 input_settings: InputSettings {
+                    gamepad: Default::default(),
                     default_context: Some("game".to_owned()),
                     contexts: BTreeMap::from([(
                         "game".to_owned(),

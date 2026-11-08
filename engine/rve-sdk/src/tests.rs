@@ -2235,6 +2235,16 @@ fn gamepad_physical_input_names_round_trip_and_reject_invalid_slots() {
     }
     assert_eq!(GamepadButton::from_code(17), None);
     assert_eq!(
+        crate::abi::split_gamepad_name("Gamepad2.LeftStick"),
+        Some((Some(2), "LeftStick"))
+    );
+    assert_eq!(
+        crate::abi::split_gamepad_name("Gamepad.RightTrigger"),
+        Some((None, "RightTrigger"))
+    );
+    assert_eq!(crate::abi::split_gamepad_name("Gamepad5.South"), None);
+    assert_eq!(crate::abi::split_gamepad_name("Mouse.Left"), None);
+    assert_eq!(
         GamepadAxis::from_name("RightTrigger"),
         Some(GamepadAxis::RightTrigger)
     );

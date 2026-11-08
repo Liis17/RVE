@@ -1650,6 +1650,7 @@ end
 return S
 "#;
         let input_settings = InputSettings {
+            gamepad: Default::default(),
             default_context: Some("game".to_owned()),
             contexts: std::collections::BTreeMap::from([(
                 "game".to_owned(),

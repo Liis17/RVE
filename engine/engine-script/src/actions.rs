@@ -711,6 +711,7 @@ mod tests {
 
     fn settings() -> InputSettings {
         InputSettings {
+            gamepad: Default::default(),
             default_context: Some("game".to_owned()),
             contexts: BTreeMap::from([
                 (

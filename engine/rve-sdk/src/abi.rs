@@ -410,6 +410,25 @@ impl GamepadAxis {
     }
 }
 
+/// Splits `Gamepad[N].<Name>` into its optional slot (1..=4, `None` for any gamepad) and the
+/// trailing name. Returns `None` for other strings and for slots outside 1..=4.
+pub fn split_gamepad_name(name: &str) -> Option<(Option<u8>, &str)> {
+    let rest = name.strip_prefix("Gamepad")?;
+    let (pad, tail) = rest.split_once('.')?;
+    let pad = match pad {
+        "" => None,
+        digits if digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+            let pad = digits.parse::<u8>().ok()?;
+            if !(1..=RVE_GAMEPAD_SLOTS as u8).contains(&pad) {
+                return None;
+            }
+            Some(pad)
+        }
+        _ => return None,
+    };
+    Some((pad, tail))
+}
+
 /// A physical keyboard key, mouse button, or gamepad button used by project input bindings.
 ///
 /// `GamepadButton.pad` is `None` for any gamepad (`Gamepad.South`) or `Some(1..=4)` for one
@@ -429,19 +448,7 @@ impl PhysicalInput {
     pub fn from_name(name: &str) -> Option<Self> {
         if let Some(button) = name.strip_prefix("Mouse.") {
             MouseButton::from_name(button).map(Self::MouseButton)
-        } else if let Some(rest) = name.strip_prefix("Gamepad") {
-            let (pad, button) = rest.split_once('.')?;
-            let pad = match pad {
-                "" => None,
-                digits if digits.bytes().all(|byte| byte.is_ascii_digit()) => {
-                    let pad = digits.parse::<u8>().ok()?;
-                    if !(1..=RVE_GAMEPAD_SLOTS as u8).contains(&pad) {
-                        return None;
-                    }
-                    Some(pad)
-                }
-                _ => return None,
-            };
+        } else if let Some((pad, button)) = split_gamepad_name(name) {
             GamepadButton::from_name(button).map(|button| Self::GamepadButton { pad, button })
         } else {
             Key::from_name(name).map(Self::Key)

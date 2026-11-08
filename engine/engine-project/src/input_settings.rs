@@ -1,4 +1,5 @@
 use rve_sdk::PhysicalInput;
+use rve_sdk::abi::split_gamepad_name;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -6,7 +7,7 @@ const MAX_CONTEXTS: usize = 32;
 const MAX_ACTIONS_PER_CONTEXT: usize = 128;
 const MAX_INPUTS_PER_SLOT: usize = rve_sdk::abi::RVE_INPUT_MAX_BINDINGS;
 
-/// Project-defined action contexts and their default active context.
+/// Project-defined action contexts, their default active context, and gamepad tuning.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputSettings {
@@ -14,6 +15,59 @@ pub struct InputSettings {
     pub default_context: Option<String>,
     #[serde(default)]
     pub contexts: BTreeMap<String, BTreeMap<String, InputAction>>,
+    #[serde(default)]
+    pub gamepad: GamepadSettings,
+}
+
+/// Gamepad tuning from `[input.gamepad]`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GamepadSettings {
+    /// Radial stick dead zone in [0, 1). Values inside it read as zero.
+    #[serde(default = "default_stick_deadzone")]
+    pub stick_deadzone: f32,
+    /// Trigger value in (0, 1) above which a trigger counts as a button press (strict `>`).
+    #[serde(default = "default_trigger_threshold")]
+    pub trigger_threshold: f32,
+}
+
+impl Default for GamepadSettings {
+    fn default() -> Self {
+        Self {
+            stick_deadzone: default_stick_deadzone(),
+            trigger_threshold: default_trigger_threshold(),
+        }
+    }
+}
+
+impl PartialEq for GamepadSettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.stick_deadzone.to_bits() == other.stick_deadzone.to_bits()
+            && self.trigger_threshold.to_bits() == other.trigger_threshold.to_bits()
+    }
+}
+
+impl Eq for GamepadSettings {}
+
+impl GamepadSettings {
+    fn validate(&self) -> Result<(), String> {
+        if !(self.stick_deadzone.is_finite() && (0.0..1.0).contains(&self.stick_deadzone)) {
+            return Err(
+                "input.gamepad.stick_deadzone должен быть конечным числом в диапазоне [0, 1)"
+                    .to_owned(),
+            );
+        }
+        if !(self.trigger_threshold.is_finite()
+            && self.trigger_threshold > 0.0
+            && self.trigger_threshold < 1.0)
+        {
+            return Err(
+                "input.gamepad.trigger_threshold должен быть конечным числом в диапазоне (0, 1)"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The value shape an action exposes to scripts.
@@ -120,6 +174,7 @@ impl Eq for InputAction {}
 
 impl InputSettings {
     pub fn validate(&self) -> Result<(), String> {
+        self.gamepad.validate()?;
         if self.contexts.len() > MAX_CONTEXTS {
             return Err(format!(
                 "input.contexts не может содержать больше {MAX_CONTEXTS} контекстов"
@@ -174,6 +229,7 @@ impl InputSettings {
                         validate_scale(*scale, context_name, action_name)?;
                         if analog.as_deref().is_some_and(|name| {
                             !matches!(name, "MouseX" | "MouseY" | "WheelX" | "WheelY")
+                                && !is_gamepad_axis_analog(name)
                         }) {
                             return Err(format!(
                                 "input action {action_name:?} в контексте {context_name:?} имеет неверный analog для axis"
@@ -193,10 +249,10 @@ impl InputSettings {
                         validate_slot(left, context_name, action_name, "left")?;
                         validate_slot(right, context_name, action_name, "right")?;
                         validate_scale(*scale, context_name, action_name)?;
-                        if analog
-                            .as_deref()
-                            .is_some_and(|name| !matches!(name, "MouseDelta" | "Wheel"))
-                        {
+                        if analog.as_deref().is_some_and(|name| {
+                            !matches!(name, "MouseDelta" | "Wheel")
+                                && !is_gamepad_stick_analog(name)
+                        }) {
                             return Err(format!(
                                 "input action {action_name:?} в контексте {context_name:?} имеет неверный analog для vector2"
                             ));
@@ -254,8 +310,157 @@ fn validate_scale(scale: f32, context: &str, action: &str) -> Result<(), String>
     Ok(())
 }
 
+fn is_gamepad_axis_analog(name: &str) -> bool {
+    split_gamepad_name(name).is_some_and(|(_, axis)| {
+        matches!(
+            axis,
+            "LeftX" | "LeftY" | "RightX" | "RightY" | "LeftTrigger" | "RightTrigger"
+        )
+    })
+}
+
+fn is_gamepad_stick_analog(name: &str) -> bool {
+    split_gamepad_name(name).is_some_and(|(_, stick)| matches!(stick, "LeftStick" | "RightStick"))
+}
+
 fn default_scale() -> f32 {
     1.0
+}
+
+fn default_stick_deadzone() -> f32 {
+    0.15
+}
+
+fn default_trigger_threshold() -> f32 {
+    0.5
+}
+
+#[cfg(test)]
+mod gamepad_tests {
+    use super::*;
+
+    fn settings_with_analog(action: InputAction) -> InputSettings {
+        InputSettings {
+            default_context: Some("game".to_owned()),
+            contexts: BTreeMap::from([(
+                "game".to_owned(),
+                BTreeMap::from([("Look".to_owned(), action)]),
+            )]),
+            gamepad: GamepadSettings::default(),
+        }
+    }
+
+    fn axis(analog: &str) -> InputAction {
+        InputAction::Axis {
+            negative: Vec::new(),
+            positive: Vec::new(),
+            analog: Some(analog.to_owned()),
+            scale: 1.0,
+        }
+    }
+
+    fn vector(analog: &str) -> InputAction {
+        InputAction::Vector2 {
+            up: Vec::new(),
+            down: Vec::new(),
+            left: Vec::new(),
+            right: Vec::new(),
+            analog: Some(analog.to_owned()),
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn gamepad_defaults_are_used_without_a_section() {
+        let settings: InputSettings = toml::from_str("").unwrap();
+        assert_eq!(settings.gamepad.stick_deadzone, 0.15);
+        assert_eq!(settings.gamepad.trigger_threshold, 0.5);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_non_finite_and_out_of_range_gamepad_tuning() {
+        let invalid_deadzones = [f32::NAN, f32::INFINITY, -0.1, 1.0, 2.0];
+        for deadzone in invalid_deadzones {
+            let settings = InputSettings {
+                gamepad: GamepadSettings {
+                    stick_deadzone: deadzone,
+                    ..GamepadSettings::default()
+                },
+                ..InputSettings::default()
+            };
+            assert!(settings.validate().is_err(), "deadzone {deadzone}");
+        }
+        let invalid_thresholds = [f32::NAN, f32::NEG_INFINITY, 0.0, -0.5, 1.0, 1.5];
+        for threshold in invalid_thresholds {
+            let settings = InputSettings {
+                gamepad: GamepadSettings {
+                    trigger_threshold: threshold,
+                    ..GamepadSettings::default()
+                },
+                ..InputSettings::default()
+            };
+            assert!(settings.validate().is_err(), "threshold {threshold}");
+        }
+    }
+
+    #[test]
+    fn accepts_gamepad_analog_names_for_matching_action_kinds() {
+        for name in [
+            "Gamepad2.LeftTrigger",
+            "Gamepad.LeftX",
+            "Gamepad1.RightY",
+            "Gamepad4.RightTrigger",
+        ] {
+            assert!(
+                settings_with_analog(axis(name)).validate().is_ok(),
+                "{name}"
+            );
+        }
+        for name in ["Gamepad.LeftStick", "Gamepad3.RightStick"] {
+            assert!(
+                settings_with_analog(vector(name)).validate().is_ok(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_gamepad_analog_names_with_wrong_kind_or_slot() {
+        for name in [
+            "Gamepad.LeftStick",
+            "Gamepad.South",
+            "Gamepad0.LeftX",
+            "Gamepad5.LeftX",
+            "LeftX",
+        ] {
+            assert!(
+                settings_with_analog(axis(name)).validate().is_err(),
+                "{name}"
+            );
+        }
+        for name in ["Gamepad.LeftX", "Gamepad9.LeftStick", "Gamepad.Trigger"] {
+            assert!(
+                settings_with_analog(vector(name)).validate().is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn gamepad_settings_round_trip_through_toml() {
+        let settings = InputSettings {
+            gamepad: GamepadSettings {
+                stick_deadzone: 0.25,
+                trigger_threshold: 0.75,
+            },
+            ..InputSettings::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        let reloaded: InputSettings = toml::from_str(&serialized).unwrap();
+        assert_eq!(reloaded, settings);
+        assert!(serialized.contains("[gamepad]"));
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +509,7 @@ mod tests {
                     ),
                 ]),
             )]),
+            gamepad: Default::default(),
         };
         let text = toml::to_string(&parsed).unwrap();
         let decoded: InputSettings = toml::from_str(&text).unwrap();

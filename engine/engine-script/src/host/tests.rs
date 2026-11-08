@@ -71,6 +71,7 @@ fn sources(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn action_settings() -> InputSettings {
     InputSettings {
+        gamepad: Default::default(),
         default_context: Some("game".to_owned()),
         contexts: BTreeMap::from([
             (
