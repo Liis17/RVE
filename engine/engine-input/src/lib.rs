@@ -2,10 +2,12 @@
 //! assigns up to four pads to slots 1..=4 and builds processed snapshots.
 
 mod backend;
+mod gate;
 mod mapper;
 mod translate;
 
 pub use backend::GilrsBackend;
+pub use gate::PadGate;
 pub use mapper::{GamepadMapper, GamepadSnapshot, GamepadTuning, PadSnapshot, SLOT_COUNT};
 pub use translate::{MapperEvent, translate};
 

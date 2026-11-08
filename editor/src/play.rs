@@ -7,12 +7,13 @@ use engine_assets::Assets;
 use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
 use engine_files::VirtualPath;
+use engine_input::{GamepadSnapshot, GamepadTuning, GilrsBackend, PadGate};
 use engine_physics::{
     BodyChange, BodyHandle, ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsClient,
     PhysicsCommand, PhysicsInitialization, PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync,
     PhysicsServer, PhysicsServerError, ShapeCache,
 };
-use engine_project::{InputSettings, PhysicsSettings, PrefabCatalogFile};
+use engine_project::{GamepadSettings, InputSettings, PhysicsSettings, PrefabCatalogFile};
 use engine_resources::ResourceHandle;
 use engine_scene::document::mesh_collider_model;
 use engine_scene::prefab::PREFAB_EXTENSION;
@@ -468,8 +469,26 @@ pub struct PlaySession {
     frame: u64,
     last_tick: Instant,
     input: ScriptInput,
+    gamepads: GilrsBackend,
+    pad_gate: PadGate,
+    /// Whether pads were accepted in the last poll; rumble from scripts plays only then.
+    pad_accepting: bool,
     heavy: HeavyLoads,
     last_step: PlayStep,
+}
+
+/// Opens the editor's gamepad backend with the project's tuning. Tests run without devices so
+/// they never open `gilrs`.
+fn gamepad_backend(settings: &GamepadSettings) -> GilrsBackend {
+    let tuning = GamepadTuning {
+        stick_deadzone: settings.stick_deadzone,
+        trigger_threshold: settings.trigger_threshold,
+    };
+    if cfg!(test) {
+        GilrsBackend::without_devices(tuning)
+    } else {
+        GilrsBackend::new(tuning)
+    }
 }
 
 impl PlaySession {
@@ -678,6 +697,9 @@ impl PlaySession {
             last_tick: Instant::now(),
             last_step: PlayStep::default(),
             input: ScriptInput::default(),
+            gamepads: gamepad_backend(&input_settings.gamepad),
+            pad_gate: PadGate::default(),
+            pad_accepting: false,
             heavy: HeavyLoads::new(resources),
         })
     }
@@ -719,6 +741,25 @@ impl PlaySession {
     /// Вводит состояние кнопок и клавиш для следующего обновления.
     pub fn input_mut(&mut self) -> &mut ScriptInput {
         &mut self.input
+    }
+
+    /// Reads the gamepads for the next update. Pads count only while `accepting` is true: the
+    /// editor window has focus and the console is closed. Otherwise they read as released.
+    pub fn poll_gamepads(&mut self, accepting: bool) {
+        self.gamepads.poll();
+        let pads = self.gamepads.snapshot();
+        self.apply_gamepads(&pads, accepting);
+    }
+
+    fn apply_gamepads(&mut self, pads: &GamepadSnapshot, accepting: bool) {
+        for (index, pad) in self.pad_gate.apply(accepting, pads).iter().enumerate() {
+            self.input
+                .set_pad(index, pad.connected, pad.buttons, pad.axes);
+        }
+        self.pad_accepting = accepting;
+        if !accepting {
+            self.gamepads.stop_rumble();
+        }
     }
 
     pub(crate) fn clear_input(&mut self) {
@@ -773,6 +814,13 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.update(&mut self.world, dt, time);
         self.watchdog.set_deadline(None);
+        let rumble = self.host.take_rumble_requests();
+        if self.pad_accepting {
+            for request in rumble {
+                self.gamepads
+                    .rumble(request.pad, request.strong, request.weak, request.seconds);
+            }
+        }
         // Порядок как в runtime: запросы скриптов, затем время; события уйдут в следующий update.
         self.animation.apply(self.host.drain_animation_requests());
         let finished = self.animation.advance(dt);
@@ -1618,6 +1666,48 @@ return Hero
             Duration::from_millis(50),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn gamepad_input_reaches_the_script_only_while_accepted() {
+        use engine_input::{PadSnapshot, SLOT_COUNT};
+        use rve_sdk::GamepadButton;
+
+        let script = r#"
+local S = {}
+function S:on_update(dt)
+  if rve.input.gamepad_pressed("South", 1) then rve.log_info("pad") end
+end
+return S
+"#;
+        let mut pads = [PadSnapshot::default(); SLOT_COUNT];
+        pads[0] = PadSnapshot {
+            connected: true,
+            buttons: 1 << GamepadButton::South as u32,
+            axes: [0.0; 6],
+        };
+
+        let mut session = start(script).unwrap();
+        // Input is regained with nothing held; a button already held then would stay masked.
+        session.apply_gamepads(&[PadSnapshot::default(); SLOT_COUNT], true);
+        session.apply_gamepads(&pads, true);
+        session.step(0.1).unwrap();
+        assert!(
+            session
+                .drain_events()
+                .iter()
+                .any(|event| event.message == "pad")
+        );
+
+        let mut session = start(script).unwrap();
+        session.apply_gamepads(&pads, false);
+        session.step(0.1).unwrap();
+        assert!(
+            !session
+                .drain_events()
+                .iter()
+                .any(|event| event.message == "pad")
+        );
     }
 
     #[test]

@@ -1250,7 +1250,11 @@ impl EditorApp {
         let ui_primitives: Vec<UiPrimitive<'_>> =
             meshes.iter().map(ConvertedMesh::primitive).collect();
 
-        let play_error = self.state.play.as_mut().and_then(|play| play.tick().err());
+        let pads_accepted = self.window_focused && !self.state.console_open;
+        let play_error = self.state.play.as_mut().and_then(|play| {
+            play.poll_gamepads(pads_accepted);
+            play.tick().err()
+        });
         if play_error.is_none()
             && let Some(play) = self.state.play.as_ref()
             && !play.is_paused()

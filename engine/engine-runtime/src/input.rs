@@ -1,4 +1,4 @@
-use engine_input::{GamepadSnapshot, SLOT_COUNT};
+use engine_input::{GamepadSnapshot, PadGate};
 use engine_script::{Key, MouseButton, ScriptInput};
 use engine_window::{Key as WindowKey, MouseButton as WindowMouseButton};
 use std::sync::{Mutex, MutexGuard};
@@ -9,9 +9,7 @@ pub(crate) struct InputAccumulator {
     input: ScriptInput,
     focused: bool,
     background: bool,
-    /// Buttons held on each pad when input was last regained. They stay masked until released.
-    pad_masks: [u32; SLOT_COUNT],
-    pads_accepting: bool,
+    pad_gate: PadGate,
 }
 
 impl InputAccumulator {
@@ -79,20 +77,9 @@ impl InputAccumulator {
     /// caller can stop rumble while it is not.
     pub(crate) fn set_pads(&mut self, pads: &GamepadSnapshot) -> bool {
         let accepting = self.accepting_input();
-        if accepting && !self.pads_accepting {
-            for (mask, pad) in self.pad_masks.iter_mut().zip(pads) {
-                *mask = pad.buttons;
-            }
-        }
-        self.pads_accepting = accepting;
-        for (index, (mask, pad)) in self.pad_masks.iter_mut().zip(pads).enumerate() {
-            if accepting {
-                *mask &= pad.buttons;
-                self.input
-                    .set_pad(index, pad.connected, pad.buttons & !*mask, pad.axes);
-            } else {
-                self.input.set_pad(index, pad.connected, 0, [0.0; 6]);
-            }
+        for (index, pad) in self.pad_gate.apply(accepting, pads).iter().enumerate() {
+            self.input
+                .set_pad(index, pad.connected, pad.buttons, pad.axes);
         }
         accepting
     }
