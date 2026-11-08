@@ -115,6 +115,12 @@ fn warm_start(
         let Some(contact) = contact_mut(pairs, constraint.key, constraint.index) else {
             continue;
         };
+        // Касательный импульс прошлого шага переносится только в пределах конуса текущего трения:
+        // при смене статического трения на динамическое старый импульс не должен остаться в покое.
+        contact.tangent_impulse = clamp_to_friction_cone(
+            contact.tangent_impulse,
+            constraint.friction * contact.normal_impulse,
+        );
         let impulse = constraint.normal * contact.normal_impulse + contact.tangent_impulse;
         apply_pair_impulse(bodies, constraint.key, constraint.point, impulse);
     }
@@ -175,15 +181,23 @@ fn solve_friction(
             return;
         };
         let old_impulse = contact.tangent_impulse;
-        let mut candidate = old_impulse + tangent * delta;
-        let maximum = constraint.friction * contact.normal_impulse;
-        let length = candidate.length();
-        if maximum.is_finite() && length > maximum && length > f32::MIN_POSITIVE {
-            candidate *= maximum / length;
-        }
+        let candidate = clamp_to_friction_cone(
+            old_impulse + tangent * delta,
+            constraint.friction * contact.normal_impulse,
+        );
         contact.tangent_impulse = candidate;
         let applied = candidate - old_impulse;
         apply_pair_impulse(bodies, constraint.key, constraint.point, applied);
+    }
+}
+
+/// Ограничивает касательный импульс конусом трения радиуса `maximum` (`μ·λn`).
+fn clamp_to_friction_cone(impulse: Vec3, maximum: f32) -> Vec3 {
+    let length = impulse.length();
+    if maximum.is_finite() && length > maximum && length > f32::MIN_POSITIVE {
+        impulse * (maximum / length)
+    } else {
+        impulse
     }
 }
 
@@ -316,7 +330,9 @@ fn slides_after_solve(
     let tangent_speed =
         (relative_velocity - constraint.normal * relative_velocity.dot(constraint.normal)).length();
     let limit = constraint.friction * contact.normal_impulse;
-    let clamped =
-        limit > 0.0 && contact.tangent_impulse.length() >= limit * (1.0 - FRICTION_CLAMP_TOLERANCE);
+    // Нулевое трение не удерживает точку: любое касательное движение остаётся скольжением.
+    let clamped = constraint.friction <= 0.0
+        || (limit > 0.0
+            && contact.tangent_impulse.length() >= limit * (1.0 - FRICTION_CLAMP_TOLERANCE));
     clamped && tangent_speed > SLIDING_SPEED
 }

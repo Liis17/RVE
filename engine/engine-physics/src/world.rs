@@ -1570,6 +1570,32 @@ mod tests {
     }
 
     #[test]
+    fn zero_dynamic_friction_slide_accelerates_like_frictionless_block() {
+        let downslope = Quat::from_rotation_z(-20.0_f32.to_radians()) * Vec3::X;
+        let downslope_speeds = |material: PhysicsMaterial| -> Vec<f32> {
+            let (mut driver, block) = ramp_block_world(60, material, material);
+            (0..60)
+                .map(|_| {
+                    driver.advance_step(1.0 / 60.0, []).unwrap();
+                    driver.world().body_velocity(block).unwrap().dot(downslope)
+                })
+                .collect()
+        };
+        let frictionless = downslope_speeds(friction_material(0.0, 0.0));
+        let sliding = downslope_speeds(friction_material(0.3, 0.0));
+        // Первые шаги блок удерживается статическим трением, пока скорость скольжения не
+        // превысит порог; дальше прирост скорости за шаг должен совпадать с безфрикционным.
+        for step in 30..60 {
+            let expected = frictionless[step] - frictionless[step - 1];
+            let actual = sliding[step] - sliding[step - 1];
+            assert!(
+                (actual - expected).abs() < 0.005,
+                "step {step}: frictionless gain {expected} vs static 0.3 / dynamic 0 gain {actual}"
+            );
+        }
+    }
+
+    #[test]
     fn collision_enter_and_exit_are_emitted_once_across_teleport() {
         let (world, _, ball) = floor_world();
         let mut driver = StepDriver::new(world, 60, 8).unwrap();
