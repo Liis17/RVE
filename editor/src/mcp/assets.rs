@@ -199,7 +199,7 @@ fn call_file_tool(app: &mut EditorApp, tool: &str, arguments: &Value) -> Result<
             let destination = required_string(arguments, "new_path")?;
             let (source_path, destination_path) =
                 paths::resolve_rename_paths(&root, source, destination)?;
-            if destination_path.exists() {
+            if destination_path.exists() && !is_case_only_rename(&source_path, &destination_path) {
                 return Err(format!(
                     "{destination} already exists; rename does not overwrite"
                 ));
@@ -268,6 +268,19 @@ fn write_asset_settings(
 
 fn parse_settings<T: serde::de::DeserializeOwned>(value: Value, path: &str) -> Result<T, String> {
     serde_json::from_value(value).map_err(|error| format!("{path}: invalid settings: {error}"))
+}
+
+/// Смена регистра имени одного и того же файла: на регистронезависимой ФС цель «существует», хотя это источник.
+fn is_case_only_rename(source: &Path, destination: &Path) -> bool {
+    let (Some(from), Some(to)) = (source.file_name(), destination.file_name()) else {
+        return false;
+    };
+    from != to
+        && from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase()
+        && matches!(
+            (fs::canonicalize(source), fs::canonicalize(destination)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 fn import_files(root: &Path, arguments: &Value) -> Result<Value, String> {
@@ -775,6 +788,74 @@ mod tests {
             fs::read_to_string(root.join("Assets/b.txt")).unwrap(),
             "second"
         );
+    }
+
+    #[test]
+    fn rename_allows_a_case_only_change_of_the_same_file() {
+        let mut fixture = TempProject::new();
+        let state = std::mem::replace(&mut fixture.state, EditorState::new(None));
+        let mut app = EditorApp::new_for_mcp_tests_with_state(state);
+        let root = app.mcp_state_mut().project.as_ref().unwrap().root.clone();
+        fs::write(root.join("Assets/a.txt"), "first").unwrap();
+        fs::write(root.join("Assets/b.txt"), "second").unwrap();
+
+        call_file_tool(
+            &mut app,
+            "rename_asset",
+            &json!({"path": "a.txt", "new_path": "A.txt"}),
+        )
+        .unwrap();
+        let names: Vec<String> = fs::read_dir(root.join("Assets"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name == "A.txt"));
+        assert!(!names.iter().any(|name| name == "a.txt"));
+        assert_eq!(
+            fs::read_to_string(root.join("Assets/A.txt")).unwrap(),
+            "first"
+        );
+
+        // Регистр не даёт права перезаписать другой существующий файл.
+        let error = call_file_tool(
+            &mut app,
+            "rename_asset",
+            &json!({"path": "A.txt", "new_path": "b.txt"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(root.join("Assets/b.txt")).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn failed_open_scene_keeps_the_autosave_of_a_discarded_dirty_scene() {
+        let mut fixture = TempProject::new();
+        let state = std::mem::replace(&mut fixture.state, EditorState::new(None));
+        let mut app = EditorApp::new_for_mcp_tests_with_state(state);
+        let root = app.mcp_state_mut().project.as_ref().unwrap().root.clone();
+        let scene_path = app.mcp_state_mut().scene.as_ref().unwrap().path().cloned();
+        app.mcp_state_mut()
+            .scene
+            .as_mut()
+            .unwrap()
+            .create_object(&crate::scene_edit::NewObject::Empty, None)
+            .unwrap();
+        let store = crate::autosave::AutosaveStore::for_project(&root);
+        store.write(scene_path.as_ref(), "autosaved").unwrap();
+
+        // Путь существует в разрешениях MCP только после проверки, поэтому открытие вызывается напрямую.
+        assert!(app.mcp_open_scene("scenes/missing.rvescene", true).is_err());
+        assert_eq!(
+            store.read(scene_path.as_ref()).as_deref(),
+            Some("autosaved")
+        );
+        assert!(app.mcp_state_mut().scene.as_ref().unwrap().is_dirty());
+
+        app.mcp_new_scene(true).unwrap();
+        assert!(store.read(scene_path.as_ref()).is_none());
     }
 
     #[test]

@@ -132,7 +132,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "starting Play requires building scripts; enable the Build permission or run build_scripts first"
+            "starting Play requires building scripts; enable the Build permission"
         );
         assert!(app.mcp_state_mut().scripts_job.is_none());
         assert!(!app.mcp_state_mut().pending_play);

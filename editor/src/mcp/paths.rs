@@ -154,7 +154,7 @@ fn canonical_project_root(path: &Path) -> Result<PathBuf, String> {
 }
 
 pub(super) fn is_link_or_junction(metadata: &fs::Metadata) -> bool {
-    // На Windows std считает симлинком и junction (проверено `rejects_junctions_for_read_and_write`).
+    // На Windows std считает junction симлинком: `is_symlink()` и этот предикат проверены в `rejects_junctions_for_read_and_write`.
     // Прочие reparse-точки (облачные заглушки, dedup) этим предикатом больше не отклоняются;
     // на реальных тегах это не проверено.
     metadata.file_type().is_symlink()
@@ -328,7 +328,12 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        assert!(resolve_write_path(&project.0, "junction/new.txt").is_err());
+        let link_metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert!(link_metadata.file_type().is_symlink());
+        assert!(super::is_link_or_junction(&link_metadata));
+        // Отказ именно по проверке ссылки, а не потому что цель лежит вне Assets.
+        let error = resolve_write_path(&project.0, "junction/new.txt").unwrap_err();
+        assert!(error.contains("symbolic link or junction"));
         assert!(resolve_read_path(&project.0, "Assets/junction/source.txt").is_err());
         // rmdir removes only the junction itself, so the target survives the cleanup below.
         let _ = std::process::Command::new("cmd")

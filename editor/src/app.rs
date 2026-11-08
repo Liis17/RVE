@@ -322,8 +322,9 @@ impl EditorApp {
         if self.state.is_playing() {
             return Err("stop Play before opening a project".to_owned());
         }
-        self.discard_dirty_scene_autosave(discard);
+        let discarded = self.discarded_scene_autosave(discard);
         self.open_project(dir, build_scripts)?;
+        self.remove_discarded_autosave(discarded);
         self.state.recovery_prompt = None;
         Ok(())
     }
@@ -342,8 +343,10 @@ impl EditorApp {
         if self.state.is_playing() {
             return Err("stop Play before opening a scene".to_owned());
         }
-        self.discard_dirty_scene_autosave(discard);
-        self.open_scene_with_recovery(path, false)
+        let discarded = self.discarded_scene_autosave(discard);
+        self.open_scene_with_recovery(path, false)?;
+        self.remove_discarded_autosave(discarded);
+        Ok(())
     }
 
     pub(crate) fn mcp_new_scene(&mut self, discard: bool) -> Result<(), String> {
@@ -353,13 +356,14 @@ impl EditorApp {
         if self.state.is_playing() {
             return Err("stop Play before creating a scene".to_owned());
         }
-        self.discard_dirty_scene_autosave(discard);
+        let discarded = self.discarded_scene_autosave(discard);
         let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
         let mut scene = EditorScene::new_untitled()?;
         if let Some(loader) = loader {
             scene.set_prefab_loader(loader)?;
         }
         self.set_scene(scene);
+        self.remove_discarded_autosave(discarded);
         Ok(())
     }
 
@@ -399,8 +403,7 @@ impl EditorApp {
         }
         if !build_scripts && self.mcp_scripts_build_needed() {
             return Err(
-                "starting Play requires building scripts; enable the Build permission or run build_scripts first"
-                    .to_owned(),
+                "starting Play requires building scripts; enable the Build permission".to_owned(),
             );
         }
         if let Some(network) = network {
@@ -749,15 +752,32 @@ impl EditorApp {
         }
     }
 
-    /// Как `Action::Discard` в UI: копия отброшенной изменённой сцены удаляется до смены сцены или проекта.
-    fn discard_dirty_scene_autosave(&mut self, discard: bool) {
-        if discard && self.state.scene.as_ref().is_some_and(EditorScene::is_dirty) {
-            let scene = self
-                .state
-                .scene
-                .as_ref()
-                .and_then(|scene| scene.path().cloned());
-            self.remove_autosave(scene.as_ref());
+    /// Копия изменённой сцены, которую `discard_changes` велит отбросить. Берётся до смены сцены или проекта,
+    /// потому что после смены проекта каталог копий уже другой; удаляется только после успешной смены.
+    fn discarded_scene_autosave(
+        &self,
+        discard: bool,
+    ) -> Option<(AutosaveStore, Option<VirtualPath>)> {
+        if !discard || !self.state.scene.as_ref().is_some_and(EditorScene::is_dirty) {
+            return None;
+        }
+        let store = self.autosave_store()?;
+        let scene = self
+            .state
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.path().cloned());
+        Some((store, scene))
+    }
+
+    fn remove_discarded_autosave(
+        &mut self,
+        discarded: Option<(AutosaveStore, Option<VirtualPath>)>,
+    ) {
+        if let Some((store, scene)) = discarded
+            && let Err(error) = store.remove(scene.as_ref())
+        {
+            self.state.log.push(LogLevel::Warn, error);
         }
     }
 
