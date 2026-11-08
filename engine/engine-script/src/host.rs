@@ -262,6 +262,9 @@ enum Phase {
     Enable,
     /// Выход экземпляра из работы: флаг выключен или объект стал неактивным.
     Disable,
+    /// `on_disable` перед `Destroy` активного экземпляра при уничтожении или выгрузке сцены.
+    /// Как и `Destroy`, не допускает записей lifecycle.
+    TeardownDisable,
     Update(f32),
     Message,
     PhysicsEvent(ScriptPhysicsEvent),
@@ -1419,8 +1422,11 @@ impl ScriptHost {
                 continue;
             }
             let started = Instant::now();
-            let outcome =
-                self.call_instance(index, world, phase, time, None, None, time_error.as_deref());
+            let outcome = if matches!(phase, Phase::Destroy) {
+                self.call_destroy(index, world, time, time_error.as_deref())
+            } else {
+                self.call_instance(index, world, phase, time, None, None, time_error.as_deref())
+            };
             let elapsed = started.elapsed();
             if is_lite {
                 profile.lua += elapsed;
@@ -1512,6 +1518,39 @@ impl ScriptHost {
                 }
             }
         }
+    }
+
+    /// Уничтожение экземпляра. Активный экземпляр сначала получает `on_disable` (порядок Unity:
+    /// OnDisable, затем OnDestroy); неактивный уже отключён при выходе из работы и получает
+    /// только `on_destroy`. Ошибка или прерывание `on_disable` пропускают `on_destroy`.
+    fn call_destroy(
+        &mut self,
+        index: usize,
+        world: &mut World,
+        time: ScriptTime,
+        time_error: Option<&str>,
+    ) -> CallOutcome {
+        let running = self.instances[index]
+            .as_ref()
+            .is_some_and(|instance| instance.running);
+        if running {
+            if let Some(instance) = self.instances[index].as_mut() {
+                instance.running = false;
+            }
+            match self.call_instance(
+                index,
+                world,
+                Phase::TeardownDisable,
+                time,
+                None,
+                None,
+                time_error,
+            ) {
+                CallOutcome::Committed => {}
+                outcome => return outcome,
+            }
+        }
+        self.call_instance(index, world, Phase::Destroy, time, None, None, time_error)
     }
 
     fn run_transition(
@@ -1851,7 +1890,7 @@ impl ScriptHost {
                 _ => None,
             },
             lifecycle: lifecycle.clone(),
-            lifecycle_writes: !matches!(phase, Phase::Destroy),
+            lifecycle_writes: !matches!(phase, Phase::Destroy | Phase::TeardownDisable),
             instance_serial: instance.serial,
             instance_enabled: instance.user_enabled,
             cursor: *cursor,
@@ -1871,7 +1910,9 @@ impl ScriptHost {
                 let has_callback = match phase {
                     Phase::Message => lite_instance.has_message_callback(),
                     Phase::Enable => lite_instance.has_callback("on_enable"),
-                    Phase::Disable => lite_instance.has_callback("on_disable"),
+                    Phase::Disable | Phase::TeardownDisable => {
+                        lite_instance.has_callback("on_disable")
+                    }
                     _ => Ok(true),
                 };
                 has_callback
@@ -1887,7 +1928,9 @@ impl ScriptHost {
                                     .and_then(|()| match phase {
                                         Phase::Start => lite_instance.invoke_start(),
                                         Phase::Enable => lite_instance.invoke_enable(),
-                                        Phase::Disable => lite_instance.invoke_disable(),
+                                        Phase::Disable | Phase::TeardownDisable => {
+                                            lite_instance.invoke_disable()
+                                        }
                                         Phase::Update(dt) => lite_instance.invoke_update(dt),
                                         Phase::Message => match message {
                                             Some(message) => lite_instance.invoke_message(
@@ -1961,7 +2004,9 @@ impl ScriptHost {
                     },
                     Phase::Start => script.invoke(AbiPhase::Start, time, call),
                     Phase::Enable => script.invoke(AbiPhase::Enable, time, call),
-                    Phase::Disable => script.invoke(AbiPhase::Disable, time, call),
+                    Phase::Disable | Phase::TeardownDisable => {
+                        script.invoke(AbiPhase::Disable, time, call)
+                    }
                     Phase::Update(dt) => script.invoke(AbiPhase::Update(dt), time, call),
                     Phase::PhysicsEvent(event) => {
                         let Some(other) = (unsafe { (*transaction_ptr).abi_handle(event.other) })
@@ -2494,15 +2539,7 @@ impl ScriptHost {
             })
             .collect::<Vec<_>>();
         for index in indexes {
-            match self.call_instance(
-                index,
-                world,
-                Phase::Destroy,
-                time,
-                None,
-                None,
-                time_error.as_deref(),
-            ) {
+            match self.call_destroy(index, world, time, time_error.as_deref()) {
                 CallOutcome::Committed => {}
                 CallOutcome::Interrupted => self.disable_instance(index),
                 CallOutcome::Failed(message) => self.fail_instance(index, message),

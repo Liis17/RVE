@@ -785,6 +785,27 @@ impl Script for BoltProbe {
     }
 }
 
+/// Logs its lifecycle callbacks so tests can check their order.
+struct TeardownProbe;
+
+fn teardown_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(TeardownProbe))
+}
+
+impl Script for TeardownProbe {
+    fn on_enable(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("enable");
+    }
+
+    fn on_disable(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("disable");
+    }
+
+    fn on_destroy(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("destroy");
+    }
+}
+
 /// Reads prefab states and requests from `on_start`.
 struct PrefabProbe;
 
@@ -822,6 +843,7 @@ fn sdk_module() -> &'static RveModule {
         "InputActionsProbe" => input_actions_probe_factory,
         "SpawnDriver" => spawn_driver_factory,
         "BoltProbe" => bolt_probe_factory,
+        "TeardownProbe" => teardown_probe_factory,
         "PrefabProbe" => prefab_probe_factory,
         "DeadHandleProbe" => dead_handle_probe_factory,
         "ExitWatcher" => exit_watcher_factory,
@@ -4138,4 +4160,37 @@ fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
         ]
     );
     assert_eq!(host.drain_peer_faults(), [(3, 1)]);
+}
+
+#[test]
+fn shutdown_runs_abi_on_disable_before_on_destroy_only_for_running_instances() {
+    let _lock = test_lock();
+    let library = library();
+    let scene = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "probe"
+[[objects.heavy_scripts]]
+name = "TeardownProbe"
+"#;
+
+    let mut running = world(scene);
+    let mut host = load_host(&running, &library);
+    host.update(&mut running, 0.1, at(0.1, 1));
+    assert_eq!(info_messages(&mut host), ["enable"]);
+    host.destroy(&mut running, at(0.2, 2));
+    assert_eq!(info_messages(&mut host), ["disable", "destroy"]);
+
+    let mut hidden = world(scene);
+    let probe = hidden.handle("probe").unwrap();
+    let mut host = load_host(&hidden, &library);
+    host.update(&mut hidden, 0.1, at(0.1, 1));
+    info_messages(&mut host);
+    hidden.set_active(probe, false).unwrap();
+    host.update(&mut hidden, 0.1, at(0.2, 2));
+    assert_eq!(info_messages(&mut host), ["disable"]);
+    host.destroy(&mut hidden, at(0.3, 3));
+    assert_eq!(info_messages(&mut host), ["destroy"]);
 }

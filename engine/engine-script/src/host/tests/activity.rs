@@ -1,6 +1,6 @@
 use super::{event_messages, sources, world};
-use crate::ScriptTime;
 use crate::host::ScriptHost;
+use crate::{ScriptEventLevel, ScriptTime};
 use engine_scene::World;
 use mlua::Table;
 
@@ -78,7 +78,11 @@ fn on_enable_runs_before_the_first_start_and_hierarchy_activity_drives_the_callb
     );
 
     host.destroy(&mut world, frame());
-    assert_eq!(event_messages(&mut host), ["destroy"]);
+    assert_eq!(
+        event_messages(&mut host),
+        ["disable", "destroy"],
+        "a running instance is disabled before it is destroyed"
+    );
 }
 
 #[test]
@@ -303,4 +307,284 @@ enabled = false
     host.update(&mut world, 1.0 / 60.0, frame());
     host.destroy(&mut world, frame());
     assert!(event_messages(&mut host).is_empty());
+}
+
+/// Камера `cam_b` внутри `rig`; `main` вне него держит скрипт. `active_camera` выбирает стартовую камеру.
+fn camera_rig_world(active_camera: &str) -> World {
+    let main_active = active_camera == "main";
+    world(&format!(
+        r#"
+[[assets]]
+path = "/camera_rig.lua"
+[[objects]]
+id = "main"
+[objects.camera]
+active = {main_active}
+[[objects.lite_scripts]]
+path = "/camera_rig.lua"
+[[objects]]
+id = "rig"
+[[objects]]
+id = "cam_b"
+parent = "rig"
+[objects.camera]
+active = {cam_b_active}
+"#,
+        cam_b_active = !main_active,
+    ))
+}
+
+const ACTIVATE_INSIDE_THEN_HIDE: &str = r#"
+local Script = {}
+function Script:on_start()
+  rve.find("cam_b"):activate_camera()
+  rve.find("rig"):set_active(false)
+end
+return Script
+"#;
+
+const ACTIVATE_OUTSIDE_THEN_HIDE: &str = r#"
+local Script = {}
+function Script:on_start()
+  rve.find("main"):activate_camera()
+  rve.find("rig"):set_active(false)
+end
+return Script
+"#;
+
+#[test]
+fn hiding_the_subtree_of_the_camera_activated_in_the_same_call_is_rejected_without_panic() {
+    let mut world = camera_rig_world("main");
+    let main = world.handle("main").unwrap();
+    let rig = world.handle("rig").unwrap();
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("camera_rig.lua", ACTIVATE_INSIDE_THEN_HIDE)]),
+        None,
+    )
+    .unwrap();
+    host.start(&mut world, frame());
+
+    let events = host.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            event.level == ScriptEventLevel::Error
+                && event
+                    .message
+                    .contains("нельзя скрыть объект с активной камерой")
+        }),
+        "the rejection must be reported as an error: {events:?}"
+    );
+    assert_eq!(
+        world.active_camera(),
+        main,
+        "rejected call applies no camera"
+    );
+    assert_eq!(
+        world.is_active(rig),
+        Some(true),
+        "rejected call applies no activity"
+    );
+}
+
+#[test]
+fn hiding_the_old_camera_subtree_is_accepted_after_activating_a_camera_outside_it() {
+    let mut world = camera_rig_world("cam_b");
+    let main = world.handle("main").unwrap();
+    let rig = world.handle("rig").unwrap();
+    assert_eq!(world.active_camera(), world.handle("cam_b").unwrap());
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("camera_rig.lua", ACTIVATE_OUTSIDE_THEN_HIDE)]),
+        None,
+    )
+    .unwrap();
+    host.start(&mut world, frame());
+
+    assert!(
+        host.drain_events().is_empty(),
+        "the call is valid: the camera moves out of the subtree before it is hidden"
+    );
+    assert_eq!(world.active_camera(), main);
+    assert_eq!(world.is_active(rig), Some(false));
+}
+
+/// `kid` под `parent` (позиция 10, масштаб `parent_scale`) и отдельный корень `solo`.
+fn pose_world(parent_scale: &str) -> World {
+    world(&format!(
+        r#"
+[[assets]]
+path = "/pose.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "parent"
+name = "Parent"
+[objects.transform]
+position = [10.0, 0.0, 0.0]
+scale = {parent_scale}
+[[objects]]
+id = "kid"
+parent = "parent"
+[[objects.lite_scripts]]
+path = "/pose.lua"
+[[objects]]
+id = "solo"
+"#
+    ))
+}
+
+const POSE_LOCAL: &str = r#"
+local Script = {}
+function Script:on_start()
+  local kid = self.object
+  rve.log("kid:" .. tostring(kid:set_world_position({x = 1, y = 2, z = 3})))
+  rve.log("solo:" .. tostring(rve.find("solo"):set_world_rotation({x = 0, y = 90, z = 0})))
+  rve.log("tag:" .. tostring(kid:set_tag("enemy")))
+end
+return Script
+"#;
+
+#[test]
+fn world_pose_and_tag_edits_commit_without_hierarchy_changes() {
+    let mut world = pose_world("[2.0, 2.0, 2.0]");
+    let kid = world.handle("kid").unwrap();
+    let solo = world.handle("solo").unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("pose.lua", POSE_LOCAL)]), None).unwrap();
+    host.start(&mut world, frame());
+
+    assert_eq!(
+        event_messages(&mut host),
+        ["kid:true", "solo:true", "tag:true"]
+    );
+    let position = world.world_position(kid).unwrap();
+    assert!(
+        position.distance(glam::Vec3::new(1.0, 2.0, 3.0)) < 1e-4,
+        "{position:?}"
+    );
+    let rotation = world.world_rotation_deg(solo).unwrap();
+    assert!(
+        rotation.distance(glam::Vec3::new(0.0, 90.0, 0.0)) < 1e-3,
+        "{rotation:?}"
+    );
+    assert_eq!(world.tag(kid), Some("enemy"));
+}
+
+const POSE_ANCESTOR_THEN_CHILD: &str = r#"
+local Script = {}
+function Script:on_start()
+  local kid = self.object
+  rve.log("parent:" .. tostring(rve.find("parent"):set_world_position({x = 5, y = 0, z = 0})))
+  rve.log("kid:" .. tostring(kid:set_world_position({x = 1, y = 2, z = 3})))
+end
+return Script
+"#;
+
+#[test]
+fn a_child_pose_after_its_ancestor_pose_in_one_call_uses_the_moved_ancestor() {
+    let mut world = pose_world("[2.0, 2.0, 2.0]");
+    let kid = world.handle("kid").unwrap();
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("pose.lua", POSE_ANCESTOR_THEN_CHILD)]),
+        None,
+    )
+    .unwrap();
+    host.start(&mut world, frame());
+
+    assert_eq!(event_messages(&mut host), ["parent:true", "kid:true"]);
+    let position = world.world_position(kid).unwrap();
+    assert!(
+        position.distance(glam::Vec3::new(1.0, 2.0, 3.0)) < 1e-4,
+        "{position:?}"
+    );
+}
+
+#[test]
+fn a_pose_under_a_degenerate_parent_rolls_back_the_whole_call_without_touching_the_world() {
+    let mut world = pose_world("[0.0, 1.0, 1.0]");
+    let kid = world.handle("kid").unwrap();
+    let before = world.world_position(kid).unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("pose.lua", POSE_LOCAL)]), None).unwrap();
+    host.start(&mut world, frame());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.contains("вырожден")),
+        "{events:?}"
+    );
+    assert_eq!(world.tag(kid), Some(""));
+    assert_eq!(world.world_position(kid), Some(before));
+}
+
+const DESTROY_SELF: &str = r#"
+local Script = {}
+function Script:on_enable() rve.log("enable") end
+function Script:on_start() rve.log("start") end
+function Script:on_update()
+  rve.log("update")
+  rve.destroy("prop")
+end
+function Script:on_disable() rve.log("disable") end
+function Script:on_destroy() rve.log("destroy") end
+return Script
+"#;
+
+#[test]
+fn destroying_an_active_instance_runs_on_disable_before_on_destroy() {
+    let mut world = life_world(true);
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("life.lua", LIFE)]), None).unwrap();
+    host.start(&mut world, frame());
+    host.update(&mut world, 1.0 / 60.0, frame());
+    assert_eq!(event_messages(&mut host), ["enable", "start", "update"]);
+
+    host.destroy(&mut world, frame());
+    assert_eq!(event_messages(&mut host), ["disable", "destroy"]);
+}
+
+#[test]
+fn destroying_an_inactive_instance_runs_only_on_destroy() {
+    let mut world = life_world(true);
+    let prop = world.handle("prop").unwrap();
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("life.lua", LIFE)]), None).unwrap();
+    host.start(&mut world, frame());
+    host.update(&mut world, 1.0 / 60.0, frame());
+    event_messages(&mut host);
+
+    world.set_active(prop, false).unwrap();
+    host.update(&mut world, 1.0 / 60.0, frame());
+    assert_eq!(event_messages(&mut host), ["disable"]);
+
+    host.destroy(&mut world, frame());
+    assert_eq!(event_messages(&mut host), ["destroy"]);
+}
+
+#[test]
+fn despawning_an_active_object_runs_on_disable_before_on_destroy() {
+    let mut world = life_world(true);
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("life.lua", DESTROY_SELF)]),
+        None,
+    )
+    .unwrap();
+    host.start(&mut world, frame());
+    host.update(&mut world, 1.0 / 60.0, frame());
+    assert_eq!(
+        event_messages(&mut host),
+        ["enable", "start", "update", "disable", "destroy"]
+    );
+    assert!(world.handle("prop").is_none());
 }

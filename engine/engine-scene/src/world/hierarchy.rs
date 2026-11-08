@@ -205,6 +205,21 @@ impl World {
         position: Vec3,
     ) -> Result<(), SceneError> {
         let index = self.live_index_or_error(handle)?;
+        self.objects[index].transform.position = self.local_position_for_world(index, position)?;
+        Ok(())
+    }
+
+    /// Проверяет, что [`World::set_world_position`] примет эту позицию, и не меняет мир.
+    pub fn check_world_position(
+        &self,
+        handle: ObjectHandle,
+        position: Vec3,
+    ) -> Result<(), SceneError> {
+        let index = self.live_index_or_error(handle)?;
+        self.local_position_for_world(index, position).map(|_| ())
+    }
+
+    fn local_position_for_world(&self, index: usize, position: Vec3) -> Result<Vec3, SceneError> {
         if !position.is_finite() {
             return Err(self.object_error(index, "мировая позиция должна быть конечной"));
         }
@@ -219,8 +234,7 @@ impl World {
         if !local.is_finite() {
             return Err(self.object_error(index, "локальная позиция объекта не конечна"));
         }
-        self.objects[index].transform.position = local;
-        Ok(())
+        Ok(local)
     }
 
     /// Мировая позиция по текущим локальным трансформациям.
@@ -236,6 +250,27 @@ impl World {
         rotation_deg: Vec3,
     ) -> Result<(), SceneError> {
         let index = self.live_index_or_error(handle)?;
+        self.objects[index].transform.rotation_deg =
+            self.local_rotation_for_world(index, rotation_deg)?;
+        Ok(())
+    }
+
+    /// Проверяет, что [`World::set_world_rotation`] примет этот поворот, и не меняет мир.
+    pub fn check_world_rotation(
+        &self,
+        handle: ObjectHandle,
+        rotation_deg: Vec3,
+    ) -> Result<(), SceneError> {
+        let index = self.live_index_or_error(handle)?;
+        self.local_rotation_for_world(index, rotation_deg)
+            .map(|_| ())
+    }
+
+    fn local_rotation_for_world(
+        &self,
+        index: usize,
+        rotation_deg: Vec3,
+    ) -> Result<Vec3, SceneError> {
         if !rotation_deg.is_finite() {
             return Err(self.object_error(index, "мировой поворот должен быть конечным"));
         }
@@ -247,8 +282,7 @@ impl World {
         if !rotation_deg.is_finite() {
             return Err(self.object_error(index, "локальный поворот объекта не конечен"));
         }
-        self.objects[index].transform.rotation_deg = rotation_deg;
-        Ok(())
+        Ok(rotation_deg)
     }
 
     /// Мировой поворот в градусах по текущим локальным трансформациям.

@@ -22,6 +22,7 @@ use engine_scene::{
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
@@ -1090,19 +1091,100 @@ impl ScriptTransaction {
         true
     }
 
-    /// Проверяет заявки на копии мира: любая отказавшая заявка отбрасывает весь вызов.
+    /// Проверяет заявки до записи в мир: любая отказавшая заявка отбрасывает весь вызов.
+    ///
+    /// Тег, слой и мировая поза проверяются на текущем мире без копии, если вызов не меняет
+    /// активность, родителя и камеру, не задаёт трансформы и не двигает предка другой позы того же
+    /// вызова: тогда каждая проверка видит те же предки, что и запись. Во всех остальных случаях
+    /// заявки применяются к копии мира в том же порядке, что и коммит.
     fn probe_edits(&self, world: &World) -> Result<(), String> {
-        if self.pending_edits.is_empty() {
+        if self.pending_edits.is_empty() && self.pending_active_camera.is_none() {
             return Ok(());
         }
-        let mut probe = world.clone();
+        let local_only = self.pending_transforms.is_empty()
+            && self.pending_active_camera.is_none()
+            && self.pending_edits.iter().all(|edit| {
+                !matches!(
+                    edit,
+                    ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
+                )
+            })
+            && self.pose_edits_are_independent(world);
+        if !local_only {
+            let mut probe = world.clone();
+            return self.apply_world_writes(&mut probe);
+        }
+        for edit in &self.pending_edits {
+            match edit {
+                ObjectEdit::SetTag { object, .. } | ObjectEdit::SetLayer { object, .. } => {
+                    if world.object(*object).is_none() {
+                        return Err("script edited an unknown object".to_owned());
+                    }
+                }
+                ObjectEdit::SetWorldPosition { object, position } => world
+                    .check_world_position(*object, *position)
+                    .map_err(|error| error.to_string())?,
+                ObjectEdit::SetWorldRotation {
+                    object,
+                    rotation_deg,
+                } => world
+                    .check_world_rotation(*object, *rotation_deg)
+                    .map_err(|error| error.to_string())?,
+                // Исключены условием local_only выше.
+                ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Ни один объект позы не является предком другого объекта позы в этом вызове.
+    fn pose_edits_are_independent(&self, world: &World) -> bool {
+        let posed = self
+            .pending_edits
+            .iter()
+            .filter_map(|edit| match edit {
+                ObjectEdit::SetWorldPosition { object, .. }
+                | ObjectEdit::SetWorldRotation { object, .. } => Some(*object),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        posed.iter().all(|&handle| {
+            let mut ancestor = world.object(handle).and_then(|object| object.parent);
+            while let Some(current) = ancestor {
+                if posed.contains(&current) {
+                    return false;
+                }
+                ancestor = world.object(current).and_then(|object| object.parent);
+            }
+            true
+        })
+    }
+
+    /// Записывает заявки вызова в мир в порядке коммита: трансформы, камеры, активная камера,
+    /// правки мира. Заявки не очищаются; очистку делает коммит после успешной записи.
+    fn apply_world_writes(&self, world: &mut World) -> Result<(), String> {
         for (handle, transform) in &self.pending_transforms {
-            probe
+            world
                 .set_local_transform(*handle, *transform)
                 .map_err(|error| error.to_string())?;
         }
+        for (handle, settings) in &self.pending_camera_settings {
+            world
+                .set_camera_settings(*handle, *settings)
+                .map_err(|error| error.to_string())?;
+        }
+        for (handle, settings) in &self.pending_post_process {
+            world
+                .set_post_process(*handle, *settings)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(handle) = self.pending_active_camera {
+            world
+                .set_active_camera(handle)
+                .map_err(|error| error.to_string())?;
+        }
         for edit in &self.pending_edits {
-            probe.apply_edit(edit).map_err(|error| error.to_string())?;
+            world.apply_edit(edit).map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -1604,6 +1686,17 @@ impl ScriptTransaction {
             return Err("script produced a non-finite physics command".to_owned());
         }
 
+        // Запись мира идёт до lifecycle: при сбое discard освободит резервации spawn.
+        if let Err(message) = self.apply_world_writes(world) {
+            self.discard();
+            return Err(message);
+        }
+        self.pending_transforms.clear();
+        self.pending_camera_settings.clear();
+        self.pending_post_process.clear();
+        self.pending_active_camera = None;
+        self.pending_edits.clear();
+
         if let Some(visible) = self.pending_cursor_visible.take() {
             self.cursor.visible = visible;
         }
@@ -1611,32 +1704,6 @@ impl ScriptTransaction {
             self.cursor.locked = locked;
         }
         self.commit_lifecycle(events);
-        for (handle, transform) in self.pending_transforms.drain() {
-            // Handles and all transforms were validated before applying any write.
-            world
-                .set_local_transform(handle, transform)
-                .expect("validated object handle remains present during commit");
-        }
-        for (handle, settings) in self.pending_camera_settings.drain() {
-            world
-                .set_camera_settings(handle, settings)
-                .expect("validated camera settings target remains present during commit");
-        }
-        for (handle, settings) in self.pending_post_process.drain() {
-            world
-                .set_post_process(handle, settings)
-                .expect("validated post process target remains present during commit");
-        }
-        if let Some(handle) = self.pending_active_camera.take() {
-            world
-                .set_active_camera(handle)
-                .expect("validated active camera target remains present during commit");
-        }
-        for edit in self.pending_edits.drain(..) {
-            world
-                .apply_edit(&edit)
-                .expect("validated world edit remains applicable during commit");
-        }
 
         self.physics.borrow_mut().commit(
             physics_commands,
