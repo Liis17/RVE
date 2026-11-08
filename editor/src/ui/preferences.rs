@@ -80,8 +80,20 @@ pub fn show(ctx: &egui::Context, preferences: &mut Preferences, status: &McpStat
             ui.label("Permissions");
             ui.checkbox(&mut preferences.draft.permissions.edit_scene, "Edit scene");
             ui.checkbox(&mut preferences.draft.permissions.assets, "Write assets");
+            if preferences.draft.permissions.assets {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Copies external files into the project; open_project can open any directory with project.rveproject.",
+                );
+            }
             ui.checkbox(&mut preferences.draft.permissions.play, "Control Play");
             ui.checkbox(&mut preferences.draft.permissions.build, "Build");
+            if preferences.draft.permissions.build {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Runs cargo for heavy scripts and writes player builds to any output_dir, even outside the project.",
+                );
+            }
 
             if let Some(error) = &preferences.error {
                 ui.colored_label(egui::Color32::RED, error);

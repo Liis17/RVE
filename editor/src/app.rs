@@ -617,6 +617,8 @@ impl EditorApp {
                 .error(format!("[MCP] token generation failed: {error}"));
         }
         self.user_settings.mcp = settings;
+        // Явный выбор в Preferences сохраняется, даже если сервер включён флагом `--mcp` на этот запуск.
+        self.stored_mcp_enabled = self.user_settings.mcp.enabled;
         self.preferences.applied(&self.user_settings.mcp);
         self.save_settings();
     }

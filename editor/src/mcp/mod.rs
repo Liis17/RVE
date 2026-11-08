@@ -771,4 +771,51 @@ mod tests {
         );
         clean(parent, app);
     }
+
+    fn listener_settings(port: u16, token: &str) -> crate::settings::McpSettings {
+        crate::settings::McpSettings {
+            enabled: true,
+            port,
+            token: token.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Применяет настройки и возвращает число попыток запуска listener за этот вызов. Без окна нет
+    /// wake-хэндла, поэтому попытка сразу пишет ошибку и не открывает сокет. Лог очищается перед
+    /// вызовом: `ConsoleLog` не дублирует подряд идущие одинаковые записи.
+    fn apply_and_count_starts(
+        host: &mut super::McpHost,
+        settings: &crate::settings::McpSettings,
+    ) -> usize {
+        let mut log = crate::console::ConsoleLog::default();
+        host.apply_settings(settings, 0, &mut log);
+        log.entries()
+            .filter(|entry| entry.message.contains("wake handle"))
+            .count()
+    }
+
+    #[test]
+    fn apply_settings_restarts_the_listener_only_for_listener_fields() {
+        let mut host = super::McpHost::default();
+        let mut settings = listener_settings(47615, "token");
+        assert_eq!(apply_and_count_starts(&mut host, &settings), 1);
+
+        settings.permissions.edit_scene = true;
+        assert_eq!(
+            apply_and_count_starts(&mut host, &settings),
+            0,
+            "a permission change must not restart the listener"
+        );
+        assert!(host.permissions.edit_scene);
+
+        settings.port = 47616;
+        assert_eq!(apply_and_count_starts(&mut host, &settings), 1);
+        settings.token = "other".to_owned();
+        assert_eq!(apply_and_count_starts(&mut host, &settings), 1);
+
+        settings.enabled = false;
+        assert_eq!(apply_and_count_starts(&mut host, &settings), 0);
+        assert_eq!(host.status(), &super::McpStatus::Off);
+    }
 }

@@ -28,8 +28,9 @@ use engine_scene::light::{
 };
 use engine_scene::world::ObjectHandle;
 use engine_scene::{
-    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, ParticleBlendMode,
-    ParticleEmitterComponent, ParticleShapeComponent, SceneFrame, Tonemapper, World,
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, MeshInstance,
+    ParticleBlendMode, ParticleEmitterComponent, ParticleShapeComponent, SceneFrame, Tonemapper,
+    World,
 };
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -1355,14 +1356,11 @@ fn append_world_draws(
     motion_history: &mut MotionHistory,
     draws: &mut Vec<DrawCommand>,
 ) -> Result<(), RenderError> {
-    for instance in &frame.meshes {
+    for (instance, level) in visible_mesh_levels(world, frame, eye) {
         let Some(object) = world.object(instance.object) else {
             continue;
         };
         let Some(mesh) = &object.mesh_renderer else {
-            continue;
-        };
-        let Some(level) = lod_for_eye(world, instance.object, eye) else {
             continue;
         };
         let Some(model_path) = lod_model_path(mesh, object.lod_group.as_ref(), level) else {
@@ -1472,9 +1470,17 @@ fn append_world_draws(
     Ok(())
 }
 
-/// Уровень LOD объекта для глаза одного вида; `None` — объект отсечён `cull_distance` этого вида.
-fn lod_for_eye(world: &World, object: ObjectHandle, eye: Vec3) -> Option<usize> {
-    world.lod_level(object, eye)
+/// Мешевые экземпляры кадра с уровнем LOD для глаза одного вида. Объект, отсечённый
+/// `cull_distance` этого вида, пропускается; список кадра при этом не фильтруется по камерам.
+fn visible_mesh_levels<'a>(
+    world: &'a World,
+    frame: &'a SceneFrame,
+    eye: Vec3,
+) -> impl Iterator<Item = (&'a MeshInstance, usize)> + 'a {
+    frame.meshes.iter().filter_map(move |instance| {
+        let level = world.lod_level(instance.object, eye)?;
+        Some((instance, level))
+    })
 }
 
 /// Объекты, у которых есть экземпляры скиннинга и палитра моста той же длины, что число
@@ -2495,11 +2501,20 @@ distance=10.0
 "#,
         )
         .unwrap();
-        let world = World::from_document(&document).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let (frame, _) = world.build_frame();
         let prop = world.handle("prop").unwrap();
-        assert_eq!(lod_for_eye(&world, prop, Vec3::new(40.0, 0.0, 0.0)), None);
-        assert_eq!(lod_for_eye(&world, prop, Vec3::new(-40.0, 0.0, 0.0)), None);
-        assert_eq!(lod_for_eye(&world, prop, Vec3::new(5.0, 0.0, 0.0)), Some(0));
+        // Обе панельные камеры отсекают объект, а capture-камера рядом с ним видит его уровень 0.
+        for panel_eye in [Vec3::new(40.0, 0.0, 0.0), Vec3::new(-40.0, 0.0, 0.0)] {
+            assert!(
+                visible_mesh_levels(&world, &frame, panel_eye)
+                    .all(|(instance, _)| instance.object != prop)
+            );
+        }
+        let captured = visible_mesh_levels(&world, &frame, Vec3::new(5.0, 0.0, 0.0))
+            .find(|(instance, _)| instance.object == prop)
+            .map(|(_, level)| level);
+        assert_eq!(captured, Some(0));
     }
 
     #[test]
