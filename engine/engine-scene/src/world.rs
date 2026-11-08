@@ -1827,6 +1827,35 @@ position=[2.0,0.0,0.0]
     }
 
     #[test]
+    fn demo_scene_ships_three_disabled_screen_shaders_on_its_camera() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/demo-game/Assets/scenes/main.rvescene"
+        ))
+        .expect("сцена демо");
+        let document = SceneDocument::parse("scenes/main.rvescene", &source).unwrap();
+        let camera = document
+            .objects
+            .iter()
+            .find(|object| object.id == "camera")
+            .and_then(|object| object.camera.as_ref())
+            .expect("камера демо");
+        let paths: Vec<&str> = camera
+            .screen_shaders
+            .iter()
+            .map(|shader| shader.shader.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            ["fx/color_isolate.glsl", "fx/vhs.glsl", "fx/crt.glsl"]
+        );
+        assert!(
+            camera.screen_shaders.iter().all(|shader| !shader.enabled),
+            "демо выглядит как прежде"
+        );
+    }
+
+    #[test]
     fn screen_shaders_are_per_camera_and_only_slots_change() {
         let document = SceneDocument::parse(
             "screens.rvescene",

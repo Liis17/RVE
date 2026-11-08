@@ -866,6 +866,39 @@ pub(crate) fn spirv_bytes(words: &[u32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Все `.glsl` примеров компилируются для обеих стадий: пример не должен расходиться с renderer.
+    #[test]
+    fn example_screen_shaders_compile_for_both_stages() {
+        fn collect(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("каталог примеров") {
+                let path = entry.expect("элемент каталога").path();
+                if path.is_dir() {
+                    collect(&path, found);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "glsl")
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut files = Vec::new();
+        collect(&root, &mut files);
+        assert!(
+            files.len() >= 3,
+            "в примерах должны быть экранные шейдеры: {files:?}"
+        );
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("исходник примера");
+            for stage in stages() {
+                if let Err(error) = compile_screen_shader(&source, stage) {
+                    panic!("{}: {error}", file.display());
+                }
+            }
+        }
+    }
+
     #[test]
     fn chain_result_alternates_between_ping_pong_images() {
         assert_eq!(chain_output_index(0), None);
