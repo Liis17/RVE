@@ -32,16 +32,6 @@ pub(crate) struct NetworkSession {
 /// Мост, которым scripts thread обменивается сетевыми сообщениями и объектами.
 pub(crate) type ScriptNetwork = NetworkBridge<NetworkHandle>;
 
-/// Идентификатор протокола: `blake3(длина id ‖ id ‖ version)`. Длина перед `id` не даёт разным парам
-/// (`"ab"`, `"c"`) и (`"a"`, `"bc"`) совпасть.
-pub(crate) fn protocol_id(id: &str, version: &str) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&(id.len() as u64).to_le_bytes());
-    hasher.update(id.as_bytes());
-    hasher.update(version.as_bytes());
-    *hasher.finalize().as_bytes()
-}
-
 /// Строит настройки сети по флагам и `[network]` проекта. Файлы ключа и пароля читаются здесь;
 /// сокет не открывается.
 pub(crate) fn prepare(
@@ -96,7 +86,7 @@ pub(crate) fn prepare(
     Ok(NetworkPlan {
         config: NetworkConfig {
             role,
-            protocol_id: protocol_id(&project.id, &project.version),
+            protocol_id: engine_network::protocol_id(&project.id, &project.version),
             scene_hash,
             timeout: Duration::from_millis(u64::from(settings.timeout_ms)),
         },
@@ -233,7 +223,7 @@ pub(crate) fn tick(
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkArgs, password_from_bytes, prepare, protocol_id};
+    use super::{NetworkArgs, password_from_bytes, prepare};
     use engine_network::NetRole;
     use engine_project::ProjectSettings;
     use engine_scene::network::NetMode;
@@ -248,14 +238,6 @@ mod tests {
 
     fn address(text: &str) -> SocketAddr {
         text.parse().unwrap()
-    }
-
-    #[test]
-    fn protocol_id_depends_on_project_id_and_version_without_ambiguity() {
-        assert_eq!(protocol_id("demo", "1"), protocol_id("demo", "1"));
-        assert_ne!(protocol_id("demo", "1"), protocol_id("demo", "2"));
-        assert_ne!(protocol_id("demo", "1"), protocol_id("other", "1"));
-        assert_ne!(protocol_id("ab", "c"), protocol_id("a", "bc"));
     }
 
     #[test]
@@ -282,7 +264,10 @@ mod tests {
         assert_eq!(player.bridge.mode, NetMode::Host);
         assert_eq!(player.bridge.tick_hz, 20);
         assert_eq!(player.config.scene_hash, [7; 32]);
-        assert_eq!(player.config.protocol_id, protocol_id("demo", "1.2.0"));
+        assert_eq!(
+            player.config.protocol_id,
+            engine_network::protocol_id("demo", "1.2.0")
+        );
         match player.config.role {
             NetRole::Server {
                 bind,

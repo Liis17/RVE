@@ -31,7 +31,6 @@ engine-resources = { path = "../engine-resources" }
 engine-scene = { path = "../engine-scene" }
 engine-script = { path = "../engine-script" }
 engine-window = { path = "../engine-window" }
-blake3.workspace = true
 flume.workspace = true
 glam.workspace = true
 log.workspace = true

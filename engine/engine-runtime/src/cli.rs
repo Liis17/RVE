@@ -257,27 +257,8 @@ fn value_after(
 
 /// Отпечаток: ровно 64 hex-символа, регистр не важен.
 pub(crate) fn parse_fingerprint(text: &str) -> Result<[u8; 32], String> {
-    const ERROR: &str = "--server-fingerprint должен содержать 64 hex-символа";
-    let bytes = text.as_bytes();
-    if bytes.len() != 64 {
-        return Err(ERROR.to_owned());
-    }
-    let mut fingerprint = [0_u8; 32];
-    for (slot, pair) in fingerprint.iter_mut().zip(bytes.as_chunks::<2>().0) {
-        let high = hex_value(pair[0]).ok_or_else(|| ERROR.to_owned())?;
-        let low = hex_value(pair[1]).ok_or_else(|| ERROR.to_owned())?;
-        *slot = high << 4 | low;
-    }
-    Ok(fingerprint)
-}
-
-fn hex_value(digit: u8) -> Option<u8> {
-    match digit {
-        b'0'..=b'9' => Some(digit - b'0'),
-        b'a'..=b'f' => Some(digit - b'a' + 10),
-        b'A'..=b'F' => Some(digit - b'A' + 10),
-        _ => None,
-    }
+    engine_network::parse_fingerprint(text)
+        .ok_or_else(|| "--server-fingerprint должен содержать 64 hex-символа".to_owned())
 }
 
 #[cfg(test)]

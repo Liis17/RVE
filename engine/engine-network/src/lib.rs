@@ -34,7 +34,7 @@ pub use bridge::{
     BridgeConfig, FAULT_LIMIT, FAULT_WINDOW, NetLink, NetworkBridge, SpawnedRoot, WorldSink,
 };
 pub use client::{Client, ClientConfig};
-pub use crypto::{Password, ServerIdentity};
+pub use crypto::{Password, ServerIdentity, parse_fingerprint};
 pub use engine::{NetRole, NetworkConfig, NetworkEngine, NetworkHandle};
 pub use error::NetError;
 pub use server::{MAX_CLIENTS, Server, ServerConfig};
@@ -42,6 +42,16 @@ pub use transport::{DatagramSocket, Faults, MemoryEndpoint, MemoryNetwork, UdpTr
 
 /// Версия крейта.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Идентификатор протокола проекта: `blake3(длина id ‖ id ‖ version)`. Длина перед `id` не даёт разным
+/// парам (`"ab"`, `"c"`) и (`"a"`, `"bc"`) совпасть. Клиент и сервер одной сборки получают одинаковое значение.
+pub fn protocol_id(id: &str, version: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(id.len() as u64).to_le_bytes());
+    hasher.update(id.as_bytes());
+    hasher.update(version.as_bytes());
+    *hasher.finalize().as_bytes()
+}
 
 /// Канал доставки: задаёт надёжность и порядок сообщения.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -109,4 +119,52 @@ pub struct Output {
     /// Адрес назначения и готовая датаграмма.
     pub datagrams: Vec<(SocketAddr, Vec<u8>)>,
     pub events: Vec<NetworkEvent>,
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{parse_fingerprint, protocol_id};
+
+    #[test]
+    fn protocol_id_depends_on_project_id_and_version_without_ambiguity() {
+        assert_eq!(protocol_id("demo", "1"), protocol_id("demo", "1"));
+        assert_ne!(protocol_id("demo", "1"), protocol_id("demo", "2"));
+        assert_ne!(protocol_id("demo", "1"), protocol_id("other", "1"));
+        assert_ne!(protocol_id("ab", "c"), protocol_id("a", "bc"));
+    }
+
+    #[test]
+    fn protocol_id_value_is_pinned_for_wire_compatibility() {
+        let id = protocol_id("demo", "1.2.0");
+        assert_eq!(
+            id,
+            [
+                0x36, 0xee, 0xf5, 0xf5, 0xc4, 0x29, 0x66, 0xd6, 0x56, 0xe3, 0x88, 0xd3, 0x0f, 0x27,
+                0x0f, 0xe5, 0xc2, 0xe5, 0x4d, 0xd2, 0xef, 0x9e, 0xab, 0x81, 0x8e, 0x22, 0x30, 0x59,
+                0x59, 0x77, 0x61, 0x2a,
+            ]
+        );
+    }
+
+    #[test]
+    fn fingerprint_accepts_64_hex_digits_in_any_case() {
+        let lower = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let upper = lower.to_ascii_uppercase();
+        let expected = parse_fingerprint(lower).unwrap();
+        assert_eq!(expected[0], 0x00);
+        assert_eq!(expected[1], 0x11);
+        assert_eq!(expected[31], 0xff);
+        assert_eq!(parse_fingerprint(&upper), Some(expected));
+    }
+
+    #[test]
+    fn fingerprint_rejects_wrong_length_and_non_hex_digits() {
+        let valid = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        assert_eq!(parse_fingerprint(""), None);
+        assert_eq!(parse_fingerprint(&valid[..63]), None);
+        assert_eq!(parse_fingerprint(&format!("{valid}0")), None);
+        let mut bad = valid.to_owned();
+        bad.replace_range(10..11, "g");
+        assert_eq!(parse_fingerprint(&bad), None);
+    }
 }

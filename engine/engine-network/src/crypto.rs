@@ -250,6 +250,30 @@ fn to_hex(bytes: &[u8]) -> String {
     text
 }
 
+/// Разбирает отпечаток сервера: ровно 64 hex-символа, регистр не важен.
+pub fn parse_fingerprint(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut fingerprint = [0_u8; 32];
+    for (slot, pair) in fingerprint.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        let high = hex_value(pair[0])?;
+        let low = hex_value(pair[1])?;
+        *slot = high << 4 | low;
+    }
+    Some(fingerprint)
+}
+
+fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Случайные байты из системного генератора.
 pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N], NetError> {
     let mut bytes = [0u8; N];

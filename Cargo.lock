@@ -1066,7 +1066,6 @@ dependencies = [
 name = "engine-runtime"
 version = "0.8.0"
 dependencies = [
- "blake3",
  "egui",
  "egui-winit",
  "engine-animation",
