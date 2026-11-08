@@ -719,8 +719,22 @@ fn pad_slots(pad: Option<u8>) -> Range<usize> {
     }
 }
 
-/// Returns the axis value with the largest magnitude among the covered slots.
+/// Returns the stick component of the covered slot with the longest stick. Triggers take the value
+/// with the largest magnitude among the covered slots.
 fn gamepad_axis_value(input: ScriptInput, pad: Option<u8>, axis: GamepadAxis) -> f32 {
+    let stick = match axis {
+        GamepadAxis::LeftX | GamepadAxis::LeftY => Some(GamepadStick::Left),
+        GamepadAxis::RightX | GamepadAxis::RightY => Some(GamepadStick::Right),
+        GamepadAxis::LeftTrigger | GamepadAxis::RightTrigger => None,
+    };
+    if let Some(stick) = stick {
+        let [x, y] = gamepad_stick_value(input, pad, stick);
+        return if matches!(axis, GamepadAxis::LeftX | GamepadAxis::RightX) {
+            x
+        } else {
+            y
+        };
+    }
     pad_slots(pad)
         .map(|slot| input.pad(slot).axis(axis))
         .max_by(|a, b| a.abs().total_cmp(&b.abs()))
@@ -1515,6 +1529,26 @@ mod tests {
             .unwrap()
             .value;
         assert_eq!(drive, [0.0, 0.5]);
+    }
+
+    #[test]
+    fn unslotted_stick_axis_takes_the_component_of_the_longest_stick_like_the_aggregate() {
+        let mut actions = gamepad_actions();
+        let input = pad_snapshot(&[
+            (0, 0, [0.3, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (1, 0, [0.0, 0.5, 0.0, 0.0, 0.0, 0.0]),
+        ]);
+        let aggregate = input.gamepad_state(0).unwrap();
+        assert_eq!(aggregate.axes[rve_sdk::GamepadAxis::LeftX as usize], 0.0);
+        assert_eq!(aggregate.axes[rve_sdk::GamepadAxis::LeftY as usize], 0.5);
+        actions.set_input(input);
+
+        let strafe = actions
+            .frame()
+            .state("Strafe", InputActionKind::Axis)
+            .unwrap()
+            .value[0];
+        assert_eq!(strafe, 0.0);
     }
 
     #[test]
