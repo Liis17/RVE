@@ -1118,12 +1118,12 @@ impl<'a> Context<'a> {
         Input { host: self.host }
     }
 
-    /// Returns physics queries available during this callback.
     /// Network state and messaging. Methods return [`NetError::Unavailable`] without host callbacks.
     pub fn net(&self) -> Net<'_> {
         Net { host: self.host }
     }
 
+    /// Returns physics queries available during this callback.
     pub fn physics(&self) -> Physics<'_> {
         Physics { host: self.host }
     }
