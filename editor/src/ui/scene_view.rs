@@ -326,7 +326,7 @@ fn collider_wires(state: &mut EditorState) -> Vec<ColliderWire> {
         .filter_map(|object| {
             Some(WireSource {
                 transform: object_world_transform(world, object.handle).ok()?,
-                collider: object.collider,
+                collider: object.collider.clone(),
                 character: object.character_controller,
                 model: object
                     .mesh_renderer

@@ -557,7 +557,7 @@ impl PlaySession {
             .objects()
             .iter()
             .filter_map(|object| {
-                mesh_collider_model(object.collider, object.mesh_renderer.as_ref())
+                mesh_collider_model(object.collider.clone(), object.mesh_renderer.as_ref())
             })
             .chain(
                 prefabs

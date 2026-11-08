@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use engine_scene::{
-    CharacterControllerComponent, ColliderComponent, ColliderShape, ObjectHandle,
-    RigidBodyComponent, RigidBodyKind, World, WorldObject,
+    CharacterControllerComponent, ColliderComponent, ColliderShape,
+    CombineMode as SceneCombineMode, ObjectHandle, PhysicsMaterialSettings, RigidBodyComponent,
+    RigidBodyKind, World, WorldObject,
 };
 use glam::{Mat3, Vec3};
 
@@ -13,7 +14,7 @@ use crate::world::{
     BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsWorld,
     PhysicsWorldError, StepDriver,
 };
-use crate::{GeometryError, PhysicsMaterial, Pose, Shape, TriMesh};
+use crate::{CombineMode, GeometryError, PhysicsMaterial, Pose, Shape, TriMesh};
 
 const POSE_POSITION_EPSILON_SQUARED: f32 = 1.0e-8;
 const POSE_ROTATION_DOT_EPSILON: f32 = 1.0e-5;
@@ -586,7 +587,7 @@ fn scene_body(
     models: &HashMap<&str, &ModelGeometry>,
     cache: &mut ShapeCache,
 ) -> Result<Option<PhysicsSceneBody>, PhysicsSceneError> {
-    let Some(collider) = object.collider else {
+    let Some(collider) = object.collider.clone() else {
         if object.character_controller.is_none() {
             return Ok(None);
         }
@@ -625,8 +626,9 @@ fn scene_body(
     if kind == BodyKind::Dynamic && object.parent.is_some() {
         return Err(PhysicsSceneError::DynamicObjectMustBeRoot(object.handle));
     }
+    let material = collider_material(&collider);
     let shape = build_shape(
-        collider,
+        collider.clone(),
         transform.scale,
         object.mesh_renderer.as_ref(),
         models,
@@ -635,8 +637,7 @@ fn scene_body(
     let mut collider_desc = ColliderDesc::new(shape);
     collider_desc.offset = Vec3::from_array(collider.offset) * transform.scale;
     collider_desc.trigger = collider.trigger;
-    collider_desc.material =
-        PhysicsMaterial::from_friction_restitution(collider.friction, collider.restitution);
+    collider_desc.material = material;
     let mut desc = BodyDesc::new(kind, transform.pose, collider_desc);
     apply_rigid_body(&mut desc, rigid_body);
     Ok(Some(PhysicsSceneBody {
@@ -644,6 +645,37 @@ fn scene_body(
         desc,
         character_controller: None,
     }))
+}
+
+/// Материал коллайдера: разрешённый `.rvephysmat`, если он задан, иначе инлайн-поля. Загрузчик
+/// сцены и префабов читает файл до построения физики, поэтому без разрешённого значения берутся
+/// значения по умолчанию материала.
+fn collider_material(collider: &ColliderComponent) -> PhysicsMaterial {
+    match (&collider.material, &collider.resolved_material) {
+        (Some(_), settings) => physics_material(settings.unwrap_or_default()),
+        (None, _) => {
+            PhysicsMaterial::from_friction_restitution(collider.friction, collider.restitution)
+        }
+    }
+}
+
+fn physics_material(settings: PhysicsMaterialSettings) -> PhysicsMaterial {
+    PhysicsMaterial {
+        static_friction: settings.static_friction,
+        dynamic_friction: settings.dynamic_friction,
+        bounciness: settings.bounciness,
+        friction_combine: combine_mode(settings.friction_combine),
+        bounce_combine: combine_mode(settings.bounce_combine),
+    }
+}
+
+fn combine_mode(mode: SceneCombineMode) -> CombineMode {
+    match mode {
+        SceneCombineMode::Average => CombineMode::Average,
+        SceneCombineMode::Minimum => CombineMode::Minimum,
+        SceneCombineMode::Multiply => CombineMode::Multiply,
+        SceneCombineMode::Maximum => CombineMode::Maximum,
+    }
 }
 
 fn model_index(
@@ -762,7 +794,9 @@ mod tests {
         ShapeCache, character_capsule_shape, primitive_collider_shape,
     };
     use crate::world::{BodyChange, BodyHandle, BodyKind, PhysicsCommand};
-    use crate::{GeometryError, PhysicsSceneError, Pose, Ray, Shape, raycast};
+    use crate::{
+        CombineMode, GeometryError, PhysicsMaterial, PhysicsSceneError, Pose, Ray, Shape, raycast,
+    };
     use engine_files::VirtualPath;
     use engine_scene::{
         ColliderComponent, ColliderShape, LocalTransform, ObjectHandle, PrefabTemplate,
@@ -1331,5 +1365,51 @@ mod tests {
             .unwrap();
         let (body, _) = insert_body(&changes[0]);
         assert_eq!(body, BodyHandle(1));
+    }
+
+    #[test]
+    fn collider_material_asset_overrides_inline_friction_and_restitution() {
+        let text = "[[assets]]\npath=\"/materials/ice.rvephysmat\"\n\
+                    [[objects]]\nid='camera'\n[objects.camera]\n\
+                    [[objects]]\nid='ice'\n[objects.collider]\nshape='box'\n\
+                    half_extents=[0.5,0.5,0.5]\nfriction=0.2\nrestitution=0.8\n\
+                    material='/materials/ice.rvephysmat'\n\
+                    [[objects]]\nid='inline'\n[objects.collider]\nshape='box'\n\
+                    half_extents=[0.5,0.5,0.5]\nfriction=0.2\nrestitution=0.8\n";
+        let mut world = world(text);
+        let mut read = |_: &engine_files::VirtualPath| {
+            Ok(
+                "static_friction = 0.05\ndynamic_friction = 0.02\nbounciness = 0.9\n\
+                friction_combine = \"multiply\"\nbounce_combine = \"maximum\"\n"
+                    .to_owned(),
+            )
+        };
+        world.resolve_physics_materials(&mut read).unwrap();
+        let descriptor = desc(&world, &[]);
+        let material_of = |id: &str| {
+            let handle = world.handle(id).unwrap();
+            descriptor
+                .bodies
+                .iter()
+                .find(|body| body.object == handle)
+                .unwrap()
+                .desc
+                .collider
+                .material
+        };
+        assert_eq!(
+            material_of("ice"),
+            PhysicsMaterial {
+                static_friction: 0.05,
+                dynamic_friction: 0.02,
+                bounciness: 0.9,
+                friction_combine: CombineMode::Multiply,
+                bounce_combine: CombineMode::Maximum,
+            }
+        );
+        assert_eq!(
+            material_of("inline"),
+            PhysicsMaterial::from_friction_restitution(0.2, 0.8)
+        );
     }
 }

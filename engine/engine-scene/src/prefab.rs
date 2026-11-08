@@ -15,6 +15,7 @@ use crate::document::{
     validate_material_override, virtual_path_serde,
 };
 use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
+use crate::physics_material::resolve_collider_material;
 use crate::world::topological_order;
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
@@ -268,7 +269,7 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .ok_or("override spot_light: у объекта нет spot_light")?;
         *target = light;
     }
-    if let Some(collider) = change.collider {
+    if let Some(collider) = change.collider.clone() {
         let target = object
             .collider
             .as_mut()
@@ -514,6 +515,20 @@ impl PrefabTemplate {
         self.spawn_rejection.clone().map_or(Ok(()), Err)
     }
 
+    /// Читает `.rvephysmat` коллайдеров объектов шаблона и заполняет их разрешённые материалы.
+    pub fn resolve_physics_materials(
+        &mut self,
+        read: &mut dyn FnMut(&VirtualPath) -> Result<String, String>,
+    ) -> Result<(), SceneError> {
+        let mut cache = BTreeMap::new();
+        for object in &mut self.objects {
+            if let Some(collider) = object.collider.as_mut() {
+                resolve_collider_material(collider, &self.stem, &object.id, read, &mut cache)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Ресурсы шаблона, включая ресурсы вложенных префабов.
     pub fn assets(&self) -> &[SceneAsset] {
         &self.assets
@@ -530,7 +545,7 @@ impl PrefabTemplate {
         self.objects
             .iter()
             .filter_map(|object| {
-                mesh_collider_model(object.collider, object.mesh_renderer.as_ref())
+                mesh_collider_model(object.collider.clone(), object.mesh_renderer.as_ref())
             })
             .collect()
     }
@@ -645,6 +660,20 @@ pub(crate) fn validate_instances(
                     settings,
                     "camerasettings",
                     "настройки камеры override",
+                )?;
+            }
+            if let Some(material) = change
+                .collider
+                .as_ref()
+                .and_then(|collider| collider.material.as_ref())
+            {
+                require_asset_path(source, id, assets, material, "физический материал override")?;
+                require_extension(
+                    source,
+                    id,
+                    material,
+                    "rvephysmat",
+                    "физический материал override",
                 )?;
             }
             if let Some(environment) = &change.environment {

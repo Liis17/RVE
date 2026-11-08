@@ -184,7 +184,7 @@ fn collider_wire(
     models: &HashMap<String, Arc<Model>>,
     source: &WireSource,
 ) -> Result<Option<ColliderWire>, String> {
-    let Some(collider) = source.collider else {
+    let Some(collider) = source.collider.clone() else {
         return Ok(None);
     };
     let placement = Placement::new(source.transform, Vec3::from_array(collider.offset));
@@ -206,8 +206,8 @@ fn collider_wire(
             }
         }
         ColliderShape::Box | ColliderShape::Sphere | ColliderShape::Capsule => {
-            let shape =
-                primitive_collider_shape(collider, scale).map_err(|error| error.to_string())?;
+            let shape = primitive_collider_shape(collider.clone(), scale)
+                .map_err(|error| error.to_string())?;
             primitive_segments(&shape, &placement)
         }
     };

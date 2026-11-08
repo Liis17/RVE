@@ -114,7 +114,12 @@ pub(crate) fn load_scene(
     let instanced = expansion.prefabs;
     let mut expanded = expansion.document;
     let prefabs = load_fast_prefabs(resources, &mut expanded, &instanced)?;
-    let world = World::from_document(&expanded).map_err(|error| error.to_string())?;
+    let mut world = World::from_document(&expanded).map_err(|error| error.to_string())?;
+    world
+        .resolve_physics_materials(&mut |path: &VirtualPath| {
+            read_utf8(resources, &format!("/{}", path.as_str()))
+        })
+        .map_err(|error| error.to_string())?;
     prepare_scene(resources, assets, scene_path, world, prefabs)
 }
 
@@ -137,10 +142,7 @@ fn load_fast_prefabs(
         .collect::<Vec<_>>();
     let mut prefabs = PreparedPrefabs::default();
     for (path, max_instances) in fast {
-        let template = PrefabTemplate::load(&path, &mut |child: &VirtualPath| {
-            read_utf8(resources, &format!("/{}", child.as_str()))
-        })
-        .map_err(|error| error.to_string())?;
+        let template = load_prefab_template(resources, &path)?;
         if let Err(error) = template.check_spawnable() {
             if !instanced.contains(&path) {
                 log::warn!(
@@ -629,15 +631,22 @@ pub(crate) fn model_geometry(path: &str, model: &Model) -> ModelGeometry {
     }
 }
 
-/// Шаблон префаба, прочитанный через ресурсы; ошибки чтения и разбора остаются текстом.
+/// Шаблон префаба, прочитанный через ресурсы, с разрешёнными физическими материалами; ошибки
+/// чтения и разбора остаются текстом.
 pub(crate) fn load_prefab_template(
     resources: &ResourceHandle,
     path: &VirtualPath,
 ) -> Result<PrefabTemplate, String> {
-    PrefabTemplate::load(path, &mut |child: &VirtualPath| {
+    let mut template = PrefabTemplate::load(path, &mut |child: &VirtualPath| {
         read_utf8(resources, &format!("/{}", child.as_str()))
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    template
+        .resolve_physics_materials(&mut |child: &VirtualPath| {
+            read_utf8(resources, &format!("/{}", child.as_str()))
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(template)
 }
 
 /// CPU-ресурсы шаблона тяжёлого префаба: то же, что для объектов сцены.
@@ -1590,6 +1599,62 @@ id = "camera"
         .err()
         .unwrap();
         assert!(error.contains("scene.rvescene"));
+    }
+
+    fn physics_material_scene() -> String {
+        format!(
+            "[[assets]]\npath = \"/materials/ice.rvephysmat\"\n{CAMERA_SCENE}\n[[objects]]\nid = \"ball\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\nmaterial = \"/materials/ice.rvephysmat\"\n"
+        )
+    }
+
+    #[test]
+    fn load_scene_resolves_collider_physics_materials_from_assets() {
+        let project = TempProject::new();
+        project.write("scene.rvescene", physics_material_scene().as_bytes());
+        project.write(
+            "materials/ice.rvephysmat",
+            b"static_friction = 0.05\nbounciness = 0.9\n",
+        );
+        let resources = LooseResources::new(project.root());
+        let prepared = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .unwrap();
+        let collider = prepared
+            .world
+            .object_by_id("ball")
+            .and_then(|object| object.collider.as_ref())
+            .unwrap();
+        let resolved = collider.resolved_material.unwrap();
+        assert_eq!(resolved.static_friction, 0.05);
+        assert_eq!(resolved.bounciness, 0.9);
+    }
+
+    #[test]
+    fn load_scene_rejects_a_missing_or_invalid_physics_material() {
+        let project = TempProject::new();
+        project.write("scene.rvescene", physics_material_scene().as_bytes());
+        let resources = LooseResources::new(project.root());
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("materials/ice.rvephysmat"), "{error}");
+
+        project.write("materials/ice.rvephysmat", b"static_friction = -1.0\n");
+        let error = load_scene(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("static_friction"), "{error}");
     }
 
     #[test]

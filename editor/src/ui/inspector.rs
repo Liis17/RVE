@@ -152,7 +152,7 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     if let Some(environment) = &object.environment {
         show_environment(ui, state, id, environment);
     }
-    if let Some(collider) = object.collider {
+    if let Some(collider) = object.collider.clone() {
         show_collider(ui, state, object, collider);
     }
     if let Some(body) = object.rigid_body {
@@ -2091,9 +2091,14 @@ fn show_collider(
                     "Shape",
                     collider.shape,
                     &COLLIDER_SHAPES,
-                    |object, shape| object.collider = Some(ColliderComponent { shape, ..collider }),
+                    |object, shape| {
+                        object.collider = Some(ColliderComponent {
+                            shape,
+                            ..collider.clone()
+                        })
+                    },
                 );
-                let mut value = collider;
+                let mut value = collider.clone();
                 let mut combined: Option<egui::Response> = None;
                 match collider.shape {
                     ColliderShape::Box => {

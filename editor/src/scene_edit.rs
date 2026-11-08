@@ -140,7 +140,7 @@ impl Component {
             ComponentKind::PointLight => Self::PointLight(object.point_light?),
             ComponentKind::SpotLight => Self::SpotLight(object.spot_light?),
             ComponentKind::Environment => Self::Environment(object.environment.clone()?),
-            ComponentKind::Collider => Self::Collider(object.collider?),
+            ComponentKind::Collider => Self::Collider(object.collider.clone()?),
             ComponentKind::RigidBody => Self::RigidBody(object.rigid_body?),
             ComponentKind::CharacterController => {
                 Self::CharacterController(object.character_controller?)
@@ -2480,9 +2480,27 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(scene.object(&id).unwrap().collider.unwrap().friction, 0.9);
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .friction,
+            0.9
+        );
         assert!(scene.undo());
-        assert_eq!(scene.object(&id).unwrap().collider.unwrap().friction, 0.5);
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .friction,
+            0.5
+        );
 
         // Коллайдер нельзя убрать, оставив тело: удаление идёт одной правкой, один undo вернёт оба.
         scene

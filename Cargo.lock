@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "engine-files",
  "glam",
