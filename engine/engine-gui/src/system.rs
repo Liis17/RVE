@@ -112,6 +112,18 @@ pub(crate) struct UiCanvas {
     pub(crate) default_focus_pending: bool,
 }
 
+/// Runtime-состояние канваса, которое меняют записи: элементы, курсоры, прокрутка, слой и
+/// открытый список. Документ и хендлы не входят — записи их не меняют.
+#[derive(Clone)]
+pub struct UiCanvasSnapshot {
+    layer: i32,
+    visible: bool,
+    elements: Vec<UiElement>,
+    cursors: Vec<usize>,
+    scroll: Vec<Vec2>,
+    popup: Option<usize>,
+}
+
 pub(crate) struct Slot {
     pub(crate) generation: u32,
     pub(crate) canvas: Option<UiCanvas>,
@@ -522,6 +534,49 @@ impl UiSystem {
         if canvas.popup == Some(index) {
             canvas.popup = None;
         }
+        Ok(())
+    }
+
+    /// Копия runtime-состояния канваса; возвращается в [`UiSystem::restore_canvas`] при откате.
+    pub fn snapshot_canvas(
+        &self,
+        canvas: UiCanvasHandle,
+    ) -> Result<UiCanvasSnapshot, UiSystemError> {
+        let canvas = self.canvas_ref(canvas)?;
+        Ok(UiCanvasSnapshot {
+            layer: canvas.layer,
+            visible: canvas.visible,
+            elements: canvas.elements.clone(),
+            cursors: canvas.cursors.clone(),
+            scroll: canvas.scroll.clone(),
+            popup: canvas.popup,
+        })
+    }
+
+    /// Возвращает канвас к снимку. Layout пересчитывается при следующем update.
+    pub fn restore_canvas(
+        &mut self,
+        canvas: UiCanvasHandle,
+        snapshot: UiCanvasSnapshot,
+    ) -> Result<(), UiSystemError> {
+        let target = self.canvas_mut(canvas)?;
+        target.layer = snapshot.layer;
+        target.visible = snapshot.visible;
+        target.elements = snapshot.elements;
+        target.cursors = snapshot.cursors;
+        target.scroll = snapshot.scroll;
+        target.popup = snapshot.popup;
+        target.layout_dirty = true;
+        Ok(())
+    }
+
+    /// Ставит фокус без событий `focus`/`blur`: откат не должен порождать новых событий.
+    pub fn restore_focus(&mut self, focus: Option<UiElementHandle>) -> Result<(), UiSystemError> {
+        if let Some(handle) = focus {
+            self.element_ref(handle)?;
+        }
+        self.paint_dirty = true;
+        self.focus = focus;
         Ok(())
     }
 
@@ -973,5 +1028,48 @@ image = { path = "/ui/icon.png" }
             system.find(canvas, "missing"),
             Err(UiSystemError::UnknownElement(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_restores_caret_value_and_text_and_restore_focus_is_silent() {
+        use crate::input::{TextInputEvent, UiInput};
+        let screen = Vec2::new(800.0, 600.0);
+        let mut system = UiSystem::default();
+        let canvas = system.open(document(BASIC), 1);
+        let field = system.find(canvas, "field").unwrap();
+        let drop = system.find(canvas, "drop").unwrap();
+        system.focus(field).unwrap();
+        let type_text = |system: &mut UiSystem, text: TextInputEvent| {
+            system.update(
+                &UiInput {
+                    text: vec![text],
+                    ..UiInput::default()
+                },
+                0.0,
+                screen,
+            );
+        };
+        type_text(&mut system, TextInputEvent::Home);
+        let snapshot = system.snapshot_canvas(canvas).unwrap();
+
+        system.set_value(drop, UiValue::Index(1)).unwrap();
+        type_text(&mut system, TextInputEvent::Text("7".to_owned()));
+        assert_eq!(system.text(field), Ok("71".to_owned()));
+
+        system.restore_canvas(canvas, snapshot).unwrap();
+        assert_eq!(system.text(field), Ok("1".to_owned()));
+        assert_eq!(system.value(drop), Ok(Some(UiValue::Index(0))));
+        type_text(&mut system, TextInputEvent::Text("7".to_owned()));
+        assert_eq!(
+            system.text(field),
+            Ok("71".to_owned()),
+            "каретка возвращается в позицию снимка"
+        );
+
+        system.restore_focus(None).unwrap();
+        assert_eq!(system.focused(), None);
+        system.close(canvas).unwrap();
+        assert!(system.restore_focus(Some(field)).is_err());
+        assert!(system.snapshot_canvas(canvas).is_err());
     }
 }

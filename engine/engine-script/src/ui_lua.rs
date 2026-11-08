@@ -207,12 +207,21 @@ fn element_table(
     element: UiElementHandle,
     active_call: ActiveCall,
 ) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
     let id = with_active_call(&active_call, |transaction| {
         transaction
             .ui_element_id(element)
             .map_err(LuaError::runtime)
     })?;
+    element_table_with_id(lua, element, id, active_call)
+}
+
+fn element_table_with_id(
+    lua: &Lua,
+    element: UiElementHandle,
+    id: String,
+    active_call: ActiveCall,
+) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
     table.set("id", id)?;
 
     method(
@@ -410,7 +419,11 @@ pub(crate) fn event_table(
         "canvas",
         canvas_table(lua, event.canvas, active_call.clone())?,
     )?;
-    table.set("element", element_table(lua, event.element, active_call)?)?;
+    // Id берётся из доставки: канвас может быть закрыт, и тогда чтение через UiSystem дало бы ошибку.
+    table.set(
+        "element",
+        element_table_with_id(lua, event.element, event.element_id.clone(), active_call)?,
+    )?;
     table.set("id", event.element_id.as_str())?;
     table.set("kind", kind_name(event.kind))?;
     table.set("value", ui_value_to_lua(lua, event.value.clone())?)?;

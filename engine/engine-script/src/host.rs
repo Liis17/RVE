@@ -23,7 +23,7 @@ use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams,
     ScriptTime, ScriptTransform,
 };
-use crate::ui::{UiDelivery, UiScriptState, owner_key};
+use crate::ui::{QueuedUiEvent, UiDelivery, UiScriptState, owner_key, queue_live};
 use engine_console::{CommandCatalog, CommandLine, CommandSpec};
 use engine_files::VirtualPath;
 use engine_gui::document::UiDocument;
@@ -225,10 +225,8 @@ pub struct ScriptHost {
     net_errors: NetErrorLog,
     /// Ошибки callback по участнику с прошлого drain; сообщения от одного пира.
     peer_faults: HashMap<PeerId, u32>,
-    /// Игровой UI: `UiSystem`, документы и канвасы компонентов; общий с транзакцией.
+    /// Игровой UI: `UiSystem`, документы, канвасы компонентов и очередь событий; общий с транзакцией.
     ui: Rc<RefCell<UiScriptState>>,
-    /// События UI, поставленные runtime; доставляются в начале следующего update.
-    ui_events: Vec<UiEvent>,
 }
 
 /// Время последнего `update` хоста по фазам. Все поля нулевые до первого `update`.
@@ -451,7 +449,6 @@ impl ScriptHost {
             net_errors: NetErrorLog::default(),
             peer_faults: HashMap::new(),
             ui,
-            ui_events: Vec::new(),
         };
 
         for object in world.objects() {
@@ -888,7 +885,12 @@ impl ScriptHost {
     /// Ставит события UI, например из `UiSystem::update`; они доходят до `on_ui_event`
     /// в начале следующего update. Событие канваса, закрытого к доставке, пропускается.
     pub fn queue_ui_events(&mut self, events: impl IntoIterator<Item = UiEvent>) {
-        self.ui_events.extend(events);
+        let mut state = self.ui.borrow_mut();
+        let queued: Vec<QueuedUiEvent> = events
+            .into_iter()
+            .filter_map(|event| queue_live(&state.system, event))
+            .collect();
+        state.queued.extend(queued);
     }
 
     /// Runs on_start once. update also calls start automatically if needed.
@@ -1636,37 +1638,16 @@ impl ScriptHost {
 
     /// Доставляет `on_ui_event` экземплярам владельца канваса; каждая доставка — отдельная транзакция.
     fn deliver_ui_events(&mut self, world: &mut World, time: ScriptTime) {
-        let events = std::mem::take(&mut self.ui_events);
+        // События, поставленные во время доставки, ждут следующего update.
+        let events = std::mem::take(&mut self.ui.borrow_mut().queued);
         if events.is_empty() {
             return;
         }
         let time_error = lite::set_time(&self.lua_time, time)
             .err()
             .map(|error| error.to_string());
-        for event in events {
-            let delivery = {
-                let state = self.ui.borrow();
-                let Ok(owner) = state.system.owner(event.canvas) else {
-                    continue;
-                };
-                let Some(object) = ObjectHandle::from_abi(owner) else {
-                    continue;
-                };
-                let Ok(element_id) = state.system.element_id(event.element) else {
-                    continue;
-                };
-                (
-                    object,
-                    UiDelivery {
-                        canvas: event.canvas,
-                        element: event.element,
-                        element_id: element_id.to_owned(),
-                        kind: event.kind,
-                        value: event.value,
-                    },
-                )
-            };
-            let (object, delivery) = delivery;
+        for QueuedUiEvent { owner, delivery } in events {
+            let object = owner;
             let targets: Vec<usize> = (0..self.instances.len())
                 .filter(|&index| {
                     self.instances[index]

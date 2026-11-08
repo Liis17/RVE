@@ -426,3 +426,135 @@ fn reverted_spawn_closes_its_canvases_and_reused_slot_does_not_see_them() {
     assert_eq!(host.ui().owner(new_canvas), Ok(owner_key(second)));
     assert_ne!(owner_key(first), owner_key(second));
 }
+
+const FORM: &str = r#"
+[[assets]]
+path = "/ui/icon.png"
+
+[[elements]]
+id = "name"
+input_field = { text = "a" }
+
+[[elements]]
+id = "mode"
+dropdown = { options = ["a", "b"] }
+
+[[elements]]
+id = "go"
+button = {}
+"#;
+
+const FORM_SCRIPT: &str = r#"
+local Form = {}
+function Form:on_update(dt)
+  local canvas = rve.ui.canvas(self.object)
+  canvas:find("name"):set_text("zzz")
+  canvas:find("mode"):set_value(2)
+  canvas:find("go"):set_image("/ui/icon.png")
+  error("callback failed")
+end
+return Form
+"#;
+
+#[test]
+fn failed_callback_restores_empty_dropdown_button_image_and_input_text() {
+    let objects = "[[assets]]\npath = \"/ui/form.rveui\"\n[[objects]]\nid = \"form\"\n\
+        [objects.ui_canvas]\ndocument = \"/ui/form.rveui\"\n\
+        [[objects.lite_scripts]]\npath = \"/form.lua\"\n";
+    let mut world = scene(objects, &["form.lua"]);
+    let mut host = load(&world, &[("form.lua", FORM_SCRIPT)]);
+    host.register_ui_document(
+        VirtualPath::parse("ui/form.rveui").unwrap(),
+        Arc::new(UiDocument::parse("ui/form.rveui", FORM).unwrap()),
+    );
+    host.update(&mut world, 0.1, ScriptTime::default());
+
+    assert!(
+        host.drain_events()
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error)
+    );
+    let canvas = component(&host, &world, "form");
+    assert_eq!(
+        host.ui().value(element(&host, canvas, "mode")),
+        Ok(None),
+        "выбор dropdown без значения должен откатываться"
+    );
+    assert_eq!(
+        host.ui().image(element(&host, canvas, "go")),
+        Ok(None),
+        "картинка кнопки без normal должна откатываться"
+    );
+    assert_eq!(
+        host.ui().text(element(&host, canvas, "name")),
+        Ok("a".to_owned())
+    );
+}
+
+const FOCUSER_SCRIPT: &str = r#"
+local Focuser = {}
+function Focuser:on_update(dt)
+  if not self.done then
+    self.done = true
+    rve.ui.canvas(self.object):find("go"):focus()
+  end
+end
+function Focuser:on_ui_event(event)
+  rve.log_info("ui " .. event.id .. " " .. event.kind)
+end
+return Focuser
+"#;
+
+#[test]
+fn focus_in_callback_is_delivered_to_owner_on_next_update() {
+    let mut world = scene(&canvas_object("menu", "focuser.lua"), &["focuser.lua"]);
+    let mut host = load(&world, &[("focuser.lua", FOCUSER_SCRIPT)]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        messages(&mut host)
+            .iter()
+            .all(|event| !event.starts_with("ui ")),
+        "событие не доставляется в том же update"
+    );
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(messages(&mut host).contains(&"ui go focus".to_owned()));
+}
+
+const CLOSER_SCRIPT: &str = r#"
+local Closer = {}
+function Closer:on_update(dt)
+  local canvas = rve.ui.canvas(self.object)
+  if not self.focused then
+    self.focused = true
+    canvas:find("go"):focus()
+  elseif not self.closed then
+    self.closed = true
+    rve.ui.close(canvas)
+  end
+end
+function Closer:on_ui_event(event)
+  rve.log_info("ui " .. event.id .. " " .. event.kind)
+end
+return Closer
+"#;
+
+#[test]
+fn close_in_callback_delivers_blur_to_owner_on_next_update() {
+    let mut world = scene(&canvas_object("menu", "closer.lua"), &["closer.lua"]);
+    let mut host = load(&world, &[("closer.lua", CLOSER_SCRIPT)]);
+    host.update(&mut world, 0.1, ScriptTime::default());
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(
+        open_canvases(&host).is_empty(),
+        "канвас закрыт после commit"
+    );
+    assert!(messages(&mut host).contains(&"ui go focus".to_owned()));
+
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = messages(&mut host);
+    assert!(
+        events.contains(&"ui go blur".to_owned()),
+        "blur от закрытия доставляется владельцу: {events:?}"
+    );
+}
