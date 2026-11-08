@@ -20,7 +20,7 @@ const CPU_LABELS: [&str; 7] = [
     "submit",
     "present",
 ];
-const PLAY_LABELS: [&str; 9] = [
+const PLAY_LABELS: [&str; 11] = [
     "total",
     "world matrices",
     "messages",
@@ -30,6 +30,8 @@ const PLAY_LABELS: [&str; 9] = [
     "other",
     "physics wait",
     "physics step",
+    "world changes",
+    "prefab replies",
 ];
 
 /// Замер одного шага Play: фазы скриптов и ожидание и шаг физики.
@@ -38,6 +40,10 @@ pub struct PlayStep {
     pub script: ScriptUpdateProfile,
     pub physics_wait: Duration,
     pub physics_step: Duration,
+    /// Применение spawn, destroy и заявок префабов после скриптов.
+    pub world_changes: Duration,
+    /// Регистрация готовых префабов, пришедших из загрузчика.
+    pub prefab_replies: Duration,
 }
 
 /// Окна замеров редактора; строятся по кадрам renderer и шагам Play.
@@ -119,6 +125,8 @@ impl EditorProfile {
             script.other(),
             step.physics_wait,
             step.physics_step,
+            step.world_changes,
+            step.prefab_replies,
         ];
         for (window, elapsed) in self.play.iter_mut().zip(phases) {
             window.push(elapsed);
@@ -262,6 +270,8 @@ mod tests {
         let step = PlayStep {
             physics_wait: ms(1),
             physics_step: ms(2),
+            world_changes: ms(3),
+            prefab_replies: ms(4),
             ..PlayStep::default()
         };
 
@@ -270,6 +280,8 @@ mod tests {
         let report = profile.report();
         assert_eq!(row_samples(&report, "Play", "physics wait"), Some(1));
         assert_eq!(row_samples(&report, "Play", "physics step"), Some(1));
+        assert_eq!(row_samples(&report, "Play", "world changes"), Some(1));
+        assert_eq!(row_samples(&report, "Play", "prefab replies"), Some(1));
         assert_eq!(row_samples(&report, "Play", "Lua instances"), Some(1));
         assert_eq!(row_samples(&report, "GPU Scene", "total"), None);
     }

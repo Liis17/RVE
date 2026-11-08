@@ -35,6 +35,8 @@ pub(crate) mod script_phase {
     pub const BUILD_FRAME: usize = 4;
     pub const MAKE_SNAPSHOT: usize = 5;
     pub const SNAPSHOT_SEND_WAIT: usize = 6;
+    pub const WORLD_CHANGES: usize = 7;
+    pub const PREFAB_REPLIES: usize = 8;
 
     pub const UPDATE_TOTAL: usize = 0;
     pub const UPDATE_WORLD_MATRICES: usize = 1;
@@ -53,6 +55,7 @@ pub(crate) mod render_phase {
 
     pub const FRAME_WAIT: usize = 0;
     pub const RENDER_BACKEND: usize = 1;
+    pub const RESOURCE_REQUESTS: usize = 2;
 
     pub const PREPARE: usize = 0;
     pub const FENCE_WAIT: usize = 1;
@@ -76,6 +79,8 @@ pub(crate) fn scripts_groups() -> Vec<(&'static str, Vec<&'static str>)> {
                 "build frame",
                 "make snapshot",
                 "snapshot send wait",
+                "world changes",
+                "prefab replies",
             ],
         ),
         (
@@ -98,7 +103,10 @@ pub(crate) fn render_groups() -> Vec<(&'static str, Vec<&'static str>)> {
     let mut gpu: Vec<&'static str> = GpuPass::ALL.iter().map(|pass| pass.label()).collect();
     gpu.extend(["total", "output + UI"]);
     vec![
-        ("Render thread", vec!["frame wait", "render backend"]),
+        (
+            "Render thread",
+            vec!["frame wait", "render backend", "resource requests"],
+        ),
         (
             "Renderer CPU",
             vec![

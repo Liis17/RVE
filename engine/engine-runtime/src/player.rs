@@ -10,6 +10,7 @@ use crate::pipeline::{
     ExitRequester, FrameSnapshot, RENDER_THREAD, RenderControl, RenderThreadConfig, RuntimeStatus,
     SCRIPTS_THREAD, ScriptControl, VulkanBackend, start_render,
 };
+use crate::prefabs::{PREFAB_LOADER_THREAD, RenderResourceRequest};
 use crate::profiling::StartupProfile;
 #[cfg(feature = "dev-console")]
 use crate::profiling::profile_command_lines;
@@ -37,6 +38,7 @@ use winit::event::{ElementState, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const PREFAB_LOADER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct WindowExit(WindowProxy);
 
@@ -65,10 +67,12 @@ pub(crate) struct PlayerConfig {
     pub render_tx: Sender<RenderControl>,
     pub render_rx: Receiver<RenderControl>,
     pub frame_rx: Receiver<Arc<FrameSnapshot>>,
+    pub resources: Receiver<RenderResourceRequest>,
     pub script_stopped_rx: std::sync::mpsc::Receiver<()>,
+    pub prefab_loader_stopped_rx: std::sync::mpsc::Receiver<()>,
     pub interrupt: ScriptInterruptHandle,
     pub status: Arc<RuntimeStatus>,
-    pub resources: ResourceHandle,
+    pub resource_stats: ResourceHandle,
     pub startup: StartupProfile,
     pub input: Arc<Mutex<InputAccumulator>>,
     #[cfg(feature = "dev-console")]
@@ -99,10 +103,12 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         render_tx,
         render_rx,
         frame_rx,
+        resources,
         script_stopped_rx,
+        prefab_loader_stopped_rx,
         interrupt,
         status,
-        resources,
+        resource_stats,
         startup,
         input,
         #[cfg(feature = "dev-console")]
@@ -135,10 +141,12 @@ pub(crate) fn run_window(config: PlayerConfig, modules: &mut ModuleHost) -> u8 {
         render_tx,
         render_rx,
         frame_rx: Some(frame_rx),
+        resource_rx: Some(resources),
         script_stopped_rx,
+        prefab_loader_stopped_rx: Some(prefab_loader_stopped_rx),
         interrupt,
         status: Arc::clone(&status),
-        resources,
+        resource_stats,
         startup,
         render_stopped_rx: None,
         close_deadline: None,
@@ -200,10 +208,12 @@ struct PlayerWindow<'a> {
     render_tx: Sender<RenderControl>,
     render_rx: Receiver<RenderControl>,
     frame_rx: Option<Receiver<Arc<FrameSnapshot>>>,
+    resource_rx: Option<Receiver<RenderResourceRequest>>,
     script_stopped_rx: std::sync::mpsc::Receiver<()>,
+    prefab_loader_stopped_rx: Option<std::sync::mpsc::Receiver<()>>,
     interrupt: ScriptInterruptHandle,
     status: Arc<RuntimeStatus>,
-    resources: ResourceHandle,
+    resource_stats: ResourceHandle,
     startup: StartupProfile,
     render_stopped_rx: Option<Receiver<()>>,
     close_deadline: Option<Instant>,
@@ -263,12 +273,28 @@ impl PlayerWindow<'_> {
         false
     }
 
+    /// Останавливает загрузчик префабов раньше render thread: его результаты уходят в render,
+    /// поэтому сначала он завершается, а потом останавливается рендер.
+    fn stop_prefab_loader(&mut self) {
+        let Some(stopped) = self.prefab_loader_stopped_rx.take() else {
+            return;
+        };
+        self.modules.stop_named(PREFAB_LOADER_THREAD);
+        wait_for_prefab_loader_or_detach(
+            self.modules,
+            &stopped,
+            &self.status,
+            PREFAB_LOADER_STOP_TIMEOUT,
+        );
+    }
+
     fn cleanup(&mut self) {
         if self.cleaned {
             return;
         }
         self.cleaned = true;
         let _ = self.script_tx.send(ScriptControl::Shutdown);
+        self.stop_prefab_loader();
 
         if self.render_started && !self.status.render_stopped() {
             let _ = self.render_tx.send(RenderControl::Shutdown);
@@ -666,6 +692,28 @@ fn wait_for_scripts_or_detach(
     }
 }
 
+/// Ждёт завершения загрузчика не дольше `timeout`. Зависший при штатном закрытии загрузчик
+/// отсоединяется с предупреждением: его результаты уже не нужны, а код выхода не меняется.
+/// Код 1 дает только паника потока, которую показывает `join`.
+fn wait_for_prefab_loader_or_detach(
+    modules: &mut impl RuntimeThreads,
+    stopped: &std::sync::mpsc::Receiver<()>,
+    status: &RuntimeStatus,
+    timeout: Duration,
+) {
+    match stopped.recv_timeout(timeout) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(error) = modules.join_named(PREFAB_LOADER_THREAD) {
+                status.record_failure(error);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            log::warn!("поток загрузки префабов не остановился за {timeout:?}; отсоединяю его");
+            modules.detach(PREFAB_LOADER_THREAD);
+        }
+    }
+}
+
 fn wait_for_render_or_detach(
     modules: &mut impl RuntimeThreads,
     status: &RuntimeStatus,
@@ -781,6 +829,9 @@ impl WindowHandler for PlayerWindow<'_> {
         let Some(frame_rx) = self.frame_rx.take() else {
             return self.fail_init("канал кадров отсутствует при запуске рендера");
         };
+        let Some(resource_rx) = self.resource_rx.take() else {
+            return self.fail_init("канал ресурсов отсутствует при запуске рендера");
+        };
         let Some(window_exit) = self.window_exit.clone() else {
             return self.fail_init("WindowProxy не прикреплён перед init");
         };
@@ -798,12 +849,13 @@ impl WindowHandler for PlayerWindow<'_> {
                 height: size.height,
                 frame_limit: self.frame_limit,
                 frame_rx,
+                resources: resource_rx,
                 control_tx: self.render_tx.clone(),
                 control_rx: self.render_rx.clone(),
                 script_tx: self.script_tx.clone(),
                 interrupt: self.interrupt.clone(),
                 status: Arc::clone(&self.status),
-                resources: Some(self.resources.clone()),
+                resource_stats: Some(self.resource_stats.clone()),
                 stopped_tx: render_stopped_tx,
                 exit: window_exit,
             },
@@ -1008,8 +1060,8 @@ mod debug_view_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeThreads, cleanup_threads, close_timed_out, wait_for_render_or_detach,
-        wait_for_scripts_or_detach,
+        RuntimeThreads, cleanup_threads, close_timed_out, wait_for_prefab_loader_or_detach,
+        wait_for_render_or_detach, wait_for_scripts_or_detach,
     };
     use crate::module_host::ModuleHost;
     use crate::pipeline::RuntimeStatus;
@@ -1044,6 +1096,33 @@ mod tests {
             self.0.push(format!("detach:{name}"));
             true
         }
+    }
+
+    #[test]
+    fn unresponsive_prefab_loader_is_detached_without_failing_the_run() {
+        let (_stopped_tx, stopped_rx) = mpsc::channel::<()>();
+        let status = RuntimeStatus::default();
+        let mut modules = FakeThreads(Vec::new());
+        wait_for_prefab_loader_or_detach(&mut modules, &stopped_rx, &status, Duration::ZERO);
+        assert_eq!(modules.0, ["detach:rve-prefabs"]);
+        assert_eq!(status.exit_code(), 0);
+        assert!(status.failure_message().is_none());
+    }
+
+    #[test]
+    fn stopped_prefab_loader_is_joined_without_marking_the_run_failed() {
+        let (stopped_tx, stopped_rx) = mpsc::channel::<()>();
+        stopped_tx.send(()).unwrap();
+        let status = RuntimeStatus::default();
+        let mut modules = FakeThreads(Vec::new());
+        wait_for_prefab_loader_or_detach(
+            &mut modules,
+            &stopped_rx,
+            &status,
+            Duration::from_secs(1),
+        );
+        assert_eq!(modules.0, ["join:rve-prefabs"]);
+        assert_eq!(status.exit_code(), 0);
     }
 
     #[test]

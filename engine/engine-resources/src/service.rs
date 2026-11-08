@@ -4,7 +4,7 @@ use engine_pak::{
     Archive, ArchiveCatalog, ArchiveLimits, ArchiveSetRegistry, CatalogLimits, MemoryFootprint,
     PakError, ReadControl, ReadReservation, discover_archives,
 };
-use flume::{Receiver, Selector, Sender, TryRecvError, TrySendError};
+use flume::{Receiver, Sender, TryRecvError, TrySendError};
 use std::fs::{self, File};
 use std::io;
 use std::ops::Range;
@@ -264,7 +264,18 @@ impl ResourceHandle {
             panic_for_test: self.inner.panic_next.swap(false, Ordering::AcqRel),
         };
 
-        match self.inner.jobs.try_send(job) {
+        let sent = {
+            let jobs = match self.inner.jobs.lock() {
+                Ok(jobs) => jobs,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match &*jobs {
+                Some(sender) => sender.try_send(job),
+                // The queue is closed by shutdown, so nothing can be queued.
+                None => Err(TrySendError::Disconnected(job)),
+            }
+        };
+        match sent {
             Ok(()) if !self.inner.stopped.load(Ordering::Acquire) => Ok(ResourceRequest {
                 response: response_rx,
                 admission: Some(admission),
@@ -374,9 +385,22 @@ impl<T> Drop for ResourceRequest<T> {
     }
 }
 
+/// Отправитель очереди заданий, общий для дескрипторов и пула. Пул закрывает очередь,
+/// очистив слот: воркеры выходят из `recv`, когда очередь опустеет.
+type JobSender = Arc<Mutex<Option<Sender<Job>>>>;
+
+/// Закрывает очередь заданий: дальнейшие отправки получают `Disconnected`.
+fn close_jobs(jobs: &JobSender) {
+    let mut sender = match jobs.lock() {
+        Ok(sender) => sender,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *sender = None;
+}
+
 struct HandleInner {
     root: PathBuf,
-    jobs: Sender<Job>,
+    jobs: JobSender,
     outstanding: Arc<Outstanding>,
     memory: Arc<MemoryBudget>,
     max_result_bytes: u64,
@@ -711,7 +735,8 @@ fn start_inner(
         .queue_capacity
         .checked_add(config.worker_count)
         .ok_or_else(|| ResourceError::InvalidConfiguration("request capacity overflow".into()))?;
-    let (jobs, job_rx) = flume::bounded(config.queue_capacity);
+    let (job_tx, job_rx) = flume::bounded(config.queue_capacity);
+    let jobs: JobSender = Arc::new(Mutex::new(Some(job_tx)));
     let (stop_tx, stop_rx) = flume::bounded(1);
     let (ready_tx, ready_rx) = flume::bounded(1);
     let stopped = Arc::new(AtomicBool::new(false));
@@ -731,6 +756,7 @@ fn start_inner(
     let coordinator_fatal = Arc::clone(&fatal_worker_panic);
     let coordinator_gate = Arc::clone(&gate);
     let coordinator_jobs = job_rx.clone();
+    let coordinator_jobs_tx = Arc::clone(&jobs);
     let config_for_thread = config.clone();
     let backend_for_thread = backend_override;
     let coordinator = thread::Builder::new()
@@ -748,6 +774,7 @@ fn start_inner(
                         stopped: coordinator_stopped.clone(),
                         fatal_worker_panic: coordinator_fatal.clone(),
                         gate: coordinator_gate.clone(),
+                        jobs_tx: coordinator_jobs_tx.clone(),
                     },
                 )
             }));
@@ -844,6 +871,7 @@ struct CoordinatorControl {
     stopped: Arc<AtomicBool>,
     fatal_worker_panic: Arc<AtomicBool>,
     gate: Arc<AdmissionGate>,
+    jobs_tx: JobSender,
 }
 
 fn coordinate(
@@ -859,6 +887,7 @@ fn coordinate(
         stopped,
         fatal_worker_panic,
         gate,
+        jobs_tx,
     } = control;
     let backend_result = backend_override
         .map(Ok)
@@ -873,15 +902,14 @@ fn coordinate(
 
     let mut pool = WorkerPool {
         workers: Vec::with_capacity(config.worker_count),
-        stop_senders: Vec::with_capacity(config.worker_count),
         jobs: jobs.clone(),
+        jobs_tx,
         stopped: Arc::clone(&stopped),
         fatal_worker_panic: Arc::clone(&fatal_worker_panic),
         gate: Arc::clone(&gate),
         joined: false,
     };
     for worker_index in 0..config.worker_count {
-        let (worker_stop_tx, worker_stop_rx) = flume::bounded(1);
         let worker_jobs = jobs.clone();
         let worker_backend = backend.clone();
         let worker_stopped = Arc::clone(&stopped);
@@ -898,17 +926,14 @@ fn coordinate(
             .name(format!("resource-worker-{worker_index}"))
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    worker_loop(worker_jobs, worker_stop_rx, worker_backend, &failure)
+                    worker_loop(worker_jobs, worker_backend, &failure)
                 }));
                 if result.is_err() {
                     failure.signal();
                 }
             });
         match worker {
-            Ok(worker) => {
-                pool.workers.push(worker);
-                pool.stop_senders.push(worker_stop_tx);
-            }
+            Ok(worker) => pool.workers.push(worker),
             Err(source) => {
                 let _ = ready.try_send(Err(ResourceError::Io { path: None, source }));
                 return;
@@ -928,8 +953,8 @@ fn coordinate(
 
 struct WorkerPool {
     workers: Vec<JoinHandle<()>>,
-    stop_senders: Vec<Sender<()>>,
     jobs: Receiver<Job>,
+    jobs_tx: JobSender,
     stopped: Arc<AtomicBool>,
     fatal_worker_panic: Arc<AtomicBool>,
     gate: Arc<AdmissionGate>,
@@ -944,11 +969,11 @@ impl WorkerPool {
         self.stopped.store(true, Ordering::Release);
         self.gate.close();
         self.gate.wait_idle();
+        // Workers leave `recv` once the closed queue is empty; the drain below
+        // answers requests that no worker has taken yet.
+        close_jobs(&self.jobs_tx);
         while let Ok(job) = self.jobs.try_recv() {
             job.respond_stopped();
-        }
-        for stop in &self.stop_senders {
-            let _ = stop.try_send(());
         }
         for worker in self.workers.drain(..) {
             if worker.join().is_err() {
@@ -1079,25 +1104,14 @@ fn catalog_limits(config: &ResourceConfig) -> CatalogLimits {
     }
 }
 
-enum Selection {
-    Job(Result<Job, flume::RecvError>),
-    Stop,
-}
-
-fn worker_loop(
-    jobs: Receiver<Job>,
-    stop: Receiver<()>,
-    backend: Backend,
-    failure: &WorkerFailureControl,
-) {
+fn worker_loop(jobs: Receiver<Job>, backend: Backend, failure: &WorkerFailureControl) {
     loop {
-        let selected = Selector::new()
-            .recv(&jobs, Selection::Job)
-            .recv(&stop, |_| Selection::Stop)
-            .wait();
-        let job = match selected {
-            Selection::Stop | Selection::Job(Err(_)) => break,
-            Selection::Job(Ok(job)) => job,
+        // A plain `recv`, not `flume::Selector`: with a second (stop) channel, the
+        // selector in flume 0.11 and 0.12 can miss a wakeup, leaving the worker
+        // blocked forever so `shutdown` never returns.
+        let job = match jobs.recv() {
+            Ok(job) => job,
+            Err(_) => break,
         };
         let _panic_guard = WorkerPanicGuard { failure };
         job.stats.queue.record(job.submitted_at.elapsed());

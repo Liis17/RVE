@@ -3000,6 +3000,7 @@ return Neighbor
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
             input: Default::default(),
+            prefabs: Default::default(),
         },
     )
     .unwrap();
@@ -3094,8 +3095,8 @@ return Neighbor
                 && event.message.contains("Lua call exceeded time limit"))
     );
     assert!(!events.iter().any(|event| event.message == "lookup escaped"));
-    assert!(!host.instances[0].enabled);
-    assert!(host.instances[1].enabled);
+    assert!(!host.instances[0].as_ref().expect("instance").enabled);
+    assert!(host.instances[1].as_ref().expect("instance").enabled);
     host.update(&mut world, 0.1, ScriptTime::default());
     assert!(
         host.drain_events()
@@ -3158,8 +3159,8 @@ return Neighbor
         Err(crate::CommandError::Failed(message)) if message.contains("Lua call exceeded time limit")));
     assert!(host.command_catalog().get("loop").is_none());
     assert!(host.command_catalog().get("other").is_none());
-    assert!(!host.instances[0].enabled);
-    assert!(host.instances[1].enabled);
+    assert!(!host.instances[0].as_ref().expect("instance").enabled);
+    assert!(host.instances[1].as_ref().expect("instance").enabled);
     assert!(matches!(
         host.execute_command(&mut world, &command),
         Err(crate::CommandError::Unknown(_))
@@ -3194,6 +3195,7 @@ return Script
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
             input: Default::default(),
+            prefabs: Default::default(),
         },
     )
     .unwrap();
@@ -3223,6 +3225,7 @@ fn lua_call_deadline_applies_to_top_level_chunks_and_is_optional() {
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: Some(Duration::from_millis(50)),
             input: Default::default(),
+            prefabs: Default::default(),
         },
     );
     assert!(matches!(
@@ -3250,6 +3253,7 @@ return Script
             interrupt: ScriptInterruptHandle::new(),
             call_time_limit: None,
             input: Default::default(),
+            prefabs: Default::default(),
         },
     )
     .unwrap();
@@ -4718,6 +4722,140 @@ return Console
     host.destroy(&mut world, ScriptTime::default());
     assert!(host.command_catalog().get("temporary").is_none());
     assert_eq!(host.commands_generation(), 2);
+}
+
+/// Two bodies in a scene: `sensor` runs the script and destroys `victim` on its first update.
+const EXIT_WINDOW_SCENE: &str = r#"
+[[assets]]
+path = "/sensor.lua"
+[[objects]]
+id = "sensor"
+[[objects.lite_scripts]]
+path = "/sensor.lua"
+[[objects]]
+id = "victim"
+"#;
+
+const EXIT_WINDOW_SENSOR: &str = r#"
+local Sensor = {}
+local step = 0
+function Sensor:on_update(dt)
+  step = step + 1
+  if step == 1 then rve.destroy("victim") end
+  rve.log_info("update " .. step)
+end
+function Sensor:on_collision_exit(other)
+  rve.log_info("exit " .. tostring(other.id) .. " alive=" .. tostring(other:is_alive()))
+end
+return Sensor
+"#;
+
+#[test]
+fn exit_with_a_destroyed_other_is_delivered_only_inside_the_retired_window() {
+    let mut world = world(EXIT_WINDOW_SCENE);
+    let sensor = world.handle("sensor").unwrap();
+    let victim = world.handle("victim").unwrap();
+    let mut physics = PhysicsWorld::new(Vec3::ZERO).unwrap();
+    let sensor_body = physics
+        .insert_body(BodyDesc::static_collider(
+            Shape::sphere(0.5).unwrap(),
+            Pose::IDENTITY,
+        ))
+        .unwrap();
+    let victim_body = physics
+        .insert_body(BodyDesc::static_collider(
+            Shape::sphere(0.5).unwrap(),
+            Pose::new(Vec3::X * 2.0, Quat::IDENTITY).unwrap(),
+        ))
+        .unwrap();
+    let binding = |object, body| PhysicsSceneBinding {
+        object,
+        body,
+        kind: BodyKind::Static,
+        character_controller: None,
+    };
+    let both = [binding(sensor, sensor_body), binding(victim, victim_body)];
+    let sensor_only = [binding(sensor, sensor_body)];
+    let snapshot = physics.query_snapshot().unwrap();
+    let exit = engine_physics::PhysicsEvent::CollisionExit {
+        first: sensor_body,
+        second: victim_body,
+    };
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("sensor.lua", EXIT_WINDOW_SENSOR)]),
+        None,
+    )
+    .unwrap();
+    let messages = |host: &mut ScriptHost| {
+        host.drain_events()
+            .into_iter()
+            .map(|event| (event.level, event.message))
+            .collect::<Vec<_>>()
+    };
+
+    host.set_physics_snapshot(snapshot.clone(), &both);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+    assert!(world.handle("victim").is_none());
+    messages(&mut host);
+
+    // The first step result without the victim keeps its body known for one more result.
+    host.set_physics_snapshot(snapshot.clone(), &sensor_only);
+    host.queue_physics_events([exit.clone()]);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 0.2,
+            frame: 2,
+        },
+    );
+    let inside = messages(&mut host);
+    assert!(
+        inside
+            .iter()
+            .any(|(level, message)| *level == ScriptEventLevel::Info
+                && message == "exit victim alive=false"),
+        "{inside:?}"
+    );
+
+    // The second result closes the window. A stale binding of the removed body must skip the
+    // callback instead of disabling the sensor with a Lua error.
+    host.set_physics_snapshot(snapshot, &both);
+    host.queue_physics_events([exit]);
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 0.3,
+            frame: 3,
+        },
+    );
+    let after = messages(&mut host);
+    assert!(
+        after
+            .iter()
+            .all(|(level, _)| *level != ScriptEventLevel::Error),
+        "{after:?}"
+    );
+    assert!(
+        after.iter().any(|(_, message)| message == "update 3"),
+        "the sensor keeps running after the window: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|(_, message)| message.starts_with("exit ")),
+        "{after:?}"
+    );
 }
 
 #[test]

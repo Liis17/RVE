@@ -283,6 +283,11 @@ impl EditorScene {
         self.expansion.origins.get(id)
     }
 
+    /// Файлы префабов, раскрытые экземплярами этого документа, включая вложенные.
+    pub fn instanced_prefabs(&self) -> &[VirtualPath] {
+        &self.expansion.prefabs
+    }
+
     /// Авторский экземпляр префаба по id.
     pub fn instance(&self, id: &str) -> Option<&PrefabInstance> {
         self.document
@@ -1145,6 +1150,74 @@ impl EditorScene {
         })
     }
 
+    /// Добавляет `.rveprefab` в ресурсы сцены: только такие префабы спавнятся быстро.
+    pub fn add_scene_prefab(&mut self, path: VirtualPath) -> Result<(), String> {
+        require_prefab_path(&path)?;
+        self.edit(None, |document| {
+            if document.assets.iter().any(|asset| asset.path == path) {
+                return Err(format!("/{} уже есть в ресурсах сцены", path.as_str()));
+            }
+            document.assets.push(SceneAsset {
+                path,
+                archive: None,
+                max_instances: None,
+            });
+            Ok(())
+        })
+    }
+
+    /// Удаляет `.rveprefab` из ресурсов сцены. Префаб, на который есть экземпляр, не удаляется.
+    pub fn remove_scene_prefab(&mut self, path: &VirtualPath) -> Result<(), String> {
+        require_prefab_path(path)?;
+        if self
+            .document
+            .instances
+            .iter()
+            .any(|instance| &instance.prefab == path)
+        {
+            return Err(format!(
+                "/{} используется экземпляром: сначала удалите экземпляр",
+                path.as_str()
+            ));
+        }
+        self.edit(None, |document| {
+            let index = scene_asset_index(document, path)?;
+            document.assets.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Задаёт архив ресурса `.rveprefab`; имя проверяет [`SceneDocument::validate`].
+    pub fn set_scene_prefab_archive(
+        &mut self,
+        path: &VirtualPath,
+        archive: Option<String>,
+    ) -> Result<(), String> {
+        self.edit_scene_prefab(path, |asset| asset.archive = archive)
+    }
+
+    /// Задаёт лимит экземпляров ресурса `.rveprefab`; ноль отклоняет валидация документа.
+    pub fn set_scene_prefab_max_instances(
+        &mut self,
+        path: &VirtualPath,
+        max_instances: Option<u32>,
+    ) -> Result<(), String> {
+        self.edit_scene_prefab(path, |asset| asset.max_instances = max_instances)
+    }
+
+    fn edit_scene_prefab(
+        &mut self,
+        path: &VirtualPath,
+        change: impl FnOnce(&mut SceneAsset),
+    ) -> Result<(), String> {
+        require_prefab_path(path)?;
+        self.edit(None, |document| {
+            let index = scene_asset_index(document, path)?;
+            change(&mut document.assets[index]);
+            Ok(())
+        })
+    }
+
     /// Заменяет scene material override; текстуры добавляются в список ресурсов сцены.
     /// Override без заданных полей удаляется.
     pub fn set_material(
@@ -1513,8 +1586,25 @@ fn ensure_asset(document: &mut SceneDocument, path: &VirtualPath) {
         document.assets.push(SceneAsset {
             path: path.clone(),
             archive: None,
+            max_instances: None,
         });
     }
+}
+
+fn require_prefab_path(path: &VirtualPath) -> Result<(), String> {
+    if is_prefab_path(path) {
+        Ok(())
+    } else {
+        Err(format!("/{}: ожидается ресурс .rveprefab", path.as_str()))
+    }
+}
+
+fn scene_asset_index(document: &SceneDocument, path: &VirtualPath) -> Result<usize, String> {
+    document
+        .assets
+        .iter()
+        .position(|asset| &asset.path == path)
+        .ok_or_else(|| format!("/{} нет в ресурсах сцены", path.as_str()))
 }
 
 fn parse_lod_path(id: &str, value: &str, field: &str) -> Result<VirtualPath, String> {
@@ -2731,6 +2821,114 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    fn prefab_loader(prefab: &'static str) -> PrefabLoader {
+        Rc::new(move |path| SceneDocument::parse_prefab(format!("/{}", path.as_str()), prefab))
+    }
+
+    #[test]
+    fn scene_prefab_assets_add_and_remove_as_undoable_steps() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        assert_eq!(scene.document().assets.len(), 1);
+        assert!(scene.add_scene_prefab(bullet.clone()).is_err());
+        assert!(scene.add_scene_prefab(path("/models/a.fbx")).is_err());
+        assert_eq!(scene.document().assets.len(), 1);
+
+        scene.remove_scene_prefab(&bullet).unwrap();
+        assert!(scene.document().assets.is_empty());
+        assert!(scene.remove_scene_prefab(&bullet).is_err());
+        assert!(scene.remove_scene_prefab(&path("/models/a.fbx")).is_err());
+
+        assert!(scene.undo());
+        assert_eq!(scene.document().assets[0].path, bullet);
+        assert!(scene.redo());
+        assert!(scene.document().assets.is_empty());
+    }
+
+    #[test]
+    fn scene_prefab_used_by_an_instance_cannot_be_removed() {
+        let mut scene = scene();
+        scene
+            .set_prefab_loader(prefab_loader("[[objects]]\nid = \"frame\"\n"))
+            .unwrap();
+        let door = path("/prefabs/door.rveprefab");
+        scene
+            .create_object(&NewObject::Prefab(door.clone(), [0.0; 3]), None)
+            .unwrap();
+        let revision = scene.revision();
+
+        assert!(scene.remove_scene_prefab(&door).is_err());
+        assert_eq!(scene.revision(), revision);
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == door)
+        );
+    }
+
+    #[test]
+    fn scene_prefab_archive_and_max_instances_are_validated_and_undoable() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        let asset = |scene: &EditorScene| scene.document().assets[0].clone();
+
+        scene
+            .set_scene_prefab_archive(&bullet, Some("weapons".to_owned()))
+            .unwrap();
+        scene
+            .set_scene_prefab_max_instances(&bullet, Some(100))
+            .unwrap();
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert_eq!(asset(&scene).max_instances, Some(100));
+
+        for archive in ["shared", "base", "bad name"] {
+            let archive = Some(archive.to_owned());
+            assert!(scene.set_scene_prefab_archive(&bullet, archive).is_err());
+        }
+        assert!(
+            scene
+                .set_scene_prefab_max_instances(&bullet, Some(0))
+                .is_err()
+        );
+        assert!(
+            scene
+                .set_scene_prefab_max_instances(&path("/models/a.fbx"), Some(1))
+                .is_err()
+        );
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert_eq!(asset(&scene).max_instances, Some(100));
+
+        assert!(scene.undo());
+        assert_eq!(asset(&scene).max_instances, None);
+        assert_eq!(asset(&scene).archive.as_deref(), Some("weapons"));
+        assert!(scene.undo());
+        assert_eq!(asset(&scene).archive, None);
+        assert!(scene.redo());
+        assert!(scene.redo());
+        assert_eq!(asset(&scene).max_instances, Some(100));
+    }
+
+    #[test]
+    fn scene_prefab_assets_serialize_without_extra_fields() {
+        let mut scene = scene();
+        let bullet = path("/prefabs/bullet.rveprefab");
+        scene.add_scene_prefab(bullet.clone()).unwrap();
+        let text = scene.document().to_toml().unwrap();
+        assert!(!text.contains("archive"), "{text}");
+        assert!(!text.contains("max_instances"), "{text}");
+
+        scene
+            .set_scene_prefab_max_instances(&bullet, Some(7))
+            .unwrap();
+        let text = scene.document().to_toml().unwrap();
+        assert!(text.contains("max_instances = 7"), "{text}");
+        assert!(!text.contains("archive"), "{text}");
     }
 
     struct TempDir(std::path::PathBuf);

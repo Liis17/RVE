@@ -777,8 +777,9 @@ dependencies = [
 
 [[package]]
 name = "engine-physics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "engine-files",
  "engine-scene",
  "flume",
  "glam",
@@ -815,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "engine-project"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine-files",
  "rve-sdk",
@@ -837,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "engine-resources"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "engine-core",
  "engine-files",
@@ -847,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -877,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "engine-files",
  "glam",
@@ -887,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -2708,7 +2709,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "engine-assets",
  "engine-files",
@@ -2728,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -2769,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "rve-sdk"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "rvepak"

@@ -50,6 +50,21 @@ impl ModuleHost {
         Ok(())
     }
 
+    /// Вызывает обработчик остановки потока сейчас, не дожидаясь общего `shutdown`. Повторный
+    /// вызов и последующий `shutdown` обработчик не запускают.
+    pub fn stop_named(&mut self, name: &str) -> bool {
+        let Some(thread) = self.threads.iter_mut().find(|thread| thread.name == name) else {
+            return false;
+        };
+        match thread.stop.take() {
+            Some(stop) => {
+                let _ = catch_unwind(AssertUnwindSafe(stop));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Drops the join handle without waiting for the thread to finish.
     pub fn detach(&mut self, name: &str) -> bool {
         let Some(thread) = self.threads.iter_mut().find(|thread| thread.name == name) else {
@@ -108,6 +123,7 @@ pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::ModuleHost;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
 
     #[test]
@@ -187,6 +203,31 @@ mod tests {
         assert!(host.shutdown().is_empty());
         stopped_rx.recv().unwrap();
         release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn stop_named_runs_the_stop_handler_once_and_shutdown_does_not_repeat_it() {
+        let stops = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut host = ModuleHost::new();
+        let counter = Arc::clone(&stops);
+        host.spawn(
+            "loader",
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            },
+            move || {
+                let _ = done_rx.recv();
+            },
+        )
+        .unwrap();
+
+        assert!(!host.stop_named("missing"));
+        assert!(host.stop_named("loader"));
+        assert!(!host.stop_named("loader"));
+        assert!(host.shutdown().is_empty());
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

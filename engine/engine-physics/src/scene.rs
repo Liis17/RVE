@@ -1,17 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use engine_scene::{
     CharacterControllerComponent, ColliderComponent, ColliderShape, ObjectHandle,
-    RigidBodyComponent, RigidBodyKind, World,
+    RigidBodyComponent, RigidBodyKind, World, WorldObject,
 };
 use glam::{Mat3, Vec3};
 
 use crate::character::{CharacterController, CharacterError};
 use crate::hull::Hull;
 use crate::world::{
-    BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsWorld, PhysicsWorldError,
-    StepDriver,
+    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsWorld,
+    PhysicsWorldError, StepDriver,
 };
 use crate::{GeometryError, Pose, Shape, TriMesh};
 
@@ -140,73 +140,13 @@ impl PhysicsSceneDesc {
         fixed_hz: u32,
         max_substeps: usize,
     ) -> Result<Self, PhysicsSceneError> {
-        let mut models = HashMap::with_capacity(model_geometry.len());
-        for model in model_geometry {
-            if models.insert(model.path.as_str(), model).is_some() {
-                return Err(PhysicsSceneError::ModelPathRepeated(model.path.clone()));
-            }
-        }
-
+        let models = model_index(model_geometry)?;
+        let mut cache = ShapeCache::default();
         let mut bodies = Vec::new();
         for object in world.objects() {
-            let Some(collider) = object.collider else {
-                if object.character_controller.is_none() {
-                    continue;
-                }
-                let transform = object_world_transform(world, object.handle)?;
-                let settings = object
-                    .character_controller
-                    .expect("checked character controller presence");
-                if object.parent.is_some() {
-                    return Err(PhysicsSceneError::CharacterObjectMustBeRoot(object.handle));
-                }
-                if object.rigid_body.is_some() {
-                    return Err(PhysicsSceneError::ConflictingComponents(object.handle));
-                }
-                let radial_scale = transform.scale.x.abs().max(transform.scale.z.abs());
-                let controller = scale_character(settings, radial_scale, transform.scale)?;
-                let shape = controller.capsule()?;
-                let mut desc = BodyDesc::new(
-                    BodyKind::Kinematic,
-                    transform.pose,
-                    ColliderDesc::new(shape),
-                );
-                desc.character_controller = true;
-                bodies.push(PhysicsSceneBody {
-                    object: object.handle,
-                    desc,
-                    character_controller: Some(controller),
-                });
-                continue;
-            };
-
-            if object.character_controller.is_some() {
-                return Err(PhysicsSceneError::ConflictingComponents(object.handle));
+            if let Some(body) = scene_body(world, object, &models, &mut cache)? {
+                bodies.push(body);
             }
-            let transform = object_world_transform(world, object.handle)?;
-            let rigid_body = object.rigid_body;
-            let kind = rigid_body.map_or(BodyKind::Static, body_kind);
-            if kind == BodyKind::Dynamic && object.parent.is_some() {
-                return Err(PhysicsSceneError::DynamicObjectMustBeRoot(object.handle));
-            }
-            let shape = build_shape(
-                collider,
-                transform.scale,
-                object.mesh_renderer.as_ref(),
-                &models,
-            )?;
-            let mut collider_desc = ColliderDesc::new(shape);
-            collider_desc.offset = Vec3::from_array(collider.offset) * transform.scale;
-            collider_desc.trigger = collider.trigger;
-            collider_desc.friction = collider.friction;
-            collider_desc.restitution = collider.restitution;
-            let mut desc = BodyDesc::new(kind, transform.pose, collider_desc);
-            apply_rigid_body(&mut desc, rigid_body);
-            bodies.push(PhysicsSceneBody {
-                object: object.handle,
-                desc,
-                character_controller: None,
-            });
         }
 
         Ok(Self {
@@ -240,6 +180,8 @@ pub enum PhysicsSceneSyncError {
     Scene(PhysicsSceneError),
     MissingObject(ObjectHandle),
     InvalidPose(ObjectHandle),
+    ObjectAlreadyBound(ObjectHandle),
+    BodyHandleOverflow,
 }
 
 impl fmt::Display for PhysicsSceneSyncError {
@@ -254,6 +196,12 @@ impl fmt::Display for PhysicsSceneSyncError {
                 "scene object {} has an invalid world pose",
                 handle.index()
             ),
+            Self::ObjectAlreadyBound(handle) => write!(
+                formatter,
+                "scene object {} already has a physics body",
+                handle.index()
+            ),
+            Self::BodyHandleOverflow => formatter.write_str("physics body handles are exhausted"),
         }
     }
 }
@@ -271,6 +219,12 @@ pub struct PhysicsSceneSync {
     bindings: Vec<PhysicsSceneBinding>,
     binding_indices: HashMap<BodyHandle, usize>,
     last_synced: Vec<Pose>,
+    /// Следующий клиентский хендл тела. Удалённые хендлы не переиспользуются.
+    next_body: u64,
+    /// Тела, удалённые после последнего применённого результата шага.
+    removed_bodies: HashMap<BodyHandle, ObjectHandle>,
+    /// Тела, удалённые до предыдущего результата шага: их `*_exit` ещё может прийти.
+    retired_bodies: HashMap<BodyHandle, ObjectHandle>,
 }
 
 impl PhysicsSceneSync {
@@ -287,10 +241,18 @@ impl PhysicsSceneSync {
             .enumerate()
             .map(|(index, binding)| (binding.body, index))
             .collect();
+        let next_body = bindings
+            .iter()
+            .map(|binding| binding.body.0)
+            .max()
+            .map_or(1, |max| max.saturating_add(1));
         Ok(Self {
             bindings,
             binding_indices,
             last_synced,
+            next_body,
+            removed_bodies: HashMap::new(),
+            retired_bodies: HashMap::new(),
         })
     }
 
@@ -298,12 +260,108 @@ impl PhysicsSceneSync {
         &self.bindings
     }
 
+    /// Объект, которому принадлежит тело. Учитывает тела, удалённые с последним результатом
+    /// шага и предыдущим, чтобы доставить их `*_exit` выжившим объектам.
+    pub fn object_for_body(&self, body: BodyHandle) -> Option<ObjectHandle> {
+        if let Some(&index) = self.binding_indices.get(&body) {
+            return Some(self.bindings[index].object);
+        }
+        self.removed_bodies
+            .get(&body)
+            .or_else(|| self.retired_bodies.get(&body))
+            .copied()
+    }
+
+    /// Создаёт тела для объектов мира по хендлам, например после `World::spawn`. Объекты без
+    /// коллайдера и character controller пропускаются. Все проверки выполняются до изменения
+    /// привязок: при ошибке состояние не меняется.
+    pub fn insert_objects(
+        &mut self,
+        world: &World,
+        handles: &[ObjectHandle],
+        geometry: &[ModelGeometry],
+        cache: &mut ShapeCache,
+    ) -> Result<Vec<BodyChange>, PhysicsSceneSyncError> {
+        let models = model_index(geometry)?;
+        let bound: HashSet<ObjectHandle> =
+            self.bindings.iter().map(|binding| binding.object).collect();
+        let mut requested = HashSet::with_capacity(handles.len());
+        let mut staged = Vec::with_capacity(handles.len());
+        for &object in handles {
+            if bound.contains(&object) || !requested.insert(object) {
+                return Err(PhysicsSceneSyncError::ObjectAlreadyBound(object));
+            }
+            let scene_object = world
+                .object(object)
+                .ok_or(PhysicsSceneSyncError::MissingObject(object))?;
+            let Some(body) = scene_body(world, scene_object, &models, cache)? else {
+                continue;
+            };
+            body.desc.validate().map_err(PhysicsSceneError::from)?;
+            staged.push((body, world_pose(world, object)?));
+        }
+
+        let first = self.next_body;
+        let end = first
+            .checked_add(staged.len() as u64)
+            .ok_or(PhysicsSceneSyncError::BodyHandleOverflow)?;
+        let mut changes = Vec::with_capacity(staged.len());
+        for (offset, (body, pose)) in staged.into_iter().enumerate() {
+            let PhysicsSceneBody {
+                object,
+                desc,
+                character_controller,
+            } = body;
+            let handle = BodyHandle(first + offset as u64);
+            self.binding_indices.insert(handle, self.bindings.len());
+            self.bindings.push(PhysicsSceneBinding {
+                object,
+                body: handle,
+                kind: desc.kind,
+                character_controller,
+            });
+            self.last_synced.push(pose);
+            changes.push(BodyChange::Insert { handle, desc });
+        }
+        self.next_body = end;
+        Ok(changes)
+    }
+
+    /// Снимает привязки объектов и возвращает `Remove` для их тел. Объекты без привязки
+    /// игнорируются, повторы в `handles` дают одно удаление.
+    pub fn remove_objects(&mut self, handles: &[ObjectHandle]) -> Vec<BodyChange> {
+        let doomed: HashSet<ObjectHandle> = handles.iter().copied().collect();
+        let mut changes = Vec::new();
+        let bindings = std::mem::take(&mut self.bindings);
+        let last_synced = std::mem::take(&mut self.last_synced);
+        for (binding, pose) in bindings.into_iter().zip(last_synced) {
+            if doomed.contains(&binding.object) {
+                self.removed_bodies.insert(binding.body, binding.object);
+                changes.push(BodyChange::Remove {
+                    handle: binding.body,
+                });
+            } else {
+                self.bindings.push(binding);
+                self.last_synced.push(pose);
+            }
+        }
+        self.binding_indices = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| (binding.body, index))
+            .collect();
+        changes
+    }
+
     /// Applies dynamic body poses, then records the pose read back from the scene cache.
+    /// Bodies removed before the previous step result are forgotten here.
     pub fn apply_physics_poses(
         &mut self,
         world: &mut World,
         poses: &[(BodyHandle, Pose)],
     ) -> Result<(), PhysicsSceneSyncError> {
+        self.retired_bodies = std::mem::take(&mut self.removed_bodies);
         for (body, pose) in poses {
             let Some(&index) = self.binding_indices.get(body) else {
                 continue;
@@ -467,11 +525,145 @@ pub fn character_capsule_shape(
     Ok(scale_character(component, radial_scale, scale)?.capsule()?)
 }
 
+/// Кэш форм мешей: выпуклая оболочка и треугольная сетка строятся один раз на пару
+/// (путь модели, знаковый масштаб, тип формы). Записи освобождаются по пути модели.
+#[derive(Clone, Debug, Default)]
+pub struct ShapeCache {
+    shapes: HashMap<ShapeKey, Shape>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    model: String,
+    scale: [u32; 3],
+    kind: MeshShapeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MeshShapeKind {
+    Convex,
+    Triangle,
+}
+
+impl ShapeCache {
+    /// Удаляет все формы, построенные по модели `model`.
+    pub fn remove_model(&mut self, model: &str) {
+        self.shapes.retain(|key, _| key.model != model);
+    }
+
+    fn get_or_build(
+        &mut self,
+        model: &str,
+        scale: Vec3,
+        kind: MeshShapeKind,
+        build: impl FnOnce() -> Result<Shape, PhysicsSceneError>,
+    ) -> Result<Shape, PhysicsSceneError> {
+        let key = ShapeKey {
+            model: model.to_owned(),
+            // Биты, а не значения: знак масштаба влияет на порядок обхода треугольников.
+            scale: scale.to_array().map(f32::to_bits),
+            kind,
+        };
+        if let Some(shape) = self.shapes.get(&key) {
+            return Ok(shape.clone());
+        }
+        let shape = build()?;
+        self.shapes.insert(key, shape.clone());
+        Ok(shape)
+    }
+}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<ShapeCache>();
+};
+
+/// Строит описание тела одного объекта мира. `None`, если у объекта нет коллайдера и
+/// character controller. Общая для [`PhysicsSceneDesc::from_world`] и вставки объектов.
+fn scene_body(
+    world: &World,
+    object: &WorldObject,
+    models: &HashMap<&str, &ModelGeometry>,
+    cache: &mut ShapeCache,
+) -> Result<Option<PhysicsSceneBody>, PhysicsSceneError> {
+    let Some(collider) = object.collider else {
+        if object.character_controller.is_none() {
+            return Ok(None);
+        }
+        let transform = object_world_transform(world, object.handle)?;
+        let settings = object
+            .character_controller
+            .expect("checked character controller presence");
+        if object.parent.is_some() {
+            return Err(PhysicsSceneError::CharacterObjectMustBeRoot(object.handle));
+        }
+        if object.rigid_body.is_some() {
+            return Err(PhysicsSceneError::ConflictingComponents(object.handle));
+        }
+        let radial_scale = transform.scale.x.abs().max(transform.scale.z.abs());
+        let controller = scale_character(settings, radial_scale, transform.scale)?;
+        let shape = controller.capsule()?;
+        let mut desc = BodyDesc::new(
+            BodyKind::Kinematic,
+            transform.pose,
+            ColliderDesc::new(shape),
+        );
+        desc.character_controller = true;
+        return Ok(Some(PhysicsSceneBody {
+            object: object.handle,
+            desc,
+            character_controller: Some(controller),
+        }));
+    };
+
+    if object.character_controller.is_some() {
+        return Err(PhysicsSceneError::ConflictingComponents(object.handle));
+    }
+    let transform = object_world_transform(world, object.handle)?;
+    let rigid_body = object.rigid_body;
+    let kind = rigid_body.map_or(BodyKind::Static, body_kind);
+    if kind == BodyKind::Dynamic && object.parent.is_some() {
+        return Err(PhysicsSceneError::DynamicObjectMustBeRoot(object.handle));
+    }
+    let shape = build_shape(
+        collider,
+        transform.scale,
+        object.mesh_renderer.as_ref(),
+        models,
+        cache,
+    )?;
+    let mut collider_desc = ColliderDesc::new(shape);
+    collider_desc.offset = Vec3::from_array(collider.offset) * transform.scale;
+    collider_desc.trigger = collider.trigger;
+    collider_desc.friction = collider.friction;
+    collider_desc.restitution = collider.restitution;
+    let mut desc = BodyDesc::new(kind, transform.pose, collider_desc);
+    apply_rigid_body(&mut desc, rigid_body);
+    Ok(Some(PhysicsSceneBody {
+        object: object.handle,
+        desc,
+        character_controller: None,
+    }))
+}
+
+fn model_index(
+    model_geometry: &[ModelGeometry],
+) -> Result<HashMap<&str, &ModelGeometry>, PhysicsSceneError> {
+    let mut models = HashMap::with_capacity(model_geometry.len());
+    for model in model_geometry {
+        if models.insert(model.path.as_str(), model).is_some() {
+            return Err(PhysicsSceneError::ModelPathRepeated(model.path.clone()));
+        }
+    }
+    Ok(models)
+}
+
 fn build_shape(
     component: ColliderComponent,
     scale: Vec3,
     mesh_renderer: Option<&engine_scene::MeshRenderer>,
     models: &HashMap<&str, &ModelGeometry>,
+    cache: &mut ShapeCache,
 ) -> Result<Shape, PhysicsSceneError> {
     Ok(match component.shape {
         ColliderShape::Box | ColliderShape::Sphere | ColliderShape::Capsule => {
@@ -479,16 +671,24 @@ fn build_shape(
         }
         ColliderShape::ConvexMesh => {
             let geometry = model_geometry(mesh_renderer, models)?;
-            let mut vertices = Vec::new();
-            for mesh in &geometry.meshes {
-                vertices.extend(mesh.positions.iter().map(|position| *position * scale));
-            }
-            Shape::ConvexHull(std::sync::Arc::new(Hull::from_points(&vertices)?))
+            cache.get_or_build(&geometry.path, scale, MeshShapeKind::Convex, || {
+                let mut vertices = Vec::new();
+                for mesh in &geometry.meshes {
+                    vertices.extend(mesh.positions.iter().map(|position| *position * scale));
+                }
+                Ok(Shape::ConvexHull(std::sync::Arc::new(Hull::from_points(
+                    &vertices,
+                )?)))
+            })?
         }
         ColliderShape::TriangleMesh => {
             let geometry = model_geometry(mesh_renderer, models)?;
-            let (vertices, triangles) = triangle_geometry(geometry, scale)?;
-            Shape::TriMesh(std::sync::Arc::new(TriMesh::new(vertices, triangles)?))
+            cache.get_or_build(&geometry.path, scale, MeshShapeKind::Triangle, || {
+                let (vertices, triangles) = triangle_geometry(geometry, scale)?;
+                Ok(Shape::TriMesh(std::sync::Arc::new(TriMesh::new(
+                    vertices, triangles,
+                )?)))
+            })?
         }
     })
 }
@@ -558,13 +758,18 @@ fn triangle_geometry(
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelGeometry, ModelMesh, PhysicsSceneDesc, PhysicsSceneSync, character_capsule_shape,
-        primitive_collider_shape,
+        ModelGeometry, ModelMesh, PhysicsSceneDesc, PhysicsSceneSync, PhysicsSceneSyncError,
+        ShapeCache, character_capsule_shape, primitive_collider_shape,
     };
-    use crate::world::{BodyKind, PhysicsCommand};
-    use crate::{Pose, Ray, Shape, raycast};
-    use engine_scene::{ColliderComponent, ColliderShape, LocalTransform, SceneDocument, World};
+    use crate::world::{BodyChange, BodyHandle, BodyKind, PhysicsCommand};
+    use crate::{GeometryError, PhysicsSceneError, Pose, Ray, Shape, raycast};
+    use engine_files::VirtualPath;
+    use engine_scene::{
+        ColliderComponent, ColliderShape, LocalTransform, ObjectHandle, PrefabTemplate,
+        SceneDocument, SpawnOptions, World,
+    };
     use glam::{Quat, Vec3};
+    use std::sync::Arc;
 
     const CAMERA: &str = "[[objects]]\nid='camera'\n[objects.camera]\n";
     const CUBE_MESH: &[Vec3] = &[
@@ -968,5 +1173,163 @@ mod tests {
         let first = Pose::new(Vec3::ONE, Quat::from_rotation_y(0.7)).unwrap();
         let second = Pose::new(Vec3::ONE, -first.rotation).unwrap();
         assert!(!super::pose_changed(first, second));
+    }
+
+    const BALL_PREFAB: &str = "[[objects]]\nid = \"root\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\n\
+[objects.rigid_body]\nkind = \"dynamic\"\nmass = 1.0\n";
+
+    fn prefab(text: &str) -> PrefabTemplate {
+        let path = VirtualPath::parse("prefabs/unit.rveprefab").unwrap();
+        let mut read = |_: &VirtualPath| -> Result<String, String> { Ok(text.to_owned()) };
+        PrefabTemplate::load(&path, &mut read).unwrap()
+    }
+
+    /// Создаёт экземпляр однообъектного префаба и возвращает его хендл.
+    fn spawn_one(world: &mut World, template: &PrefabTemplate, position: Vec3) -> ObjectHandle {
+        let reserved = vec![world.reserve_object()];
+        let options = SpawnOptions {
+            position: Some(position),
+            ..SpawnOptions::default()
+        };
+        world.spawn(reserved, template, options).unwrap()[0]
+    }
+
+    fn insert_body(change: &BodyChange) -> (BodyHandle, &crate::BodyDesc) {
+        match change {
+            BodyChange::Insert { handle, desc } => (*handle, desc),
+            other => panic!("expected an insertion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_cache_reuses_hulls_per_model_and_scale_and_forgets_removed_models() {
+        let mut scene = world(CAMERA);
+        let hull = prefab(
+            "[[assets]]\npath = \"/models/cube.fbx\"\n[[objects]]\nid = \"root\"\n\
+             [objects.mesh_renderer]\nmodel = \"/models/cube.fbx\"\n\
+             [objects.collider]\nshape = \"convex_mesh\"\n",
+        );
+        let first = spawn_one(&mut scene, &hull, Vec3::ZERO);
+        let second = spawn_one(&mut scene, &hull, Vec3::X * 3.0);
+        let mut sync = PhysicsSceneSync::new(&scene, Vec::new()).unwrap();
+        let mut cache = ShapeCache::default();
+        let changes = sync
+            .insert_objects(&scene, &[first, second], &[cube_model()], &mut cache)
+            .unwrap();
+        let [first_change, second_change] = changes.as_slice() else {
+            panic!("expected two insertions")
+        };
+        let (_, first_desc) = insert_body(first_change);
+        let (_, second_desc) = insert_body(second_change);
+        let (Shape::ConvexHull(first_hull), Shape::ConvexHull(second_hull)) =
+            (&first_desc.collider.shape, &second_desc.collider.shape)
+        else {
+            panic!("expected convex hulls")
+        };
+        assert!(Arc::ptr_eq(first_hull, second_hull));
+
+        cache.remove_model("models/cube.fbx");
+        let third = spawn_one(&mut scene, &hull, Vec3::X * 6.0);
+        let changes = sync
+            .insert_objects(&scene, &[third], &[cube_model()], &mut cache)
+            .unwrap();
+        let (_, third_desc) = insert_body(&changes[0]);
+        let Shape::ConvexHull(rebuilt) = &third_desc.collider.shape else {
+            panic!("expected a convex hull")
+        };
+        assert!(!Arc::ptr_eq(first_hull, rebuilt));
+    }
+
+    #[test]
+    fn spawned_objects_get_bodies_by_handle_and_removals_keep_exit_owners_for_one_result() {
+        let mut scene = world(CAMERA);
+        let ball = prefab(BALL_PREFAB);
+        let camera = scene.handle("camera").unwrap();
+        let first = spawn_one(&mut scene, &ball, Vec3::ZERO);
+        let second = spawn_one(&mut scene, &ball, Vec3::X * 2.0);
+        let mut sync = PhysicsSceneSync::new(&scene, Vec::new()).unwrap();
+        let mut cache = ShapeCache::default();
+
+        let changes = sync
+            .insert_objects(&scene, &[first, second, camera], &[], &mut cache)
+            .unwrap();
+        assert_eq!(changes.len(), 2, "the camera has no physics body");
+        let (first_body, _) = insert_body(&changes[0]);
+        let (second_body, _) = insert_body(&changes[1]);
+        assert_eq!((first_body, second_body), (BodyHandle(1), BodyHandle(2)));
+        assert_eq!(sync.bindings().len(), 2);
+        assert_eq!(sync.bindings()[0].object, first);
+        assert_eq!(sync.bindings()[1].object, second);
+        assert_eq!(
+            sync.insert_objects(&scene, &[first], &[], &mut cache)
+                .unwrap_err(),
+            PhysicsSceneSyncError::ObjectAlreadyBound(first)
+        );
+
+        scene.despawn_many(&[first]).unwrap();
+        let removals = sync.remove_objects(&[first, first, camera]);
+        assert_eq!(removals, vec![BodyChange::Remove { handle: first_body }]);
+        assert_eq!(sync.bindings().len(), 1);
+        assert_eq!(sync.object_for_body(first_body), Some(first));
+        assert_eq!(sync.object_for_body(second_body), Some(second));
+
+        let pose = Pose::new(Vec3::Y * 4.0, Quat::IDENTITY).unwrap();
+        sync.apply_physics_poses(&mut scene, &[(second_body, pose)])
+            .unwrap();
+        assert_eq!(
+            sync.object_for_body(first_body),
+            Some(first),
+            "the exit of the removed body is still delivered after the removal result"
+        );
+        sync.apply_physics_poses(&mut scene, &[]).unwrap();
+        assert_eq!(sync.object_for_body(first_body), None);
+
+        let reused = spawn_one(&mut scene, &ball, Vec3::X * 8.0);
+        assert_ne!(reused, first, "a reused slot has a new generation");
+        let changes = sync
+            .insert_objects(&scene, &[reused], &[], &mut cache)
+            .unwrap();
+        let (reused_body, _) = insert_body(&changes[0]);
+        assert_eq!(
+            reused_body,
+            BodyHandle(3),
+            "removed body handles are not reused"
+        );
+        assert_eq!(sync.object_for_body(reused_body), Some(reused));
+    }
+
+    #[test]
+    fn failed_insertion_changes_no_bindings_and_leaves_body_handles_free() {
+        let mut scene = world(CAMERA);
+        let ball = prefab(BALL_PREFAB);
+        let flat_hull = prefab(
+            "[[assets]]\npath = \"/models/flat.fbx\"\n[[objects]]\nid = \"root\"\n\
+             [objects.mesh_renderer]\nmodel = \"/models/flat.fbx\"\n\
+             [objects.collider]\nshape = \"convex_mesh\"\n",
+        );
+        let good = spawn_one(&mut scene, &ball, Vec3::ZERO);
+        let bad = spawn_one(&mut scene, &flat_hull, Vec3::X * 2.0);
+        let flat = ModelGeometry {
+            path: "models/flat.fbx".to_owned(),
+            meshes: vec![ModelMesh {
+                positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::X + Vec3::Y],
+                indices: vec![0, 1, 2],
+            }],
+        };
+        let mut sync = PhysicsSceneSync::new(&scene, Vec::new()).unwrap();
+        let mut cache = ShapeCache::default();
+        assert!(matches!(
+            sync.insert_objects(&scene, &[good, bad], &[flat], &mut cache),
+            Err(PhysicsSceneSyncError::Scene(PhysicsSceneError::Geometry(
+                GeometryError::DegenerateHull
+            )))
+        ));
+        assert!(sync.bindings().is_empty());
+
+        let changes = sync
+            .insert_objects(&scene, &[good], &[], &mut cache)
+            .unwrap();
+        let (body, _) = insert_body(&changes[0]);
+        assert_eq!(body, BodyHandle(1));
     }
 }
