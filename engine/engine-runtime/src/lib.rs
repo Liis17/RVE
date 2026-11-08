@@ -506,7 +506,6 @@ fn run_from_args(
             &status,
             resource_rx,
             script_tx,
-            interrupt,
             script_thread.stopped,
         )
     } else {
@@ -793,7 +792,6 @@ fn run_headless(
     status: &RuntimeStatus,
     requests: flume::Receiver<RenderResourceRequest>,
     script_tx: flume::Sender<ScriptControl>,
-    interrupt: ScriptInterruptHandle,
     stopped: std::sync::mpsc::Receiver<()>,
 ) -> u8 {
     let responder_stop = Arc::new(AtomicBool::new(false));
@@ -807,7 +805,7 @@ fn run_headless(
         log::error!("не удалось запустить ответчик ресурсов: {error}");
         return 1;
     }
-    if let Err(error) = spawn_quit_listener(script_tx, interrupt) {
+    if let Err(error) = spawn_quit_listener(script_tx) {
         log::error!("не удалось читать команды из stdin: {error}");
         return 1;
     }

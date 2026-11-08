@@ -6,7 +6,6 @@
 
 use crate::pipeline::ScriptControl;
 use crate::prefabs::{LoadedPrefab, PrefabReady, PrefabReply, RenderResourceRequest};
-use engine_script::ScriptInterruptHandle;
 use flume::{Receiver, RecvTimeoutError, Sender};
 use std::io::BufRead;
 use std::sync::Arc;
@@ -59,19 +58,15 @@ pub(crate) fn is_quit_command(line: &str) -> bool {
     line.trim() == "quit"
 }
 
-/// Читает stdin и на `quit` останавливает скрипты. Закрытый stdin (например, `</dev/null`) не
-/// останавливает сервер: поток просто завершается.
-pub(crate) fn spawn_quit_listener(
-    script_tx: Sender<ScriptControl>,
-    interrupt: ScriptInterruptHandle,
-) -> std::io::Result<()> {
+/// Читает stdin и на `quit` штатно останавливает скрипты (`Shutdown`, без прерывания вызовов).
+/// Закрытый stdin (например, `</dev/null`) не останавливает сервер: поток просто завершается.
+pub(crate) fn spawn_quit_listener(script_tx: Sender<ScriptControl>) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("rve-stdin".to_owned())
         .spawn(move || {
             for line in std::io::stdin().lock().lines() {
                 match line {
                     Ok(line) if is_quit_command(&line) => {
-                        interrupt.interrupt();
                         let _ = script_tx.send(ScriptControl::Shutdown);
                         return;
                     }
