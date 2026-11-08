@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "engine-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "flume",
@@ -3148,6 +3148,7 @@ dependencies = [
  "engine-core",
  "engine-files",
  "engine-input",
+ "engine-mcp",
  "engine-network",
  "engine-physics",
  "engine-platform",
@@ -3159,6 +3160,7 @@ dependencies = [
  "engine-ui",
  "engine-window",
  "flume",
+ "getrandom 0.4.3",
  "glam",
  "libc",
  "notify",

@@ -13,6 +13,7 @@ mod gestures;
 mod icons;
 mod input;
 mod layout;
+mod mcp;
 mod new_project;
 mod play;
 mod play_cursor;
@@ -82,7 +83,7 @@ fn main() -> ExitCode {
         }
     };
     prepare_vulkan_environment();
-    let mut editor = app::EditorApp::new(args.project, args.scripts, reflex);
+    let mut editor = app::EditorApp::new(args.project, args.scripts, reflex, args.mcp);
     let run_result = engine_window::run(config, &mut editor);
     editor.save_pipeline_cache();
     if let Err(error) = run_result {
@@ -136,6 +137,7 @@ mod tests {
             prepare(&cli::EditorArgs {
                 project: Some(missing.clone()),
                 scripts: None,
+                mcp: false,
             })
             .is_err()
         );
@@ -143,6 +145,7 @@ mod tests {
             prepare(&cli::EditorArgs {
                 project: None,
                 scripts: Some(missing),
+                mcp: false,
             })
             .is_err()
         );
@@ -158,6 +161,7 @@ mod tests {
         let (config, reflex) = prepare(&cli::EditorArgs {
             project: Some(dir),
             scripts: None,
+            mcp: false,
         })
         .unwrap();
         assert_eq!(config.redraw, RedrawMode::OnDemand);

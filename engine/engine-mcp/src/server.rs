@@ -5,7 +5,10 @@ use std::{
     collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +31,8 @@ pub struct ToolCall {
     pub arguments: Value,
     pub deadline: Instant,
     pub required_permission: Permission,
+    /// Editor-state generation captured when the HTTP worker queued this call.
+    pub(crate) generation: u64,
     pub(crate) responder: flume::Sender<ToolResult>,
 }
 
@@ -41,6 +46,11 @@ impl ToolCall {
     pub fn is_abandoned(&self) -> bool {
         Instant::now() >= self.deadline || self.responder.is_disconnected()
     }
+
+    /// Returns the editor-state generation captured when the call was queued.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 /// Running localhost MCP server. Dropping it requests shutdown without joining workers.
@@ -49,6 +59,7 @@ pub struct McpServer {
     permissions: Arc<RwLock<Permissions>>,
     shutdown: Option<flume::Sender<()>>,
     listener: Arc<Server>,
+    generation: Arc<AtomicU64>,
 }
 
 pub(crate) struct Shared {
@@ -57,6 +68,7 @@ pub(crate) struct Shared {
     pub tools: Vec<ToolSpec>,
     pub sessions: Mutex<HashMap<String, Session>>,
     pub permissions: Arc<RwLock<Permissions>>,
+    pub generation: Arc<AtomicU64>,
     pub calls: flume::Sender<ToolCall>,
     pub wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -72,6 +84,15 @@ pub(crate) enum WaitResult {
 impl McpServer {
     /// Binds only to IPv4 localhost and starts four detached request workers.
     pub fn start(config: McpConfig, wake: Arc<dyn Fn() + Send + Sync>) -> io::Result<Self> {
+        Self::start_with_generation(config, wake, 0)
+    }
+
+    /// Starts a server and stamps each queued tool call with the supplied state generation.
+    pub fn start_with_generation(
+        config: McpConfig,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        generation: u64,
+    ) -> io::Result<Self> {
         if config.port == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -83,12 +104,14 @@ impl McpServer {
         let (calls_tx, calls_rx) = flume::unbounded();
         let (shutdown_tx, shutdown_rx) = flume::unbounded();
         let permissions = Arc::new(RwLock::new(config.permissions));
+        let generation = Arc::new(AtomicU64::new(generation));
         let shared = Arc::new(Shared {
             port: config.port,
             token: config.token,
             tools: config.tools,
             sessions: Mutex::new(HashMap::new()),
             permissions: Arc::clone(&permissions),
+            generation: Arc::clone(&generation),
             calls: calls_tx,
             wake,
         });
@@ -112,6 +135,7 @@ impl McpServer {
             permissions,
             shutdown: Some(shutdown_tx),
             listener,
+            generation,
         })
     }
 
@@ -128,6 +152,11 @@ impl McpServer {
     /// Replaces permissions for subsequent HTTP checks and host-side revalidation.
     pub fn set_permissions(&self, permissions: Permissions) {
         *self.permissions.write().unwrap() = permissions;
+    }
+
+    /// Updates the generation stamped onto calls enqueued after this point.
+    pub fn set_generation(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Release);
     }
 
     /// Signals waiting requests and unblocks workers receiving from tiny_http.
@@ -248,6 +277,7 @@ mod tests {
             arguments: json!({}),
             deadline: Instant::now() + Duration::from_secs(5),
             required_permission: Permission::Read,
+            generation: 0,
             responder,
         };
         assert!(!call.is_abandoned());
@@ -260,6 +290,7 @@ mod tests {
             arguments: json!({}),
             deadline: Instant::now(),
             required_permission: Permission::Read,
+            generation: 0,
             responder,
         };
         assert!(expired.is_abandoned());

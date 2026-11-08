@@ -149,6 +149,8 @@ pub struct FrameParts<'a> {
 }
 
 pub struct EditorState {
+    /// Invalidates queued MCP calls whenever a project or scene is replaced.
+    pub mcp_generation: u64,
     pub project: Option<OpenProject>,
     /// Открытый в подокне «Project Prefabs» список тяжёлых префабов; хранится с несохранёнными правками.
     pub project_prefabs: Option<ProjectPrefabs>,
@@ -242,6 +244,7 @@ pub struct EditorState {
 impl EditorState {
     pub fn new(scripts_path: Option<PathBuf>) -> Self {
         Self {
+            mcp_generation: 0,
             project: None,
             project_prefabs: None,
             scene: None,
@@ -306,6 +309,10 @@ impl EditorState {
 
     pub fn is_playing(&self) -> bool {
         self.play.is_some()
+    }
+
+    pub fn advance_mcp_generation(&mut self) {
+        self.mcp_generation = self.mcp_generation.wrapping_add(1);
     }
 
     /// Начинает переименование в Hierarchy; поле получит фокус один раз при отрисовке.

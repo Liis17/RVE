@@ -4,6 +4,7 @@ use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
+use crate::mcp::McpHost;
 use crate::play::{PlayPrefabs, PlaySession, editor_gamepads, gamepad_tuning};
 use crate::play_cursor;
 use crate::project::OpenProject;
@@ -12,6 +13,7 @@ use crate::settings::{SettingsStore, UserSettings};
 use crate::state::{Action, EditorState, RecoveryPrompt, UnsavedPrompt, ViewCommand};
 use crate::ui;
 use crate::ui::game_view;
+use crate::ui::preferences::Preferences;
 use crate::ui::scene_view::bounding_sphere;
 use crate::viewport::camera::View;
 use crate::viewport::render::{SceneRenderer, render_local_lights};
@@ -55,6 +57,11 @@ pub struct EditorApp {
     dock: DockState<Tab>,
     /// Файл настроек пользователя; `None`, если каталог настроек ОС неизвестен.
     settings: Option<SettingsStore>,
+    user_settings: UserSettings,
+    preferences: Preferences,
+    mcp_host: McpHost,
+    mcp_cli_enabled: bool,
+    stored_mcp_enabled: bool,
     initial_project: Option<PathBuf>,
     gpu: Option<GpuState>,
     egui_ctx: egui::Context,
@@ -95,22 +102,28 @@ impl EditorApp {
         project: Option<PathBuf>,
         scripts: Option<PathBuf>,
         reflex: Option<BootstrapReflexMode>,
+        mcp: bool,
     ) -> Self {
         let engine_log = editor_log_buffer();
         let mut state = EditorState::new(scripts);
         let pipeline_cache_path = engine_platform::pipeline_cache_path("rve-editor");
         let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
         let settings = SettingsStore::default_location();
-        let (user, problem) = settings
+        let (mut user, problem) = settings
             .as_ref()
             .map(SettingsStore::load)
             .unwrap_or_default();
         if let Some(problem) = problem {
             state.log.push(LogLevel::Warn, problem);
         }
+        let stored_mcp_enabled = user.mcp.enabled;
+        if mcp {
+            user.mcp.enabled = true;
+        }
         let dock = user.layout_or_default();
         state.scroll_navigation = user.scroll_navigation;
-        state.recent_projects = user.recent_projects;
+        state.recent_projects = user.recent_projects.clone();
+        let preferences = Preferences::default();
         Self {
             state,
             control_click: false,
@@ -118,6 +131,11 @@ impl EditorApp {
             modifiers: ModifiersState::empty(),
             dock,
             settings,
+            user_settings: user,
+            preferences,
+            mcp_host: McpHost::default(),
+            mcp_cli_enabled: mcp,
+            stored_mcp_enabled,
             initial_project: project,
             gpu: None,
             egui_ctx: egui::Context::default(),
@@ -209,6 +227,7 @@ impl EditorApp {
                     &mut self.state.recent_projects,
                     project.root.clone(),
                 );
+                self.state.advance_mcp_generation();
                 self.state.project = Some(project);
                 self.state.project_replaced();
                 self.save_settings();
@@ -332,14 +351,37 @@ impl EditorApp {
         let Some(store) = &self.settings else {
             return;
         };
-        let settings = UserSettings {
-            recent_projects: self.state.recent_projects.clone(),
-            layout: Some(self.dock.clone()),
-            scroll_navigation: self.state.scroll_navigation,
-        };
-        if let Err(error) = store.save(&settings) {
+        self.user_settings.recent_projects = self.state.recent_projects.clone();
+        self.user_settings.layout = Some(self.dock.clone());
+        self.user_settings.scroll_navigation = self.state.scroll_navigation;
+        let runtime_enabled = self.user_settings.mcp.enabled;
+        if self.mcp_cli_enabled {
+            self.user_settings.mcp.enabled = self.stored_mcp_enabled;
+        }
+        let result = store.save(&self.user_settings);
+        if self.mcp_cli_enabled {
+            self.user_settings.mcp.enabled = runtime_enabled;
+        }
+        if let Err(error) = result {
             self.state.log.push(LogLevel::Warn, error);
         }
+    }
+
+    fn apply_mcp_preferences(&mut self) {
+        let Some(mut settings) = self.preferences.take_pending() else {
+            return;
+        };
+        if settings.enabled
+            && settings.token.is_empty()
+            && let Err(error) = settings.regenerate_token()
+        {
+            self.state
+                .log
+                .error(format!("[MCP] token generation failed: {error}"));
+        }
+        self.user_settings.mcp = settings;
+        self.preferences.applied(&self.user_settings.mcp);
+        self.save_settings();
     }
 
     fn apply_asset_changes(&mut self, changes: AssetChanges) {
@@ -547,6 +589,7 @@ impl EditorApp {
     }
 
     fn set_scene(&mut self, scene: EditorScene) {
+        self.state.advance_mcp_generation();
         self.state.scene = Some(scene);
         self.state.scene_replaced();
         self.state.recovery_prompt = None;
@@ -1263,13 +1306,16 @@ impl EditorApp {
             .map_or_else(CommandCatalog::default, |play| play.command_catalog());
         let state = &mut self.state;
         let dock = &mut self.dock;
+        let preferences = &mut self.preferences;
+        let mcp_settings = &self.user_settings.mcp;
+        let mcp_status = self.mcp_host.status().clone();
         let console_overlay = &mut self.console_overlay;
         let console_open = state.console_open;
         let window_focused = self.window_focused;
         let mut console_output = Default::default();
         let mut cursor_request = None;
         let mut output = self.egui_ctx.run_ui(raw_input, |ui| {
-            ui::show(ui, state, dock);
+            ui::show_with_mcp(ui, state, dock, preferences, mcp_settings, &mcp_status);
             cursor_request = play_cursor::sync(ui.ctx(), state, dock, window_focused);
             if console_open && let Some(rect) = state.game_view.rect {
                 console_output =
@@ -1836,6 +1882,23 @@ impl WindowHandler for EditorApp {
         if let Some(project) = self.initial_project.take() {
             self.open_project(&project);
         }
+        if self.user_settings.mcp.enabled && self.user_settings.mcp.token.is_empty() {
+            if let Err(error) = self.user_settings.mcp.regenerate_token() {
+                self.state
+                    .log
+                    .error(format!("[MCP] token generation failed: {error}"));
+            }
+            self.preferences.applied(&self.user_settings.mcp);
+            self.save_settings();
+        }
+        if let Some(proxy) = self.proxy.clone() {
+            self.mcp_host.initialize(
+                &self.user_settings.mcp,
+                self.state.mcp_generation,
+                Arc::new(move || proxy.wake()),
+                &mut self.state.log,
+            );
+        }
         window.request_redraw();
         true
     }
@@ -1918,6 +1981,17 @@ impl WindowHandler for EditorApp {
     fn update(&mut self, window: &Window) -> bool {
         // Здесь, а не в кадре: при простое окно просыпается к сроку без перерисовки.
         let now = Instant::now();
+        self.apply_mcp_preferences();
+        let previous_mcp_status = self.mcp_host.status().clone();
+        self.mcp_host.apply_settings(
+            &self.user_settings.mcp,
+            self.state.mcp_generation,
+            &mut self.state.log,
+        );
+        let handled_mcp_calls = self.mcp_host.drain(&mut self.state);
+        if handled_mcp_calls || *self.mcp_host.status() != previous_mcp_status {
+            window.request_redraw();
+        }
         let watcher_errors = self
             .asset_watcher
             .as_mut()
@@ -1977,6 +2051,7 @@ impl WindowHandler for EditorApp {
             build,
             scripts,
             idle_pads,
+            self.mcp_host.next_wakeup(),
             self.autosave_deadline(),
             self.asset_changes.deadline(),
         ]
@@ -1996,6 +2071,7 @@ impl WindowHandler for EditorApp {
 
     fn exiting(&mut self) {
         self.stop_play();
+        self.mcp_host.shutdown();
         self.asset_watcher = None;
         self.proxy = None;
         if let Some(job) = self.state.build.take() {
@@ -2164,7 +2240,7 @@ mod tests {
 
     #[test]
     fn pending_play_rechecks_the_current_document_after_build() {
-        let mut app = EditorApp::new(None, None, None);
+        let mut app = EditorApp::new(None, None, None, false);
         app.state.scene = Some(
             EditorScene::parse(
                 VirtualPath::parse("prefabs/test.rveprefab").unwrap(),

@@ -459,7 +459,8 @@ fn handle_tool_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
     let deadline = Instant::now() + TOOL_CALL_TIMEOUT;
-    let (call, response) = pending_tool_call(name, arguments, permission, deadline);
+    let generation = shared.generation.load(std::sync::atomic::Ordering::Acquire);
+    let (call, response) = pending_tool_call(name, arguments, permission, deadline, generation);
     if shared.calls.send(call).is_err() {
         respond_failure(request, HttpFailure::ServiceUnavailable);
         return;
@@ -482,6 +483,7 @@ fn pending_tool_call(
     arguments: Value,
     permission: Permission,
     deadline: Instant,
+    generation: u64,
 ) -> (ToolCall, flume::Receiver<ToolResult>) {
     let (responder, response) = flume::bounded(1);
     (
@@ -490,6 +492,7 @@ fn pending_tool_call(
             arguments,
             deadline,
             required_permission: permission,
+            generation,
             responder,
         },
         response,
@@ -804,8 +807,10 @@ mod tests {
             serde_json::json!({}),
             Permission::Read,
             Instant::now() + Duration::from_secs(5),
+            41,
         );
         assert!(!call.is_abandoned());
+        assert_eq!(call.generation(), 41);
         drop(response);
         assert!(call.is_abandoned());
     }

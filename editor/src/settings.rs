@@ -6,11 +6,66 @@
 use crate::layout::{Tab, default_layout};
 use crate::scene_edit::write_atomic;
 use egui_dock::DockState;
+use engine_mcp::Permissions;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Сколько недавних проектов хранится.
 pub const MAX_RECENT_PROJECTS: usize = 10;
 const FILE_NAME: &str = "settings.json";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSettings {
+    pub enabled: bool,
+    pub port: u16,
+    pub token: String,
+    pub permissions: McpPermissionSettings,
+}
+
+impl Default for McpSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 47615,
+            token: String::new(),
+            permissions: McpPermissionSettings::default(),
+        }
+    }
+}
+
+impl McpSettings {
+    pub fn engine_permissions(&self) -> Permissions {
+        Permissions {
+            edit_scene: self.permissions.edit_scene,
+            assets: self.permissions.assets,
+            play: self.permissions.play,
+            build: self.permissions.build,
+        }
+    }
+
+    pub fn regenerate_token(&mut self) -> Result<(), String> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut token = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            token.push(HEX[usize::from(byte >> 4)] as char);
+            token.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+        self.token = token;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpPermissionSettings {
+    pub edit_scene: bool,
+    pub assets: bool,
+    pub play: bool,
+    pub build: bool,
+}
 
 #[derive(Debug, Default)]
 pub struct UserSettings {
@@ -19,6 +74,7 @@ pub struct UserSettings {
     pub recent_projects: Vec<PathBuf>,
     /// Раскладка панелей; `None` — раскладка по умолчанию.
     pub layout: Option<DockState<Tab>>,
+    pub mcp: McpSettings,
 }
 
 impl UserSettings {
@@ -105,6 +161,7 @@ impl SettingsStore {
             scroll_navigation: field(&value, "scroll_navigation", &mut problems)
                 .unwrap_or_default(),
             layout: field(&value, "layout", &mut problems),
+            mcp: field(&value, "mcp", &mut problems).unwrap_or_default(),
         };
         let message = (!problems.is_empty()).then(|| {
             format!(
@@ -125,6 +182,7 @@ impl SettingsStore {
             "recent_projects": settings.recent_projects,
             "layout": settings.layout,
             "scroll_navigation": settings.scroll_navigation,
+            "mcp": settings.mcp,
         });
         let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
         write_atomic(&self.file, text.as_bytes())
@@ -216,6 +274,7 @@ mod tests {
             recent_projects: vec![PathBuf::from("a"), PathBuf::from("b")],
             scroll_navigation: crate::gestures::ScrollNavigation::Trackpad,
             layout: Some(layout.clone()),
+            ..UserSettings::default()
         };
         store.save(&settings).unwrap();
         let (loaded, message) = store.load();
@@ -258,6 +317,59 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_mcp_field_resets_only_mcp_settings() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let store = SettingsStore::in_dir(&dir.0);
+        std::fs::write(
+            dir.0.join(FILE_NAME),
+            r#"{"recent_projects":["kept"],"mcp":{"enabled":"yes"}}"#,
+        )
+        .unwrap();
+
+        let (settings, message) = store.load();
+
+        assert_eq!(settings.recent_projects, [PathBuf::from("kept")]);
+        assert!(!settings.mcp.enabled);
+        assert_eq!(settings.mcp.port, 47615);
+        assert!(message.unwrap().contains("mcp"));
+    }
+
+    #[test]
+    fn mcp_settings_are_off_by_default_and_round_trip() {
+        let dir = TempDir::new();
+        let store = SettingsStore::in_dir(&dir.0);
+        let mut settings = UserSettings::default();
+        assert!(!settings.mcp.enabled);
+        assert_eq!(settings.mcp.port, 47615);
+        settings.mcp.enabled = true;
+        settings.mcp.token = "token".to_owned();
+        settings.mcp.permissions.edit_scene = true;
+
+        store.save(&settings).unwrap();
+        let (loaded, message) = store.load();
+
+        assert!(loaded.mcp.enabled);
+        assert_eq!(loaded.mcp.port, 47615);
+        assert_eq!(loaded.mcp.token, "token");
+        assert!(loaded.mcp.permissions.edit_scene);
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn regenerated_mcp_token_is_32_bytes_of_lowercase_hex() {
+        let mut settings = McpSettings::default();
+        settings.regenerate_token().unwrap();
+        assert_eq!(settings.token.len(), 64);
+        assert!(
+            settings
+                .token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
+    #[test]
     fn layout_with_duplicate_panels_is_replaced_by_the_default() {
         let mut layout = DockState::new(vec![Tab::Scene, Tab::Scene]);
         layout.push_to_first_leaf(Tab::Console);
@@ -265,6 +377,7 @@ mod tests {
             recent_projects: Vec::new(),
             scroll_navigation: crate::gestures::ScrollNavigation::Trackpad,
             layout: Some(layout),
+            ..UserSettings::default()
         };
         assert_eq!(tabs(&settings.layout_or_default()), tabs(&default_layout()));
     }

@@ -3,7 +3,9 @@
 use crate::layout::{Tab, default_layout, is_open};
 use crate::play_network::{NETWORK_DISABLED_HINT, PlayNetworkMode};
 use crate::scene_edit::{NewObject, objects_from_clipboard, objects_to_clipboard};
+use crate::settings::McpSettings;
 use crate::state::{Action, EditorState};
+use crate::ui::preferences::Preferences;
 use crate::ui::scene_view;
 use crate::viewport::gizmo::{GizmoSpace, GizmoTool};
 use egui::{Key, KeyboardShortcut, Modifiers};
@@ -160,9 +162,28 @@ pub fn duplicate_selection(state: &mut EditorState) {
     state.edit_scene(|scene| scene.duplicate_selection());
 }
 
+#[cfg(test)]
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab>) {
+    show_with_mcp(
+        ui,
+        state,
+        dock,
+        &mut Preferences::default(),
+        &McpSettings::default(),
+    );
+}
+
+pub fn show_with_mcp(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    dock: &mut DockState<Tab>,
+    preferences: &mut Preferences,
+    mcp_settings: &McpSettings,
+) {
     egui::Panel::top("menu_bar").show(ui, |ui| {
-        egui::MenuBar::new().ui(ui, |ui| show_menus(ui, state, dock));
+        egui::MenuBar::new().ui(ui, |ui| {
+            show_menus(ui, state, dock, preferences, mcp_settings)
+        });
     });
     if state.project.is_some() {
         egui::Panel::top("tool_bar").show(ui, |ui| {
@@ -171,7 +192,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     }
 }
 
-fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab>) {
+fn show_menus(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    dock: &mut DockState<Tab>,
+    preferences: &mut Preferences,
+    mcp_settings: &McpSettings,
+) {
     let has_project = state.project.is_some();
     let editing = has_project && !state.is_playing();
     let has_selection = state
@@ -234,6 +261,10 @@ fn show_menus(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<T
         }
     });
     ui.menu_button("Edit", |ui| {
+        if ui.button("Preferences…").clicked() {
+            preferences.open(mcp_settings);
+        }
+        ui.separator();
         ui.menu_button("Scene Navigation", |ui| {
             use crate::gestures::ScrollNavigation;
             for (mode, hint) in [

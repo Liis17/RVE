@@ -5,6 +5,7 @@ mod debug_view;
 pub mod game_view;
 pub mod hierarchy;
 pub mod inspector;
+pub mod preferences;
 pub mod profiler;
 pub mod project_panel;
 pub mod project_prefabs;
@@ -20,7 +21,26 @@ use crate::state::{Action, AssetDrag, EditorState};
 use egui_dock::{DockArea, DockState, Style};
 
 /// Строит весь интерфейс кадра.
+#[cfg(test)]
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab>) {
+    show_with_mcp(
+        ui,
+        state,
+        dock,
+        &mut preferences::Preferences::default(),
+        &crate::settings::McpSettings::default(),
+        &crate::mcp::McpStatus::Off,
+    );
+}
+
+pub fn show_with_mcp(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    dock: &mut DockState<Tab>,
+    preferences: &mut preferences::Preferences,
+    mcp_settings: &crate::settings::McpSettings,
+    mcp_status: &crate::mcp::McpStatus,
+) {
     // Видимость и наведение панелей известны только с прошлого кадра: сброс ниже их стирает.
     // В Play numpad-команды Scene действуют, лишь если Scene показана и курсор не над Game.
     if state.is_playing() && (!state.scene_view.visible || state.game_view.hovered) {
@@ -33,7 +53,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     state.game_view.hovered = false;
     state.game_view.rect = None;
     toolbar::handle_shortcuts(ui.ctx(), state);
-    toolbar::show(ui, state, dock);
+    toolbar::show_with_mcp(ui, state, dock, preferences, mcp_settings);
     show_status_bar(ui, state);
 
     if state.project.is_none() {
@@ -49,6 +69,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     show_recovery_prompt(ui.ctx(), state);
     project_panel::show_dialog(ui.ctx(), state);
     show_new_project_dialog(ui.ctx(), state);
+    preferences::show(ui.ctx(), preferences, mcp_status);
     state.smart_zoom = false;
     state.text_focused_last_frame = ui.ctx().egui_wants_keyboard_input();
 }
