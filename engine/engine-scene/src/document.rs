@@ -3,6 +3,10 @@
 use crate::CameraSettings;
 use crate::animation::{AnimatorComponent, validate_animator};
 use crate::audio::{AudioSourceComponent, validate_audio_source};
+use crate::network::{
+    NetworkIdentityComponent, NetworkTransformComponent, validate_network_object,
+    validate_scene_net_ids,
+};
 use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
 use crate::prefab::{PREFAB_EXTENSION, PrefabInstance};
 use crate::world::{LocalTransform, calculate_world_matrices};
@@ -245,6 +249,7 @@ impl SceneDocument {
             }
             validate_transform(source, object)?;
             validate_physics_components(source, object)?;
+            validate_network_object(source, object)?;
             if let Some(camera) = &object.camera {
                 camera_count += 1;
                 active_camera_count += usize::from(camera.active);
@@ -386,6 +391,9 @@ impl SceneDocument {
             }
         }
 
+        if !local_only {
+            validate_scene_net_ids(source, &self.objects)?;
+        }
         if camera_count == 0 && self.kind == DocumentKind::Scene && !local_only {
             return Err(SceneError::new(
                 source,
@@ -516,6 +524,10 @@ pub struct SceneObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub animator: Option<AnimatorComponent>,
     pub particle_emitter: Option<ParticleEmitterComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_identity: Option<NetworkIdentityComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_transform: Option<NetworkTransformComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]

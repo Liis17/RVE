@@ -11,6 +11,7 @@ use crate::document::{
     SpotLightComponent, camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
 };
 use crate::light::ShadowSettings;
+use crate::network::{NetworkIdentityComponent, NetworkTransformComponent};
 use crate::particles::ParticleEmitterComponent;
 use crate::prefab::{MAX_EXPANDED_ID_BYTES, PrefabTemplate};
 use engine_files::VirtualPath;
@@ -225,6 +226,8 @@ pub struct WorldObject {
     pub audio_source: Option<AudioSourceComponent>,
     pub animator: Option<AnimatorComponent>,
     pub particle_emitter: Option<ParticleEmitterComponent>,
+    pub network_identity: Option<NetworkIdentityComponent>,
+    pub network_transform: Option<NetworkTransformComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
 }
@@ -597,6 +600,16 @@ impl World {
     /// Эмиттер частиц объекта, если у него есть `particle_emitter`.
     pub fn particle_emitter(&self, handle: ObjectHandle) -> Option<&ParticleEmitterComponent> {
         self.object(handle)?.particle_emitter.as_ref()
+    }
+
+    /// Сетевой идентификатор объекта, если у него есть `network_identity`.
+    pub fn network_identity(&self, handle: ObjectHandle) -> Option<&NetworkIdentityComponent> {
+        self.object(handle)?.network_identity.as_ref()
+    }
+
+    /// Сетевая трансформация объекта, если у него есть `network_transform`.
+    pub fn network_transform(&self, handle: ObjectHandle) -> Option<&NetworkTransformComponent> {
+        self.object(handle)?.network_transform.as_ref()
     }
 
     /// Пути `[[assets]]` сцены в порядке документа.
@@ -1197,6 +1210,8 @@ fn world_object(
         audio_source: object.audio_source.clone(),
         animator: object.animator.clone(),
         particle_emitter: object.particle_emitter.clone(),
+        network_identity: object.network_identity,
+        network_transform: object.network_transform,
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
     }

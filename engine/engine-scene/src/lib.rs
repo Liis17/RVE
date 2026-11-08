@@ -6,6 +6,7 @@ pub mod camera;
 pub mod camera_settings;
 pub mod document;
 pub mod light;
+pub mod network;
 pub mod params;
 pub mod particles;
 pub mod prefab;
@@ -22,6 +23,11 @@ pub use audio::{
     AudioGroup, AudioRequest, AudioSourceComponent, ClipParams, MAX_AUDIO_VOLUME, VoiceId,
 };
 pub use light::ShadowSettings;
+pub use network::{
+    MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetAuthority, NetEvent,
+    NetId, NetMode, NetRequest, NetTarget, NetworkIdentityComponent, NetworkTransformComponent,
+    PeerId, SERVER_PEER_ID, scene_net_id,
+};
 pub use particles::{
     MAX_ADDITIVE_PARTICLE_CAPACITY, MAX_ALPHA_PARTICLE_CAPACITY, ParticleBlendMode,
     ParticleBurstComponent, ParticleCollisionComponent, ParticleColorKeyComponent,

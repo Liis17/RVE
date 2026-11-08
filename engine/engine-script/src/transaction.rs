@@ -12,7 +12,8 @@ use engine_physics::{
     QueryHit, Ray,
 };
 use engine_scene::{
-    AnimationRequest, AudioRequest, CameraSettings, LocalTransform, ObjectHandle, ParamValue, World,
+    AnimationRequest, AudioRequest, CameraSettings, LocalTransform, MAX_MESSAGE_DEPTH,
+    MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, ObjectHandle, ParamValue, World,
 };
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
@@ -26,9 +27,6 @@ pub(crate) const MAX_AUDIO_REQUESTS_PER_FRAME: usize = 256;
 /// Запросов аниматора за кадр, включая уже зафиксированные скриптами.
 pub(crate) const MAX_ANIMATION_REQUESTS_PER_FRAME: usize = 256;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
-pub(crate) const MAX_MESSAGE_DEPTH: usize = 16;
-pub(crate) const MAX_MESSAGE_ELEMENTS: usize = 1024;
-pub(crate) const MAX_MESSAGE_STRING_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_MESSAGE_NAME_BYTES: usize = 256;
 pub(crate) const MAX_MESSAGE_TARGET_ID_BYTES: usize = 256;
 

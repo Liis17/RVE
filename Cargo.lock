@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "engine-project"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "engine-files",
  "rve-sdk",
@@ -890,8 +890,9 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
+ "blake3",
  "engine-files",
  "glam",
  "serde",
@@ -900,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "engine-console",
  "engine-files",

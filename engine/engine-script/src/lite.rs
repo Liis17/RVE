@@ -2811,10 +2811,8 @@ fn read_vector(table: &Table, property: &str) -> mlua::Result<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::{
-        MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES,
-        MAX_MESSAGE_TARGET_ID_BYTES,
-    };
+    use crate::transaction::MAX_MESSAGE_TARGET_ID_BYTES;
+    use engine_scene::{MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES};
 
     fn convert(source: &str) -> mlua::Result<ParamValue> {
         let lua = Lua::new();

@@ -1,5 +1,6 @@
 use super::*;
 use crate::World;
+use crate::network::{NetAuthority, NetworkTransformComponent};
 
 const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
 
@@ -1044,4 +1045,87 @@ fn spawnable_template_passes_check_and_structural_errors_still_fail_load() {
         "[[objects]]\nid = \"root\"\n[[objects]]\nid = \"child\"\nparent = \"missing\"\n",
     )]);
     assert!(load_template(&broken, "prefabs/bad.rveprefab").is_err());
+}
+
+#[test]
+fn network_prefab_override_replaces_the_whole_component() {
+    let prefab = "[[objects]]\nid = \"crate\"\n[objects.network_identity]\nauthority = \"owner\"\n[objects.network_transform]\nsend_rate_hz = 10\nsnap_distance = 2.0\n";
+    let library = Library::new(&[("prefabs/crate.rveprefab", prefab)]);
+    assert!(
+        load_template(&library, "prefabs/crate.rveprefab")
+            .unwrap()
+            .check_spawnable()
+            .is_ok(),
+        "сетевые компоненты допустимы в spawn-префабе"
+    );
+    let assets = "[[assets]]\npath = \"/prefabs/crate.rveprefab\"\n";
+    let overridden = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"box\"\nprefab = \"/prefabs/crate.rveprefab\"\n[[instances.overrides]]\ntarget = \"crate\"\nnetwork_transform = {{ sync_scale = true }}\n"
+    );
+    let expanded = library.expand(&scene(&overridden)).unwrap().document;
+    let root = object(&expanded, "box");
+    assert_eq!(
+        root.network_transform,
+        Some(NetworkTransformComponent {
+            sync_scale: true,
+            ..NetworkTransformComponent::default()
+        }),
+        "замена не сохраняет унаследованные send_rate_hz и snap_distance"
+    );
+    assert_eq!(
+        root.network_identity.map(|identity| identity.authority),
+        Some(NetAuthority::Owner),
+        "identity без override наследуется"
+    );
+
+    let inherited = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"box\"\nprefab = \"/prefabs/crate.rveprefab\"\n"
+    );
+    let kept = library.expand(&scene(&inherited)).unwrap().document;
+    assert_eq!(
+        object(&kept, "box").network_transform.unwrap().send_rate_hz,
+        10
+    );
+
+    let identity_override = format!(
+        "{assets}{CAMERA}[[instances]]\nid = \"box\"\nprefab = \"/prefabs/crate.rveprefab\"\n[[instances.overrides]]\ntarget = \"crate\"\nnetwork_identity = {{ authority = \"server\" }}\n"
+    );
+    let replaced = library.expand(&scene(&identity_override)).unwrap().document;
+    assert_eq!(
+        object(&replaced, "box")
+            .network_identity
+            .map(|identity| identity.authority),
+        Some(NetAuthority::Server)
+    );
+}
+
+#[test]
+fn network_prefab_overrides_need_existing_components_and_valid_fields() {
+    let lamp = "[[objects]]\nid = \"lamp\"\n[objects.point_light]\n";
+    let library = Library::new(&[("prefabs/lamp.rveprefab", lamp)]);
+    let assets = "[[assets]]\npath = \"/prefabs/lamp.rveprefab\"\n";
+    let instance = |override_line: &str| {
+        format!(
+            "{assets}{CAMERA}[[instances]]\nid = \"lamp\"\nprefab = \"/prefabs/lamp.rveprefab\"\n[[instances.overrides]]\ntarget = \"lamp\"\n{override_line}\n"
+        )
+    };
+
+    let error = library
+        .expand(&scene(&instance(
+            "network_identity = { authority = \"owner\" }",
+        )))
+        .unwrap_err();
+    assert!(error.message.contains("network_identity"), "{error}");
+
+    let error = library
+        .expand(&scene(&instance("network_transform = {}")))
+        .unwrap_err();
+    assert!(error.message.contains("network_transform"), "{error}");
+
+    let error = SceneDocument::parse(
+        "scene.rvescene",
+        &instance("network_transform = { send_rate_hz = 0 }"),
+    )
+    .unwrap_err();
+    assert!(error.message.contains("send_rate_hz"), "{error}");
 }

@@ -22,6 +22,9 @@ pub struct ProjectSettings {
     pub runtime: RuntimeSettings,
     #[serde(default)]
     pub physics: PhysicsSettings,
+    /// Значения по умолчанию не сериализуются, поэтому проекты без `[network]` не меняются.
+    #[serde(default, skip_serializing_if = "NetworkSettings::is_default")]
+    pub network: NetworkSettings,
     #[serde(default)]
     pub input: InputSettings,
 }
@@ -108,6 +111,40 @@ impl Default for PhysicsSettings {
             fixed_hz: 60,
             max_substeps: 8,
         }
+    }
+}
+
+/// Сетевые настройки проекта: `[network]`. Пароль и ключ сервера в проект не записываются.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkSettings {
+    /// Включает сетевой режим в player; без флагов сети приложение работает offline.
+    pub enabled: bool,
+    /// Порт сервера по умолчанию, 1..=65535.
+    pub port: u16,
+    /// Наибольшее число подключённых клиентов, 1..=64.
+    pub max_clients: u32,
+    /// Частота сетевого тика, 1..=240 Гц.
+    pub tick_hz: u32,
+    /// Тайм-аут молчащего пира, 1000..=120000 мс.
+    pub timeout_ms: u32,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 7777,
+            max_clients: 8,
+            tick_hz: 30,
+            timeout_ms: 10_000,
+        }
+    }
+}
+
+impl NetworkSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -205,6 +242,18 @@ impl ProjectSettings {
         }
         if !(1..=64).contains(&self.physics.max_substeps) {
             return Err("physics.max_substeps должен быть в диапазоне 1..=64".to_owned());
+        }
+        if self.network.port == 0 {
+            return Err("network.port должен быть в диапазоне 1..=65535".to_owned());
+        }
+        if !(1..=64).contains(&self.network.max_clients) {
+            return Err("network.max_clients должен быть в диапазоне 1..=64".to_owned());
+        }
+        if !(1..=240).contains(&self.network.tick_hz) {
+            return Err("network.tick_hz должен быть в диапазоне 1..=240".to_owned());
+        }
+        if !(1000..=120_000).contains(&self.network.timeout_ms) {
+            return Err("network.timeout_ms должен быть в диапазоне 1000..=120000".to_owned());
         }
         if let Some(path) = &self.runtime.fsr_library
             && (!is_relative_project_path(path)
@@ -308,7 +357,7 @@ fn default_background_tick_hz() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PhysicsSettings, ProjectSettings, RuntimeSettings};
+    use super::{NetworkSettings, PhysicsSettings, ProjectSettings, RuntimeSettings};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -619,6 +668,81 @@ mod tests {
             let error = ProjectSettings::parse(&contents).unwrap_err();
             assert!(error.to_ascii_lowercase().contains("dlss"), "{runtime:?}");
         }
+    }
+
+    #[test]
+    fn network_section_has_documented_defaults_and_is_not_serialized_when_default() {
+        let settings =
+            ProjectSettings::parse(&project("[[scenes]]\npath = \"scene.rvescene\"\n")).unwrap();
+        assert_eq!(settings.network, NetworkSettings::default());
+        assert!(!settings.network.enabled);
+        assert_eq!(settings.network.port, 7777);
+        assert_eq!(settings.network.max_clients, 8);
+        assert_eq!(settings.network.tick_hz, 30);
+        assert_eq!(settings.network.timeout_ms, 10_000);
+
+        let serialized = settings.to_toml().unwrap();
+        assert!(!serialized.contains("network"), "{serialized}");
+        let again = ProjectSettings::parse(&serialized).unwrap();
+        assert_eq!(again, settings);
+    }
+
+    #[test]
+    fn network_section_round_trips_and_checks_ranges() {
+        let settings = ProjectSettings::parse(&format!(
+            "{}\n[network]\nenabled = true\nport = 9000\nmax_clients = 64\ntick_hz = 240\ntimeout_ms = 120000\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.network,
+            NetworkSettings {
+                enabled: true,
+                port: 9000,
+                max_clients: 64,
+                tick_hz: 240,
+                timeout_ms: 120_000,
+            }
+        );
+        let serialized = settings.to_toml().unwrap();
+        assert!(serialized.contains("[network]"), "{serialized}");
+        assert_eq!(ProjectSettings::parse(&serialized).unwrap(), settings);
+
+        for (field, value) in [
+            ("port", "0"),
+            ("max_clients", "0"),
+            ("max_clients", "65"),
+            ("tick_hz", "0"),
+            ("tick_hz", "241"),
+            ("timeout_ms", "999"),
+            ("timeout_ms", "120001"),
+        ] {
+            let contents = format!(
+                "{}\n[network]\n{field} = {value}\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            );
+            let error = ProjectSettings::parse(&contents).unwrap_err();
+            assert!(
+                error.contains(&format!("network.{field}")),
+                "{field}={value}: {error}"
+            );
+        }
+
+        // Порт вне u16 отсекает разбор TOML до проверки диапазона.
+        assert!(
+            ProjectSettings::parse(&format!(
+                "{}\n[network]\nport = 65536\n",
+                project("[[scenes]]\npath = \"scene.rvescene\"\n")
+            ))
+            .is_err()
+        );
+
+        let unknown = ProjectSettings::parse(&format!(
+            "{}\n[network]\nsecret = \"x\"\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap_err();
+        assert!(unknown.contains("secret"), "{unknown}");
     }
 
     #[test]

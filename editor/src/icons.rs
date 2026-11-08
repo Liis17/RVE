@@ -78,6 +78,8 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         animator,
 
         particle_emitter,
+        network_identity,
+        network_transform,
         lite_scripts,
         heavy_scripts,
     } = object;
@@ -99,6 +101,8 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         && audio_source.is_none()
         && animator.is_none()
         && particle_emitter.is_none()
+        && network_identity.is_none()
+        && network_transform.is_none()
         && lite_scripts.is_empty()
         && heavy_scripts.is_empty()
     {
