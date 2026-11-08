@@ -8,9 +8,13 @@ use ash::{Entry, vk};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod environment;
+mod latency;
 mod skin;
 
+pub use latency::{LatencyHandle, LatencyMarker, LowLatencyMode};
 pub use skin::{SkinBinding, SkinId, SkinVertex};
+
+use latency::{PresentIdTracker, Shared, VulkanLatency, low_latency_device_extensions};
 
 use clusters::{ClusterBounds, DepthRange, GpuLocalLight, camera_cluster_bounds};
 use culling::{Frustum, LocalBounds, back_to_front_order};
@@ -622,6 +626,8 @@ pub struct RendererConfig {
     /// Vulkan pipeline cache bytes validated against the selected physical device.
     pub pipeline_cache: Vec<u8>,
     pub upscalers: UpscalerConfig,
+    /// NVIDIA Reflex через `VK_NV_low_latency2`; без поддержки устройством работает как `Off`.
+    pub low_latency: LowLatencyMode,
 }
 
 /// Optional vendor runtime configuration for temporal upscalers.
@@ -649,6 +655,8 @@ pub struct Capabilities {
     pub wireframe: bool,
     pub fsr: bool,
     pub dlss: bool,
+    /// Включён ли NVIDIA Reflex: расширения, features и timeline semaphore поддержаны и созданы.
+    pub low_latency: bool,
 }
 
 /// Результат проверки базовых Vulkan-требований для физического устройства.
@@ -744,6 +752,8 @@ struct AcquiredFrameSubmission<'a> {
     local_shadow_layout: vk::ImageLayout,
     /// План skinning вызова; состояние кольца фиксируется после отправки.
     skin: Option<&'a skin::SkinPlan>,
+    /// Present id кадра Reflex; 0, если кадр без Reflex.
+    present_id: u64,
 }
 
 /// Результат попытки показать кадр.
@@ -1095,6 +1105,10 @@ pub struct Renderer {
     fsr_warning_emitted: bool,
     dlss_warning_emitted: bool,
     swapchain: Option<SwapchainBundle>,
+    latency: Option<Arc<Shared>>,
+    latency_semaphore: vk::Semaphore,
+    latency_frame: u64,
+    present_ids: PresentIdTracker,
     surface_format: vk::SurfaceFormatKHR,
     present_mode: PresentMode,
     last_warned_present_mode: Option<PresentMode>,
@@ -1204,6 +1218,10 @@ impl Renderer {
             particles: ParticleSystem::default(),
             retired: RetireQueue::new(FRAMES_IN_FLIGHT),
             retired_swapchains: RetiredSwapchains::new(FRAMES_IN_FLIGHT),
+            latency: None,
+            latency_semaphore: vk::Semaphore::null(),
+            latency_frame: 0,
+            present_ids: PresentIdTracker::default(),
             pending_swapchain_drop: None,
             frames: Vec::new(),
             frame_slot: 0,
@@ -1235,11 +1253,42 @@ impl Renderer {
                 wireframe: false,
                 fsr: false,
                 dlss: false,
+                low_latency: false,
             },
             window,
         };
         renderer.initialize()?;
         Ok(renderer)
+    }
+
+    /// Handle для Reflex-сна и маркеров симуляции; `None`, если Reflex выключен или не поддержан.
+    pub fn latency_handle(&self) -> Option<LatencyHandle> {
+        self.latency.as_ref().map(|shared| LatencyHandle {
+            shared: Arc::clone(shared),
+        })
+    }
+
+    /// Задаёт `snapshot.sequence` кадра, который следующий `render_frame*` отправит с present id.
+    pub fn set_latency_frame(&mut self, frame_id: u64) {
+        self.latency_frame = frame_id;
+    }
+
+    /// Выбирает present id кадра и ставит `RENDERSUBMIT_START`; 0 — кадр без Reflex-маркеров.
+    fn begin_latency_frame(&mut self) -> u64 {
+        let Some(latency) = self.latency.as_ref() else {
+            return 0;
+        };
+        let Some(present_id) = self.present_ids.begin(self.latency_frame) else {
+            return 0;
+        };
+        latency.marker(present_id, vk::LatencyMarkerNV::RENDERSUBMIT_START);
+        present_id
+    }
+
+    fn latency_marker(&self, present_id: u64, marker: vk::LatencyMarkerNV) {
+        if let Some(latency) = self.latency.as_ref() {
+            latency.marker(present_id, marker);
+        }
     }
 
     /// Возвращает характеристики выбранного GPU.
@@ -1848,6 +1897,7 @@ impl Renderer {
                 submitted: false,
             });
         }
+        let present_id = self.begin_latency_frame();
 
         let instance = self.instance()?.clone();
         let device = self.device()?.clone();
@@ -2409,6 +2459,7 @@ impl Renderer {
             device: &device,
             swapchain_loader: &swapchain_loader,
             queue,
+            present_id,
             frame_slot,
             fence,
             image_available,
@@ -2532,6 +2583,7 @@ impl Renderer {
                 submitted: false,
             });
         }
+        let present_id = self.begin_latency_frame();
 
         let instance = self.instance()?.clone();
         let device = self.device()?.clone();
@@ -3326,6 +3378,7 @@ impl Renderer {
             device: &device,
             swapchain_loader: &swapchain_loader,
             queue,
+            present_id,
             frame_slot,
             fence,
             image_available,
@@ -3486,6 +3539,7 @@ impl Renderer {
             shadow_layout,
             local_shadow_layout,
             skin,
+            present_id,
         } = acquired;
         let submit_started = Instant::now();
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
@@ -3507,10 +3561,16 @@ impl Renderer {
             .semaphore(render_finished)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .device_index(0)];
-        let submit_info = [vk::SubmitInfo2::default()
+        let mut latency_submission =
+            vk::LatencySubmissionPresentIdNV::default().present_id(present_id);
+        let mut submit_info = vk::SubmitInfo2::default()
             .wait_semaphore_infos(&wait_infos)
             .command_buffer_infos(&command_infos)
-            .signal_semaphore_infos(&signal_infos)];
+            .signal_semaphore_infos(&signal_infos);
+        if present_id != 0 {
+            submit_info = submit_info.push_next(&mut latency_submission);
+        }
+        let submit_info = [submit_info];
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
         if let Err(error) = unsafe { device.queue_submit2(queue, &submit_info, fence) } {
             return Err(SubmitAndPresentError::BeforeSubmit(RenderError::Vulkan(
@@ -3518,6 +3578,10 @@ impl Renderer {
             )));
         }
         timings.submit = submit_started.elapsed();
+        if present_id != 0 {
+            self.present_ids.submitted(present_id);
+            self.latency_marker(present_id, vk::LatencyMarkerNV::RENDERSUBMIT_END);
+        }
         self.record_frame_submission(frame_slot);
         self.commit_skin(skin);
         self.shadow_layout = shadow_layout;
@@ -3529,13 +3593,20 @@ impl Renderer {
         let wait_semaphores = [render_finished];
         let swapchains = [swapchain_handle];
         let image_indices = [image_index as u32];
-        let present_info = vk::PresentInfoKHR::default()
+        let present_ids = [present_id];
+        let mut present_id_info = vk::PresentIdKHR::default().present_ids(&present_ids);
+        let mut present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&wait_semaphores)
             .swapchains(&swapchains)
             .image_indices(&image_indices);
+        if present_id != 0 {
+            present_info = present_info.push_next(&mut present_id_info);
+        }
+        self.latency_marker(present_id, vk::LatencyMarkerNV::PRESENT_START);
         // SAFETY: present waits on the semaphore signaled by the preceding queue submission.
         let present_started = Instant::now();
         let present_result = unsafe { swapchain_loader.queue_present(queue, &present_info) };
+        self.latency_marker(present_id, vk::LatencyMarkerNV::PRESENT_END);
         timings.present = present_started.elapsed();
         self.frame_slot = (self.frame_slot + 1) % self.frames.len();
         match present_result {
@@ -3804,6 +3875,7 @@ impl Renderer {
             wireframe: choice.wireframe,
             fsr: false,
             dlss: false,
+            low_latency: false,
         };
 
         #[allow(unused_mut)]
@@ -3835,6 +3907,21 @@ impl Renderer {
                 Err(error) => self.dlss_load_error = Some(error),
             }
         }
+        let low_latency_ready = self.config.low_latency != LowLatencyMode::Off
+            && match low_latency_support(self.instance()?, self.physical_device) {
+                Ok(()) => true,
+                Err(reason) => {
+                    eprintln!("NVIDIA Reflex отключён: {reason}; рендеринг продолжается без него");
+                    false
+                }
+            };
+        if low_latency_ready {
+            device_extensions.extend(
+                low_latency_device_extensions()
+                    .into_iter()
+                    .map(CString::from),
+            );
+        }
         let device_extensions = deduplicate_names(device_extensions);
 
         let queue_priority = [1.0_f32];
@@ -3856,18 +3943,30 @@ impl Renderer {
         let mut extended_dynamic_state =
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
                 .extended_dynamic_state(true);
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut present_id_features =
+            vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut timeline_features =
+            vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&extension_pointers)
             .enabled_features(&features)
             .push_next(&mut features_13)
             .push_next(&mut extended_dynamic_state);
+        if low_latency_ready {
+            device_info = device_info
+                .push_next(&mut present_id_features)
+                .push_next(&mut timeline_features);
+        }
         // SAFETY: the selected physical device reported every requested feature and extension.
         let device = unsafe {
             self.instance()?
                 .create_device(self.physical_device, &device_info, None)
         }?;
         self.device = Some(device);
+        if low_latency_ready {
+            self.init_low_latency()?;
+        }
         #[cfg(all(windows, feature = "dlss"))]
         if dlss_device_ready {
             let instance_handle = self.instance()?.handle();
@@ -6044,6 +6143,25 @@ impl Renderer {
         Ok(())
     }
 
+    /// Создаёт timeline semaphore Reflex и общее состояние после создания device.
+    fn init_low_latency(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+        // SAFETY: the device enabled timelineSemaphore; the create info lives for this call.
+        let semaphore = unsafe { device.create_semaphore(&create_info, None) }?;
+        self.latency_semaphore = semaphore;
+        let backend = VulkanLatency::new(self.instance()?, &device, semaphore);
+        self.latency = Some(Arc::new(Shared::new(
+            self.config.low_latency,
+            Arc::new(backend),
+        )));
+        self.capabilities.low_latency = true;
+        Ok(())
+    }
+
     fn recreate_swapchain(&mut self) -> Result<(), RenderError> {
         let capabilities = unsafe {
             self.surface_loader()?
@@ -6069,6 +6187,7 @@ impl Renderer {
             .swapchain
             .as_ref()
             .map_or(vk::SwapchainKHR::null(), |bundle| bundle.handle);
+        let latency = self.latency.clone();
         let new_swapchain = SwapchainBundle::new(
             self.instance()?,
             &device,
@@ -6081,7 +6200,12 @@ impl Renderer {
             capabilities,
             old_swapchain,
             self.config.present_mode,
+            latency.is_some(),
         )?;
+        // Под блокировкой меняется только handle: старый swapchain уничтожается позже, вне неё.
+        if let Some(latency) = latency.as_deref() {
+            latency.lock_swapchain().replace(new_swapchain.handle);
+        }
         self.present_mode = new_swapchain.present_mode;
         if self.present_mode == self.config.present_mode {
             self.last_warned_present_mode = None;
@@ -6200,9 +6324,18 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
+        // Reflex выключается до ожидания простоя: sleep/marker из других потоков перестают доходить до Vulkan.
+        if let Some(latency) = self.latency.take() {
+            latency.deactivate();
+        }
         if let Some(device) = self.device.as_ref() {
             // SAFETY: teardown waits for renderer submissions before destroying owned Vulkan resources.
             let _ = unsafe { device.device_wait_idle() };
+            if self.latency_semaphore != vk::Semaphore::null() {
+                // SAFETY: device idle and Reflex deactivated: no sleep, marker or submit references the semaphore.
+                unsafe { device.destroy_semaphore(self.latency_semaphore, None) };
+                self.latency_semaphore = vk::Semaphore::null();
+            }
         }
         self.pending_upload.take();
         self.in_flight_uploads.clear();
@@ -6953,6 +7086,7 @@ impl SwapchainBundle {
         capabilities: vk::SurfaceCapabilitiesKHR,
         old_swapchain: vk::SwapchainKHR,
         requested_present_mode: PresentMode,
+        low_latency: bool,
     ) -> Result<Self, RenderError> {
         if !capabilities.supported_usage_flags.contains(SWAPCHAIN_USAGE) {
             return Err(RenderError::Unsupported(
@@ -6974,7 +7108,7 @@ impl SwapchainBundle {
             surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
         }?;
         let selected_present_mode = select_present_mode(requested_present_mode, &present_modes);
-        let create_info = vk::SwapchainCreateInfoKHR::default()
+        let mut create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
             .image_format(surface_format.format)
@@ -6988,6 +7122,11 @@ impl SwapchainBundle {
             .present_mode(selected_present_mode)
             .clipped(true)
             .old_swapchain(old_swapchain);
+        let mut latency_create_info =
+            vk::SwapchainLatencyCreateInfoNV::default().latency_mode_enable(low_latency);
+        if low_latency {
+            create_info = create_info.push_next(&mut latency_create_info);
+        }
         // SAFETY: all swapchain parameters were checked against the current surface capabilities.
         let handle = unsafe { loader.create_swapchain(&create_info, None) }?;
         let mut bundle = Self {
@@ -13486,6 +13625,38 @@ fn sub3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 fn add3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
     [left[0] + right[0], left[1] + right[1], left[2] + right[2]]
+}
+
+/// Проверяет, что устройство способно на NVIDIA Reflex: расширения, `presentId` и timeline semaphore.
+fn low_latency_support(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<(), String> {
+    // SAFETY: the physical device was enumerated from this live instance.
+    let available = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .map_err(|error| format!("не удалось прочитать расширения устройства: {error:?}"))?;
+    let requested = low_latency_device_extensions()
+        .into_iter()
+        .map(CString::from)
+        .collect::<Vec<_>>();
+    let missing = missing_extensions(&requested, &available, "NVIDIA Reflex");
+    if !missing.is_empty() {
+        return Err(missing.join(", "));
+    }
+    let mut present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+    let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut present_id)
+        .push_next(&mut vulkan12);
+    // SAFETY: the physical device belongs to the live instance; both feature structs are chained for the call.
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+    if present_id.present_id != vk::TRUE {
+        return Err("feature presentId недоступна".to_owned());
+    }
+    if vulkan12.timeline_semaphore != vk::TRUE {
+        return Err("feature timelineSemaphore недоступна".to_owned());
+    }
+    Ok(())
 }
 
 fn deduplicate_names(names: Vec<CString>) -> Vec<CString> {

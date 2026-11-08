@@ -7,13 +7,13 @@ use debug_overlay::DebugOverlay;
 use engine_assets::{ASSETS_DIR, AssetError, Assets, ModelAlphaMode};
 use engine_core::Time;
 use engine_files::VirtualPath;
-use engine_project::{BootstrapConfig, BootstrapPresentMode};
+use engine_project::{BootstrapConfig, BootstrapPresentMode, BootstrapReflexMode};
 use engine_render::{
     AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId,
-    MeshId, ParticleBlend, ParticleCollision, ParticleEmitterDesc, ParticleEmitterFrame,
-    ParticleShape, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
-    Tonemapper as RenderTonemapper, ViewSettings,
+    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, LatencyHandle,
+    LatencyMarker, LowLatencyMode, Material, MaterialId, MeshId, ParticleBlend, ParticleCollision,
+    ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape, ProceduralSky, Renderer,
+    RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
@@ -350,6 +350,13 @@ struct Sandbox {
     environment: Option<EnvironmentId>,
     camera_settings: CameraSettings,
     present_mode: Option<BootstrapPresentMode>,
+    reflex: Option<BootstrapReflexMode>,
+    /// Reflex-handle renderer; `None`, если Reflex выключен или не поддержан.
+    latency: Option<LatencyHandle>,
+    /// Счётчик кадров песочницы: id маркеров Reflex и `set_latency_frame`.
+    latency_frame: u64,
+    /// Предыдущий кадр не был показан: следующий кадр не ждёт Reflex, чтобы не блокироваться.
+    previous_skipped: bool,
     pipeline_cache_path: Option<PathBuf>,
     pipeline_cache: Vec<u8>,
     meshes: Vec<(MeshId, MaterialId, bool)>,
@@ -384,6 +391,10 @@ impl Sandbox {
             environment: None,
             camera_settings,
             present_mode,
+            reflex: None,
+            latency: None,
+            latency_frame: 0,
+            previous_skipped: false,
             pipeline_cache_path,
             pipeline_cache,
             meshes: Vec::new(),
@@ -602,11 +613,17 @@ impl WindowHandler for Sandbox {
                     BootstrapPresentMode::Immediate => engine_render::PresentMode::Immediate,
                 })
                 .unwrap_or_default(),
+            low_latency: match self.reflex {
+                Some(BootstrapReflexMode::On) => LowLatencyMode::On,
+                Some(BootstrapReflexMode::Boost) => LowLatencyMode::Boost,
+                Some(BootstrapReflexMode::Off) | None => LowLatencyMode::Off,
+            },
             pipeline_cache: self.pipeline_cache.clone(),
             ..RendererConfig::default()
         };
         match Renderer::new(Arc::clone(&window), size.width, size.height, config) {
             Ok(mut renderer) => {
+                self.latency = renderer.latency_handle();
                 let capabilities = renderer.capabilities();
                 let api_major = (capabilities.api_version >> 22) & 0x7f;
                 let api_minor = (capabilities.api_version >> 12) & 0x3ff;
@@ -661,6 +678,17 @@ impl WindowHandler for Sandbox {
         let _ = self.time.tick();
         if window.is_minimized() == Some(true) {
             return true;
+        }
+        // Reflex: сон перед сэмплированием времени; после пропущенного кадра не ждём.
+        self.latency_frame = self.latency_frame.saturating_add(1);
+        let frame_id = self.latency_frame;
+        if let Some(latency) = self.latency.as_ref() {
+            if !self.previous_skipped {
+                latency.sleep();
+            }
+            latency.marker(frame_id, LatencyMarker::SimulationStart);
+            latency.marker(frame_id, LatencyMarker::InputSample);
+            latency.marker(frame_id, LatencyMarker::SimulationEnd);
         }
         let elapsed = self.time.elapsed().as_secs_f32();
         let Some(renderer) = self.renderer.as_mut() else {
@@ -785,8 +813,10 @@ impl WindowHandler for Sandbox {
             particles: &self.particle_emitters,
             particle_step,
         };
+        renderer.set_latency_frame(frame_id);
         match renderer.render_frame(&frame) {
             Ok(FrameStatus::Presented) => {
+                self.previous_skipped = false;
                 self.previous_elapsed = Some(elapsed);
                 self.presented_frames += 1;
                 if let Some(overlay) = self.debug_overlay.as_mut() {
@@ -809,7 +839,10 @@ impl WindowHandler for Sandbox {
                 }
                 true
             }
-            Ok(FrameStatus::Skipped) => true,
+            Ok(FrameStatus::Skipped) => {
+                self.previous_skipped = true;
+                true
+            }
             Err(error) => {
                 self.failure = Some(format!("ошибка Vulkan render_frame: {error}"));
                 false
@@ -893,6 +926,7 @@ fn main_after_vulkan_environment() -> ExitCode {
         }
     };
     let present_mode = bootstrap.present_mode;
+    let reflex = bootstrap.reflex;
     let default_window = WindowConfig::default();
     let config = WindowConfig {
         title: bootstrap.window_title.unwrap_or(default_window.title),
@@ -944,6 +978,7 @@ fn main_after_vulkan_environment() -> ExitCode {
         pipeline_cache_path,
         pipeline_cache,
     );
+    app.reflex = reflex;
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
     let mut exit_code = match (run_result, failure) {
