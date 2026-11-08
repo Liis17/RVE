@@ -437,7 +437,7 @@ mod screen_shader_asset_tests {
     }
 
     #[test]
-    fn valid_screen_shader_is_packaged_and_invalid_one_names_its_file() {
+    fn valid_screen_shader_passes_project_preparation_and_invalid_one_names_its_file() {
         let good_root = TempDir::create(&std::env::temp_dir(), "rve-build-glsl-good").unwrap();
         create_demo_like_project(good_root.path());
         declare_screen_shader(
