@@ -810,8 +810,11 @@ mod tests {
         for file in [&stale, &fresh, &other] {
             std::fs::write(file, b"partial").unwrap();
         }
+        // Windows требует право записи для SetFileTime, поэтому файл открывается не только на чтение.
         for file in [&stale, &other] {
-            std::fs::File::open(file)
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(file)
                 .unwrap()
                 .set_modified(old_age)
                 .unwrap();
