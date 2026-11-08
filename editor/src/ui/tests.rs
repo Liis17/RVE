@@ -2011,3 +2011,68 @@ fn project_prefabs_panel_loads_the_project_list_on_first_show() {
     );
     assert_eq!(entries[1].max_instances, Some(2));
 }
+
+#[test]
+fn inspector_shows_the_active_tag_and_layer_rows_with_their_defaults() {
+    let mut harness = Harness::new();
+    harness.scene_mut().select(Some("sun"));
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| inspector::show(ui, state));
+    });
+    output.textures_delta.clear();
+    let texts = texts(&output.shapes);
+    position_of(&texts, "Active");
+    position_of(&texts, "Tag");
+    position_of(&texts, "Untagged");
+    position_of(&texts, "Layer");
+    position_of(&texts, "0");
+}
+
+#[test]
+fn an_inactive_parent_marks_its_whole_subtree_inactive_in_the_hierarchy() {
+    let mut harness = Harness::new();
+    let model = VirtualPath::parse("/cube.fbx").unwrap();
+    let scene = harness.scene_mut();
+    let child = scene
+        .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+        .unwrap();
+    scene.set_parent(&child, Some("sun")).unwrap();
+    assert!(scene.inactive_in_hierarchy().is_empty());
+
+    scene
+        .edit_object("sun", None, |object| {
+            object.active = false;
+            Ok(())
+        })
+        .unwrap();
+    let inactive = scene.inactive_in_hierarchy();
+    assert!(inactive.contains("sun"));
+    assert!(inactive.contains(&child));
+    assert!(!inactive.contains("camera"));
+}
+
+#[test]
+fn project_settings_tab_shows_saved_tags_and_layers_and_starts_clean() {
+    let fixture = ProjectFixture::new("");
+    std::fs::write(
+        fixture.0.join("project.rveproject"),
+        "id = \"fixture\"\nname = \"Fixture\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/main.rvescene\"\n\n[tags]\nnames = [\"Player\"]\n\n[layers]\nnames = [\"UI\"]\n",
+    )
+    .unwrap();
+    let mut harness = Harness::new();
+    harness.state.project = Some(OpenProject::open(&fixture.0).unwrap());
+    let input = harness.input(Vec::new());
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| crate::ui::project_tags::show(ui, state));
+    });
+    output.textures_delta.clear();
+    let texts = texts(&output.shapes);
+    position_of(&texts, "Save");
+    position_of(&texts, "Add Tag");
+    position_of(&texts, "Add Layer");
+    let draft = harness.state.tags_layers.as_ref().unwrap();
+    assert!(!draft.is_dirty());
+}

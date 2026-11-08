@@ -99,6 +99,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     let rename_focus = state.hierarchy_rename_focus;
     let query = state.hierarchy_filter.trim();
     let visible = (!query.is_empty()).then(|| filter_visible(&scene.view().objects, query));
+    let inactive = scene.inactive_in_hierarchy();
     egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
         ui.add_enabled_ui(editable, |ui| {
             let children = children_map(&scene.view().objects);
@@ -109,6 +110,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                 rename: rename.as_ref(),
                 rename_focus,
                 visible: visible.as_ref(),
+                inactive: &inactive,
             };
             if let Some(roots) = children.get(&None) {
                 for object in roots.iter().filter(|object| tree.is_visible(object)) {
@@ -153,6 +155,8 @@ struct TreeContext<'a> {
     rename_focus: bool,
     /// Видимые при фильтре объекты; `None` — фильтра нет.
     visible: Option<&'a HashSet<String>>,
+    /// Объекты, которые неактивны сами или через предка; их подписи приглушены.
+    inactive: &'a HashSet<String>,
 }
 
 impl TreeContext<'_> {
@@ -235,6 +239,9 @@ impl TreeContext<'_> {
         });
         if instance.is_some() || part {
             text = text.color(PREFAB_COLOR);
+        }
+        if self.inactive.contains(&object.id) {
+            text = text.weak();
         }
         // Иконка по компонентам объекта; без текстуры строка остаётся одной подписью.
         if let Some(texture) = object_icon(object).and_then(|name| self.icons.get(name)) {

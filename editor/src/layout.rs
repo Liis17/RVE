@@ -17,11 +17,13 @@ pub enum Tab {
     SceneAssets,
     /// Подокно списка тяжёлых префабов `prefabs.rveprefabs` проекта.
     ProjectPrefabs,
+    /// Подокно тегов и слоёв `[tags]` и `[layers]` в `project.rveproject`.
+    ProjectSettings,
     Profiler,
 }
 
 impl Tab {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
@@ -30,6 +32,7 @@ impl Tab {
         Self::Console,
         Self::SceneAssets,
         Self::ProjectPrefabs,
+        Self::ProjectSettings,
         Self::Profiler,
     ];
 
@@ -43,6 +46,7 @@ impl Tab {
             Self::Console => "Console",
             Self::SceneAssets => "Scene Assets",
             Self::ProjectPrefabs => "Project Prefabs",
+            Self::ProjectSettings => "Project Settings",
             Self::Profiler => "Profiler",
         }
     }
@@ -88,6 +92,7 @@ impl TabViewer for EditorTabs<'_> {
             Tab::Console => ui::console::show(ui, self.state),
             Tab::SceneAssets => ui::scene_assets::show(ui, self.state),
             Tab::ProjectPrefabs => ui::project_prefabs::show(ui, self.state),
+            Tab::ProjectSettings => ui::project_tags::show(ui, self.state),
             Tab::Profiler => ui::profiler::show(ui, self.state),
         }
     }
@@ -115,8 +120,11 @@ mod tests {
                 .iter_all_tabs()
                 .filter(|(_, open)| **open == tab)
                 .count();
-            // Подокна Scene Assets и Project Prefabs открываются из меню Window.
-            let optional = matches!(tab, Tab::SceneAssets | Tab::ProjectPrefabs);
+            // Подокна Scene Assets, Project Prefabs и Project Settings открываются из меню Window.
+            let optional = matches!(
+                tab,
+                Tab::SceneAssets | Tab::ProjectPrefabs | Tab::ProjectSettings
+            );
             let expected = usize::from(!optional);
             assert_eq!(count, expected, "{tab:?}");
         }

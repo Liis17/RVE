@@ -8,6 +8,7 @@ pub mod inspector;
 pub mod profiler;
 pub mod project_panel;
 pub mod project_prefabs;
+pub mod project_tags;
 pub mod scene_assets;
 pub mod scene_view;
 pub mod toolbar;
