@@ -204,6 +204,20 @@ impl SceneDocument {
                     "id должен соответствовать [A-Za-z0-9_-]{1,64}",
                 ));
             }
+            if !object.tag.is_empty() && !valid_ascii_name(&object.tag, true) {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    "tag должен соответствовать [A-Za-z0-9_-]{1,64}",
+                ));
+            }
+            if object.layer >= LAYER_COUNT {
+                return Err(SceneError::new(
+                    source,
+                    Some(&object.id),
+                    format!("layer должен быть в диапазоне 0..{LAYER_COUNT}"),
+                ));
+            }
             if object_indices.insert(object.id.as_str(), index).is_some() {
                 return Err(SceneError::new(
                     source,
@@ -590,7 +604,7 @@ pub struct SceneAsset {
 }
 
 /// Объект сцены в порядке документа.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneObject {
     pub id: String,
@@ -598,6 +612,15 @@ pub struct SceneObject {
     pub name: Option<String>,
     #[serde(default)]
     pub parent: Option<String>,
+    /// `false` скрывает объект и его поддерево из кадра, физики, звука и скриптов.
+    #[serde(default = "default_active", skip_serializing_if = "is_active")]
+    pub active: bool,
+    /// Тег из `[tags]` проекта; пустая строка означает отсутствие тега.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+    /// Слой `0..32` из `[layers]` проекта.
+    #[serde(default, skip_serializing_if = "is_default_layer")]
+    pub layer: u8,
     #[serde(default)]
     pub transform: SceneTransform,
     #[serde(default)]
@@ -634,6 +657,53 @@ pub struct SceneObject {
     #[serde(default)]
     pub heavy_scripts: Vec<HeavyScript>,
 }
+
+impl Default for SceneObject {
+    /// Пустой объект активен: `bool::default()` дал бы `false`, поэтому реализация ручная.
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: None,
+            parent: None,
+            active: true,
+            tag: String::new(),
+            layer: 0,
+            transform: SceneTransform::default(),
+            camera: None,
+            mesh_renderer: None,
+            lod_group: None,
+            directional_light: None,
+            point_light: None,
+            spot_light: None,
+            environment: None,
+            collider: None,
+            rigid_body: None,
+            character_controller: None,
+            audio_source: None,
+            animator: None,
+            particle_emitter: None,
+            network_identity: None,
+            network_transform: None,
+            lite_scripts: Vec::new(),
+            heavy_scripts: Vec::new(),
+        }
+    }
+}
+
+fn default_active() -> bool {
+    true
+}
+
+fn is_active(active: &bool) -> bool {
+    *active
+}
+
+fn is_default_layer(layer: &u8) -> bool {
+    *layer == 0
+}
+
+/// Число слоёв проекта; `layer` объекта меньше этого значения.
+pub const LAYER_COUNT: u8 = 32;
 
 impl SceneObject {
     pub fn display_name(&self) -> &str {

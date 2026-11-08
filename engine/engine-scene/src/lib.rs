@@ -65,6 +65,6 @@ pub use prefab::{
 };
 pub use world::{
     EnvironmentState, LightState, LocalLightState, LocalTransform, MAX_GENERATION,
-    MAX_LIVE_OBJECTS, MeshInstance, ObjectHandle, ParticleEmitterInstance, SceneFrame,
+    MAX_LIVE_OBJECTS, MeshInstance, ObjectEdit, ObjectHandle, ParticleEmitterInstance, SceneFrame,
     SceneWarning, SpawnOptions, World, WorldObject,
 };
