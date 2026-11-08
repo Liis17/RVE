@@ -28,6 +28,7 @@ use ui::{
     validate_texture_region, validate_viewport_size,
 };
 
+mod ambient_occlusion;
 mod bloom;
 mod clusters;
 mod culling;
@@ -37,6 +38,7 @@ mod particle_gpu;
 mod particles;
 mod post;
 
+use ambient_occlusion::{AoPipelines, AoRecord, AoTarget, record_ambient_occlusion};
 use bloom::{
     BloomChain, BloomPipelines, BloomRecord, bloom_record, record_bloom, write_composite_bloom,
 };
@@ -787,6 +789,10 @@ pub enum GpuPass {
     ShadowDirectional,
     /// Локальные теневые слои.
     ShadowLocal,
+    /// Depth prepass непрозрачных мешей; отсутствует, если AO выключен.
+    DepthPrepass,
+    /// GTAO и denoise; отсутствует, если AO выключен.
+    AmbientOcclusion,
     /// Непрозрачные и маскированные меши.
     Opaque,
     /// Skybox.
@@ -811,12 +817,14 @@ pub enum GpuPass {
 
 impl GpuPass {
     /// Число проходов, для которых записываются границы.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 15;
     /// Все проходы в порядке выполнения.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Clusters,
         Self::ShadowDirectional,
         Self::ShadowLocal,
+        Self::DepthPrepass,
+        Self::AmbientOcclusion,
         Self::Opaque,
         Self::Skybox,
         Self::Transparent,
@@ -835,6 +843,8 @@ impl GpuPass {
             Self::Clusters => "Clusters",
             Self::ShadowDirectional => "Shadow directional",
             Self::ShadowLocal => "Shadow local",
+            Self::DepthPrepass => "Depth prepass",
+            Self::AmbientOcclusion => "Ambient occlusion",
             Self::Opaque => "Opaque",
             Self::Skybox => "Skybox",
             Self::Transparent => "Transparent",
@@ -1058,6 +1068,11 @@ pub struct Renderer {
     exposure_semaphore: vk::Semaphore,
     exposure_semaphore_signaled: bool,
     filter_pipelines: Option<FilterPipelines>,
+    ao_pipelines: Option<AoPipelines>,
+    /// Вариант непрозрачного пайплайна с LESS_OR_EQUAL для прохода после prepass.
+    opaque_equal_pipeline: Option<vk::Pipeline>,
+    /// Depth-only пайплайн непрозрачных мешей для prepass.
+    prepass_pipeline: Option<vk::Pipeline>,
     taa_set_layout: Option<vk::DescriptorSetLayout>,
     taa_pipeline_layout: Option<vk::PipelineLayout>,
     taa_pipeline: Option<vk::Pipeline>,
@@ -1198,6 +1213,9 @@ impl Renderer {
             exposure_semaphore: vk::Semaphore::null(),
             exposure_semaphore_signaled: false,
             filter_pipelines: None,
+            ao_pipelines: None,
+            opaque_equal_pipeline: None,
+            prepass_pipeline: None,
             taa_set_layout: None,
             taa_pipeline_layout: None,
             taa_pipeline: None,
@@ -2027,6 +2045,16 @@ impl Renderer {
         let queue = self.queue;
         let taa_set_layout = self.taa_set_layout()?;
         let bloom_layout = self.texture_set_layout()?;
+        let ao_layout = self
+            .ao_pipelines
+            .ok_or(RenderError::InvalidState("ao pipelines отсутствуют"))?
+            .set_layout();
+        let white_ao_view = self
+            .textures
+            .get(WHITE_LINEAR_TEXTURE)
+            .and_then(Option::as_ref)
+            .map(|texture| texture.image.view)
+            .ok_or(RenderError::InvalidState("белая текстура отсутствует"))?;
         let bloom_pipelines = self.bloom_pipelines;
         let exposure_layout = self
             .exposure_pipelines
@@ -2038,6 +2066,9 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("filter pipelines отсутствуют"))?
             .set_layout();
         let filter_pipelines = self.filter_pipelines;
+        let ao_pipelines = self.ao_pipelines;
+        let opaque_equal_pipeline = self.opaque_equal_pipeline;
+        let prepass_pipeline = self.prepass_pipeline;
         let exposure_dt_ms =
             temporal_frame_delta_ms(self.screen_temporal.last_submitted_at, submitted_at);
         let frame_resources = self
@@ -2218,6 +2249,26 @@ impl Renderer {
                 post_sampler,
             )?);
         }
+        if post_frame.plan.ambient_occlusion
+            && let Some(target) = frame_resources.target.as_mut()
+            && target.scene.ao.is_none()
+        {
+            target.scene.ao = Some(AoTarget::new(
+                &instance,
+                &device,
+                self.physical_device,
+                target.render_extent,
+                target.scene.depth.view,
+                ao_layout,
+            )?);
+        }
+        let frame_ao_view = frame_resources
+            .target
+            .as_ref()
+            .and_then(|target| target.scene.ao.as_ref())
+            .filter(|_| post_frame.plan.ambient_occlusion)
+            .map_or(white_ao_view, |ao| ao.filtered.view);
+        write_frame_ao(&device, frame_set, frame_ao_view);
         if post_frame.plan.motion_blur || post_frame.plan.depth_of_field {
             let filter_extent = if view.anti_aliasing.is_temporal() {
                 output_extent
@@ -2365,6 +2416,11 @@ impl Renderer {
                 exposure_dt_ms,
                 reset_history: frame.reset_history,
                 filter_pipelines,
+                ao_pipelines,
+                opaque_equal_pipeline,
+                prepass_pipeline,
+                depth_prepass: post_frame.plan.depth_prepass && prepass_pipeline.is_some(),
+                projection_scale: [frame.camera.projection[0][0], frame.camera.projection[1][1]],
                 particles: particle_pass,
             };
             let frame_resources = &mut self.frames[frame_slot];
@@ -2957,6 +3013,16 @@ impl Renderer {
         let framebuffer_is_srgb = is_srgb_format(self.surface_format.format);
         let physical_device = self.physical_device;
         let mut rendered = Vec::with_capacity(scenes.len());
+        let ao_set_layout = self
+            .ao_pipelines
+            .ok_or(RenderError::InvalidState("ao pipelines отсутствуют"))?
+            .set_layout();
+        let white_ao_view = self
+            .textures
+            .get(WHITE_LINEAR_TEXTURE)
+            .and_then(Option::as_ref)
+            .map(|texture| texture.image.view)
+            .ok_or(RenderError::InvalidState("белая текстура отсутствует"))?;
         let mut exposure_work = false;
         for ((scene, prepared_scene), environment) in scenes
             .iter()
@@ -3036,6 +3102,23 @@ impl Renderer {
                 frame_serial,
                 camera_near_far(frame.camera.projection),
             );
+            if post_frame.plan.ambient_occlusion && target.scene.ao.is_none() {
+                target.scene.ao = Some(AoTarget::new(
+                    &instance,
+                    &device,
+                    physical_device,
+                    target.render_extent,
+                    target.scene.depth.view,
+                    ao_set_layout,
+                )?);
+            }
+            let frame_ao_view = target
+                .scene
+                .ao
+                .as_ref()
+                .filter(|_| post_frame.plan.ambient_occlusion)
+                .map_or(white_ao_view, |ao| ao.filtered.view);
+            write_frame_ao(&device, frame_set, frame_ao_view);
             if post_frame.plan.bloom_mips > 0 && target.bloom.is_none() {
                 target.bloom = Some(BloomChain::new(
                     &instance,
@@ -3166,6 +3249,9 @@ impl Renderer {
         let bloom_pipelines = self.bloom_pipelines;
         let exposure_pipelines = self.exposure_pipelines;
         let filter_pipelines = self.filter_pipelines;
+        let ao_pipelines = self.ao_pipelines;
+        let opaque_equal_pipeline = self.opaque_equal_pipeline;
+        let prepass_pipeline = self.prepass_pipeline;
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -3242,6 +3328,15 @@ impl Renderer {
                             exposure_dt_ms: *frame_delta_ms,
                             reset_history: frame.reset_history,
                             filter_pipelines,
+                            ao_pipelines,
+                            opaque_equal_pipeline,
+                            prepass_pipeline,
+                            depth_prepass: post_frame.plan.depth_prepass
+                                && prepass_pipeline.is_some(),
+                            projection_scale: [
+                                frame.camera.projection[0][0],
+                                frame.camera.projection[1][1],
+                            ],
                             particles: particle_pipelines.map(|pipelines| ParticlePass {
                                 works: &particle_works[index],
                                 pipelines,
@@ -4272,6 +4367,11 @@ impl Renderer {
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let frame_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&frame_bindings);
@@ -4470,7 +4570,7 @@ impl Renderer {
                 .descriptor_count(self.frames.len() as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count((self.frames.len() * 2) as u32),
+                .descriptor_count((self.frames.len() * 3) as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(self.frames.len() as u32),
@@ -5873,6 +5973,16 @@ impl Renderer {
         let overdraw_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(false)
             .depth_write_enable(false);
+        let opaque_equal_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let prepass_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let prepass_stages = [vertex_stage];
+        let no_color_blend = vk::PipelineColorBlendStateCreateInfo::default();
         let wireframe_rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_bias_enable(true)
             .depth_bias_constant_factor(-1.0)
@@ -5909,6 +6019,11 @@ impl Renderer {
         let mut wireframe_rendering_info = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(DEPTH_FORMAT);
+        let mut opaque_equal_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let mut prepass_rendering_info =
+            vk::PipelineRenderingCreateInfo::default().depth_attachment_format(DEPTH_FORMAT);
         let pipeline_layout = self
             .pipeline_layout
             .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
@@ -5961,6 +6076,30 @@ impl Renderer {
                 .dynamic_state(&dynamic_state)
                 .layout(pipeline_layout)
                 .push_next(&mut overdraw_rendering_info),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&opaque_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&opaque_equal_depth_stencil)
+                .color_blend_state(&color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut opaque_equal_rendering_info),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&prepass_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&prepass_depth_stencil)
+                .color_blend_state(&no_color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut prepass_rendering_info),
         ];
         // SAFETY: shader modules, layout and dynamic-rendering formats are valid for this device.
         let mut pipelines = match unsafe {
@@ -5975,7 +6114,7 @@ impl Renderer {
                 return Err(RenderError::Vulkan(error));
             }
         };
-        if pipelines.len() != 4 {
+        if pipelines.len() != 6 {
             for pipeline in pipelines {
                 // SAFETY: these pipeline handles were returned by this device.
                 unsafe { device.destroy_pipeline(pipeline, None) };
@@ -5988,6 +6127,8 @@ impl Renderer {
         self.mask_pipeline = Some(pipelines.remove(0));
         self.blend_pipeline = Some(pipelines.remove(0));
         self.overdraw_pipeline = Some(pipelines.remove(0));
+        self.opaque_equal_pipeline = Some(pipelines.remove(0));
+        self.prepass_pipeline = Some(pipelines.remove(0));
         if self.capabilities.wireframe {
             let wireframe_info = [vk::GraphicsPipelineCreateInfo::default()
                 .stages(&wireframe_stages)
@@ -6127,6 +6268,7 @@ impl Renderer {
         )?);
         self.exposure_pipelines = Some(ExposurePipelines::new(&device, cache)?);
         self.filter_pipelines = Some(FilterPipelines::new(&device, cache)?);
+        self.ao_pipelines = Some(AoPipelines::new(&device, cache)?);
         // SAFETY: a default semaphore creation has no borrowed inputs.
         self.exposure_semaphore =
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
@@ -6638,6 +6780,19 @@ impl Drop for Renderer {
             }
             if let Some(pipelines) = self.filter_pipelines.take() {
                 pipelines.destroy(device);
+            }
+            if let Some(pipelines) = self.ao_pipelines.take() {
+                pipelines.destroy(device);
+            }
+            for pipeline in [
+                self.opaque_equal_pipeline.take(),
+                self.prepass_pipeline.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                // SAFETY: the device is idle, so no command buffer uses the mesh variant.
+                unsafe { device.destroy_pipeline(pipeline, None) };
             }
             let exposure_semaphore =
                 std::mem::replace(&mut self.exposure_semaphore, vk::Semaphore::null());
@@ -7549,6 +7704,8 @@ struct OffscreenTarget {
     /// Набор с depth для проходов частиц; пул освобождается вместе с целью.
     _depth_pool: OwnedDescriptorPool,
     depth_set: vk::DescriptorSet,
+    /// Экранный AO цели; создаётся, когда эффект запланирован, и живёт вместе с целью.
+    ao: Option<AoTarget>,
 }
 
 impl OffscreenTarget {
@@ -7594,6 +7751,7 @@ impl OffscreenTarget {
             depth_layout: vk::ImageLayout::UNDEFINED,
             _depth_pool: depth_pool,
             depth_set,
+            ao: None,
         })
     }
 }
@@ -7697,6 +7855,21 @@ impl FrameTarget {
 }
 
 /// Заполняет набор дескрипторов кадра: uniform, shadow map и локальные источники.
+#[allow(clippy::too_many_arguments)]
+/// Привязывает экранный AO цели к binding 8 набора кадра; вызывается каждый кадр до записи.
+fn write_frame_ao(device: &ash::Device, set: vk::DescriptorSet, view: vk::ImageView) {
+    let image_info = [vk::DescriptorImageInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(8)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+        .image_info(&image_info)];
+    // SAFETY: the set and view are alive and the set is not used by in-flight work.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_frame_set(
     device: &ash::Device,
@@ -7879,7 +8052,7 @@ impl ViewportFrameSet {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(2),
+                .descriptor_count(3),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
@@ -9793,6 +9966,52 @@ fn begin_command_buffer(
 
 /// Записывает cluster, shadow и scene pass; цвет цели остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
 #[allow(clippy::too_many_arguments)]
+/// Записывает depth prepass непрозрачных мешей. Глубина очищается здесь, основной проход её загружает.
+fn record_depth_prepass(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    target: &OffscreenTarget,
+    render_extent: vk::Extent2D,
+    scene: &ScenePass<'_>,
+) {
+    let depth_attachment = vk::RenderingAttachmentInfo::default()
+        .image_view(target.depth.view)
+        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .clear_value(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        });
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: render_extent,
+        })
+        .layer_count(1)
+        .depth_attachment(&depth_attachment);
+    // SAFETY: the depth view covers the render extent and matches the prepass pipeline.
+    unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
+    record_draws(
+        device,
+        command_buffer,
+        render_extent,
+        scene,
+        DrawPass::Prepass,
+    );
+    // SAFETY: this matches the preceding cmd_begin_rendering call.
+    unsafe { device.cmd_end_rendering(command_buffer) };
+    mark_pass(
+        device,
+        command_buffer,
+        scene.timestamps,
+        GpuPass::DepthPrepass,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_scene(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -10029,10 +10248,70 @@ fn record_scene(
                 color: vk::ClearColorValue { float32: [0.0; 4] },
             }),
     ];
+    if scene.depth_prepass {
+        record_depth_prepass(device, command_buffer, target, render_extent, scene);
+    }
+    if scene.depth_prepass
+        && scene.post.plan.ambient_occlusion
+        && let (Some(pipelines), Some(ao)) = (scene.ao_pipelines, target.ao.as_mut())
+    {
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                target.depth.image,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+                depth_subresource_range(),
+            ),
+        );
+        let gtao = post::ao_parameters(
+            &scene.post.ao,
+            scene.projection_scale,
+            scene.post.filters.near_far,
+            (render_extent.width, render_extent.height),
+        );
+        record_ambient_occlusion(
+            device,
+            command_buffer,
+            render_extent,
+            AoRecord {
+                target: ao,
+                pipelines,
+                gtao,
+                near_far: scene.post.filters.near_far,
+            },
+            scene.timestamps,
+        );
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                target.depth.image,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                depth_subresource_range(),
+            ),
+        );
+    }
     let depth_attachment = vk::RenderingAttachmentInfo::default()
         .image_view(target.depth.view)
         .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(if scene.depth_prepass {
+            vk::AttachmentLoadOp::LOAD
+        } else {
+            vk::AttachmentLoadOp::CLEAR
+        })
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
@@ -10484,6 +10763,8 @@ fn record_skybox(
 
 #[derive(Clone, Copy)]
 enum DrawPass {
+    /// Непрозрачные меши без маски: только глубина, перед основным проходом.
+    Prepass,
     OpaqueAndMask,
     Blend,
     Overdraw,
@@ -10525,6 +10806,13 @@ struct ScenePass<'a> {
     exposure_dt_ms: f32,
     reset_history: bool,
     filter_pipelines: Option<FilterPipelines>,
+    ao_pipelines: Option<AoPipelines>,
+    opaque_equal_pipeline: Option<vk::Pipeline>,
+    prepass_pipeline: Option<vk::Pipeline>,
+    /// Prepass записан: основной непрозрачный проход использует LESS_OR_EQUAL и загружает глубину.
+    depth_prepass: bool,
+    /// (proj[0][0], proj[1][1]) камеры для восстановления позиции по глубине в AO.
+    projection_scale: [f32; 2],
     particles: Option<ParticlePass<'a>>,
 }
 
@@ -10617,6 +10905,10 @@ fn record_draws(
             continue;
         };
         let pipeline_kind = match pass {
+            DrawPass::Prepass => match material.alpha_mode {
+                AlphaMode::Opaque => DrawPipeline::Prepass,
+                AlphaMode::Mask { .. } | AlphaMode::Blend => continue,
+            },
             DrawPass::Overdraw => DrawPipeline::Overdraw,
             DrawPass::Wireframe => DrawPipeline::Wireframe,
             DrawPass::OpaqueAndMask => match material.alpha_mode {
@@ -10631,6 +10923,13 @@ fn record_draws(
         };
         if bound_pipeline != Some(pipeline_kind) {
             let pipeline = match pipeline_kind {
+                DrawPipeline::Prepass => match scene.prepass_pipeline {
+                    Some(pipeline) => pipeline,
+                    None => continue,
+                },
+                DrawPipeline::Opaque if scene.depth_prepass => {
+                    scene.opaque_equal_pipeline.unwrap_or(scene.pipeline)
+                }
                 DrawPipeline::Opaque => scene.pipeline,
                 DrawPipeline::Mask => scene.mask_pipeline,
                 DrawPipeline::Blend => scene.blend_pipeline,
@@ -10705,6 +11004,7 @@ fn record_draws(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DrawPipeline {
+    Prepass,
     Opaque,
     Mask,
     Blend,
@@ -17100,21 +17400,23 @@ mod tests {
 
     #[test]
     fn view_timings_split_ticks_between_recorded_boundaries() {
-        // Начало, затем граница после каждого из тринадцати проходов в порядке выполнения.
+        // Начало, затем граница после каждого из пятнадцати проходов в порядке выполнения.
         let marks = [
             Some(100),
             Some(110),
             Some(125),
             Some(140),
+            Some(145),
             Some(150),
             Some(160),
-            Some(170),
+            Some(165),
+            Some(175),
+            Some(180),
             Some(185),
             Some(190),
             Some(195),
             Some(200),
             Some(205),
-            Some(210),
             Some(215),
         ];
         let view = decode_view(ProfiledView::Screen, &marks, 64, 1.0).unwrap();
@@ -17126,16 +17428,18 @@ mod tests {
                 Some(ns(10)),
                 Some(ns(15)),
                 Some(ns(15)),
+                Some(ns(5)),
+                Some(ns(5)),
                 Some(ns(10)),
+                Some(ns(5)),
                 Some(ns(10)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(5)),
                 Some(ns(10)),
-                Some(ns(15)),
-                Some(ns(5)),
-                Some(ns(5)),
-                Some(ns(5)),
-                Some(ns(5)),
-                Some(ns(5)),
-                Some(ns(5)),
             ]
         );
         assert_eq!(view.total, ns(115));
@@ -17301,7 +17605,7 @@ mod tests {
 
     #[test]
     fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
-        assert_eq!(TIMESTAMP_QUERY_COUNT, 58);
+        assert_eq!(TIMESTAMP_QUERY_COUNT, 66);
         let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
         let mut layout = GpuProfileLayout::default();
         for index in 0..MAX_PROFILED_VIEWS {

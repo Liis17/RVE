@@ -67,13 +67,13 @@ const SHADERS: &[ShaderBuild] = &[
     (
         "mesh.frag",
         naga::ShaderStage::Fragment,
-        &[("ALPHA_MASK", "1")],
+        &[("ALPHA_MASK", "1"), ("NO_SCREEN_AO", "1")],
         "mesh.frag.mask.spv",
     ),
     (
         "mesh.frag",
         naga::ShaderStage::Fragment,
-        &[("ALPHA_BLEND", "1")],
+        &[("ALPHA_BLEND", "1"), ("NO_SCREEN_AO", "1")],
         "mesh.frag.blend.spv",
     ),
     (
@@ -186,6 +186,18 @@ const SHADERS: &[ShaderBuild] = &[
         naga::ShaderStage::Fragment,
         &[],
         "bloom_downsample.frag.spv",
+    ),
+    (
+        "gtao.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "gtao.comp.spv",
+    ),
+    (
+        "gtao_denoise.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "gtao_denoise.comp.spv",
     ),
     (
         "bloom_upsample.frag",

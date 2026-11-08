@@ -724,6 +724,63 @@ fn linear_depth(depth: f32, near: f32, far: f32) -> f32 {
     near * far / (far - depth * (far - near))
 }
 
+/// Число направлений и шагов поиска горизонта для качества AO.
+pub fn ao_sampling(quality: AmbientOcclusionQuality) -> (u32, u32) {
+    match quality {
+        AmbientOcclusionQuality::Low => (4, 3),
+        AmbientOcclusionQuality::Medium => (6, 4),
+        AmbientOcclusionQuality::High => (8, 6),
+    }
+}
+
+/// Push constants GTAO: масштабы проекции и плоскости, радиус, интенсивность, спад, направления,
+/// размер цели и шаги. Раскладка совпадает с `gtao.comp`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AoParams {
+    pub projection_near_far: [f32; 4],
+    pub radius_intensity_falloff_slices: [f32; 4],
+    pub size_steps: [f32; 4],
+}
+
+impl AoParams {
+    /// Байты push constants в порядке записи.
+    pub fn to_bytes(self) -> [u8; 48] {
+        let mut bytes = [0; 48];
+        for (index, value) in self
+            .projection_near_far
+            .iter()
+            .chain(&self.radius_intensity_falloff_slices)
+            .chain(&self.size_steps)
+            .enumerate()
+        {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
+    }
+}
+
+/// Строит параметры GTAO для цели. `projection_scale` — (proj[0][0], proj[1][1]);
+/// `near_far` — плоскости камеры; `size` — разрешение цели глубины.
+pub fn ao_parameters(
+    ao: &AmbientOcclusion,
+    projection_scale: [f32; 2],
+    near_far: [f32; 2],
+    size: (u32, u32),
+) -> AoParams {
+    let (slices, steps) = ao_sampling(ao.quality);
+    AoParams {
+        projection_near_far: [
+            projection_scale[0],
+            projection_scale[1],
+            near_far[0],
+            near_far[1],
+        ],
+        radius_intensity_falloff_slices: [ao.radius, ao.intensity, ao.falloff, slices as f32],
+        size_steps: [size.0 as f32, size.1 as f32, steps as f32, 0.0],
+    }
+}
+
 /// Зерно считается по сиду кадра; ограничение по модулю сохраняет точность `f32`.
 const GRAIN_SEED_PERIOD: u32 = 4096;
 
@@ -735,6 +792,8 @@ pub struct PostFrame {
     pub grain: [f32; 4],
     /// Параметры motion blur и DoF; DoF задан на единицу высоты источника (см. `filters.rs`).
     pub filters: FilterParams,
+    /// Настройки экранного AO; применяются только при плане prepass.
+    pub ao: AmbientOcclusion,
 }
 
 impl PostFrame {
@@ -762,6 +821,7 @@ impl PostFrame {
                     .then(|| dof_parameters(&post.depth_of_field, 1.0)),
                 near_far,
             },
+            ao: post.ambient_occlusion,
         }
     }
 }
@@ -1157,6 +1217,37 @@ mod tests {
         );
         assert_eq!(wireframe.filters.motion, None);
         assert_eq!(wireframe.filters.dof, None);
+    }
+
+    #[test]
+    fn ambient_occlusion_quality_scales_sample_counts() {
+        assert_eq!(ao_sampling(AmbientOcclusionQuality::Low), (4, 3));
+        assert_eq!(ao_sampling(AmbientOcclusionQuality::Medium), (6, 4));
+        assert_eq!(ao_sampling(AmbientOcclusionQuality::High), (8, 6));
+    }
+
+    #[test]
+    fn ambient_occlusion_parameters_carry_camera_planes_and_radius_in_meters() {
+        let ao = AmbientOcclusion {
+            enabled: true,
+            radius: 0.75,
+            intensity: 1.5,
+            falloff: 0.4,
+            quality: AmbientOcclusionQuality::High,
+        };
+        let params = ao_parameters(&ao, [1.8, 2.4], [0.1, 1000.0], (1280, 720));
+        assert_eq!(params.projection_near_far, [1.8, 2.4, 0.1, 1000.0]);
+        assert_eq!(
+            params.radius_intensity_falloff_slices,
+            [0.75, 1.5, 0.4, 8.0]
+        );
+        assert_eq!(params.size_steps, [1280.0, 720.0, 6.0, 0.0]);
+        let bytes = params.to_bytes();
+        assert_eq!(bytes.len(), 48);
+        assert_eq!(
+            f32::from_ne_bytes(bytes[12..16].try_into().unwrap()),
+            1000.0
+        );
     }
 
     #[test]
