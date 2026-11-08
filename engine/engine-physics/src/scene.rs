@@ -67,6 +67,7 @@ pub enum PhysicsSceneError {
     MissingModelGeometry(String),
     InvalidModelGeometry(String),
     ModelPathRepeated(String),
+    UnresolvedPhysicsMaterial(String),
 }
 
 impl fmt::Display for PhysicsSceneError {
@@ -108,6 +109,9 @@ impl fmt::Display for PhysicsSceneError {
             }
             Self::ModelPathRepeated(path) => {
                 write!(formatter, "CPU model geometry path {path:?} is repeated")
+            }
+            Self::UnresolvedPhysicsMaterial(path) => {
+                write!(formatter, "physics material {path:?} is not loaded")
             }
         }
     }
@@ -626,7 +630,7 @@ fn scene_body(
     if kind == BodyKind::Dynamic && object.parent.is_some() {
         return Err(PhysicsSceneError::DynamicObjectMustBeRoot(object.handle));
     }
-    let material = collider_material(&collider);
+    let material = collider_material(&collider)?;
     let shape = build_shape(
         collider.clone(),
         transform.scale,
@@ -648,14 +652,18 @@ fn scene_body(
 }
 
 /// Материал коллайдера: разрешённый `.rvephysmat`, если он задан, иначе инлайн-поля. Загрузчик
-/// сцены и префабов читает файл до построения физики, поэтому без разрешённого значения берутся
-/// значения по умолчанию материала.
-fn collider_material(collider: &ColliderComponent) -> PhysicsMaterial {
+/// сцены и префабов читает файл до построения физики; если файл не разрешён, это ошибка, а не
+/// молчаливый переход к значениям по умолчанию.
+fn collider_material(collider: &ColliderComponent) -> Result<PhysicsMaterial, PhysicsSceneError> {
     match (&collider.material, &collider.resolved_material) {
-        (Some(_), settings) => physics_material(settings.unwrap_or_default()),
-        (None, _) => {
-            PhysicsMaterial::from_friction_restitution(collider.friction, collider.restitution)
-        }
+        (Some(_), Some(settings)) => Ok(physics_material(*settings)),
+        (Some(path), None) => Err(PhysicsSceneError::UnresolvedPhysicsMaterial(
+            path.as_str().to_owned(),
+        )),
+        (None, _) => Ok(PhysicsMaterial::from_friction_restitution(
+            collider.friction,
+            collider.restitution,
+        )),
     }
 }
 
@@ -1411,5 +1419,56 @@ mod tests {
             material_of("inline"),
             PhysicsMaterial::from_friction_restitution(0.2, 0.8)
         );
+    }
+
+    #[test]
+    fn unresolved_material_asset_is_an_error_instead_of_default_friction() {
+        let text = "[[assets]]\npath=\"/materials/ice.rvephysmat\"\n\
+                    [[objects]]\nid='camera'\n[objects.camera]\n\
+                    [[objects]]\nid='ice'\n[objects.collider]\nshape='box'\n\
+                    half_extents=[0.5,0.5,0.5]\nmaterial='/materials/ice.rvephysmat'\n";
+        let scene = world(text);
+        assert_eq!(
+            PhysicsSceneDesc::from_world(&scene, &[], Vec3::ZERO, 60, 8).unwrap_err(),
+            PhysicsSceneError::UnresolvedPhysicsMaterial("materials/ice.rvephysmat".to_owned())
+        );
+    }
+
+    #[test]
+    fn spawned_prefab_material_reaches_its_body_and_unresolved_spawn_is_rejected() {
+        let rubber_ball = "[[assets]]\npath = \"/materials/rubber.rvephysmat\"\n\
+            [[objects]]\nid = \"root\"\n[objects.collider]\nshape = \"sphere\"\nradius = 0.5\n\
+            material = \"/materials/rubber.rvephysmat\"\n\
+            [objects.rigid_body]\nkind = \"dynamic\"\nmass = 1.0\n";
+        let path = VirtualPath::parse("prefabs/ball.rveprefab").unwrap();
+        let mut template =
+            PrefabTemplate::load(&path, &mut |_| Ok(rubber_ball.to_owned())).unwrap();
+        let mut scene = world(CAMERA);
+        let mut sync = PhysicsSceneSync::new(&scene, Vec::new()).unwrap();
+        let mut cache = ShapeCache::default();
+
+        let unresolved = spawn_one(&mut scene, &template, Vec3::ZERO);
+        assert_eq!(
+            sync.insert_objects(&scene, &[unresolved], &[], &mut cache)
+                .unwrap_err(),
+            PhysicsSceneSyncError::Scene(PhysicsSceneError::UnresolvedPhysicsMaterial(
+                "materials/rubber.rvephysmat".to_owned()
+            ))
+        );
+        assert!(sync.bindings().is_empty());
+
+        template
+            .resolve_physics_materials(&mut |_| {
+                Ok("static_friction = 0.8\ndynamic_friction = 0.6\nbounciness = 0.7\n".to_owned())
+            })
+            .unwrap();
+        let resolved = spawn_one(&mut scene, &template, Vec3::X * 2.0);
+        let changes = sync
+            .insert_objects(&scene, &[resolved], &[], &mut cache)
+            .unwrap();
+        let (_, desc) = insert_body(&changes[0]);
+        assert_eq!(desc.collider.material.static_friction, 0.8);
+        assert_eq!(desc.collider.material.dynamic_friction, 0.6);
+        assert_eq!(desc.collider.material.bounciness, 0.7);
     }
 }
