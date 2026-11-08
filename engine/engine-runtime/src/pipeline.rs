@@ -1467,7 +1467,7 @@ fn scripts_thread(
         let made =
             make_snapshot(scene_frame, &world, &gpu_scene, &animation).map(|mut snapshot| {
                 snapshot.sim_time = sim_time;
-                snapshot.screen_shaders.time = sim_time as f32;
+                snapshot.screen_shaders.time = screen_shader_time(sim_time);
                 snapshot
             });
         timings.record(
@@ -2293,6 +2293,12 @@ fn spawn_particle_requests(
 /// Первый кадр шага не получает, чтобы время загрузки не превратилось в скачок.
 fn particle_step(sim_time: f64, last_submitted: Option<f64>) -> f32 {
     last_submitted.map_or(0.0, |last| (sim_time - last).max(0.0) as f32)
+}
+
+/// Время для `rve.time` экранных шейдеров: остаток от 3600 считается в f64, иначе после долгой
+/// игры f32 округляет дробную часть секунд.
+fn screen_shader_time(sim_time: f64) -> f32 {
+    sim_time.rem_euclid(3600.0) as f32
 }
 
 fn render_local_lights(states: &[LocalLightState]) -> (Vec<LocalLight>, Vec<LocalLightShadow>) {
@@ -7274,5 +7280,13 @@ mod post_process_mapping_tests {
         );
         assert_eq!(mapped.exposure.mode, engine_render::ExposureMode::Auto);
         assert_eq!(mapped.exposure.ev, -0.5);
+    }
+
+    #[test]
+    fn screen_shader_time_keeps_fraction_of_long_sessions() {
+        // 3_600_000 имеет ulp 0.25 в f32: сначала переведённое в f32 время потеряло бы 0.1 с.
+        let time = screen_shader_time(3_600_000.1);
+        assert!((time - 0.1).abs() < 1e-4, "получено {time}");
+        assert_eq!(screen_shader_time(3_600.0 + 2.5), 2.5);
     }
 }
