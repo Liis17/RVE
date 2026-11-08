@@ -728,9 +728,45 @@ impl PhysicsWorld {
         }
     }
 
+    /// Соседство динамических тел по активным контактным парам; основа островов сна.
+    fn dynamic_contact_graph(&self) -> BTreeMap<BodyHandle, Vec<BodyHandle>> {
+        let is_dynamic = |handle: BodyHandle| {
+            self.bodies
+                .get(&handle)
+                .is_some_and(|body| body.kind == BodyKind::Dynamic)
+        };
+        let mut graph: BTreeMap<BodyHandle, Vec<BodyHandle>> = BTreeMap::new();
+        for (key, pair) in &self.active_pairs {
+            let first = BodyHandle(key.first);
+            let second = BodyHandle(key.second);
+            if pair.kind == PairKind::Collision && is_dynamic(first) && is_dynamic(second) {
+                graph.entry(first).or_default().push(second);
+                graph.entry(second).or_default().push(first);
+            }
+        }
+        graph
+    }
+
+    /// Будит тело вместе с его островом: спящие динамические тела, связанные контактами, тоже
+    /// поднимаются в этом же вызове.
     fn wake_body(&mut self, handle: BodyHandle) {
-        if let Some(body) = self.bodies.get_mut(&handle) {
+        let graph = self.dynamic_contact_graph();
+        let mut pending = vec![handle];
+        let mut visited = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(body) = self.bodies.get_mut(&current) else {
+                continue;
+            };
+            if body.kind != BodyKind::Dynamic {
+                continue;
+            }
             body.wake();
+            if let Some(neighbors) = graph.get(&current) {
+                pending.extend(neighbors.iter().copied());
+            }
         }
     }
 
@@ -771,9 +807,9 @@ impl PhysicsWorld {
                         PhysicsWorldError::InvalidBody
                     });
                 }
+                self.wake_body(handle);
                 let body = self.bodies.get_mut(&handle).expect("body was checked");
                 body.linear_velocity = velocity;
-                body.wake();
             }
             PhysicsCommand::AddImpulse { impulse, point, .. } => {
                 if body.kind != BodyKind::Dynamic {
@@ -783,8 +819,8 @@ impl PhysicsWorld {
                     return Err(PhysicsWorldError::InvalidBody);
                 }
                 let point = point.unwrap_or_else(|| body.center_of_mass_world());
+                self.wake_body(handle);
                 let body = self.bodies.get_mut(&handle).expect("body was checked");
-                body.wake();
                 body.apply_impulse(point, impulse);
             }
             PhysicsCommand::AddForce { force, point, .. } => {
@@ -799,13 +835,14 @@ impl PhysicsWorld {
                 if !impulse.is_finite() {
                     return Err(PhysicsWorldError::InvalidBody);
                 }
+                self.wake_body(handle);
                 let body = self.bodies.get_mut(&handle).expect("body was checked");
-                body.wake();
                 body.apply_impulse(point, impulse);
             }
             PhysicsCommand::Teleport { pose, .. } => {
                 let pose = Pose::new(pose.position, pose.rotation)?;
                 self.wake_neighbors(handle);
+                self.wake_body(handle);
                 let body = self.bodies.get_mut(&handle).expect("body was checked");
                 body.pose = pose;
                 body.kinematic_target = None;
@@ -813,14 +850,13 @@ impl PhysicsWorld {
                     body.linear_velocity = Vec3::ZERO;
                     body.angular_velocity = Vec3::ZERO;
                 }
-                body.wake();
             }
             PhysicsCommand::SetColliderEnabled { enabled, .. } => {
                 if body.collider.enabled != enabled {
                     self.wake_neighbors(handle);
+                    self.wake_body(handle);
                     let body = self.bodies.get_mut(&handle).expect("body was checked");
                     body.collider.enabled = enabled;
-                    body.wake();
                 }
             }
             PhysicsCommand::KinematicTarget { pose, .. } => {
@@ -842,6 +878,8 @@ impl PhysicsWorld {
         Ok(())
     }
 
+    /// Засыпание островами: остров — компонента контактов между динамическими телами. Он засыпает
+    /// целиком, когда каждое тело успокоилось и ни одно не касается движущегося kinematic.
     fn update_sleep(&mut self, dt: f32) {
         for body in self.bodies.values_mut() {
             if body.kind != BodyKind::Dynamic || body.sleeping {
@@ -851,13 +889,66 @@ impl PhysicsWorld {
                 && body.angular_velocity.length_squared() <= SLEEP_ANGULAR_SPEED.powi(2)
             {
                 body.sleep_time += dt;
-                if body.sleep_time >= SLEEP_DELAY_SECONDS {
-                    body.sleeping = true;
-                    body.linear_velocity = Vec3::ZERO;
-                    body.angular_velocity = Vec3::ZERO;
-                }
             } else {
                 body.sleep_time = 0.0;
+            }
+        }
+
+        let graph = self.dynamic_contact_graph();
+        let mut held_awake = HashSet::new();
+        for (key, pair) in &self.active_pairs {
+            if pair.kind != PairKind::Collision {
+                continue;
+            }
+            let first = BodyHandle(key.first);
+            let second = BodyHandle(key.second);
+            let is_moving =
+                |handle: BodyHandle| self.bodies.get(&handle).is_some_and(is_moving_kinematic);
+            if is_moving(first) {
+                held_awake.insert(second);
+            }
+            if is_moving(second) {
+                held_awake.insert(first);
+            }
+        }
+
+        let starts: Vec<BodyHandle> = self
+            .bodies
+            .values()
+            .filter(|body| body.kind == BodyKind::Dynamic && !body.sleeping)
+            .map(|body| body.handle)
+            .collect();
+        let mut visited = HashSet::new();
+        for start in starts {
+            if !visited.insert(start) {
+                continue;
+            }
+            let mut island = vec![start];
+            let mut index = 0;
+            while index < island.len() {
+                let current = island[index];
+                index += 1;
+                for neighbor in graph.get(&current).into_iter().flatten() {
+                    if visited.insert(*neighbor) {
+                        island.push(*neighbor);
+                    }
+                }
+            }
+            let ready = island.iter().all(|handle| {
+                !held_awake.contains(handle)
+                    && self
+                        .bodies
+                        .get(handle)
+                        .is_some_and(|body| body.sleep_time >= SLEEP_DELAY_SECONDS)
+            });
+            if ready {
+                for handle in island {
+                    if let Some(body) = self.bodies.get_mut(&handle) {
+                        body.sleeping = true;
+                        body.linear_velocity = Vec3::ZERO;
+                        body.angular_velocity = Vec3::ZERO;
+                    }
+                }
             }
         }
     }
@@ -1201,7 +1292,7 @@ mod tests {
                 "box {index}: {pose:?}"
             );
             assert!(
-                pose.position.x.abs() < 0.15 && pose.position.z.abs() < 0.15,
+                pose.position.x.abs() < 0.02 && pose.position.z.abs() < 0.02,
                 "box {index}: {pose:?}"
             );
         }
@@ -2254,6 +2345,174 @@ mod tests {
             ))
             .unwrap();
         (StepDriver::new(world, hz, 8).unwrap(), body)
+    }
+
+    fn stacked_boxes_world(count: usize) -> (StepDriver, Vec<BodyHandle>) {
+        let mut world = PhysicsWorld::default();
+        world.insert_body(floor_desc()).unwrap();
+        let mut boxes = Vec::new();
+        for index in 0..count {
+            let mut desc = BodyDesc::dynamic(
+                box_shape(0.5),
+                Pose::new(Vec3::new(0.0, 0.5 + index as f32, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            );
+            desc.linear_damping = 0.02;
+            boxes.push(world.insert_body(desc).unwrap());
+        }
+        (StepDriver::new(world, 60, 8).unwrap(), boxes)
+    }
+
+    #[test]
+    fn stack_of_boxes_sleeps_as_one_island_within_three_seconds_and_stays_asleep() {
+        let (mut driver, boxes) = stacked_boxes_world(4);
+        let mut first_sleep_frame = vec![None; boxes.len()];
+        for frame in 0..420 {
+            driver.advance_step(1.0 / 60.0, []).unwrap();
+            for (index, handle) in boxes.iter().enumerate() {
+                let sleeping = driver.world().body_is_sleeping(*handle).unwrap();
+                if first_sleep_frame[index].is_none() && sleeping {
+                    first_sleep_frame[index] = Some(frame);
+                }
+                if first_sleep_frame[index].is_some() {
+                    assert!(sleeping, "box {index} woke at frame {frame}");
+                }
+            }
+        }
+        let frames: Vec<usize> = first_sleep_frame
+            .iter()
+            .map(|frame| frame.expect("every box of the stack sleeps"))
+            .collect();
+        assert!(frames.iter().all(|frame| *frame < 180), "{frames:?}");
+        assert!(frames.iter().all(|frame| *frame == frames[0]), "{frames:?}");
+    }
+
+    #[test]
+    fn impulse_on_top_box_wakes_the_whole_sleeping_stack_in_the_same_step() {
+        let (mut driver, boxes) = stacked_boxes_world(4);
+        run_steps(&mut driver, 240);
+        assert!(
+            boxes
+                .iter()
+                .all(|handle| driver.world().body_is_sleeping(*handle).unwrap())
+        );
+        let top = *boxes.last().unwrap();
+        driver
+            .advance_step(
+                1.0 / 60.0,
+                [PhysicsCommand::AddImpulse {
+                    body: top,
+                    impulse: Vec3::Y * 0.5,
+                    point: None,
+                }],
+            )
+            .unwrap();
+        for handle in &boxes {
+            assert_eq!(driver.world().body_is_sleeping(*handle), Some(false));
+        }
+    }
+
+    #[test]
+    fn separate_islands_on_one_floor_sleep_and_wake_independently() {
+        let mut world = PhysicsWorld::default();
+        world
+            .insert_body(BodyDesc::static_collider(
+                Shape::cuboid(Vec3::new(20.0, 0.5, 20.0)).unwrap(),
+                Pose::new(Vec3::new(0.0, -0.5, 0.0), Quat::IDENTITY).unwrap(),
+            ))
+            .unwrap();
+        let near = world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.5),
+                Pose::new(Vec3::new(-4.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let far = world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.5),
+                Pose::new(Vec3::new(4.0, 10.0, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        run_steps(&mut driver, 90);
+        assert_eq!(driver.world().body_is_sleeping(near), Some(true));
+        assert_eq!(driver.world().body_is_sleeping(far), Some(false));
+        run_steps(&mut driver, 330);
+        assert_eq!(driver.world().body_is_sleeping(far), Some(true));
+
+        driver
+            .advance_step(
+                1.0 / 60.0,
+                [PhysicsCommand::AddImpulse {
+                    body: far,
+                    impulse: Vec3::Y * 0.5,
+                    point: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(driver.world().body_is_sleeping(far), Some(false));
+        assert_eq!(driver.world().body_is_sleeping(near), Some(true));
+    }
+
+    #[test]
+    fn sleeping_contact_islands_never_hold_awake_sleeping_dynamic_pairs() {
+        let (mut driver, _) = stacked_boxes_world(4);
+        for _ in 0..240 {
+            driver.advance_step(1.0 / 60.0, []).unwrap();
+            let world = driver.world();
+            for pair in world.active_pairs.keys() {
+                let (Some(first), Some(second)) = (
+                    world.bodies.get(&BodyHandle(pair.first)),
+                    world.bodies.get(&BodyHandle(pair.second)),
+                ) else {
+                    continue;
+                };
+                if first.kind == BodyKind::Dynamic && second.kind == BodyKind::Dynamic {
+                    assert_eq!(first.sleeping, second.sleeping, "{pair:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn box_riding_a_slowly_moving_kinematic_platform_never_cycles_sleep_and_wake() {
+        let mut world = PhysicsWorld::default();
+        let platform = world
+            .insert_body(BodyDesc::new(
+                BodyKind::Kinematic,
+                Pose::new(Vec3::new(0.0, -0.5, 0.0), Quat::IDENTITY).unwrap(),
+                ColliderDesc::new(Shape::cuboid(Vec3::new(20.0, 0.5, 20.0)).unwrap()),
+            ))
+            .unwrap();
+        let rider = world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.5),
+                Pose::new(Vec3::new(0.0, 0.7, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        let mut driver = StepDriver::new(world, 60, 8).unwrap();
+        for frame in 0..300 {
+            let x = 0.02 * (frame + 1) as f32 / 60.0;
+            driver
+                .advance_step(
+                    1.0 / 60.0,
+                    [PhysicsCommand::KinematicTarget {
+                        body: platform,
+                        pose: Pose::new(Vec3::new(x, -0.5, 0.0), Quat::IDENTITY).unwrap(),
+                    }],
+                )
+                .unwrap();
+            if frame >= 60 {
+                assert_eq!(
+                    driver.world().body_is_sleeping(rider),
+                    Some(false),
+                    "frame {frame}"
+                );
+            }
+        }
     }
 
     #[test]
