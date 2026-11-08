@@ -808,6 +808,8 @@ fn collide_convex_mesh(
     }
 
     let mut contacts = Vec::new();
+    // Точки EPA треугольников группы без вершин грани; нужны, только если вершин в группе нет.
+    let mut fallbacks = Vec::new();
     let mut normal = None;
     let mut group_depth = -1.0;
     for triangle_index in candidates {
@@ -819,34 +821,45 @@ fn collide_convex_mesh(
             generic_contact(&convex_proxy, &triangle, triangle_index as u64 + 1)?
         {
             let feature_id = (triangle_index as u64 + 1) << 32;
-            let (triangle_normal, triangle_contacts) = triangle_face_contacts(
+            let (triangle_normal, triangle_contacts, fallback) = match triangle_face_contacts(
                 convex,
                 convex_pose,
                 vertices,
                 epa_normal,
                 contact.penetration,
                 feature_id,
-            )
-            .unwrap_or_else(|| {
-                let mut single = contact;
-                single.feature_id = feature_id;
-                (epa_normal, vec![single])
-            });
+            ) {
+                Some((triangle_normal, triangle_contacts)) => {
+                    (triangle_normal, triangle_contacts, None)
+                }
+                None => {
+                    let mut single = contact;
+                    single.feature_id = feature_id;
+                    (epa_normal, Vec::new(), Some(single))
+                }
+            };
             if normal.is_none_or(|best: Vec3| best.dot(triangle_normal) < CONTACT_NORMAL_THRESHOLD)
             {
                 if normal.is_none_or(|_| contact.penetration > group_depth) {
                     normal = Some(triangle_normal);
                     group_depth = contact.penetration;
                     contacts.clear();
+                    fallbacks.clear();
                 } else {
                     continue;
                 }
             }
             contacts.extend(triangle_contacts);
+            fallbacks.extend(fallback);
         }
     }
     let Some(normal) = normal else {
         return Ok(None);
+    };
+    let contacts = if contacts.is_empty() {
+        fallbacks
+    } else {
+        contacts
     };
     let epsilon = linear_epsilon(
         convex_proxy.scale(),
@@ -2405,6 +2418,71 @@ mod tests {
                 (0.0045..=0.0055).contains(&contact.penetration),
                 "{contact:?}"
             );
+        }
+    }
+
+    /// Нижние углы ящика половины `half` в мировых координатах.
+    fn bottom_corners(pose: Pose, half: f32) -> Vec<Vec3> {
+        [-1.0, 1.0]
+            .into_iter()
+            .flat_map(|x| [-1.0, 1.0].into_iter().map(move |z| (x, z)))
+            .map(|(x, z)| pose.position + pose.rotation * Vec3::new(x * half, -half, z * half))
+            .collect()
+    }
+
+    /// Сетка квадов 0.3 с диагоналями (края ±2.1) для проверки швов между треугольниками.
+    fn seam_grid_floor() -> Shape {
+        let count = 15;
+        let coordinate = |index: usize| -2.1 + 0.3 * index as f32;
+        let vertex = |x: usize, z: usize| (z * count + x) as u32;
+        let mut vertices = Vec::new();
+        for z in 0..count {
+            for x in 0..count {
+                vertices.push(Vec3::new(coordinate(x), 0.0, coordinate(z)));
+            }
+        }
+        let mut triangles = Vec::new();
+        for z in 0..count - 1 {
+            for x in 0..count - 1 {
+                triangles.push([vertex(x, z), vertex(x + 1, z), vertex(x + 1, z + 1)]);
+                triangles.push([vertex(x, z), vertex(x + 1, z + 1), vertex(x, z + 1)]);
+            }
+        }
+        Shape::TriMesh(Arc::new(TriMesh::new(vertices, triangles).unwrap()))
+    }
+
+    #[test]
+    fn box_over_mesh_seams_keeps_only_face_vertex_contacts() {
+        let half = 0.5;
+        let box_shape = Shape::cuboid(Vec3::splat(half)).unwrap();
+        let floor = seam_grid_floor();
+        // Ящик лежит на сетке на краю пола (часть углов за пределами сетки) и сдвигается по x:
+        // треугольники внутри основания без углов ящика дают EPA-точку, которой быть не должно.
+        for x_step in 0..=22 {
+            for z_step in 0..=8 {
+                let x = -2.35 + 0.013 + x_step as f32 * 0.13;
+                let z = -0.5 + 0.013 + z_step as f32 * 0.13;
+                // Второй прогон сдвинут на малый шаг: соседний кадр даёт те же точки контакта.
+                for drift in [0.0, 0.001] {
+                    let pose = Pose::new(Vec3::new(x + drift, 0.495, z), Quat::IDENTITY).unwrap();
+                    // Численный сбой пары (вырожденный симплекс) мир пропускает на шаге; здесь
+                    // проверяется только геометрия контактов, которые narrowphase вернул.
+                    let manifold = match collide(&box_shape, pose, &floor, Pose::IDENTITY) {
+                        Ok(manifold) => manifold.unwrap(),
+                        Err(error) if error.is_numeric_limit() => continue,
+                        Err(error) => panic!("x {x} z {z} drift {drift}: {error}"),
+                    };
+                    let corners = bottom_corners(pose, half);
+                    for contact in &manifold.contacts {
+                        assert!(
+                            corners
+                                .iter()
+                                .any(|corner| corner.distance(contact.point_a) < 1.0e-3),
+                            "x {x} z {z} drift {drift}: {contact:?} is not a box corner"
+                        );
+                    }
+                }
+            }
         }
     }
 
