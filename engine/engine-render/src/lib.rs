@@ -28,12 +28,16 @@ use ui::{
     validate_texture_region, validate_viewport_size,
 };
 
+mod bloom;
 mod clusters;
 mod culling;
 mod particle_gpu;
 mod particles;
 mod post;
 
+use bloom::{
+    BloomChain, BloomPipelines, BloomRecord, bloom_record, record_bloom, write_composite_bloom,
+};
 use particle_gpu::{
     ParticleEmitter, ParticlePass, ParticleSystem, particle_depth_source_masks, record_particles,
 };
@@ -786,13 +790,15 @@ pub enum GpuPass {
     Particles,
     /// TAA, FSR или DLSS; отсутствует, если временное сглаживание выключено.
     TemporalResolve,
-    /// Tonemap до вывода на swapchain.
+    /// Bloom: prefilter, downsample и upsample; отсутствует, если эффект выключен.
+    Bloom,
+    /// Composite: tonemap до вывода на swapchain.
     Tonemap,
 }
 
 impl GpuPass {
     /// Число проходов, для которых записываются границы.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
     /// Все проходы в порядке выполнения.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Clusters,
@@ -804,6 +810,7 @@ impl GpuPass {
         Self::Wireframe,
         Self::Particles,
         Self::TemporalResolve,
+        Self::Bloom,
         Self::Tonemap,
     ];
 
@@ -819,6 +826,7 @@ impl GpuPass {
             Self::Wireframe => "Wireframe",
             Self::Particles => "Particles",
             Self::TemporalResolve => "Temporal resolve",
+            Self::Bloom => "Bloom",
             Self::Tonemap => "Tonemap",
         }
     }
@@ -1027,6 +1035,7 @@ pub struct Renderer {
     /// Номер последнего отправленного вызова с skinning; нужен для предыдущей позы.
     skin_call_serial: u64,
     post_pipeline_layout: Option<vk::PipelineLayout>,
+    bloom_pipelines: Option<BloomPipelines>,
     taa_set_layout: Option<vk::DescriptorSetLayout>,
     taa_pipeline_layout: Option<vk::PipelineLayout>,
     taa_pipeline: Option<vk::Pipeline>,
@@ -1052,6 +1061,8 @@ pub struct Renderer {
     environment_set_layout: Option<vk::DescriptorSetLayout>,
     compute_set_layout: Option<vk::DescriptorSetLayout>,
     texture_set_layout: Option<vk::DescriptorSetLayout>,
+    /// Набор постобработки: HDR-источник, sampler и bloom для composite.
+    post_set_layout: Option<vk::DescriptorSetLayout>,
     frame_descriptor_pool: Option<vk::DescriptorPool>,
     post_descriptor_pool: Option<vk::DescriptorPool>,
     frame_uniforms: Vec<FrameUniforms>,
@@ -1160,6 +1171,7 @@ impl Renderer {
             skin_instances: Vec::new(),
             skin_call_serial: 0,
             post_pipeline_layout: None,
+            bloom_pipelines: None,
             taa_set_layout: None,
             taa_pipeline_layout: None,
             taa_pipeline: None,
@@ -1181,6 +1193,7 @@ impl Renderer {
             environment_set_layout: None,
             compute_set_layout: None,
             texture_set_layout: None,
+            post_set_layout: None,
             frame_descriptor_pool: None,
             post_descriptor_pool: None,
             frame_uniforms: Vec::new(),
@@ -1830,6 +1843,13 @@ impl Renderer {
             .as_ref()
             .map_or(self.output_extent, |swapchain| swapchain.extent);
         let render_extent = scaled_extent(output_extent, frame.view.render_scale);
+        let post_frame = PostFrame::new(
+            &view.post,
+            frame.debug_view,
+            (render_extent.width, render_extent.height),
+            (output_extent.width, output_extent.height),
+            frame_serial,
+        );
         let temporal_plan = self.screen_temporal.state.plan(
             temporal_key(
                 render_extent,
@@ -1979,6 +1999,8 @@ impl Renderer {
         let swapchain_image_count = swapchain.images.len();
         let queue = self.queue;
         let taa_set_layout = self.taa_set_layout()?;
+        let bloom_layout = self.texture_set_layout()?;
+        let bloom_pipelines = self.bloom_pipelines;
         let frame_resources = self
             .frames
             .get_mut(frame_slot)
@@ -2142,6 +2164,20 @@ impl Renderer {
             );
             frame_resources.target = Some(target);
         }
+        if post_frame.plan.bloom_mips > 0
+            && let Some(target) = frame_resources.target.as_mut()
+            && target.bloom.is_none()
+        {
+            target.bloom = Some(BloomChain::new(
+                &instance,
+                &device,
+                self.physical_device,
+                target.render_extent,
+                post_frame.plan.bloom_mips,
+                bloom_layout,
+                post_sampler,
+            )?);
+        }
         let target = frame_resources
             .target
             .as_ref()
@@ -2232,13 +2268,6 @@ impl Renderer {
                 shadow_cascades: frame.shadow_cascades,
                 local_shadow_matrices: &prepared.local_shadow_matrices,
             };
-            let post_frame = PostFrame::new(
-                &view.post,
-                frame.debug_view,
-                (render_extent.width, render_extent.height),
-                (output_extent.width, output_extent.height),
-                frame_serial,
-            );
             let scene = ScenePass {
                 pipeline: scene_pipeline,
                 mask_pipeline,
@@ -2270,6 +2299,7 @@ impl Renderer {
                 timestamps: screen_marks,
                 view,
                 post: post_frame,
+                bloom_pipelines,
                 particles: particle_pass,
             };
             let frame_resources = &mut self.frames[frame_slot];
@@ -2700,6 +2730,7 @@ impl Renderer {
         let swapchain_image_count = swapchain.images.len();
         let queue = self.queue;
         let image_set_layout = self.texture_set_layout()?;
+        let post_set_layout = self.post_set_layout()?;
         let taa_set_layout = self.taa_set_layout()?;
         let frame_set_layout = self.frame_set_layout()?;
         let frame_resources = self
@@ -2736,6 +2767,7 @@ impl Renderer {
         // сигнальный semaphore.
         let target_resources = ViewportTargetResources {
             image_set_layout,
+            post_set_layout,
             taa_set_layout,
             particle_depth_layout: self.particles.depth_layout()?,
             image_sampler: self
@@ -2926,6 +2958,17 @@ impl Renderer {
                 (target.extent.width, target.extent.height),
                 frame_serial,
             );
+            if post_frame.plan.bloom_mips > 0 && target.bloom.is_none() {
+                target.bloom = Some(BloomChain::new(
+                    &instance,
+                    &device,
+                    physical_device,
+                    target.render_extent,
+                    post_frame.plan.bloom_mips,
+                    target_resources.image_set_layout,
+                    target_resources.post_sampler,
+                )?);
+            }
             rendered.push((
                 *viewport,
                 *frame,
@@ -3018,6 +3061,7 @@ impl Renderer {
             )?);
         }
         let mut gpu_layout = GpuProfileLayout::default();
+        let bloom_pipelines = self.bloom_pipelines;
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -3089,6 +3133,7 @@ impl Renderer {
                             }),
                             view: effective_view_settings(frame.view, frame.debug_view),
                             post: *post_frame,
+                            bloom_pipelines,
                             particles: particle_pipelines.map(|pipelines| ParticlePass {
                                 works: &particle_works[index],
                                 pipelines,
@@ -3165,6 +3210,13 @@ impl Renderer {
                     shadow,
                     pass,
                 );
+                let bloom = bloom_record(
+                    target.bloom.as_mut(),
+                    pass.bloom_pipelines,
+                    pass.post.plan.bloom_mips,
+                    target_resources.post_sampler,
+                    &pass.view.post,
+                );
                 let temporal_outcome = if pass.view.anti_aliasing.is_temporal() {
                     let temporal = &mut entry.temporal;
                     let history = temporal
@@ -3200,6 +3252,7 @@ impl Renderer {
                         pass.frame_set,
                         target.extent,
                         pass.post.composite,
+                        bloom,
                         pass.timestamps,
                         tonemap_pipeline,
                         post_pipeline_layout,
@@ -3239,6 +3292,7 @@ impl Renderer {
                         tonemap_pipeline,
                         post_pipeline_layout,
                         pass.post.composite,
+                        bloom,
                         pass.timestamps,
                     );
                     target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -4157,6 +4211,29 @@ impl Renderer {
         self.texture_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&texture_layout_info, None) }?);
 
+        let post_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let post_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&post_bindings);
+        // SAFETY: composite, output and fullscreen post shaders read bindings 0, 1 and (composite) 2.
+        self.post_set_layout =
+            Some(unsafe { device.create_descriptor_set_layout(&post_layout_info, None) }?);
+
         let taa_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -4308,7 +4385,7 @@ impl Renderer {
         let post_pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(post_set_count),
+                .descriptor_count(post_set_count * 2),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(post_set_count),
@@ -4319,7 +4396,7 @@ impl Renderer {
         // SAFETY: each frame slot owns a tonemap and output image set.
         let post_pool = unsafe { device.create_descriptor_pool(&post_pool_info, None) }?;
         self.post_descriptor_pool = Some(post_pool);
-        let post_layouts = vec![self.texture_set_layout()?; post_set_count as usize];
+        let post_layouts = vec![self.post_set_layout()?; post_set_count as usize];
         let post_allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(post_pool)
             .set_layouts(&post_layouts);
@@ -5815,7 +5892,7 @@ impl Renderer {
     fn create_post_pipelines(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
         let cache = self.pipeline_cache()?;
-        let set_layouts = [self.texture_set_layout()?];
+        let set_layouts = [self.post_set_layout()?];
         let push_constant_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -5832,6 +5909,7 @@ impl Renderer {
             layout,
             LDR_FORMAT,
             TONEMAP_FRAGMENT_SHADER,
+            false,
         )?);
         self.output_pipeline = Some(create_post_pipeline(
             &device,
@@ -5839,6 +5917,7 @@ impl Renderer {
             layout,
             self.surface_format.format,
             OUTPUT_FRAGMENT_SHADER,
+            false,
         )?);
         self.viewport_output_pipeline = Some(create_post_pipeline(
             &device,
@@ -5846,6 +5925,7 @@ impl Renderer {
             layout,
             LDR_FORMAT,
             OUTPUT_FRAGMENT_SHADER,
+            false,
         )?);
         let taa_set_layouts = [self.taa_set_layout()?, self.frame_set_layout()?];
         let taa_push_constants = [vk::PushConstantRange::default()
@@ -5864,6 +5944,12 @@ impl Renderer {
             taa_layout,
             OFFSCREEN_FORMAT,
             TAA_FRAGMENT_SHADER,
+            false,
+        )?);
+        self.bloom_pipelines = Some(BloomPipelines::new(
+            &device,
+            cache,
+            self.texture_set_layout()?,
         )?);
         Ok(())
     }
@@ -6219,6 +6305,12 @@ impl Renderer {
         ))
     }
 
+    fn post_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
+        self.post_set_layout.ok_or(RenderError::InvalidState(
+            "layout дескрипторов постобработки отсутствует",
+        ))
+    }
+
     fn taa_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
         self.taa_set_layout.ok_or(RenderError::InvalidState(
             "layout дескрипторов TAA отсутствует",
@@ -6359,6 +6451,9 @@ impl Drop for Renderer {
                 // SAFETY: all pipelines created with this layout were destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
+            if let Some(pipelines) = self.bloom_pipelines.take() {
+                pipelines.destroy(device);
+            }
             if let Some(layout) = self.taa_pipeline_layout.take() {
                 // SAFETY: the TAA pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
@@ -6405,6 +6500,7 @@ impl Drop for Renderer {
                 self.environment_set_layout.take(),
                 self.compute_set_layout.take(),
                 self.texture_set_layout.take(),
+                self.post_set_layout.take(),
                 self.taa_set_layout.take(),
             ]
             .into_iter()
@@ -7357,6 +7453,8 @@ struct FrameTarget {
     ldr_layout: vk::ImageLayout,
     render_extent: vk::Extent2D,
     output_extent: vk::Extent2D,
+    /// Цепочка bloom создаётся лениво, когда эффект запланирован для этого разрешения.
+    bloom: Option<BloomChain>,
 }
 
 impl FrameTarget {
@@ -7389,6 +7487,7 @@ impl FrameTarget {
         Ok(Self {
             _taa_pool: taa_pool,
             taa_set,
+            bloom: None,
             scene,
             ldr,
             ldr_layout: vk::ImageLayout::UNDEFINED,
@@ -7507,6 +7606,7 @@ fn write_local_light_descriptor(
 /// Общие объекты renderer, нужные каждой цели viewport.
 struct ViewportTargetResources {
     image_set_layout: vk::DescriptorSetLayout,
+    post_set_layout: vk::DescriptorSetLayout,
     particle_depth_layout: vk::DescriptorSetLayout,
     taa_set_layout: vk::DescriptorSetLayout,
     image_sampler: vk::Sampler,
@@ -7696,6 +7796,8 @@ struct ViewportTarget {
     output: DeviceImage,
     output_layout: vk::ImageLayout,
     frame_set: ViewportFrameSet,
+    /// Цепочка bloom создаётся лениво, как у цели экрана.
+    bloom: Option<BloomChain>,
 }
 
 impl ViewportTarget {
@@ -7736,7 +7838,7 @@ impl ViewportTarget {
         let (taa_pool, taa_set) = allocate_taa_image_set(device, resources.taa_set_layout)?;
         let (post_pool, post_sets) = allocate_post_image_sets(
             device,
-            resources.image_set_layout,
+            resources.post_set_layout,
             resources.post_sampler,
             [scene.color.view, ldr.view],
         )?;
@@ -7755,6 +7857,7 @@ impl ViewportTarget {
         };
         Ok(Self {
             device: device.clone(),
+            bloom: None,
             ui_pool,
             set,
             _taa_pool: taa_pool,
@@ -8350,7 +8453,7 @@ fn allocate_post_image_sets(
     let pool_sizes = [
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLED_IMAGE)
-            .descriptor_count(2),
+            .descriptor_count(4),
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLER)
             .descriptor_count(2),
@@ -8358,7 +8461,7 @@ fn allocate_post_image_sets(
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(2)
         .pool_sizes(&pool_sizes);
-    // SAFETY: the pool holds one tonemap and one output descriptor set.
+    // SAFETY: the pool holds one tonemap and one output descriptor set (two sampled images each).
     let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
     let layouts = [layout; 2];
     let allocate_info = vk::DescriptorSetAllocateInfo::default()
@@ -8812,6 +8915,7 @@ fn record_temporal_resolve_and_tonemap(
     frame_set: vk::DescriptorSet,
     output_extent: vk::Extent2D,
     composite: post::CompositeParams,
+    bloom: Option<BloomRecord<'_>>,
     timestamps: Option<GpuMarks>,
     tonemap_pipeline: vk::Pipeline,
     post_pipeline_layout: vk::PipelineLayout,
@@ -8936,6 +9040,7 @@ fn record_temporal_resolve_and_tonemap(
         tonemap_pipeline,
         post_pipeline_layout,
         composite,
+        bloom,
         timestamps,
     );
     Ok(TemporalResolveOutcome {
@@ -9330,6 +9435,13 @@ fn record_frame(
         shadow,
         scene,
     );
+    let bloom = bloom_record(
+        target.bloom.as_mut(),
+        scene.bloom_pipelines,
+        scene.post.plan.bloom_mips,
+        post_sampler,
+        &view.post,
+    );
     let temporal_outcome = if let Some(resolve) = temporal {
         Some(record_temporal_resolve_and_tonemap(
             device,
@@ -9342,6 +9454,7 @@ fn record_frame(
             scene.frame_set,
             target.output_extent,
             scene.post.composite,
+            bloom,
             scene.timestamps,
             tonemap_pipeline,
             post_pipeline_layout,
@@ -9362,6 +9475,7 @@ fn record_frame(
             tonemap_pipeline,
             post_pipeline_layout,
             scene.post.composite,
+            bloom,
             scene.timestamps,
         );
         target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -10145,6 +10259,7 @@ struct ScenePass<'a> {
     debug_view: DebugView,
     view: ViewSettings,
     post: PostFrame,
+    bloom_pipelines: Option<BloomPipelines>,
     particles: Option<ParticlePass<'a>>,
 }
 
@@ -10517,8 +10632,21 @@ fn record_tonemap_pass(
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     composite: post::CompositeParams,
+    bloom: Option<BloomRecord<'_>>,
     timestamps: Option<GpuMarks>,
 ) {
+    let mut source_layout = source_layout;
+    let bloom_view = bloom.map(|record| {
+        record_bloom(
+            device,
+            command_buffer,
+            source,
+            &mut source_layout,
+            record,
+            timestamps,
+        )
+    });
+    write_composite_bloom(device, set, bloom_view.unwrap_or(source.view));
     if source_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
         let (source_stage, source_access) = match source_layout {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
@@ -11641,6 +11769,7 @@ fn create_post_pipeline(
     layout: vk::PipelineLayout,
     color_format: vk::Format,
     fragment_shader: &[u8],
+    additive: bool,
 ) -> Result<vk::Pipeline, RenderError> {
     let vertex_module = ShaderModule::new(device, FULLSCREEN_VERTEX_SHADER)?;
     let fragment_module = ShaderModule::new(device, fragment_shader)?;
@@ -11667,8 +11796,22 @@ fn create_post_pipeline(
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    // Аддитивное смешивание нужно только upsample bloom: цель уже содержит уровень.
+    let blend_attachment = if additive {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+            .alpha_blend_op(vk::BlendOp::ADD)
+    } else {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+    };
+    let blend_attachments = [blend_attachment];
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -16644,7 +16787,7 @@ mod tests {
 
     #[test]
     fn view_timings_split_ticks_between_recorded_boundaries() {
-        // Начало, затем граница после каждого из десяти проходов в порядке выполнения.
+        // Начало, затем граница после каждого из одиннадцати проходов в порядке выполнения.
         let marks = [
             Some(100),
             Some(110),
@@ -16656,6 +16799,7 @@ mod tests {
             Some(190),
             Some(195),
             Some(200),
+            Some(205),
             Some(215),
         ];
         let view = decode_view(ProfiledView::Screen, &marks, 64, 1.0).unwrap();
@@ -16673,7 +16817,8 @@ mod tests {
                 Some(ns(15)),
                 Some(ns(5)),
                 Some(ns(5)),
-                Some(ns(15)),
+                Some(ns(5)),
+                Some(ns(10)),
             ]
         );
         assert_eq!(view.total, ns(115));
@@ -16839,7 +16984,7 @@ mod tests {
 
     #[test]
     fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
-        assert_eq!(TIMESTAMP_QUERY_COUNT, 46);
+        assert_eq!(TIMESTAMP_QUERY_COUNT, 50);
         let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
         let mut layout = GpuProfileLayout::default();
         for index in 0..MAX_PROFILED_VIEWS {

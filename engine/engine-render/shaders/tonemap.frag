@@ -9,14 +9,15 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform texture2D source_image;
 layout(set = 0, binding = 1) uniform sampler source_sampler;
+layout(set = 0, binding = 2) uniform texture2D bloom_image;
 
 layout(push_constant) uniform PushConstants {
     // v0: x — экспозиция EV, y — код tonemapper, z — код debug view, w — интенсивность CA.
     vec4 exposure_tonemap_debug_aberration;
     // v1: x — температура, y — tint, z — контраст, w — насыщенность.
     vec4 white_balance_contrast_saturation;
-    // v2: rgb — lift.
-    vec4 lift;
+    // v2: rgb — lift, w — bloom включён (1) или выключен (0).
+    vec4 lift_bloom_enabled;
     // v3: rgb — gamma, w — интенсивность vignette.
     vec4 gamma_vignette_intensity;
     // v4: rgb — gain, w — smoothness vignette.
@@ -89,7 +90,7 @@ vec3 grade_linear(vec3 color) {
 vec3 lift_gamma_gain(vec3 color) {
     vec3 gamma = push_constants.gamma_vignette_intensity.rgb;
     vec3 gain = push_constants.gain_vignette_smoothness.rgb;
-    vec3 lift = push_constants.lift.rgb;
+    vec3 lift = push_constants.lift_bloom_enabled.rgb;
     return pow(clamp(color, 0.0, 1.0), 1.0 / gamma) * gain + lift;
 }
 
@@ -120,6 +121,10 @@ void main() {
         color = chromatic_aberration(in_uv, controls.w);
     } else {
         color = sample_hdr(in_uv);
+    }
+    // Bloom хранится без экспозиции и складывается с HDR до неё.
+    if (push_constants.lift_bloom_enabled.w > 0.5) {
+        color += textureLod(sampler2D(bloom_image, source_sampler), in_uv, 0.0).rgb;
     }
     if (debug_view == 3) {
         float normalized_count = clamp(log2(color.r + 1.0) / log2(9.0), 0.0, 1.0);

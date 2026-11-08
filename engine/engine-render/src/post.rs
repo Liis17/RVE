@@ -493,7 +493,7 @@ pub fn bloom_mip_count(extent: (u32, u32)) -> u32 {
 /// Параметры composite-прохода (tonemap.frag). Раскладка совпадает с шейдером:
 /// v0 — (exposure EV, код tonemapper, код debug view, интенсивность CA);
 /// v1 — (temperature, tint, contrast, saturation);
-/// v2 — (lift.rgb, 0); v3 — (gamma.rgb, интенсивность vignette);
+/// v2 — (lift.rgb, bloom включён); v3 — (gamma.rgb, интенсивность vignette);
 /// v4 — (gain.rgb, smoothness); v5 — (цвет vignette.rgb, roundness).
 /// Выключенный эффект кодируется тождественными значениями.
 #[repr(C)]
@@ -545,6 +545,7 @@ pub fn composite_params(
         } else {
             (0.0, 0.0, 1.0, [0.0; 3])
         };
+    let bloom_enabled = if plan.bloom_mips > 0 { 1.0 } else { 0.0 };
     let aberration = if plan.chromatic_aberration {
         post.chromatic_aberration.intensity
     } else {
@@ -559,7 +560,7 @@ pub fn composite_params(
                 aberration,
             ],
             [temperature, tint, contrast, saturation],
-            [lift[0], lift[1], lift[2], 0.0],
+            [lift[0], lift[1], lift[2], bloom_enabled],
             [gamma[0], gamma[1], gamma[2], vignette_intensity],
             [gain[0], gain[1], gain[2], vignette_smoothness],
             [

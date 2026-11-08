@@ -175,6 +175,24 @@ const SHADERS: &[ShaderBuild] = &[
         &[],
         "particle_sort.comp.spv",
     ),
+    (
+        "bloom_prefilter.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "bloom_prefilter.frag.spv",
+    ),
+    (
+        "bloom_downsample.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "bloom_downsample.frag.spv",
+    ),
+    (
+        "bloom_upsample.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "bloom_upsample.frag.spv",
+    ),
 ];
 
 /// GLSL `barrier()` lowers to a barrier with subgroup scope, which naga validates only
