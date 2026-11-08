@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "egui",
  "egui-winit",
