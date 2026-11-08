@@ -197,7 +197,7 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         fs::write(path, fbx).unwrap();
     }
 
-    fn create_demo_like_project(root: &Path) {
+    pub(super) fn create_demo_like_project(root: &Path) {
         let assets = root.join("Assets");
         for path in [
             "scenes",
@@ -410,6 +410,53 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
             "{error}"
         );
         assert!(error.to_string().contains("intensity"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod screen_shader_asset_tests {
+    use super::tests::create_demo_like_project;
+    use super::*;
+    use crate::project::prepare_project;
+
+    /// Добавляет `.glsl` в `[[assets]]` демо-сцены и создаёт файл с заданным текстом.
+    fn declare_screen_shader(project_root: &Path, path: &str, source: &str) {
+        let assets = project_root.join("Assets");
+        let file = assets.join(path.trim_start_matches('/'));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, source).unwrap();
+        let scene = assets.join("scenes/main.rvescene");
+        let text = fs::read_to_string(&scene).unwrap();
+        let patched = text.replacen(
+            "[[assets]]",
+            &format!("[[assets]]\npath = \"{path}\"\n[[assets]]"),
+            1,
+        );
+        assert_ne!(patched, text);
+        fs::write(&scene, patched).unwrap();
+    }
+
+    #[test]
+    fn valid_screen_shader_is_packaged_and_invalid_one_names_its_file() {
+        let good_root = TempDir::create(&std::env::temp_dir(), "rve-build-glsl-good").unwrap();
+        create_demo_like_project(good_root.path());
+        declare_screen_shader(
+            good_root.path(),
+            "/fx/identity.glsl",
+            "vec3 rve_shade(vec2 uv) { return rve_sample(uv).rgb; }\n",
+        );
+        prepare_project(good_root.path()).expect("корректный экранный шейдер собирается");
+
+        let bad_root = TempDir::create(&std::env::temp_dir(), "rve-build-glsl-bad").unwrap();
+        create_demo_like_project(bad_root.path());
+        declare_screen_shader(
+            bad_root.path(),
+            "/fx/bad.glsl",
+            "vec3 rve_shade(vec2 uv) {\n    return rve_sample(uv).rgb\n}\n",
+        );
+        let error = prepare_project(bad_root.path()).unwrap_err();
+        assert!(error.to_string().contains("/fx/bad.glsl"), "{error}");
+        assert!(error.to_string().contains("строка"), "{error}");
     }
 }
 
