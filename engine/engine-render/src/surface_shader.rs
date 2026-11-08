@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn template_shader_compiles_all_lighting_and_alpha_variants() {
-        let code = "void surface(inout Surface s) { s.albedo *= tint; s.normal = rve_perturb_normal(vec3(0.0, 0.0, 1.0)); }";
+        let code = "void surface(inout Surface s) { s.albedo *= tint; s.opacity *= clamp(1.0 - s.position.y * 0.1, 0.0, 1.0); s.normal = rve_perturb_normal(vec3(0.0, 0.0, 1.0)); }";
         for lighting in [SurfaceLighting::Lit, SurfaceLighting::Unlit] {
             let variants = compile_surface_shader(&source(lighting, code)).unwrap();
             for words in [&variants.opaque, &variants.mask, &variants.blend] {

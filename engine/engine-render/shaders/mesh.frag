@@ -88,8 +88,9 @@ layout(set = 1, binding = 15) uniform texture2D rve_user_texture7;
 
 struct Surface {
     vec2 uv;
+    vec3 position;
     vec3 albedo;
-    float alpha;
+    float opacity;
     vec3 geometric_normal;
     vec3 normal;
     float metallic;
@@ -337,7 +338,8 @@ Surface rve_default_surface() {
     Surface result;
     result.uv = in_uv;
     result.albedo = base_sample.rgb * material.base_color.rgb * in_color;
-    result.alpha = base_sample.a * material.alpha_parameters.x;
+    result.position = in_world_position;
+    result.opacity = base_sample.a * material.alpha_parameters.x;
     result.geometric_normal = geometric_normal;
     result.normal = normal;
     result.metallic = clamp(material.parameters.x * metallic_roughness_sample.b, 0.0, 1.0);
@@ -362,7 +364,7 @@ void main() {
     }
     Surface surface_data = rve_default_surface();
     surface(surface_data);
-    float surface_alpha = surface_data.alpha;
+    float surface_alpha = surface_data.opacity;
 #ifdef ALPHA_MASK
     if (surface_alpha < material.alpha_parameters.y) {
         discard;
