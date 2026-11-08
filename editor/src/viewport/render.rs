@@ -1004,6 +1004,7 @@ impl SceneRenderer {
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
                 post: render_post_process(&post, with_grid),
+                screen_shaders: engine_render::ScreenShaders::default(),
                 anti_aliasing: match settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,

@@ -698,6 +698,7 @@ impl RenderBackend for VulkanBackend {
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 post: render_post_process(&snapshot.post_process),
+                screen_shaders: engine_render::ScreenShaders::default(),
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -816,6 +817,7 @@ impl RenderBackend for VulkanBackend {
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
                 post: render_post_process(&snapshot.post_process),
+                screen_shaders: engine_render::ScreenShaders::default(),
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
