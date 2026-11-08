@@ -3388,7 +3388,6 @@ mod schema_tests {
     }
 }
 
-/// Редактор `.postprocess` под камерой: секции по эффектам, черновик хранится до кнопки Save.
 /// Экранные шейдеры камеры: до четырёх `.glsl` с порядком, стадией, включением и параметрами.
 /// Каждая правка идёт через `edit_scene`, поэтому откатывается отменой; ошибка компиляции из
 /// горячей перезагрузки показывается под шейдером.
@@ -3404,7 +3403,8 @@ fn show_screen_shaders(
         .show(ui, |ui| {
             let options = state.assets_of_kind(AssetKind::ScreenShader);
             let mut next = shaders.to_vec();
-            let mut changed = false;
+            let mut other_change = false;
+            let mut param_key: Option<String> = None;
             let mut remove = None;
             let mut swap = None;
             for (index, shader) in shaders.iter().enumerate() {
@@ -3416,7 +3416,7 @@ fn show_screen_shaders(
                             && let Some(path) = parse_path(state, &chosen)
                         {
                             next[index].shader = path;
-                            changed = true;
+                            other_change = true;
                         }
                         let mut stage = shader.stage;
                         egui::ComboBox::from_id_salt("screen_shader_stage")
@@ -3435,12 +3435,12 @@ fn show_screen_shaders(
                             });
                         if stage != shader.stage {
                             next[index].stage = stage;
-                            changed = true;
+                            other_change = true;
                         }
                         let mut enabled = shader.enabled;
                         if ui.checkbox(&mut enabled, "On").changed() {
                             next[index].enabled = enabled;
-                            changed = true;
+                            other_change = true;
                         }
                         if ui.add_enabled(index > 0, egui::Button::new("Up")).clicked() {
                             swap = Some((index, index - 1));
@@ -3478,8 +3478,11 @@ fn show_screen_shaders(
                                                 0.0,
                                             );
                                             params[parameter] = value;
-                                            changed = true;
+                                            param_key = Some(format!(
+                                                "screen-shader-{id}-{index}-p{parameter}"
+                                            ));
                                         }
+                                        finish_edit(state, &response);
                                         if parameter % 4 == 3 {
                                             ui.end_row();
                                         }
@@ -3490,11 +3493,11 @@ fn show_screen_shaders(
             }
             if let Some(index) = remove {
                 next.remove(index);
-                changed = true;
+                other_change = true;
             }
             if let Some((from, to)) = swap {
                 next.swap(from, to);
-                changed = true;
+                other_change = true;
             }
             if shaders.len() < engine_scene::MAX_SCREEN_SHADERS {
                 match options.first().and_then(|path| parse_path(state, path)) {
@@ -3506,7 +3509,7 @@ fn show_screen_shaders(
                                 enabled: true,
                                 params: Vec::new(),
                             });
-                            changed = true;
+                            other_change = true;
                         }
                     }
                     None => {
@@ -3514,8 +3517,14 @@ fn show_screen_shaders(
                     }
                 }
             }
-            if changed {
-                state.edit_scene(|scene| scene.set_camera_screen_shaders(id, next));
+            if other_change || param_key.is_some() {
+                // Только правка одного параметра объединяется с соседними шагами перетаскивания.
+                let coalesce = if other_change {
+                    None
+                } else {
+                    param_key.as_deref()
+                };
+                state.edit_scene(|scene| scene.set_camera_screen_shaders(id, next, coalesce));
             }
         });
 }
@@ -3527,6 +3536,7 @@ fn screen_stage_label(stage: engine_scene::ScreenShaderStage) -> &'static str {
     }
 }
 
+/// Редактор `.postprocess` под камерой: секции по эффектам, черновик хранится до кнопки Save.
 fn show_post_process_editor(ui: &mut egui::Ui, state: &mut EditorState, path: &VirtualPath) {
     let Some(cached) = state
         .project
