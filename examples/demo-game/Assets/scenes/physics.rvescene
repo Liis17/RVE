@@ -16,6 +16,13 @@ path = "/audio/hum.wav"
 [[assets]]
 path = "/scripts/coin.lua"
 
+# Физические материалы: лёд под ящиком и резиновый мяч.
+[[assets]]
+path = "/materials/ice.rvephysmat"
+
+[[assets]]
+path = "/materials/rubber.rvephysmat"
+
 # Быстрые префабы для стрельбы: пули и следы spawn-ятся из скриптов. Следам ограничен лимит живых.
 [[assets]]
 path = "/prefabs/bullet.rveprefab"
@@ -229,6 +236,47 @@ scale = [0.5, 0.5, 0.5]
 model = "/models/shared-cube.fbx"
 [objects.collider]
 half_extents = [1.0, 1.0, 1.0]
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+
+# Ледяная площадка с ящиком: материал льда задаёт трение 0.05 у пары с ящиком.
+[[objects]]
+id = "ice-pad"
+name = "Ice Pad"
+[objects.transform]
+position = [6.0, 0.05, 7.0]
+scale = [1.5, 0.05, 1.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+material = "/materials/ice.rvephysmat"
+
+[[objects]]
+id = "crate-ice"
+name = "Crate On Ice"
+[objects.transform]
+position = [6.0, 0.6, 7.0]
+scale = [0.5, 0.5, 0.5]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.collider]
+half_extents = [1.0, 1.0, 1.0]
+[objects.rigid_body]
+kind = "dynamic"
+mass = 1.0
+
+# Резиновый мяч: падает на арену и отскакивает по материалу резины.
+[[objects]]
+id = "rubber-ball"
+name = "Rubber Ball"
+[objects.transform]
+position = [2.0, 4.0, -2.0]
+[objects.collider]
+shape = "sphere"
+radius = 0.5
+material = "/materials/rubber.rvephysmat"
 [objects.rigid_body]
 kind = "dynamic"
 mass = 1.0

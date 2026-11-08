@@ -1302,6 +1302,14 @@ id = "camera"
         }
 
         let prepared = load_scene(&handle, &resources.assets, "/scenes/physics.rvescene").unwrap();
+        let resolved = |id: &str| {
+            prepared
+                .world
+                .object_by_id(id)
+                .and_then(|object| object.collider.as_ref()?.resolved_material)
+        };
+        assert_eq!(resolved("ice-pad").map(|m| m.static_friction), Some(0.05));
+        assert_eq!(resolved("rubber-ball").map(|m| m.bounciness), Some(0.9));
         engine_script::ScriptHost::load(
             &prepared.world,
             "/scenes/physics.rvescene",
@@ -1313,14 +1321,15 @@ id = "camera"
         let (_, bindings) = prepared
             .build_physics(&geometry, &PhysicsSettings::default())
             .unwrap();
-        // 10 статических коллайдеров, 4 монеты-триггера, 4 ящика и 1 персонаж.
-        assert_eq!(bindings.len(), 19);
+        // 11 статических коллайдеров (с ледяной площадкой), 4 монеты-триггера, 4 ящика, ящик на льду,
+        // мяч и 1 персонаж.
+        assert_eq!(bindings.len(), 22);
         assert_eq!(
             bindings
                 .iter()
                 .filter(|binding| binding.kind == BodyKind::Dynamic)
                 .count(),
-            4
+            6
         );
         assert_eq!(
             bindings

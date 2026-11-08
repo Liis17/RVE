@@ -1,0 +1,6 @@
+# Лёд: трение перемножается, поэтому даже обычный ящик скользит по льду.
+static_friction = 0.05
+dynamic_friction = 0.02
+bounciness = 0.0
+friction_combine = "multiply"
+bounce_combine = "average"
