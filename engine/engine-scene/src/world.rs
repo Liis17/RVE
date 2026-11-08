@@ -16,6 +16,7 @@ use crate::particles::ParticleEmitterComponent;
 use crate::physics_material::resolve_collider_material;
 use crate::post_process::PostProcessSettings;
 use crate::prefab::{MAX_EXPANDED_ID_BYTES, PrefabTemplate};
+use crate::ui_canvas::UiCanvasComponent;
 use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::cell::RefCell;
@@ -232,6 +233,7 @@ pub struct WorldObject {
     pub particle_emitter: Option<ParticleEmitterComponent>,
     pub network_identity: Option<NetworkIdentityComponent>,
     pub network_transform: Option<NetworkTransformComponent>,
+    pub ui_canvas: Option<UiCanvasComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
 }
@@ -616,6 +618,11 @@ impl World {
     /// Сетевая трансформация объекта, если у него есть `network_transform`.
     pub fn network_transform(&self, handle: ObjectHandle) -> Option<&NetworkTransformComponent> {
         self.object(handle)?.network_transform.as_ref()
+    }
+
+    /// Игровой UI объекта, если у него есть `ui_canvas`.
+    pub fn ui_canvas(&self, handle: ObjectHandle) -> Option<&UiCanvasComponent> {
+        self.object(handle)?.ui_canvas.as_ref()
     }
 
     /// Пути `[[assets]]` сцены в порядке документа.
@@ -1278,6 +1285,7 @@ fn world_object(
         particle_emitter: object.particle_emitter.clone(),
         network_identity: object.network_identity,
         network_transform: object.network_transform,
+        ui_canvas: object.ui_canvas.clone(),
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
     }

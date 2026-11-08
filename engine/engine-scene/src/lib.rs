@@ -13,6 +13,7 @@ pub mod physics_material;
 pub mod post_process;
 pub mod prefab;
 pub mod transform;
+pub mod ui_canvas;
 pub mod world;
 
 /// Версия крейта, заданная в `Cargo.toml`.
@@ -37,6 +38,7 @@ pub use particles::{
     ParticleSizeKeyComponent,
 };
 pub use physics_material::{CombineMode, PhysicsMaterialError, PhysicsMaterialSettings};
+pub use ui_canvas::UiCanvasComponent;
 
 pub use camera_settings::{
     AntiAliasing, CameraColorSettings, CameraRenderSettings, CameraSettings, CameraSettingsError,

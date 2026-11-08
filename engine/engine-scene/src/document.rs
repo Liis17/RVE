@@ -10,6 +10,7 @@ use crate::network::{
 use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
 use crate::physics_material::PhysicsMaterialSettings;
 use crate::prefab::{PREFAB_EXTENSION, PrefabInstance};
+use crate::ui_canvas::{UiCanvasComponent, validate_ui_canvas};
 use crate::world::{LocalTransform, calculate_world_matrices};
 use engine_files::VirtualPath;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -323,6 +324,9 @@ impl SceneDocument {
             if let Some(animator) = &object.animator {
                 validate_animator(source, object, &asset_paths, animator)?;
             }
+            if let Some(canvas) = &object.ui_canvas {
+                validate_ui_canvas(source, &object.id, &asset_paths, canvas)?;
+            }
             if let Some(emitter) = &object.particle_emitter {
                 validate_particle_emitter(source, &object.id, &asset_paths, emitter)?;
             }
@@ -561,6 +565,8 @@ pub struct SceneObject {
     pub network_identity: Option<NetworkIdentityComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_transform: Option<NetworkTransformComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_canvas: Option<UiCanvasComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,
     #[serde(default)]

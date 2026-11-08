@@ -83,6 +83,7 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         particle_emitter,
         network_identity,
         network_transform,
+        ui_canvas,
         lite_scripts,
         heavy_scripts,
     } = object;
@@ -106,6 +107,7 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         && particle_emitter.is_none()
         && network_identity.is_none()
         && network_transform.is_none()
+        && ui_canvas.is_none()
         && lite_scripts.is_empty()
         && heavy_scripts.is_empty()
     {
@@ -271,6 +273,15 @@ mod tests {
             ..empty.clone()
         };
         assert_eq!(object_icon(&with_audio), None);
+        let with_ui = SceneObject {
+            ui_canvas: Some(engine_scene::UiCanvasComponent {
+                document: VirtualPath::parse("/ui/hud.rveui").unwrap(),
+                visible: true,
+                layer: None,
+            }),
+            ..empty.clone()
+        };
+        assert_eq!(object_icon(&with_ui), None);
         let with_script = SceneObject {
             lite_scripts: vec![engine_scene::LiteScript {
                 path: VirtualPath::parse("/scripts/spin.lua").unwrap(),

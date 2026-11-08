@@ -19,6 +19,7 @@ use crate::network::{
 };
 use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
 use crate::physics_material::resolve_collider_material;
+use crate::ui_canvas::{UiCanvasComponent, validate_ui_canvas};
 use crate::world::topological_order;
 use engine_files::VirtualPath;
 use serde::{Deserialize, Serialize};
@@ -89,6 +90,8 @@ pub struct PrefabOverride {
     pub network_identity: Option<NetworkIdentityComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_transform: Option<NetworkTransformComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_canvas: Option<UiCanvasComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -331,6 +334,13 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .as_mut()
             .ok_or("override network_transform: у объекта нет network_transform")?;
         *target = transform;
+    }
+    if let Some(canvas) = &change.ui_canvas {
+        let target = object
+            .ui_canvas
+            .as_mut()
+            .ok_or("override ui_canvas: у объекта нет ui_canvas")?;
+        *target = canvas.clone();
     }
     if let Some(environment) = &change.environment {
         let target = object
@@ -731,6 +741,9 @@ pub(crate) fn validate_instances(
             }
             if let Some(transform) = &change.network_transform {
                 validate_network_transform(source, id, transform)?;
+            }
+            if let Some(canvas) = &change.ui_canvas {
+                validate_ui_canvas(source, id, assets, canvas)?;
             }
         }
     }
