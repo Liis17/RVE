@@ -65,7 +65,7 @@ pub fn max_scroll(view: Rect, content: Rect) -> Vec2 {
 }
 
 /// Результат layout одного канваса; все массивы индексируются индексом элемента документа.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Layout {
     /// Прямоугольники видимых элементов в координатах канваса; у скрытых — нулевые.
     pub rects: Vec<Rect>,

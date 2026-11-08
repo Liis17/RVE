@@ -40,6 +40,13 @@ impl Error for UiError {}
 pub struct UiPath(String);
 
 impl UiPath {
+    /// Разбирает путь с необязательным ведущим слешем; ошибка — текст причины.
+    pub fn parse(input: &str) -> Result<Self, String> {
+        VirtualPath::parse(input)
+            .map(|path| Self(path.as_str().to_owned()))
+            .map_err(|error| error.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -54,9 +61,7 @@ impl Serialize for UiPath {
 impl<'de> Deserialize<'de> for UiPath {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let input = String::deserialize(deserializer)?;
-        VirtualPath::parse(&input)
-            .map(|path| Self(path.as_str().to_owned()))
-            .map_err(<D::Error as serde::de::Error>::custom)
+        Self::parse(&input).map_err(<D::Error as serde::de::Error>::custom)
     }
 }
 
@@ -909,7 +914,8 @@ fn valid_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-fn check_rect(rect: &RectSpec) -> Result<(), String> {
+/// Проверяет числа и якоря прямоугольника; используется и при загрузке, и при правках API.
+pub(crate) fn check_rect(rect: &RectSpec) -> Result<(), String> {
     let values = [
         rect.anchor_min,
         rect.anchor_max,
