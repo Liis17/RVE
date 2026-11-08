@@ -56,12 +56,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.separator();
 
     ui.strong("Layers");
-    ui.label("Индекс имени — значение layer объекта, не более 32 имён.");
+    ui.label(
+        "Индекс — значение layer объекта. ✕ очищает имя, индексы остальных слоёв не меняются.",
+    );
     for (index, name) in draft.layers_mut().iter_mut().enumerate() {
         ui.horizontal(|ui| {
             ui.label(format!("{index}"));
             ui.text_edit_singleline(name);
-            if ui.small_button("✕").on_hover_text("Удалить слой").clicked() {
+            if ui
+                .small_button("✕")
+                .on_hover_text("Очистить имя слоя")
+                .clicked()
+            {
                 commands.push(Command::RemoveLayer(index));
             }
         });
@@ -80,15 +86,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                 draft.tags_mut().push(next);
             }
             Command::RemoveTag(index) => {
-                draft.tags_mut().remove(index);
+                if let Some(name) = draft.remove_tag(index) {
+                    state.log.warn(format!(
+                        "тег «{name}» удалён из [tags]: объекты сцены с ним сохранят тег, но он не записан в списке"
+                    ));
+                }
             }
             Command::AddLayer => {
                 let next = format!("layer_{}", draft.layers_mut().len());
                 draft.layers_mut().push(next);
             }
-            Command::RemoveLayer(index) => {
-                draft.layers_mut().remove(index);
-            }
+            Command::RemoveLayer(index) => draft.clear_layer(index),
             Command::Revert => draft.revert(),
             Command::Save => {
                 if let Some(project) = state.project.as_mut() {

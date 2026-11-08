@@ -1,7 +1,11 @@
 //! Черновик тегов и слоёв проекта: правки `[tags]` и `[layers]` в `project.rveproject` до сохранения.
+//! Слой — фиксированный слот: очистка имени оставляет индекс занятым, поэтому `layer` объектов
+//! не сдвигается.
 
 use engine_project::{MAX_LAYERS, ProjectSettings};
 use std::path::{Path, PathBuf};
+
+const PROJECT_FILE: &str = "project.rveproject";
 
 /// Несохранённые списки тегов и слоёв открытого проекта.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11,6 +15,9 @@ pub struct TagsLayersDraft {
     layers: Vec<String>,
     saved_tags: Vec<String>,
     saved_layers: Vec<String>,
+    /// Текст файла, который черновик видел при открытии или последнем сохранении. Нужен, чтобы
+    /// не затереть правки, сделанные вне редактора.
+    disk_text: Option<String>,
     /// Причина последнего неудачного сохранения; сбрасывается при следующем сохранении или откате.
     pub error: Option<String>,
 }
@@ -24,6 +31,7 @@ impl TagsLayersDraft {
             layers: settings.layers.names.clone(),
             saved_tags: settings.tags.names.clone(),
             saved_layers: settings.layers.names.clone(),
+            disk_text: std::fs::read_to_string(root.join(PROJECT_FILE)).ok(),
             error: None,
         }
     }
@@ -38,6 +46,19 @@ impl TagsLayersDraft {
 
     pub fn layers_mut(&mut self) -> &mut Vec<String> {
         &mut self.layers
+    }
+
+    /// Удаляет тег из списка и возвращает его имя. Объекты сцены с этим тегом сохраняют значение,
+    /// но тег больше не записан в `[tags]`.
+    pub fn remove_tag(&mut self, index: usize) -> Option<String> {
+        (index < self.tags.len()).then(|| self.tags.remove(index))
+    }
+
+    /// Очищает имя слоя и не трогает остальные слоты: их индексы остаются прежними.
+    pub fn clear_layer(&mut self, index: usize) {
+        if let Some(name) = self.layers.get_mut(index) {
+            name.clear();
+        }
     }
 
     /// Можно ли добавить слой: проект допускает не больше [`MAX_LAYERS`] имён.
@@ -56,8 +77,9 @@ impl TagsLayersDraft {
         self.error = None;
     }
 
-    /// Проверяет черновик и записывает `project.rveproject`. Возвращает новые настройки проекта.
-    /// Файл пишется заново, поэтому комментарии исходного файла не сохраняются.
+    /// Проверяет черновик и записывает `project.rveproject` через временный файл. Если файл
+    /// изменён вне редактора после открытия или последнего сохранения, запись отменяется.
+    /// Возвращает новые настройки проекта. Файл пишется заново, поэтому комментарии не сохраняются.
     pub fn save(&mut self, settings: &ProjectSettings) -> Result<ProjectSettings, String> {
         let mut next = settings.clone();
         next.tags.names = self.tags.clone();
@@ -65,16 +87,41 @@ impl TagsLayersDraft {
         let text = next
             .to_toml()
             .inspect_err(|error| self.error = Some(error.clone()))?;
-        std::fs::write(self.root.join("project.rveproject"), text).map_err(|error| {
-            let message = format!("project.rveproject: {error}");
+        let path = self.root.join(PROJECT_FILE);
+        self.ensure_unchanged(&path)
+            .inspect_err(|error| self.error = Some(error.clone()))?;
+        write_atomically(&path, &text).map_err(|error| {
+            let message = format!("{PROJECT_FILE}: {error}");
             self.error = Some(message.clone());
             message
         })?;
+        self.disk_text = Some(text);
         self.saved_tags = self.tags.clone();
         self.saved_layers = self.layers.clone();
         self.error = None;
         Ok(next)
     }
+
+    fn ensure_unchanged(&self, path: &Path) -> Result<(), String> {
+        if std::fs::read_to_string(path).ok() == self.disk_text {
+            return Ok(());
+        }
+        Err(format!(
+            "{PROJECT_FILE} изменён вне редактора после открытия проекта; сохранение отменено, откройте проект заново"
+        ))
+    }
+}
+
+/// Пишет `text` во временный файл рядом с `path` и переименовывает его поверх `path`: при сбое
+/// записи исходный файл остаётся целым.
+fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    std::fs::write(&temp, text)?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
 }
 
 #[cfg(test)]
@@ -149,5 +196,67 @@ mod tests {
         draft.revert();
         assert!(draft.layers_mut().is_empty());
         assert!(!draft.is_dirty());
+    }
+
+    #[test]
+    fn an_external_edit_after_open_is_not_overwritten() {
+        let temp = TempProject::new("external");
+        let path = temp.0.join(PROJECT_FILE);
+        std::fs::write(&path, PROJECT).unwrap();
+        let mut draft = TagsLayersDraft::open(&temp.0, &settings());
+        draft.tags_mut().push("Player".to_owned());
+        let edited = format!("# edited by hand\n{PROJECT}");
+        std::fs::write(&path, &edited).unwrap();
+
+        let error = draft.save(&settings()).unwrap_err();
+        assert!(error.contains("изменён вне редактора"), "{error}");
+        assert_eq!(draft.error.as_deref(), Some(error.as_str()));
+        assert!(draft.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    }
+
+    #[test]
+    fn repeated_saves_are_accepted_and_leave_no_temporary_file() {
+        let temp = TempProject::new("repeat");
+        let path = temp.0.join(PROJECT_FILE);
+        std::fs::write(&path, PROJECT).unwrap();
+        let mut draft = TagsLayersDraft::open(&temp.0, &settings());
+        draft.tags_mut().push("Player".to_owned());
+        draft.save(&settings()).unwrap();
+        draft.tags_mut().push("Enemy".to_owned());
+        draft.save(&settings()).unwrap();
+
+        let reloaded = ProjectSettings::load(&path).unwrap();
+        assert_eq!(reloaded.tags.names, ["Player", "Enemy"]);
+        assert!(!temp.0.join(format!("{PROJECT_FILE}.tmp")).exists());
+    }
+
+    #[test]
+    fn cleared_layer_keeps_the_slots_of_the_other_layers() {
+        let temp = TempProject::new("slots");
+        let path = temp.0.join(PROJECT_FILE);
+        std::fs::write(&path, PROJECT).unwrap();
+        let mut draft = TagsLayersDraft::open(&temp.0, &settings());
+        draft
+            .layers_mut()
+            .extend(["Default", "UI", "FX"].map(str::to_owned));
+
+        draft.clear_layer(1);
+        assert_eq!(draft.layers_mut().clone(), ["Default", "", "FX"]);
+        draft.save(&settings()).unwrap();
+        let reloaded = ProjectSettings::load(&path).unwrap();
+        assert_eq!(reloaded.layers.names, ["Default", "", "FX"]);
+    }
+
+    #[test]
+    fn removing_a_tag_returns_its_name_and_out_of_range_is_ignored() {
+        let mut draft = TagsLayersDraft::open(Path::new("."), &settings());
+        draft
+            .tags_mut()
+            .extend(["Player", "Enemy"].map(str::to_owned));
+
+        assert_eq!(draft.remove_tag(0).as_deref(), Some("Player"));
+        assert_eq!(draft.tags_mut().clone(), ["Enemy"]);
+        assert_eq!(draft.remove_tag(5), None);
     }
 }

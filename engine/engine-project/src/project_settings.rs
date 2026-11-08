@@ -52,7 +52,7 @@ impl TagSettings {
     }
 
     fn validate(&self) -> Result<(), String> {
-        validate_names("tags", &self.names, usize::MAX)
+        validate_names("tags", &self.names, usize::MAX, false)
     }
 }
 
@@ -60,7 +60,8 @@ impl TagSettings {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LayerSettings {
-    /// Имена слоёв `[A-Za-z0-9_-]{1,64}`, без повторов; не более [`MAX_LAYERS`].
+    /// Имена слоёв `[A-Za-z0-9_-]{1,64}`, без повторов; не более [`MAX_LAYERS`]. Пустая строка —
+    /// слот без имени: индексы остальных слоёв от этого не меняются.
     pub names: Vec<String>,
 }
 
@@ -70,11 +71,16 @@ impl LayerSettings {
     }
 
     fn validate(&self) -> Result<(), String> {
-        validate_names("layers", &self.names, MAX_LAYERS)
+        validate_names("layers", &self.names, MAX_LAYERS, true)
     }
 }
 
-fn validate_names(section: &str, names: &[String], limit: usize) -> Result<(), String> {
+fn validate_names(
+    section: &str,
+    names: &[String],
+    limit: usize,
+    allow_empty: bool,
+) -> Result<(), String> {
     if names.len() > limit {
         return Err(format!(
             "[{section}] names допускает не больше {limit} имён"
@@ -82,6 +88,9 @@ fn validate_names(section: &str, names: &[String], limit: usize) -> Result<(), S
     }
     let mut seen = HashSet::with_capacity(names.len());
     for name in names {
+        if allow_empty && name.is_empty() {
+            continue;
+        }
         let valid = !name.is_empty()
             && name.len() <= 64
             && name
@@ -467,6 +476,30 @@ mod tests {
         assert_eq!(settings.layers.names, ["Default", "UI"]);
         let again = ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap();
         assert_eq!(again, settings);
+    }
+
+    #[test]
+    fn cleared_layer_slots_are_allowed_but_empty_tags_and_duplicates_are_not() {
+        let scene = "[[scenes]]\npath = \"scene.rvescene\"\n";
+        let settings = ProjectSettings::parse(&project(&format!(
+            "{scene}[layers]\nnames = [\"Default\", \"\", \"UI\", \"\"]\n"
+        )))
+        .unwrap();
+        assert_eq!(settings.layers.names, ["Default", "", "UI", ""]);
+        let text = settings.to_toml().unwrap();
+        assert_eq!(
+            ProjectSettings::parse(&text).unwrap().layers.names,
+            settings.layers.names
+        );
+
+        let error = ProjectSettings::parse(&project(&format!("{scene}[tags]\nnames = [\"\"]\n")))
+            .unwrap_err();
+        assert!(error.contains("[tags]"), "{error}");
+        let error = ProjectSettings::parse(&project(&format!(
+            "{scene}[layers]\nnames = [\"UI\", \"UI\"]\n"
+        )))
+        .unwrap_err();
+        assert!(error.contains("[layers]"), "{error}");
     }
 
     #[test]
