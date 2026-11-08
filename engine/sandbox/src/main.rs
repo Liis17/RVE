@@ -708,6 +708,9 @@ impl Sandbox {
                 .transpose()?;
             let material_id = renderer
                 .create_material(&Material {
+                    shader: None,
+                    user_values: [[0.0; 4]; 16],
+                    user_textures: [None; 8],
                     base_color: mesh.material.base_color,
                     metallic: mesh.material.metallic,
                     roughness: mesh.material.roughness,
