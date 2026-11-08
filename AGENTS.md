@@ -24,6 +24,7 @@ Obsidian/RVEVault/Engine/EngineScript.md — Lua и Rust-скрипты сцен
 Obsidian/RVEVault/Engine/EngineNetwork.md — Сетевой модуль: протокол, шифрование, репликация и мост к миру
 Obsidian/RVEVault/Engine/EngineInput.md — Геймпады: gilrs-бэкенд, перевод событий, слоты 1..4, фокусный гейт и вибрация
 Obsidian/RVEVault/Engine/EngineConsole.md — Буфер лога, команды и общий egui developer console
+Obsidian/RVEVault/Engine/EngineMcp.md — Локальный MCP-сервер редактора: Streamable HTTP, сессии, права и очередь вызовов
 Obsidian/RVEVault/Engine/RveSdk.md — C ABI и гостевой API Rust-скриптов
 Obsidian/RVEVault/Engine/EngineRuntime.md — Игровой runtime и player
 Obsidian/RVEVault/Engine/RveBuild.md — Сборка проекта в release player
@@ -70,11 +71,12 @@ Obsidian/RVEVault/Engine/RveEditor.md — Графический редакто�
   - engine-network (потребители engine-runtime и rve-editor): engine-scene, blake3, chacha20poly1305, ed25519-dalek,
     x25519-dalek, getrandom, zeroize, flume, glam, log. От скриптов, runtime, renderer и окна не зависит.
   - engine-input (потребители engine-runtime и rve-editor): gilrs, log, rve-sdk.
+  - engine-mcp (потребитель rve-editor): tiny_http, base64, getrandom, flume, serde_json.
   - rve-player: engine-runtime.
   - rve-server: engine-runtime (headless-путь без окна и renderer).
   - rve-editor: engine-animation, engine-assets, engine-files, engine-input, engine-network, engine-physics, engine-project, engine-render,
     engine-audio, engine-resources, engine-scene, engine-script, engine-window,
-    engine-console, engine-ui.
+    engine-console, engine-ui, engine-mcp.
 - При изменении engine-platform проверяй общий интерфейс, адаптеры engine-platform-windows и engine-platform-macos и вызовы из renderer.
 - Контракты: учитывай WindowHandler, WindowConfig, RendererConfig, FrameStatus, ошибки библиотек, CLI sandbox и коды завершения. При их изменении проверяй производителей и потребителей.
 - Платформы: учитывай Windows с Vulkan-драйвером и macOS с Vulkan loader и MoltenVK. Меняй только затронутые платформы и явно указывай непроверенные.

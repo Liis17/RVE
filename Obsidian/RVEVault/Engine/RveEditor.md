@@ -19,7 +19,9 @@ Parent: [[Index]]
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject` | Команды над документом, undo/redo, атомарное сохранение, раскрытие префабов |
 | `editor/src/scene_edit/prefabs.rs` | `OverrideField`, `object_override` | Instantiate, Create Prefab, Unpack, overrides и Apply to Prefab |
 | `editor/src/scene_edit.rs` | `EditorScene`, `NewObject`, `Component` | Команды над документом, выделение, undo/redo, буфер обмена объектов, атомарное сохранение |
-| `editor/src/settings.rs` | `SettingsStore`, `UserSettings` | Настройки пользователя: недавние проекты и раскладка панелей |
+| `editor/src/settings.rs` | `SettingsStore`, `UserSettings`, `McpSettings` | Настройки пользователя: недавние проекты, раскладка панелей и настройки MCP-сервера |
+| `editor/src/mcp/` | `McpHost`, `dispatch`, `capture`, `paths` | MCP-сервер редактора: применение настроек, выполнение инструментов на главном потоке, политика путей и `capture_view` |
+| `editor/src/ui/preferences.rs` | `Preferences`, `show` | Окно Edit → Preferences… с настройками MCP-сервера |
 | `editor/src/autosave.rs` | `AutosaveStore` | Копии несохранённых сцен и их восстановление |
 | `editor/src/assets_fs.rs` | `AssetsDir` | Файловые операции в `Assets/` с проверкой путей |
 | `editor/src/asset_watch.rs` | `AssetWatcher`, `AssetChanges`, `ChangeBatch` | Watcher `Assets/`, классификация путей, debounce и выборочная обработка изменений |
@@ -42,12 +44,12 @@ Parent: [[Index]]
 
 | Контракт | Поведение |
 |---|---|
-| CLI | `rve-editor [--project <dir>] [--scripts <library>]`. Без `--project` показывается стартовый экран. Если `--scripts` задан, эта ABI-библиотека заменяет autobuild; иначе проект с `heavy_scripts` собирается при открытии и перед Play |
+| CLI | `rve-editor [--project <dir>] [--scripts <library>] [--mcp]`. Без `--project` показывается стартовый экран. `--mcp` включает MCP-сервер на этот запуск и не меняет сохранённую настройку. Если `--scripts` задан, эта ABI-библиотека заменяет autobuild; иначе проект с `heavy_scripts` собирается при открытии и перед Play |
 | Коды завершения | 0 — успех; 2 — неверные аргументы, настройки проекта или `bootstrap.rves`; 1 — ошибка окна или renderer |
 | Консоль Windows | Release-сборка использует подсистему `windows`, как `rve-player`: окно консоли не открывается, а stderr ошибок CLI и запуска при старте из терминала не виден; коды завершения сохраняются. Debug-сборка остаётся консольной. Дочерние процессы сборки запускаются с `CREATE_NO_WINDOW` |
 | Окно | Размер из `bootstrap.rves` проекта, иначе 1600×900; заголовок содержит проект, сцену и признак несохранённых правок |
 | Раскладка проекта | Как dev-запуск player: `project.rveproject`, `bootstrap.rves`, `Assets/`; ресурсы читаются в `SourceMode::Loose`. `AssetWatcher` автоматически наблюдает за `Assets/`. Камеры читают общие `.camerasettings` и `.postprocess` по объявленным scene asset paths |
-| Настройки пользователя | `rve-editor/settings.json` в каталоге настроек ОС (`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` или `~/.config`): до 10 недавних проектов, раскладка egui_dock и режим `scroll_navigation` (Auto/Trackpad/Mouse). Пишется при открытии проекта и выходе; повреждённое поле или раскладка с повторяющимися панелями заменяются значением по умолчанию с предупреждением в Console |
+| Настройки пользователя | `rve-editor/settings.json` в каталоге настроек ОС (`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` или `~/.config`): до 10 недавних проектов, раскладка egui_dock, режим `scroll_navigation` (Auto/Trackpad/Mouse) и настройки MCP-сервера в поле `mcp` (не зависят от проекта). Пишется при открытии проекта и выходе; повреждённое поле или раскладка с повторяющимися панелями заменяются значением по умолчанию с предупреждением в Console |
 | Pipeline cache | `RendererConfig` всегда запрашивает FIFO; pipeline cache хранится отдельно в каталоге пользователя ОС для `rve-editor`, загружается до создания renderer и атомарно сохраняется после оконного цикла ([[Engine/EnginePlatform]], [[Engine/EngineRender]]) |
 | Автосохранение | `<проект>/.rve/editor/autosave/<сцена>.autosave`, где `~` и `/` пути экранированы как `~7E` и `~2F`, а новая сцена — `~untitled`. Каталог вне `Assets/`, поэтому копии не попадают в ресурсы и сборку |
 | Буфер обмена | Ctrl/Cmd+C кладёт в буфер ОС JSON с ключом `rve_editor_objects` (выделенные поддеревья `SceneObject`); вставка чужого текста игнорируется |
@@ -58,7 +60,7 @@ Parent: [[Index]]
 
 Каждый viewport получает собственный список draws, `FrameCamera`, environment, локальные lights, local shadow requests/matrices и camera-relative directional shadow cascades. Runtime helpers из `engine-scene::light` строят матрицы из мирового состояния lights; renderer независимо распределяет 32 слоя с учётом camera distance для каждой панели. Scene использует камеру редактора вне Play и камеру сцены в Play; Game использует выбранную игровую камеру, поэтому проекция, cluster lists, environment transform, выбор локальных источников/теней и каскады считаются отдельно для каждой панели. Общий local shadow array перерисовывается последовательно перед каждым viewport opaque pass; матрицы лежат в per-frame viewport buffers. Сетка добавляется только к списку Scene. Обе панели используют общие кэши FBX/PNG/HDR и могут независимо выбрать разные LOD одного объекта.
 
-Окно работает в `RedrawMode::OnDemand`: кадр запрашивают события egui-winit, отложенный repaint egui через `WindowHandler::next_wakeup`, незавершённые превью и модели и пропущенный кадр. В Play вне паузы кадр запрашивается постоянно. Срок автосохранения тоже входит в `next_wakeup`, а копия пишется в `WindowHandler::update`, поэтому последняя правка перед простоем записывается без перерисовки.
+Окно работает в `RedrawMode::OnDemand`: кадр запрашивают события egui-winit, отложенный repaint egui через `WindowHandler::next_wakeup`, незавершённые превью и модели и пропущенный кадр. В Play вне паузы кадр запрашивается постоянно. Срок автосохранения тоже входит в `next_wakeup`, а копия пишется в `WindowHandler::update`, поэтому последняя правка перед простоем записывается без перерисовки. Вызовы MCP будят окно через `WindowProxy::wake`; пока `capture_view` активен, `next_wakeup` возвращает опрос каждые 16 мс (см. «MCP-сервер» ниже и [[Engine/EngineMcp]]).
 
 Модели FBX разбирает `ModelLoader` в потоке `rve-editor-models`, а загрузку готовой модели в GPU выполняет `SceneRenderer::sync_assets` на главном потоке; до готовности объект не рисуется и не выбирается, ошибка пишется в Console. Смена проекта перезапускает очередь с новым поколением, и результаты, начатые раньше, отбрасываются. Наведение камеры на новую модель (`pending_frame`) ждёт окончания её загрузки.
 
@@ -284,6 +286,54 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - Редактор перерисовывает по запросу, поэтому `sleep()` выполняется только при непрерывной перерисовке. Признак `continuous_redraw` — `playing_now || previewing`, сохранённое с прошлого кадра; в простое кадр не ждёт Reflex.
 - Маркеры ставятся всегда, когда есть handle: `SimulationStart` до сбора egui `raw_input`, `InputSample` перед `play.tick()`, `SimulationEnd` перед рендером. Локальный счётчик кадров задаёт id и вызывает `set_latency_frame` перед `render_scene_frame`.
 
+## MCP-сервер
+
+Редактор запускает локальный MCP-сервер ([[Engine/EngineMcp]]) для агентов: он читает ассеты, файлы, сцену и лог, правит сцену и ассеты, управляет Play и сборкой и делает скриншоты. Сервер живёт вместе с редактором и не зависит от открытого проекта.
+
+**Настройки.** Edit → Preferences… → «MCP Server» (`editor/src/ui/preferences.rs`): вкл/выкл, порт (1024–65535, по умолчанию 47615), статус, токен (скрыт; кнопки Copy и Regenerate), флажки прав «Edit scene», «Write assets», «Control Play», «Build» и кнопка «Copy connection command» (`claude mcp add --transport http rve-editor http://127.0.0.1:<порт>/mcp --header "Authorization: Bearer <токен>"`). Изменения применяются по Apply и сохраняются в поле `mcp` файла `settings.json` пользователя (`McpSettings` в `editor/src/settings.rs`). Токен создаётся при первом включении. Regenerate заменяет токен в черновике; новый токен действует после Apply, и клиенты со старым получают 401. Право Read всегда доступно; остальные выключены по умолчанию.
+
+**Флаг `--mcp`.** Включает сервер на этот запуск. В памяти `mcp.enabled` становится `true`, но при записи `settings.json` записывается сохранённое значение.
+
+**Хозяин сервера.** `McpHost` (`editor/src/mcp/mod.rs`) создаётся в `EditorApp` и стартует в обработчике создания окна, где есть `WindowProxy`. Каждый `update` передаёт ему текущие настройки: listener перезапускается только при смене enabled, порта или токена, а права и поколение обновляются на лету. Если порт занят, bind повторяется каждые 100 мс в течение 2 с (статус «Starting»), затем сервер переходит в состояние ошибки. Ошибки пишутся в Console с префиксом `[MCP]`, редактор продолжает работать.
+
+**Выполнение вызовов.** `McpHost::drain` вызывается из `EditorApp::update` вне построения UI. Он пропускает вызовы, которые уже брошены клиентом или истекли, повторно проверяет право и поколение, затем выполняет инструмент на главном потоке через `dispatch` над `EditorState` и `EditorScene`. Вызовы, меняющие состояние (всё, кроме Read и `build_status`), пишутся в Console как `[MCP] <tool>`. Поколение растёт при открытии проекта (`open_project`) и при любой замене сцены (`set_scene`): вызов, поставленный до этого, завершается ошибкой «project or scene changed while request was queued» и не меняет новую сцену.
+
+**Инструменты по правам.**
+
+| Право | Инструменты |
+|---|---|
+| Read (всегда) | `editor_status`, `list_assets`, `list_project_files`, `read_text_file`, `get_project_settings`, `get_scene_hierarchy` (`source`: `edit` или `play`), `get_object`, `get_component`, `describe_components`, `get_asset_settings`, `get_script_params_schema`, `get_console_log`, `capture_view` |
+| Edit scene | `select_objects`, `create_object`, `delete_objects`, `duplicate_objects`, `set_parent`, `rename_object`, `change_id`, `set_transform`, `set_component` (по умолчанию слияние с текущим значением), `remove_component`, `set_script_param`, `set_camera_active`, `undo`, `redo` |
+| Write assets | `save_scene`, `open_scene`, `new_scene`, `open_project`, `write_asset_settings`, `create_folder`, `write_text_file`, `rename_asset`, `delete_asset`, `import_files`, `create_prefab`, `apply_to_prefab` |
+| Play | `play_start`, `play_stop`, `play_pause`, `play_resume`, `console_command` |
+| Build | `build_scripts`, `build_player`, `build_status` |
+
+Правки сцены отклоняются во время Play, как и в Inspector. Каждая правка проходит через `EditorScene` с `SceneDocument::validate` и становится отдельным шагом undo: перед ней закрывается непрерывная правка (`end_continuous_edit`). Открытие проекта или сцены и `new_scene` при несохранённых изменениях требуют `discard_changes=true`; модальный диалог при этом не открывается. Инструменты, которым нужен проект, без открытого проекта возвращают ошибку.
+
+**Политика путей** (`editor/src/mcp/paths.rs`):
+
+- Чтение (`read_text_file`, `list_project_files`, `get_project_settings`) разрешено внутри канонического корня проекта, кроме каталога `.rve`. Списки и настройки ассетов (`list_assets`, `get_asset_settings`) — только внутри `Assets/`.
+- Запись, создание, переименование, удаление и сохранение сцены — только внутри `Assets/`. Для существующей цели проверяется `canonicalize` и префикс каталога; для новой — канонический родитель. Компонент пути, являющийся symlink или junction, отклоняется; `..`, абсолютные пути вне проекта и `.rve` тоже отклоняются.
+- Вне этих правил три исключения: `open_project` принимает любой каталог с `project.rveproject` (право Assets), `import_files` копирует файлы с произвольных путей-источников в папку `Assets/` (право Assets), `build_player` пишет в произвольный `output_dir` (право Build). Поэтому право Assets позволяет скопировать внешний файл в проект и затем прочитать его через `read_text_file`.
+
+**Скриншоты `capture_view`.**
+
+- Аргументы: `view` (`scene` или `game`, обязательный), `camera_id` (объект с компонентом `camera`), `width` и `height` (от 1 до `min(4096, max_texture_size)`), `warmup_frames` (от 1 до 64, по умолчанию 8).
+- Панельный режим выбирается, если панель видна, а `camera_id`, `width` и `height` не заданы. Renderer запрашивает readback viewport панели, и ответ — тот кадр, который видит пользователь.
+- Иначе используется offscreen-режим. Создаётся один offscreen viewport с камерой редактора (`scene`), игровой камерой (`game`) или камерой объекта. Размер по умолчанию — последний размер панели, а при его отсутствии 1280×720. Кадр рисуется `warmup_frames` раз (первый с `reset_history`), затем запрашивается readback. Такой кадр строится, даже если обе панели скрыты.
+- `SceneRenderer` (`editor/src/viewport/render.rs`) строит для capture-камеры отдельный третий список отрисовки: отсечение и LOD считаются по её позиции. Для вида `scene` применяются постобработка и DebugView панели Scene, сетка не добавляется.
+- Задача живёт в `EditorState` до готового кадра. Пока она активна, `update` запрашивает redraw, а `next_wakeup` возвращает опрос каждые 16 мс. Ответ — PNG, кодируемый на главном потоке, и JSON с полями `view`, `source` (`panel` или `offscreen`), `camera`, `width`, `height` и `warmup_frames` (для offscreen).
+- Срок ожидания — 10 с. Задача также отменяется при смене поколения, отключении клиента, остановке сервера или закрытии редактора. Отмена вызывает `cancel_capture` и освобождает offscreen viewport, клиент получает `isError` с причиной.
+
+**Ограничения MCP.**
+
+- Одновременно выполняется только один `capture_view`; второй вызов получает ошибку.
+- Readback и кодирование PNG выполняются на главном потоке и могут задерживать UI на большом разрешении.
+- Свёрнутое окно не получает кадров (`FrameStatus::Skipped`), поэтому захват не завершается и заканчивается ошибкой по 10-секундному сроку.
+- Возможный риск: offscreen-кадр может не успеть стабилизировать auto-exposure и TAA за `warmup_frames`. Панельный захват этого не требует.
+- Токен хранится в `settings.json` открытым текстом. Права Assets и Build открывают внешние пути (см. политику путей).
+- `read_text_file` читает UTF-8 текст размером до 1 МиБ.
+
 ## Ограничения
 
 - Захват курсора в Game и raw-дельта на Windows не проверены вручную; на macOS проверка требует запуска редактора с Play и Cmd+Tab.
@@ -302,6 +352,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - egui, egui-winit и egui_dock закреплены на 0.36.2, 0.36.2 и 0.21.1: egui_dock 0.21.1 требует egui ^0.36, поэтому более новый egui 0.37 недоступен.
 - UI рисуется собственным проходом в `engine-render` по решению пользователя: renderer принимает готовые примитивы и не зависит от egui.
 - Логика кадра сцены (`upload_scene`) перенесена в редактор, а не вынесена в общий крейт: в runtime она `pub(crate)`, и общий крейт ради одного потребителя не создавался.
+- MCP-сервер живёт в процессе редактора и не привязан к проекту, его настройки лежат в `settings.json` пользователя; по умолчанию сервер выключен, а права только на чтение: решения пользователя. Протокол, транспорт и причины ограничений — в [[Engine/EngineMcp]].
 
 ## Навигация Scene
 

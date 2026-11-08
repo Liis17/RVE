@@ -74,11 +74,24 @@ Parent: [[Index]]
 | `UiImage` | `Texture(UiTextureId)` или `Viewport(ViewportId)` |
 | `Renderer::create_ui_texture`, `update_ui_texture`, `free_ui_texture` | UI-текстуры RGBA8 создаются и обновляются по области, имеют один mip level и удаляются отложенно |
 | `Renderer::create_viewport`, `resize_viewport`, `free_viewport` | Создают и управляют scene render targets; нулевой размер пропускает pass, targets каждого frame slot заменяются после ожидания своего fence |
+| `Renderer::request_viewport_capture`, `take_captures`, `cancel_capture` | Readback post-composite изображения viewport в `CapturedImage { width, height, rgba8 }`. Запрос ставится в очередь и выполняется в первом отрисованном кадре с этим viewport; `take_captures` неблокирующе отдаёт готовые результаты, `cancel_capture` безопасен в любом состоянии. Подробности — в разделе «Захват viewport» |
+| `CaptureTicket`, `CapturedImage` | Непрозрачный идентификатор запроса и изображение в RGBA8 sRGB. Перестановка байтов выполняется только для BGRA-формата вывода; текущий `LDR_FORMAT` — `R8G8B8A8_SRGB`, поэтому перестановки нет |
 | `Renderer::render_frame_with_ui(scenes, ui, clear)` | Для каждой переданной сцены выполняет собственные cluster compute, directional и local shadow, HDR, tonemap и output passes в viewport target, затем рисует UI прямо в swapchain. Каждый `Frame` несёт свои camera position, local shadow selection/matrices и `ViewSettings`; frame slot хранит отдельные матрицы, а общий local depth array последовательно очищается и перерисовывается для каждого viewport до его opaque pass. Повтор viewport или неизвестная ссылка дают `InvalidTexture`; `Frame::overlay` здесь не используется. GPU-время измеряет первую нарисованную сцену до конца tonemap |
 | `FrameStatus::Presented` | `queue_present` вернул успех, в том числе при suboptimal; это не подтверждение фактического сканирования кадра монитором |
 | `FrameStatus::Skipped` | Нулевой размер, пересоздание swapchain, `OUT_OF_DATE` или `TIMEOUT`/`NOT_READY` от acquire, либо `OUT_OF_DATE` от present без успешной презентации |
 | `Renderer::render_frame_with_outcome` и `render_frame_with_ui_outcome` | Расширенные варианты render API возвращают `FrameOutcome { status, submitted }`; `submitted` истинно после успешного `vkQueueSubmit2`, даже если `queue_present` затем сообщил `OUT_OF_DATE`. Это позволяет runtime продвигать temporal model history только для кадров, действительно отправленных в очередь. Исходные `render_frame` и `render_frame_with_ui` сохраняют контракт `FrameStatus` |
 | `RenderError` | Варианты `InvalidConfig`, `Loader`, `Handle`, `Vulkan`, `Unsupported`, `NoSuitableDevice`, `InvalidState`, `InvalidMesh`, `InvalidTexture` и `InvalidMaterial` (неверные факторы или ID материала/текстуры, либо несовместимое цветовое пространство). Нулевой свет или неконечная shadow-матрица дают `InvalidConfig`; реализует `Display` и `Error` |
+
+## Захват viewport
+
+Захват — асинхронный readback изображения вывода viewport после composite. Его использует редактор для `capture_view` ([[Engine/RveEditor]]). Изменение аддитивно: `render_frame*` без запросов захвата работают как прежде.
+
+- Изображение вывода viewport создаётся с `TRANSFER_SRC` вместе с `COLOR_ATTACHMENT` и `SAMPLED`.
+- Тикет проходит состояния `Queued` (ждёт кадра, где viewport отрисован) → `Submitted` (копия записана в кадр слота, ждёт fence слота) → `Completed` или `Failed`. `Cancelled` возможен из любого состояния. Готовый результат отдаётся `take_captures` один раз.
+- При записи кадра после composite барьер переводит вывод в `TRANSFER_SRC_OPTIMAL`, `cmd_copy_image_to_buffer` пишет в host-visible буфер, затем барьер возвращает layout `SHADER_READ_ONLY_OPTIMAL` для UI. Буфер создаётся на каждый тикет, общего пула нет.
+- `take_captures` опрашивает fence отправленных слотов (`vkGetFenceStatus`) без ожидания; он не ждёт повторного использования слота. Буфер читается и освобождается только после сигнала fence. Отменённый, но уже отправленный тикет удерживает буфер до своего fence.
+- `cancel_capture` переводит тикет в `Cancelled` до отправки. Для отправленного тикета помечается только результат, без раннего освобождения staging-буфера.
+- `free_viewport` переводит ожидающие тикеты этого viewport в ошибку: очередь получает `InvalidTexture`, отправленные — `InvalidState`. Потеря синхронизации слотов или сбой записи кадра переводят тикеты в `InvalidState`.
 
 ## Skinning
 
