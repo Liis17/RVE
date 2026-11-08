@@ -1434,7 +1434,9 @@ impl Input<'_> {
     }
 
     /// Queues a rumble request for slot `pad` (0 for every connected gamepad). Returns `false`
-    /// when the host does not support rumble or rejects the request.
+    /// when the host does not support rumble, the slot is not 0..=4, rumble is unavailable during
+    /// script creation, or the frame already holds the maximum number of requests. A refusal is
+    /// also logged as a script error, as for audio requests, even if the guest ignores the result.
     pub fn rumble(&self, pad: u8, strong: f32, weak: f32, seconds: f32) -> bool {
         let Some(callback) = self.host.gamepad_rumble else {
             return false;
