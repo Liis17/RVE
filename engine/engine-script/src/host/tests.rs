@@ -225,6 +225,42 @@ id = "plain"
 }
 
 #[test]
+fn lua_array_property_schema_rejects_recursive_types_with_a_load_error() {
+    let world = world(
+        r#"
+[[assets]]
+path = "/recursive.lua"
+[[objects]]
+id = "object"
+[[objects.lite_scripts]]
+path = "/recursive.lua"
+"#,
+    );
+    let source = r#"
+local recursive = { type = "array" }
+recursive.of = recursive
+return { properties = { items = recursive } }
+"#;
+
+    let error = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("recursive.lua", source)]),
+        None,
+    )
+    .err()
+    .unwrap();
+
+    let ScriptLoadError::Lite { message, .. } = error else {
+        panic!("expected a lite script load error, got {error}");
+    };
+    assert!(
+        message.contains("array property nesting exceeds maximum depth of 4"),
+        "{message}"
+    );
+}
+
+#[test]
 fn lua_input_actions_read_values_bindings_and_delayed_mutations() {
     let mut world = one_camera(
         r#"

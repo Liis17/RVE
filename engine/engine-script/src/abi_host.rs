@@ -370,7 +370,7 @@ impl AbiScriptInstance {
         value: &ParamValue,
         call: AbiScriptCall<'_>,
     ) -> Result<(), String> {
-        let object_refs = message_object_refs(value, call.transaction)?;
+        let object_refs = message_object_refs(value, call.transaction);
         let value = OwnedAbiValue::new(value, &object_refs);
         let sender = RveStr::from_str_ref(sender);
         let name = RveStr::from_str_ref(name);
@@ -420,7 +420,7 @@ impl AbiScriptInstance {
                 RveStr::empty(),
                 Some(OwnedAbiValue::new(
                     value,
-                    &message_object_refs(value, call.transaction)?,
+                    &message_object_refs(value, call.transaction),
                 )),
             ),
             NetEvent::PeerConnected { peer } => (
@@ -2712,36 +2712,38 @@ struct OwnedAbiValue {
 fn message_object_refs(
     value: &ParamValue,
     transaction: &ScriptTransaction,
-) -> Result<std::collections::HashMap<String, ScriptObjectRef>, String> {
+) -> std::collections::HashMap<String, ScriptObjectRef> {
     fn visit(
         value: &ParamValue,
         transaction: &ScriptTransaction,
         references: &mut std::collections::HashMap<String, ScriptObjectRef>,
-    ) -> Result<(), String> {
+    ) {
         match value {
             ParamValue::Object(id) if !id.is_empty() => {
-                let handle = transaction
-                    .handle_by_id(id)
-                    .ok_or_else(|| format!("message object reference {id:?} is missing"))?;
-                let name = transaction
-                    .object_name(handle)
-                    .ok_or_else(|| format!("message object reference {id:?} is missing"))?
-                    .to_owned();
-                references.insert(id.clone(), ScriptObjectRef { handle, name });
+                if let Some(handle) = transaction.handle_by_id(id)
+                    && let Some(name) = transaction.object_name(handle)
+                {
+                    references.insert(
+                        id.clone(),
+                        ScriptObjectRef {
+                            handle,
+                            name: name.to_owned(),
+                        },
+                    );
+                }
             }
             ParamValue::Array(values) => {
                 for value in values {
-                    visit(value, transaction, references)?;
+                    visit(value, transaction, references);
                 }
             }
             _ => {}
         }
-        Ok(())
     }
 
     let mut references = std::collections::HashMap::new();
-    visit(value, transaction, &mut references)?;
-    Ok(references)
+    visit(value, transaction, &mut references);
+    references
 }
 
 impl OwnedAbiValue {

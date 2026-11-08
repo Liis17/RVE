@@ -784,6 +784,17 @@ impl Expander<'_, '_> {
             let prefab = self.prefab(&instance.prefab, source)?;
             assets.merge(&prefab.assets, source)?;
             let mut local = prefab.objects.clone();
+            let local_ids = local
+                .iter()
+                .map(|object| object.id.clone())
+                .collect::<HashSet<_>>();
+            for object in &mut local {
+                remap_object_param_refs(object, |reference| {
+                    local_ids
+                        .contains(reference)
+                        .then(|| map_id(&instance.id, &prefab.root, reference))
+                });
+            }
             if skip_overrides != Some(instance.id.as_str()) {
                 for change in &instance.overrides {
                     let object = local
@@ -804,18 +815,9 @@ impl Expander<'_, '_> {
                         .map_err(|message| SceneError::new(source, Some(&instance.id), message))?;
                 }
             }
-            let local_ids = local
-                .iter()
-                .map(|object| object.id.clone())
-                .collect::<HashSet<_>>();
             for mut object in local {
                 let target = object.id.clone();
                 let is_root = target == prefab.root;
-                remap_object_param_refs(&mut object, |reference| {
-                    local_ids
-                        .contains(reference)
-                        .then(|| map_id(&instance.id, &prefab.root, reference))
-                });
                 object.id = map_id(&instance.id, &prefab.root, &target);
                 if is_root {
                     object.parent = instance.parent.clone();

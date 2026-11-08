@@ -199,6 +199,7 @@ fn prepare_with_resources(
         let document = expansion.document;
         validate_lite_params(
             &document.objects,
+            &document.objects,
             &document.assets,
             &format!("сцена /{path}"),
             &handle,
@@ -375,15 +376,29 @@ fn load_spawn_template(
         read_prefab_text(handle, child)
     })
     .map_err(|error| BuildError::input(format!("ошибка префаба /{path}: {error}")))?;
+    let reference_objects = template
+        .objects()
+        .iter()
+        .cloned()
+        .map(|mut object| {
+            object.id = if object.id.is_empty() {
+                "__template".to_owned()
+            } else {
+                format!("__template.{}", object.id)
+            };
+            object
+        })
+        .collect::<Vec<_>>();
     validate_lite_params(
         template.objects(),
+        &reference_objects,
         template.assets(),
         &format!("префаб /{path}"),
         handle,
         schemas,
     )?;
     let references = Arc::new(ScriptReferenceContext {
-        objects: template.objects().to_vec(),
+        objects: reference_objects,
         assets: template
             .assets()
             .iter()
@@ -510,6 +525,7 @@ fn add_explicit_archive(
 /// `properties` их классов; схемы кэшируются по пути скрипта для всех документов.
 fn validate_lite_params(
     objects: &[SceneObject],
+    reference_objects: &[SceneObject],
     declared_assets: &[SceneAsset],
     owner: &str,
     handle: &ResourceHandle,
@@ -542,7 +558,7 @@ fn validate_lite_params(
                         object.id, script.path
                     ))
                 })?;
-                validate_script_references(schema, &resolved, objects, &assets).map_err(
+                validate_script_references(schema, &resolved, reference_objects, &assets).map_err(
                     |error| {
                         BuildError::input(format!(
                             "{owner}, объект {:?}, скрипт /{}: {error}",
@@ -1509,6 +1525,7 @@ mod heavy_prefab_tests {
     const SPIN_SCRIPT: &str =
         "return { properties = { speed = { type = \"float\", default = 1 } } }\n";
     const TOWER_BODY: &str = "[[assets]]\npath = \"/scripts/spin.lua\"\n[[assets]]\npath = \"/textures/tower.png\"\n[[objects]]\nid = \"tower\"\n[[objects.lite_scripts]]\npath = \"/scripts/spin.lua\"\nparams = { speed = 2 }\n";
+    const CAMERA: &str = "[[objects]]\nid = \"camera\"\n[objects.camera]\n";
 
     fn write(root: &Path, path: &str, text: &str) {
         let path = root.join("Assets").join(path);
@@ -1540,6 +1557,45 @@ mod heavy_prefab_tests {
         write(root, "scripts/spin.lua", SPIN_SCRIPT);
         write(root, "textures/tower.png", "texture");
         write(root, "prefabs/tower.rveprefab", TOWER_BODY);
+    }
+
+    fn script_reference_project(root: &Path, target: &str) {
+        fs::write(
+            root.join("project.rveproject"),
+            "id = \"game\"\nname = \"Game\"\nversion = \"1\"\n[[scenes]]\npath = \"/scenes/main.rvescene\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("bootstrap.rves"), "").unwrap();
+        write(
+            root,
+            "scenes/main.rvescene",
+            &format!("[[assets]]\npath = \"/prefabs/spawn.rveprefab\"\n{CAMERA}"),
+        );
+        write(
+            root,
+            "scripts/ref.lua",
+            "return { properties = { target = { type = \"object\" } } }\n",
+        );
+        write(
+            root,
+            "prefabs/spawn.rveprefab",
+            &format!(
+                "[[assets]]\npath = \"/scripts/ref.lua\"\n[[objects]]\nid = \"root\"\n[[objects.lite_scripts]]\npath = \"/scripts/ref.lua\"\nparams = {{ target = {{ object = {target:?} }} }}\n[[objects]]\nid = \"child\"\nparent = \"root\"\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn spawn_prefab_script_references_use_template_object_ids() {
+        let root = TempDir::create(&std::env::temp_dir(), "rve-build-prefab-refs").unwrap();
+        script_reference_project(root.path(), "child");
+        prepare_project(root.path()).unwrap();
+
+        script_reference_project(root.path(), "ghost");
+        let error = prepare_project(root.path()).unwrap_err();
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(error.to_string().contains("ghost"), "{error}");
+        assert!(error.to_string().contains("пределы префаба"), "{error}");
     }
 
     #[test]

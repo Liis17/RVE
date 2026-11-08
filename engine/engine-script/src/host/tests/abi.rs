@@ -1,4 +1,4 @@
-use super::world;
+use super::{sources, world};
 use crate::ScriptTime;
 use crate::host::{ScriptHost, ScriptLoadError};
 use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec};
@@ -101,6 +101,14 @@ impl Script for ReferenceProbe {
 
 impl Script for ReferenceReceiver {
     fn on_message(&mut self, ctx: &mut rve_sdk::Context<'_>, _: &str, name: &str, value: &Value) {
+        if name == "dead_ref" {
+            let Value::Object(object) = value else {
+                panic!("ABI object message was not decoded as an object handle");
+            };
+            assert_eq!(object.id(ctx), None);
+            ctx.log_info("ABI missing object message became null");
+            return;
+        }
         if name == "object" {
             let Value::Object(object) = value else {
                 panic!("object message was not decoded as a handle");
@@ -3255,6 +3263,89 @@ name = "ReferenceReceiver"
 }
 
 #[test]
+fn missing_object_message_references_are_nil_for_lua_and_abi_receivers() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/refs.lua"
+[[objects]]
+id = "sender"
+[[objects.lite_scripts]]
+path = "/refs.lua"
+[[objects]]
+id = "lua_receiver"
+[[objects.lite_scripts]]
+path = "/refs.lua"
+[[objects]]
+id = "abi_receiver"
+[[objects.heavy_scripts]]
+name = "ReferenceReceiver"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let lua = r#"
+local Script = {}
+function Script:on_start()
+  if self.object.id == "sender" then
+    local victim = rve.find("victim")
+    rve.send("lua_receiver", "dead_ref", victim)
+    rve.send("abi_receiver", "dead_ref", victim)
+    assert(rve.destroy("victim"))
+  end
+end
+function Script:on_message(_, name, value)
+  if name == "dead_ref" then
+    assert(value == nil)
+    rve.log_info("Lua missing object message became nil")
+  end
+end
+return Script
+"#;
+    let library = library();
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("refs.lua", lua)]),
+        Some(&library),
+    )
+    .unwrap();
+    host.start(&mut world, ScriptTime::default());
+    assert!(world.handle("victim").is_none());
+
+    host.update(
+        &mut world,
+        0.1,
+        ScriptTime {
+            elapsed: 0.1,
+            frame: 1,
+        },
+    );
+
+    let events = host.drain_events();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message.clone())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert!(
+        infos.contains(&"Lua missing object message became nil"),
+        "{infos:?}"
+    );
+    assert!(
+        infos.contains(&"ABI missing object message became null"),
+        "{infos:?}"
+    );
+}
+
+#[test]
 fn heavy_params_that_violate_the_schema_fail_loading() {
     let library = typed_library();
     for params in ["{ speed = 11.0 }", "{ enabled = 1 }", "{ unknown = 1 }"] {
@@ -3759,6 +3850,14 @@ impl Script for NetGuest {
         if name == "fail" {
             panic!("net callback exploded");
         }
+        if name == "missing_ref" {
+            let Value::Object(object) = value else {
+                panic!("missing network reference was not decoded as an object handle");
+            };
+            assert_eq!(object.id(ctx), None);
+            ctx.log_info("missing network object became null");
+            return;
+        }
         ctx.log_info(format!("message {peer} {name} {value:?}"));
     }
 
@@ -3916,6 +4015,12 @@ fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
                 name: "ok".to_owned(),
                 value: engine_scene::ParamValue::String("x".to_owned()),
             },
+            engine_scene::NetEvent::Message {
+                peer: 4,
+                object: None,
+                name: "missing_ref".to_owned(),
+                value: engine_scene::ParamValue::Object("unknown_from_peer".to_owned()),
+            },
             engine_scene::NetEvent::PeerConnected { peer: 8 },
             engine_scene::NetEvent::PeerDisconnected {
                 peer: 8,
@@ -3948,6 +4053,7 @@ fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
         infos,
         [
             "message 3 ok String(\"x\")",
+            "missing network object became null",
             "connected 8",
             "disconnected 8 timeout",
         ]

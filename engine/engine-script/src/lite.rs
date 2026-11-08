@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 const LUA_HOOK_INSTRUCTION_INTERVAL: u32 = 1_000;
 const LUA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PROPERTY_ARRAY_DEPTH: usize = 4;
 
 pub(crate) const MAX_PENDING_LOG_EVENTS: usize = 1_024;
 pub(crate) const MAX_LOG_MESSAGE_BYTES: usize = 4_096;
@@ -550,7 +551,7 @@ fn property_spec(name: String, entry: &Table) -> Result<ParamSpec, String> {
             _ => Err(LuaError::runtime("unknown field in script parameter")),
         })
         .map_err(|error| context(&error.to_string()))?;
-    let kind = property_kind(entry).map_err(|message| context(&message))?;
+    let kind = property_kind(entry, 0).map_err(|message| context(&message))?;
     let default = match entry.get::<Value>("default") {
         Ok(Value::Nil) => kind.zero(),
         Ok(value) => lua_param_value(value).map_err(|error| context(&error.to_string()))?,
@@ -582,7 +583,7 @@ fn property_spec(name: String, entry: &Table) -> Result<ParamSpec, String> {
     })
 }
 
-fn property_kind(entry: &Table) -> Result<ParamKind, String> {
+fn property_kind(entry: &Table, array_depth: usize) -> Result<ParamKind, String> {
     let kind = match entry.get::<Value>("type") {
         Ok(Value::String(kind)) => kind
             .to_str()
@@ -683,11 +684,16 @@ fn property_kind(entry: &Table) -> Result<ParamKind, String> {
             ParamKind::Enum(items.into_iter().map(|(_, value)| value).collect())
         }
         "array" => {
+            if array_depth >= MAX_PROPERTY_ARRAY_DEPTH {
+                return Err(format!(
+                    "array property nesting exceeds maximum depth of {MAX_PROPERTY_ARRAY_DEPTH}"
+                ));
+            }
             let of = match entry.get::<Value>("of") {
                 Ok(Value::Table(of)) => of,
                 _ => return Err("array requires an of table".to_owned()),
             };
-            ParamKind::Array(Box::new(property_kind(&of)?))
+            ParamKind::Array(Box::new(property_kind(&of, array_depth + 1)?))
         }
         primitive => ParamKind::parse(primitive)
             .ok_or_else(|| format!("unknown parameter type {primitive:?}"))?,
