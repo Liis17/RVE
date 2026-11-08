@@ -4,6 +4,7 @@ use crate::CameraSettings;
 use crate::animation::AnimatorComponent;
 use crate::audio::AudioSourceComponent;
 use crate::camera::Camera;
+use crate::document::ColliderShape;
 use crate::document::{
     CameraComponent, CameraCursor, CharacterControllerComponent, ColliderComponent,
     DirectionalLightComponent, EnvironmentComponent, HeavyScript, LiteScript, LodGroup,
@@ -679,6 +680,132 @@ impl World {
         }
         object.camera_settings = Some(settings);
         Ok(())
+    }
+
+    /// Проверяет и заменяет коллайдер существующего объекта. Только примитивы: mesh-формы
+    /// строятся из модели при загрузке сцены и не задаются из скрипта.
+    pub fn set_collider(
+        &mut self,
+        handle: ObjectHandle,
+        collider: ColliderComponent,
+    ) -> Result<(), SceneError> {
+        let index = self.live_index_or_error(handle)?;
+        if self.objects[index].collider.is_none() {
+            return Err(self.component_error(index, "у объекта нет Collider component"));
+        }
+        let finite = collider
+            .half_extents
+            .into_iter()
+            .chain(collider.offset)
+            .chain([
+                collider.radius,
+                collider.height,
+                collider.friction,
+                collider.restitution,
+            ])
+            .all(f32::is_finite);
+        let valid = match collider.shape {
+            ColliderShape::Box => collider.half_extents.into_iter().all(|value| value > 0.0),
+            ColliderShape::Sphere => collider.radius > 0.0,
+            ColliderShape::Capsule => collider.radius > 0.0 && collider.height > 0.0,
+            ColliderShape::ConvexMesh | ColliderShape::TriangleMesh => false,
+        };
+        if !finite
+            || !valid
+            || collider.friction < 0.0
+            || !(0.0..=1.0).contains(&collider.restitution)
+        {
+            return Err(self.component_error(
+                index,
+                "collider требует конечные размеры > 0 у box/sphere/capsule, трение >= 0 и restitution в [0, 1]",
+            ));
+        }
+        self.objects[index].collider = Some(collider);
+        Ok(())
+    }
+
+    /// Проверяет и заменяет rigid body существующего объекта с коллайдером.
+    pub fn set_rigid_body(
+        &mut self,
+        handle: ObjectHandle,
+        body: RigidBodyComponent,
+    ) -> Result<(), SceneError> {
+        let index = self.live_index_or_error(handle)?;
+        if self.objects[index].rigid_body.is_none() {
+            return Err(self.component_error(index, "у объекта нет RigidBody component"));
+        }
+        let finite = [
+            body.mass,
+            body.linear_damping,
+            body.angular_damping,
+            body.gravity_scale,
+        ]
+        .into_iter()
+        .all(f32::is_finite);
+        if !finite
+            || body.linear_damping < 0.0
+            || body.angular_damping < 0.0
+            || (body.kind == RigidBodyKind::Dynamic && body.mass <= 0.0)
+        {
+            return Err(self.component_error(
+                index,
+                "rigid_body требует конечные значения, демпфирование >= 0 и массу > 0 для dynamic",
+            ));
+        }
+        if body.kind == RigidBodyKind::Dynamic && self.objects[index].parent.is_some() {
+            return Err(
+                self.component_error(index, "dynamic rigid body должен быть корневым объектом")
+            );
+        }
+        self.objects[index].rigid_body = Some(body);
+        Ok(())
+    }
+
+    /// Проверяет и заменяет character controller существующего объекта.
+    pub fn set_character_controller(
+        &mut self,
+        handle: ObjectHandle,
+        controller: CharacterControllerComponent,
+    ) -> Result<(), SceneError> {
+        let index = self.live_index_or_error(handle)?;
+        if self.objects[index].character_controller.is_none() {
+            return Err(self.component_error(index, "у объекта нет CharacterController component"));
+        }
+        let finite = [
+            controller.radius,
+            controller.height,
+            controller.step_height,
+            controller.max_slope_deg,
+            controller.snap_distance,
+            controller.skin,
+            controller.push_strength,
+            controller.gravity_scale,
+            controller.jump_height,
+        ]
+        .into_iter()
+        .all(f32::is_finite);
+        if !finite
+            || controller.radius <= 0.0
+            || controller.height <= 0.0
+            || controller.step_height < 0.0
+            || !(0.0 < controller.max_slope_deg && controller.max_slope_deg < 90.0)
+            || controller.snap_distance < 0.0
+            || controller.skin < 0.0
+            || controller.push_strength < 0.0
+            || controller.gravity_scale < 0.0
+            || controller.jump_height < 0.0
+        {
+            return Err(self.component_error(
+                index,
+                "character_controller требует положительные radius/height, slope в (0, 90) и остальные значения >= 0",
+            ));
+        }
+        self.objects[index].character_controller = Some(controller);
+        Ok(())
+    }
+
+    fn component_error(&self, index: usize, message: &str) -> SceneError {
+        SceneError::new(&self.source_label, Some(&self.objects[index].id), message)
     }
 
     /// Постобработка камеры; `None`, если объект не содержит Camera component.
@@ -1471,6 +1598,8 @@ fn local_light_position_from_matrix(matrix: Mat4) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod spawn_tests;
 
+#[cfg(test)]
+mod component_tests;
 #[cfg(test)]
 mod hierarchy_tests;
 
