@@ -965,6 +965,7 @@ dependencies = [
  "engine-files",
  "epaint",
  "serde",
+ "skrifa",
  "toml",
 ]
 

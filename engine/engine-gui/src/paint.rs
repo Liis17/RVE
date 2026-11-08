@@ -21,7 +21,6 @@ use epaint::{
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 /// Пункт открытого Dropdown под курсором подсвечивается этим цветом.
@@ -104,27 +103,23 @@ struct ButtonState {
 }
 
 impl UiSystem {
-    /// Регистрирует шрифт `.ttf`/`.otf` по пути ассета. Байты, которые не читает epaint, дают
-    /// ошибку, а не панику; шрифт не сохраняется.
+    /// Регистрирует шрифт `.ttf`/`.otf` по пути ассета. Байты, которые не читает skrifa, дают
+    /// ошибку до сборки атласа; шрифт не сохраняется.
     pub fn register_font(&mut self, path: &str, bytes: Vec<u8>) -> Result<(), UiSystemError> {
         let path = canonical_asset(path, AssetKind::Font)?;
-        self.font_data.insert(path.clone(), bytes);
-        let definitions = font_definitions(&self.font_data);
-        match catch_unwind(AssertUnwindSafe(|| {
-            Fonts::new(TextOptions::default(), definitions)
-        })) {
-            Ok(fonts) => {
-                self.fonts = Some(fonts);
-                self.paint_dirty = true;
-                Ok(())
-            }
-            Err(_) => {
-                self.font_data.remove(&path);
-                Err(UiSystemError::InvalidValue(format!(
-                    "шрифт /{path} не читается как TTF/OTF"
-                )))
-            }
+        // epaint паникует при нечитаемом шрифте (`Fonts::new`), поэтому проверка идёт раньше.
+        if skrifa::FontRef::new(&bytes).is_err() {
+            return Err(UiSystemError::InvalidValue(format!(
+                "шрифт /{path} не читается как TTF/OTF"
+            )));
         }
+        self.font_data.insert(path, bytes);
+        self.fonts = Some(Fonts::new(
+            TextOptions::default(),
+            font_definitions(&self.font_data),
+        ));
+        self.paint_dirty = true;
+        Ok(())
     }
 
     /// Регистрирует размер картинки `.png`: нужен для 9-slice и `preserve_aspect`.
