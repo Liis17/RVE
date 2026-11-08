@@ -2132,7 +2132,7 @@ fn render_scene_frame(
             );
             view.draws = gpu.scene.capture_draws();
             view.particle_step = 0.0;
-            view.reset_history = frame.reset_history;
+            view.reset_history |= frame.reset_history;
             Some((viewport, requested, view))
         }
         _ => None,
