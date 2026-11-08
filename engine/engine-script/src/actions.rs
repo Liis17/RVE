@@ -642,6 +642,7 @@ fn physical_state(input: ScriptInput, binding: PhysicalInput) -> u32 {
     match binding {
         PhysicalInput::Key(key) => input.key_state(key as u32),
         PhysicalInput::MouseButton(button) => input.mouse_button_state(button as u32),
+        PhysicalInput::GamepadButton { .. } => 0,
     }
 }
 
@@ -649,6 +650,7 @@ fn is_suppressed(binding: PhysicalInput, keys: u128, mouse: u8) -> bool {
     match binding {
         PhysicalInput::Key(key) => keys & (1_u128 << key as u32) != 0,
         PhysicalInput::MouseButton(button) => mouse & (1_u8 << button as u32) != 0,
+        PhysicalInput::GamepadButton { .. } => false,
     }
 }
 
@@ -676,6 +678,7 @@ fn bound_inputs(definition: &ActionDefinition) -> InputMask {
             match input {
                 PhysicalInput::Key(key) => bound.keys |= 1_u128 << *key as u32,
                 PhysicalInput::MouseButton(button) => bound.mouse |= 1_u8 << *button as u32,
+                PhysicalInput::GamepadButton { .. } => {}
             }
         }
     }

@@ -216,6 +216,8 @@ impl<'a> AbiCallContext<'a> {
             animation_set_parameter: Some(host_animation_set_parameter),
             animation_set_speed: Some(host_animation_set_speed),
             animation_stop: Some(host_animation_stop),
+            gamepad_state: None,
+            gamepad_rumble: None,
         }
     }
 

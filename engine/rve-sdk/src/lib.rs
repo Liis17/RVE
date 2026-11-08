@@ -8,7 +8,7 @@ pub mod abi;
 /// Version of this SDK crate, as declared in its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub use abi::{Key, MouseButton, PhysicalInput};
+pub use abi::{GamepadAxis, GamepadButton, Key, MouseButton, PhysicalInput};
 use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
     RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
@@ -391,6 +391,57 @@ pub struct Console<'a> {
 /// Read-only snapshot of keyboard, mouse, and wheel input for the current script callback.
 pub struct Input<'a> {
     host: &'a RveHost,
+}
+
+/// Stick side for [`GamepadState::stick`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GamepadStick {
+    Left,
+    Right,
+}
+
+/// Read-only gamepad snapshot for one slot, or for the aggregate of all slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GamepadState {
+    state: abi::RveGamepadState,
+}
+
+impl GamepadState {
+    /// Returns whether a gamepad is connected in this slot (any slot for the aggregate).
+    pub fn connected(&self) -> bool {
+        self.state.connected != 0
+    }
+
+    /// Returns whether a button is currently held.
+    pub fn down(&self, button: GamepadButton) -> bool {
+        self.state.down & (1 << button as u32) != 0
+    }
+
+    /// Returns whether a button became held since the previous script update.
+    pub fn pressed(&self, button: GamepadButton) -> bool {
+        self.state.pressed & (1 << button as u32) != 0
+    }
+
+    /// Returns whether a button became released since the previous script update.
+    pub fn released(&self, button: GamepadButton) -> bool {
+        self.state.released & (1 << button as u32) != 0
+    }
+
+    /// Returns an analog axis value: sticks in [-1, 1] and triggers in [0, 1].
+    pub fn axis(&self, axis: GamepadAxis) -> f32 {
+        self.state.axes[axis as usize]
+    }
+
+    /// Returns a stick as `[x, y]`, with positive `y` pointing up.
+    pub fn stick(&self, stick: GamepadStick) -> [f32; 2] {
+        match stick {
+            GamepadStick::Left => [self.axis(GamepadAxis::LeftX), self.axis(GamepadAxis::LeftY)],
+            GamepadStick::Right => [
+                self.axis(GamepadAxis::RightX),
+                self.axis(GamepadAxis::RightY),
+            ],
+        }
+    }
 }
 
 /// Physics query access available during one script callback.
@@ -1356,7 +1407,40 @@ impl Input<'_> {
                 pressed.push(format!("Mouse.{button:?}"));
             }
         }
+        for pad in 1..=abi::RVE_GAMEPAD_SLOTS as u8 {
+            let state = self.gamepad(pad);
+            for button in GamepadButton::ALL {
+                if state.pressed(button) {
+                    pressed.push(format!("Gamepad{pad}.{}", button.name()));
+                }
+            }
+        }
         pressed
+    }
+
+    /// Returns the gamepad snapshot for slot `pad` (1..=4), or the aggregate of all slots for 0.
+    /// Unknown slots and hosts without ABI v11 gamepad callbacks return a disconnected state.
+    pub fn gamepad(&self, pad: u8) -> GamepadState {
+        let Some(callback) = self.host.gamepad_state else {
+            return GamepadState::default();
+        };
+        let mut state = abi::RveGamepadState::default();
+        // SAFETY: the host pointer and output slot remain valid during this script callback.
+        if unsafe { callback(self.host.ctx, u32::from(pad), &mut state) } {
+            GamepadState { state }
+        } else {
+            GamepadState::default()
+        }
+    }
+
+    /// Queues a rumble request for slot `pad` (0 for every connected gamepad). Returns `false`
+    /// when the host does not support rumble or rejects the request.
+    pub fn rumble(&self, pad: u8, strong: f32, weak: f32, seconds: f32) -> bool {
+        let Some(callback) = self.host.gamepad_rumble else {
+            return false;
+        };
+        // SAFETY: the host pointer remains valid during this script callback.
+        unsafe { callback(self.host.ctx, u32::from(pad), strong, weak, seconds) }
     }
 
     /// Returns whether a key is currently held.
