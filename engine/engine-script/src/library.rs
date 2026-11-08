@@ -4,7 +4,7 @@ use engine_scene::{ParamKind, ParamSchema, ParamSpec};
 use rve_sdk::abi::{
     RVE_PARAM_BOOL, RVE_PARAM_FLOAT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN, RVE_PARAM_INT,
     RVE_PARAM_STRING, RVE_PARAM_VEC3, RVE_SCRIPT_ABI_VERSION, RveModule, RveParamDesc,
-    RveScriptDesc, RveScriptDescV6,
+    RveScriptDesc, RveScriptDescV6, RveScriptDescV13,
 };
 use rve_sdk::abi::{RVE_SCRIPT_ABI_MIN_VERSION, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4};
 use std::collections::HashMap;
@@ -157,7 +157,8 @@ impl ScriptLibrary {
         // SAFETY: see the `scripts_ptr` read above.
         let count = unsafe { std::ptr::addr_of!((*module).script_count).read() };
         let descriptor_size = match header.abi_version {
-            13.. => std::mem::size_of::<RveScriptDesc>(),
+            14.. => std::mem::size_of::<RveScriptDesc>(),
+            13 => std::mem::size_of::<RveScriptDescV13>(),
             6..=12 => std::mem::size_of::<RveScriptDescV6>(),
             4 | 5 => std::mem::size_of::<RveScriptDescV4>(),
             3 => std::mem::size_of::<RveScriptDescV3>(),
@@ -177,8 +178,12 @@ impl ScriptLibrary {
         }
         // SAFETY: the ABI version selects the descriptor layout and the caller guarantees the
         // matching immutable table remains readable for process lifetime.
-        let descriptors_v13 = (header.abi_version >= 13)
+        let descriptors_v14 = (header.abi_version >= 14)
             .then(|| unsafe { std::slice::from_raw_parts(scripts_ptr, count) });
+        // SAFETY: version 13 has the net event tail but no UI callback.
+        let descriptors_v13 = (header.abi_version == 13).then(|| unsafe {
+            std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV13>(), count)
+        });
         // SAFETY: versions 6 through 12 share the descriptor layout without network callbacks.
         let descriptors_v6 = (6..=12).contains(&header.abi_version).then(|| unsafe {
             std::slice::from_raw_parts(scripts_ptr.cast::<RveScriptDescV6>(), count)
@@ -197,8 +202,26 @@ impl ScriptLibrary {
         });
         let mut scripts = HashMap::with_capacity(count);
         for index in 0..count {
-            let descriptor = if let Some(descriptors) = descriptors_v13 {
+            let descriptor = if let Some(descriptors) = descriptors_v14 {
                 &descriptors[index]
+            } else if let Some(descriptors) = descriptors_v13 {
+                // ABI v13 has no UI callback; normalize it to `None`.
+                let descriptor = &descriptors[index];
+                Box::leak(Box::new(RveScriptDesc {
+                    name: descriptor.name,
+                    create: descriptor.create,
+                    start: descriptor.start,
+                    update: descriptor.update,
+                    message: descriptor.message,
+                    destroy: descriptor.destroy,
+                    drop: descriptor.drop,
+                    params: descriptor.params,
+                    param_count: descriptor.param_count,
+                    command: descriptor.command,
+                    collision: descriptor.collision,
+                    net_event: descriptor.net_event,
+                    ui_event: None,
+                }))
             } else if let Some(descriptors) = descriptors_v6 {
                 // ABI v6 through v12 have no network callback; normalize it to `None`.
                 let descriptor = &descriptors[index];
@@ -215,6 +238,7 @@ impl ScriptLibrary {
                     command: descriptor.command,
                     collision: descriptor.collision,
                     net_event: None,
+                    ui_event: None,
                 }))
             } else if let Some(descriptors) = descriptors_v4 {
                 // ABI v4 and v5 have no collision pointer; normalize it to `None`.
@@ -232,6 +256,7 @@ impl ScriptLibrary {
                     command: descriptor.command,
                     collision: None,
                     net_event: None,
+                    ui_event: None,
                 }))
             } else if let Some(descriptors) = descriptors_v3 {
                 let descriptor = &descriptors[index];
@@ -249,6 +274,7 @@ impl ScriptLibrary {
                     command: None,
                     collision: None,
                     net_event: None,
+                    ui_event: None,
                 }))
             } else {
                 let descriptor = &descriptors_v1.expect("legacy descriptor table")[index];
@@ -267,6 +293,7 @@ impl ScriptLibrary {
                     command: None,
                     collision: None,
                     net_event: None,
+                    ui_event: None,
                 }))
             };
             // SAFETY: the caller guarantees process-lifetime storage for every non-null name.

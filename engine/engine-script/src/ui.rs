@@ -203,6 +203,20 @@ impl ScriptTransaction {
         }
     }
 
+    /// Элемент по индексу в документе канваса (ABI). Индекс вне документа — ошибка.
+    pub(crate) fn ui_element_at(
+        &self,
+        canvas: UiCanvasHandle,
+        index: usize,
+    ) -> Result<UiElementHandle, String> {
+        self.ui_live(canvas)?;
+        self.ui
+            .borrow()
+            .system
+            .element(canvas, index)
+            .map_err(ui_error)
+    }
+
     pub(crate) fn ui_canvas_visible(&self, canvas: UiCanvasHandle) -> Result<bool, String> {
         self.ui_live(canvas)?;
         self.ui

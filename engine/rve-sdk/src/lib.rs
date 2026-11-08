@@ -18,6 +18,15 @@ use abi::{
     RveCameraSettings, RveCharacterMoveResult, RveHost, RveParams, RvePostProcessSettings,
     RveRaycastHit, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
+use abi::{
+    RVE_UI_EVENT_BLUR, RVE_UI_EVENT_CANCEL, RVE_UI_EVENT_CLICK, RVE_UI_EVENT_FOCUS,
+    RVE_UI_EVENT_HOVER_ENTER, RVE_UI_EVENT_HOVER_EXIT, RVE_UI_EVENT_SUBMIT,
+    RVE_UI_EVENT_VALUE_CHANGED, RVE_UI_INVALID_INPUT, RVE_UI_OK, RVE_UI_PROP_CANVAS_LAYER,
+    RVE_UI_PROP_CANVAS_VISIBLE, RVE_UI_PROP_COLOR, RVE_UI_PROP_INTERACTABLE, RVE_UI_PROP_TEXT,
+    RVE_UI_PROP_VALUE, RVE_UI_PROP_VISIBLE, RVE_UI_VALUE_BOOL, RVE_UI_VALUE_COLOR,
+    RVE_UI_VALUE_INDEX, RVE_UI_VALUE_INTEGER, RVE_UI_VALUE_NONE, RVE_UI_VALUE_NUMBER,
+    RVE_UI_VALUE_TEXT, RveUiRect, RveUiValue,
+};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
@@ -368,6 +377,8 @@ pub trait Script: 'static {
     fn on_peer_connected(&mut self, _ctx: &mut Context<'_>, _peer: u32) {}
     /// Called when a peer disconnects; delivered to every instance with this callback.
     fn on_peer_disconnected(&mut self, _ctx: &mut Context<'_>, _peer: u32, _reason: &str) {}
+    /// Called for a UI event on a canvas owned by this object, at the start of update.
+    fn on_ui_event(&mut self, _ctx: &mut Context<'_>, _event: UiEvent) {}
 }
 
 /// Call-scoped access to the host and this script's object.
@@ -1121,6 +1132,11 @@ impl<'a> Context<'a> {
     /// Network state and messaging. Methods return [`NetError::Unavailable`] without host callbacks.
     pub fn net(&self) -> Net<'_> {
         Net { host: self.host }
+    }
+
+    /// Game UI: canvases of preloaded `.rveui` documents and their elements.
+    pub fn ui(&self) -> Ui<'_> {
+        Ui { host: self.host }
     }
 
     /// Returns physics queries available during this callback.
@@ -2153,15 +2169,502 @@ impl Object {
     }
 }
 
+/// Failure of a UI call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiError {
+    /// The host does not provide UI callbacks.
+    Unavailable,
+    /// The host refused the call: a stale handle, an unsupported property, or a write outside
+    /// lifecycle calls.
+    Rejected,
+    /// The value does not fit the property, for example a non-finite number or a bad index.
+    InvalidInput,
+}
+
+impl std::fmt::Display for UiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "UI callback is unavailable in this host",
+            Self::Rejected => "UI operation was rejected by the host",
+            Self::InvalidInput => "UI value does not fit the property",
+        })
+    }
+}
+
+impl std::error::Error for UiError {}
+
+fn ui_status(status: u32) -> Result<(), UiError> {
+    match status {
+        RVE_UI_OK => Ok(()),
+        RVE_UI_INVALID_INPUT => Err(UiError::InvalidInput),
+        _ => Err(UiError::Rejected),
+    }
+}
+
+/// Handle of an open canvas. A closed canvas's handle is rejected, even if its slot is reused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct Canvas {
+    raw: u64,
+}
+
+/// Handle of one element of a canvas.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct Element {
+    canvas: Canvas,
+    index: u32,
+}
+
+impl Element {
+    /// The canvas that contains this element.
+    pub fn canvas(self) -> Canvas {
+        self.canvas
+    }
+}
+
+/// Value of an element. A dropdown index counts from zero.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiValue {
+    Number(f64),
+    Bool(bool),
+    Index(usize),
+    Text(String),
+    Color([u8; 4]),
+}
+
+/// Kind of a UI event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiEventKind {
+    Click,
+    ValueChanged,
+    Submit,
+    Cancel,
+    Focus,
+    Blur,
+    HoverEnter,
+    HoverExit,
+}
+
+/// UI event delivered to [`Script::on_ui_event`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiEvent {
+    pub kind: UiEventKind,
+    pub canvas: Canvas,
+    pub element: Element,
+    /// Identifier of the element in its document.
+    pub element_id: String,
+    /// Value carried by the event, when the kind has one.
+    pub value: Option<UiValue>,
+}
+
+/// Rectangle of an element in canvas units: anchors, pivot, and offsets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiRect {
+    pub anchor_min: [f32; 2],
+    pub anchor_max: [f32; 2],
+    pub pivot: [f32; 2],
+    pub offset_min: [f32; 2],
+    pub offset_max: [f32; 2],
+}
+
+impl From<RveUiRect> for UiRect {
+    fn from(rect: RveUiRect) -> Self {
+        Self {
+            anchor_min: rect.anchor_min,
+            anchor_max: rect.anchor_max,
+            pivot: rect.pivot,
+            offset_min: rect.offset_min,
+            offset_max: rect.offset_max,
+        }
+    }
+}
+
+impl From<UiRect> for RveUiRect {
+    fn from(rect: UiRect) -> Self {
+        Self {
+            anchor_min: rect.anchor_min,
+            anchor_max: rect.anchor_max,
+            pivot: rect.pivot,
+            offset_min: rect.offset_min,
+            offset_max: rect.offset_max,
+        }
+    }
+}
+
+fn empty_ui_value() -> RveUiValue {
+    RveUiValue {
+        kind: RVE_UI_VALUE_NONE,
+        flag: false,
+        number: 0.0,
+        integer: 0,
+        text: RveStr::empty(),
+        color: [0; 4],
+    }
+}
+
+/// Converts a host value; `None` means the host reported no value.
+///
+/// # Safety
+/// For a text value, `value.text` must refer to readable storage for this callback.
+unsafe fn ui_value_from_abi(value: RveUiValue) -> Result<Option<UiValue>, UiError> {
+    Ok(match value.kind {
+        RVE_UI_VALUE_NONE => None,
+        RVE_UI_VALUE_NUMBER => Some(UiValue::Number(value.number)),
+        RVE_UI_VALUE_BOOL => Some(UiValue::Bool(value.flag)),
+        RVE_UI_VALUE_INDEX => Some(UiValue::Index(
+            usize::try_from(value.integer).map_err(|_| UiError::Rejected)?,
+        )),
+        RVE_UI_VALUE_TEXT => {
+            // SAFETY: the caller guarantees the host keeps the text readable for this callback.
+            let text = unsafe { value.text.to_str() }.map_err(|_| UiError::Rejected)?;
+            Some(UiValue::Text(text.to_owned()))
+        }
+        RVE_UI_VALUE_COLOR => Some(UiValue::Color(value.color)),
+        _ => return Err(UiError::Rejected),
+    })
+}
+
+/// Borrowed host value for `value`; the caller keeps `value` alive for the call.
+fn ui_value_to_abi(value: &UiValue) -> Result<RveUiValue, UiError> {
+    let mut abi = empty_ui_value();
+    match value {
+        UiValue::Number(number) => {
+            abi.kind = RVE_UI_VALUE_NUMBER;
+            abi.number = *number;
+        }
+        UiValue::Bool(flag) => {
+            abi.kind = RVE_UI_VALUE_BOOL;
+            abi.flag = *flag;
+        }
+        UiValue::Index(index) => {
+            abi.kind = RVE_UI_VALUE_INDEX;
+            abi.integer = i64::try_from(*index).map_err(|_| UiError::InvalidInput)?;
+        }
+        UiValue::Text(text) => {
+            abi.kind = RVE_UI_VALUE_TEXT;
+            abi.text = RveStr::from_str_ref(text);
+        }
+        UiValue::Color(color) => {
+            abi.kind = RVE_UI_VALUE_COLOR;
+            abi.color = *color;
+        }
+    }
+    Ok(abi)
+}
+
+fn ui_event_kind(kind: u32) -> Option<UiEventKind> {
+    Some(match kind {
+        RVE_UI_EVENT_CLICK => UiEventKind::Click,
+        RVE_UI_EVENT_VALUE_CHANGED => UiEventKind::ValueChanged,
+        RVE_UI_EVENT_SUBMIT => UiEventKind::Submit,
+        RVE_UI_EVENT_CANCEL => UiEventKind::Cancel,
+        RVE_UI_EVENT_FOCUS => UiEventKind::Focus,
+        RVE_UI_EVENT_BLUR => UiEventKind::Blur,
+        RVE_UI_EVENT_HOVER_ENTER => UiEventKind::HoverEnter,
+        RVE_UI_EVENT_HOVER_EXIT => UiEventKind::HoverExit,
+        _ => return None,
+    })
+}
+
+/// Call-scoped UI access from [`Context::ui`]. Every method returns [`UiError::Unavailable`]
+/// when the host has no UI callbacks.
+pub struct Ui<'a> {
+    host: &'a RveHost,
+}
+
+impl Ui<'_> {
+    /// Opens a preloaded `.rveui` document as a canvas owned by this object.
+    pub fn open(&self, path: &str) -> Result<Canvas, UiError> {
+        let callback = self.host.ui_open.ok_or(UiError::Unavailable)?;
+        let mut raw = 0_u64;
+        // SAFETY: the host and the output slot are valid for this callback.
+        let status = unsafe { callback(self.host.ctx, RveStr::from_str_ref(path), &mut raw) };
+        ui_status(status)?;
+        Ok(Canvas { raw })
+    }
+
+    /// Closes a canvas at the end of this call; later calls in the same callback see it closed.
+    pub fn close(&self, canvas: Canvas) -> Result<(), UiError> {
+        let callback = self.host.ui_close.ok_or(UiError::Unavailable)?;
+        // SAFETY: the host is valid for this callback and checks the handle itself.
+        ui_status(unsafe { callback(self.host.ctx, canvas.raw) })
+    }
+
+    /// The canvas of an object's `ui_canvas` component, if it is open.
+    pub fn canvas_of(&self, object: Object) -> Option<Canvas> {
+        let callback = self.host.ui_object_canvas?;
+        let mut raw = 0_u64;
+        // SAFETY: the host and the output slot are valid for this callback.
+        unsafe { callback(self.host.ctx, object.handle, &mut raw) }.then_some(Canvas { raw })
+    }
+
+    /// The element that has focus, if any.
+    pub fn focused(&self) -> Option<Element> {
+        let callback = self.host.ui_focused?;
+        let mut canvas = 0_u64;
+        let mut index = 0_u32;
+        // SAFETY: the host and both output slots are valid for this callback.
+        unsafe { callback(self.host.ctx, &mut canvas, &mut index) }.then_some(Element {
+            canvas: Canvas { raw: canvas },
+            index,
+        })
+    }
+
+    /// Whether the pointer was over interactive UI on the last update.
+    pub fn pointer_over(&self) -> bool {
+        self.host
+            .ui_pointer_over
+            // SAFETY: the host is valid for this callback.
+            .is_some_and(|callback| unsafe { callback(self.host.ctx) })
+    }
+
+    /// The element with this identifier, or `None` when the canvas has no such element.
+    pub fn find(&self, canvas: Canvas, id: &str) -> Result<Option<Element>, UiError> {
+        let callback = self.host.ui_find.ok_or(UiError::Unavailable)?;
+        let mut index = 0_u32;
+        // SAFETY: the host and the output slot are valid for this callback.
+        let found = unsafe {
+            callback(
+                self.host.ctx,
+                canvas.raw,
+                RveStr::from_str_ref(id),
+                &mut index,
+            )
+        };
+        Ok(found.then_some(Element { canvas, index }))
+    }
+
+    fn get(&self, canvas: u64, element: u32, property: u32) -> Result<RveUiValue, UiError> {
+        let callback = self.host.ui_get.ok_or(UiError::Unavailable)?;
+        let mut out = empty_ui_value();
+        // SAFETY: the host and the output slot are valid for this callback.
+        ui_status(unsafe { callback(self.host.ctx, canvas, element, property, &mut out) })?;
+        Ok(out)
+    }
+
+    fn set(
+        &self,
+        canvas: u64,
+        element: u32,
+        property: u32,
+        value: &UiValue,
+    ) -> Result<(), UiError> {
+        let callback = self.host.ui_set.ok_or(UiError::Unavailable)?;
+        let value = ui_value_to_abi(value)?;
+        // SAFETY: the host reads the borrowed value only during this callback; `value` lives on.
+        ui_status(unsafe { callback(self.host.ctx, canvas, element, property, &value) })
+    }
+
+    fn get_bool(&self, canvas: u64, element: u32, property: u32) -> Result<bool, UiError> {
+        match self.get(canvas, element, property)? {
+            RveUiValue {
+                kind: RVE_UI_VALUE_BOOL,
+                flag,
+                ..
+            } => Ok(flag),
+            _ => Err(UiError::Rejected),
+        }
+    }
+
+    /// Whether the canvas is visible.
+    pub fn canvas_visible(&self, canvas: Canvas) -> Result<bool, UiError> {
+        self.get_bool(canvas.raw, 0, RVE_UI_PROP_CANVAS_VISIBLE)
+    }
+
+    pub fn set_canvas_visible(&self, canvas: Canvas, visible: bool) -> Result<(), UiError> {
+        self.set(
+            canvas.raw,
+            0,
+            RVE_UI_PROP_CANVAS_VISIBLE,
+            &UiValue::Bool(visible),
+        )
+    }
+
+    /// Drawing layer of the canvas; higher layers draw above lower ones.
+    pub fn canvas_layer(&self, canvas: Canvas) -> Result<i32, UiError> {
+        match self.get(canvas.raw, 0, RVE_UI_PROP_CANVAS_LAYER)? {
+            RveUiValue {
+                kind: RVE_UI_VALUE_INTEGER,
+                integer,
+                ..
+            } => i32::try_from(integer).map_err(|_| UiError::Rejected),
+            _ => Err(UiError::Rejected),
+        }
+    }
+
+    pub fn set_canvas_layer(&self, canvas: Canvas, layer: i32) -> Result<(), UiError> {
+        let callback = self.host.ui_set.ok_or(UiError::Unavailable)?;
+        let value = RveUiValue {
+            kind: RVE_UI_VALUE_INTEGER,
+            integer: i64::from(layer),
+            ..empty_ui_value()
+        };
+        // SAFETY: the host reads the value only during this callback.
+        ui_status(unsafe {
+            callback(
+                self.host.ctx,
+                canvas.raw,
+                0,
+                RVE_UI_PROP_CANVAS_LAYER,
+                &value,
+            )
+        })
+    }
+
+    /// Text of a `Text` or `InputField` element.
+    pub fn text(&self, element: Element) -> Result<String, UiError> {
+        match self.get_value_abi(element, RVE_UI_PROP_TEXT)? {
+            Some(UiValue::Text(text)) => Ok(text),
+            _ => Err(UiError::Rejected),
+        }
+    }
+
+    pub fn set_text(&self, element: Element, text: &str) -> Result<(), UiError> {
+        self.set(
+            element.canvas.raw,
+            element.index,
+            RVE_UI_PROP_TEXT,
+            &UiValue::Text(text.to_owned()),
+        )
+    }
+
+    /// Value of a slider, progress bar, toggle, dropdown, or input field. `None` for a dropdown
+    /// without a selection.
+    pub fn value(&self, element: Element) -> Result<Option<UiValue>, UiError> {
+        self.get_value_abi(element, RVE_UI_PROP_VALUE)
+    }
+
+    pub fn set_value(&self, element: Element, value: UiValue) -> Result<(), UiError> {
+        self.set(element.canvas.raw, element.index, RVE_UI_PROP_VALUE, &value)
+    }
+
+    fn get_value_abi(&self, element: Element, property: u32) -> Result<Option<UiValue>, UiError> {
+        let value = self.get(element.canvas.raw, element.index, property)?;
+        // SAFETY: the host keeps the text of the value readable for this callback.
+        unsafe { ui_value_from_abi(value) }
+    }
+
+    pub fn element_visible(&self, element: Element) -> Result<bool, UiError> {
+        self.get_bool(element.canvas.raw, element.index, RVE_UI_PROP_VISIBLE)
+    }
+
+    pub fn set_element_visible(&self, element: Element, visible: bool) -> Result<(), UiError> {
+        self.set(
+            element.canvas.raw,
+            element.index,
+            RVE_UI_PROP_VISIBLE,
+            &UiValue::Bool(visible),
+        )
+    }
+
+    pub fn interactable(&self, element: Element) -> Result<bool, UiError> {
+        self.get_bool(element.canvas.raw, element.index, RVE_UI_PROP_INTERACTABLE)
+    }
+
+    pub fn set_interactable(&self, element: Element, interactable: bool) -> Result<(), UiError> {
+        self.set(
+            element.canvas.raw,
+            element.index,
+            RVE_UI_PROP_INTERACTABLE,
+            &UiValue::Bool(interactable),
+        )
+    }
+
+    /// Tint color of the element as sRGB bytes.
+    pub fn color(&self, element: Element) -> Result<[u8; 4], UiError> {
+        match self.get(element.canvas.raw, element.index, RVE_UI_PROP_COLOR)? {
+            RveUiValue {
+                kind: RVE_UI_VALUE_COLOR,
+                color,
+                ..
+            } => Ok(color),
+            _ => Err(UiError::Rejected),
+        }
+    }
+
+    pub fn set_color(&self, element: Element, color: [u8; 4]) -> Result<(), UiError> {
+        self.set(
+            element.canvas.raw,
+            element.index,
+            RVE_UI_PROP_COLOR,
+            &UiValue::Color(color),
+        )
+    }
+
+    /// Replaces the image of an `Image` or `Button` element with a declared `.png` path.
+    pub fn set_image(&self, element: Element, path: &str) -> Result<(), UiError> {
+        let callback = self.host.ui_set_image.ok_or(UiError::Unavailable)?;
+        // SAFETY: the host copies the borrowed path during this callback.
+        ui_status(unsafe {
+            callback(
+                self.host.ctx,
+                element.canvas.raw,
+                element.index,
+                RveStr::from_str_ref(path),
+            )
+        })
+    }
+
+    pub fn rect(&self, element: Element) -> Result<UiRect, UiError> {
+        let callback = self.host.ui_get_rect.ok_or(UiError::Unavailable)?;
+        let mut out = RveUiRect {
+            anchor_min: [0.0; 2],
+            anchor_max: [0.0; 2],
+            pivot: [0.0; 2],
+            offset_min: [0.0; 2],
+            offset_max: [0.0; 2],
+        };
+        // SAFETY: the host and the output slot are valid for this callback.
+        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index, &mut out) })?;
+        Ok(out.into())
+    }
+
+    pub fn set_rect(&self, element: Element, rect: UiRect) -> Result<(), UiError> {
+        let callback = self.host.ui_set_rect.ok_or(UiError::Unavailable)?;
+        let rect = RveUiRect::from(rect);
+        // SAFETY: the host reads the rectangle only during this callback.
+        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index, &rect) })
+    }
+
+    /// Replaces the options of a dropdown; the selection is kept only while its index remains.
+    pub fn set_options(&self, element: Element, options: &[&str]) -> Result<(), UiError> {
+        let callback = self.host.ui_set_options.ok_or(UiError::Unavailable)?;
+        let borrowed: Vec<RveStr> = options
+            .iter()
+            .map(|option| RveStr::from_str_ref(option))
+            .collect();
+        // SAFETY: `borrowed` and the strings it points to outlive this callback.
+        ui_status(unsafe {
+            callback(
+                self.host.ctx,
+                element.canvas.raw,
+                element.index,
+                borrowed.as_ptr(),
+                borrowed.len(),
+            )
+        })
+    }
+
+    /// Moves focus to a focusable element.
+    pub fn focus(&self, element: Element) -> Result<(), UiError> {
+        let callback = self.host.ui_focus.ok_or(UiError::Unavailable)?;
+        // SAFETY: the host is valid for this callback and checks the handle itself.
+        ui_status(unsafe { callback(self.host.ctx, element.canvas.raw, element.index) })
+    }
+}
+
 #[doc(hidden)]
 pub mod __private {
-    use super::{CollisionContact, Context, Object, Params, Script, ValueError};
+    use super::{
+        Canvas, CollisionContact, Context, Element, Object, Params, Script, UiEvent, ValueError,
+        ui_event_kind, ui_value_from_abi,
+    };
     use crate::abi::{
         RVE_COLLISION_ENTER, RVE_COLLISION_EXIT, RVE_NET_EVENT_MESSAGE,
         RVE_NET_EVENT_PEER_CONNECTED, RVE_NET_EVENT_PEER_DISCONNECTED, RVE_PARAM_HAS_MAX,
         RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCollisionFn,
         RveCommandFn, RveCreateFn, RveDropFn, RveHost, RveMessageFn, RveNetEvent, RveNetEventFn,
-        RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUpdateFn, RveValue,
+        RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUiEvent, RveUiEventFn,
+        RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
@@ -2182,6 +2685,7 @@ pub mod __private {
         command: RveCommandFn,
         collision: RveCollisionFn,
         net_event: RveNetEventFn,
+        ui_event: RveUiEventFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -2197,6 +2701,7 @@ pub mod __private {
             command: Some(command),
             collision: Some(collision),
             net_event: Some(net_event),
+            ui_event: Some(ui_event),
         }
     }
 
@@ -2416,6 +2921,43 @@ pub mod __private {
                 }
                 _ => return Err("unknown net event kind".to_owned()),
             }
+            context.commit()
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn ui_event(
+        instance: *mut c_void,
+        host: *const RveHost,
+        event: RveUiEvent,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() {
+            return report(host, "null ui event callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: instance and host are valid for this synchronous ABI callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new(unsafe { &*host })?;
+            let kind =
+                ui_event_kind(event.kind).ok_or_else(|| "unknown ui event kind".to_owned())?;
+            // SAFETY: the host keeps the identifier and value readable for this callback.
+            let element_id =
+                unsafe { event.element_id.to_str() }.map_err(|error| error.to_string())?;
+            let value =
+                unsafe { ui_value_from_abi(event.value) }.map_err(|error| error.to_string())?;
+            instance.0.on_ui_event(
+                &mut context,
+                UiEvent {
+                    kind,
+                    canvas: Canvas { raw: event.canvas },
+                    element: Element {
+                        canvas: Canvas { raw: event.canvas },
+                        index: event.element,
+                    },
+                    element_id: element_id.to_owned(),
+                    value,
+                },
+            );
             context.commit()
         }));
         status_from_result(host, result)
@@ -2694,6 +3236,14 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: the host owns the instance and event for this callback.
             unsafe { $crate::__private::net_event(instance, host, event) }
         }
+        unsafe extern "C" fn __rve_ui_event(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            event: $crate::abi::RveUiEvent,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: the host owns the instance and event for this callback.
+            unsafe { $crate::__private::ui_event(instance, host, event) }
+        }
         unsafe extern "C" fn __rve_destroy(
             instance: *mut ::std::ffi::c_void,
             host: *const $crate::abi::RveHost,
@@ -2718,6 +3268,7 @@ macro_rules! __rve_script_descriptor {
             __rve_command,
             __rve_collision,
             __rve_net_event,
+            __rve_ui_event,
             $crate::__rve_params!(@munch [] $($params)*),
         )
     }};

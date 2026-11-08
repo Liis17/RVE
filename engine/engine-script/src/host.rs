@@ -1710,7 +1710,8 @@ impl ScriptHost {
             Some(ScriptKind::Lite(instance)) => {
                 instance.has_callback("on_ui_event").unwrap_or(true)
             }
-            _ => false,
+            Some(ScriptKind::Heavy(HeavyInstance::Abi(script))) => script.has_ui_event(),
+            None => false,
         }
     }
 
@@ -2096,7 +2097,10 @@ impl ScriptHost {
                         Some(event) => script.invoke_net_event(time, event, call),
                         None => Err("missing net event data".to_owned()),
                     },
-                    Phase::Ui => Err("UI events need ABI v14".to_owned()),
+                    Phase::Ui => match ui_event {
+                        Some(event) => script.invoke_ui_event(time, event, call),
+                        None => Err("missing ui event data".to_owned()),
+                    },
                     Phase::Destroy => script.invoke(AbiPhase::Destroy, time, call),
                 }
                 .map(|()| None)
