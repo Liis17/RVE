@@ -3,11 +3,16 @@ use crate::actions::InputActions;
 use crate::library::{ScriptLibrary, SharedLibrary};
 use crate::lifecycle::{
     Lifecycle, MAX_SPAWNED_OBJECTS_PER_FRAME, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSlot,
-    PrefabStatus, SpawnRequest, SpawnedObject, WorldChanges, prefab_display, prefab_key,
+    PrefabStatus, SpawnArgs, SpawnRequest, SpawnedObject, WorldChanges, check_spawn_request,
+    prefab_display, prefab_key,
 };
 use crate::lite::{
     self, ActiveCall, ActiveOwner, ActiveSource, CommandGeneration, EventQueue, LitePhysicsEvent,
     LuaCommands, LuaInstance, RegisteredCommandCallback, ScriptEventQueue,
+};
+use crate::net::{
+    InboundBudget, MAX_INBOUND_MESSAGES_PER_PEER, NetErrorLog, NetObjectState, NetScriptState,
+    validate_message,
 };
 use crate::physics::PhysicsScriptState;
 use crate::transaction::{
@@ -22,8 +27,9 @@ use engine_console::{CommandCatalog, CommandLine, CommandSpec};
 use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
 use engine_project::InputSettings;
 use engine_scene::{
-    AnimationRequest, AudioRequest, LocalTransform, ObjectHandle, ParamSchema, ParamValue,
-    PrefabTemplate, RigidBodyKind, World,
+    AnimationRequest, AudioRequest, LocalTransform, NetEvent, NetId, NetMode, NetRequest,
+    ObjectHandle, ParamSchema, ParamValue, PeerId, PrefabTemplate, RigidBodyKind, SpawnOptions,
+    World,
 };
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use rve_sdk::abi::RveScriptDesc;
@@ -203,6 +209,16 @@ pub struct ScriptHost {
     physics: Rc<RefCell<PhysicsScriptState>>,
     update_profile: ScriptUpdateProfile,
     cursor: ScriptCursor,
+    /// Режим сети, участники и сетевые атрибуты объектов, общие с транзакциями.
+    net: Rc<RefCell<NetScriptState>>,
+    /// Сетевые запросы скриптов, зафиксированные с прошлого drain.
+    net_requests: Vec<NetRequest>,
+    /// Принятые сетевые события, доставляемые в начале следующего update.
+    net_events: Vec<NetEvent>,
+    inbound: InboundBudget,
+    net_errors: NetErrorLog,
+    /// Ошибки callback по участнику с прошлого drain; сообщения от одного пира.
+    peer_faults: HashMap<PeerId, u32>,
 }
 
 /// Время последнего `update` хоста по фазам. Все поля нулевые до первого `update`.
@@ -240,6 +256,8 @@ enum Phase {
     Update(f32),
     Message,
     PhysicsEvent(ScriptPhysicsEvent),
+    /// Сетевое событие; его данные передаются в `call_instance` отдельно.
+    Net,
     Destroy,
 }
 
@@ -412,6 +430,12 @@ impl ScriptHost {
             current_time: ScriptTime::default(),
             physics: Rc::new(RefCell::new(PhysicsScriptState::default())),
             cursor: ScriptCursor::default(),
+            net: Rc::new(RefCell::new(NetScriptState::default())),
+            net_requests: Vec::new(),
+            net_events: Vec::new(),
+            inbound: InboundBudget::default(),
+            net_errors: NetErrorLog::default(),
+            peer_faults: HashMap::new(),
         };
 
         for object in world.objects() {
@@ -439,6 +463,8 @@ impl ScriptHost {
                         queued_audio: host.audio_requests.len(),
                         queued_animation: host.animation_requests.len(),
                         physics: host.physics.clone(),
+                        net: host.net.clone(),
+                        queued_net: host.net_requests.len(),
                         physics_phase_dt: None,
                         lifecycle: host.lifecycle.clone(),
                         lifecycle_writes: false,
@@ -532,6 +558,8 @@ impl ScriptHost {
                         queued_audio: host.audio_requests.len(),
                         queued_animation: host.animation_requests.len(),
                         physics: host.physics.clone(),
+                        net: host.net.clone(),
+                        queued_net: host.net_requests.len(),
                         physics_phase_dt: None,
                         lifecycle: host.lifecycle.clone(),
                         lifecycle_writes: false,
@@ -850,6 +878,7 @@ impl ScriptHost {
             return;
         }
         self.destroyed = true;
+        self.net_events.clear();
         self.actions.clear_frame_transients();
         if self.started {
             self.run_phase(world, Phase::Destroy, time);
@@ -871,6 +900,182 @@ impl ScriptHost {
     /// Takes animator requests committed by scripts since the previous drain, in commit order.
     pub fn drain_animation_requests(&mut self) -> Vec<AnimationRequest> {
         std::mem::take(&mut self.animation_requests)
+    }
+
+    /// Takes network requests committed by scripts since the previous drain, in commit order.
+    pub fn drain_network_requests(&mut self) -> Vec<NetRequest> {
+        std::mem::take(&mut self.net_requests)
+    }
+
+    /// Takes the failed-callback count of each peer since the previous drain, sorted by peer.
+    /// Only messages from a remote peer add to the count; the bridge applies its disconnect rule.
+    pub fn drain_peer_faults(&mut self) -> Vec<(PeerId, u32)> {
+        let mut faults: Vec<(PeerId, u32)> = self.peer_faults.drain().collect();
+        faults.sort_unstable_by_key(|(peer, _)| *peer);
+        faults
+    }
+
+    /// Sets the network mode, this process's peer and the connected remote peers.
+    ///
+    /// Until the bridge calls this, the host is `Offline`: `is_server()` and `has_authority()` are
+    /// true, `is_client()` is false, and `send` or `set_net_owner` stage no request.
+    pub fn set_network_state(&mut self, mode: NetMode, local_peer: PeerId, peers: Vec<PeerId>) {
+        self.net.borrow_mut().set_network(mode, local_peer, peers);
+    }
+
+    /// Sets the network number and owner of an object. Scripts see the values from the next callback.
+    pub fn set_object_net(&mut self, object: ObjectHandle, net_id: NetId, owner: Option<PeerId>) {
+        self.net
+            .borrow_mut()
+            .set_object(object, NetObjectState { net_id, owner });
+    }
+
+    /// Removes the network attributes of an object that is no longer replicated.
+    pub fn clear_object_net(&mut self, object: ObjectHandle) {
+        self.net.borrow_mut().clear_object(object);
+    }
+
+    /// Queues network events for the beginning of the next update, after physics events.
+    ///
+    /// A message for a dead object is dropped. A message beyond [`MAX_INBOUND_MESSAGES_PER_PEER`]
+    /// or its byte budget is dropped for the rest of the update, with one warning per peer. A
+    /// malformed message is dropped and counts as a fault of its peer.
+    pub fn queue_network_events(
+        &mut self,
+        world: &World,
+        events: impl IntoIterator<Item = NetEvent>,
+    ) {
+        for event in events {
+            match event {
+                NetEvent::Message {
+                    peer,
+                    object,
+                    name,
+                    value,
+                } => {
+                    if object.is_some_and(|object| !world.is_alive(object)) {
+                        continue;
+                    }
+                    let size = match validate_message(&name, &value) {
+                        Ok(size) => size,
+                        Err(reason) => {
+                            self.count_peer_fault(peer);
+                            self.warn(format!("сообщение участника {peer} отброшено: {reason}"));
+                            continue;
+                        }
+                    };
+                    if !self.inbound.admit(peer, size) {
+                        if self.inbound.first_refusal(peer) {
+                            self.warn(format!(
+                                "сообщения участника {peer} сверх лимита {MAX_INBOUND_MESSAGES_PER_PEER} за update отброшены"
+                            ));
+                        }
+                        continue;
+                    }
+                    self.net_events.push(NetEvent::Message {
+                        peer,
+                        object,
+                        name,
+                        value,
+                    });
+                }
+                other => self.net_events.push(other),
+            }
+        }
+    }
+
+    /// Creates the root of a prefab for the network bridge. The request passes the same checks and
+    /// goes through the same application path as `rve.spawn`, but it is applied before this call
+    /// returns. The root is in `World` afterwards, and its `on_start` runs in the next update. A heavy
+    /// prefab that is still loading waits for its load. A refusal rolls back the reservation and
+    /// returns `Err`; the reason is also an error event of the scene.
+    pub fn spawn_external(
+        &mut self,
+        world: &mut World,
+        prefab: &str,
+        options: SpawnOptions,
+    ) -> Result<ObjectHandle, String> {
+        let prefab = prefab_key(prefab)?;
+        let args = SpawnArgs {
+            options,
+            velocity: None,
+        };
+        check_spawn_request(
+            world,
+            &self.lifecycle.borrow(),
+            0,
+            &HashMap::new(),
+            &prefab,
+            &args,
+        )?;
+        let root = world.reserve_object();
+        let seq = {
+            let mut lifecycle = self.lifecycle.borrow_mut();
+            if let Some(id) = &args.options.id {
+                lifecycle.pending_ids.insert(id.clone(), root);
+            }
+            lifecycle.next_seq()
+        };
+        self.lifecycle.borrow_mut().queued.push_back(SpawnRequest {
+            seq,
+            root,
+            prefab: prefab.clone(),
+            args,
+            source: self.scene_name.clone(),
+        });
+        self.apply_queued_spawns(world);
+        let waiting = self
+            .lifecycle
+            .borrow()
+            .waiting
+            .iter()
+            .any(|request| request.root == root);
+        if world.is_alive(root) || waiting {
+            Ok(root)
+        } else {
+            Err(format!(
+                "spawn of prefab {:?} was refused; see the scene log",
+                prefab_display(&prefab)
+            ))
+        }
+    }
+
+    /// Removes the subtree of `root` without a delay, as `rve.destroy` does: `on_destroy` of its
+    /// started instances runs first. A pending spawn of `root` is cancelled. Returns `false` when
+    /// `root` is neither alive nor pending, or when the removal was refused, for example for the
+    /// active camera. Removed objects are listed in [`WorldChanges::despawned`].
+    pub fn despawn_external(&mut self, world: &mut World, root: ObjectHandle) -> bool {
+        let pending = self
+            .lifecycle
+            .borrow()
+            .waiting
+            .iter()
+            .any(|request| request.root == root);
+        if !world.is_alive(root) && !pending {
+            return false;
+        }
+        let time = self.current_time;
+        self.destroy_objects(world, vec![root], time);
+        !world.is_alive(root)
+    }
+
+    /// Applies queued spawn requests in `seq` order. Each request is taken one at a time, so a
+    /// refused request sees the rest of the queue.
+    fn apply_queued_spawns(&mut self, world: &mut World) {
+        self.lifecycle
+            .borrow_mut()
+            .queued
+            .make_contiguous()
+            .sort_by_key(|request| request.seq);
+        // Заявки снимаются по одной, и оставшиеся остаются в очереди: отмена одной заявки видит
+        // остальные и не начинает выгрузку префаба раньше времени.
+        loop {
+            let next = self.lifecycle.borrow_mut().queued.pop_front();
+            let Some(request) = next else {
+                break;
+            };
+            self.process_spawn(world, &request);
+        }
     }
 
     /// Queues `animation_finished` messages for the next update, before script messages of
@@ -989,6 +1194,8 @@ impl ScriptHost {
             queued_audio: self.audio_requests.len(),
             queued_animation: self.animation_requests.len(),
             physics: self.physics.clone(),
+            net: self.net.clone(),
+            queued_net: self.net_requests.len(),
             physics_phase_dt: None,
             lifecycle: self.lifecycle.clone(),
             lifecycle_writes: true,
@@ -1073,6 +1280,7 @@ impl ScriptHost {
             &self.events,
             &mut self.audio_requests,
             &mut self.animation_requests,
+            &mut self.net_requests,
         ) {
             Ok(mutations) => {
                 self.cursor = self.transaction.cursor();
@@ -1117,6 +1325,7 @@ impl ScriptHost {
             let started = Instant::now();
             self.deliver_physics_events(world, time);
             profile.physics_events = started.elapsed();
+            self.deliver_net_events(world, time);
         }
 
         let time_error = lite::set_time(&self.lua_time, time)
@@ -1144,7 +1353,7 @@ impl ScriptHost {
             }
             let started = Instant::now();
             let outcome =
-                self.call_instance(index, world, phase, time, None, time_error.as_deref());
+                self.call_instance(index, world, phase, time, None, None, time_error.as_deref());
             let elapsed = started.elapsed();
             if is_lite {
                 profile.lua += elapsed;
@@ -1209,6 +1418,7 @@ impl ScriptHost {
                 Phase::Start,
                 time,
                 None,
+                None,
                 time_error.as_deref(),
             ) {
                 CallOutcome::Committed => {}
@@ -1246,6 +1456,7 @@ impl ScriptHost {
                     Phase::Message,
                     time,
                     Some(&message),
+                    None,
                     time_error.as_deref(),
                 ) {
                     CallOutcome::Committed => {}
@@ -1254,6 +1465,103 @@ impl ScriptHost {
                 }
             }
         }
+    }
+
+    /// Доставляет принятые сетевые события: каждое событие отдельной транзакцией на каждый экземпляр.
+    /// Ошибка callback не отключает экземпляр; она записывается в журнал и считается по участнику.
+    fn deliver_net_events(&mut self, world: &mut World, time: ScriptTime) {
+        let events = std::mem::take(&mut self.net_events);
+        self.inbound.reset();
+        if events.is_empty() {
+            return;
+        }
+        let time_error = lite::set_time(&self.lua_time, time)
+            .err()
+            .map(|error| error.to_string());
+        for event in events {
+            let peer = match &event {
+                NetEvent::Message { peer, .. } => Some(*peer),
+                NetEvent::PeerConnected { .. } | NetEvent::PeerDisconnected { .. } => None,
+            };
+            let targets: Vec<usize> = (0..self.instances.len())
+                .filter(|&index| {
+                    let Some(instance) = self.instances[index].as_ref() else {
+                        return false;
+                    };
+                    let addressed = match &event {
+                        NetEvent::Message { object, .. } => {
+                            object.is_none_or(|object| object == instance.handle)
+                        }
+                        NetEvent::PeerConnected { .. } | NetEvent::PeerDisconnected { .. } => true,
+                    };
+                    instance.enabled && addressed && self.has_net_callback(index, &event)
+                })
+                .collect();
+            for index in targets {
+                // Экземпляр мог отключиться предыдущим событием этого же кадра.
+                if !self.instances[index]
+                    .as_ref()
+                    .is_some_and(|instance| instance.enabled)
+                {
+                    continue;
+                }
+                match self.call_instance(
+                    index,
+                    world,
+                    Phase::Net,
+                    time,
+                    None,
+                    Some(&event),
+                    time_error.as_deref(),
+                ) {
+                    CallOutcome::Committed => {}
+                    CallOutcome::Interrupted => self.disable_instance(index),
+                    CallOutcome::Failed(message) => {
+                        self.net_callback_failed(index, peer, message);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Есть ли у экземпляра callback для этого события сети.
+    fn has_net_callback(&self, index: usize, event: &NetEvent) -> bool {
+        let Some(instance) = self.instances[index].as_ref() else {
+            return false;
+        };
+        match &instance.kind {
+            ScriptKind::Lite(lite_instance) => lite_instance
+                .has_callback(net_callback_name(event))
+                .unwrap_or(true),
+            ScriptKind::Heavy(HeavyInstance::Abi(script)) => script.has_net_event(),
+        }
+    }
+
+    /// Ошибка net-callback: экземпляр остаётся включённым, ошибка попадает в журнал с лимитом и,
+    /// для сообщения, увеличивает счётчик участника.
+    fn net_callback_failed(&mut self, index: usize, peer: Option<PeerId>, message: String) {
+        let source = self.instances[index]
+            .as_ref()
+            .map(|instance| instance.source.clone())
+            .unwrap_or_else(|| self.scene_name.clone());
+        self.net_errors
+            .report(self.current_time.elapsed, &source, message, &self.events);
+        if let Some(peer) = peer {
+            self.count_peer_fault(peer);
+        }
+    }
+
+    fn count_peer_fault(&mut self, peer: PeerId) {
+        let count = self.peer_faults.entry(peer).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    fn warn(&mut self, message: String) {
+        self.events.borrow_mut().push(ScriptEvent {
+            level: ScriptEventLevel::Warn,
+            source: self.scene_name.clone(),
+            message,
+        });
     }
 
     fn deliver_physics_events(&mut self, world: &mut World, time: ScriptTime) {
@@ -1359,7 +1667,15 @@ impl ScriptHost {
             })
             .collect::<Vec<_>>();
         for index in indexes {
-            match self.call_instance(index, world, Phase::PhysicsEvent(event), time, None, None) {
+            match self.call_instance(
+                index,
+                world,
+                Phase::PhysicsEvent(event),
+                time,
+                None,
+                None,
+                None,
+            ) {
                 CallOutcome::Committed => {}
                 CallOutcome::Interrupted => self.disable_instance(index),
                 CallOutcome::Failed(message) => self.fail_instance(index, message),
@@ -1367,6 +1683,7 @@ impl ScriptHost {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn call_instance(
         &mut self,
         index: usize,
@@ -1374,6 +1691,7 @@ impl ScriptHost {
         phase: Phase,
         time: ScriptTime,
         message: Option<&PendingMessage>,
+        net_event: Option<&NetEvent>,
         time_error: Option<&str>,
     ) -> CallOutcome {
         let Self {
@@ -1396,6 +1714,8 @@ impl ScriptHost {
             physics,
             lifecycle,
             cursor,
+            net,
+            net_requests,
             ..
         } = self;
         let Some(instance) = instances[index].as_mut() else {
@@ -1416,6 +1736,8 @@ impl ScriptHost {
             queued_audio: audio_requests.len(),
             queued_animation: animation_requests.len(),
             physics: physics.clone(),
+            net: net.clone(),
+            queued_net: net_requests.len(),
             physics_phase_dt: match phase {
                 Phase::Update(dt) => Some(dt),
                 _ => None,
@@ -1479,6 +1801,14 @@ impl ScriptHost {
                                                     ),
                                                 },
                                             ),
+                                        Phase::Net => match net_event {
+                                            Some(event) => {
+                                                lite_instance.invoke_net_event(lua, event)
+                                            }
+                                            None => {
+                                                Err(LuaError::runtime("missing net event data"))
+                                            }
+                                        },
                                         Phase::Destroy => lite_instance.invoke_destroy(),
                                     })
                             }
@@ -1536,6 +1866,10 @@ impl ScriptHost {
                             call,
                         )
                     }
+                    Phase::Net => match net_event {
+                        Some(event) => script.invoke_net_event(time, event, call),
+                        None => Err("missing net event data".to_owned()),
+                    },
                     Phase::Destroy => script.invoke(AbiPhase::Destroy, time, call),
                 }
                 .map(|()| None)
@@ -1585,6 +1919,7 @@ impl ScriptHost {
                 events,
                 audio_requests,
                 animation_requests,
+                net_requests,
             )
         } {
             Ok(mutations) => {
@@ -1600,20 +1935,7 @@ impl ScriptHost {
     /// Применяет накопленные заявки в конце фазы: spawn в порядке commit, затем удаления,
     /// вытеснение по `max_instances` и созревшие отложенные удаления.
     fn apply_lifecycle(&mut self, world: &mut World, time: ScriptTime) {
-        self.lifecycle
-            .borrow_mut()
-            .queued
-            .make_contiguous()
-            .sort_by_key(|request| request.seq);
-        // Заявки снимаются по одной, и оставшиеся остаются в очереди: отмена одной заявки видит
-        // остальные и не начинает выгрузку префаба раньше времени.
-        loop {
-            let next = self.lifecycle.borrow_mut().queued.pop_front();
-            let Some(request) = next else {
-                break;
-            };
-            self.process_spawn(world, &request);
-        }
+        self.apply_queued_spawns(world);
 
         let mut doomed = Vec::new();
         {
@@ -1882,6 +2204,8 @@ impl ScriptHost {
                     queued_audio: self.audio_requests.len(),
                     queued_animation: self.animation_requests.len(),
                     physics: self.physics.clone(),
+                    net: self.net.clone(),
+                    queued_net: self.net_requests.len(),
                     physics_phase_dt: None,
                     lifecycle: self.lifecycle.clone(),
                     lifecycle_writes: false,
@@ -2018,6 +2342,7 @@ impl ScriptHost {
                 Phase::Destroy,
                 time,
                 None,
+                None,
                 time_error.as_deref(),
             ) {
                 CallOutcome::Committed => {}
@@ -2073,6 +2398,9 @@ impl ScriptHost {
                 .and_then(Option::as_ref)
                 .is_some_and(|instance| instance.serial == serial)
         });
+        for handle in &removed {
+            self.net.borrow_mut().clear_object(*handle);
+        }
         Some(removed)
     }
 
@@ -2189,6 +2517,8 @@ impl ScriptHost {
             queued_audio: self.audio_requests.len(),
             queued_animation: self.animation_requests.len(),
             physics: self.physics.clone(),
+            net: self.net.clone(),
+            queued_net: self.net_requests.len(),
             physics_phase_dt: None,
             lifecycle: self.lifecycle.clone(),
             lifecycle_writes: false,
@@ -2378,6 +2708,15 @@ fn script_transform(transform: LocalTransform) -> ScriptTransform {
     }
 }
 
+/// Имя callback Lua-класса для сетевого события.
+fn net_callback_name(event: &NetEvent) -> &'static str {
+    match event {
+        NetEvent::Message { .. } => "on_net_message",
+        NetEvent::PeerConnected { .. } => "on_peer_connected",
+        NetEvent::PeerDisconnected { .. } => "on_peer_disconnected",
+    }
+}
+
 fn event_source(scene_name: &str, object_id: &str, script_name: &str) -> String {
     format!("{scene_name}/{object_id}/{script_name}")
 }
@@ -2388,5 +2727,7 @@ mod animation_tests;
 mod audio_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod net_tests;
 #[cfg(test)]
 mod tests;

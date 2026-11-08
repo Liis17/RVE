@@ -12,8 +12,9 @@ use engine_files::VirtualPath;
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
-    AnimationRequest, AntiAliasing, AudioGroup, AudioRequest, CameraSettings, ClipParams,
-    ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue, Tonemapper, VoiceId,
+    AnimationRequest, AntiAliasing, AudioGroup, AudioRequest, CameraSettings, ClipParams, NetEvent,
+    NetMode, NetTarget, ObjectHandle, ParamKind, ParamSchema, ParamSpec, ParamValue, PeerId,
+    Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use mlua::chunk::ChunkMode;
@@ -393,6 +394,7 @@ pub(crate) fn create_lua(
     rve.set("send", send_function(&lua, active_call.clone())?)?;
     rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
     rve.set("audio", audio_table(&lua, active_call.clone())?)?;
+    rve.set("net", net_table(&lua, active_call.clone())?)?;
     rve.set("input", input_table(&lua, active_call)?)?;
     globals.set("rve", rve)?;
     Ok(LuaState {
@@ -685,6 +687,36 @@ impl LuaInstance {
                 param_value(lua, value)?,
             ),
         )
+    }
+
+    /// Есть ли у класса функция `name`.
+    pub(crate) fn has_callback(&self, name: &str) -> mlua::Result<bool> {
+        self.class
+            .get::<Value>(name)
+            .map(|value| !matches!(value, Value::Nil))
+    }
+
+    pub(crate) fn invoke_net_event(&self, lua: &Lua, event: &NetEvent) -> mlua::Result<()> {
+        match event {
+            NetEvent::Message {
+                peer, name, value, ..
+            } => self.invoke(
+                "on_net_message",
+                (
+                    self.instance.clone(),
+                    *peer,
+                    name.as_str(),
+                    param_value(lua, value)?,
+                ),
+            ),
+            NetEvent::PeerConnected { peer } => {
+                self.invoke("on_peer_connected", (self.instance.clone(), *peer))
+            }
+            NetEvent::PeerDisconnected { peer, reason } => self.invoke(
+                "on_peer_disconnected",
+                (self.instance.clone(), *peer, reason.as_str()),
+            ),
+        }
     }
 
     pub(crate) fn invoke_physics_event(
@@ -1167,6 +1199,7 @@ fn object_table(
     )?;
     add_audio_object_api(lua, &object, handle, active_call.clone())?;
     add_animation_object_api(lua, &object, handle, active_call.clone())?;
+    add_net_object_api(lua, &object, handle, active_call.clone())?;
     add_physics_object_api(lua, &object, handle, active_call)?;
     Ok(object)
 }
@@ -1183,6 +1216,291 @@ fn delay_argument(arguments: MultiValue, name: &str) -> mlua::Result<f64> {
         Some(Value::Integer(delay)) => Ok(delay as f64),
         Some(Value::Number(delay)) => Ok(delay),
         Some(_) => Err(LuaError::runtime(format!("{name} delay must be a number"))),
+    }
+}
+
+/// Методы сети объекта: `net_id`, `net_owner`, `is_owner`, `has_authority`, `set_net_owner` и
+/// `net_send`. Для мёртвого объекта чтения дают `nil` или `false`, записи ничего не делают.
+fn add_net_object_api(
+    lua: &Lua,
+    object: &Table,
+    handle: ObjectHandle,
+    active_call: ActiveCall,
+) -> mlua::Result<()> {
+    let id_active = active_call.clone();
+    object.set(
+        "net_id",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&id_active, handle)? {
+                return Ok(Option::<i64>::None);
+            }
+            with_active_call(&id_active, |transaction| {
+                Ok(transaction
+                    .net_object(handle)
+                    .map(|state| i64::from(state.net_id.get())))
+            })
+        })?,
+    )?;
+
+    let owner_active = active_call.clone();
+    object.set(
+        "net_owner",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&owner_active, handle)? {
+                return Ok(Option::<i64>::None);
+            }
+            with_active_call(&owner_active, |transaction| {
+                Ok(transaction
+                    .net_object(handle)
+                    .and_then(|state| state.owner)
+                    .map(i64::from))
+            })
+        })?,
+    )?;
+
+    let is_owner_active = active_call.clone();
+    object.set(
+        "is_owner",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&is_owner_active, handle)? {
+                return Ok(false);
+            }
+            with_active_call(&is_owner_active, |transaction| {
+                Ok(transaction.net_is_owner(handle))
+            })
+        })?,
+    )?;
+
+    let authority_active = active_call.clone();
+    object.set(
+        "has_authority",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            if !object_alive(&authority_active, handle)? {
+                return Ok(false);
+            }
+            with_active_call(&authority_active, |transaction| {
+                Ok(transaction.net_has_authority(handle))
+            })
+        })?,
+    )?;
+
+    let owner_set_active = active_call.clone();
+    object.set(
+        "set_net_owner",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let peer = net_method_arguments(arguments, "object.set_net_owner", 1, 1)?
+                .pop()
+                .unwrap_or(Value::Nil);
+            let peer = lua_peer(lua_integer(peer, "object.set_net_owner peer")?)?;
+            if !object_alive(&owner_set_active, handle)? {
+                return Ok(());
+            }
+            with_active_call(&owner_set_active, |transaction| {
+                transaction
+                    .set_net_owner(handle, peer)
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+
+    let send_active = active_call;
+    object.set(
+        "net_send",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let mut values = net_method_arguments(arguments, "object.net_send", 3, 4)?;
+            let options = if values.len() == 4 {
+                values.pop()
+            } else {
+                None
+            };
+            let [name, value, target]: [Value; 3] = values.try_into().map_err(|_| {
+                LuaError::runtime("object.net_send expects a name, value and target")
+            })?;
+            let name = lua_name_value(name, "object.net_send")?;
+            let target = lua_net_target(target)?;
+            let reliable = lua_reliable(lua_options(options)?.as_ref(), "object.net_send")?;
+            let (value, _) = lua_param_value_with_size(value)?;
+            if !object_alive(&send_active, handle)? {
+                return Ok(());
+            }
+            with_active_call(&send_active, |transaction| {
+                transaction
+                    .send_net(Some(handle), &name, value.clone(), target, reliable)
+                    .map_err(LuaError::runtime)
+            })
+        })?,
+    )?;
+    Ok(())
+}
+
+/// Аргументы метода без `self`: Lua передаёт таблицу объекта первой, поэтому её пропускаем.
+fn net_method_arguments(
+    arguments: MultiValue,
+    function: &str,
+    min: usize,
+    max: usize,
+) -> mlua::Result<Vec<Value>> {
+    let mut values: Vec<Value> = arguments.into_iter().collect();
+    if matches!(values.first(), Some(Value::Table(_))) {
+        values.remove(0);
+    }
+    if !(min..=max).contains(&values.len()) {
+        return Err(LuaError::runtime(format!(
+            "{function} expects {min} to {max} arguments"
+        )));
+    }
+    Ok(values)
+}
+
+fn lua_name_value(value: Value, function: &str) -> mlua::Result<String> {
+    match value {
+        Value::String(name) => lua_message_name(name),
+        other => Err(LuaError::runtime(format!(
+            "{function} expects the message name as a string, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn lua_integer(value: Value, what: &str) -> mlua::Result<i64> {
+    match value {
+        Value::Integer(value) => Ok(value),
+        Value::Number(value) if value.is_finite() && value.fract() == 0.0 => Ok(value as i64),
+        other => Err(LuaError::runtime(format!(
+            "{what} must be an integer, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn lua_options(value: Option<Value>) -> mlua::Result<Option<Table>> {
+    match value {
+        None | Some(Value::Nil) => Ok(None),
+        Some(Value::Table(options)) => Ok(Some(options)),
+        Some(other) => Err(LuaError::runtime(format!(
+            "network options must be a table, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Таблица `rve.net`: режим, участники и отправка. Ошибки записи (клиент, лимиты) — ошибки Lua.
+fn net_table(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Table> {
+    let net = lua.create_table()?;
+
+    let mode_active = active_call.clone();
+    net.set(
+        "mode",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            let mode = with_active_call(&mode_active, |transaction| Ok(transaction.net_mode()))?;
+            Ok(net_mode_name(mode))
+        })?,
+    )?;
+
+    let server_active = active_call.clone();
+    net.set(
+        "is_server",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            let mode = with_active_call(&server_active, |transaction| Ok(transaction.net_mode()))?;
+            Ok(matches!(
+                mode,
+                NetMode::Offline | NetMode::Host | NetMode::Server
+            ))
+        })?,
+    )?;
+
+    let client_active = active_call.clone();
+    net.set(
+        "is_client",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            let mode = with_active_call(&client_active, |transaction| Ok(transaction.net_mode()))?;
+            Ok(matches!(mode, NetMode::Host | NetMode::Client))
+        })?,
+    )?;
+
+    let local_active = active_call.clone();
+    net.set(
+        "local_peer",
+        lua.create_function(move |_, _arguments: MultiValue| {
+            with_active_call(&local_active, |transaction| {
+                Ok(i64::from(transaction.net_local_peer()))
+            })
+        })?,
+    )?;
+
+    let peers_active = active_call.clone();
+    net.set(
+        "peers",
+        lua.create_function(move |lua, _arguments: MultiValue| {
+            let peers = with_active_call(&peers_active, |transaction| Ok(transaction.net_peers()))?;
+            lua.create_sequence_from(peers.into_iter().map(i64::from))
+        })?,
+    )?;
+
+    net.set(
+        "send",
+        lua.create_function(
+            move |_, (target, name, value, options): (Value, LuaString, Value, Option<Table>)| {
+                let target = lua_net_target(target)?;
+                let reliable = lua_reliable(options.as_ref(), "rve.net.send")?;
+                let name = lua_message_name(name)?;
+                let (value, _) = lua_param_value_with_size(value)?;
+                with_active_call(&active_call, |transaction| {
+                    transaction
+                        .send_net(None, &name, value.clone(), target, reliable)
+                        .map_err(LuaError::runtime)
+                })
+            },
+        )?,
+    )?;
+    Ok(net)
+}
+
+fn net_mode_name(mode: NetMode) -> &'static str {
+    match mode {
+        NetMode::Offline => "offline",
+        NetMode::Host => "host",
+        NetMode::Server => "server",
+        NetMode::Client => "client",
+    }
+}
+
+/// Адресат `"server"`, `"all"` или номер участника.
+fn lua_net_target(value: Value) -> mlua::Result<NetTarget> {
+    match value {
+        Value::String(text) => match text.to_str()?.to_owned().as_str() {
+            "server" => Ok(NetTarget::Server),
+            "all" => Ok(NetTarget::All),
+            other => Err(LuaError::runtime(format!(
+                "сетевой адресат {other:?} должен быть \"server\", \"all\" или номером участника"
+            ))),
+        },
+        value @ (Value::Integer(_) | Value::Number(_)) => Ok(NetTarget::Peer(lua_peer(
+            lua_integer(value, "сетевой адресат")?,
+        )?)),
+        _ => Err(LuaError::runtime(
+            "сетевой адресат должен быть строкой \"server\" или \"all\" либо номером участника",
+        )),
+    }
+}
+
+fn lua_peer(peer: i64) -> mlua::Result<PeerId> {
+    PeerId::try_from(peer).map_err(|_| {
+        LuaError::runtime(format!(
+            "номер участника {peer} вне диапазона 0..={}",
+            PeerId::MAX
+        ))
+    })
+}
+
+/// Необязательный `reliable` в таблице опций; по умолчанию `true`.
+fn lua_reliable(options: Option<&Table>, function: &str) -> mlua::Result<bool> {
+    let Some(options) = options else {
+        return Ok(true);
+    };
+    match options.get::<Value>("reliable")? {
+        Value::Nil => Ok(true),
+        value => lua_boolean(value, &format!("{function} option reliable")),
     }
 }
 

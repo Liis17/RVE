@@ -10,6 +10,7 @@ mod host;
 mod library;
 mod lifecycle;
 mod lite;
+mod net;
 mod physics;
 mod transaction;
 mod types;

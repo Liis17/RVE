@@ -9,9 +9,11 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 8 appends cursor callbacks after the v7 audio tail.
 /// Version 9 appends spawn, destroy, object-state and prefab callbacks after the v8 cursor tail.
 /// Version 10 appends animation callbacks after the v9 prefab tail.
+/// Version 11 appends network callbacks after the v10 animation tail and the net event callback
+/// after the v6 collision tail of the descriptor.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 10;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 11;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -881,6 +883,77 @@ pub type RveAnimationSetSpeedFn =
 /// Stops every motion of one animated object; returns `RveStatus` as a `u32`. Appended in ABI v10.
 pub type RveAnimationStopFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
 
+/// Network mode code returned by [`RveHost::net_mode`]: no network.
+pub const RVE_NET_MODE_OFFLINE: u32 = 0;
+/// Network mode code: listen server, which also has a local client.
+pub const RVE_NET_MODE_HOST: u32 = 1;
+/// Network mode code: dedicated server.
+pub const RVE_NET_MODE_SERVER: u32 = 2;
+/// Network mode code: client connected to a server.
+pub const RVE_NET_MODE_CLIENT: u32 = 3;
+
+/// Message target code: the server.
+pub const RVE_NET_TARGET_SERVER: u32 = 0;
+/// Message target code: every connected peer.
+pub const RVE_NET_TARGET_ALL: u32 = 1;
+/// Message target code: the peer whose number is passed next to the code.
+pub const RVE_NET_TARGET_PEER: u32 = 2;
+
+/// Network status code: the request was accepted.
+pub const RVE_NET_OK: u32 = 0;
+/// Network status code: the host refused the request in the current phase or state.
+pub const RVE_NET_REJECTED: u32 = 1;
+/// Network status code: the arguments violate the message or peer limits.
+pub const RVE_NET_INVALID_INPUT: u32 = 2;
+
+/// Net event kind: a message from a peer. Also sets `value`.
+pub const RVE_NET_EVENT_MESSAGE: u32 = 0;
+/// Net event kind: a peer connected.
+pub const RVE_NET_EVENT_PEER_CONNECTED: u32 = 1;
+/// Net event kind: a peer disconnected; `reason` is set.
+pub const RVE_NET_EVENT_PEER_DISCONNECTED: u32 = 2;
+
+/// Returns one of the `RVE_NET_MODE_*` codes.
+pub type RveNetModeFn = unsafe extern "C" fn(ctx: *mut c_void) -> u32;
+/// Returns the local peer number.
+pub type RveNetLocalPeerFn = unsafe extern "C" fn(ctx: *mut c_void) -> u32;
+/// Copies up to `capacity` remote peer numbers into `out` and writes the total count to
+/// `count`. A guest may call it with zero capacity to learn the count first.
+pub type RveNetPeersFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    out: *mut u32,
+    capacity: usize,
+    count: *mut usize,
+) -> bool;
+/// Stages a message for `target_kind` (`RVE_NET_TARGET_*`) and `peer`; returns `RVE_NET_*`.
+pub type RveNetSendFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32;
+/// Copies one object's network number into `out`; returns false when it has no identity.
+pub type RveNetObjectIdFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut u32) -> bool;
+/// Writes one object's network boolean into `out`; returns false when the object is unavailable.
+pub type RveNetObjectBoolFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, out: *mut bool) -> bool;
+/// Stages the owner of one object; returns `RVE_NET_*`.
+pub type RveNetObjectSetOwnerFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, peer: u32) -> u32;
+/// Stages a message for the same object on the other side; returns `RVE_NET_*`.
+pub type RveNetObjectSendFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32;
+
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
 pub struct RveHost {
@@ -984,6 +1057,17 @@ pub struct RveHost {
     pub animation_set_parameter: Option<RveAnimationSetParameterFn>,
     pub animation_set_speed: Option<RveAnimationSetSpeedFn>,
     pub animation_stop: Option<RveAnimationStopFn>,
+    /// Network callbacks appended in ABI v11; `None` marks an unavailable callback.
+    pub net_mode: Option<RveNetModeFn>,
+    pub net_local_peer: Option<RveNetLocalPeerFn>,
+    pub net_peers: Option<RveNetPeersFn>,
+    pub net_send: Option<RveNetSendFn>,
+    pub net_object_id: Option<RveNetObjectIdFn>,
+    pub net_object_owner: Option<RveNetObjectIdFn>,
+    pub net_object_is_owner: Option<RveNetObjectBoolFn>,
+    pub net_object_has_authority: Option<RveNetObjectBoolFn>,
+    pub net_object_set_owner: Option<RveNetObjectSetOwnerFn>,
+    pub net_object_send: Option<RveNetObjectSendFn>,
 }
 
 /// Guest factory callback.
@@ -1096,9 +1180,33 @@ pub struct RveScriptDescV4 {
     pub command: Option<RveCommandFn>,
 }
 
-/// One exported guest script implementation in ABI version 6.
+/// Guest network event callback. `event` is valid only for the call.
+pub type RveNetEventFn = unsafe extern "C" fn(
+    instance: *mut c_void,
+    host: *const RveHost,
+    event: RveNetEvent,
+) -> RveStatus;
+
+/// One network event delivered to a guest instance. Text fields are empty and `value` is null
+/// when the event kind does not use them.
 #[repr(C)]
-pub struct RveScriptDesc {
+#[derive(Clone, Copy)]
+pub struct RveNetEvent {
+    /// One of the `RVE_NET_EVENT_*` kinds.
+    pub kind: u32,
+    /// Sender for messages; the connected or disconnected peer otherwise.
+    pub peer: u32,
+    /// Message name; empty for peer events.
+    pub name: RveStr,
+    /// Message value; null for peer events.
+    pub value: *const RveValue,
+    /// Disconnect reason; empty for other kinds.
+    pub reason: RveStr,
+}
+
+/// One exported guest script implementation in ABI version 6 through 10.
+#[repr(C)]
+pub struct RveScriptDescV6 {
     pub name: RveStr,
     pub create: RveCreateFn,
     pub start: RveStartFn,
@@ -1111,6 +1219,24 @@ pub struct RveScriptDesc {
     pub command: Option<RveCommandFn>,
     /// Optional collision and trigger callback appended in ABI v6.
     pub collision: Option<RveCollisionFn>,
+}
+
+/// One exported guest script implementation in ABI version 11.
+#[repr(C)]
+pub struct RveScriptDesc {
+    pub name: RveStr,
+    pub create: RveCreateFn,
+    pub start: RveStartFn,
+    pub update: RveUpdateFn,
+    pub message: RveMessageFn,
+    pub destroy: RveDestroyFn,
+    pub drop: RveDropFn,
+    pub params: *const RveParamDesc,
+    pub param_count: usize,
+    pub command: Option<RveCommandFn>,
+    pub collision: Option<RveCollisionFn>,
+    /// Optional network event callback appended in ABI v11.
+    pub net_event: Option<RveNetEventFn>,
 }
 
 /// Parameter kind: boolean.
@@ -1185,6 +1311,7 @@ unsafe impl Sync for RveParamDesc {}
 unsafe impl Sync for RveScriptDescV1 {}
 unsafe impl Sync for RveScriptDescV3 {}
 unsafe impl Sync for RveScriptDescV4 {}
+unsafe impl Sync for RveScriptDescV6 {}
 unsafe impl Sync for RveScriptDesc {}
 unsafe impl Sync for RveModule {}
 
