@@ -193,6 +193,18 @@ const SHADERS: &[ShaderBuild] = &[
         &[],
         "bloom_upsample.frag.spv",
     ),
+    (
+        "exposure_histogram.wgsl",
+        naga::ShaderStage::Compute,
+        &[],
+        "exposure_histogram.comp.spv",
+    ),
+    (
+        "exposure_average.comp",
+        naga::ShaderStage::Compute,
+        &[],
+        "exposure_average.comp.spv",
+    ),
 ];
 
 /// GLSL `barrier()` lowers to a barrier with subgroup scope, which naga validates only
@@ -336,11 +348,19 @@ fn main() {
                 CLUSTER_COMPUTE_LOCAL_SIZE.to_string(),
             );
         }
-        let mut module = frontend
-            .parse(&shader_options, &source)
-            .unwrap_or_else(|error| {
+        // Атомарные операции в naga glsl-in 30.0.1 не поддерживаются, поэтому такие шейдеры
+        // пишутся на WGSL и компилируются тем же валидатором.
+        let mut module = if name.ends_with(".wgsl") {
+            naga::front::wgsl::parse_str(&source).unwrap_or_else(|error| {
                 panic!("{name}: {}", error.emit_to_string(&source));
-            });
+            })
+        } else {
+            frontend
+                .parse(&shader_options, &source)
+                .unwrap_or_else(|error| {
+                    panic!("{name}: {}", error.emit_to_string(&source));
+                })
+        };
         for entry_point in &mut module.entry_points {
             drop_subgroup_barriers(&mut entry_point.function.body);
         }

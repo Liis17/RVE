@@ -1,0 +1,62 @@
+#version 450
+
+// Адаптация экспозиции: средняя log2-яркость по бинам между перцентилями low и high,
+// целевой EV = log2(0.18) - средняя, затем экспоненциальное приближение с разной скоростью
+// вверх и вниз. Одна рабочая группа; суммирование выполняет первый поток. Гистограмма
+// записана атомиками в exposure_histogram.wgsl, здесь её только читают.
+// Компенсация EV добавляется в composite; буфер хранит адаптированное значение.
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 1) buffer ExposureBuffer {
+    uint histogram[256];
+    float adapted_ev;
+    float pad0;
+    float pad1;
+    float pad2;
+} exposure;
+
+layout(push_constant) uniform PushConstants {
+    // x — dt в секундах, y — скорость роста, z — скорость падения, w — 1 для snap.
+    vec4 timing;
+    // x — min_ev, y — max_ev, z — низкий перцентиль (доля), w — высокий перцентиль (доля).
+    vec4 range;
+} push_constants;
+
+const float MIN_LOG2 = -10.0;
+const float MAX_LOG2 = 4.0;
+const float KEY_LOG2 = -2.47393;
+
+void main() {
+    if (gl_LocalInvocationIndex != 0u) {
+        return;
+    }
+    float total = 0.0;
+    for (uint i = 0u; i < 256u; i++) {
+        total += float(exposure.histogram[i]);
+    }
+    float low = total * push_constants.range.z;
+    float high = total * push_constants.range.w;
+    float before = 0.0;
+    float weight_sum = 0.0;
+    float weighted_log = 0.0;
+    for (uint i = 0u; i < 256u; i++) {
+        float count = float(exposure.histogram[i]);
+        float after = before + count;
+        float weight = max(0.0, min(after, high) - max(before, low));
+        float bin_log = MIN_LOG2 + (float(i) + 0.5) * (MAX_LOG2 - MIN_LOG2) / 256.0;
+        weight_sum += weight;
+        weighted_log += weight * bin_log;
+        before = after;
+    }
+    float average_log = weight_sum > 0.0 ? weighted_log / weight_sum : KEY_LOG2;
+    float target_ev = clamp(KEY_LOG2 - average_log, push_constants.range.x, push_constants.range.y);
+    float next = target_ev;
+    if (push_constants.timing.w < 0.5) {
+        float current = exposure.adapted_ev;
+        float speed = target_ev > current ? push_constants.timing.y : push_constants.timing.z;
+        float alpha = 1.0 - exp(-push_constants.timing.x * speed);
+        next = current + (target_ev - current) * alpha;
+    }
+    exposure.adapted_ev = next;
+}

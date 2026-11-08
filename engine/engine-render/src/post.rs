@@ -493,7 +493,7 @@ pub fn bloom_mip_count(extent: (u32, u32)) -> u32 {
 /// Параметры composite-прохода (tonemap.frag). Раскладка совпадает с шейдером:
 /// v0 — (exposure EV, код tonemapper, код debug view, интенсивность CA);
 /// v1 — (temperature, tint, contrast, saturation);
-/// v2 — (lift.rgb, bloom включён); v3 — (gamma.rgb, интенсивность vignette);
+/// v2 — (lift.rgb, флаги: bit0 bloom, bit1 auto exposure); v3 — (gamma.rgb, интенсивность vignette);
 /// v4 — (gain.rgb, smoothness); v5 — (цвет vignette.rgb, roundness).
 /// Выключенный эффект кодируется тождественными значениями.
 #[repr(C)]
@@ -545,7 +545,9 @@ pub fn composite_params(
         } else {
             (0.0, 0.0, 1.0, [0.0; 3])
         };
-    let bloom_enabled = if plan.bloom_mips > 0 { 1.0 } else { 0.0 };
+    // Флаги композита: бит 0 — bloom, бит 1 — экспозиция по гистограмме (читается из буфера).
+    let flags =
+        f32::from(u8::from(plan.bloom_mips > 0)) + 2.0 * f32::from(u8::from(plan.auto_exposure));
     let aberration = if plan.chromatic_aberration {
         post.chromatic_aberration.intensity
     } else {
@@ -560,7 +562,7 @@ pub fn composite_params(
                 aberration,
             ],
             [temperature, tint, contrast, saturation],
-            [lift[0], lift[1], lift[2], bloom_enabled],
+            [lift[0], lift[1], lift[2], flags],
             [gamma[0], gamma[1], gamma[2], vignette_intensity],
             [gain[0], gain[1], gain[2], vignette_smoothness],
             [
@@ -571,6 +573,116 @@ pub fn composite_params(
             ],
         ],
     }
+}
+
+/// Число бинов гистограммы экспозиции (совпадает с exposure_histogram.wgsl).
+pub const EXPOSURE_BINS: usize = 256;
+/// Диапазон log2-яркости гистограммы и log2 средней серой нужны только CPU-зеркалам ниже,
+/// которые проверяют формулы шейдеров; сами шейдеры хранят эти значения у себя.
+#[cfg(test)]
+const EXPOSURE_MIN_LOG2: f32 = -10.0;
+#[cfg(test)]
+const EXPOSURE_MAX_LOG2: f32 = 4.0;
+#[cfg(test)]
+const EXPOSURE_KEY_LOG2: f32 = -2.473_931_2;
+
+/// Push constants усредняющего прохода экспозиции: тайминг и диапазон адаптации.
+/// Раскладка: timing = (dt, скорость роста, скорость падения, snap); range = (min, max, low, high).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExposureAverageParams {
+    pub timing: [f32; 4],
+    pub range: [f32; 4],
+}
+
+impl ExposureAverageParams {
+    /// Байты push constants в порядке записи.
+    pub fn to_bytes(self) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        for (index, value) in self.timing.iter().chain(&self.range).enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
+    }
+}
+
+/// Параметры адаптации для вида. Перцентили переводятся из процентов в доли.
+/// `snap` — адаптация не сглаживается: первый кадр вида или явный сброс истории.
+pub fn exposure_average_params(
+    exposure: &Exposure,
+    frame_delta_ms: f32,
+    snap: bool,
+) -> ExposureAverageParams {
+    ExposureAverageParams {
+        timing: [
+            (frame_delta_ms.max(0.0)) / 1000.0,
+            exposure.speed_up,
+            exposure.speed_down,
+            f32::from(u8::from(snap)),
+        ],
+        range: [
+            exposure.min_ev,
+            exposure.max_ev,
+            exposure.low_percent / 100.0,
+            exposure.high_percent / 100.0,
+        ],
+    }
+}
+
+/// CPU-зеркало `exposure_average.comp`: целевой EV по средней log2-яркости между перцентилями.
+/// Пустая гистограмма даёт средний серый, то есть 0 EV до ограничения диапазона.
+#[cfg(test)]
+fn target_exposure(
+    histogram: &[u32; EXPOSURE_BINS],
+    low_fraction: f32,
+    high_fraction: f32,
+    min_ev: f32,
+    max_ev: f32,
+) -> f32 {
+    let total: f64 = histogram.iter().map(|count| f64::from(*count)).sum();
+    let low = total * f64::from(low_fraction);
+    let high = total * f64::from(high_fraction);
+    let mut before = 0.0_f64;
+    let mut weight_sum = 0.0_f64;
+    let mut weighted_log = 0.0_f64;
+    let bin_width = f64::from(EXPOSURE_MAX_LOG2 - EXPOSURE_MIN_LOG2) / EXPOSURE_BINS as f64;
+    for (index, count) in histogram.iter().enumerate() {
+        let after = before + f64::from(*count);
+        let weight = (after.min(high) - before.max(low)).max(0.0);
+        let bin_log = f64::from(EXPOSURE_MIN_LOG2) + (index as f64 + 0.5) * bin_width;
+        weight_sum += weight;
+        weighted_log += weight * bin_log;
+        before = after;
+    }
+    let average_log = if weight_sum > 0.0 {
+        weighted_log / weight_sum
+    } else {
+        f64::from(EXPOSURE_KEY_LOG2)
+    };
+    (f64::from(EXPOSURE_KEY_LOG2) - average_log).clamp(f64::from(min_ev), f64::from(max_ev)) as f32
+}
+
+/// CPU-зеркало адаптации из `exposure_average.comp`: экспоненциальное приближение к цели.
+/// Скорость роста применяется, когда цель выше текущего EV, иначе — скорость падения.
+#[cfg(test)]
+fn adapt_exposure(
+    current: f32,
+    target: f32,
+    frame_delta_ms: f32,
+    speed_up: f32,
+    speed_down: f32,
+    snap: bool,
+) -> f32 {
+    if snap {
+        return target;
+    }
+    let speed = if target > current {
+        speed_up
+    } else {
+        speed_down
+    };
+    let alpha = 1.0 - (-(frame_delta_ms.max(0.0) / 1000.0) * speed).exp();
+    current + (target - current) * alpha
 }
 
 /// Зерно считается по сиду кадра; ограничение по модулю сохраняет точность `f32`.
@@ -806,6 +918,106 @@ mod tests {
         assert_eq!(grain[2], (5000 % GRAIN_SEED_PERIOD) as f32);
         let wireframe = build_plan(&post, DebugView::Wireframe, (64, 64), (64, 64));
         assert_eq!(grain_params(&wireframe, &post, 0)[0], 0.0);
+    }
+
+    #[test]
+    fn empty_histogram_targets_the_middle_grey_exposure() {
+        let histogram = [0_u32; EXPOSURE_BINS];
+        assert_eq!(target_exposure(&histogram, 0.1, 0.9, -16.0, 16.0), 0.0);
+    }
+
+    #[test]
+    fn target_follows_the_average_log_luminance_and_respects_the_range() {
+        // Все пиксели в одном бине около log2 яркости 1.0: цель приводит её к среднему серому.
+        let mut histogram = [0_u32; EXPOSURE_BINS];
+        let bin = ((1.0 - EXPOSURE_MIN_LOG2) / (EXPOSURE_MAX_LOG2 - EXPOSURE_MIN_LOG2)
+            * EXPOSURE_BINS as f32) as usize;
+        histogram[bin] = 1000;
+        let target = target_exposure(&histogram, 0.1, 0.9, -16.0, 16.0);
+        assert!(
+            (target - (EXPOSURE_KEY_LOG2 - 1.0)).abs() < 0.05,
+            "{target}"
+        );
+        assert_eq!(target_exposure(&histogram, 0.1, 0.9, -0.5, 16.0), -0.5);
+    }
+
+    #[test]
+    fn percentiles_ignore_samples_outside_the_requested_window() {
+        // Половина пикселей очень тёмные, половина очень яркие; окно 50–100 берёт только яркие.
+        let mut histogram = [0_u32; EXPOSURE_BINS];
+        histogram[0] = 1000;
+        histogram[EXPOSURE_BINS - 1] = 1000;
+        let bright_only = target_exposure(&histogram, 0.5, 1.0, -16.0, 16.0);
+        let bright_expected = target_exposure(
+            &{
+                let mut only = [0_u32; EXPOSURE_BINS];
+                only[EXPOSURE_BINS - 1] = 1000;
+                only
+            },
+            0.0,
+            1.0,
+            -16.0,
+            16.0,
+        );
+        assert!(
+            (bright_only - bright_expected).abs() < 0.05,
+            "{bright_only} vs {bright_expected}"
+        );
+    }
+
+    #[test]
+    fn adaptation_snaps_on_request_and_holds_without_elapsed_time() {
+        assert_eq!(adapt_exposure(0.0, 2.0, 16.0, 3.0, 1.0, true), 2.0);
+        assert_eq!(adapt_exposure(0.5, 2.0, 0.0, 3.0, 1.0, false), 0.5);
+    }
+
+    #[test]
+    fn adaptation_brightening_is_faster_than_darkening_and_never_overshoots() {
+        let up = adapt_exposure(0.0, 2.0, 100.0, 3.0, 1.0, false) - 0.0;
+        let down = 0.0 - adapt_exposure(0.0, -2.0, 100.0, 3.0, 1.0, false);
+        assert!(up > down, "up {up} down {down}");
+        let after_long_time = adapt_exposure(0.0, 2.0, 60_000.0, 3.0, 1.0, false);
+        assert!(
+            after_long_time <= 2.0 && after_long_time > 1.99,
+            "{after_long_time}"
+        );
+    }
+
+    #[test]
+    fn average_params_convert_percentages_and_mark_snap() {
+        let exposure = Exposure {
+            speed_up: 2.5,
+            speed_down: 0.5,
+            low_percent: 5.0,
+            high_percent: 95.0,
+            min_ev: -4.0,
+            max_ev: 4.0,
+            ..Exposure::default()
+        };
+        let params = exposure_average_params(&exposure, 250.0, true);
+        assert_eq!(params.timing, [0.25, 2.5, 0.5, 1.0]);
+        assert_eq!(params.range, [-4.0, 4.0, 0.05, 0.95]);
+        assert_eq!(
+            exposure_average_params(&exposure, -5.0, false).timing[0],
+            0.0
+        );
+    }
+
+    #[test]
+    fn composite_flags_mark_bloom_and_auto_exposure_bits() {
+        let mut post = PostProcess::default();
+        post.exposure.mode = ExposureMode::Auto;
+        post.bloom.enabled = true;
+        let both = plan(&post, DebugView::Lit, (64, 64), (64, 64));
+        assert_eq!(
+            composite_params(&post, &both, DebugView::Lit).vectors[2][3],
+            3.0
+        );
+        let auto_only = plan(&post, DebugView::Wireframe, (64, 64), (64, 64));
+        assert_eq!(
+            composite_params(&post, &auto_only, DebugView::Wireframe).vectors[2][3],
+            0.0
+        );
     }
 
     #[test]

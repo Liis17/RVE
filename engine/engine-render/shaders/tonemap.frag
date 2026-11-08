@@ -11,12 +11,21 @@ layout(set = 0, binding = 0) uniform texture2D source_image;
 layout(set = 0, binding = 1) uniform sampler source_sampler;
 layout(set = 0, binding = 2) uniform texture2D bloom_image;
 
+// Буфер экспозиции вида: гистограмма для адаптации и адаптированный EV (см. exposure.rs).
+layout(std430, set = 0, binding = 3) readonly buffer ExposureBuffer {
+    uint histogram[256];
+    float adapted_ev;
+    float pad0;
+    float pad1;
+    float pad2;
+} exposure;
+
 layout(push_constant) uniform PushConstants {
     // v0: x — экспозиция EV, y — код tonemapper, z — код debug view, w — интенсивность CA.
     vec4 exposure_tonemap_debug_aberration;
     // v1: x — температура, y — tint, z — контраст, w — насыщенность.
     vec4 white_balance_contrast_saturation;
-    // v2: rgb — lift, w — bloom включён (1) или выключен (0).
+    // v2: rgb — lift, w — флаги: бит 0 — bloom, бит 1 — экспозиция по буферу.
     vec4 lift_bloom_enabled;
     // v3: rgb — gamma, w — интенсивность vignette.
     vec4 gamma_vignette_intensity;
@@ -123,7 +132,9 @@ void main() {
         color = sample_hdr(in_uv);
     }
     // Bloom хранится без экспозиции и складывается с HDR до неё.
-    if (push_constants.lift_bloom_enabled.w > 0.5) {
+    int flags = int(push_constants.lift_bloom_enabled.w + 0.5);
+    bool auto_exposure = (flags & 2) != 0;
+    if ((flags & 1) != 0) {
         color += textureLod(sampler2D(bloom_image, source_sampler), in_uv, 0.0).rgb;
     }
     if (debug_view == 3) {
@@ -131,7 +142,8 @@ void main() {
         color = overdraw_heat(normalized_count);
     } else {
         if (debug_view == 0 || debug_view == 1) {
-            color *= exp2(controls.x);
+            float ev = controls.x + (auto_exposure ? exposure.adapted_ev : 0.0);
+            color *= exp2(ev);
             color = grade_linear(color);
             int tonemapper = int(controls.y + 0.5);
             if (tonemapper == 0) {

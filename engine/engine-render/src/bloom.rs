@@ -233,6 +233,34 @@ pub(crate) fn bloom_record<'a>(
     }
 }
 
+/// Переводит изображение в `SHADER_READ_ONLY_OPTIMAL` для чтения проходами постобработки.
+pub(crate) fn ensure_sampled(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    layout: &mut vk::ImageLayout,
+) {
+    if *layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        return;
+    }
+    let (stage, access) = offscreen_previous_use(*layout);
+    pipeline_barrier(
+        device,
+        command_buffer,
+        image_layout_barrier(
+            image,
+            *layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            stage,
+            access,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            color_subresource_range(),
+        ),
+    );
+    *layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+}
+
 /// Записывает prefilter, downsample и upsample; возвращает view итогового уровня 0.
 ///
 /// `source` должен быть в `SHADER_READ_ONLY_OPTIMAL` либо переводится сюда; `source_layout`
@@ -245,24 +273,7 @@ pub(crate) fn record_bloom(
     record: BloomRecord<'_>,
     timestamps: Option<GpuMarks>,
 ) -> vk::ImageView {
-    if *source_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-        let (stage, access) = offscreen_previous_use(*source_layout);
-        pipeline_barrier(
-            device,
-            command_buffer,
-            image_layout_barrier(
-                source.image,
-                *source_layout,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                stage,
-                access,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::SHADER_SAMPLED_READ,
-                color_subresource_range(),
-            ),
-        );
-        *source_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-    }
+    ensure_sampled(device, command_buffer, source.image, source_layout);
     let BloomRecord {
         chain,
         pipelines,
