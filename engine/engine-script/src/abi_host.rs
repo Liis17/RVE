@@ -17,9 +17,9 @@ use engine_files::VirtualPath;
 use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
-    AnimationRequest, AntiAliasing, AudioGroup, AudioRequest, CameraColorSettings,
-    CameraRenderSettings, CameraSettings, ClipParams, ObjectHandle, ParamValue, ProjectionSettings,
-    Tonemapper, VoiceId,
+    AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AudioGroup, AudioRequest,
+    CameraColorSettings, CameraRenderSettings, CameraSettings, ClipParams, ExposureMode,
+    ObjectHandle, ParamValue, PostProcessSettings, ProjectionSettings, Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use rve_sdk::PhysicalInput;
@@ -34,8 +34,9 @@ use rve_sdk::abi::{
     RveTransform, RveValue, RveValueData,
 };
 use rve_sdk::abi::{
-    RVE_AUDIO_GROUP_AMBIENT, RVE_AUDIO_GROUP_EFFECTS, RVE_AUDIO_GROUP_MASTER,
-    RVE_AUDIO_GROUP_MUSIC, RveAudioParams, RvePlayAnimationParams,
+    RVE_AO_QUALITY_HIGH, RVE_AO_QUALITY_LOW, RVE_AO_QUALITY_MEDIUM, RVE_AUDIO_GROUP_AMBIENT,
+    RVE_AUDIO_GROUP_EFFECTS, RVE_AUDIO_GROUP_MASTER, RVE_AUDIO_GROUP_MUSIC, RVE_EXPOSURE_MODE_AUTO,
+    RVE_EXPOSURE_MODE_MANUAL, RveAudioParams, RvePlayAnimationParams, RvePostProcessSettings,
 };
 use rve_sdk::abi::{
     RVE_OBJECT_ALIVE, RVE_OBJECT_DEAD, RVE_OBJECT_PENDING, RVE_PREFAB_FAILED, RVE_PREFAB_LOADED,
@@ -216,6 +217,8 @@ impl<'a> AbiCallContext<'a> {
             animation_set_parameter: Some(host_animation_set_parameter),
             animation_set_speed: Some(host_animation_set_speed),
             animation_stop: Some(host_animation_stop),
+            get_post_process: Some(host_get_post_process),
+            set_post_process: Some(host_set_post_process),
         }
     }
 
@@ -711,6 +714,46 @@ unsafe extern "C" fn host_set_camera_settings(
         context
             .transaction
             .set_camera_settings_from_abi(object, settings)
+    })
+}
+
+unsafe extern "C" fn host_get_post_process(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut RvePostProcessSettings,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(settings) = context.transaction.post_process(handle) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the guest's writable stack slot.
+        unsafe { *out = post_process_to_abi(settings) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_set_post_process(
+    ctx: *mut c_void,
+    object: u64,
+    settings: *const RvePostProcessSettings,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if !context.transaction.writable() || settings.is_null() {
+            return false;
+        }
+        // SAFETY: settings was checked non-null and is valid for this callback.
+        let Some(settings) = post_process_from_abi(unsafe { *settings }) else {
+            return false;
+        };
+        context
+            .transaction
+            .set_post_process_from_abi(object, settings)
     })
 }
 
@@ -1650,6 +1693,160 @@ fn camera_settings_to_abi(settings: CameraSettings) -> RveCameraSettings {
     }
 }
 
+/// Переводит постобработку в плоскую запись ABI v11; булевы поля кодируются 0 и 1.
+fn post_process_to_abi(settings: PostProcessSettings) -> RvePostProcessSettings {
+    let exposure = settings.exposure;
+    let tonemapping = settings.tonemapping;
+    let bloom = settings.bloom;
+    let ao = settings.ambient_occlusion;
+    let grading = settings.color_grading;
+    let vignette = settings.vignette;
+    let aberration = settings.chromatic_aberration;
+    let grain = settings.film_grain;
+    let dof = settings.depth_of_field;
+    let motion = settings.motion_blur;
+    RvePostProcessSettings {
+        exposure_enabled: u32::from(exposure.enabled),
+        exposure_mode: match exposure.mode {
+            ExposureMode::Manual => RVE_EXPOSURE_MODE_MANUAL,
+            ExposureMode::Auto => RVE_EXPOSURE_MODE_AUTO,
+        },
+        exposure_ev: exposure.ev,
+        exposure_min_ev: exposure.min_ev,
+        exposure_max_ev: exposure.max_ev,
+        exposure_speed_up: exposure.speed_up,
+        exposure_speed_down: exposure.speed_down,
+        exposure_low_percent: exposure.low_percent,
+        exposure_high_percent: exposure.high_percent,
+        tonemapping_enabled: u32::from(tonemapping.enabled),
+        tonemapper: match tonemapping.tonemapper {
+            Tonemapper::Aces => RVE_TONEMAPPER_ACES,
+            Tonemapper::Neutral => RVE_TONEMAPPER_NEUTRAL,
+            Tonemapper::None => RVE_TONEMAPPER_NONE,
+        },
+        bloom_enabled: u32::from(bloom.enabled),
+        bloom_intensity: bloom.intensity,
+        bloom_threshold: bloom.threshold,
+        bloom_knee: bloom.knee,
+        bloom_scatter: bloom.scatter,
+        bloom_tint: bloom.tint,
+        ao_enabled: u32::from(ao.enabled),
+        ao_radius: ao.radius,
+        ao_intensity: ao.intensity,
+        ao_falloff: ao.falloff,
+        ao_quality: match ao.quality {
+            AmbientOcclusionQuality::Low => RVE_AO_QUALITY_LOW,
+            AmbientOcclusionQuality::Medium => RVE_AO_QUALITY_MEDIUM,
+            AmbientOcclusionQuality::High => RVE_AO_QUALITY_HIGH,
+        },
+        grading_enabled: u32::from(grading.enabled),
+        grading_temperature: grading.temperature,
+        grading_tint: grading.tint,
+        grading_contrast: grading.contrast,
+        grading_saturation: grading.saturation,
+        grading_lift: grading.lift,
+        grading_gamma: grading.gamma,
+        grading_gain: grading.gain,
+        vignette_enabled: u32::from(vignette.enabled),
+        vignette_intensity: vignette.intensity,
+        vignette_smoothness: vignette.smoothness,
+        vignette_roundness: vignette.roundness,
+        vignette_color: vignette.color,
+        aberration_enabled: u32::from(aberration.enabled),
+        aberration_intensity: aberration.intensity,
+        grain_enabled: u32::from(grain.enabled),
+        grain_intensity: grain.intensity,
+        grain_response: grain.response,
+        dof_enabled: u32::from(dof.enabled),
+        dof_focus_distance: dof.focus_distance,
+        dof_aperture: dof.aperture,
+        dof_focal_length_mm: dof.focal_length_mm,
+        dof_max_blur_px: dof.max_blur_px,
+        motion_enabled: u32::from(motion.enabled),
+        motion_shutter_angle_deg: motion.shutter_angle_deg,
+        motion_samples: motion.samples,
+        motion_max_blur_px: motion.max_blur_px,
+    }
+}
+
+/// Разбирает плоскую запись ABI v11. Коды и булевы значения проверяются строго; диапазоны —
+/// той же функцией `validate`, что и в `.postprocess`.
+fn post_process_from_abi(value: RvePostProcessSettings) -> Option<PostProcessSettings> {
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+    let mut settings = PostProcessSettings::default();
+    settings.exposure.enabled = flag(value.exposure_enabled)?;
+    settings.exposure.mode = match value.exposure_mode {
+        RVE_EXPOSURE_MODE_MANUAL => ExposureMode::Manual,
+        RVE_EXPOSURE_MODE_AUTO => ExposureMode::Auto,
+        _ => return None,
+    };
+    settings.exposure.ev = value.exposure_ev;
+    settings.exposure.min_ev = value.exposure_min_ev;
+    settings.exposure.max_ev = value.exposure_max_ev;
+    settings.exposure.speed_up = value.exposure_speed_up;
+    settings.exposure.speed_down = value.exposure_speed_down;
+    settings.exposure.low_percent = value.exposure_low_percent;
+    settings.exposure.high_percent = value.exposure_high_percent;
+    settings.tonemapping.enabled = flag(value.tonemapping_enabled)?;
+    settings.tonemapping.tonemapper = match value.tonemapper {
+        RVE_TONEMAPPER_ACES => Tonemapper::Aces,
+        RVE_TONEMAPPER_NEUTRAL => Tonemapper::Neutral,
+        RVE_TONEMAPPER_NONE => Tonemapper::None,
+        _ => return None,
+    };
+    settings.bloom.enabled = flag(value.bloom_enabled)?;
+    settings.bloom.intensity = value.bloom_intensity;
+    settings.bloom.threshold = value.bloom_threshold;
+    settings.bloom.knee = value.bloom_knee;
+    settings.bloom.scatter = value.bloom_scatter;
+    settings.bloom.tint = value.bloom_tint;
+    settings.ambient_occlusion.enabled = flag(value.ao_enabled)?;
+    settings.ambient_occlusion.radius = value.ao_radius;
+    settings.ambient_occlusion.intensity = value.ao_intensity;
+    settings.ambient_occlusion.falloff = value.ao_falloff;
+    settings.ambient_occlusion.quality = match value.ao_quality {
+        RVE_AO_QUALITY_LOW => AmbientOcclusionQuality::Low,
+        RVE_AO_QUALITY_MEDIUM => AmbientOcclusionQuality::Medium,
+        RVE_AO_QUALITY_HIGH => AmbientOcclusionQuality::High,
+        _ => return None,
+    };
+    settings.color_grading.enabled = flag(value.grading_enabled)?;
+    settings.color_grading.temperature = value.grading_temperature;
+    settings.color_grading.tint = value.grading_tint;
+    settings.color_grading.contrast = value.grading_contrast;
+    settings.color_grading.saturation = value.grading_saturation;
+    settings.color_grading.lift = value.grading_lift;
+    settings.color_grading.gamma = value.grading_gamma;
+    settings.color_grading.gain = value.grading_gain;
+    settings.vignette.enabled = flag(value.vignette_enabled)?;
+    settings.vignette.intensity = value.vignette_intensity;
+    settings.vignette.smoothness = value.vignette_smoothness;
+    settings.vignette.roundness = value.vignette_roundness;
+    settings.vignette.color = value.vignette_color;
+    settings.chromatic_aberration.enabled = flag(value.aberration_enabled)?;
+    settings.chromatic_aberration.intensity = value.aberration_intensity;
+    settings.film_grain.enabled = flag(value.grain_enabled)?;
+    settings.film_grain.intensity = value.grain_intensity;
+    settings.film_grain.response = value.grain_response;
+    settings.depth_of_field.enabled = flag(value.dof_enabled)?;
+    settings.depth_of_field.focus_distance = value.dof_focus_distance;
+    settings.depth_of_field.aperture = value.dof_aperture;
+    settings.depth_of_field.focal_length_mm = value.dof_focal_length_mm;
+    settings.depth_of_field.max_blur_px = value.dof_max_blur_px;
+    settings.motion_blur.enabled = flag(value.motion_enabled)?;
+    settings.motion_blur.shutter_angle_deg = value.motion_shutter_angle_deg;
+    settings.motion_blur.samples = value.motion_samples;
+    settings.motion_blur.max_blur_px = value.motion_max_blur_px;
+    settings.validate().ok()?;
+    Some(settings)
+}
+
 fn camera_settings_from_abi(value: RveCameraSettings) -> Option<CameraSettings> {
     let anti_aliasing = match value.anti_aliasing {
         RVE_ANTI_ALIASING_FXAA => AntiAliasing::Fxaa,
@@ -2302,6 +2499,99 @@ mod tests {
                 0,
             ));
         }
+    }
+
+    #[test]
+    fn post_process_callbacks_round_trip_and_reject_invalid_values_and_non_cameras() {
+        let document = SceneDocument::parse(
+            "scene.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"plain\"\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        transaction.begin(ScriptTransactionInit {
+            world: &world,
+            self_object: Some(world.active_camera()),
+            source: "scene/camera/Probe",
+            writable: true,
+            actions: std::sync::Arc::new(
+                crate::actions::ActionFrame::empty(ScriptInput::default()),
+            ),
+            queued_messages: (0, 0),
+            queued_audio: 0,
+            queued_animation: 0,
+            physics: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::physics::PhysicsScriptState::default(),
+            )),
+            physics_phase_dt: None,
+            lifecycle: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::lifecycle::Lifecycle::default(),
+            )),
+            lifecycle_writes: true,
+            instance_serial: 0,
+            cursor: ScriptCursor::default(),
+        });
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
+        let host = context.host(ScriptTime::default());
+        let get = host.get_post_process.unwrap();
+        let set = host.set_post_process.unwrap();
+        let camera = 1;
+        let plain = 2;
+        let mut actual = rve_sdk::abi::RvePostProcessSettings {
+            bloom_intensity: -5.0,
+            ..rve_sdk::abi::RvePostProcessSettings::default()
+        };
+        // SAFETY: output and settings pointers are valid for each synchronous callback.
+        unsafe {
+            assert!(get(host.ctx, camera, &mut actual));
+            assert_eq!(actual, rve_sdk::abi::RvePostProcessSettings::default());
+            assert!(!get(host.ctx, plain, &mut actual));
+            assert!(!get(host.ctx, camera, std::ptr::null_mut()));
+        }
+
+        let updated = rve_sdk::abi::RvePostProcessSettings {
+            bloom_enabled: 1,
+            bloom_intensity: 2.0,
+            exposure_mode: rve_sdk::abi::RVE_EXPOSURE_MODE_AUTO,
+            ..rve_sdk::abi::RvePostProcessSettings::default()
+        };
+        let invalid = [
+            rve_sdk::abi::RvePostProcessSettings {
+                bloom_intensity: -1.0,
+                ..updated
+            },
+            rve_sdk::abi::RvePostProcessSettings {
+                bloom_enabled: 2,
+                ..updated
+            },
+            rve_sdk::abi::RvePostProcessSettings {
+                exposure_mode: 7,
+                ..updated
+            },
+            rve_sdk::abi::RvePostProcessSettings {
+                ao_quality: 9,
+                ..updated
+            },
+            rve_sdk::abi::RvePostProcessSettings {
+                tonemapper: u32::MAX,
+                ..updated
+            },
+        ];
+        // SAFETY: pointers are valid for each synchronous callback.
+        unsafe {
+            assert!(set(host.ctx, camera, &updated));
+            assert!(get(host.ctx, camera, &mut actual));
+            assert_eq!(actual, updated);
+            for settings in &invalid {
+                assert!(!set(host.ctx, camera, settings), "{settings:?}");
+            }
+            assert!(!set(host.ctx, plain, &updated));
+            assert!(!set(host.ctx, camera, std::ptr::null()));
+        }
+        drop(context);
+        assert!(transaction.post_process(world.active_camera()).is_some());
     }
 
     #[test]

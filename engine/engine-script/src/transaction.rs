@@ -12,7 +12,8 @@ use engine_physics::{
     QueryHit, Ray,
 };
 use engine_scene::{
-    AnimationRequest, AudioRequest, CameraSettings, LocalTransform, ObjectHandle, ParamValue, World,
+    AnimationRequest, AudioRequest, CameraSettings, LocalTransform, ObjectHandle, ParamValue,
+    PostProcessSettings, World,
 };
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
@@ -176,6 +177,7 @@ pub(crate) struct ScriptTransaction {
     source: String,
     pending_transforms: HashMap<ObjectHandle, LocalTransform>,
     pending_camera_settings: HashMap<ObjectHandle, CameraSettings>,
+    pending_post_process: HashMap<ObjectHandle, PostProcessSettings>,
     pending_active_camera: Option<ObjectHandle>,
     pending_messages: Vec<PendingMessage>,
     pending_warnings: Vec<String>,
@@ -230,6 +232,7 @@ impl Default for ScriptTransaction {
             source: String::new(),
             pending_transforms: HashMap::with_capacity(8),
             pending_camera_settings: HashMap::with_capacity(2),
+            pending_post_process: HashMap::with_capacity(2),
             pending_active_camera: None,
             pending_messages: Vec::with_capacity(16),
             pending_warnings: Vec::new(),
@@ -285,6 +288,7 @@ impl ScriptTransaction {
         self.source.push_str(init.source);
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
+        self.pending_post_process.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
         self.pending_warnings.clear();
@@ -953,16 +957,69 @@ impl ScriptTransaction {
         handle: ObjectHandle,
         settings: CameraSettings,
     ) -> bool {
-        if !self.writable
-            || self
-                .world()
-                .and_then(|world| world.object(handle))
-                .is_none_or(|object| object.camera.is_none())
-        {
+        if !self.writable || !self.is_camera(handle) {
             return false;
+        }
+        // Устаревший блок [color] — прокси к постобработке. Пишутся только поля, которые
+        // изменились относительно текущих настроек камеры: иначе чтение и запись без изменений
+        // затёрли бы значения из `.postprocess`. Порядок вызовов сохраняется, потому что обе
+        // операции обновляют одну и ту же копию постобработки в очереди.
+        if let Some(color) = settings.color {
+            let current = self
+                .camera_settings(handle)
+                .and_then(|current| current.color)
+                .unwrap_or_default();
+            let exposure_changed = color.exposure_ev != current.exposure_ev;
+            let tonemapper_changed = color.tonemapper != current.tonemapper;
+            if (exposure_changed || tonemapper_changed)
+                && let Some(mut post) = self.post_process(handle)
+            {
+                if exposure_changed {
+                    post.exposure.ev = color.exposure_ev;
+                }
+                if tonemapper_changed {
+                    post.tonemapping.tonemapper = color.tonemapper;
+                }
+                self.pending_post_process.insert(handle, post);
+            }
         }
         self.pending_camera_settings.insert(handle, settings);
         true
+    }
+
+    /// Постобработка камеры с учётом уже поставленных в очередь изменений.
+    pub(crate) fn post_process(&self, handle: ObjectHandle) -> Option<PostProcessSettings> {
+        self.pending_post_process
+            .get(&handle)
+            .copied()
+            .or_else(|| self.world()?.post_process(handle).copied())
+    }
+
+    pub(crate) fn set_post_process(
+        &mut self,
+        handle: ObjectHandle,
+        settings: PostProcessSettings,
+    ) -> bool {
+        if !self.writable || !self.is_camera(handle) {
+            return false;
+        }
+        self.pending_post_process.insert(handle, settings);
+        true
+    }
+
+    pub(crate) fn set_post_process_from_abi(
+        &mut self,
+        handle: u64,
+        settings: PostProcessSettings,
+    ) -> bool {
+        self.object_from_abi_handle(handle)
+            .is_some_and(|handle| self.set_post_process(handle, settings))
+    }
+
+    fn is_camera(&self, handle: ObjectHandle) -> bool {
+        self.world()
+            .and_then(|world| world.object(handle))
+            .is_some_and(|object| object.camera.is_some())
     }
 
     pub(crate) fn active_camera(&self) -> Option<ObjectHandle> {
@@ -1171,6 +1228,27 @@ impl ScriptTransaction {
             self.discard();
             return Err("script wrote camera settings for an object without a camera".to_owned());
         }
+        if let Some(error) = self
+            .pending_post_process
+            .values()
+            .find_map(|settings| settings.validate().err())
+        {
+            self.discard();
+            return Err(format!(
+                "script produced invalid post process settings: {error}"
+            ));
+        }
+        let post_process_target_valid = self.pending_post_process.keys().all(|handle| {
+            world
+                .object(*handle)
+                .is_some_and(|object| object.camera.is_some())
+        });
+        if !post_process_target_valid {
+            self.discard();
+            return Err(
+                "script wrote post process settings for an object without a camera".to_owned(),
+            );
+        }
         if !active_camera_target_valid {
             self.discard();
             return Err("script selected an object without a camera as active".to_owned());
@@ -1218,6 +1296,11 @@ impl ScriptTransaction {
             world
                 .set_camera_settings(handle, settings)
                 .expect("validated camera settings target remains present during commit");
+        }
+        for (handle, settings) in self.pending_post_process.drain() {
+            world
+                .set_post_process(handle, settings)
+                .expect("validated post process target remains present during commit");
         }
         if let Some(handle) = self.pending_active_camera.take() {
             world
@@ -1317,6 +1400,7 @@ impl ScriptTransaction {
         self.pending_dead_warnings.clear();
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
+        self.pending_post_process.clear();
         self.pending_active_camera = None;
         self.pending_messages.clear();
         self.pending_warnings.clear();

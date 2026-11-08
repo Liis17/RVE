@@ -5092,3 +5092,158 @@ return Cursor
         }
     );
 }
+
+fn post_process_script_result(body: &str) -> (World, Vec<crate::ScriptEvent>) {
+    let mut world = two_cameras_with_lite_script();
+    let source =
+        format!("local Script = {{}}\nfunction Script:on_update() {body} end\nreturn Script");
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("camera.lua", source.as_str())]),
+        None,
+    )
+    .unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    let events = host.drain_events();
+    (world, events)
+}
+
+#[test]
+fn lua_post_process_reads_defaults_and_applies_partial_nested_tables() {
+    let (world, events) = post_process_script_result(
+        r#"
+  local camera = rve.find("camera")
+  local before = camera:get_post_process()
+  assert(before.bloom.enabled == false and before.bloom.threshold == 1)
+  assert(before.exposure.ev == 0 and before.exposure.mode == "manual")
+  assert(before.tonemapping.tonemapper == "aces")
+  assert(camera:set_post_process({ bloom = { enabled = true, intensity = 2.0 }, exposure = { ev = 1.5 } }))
+  local pending = camera:get_post_process()
+  assert(pending.bloom.enabled and pending.bloom.intensity == 2.0 and pending.exposure.ev == 1.5)
+  assert(pending.bloom.threshold == 1)
+"#,
+    );
+    assert!(events.is_empty(), "unexpected script events: {events:?}");
+    let camera = world.handle("camera").unwrap();
+    let post = world.post_process(camera).unwrap();
+    assert!(post.bloom.enabled);
+    assert_eq!(post.bloom.intensity, 2.0);
+    assert_eq!(post.exposure.ev, 1.5);
+    assert!(
+        !world
+            .post_process(world.handle("second").unwrap())
+            .unwrap()
+            .bloom
+            .enabled
+    );
+}
+
+#[test]
+fn lua_post_process_and_legacy_color_proxy_apply_in_call_order() {
+    let (world, events) = post_process_script_result(
+        r#"
+  local camera = rve.find("camera")
+  camera:set_post_process({ exposure = { ev = 3 } })
+  camera:set_camera_settings({ color = { exposure_ev = 1 } })
+"#,
+    );
+    assert!(events.is_empty(), "unexpected script events: {events:?}");
+    let camera = world.handle("camera").unwrap();
+    assert_eq!(world.post_process(camera).unwrap().exposure.ev, 1.0);
+
+    let (world, events) = post_process_script_result(
+        r#"
+  local camera = rve.find("camera")
+  camera:set_camera_settings({ color = { exposure_ev = 1 } })
+  camera:set_post_process({ exposure = { ev = 3 } })
+"#,
+    );
+    assert!(events.is_empty(), "unexpected script events: {events:?}");
+    let camera = world.handle("camera").unwrap();
+    assert_eq!(world.post_process(camera).unwrap().exposure.ev, 3.0);
+}
+
+#[test]
+fn lua_legacy_color_round_trip_does_not_overwrite_post_process_file_values() {
+    let mut world = two_cameras_with_lite_script();
+    let camera = world.handle("camera").unwrap();
+    let mut file = engine_scene::PostProcessSettings::default();
+    file.exposure.ev = -1.25;
+    file.tonemapping.tonemapper = engine_scene::Tonemapper::Neutral;
+    world.set_post_process(camera, file).unwrap();
+    let source = r#"
+local Script = {}
+function Script:on_update()
+  local camera = rve.find("camera")
+  local settings = camera:get_camera_settings()
+  settings.projection.fov_deg = 75
+  camera:set_camera_settings(settings)
+end
+return Script
+"#;
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("camera.lua", source)]), None).unwrap();
+    host.update(&mut world, 0.1, ScriptTime::default());
+    assert!(host.drain_events().is_empty());
+    assert_eq!(
+        world.camera_settings(camera).unwrap().projection.fov_deg,
+        75.0
+    );
+    assert_eq!(world.post_process(camera).unwrap().exposure.ev, -1.25);
+    assert_eq!(
+        world.post_process(camera).unwrap().tonemapping.tonemapper,
+        engine_scene::Tonemapper::Neutral
+    );
+}
+
+#[test]
+fn lua_post_process_rejects_unknown_fields_wrong_types_and_invalid_ranges() {
+    for (label, body, expected) in [
+        (
+            "unknown section",
+            r#"rve.find("camera"):set_post_process({ unknown = {} })"#,
+            "unknown post process field",
+        ),
+        (
+            "unknown bloom field",
+            r#"rve.find("camera"):set_post_process({ bloom = { glow = 1 } })"#,
+            "unknown bloom field",
+        ),
+        (
+            "wrong type",
+            r#"rve.find("camera"):set_post_process({ bloom = { enabled = 1 } })"#,
+            "enabled must be a boolean",
+        ),
+        (
+            "bad enum",
+            r#"rve.find("camera"):set_post_process({ tonemapping = { tonemapper = "filmic" } })"#,
+            "tonemapper must be",
+        ),
+        (
+            "range",
+            r#"rve.find("camera"):set_post_process({ bloom = { intensity = -1 } })"#,
+            "bloom.intensity",
+        ),
+        (
+            "non-camera",
+            r#"rve.find("plain"):set_post_process({})"#,
+            "has no camera",
+        ),
+    ] {
+        let (world, events) = post_process_script_result(body);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.level == ScriptEventLevel::Error
+                    && event.message.contains(expected)),
+            "{label} did not report {expected:?}: {events:?}"
+        );
+        let camera = world.handle("camera").unwrap();
+        assert_eq!(
+            world.post_process(camera),
+            Some(&engine_scene::PostProcessSettings::default()),
+            "{label}"
+        );
+    }
+}

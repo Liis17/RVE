@@ -13,8 +13,8 @@ use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
     RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
     RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveCharacterMoveResult, RveHost, RveParams, RveRaycastHit, RveStr, RveTime,
-    RveTransform, RveValue, RveValueData,
+    RveCameraSettings, RveCharacterMoveResult, RveHost, RveParams, RvePostProcessSettings,
+    RveRaycastHit, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -1504,6 +1504,33 @@ impl Object {
         let settings: RveCameraSettings = settings.into();
         // SAFETY: host callback and settings are valid during this guest callback.
         unsafe { callback(ctx.host.ctx, self.handle, &settings) }
+    }
+
+    /// Returns this camera's post-process settings in the flat ABI v11 layout. `None` when the
+    /// object is not a camera or the host does not provide ABI v11 post-process callbacks.
+    pub fn post_process(&self, ctx: &Context<'_>) -> Option<RvePostProcessSettings> {
+        let callback = ctx.host.get_post_process?;
+        let mut settings = RvePostProcessSettings::default();
+        // SAFETY: host callback and output storage are valid during this guest callback.
+        if unsafe { callback(ctx.host.ctx, self.handle, &mut settings) } {
+            Some(settings)
+        } else {
+            None
+        }
+    }
+
+    /// Stages this camera's post-process settings. Returns false when the host lacks ABI v11
+    /// callbacks, the object is not a camera, or the settings are out of range.
+    pub fn set_post_process(
+        &self,
+        ctx: &mut Context<'_>,
+        settings: &RvePostProcessSettings,
+    ) -> bool {
+        let Some(callback) = ctx.host.set_post_process else {
+            return false;
+        };
+        // SAFETY: host callback and settings are valid during this guest callback.
+        unsafe { callback(ctx.host.ctx, self.handle, settings) }
     }
 
     /// Stages this object as the active scene camera.
