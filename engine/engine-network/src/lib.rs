@@ -1,51 +1,86 @@
-//! Сетевые игровые сервисы.
+//! Сетевой модуль RVE: протокол поверх UDP с шифрованием и модель «клиент-сервер».
+//!
+//! [`Server`] и [`Client`] — машины состояний без ввода-вывода: им передают датаграммы и текущее
+//! время, они возвращают исходящие датаграммы и события ([`Output`]). [`NetworkEngine`] владеет
+//! сокетом и потоком `rve-network`, [`NetworkHandle`] даёт доступ к нему из других потоков.
 
-use std::sync::mpsc::Receiver;
+mod client;
+pub mod codec;
+mod crypto;
+mod engine;
+mod error;
+mod handshake;
+mod link;
+mod packet;
+mod reliable;
+mod server;
+mod transport;
 
-#[derive(Default)]
-pub struct NetworkEngine;
+#[cfg(test)]
+mod tests;
 
-impl NetworkEngine {
-    pub fn new() -> Self {
-        Self
+use std::net::SocketAddr;
+
+use engine_scene::network::PeerId;
+
+pub use client::{Client, ClientConfig};
+pub use crypto::{Password, ServerIdentity};
+pub use engine::{NetRole, NetworkConfig, NetworkEngine, NetworkHandle};
+pub use error::NetError;
+pub use server::{MAX_CLIENTS, Server, ServerConfig};
+pub use transport::{DatagramSocket, Faults, MemoryEndpoint, MemoryNetwork, UdpTransport};
+
+/// Версия крейта.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Канал доставки: задаёт надёжность и порядок сообщения.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Channel {
+    /// Надёжный и упорядоченный: управление, spawn и despawn.
+    Reliable,
+    /// Надёжный и упорядоченный, отдельный от `Reliable`, чтобы RPC не задерживали spawn.
+    Rpc,
+    /// Ненадёжный: при потере доставляется более новое состояние, старое отбрасывается.
+    State,
+    /// Ненадёжный и без порядка.
+    Unreliable,
+}
+
+impl Channel {
+    const ALL: [Channel; 4] = [Self::Reliable, Self::Rpc, Self::State, Self::Unreliable];
+
+    pub(crate) fn index(self) -> usize {
+        self as usize
     }
 
-    pub fn run(self, stop: Receiver<()>) {
-        let _ = stop.recv();
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(value)).copied()
+    }
+
+    pub(crate) fn is_reliable(self) -> bool {
+        matches!(self, Self::Reliable | Self::Rpc)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::NetworkEngine;
-    use std::sync::mpsc;
-    use std::thread;
+/// Событие сети для приложения.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetworkEvent {
+    /// Участник подключён. На клиенте `peer` — сервер.
+    Connected { peer: PeerId },
+    /// Участник отключён; `reason` — причина на русском языке.
+    Disconnected { peer: PeerId, reason: String },
+    /// Получено сообщение по каналу.
+    Message {
+        peer: PeerId,
+        channel: Channel,
+        bytes: Vec<u8>,
+    },
+}
 
-    #[test]
-    fn run_returns_after_stop_signal() {
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            NetworkEngine::new().run(stop_rx);
-            done_tx.send(()).unwrap();
-        });
-
-        stop_tx.send(()).unwrap();
-        done_rx.recv().unwrap();
-        worker.join().unwrap();
-    }
-
-    #[test]
-    fn run_returns_when_stop_sender_is_dropped() {
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            NetworkEngine::new().run(stop_rx);
-            done_tx.send(()).unwrap();
-        });
-
-        drop(stop_tx);
-        done_rx.recv().unwrap();
-        worker.join().unwrap();
-    }
+/// Результат шага машины состояний: датаграммы для отправки и события для приложения.
+#[derive(Debug, Default)]
+pub struct Output {
+    /// Адрес назначения и готовая датаграмма.
+    pub datagrams: Vec<(SocketAddr, Vec<u8>)>,
+    pub events: Vec<NetworkEvent>,
 }

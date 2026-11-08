@@ -638,17 +638,6 @@ fn start_modules(
         },
     )?;
 
-    let (network_tx, network_rx) = std::sync::mpsc::channel();
-    modules.spawn(
-        "rve-network",
-        move || {
-            let _ = network_tx.send(());
-        },
-        move || {
-            engine_network::NetworkEngine::new().run(network_rx);
-        },
-    )?;
-
     let (neural_tx, neural_rx) = std::sync::mpsc::channel();
     modules.spawn(
         "rve-neural",
