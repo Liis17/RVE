@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.6.0"
+version = "0.7.1"
 dependencies = [
  "ash",
  "engine-platform",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "engine-files",
@@ -3101,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3132,6 +3132,7 @@ dependencies = [
  "rve-sdk",
  "serde",
  "serde_json",
+ "toml",
  "windows-sys 0.61.2",
  "winit",
 ]
@@ -3173,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine-assets",
  "engine-core",

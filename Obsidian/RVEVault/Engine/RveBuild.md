@@ -111,6 +111,10 @@ Dev-player использует библиотеку из проекта. При
 только если `RVE_DLSS_SDK` задан, и записывает `dlss_enabled` в `rve-sdk.toml`;
 `run`/`build` с проектом, требующим DLSS, отклоняют SDK player без этой feature.
 
+## Материалы и Surface shaders
+
+tools/rve-build/src/project.rs валидирует каждый используемый .rvemat, затем рекурсивно включает его .rveshader и текстуры из properties в ресурсный набор сцены. Эти dependencies получают archive owner по тем же правилам, что и остальные использованные файлы. .rveshader разбирается и проверяется как формат engine-scene; GLSL body не компилируется в builder, потому что rve-build не зависит от engine-render. Ошибки TOML, schema material или отсутствующие dependencies — ошибка проекта с кодом 2. Ошибка GLSL появляется в editor/runtime и использует magenta Lit fallback; формат и ограничение compile-time см. [[Engine/EngineMaterials]].
+
 ## Назначение архивов
 
 - Явный `[[assets]].archive` сохраняется и имеет приоритет для этого ресурса.

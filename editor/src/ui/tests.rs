@@ -1290,6 +1290,15 @@ fn position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {
         })
 }
 
+fn last_position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {
+    texts
+        .iter()
+        .rev()
+        .find(|(found, _)| found == text)
+        .map(|(_, at)| *at)
+        .unwrap_or_else(|| position_of(texts, text))
+}
+
 fn inspector_click(harness: &mut Harness, at: Pos2) {
     inspector_frame(harness, vec![Event::PointerMoved(at)]);
     inspector_frame(harness, vec![button(at, PointerButton::Primary, true)]);
@@ -1972,6 +1981,12 @@ impl ProjectFixture {
         std::fs::write(dir.join("prefabs.rveprefabs"), prefabs).unwrap();
         Self(dir)
     }
+
+    fn write_asset(&self, path: &str, source: &str) {
+        let file = self.0.join("Assets").join(path.trim_start_matches('/'));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, source).unwrap();
+    }
 }
 
 impl Drop for ProjectFixture {
@@ -2075,4 +2090,227 @@ fn project_settings_tab_shows_saved_tags_and_layers_and_starts_clean() {
     position_of(&texts, "Add Layer");
     let draft = harness.state.tags_layers.as_ref().unwrap();
     assert!(!draft.is_dirty());
+}
+
+fn project_panel_frame(harness: &mut Harness, events: Vec<Event>) -> Vec<(String, Pos2)> {
+    let input = harness.input(events);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| project_panel::show(ui, state));
+    });
+    output.textures_delta.clear();
+    texts(&output.shapes)
+}
+
+fn open_asset_fixture(harness: &mut Harness, fixture: &ProjectFixture) {
+    let project = OpenProject::open(&fixture.0).unwrap();
+    harness.state.asset_tree = project.assets_dir.list().unwrap();
+    harness
+        .state
+        .materials
+        .refresh_all(&project, &harness.state.asset_tree);
+    harness.state.project = Some(project);
+}
+
+#[test]
+fn clicking_material_opens_asset_inspector_and_shader_combo_lists_project_shaders() {
+    let fixture = ProjectFixture::new("");
+    fixture.write_asset(
+        "materials/test.rvemat",
+        &engine_scene::MaterialAsset::default().to_toml().unwrap(),
+    );
+    fixture.write_asset(
+        "shaders/surface.rveshader",
+        &engine_scene::ShaderAsset::template("Surface"),
+    );
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+    harness.state.current_folder = "materials".to_owned();
+
+    let assets = project_panel_frame(&mut harness, Vec::new());
+    let material = position_of(&assets, "test.rvemat");
+    harness.click(material, project_panel::show);
+    assert_eq!(
+        harness.state.inspected_asset.as_deref(),
+        Some("materials/test.rvemat")
+    );
+    let inspector = inspector_frame(&mut harness, Vec::new());
+    position_of(&inspector, "Material");
+    let shader_combo = position_of(&inspector, "Lit (built-in)");
+    inspector_click(&mut harness, shader_combo);
+    let choices = inspector_frame(&mut harness, Vec::new());
+    position_of(&choices, "shaders/surface.rveshader");
+}
+
+#[test]
+fn material_property_reset_writes_the_asset_file() {
+    let fixture = ProjectFixture::new("");
+    fixture.write_asset(
+        "materials/test.rvemat",
+        &engine_scene::MaterialAsset::default().to_toml().unwrap(),
+    );
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+    harness.state.inspected_asset = Some("materials/test.rvemat".to_owned());
+
+    let labels = inspector_frame(&mut harness, Vec::new());
+    let reset = position_of(&labels, "↺");
+    inspector_click(&mut harness, reset);
+    let saved = std::fs::read_to_string(fixture.0.join("Assets/materials/test.rvemat")).unwrap();
+    assert!(saved.contains("base_color"), "{saved}");
+}
+
+#[test]
+fn create_material_context_menu_uses_the_folder_where_it_was_opened() {
+    let fixture = ProjectFixture::new("");
+    std::fs::create_dir_all(fixture.0.join("Assets/Materials")).unwrap();
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+
+    let labels = project_panel_frame(&mut harness, Vec::new());
+    let folder = position_of(&labels, "Materials");
+    project_panel_frame(&mut harness, vec![Event::PointerMoved(folder)]);
+    project_panel_frame(
+        &mut harness,
+        vec![button(folder, PointerButton::Secondary, true)],
+    );
+    project_panel_frame(
+        &mut harness,
+        vec![button(folder, PointerButton::Secondary, false)],
+    );
+    let menu = project_panel_frame(&mut harness, Vec::new());
+    let create = last_position_of(&menu, "Create");
+    harness.click(create, project_panel::show);
+    let submenu = project_panel_frame(&mut harness, Vec::new());
+    let material = position_of(&submenu, "Material");
+    harness.click(material, project_panel::show);
+    assert_eq!(
+        harness.state.project_dialog,
+        Some(project_panel::ProjectDialog::NewMaterial {
+            folder: "Materials".to_owned(),
+            name: "New Material".to_owned(),
+        })
+    );
+
+    let input = harness.input(vec![key(egui::Key::Enter)]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        project_panel::show_dialog(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    assert!(
+        fixture
+            .0
+            .join("Assets/Materials/New Material.rvemat")
+            .is_file()
+    );
+}
+
+/// Модель из двух частей: Mesh Renderer показывает два слота материалов.
+fn two_part_model() -> Arc<Model> {
+    let mut model = (*cube()).clone();
+    model.meshes.push(model.meshes[0].clone());
+    Arc::new(model)
+}
+
+#[test]
+fn showing_a_multi_part_mesh_leaves_the_scene_untouched() {
+    let mut harness = Harness::new();
+    let model = VirtualPath::parse("/multi.fbx").unwrap();
+    let id = harness
+        .scene_mut()
+        .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+        .unwrap();
+    harness.scene_mut().select(Some(id.as_str()));
+    harness
+        .state
+        .models
+        .insert("multi.fbx".to_owned(), two_part_model());
+    let revision = harness.scene().revision();
+    let can_undo = harness.scene().can_undo();
+    let dirty = harness.scene().is_dirty();
+    for _ in 0..3 {
+        harness.panel(Vec::new(), inspector::show);
+    }
+    let scene = harness.scene();
+    assert_eq!(scene.revision(), revision);
+    assert_eq!(scene.can_undo(), can_undo);
+    assert_eq!(scene.is_dirty(), dirty);
+    let mesh = scene.object(&id).unwrap().mesh_renderer.as_ref().unwrap();
+    assert!(mesh.materials.is_empty(), "{:?}", mesh.materials);
+}
+
+/// Надписи кадра вместе с прямоугольниками, которые они занимают.
+fn collect_labels(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+    match shape {
+        egui::Shape::Text(text) => {
+            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+            out.push((text.galley.text().to_owned(), rect));
+        }
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_labels(shape, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl Harness {
+    /// Один кадр с `panel`; возвращает надписи, нарисованные в этом кадре.
+    fn labels(&mut self, events: Vec<Event>, panel: Panel) -> Vec<(String, Rect)> {
+        let input = self.input(events);
+        let state = &mut self.state;
+        let mut output = self.ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| panel(ui, state));
+        });
+        output.textures_delta.clear();
+        let mut labels = Vec::new();
+        for clipped in &output.shapes {
+            collect_labels(&clipped.shape, &mut labels);
+        }
+        labels
+    }
+}
+
+fn material_preview_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    crate::ui::material_preview::show(ui, state);
+}
+
+#[test]
+fn material_preview_without_a_selected_asset_shows_a_hint_instead_of_an_old_image() {
+    let mut harness = Harness::new();
+    // Текстура от прежнего материала остаётся зарегистрированной, но без выбора её не показываем.
+    harness.state.material_preview_texture = Some(egui::TextureId::default());
+    let hint = "Select a material or shader";
+    let labels = harness.labels(Vec::new(), material_preview_panel);
+    assert!(labels.iter().any(|(text, _)| text == hint), "{labels:?}");
+    harness.state.material_preview_asset = Some("/materials/steel.rvemat".to_owned());
+    let labels = harness.labels(Vec::new(), material_preview_panel);
+    assert!(labels.iter().all(|(text, _)| text != hint), "{labels:?}");
+}
+
+fn create_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    crate::ui::project_panel::create_menu(ui, state, String::new());
+}
+
+#[test]
+fn create_menu_opens_material_and_shader_items_without_a_second_create_level() {
+    let mut harness = Harness::new();
+    let labels = harness.labels(Vec::new(), create_panel);
+    let button = labels
+        .iter()
+        .find(|(text, _)| text == "Create")
+        .map(|(_, rect)| rect.center())
+        .expect("кнопка Create в шапке");
+    harness.click(button, create_panel);
+    let labels = harness.labels(Vec::new(), create_panel);
+    let count = |name: &str| labels.iter().filter(|(text, _)| text == name).count();
+    assert_eq!(count("Create"), 1, "{labels:?}");
+    assert_eq!(count("Material"), 1, "{labels:?}");
+    assert_eq!(count("Shader"), 1, "{labels:?}");
 }

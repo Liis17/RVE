@@ -6,6 +6,8 @@ Parent: [[Index]]
 
 RVE — workspace игрового движка на Rust. `engine-runtime` соединяет проектные настройки, сцены, скрипты, окно, ресурсы и Vulkan renderer для игры `rve-player`; sandbox остаётся отдельным приложением ручной проверки, а `rve-editor` — графический редактор сцен на egui. Рабочий путь создаёт настольное окно, выбирает совместимое Vulkan-устройство, запекает Radiance HDR panorama или procedural sky в image-based lighting (IBL), рисует PBR metallic-roughness меши с tangent-space normal maps, emissive, ambient occlusion и opaque/mask/blend alpha, одним directional light со стабильными camera-relative PCF shadow cascades и кластеризованными forward point/spot lights в HDR offscreen-изображение, затем применяет temporal AA/upscale либо FXAA/bilinear output, per-camera exposure и tonemapping перед swapchain. `engine-scene` разбирает и проверяет `.rvescene` и общие `.camerasettings`, строит runtime-граф `World` и выдаёт активную камеру с настройками вывода, directional и локальные источники света, environment и меши для кадра. `engine-script` запускает Lua и Rust-скрипты из ABI-библиотеки и работает с immutable query snapshot; runtime и editor Play передают начальный snapshot до `on_start` и соединяют команды и physics events с `PhysicsServer`. Модели FBX, текстуры PNG, environment HDR и настройки камер читаются из loose assets или RVEPAK через `engine-resources`. `engine-physics` предоставляет CPU-геометрию, bounded broadphase/narrowphase и raycast, а также fixed-step `PhysicsWorld` с solver, triggers и pair events; runtime и editor Play используют отдельный `PhysicsServer` thread (контракт — [[Engine/EnginePhysics]]). Звук работает отдельным потоком с собственным микшером. Сеть (`engine-network`) запускается только при сетевых флагах и связана с миром через мост (контракт — [[Engine/EngineNetwork]]); нейросетевые вычисления остаются потоком-заглушкой.
 
+Контракты .rvemat и .rveshader, per-part material slots и их runtime/editor/build пути описаны в [[Engine/EngineMaterials]].
+
 ## Стек
 
 | Технология | Роль | Источник |
@@ -13,7 +15,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 | Rust 2024, Cargo workspace с resolver 3 | Сборка библиотечных крейтов и приложения | `Cargo.toml` |
 | winit 0.30.13 | Окно и цикл событий | `engine/engine-window/Cargo.toml` |
 | ash 0.38.0 | Vulkan bindings и runtime-загрузка loader | `engine/engine-render/Cargo.toml`, `engine/engine-render/src/lib.rs` |
-| naga 30.0.1 | Компиляция GLSL-шейдеров в SPIR-V при сборке, без Vulkan SDK | `engine/engine-render/build.rs` |
+| naga 30.0.1 | GLSL → SPIR-V для встроенных shaders при сборке и Surface GLSL при runtime shader creation, без Vulkan SDK | engine/engine-render/build.rs, engine/engine-render/src/surface_shader.rs |
 | glam 0.34.1 | Камеры, трансформации, свет, матрицы сцены и physics-геометрия | `engine/engine-scene/src`, `engine/engine-physics/src`, `engine/sandbox/src/scene.rs`, `engine/sandbox/src/content.rs` |
 | blake3 1.8.7 | ArchiveId, hashes chunks и полных decoded blobs; ключи протокола, transcript и `scene_hash` сети | `engine/engine-pak/src`, `engine/engine-network/src` |
 | chacha20poly1305 0.11.0, x25519-dalek 2.0.1, ed25519-dalek 2.2.0, getrandom 0.4.3, zeroize 1.9.1 | Шифрование датаграмм, обмен ключами, подпись ключа сервера, случайные секреты и обнуление ключей сетевого протокола | `Cargo.toml`, `engine/engine-network/Cargo.toml` |
@@ -50,13 +52,14 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EngineWindow]] — цикл окна на winit.
 - [[Engine/EnginePlatform]] — общий интерфейс и отдельные адаптеры Windows/macOS.
 - [[Engine/EngineRender]] — Vulkan renderer, независимый от конкретной оконной библиотеки.
+- [[Engine/EngineMaterials]] — форматы .rvemat/.rveshader, shader schema и связь материал-слот-renderer.
 - [[Engine/EngineFiles]] — канонические virtual paths, Windows filesystem path normalization и `ReadAt` для позиционного чтения.
 - [[Engine/EngineProject]] — общие форматы настроек проекта и bootstrap для приложений и инструментов.
 - [[Engine/EnginePak]] — чтение RVEPAK v1/v2, запись v2, потоковый writer и каталог архивов.
 - [[Engine/EngineResources]] — фоновый доступ к loose files и RVEPAK через ограниченный worker pool.
 - `rvepak` — CLI для сборки, просмотра и проверки наборов архивов через `engine-pak`.
 - [[Engine/EngineAssets]] — пути ресурсов и загрузка FBX/PNG/Radiance HDR в память CPU, без зависимости от renderer.
-- [[Engine/EngineScene]] — форматы `.rvescene`, `.camerasettings`, `.postprocess` и `.rvephysmat`, их проверка и runtime-граф `World` с множеством камер, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
+- [[Engine/EngineScene]] — форматы .rvescene, .rvemat, .rveshader, .camerasettings, .postprocess и .rvephysmat, их проверка и runtime-граф World с множеством камер, per-FBX-part material slots, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
 - [[Engine/EngineAnimation]] — скелетная анимация без GPU и без файлов: позы, клипы по именам костей, crossfade, blend tree, разовые клипы с переходом, палитры skinning и мост `AnimationBridge` между `World` и аниматорами объектов.
 - [[Engine/EngineNetwork]] — сетевой модуль: UDP-протокол с шифрованием и рукопожатием, sans-IO `Server`/`Client`, поток `rve-network` и мост `NetworkBridge` к `World`; общие сетевые компоненты и типы лежат в `engine-scene`.
 - [[Engine/EngineScript]] — Lua host и загрузчик ABI-библиотеки Rust-скриптов; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
@@ -83,7 +86,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - `engine-animation` зависит от `engine-assets`, `engine-scene`, `engine-files` и glam; dev-зависимость `ufbx` нужна оракулу. Потребители: `engine-runtime` и `rve-editor`. Крейт не зависит от renderer, окна и script runtime; скелеты и клипы приходят через замыкания.
 - `engine-assets` зависит от `engine-resources`, ufbx и png; от renderer и окна не зависит. Кроме статической геометрии он читает скелет, skin и клипы FBX. `Assets::model_dependencies` использует тот же поиск внешних текстур и stat-источник, что и `load_model`, чтобы builder мог собрать зависимости без декодирования PNG.
 - `engine-window` зависит от winit.
-- `engine-render` зависит от ash, engine-platform и raw-window-handle, но не от winit и glam; naga — его build-зависимость.
+- engine-render зависит от ash, engine-platform и raw-window-handle, но не от winit, glam или engine-scene; naga используется и build.rs, и runtime Surface GLSL compiler. rve-build валидирует material/shader assets через engine-scene и не зависит от renderer.
 - `engine-platform` выбирает `engine-platform-windows` или `engine-platform-macos` через target-specific зависимости Cargo. Адаптеры зависят от ash и ash-window; обратной зависимости от renderer нет.
 - `engine-physics` зависит от `engine-scene` (построение физической сцены из `World`), glam (CPU-геометрия) и flume (протокол потока `rve-physics`). Потребители: `engine-script`, `engine-runtime` и `rve-editor`. `engine-audio` зависит от `engine-scene`, `engine-resources`, `cpal`, `lewton`, `rtrb`, `flume` и `log`; потребители: `engine-runtime` и `rve-editor`. `engine-input` зависит от `gilrs`, `rve-sdk` и `log`; потребители: `engine-runtime` и `rve-editor`. `engine-network` зависит от `engine-scene`, `engine-files`, blake3, flume, glam, log и крипто-крейтов (`chacha20poly1305`, `x25519-dalek`, `ed25519-dalek`, `getrandom`, `zeroize`); скриптов, runtime, renderer и окна он не касается. Потребители: `engine-runtime` и `rve-editor`. `engine-core` и `engine-neural` не имеют внешних зависимостей.
 
