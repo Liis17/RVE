@@ -379,12 +379,18 @@ mod tests {
         assert!(input.set_pads(&pads));
 
         let tapped = input.take_frame().gamepad_state(1).unwrap();
-        assert_eq!((tapped.down, tapped.pressed, tapped.released), (SOUTH, SOUTH, 0));
+        assert_eq!(
+            (tapped.down, tapped.pressed, tapped.released),
+            (SOUTH, SOUTH, 0)
+        );
 
         pads[0].buttons = 0;
         assert!(input.set_pads(&pads));
         let released = input.take_frame().gamepad_state(1).unwrap();
-        assert_eq!((released.down, released.pressed, released.released), (0, 0, SOUTH));
+        assert_eq!(
+            (released.down, released.pressed, released.released),
+            (0, 0, SOUTH)
+        );
     }
 
     #[test]
