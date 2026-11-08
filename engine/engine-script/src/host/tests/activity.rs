@@ -411,6 +411,34 @@ fn hiding_the_old_camera_subtree_is_accepted_after_activating_a_camera_outside_i
     assert_eq!(world.is_active(rig), Some(false));
 }
 
+const ACTIVATE_AND_TAG: &str = r#"
+local Script = {}
+function Script:on_start()
+  rve.find("cam_b"):activate_camera()
+  rve.find("rig"):set_tag("Rig")
+end
+return Script
+"#;
+
+#[test]
+fn camera_switch_commits_with_edits_that_need_no_world_copy() {
+    let mut world = camera_rig_world("main");
+    let cam_b = world.handle("cam_b").unwrap();
+    let rig = world.handle("rig").unwrap();
+    let mut host = ScriptHost::load(
+        &world,
+        "scene",
+        &sources(&[("camera_rig.lua", ACTIVATE_AND_TAG)]),
+        None,
+    )
+    .unwrap();
+    host.start(&mut world, frame());
+
+    assert!(host.drain_events().is_empty());
+    assert_eq!(world.active_camera(), cam_b);
+    assert_eq!(world.object(rig).unwrap().tag, "Rig");
+}
+
 /// `kid` под `parent` (позиция 10, масштаб `parent_scale`) и отдельный корень `solo`.
 fn pose_world(parent_scale: &str) -> World {
     world(&format!(

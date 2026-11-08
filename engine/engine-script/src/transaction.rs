@@ -1094,21 +1094,20 @@ impl ScriptTransaction {
     /// Проверяет заявки до записи в мир: любая отказавшая заявка отбрасывает весь вызов.
     ///
     /// Тег, слой и мировая поза проверяются на текущем мире без копии, если вызов не меняет
-    /// активность, родителя и камеру и каждая проверка видит тех же предков, что и запись (см.
+    /// активность и родителя и каждая проверка видит тех же предков, что и запись (см.
     /// `pose_edits_are_local`). Во всех остальных случаях заявки применяются к копии мира в том же
-    /// порядке, что и коммит. Собственные трансформы объектов от этого не зависят.
+    /// порядке, что и коммит. Собственные трансформы объектов от этого не зависят. Смена активной
+    /// камеры конфликтует только с активностью и родителем, поэтому сама копию не требует.
     fn probe_edits(&self, world: &World) -> Result<(), String> {
-        if self.pending_edits.is_empty() && self.pending_active_camera.is_none() {
+        if self.pending_edits.is_empty() {
             return Ok(());
         }
-        let local_only = self.pending_active_camera.is_none()
-            && self.pending_edits.iter().all(|edit| {
-                !matches!(
-                    edit,
-                    ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
-                )
-            })
-            && self.pose_edits_are_local(world);
+        let local_only = self.pending_edits.iter().all(|edit| {
+            !matches!(
+                edit,
+                ObjectEdit::SetActive { .. } | ObjectEdit::SetParent { .. }
+            )
+        }) && self.pose_edits_are_local(world);
         if !local_only {
             let mut probe = world.clone();
             return self.apply_world_writes(&mut probe);
