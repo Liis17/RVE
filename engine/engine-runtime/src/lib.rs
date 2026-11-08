@@ -408,6 +408,7 @@ fn run_from_args(
         player::PlayerConfig {
             window: config,
             present_mode: bootstrap.present_mode,
+            reflex: bootstrap.reflex,
             pipeline_cache_path,
             fsr_library,
             dlss_library,
