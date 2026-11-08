@@ -63,7 +63,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                         }
                     })
                     .response;
-                root_response.context_menu(|ui| create_context_menu(ui, state, "".to_owned()));
+                root_response.context_menu(|ui| create_menu(ui, state, "".to_owned()));
                 let tree = std::mem::take(&mut state.asset_tree);
                 folder_tree(ui, state, &tree);
                 state.asset_tree = tree;
@@ -101,7 +101,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
                     egui::Sense::click(),
                 );
                 empty_response.context_menu(|ui| {
-                    create_context_menu(ui, state, state.current_folder.clone());
+                    create_menu(ui, state, state.current_folder.clone());
                 });
                 state.asset_tree = tree;
             });
@@ -135,7 +135,7 @@ fn folder_tree(ui: &mut egui::Ui, state: &mut EditorState, entries: &[AssetEntry
                         state.current_folder = entry.path.clone();
                     }
                     response.context_menu(|ui| {
-                        create_context_menu(ui, state, create_target(Some(entry), ""));
+                        create_menu(ui, state, create_target(Some(entry), ""));
                     });
                 })
                 .body(|ui| folder_tree(ui, state, &entry.children));
@@ -152,7 +152,7 @@ fn folder_tree(ui: &mut egui::Ui, state: &mut EditorState, entries: &[AssetEntry
                 })
                 .inner;
             response.context_menu(|ui| {
-                create_context_menu(ui, state, create_target(Some(entry), ""));
+                create_menu(ui, state, create_target(Some(entry), ""));
             });
         }
     }
@@ -315,7 +315,7 @@ fn tile(ui: &mut egui::Ui, state: &mut EditorState, entry: &AssetEntry) {
         response.dnd_set_drag_payload(AssetDrag(entry.path.clone()));
     }
     response.context_menu(|ui| {
-        create_context_menu(ui, state, create_target(Some(entry), &state.current_folder));
+        create_menu(ui, state, create_target(Some(entry), &state.current_folder));
         ui.separator();
         if ui.button("Rename").clicked() {
             state.project_dialog = Some(ProjectDialog::Rename {
@@ -345,11 +345,8 @@ pub fn create_target(entry: Option<&AssetEntry>, current_folder: &str) -> String
     }
 }
 
-fn create_menu(ui: &mut egui::Ui, state: &mut EditorState, folder: String) {
-    ui.menu_button("Create", |ui| create_context_menu(ui, state, folder));
-}
-
-fn create_context_menu(ui: &mut egui::Ui, state: &mut EditorState, folder: String) {
+/// Подменю «Create» с пунктами создания ресурсов в `folder`; используется и в шапке, и в контекстных меню.
+pub(super) fn create_menu(ui: &mut egui::Ui, state: &mut EditorState, folder: String) {
     ui.menu_button("Create", |ui| {
         if ui.button("Material").clicked() {
             state.project_dialog = Some(ProjectDialog::NewMaterial {

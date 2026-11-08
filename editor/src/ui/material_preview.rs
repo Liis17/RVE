@@ -29,7 +29,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
         (rect.width() * pixels_per_point).round().max(0.0) as u32,
         (rect.height() * pixels_per_point).round().max(0.0) as u32,
     ];
-    if let Some(texture) = state.material_preview_texture {
+    let has_asset = state.material_preview_asset.is_some() || state.inspected_asset.is_some();
+    if let (true, Some(texture)) = (has_asset, state.material_preview_texture) {
         ui.painter().image(
             texture,
             rect,
@@ -37,10 +38,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
             egui::Color32::WHITE,
         );
     } else {
+        // Без ресурса картинка не рисуется, поэтому старый кадр не остаётся на экране.
+        let text = if has_asset {
+            "Material viewport is starting"
+        } else {
+            "Select a material or shader"
+        };
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "Material viewport is starting",
+            text,
             egui::FontId::proportional(14.0),
             ui.visuals().weak_text_color(),
         );

@@ -4,7 +4,7 @@ use crate::asset_watch::AssetChanges;
 use crate::assets_fs::{AssetEntry, AssetKind};
 use crate::project::OpenProject;
 use engine_render::{
-    SurfaceLighting, SurfaceProperty, SurfacePropertyKind, SurfaceShaderSource,
+    ShaderCompileError, SurfaceLighting, SurfaceProperty, SurfacePropertyKind, SurfaceShaderSource,
     SurfaceTextureFallback, TextureColorSpace,
 };
 use engine_scene::{
@@ -34,6 +34,8 @@ pub struct CachedShader {
     pub source: Option<String>,
     pub revision: u64,
     pub error: Option<String>,
+    /// Результат компиляции последней разобранной версии; пересчитывается только при смене `revision`.
+    pub compile: Option<Result<(), ShaderCompileError>>,
 }
 
 /// Project asset cache. A failed external edit records its error while keeping the last valid
@@ -178,6 +180,7 @@ impl MaterialLibrary {
             source: None,
             revision,
             error: None,
+            compile: None,
         });
         match source.and_then(|source| {
             ShaderAsset::parse(path, &source)
@@ -187,6 +190,9 @@ impl MaterialLibrary {
             Ok((source, asset)) => {
                 if entry.source.as_deref() != Some(&source) || entry.error.is_some() {
                     entry.revision = revision;
+                    entry.compile = Some(
+                        engine_render::compile_surface_shader(&surface_source(&asset)).map(|_| ()),
+                    );
                 }
                 entry.source = Some(source);
                 entry.asset = Some(asset);
@@ -320,6 +326,53 @@ mod tests {
         assert_eq!(cached.effective_asset(), Some(&draft));
         assert!(cached.draft.is_none());
         assert_eq!(cached.asset.as_ref(), Some(&draft));
+    }
+
+    #[test]
+    fn compile_status_is_recorded_on_reload_and_kept_for_unchanged_source() {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "rve-editor-compile-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let assets = root.join("Assets");
+        std::fs::create_dir_all(assets.join("shaders")).unwrap();
+        std::fs::write(
+            root.join("project.rveproject"),
+            "id = \"fixture\"\nname = \"Fixture\"\nversion = \"1\"\n\n[[scenes]]\npath = \"/main.rvescene\"\n",
+        )
+        .unwrap();
+        let shader_path = assets.join("shaders/broken.rveshader");
+        std::fs::write(
+            &shader_path,
+            "[shader]\nlighting = \"lit\"\n---\nvoid surface(inout Surface s) { s.albedo = vec3(;\n}\n",
+        )
+        .unwrap();
+        let project = OpenProject::open(&root).unwrap();
+        let mut library = MaterialLibrary::default();
+        let path = "shaders/broken.rveshader";
+        library.reload_shader(&project, path);
+        let cached = library.shader(path).unwrap();
+        assert!(
+            matches!(cached.compile, Some(Err(_))),
+            "{:?}",
+            cached.compile
+        );
+        let revision = cached.revision;
+
+        library.reload_shader(&project, path);
+        let cached = library.shader(path).unwrap();
+        assert_eq!(cached.revision, revision);
+        assert!(matches!(cached.compile, Some(Err(_))));
+
+        std::fs::write(&shader_path, ShaderAsset::template("Fixed")).unwrap();
+        library.reload_shader(&project, path);
+        let cached = library.shader(path).unwrap();
+        assert!(cached.revision > revision);
+        assert_eq!(cached.compile, Some(Ok(())));
+        drop(project);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1124,14 +1124,14 @@ impl SceneRenderer {
             let Some(asset) = cached.asset.as_ref() else {
                 continue;
             };
-            if self
-                .surface_shaders
-                .get(&path)
-                .is_some_and(|current| current.revision == cached.revision)
-                || self
-                    .failed_surface_shaders
-                    .contains(&(path.clone(), cached.revision))
-            {
+            if !surface_shader_rebuild_needed(
+                self.surface_shaders
+                    .get(&path)
+                    .map(|current| current.revision),
+                &self.failed_surface_shaders,
+                &path,
+                cached.revision,
+            ) {
                 continue;
             }
             let source = library
@@ -1159,17 +1159,17 @@ impl SceneRenderer {
                 asset: asset.clone(),
                 id: shader_id,
             };
-            let dependent_paths = active_materials
-                .iter()
-                .filter(|material_path| {
+            let dependent_paths = materials_using_shader(
+                active_materials,
+                |material_path| {
                     library
                         .material(material_path)
                         .and_then(|material| material.effective_asset())
                         .and_then(|material| material.shader.as_ref())
-                        .is_some_and(|shader_path| shader_path.as_str() == path)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+                        .map(|shader_path| shader_path.as_str().to_owned())
+                },
+                &path,
+            );
             let mut staged = Vec::with_capacity(dependent_paths.len());
             let mut failure = None;
             for material_path in dependent_paths {
@@ -1257,6 +1257,7 @@ impl SceneRenderer {
     fn retire_unused_surface_shaders(
         &mut self,
         renderer: &mut Renderer,
+        preview_shader_path: Option<&str>,
     ) -> Result<(), RenderError> {
         let mut referenced = self
             .asset_materials
@@ -1268,12 +1269,13 @@ impl SceneRenderer {
         {
             referenced.insert(shader);
         }
-        let unused = self
-            .surface_shaders
-            .iter()
-            .filter(|(_, shader)| !referenced.contains(&shader.id))
-            .map(|(path, shader)| (path.clone(), shader.id))
-            .collect::<Vec<_>>();
+        let unused = unused_surface_shaders(
+            self.surface_shaders
+                .iter()
+                .map(|(path, shader)| (path.clone(), shader.id)),
+            &referenced,
+            preview_shader_path,
+        );
         for (path, shader) in unused {
             renderer.destroy_surface_shader(shader)?;
             self.surface_shaders.remove(&path);
@@ -1392,7 +1394,7 @@ impl SceneRenderer {
                 renderer.destroy_material(material.id)?;
             }
         }
-        self.retire_unused_surface_shaders(renderer)?;
+        self.retire_unused_surface_shaders(renderer, preview_shader_path)?;
         if let Some(distance) = grid_camera_distance {
             let grid = match self.grid {
                 Some(grid) => grid,
@@ -3045,6 +3047,45 @@ fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProc
     }
 }
 
+/// Пересоздавать ли шейдер при hot-reload: нужна ревизия, которая ещё не загружена и не падала.
+/// Провалившаяся ревизия не повторяется, пока файл не изменится; прежний шейдер остаётся активным.
+fn surface_shader_rebuild_needed(
+    loaded_revision: Option<u64>,
+    failed: &HashSet<(String, u64)>,
+    path: &str,
+    revision: u64,
+) -> bool {
+    loaded_revision != Some(revision) && !failed.contains(&(path.to_owned(), revision))
+}
+
+/// Материалы из `active`, которые ссылаются на `shader_path`; при смене шейдера их надо пересоздать.
+fn materials_using_shader(
+    active: &HashSet<String>,
+    shader_of: impl Fn(&str) -> Option<String>,
+    shader_path: &str,
+) -> Vec<String> {
+    let mut paths = active
+        .iter()
+        .filter(|material| shader_of(material).as_deref() == Some(shader_path))
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+/// Шейдеры без ссылок из материалов. Шейдер превью исключается: его материал создаётся позже
+/// в том же кадре, и уничтожение заставило бы компилировать шейдер заново.
+fn unused_surface_shaders<T: Copy + Eq + Hash>(
+    loaded: impl IntoIterator<Item = (String, T)>,
+    referenced: &HashSet<T>,
+    preview_shader_path: Option<&str>,
+) -> Vec<(String, T)> {
+    loaded
+        .into_iter()
+        .filter(|(path, id)| !referenced.contains(id) && Some(path.as_str()) != preview_shader_path)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3052,18 +3093,48 @@ mod tests {
     use engine_scene::{EnvironmentComponent, LodLevel, ProceduralSkyComponent};
 
     #[test]
-    fn asset_material_cache_key_tracks_shader_and_texture_generations() {
-        let key = AssetMaterialKey {
-            material_revision: 3,
-            shader_generation: 4,
-            texture_revisions: vec![("textures/albedo.png".to_owned(), TextureColorSpace::Srgb, 7)],
+    fn hot_reload_rebuilds_only_new_revisions_that_have_not_failed() {
+        let path = "/s.rveshader";
+        let mut failed = HashSet::new();
+        let needed = |loaded, failed: &HashSet<(String, u64)>, path, revision| {
+            surface_shader_rebuild_needed(loaded, failed, path, revision)
         };
-        let mut changed_shader = key.clone();
-        changed_shader.shader_generation += 1;
-        assert_ne!(key, changed_shader);
-        let mut changed_texture = key.clone();
-        changed_texture.texture_revisions[0].2 += 1;
-        assert_ne!(key, changed_texture);
+        assert!(!needed(Some(4), &failed, path, 4));
+        assert!(needed(Some(4), &failed, path, 5));
+        assert!(needed(None, &failed, path, 1));
+        failed.insert((path.to_owned(), 5));
+        assert!(!needed(Some(4), &failed, path, 5));
+        assert!(needed(Some(4), &failed, path, 6));
+        assert!(needed(Some(4), &failed, "/other.rveshader", 5));
+    }
+
+    #[test]
+    fn shader_change_selects_only_its_dependent_materials_in_order() {
+        let active: HashSet<String> = ["/m/b.rvemat", "/m/a.rvemat", "/m/lit.rvemat"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        let shader_of = |material: &str| match material {
+            "/m/a.rvemat" | "/m/b.rvemat" => Some("/s/water.rveshader".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            materials_using_shader(&active, shader_of, "/s/water.rveshader"),
+            ["/m/a.rvemat", "/m/b.rvemat"]
+        );
+        assert!(materials_using_shader(&active, shader_of, "/s/other.rveshader").is_empty());
+    }
+
+    #[test]
+    fn unreferenced_shader_is_retired_unless_it_backs_the_preview() {
+        let loaded = vec![
+            ("/s/unused.rveshader".to_owned(), 1_usize),
+            ("/s/preview.rveshader".to_owned(), 2),
+            ("/s/used.rveshader".to_owned(), 3),
+        ];
+        let referenced = HashSet::from([3_usize]);
+        let retired = unused_surface_shaders(loaded, &referenced, Some("/s/preview.rveshader"));
+        assert_eq!(retired, [("/s/unused.rveshader".to_owned(), 1)]);
     }
 
     fn camera() -> Camera {

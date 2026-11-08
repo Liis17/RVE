@@ -1980,3 +1980,110 @@ fn create_material_context_menu_uses_the_folder_where_it_was_opened() {
             .is_file()
     );
 }
+
+/// Модель из двух частей: Mesh Renderer показывает два слота материалов.
+fn two_part_model() -> Arc<Model> {
+    let mut model = (*cube()).clone();
+    model.meshes.push(model.meshes[0].clone());
+    Arc::new(model)
+}
+
+#[test]
+fn showing_a_multi_part_mesh_leaves_the_scene_untouched() {
+    let mut harness = Harness::new();
+    let model = VirtualPath::parse("/multi.fbx").unwrap();
+    let id = harness
+        .scene_mut()
+        .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+        .unwrap();
+    harness.scene_mut().select(Some(id.as_str()));
+    harness
+        .state
+        .models
+        .insert("multi.fbx".to_owned(), two_part_model());
+    let revision = harness.scene().revision();
+    let can_undo = harness.scene().can_undo();
+    let dirty = harness.scene().is_dirty();
+    for _ in 0..3 {
+        harness.panel(Vec::new(), inspector::show);
+    }
+    let scene = harness.scene();
+    assert_eq!(scene.revision(), revision);
+    assert_eq!(scene.can_undo(), can_undo);
+    assert_eq!(scene.is_dirty(), dirty);
+    let mesh = scene.object(&id).unwrap().mesh_renderer.as_ref().unwrap();
+    assert!(mesh.materials.is_empty(), "{:?}", mesh.materials);
+}
+
+/// Надписи кадра вместе с прямоугольниками, которые они занимают.
+fn collect_labels(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+    match shape {
+        egui::Shape::Text(text) => {
+            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+            out.push((text.galley.text().to_owned(), rect));
+        }
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_labels(shape, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl Harness {
+    /// Один кадр с `panel`; возвращает надписи, нарисованные в этом кадре.
+    fn labels(&mut self, events: Vec<Event>, panel: Panel) -> Vec<(String, Rect)> {
+        let input = self.input(events);
+        let state = &mut self.state;
+        let mut output = self.ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| panel(ui, state));
+        });
+        output.textures_delta.clear();
+        let mut labels = Vec::new();
+        for clipped in &output.shapes {
+            collect_labels(&clipped.shape, &mut labels);
+        }
+        labels
+    }
+}
+
+fn material_preview_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    crate::ui::material_preview::show(ui, state);
+}
+
+#[test]
+fn material_preview_without_a_selected_asset_shows_a_hint_instead_of_an_old_image() {
+    let mut harness = Harness::new();
+    // Текстура от прежнего материала остаётся зарегистрированной, но без выбора её не показываем.
+    harness.state.material_preview_texture = Some(egui::TextureId::default());
+    let hint = "Select a material or shader";
+    let labels = harness.labels(Vec::new(), material_preview_panel);
+    assert!(labels.iter().any(|(text, _)| text == hint), "{labels:?}");
+    harness.state.material_preview_asset = Some("/materials/steel.rvemat".to_owned());
+    let labels = harness.labels(Vec::new(), material_preview_panel);
+    assert!(labels.iter().all(|(text, _)| text != hint), "{labels:?}");
+}
+
+fn create_panel(ui: &mut egui::Ui, state: &mut EditorState) {
+    crate::ui::project_panel::create_menu(ui, state, String::new());
+}
+
+#[test]
+fn create_menu_opens_material_and_shader_items_without_a_second_create_level() {
+    let mut harness = Harness::new();
+    let labels = harness.labels(Vec::new(), create_panel);
+    let button = labels
+        .iter()
+        .find(|(text, _)| text == "Create")
+        .map(|(_, rect)| rect.center())
+        .expect("кнопка Create в шапке");
+    harness.click(button, create_panel);
+    let labels = harness.labels(Vec::new(), create_panel);
+    let count = |name: &str| labels.iter().filter(|(text, _)| text == name).count();
+    assert_eq!(count("Create"), 1, "{labels:?}");
+    assert_eq!(count("Material"), 1, "{labels:?}");
+    assert_eq!(count("Shader"), 1, "{labels:?}");
+}

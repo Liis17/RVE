@@ -1258,8 +1258,8 @@ impl EditorApp {
             self.state.game_viewport_texture =
                 Some(self.bridge.register_viewport(gpu.scene.game_viewport));
         }
-        if self.state.project.is_some() && crate::layout::is_open(&self.dock, Tab::MaterialPreview)
-        {
+        // Вкладка может быть в доке, но скрытой: viewport нужен только когда панель видна.
+        if self.state.project.is_some() && self.state.material_preview.visible {
             let viewport = gpu
                 .scene
                 .ensure_material_preview_viewport(&mut gpu.renderer)?;
@@ -1750,7 +1750,8 @@ fn render_scene_frame(
     {
         gpu.renderer.resize_viewport(viewport, width, height)?;
     }
-    let preview_draw = if preview_size.is_some() {
+    // Без выбранного ресурса проход не нужен: иначе каждый кадр рисовался бы дефолтный материал.
+    let preview_draw = if preview_size.is_some() && preview_asset.is_some() {
         Some(gpu.scene.material_preview_frame(
             &mut gpu.renderer,
             parts.project,

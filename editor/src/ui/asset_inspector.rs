@@ -1,7 +1,7 @@
 //! Inspector for `.rvemat` and `.rveshader` project assets.
 
 use crate::assets_fs::AssetKind;
-use crate::materials::{material_to_toml_value, shader_schema, sorted_paths, surface_source};
+use crate::materials::{material_to_toml_value, shader_schema, sorted_paths};
 use crate::state::EditorState;
 use engine_files::VirtualPath;
 use engine_scene::{
@@ -324,11 +324,12 @@ fn show_shader(ui: &mut egui::Ui, state: &mut EditorState, path: &str) {
         return;
     };
     ui.label(format!("Lighting: {:?}", asset.lighting));
-    match engine_render::compile_surface_shader(&surface_source(&asset)) {
-        Ok(_) => {
+    match shader.compile {
+        None => {}
+        Some(Ok(())) => {
             ui.colored_label(egui::Color32::GREEN, "Compile status: OK");
         }
-        Err(error) => {
+        Some(Err(error)) => {
             let location = error.line.map_or_else(String::new, |line| {
                 format!(
                     " (file line {})",
