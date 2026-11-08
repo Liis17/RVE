@@ -4,7 +4,7 @@ use crate::asset_watch::{AssetChanges, AssetWatcher, ChangeBatch};
 use crate::autosave::{AUTOSAVE_INTERVAL, AutosaveStore, autosave_due};
 use crate::console::LogLevel;
 use crate::layout::Tab;
-use crate::mcp::McpHost;
+use crate::mcp::{McpHost, capture};
 use crate::play::{PlayPrefabs, PlaySession, editor_gamepads, gamepad_tuning};
 use crate::play_cursor;
 use crate::project::OpenProject;
@@ -46,6 +46,8 @@ const PREVIEW_POLL: Duration = Duration::from_millis(30);
 const BUILD_POLL: Duration = Duration::from_millis(50);
 /// Как часто дренировать очередь геймпадов вне Play: без этого события копятся до следующего Play.
 const IDLE_GAMEPAD_POLL: Duration = Duration::from_secs(1);
+/// Как часто забирать готовый захват `capture_view`, пока задача активна.
+const CAPTURE_POLL: Duration = Duration::from_millis(16);
 
 pub struct EditorApp {
     state: EditorState,
@@ -291,6 +293,13 @@ impl EditorApp {
 
     pub(crate) fn mcp_state_mut(&mut self) -> &mut EditorState {
         &mut self.state
+    }
+
+    /// Renderer и рендер сцены для захвата; `None`, пока окно и renderer не созданы.
+    pub(crate) fn mcp_capture_gpu(&mut self) -> Option<(&mut Renderer, &mut SceneRenderer)> {
+        self.gpu
+            .as_mut()
+            .map(|gpu| (&mut gpu.renderer, &mut gpu.scene))
     }
 
     pub(crate) fn mcp_execute_tool(
@@ -1869,9 +1878,17 @@ fn render_scene_frame(
     let game_size = drawable(state.game_view);
     let scene_debug_view = state.scene_view.debug_view;
     let game_debug_view = state.game_view.debug_view;
-    if scene_size.is_none() && game_size.is_none() {
+    let offscreen_capture = state
+        .mcp_capture
+        .as_ref()
+        .is_some_and(|job| job.plan.is_offscreen());
+    if !capture::needs_scene_frame(scene_size.is_some(), game_size.is_some(), offscreen_capture) {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     }
+    let capture_frame = state
+        .mcp_capture
+        .as_ref()
+        .and_then(|job| capture::offscreen_frame(&job.plan));
     let playing = state.is_playing();
     let game_camera_id = state.game_camera.clone();
     // Сетка нужна только панели Scene вне Play-режима.
@@ -1980,6 +1997,23 @@ fn render_scene_frame(
     let Some(parts) = state.frame_parts() else {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
     };
+    let capture_camera = capture_frame
+        .as_ref()
+        .and_then(|frame| match &frame.camera {
+            capture::CameraChoice::Editor => Some(capture::CaptureCamera {
+                camera: scene_camera,
+                settings: scene_settings,
+                post: scene_post,
+                scene_like: true,
+            }),
+            capture::CameraChoice::Game => Some(capture::CaptureCamera {
+                camera: game_camera,
+                settings: game_settings,
+                post: game_post,
+                scene_like: false,
+            }),
+            capture::CameraChoice::Object(id) => capture::object_camera(&*parts.world, id),
+        });
     let (local_lights, local_light_shadows) = render_local_lights(&scene_frame.local_lights);
     gpu.scene.begin_motion_frame(game_camera_handle, playing);
     gpu.scene.build_draws(
@@ -1990,6 +2024,7 @@ fn render_scene_frame(
         game_camera.position,
         grid_camera_distance,
         parts.animation,
+        capture_camera.as_ref().map(|camera| camera.camera.position),
     )?;
     gpu.scene.sync_environment(
         &mut gpu.renderer,
@@ -2002,6 +2037,29 @@ fn render_scene_frame(
     let game_shadow_cascades = game_size.map_or_else(Vec::new, |[width, height]| {
         SceneRenderer::shadow_cascades(game_camera, width, height, &scene_frame.light, has_light)
     });
+    // Viewport захвата создаётся лениво; тикет запрашивается до отрисовки, чтобы копия попала в этот кадр.
+    let capture_setup = match (&capture_frame, &capture_camera) {
+        (Some(frame), Some(_)) => {
+            let viewport = gpu.scene.ensure_capture_viewport(&mut gpu.renderer)?;
+            let [width, height] = frame.size;
+            gpu.renderer.resize_viewport(viewport, width, height)?;
+            let requested = frame
+                .request
+                .then(|| gpu.renderer.request_viewport_capture(viewport));
+            Some((viewport, requested))
+        }
+        _ => None,
+    };
+    let capture_shadow_cascades = match (&capture_frame, &capture_camera) {
+        (Some(frame), Some(camera)) => SceneRenderer::shadow_cascades(
+            camera.camera,
+            frame.size[0],
+            frame.size[1],
+            &scene_frame.light,
+            has_light,
+        ),
+        _ => Vec::new(),
+    };
     if let Some([width, height]) = scene_size {
         gpu.renderer
             .resize_viewport(gpu.scene.viewport, width, height)?;
@@ -2047,13 +2105,52 @@ fn render_scene_frame(
             game_debug_view,
         )
     });
-    let mut scenes = Vec::with_capacity(2);
+    // Кадр захвата: отдельный список без сетки, частицы не симулируются повторно.
+    let capture_view = match (&capture_frame, &capture_camera, capture_setup) {
+        (Some(frame), Some(camera), Some((viewport, requested))) => {
+            let [width, height] = frame.size;
+            let debug_view = if camera.scene_like {
+                scene_debug_view
+            } else {
+                game_debug_view
+            };
+            let mut view = gpu.scene.frame(
+                camera.camera,
+                width,
+                height,
+                camera.settings,
+                camera.post,
+                &scene_frame.light,
+                &local_lights,
+                &local_light_shadows,
+                has_light,
+                scene_frame.environment.as_ref(),
+                &capture_shadow_cascades,
+                &joint_palettes,
+                camera.scene_like,
+                debug_view,
+            );
+            view.draws = gpu.scene.capture_draws();
+            view.particle_step = 0.0;
+            view.reset_history = frame.reset_history;
+            Some((viewport, requested, view))
+        }
+        _ => None,
+    };
+    let mut scenes = Vec::with_capacity(3);
     if let Some(frame) = &scene_view {
         scenes.push((gpu.scene.viewport, frame));
     }
     if let Some(frame) = &game_view {
         scenes.push((gpu.scene.game_viewport, frame));
     }
+    if let Some((viewport, _, view)) = &capture_view {
+        scenes.push((*viewport, view));
+    }
+    let requested = capture_view
+        .as_ref()
+        .and_then(|(_, requested, _)| *requested);
+    let capture_drawn = capture_view.is_some();
     let drawn = scenes
         .iter()
         .map(|(viewport, _)| *viewport)
@@ -2065,6 +2162,12 @@ fn render_scene_frame(
     if result.is_ok() {
         gpu.scene.commit_motion_history();
     }
+    let presented = matches!(result, Ok(FrameStatus::Presented));
+    capture::offscreen_rendered(
+        state.mcp_capture.as_mut(),
+        requested,
+        capture_drawn && presented,
+    );
     if let Some(profile) = gpu.renderer.take_frame_profile() {
         state
             .profile
@@ -2268,7 +2371,8 @@ impl WindowHandler for EditorApp {
         let mut mcp_host = std::mem::take(&mut self.mcp_host);
         let handled_mcp_calls = mcp_host.drain(self);
         self.mcp_host = mcp_host;
-        if handled_mcp_calls || *self.mcp_host.status() != previous_mcp_status {
+        let capture_pending = self.state.mcp_capture.is_some();
+        if handled_mcp_calls || capture_pending || *self.mcp_host.status() != previous_mcp_status {
             window.request_redraw();
         }
         let watcher_errors = self
@@ -2324,12 +2428,18 @@ impl WindowHandler for EditorApp {
             .then(|| Instant::now() + BUILD_POLL);
         let idle_pads = (self.state.play.is_none() && self.state.gamepads.is_some())
             .then(|| Instant::now() + IDLE_GAMEPAD_POLL);
+        let capture = self
+            .state
+            .mcp_capture
+            .is_some()
+            .then(|| Instant::now() + CAPTURE_POLL);
         [
             self.repaint_at,
             preview,
             build,
             scripts,
             idle_pads,
+            capture,
             self.mcp_host.next_wakeup(),
             self.autosave_deadline(),
             self.asset_changes.deadline(),
@@ -2350,6 +2460,7 @@ impl WindowHandler for EditorApp {
 
     fn exiting(&mut self) {
         self.stop_play();
+        capture::cancel_active(self, "editor is shutting down");
         self.mcp_host.shutdown();
         self.asset_watcher = None;
         self.proxy = None;

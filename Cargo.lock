@@ -3164,6 +3164,7 @@ dependencies = [
  "glam",
  "libc",
  "notify",
+ "png",
  "resvg",
  "rfd",
  "rve-sdk",

@@ -640,7 +640,10 @@ pub(super) fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'
         .ok_or_else(|| format!("{name} must be a string"))
 }
 
-fn optional_string<'a>(arguments: &'a Value, name: &str) -> Result<Option<&'a str>, String> {
+pub(super) fn optional_string<'a>(
+    arguments: &'a Value,
+    name: &str,
+) -> Result<Option<&'a str>, String> {
     match arguments.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value)),
@@ -656,7 +659,7 @@ fn optional_bool(arguments: &Value, name: &str) -> Result<Option<bool>, String> 
     }
 }
 
-fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, String> {
+pub(super) fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, String> {
     match arguments.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value

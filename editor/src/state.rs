@@ -155,6 +155,8 @@ pub struct FrameParts<'a> {
 pub struct EditorState {
     /// Invalidates queued MCP calls whenever a project or scene is replaced.
     pub mcp_generation: u64,
+    /// Незавершённый `capture_view`: ответ отправляется, когда кадр отдал PNG или задача снята.
+    pub(crate) mcp_capture: Option<crate::mcp::capture::CaptureJob>,
     pub project: Option<OpenProject>,
     /// Открытый в подокне «Project Prefabs» список тяжёлых префабов; хранится с несохранёнными правками.
     pub project_prefabs: Option<ProjectPrefabs>,
@@ -253,6 +255,7 @@ impl EditorState {
     pub fn new(scripts_path: Option<PathBuf>) -> Self {
         Self {
             mcp_generation: 0,
+            mcp_capture: None,
             project: None,
             project_prefabs: None,
             scene: None,

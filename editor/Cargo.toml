@@ -36,6 +36,7 @@ glam.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+png.workspace = true
 flume.workspace = true
 getrandom.workspace = true
 

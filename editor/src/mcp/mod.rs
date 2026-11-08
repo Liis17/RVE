@@ -1,5 +1,6 @@
 mod assets;
 mod build;
+pub(crate) mod capture;
 mod edit;
 pub mod paths;
 mod play;
@@ -160,15 +161,21 @@ impl McpHost {
     }
 
     pub fn drain(&mut self, app: &mut crate::app::EditorApp) -> bool {
+        let mut handled = capture::poll(app, self.server.is_some());
         let Some(server) = &self.server else {
-            return false;
+            return handled;
         };
         let generation = app.mcp_state_mut().mcp_generation;
         server.set_generation(generation);
         let permissions = server.permissions();
-        let mut handled = false;
         while let Some(call) = server.try_recv() {
             if call.is_abandoned() {
+                continue;
+            }
+            if call.name == "capture_view" {
+                capture::begin(app, call);
+                server.set_generation(app.mcp_state_mut().mcp_generation);
+                handled = true;
                 continue;
             }
             let result = execute_pending(
@@ -475,6 +482,7 @@ fn tool_specs() -> Vec<ToolSpec> {
     tools.extend(assets::tool_specs());
     tools.extend(play::tool_specs());
     tools.extend(build::tool_specs());
+    tools.extend(capture::tool_specs());
     tools
 }
 
@@ -529,11 +537,12 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 46);
+        assert_eq!(names.len(), 47);
         assert!(names.contains(&"editor_status"));
         assert!(names.contains(&"get_console_log"));
-        assert!(!names.contains(&"capture_view"));
+        assert!(names.contains(&"capture_view"));
         for (name, permission) in [
+            ("capture_view", Permission::Read),
             ("set_component", Permission::EditScene),
             ("undo", Permission::EditScene),
             ("write_text_file", Permission::Assets),

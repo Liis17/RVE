@@ -78,6 +78,10 @@ pub struct SceneRenderer {
     grid_material: Option<MaterialId>,
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
+    /// Viewport захвата с отдельной камерой; создаётся только на время `capture_view`.
+    capture_viewport: Option<ViewportId>,
+    /// Список захвата: тот же мир, что и панели, но отсечение и LOD по камере захвата.
+    capture_draws: Vec<DrawCommand>,
     motion_history: MotionHistory,
     /// Скиннинг аниматоров сцены по объектам.
     skins: HashMap<ObjectHandle, SkinnedObject>,
@@ -284,6 +288,8 @@ impl SceneRenderer {
             grid_material: None,
             scene_draws: Vec::new(),
             game_draws: Vec::new(),
+            capture_viewport: None,
+            capture_draws: Vec::new(),
             motion_history: MotionHistory::default(),
             skins: HashMap::new(),
             animation: EditorAnimation::default(),
@@ -722,7 +728,35 @@ impl SceneRenderer {
         Ok(())
     }
 
+    /// Возвращает offscreen-viewport захвата, создавая его при первом запросе.
+    pub fn ensure_capture_viewport(
+        &mut self,
+        renderer: &mut Renderer,
+    ) -> Result<ViewportId, RenderError> {
+        if let Some(viewport) = self.capture_viewport {
+            return Ok(viewport);
+        }
+        let viewport = renderer.create_viewport(1, 1)?;
+        self.capture_viewport = Some(viewport);
+        Ok(viewport)
+    }
+
+    /// Освобождает offscreen-viewport после завершения или отмены захвата.
+    pub fn release_capture_viewport(&mut self, renderer: &mut Renderer) -> Result<(), RenderError> {
+        self.capture_draws.clear();
+        if let Some(viewport) = self.capture_viewport.take() {
+            renderer.free_viewport(viewport)?;
+        }
+        Ok(())
+    }
+
+    /// Список захвата текущего кадра; пуст, если захвата нет.
+    pub fn capture_draws(&self) -> &[DrawCommand] {
+        &self.capture_draws
+    }
+
     /// Строит отдельные draw lists для Scene и Game; сетка добавляется только в Scene.
+    /// Список захвата строится только при `capture_eye`, без захвата работы нет.
     #[allow(clippy::too_many_arguments)]
     pub fn build_draws(
         &mut self,
@@ -733,9 +767,11 @@ impl SceneRenderer {
         game_eye: Vec3,
         grid_camera_distance: Option<f32>,
         play_bridge: Option<&AnimationBridge>,
+        capture_eye: Option<Vec3>,
     ) -> Result<(), RenderError> {
         self.scene_draws.clear();
         self.game_draws.clear();
+        self.capture_draws.clear();
         self.sync_particles(renderer, world, frame)?;
         let palette_index = palette_indices(&self.skins, play_bridge.or(self.animation.bridge()));
         let used_object_materials = {
@@ -765,6 +801,17 @@ impl SceneRenderer {
                 &mut self.motion_history,
                 &mut self.game_draws,
             )?;
+            if let Some(eye) = capture_eye {
+                append_world_draws(
+                    renderer,
+                    world,
+                    frame,
+                    eye,
+                    &mut resources,
+                    &mut self.motion_history,
+                    &mut self.capture_draws,
+                )?;
+            }
             resources.used_object_materials
         };
         let stale = self
@@ -1315,7 +1362,7 @@ fn append_world_draws(
         let Some(mesh) = &object.mesh_renderer else {
             continue;
         };
-        let Some(level) = world.lod_level(instance.object, eye) else {
+        let Some(level) = lod_for_eye(world, instance.object, eye) else {
             continue;
         };
         let Some(model_path) = lod_model_path(mesh, object.lod_group.as_ref(), level) else {
@@ -1423,6 +1470,11 @@ fn append_world_draws(
         }
     }
     Ok(())
+}
+
+/// Уровень LOD объекта для глаза одного вида; `None` — объект отсечён `cull_distance` этого вида.
+fn lod_for_eye(world: &World, object: ObjectHandle, eye: Vec3) -> Option<usize> {
+    world.lod_level(object, eye)
 }
 
 /// Объекты, у которых есть экземпляры скиннинга и палитра моста той же длины, что число
@@ -2417,6 +2469,37 @@ id = "camera"
         assert_eq!(cache.len(), 2);
         assert_eq!(cache[&scene_key], "scene texture material");
         assert_eq!(cache[&game_key], "game texture material");
+    }
+
+    #[test]
+    fn capture_eye_keeps_an_object_culled_for_both_panels() {
+        let document = engine_scene::SceneDocument::parse(
+            "test",
+            r#"
+[[assets]]
+path="/base.fbx"
+[[assets]]
+path="/lod.fbx"
+[[objects]]
+id="camera"
+[objects.camera]
+[[objects]]
+id="prop"
+[objects.mesh_renderer]
+model="/base.fbx"
+[objects.lod_group]
+cull_distance=20.0
+[[objects.lod_group.levels]]
+model="/lod.fbx"
+distance=10.0
+"#,
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        let prop = world.handle("prop").unwrap();
+        assert_eq!(lod_for_eye(&world, prop, Vec3::new(40.0, 0.0, 0.0)), None);
+        assert_eq!(lod_for_eye(&world, prop, Vec3::new(-40.0, 0.0, 0.0)), None);
+        assert_eq!(lod_for_eye(&world, prop, Vec3::new(5.0, 0.0, 0.0)), Some(0));
     }
 
     #[test]
