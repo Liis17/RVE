@@ -852,6 +852,19 @@ mod tests {
     }
 
     #[test]
+    fn inactive_objects_and_their_children_get_no_body_at_load() {
+        let scene = world(
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n\
+[[objects]]\nid = \"hidden\"\nactive = false\n[objects.collider]\n\
+[[objects]]\nid = \"hidden_child\"\nparent = \"hidden\"\n[objects.collider]\n\
+[[objects]]\nid = \"shown\"\n[objects.collider]\n",
+        );
+        let description = desc(&scene, &[]);
+        let bodies: Vec<_> = description.bodies.iter().map(|body| body.object).collect();
+        assert_eq!(bodies, [scene.handle("shown").unwrap()]);
+    }
+
+    #[test]
     fn scene_builds_convex_hull_and_triangle_mesh_from_base_model_geometry() {
         let scene = world(&format!(
             "{CAMERA}\n[[assets]]\npath='/models/cube.fbx'\n\
