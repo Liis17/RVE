@@ -27,6 +27,76 @@ pub struct ProjectSettings {
     pub network: NetworkSettings,
     #[serde(default)]
     pub input: InputSettings,
+    /// Теги объектов: `[tags] names = [...]`. Пустой список не сериализуется.
+    #[serde(default, skip_serializing_if = "TagSettings::is_default")]
+    pub tags: TagSettings,
+    /// Слои объектов: `[layers] names = [...]`. Индекс имени — значение `layer` объекта.
+    #[serde(default, skip_serializing_if = "LayerSettings::is_default")]
+    pub layers: LayerSettings,
+}
+
+/// Наибольшее число слоёв проекта; `layer` объекта меньше этого значения.
+pub const MAX_LAYERS: usize = 32;
+
+/// Теги проекта, которые можно назначить объектам сцены.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TagSettings {
+    /// Имена тегов `[A-Za-z0-9_-]{1,64}`, без повторов.
+    pub names: Vec<String>,
+}
+
+impl TagSettings {
+    fn is_default(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_names("tags", &self.names, usize::MAX)
+    }
+}
+
+/// Слои проекта: до 32 имён, индекс имени совпадает со значением `layer` объекта.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayerSettings {
+    /// Имена слоёв `[A-Za-z0-9_-]{1,64}`, без повторов; не более [`MAX_LAYERS`].
+    pub names: Vec<String>,
+}
+
+impl LayerSettings {
+    fn is_default(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_names("layers", &self.names, MAX_LAYERS)
+    }
+}
+
+fn validate_names(section: &str, names: &[String], limit: usize) -> Result<(), String> {
+    if names.len() > limit {
+        return Err(format!(
+            "[{section}] names допускает не больше {limit} имён"
+        ));
+    }
+    let mut seen = HashSet::with_capacity(names.len());
+    for name in names {
+        let valid = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        if !valid {
+            return Err(format!(
+                "имя в [{section}] {name:?} должно соответствовать [A-Za-z0-9_-]{{1,64}}"
+            ));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(format!("имя в [{section}] {name:?} указано повторно"));
+        }
+    }
+    Ok(())
 }
 
 /// A scene listed by a project, in project order.
@@ -203,6 +273,8 @@ impl ProjectSettings {
             return Err("version не должен быть пустым".to_owned());
         }
         self.input.validate()?;
+        self.tags.validate()?;
+        self.layers.validate()?;
         if let Some(path) = &self.heavy_scripts
             && !is_relative_project_path(path)
         {
@@ -374,6 +446,75 @@ mod tests {
 
     fn project(scene_lines: &str) -> String {
         format!("id = \"demo-game\"\nname = \"Demo Game\"\nversion = \"1.2.3\"\n{scene_lines}")
+    }
+
+    #[test]
+    fn tags_and_layers_parse_round_trip_and_stay_out_of_default_files() {
+        let plain =
+            ProjectSettings::parse(&project("[[scenes]]\npath = \"scene.rvescene\"\n")).unwrap();
+        assert!(plain.tags.names.is_empty());
+        assert!(plain.layers.names.is_empty());
+        let serialized = plain.to_toml().unwrap();
+        assert!(!serialized.contains("tags"), "{serialized}");
+        assert!(!serialized.contains("layers"), "{serialized}");
+
+        let settings = ProjectSettings::parse(&format!(
+            "{}\n[tags]\nnames = [\"Player\", \"enemy_1\"]\n[layers]\nnames = [\"Default\", \"UI\"]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n")
+        ))
+        .unwrap();
+        assert_eq!(settings.tags.names, ["Player", "enemy_1"]);
+        assert_eq!(settings.layers.names, ["Default", "UI"]);
+        let again = ProjectSettings::parse(&settings.to_toml().unwrap()).unwrap();
+        assert_eq!(again, settings);
+    }
+
+    #[test]
+    fn layers_accept_exactly_32_names_and_reject_more() {
+        let names = (0..32)
+            .map(|index| format!("\"layer{index}\""))
+            .collect::<Vec<_>>();
+        let accepted = format!(
+            "{}\n[layers]\nnames = [{}]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n"),
+            names.join(", ")
+        );
+        assert_eq!(
+            ProjectSettings::parse(&accepted)
+                .unwrap()
+                .layers
+                .names
+                .len(),
+            32
+        );
+
+        let rejected = format!(
+            "{}\n[layers]\nnames = [{}, \"layer32\"]\n",
+            project("[[scenes]]\npath = \"scene.rvescene\"\n"),
+            names.join(", ")
+        );
+        let error = ProjectSettings::parse(&rejected).unwrap_err();
+        assert!(error.contains("[layers]"), "{error}");
+    }
+
+    #[test]
+    fn tag_and_layer_names_must_be_unique_identifiers() {
+        let scene = project("[[scenes]]\npath = \"scene.rvescene\"\n");
+        let long_name = "x".repeat(65);
+        let sections = [
+            "[tags]\nnames = [\"Player\", \"Player\"]\n".to_owned(),
+            "[tags]\nnames = [\"bad name\"]\n".to_owned(),
+            "[tags]\nnames = [\"\"]\n".to_owned(),
+            "[layers]\nnames = [\"UI\", \"UI\"]\n".to_owned(),
+            format!("[layers]\nnames = [\"{long_name}\"]\n"),
+        ];
+        for section in sections {
+            let error = ProjectSettings::parse(&format!("{scene}\n{section}")).unwrap_err();
+            assert!(
+                error.contains("[tags]") || error.contains("[layers]"),
+                "{section}: {error}"
+            );
+        }
     }
 
     #[test]
