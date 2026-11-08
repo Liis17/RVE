@@ -328,7 +328,7 @@ impl EditorApp {
         Ok(())
     }
 
-    /// Авто-сборка скриптов после открытия проекта, которую пропускает MCP без права Build.
+    /// Нужна ли сборка `heavy_scripts` перед Play или после открытия проекта; MCP без права Build её не запускает.
     pub(crate) fn mcp_scripts_build_needed(&self) -> bool {
         self.state.scripts_path.is_none()
             && self
@@ -388,9 +388,20 @@ impl EditorApp {
         Ok(target.as_str().to_owned())
     }
 
-    pub(crate) fn mcp_start_play(&mut self, network: Option<bool>) -> Result<String, String> {
+    /// `build_scripts` — право Build: без него Play, которому нужна сборка скриптов, не стартует.
+    pub(crate) fn mcp_start_play(
+        &mut self,
+        network: Option<bool>,
+        build_scripts: bool,
+    ) -> Result<String, String> {
         if self.state.is_playing() || self.state.pending_play {
             return Err("Play is already running or starting".to_owned());
+        }
+        if !build_scripts && self.mcp_scripts_build_needed() {
+            return Err(
+                "starting Play requires building scripts; enable the Build permission or run build_scripts first"
+                    .to_owned(),
+            );
         }
         if let Some(network) = network {
             if network {

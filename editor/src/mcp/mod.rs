@@ -362,7 +362,7 @@ pub(crate) fn dispatch(
         | "create_prefab"
         | "apply_to_prefab" => assets::call(app, tool, arguments),
         "play_start" | "play_stop" | "play_pause" | "play_resume" | "console_command" => {
-            play::call(app, tool, arguments)
+            play::call(app, tool, arguments, permissions)
         }
         "build_scripts" | "build_player" | "build_status" => build::call(app, tool, arguments),
         _ => Err(format!("unknown or unimplemented tool: {tool}")),

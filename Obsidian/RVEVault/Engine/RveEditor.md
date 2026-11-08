@@ -315,7 +315,7 @@ File → Build Player… собирает релиз через [[Engine/RveBuil
 - `open_project` с правом Build вызывает авто-сборку `heavy_scripts` (cargo). Без Build проект открывается без сборки, а ответ содержит `scripts_build` с пометкой «skipped». UI-путь открытия не меняется и собирает скрипты всегда.
 - `import_files` принимает только обычные файлы известного типа ассета (`AssetKind` не `Other`). Symlink и junction в конечном элементе пути отклоняются; проверка парентов пути не выполняется. Если хотя бы один источник отклонён, импорт не начинается и возвращается `isError` с именами файлов.
 - `rename_asset` не перезаписывает существующую цель. `save_scene` с `path` принимает только расширение `.rvescene`.
-- Находка, не исправленная: `play_start` при `heavy_scripts` запускает сборку скриптов через `start_play`, поэтому право Play без Build тоже запускает cargo.
+- `play_start` при праве Build работает как UI: если Play нужна сборка `heavy_scripts`, он запускает `rve-build scripts` и ждёт результата. Без Build, когда старт требует сборки (есть `heavy_scripts` и не подключена ручная библиотека `--scripts`), возвращается `isError` «starting Play requires building scripts…»; сборка и Play не запускаются. Без `heavy_scripts` или с ручной библиотекой поведение прежнее.
 
 **Политика путей** (`editor/src/mcp/paths.rs`):
 
