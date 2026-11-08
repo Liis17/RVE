@@ -7,9 +7,9 @@ use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::error::{EventLoopError, OsError};
-use winit::event::{DeviceEvent, ElementState, MouseScrollDelta};
+use winit::event::{DeviceEvent, ElementState, Ime, MouseScrollDelta};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key as LogicalKey, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Icon, WindowId};
 
 pub use winit::dpi::PhysicalSize;
@@ -195,6 +195,67 @@ fn map_mouse_scroll(delta: MouseScrollDelta) -> (f32, f32) {
     }
 }
 
+/// Текстовый ввод для полей ввода: набранный текст и клавиши редактирования.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextInputEvent {
+    /// Печатный текст или IME-фиксация без управляющих символов.
+    Text(String),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    Enter,
+}
+
+/// Переводит нажатие клавиши в текстовое событие. Отпускание ничего не даёт.
+///
+/// Клавиши редактирования имеют приоритет над сопровождающим их текстом (например, `\r` у Enter).
+/// Управляющие символы и символы приватной области (коды функциональных клавиш macOS) отбрасываются.
+fn text_input_for_key(
+    pressed: bool,
+    named: Option<NamedKey>,
+    text: Option<&str>,
+) -> Option<TextInputEvent> {
+    if !pressed {
+        return None;
+    }
+    if let Some(edit) = named.and_then(edit_event) {
+        return Some(edit);
+    }
+    let printable: String = text?
+        .chars()
+        .filter(|&c| !c.is_control() && !matches!(c, '\u{E000}'..='\u{F8FF}'))
+        .collect();
+    (!printable.is_empty()).then_some(TextInputEvent::Text(printable))
+}
+
+fn edit_event(key: NamedKey) -> Option<TextInputEvent> {
+    Some(match key {
+        NamedKey::Backspace => TextInputEvent::Backspace,
+        NamedKey::Delete => TextInputEvent::Delete,
+        NamedKey::ArrowLeft => TextInputEvent::Left,
+        NamedKey::ArrowRight => TextInputEvent::Right,
+        NamedKey::Home => TextInputEvent::Home,
+        NamedKey::End => TextInputEvent::End,
+        NamedKey::Enter => TextInputEvent::Enter,
+        _ => return None,
+    })
+}
+
+/// Фиксация IME передаётся как текст; пустая фиксация ничего не меняет.
+fn commit_event(text: String) -> Option<TextInputEvent> {
+    (!text.is_empty()).then_some(TextInputEvent::Text(text))
+}
+
+fn named_key(key: &LogicalKey) -> Option<NamedKey> {
+    match key {
+        LogicalKey::Named(named) => Some(*named),
+        _ => None,
+    }
+}
+
 /// Параметры создаваемого окна.
 pub struct WindowConfig {
     pub title: String,
@@ -305,6 +366,7 @@ enum InternalEvent {
     RequestFocus,
     RequestExit,
     SetCursor(CursorState),
+    SetTextInput(bool),
     Wake,
 }
 
@@ -340,6 +402,16 @@ impl WindowProxy {
         let _ = self
             .event_loop_proxy
             .send_event(InternalEvent::SetCursor(state));
+    }
+
+    /// Включает или выключает IME окна в потоке цикла событий.
+    ///
+    /// Текст приходит через `WindowHandler::text_input`. Запрос, поступивший до создания окна,
+    /// сохраняется и применяется при его создании.
+    pub fn set_text_input(&self, enabled: bool) {
+        let _ = self
+            .event_loop_proxy
+            .send_event(InternalEvent::SetTextInput(enabled));
     }
 
     /// Будит цикл событий, чтобы он снова вызвал `WindowHandler::update`.
@@ -423,6 +495,10 @@ pub trait WindowHandler {
     /// Вызывается для поддерживаемой физической клавиши; автоповтор не передаётся.
     fn key(&mut self, _key: Key, _pressed: bool) {}
 
+    /// Вызывается для текстового ввода: печатный текст, IME-фиксация и клавиши редактирования.
+    /// Автоповтор клавиш передаётся, в отличие от `key`.
+    fn text_input(&mut self, _event: TextInputEvent) {}
+
     /// Вызывается при нажатии или отпускании поддерживаемой кнопки мыши.
     fn mouse_button(&mut self, _button: MouseButton, _pressed: bool) {}
 
@@ -460,6 +536,7 @@ pub fn run(mut config: WindowConfig, handler: &mut impl WindowHandler) -> Result
         focus_requests: FocusRequestState::default(),
         focused: false,
         cursor: CursorController::default(),
+        text_input: false,
     };
     let run_result = event_loop.run_app(&mut app);
     app.finish();
@@ -480,6 +557,8 @@ struct WindowApplication<'a, H> {
     focus_requests: FocusRequestState,
     focused: bool,
     cursor: CursorController,
+    /// Запрошен ли IME; применяется к окну при создании и при каждом изменении.
+    text_input: bool,
 }
 
 impl<H: WindowHandler> WindowApplication<'_, H> {
@@ -716,6 +795,9 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
         if let Some(icon) = self.icon.take() {
             window.set_window_icon(Some(icon));
         }
+        if self.text_input {
+            window.set_ime_allowed(true);
+        }
 
         self.window = Some(Arc::clone(&window));
         self.focused = window.has_focus();
@@ -751,6 +833,17 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
             self.handler.window_event(window, &event);
         }
 
+        // Текст приходит и при автоповторе, поэтому проверка не зависит от `key`.
+        if let WindowEvent::KeyboardInput { event, .. } = &event
+            && let Some(text_event) = text_input_for_key(
+                event.state == ElementState::Pressed,
+                named_key(&event.logical_key),
+                event.text.as_deref(),
+            )
+        {
+            self.handler.text_input(text_event);
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 if self.should_exit_on_close_requested() {
@@ -772,6 +865,11 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                     && let Some(key) = map_key_code(code)
                 {
                     self.handler.key(key, event.state == ElementState::Pressed);
+                }
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                if let Some(text_event) = commit_event(text) {
+                    self.handler.text_input(text_event);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -837,6 +935,12 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
                 let plan = self.cursor.request(state, size);
                 if let Some(window) = self.window.as_ref() {
                     apply_cursor_plan(window, plan);
+                }
+            }
+            InternalEvent::SetTextInput(enabled) => {
+                self.text_input = enabled;
+                if let Some(window) = self.window.as_ref() {
+                    window.set_ime_allowed(enabled);
                 }
             }
             InternalEvent::Wake => {}
@@ -985,6 +1089,74 @@ mod tests {
         );
     }
 
+    fn text(value: &str) -> Option<TextInputEvent> {
+        Some(TextInputEvent::Text(value.to_owned()))
+    }
+
+    #[test]
+    fn released_keys_produce_no_text_input() {
+        assert_eq!(
+            text_input_for_key(false, Some(NamedKey::Backspace), None),
+            None
+        );
+        assert_eq!(text_input_for_key(false, None, Some("a")), None);
+    }
+
+    #[test]
+    fn edit_keys_map_to_edit_events_before_their_control_text() {
+        let cases = [
+            (
+                NamedKey::Backspace,
+                Some("\u{8}"),
+                TextInputEvent::Backspace,
+            ),
+            (NamedKey::Delete, Some("\u{7f}"), TextInputEvent::Delete),
+            (NamedKey::ArrowLeft, None, TextInputEvent::Left),
+            (NamedKey::ArrowRight, None, TextInputEvent::Right),
+            (NamedKey::Home, None, TextInputEvent::Home),
+            (NamedKey::End, None, TextInputEvent::End),
+            (NamedKey::Enter, Some("\r"), TextInputEvent::Enter),
+        ];
+        for (key, produced, expected) in cases {
+            assert_eq!(
+                text_input_for_key(true, Some(key), produced),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn printable_text_passes_and_control_or_private_use_characters_are_dropped() {
+        assert_eq!(text_input_for_key(true, None, Some("ж")), text("ж"));
+        assert_eq!(
+            text_input_for_key(true, Some(NamedKey::Space), Some(" ")),
+            text(" ")
+        );
+        assert_eq!(text_input_for_key(true, None, Some("a\u{7}b")), text("ab"));
+        assert_eq!(
+            text_input_for_key(true, Some(NamedKey::Tab), Some("\t")),
+            None
+        );
+        assert_eq!(
+            text_input_for_key(true, Some(NamedKey::Escape), Some("\u{1b}")),
+            None
+        );
+        assert_eq!(text_input_for_key(true, None, Some("\u{f704}")), None);
+        assert_eq!(text_input_for_key(true, None, Some("")), None);
+        assert_eq!(text_input_for_key(true, None, None), None);
+    }
+
+    #[test]
+    fn unsupported_named_keys_without_text_are_ignored() {
+        assert_eq!(text_input_for_key(true, Some(NamedKey::F1), None), None);
+    }
+
+    #[test]
+    fn ime_commit_is_text_and_empty_commit_is_ignored() {
+        assert_eq!(commit_event("é".to_owned()), text("é"));
+        assert_eq!(commit_event(String::new()), None);
+    }
+
     #[test]
     fn window_icon_requires_exact_nonzero_rgba_buffer_size() {
         let icon = WindowIcon {
@@ -1046,6 +1218,7 @@ mod tests {
             focus_requests: FocusRequestState::default(),
             focused: false,
             cursor: CursorController::default(),
+            text_input: false,
         };
         assert!(default_app.should_exit_on_close_requested());
 
@@ -1060,6 +1233,7 @@ mod tests {
             focus_requests: FocusRequestState::default(),
             focused: false,
             cursor: CursorController::default(),
+            text_input: false,
         };
         assert!(!keep_open_app.should_exit_on_close_requested());
     }
@@ -1314,6 +1488,7 @@ mod tests {
             focus_requests: FocusRequestState::default(),
             focused: false,
             cursor: CursorController::default(),
+            text_input: false,
         };
 
         app.finish();
@@ -1336,6 +1511,7 @@ mod tests {
             focus_requests: FocusRequestState::default(),
             focused: false,
             cursor: CursorController::default(),
+            text_input: false,
         };
 
         app.finish();
