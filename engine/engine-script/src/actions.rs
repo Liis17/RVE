@@ -1549,6 +1549,39 @@ mod tests {
     }
 
     #[test]
+    fn held_gamepad_slot_stays_suppressed_across_a_context_change() {
+        let mut settings = settings();
+        settings.contexts.get_mut("menu").unwrap().insert(
+            "Confirm".to_owned(),
+            InputAction::Button {
+                inputs: vec!["Gamepad.East".to_owned()],
+            },
+        );
+        let mut actions = InputActions::new(settings).unwrap();
+        actions.set_input(pad_snapshot(&[(1, EAST_BIT, [0.0; 6])]));
+
+        actions.queue_mutations(vec![ActionMutation::SetContext("menu".to_owned())]);
+        actions.set_input(pad_snapshot(&[(1, EAST_BIT, [0.0; 6])]));
+        assert!(
+            !actions
+                .frame()
+                .state("Confirm", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
+
+        actions.set_input(pad_snapshot(&[
+            (0, EAST_BIT, [0.0; 6]),
+            (1, EAST_BIT, [0.0; 6]),
+        ]));
+        let confirm = actions
+            .frame()
+            .state("Confirm", InputActionKind::Button)
+            .unwrap();
+        assert!(confirm.down && confirm.pressed);
+    }
+
+    #[test]
     fn physical_gamepad_inputs_bind_only_the_named_slot() {
         let mut actions = gamepad_actions();
         actions.set_input(pad_snapshot(&[(2, SOUTH_BIT, [0.0; 6])]));
