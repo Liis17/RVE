@@ -69,9 +69,19 @@ impl ToolSpec {
     }
 
     pub(crate) fn to_value(&self) -> Value {
+        // Список инструментов постоянный: клиент видит требуемое право, а вызов без него отклоняется.
+        let description = if self.permission == Permission::Read {
+            self.description.clone()
+        } else {
+            format!(
+                "{} Requires permission: {}.",
+                self.description,
+                self.permission.flag()
+            )
+        };
         json!({
             "name": self.name,
-            "description": self.description,
+            "description": description,
             "inputSchema": self.input_schema,
         })
     }
@@ -135,7 +145,7 @@ impl ToolResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{Permission, Permissions, ToolResult};
+    use super::{Permission, Permissions, ToolResult, ToolSpec};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
 
@@ -152,6 +162,17 @@ mod tests {
         };
         assert!(permissions.allows(Permission::EditScene));
         assert!(!permissions.allows(Permission::Assets));
+    }
+
+    #[test]
+    fn tool_descriptions_name_the_permission_required_by_non_read_tools() {
+        let read = ToolSpec::new("status", "Read it.", json!({}), Permission::Read);
+        assert_eq!(read.to_value()["description"], "Read it.");
+        let edit = ToolSpec::new("set", "Change it.", json!({}), Permission::EditScene);
+        assert_eq!(
+            edit.to_value()["description"],
+            "Change it. Requires permission: edit_scene."
+        );
     }
 
     #[test]

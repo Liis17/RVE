@@ -67,6 +67,8 @@ pub(crate) struct Shared {
     pub token: String,
     pub tools: Vec<ToolSpec>,
     pub sessions: Mutex<HashMap<String, Session>>,
+    /// Счётчик обращений к сессиям для вытеснения самой давно использованной.
+    pub clock: AtomicU64,
     pub permissions: Arc<RwLock<Permissions>>,
     pub generation: Arc<AtomicU64>,
     pub calls: flume::Sender<ToolCall>,
@@ -110,6 +112,7 @@ impl McpServer {
             token: config.token,
             tools: config.tools,
             sessions: Mutex::new(HashMap::new()),
+            clock: AtomicU64::new(0),
             permissions: Arc::clone(&permissions),
             generation: Arc::clone(&generation),
             calls: calls_tx,

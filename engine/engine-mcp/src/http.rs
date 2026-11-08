@@ -268,6 +268,27 @@ fn validate_authority(headers: Headers<'_>, port: u16, token: &str) -> Result<()
     Ok(())
 }
 
+/// Upper bound on live sessions; the least recently used one is evicted to make room.
+pub(crate) const MAX_SESSIONS: usize = 64;
+
+/// Result of handling one POST body, before any HTTP response is written.
+#[derive(Debug)]
+pub(crate) enum PostOutcome {
+    Failure(HttpFailure),
+    Json {
+        status: u16,
+        body: Value,
+        session_id: Option<String>,
+    },
+    Empty(u16),
+    /// A tool call was queued for the editor thread; the caller waits for its response.
+    AwaitTool {
+        id: Value,
+        response: flume::Receiver<ToolResult>,
+        deadline: Instant,
+    },
+}
+
 fn handle_post(
     mut request: Request,
     headers: Headers<'_>,
@@ -285,18 +306,48 @@ fn handle_post(
             return;
         }
     };
-    let rpc = match parse_request(&body) {
+    match post_outcome(&body, headers, shared) {
+        PostOutcome::Failure(failure) => respond_failure(request, failure),
+        PostOutcome::Json {
+            status,
+            body,
+            session_id,
+        } => {
+            let extra = session_headers(session_id);
+            respond_json(request, status, body, &extra);
+        }
+        PostOutcome::Empty(status) => respond_empty(request, status),
+        PostOutcome::AwaitTool {
+            id,
+            response,
+            deadline,
+        } => match wait_for_result(&response, shutdown, deadline) {
+            WaitResult::Response(result) => {
+                respond_json(request, 200, success(Some(id), result.to_value()), &[])
+            }
+            result => respond_failure(
+                request,
+                wait_failure(result).expect("non-response wait outcomes map to an HTTP failure"),
+            ),
+        },
+    }
+}
+
+/// Decides the POST outcome: session lifecycle, JSON-RPC routing, and queuing of tool calls.
+pub(crate) fn post_outcome(body: &[u8], headers: Headers<'_>, shared: &Shared) -> PostOutcome {
+    let rpc = match parse_request(body) {
         Ok(request) => request,
         Err(rpc_error) => {
-            respond_json(
-                request,
-                400,
-                error(None, rpc_error.code, rpc_error.message, None),
-                &[],
-            );
-            return;
+            return PostOutcome::Json {
+                status: 400,
+                body: error(None, rpc_error.code, rpc_error.message, None),
+                session_id: None,
+            };
         }
     };
+    let clock = shared
+        .clock
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let mut sessions = shared.sessions.lock().unwrap();
     if let Err(failure) = validate_headers(
@@ -306,152 +357,136 @@ fn handle_post(
         &sessions,
         Some(&rpc.method),
     ) {
-        drop(sessions);
-        respond_failure(request, failure);
-        return;
+        return PostOutcome::Failure(failure);
     }
 
     if rpc.method == "initialize" {
         let Some(id) = rpc.id.clone() else {
-            drop(sessions);
-            respond_json(
-                request,
-                400,
-                error(None, -32600, "Invalid Request", None),
-                &[],
-            );
-            return;
+            return PostOutcome::Json {
+                status: 400,
+                body: error(None, -32600, "Invalid Request", None),
+                session_id: None,
+            };
         };
         let Some(client_version) = initialize_client_version(&rpc.params) else {
-            drop(sessions);
-            respond_json(
-                request,
-                400,
-                error(Some(id), -32602, "Invalid params", None),
-                &[],
-            );
-            return;
+            return PostOutcome::Json {
+                status: 400,
+                body: error(Some(id), -32602, "Invalid params", None),
+                session_id: None,
+            };
         };
         let (protocol_version, result) = initialize_result(Some(client_version), crate::VERSION);
         let session_id = match new_session_id() {
             Ok(id) => id,
-            Err(_) => {
-                drop(sessions);
-                respond_failure(request, HttpFailure::InternalServerError);
-                return;
-            }
+            Err(_) => return PostOutcome::Failure(HttpFailure::InternalServerError),
         };
-        sessions.insert(session_id.clone(), Session::new(protocol_version));
-        drop(sessions);
-        let session_header = Header::from_bytes("Mcp-Session-Id", session_id)
-            .expect("MCP session header name and value are valid");
-        respond_json(request, 200, success(Some(id), result), &[session_header]);
-        return;
+        insert_session(
+            &mut sessions,
+            session_id.clone(),
+            Session::new(protocol_version, clock),
+        );
+        return PostOutcome::Json {
+            status: 200,
+            body: success(Some(id), result),
+            session_id: Some(session_id),
+        };
     }
 
     let Some(session_id) = headers.session_id else {
-        drop(sessions);
-        respond_failure(request, HttpFailure::BadRequest);
-        return;
+        return PostOutcome::Failure(HttpFailure::BadRequest);
     };
     let Some(session) = sessions.get_mut(session_id) else {
-        drop(sessions);
-        respond_failure(request, HttpFailure::NotFound);
-        return;
+        return PostOutcome::Failure(HttpFailure::NotFound);
     };
+    session.last_used = clock;
     if rpc.method == "notifications/initialized" && rpc.id.is_some() {
-        let id = rpc.id.clone();
-        drop(sessions);
-        respond_json(
-            request,
-            400,
-            error(id, -32600, "Invalid Request", None),
-            &[],
-        );
-        return;
+        return PostOutcome::Json {
+            status: 400,
+            body: error(rpc.id, -32600, "Invalid Request", None),
+            session_id: None,
+        };
     }
     match session.accept(&rpc.method) {
-        Ok(false) => {
-            drop(sessions);
-            respond_empty(request, 202);
-            return;
-        }
+        Ok(false) => return PostOutcome::Empty(202),
         Ok(true) => {}
         Err(message) => {
-            let id = rpc.id.clone();
-            drop(sessions);
-            respond_json(request, 200, error(id, -32002, message, None), &[]);
-            return;
+            return PostOutcome::Json {
+                status: 200,
+                body: error(rpc.id, -32002, message, None),
+                session_id: None,
+            };
         }
     }
     drop(sessions);
 
-    if rpc.id.is_none() {
-        respond_empty(request, 202);
-        return;
-    }
+    let Some(id) = rpc.id else {
+        return PostOutcome::Empty(202);
+    };
     match rpc.method.as_str() {
-        "ping" => respond_json(request, 200, success(rpc.id, json!({})), &[]),
+        "ping" => PostOutcome::Json {
+            status: 200,
+            body: success(Some(id), json!({})),
+            session_id: None,
+        },
+        // Постоянный список: права не фильтруют его, а проверяются при вызове.
         "tools/list" => {
-            let permissions = *shared.permissions.read().unwrap();
             let tools = shared
                 .tools
                 .iter()
-                .filter(|tool| permissions.allows(tool.permission))
                 .map(crate::tools::ToolSpec::to_value)
                 .collect::<Vec<_>>();
-            respond_json(
-                request,
-                200,
-                success(rpc.id, json!({ "tools": tools })),
-                &[],
-            );
+            PostOutcome::Json {
+                status: 200,
+                body: success(Some(id), json!({ "tools": tools })),
+                session_id: None,
+            }
         }
-        "tools/call" => handle_tool_call(request, rpc.id, rpc.params, shared, shutdown),
-        _ => respond_json(
-            request,
-            200,
-            error(rpc.id, -32601, "Method not found", None),
-            &[],
-        ),
+        "tools/call" => tool_call_outcome(id, &rpc.params, shared),
+        _ => PostOutcome::Json {
+            status: 200,
+            body: error(Some(id), -32601, "Method not found", None),
+            session_id: None,
+        },
     }
 }
 
-fn handle_tool_call(
-    request: Request,
-    id: Option<Value>,
-    params: Value,
-    shared: &Shared,
-    shutdown: &flume::Receiver<()>,
-) {
-    let Some(id) = id else {
-        respond_failure(request, HttpFailure::BadRequest);
-        return;
-    };
+/// Inserts a session; at the cap, the least recently used session is evicted first.
+fn insert_session(sessions: &mut HashMap<String, Session>, id: String, session: Session) {
+    if sessions.len() >= MAX_SESSIONS
+        && let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, session)| session.last_used)
+            .map(|(id, _)| id.clone())
+    {
+        sessions.remove(&oldest);
+    }
+    sessions.insert(id, session);
+}
+
+fn tool_call_outcome(id: Value, params: &Value, shared: &Shared) -> PostOutcome {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
-        respond_json(
-            request,
-            200,
-            error(Some(id), -32602, "Invalid params", None),
-            &[],
-        );
-        return;
+        return PostOutcome::Json {
+            status: 200,
+            body: error(Some(id), -32602, "Invalid params", None),
+            session_id: None,
+        };
     };
     let Some(tool) = shared.tools.iter().find(|tool| tool.name == name) else {
-        respond_json(
-            request,
-            200,
-            error(Some(id), -32602, "Unknown tool", None),
-            &[],
-        );
-        return;
+        return PostOutcome::Json {
+            status: 200,
+            body: error(Some(id), -32602, "Unknown tool", None),
+            session_id: None,
+        };
     };
     let permission = tool.permission;
     let permissions = *shared.permissions.read().unwrap();
     if !permissions.allows(permission) {
         let result = ToolResult::error(format!("Permission `{}` is disabled", permission.flag()));
-        respond_json(request, 200, success(Some(id), result.to_value()), &[]);
-        return;
+        return PostOutcome::Json {
+            status: 200,
+            body: success(Some(id), result.to_value()),
+            session_id: None,
+        };
     }
 
     let arguments = params
@@ -462,19 +497,13 @@ fn handle_tool_call(
     let generation = shared.generation.load(std::sync::atomic::Ordering::Acquire);
     let (call, response) = pending_tool_call(name, arguments, permission, deadline, generation);
     if shared.calls.send(call).is_err() {
-        respond_failure(request, HttpFailure::ServiceUnavailable);
-        return;
+        return PostOutcome::Failure(HttpFailure::ServiceUnavailable);
     }
     (shared.wake)();
-    let result = wait_for_result(&response, shutdown, deadline);
-    match result {
-        WaitResult::Response(result) => {
-            respond_json(request, 200, success(Some(id), result.to_value()), &[])
-        }
-        result => respond_failure(
-            request,
-            wait_failure(result).expect("non-response wait outcomes map to an HTTP failure"),
-        ),
+    PostOutcome::AwaitTool {
+        id,
+        response,
+        deadline,
     }
 }
 
@@ -509,17 +538,30 @@ fn wait_failure(result: WaitResult) -> Option<HttpFailure> {
 }
 
 fn handle_delete(request: Request, headers: Headers<'_>, shared: &Shared) {
-    let sessions = shared.sessions.lock().unwrap();
-    if let Err(failure) = validate_headers(headers, shared.port, &shared.token, &sessions, None) {
-        drop(sessions);
-        respond_failure(request, failure);
-        return;
+    match delete_session(headers, shared) {
+        Ok(()) => respond_empty(request, 200),
+        Err(failure) => respond_failure(request, failure),
     }
-    drop(sessions);
+}
+
+/// Ends the session named by `Mcp-Session-Id`; later requests with it get 404.
+fn delete_session(headers: Headers<'_>, shared: &Shared) -> Result<(), HttpFailure> {
+    let mut sessions = shared.sessions.lock().unwrap();
+    validate_headers(headers, shared.port, &shared.token, &sessions, None)?;
     if let Some(session_id) = headers.session_id {
-        shared.sessions.lock().unwrap().remove(session_id);
+        sessions.remove(session_id);
     }
-    respond_empty(request, 200);
+    Ok(())
+}
+
+fn session_headers(session_id: Option<String>) -> Vec<Header> {
+    session_id
+        .map(|id| {
+            Header::from_bytes("Mcp-Session-Id", id)
+                .expect("MCP session header name and value are valid")
+        })
+        .into_iter()
+        .collect()
 }
 
 fn request_headers(request: &Request) -> OwnedHeaders {
@@ -612,12 +654,17 @@ fn respond_raw(
 #[cfg(test)]
 mod tests {
     use super::{
-        Headers, HttpFailure, MAX_BODY_BYTES, accepts_mcp_streamable_http, is_json_content_type,
-        pending_tool_call, read_limited_body, validate_headers, wait_failure,
+        Headers, HttpFailure, MAX_BODY_BYTES, MAX_SESSIONS, PostOutcome,
+        accepts_mcp_streamable_http, delete_session, insert_session, is_json_content_type,
+        pending_tool_call, post_outcome, read_limited_body, validate_headers, wait_failure,
     };
     use crate::protocol::{Session, SessionPhase};
-    use crate::{Permission, server::WaitResult};
+    use crate::server::{Shared, ToolCall, WaitResult, wait_for_result};
+    use crate::{Permission, Permissions, ToolResult, ToolSpec};
+    use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::{Duration, Instant};
 
     fn headers() -> Headers<'static> {
@@ -642,6 +689,7 @@ mod tests {
             Session {
                 protocol_version: "2025-11-25".to_owned(),
                 phase: SessionPhase::Initializing,
+                last_used: 0,
             },
         );
         let cases = [
@@ -813,5 +861,146 @@ mod tests {
         assert_eq!(call.generation(), 41);
         drop(response);
         assert!(call.is_abandoned());
+    }
+
+    #[test]
+    fn session_table_evicts_the_least_recently_used_session_at_the_cap() {
+        let mut sessions = HashMap::new();
+        for clock in 0..MAX_SESSIONS as u64 {
+            insert_session(
+                &mut sessions,
+                format!("s{clock}"),
+                Session::new("2025-11-25".to_owned(), clock),
+            );
+        }
+        assert_eq!(sessions.len(), MAX_SESSIONS);
+        // s0 is used again, so s1 becomes the least recently used session.
+        sessions.get_mut("s0").unwrap().last_used = 1_000;
+        insert_session(
+            &mut sessions,
+            "newest".to_owned(),
+            Session::new("2025-11-25".to_owned(), 1_001),
+        );
+        assert_eq!(sessions.len(), MAX_SESSIONS);
+        assert!(sessions.contains_key("s0"));
+        assert!(!sessions.contains_key("s1"));
+        assert!(sessions.contains_key("newest"));
+    }
+
+    fn shared_with(tools: Vec<ToolSpec>) -> (Shared, flume::Receiver<ToolCall>) {
+        let (calls, receiver) = flume::unbounded();
+        let shared = Shared {
+            port: 47615,
+            token: "secret".to_owned(),
+            tools,
+            sessions: Mutex::new(HashMap::new()),
+            clock: AtomicU64::new(1),
+            permissions: Arc::new(RwLock::new(Permissions::default())),
+            generation: Arc::new(AtomicU64::new(0)),
+            calls,
+            wake: Arc::new(|| {}),
+        };
+        (shared, receiver)
+    }
+
+    fn rpc_headers<'a>(method: &'a str, session: Option<&'a str>) -> Headers<'a> {
+        Headers {
+            method,
+            path: "/mcp",
+            authorization: Some("Bearer secret"),
+            host: Some("127.0.0.1:47615"),
+            origin: None,
+            content_type: Some("application/json"),
+            accept: Some("application/json, text/event-stream"),
+            protocol_version: session.map(|_| "2025-11-25"),
+            session_id: session,
+        }
+    }
+
+    #[test]
+    fn session_phases_and_delete_are_enforced_without_sockets() {
+        let (shared, calls) = shared_with(vec![
+            ToolSpec::new(
+                "probe",
+                "Probe.",
+                json!({"type": "object"}),
+                Permission::Read,
+            ),
+            ToolSpec::new(
+                "set",
+                "Set.",
+                json!({"type": "object"}),
+                Permission::EditScene,
+            ),
+        ]);
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let PostOutcome::Json {
+            status: 200,
+            session_id: Some(session),
+            ..
+        } = post_outcome(initialize, rpc_headers("POST", None), &shared)
+        else {
+            panic!("initialize must answer 200 with a session id");
+        };
+        let session = session.as_str();
+        let tools_list = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let call = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"probe"}}"#;
+
+        // Before notifications/initialized a tool call is a JSON-RPC error and never reaches the editor.
+        let PostOutcome::Json { body, .. } =
+            post_outcome(call, rpc_headers("POST", Some(session)), &shared)
+        else {
+            panic!("tools/call before initialized must be answered in JSON");
+        };
+        assert_eq!(body["error"]["code"], -32002);
+        assert!(calls.try_recv().is_err());
+
+        let initialized = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(matches!(
+            post_outcome(initialized, rpc_headers("POST", Some(session)), &shared),
+            PostOutcome::Empty(202)
+        ));
+
+        // The list is complete for every permission state; the description names what each tool needs.
+        let PostOutcome::Json { body, .. } =
+            post_outcome(tools_list, rpc_headers("POST", Some(session)), &shared)
+        else {
+            panic!("tools/list must be answered in JSON");
+        };
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools[1]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Requires permission: edit_scene")
+        );
+
+        let PostOutcome::AwaitTool {
+            response, deadline, ..
+        } = post_outcome(call, rpc_headers("POST", Some(session)), &shared)
+        else {
+            panic!("tools/call after initialization must queue the call");
+        };
+        let queued = calls.try_recv().expect("the call reached the editor queue");
+        assert_eq!(queued.name, "probe");
+        assert!(!queued.is_abandoned());
+        assert!(queued.respond(ToolResult::text("done")));
+        let (_shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
+        assert_eq!(
+            wait_for_result(&response, &shutdown_rx, deadline),
+            WaitResult::Response(ToolResult::text("done"))
+        );
+
+        assert_eq!(
+            delete_session(rpc_headers("DELETE", Some(session)), &shared),
+            Ok(())
+        );
+        let PostOutcome::Failure(failure) =
+            post_outcome(tools_list, rpc_headers("POST", Some(session)), &shared)
+        else {
+            panic!("a deleted session must not be accepted");
+        };
+        assert_eq!(failure, HttpFailure::NotFound);
     }
 }

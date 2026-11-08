@@ -107,13 +107,16 @@ pub(crate) enum SessionPhase {
 pub(crate) struct Session {
     pub protocol_version: String,
     pub phase: SessionPhase,
+    /// Значение общих часов сервера при создании или последнем валидном запросе; меньше — старше.
+    pub last_used: u64,
 }
 
 impl Session {
-    pub fn new(protocol_version: String) -> Self {
+    pub fn new(protocol_version: String, last_used: u64) -> Self {
         Self {
             protocol_version,
             phase: SessionPhase::Initializing,
+            last_used,
         }
     }
 
@@ -163,7 +166,7 @@ mod tests {
 
     #[test]
     fn session_requires_initialized_notification_before_requests() {
-        let mut session = Session::new("2025-11-25".to_owned());
+        let mut session = Session::new("2025-11-25".to_owned(), 0);
         assert_eq!(session.phase, SessionPhase::Initializing);
         assert_eq!(
             session.accept("tools/list"),
