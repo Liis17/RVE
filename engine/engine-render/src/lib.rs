@@ -16235,10 +16235,16 @@ mod tests {
         let geometric_flip = shader[default_surface..]
             .find("geometric_normal = -geometric_normal;")
             .unwrap();
+        // Both flips are absolute offsets in the shader and must follow the TBN mapping they reverse.
         let perturb = shader.find("vec3 rve_perturb_normal(").unwrap();
-        let normal_flip = shader[perturb..].find("normal = -normal;").unwrap();
-        assert!(normal_flip > 0);
-        assert!(geometric_flip > 0);
+        let perturb_mapping = perturb + shader[perturb..].find("normal = safe_normalize(").unwrap();
+        let normal_flip = perturb + shader[perturb..].find("normal = -normal;").unwrap();
+        assert!(normal_flip > perturb_mapping);
+        let surface_mapping = shader
+            .find("normal = rve_perturb_normal(tangent_normal);")
+            .unwrap();
+        let geometric_flip = default_surface + geometric_flip;
+        assert!(geometric_flip > surface_mapping);
     }
 
     fn ggx_shader_has_analytic_peak(source: &str) -> bool {

@@ -226,6 +226,13 @@ impl ShaderAsset {
                 return Err(invalid(format!("имя свойства {name:?} повторяется")));
             }
             let validated = validate_property(raw_property, &path, line)?;
+            // Числовые свойства становятся макросами, поэтому не могут совпадать с именами,
+            // которые пользовательский код видит рядом с Surface и шаблоном. У текстур макроса нет.
+            if validated.kind != ShaderPropertyKind::Texture && is_macro_conflict(&name) {
+                return Err(invalid(format!(
+                    "имя числового свойства {name:?} совпадает с полем Surface, функцией или переменной шаблона; выберите другое"
+                )));
+            }
             if validated.color_space.is_some()
                 != matches!(validated.default, ShaderPropertyDefault::Texture(_))
             {
@@ -525,6 +532,99 @@ fn valid_identifier(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+/// Имена, которые числовое свойство не может получить: оно превращается в `#define` в renderer,
+/// и макрос подменил бы поле `s.opacity`, вызов `max(a, b)` или переменную шаблона `frame`.
+/// Список повторяет `engine-render/shaders/mesh.frag`; префикс `sample_` занят хелперами текстур.
+fn is_macro_conflict(name: &str) -> bool {
+    const CONFLICTS: &[&str] = &[
+        // Поля `struct Surface`.
+        "uv",
+        "position",
+        "albedo",
+        "opacity",
+        "geometric_normal",
+        "normal",
+        "metallic",
+        "roughness",
+        "occlusion",
+        "emissive",
+        // Глобальные имена шаблона, видимые пользовательскому коду.
+        "PI",
+        "frame",
+        "push_constants",
+        "material_sampler",
+        "shadow_map",
+        "shadow_sampler",
+        "local_shadow_map",
+        "ao_image",
+        "environment_map",
+        "environment_sampler",
+        "irradiance_map",
+        "prefiltered_map",
+        "brdf_lut",
+        "brdf_sampler",
+        "base_color_texture",
+        "metallic_roughness_texture",
+        "normal_texture",
+        "emissive_texture",
+        "occlusion_texture",
+        "safe_normalize",
+        "distribution_ggx",
+        "visibility_smith_ggx_correlated",
+        "fresnel_schlick",
+        "direct_brdf",
+        "range_attenuation",
+        "spot_attenuation",
+        "local_shadow_visibility",
+        "lod_color",
+        "cascade_color",
+        "LocalLightData",
+        "ClusterRecord",
+        // Встроенные функции GLSL, которые пользователь вызывает в surface().
+        "min",
+        "max",
+        "clamp",
+        "mix",
+        "step",
+        "smoothstep",
+        "pow",
+        "exp",
+        "exp2",
+        "log",
+        "log2",
+        "sqrt",
+        "inversesqrt",
+        "abs",
+        "sign",
+        "floor",
+        "ceil",
+        "fract",
+        "mod",
+        "round",
+        "trunc",
+        "dot",
+        "cross",
+        "length",
+        "distance",
+        "normalize",
+        "reflect",
+        "refract",
+        "texture",
+        "textureLod",
+        "texelFetch",
+        "sin",
+        "cos",
+        "tan",
+        "any",
+        "all",
+        "not",
+        "transpose",
+        "inverse",
+        "determinant",
+    ];
+    name.starts_with("sample_") || CONFLICTS.contains(&name)
+}
+
 fn is_reserved_identifier(name: &str) -> bool {
     const RESERVED: &[&str] = &[
         "attribute",
@@ -741,10 +841,31 @@ mod tests {
     }
 
     #[test]
-    fn template_has_valid_format_and_allows_surface_field_names() {
+    fn template_has_valid_format_and_texture_may_be_named_like_surface_field() {
         let template = ShaderAsset::template("example");
         assert!(ShaderAsset::parse("example.rveshader", &template).is_ok());
-        let source = "[shader]\n[[properties]]\nname=\"base_color\"\ntype=\"color\"\ndefault=[1,1,1]\n---\nvoid surface(inout Surface s) { s.albedo = base_color; }\n";
+        // Текстура `albedo` генерирует только хелпер `sample_albedo`, макроса нет.
+        let source = "[shader]\n[[properties]]\nname=\"albedo\"\ntype=\"texture\"\n---\nvoid surface(inout Surface s) { s.albedo = sample_albedo(s.uv).rgb; }\n";
         assert!(ShaderAsset::parse("field.rveshader", source).is_ok());
+    }
+
+    #[test]
+    fn numeric_property_named_like_surface_field_or_template_symbol_is_rejected() {
+        let numeric = |name: &str, kind: &str| {
+            format!(
+                "[shader]\n[[properties]]\nname=\"{name}\"\ntype=\"{kind}\"\ndefault={}\n---\n",
+                if kind == "float" { "1" } else { "[1,1,1]" }
+            )
+        };
+        for name in [
+            "opacity", "albedo", "uv", "position", "normal", "max", "sample_x",
+        ] {
+            let error =
+                ShaderAsset::parse("bad.rveshader", &numeric(name, "float")).expect_err(name);
+            assert!(error.message.contains("совпадает"), "{error}");
+            assert_eq!(error.line, Some(2), "{error}");
+        }
+        assert!(ShaderAsset::parse("ok.rveshader", &numeric("tint", "color")).is_ok());
+        assert!(ShaderAsset::parse("ok.rveshader", &numeric("roughness_scale", "float")).is_ok());
     }
 }

@@ -142,14 +142,10 @@ impl MaterialAsset {
 
         for layout in &schema.properties {
             let property = &layout.property;
+            // Отсутствующее свойство тихо берёт default: предупреждения только о несовпадении типа.
             let supplied = self.properties.get(&property.name);
             if supplied.is_some() {
                 used.insert(property.name.as_str());
-            } else {
-                warnings.push(format!(
-                    "properties.{} отсутствует; используется default",
-                    property.name
-                ));
             }
             match property.kind {
                 ShaderPropertyKind::Texture => {
@@ -422,6 +418,14 @@ mod tests {
                 .iter()
                 .any(|path| path.as_str() == "textures/unused.png")
         );
+    }
+
+    #[test]
+    fn absent_properties_use_defaults_without_warnings() {
+        let material = MaterialAsset::default();
+        let resolved = material.resolve(&ShaderSchema::lit());
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+        assert_eq!(resolved.lit.unwrap().metallic, 0.0);
     }
 
     #[test]
