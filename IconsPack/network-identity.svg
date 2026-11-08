@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" role="img" aria-label="RVE Network Identity">
+  <defs>
+    <linearGradient id="peer" x1="16" y1="14" x2="48" y2="50" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A6EEFA"/>
+      <stop offset="1" stop-color="#46BFDB"/>
+    </linearGradient>
+  </defs>
+  <!-- Links from the networked object to its peers. -->
+  <path d="M32 32L16 16M32 32L48 16M32 32V50" stroke="#55CEE5" stroke-width="3" stroke-linecap="round"/>
+  <!-- The object itself is the larger node in the centre. -->
+  <g fill="url(#peer)" stroke="#64D5EB" stroke-width="2.2">
+    <circle cx="32" cy="32" r="7"/>
+    <circle cx="16" cy="16" r="6"/>
+    <circle cx="48" cy="16" r="6"/>
+    <circle cx="32" cy="50" r="6"/>
+  </g>
+</svg>

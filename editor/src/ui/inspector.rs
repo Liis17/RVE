@@ -11,7 +11,8 @@ use engine_scene::document::MaterialOverride;
 use engine_scene::{
     AntiAliasing, AudioGroup, AudioSourceComponent, CameraComponent, CharacterControllerComponent,
     ColliderComponent, ColliderShape, EnvironmentComponent, HeavyScript, LodGroup, LodLevel,
-    MAX_LOD_LEVELS, MaterialAlphaMode, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
+    MAX_LOD_LEVELS, MaterialAlphaMode, NetAuthority, NetworkIdentityComponent,
+    NetworkTransformComponent, ParamSchema, ParamSpec, ParamValue, PointLightComponent,
     ProceduralSkyComponent, RigidBodyComponent, RigidBodyKind, SceneObject, SceneTransform,
     SpotLightComponent,
 };
@@ -160,6 +161,12 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     }
     if let Some(controller) = object.character_controller {
         show_character_controller(ui, state, id, controller);
+    }
+    if let Some(identity) = object.network_identity {
+        show_network_identity(ui, state, id, identity);
+    }
+    if let Some(transform) = object.network_transform {
+        show_network_transform(ui, state, id, transform);
     }
     for index in 0..object.lite_scripts.len() {
         show_lite_script(ui, state, object, index);
@@ -1589,6 +1596,138 @@ fn show_audio_source(
     run_menu_action(state, id, ComponentKind::AudioSource, action);
 }
 
+fn show_network_identity(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    identity: NetworkIdentityComponent,
+) {
+    let field = OverrideField::NetworkIdentity;
+    let action = component_header(
+        ui,
+        HeaderTitle {
+            text: "Network Identity",
+            icon: component_icon(state, ComponentKind::NetworkIdentity),
+        },
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::NetworkIdentity)),
+        true,
+        |ui| {
+            egui::Grid::new("network_identity")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    let mut value = identity;
+                    ui.label("Authority");
+                    let authority = egui::ComboBox::from_id_salt("network_authority")
+                        .selected_text(net_authority_label(value.authority))
+                        .show_ui(ui, |ui| {
+                            for option in [NetAuthority::Server, NetAuthority::Owner] {
+                                ui.selectable_value(
+                                    &mut value.authority,
+                                    option,
+                                    net_authority_label(option),
+                                );
+                            }
+                        })
+                        .response;
+                    ui.end_row();
+                    commit(state, id, "network_identity", &authority, |object| {
+                        object.network_identity = Some(value);
+                    });
+                });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    // Идентификатор без трансформации не бывает: удаление уносит и `network_transform`.
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| scene.remove_network_identity(id));
+    }
+    run_menu_action(state, id, ComponentKind::NetworkIdentity, action);
+}
+
+fn show_network_transform(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    transform: NetworkTransformComponent,
+) {
+    let field = OverrideField::NetworkTransform;
+    let action = component_header(
+        ui,
+        HeaderTitle {
+            text: "Network Transform",
+            icon: component_icon(state, ComponentKind::NetworkTransform),
+        },
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::NetworkTransform)),
+        true,
+        |ui| {
+            egui::Grid::new("network_transform")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    let mut value = transform;
+                    ui.label("Sync position");
+                    let position = ui.checkbox(&mut value.sync_position, "");
+                    ui.end_row();
+                    ui.label("Sync rotation");
+                    let rotation = ui.checkbox(&mut value.sync_rotation, "");
+                    ui.end_row();
+                    ui.label("Sync scale");
+                    let scale = ui.checkbox(&mut value.sync_scale, "");
+                    ui.end_row();
+                    ui.label("Send rate");
+                    let rate = ui.add(
+                        egui::DragValue::new(&mut value.send_rate_hz)
+                            .range(1..=engine_scene::MAX_SEND_RATE_HZ)
+                            .suffix(" Hz"),
+                    );
+                    ui.end_row();
+                    ui.label("Interpolate");
+                    let interpolate = ui.checkbox(&mut value.interpolate, "");
+                    ui.end_row();
+                    ui.label("Interpolation delay");
+                    let delay = ui.add(
+                        egui::DragValue::new(&mut value.interpolation_delay_ms)
+                            .range(0..=engine_scene::MAX_INTERPOLATION_DELAY_MS)
+                            .suffix(" ms"),
+                    );
+                    ui.end_row();
+                    ui.label("Snap distance");
+                    let snap = ui.add(
+                        egui::DragValue::new(&mut value.snap_distance)
+                            .speed(0.05)
+                            .range(f32::MIN_POSITIVE..=f32::MAX),
+                    );
+                    ui.end_row();
+                    let response = position | rotation | scale | rate | interpolate | delay | snap;
+                    commit(state, id, "network_transform", &response, |object| {
+                        object.network_transform = Some(value);
+                    });
+                });
+        },
+    );
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| scene.remove_network_transform(id));
+    }
+    run_menu_action(state, id, ComponentKind::NetworkTransform, action);
+}
+
+fn net_authority_label(authority: NetAuthority) -> &'static str {
+    match authority {
+        NetAuthority::Server => "Server",
+        NetAuthority::Owner => "Owner",
+    }
+}
+
 fn show_particle_emitter(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -2978,6 +3117,29 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                     }
                 }
             });
+        }
+        if object.network_identity.is_none() && ui.button("Network Identity").clicked() {
+            state.edit_scene(|scene| {
+                scene.set_component(
+                    id,
+                    Component::NetworkIdentity(NetworkIdentityComponent::default()),
+                )
+            });
+        }
+        if object.network_transform.is_none() {
+            let has_identity = object.network_identity.is_some();
+            if ui
+                .add_enabled(has_identity, egui::Button::new("Network Transform"))
+                .on_disabled_hover_text("Сначала добавьте Network Identity")
+                .clicked()
+            {
+                state.edit_scene(|scene| {
+                    scene.set_component(
+                        id,
+                        Component::NetworkTransform(NetworkTransformComponent::default()),
+                    )
+                });
+            }
         }
         if object.mesh_renderer.is_some()
             && object.animator.is_none()

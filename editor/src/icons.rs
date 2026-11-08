@@ -49,6 +49,8 @@ pub fn component_icon(kind: ComponentKind) -> Option<&'static str> {
         ComponentKind::SpotLight => Some("spot-light"),
         ComponentKind::Collider => Some("collider"),
         ComponentKind::AudioSource => Some("audio-component"),
+        ComponentKind::NetworkIdentity => Some("network-identity"),
+        ComponentKind::NetworkTransform => Some("network-transform"),
         _ => None,
     }
 }
@@ -203,6 +205,14 @@ mod tests {
             component_icon(ComponentKind::AudioSource),
             Some("audio-component")
         );
+        assert_eq!(
+            component_icon(ComponentKind::NetworkIdentity),
+            Some("network-identity")
+        );
+        assert_eq!(
+            component_icon(ComponentKind::NetworkTransform),
+            Some("network-transform")
+        );
         assert_eq!(component_icon(ComponentKind::RigidBody), None);
         assert_eq!(
             file_icon(AssetKind::CameraSettings),
@@ -222,6 +232,8 @@ mod tests {
             ComponentKind::RigidBody,
             ComponentKind::CharacterController,
             ComponentKind::AudioSource,
+            ComponentKind::NetworkIdentity,
+            ComponentKind::NetworkTransform,
         ];
         let icons = components
             .into_iter()
