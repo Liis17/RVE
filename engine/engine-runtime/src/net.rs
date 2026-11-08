@@ -134,7 +134,7 @@ impl<'a> ScriptNetSink<'a> {
 }
 
 impl WorldSink for ScriptNetSink<'_> {
-    fn set_network_state(&mut self, mode: NetMode, local_peer: PeerId, peers: Vec<PeerId>) {
+    fn set_network_state(&mut self, mode: NetMode, local_peer: Option<PeerId>, peers: Vec<PeerId>) {
         self.scripts.set_network_state(mode, local_peer, peers);
     }
 

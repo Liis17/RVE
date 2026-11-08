@@ -115,15 +115,15 @@ return Script
     run(&mut world, &mut host, 0.0, 1);
     assert_eq!(infos(&mut host), ["offline true false 0 0"]);
 
-    host.set_network_state(NetMode::Host, 0, vec![1, 2]);
+    host.set_network_state(NetMode::Host, Some(0), vec![1, 2]);
     run(&mut world, &mut host, 0.1, 2);
     assert_eq!(infos(&mut host), ["host true true 0 2"]);
 
-    host.set_network_state(NetMode::Server, 0, vec![]);
+    host.set_network_state(NetMode::Server, Some(0), vec![]);
     run(&mut world, &mut host, 0.2, 3);
     assert_eq!(infos(&mut host), ["server true false 0 0"]);
 
-    host.set_network_state(NetMode::Client, 5, vec![0]);
+    host.set_network_state(NetMode::Client, Some(5), vec![0]);
     run(&mut world, &mut host, 0.3, 4);
     assert_eq!(infos(&mut host), ["client false true 5 1"]);
 }
@@ -147,7 +147,7 @@ end
 return Script
 "#;
     let (mut world, mut host) = load(sender, BLANK);
-    host.set_network_state(NetMode::Host, 0, vec![]);
+    host.set_network_state(NetMode::Host, Some(0), vec![]);
     run(&mut world, &mut host, 0.0, 1);
     let player = world.handle("player").unwrap();
     assert_eq!(
@@ -206,7 +206,7 @@ end
 return Script
 "#;
     let (mut world, mut host) = load(sender, BLANK);
-    host.set_network_state(NetMode::Server, 0, vec![]);
+    host.set_network_state(NetMode::Server, Some(0), vec![]);
     run(&mut world, &mut host, 0.0, 1);
     assert!(host.drain_network_requests().is_empty());
     let logged = infos(&mut host);
@@ -248,7 +248,7 @@ end
 return Script
 "#;
     let (mut world, mut host) = load(sender, BLANK);
-    host.set_network_state(NetMode::Client, 5, vec![0]);
+    host.set_network_state(NetMode::Client, Some(5), vec![0]);
     run(&mut world, &mut host, 0.0, 1);
     assert_eq!(
         host.drain_network_requests(),
@@ -279,7 +279,7 @@ end
 return Script
 "#;
     let (mut world, mut host) = load(owner, BLANK);
-    host.set_network_state(NetMode::Server, 0, vec![4]);
+    host.set_network_state(NetMode::Server, Some(0), vec![4]);
     run(&mut world, &mut host, 0.0, 1);
     assert_eq!(
         host.drain_network_requests(),
@@ -304,7 +304,7 @@ return Script
 "#;
     let (mut world, mut host) = load(reader, reader);
     let player = world.handle("player").unwrap();
-    host.set_network_state(NetMode::Client, 5, vec![0]);
+    host.set_network_state(NetMode::Client, Some(5), vec![0]);
     host.set_object_net(player, NetId::scene(42).unwrap(), Some(5));
     run(&mut world, &mut host, 0.0, 1);
     let logged = infos(&mut host);
@@ -322,7 +322,7 @@ return Script
         "{logged:?}"
     );
 
-    host.set_network_state(NetMode::Server, 0, vec![]);
+    host.set_network_state(NetMode::Server, Some(0), vec![]);
     run(&mut world, &mut host, 0.2, 3);
     let logged = infos(&mut host);
     assert!(logged.contains(&"42 4 false true".to_owned()), "{logged:?}");
@@ -332,7 +332,7 @@ return Script
 fn net_messages_reach_the_addressed_object_or_every_instance_with_the_callback() {
     let (mut world, mut host) = load(ECHO, ECHO);
     let player = world.handle("player").unwrap();
-    host.set_network_state(NetMode::Server, 0, vec![3]);
+    host.set_network_state(NetMode::Server, Some(0), vec![3]);
     host.queue_network_events(
         &world,
         [
@@ -542,16 +542,15 @@ fn template(text: &str) -> Arc<PrefabTemplate> {
     Arc::new(PrefabTemplate::load(&path, &mut read).unwrap())
 }
 
-/// Сцена с префабом. Регистрируется шаблон `text`, его скрипты берутся из `SHIP_LUA`;
-/// скрипт игрока — `player`.
-fn prefab_host(player: &str, text: &str) -> (World, ScriptHost) {
+/// Сцена с префабом без шаблона: его вид — `kind`, шаблон регистрирует вызывающий.
+fn unregistered_prefab_host(player: &str, kind: PrefabKind) -> (World, ScriptHost) {
     let world =
         World::from_document(&SceneDocument::parse("test.rvescene", SCENE).unwrap()).unwrap();
     let mut prefabs = PrefabCatalog::default();
     prefabs.insert(
         PREFAB,
         PrefabSpec {
-            kind: PrefabKind::Fast,
+            kind,
             max_instances: None,
         },
     );
@@ -560,7 +559,7 @@ fn prefab_host(player: &str, text: &str) -> (World, ScriptHost) {
         ("other.lua".to_owned(), BLANK.to_owned()),
         ("ship.lua".to_owned(), SHIP_LUA.to_owned()),
     ]);
-    let mut host = ScriptHost::load_with_options(
+    let host = ScriptHost::load_with_options(
         &world,
         "scene",
         &sources,
@@ -571,6 +570,13 @@ fn prefab_host(player: &str, text: &str) -> (World, ScriptHost) {
         },
     )
     .unwrap();
+    (world, host)
+}
+
+/// Сцена с префабом. Регистрируется шаблон `text`, его скрипты берутся из `SHIP_LUA`;
+/// скрипт игрока — `player`.
+fn prefab_host(player: &str, text: &str) -> (World, ScriptHost) {
+    let (world, mut host) = unregistered_prefab_host(player, PrefabKind::Fast);
     host.register_prefab(
         &world,
         PREFAB,
@@ -594,7 +600,7 @@ return Script
 "#
     );
     let (mut world, mut host) = prefab_host(&spawner, NET_PREFAB_TEXT);
-    host.set_network_state(NetMode::Client, 5, vec![0]);
+    host.set_network_state(NetMode::Client, Some(5), vec![0]);
     run(&mut world, &mut host, 0.0, 1);
     let logged = infos(&mut host);
     assert!(logged[0].starts_with("false "), "{logged:?}");
@@ -733,4 +739,64 @@ fn spawn_external_rejects_unregistered_prefabs_without_leaving_objects() {
         errors(&mut host).is_empty(),
         "отказ проверки возвращается вызывающему коду"
     );
+}
+
+#[test]
+fn heavy_networked_prefab_spawned_by_a_client_script_is_refused_when_it_loads() {
+    let spawner = format!(
+        r#"
+local Script = {{}}
+function Script:on_update()
+  rve.spawn("{PREFAB}", {{ id = "local_ship" }})
+end
+return Script
+"#
+    );
+    let (mut world, mut host) = unregistered_prefab_host(&spawner, PrefabKind::Heavy);
+    host.set_network_state(NetMode::Client, Some(5), vec![0]);
+    // Шаблон ещё не загружен: проверка при вызове пройти не может, spawn ждёт загрузки.
+    run(&mut world, &mut host, 0.0, 1);
+    assert!(world.handle("local_ship").is_none());
+
+    host.register_prefab(
+        &world,
+        PREFAB,
+        template(NET_PREFAB_TEXT),
+        &BTreeMap::from([("ship.lua".to_owned(), SHIP_LUA.to_owned())]),
+    )
+    .unwrap();
+    run(&mut world, &mut host, 0.1, 2);
+    assert!(
+        world.handle("local_ship").is_none(),
+        "сетевой префаб не создан клиентом"
+    );
+    assert!(host.drain_world_changes().spawned.is_empty());
+    let logged = errors(&mut host);
+    assert!(
+        logged.iter().any(|line| line.contains("network objects")),
+        "{logged:?}"
+    );
+}
+
+#[test]
+fn an_unknown_local_peer_owns_nothing_until_it_is_known() {
+    let reader = r#"
+local Script = {}
+function Script:on_update()
+  local obj = rve.find(self.object.id)
+  rve.log_info(tostring(obj:net_owner()) .. " "
+    .. tostring(obj:is_owner()) .. " " .. tostring(obj:has_authority()))
+end
+return Script
+"#;
+    let (mut world, mut host) = load(reader, reader);
+    let player = world.handle("player").unwrap();
+    host.set_network_state(NetMode::Client, None, vec![]);
+    host.set_object_net(player, NetId::scene(42).unwrap(), Some(0));
+    run(&mut world, &mut host, 0.0, 1);
+    assert!(infos(&mut host).contains(&"0 false false".to_owned()));
+
+    host.set_network_state(NetMode::Client, Some(0), vec![]);
+    run(&mut world, &mut host, 0.1, 2);
+    assert!(infos(&mut host).contains(&"0 true true".to_owned()));
 }

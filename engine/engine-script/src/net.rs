@@ -7,7 +7,7 @@
 use crate::lite::EventQueue;
 use crate::transaction::{MAX_MESSAGE_NAME_BYTES, MessageValueBudget};
 use crate::types::{ScriptEvent, ScriptEventLevel};
-use engine_scene::{NetId, NetMode, ObjectHandle, ParamValue, PeerId};
+use engine_scene::{NetId, NetMode, ObjectHandle, ParamValue, PeerId, PrefabTemplate};
 use std::collections::{HashMap, HashSet};
 
 /// Наибольшее число сетевых запросов, которые скрипты ставят за кадр, включая уже зафиксированные.
@@ -30,13 +30,19 @@ pub(crate) struct NetObjectState {
 #[derive(Default)]
 pub(crate) struct NetScriptState {
     mode: NetMode,
-    local_peer: PeerId,
+    /// Свой номер; клиент до `LocalPeer` его не знает.
+    local_peer: Option<PeerId>,
     peers: Vec<PeerId>,
     objects: HashMap<ObjectHandle, NetObjectState>,
 }
 
 impl NetScriptState {
-    pub(crate) fn set_network(&mut self, mode: NetMode, local_peer: PeerId, peers: Vec<PeerId>) {
+    pub(crate) fn set_network(
+        &mut self,
+        mode: NetMode,
+        local_peer: Option<PeerId>,
+        peers: Vec<PeerId>,
+    ) {
         self.mode = mode;
         self.local_peer = local_peer;
         self.peers = peers;
@@ -46,7 +52,7 @@ impl NetScriptState {
         self.mode
     }
 
-    pub(crate) fn local_peer(&self) -> PeerId {
+    pub(crate) fn local_peer(&self) -> Option<PeerId> {
         self.local_peer
     }
 
@@ -65,6 +71,14 @@ impl NetScriptState {
     pub(crate) fn clear_object(&mut self, handle: ObjectHandle) {
         self.objects.remove(&handle);
     }
+}
+
+/// Префаб содержит сетевые объекты: клиент получает их только от сервера.
+pub(crate) fn networked_template(template: &PrefabTemplate) -> bool {
+    template
+        .objects()
+        .iter()
+        .any(|object| object.network_identity.is_some())
 }
 
 /// Бюджет входящих сообщений одного update. Счётчики сбрасываются, когда очередь уходит в скрипты.

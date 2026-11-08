@@ -3,6 +3,8 @@
 //! Формат: версия (1 байт), тип (1 байт), тело. Числа — big-endian, как в кодеке значений.
 //! Разбор проверяет длины до выделения памяти, отклоняет нечисловые значения и не паникует.
 
+use std::ops::Range;
+
 use engine_scene::document::SceneDocument;
 use engine_scene::network::{NetAuthority, NetId, NetworkTransformComponent, PeerId};
 use engine_scene::{LocalTransform, ParamValue};
@@ -10,9 +12,11 @@ use glam::Vec3;
 
 use crate::NetError;
 use crate::codec::{Reader, decode_value, encode_value};
+use crate::packet::FRAGMENT_PAYLOAD;
 
 /// Версия формата репликации. Несовпадение версий — ошибка разбора сообщения.
-pub const VERSION: u8 = 1;
+/// Версия 2: состояния передаются пакетами [`Message::States`].
+pub const VERSION: u8 = 2;
 /// Наибольшая длина пути префаба в сообщении.
 pub const MAX_PREFAB_BYTES: usize = 512;
 /// Наибольшая длина id объекта: совпадает с лимитом авторского id в `World`.
@@ -21,6 +25,8 @@ pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_NAME_BYTES: usize = 64;
 /// Размер одного snapshot-сообщения; остальное уходит следующими сообщениями.
 pub const SNAPSHOT_CHUNK_BYTES: usize = 60 * 1024;
+/// Наибольший размер пакета состояний. Ненадёжный канал передаёт сообщение одним кадром.
+pub const STATE_BATCH_BYTES: usize = FRAGMENT_PAYLOAD;
 
 /// Маски полей позы: какие значения переданы.
 pub const MASK_POSITION: u8 = 1;
@@ -32,7 +38,7 @@ const TAG_SPAWN: u8 = 1;
 const TAG_DESPAWN: u8 = 2;
 const TAG_SCENE_DELETED: u8 = 3;
 const TAG_SET_OWNER: u8 = 4;
-const TAG_STATE: u8 = 5;
+const TAG_STATES: u8 = 5;
 const TAG_RPC: u8 = 6;
 const TAG_SNAPSHOT: u8 = 7;
 const TAG_SNAPSHOT_END: u8 = 8;
@@ -128,6 +134,14 @@ pub struct SpawnBody {
     pub pose: Pose,
 }
 
+/// Состояние одного объекта в пакете: `mask` — переданные поля позы.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StateItem {
+    pub object: NetId,
+    pub mask: u8,
+    pub pose: Pose,
+}
+
 /// Элемент снимка для нового участника.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SnapItem {
@@ -154,12 +168,10 @@ pub enum Message {
         object: NetId,
         owner: Option<PeerId>,
     },
-    /// Состояние позы; `tick` — серверная метка времени, `mask` — переданные поля.
-    State {
-        object: NetId,
+    /// Состояния поз одним пакетом; `tick` — серверная метка времени общая для всех элементов.
+    States {
         tick: u32,
-        mask: u8,
-        pose: Pose,
+        items: Vec<StateItem>,
     },
     /// RPC. `object` задаёт адресата-объект, `None` — сообщение без объекта.
     Rpc {
@@ -227,17 +239,12 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, NetError> {
             put_u32(&mut out, object.get());
             put_opt_peer(&mut out, *owner);
         }
-        Message::State {
-            object,
-            tick,
-            mask,
-            pose,
-        } => {
-            out.push(TAG_STATE);
-            put_u32(&mut out, object.get());
+        Message::States { tick, items } => {
+            out.push(TAG_STATES);
             put_u32(&mut out, *tick);
-            out.push(*mask);
-            put_masked_pose(&mut out, pose, *mask);
+            for item in items {
+                write_state_item(&mut out, item);
+            }
         }
         Message::Rpc {
             object,
@@ -259,6 +266,28 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, NetError> {
         Message::ResyncRequest => out.push(TAG_RESYNC),
     }
     Ok(out)
+}
+
+/// Делит состояния на непрерывные группы, каждая из которых кодируется в одно сообщение
+/// не больше [`STATE_BATCH_BYTES`]. Одно состояние больше сообщения не бывает.
+pub fn state_batches(items: &[StateItem]) -> Vec<Range<usize>> {
+    const HEADER: usize = 2 + 4;
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut size = HEADER;
+    for (index, item) in items.iter().enumerate() {
+        let len = state_item_len(item);
+        if index > start && size + len > STATE_BATCH_BYTES {
+            batches.push(start..index);
+            start = index;
+            size = HEADER;
+        }
+        size += len;
+    }
+    if start < items.len() {
+        batches.push(start..items.len());
+    }
+    batches
 }
 
 /// Делит снимок на сообщения не больше [`SNAPSHOT_CHUNK_BYTES`]. Элементы не рвутся.
@@ -304,18 +333,17 @@ pub fn decode(bytes: &[u8]) -> Result<Message, NetError> {
             object: read_net(&mut reader)?,
             owner: read_opt_peer(&mut reader)?,
         },
-        TAG_STATE => {
-            let object = read_net(&mut reader)?;
+        TAG_STATES => {
             let tick = take_u32(&mut reader)?;
-            let mask = take_u8(&mut reader)?;
-            check_mask(mask)?;
-            let pose = read_masked_pose(&mut reader, mask)?;
-            Message::State {
-                object,
-                tick,
-                mask,
-                pose,
+            let mut items = Vec::new();
+            while reader.remaining() > 0 {
+                items.push(read_state_item(&mut reader)?);
             }
+            // Пустой пакет кодек не создаёт; обрезанное до заголовка сообщение — ошибка.
+            if items.is_empty() {
+                return Err(invalid("пустой пакет состояний"));
+            }
+            Message::States { tick, items }
         }
         TAG_RPC => Message::Rpc {
             object: read_opt_peer(&mut reader)?.map(NetId::from_raw),
@@ -341,8 +369,9 @@ pub fn decode(bytes: &[u8]) -> Result<Message, NetError> {
 
 /// Канонический хэш раскрытого документа сцены для проверки совместимости клиента и сервера.
 ///
-/// Учитываются сетевые объекты (id, authority, `network_transform`) и экземпляры префабов
-/// (id, путь). Порядок в тексте и форматирование TOML на хэш не влияют.
+/// Учитываются сетевые объекты документа (id, authority, `network_transform`). Документ — результат
+/// раскрытия префабов: экземпляры `[[instances]]` в нём уже развёрнуты, поэтому путь префаба входит
+/// в хэш только через раскрытые объекты. Порядок в тексте и форматирование TOML на хэш не влияют.
 pub fn scene_hash(document: &SceneDocument) -> [u8; 32] {
     let mut objects: Vec<Vec<u8>> = document
         .objects
@@ -400,6 +429,25 @@ pub fn scene_hash(document: &SceneDocument) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("RVE network scene hash v1");
     hasher.update(&buffer);
     *hasher.finalize().as_bytes()
+}
+
+/// Размер элемента состояния в пакете: id, маска и поля позы, отмеченные маской.
+fn state_item_len(item: &StateItem) -> usize {
+    4 + 1 + 12 * (item.mask & MASK_ALL).count_ones() as usize
+}
+
+fn write_state_item(out: &mut Vec<u8>, item: &StateItem) {
+    put_u32(out, item.object.get());
+    out.push(item.mask);
+    put_masked_pose(out, &item.pose, item.mask);
+}
+
+fn read_state_item(reader: &mut Reader<'_>) -> Result<StateItem, NetError> {
+    let object = read_net(reader)?;
+    let mask = take_u8(reader)?;
+    check_mask(mask)?;
+    let pose = read_masked_pose(reader, mask)?;
+    Ok(StateItem { object, mask, pose })
 }
 
 fn write_spawn(out: &mut Vec<u8>, body: &SpawnBody) -> Result<(), NetError> {

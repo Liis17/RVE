@@ -4,7 +4,7 @@ use crate::lifecycle::{
     SpawnRequest, check_spawn_request, prefab_display, prefab_key,
 };
 use crate::lite::EventQueue;
-use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState};
+use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
 use crate::physics::PhysicsScriptState;
 use crate::types::{ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform};
 use engine_physics::{
@@ -14,7 +14,7 @@ use engine_physics::{
 use engine_scene::{
     AnimationRequest, AudioRequest, CameraSettings, LocalTransform, MAX_MESSAGE_DEPTH,
     MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetMode, NetRequest, NetTarget, ObjectHandle,
-    ParamValue, PeerId, World,
+    ParamValue, PeerId, SERVER_PEER_ID, World,
 };
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
@@ -418,8 +418,9 @@ impl ScriptTransaction {
         self.net.borrow().mode()
     }
 
+    /// Номер локального участника; до подключения клиента скрипты видят 0, как и раньше.
     pub(crate) fn net_local_peer(&self) -> PeerId {
-        self.net.borrow().local_peer()
+        self.net.borrow().local_peer().unwrap_or(SERVER_PEER_ID)
     }
 
     pub(crate) fn net_peers(&self) -> Vec<PeerId> {
@@ -446,16 +447,19 @@ impl ScriptTransaction {
         match net.mode() {
             NetMode::Offline | NetMode::Host | NetMode::Server => true,
             NetMode::Client => {
+                let owner = net.object(handle).and_then(|state| state.owner);
                 identity.authority == engine_scene::NetAuthority::Owner
-                    && net.object(handle).and_then(|state| state.owner) == Some(net.local_peer())
+                    && owner.is_some()
+                    && owner == net.local_peer()
             }
         }
     }
 
-    /// Владелец объекта совпадает с локальным участником.
+    /// Владелец объекта совпадает с локальным участником. Пока номер неизвестен, никто не владелец.
     pub(crate) fn net_is_owner(&self, handle: ObjectHandle) -> bool {
         let net = self.net.borrow();
-        net.object(handle).and_then(|state| state.owner) == Some(net.local_peer())
+        let owner = net.object(handle).and_then(|state| state.owner);
+        owner.is_some() && owner == net.local_peer()
     }
 
     /// Ставит сообщение сети до коммита. Без `object` это `rve.net.send`, с ним — `obj:net_send`.
@@ -915,16 +919,12 @@ impl ScriptTransaction {
                 &args,
             )?;
             // Клиент получает сетевые объекты только от сервера: локальный spawn такого префаба запрещён.
+            // Незагруженный тяжёлый префаб проверяется при создании (см. `ScriptHost::materialize`).
             let networked = lifecycle
                 .prefabs
                 .get(&prefab)
                 .and_then(|slot| slot.template.as_deref())
-                .is_some_and(|template| {
-                    template
-                        .objects()
-                        .iter()
-                        .any(|object| object.network_identity.is_some())
-                });
+                .is_some_and(networked_template);
             if networked && self.net.borrow().mode() == NetMode::Client {
                 return Err(format!(
                     "prefab {:?} has network objects; a client can spawn them only through the network",
@@ -942,6 +942,7 @@ impl ScriptTransaction {
             prefab,
             args,
             source: self.source.clone(),
+            from_script: true,
         });
         Ok(root)
     }

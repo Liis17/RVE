@@ -39,11 +39,25 @@ fn sample_messages() -> Vec<Message> {
             object: NetId::spawned(3).unwrap(),
             owner: Some(0),
         },
-        Message::State {
-            object: NetId::spawned(4).unwrap(),
+        Message::States {
             tick: 99,
-            mask: MASK_ALL,
-            pose: pose(5.0),
+            items: vec![
+                StateItem {
+                    object: NetId::spawned(4).unwrap(),
+                    mask: MASK_ALL,
+                    pose: pose(5.0),
+                },
+                StateItem {
+                    object: NetId::spawned(6).unwrap(),
+                    mask: MASK_POSITION,
+                    // Поля вне маски при разборе приходят нулевыми.
+                    pose: Pose {
+                        position: Vec3::new(-1.0, 2.0, 3.0),
+                        rotation_deg: Vec3::ZERO,
+                        scale: Vec3::ZERO,
+                    },
+                },
+            ],
         },
         Message::Rpc {
             object: None,
@@ -78,35 +92,77 @@ fn every_message_round_trips() {
     }
 }
 
+fn one_state(x: f32) -> StateItem {
+    StateItem {
+        object: NetId::spawned(4).unwrap(),
+        mask: MASK_POSITION,
+        pose: pose(x),
+    }
+}
+
 #[test]
 fn state_carries_only_the_masked_fields() {
-    let message = Message::State {
-        object: NetId::spawned(4).unwrap(),
+    let message = Message::States {
         tick: 1,
-        mask: MASK_POSITION,
-        pose: pose(5.0),
+        items: vec![one_state(5.0)],
     };
     let bytes = encode(&message).unwrap();
-    // версия, тип, id, тик, маска и три числа позиции
+    // версия, тип, тик, id, маска и три числа позиции
     assert_eq!(bytes.len(), 2 + 4 + 4 + 1 + 12);
-    let Message::State {
-        mask,
-        pose: decoded,
-        ..
-    } = decode(&bytes).unwrap()
-    else {
-        panic!("ожидалось состояние");
+    let Message::States { items, .. } = decode(&bytes).unwrap() else {
+        panic!("ожидался пакет состояний");
     };
-    assert_eq!(mask, MASK_POSITION);
-    assert_eq!(decoded.position, pose(5.0).position);
-    assert_eq!(decoded.rotation_deg, Vec3::ZERO);
+    assert_eq!(items[0].mask, MASK_POSITION);
+    assert_eq!(items[0].pose.position, pose(5.0).position);
+    assert_eq!(items[0].pose.rotation_deg, Vec3::ZERO);
+}
+
+#[test]
+fn state_batches_cover_every_item_and_fit_one_frame() {
+    let items: Vec<StateItem> = (0..300)
+        .map(|index| StateItem {
+            object: NetId::spawned(index + 1).unwrap(),
+            mask: if index % 3 == 0 {
+                MASK_POSITION
+            } else {
+                MASK_ALL
+            },
+            pose: pose(index as f32),
+        })
+        .collect();
+    let batches = state_batches(&items);
+    assert!(batches.len() > 1, "300 состояний не помещаются в один кадр");
+    let mut next = 0;
+    for range in &batches {
+        assert_eq!(range.start, next, "группы идут подряд без пропусков");
+        next = range.end;
+        let bytes = encode(&Message::States {
+            tick: 7,
+            items: items[range.clone()].to_vec(),
+        })
+        .unwrap();
+        assert!(bytes.len() <= STATE_BATCH_BYTES, "{} байт", bytes.len());
+    }
+    assert_eq!(next, items.len());
+}
+
+#[test]
+fn empty_state_batch_is_rejected() {
+    let bytes = encode(&Message::States {
+        tick: 1,
+        items: vec![one_state(0.0)],
+    })
+    .unwrap();
+    assert!(decode(&bytes[..6]).is_err(), "пакет без элементов");
 }
 
 #[test]
 fn truncated_messages_are_rejected() {
+    // Пакеты состояний и снимки — последовательности без счётчика: обрыв на границе элемента даёт
+    // короче, но валидный пакет. Транспорт передаёт сообщение целиком, поэтому проверяем отдельно.
     for message in sample_messages()
         .into_iter()
-        .filter(|message| !matches!(message, Message::Snapshot(_)))
+        .filter(|message| !matches!(message, Message::Snapshot(_) | Message::States { .. }))
     {
         let bytes = encode(&message).unwrap();
         for len in 0..bytes.len() {
@@ -115,6 +171,18 @@ fn truncated_messages_are_rejected() {
                 "{message:?} обрезано до {len}"
             );
         }
+    }
+}
+
+#[test]
+fn truncated_single_state_batch_is_rejected() {
+    let bytes = encode(&Message::States {
+        tick: 1,
+        items: vec![one_state(2.0)],
+    })
+    .unwrap();
+    for len in 0..bytes.len() {
+        assert!(decode(&bytes[..len]).is_err(), "пакет обрезан до {len}");
     }
 }
 
@@ -128,11 +196,13 @@ fn malformed_headers_and_bodies_are_errors() {
         "лишние байты"
     );
     // Маска с неизвестными битами.
-    let mut state = encode(&Message::State {
-        object: NetId::spawned(4).unwrap(),
+    let mut state = encode(&Message::States {
         tick: 1,
-        mask: MASK_ALL,
-        pose: pose(0.0),
+        items: vec![StateItem {
+            object: NetId::spawned(4).unwrap(),
+            mask: MASK_ALL,
+            pose: pose(0.0),
+        }],
     })
     .unwrap();
     state[2 + 4 + 4] = 0x40;
@@ -144,11 +214,9 @@ fn malformed_headers_and_bodies_are_errors() {
 
 #[test]
 fn non_finite_pose_values_are_rejected() {
-    let mut bytes = encode(&Message::State {
-        object: NetId::spawned(4).unwrap(),
+    let mut bytes = encode(&Message::States {
         tick: 1,
-        mask: MASK_POSITION,
-        pose: pose(0.0),
+        items: vec![one_state(0.0)],
     })
     .unwrap();
     let nan = f32::NAN.to_bits().to_be_bytes();

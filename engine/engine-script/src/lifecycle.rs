@@ -153,6 +153,8 @@ pub(crate) struct SpawnRequest {
     pub(crate) prefab: String,
     pub(crate) args: SpawnArgs,
     pub(crate) source: String,
+    /// Заявка от скрипта, а не от сетевого моста: клиенту скрипт не создаёт сетевые префабы.
+    pub(crate) from_script: bool,
 }
 
 /// Заявка на удаление поддерева. `due = None` — в конце текущей фазы.

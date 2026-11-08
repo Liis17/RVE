@@ -12,7 +12,7 @@ use crate::lite::{
 };
 use crate::net::{
     InboundBudget, MAX_INBOUND_MESSAGES_PER_PEER, NetErrorLog, NetObjectState, NetScriptState,
-    validate_message,
+    networked_template, validate_message,
 };
 use crate::physics::PhysicsScriptState;
 use crate::transaction::{
@@ -919,7 +919,12 @@ impl ScriptHost {
     ///
     /// Until the bridge calls this, the host is `Offline`: `is_server()` and `has_authority()` are
     /// true, `is_client()` is false, and `send` or `set_net_owner` stage no request.
-    pub fn set_network_state(&mut self, mode: NetMode, local_peer: PeerId, peers: Vec<PeerId>) {
+    pub fn set_network_state(
+        &mut self,
+        mode: NetMode,
+        local_peer: Option<PeerId>,
+        peers: Vec<PeerId>,
+    ) {
         self.net.borrow_mut().set_network(mode, local_peer, peers);
     }
 
@@ -1022,6 +1027,7 @@ impl ScriptHost {
             prefab: prefab.clone(),
             args,
             source: self.scene_name.clone(),
+            from_script: false,
         });
         self.apply_queued_spawns(world);
         let waiting = self
@@ -2057,6 +2063,17 @@ impl ScriptHost {
         template: &PrefabTemplate,
         template_index: usize,
     ) -> Result<(), String> {
+        // Скриптовый spawn клиента проверен при вызове, но шаблон тяжёлого префаба мог ещё не быть
+        // загружен: проверка повторяется здесь. Мост создаёт сетевые объекты через `spawn_external`.
+        if request.from_script
+            && self.net.borrow().mode() == NetMode::Client
+            && networked_template(template)
+        {
+            return Err(format!(
+                "prefab {:?} has network objects; a client can spawn them only through the network",
+                prefab_display(&request.prefab)
+            ));
+        }
         let objects = template.objects();
         let count = objects.len();
         if self.frame_spawned + count > MAX_SPAWNED_OBJECTS_PER_FRAME {

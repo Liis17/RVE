@@ -21,8 +21,8 @@ use log::{debug, error, warn};
 
 use crate::interpolation::{Clock, Sample, push_sample, sample_at};
 use crate::replication::{
-    self, MASK_POSITION, MASK_ROTATION, MASK_SCALE, Message, Pose, SnapItem, SpawnBody,
-    child_net_id, sync_mask,
+    self, MASK_POSITION, MASK_ROTATION, MASK_SCALE, Message, Pose, SnapItem, SpawnBody, StateItem,
+    child_net_id, state_batches, sync_mask,
 };
 use crate::{Channel, NetError, NetworkEvent, NetworkHandle};
 
@@ -32,12 +32,19 @@ pub const FAULT_LIMIT: u32 = 32;
 pub const FAULT_WINDOW: Duration = Duration::from_secs(10);
 /// Наибольший интервал между keyframe состояния, даже если оно не менялось.
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
-/// Наибольшее число надёжных сообщений, ждущих места в очереди.
-const RETRY_LIMIT: usize = 4096;
+/// Наибольший объём надёжных сообщений участника, ждущих места в очереди команд. Переполнение
+/// отключает участника: его очередь не может расти без предела, а остальные участники не ждут её.
+const RETRY_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+/// Наименьший интервал между снимками по запросу одного участника. Более частые запросы — ошибки.
+const RESYNC_INTERVAL: Duration = Duration::from_secs(5);
+/// Наибольшее число удалённых сетевых id, которые помнятся: состояние к ним не буферизуется.
+const REMOVED_LIMIT: usize = 65_536;
 /// Наибольшее число состояний неизвестных объектов, которые буферизуются.
 const BUFFER_LIMIT: usize = 4096;
 /// Причина отключения участника за ошибки сообщений.
 const FAULT_REASON: &str = "слишком много ошибок в сетевых сообщениях";
+/// Причина отключения участника, чья очередь повторной отправки переполнена.
+pub(crate) const RETRY_REASON: &str = "очередь надёжных сообщений переполнена";
 /// Причина отключения клиента, которому не удалось создать объект дважды подряд.
 const SPAWN_REASON: &str = "не удалось создать сетевой объект после повторного запроса";
 
@@ -65,8 +72,9 @@ impl NetLink for NetworkHandle {
 
 /// Операции над миром, которые мост не может выполнить сам.
 pub trait WorldSink {
-    /// Режим и номера участников для скриптов (`rve.net.mode()`, `peers()`).
-    fn set_network_state(&mut self, mode: NetMode, local_peer: PeerId, peers: Vec<PeerId>);
+    /// Режим, свой номер и участники для скриптов (`rve.net.mode()`, `peers()`). Клиент до события
+    /// `LocalPeer` своего номера не знает: передаётся `None`.
+    fn set_network_state(&mut self, mode: NetMode, local_peer: Option<PeerId>, peers: Vec<PeerId>);
     /// Сетевой id и владелец объекта.
     fn set_object_net(&mut self, object: ObjectHandle, net_id: NetId, owner: Option<PeerId>);
     /// Создаёт корень префаба с явным id. Тяжёлый префаб может вернуть резерв, который станет живым
@@ -142,11 +150,20 @@ struct PendingSpawn {
     owner: Option<PeerId>,
 }
 
-/// Последнее состояние объекта, которого ещё нет в мире.
+/// Последнее состояние объекта, которого ещё нет в мире. `seq` — порядок первой буферизации.
 #[derive(Clone, Copy, Debug)]
 struct PartialState {
     mask: u8,
     pose: Pose,
+    seq: u64,
+}
+
+/// Надёжные сообщения одного участника, ждущие места в очереди команд. Порядок внутри участника
+/// сохраняется; `bytes` — их суммарный размер.
+#[derive(Default)]
+struct Backlog {
+    messages: VecDeque<(Channel, Vec<u8>)>,
+    bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,19 +176,28 @@ struct FaultWindow {
 pub struct NetworkBridge<L: NetLink> {
     link: L,
     mode: NetMode,
-    local_peer: PeerId,
+    /// Свой номер; у клиента неизвестен до события `LocalPeer`.
+    local_peer: Option<PeerId>,
     clock: Clock,
     replicas: BTreeMap<NetId, Replica>,
     by_handle: HashMap<ObjectHandle, NetId>,
     pending: BTreeMap<NetId, PendingSpawn>,
     buffered: BTreeMap<NetId, PartialState>,
+    buffer_seq: u64,
+    /// Удалённые за сессию сетевые id: запоздалые состояния к ним не буферизуются.
+    removed: HashSet<NetId>,
+    removed_order: VecDeque<NetId>,
     /// Объекты сцены, удалённые на сервере за сессию (только сервер).
     deleted_scene: BTreeSet<NetId>,
     peers: BTreeSet<PeerId>,
     next_serial: u32,
     faults: HashMap<PeerId, FaultWindow>,
     refusals: u32,
-    retry: VecDeque<(NetTarget, Channel, Vec<u8>)>,
+    /// Надёжные сообщения, ждущие очереди команд, по участникам. Сервер ключует номером адресата,
+    /// клиент — номером сервера.
+    retry: BTreeMap<PeerId, Backlog>,
+    /// Когда участнику в последний раз отправлен снимок по его запросу.
+    resynced_at: HashMap<PeerId, Instant>,
     /// Клиент: id, пришедшие в текущем снимке.
     snapshot_seen: Option<HashSet<NetId>>,
 }
@@ -191,18 +217,22 @@ impl<L: NetLink> NetworkBridge<L> {
         let mut bridge = Self {
             link,
             mode: config.mode,
-            local_peer: SERVER_PEER_ID,
+            local_peer: (config.mode != NetMode::Client).then_some(SERVER_PEER_ID),
             clock: Clock::new(now, config.tick_hz),
             replicas: BTreeMap::new(),
             by_handle: HashMap::new(),
             pending: BTreeMap::new(),
             buffered: BTreeMap::new(),
+            buffer_seq: 0,
+            removed: HashSet::new(),
+            removed_order: VecDeque::new(),
             deleted_scene: BTreeSet::new(),
             peers: BTreeSet::new(),
             next_serial: 1,
             faults: HashMap::new(),
             refusals: 0,
-            retry: VecDeque::new(),
+            retry: BTreeMap::new(),
+            resynced_at: HashMap::new(),
             snapshot_seen: None,
         };
         let scene: Vec<(NetId, ObjectHandle)> = world
@@ -330,7 +360,7 @@ impl<L: NetLink> NetworkBridge<L> {
         match event {
             NetworkEvent::LocalPeer { peer } => {
                 if self.mode == NetMode::Client {
-                    self.local_peer = peer;
+                    self.local_peer = Some(peer);
                     self.sync_state(sink);
                 }
             }
@@ -389,11 +419,12 @@ impl<L: NetLink> NetworkBridge<L> {
     ) {
         self.peers.remove(&peer);
         self.faults.remove(&peer);
+        self.retry.remove(&peer);
+        self.resynced_at.remove(&peer);
         out.push(NetEvent::PeerDisconnected { peer, reason });
         if self.mode == NetMode::Client && peer == SERVER_PEER_ID {
             // Сервер ушёл: клиент работает офлайн, объекты остаются последними известными.
             self.mode = NetMode::Offline;
-            self.retry.clear();
             self.snapshot_seen = None;
         }
         self.sync_state(sink);
@@ -413,23 +444,28 @@ impl<L: NetLink> NetworkBridge<L> {
                 return;
             }
             match message {
-                Message::State {
-                    object, mask, pose, ..
-                } => self.on_owner_state(peer, object, mask, pose, world),
+                Message::States { items, .. } => {
+                    for item in items {
+                        self.on_owner_state(peer, item.object, item.mask, item.pose, world);
+                    }
+                }
                 Message::Rpc {
                     object,
                     name,
                     value,
-                } => {
-                    let handle = object.and_then(|net| self.resolve(net, world));
-                    out.push(NetEvent::Message {
+                } => match self.rpc_object(object, world) {
+                    Ok(object) => out.push(NetEvent::Message {
                         peer,
-                        object: handle,
+                        object,
                         name,
                         value,
-                    });
-                }
-                Message::ResyncRequest => self.send_snapshot(peer, world),
+                    }),
+                    Err(net) => debug!(
+                        "RPC участника {peer} адресован неизвестному объекту {:#010x}",
+                        net.get()
+                    ),
+                },
+                Message::ResyncRequest => self.on_resync(peer, world, now),
                 Message::Spawn(_)
                 | Message::Despawn(_)
                 | Message::SceneDeleted(_)
@@ -453,29 +489,29 @@ impl<L: NetLink> NetworkBridge<L> {
                     }
                 }
                 Message::SetOwner { object, owner } => self.on_set_owner(object, owner, sink),
-                Message::State {
-                    object,
-                    tick,
-                    mask,
-                    pose,
-                } => {
+                Message::States { tick, items } => {
                     self.clock.observe(tick, now);
                     self.clock.last_tick = tick;
-                    self.on_state(object, tick, mask, pose, world);
+                    for item in items {
+                        self.on_state(item.object, tick, item.mask, item.pose, world);
+                    }
                 }
                 Message::Rpc {
                     object,
                     name,
                     value,
-                } => {
-                    let handle = object.and_then(|net| self.resolve(net, world));
-                    out.push(NetEvent::Message {
+                } => match self.rpc_object(object, world) {
+                    Ok(object) => out.push(NetEvent::Message {
                         peer: SERVER_PEER_ID,
-                        object: handle,
+                        object,
                         name,
                         value,
-                    });
-                }
+                    }),
+                    Err(net) => debug!(
+                        "RPC от сервера адресован неизвестному объекту {:#010x}",
+                        net.get()
+                    ),
+                },
                 Message::Snapshot(items) => {
                     self.snapshot_seen.get_or_insert_with(HashSet::new);
                     for item in items {
@@ -512,7 +548,7 @@ impl<L: NetLink> NetworkBridge<L> {
 
     fn on_state(&mut self, object: NetId, tick: u32, mask: u8, pose: Pose, world: &mut World) {
         if let Some(replica) = self.replicas.get_mut(&object) {
-            if replica.authority == NetAuthority::Owner && replica.owner == Some(self.local_peer) {
+            if owned_by(replica, self.local_peer) {
                 return;
             }
             let Some(sync) = replica.sync else {
@@ -539,16 +575,48 @@ impl<L: NetLink> NetworkBridge<L> {
         }
     }
 
-    /// Сохраняет последнее состояние для объекта, которого ещё нет в мире.
+    /// Сохраняет последнее состояние для объекта, которого ещё нет в мире. Удалённые id не
+    /// буферизуются; при переполнении уходит состояние, буферизованное раньше всех.
     fn buffer(&mut self, object: NetId, mask: u8, pose: Pose) {
-        let entry = self
-            .buffered
-            .entry(object)
-            .or_insert(PartialState { mask: 0, pose });
-        entry.pose = entry.pose.merged(pose, mask);
-        entry.mask |= mask;
-        while self.buffered.len() > BUFFER_LIMIT {
-            self.buffered.pop_first();
+        if self.removed.contains(&object) {
+            return;
+        }
+        if let Some(entry) = self.buffered.get_mut(&object) {
+            entry.pose = entry.pose.merged(pose, mask);
+            entry.mask |= mask;
+            return;
+        }
+        self.buffer_seq += 1;
+        self.buffered.insert(
+            object,
+            PartialState {
+                mask,
+                pose,
+                seq: self.buffer_seq,
+            },
+        );
+        if self.buffered.len() > BUFFER_LIMIT {
+            let oldest = self
+                .buffered
+                .iter()
+                .min_by_key(|(_, state)| state.seq)
+                .map(|(net, _)| *net);
+            if let Some(oldest) = oldest {
+                self.buffered.remove(&oldest);
+            }
+        }
+    }
+
+    /// Запоминает удалённый сетевой id; старейшие записи вытесняются по порядку добавления.
+    fn remember_removed(&mut self, net: NetId) {
+        if !self.removed.insert(net) {
+            return;
+        }
+        self.removed_order.push_back(net);
+        if self.removed_order.len() > REMOVED_LIMIT
+            && let Some(oldest) = self.removed_order.pop_front()
+        {
+            self.removed.remove(&oldest);
         }
     }
 
@@ -715,6 +783,7 @@ impl<L: NetLink> NetworkBridge<L> {
     }
 
     fn on_despawn<S: WorldSink>(&mut self, net: NetId, world: &mut World, sink: &mut S) {
+        self.remember_removed(net);
         self.buffered.remove(&net);
         if let Some(pending) = self.pending.remove(&net) {
             sink.despawn(world, pending.handle);
@@ -757,9 +826,7 @@ impl<L: NetLink> NetworkBridge<L> {
                         replica.owner = owner;
                         sink.set_object_net(replica.handle, object, owner);
                     }
-                    let own = replica.authority == NetAuthority::Owner
-                        && replica.owner == Some(self.local_peer);
-                    if !own {
+                    if !owned_by(replica, self.local_peer) {
                         let mask = replica.sync.map_or(0, |sync| mask & sync_mask(&sync));
                         self.teleport(object, pose, mask, world);
                     }
@@ -855,14 +922,15 @@ impl<L: NetLink> NetworkBridge<L> {
             self.send_bytes(NetTarget::Server, channel, bytes);
             return;
         }
+        // Сервер всегда имеет номер SERVER_PEER_ID: локальный адресат — он сам.
         let local = matches!(target, NetTarget::All | NetTarget::Server)
-            || target == NetTarget::Peer(self.local_peer);
+            || target == NetTarget::Peer(SERVER_PEER_ID);
         let Message::Rpc { name, value, .. } = message else {
             return;
         };
         if local {
             out.push(NetEvent::Message {
-                peer: self.local_peer,
+                peer: SERVER_PEER_ID,
                 object: object.map(|(_, handle)| handle),
                 name,
                 value,
@@ -870,7 +938,7 @@ impl<L: NetLink> NetworkBridge<L> {
         }
         match target {
             NetTarget::All => self.send_bytes(NetTarget::All, channel, bytes),
-            NetTarget::Peer(peer) if peer != self.local_peer => {
+            NetTarget::Peer(peer) if peer != SERVER_PEER_ID => {
                 self.send_bytes(NetTarget::Peer(peer), channel, bytes)
             }
             _ => {}
@@ -900,7 +968,10 @@ impl<L: NetLink> NetworkBridge<L> {
                     }
                     scene_gone.push(net);
                 }
-                Kind::Child | Kind::Root(_) => despawned.push(net),
+                Kind::Child | Kind::Root(_) => {
+                    self.remember_removed(net);
+                    despawned.push(net);
+                }
             }
         }
         if !self.is_server() {
@@ -1034,18 +1105,8 @@ impl<L: NetLink> NetworkBridge<L> {
             return;
         }
         let tick = self.clock.server_tick(now);
-        for (net, mask, pose) in self.due_states(world, now, |_| true) {
-            self.transmit(
-                NetTarget::All,
-                Channel::State,
-                &Message::State {
-                    object: net,
-                    tick,
-                    mask,
-                    pose,
-                },
-            );
-        }
+        let due = self.due_states(world, now, |_| true);
+        self.send_batches(NetTarget::All, tick, &due, now);
     }
 
     /// Клиент-владелец шлёт позу своих объектов серверу.
@@ -1055,30 +1116,20 @@ impl<L: NetLink> NetworkBridge<L> {
         }
         let local = self.local_peer;
         let tick = self.clock.last_tick;
-        for (net, mask, pose) in self.due_states(world, now, |replica| {
-            replica.authority == NetAuthority::Owner && replica.owner == Some(local)
-        }) {
-            self.transmit(
-                NetTarget::Server,
-                Channel::State,
-                &Message::State {
-                    object: net,
-                    tick,
-                    mask,
-                    pose,
-                },
-            );
-        }
+        let due = self.due_states(world, now, |replica| owned_by(replica, local));
+        self.send_batches(NetTarget::Server, tick, &due, now);
     }
 
+    /// Состояния, которые пора отправить. Не меняет `last_sent`: его обновляет [`Self::send_batches`]
+    /// для принятых очередью состояний.
     fn due_states(
-        &mut self,
+        &self,
         world: &World,
         now: Instant,
         filter: impl Fn(&Replica) -> bool,
-    ) -> Vec<(NetId, u8, Pose)> {
+    ) -> Vec<StateItem> {
         let mut due = Vec::new();
-        for (net, replica) in self.replicas.iter_mut() {
+        for (net, replica) in self.replicas.iter() {
             if !filter(replica) {
                 continue;
             }
@@ -1104,11 +1155,50 @@ impl<L: NetLink> NetworkBridge<L> {
                 }
             };
             if send {
-                replica.last_sent = Some((pose, now));
-                due.push((*net, mask, pose));
+                due.push(StateItem {
+                    object: *net,
+                    mask,
+                    pose,
+                });
             }
         }
         due
+    }
+
+    /// Отправляет состояния пакетами. `last_sent` меняется только у состояний, которые приняла
+    /// очередь: непринятые уйдут в следующем тике, а не будут ждать keyframe.
+    fn send_batches(&mut self, target: NetTarget, tick: u32, due: &[StateItem], now: Instant) {
+        let mut lost = 0;
+        let mut reason = None;
+        for range in state_batches(due) {
+            let message = Message::States {
+                tick,
+                items: due[range.clone()].to_vec(),
+            };
+            let bytes = match replication::encode(&message) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    error!("пакет состояний не закодирован: {err}");
+                    continue;
+                }
+            };
+            match self.try_send(target, Channel::State, bytes) {
+                Ok(()) => {
+                    for item in &due[range] {
+                        if let Some(replica) = self.replicas.get_mut(&item.object) {
+                            replica.last_sent = Some((item.pose, now));
+                        }
+                    }
+                }
+                Err(err) => {
+                    lost += range.len();
+                    reason = Some(err);
+                }
+            }
+        }
+        if let Some(err) = reason {
+            warn!("{lost} состояний не отправлено: {err}");
+        }
     }
 
     /// Клиент применяет интерполированные позы к объектам с буфером состояний. Свои объекты
@@ -1122,7 +1212,7 @@ impl<L: NetLink> NetworkBridge<L> {
             let Some(sync) = replica.sync else {
                 continue;
             };
-            if replica.authority == NetAuthority::Owner && replica.owner == Some(local) {
+            if owned_by(replica, local) {
                 replica.samples.clear();
                 continue;
             }
@@ -1172,6 +1262,31 @@ impl<L: NetLink> NetworkBridge<L> {
             .filter(|handle| world.is_alive(*handle))
     }
 
+    /// Адресат RPC. `Err` — объект адресован, но неизвестен или удалён: сообщение никому не уходит.
+    fn rpc_object(
+        &self,
+        object: Option<NetId>,
+        world: &World,
+    ) -> Result<Option<ObjectHandle>, NetId> {
+        match object {
+            None => Ok(None),
+            Some(net) => self.resolve(net, world).map(Some).ok_or(net),
+        }
+    }
+
+    /// Снимок по запросу участника. Повтор раньше [`RESYNC_INTERVAL`] — ошибка протокола: снимок
+    /// не отправляется, участник получает штраф в счётчик ошибок.
+    fn on_resync(&mut self, peer: PeerId, world: &World, now: Instant) {
+        if let Some(last) = self.resynced_at.get(&peer)
+            && now.saturating_duration_since(*last) < RESYNC_INTERVAL
+        {
+            self.fault(peer, 1, now);
+            return;
+        }
+        self.resynced_at.insert(peer, now);
+        self.send_snapshot(peer, world);
+    }
+
     fn transmit(&mut self, target: NetTarget, channel: Channel, message: &Message) {
         match replication::encode(message) {
             Ok(bytes) => self.send_bytes(target, channel, bytes),
@@ -1179,41 +1294,129 @@ impl<L: NetLink> NetworkBridge<L> {
         }
     }
 
-    /// Надёжные сообщения при переполненной очереди ждут в `retry`, сохраняя порядок.
+    /// Отправляет сообщение; ошибка попадает в лог.
     fn send_bytes(&mut self, target: NetTarget, channel: Channel, bytes: Vec<u8>) {
-        if channel.is_reliable() && !self.retry.is_empty() {
+        if let Err(err) = self.try_send(target, channel, bytes) {
+            warn!("сообщение репликации не отправлено: {err}");
+        }
+    }
+
+    /// Надёжное сообщение встаёт в очередь повтора, если очередь команд заполнена или у адресата
+    /// уже ждут другие надёжные сообщения (порядок сохраняется). Ненадёжное при переполнении
+    /// возвращает `QueueFull`, его потерю учитывает вызывающий.
+    fn try_send(
+        &mut self,
+        target: NetTarget,
+        channel: Channel,
+        bytes: Vec<u8>,
+    ) -> Result<(), NetError> {
+        if channel.is_reliable() && self.has_backlog(target) {
             self.enqueue_retry(target, channel, bytes);
-            return;
+            return Ok(());
         }
         match self.link.send(target, channel, &bytes) {
-            Ok(()) => {}
             Err(NetError::QueueFull) if channel.is_reliable() => {
-                self.enqueue_retry(target, channel, bytes)
+                self.enqueue_retry(target, channel, bytes);
+                Ok(())
             }
-            Err(err) => warn!("сообщение репликации не отправлено: {err}"),
+            result => result,
         }
     }
 
+    /// Ждут ли адресата надёжные сообщения в очереди повтора.
+    fn has_backlog(&self, target: NetTarget) -> bool {
+        match target {
+            NetTarget::All => self.peers.iter().any(|peer| self.retry.contains_key(peer)),
+            NetTarget::Peer(peer) => self.retry.contains_key(&peer),
+            NetTarget::Server => self.retry.contains_key(&SERVER_PEER_ID),
+        }
+    }
+
+    /// Ставит сообщение в очередь каждого адресата. Участник, чья очередь переполнена, отключается;
+    /// очереди остальных от него не зависят. Адресат, уже не участвующий в сессии, пропускается.
     fn enqueue_retry(&mut self, target: NetTarget, channel: Channel, bytes: Vec<u8>) {
-        if self.retry.len() < RETRY_LIMIT {
-            self.retry.push_back((target, channel, bytes));
-        } else {
-            error!("очередь надёжных сообщений переполнена; сообщение потеряно");
+        let peers: Vec<PeerId> = match target {
+            NetTarget::All => self.peers.iter().copied().collect(),
+            NetTarget::Peer(peer) => vec![peer],
+            NetTarget::Server => vec![SERVER_PEER_ID],
+        };
+        for peer in peers {
+            if !self.peers.contains(&peer) {
+                continue;
+            }
+            let queued = self.retry.get(&peer).map_or(0, |backlog| backlog.bytes);
+            if queued + bytes.len() > RETRY_BYTES_LIMIT {
+                self.retry.remove(&peer);
+                self.peers.remove(&peer);
+                warn!("участник {peer} отключён: {RETRY_REASON}");
+                let _ = self.link.disconnect(peer, RETRY_REASON);
+                continue;
+            }
+            let backlog = self.retry.entry(peer).or_default();
+            backlog.bytes += bytes.len();
+            backlog.messages.push_back((channel, bytes.clone()));
         }
     }
 
+    /// Отправляет очереди повтора по порядку. Очередь ждёт, пока очередь команд заполнена. При
+    /// иной ошибке сети очередь участника очищается одной записью лога.
     fn flush_retry(&mut self) {
-        while let Some((target, channel, bytes)) = self.retry.pop_front() {
-            match self.link.send(target, channel, &bytes) {
-                Ok(()) => {}
-                Err(NetError::QueueFull) => {
-                    self.retry.push_front((target, channel, bytes));
-                    break;
+        let server = self.is_server();
+        for (peer, backlog) in self.retry.iter_mut() {
+            let target = if server {
+                NetTarget::Peer(*peer)
+            } else {
+                NetTarget::Server
+            };
+            while let Some((channel, bytes)) = backlog.messages.pop_front() {
+                match self.link.send(target, channel, &bytes) {
+                    Ok(()) => backlog.bytes -= bytes.len(),
+                    Err(NetError::QueueFull) => {
+                        backlog.messages.push_front((channel, bytes));
+                        break;
+                    }
+                    Err(err) => {
+                        let dropped = backlog.messages.len() + 1;
+                        warn!(
+                            "повторная отправка участнику {peer} остановлена: {err}; сообщений отброшено: {dropped}"
+                        );
+                        backlog.messages.clear();
+                        backlog.bytes = 0;
+                        break;
+                    }
                 }
-                Err(err) => warn!("повторная отправка не удалась: {err}"),
             }
         }
+        self.retry.retain(|_, backlog| !backlog.messages.is_empty());
     }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buffered.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_buffered(&self, net: NetId) -> bool {
+        self.buffered.contains_key(&net)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_peer_known(&self) -> bool {
+        self.local_peer.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backlog_len(&self) -> usize {
+        self.retry
+            .values()
+            .map(|backlog| backlog.messages.len())
+            .sum()
+    }
+}
+
+/// Объект принадлежит локальному участнику: клиент-владелец ведёт его позу сам.
+fn owned_by(replica: &Replica, local: Option<PeerId>) -> bool {
+    local.is_some() && replica.authority == NetAuthority::Owner && replica.owner == local
 }
 
 /// Применяет поля позы, отмеченные в маске, к локальной трансформации объекта.

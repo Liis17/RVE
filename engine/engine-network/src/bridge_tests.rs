@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use engine_files::VirtualPath;
@@ -13,8 +14,8 @@ use engine_scene::{
 };
 use glam::Vec3;
 
-use crate::bridge::{BridgeConfig, NetLink, NetworkBridge, SpawnedRoot, WorldSink};
-use crate::replication::{self, MASK_POSITION, Message, child_net_id};
+use crate::bridge::{BridgeConfig, NetLink, NetworkBridge, RETRY_REASON, SpawnedRoot, WorldSink};
+use crate::replication::{self, MASK_POSITION, Message, Pose, StateItem, child_net_id};
 use crate::{Channel, NetError, NetworkEvent};
 
 const TICK_HZ: u32 = 30;
@@ -51,6 +52,15 @@ struct Hub {
     /// Пока `true`, состояния (канал `State`) не доходят до получателей.
     drop_state: bool,
     snapshot_messages: usize,
+    /// Доставленные `SnapshotEnd`: по одному на каждый отправленный снимок.
+    snapshot_ends: usize,
+    /// Сколько состояний сервер принимает за шаг; `None` — без ограничения.
+    state_budget: Option<usize>,
+    state_sent: usize,
+    /// Участники, чья очередь команд заполнена: надёжные сообщения к ним отклоняются `QueueFull`.
+    stalled: HashSet<PeerId>,
+    /// Сеть остановлена: любая отправка возвращает `Stopped`.
+    stopped: bool,
 }
 
 impl Hub {
@@ -58,13 +68,28 @@ impl Hub {
         self.inbox.entry(to).or_default().push_back(event);
     }
 
+    /// Закрытый участник для сервера: сообщения к нему не принимаются, пока он в `stalled`.
+    fn stalled_for(&self, target: NetTarget) -> bool {
+        match target {
+            NetTarget::All => self
+                .clients
+                .iter()
+                .any(|client| self.stalled.contains(client)),
+            NetTarget::Peer(peer) => self.stalled.contains(&peer),
+            NetTarget::Server => false,
+        }
+    }
+
     fn pump(&mut self) {
+        self.state_sent = 0;
         for (from, target, channel, bytes) in std::mem::take(&mut self.outbox) {
             if channel == Channel::State && self.drop_state {
                 continue;
             }
-            if matches!(replication::decode(&bytes), Ok(Message::Snapshot(_))) {
-                self.snapshot_messages += 1;
+            match replication::decode(&bytes) {
+                Ok(Message::Snapshot(_)) => self.snapshot_messages += 1,
+                Ok(Message::SnapshotEnd) => self.snapshot_ends += 1,
+                _ => {}
             }
             match from {
                 Side::Server => {
@@ -105,9 +130,25 @@ struct Endpoint {
 
 impl NetLink for Endpoint {
     fn send(&self, target: NetTarget, channel: Channel, bytes: &[u8]) -> Result<(), NetError> {
-        self.hub
-            .borrow_mut()
-            .outbox
+        let mut hub = self.hub.borrow_mut();
+        if hub.stopped {
+            return Err(NetError::Stopped);
+        }
+        if self.side == Side::Server {
+            if channel == Channel::State {
+                if hub
+                    .state_budget
+                    .is_some_and(|budget| hub.state_sent >= budget)
+                {
+                    return Err(NetError::QueueFull);
+                }
+                hub.state_sent += 1;
+            }
+            if channel.is_reliable() && hub.stalled_for(target) {
+                return Err(NetError::QueueFull);
+            }
+        }
+        hub.outbox
             .push((self.side, target, channel, bytes.to_vec()));
         Ok(())
     }
@@ -172,7 +213,7 @@ struct TestSink {
     /// Ожидающие загрузки префабы: резервы всех объектов шаблона в порядке шаблона.
     waiting: Vec<(Vec<ObjectHandle>, String, SpawnOptions)>,
     refuse: u32,
-    net_state: Option<(NetMode, PeerId, Vec<PeerId>)>,
+    net_state: Option<(NetMode, Option<PeerId>, Vec<PeerId>)>,
     nets: HashMap<ObjectHandle, (NetId, Option<PeerId>)>,
     events: Vec<NetEvent>,
     faults: Vec<(PeerId, u32)>,
@@ -219,7 +260,7 @@ fn load_template(path: &str, text: &str) -> PrefabTemplate {
 }
 
 impl WorldSink for TestSink {
-    fn set_network_state(&mut self, mode: NetMode, local_peer: PeerId, peers: Vec<PeerId>) {
+    fn set_network_state(&mut self, mode: NetMode, local_peer: Option<PeerId>, peers: Vec<PeerId>) {
         self.net_state = Some((mode, local_peer, peers));
     }
 
@@ -325,15 +366,17 @@ fn set_position(world: &mut World, handle: ObjectHandle, position: Vec3) {
 }
 
 fn state_message(object: NetId, x: f32) -> Message {
-    Message::State {
-        object,
+    Message::States {
         tick: 0,
-        mask: MASK_POSITION,
-        pose: replication::Pose {
-            position: Vec3::new(x, 0.0, 0.0),
-            rotation_deg: Vec3::ZERO,
-            scale: Vec3::ONE,
-        },
+        items: vec![StateItem {
+            object,
+            mask: MASK_POSITION,
+            pose: Pose {
+                position: Vec3::new(x, 0.0, 0.0),
+                rotation_deg: Vec3::ZERO,
+                scale: Vec3::ONE,
+            },
+        }],
     }
 }
 
@@ -466,12 +509,54 @@ impl Session {
 
     /// Шлёт сообщение от участника серверу в обход своего моста: имитация чужого или испорченного пакета.
     fn inject(&mut self, from: Side, message: &Message, channel: Channel) {
+        self.inject_from(from, NetTarget::Server, message, channel);
+    }
+
+    /// Шлёт сообщение в обход моста с произвольным адресатом.
+    fn inject_from(&mut self, from: Side, target: NetTarget, message: &Message, channel: Channel) {
         let bytes = replication::encode(message).unwrap();
         self.hub
             .borrow_mut()
             .outbox
-            .push((from, NetTarget::Server, channel, bytes));
+            .push((from, target, channel, bytes));
     }
+}
+
+fn has_rpc(events: &[NetEvent], name: &str) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, NetEvent::Message { name: n, .. } if n.as_str() == name))
+}
+
+/// Перехватчик предупреждений: проверяет число записей лога, а не их текст целиком.
+struct Capture;
+
+static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CAPTURE: Capture = Capture;
+
+impl log::Log for Capture {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() == log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            WARNINGS.lock().unwrap().push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn warnings_containing(text: &str) -> usize {
+    let _ = log::set_logger(&CAPTURE);
+    log::set_max_level(log::LevelFilter::Warn);
+    WARNINGS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.contains(text))
+        .count()
 }
 
 fn has_message(
@@ -696,6 +781,8 @@ fn refused_spawn_resyncs_once_and_disconnects_on_a_second_refusal() {
     );
     assert!(session.hub.borrow().disconnects.is_empty());
 
+    // Снимок по запросу участнику не чаще раза в RESYNC_INTERVAL: ждём окно, как между реальными отказами.
+    session.step(Duration::from_secs(5));
     session.client_mut(1).sink.refuse = 2;
     session.spawn_on_server(CRATE);
     session.step_n(8, STEP);
@@ -883,4 +970,268 @@ fn server_disconnect_switches_the_client_offline() {
         event,
         NetEvent::PeerDisconnected { peer: 0, reason } if reason == "тест"
     )));
+}
+
+#[test]
+fn rpc_addressed_to_a_dead_or_unknown_object_reaches_nobody() {
+    let mut session = Session::new();
+    session.connect();
+    let root = session.spawn_on_server(CRATE);
+    let net = session.server.sink.nets[&root].0;
+    session.step_n(2, STEP);
+    assert!(session.server.sink.despawn(&mut session.server.world, root));
+    session.step_n(2, STEP);
+
+    let unknown = NetId::spawned(900).unwrap();
+    for object in [net, unknown] {
+        let message = Message::Rpc {
+            object: Some(object),
+            name: "ghost".to_owned(),
+            value: ParamValue::Bool(true),
+        };
+        session.inject(Side::Client(1), &message, Channel::Rpc);
+        session.inject_from(Side::Server, NetTarget::All, &message, Channel::Rpc);
+    }
+    session.step_n(3, STEP);
+    assert!(
+        !has_rpc(&session.server.sink.events, "ghost"),
+        "серверу не доставлено"
+    );
+    assert!(
+        !has_rpc(&session.client(1).sink.events, "ghost"),
+        "клиенту не доставлено"
+    );
+}
+
+#[test]
+fn resync_requests_are_served_once_per_interval_per_peer() {
+    let mut session = Session::new();
+    session.connect();
+    session.step_n(2, STEP);
+    let served = session.hub.borrow().snapshot_ends;
+
+    session.inject(Side::Client(1), &Message::ResyncRequest, Channel::Reliable);
+    session.step_n(2, STEP);
+    assert_eq!(
+        session.hub.borrow().snapshot_ends,
+        served + 1,
+        "первый запрос обслужен"
+    );
+
+    session.inject(Side::Client(1), &Message::ResyncRequest, Channel::Reliable);
+    session.step_n(2, STEP);
+    assert_eq!(
+        session.hub.borrow().snapshot_ends,
+        served + 1,
+        "повтор раньше интервала не обслужен"
+    );
+    assert!(
+        session.hub.borrow().disconnects.is_empty(),
+        "одна лишняя просьба не отключает"
+    );
+
+    session.step(Duration::from_secs(5));
+    session.inject(Side::Client(1), &Message::ResyncRequest, Channel::Reliable);
+    session.step_n(2, STEP);
+    assert_eq!(
+        session.hub.borrow().snapshot_ends,
+        served + 2,
+        "после интервала снова обслужен"
+    );
+
+    for _ in 0..FAULT_BURST {
+        session.inject(Side::Client(1), &Message::ResyncRequest, Channel::Reliable);
+    }
+    session.step(STEP);
+    assert!(
+        session
+            .hub
+            .borrow()
+            .disconnects
+            .iter()
+            .any(|(who, peer, _)| *who == Side::Server && *peer == 1),
+        "поток просьб о снимке отключает участника"
+    );
+}
+
+#[test]
+fn stalled_peer_is_disconnected_on_overflow_without_holding_back_others() {
+    let mut session = Session::new();
+    session.connect();
+    session.connect();
+    session.step_n(2, STEP);
+    session.hub.borrow_mut().stalled.insert(2);
+
+    // Каждое сообщение около 60 KB: при лимите 4 MiB очередь второго участника переполняется.
+    let payload = "x".repeat(60_000);
+    for _ in 0..80 {
+        let server = &mut session.server;
+        server.bridge.apply(
+            vec![NetRequest::Send {
+                target: NetTarget::All,
+                name: "bulk".to_owned(),
+                value: ParamValue::String(payload.clone()),
+                reliable: true,
+            }],
+            &mut server.world,
+            &mut server.sink,
+        );
+        session.step(STEP);
+    }
+    session.step_n(3, STEP);
+
+    let hub = session.hub.borrow();
+    assert!(
+        hub.disconnects.iter().any(|(who, peer, reason)| {
+            *who == Side::Server && *peer == 2 && reason == RETRY_REASON
+        }),
+        "переполненный участник отключён с причиной"
+    );
+    assert!(
+        !hub.disconnects.iter().any(|(_, peer, _)| *peer == 1),
+        "остальные не отключены"
+    );
+    drop(hub);
+    let received = session
+        .client(1)
+        .sink
+        .events
+        .iter()
+        .filter(|event| matches!(event, NetEvent::Message { name, .. } if name == "bulk"))
+        .count();
+    assert_eq!(received, 80, "участник 1 получил все сообщения");
+}
+
+#[test]
+fn moving_objects_beyond_one_queue_limit_all_reach_the_replicas() {
+    let mut session = Session::new();
+    session.connect();
+    let roots: Vec<ObjectHandle> = (0..300).map(|_| session.spawn_on_server(CRATE)).collect();
+    session.step_n(3, STEP);
+
+    // Очередь команд принимает 256 сообщений за шаг, как настоящая.
+    session.hub.borrow_mut().state_budget = Some(256);
+    for (index, root) in roots.iter().enumerate() {
+        let x = 0.5 + index as f32 * 0.001;
+        set_position(&mut session.server.world, *root, Vec3::new(x, 0.0, 0.0));
+    }
+    session.step_n(40, STEP);
+
+    let client = session.client(1);
+    for (index, root) in roots.iter().enumerate() {
+        let net = session.server.sink.nets[root].0;
+        let mirror = mirror(client, net).expect("объект реплицирован");
+        let expected = 0.5 + index as f32 * 0.001;
+        assert!(
+            (position_of(&client.world, mirror).x - expected).abs() < 1e-3,
+            "объект {index} не получил позу"
+        );
+    }
+}
+
+#[test]
+fn late_state_of_a_despawned_object_is_not_buffered() {
+    let mut session = Session::new();
+    session.connect();
+    let root = session.spawn_on_server(CRATE);
+    let net = session.server.sink.nets[&root].0;
+    session.step_n(2, STEP);
+    assert!(session.server.sink.despawn(&mut session.server.world, root));
+    session.step_n(2, STEP);
+    assert!(mirror(session.client(1), net).is_none());
+
+    session.inject_from(
+        Side::Server,
+        NetTarget::Peer(1),
+        &state_message(net, 4.0),
+        Channel::State,
+    );
+    session.step_n(2, STEP);
+    assert_eq!(
+        session.client(1).bridge.buffered_len(),
+        0,
+        "удалённый id не буферизуется"
+    );
+}
+
+#[test]
+fn buffer_overflow_drops_the_state_that_was_buffered_first() {
+    let mut session = Session::new();
+    session.connect();
+    session.step(STEP);
+    let first = NetId::spawned(60_000).unwrap();
+    session.inject_from(
+        Side::Server,
+        NetTarget::Peer(1),
+        &state_message(first, 1.0),
+        Channel::State,
+    );
+    for serial in 1..=4096 {
+        let object = NetId::spawned(serial).unwrap();
+        session.inject_from(
+            Side::Server,
+            NetTarget::Peer(1),
+            &state_message(object, 1.0),
+            Channel::State,
+        );
+    }
+    session.step_n(2, STEP);
+
+    let client = session.client(1);
+    assert!(
+        !client.bridge.is_buffered(first),
+        "самое раннее состояние вытеснено"
+    );
+    assert!(
+        client.bridge.is_buffered(NetId::spawned(1).unwrap()),
+        "младший id не вытеснен"
+    );
+    assert_eq!(client.bridge.buffered_len(), 4096);
+}
+
+#[test]
+fn stopped_link_drops_the_backlog_with_one_warning() {
+    let mut session = Session::new();
+    session.connect();
+    session.step_n(2, STEP);
+    session.hub.borrow_mut().stalled.insert(1);
+    let before = warnings_containing("повторная отправка");
+
+    for _ in 0..5 {
+        let server = &mut session.server;
+        server.bridge.apply(
+            vec![NetRequest::Send {
+                target: NetTarget::All,
+                name: "queued".to_owned(),
+                value: ParamValue::Bool(true),
+                reliable: true,
+            }],
+            &mut server.world,
+            &mut server.sink,
+        );
+    }
+    assert_eq!(session.server.bridge.backlog_len(), 5);
+
+    session.hub.borrow_mut().stalled.clear();
+    session.hub.borrow_mut().stopped = true;
+    session.step(STEP);
+    assert_eq!(session.server.bridge.backlog_len(), 0, "очередь очищена");
+    assert_eq!(
+        warnings_containing("повторная отправка") - before,
+        1,
+        "одна запись лога"
+    );
+}
+
+#[test]
+fn client_local_peer_is_unknown_until_the_server_assigns_it() {
+    let mut session = Session::new();
+    let peer = session.connect();
+    let state = session.client(peer).sink.net_state.clone().unwrap();
+    assert_eq!(state.1, None, "до LocalPeer номер неизвестен");
+    assert!(!session.client(peer).bridge.local_peer_known());
+
+    session.step(STEP);
+    let state = session.client(peer).sink.net_state.clone().unwrap();
+    assert_eq!(state.1, Some(peer));
 }

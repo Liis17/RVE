@@ -3468,7 +3468,7 @@ fn abi_v11_net_guest_reads_state_and_stages_requests_through_the_sdk() {
     let mut world = net_world();
     let mut host = load_host(&world, &library);
     let player = world.handle("player").unwrap();
-    host.set_network_state(engine_scene::NetMode::Client, 5, vec![0]);
+    host.set_network_state(engine_scene::NetMode::Client, Some(5), vec![0]);
     host.set_object_net(player, engine_scene::NetId::scene(42).unwrap(), Some(5));
     host.start(
         &mut world,
@@ -3508,12 +3508,12 @@ fn abi_v11_net_guest_reads_state_and_stages_requests_through_the_sdk() {
         }]
     );
 
-    host.set_network_state(engine_scene::NetMode::Server, 0, vec![5]);
+    host.set_network_state(engine_scene::NetMode::Server, Some(0), vec![5]);
     let mut world = net_world();
     let mut host = load_host(&world, &library);
     let player = world.handle("player").unwrap();
     host.set_object_net(player, engine_scene::NetId::scene(42).unwrap(), Some(5));
-    host.set_network_state(engine_scene::NetMode::Server, 0, vec![5]);
+    host.set_network_state(engine_scene::NetMode::Server, Some(0), vec![5]);
     host.start(
         &mut world,
         ScriptTime {
