@@ -20,9 +20,10 @@ use engine_console::{
     CommandCatalog, ConsoleBuffer, ConsoleLevel, ConsoleLine, install_logger, parse_command_line,
 };
 use engine_files::VirtualPath;
-use engine_project::{PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile};
+use engine_project::{BootstrapReflexMode, PREFAB_CATALOG_FILE_NAME, PrefabCatalogFile};
 use engine_render::{
-    FrameStatus, RenderError, Renderer, RendererConfig, UiImage, UiPrimitive, ViewportId,
+    FrameStatus, LatencyHandle, LatencyMarker, LowLatencyMode, RenderError, Renderer,
+    RendererConfig, UiImage, UiPrimitive, ViewportId,
 };
 use engine_scene::{CameraSettings, World};
 use engine_script::ScriptLibrary;
@@ -60,6 +61,14 @@ pub struct EditorApp {
     bridge: UiBridge,
     engine_log: Arc<Mutex<ConsoleBuffer>>,
     repaint_at: Option<Instant>,
+    /// Режим NVIDIA Reflex из bootstrap проекта; применяется при создании renderer.
+    reflex: Option<BootstrapReflexMode>,
+    /// Reflex-handle renderer; `None`, если Reflex выключен или не поддержан.
+    latency: Option<LatencyHandle>,
+    /// Счётчик кадров редактора: id маркеров Reflex и `set_latency_frame`.
+    latency_frame: u64,
+    /// Перерисовка непрерывна (Play или превью): только тогда кадр ждёт разрешения Reflex.
+    continuous_redraw: bool,
     /// Ревизия сцены в последней копии автосохранения и время записи.
     autosaved_revision: Option<u64>,
     last_autosave: Instant,
@@ -80,7 +89,11 @@ struct GpuState {
 }
 
 impl EditorApp {
-    pub fn new(project: Option<PathBuf>, scripts: Option<PathBuf>) -> Self {
+    pub fn new(
+        project: Option<PathBuf>,
+        scripts: Option<PathBuf>,
+        reflex: Option<BootstrapReflexMode>,
+    ) -> Self {
         let engine_log = editor_log_buffer();
         let mut state = EditorState::new(scripts);
         let pipeline_cache_path = engine_platform::pipeline_cache_path("rve-editor");
@@ -111,6 +124,10 @@ impl EditorApp {
             bridge: UiBridge::default(),
             engine_log,
             repaint_at: None,
+            reflex,
+            latency: None,
+            latency_frame: 0,
+            continuous_redraw: false,
             autosaved_revision: None,
             last_autosave: Instant::now(),
             exit: false,
@@ -1194,6 +1211,18 @@ impl EditorApp {
                 Some(self.bridge.register_viewport(gpu.scene.game_viewport));
         }
 
+        self.latency_frame = self.latency_frame.saturating_add(1);
+        let frame_id = self.latency_frame;
+        if let Some(latency) = self.latency.as_ref() {
+            // Свёрнутое или нулевое окно не делает present, и сон дождался бы таймаута каждый кадр.
+            let size = window.inner_size();
+            let presentable =
+                size.width != 0 && size.height != 0 && window.is_minimized() != Some(true);
+            if self.continuous_redraw && presentable {
+                latency.sleep();
+            }
+            latency.marker(frame_id, LatencyMarker::SimulationStart);
+        }
         let mut raw_input = egui_state.take_egui_input(window);
         if cfg!(target_os = "macos") {
             crate::gestures::remap_control_click(&mut raw_input.events, &mut self.control_click);
@@ -1250,6 +1279,9 @@ impl EditorApp {
         let ui_primitives: Vec<UiPrimitive<'_>> =
             meshes.iter().map(ConvertedMesh::primitive).collect();
 
+        if let Some(latency) = self.latency.as_ref() {
+            latency.marker(frame_id, LatencyMarker::InputSample);
+        }
         let play_error = self.state.play.as_mut().and_then(|play| play.tick().err());
         if play_error.is_none()
             && let Some(play) = self.state.play.as_ref()
@@ -1278,6 +1310,10 @@ impl EditorApp {
         // Камера могла сместиться к новой модели: гизмо и маркеры нужно перестроить.
         // Пока модель загружается, кадр запросит готовность загрузки, а не этот флаг.
         let framing = self.state.pending_frame.is_some();
+        if let Some(latency) = self.latency.as_ref() {
+            latency.marker(frame_id, LatencyMarker::SimulationEnd);
+        }
+        gpu.renderer.set_latency_frame(frame_id);
         let status = render_scene_frame(gpu, &mut self.state, &ui_primitives)?;
         let framing = framing && self.state.pending_frame.is_none();
 
@@ -1296,6 +1332,7 @@ impl EditorApp {
         let skipped = status == FrameStatus::Skipped && size.width != 0 && size.height != 0;
         // Превью проигрывается без Play: кадры нужны, пока оно идёт.
         let previewing = !self.state.is_playing() && self.state.animation_preview.is_animating();
+        self.continuous_redraw = playing_now || previewing;
         if playing_now || previewing || skipped || framing || repaint_delay.is_zero() {
             window.request_redraw();
             self.repaint_at = None;
@@ -1706,6 +1743,11 @@ impl WindowHandler for EditorApp {
             size.height,
             RendererConfig {
                 present_mode: engine_render::PresentMode::Fifo,
+                low_latency: match self.reflex {
+                    Some(BootstrapReflexMode::On) => LowLatencyMode::On,
+                    Some(BootstrapReflexMode::Boost) => LowLatencyMode::Boost,
+                    Some(BootstrapReflexMode::Off) | None => LowLatencyMode::Off,
+                },
                 pipeline_cache: self.pipeline_cache.clone(),
                 ..RendererConfig::default()
             },
@@ -1733,6 +1775,7 @@ impl WindowHandler for EditorApp {
             None,
             Some(renderer.max_texture_size() as usize),
         ));
+        self.latency = renderer.latency_handle();
         self.gpu = Some(GpuState { renderer, scene });
         self.window = Some(Arc::clone(&window));
         self.state
@@ -2060,7 +2103,7 @@ mod tests {
 
     #[test]
     fn pending_play_rechecks_the_current_document_after_build() {
-        let mut app = EditorApp::new(None, None);
+        let mut app = EditorApp::new(None, None, None);
         app.state.scene = Some(
             EditorScene::parse(
                 VirtualPath::parse("prefabs/test.rveprefab").unwrap(),

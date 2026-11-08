@@ -37,6 +37,7 @@ Parent: [[Index]]
 | `AllowMultipleInstances` | Только `true` или `false`; default `true`. При `false` player использует `ProjectSettings.id` как ключ singleton lock |
 | `AppIcon` | Необязательный virtual path в `Assets`; bootstrap проверяет только корректность пути |
 | `PresentMode` | Необязательный `Fifo`, `Mailbox` или `Immediate`; при отсутствии используется FIFO |
+| `Reflex` | Необязательный `Off`, `On` или `Boost` (`BootstrapReflexMode`); при отсутствии равен `Off`. Передаётся в `RendererConfig::low_latency` игрока, редактора и sandbox; на устройствах без поддержки Reflex работает как `Off` (см. [[Engine/EngineRender]]) |
 
 `BootstrapConfig::load` трактует отсутствующий файл как настройки по умолчанию.
 Пути bootstrap и применение `WindowTitle`/`AppIcon` в player, а также его коды
