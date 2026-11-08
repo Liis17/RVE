@@ -2222,9 +2222,61 @@ impl OwnedAbiParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ScriptCursor, ScriptInput};
+    use crate::types::{ScriptCursor, ScriptEventLevel, ScriptInput};
     use engine_scene::{SceneDocument, World};
     use rve_sdk::abi::RveCameraSettings;
+
+    #[test]
+    fn gamepad_state_refuses_null_output_and_unknown_slots_with_zeroed_output() {
+        let events = EventQueue::default();
+        let mut transaction = ScriptTransaction::default();
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
+        let host = context.host(ScriptTime::default());
+        let get_state = host.gamepad_state.unwrap();
+        let mut state = RveGamepadState {
+            connected: 9,
+            axes: [1.0; 6],
+            ..RveGamepadState::default()
+        };
+
+        // SAFETY: the host context and the output slot remain live for these calls.
+        unsafe {
+            assert!(!get_state(host.ctx, 0, std::ptr::null_mut()));
+            assert!(!get_state(host.ctx, 5, &mut state));
+        }
+        assert_eq!(state, RveGamepadState::default());
+    }
+
+    #[test]
+    fn gamepad_rumble_is_refused_for_bad_slots_and_during_script_creation() {
+        let events = EventQueue::default();
+        // A default transaction is not writable, as during script creation.
+        let mut transaction = ScriptTransaction::default();
+        let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
+        let host = context.host(ScriptTime::default());
+        let rumble = host.gamepad_rumble.unwrap();
+
+        // SAFETY: the host context remains live for these calls.
+        unsafe {
+            assert!(!rumble(host.ctx, 5, 1.0, 1.0, 1.0));
+            assert!(!rumble(host.ctx, 1, 1.0, 1.0, 1.0));
+        }
+        let events = events.borrow();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.level == ScriptEventLevel::Error)
+        );
+        assert!(events[0].message.contains("got 5"), "{}", events[0].message);
+        assert!(
+            events[1]
+                .message
+                .contains("rumble is unavailable during script creation"),
+            "{}",
+            events[1].message
+        );
+    }
 
     #[test]
     fn warning_logs_keep_the_warn_level() {
@@ -2357,6 +2409,7 @@ mod tests {
             ),
             queued_messages: (0, 0),
             queued_audio: 0,
+            queued_rumble: 0,
             queued_animation: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
@@ -2447,6 +2500,7 @@ mod tests {
             ),
             queued_messages: (0, 0),
             queued_audio: 0,
+            queued_rumble: 0,
             queued_animation: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
@@ -2489,6 +2543,7 @@ mod tests {
             ),
             queued_messages: (0, 0),
             queued_audio: 0,
+            queued_rumble: 0,
             queued_animation: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),

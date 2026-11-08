@@ -237,6 +237,27 @@ impl Script for AudioRejected {
     }
 }
 
+struct RumbleProbe {
+    panic_after: bool,
+}
+
+fn rumble_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(RumbleProbe {
+        panic_after: matches!(params.get("panic_after"), Some(Value::Bool(true))),
+    }))
+}
+
+impl Script for RumbleProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let input = ctx.input();
+        let accepted = (0..300).filter(|_| input.rumble(1, 0.5, 0.25, 0.1)).count();
+        ctx.log_info(format!("rumble accepted {accepted}"));
+        if self.panic_after {
+            panic!("rumble panic");
+        }
+    }
+}
+
 fn input_actions_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(InputActionsProbe(0)))
 }
@@ -744,6 +765,7 @@ fn sdk_module() -> &'static RveModule {
         "PhysicsProbe" => physics_probe_factory,
         "AudioProbe" => audio_probe_factory,
         "AudioRejected" => audio_rejected_factory,
+        "RumbleProbe" => rumble_probe_factory,
         "InputActionsProbe" => input_actions_probe_factory,
         "SpawnDriver" => spawn_driver_factory,
         "BoltProbe" => bolt_probe_factory,
@@ -1320,6 +1342,61 @@ name = "AudioRejected"
     );
     // The call itself succeeded, so its earlier play_sound is still committed.
     assert_eq!(host.drain_audio_requests().len(), 1);
+}
+
+#[test]
+fn abi_v11_rumble_requests_are_capped_per_frame_and_keep_guest_order() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "RumbleProbe"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.starts_with("rumble requests limit")),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "rumble accepted 256")
+    );
+    let rumble = host.take_rumble_requests();
+    assert_eq!(rumble.len(), 256);
+    assert!(rumble.iter().all(|request| request.pad == 1));
+}
+
+#[test]
+fn abi_v11_rumble_is_rolled_back_when_the_guest_panics() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "RumbleProbe"
+params = { panic_after = true }
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message.contains("rumble panic"))
+    );
+    assert!(host.take_rumble_requests().is_empty());
 }
 
 #[test]
