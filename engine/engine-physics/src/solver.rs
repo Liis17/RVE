@@ -205,11 +205,17 @@ pub(crate) fn correct_positions(
             ((penetration - POSITIONAL_SLOP).max(0.0) * POSITIONAL_CORRECTION) / inverse_mass_sum;
         let translation_a = -manifold.normal * (correction * body_a.inverse_mass);
         let translation_b = manifold.normal * (correction * body_b.inverse_mass);
-        if let Some(body) = bodies.get_mut(&BodyHandle(key.first)) {
+        if let Some(body) = bodies.get_mut(&BodyHandle(key.first))
+            && translation_a != Vec3::ZERO
+        {
             body.pose.position += translation_a;
+            body.mark_pose_changed();
         }
-        if let Some(body) = bodies.get_mut(&BodyHandle(key.second)) {
+        if let Some(body) = bodies.get_mut(&BodyHandle(key.second))
+            && translation_b != Vec3::ZERO
+        {
             body.pose.position += translation_b;
+            body.mark_pose_changed();
         }
     }
 }

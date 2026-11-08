@@ -287,9 +287,38 @@ pub(crate) struct Body {
     pub(crate) sleeping: bool,
     pub(crate) sleep_time: f32,
     pub(crate) kinematic_target: Option<Pose>,
+    /// Кэш AABB коллайдера; сбрасывается вместе с изменением позы.
+    aabb: Option<Aabb>,
+    /// Поза менялась с последнего отчёта `StepResult.poses`.
+    pose_reported: bool,
+    /// Поза или коллайдер менялись с последнего `refresh_pairs`.
+    pending_refresh: bool,
 }
 
 impl Body {
+    pub(crate) fn mark_pose_changed(&mut self) {
+        self.aabb = None;
+        self.pose_reported = true;
+        self.pending_refresh = true;
+    }
+
+    /// Тело участвует в broadphase как активное. Спящие, статические и неподвижные kinematic
+    /// тела сравниваются только с активными, а их пары переносятся из прошлого шага без
+    /// перерасчёта. Триггеры всегда активны; статики без триггера не активны никогда: их
+    /// изменение будит спящие тела над ними (см. `wake_sleepers_under_changed_statics`).
+    fn is_pairable(&self) -> bool {
+        if self.collider.trigger {
+            return true;
+        }
+        match self.kind {
+            BodyKind::Dynamic => self.pending_refresh || !self.sleeping,
+            BodyKind::Kinematic => {
+                self.pending_refresh || self.kinematic_target.is_some() || is_moving_kinematic(self)
+            }
+            BodyKind::Static => false,
+        }
+    }
+
     pub(crate) fn center_of_mass_world(&self) -> Vec3 {
         self.pose.position + self.pose.rotation * self.center_of_mass_local
     }
@@ -366,6 +395,7 @@ impl Body {
             position: center - rotation * self.center_of_mass_local,
             rotation,
         };
+        self.mark_pose_changed();
     }
 
     fn advance_kinematic(&mut self, dt: f32, remaining_substeps: usize) {
@@ -394,6 +424,7 @@ impl Body {
                 .normalize()
         };
         self.pose = Pose { position, rotation };
+        self.mark_pose_changed();
         self.linear_velocity = (self.center_of_mass_world()
             - (old_pose.position + old_pose.rotation * self.center_of_mass_local))
             / dt;
@@ -484,6 +515,9 @@ impl PhysicsWorld {
                 sleeping: false,
                 sleep_time: 0.0,
                 kinematic_target: None,
+                aabb: None,
+                pose_reported: true,
+                pending_refresh: true,
             },
         );
         self.next_body_id = self.next_body_id.max(handle.0.saturating_add(1));
@@ -594,28 +628,80 @@ impl PhysicsWorld {
         Ok(events)
     }
 
+    /// Статик, который появился или сдвинулся, может оказаться под спящими телами. Broadphase
+    /// спящие тела с неактивными не сравнивает, поэтому будим такие тела по AABB.
+    fn wake_sleepers_under_changed_statics(&mut self) -> Result<(), PhysicsWorldError> {
+        let mut changed = Vec::new();
+        for body in self.bodies.values() {
+            if body.kind == BodyKind::Static
+                && !body.collider.trigger
+                && body.collider.enabled
+                && body.pending_refresh
+            {
+                changed.push(body.collider_aabb()?);
+            }
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let mut woken = Vec::new();
+        for body in self.bodies.values() {
+            if body.kind == BodyKind::Dynamic && body.sleeping && body.collider.enabled {
+                let aabb = body.collider_aabb()?;
+                if changed.iter().any(|static_aabb| static_aabb.overlaps(aabb)) {
+                    woken.push(body.handle);
+                }
+            }
+        }
+        for handle in woken {
+            self.wake_body(handle);
+        }
+        Ok(())
+    }
+
     fn refresh_pairs(&mut self) -> Result<Vec<PhysicsEvent>, PhysicsWorldError> {
+        self.wake_sleepers_under_changed_statics()?;
         let mut proxies = Vec::new();
         let mut bounds = Vec::new();
-        for body in self.bodies.values() {
+        let mut paired = Vec::new();
+        let mut frozen = HashSet::new();
+        for body in self.bodies.values_mut() {
             if !body.collider.enabled {
                 continue;
             }
+            let aabb = match body.aabb {
+                Some(aabb) => aabb,
+                None => {
+                    let aabb = body.collider_aabb()?;
+                    body.aabb = Some(aabb);
+                    aabb
+                }
+            };
+            let is_paired = body.is_pairable();
+            if !is_paired {
+                frozen.insert(body.handle);
+            }
+            paired.push(is_paired);
+            bounds.push(aabb);
             proxies.push((
                 body.handle,
                 body.collider.clone(),
                 body.kind,
                 body.collider_pose(),
             ));
-            bounds.push(body.collider_aabb()?);
         }
-        // Пара без динамического тела и без триггера никогда не решается ниже, поэтому такие
-        // тела (static/kinematic) не сравниваются между собой в broadphase.
-        let candidates = sweep_and_prune_pairable(&bounds, |index| {
-            let (_, collider, kind, _) = &proxies[index];
-            *kind == BodyKind::Dynamic || collider.trigger
-        })?;
+        for body in self.bodies.values_mut() {
+            body.pending_refresh = false;
+        }
+        // Неактивные тела не двигались и не менялись, поэтому их пары переносятся как есть.
+        // Пары с активным телом пересчитываются broadphase и narrowphase.
+        let candidates = sweep_and_prune_pairable(&bounds, |index| paired[index])?;
         let mut current = BTreeMap::new();
+        for (key, pair) in &self.active_pairs {
+            if frozen.contains(&BodyHandle(key.first)) && frozen.contains(&BodyHandle(key.second)) {
+                current.insert(*key, pair.clone());
+            }
+        }
         for candidate in candidates {
             let (handle_a, collider_a, kind_a, pose_a) = &proxies[candidate.first];
             let (handle_b, collider_b, kind_b, pose_b) = &proxies[candidate.second];
@@ -631,13 +717,6 @@ impl PhysicsWorld {
                 PairKind::Collision
             };
             let key = PairKey::new(handle_a.0, handle_b.0);
-            if pair_kind == PairKind::Collision
-                && self.pair_can_remain_sleeping(*handle_a, *handle_b)
-                && let Some(previous) = self.active_pairs.get(&key)
-            {
-                current.insert(key, previous.clone());
-                continue;
-            }
             let outcome = collide(&collider_a.shape, *pose_a, &collider_b.shape, *pose_b);
             let mut manifold = match outcome {
                 Ok(Some(manifold)) => manifold,
@@ -681,24 +760,6 @@ impl PhysicsWorld {
             .collect();
         self.manifolds.retain(&contact_keys);
         Ok(events)
-    }
-
-    fn pair_can_remain_sleeping(&self, first: BodyHandle, second: BodyHandle) -> bool {
-        let Some(a) = self.bodies.get(&first) else {
-            return false;
-        };
-        let Some(b) = self.bodies.get(&second) else {
-            return false;
-        };
-        let sleeping_dynamic = |body: &Body| body.kind == BodyKind::Dynamic && body.sleeping;
-        let stationary_non_dynamic = |body: &Body| {
-            body.kind == BodyKind::Static
-                || (body.kind == BodyKind::Kinematic
-                    && body.linear_velocity.length_squared() <= WAKE_SPEED_SQUARED
-                    && body.angular_velocity.length_squared() <= WAKE_SPEED_SQUARED)
-        };
-        (sleeping_dynamic(a) && (sleeping_dynamic(b) || stationary_non_dynamic(b)))
-            || (sleeping_dynamic(b) && (sleeping_dynamic(a) || stationary_non_dynamic(a)))
     }
 
     fn wake_contact_pair(&mut self, first: BodyHandle, second: BodyHandle) {
@@ -845,6 +906,7 @@ impl PhysicsWorld {
                 self.wake_body(handle);
                 let body = self.bodies.get_mut(&handle).expect("body was checked");
                 body.pose = pose;
+                body.mark_pose_changed();
                 body.kinematic_target = None;
                 if body.kind == BodyKind::Kinematic {
                     body.linear_velocity = Vec3::ZERO;
@@ -857,6 +919,7 @@ impl PhysicsWorld {
                     self.wake_body(handle);
                     let body = self.bodies.get_mut(&handle).expect("body was checked");
                     body.collider.enabled = enabled;
+                    body.pending_refresh = true;
                 }
             }
             PhysicsCommand::KinematicTarget { pose, .. } => {
@@ -977,6 +1040,8 @@ impl PhysicsCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StepResult {
     pub substeps: usize,
+    /// Позы тел, изменившихся с прошлого отчёта: движение, телепорт, вставка, коррекция.
+    /// Спящие и неподвижные тела сюда не входят; полный набор отдаёт `StepDriver::initial_result`.
     pub poses: Vec<(BodyHandle, Pose)>,
     pub events: Vec<PhysicsEvent>,
     /// Pairs whose narrowphase hit a numeric limit during this step and were kept unresolved.
@@ -1085,12 +1150,14 @@ impl StepDriver {
         for index in 0..substeps {
             events.extend(self.world.step_substep(self.fixed_dt, substeps - index)?);
         }
-        let poses = self
-            .world
-            .bodies
-            .values()
-            .map(|body| (body.handle, body.pose))
-            .collect();
+        // Отчёт содержит только тела, чья поза изменилась с прошлого вызова.
+        let mut poses = Vec::new();
+        for body in self.world.bodies.values_mut() {
+            if body.pose_reported {
+                body.pose_reported = false;
+                poses.push((body.handle, body.pose));
+            }
+        }
         Ok(StepResult {
             substeps,
             poses,
@@ -1694,7 +1761,12 @@ mod tests {
             )
             .unwrap();
         assert!(driver.world().body_is_sleeping(ball).unwrap());
-        driver.advance_step(0.4, []).unwrap();
+        let result = driver.advance_step(0.4, []).unwrap();
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            PhysicsEvent::CollisionEnter { first, second, .. }
+                if (*first == ball && *second == kin) || (*first == kin && *second == ball)
+        )));
         assert!(!driver.world().body_is_sleeping(ball).unwrap());
         assert!(driver.world().body_velocity(ball).unwrap().x < -0.1);
     }
@@ -2361,6 +2433,125 @@ mod tests {
             boxes.push(world.insert_body(desc).unwrap());
         }
         (StepDriver::new(world, 60, 8).unwrap(), boxes)
+    }
+
+    fn sleeping_stack_driver() -> (StepDriver, Vec<BodyHandle>) {
+        let (mut driver, boxes) = stacked_boxes_world(3);
+        run_steps(&mut driver, 300);
+        assert!(
+            boxes
+                .iter()
+                .all(|handle| driver.world().body_is_sleeping(*handle).unwrap())
+        );
+        (driver, boxes)
+    }
+
+    #[test]
+    fn all_sleeping_world_reports_no_poses_and_keeps_pairs_and_events() {
+        let (mut driver, _) = sleeping_stack_driver();
+        let pairs = driver.world().active_pair_count();
+        let result = driver.advance_step(1.0 / 60.0, []).unwrap();
+        assert_eq!(result.substeps, 1);
+        assert!(result.poses.is_empty(), "{:?}", result.poses);
+        assert!(result.events.is_empty(), "{:?}", result.events);
+        assert_eq!(driver.world().active_pair_count(), pairs);
+    }
+
+    #[test]
+    fn teleport_of_a_sleeping_body_reports_its_pose_without_substeps() {
+        let (mut driver, boxes) = sleeping_stack_driver();
+        let target = Pose::new(Vec3::new(3.0, 0.5, 0.0), Quat::IDENTITY).unwrap();
+        let result = driver
+            .advance_step(
+                0.0,
+                [PhysicsCommand::Teleport {
+                    body: boxes[1],
+                    pose: target,
+                }],
+            )
+            .unwrap();
+        assert_eq!(result.substeps, 0);
+        assert_eq!(result.poses, vec![(boxes[1], target)]);
+    }
+
+    #[test]
+    fn inserted_body_reports_its_pose_and_sleeping_stack_stays_out_of_poses() {
+        let (mut driver, boxes) = sleeping_stack_driver();
+        let handle = BodyHandle(100);
+        let result = driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle,
+                    desc: BodyDesc::dynamic(
+                        box_shape(0.5),
+                        Pose::new(Vec3::new(8.0, 3.0, 0.0), Quat::IDENTITY).unwrap(),
+                        1.0,
+                    ),
+                }],
+                [],
+            )
+            .unwrap();
+        assert!(result.poses.iter().any(|(body, _)| *body == handle));
+        assert!(
+            result.poses.iter().all(|(body, _)| !boxes.contains(body)),
+            "{:?}",
+            result.poses
+        );
+    }
+
+    #[test]
+    fn initial_result_still_reports_every_body() {
+        let (driver, boxes) = sleeping_stack_driver();
+        let initial = driver.initial_result();
+        assert_eq!(initial.poses.len(), boxes.len() + 1);
+    }
+
+    #[test]
+    fn static_inserted_against_a_sleeping_box_wakes_it() {
+        let (mut driver, boxes) = sleeping_stack_driver();
+        let top = *boxes.last().unwrap();
+        let plate_center_y = 3.0 + 0.05 - 0.01;
+        driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: BodyHandle(100),
+                    desc: BodyDesc::static_collider(
+                        box_shape(0.05),
+                        Pose::new(Vec3::new(0.0, plate_center_y, 0.0), Quat::IDENTITY).unwrap(),
+                    ),
+                }],
+                [],
+            )
+            .unwrap();
+        assert_eq!(driver.world().body_is_sleeping(top), Some(false));
+    }
+
+    #[test]
+    fn falling_body_wakes_the_sleeping_stack_it_lands_on() {
+        let (mut driver, boxes) = sleeping_stack_driver();
+        let bottom = boxes[0];
+        driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: BodyHandle(100),
+                    desc: BodyDesc::dynamic(
+                        box_shape(0.5),
+                        Pose::new(Vec3::new(0.0, 6.0, 0.0), Quat::IDENTITY).unwrap(),
+                        1.0,
+                    ),
+                }],
+                [],
+            )
+            .unwrap();
+        let mut woke = false;
+        for _ in 0..240 {
+            driver.advance_step(1.0 / 60.0, []).unwrap();
+            woke |= driver.world().body_is_sleeping(bottom) == Some(false);
+        }
+        assert!(woke);
     }
 
     #[test]
