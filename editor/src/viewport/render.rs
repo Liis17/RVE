@@ -328,6 +328,13 @@ impl SceneRenderer {
         for texture in self.textures.drain().filter_map(|(_, texture)| texture) {
             renderer.destroy_texture(texture)?;
         }
+        for shader in self
+            .screen_shaders
+            .drain()
+            .filter_map(|(_, entry)| entry.id)
+        {
+            renderer.destroy_screen_shader(shader)?;
+        }
         cpu_models.clear();
         Ok(())
     }
@@ -645,11 +652,13 @@ impl SceneRenderer {
             }
         }
 
-        // Изменённый `.glsl` перекомпилируется; ошибка оставляет прежнюю версию и текст для инспектора.
-        let changed_shaders = changes
-            .screen_shader_paths()
-            .map(|path| path.as_str().to_owned())
-            .filter(|path| self.screen_shaders.contains_key(path))
+        // Изменённый `.glsl` (при rescan — все кэшированные) перекомпилируется; ошибка оставляет
+        // прежнюю версию и текст для инспектора.
+        let changed_shaders = self
+            .screen_shaders
+            .keys()
+            .filter(|path| key_matches_changes(changes, path))
+            .cloned()
             .collect::<Vec<_>>();
         for path in changed_shaders {
             match load_screen_shader(renderer, project, &path) {

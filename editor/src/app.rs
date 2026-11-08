@@ -250,6 +250,7 @@ impl EditorApp {
         self.state.previews.clear();
         self.state.clear_lite_schemas();
         self.state.models.clear();
+        self.state.screen_shader_errors.clear();
         if let Some(assets) = self
             .state
             .project
@@ -2200,6 +2201,17 @@ mod tests {
                 .entries()
                 .any(|entry| entry.message.contains("префаба"))
         );
+    }
+
+    #[test]
+    fn opening_a_project_forgets_screen_shader_errors_of_the_previous_one() {
+        let mut app = EditorApp::new(None, None, None);
+        app.state.screen_shader_errors.insert(
+            "/fx/old.glsl".to_owned(),
+            "ошибка прежнего проекта".to_owned(),
+        );
+        app.reset_project_assets();
+        assert!(app.state.screen_shader_errors.is_empty());
     }
 
     #[test]
