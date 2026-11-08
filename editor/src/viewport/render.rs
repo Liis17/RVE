@@ -20,6 +20,7 @@ use engine_render::{
     ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, SkinBinding, SkinId, SkinVertex,
     TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
+use engine_scene::PostProcessSettings;
 use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
 use engine_scene::light::{
@@ -954,6 +955,7 @@ impl SceneRenderer {
         width: u32,
         height: u32,
         settings: CameraSettings,
+        post: PostProcessSettings,
         light: &LightState,
         local_lights: &'a [LocalLight],
         local_light_shadows: &'a [LocalLightShadow],
@@ -1001,18 +1003,7 @@ impl SceneRenderer {
             },
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
-                post: PostProcess {
-                    exposure: Exposure {
-                        ev: settings.color.unwrap_or_default().exposure_ev,
-                        ..Exposure::default()
-                    },
-                    tonemapper: match settings.color.unwrap_or_default().tonemapper {
-                        Tonemapper::Aces => RenderTonemapper::Aces,
-                        Tonemapper::Neutral => RenderTonemapper::Neutral,
-                        Tonemapper::None => RenderTonemapper::None,
-                    },
-                    ..PostProcess::default()
-                },
+                post: render_post_process(&post, with_grid),
                 anti_aliasing: match settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -2092,6 +2083,106 @@ fn grid_mesh() -> (Vec<Vertex>, Vec<u32>) {
         );
     }
     (vertices, indices)
+}
+
+/// Переводит постобработку камеры в настройки renderer. Scene-вид редактора не выполняет DoF и
+/// motion blur: эти эффекты мешают редактированию, остальные эффекты совпадают с Game-видом.
+fn render_post_process(post: &PostProcessSettings, scene_view: bool) -> PostProcess {
+    let exposure = if post.exposure.enabled {
+        Exposure {
+            mode: match post.exposure.mode {
+                engine_scene::ExposureMode::Manual => engine_render::ExposureMode::Manual,
+                engine_scene::ExposureMode::Auto => engine_render::ExposureMode::Auto,
+            },
+            ev: post.exposure.ev,
+            min_ev: post.exposure.min_ev,
+            max_ev: post.exposure.max_ev,
+            speed_up: post.exposure.speed_up,
+            speed_down: post.exposure.speed_down,
+            low_percent: post.exposure.low_percent,
+            high_percent: post.exposure.high_percent,
+        }
+    } else {
+        Exposure::default()
+    };
+    let tonemapper = match (post.tonemapping.enabled, post.tonemapping.tonemapper) {
+        (false, _) | (true, Tonemapper::None) => RenderTonemapper::None,
+        (true, Tonemapper::Aces) => RenderTonemapper::Aces,
+        (true, Tonemapper::Neutral) => RenderTonemapper::Neutral,
+    };
+    let quality = match post.ambient_occlusion.quality {
+        engine_scene::AmbientOcclusionQuality::Low => engine_render::AmbientOcclusionQuality::Low,
+        engine_scene::AmbientOcclusionQuality::Medium => {
+            engine_render::AmbientOcclusionQuality::Medium
+        }
+        engine_scene::AmbientOcclusionQuality::High => engine_render::AmbientOcclusionQuality::High,
+    };
+    let bloom = post.bloom;
+    let ao = post.ambient_occlusion;
+    let grading = post.color_grading;
+    let vignette = post.vignette;
+    let aberration = post.chromatic_aberration;
+    let grain = post.film_grain;
+    let dof = post.depth_of_field;
+    let motion = post.motion_blur;
+    PostProcess {
+        exposure,
+        tonemapper,
+        bloom: engine_render::Bloom {
+            enabled: bloom.enabled,
+            intensity: bloom.intensity,
+            threshold: bloom.threshold,
+            knee: bloom.knee,
+            scatter: bloom.scatter,
+            tint: bloom.tint,
+        },
+        ambient_occlusion: engine_render::AmbientOcclusion {
+            enabled: ao.enabled,
+            radius: ao.radius,
+            intensity: ao.intensity,
+            falloff: ao.falloff,
+            quality,
+        },
+        color_grading: engine_render::ColorGrading {
+            enabled: grading.enabled,
+            temperature: grading.temperature,
+            tint: grading.tint,
+            contrast: grading.contrast,
+            saturation: grading.saturation,
+            lift: grading.lift,
+            gamma: grading.gamma,
+            gain: grading.gain,
+        },
+        vignette: engine_render::Vignette {
+            enabled: vignette.enabled,
+            intensity: vignette.intensity,
+            smoothness: vignette.smoothness,
+            roundness: vignette.roundness,
+            color: vignette.color,
+        },
+        chromatic_aberration: engine_render::ChromaticAberration {
+            enabled: aberration.enabled,
+            intensity: aberration.intensity,
+        },
+        film_grain: engine_render::FilmGrain {
+            enabled: grain.enabled,
+            intensity: grain.intensity,
+            response: grain.response,
+        },
+        depth_of_field: engine_render::DepthOfField {
+            enabled: dof.enabled && !scene_view,
+            focus_distance: dof.focus_distance,
+            aperture: dof.aperture,
+            focal_length_mm: dof.focal_length_mm,
+            max_blur_px: dof.max_blur_px,
+        },
+        motion_blur: engine_render::MotionBlur {
+            enabled: motion.enabled && !scene_view,
+            shutter_angle_deg: motion.shutter_angle_deg,
+            samples: motion.samples,
+            max_blur_px: motion.max_blur_px,
+        },
+    }
 }
 
 #[cfg(test)]

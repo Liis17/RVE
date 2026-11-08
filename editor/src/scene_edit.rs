@@ -1164,6 +1164,41 @@ impl EditorScene {
         })
     }
 
+    /// Назначает файл постобработки камеры и добавляет его путь в список ресурсов сцены.
+    /// Изменение входит в общий undo/redo, как и назначение `.camerasettings`.
+    pub fn set_camera_post_process(
+        &mut self,
+        id: &str,
+        post_process: Option<VirtualPath>,
+    ) -> Result<(), String> {
+        if let Some(path) = &post_process
+            && !path.as_str().to_ascii_lowercase().ends_with(".postprocess")
+        {
+            return Err(format!("{}: ожидается ресурс .postprocess", path));
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                let camera = object
+                    .camera
+                    .as_mut()
+                    .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+                camera.post_process = post_process;
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            if let Some(path) = &post_process {
+                ensure_asset(document, path);
+            }
+            let camera = find_object_mut(document, id)?
+                .camera
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет камеры"))?;
+            camera.post_process = post_process;
+            Ok(())
+        })
+    }
+
     /// Задаёт флаги курсора камеры для старта сцены; действуют, только если камера активна.
     pub fn set_camera_cursor(&mut self, id: &str, cursor: CameraCursor) -> Result<(), String> {
         self.edit_object(id, None, |object| {
@@ -2099,6 +2134,59 @@ mod tests {
             scene
                 .set_camera_settings("camera", Some(path("/cameras/main.toml")))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn assigning_post_process_registers_asset_and_supports_undo() {
+        let mut scene = scene();
+        let post = path("/cameras/look.postprocess");
+        scene
+            .set_camera_post_process("camera", Some(post.clone()))
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .post_process,
+            Some(post.clone())
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == post)
+        );
+        assert!(
+            scene
+                .set_camera_post_process("camera", Some(path("/cameras/look.toml")))
+                .is_err()
+        );
+        assert!(scene.undo());
+        assert_eq!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .post_process,
+            None
+        );
+        assert!(scene.redo());
+        assert!(
+            scene
+                .object("camera")
+                .unwrap()
+                .camera
+                .as_ref()
+                .unwrap()
+                .post_process
+                .is_some()
         );
     }
 

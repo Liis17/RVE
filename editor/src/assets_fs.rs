@@ -22,6 +22,7 @@ pub enum AssetKind {
     Scene,
     Prefab,
     CameraSettings,
+    PostProcess,
     Model,
     Texture,
     Hdr,
@@ -41,6 +42,7 @@ impl AssetKind {
             Some("rvescene") => Self::Scene,
             Some("rveprefab") => Self::Prefab,
             Some("camerasettings") => Self::CameraSettings,
+            Some("postprocess") => Self::PostProcess,
             Some("fbx") => Self::Model,
             Some("png") => Self::Texture,
             Some("hdr") => Self::Hdr,
@@ -305,6 +307,7 @@ mod tests {
             AssetKind::of("camera.CAMERASETTINGS"),
             AssetKind::CameraSettings
         );
+        assert_eq!(AssetKind::of("look.PostProcess"), AssetKind::PostProcess);
         assert_eq!(AssetKind::of("s.lua"), AssetKind::Script);
     }
 

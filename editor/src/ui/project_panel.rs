@@ -157,6 +157,7 @@ fn kind_label(entry: &AssetEntry) -> &'static str {
         AssetKind::Scene => "SCENE",
         AssetKind::Prefab => "PREFAB",
         AssetKind::CameraSettings => "CAMERA",
+        AssetKind::PostProcess => "POST",
         AssetKind::Model => "FBX",
         AssetKind::Texture => "PNG",
         AssetKind::Hdr => "HDR",

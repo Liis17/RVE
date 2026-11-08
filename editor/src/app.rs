@@ -366,13 +366,11 @@ impl EditorApp {
 
         let camera_settings_changed = changes.rescan
             || changes.camera_settings_paths().next().is_some()
+            || changes.post_process_paths().next().is_some()
             || self.state.scene.as_ref().is_some_and(|scene| {
                 scene.view().assets.iter().any(|asset| {
-                    asset
-                        .path
-                        .as_str()
-                        .to_ascii_lowercase()
-                        .ends_with(".camerasettings")
+                    let lower = asset.path.as_str().to_ascii_lowercase();
+                    (lower.ends_with(".camerasettings") || lower.ends_with(".postprocess"))
                         && changes.contains_path_or_parent(&asset.path)
                 })
             });
@@ -1492,7 +1490,15 @@ fn render_scene_frame(
     let pending_frame = state.pending_frame.take();
     // Модель ещё разбирается в фоне: наведение камеры ждёт её готовности.
     let mut still_loading = None;
-    let (scene_frame, game_camera, game_settings, game_camera_handle, has_light, frame_target) = {
+    let (
+        scene_frame,
+        game_camera,
+        game_settings,
+        game_post,
+        game_camera_handle,
+        has_light,
+        frame_target,
+    ) = {
         let Some(mut parts) = state.frame_parts() else {
             return render_ui_only(&mut gpu.renderer, ui, &[]);
         };
@@ -1525,6 +1531,11 @@ fn render_scene_frame(
             .camera_settings(game_camera_handle)
             .copied()
             .unwrap_or_default();
+        let game_post = parts
+            .world
+            .post_process(game_camera_handle)
+            .copied()
+            .unwrap_or_default();
         let has_light = parts
             .world
             .objects()
@@ -1548,6 +1559,7 @@ fn render_scene_frame(
             scene_frame,
             game_camera,
             game_settings,
+            game_post,
             game_camera_handle,
             has_light,
             frame_target,
@@ -1568,6 +1580,11 @@ fn render_scene_frame(
         scene_frame.view
     } else {
         CameraSettings::default()
+    };
+    let scene_post = if playing {
+        scene_frame.post_process
+    } else {
+        engine_scene::PostProcessSettings::default()
     };
     let Some(parts) = state.frame_parts() else {
         return render_ui_only(&mut gpu.renderer, ui, &[]);
@@ -1609,6 +1626,7 @@ fn render_scene_frame(
             width,
             height,
             scene_settings,
+            scene_post,
             &scene_frame.light,
             &local_lights,
             &local_light_shadows,
@@ -1626,6 +1644,7 @@ fn render_scene_frame(
             width,
             height,
             game_settings,
+            game_post,
             &scene_frame.light,
             &local_lights,
             &local_light_shadows,
