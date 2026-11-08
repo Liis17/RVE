@@ -959,6 +959,16 @@ name = "engine-files"
 version = "0.1.0"
 
 [[package]]
+name = "engine-gui"
+version = "0.1.0"
+dependencies = [
+ "engine-files",
+ "epaint",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "engine-input"
 version = "0.1.0"
 dependencies = [
