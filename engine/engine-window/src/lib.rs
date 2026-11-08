@@ -249,6 +249,13 @@ fn commit_event(text: String) -> Option<TextInputEvent> {
     (!text.is_empty()).then_some(TextInputEvent::Text(text))
 }
 
+/// `NamedKey::Process` на Windows означает, что клавишу обработал IME: набранный текст придёт
+/// через `Ime::Commit`. Пока IME разрешён, такое нажатие не должно дать текст, иначе символ
+/// дублируется (как в egui-winit 0.36.2, `try_on_ime_processed_keyboard_input`).
+fn ime_processed_key(ime_allowed: bool, key: Option<NamedKey>) -> bool {
+    ime_allowed && key == Some(NamedKey::Process)
+}
+
 fn named_key(key: &LogicalKey) -> Option<NamedKey> {
     match key {
         LogicalKey::Named(named) => Some(*named),
@@ -835,6 +842,7 @@ impl<H: WindowHandler> ApplicationHandler<InternalEvent> for WindowApplication<'
 
         // Текст приходит и при автоповторе, поэтому проверка не зависит от `key`.
         if let WindowEvent::KeyboardInput { event, .. } = &event
+            && !ime_processed_key(self.text_input, named_key(&event.logical_key))
             && let Some(text_event) = text_input_for_key(
                 event.state == ElementState::Pressed,
                 named_key(&event.logical_key),
@@ -1155,6 +1163,14 @@ mod tests {
     fn ime_commit_is_text_and_empty_commit_is_ignored() {
         assert_eq!(commit_event("é".to_owned()), text("é"));
         assert_eq!(commit_event(String::new()), None);
+    }
+
+    #[test]
+    fn ime_processed_key_is_skipped_only_while_ime_is_allowed() {
+        assert!(ime_processed_key(true, Some(NamedKey::Process)));
+        assert!(!ime_processed_key(false, Some(NamedKey::Process)));
+        assert!(!ime_processed_key(true, Some(NamedKey::Enter)));
+        assert!(!ime_processed_key(true, None));
     }
 
     #[test]
