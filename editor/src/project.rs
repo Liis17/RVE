@@ -8,8 +8,8 @@ use engine_project::{BootstrapConfig, ProjectSettings};
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceStats, ResourceSystem, SourceMode};
 use engine_scene::world::ObjectHandle;
 use engine_scene::{
-    CameraSettings, PhysicsMaterialSettings, PostProcessSettings, SceneDocument, SceneError, World,
-    resolve_post_process,
+    CameraSettings, MaterialAsset, PhysicsMaterialSettings, PostProcessSettings, SceneDocument,
+    SceneError, ShaderAsset, World, resolve_post_process,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -234,6 +234,50 @@ impl OpenProject {
         self.assets_dir
             .create_file(folder, &name, &source)
             .map_err(|error| format!("{name}: {error}"))
+    }
+
+    /// Creates a default `.rvemat` without replacing an existing asset.
+    pub fn create_material(&self, folder: &str, name: &str) -> Result<String, String> {
+        let name = with_extension(name, ".rvemat");
+        let source = MaterialAsset::default()
+            .to_toml()
+            .map_err(|error| error.to_string())?;
+        self.assets_dir
+            .create_file(folder, &name, &source)
+            .map_err(|error| format!("{name}: {error}"))
+    }
+
+    /// Creates the built-in Lit surface shader template without replacing an existing asset.
+    pub fn create_shader(&self, folder: &str, name: &str) -> Result<String, String> {
+        let name = with_extension(name, ".rveshader");
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("New Shader");
+        let source = ShaderAsset::template(stem);
+        self.assets_dir
+            .create_file(folder, &name, &source)
+            .map_err(|error| format!("{name}: {error}"))
+    }
+
+    /// Atomically saves an existing material asset.
+    pub fn save_material(
+        &self,
+        path: &VirtualPath,
+        material: &MaterialAsset,
+    ) -> Result<(), String> {
+        if !path.as_str().to_ascii_lowercase().ends_with(".rvemat") {
+            return Err(format!("{path}: ожидается ресурс .rvemat"));
+        }
+        let file = self
+            .assets_dir
+            .resolve(path.as_str())
+            .map_err(|error| format!("{path}: {error}"))?;
+        if !file.is_file() {
+            return Err(format!("{path}: файл материала не найден"));
+        }
+        let source = material.to_toml().map_err(|error| error.to_string())?;
+        crate::scene_edit::write_atomic(&file, source.as_bytes())
     }
 
     /// Загрузчик префабов проекта для [`crate::scene_edit::EditorScene`].
@@ -462,6 +506,14 @@ fn without_dot_components(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+fn with_extension(name: &str, extension: &str) -> String {
+    if name.to_ascii_lowercase().ends_with(extension) {
+        name.to_owned()
+    } else {
+        format!("{name}{extension}")
+    }
 }
 
 impl Drop for OpenProject {
@@ -778,6 +830,25 @@ mod tests {
                 .save_physics_material(&missing, &PhysicsMaterialSettings::default())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn material_and_shader_assets_are_created_without_overwriting() {
+        let temp = TempProject::new(Some(SETTINGS), true);
+        fs::create_dir_all(temp.0.join("Assets/materials")).unwrap();
+        let project = OpenProject::open(&temp.0).unwrap();
+        let material_path = project.create_material("materials", "stone").unwrap();
+        assert_eq!(material_path, "materials/stone.rvemat");
+        assert!(project.create_material("materials", "stone").is_err());
+        let material_source =
+            fs::read_to_string(temp.0.join("Assets").join(&material_path)).unwrap();
+        MaterialAsset::parse(&material_path, &material_source).unwrap();
+
+        let shader_path = project.create_shader("materials", "stone").unwrap();
+        assert_eq!(shader_path, "materials/stone.rveshader");
+        assert!(project.create_shader("materials", "stone").is_err());
+        let shader_source = fs::read_to_string(temp.0.join("Assets").join(&shader_path)).unwrap();
+        ShaderAsset::parse(&shader_path, &shader_source).unwrap();
     }
 
     #[test]

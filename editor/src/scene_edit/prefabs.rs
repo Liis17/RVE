@@ -391,6 +391,7 @@ fn used_paths(document: &SceneDocument) -> HashSet<VirtualPath> {
         if let Some(mesh) = &object.mesh_renderer {
             collected.push(mesh.model.clone());
             collected.extend(mesh.texture.clone());
+            collected.extend(mesh.materials.iter().flatten().cloned());
             if let Some(material) = &mesh.material {
                 collected.extend(material_paths(material));
             }
@@ -411,6 +412,7 @@ fn used_paths(document: &SceneDocument) -> HashSet<VirtualPath> {
             if let Some(mesh) = &change.mesh_renderer {
                 collected.extend(mesh.model.clone());
                 collected.extend(mesh.texture.clone());
+                collected.extend(mesh.materials.iter().flatten().flatten().cloned());
                 if let Some(material) = &mesh.material {
                     collected.extend(material_paths(material));
                 }
@@ -622,6 +624,9 @@ pub(crate) fn object_override(
                         .unwrap_or(&MaterialOverride::default()),
                     to.material.as_ref().unwrap_or(&MaterialOverride::default()),
                 )?);
+            }
+            if to.materials != from.materials {
+                mesh.materials = Some(to.materials.clone());
             }
             if mesh != MeshRendererOverride::default() {
                 change.mesh_renderer = Some(mesh);
@@ -1039,6 +1044,7 @@ fn override_paths(change: &PrefabOverride) -> Vec<VirtualPath> {
     if let Some(mesh) = &change.mesh_renderer {
         paths.extend(mesh.model.clone());
         paths.extend(mesh.texture.clone());
+        paths.extend(mesh.materials.iter().flatten().flatten().cloned());
         if let Some(material) = &mesh.material {
             paths.extend(material_paths(material));
         }
