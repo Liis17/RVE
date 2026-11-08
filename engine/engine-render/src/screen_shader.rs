@@ -801,17 +801,13 @@ pub(crate) fn chain_record<'a>(
         return None;
     }
     let scratch = scratch?;
-    let mut passes = [None; SCREEN_SHADER_MAX_PASSES];
-    for (index, pass) in chain.passes.iter().flatten().enumerate() {
-        passes[index] = context
+    let passes = screen_pass_draws(chain, |shader, stage| {
+        context
             .shaders
-            .get(pass.shader.0)
+            .get(shader.0)
             .and_then(Option::as_ref)
-            .map(|pipelines| ScreenPassDraw {
-                pipeline: pipelines.for_stage(pass.stage),
-                params: pass.params,
-            });
-    }
+            .map(|pipelines| pipelines.for_stage(stage))
+    });
     let record = ScreenChainRecord {
         scratch,
         sampler,
@@ -823,8 +819,47 @@ pub(crate) fn chain_record<'a>(
     (record.len() > 0).then_some(record)
 }
 
-/// Создаёт или пересоздаёт scratch стадии, если цепочка непуста и размер не совпадает.
-/// Пустая цепочка не выделяет память; scratch уничтожается вместе с целью вида.
+/// Проходы цепочки в её порядке. Шейдер без пайплайна оставляет пустую позицию, но не сдвигает
+/// остальные: запись берёт непустые позиции по порядку, а ping-pong считает только их.
+fn screen_pass_draws(
+    chain: &ScreenChain,
+    pipeline: impl Fn(ScreenShaderId, ScreenShaderStage) -> Option<vk::Pipeline>,
+) -> [Option<ScreenPassDraw>; SCREEN_SHADER_MAX_PASSES] {
+    let mut passes = [None; SCREEN_SHADER_MAX_PASSES];
+    for (index, pass) in chain.passes.iter().flatten().enumerate() {
+        passes[index] = pipeline(pass.shader, pass.stage).map(|pipeline| ScreenPassDraw {
+            pipeline,
+            params: pass.params,
+        });
+    }
+    passes
+}
+
+/// Действие над scratch стадии в кадре.
+#[derive(Debug, PartialEq, Eq)]
+enum ScratchPlan {
+    Keep,
+    Create,
+    Release,
+}
+
+/// Пустая цепочка освобождает scratch, непустая создаёт его при отсутствии или смене размера.
+fn screen_scratch_plan(
+    chain_len: usize,
+    current: Option<vk::Extent2D>,
+    extent: vk::Extent2D,
+) -> ScratchPlan {
+    match (chain_len, current) {
+        (0, None) => ScratchPlan::Keep,
+        (0, Some(_)) => ScratchPlan::Release,
+        (_, Some(current)) if current == extent => ScratchPlan::Keep,
+        (_, _) => ScratchPlan::Create,
+    }
+}
+
+/// Создаёт, пересоздаёт или освобождает scratch стадии по длине цепочки.
+/// Освобождение сразу безопасно: scratch принадлежит кадровому слоту, чей fence уже дождан,
+/// и пустая цепочка его не записывает. Так же заменяется scratch при смене размера.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_screen_scratch(
     slot: &mut Option<ScreenShaderScratch>,
@@ -836,25 +871,31 @@ pub(crate) fn prepare_screen_scratch(
     physical_device: vk::PhysicalDevice,
     set_layout: Option<vk::DescriptorSetLayout>,
 ) -> Result<(), RenderError> {
-    if chain_len == 0
-        || slot
-            .as_ref()
-            .is_some_and(|scratch| scratch.extent == extent)
-    {
-        return Ok(());
-    }
-    let set_layout = set_layout.ok_or(RenderError::InvalidState(
-        "layout экранных шейдеров отсутствует",
-    ))?;
-    *slot = Some(ScreenShaderScratch::new(
-        instance,
-        device,
-        physical_device,
+    match screen_scratch_plan(
+        chain_len,
+        slot.as_ref().map(|scratch| scratch.extent),
         extent,
-        format,
-        set_layout,
-    )?);
-    Ok(())
+    ) {
+        ScratchPlan::Keep => Ok(()),
+        ScratchPlan::Release => {
+            *slot = None;
+            Ok(())
+        }
+        ScratchPlan::Create => {
+            let set_layout = set_layout.ok_or(RenderError::InvalidState(
+                "layout экранных шейдеров отсутствует",
+            ))?;
+            *slot = Some(ScreenShaderScratch::new(
+                instance,
+                device,
+                physical_device,
+                extent,
+                format,
+                set_layout,
+            )?);
+            Ok(())
+        }
+    }
 }
 
 /// Байты SPIR-V в порядке хоста, как их ожидает `create_post_pipeline`.
@@ -1081,10 +1122,127 @@ vec3 rve_shade(vec2 uv) {
         }
     }
 
+    /// Блок push constants prelude, как его видит naga: член → смещение в байтах и размер блока.
+    fn push_block_layout(stage: ScreenShaderStage) -> (Vec<(String, u32)>, u32) {
+        let source = format!("{PRELUDE_HEAD}{IDENTITY}\n{}", stage.tail());
+        let mut frontend = glsl::Frontend::default();
+        let module = frontend
+            .parse(&glsl::Options::from(ShaderStage::Fragment), &source)
+            .expect("prelude с identity шейдером");
+        let block = module
+            .global_variables
+            .iter()
+            .find_map(|(_, global)| (global.space == AddressSpace::Immediate).then_some(global))
+            .expect("блок push constants");
+        let TypeInner::Struct { members, span } = &module.types[block.ty].inner else {
+            panic!("блок push constants должен быть struct");
+        };
+        let offsets = members
+            .iter()
+            .map(|member| (member.name.clone().unwrap_or_default(), member.offset))
+            .collect();
+        (offsets, *span)
+    }
+
     #[test]
-    fn push_constant_block_is_exactly_112_bytes() {
-        // params (64) + resolution (16) + content (16) + time (16) = 112; prelude не выходит за лимит.
-        assert_eq!(SCREEN_PUSH_CONSTANTS_SIZE, 112);
+    fn push_block_offsets_from_naga_match_the_packed_layout() {
+        for stage in stages() {
+            let (offsets, span) = push_block_layout(stage);
+            assert_eq!(
+                offsets,
+                [
+                    ("params".to_owned(), 0),
+                    ("resolution".to_owned(), 64),
+                    ("content".to_owned(), 80),
+                    ("time".to_owned(), 96),
+                ],
+                "смещения членов блока"
+            );
+            assert_eq!(span, 112);
+            assert_eq!(span as usize, SCREEN_PUSH_CONSTANTS_SIZE);
+        }
+    }
+
+    #[test]
+    fn packed_values_land_at_the_offsets_naga_reports() {
+        let (offsets, _) = push_block_layout(ScreenShaderStage::AfterPost);
+        let float_index = |name: &str| {
+            let (_, offset) = offsets
+                .iter()
+                .find(|(member, _)| member == name)
+                .expect("член блока");
+            (*offset / 4) as usize
+        };
+        let params: [f32; SCREEN_SHADER_PARAM_COUNT] =
+            std::array::from_fn(|index| index as f32 + 1.0);
+        let bytes = screen_push_constants(&params, (640, 360), (1280, 720), 5.0, 9);
+        let floats = read_floats(&bytes);
+        let params_at = float_index("params");
+        assert_eq!(floats[params_at..params_at + 16], params);
+        let resolution_at = float_index("resolution");
+        assert_eq!(
+            floats[resolution_at..resolution_at + 4],
+            [640.0, 360.0, 1.0 / 640.0, 1.0 / 360.0]
+        );
+        let content_at = float_index("content");
+        assert_eq!(
+            floats[content_at..content_at + 4],
+            [0.5, 0.5, 1.0 / 1280.0, 1.0 / 720.0]
+        );
+        let time_at = float_index("time");
+        assert_eq!(floats[time_at..time_at + 2], [5.0, 9.0]);
+    }
+
+    #[test]
+    fn destroyed_or_missing_shader_keeps_order_of_remaining_passes() {
+        use ash::vk::Handle as _;
+        let pass = |id: usize| ScreenShaderPass {
+            shader: ScreenShaderId(id),
+            stage: ScreenShaderStage::AfterPost,
+            params: [id as f32; SCREEN_SHADER_PARAM_COUNT],
+        };
+        let chain = ScreenChain {
+            passes: [Some(pass(0)), Some(pass(1)), Some(pass(2)), None],
+            time: 0.0,
+            frame: 0,
+        };
+        // Шейдер 1 уничтожен: его позиция пустая, соседние проходы остаются на своих местах.
+        let draws = screen_pass_draws(&chain, |shader, _| {
+            (shader.0 != 1).then(|| vk::Pipeline::from_raw(100 + shader.0 as u64))
+        });
+        let drawn: Vec<(u64, f32)> = draws
+            .iter()
+            .flatten()
+            .map(|draw| (draw.pipeline.as_raw(), draw.params[0]))
+            .collect();
+        assert_eq!(drawn, [(100, 0.0), (102, 2.0)]);
+        assert!(draws[1].is_none(), "позиция уничтоженного шейдера пуста");
+    }
+
+    #[test]
+    fn scratch_is_released_by_empty_chain_and_recreated_on_resize() {
+        let small = vk::Extent2D {
+            width: 64,
+            height: 32,
+        };
+        let large = vk::Extent2D {
+            width: 128,
+            height: 32,
+        };
+        assert_eq!(
+            screen_scratch_plan(0, Some(small), small),
+            ScratchPlan::Release
+        );
+        assert_eq!(screen_scratch_plan(0, None, small), ScratchPlan::Keep);
+        assert_eq!(
+            screen_scratch_plan(2, Some(small), small),
+            ScratchPlan::Keep
+        );
+        assert_eq!(
+            screen_scratch_plan(2, Some(small), large),
+            ScratchPlan::Create
+        );
+        assert_eq!(screen_scratch_plan(1, None, small), ScratchPlan::Create);
     }
 
     #[test]
