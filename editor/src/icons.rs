@@ -75,6 +75,7 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         rigid_body,
         character_controller,
         audio_source,
+        animator,
 
         particle_emitter,
         lite_scripts,
@@ -96,6 +97,7 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         && rigid_body.is_none()
         && character_controller.is_none()
         && audio_source.is_none()
+        && animator.is_none()
         && particle_emitter.is_none()
         && lite_scripts.is_empty()
         && heavy_scripts.is_empty()

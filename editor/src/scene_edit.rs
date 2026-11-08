@@ -3,11 +3,12 @@
 use engine_files::VirtualPath;
 use engine_scene::document::MaterialOverride;
 use engine_scene::{
-    AudioSourceComponent, CameraComponent, CameraCursor, CharacterControllerComponent,
-    ColliderComponent, DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup,
-    MeshRenderer, ObjectOrigin, ParticleEmitterComponent, PointLightComponent, PrefabInstance,
-    PrefabOverride, ProceduralSkyComponent, RigidBodyComponent, SceneAsset, SceneDocument,
-    SceneError, SceneObject, SceneTransform, SpotLightComponent,
+    AnimatorComponent, AudioSourceComponent, CameraComponent, CameraCursor,
+    CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
+    EnvironmentComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin,
+    ParticleEmitterComponent, PointLightComponent, PrefabInstance, PrefabOverride,
+    ProceduralSkyComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
+    SceneTransform, SpotLightComponent,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -85,6 +86,7 @@ pub enum ComponentKind {
     RigidBody,
     CharacterController,
     AudioSource,
+    Animator,
     ParticleEmitter,
 }
 
@@ -103,6 +105,7 @@ pub enum Component {
     RigidBody(RigidBodyComponent),
     CharacterController(CharacterControllerComponent),
     AudioSource(AudioSourceComponent),
+    Animator(AnimatorComponent),
     ParticleEmitter(ParticleEmitterComponent),
 }
 
@@ -121,6 +124,7 @@ impl Component {
             Self::RigidBody(_) => ComponentKind::RigidBody,
             Self::CharacterController(_) => ComponentKind::CharacterController,
             Self::AudioSource(_) => ComponentKind::AudioSource,
+            Self::Animator(_) => ComponentKind::Animator,
             Self::ParticleEmitter(_) => ComponentKind::ParticleEmitter,
         }
     }
@@ -142,6 +146,7 @@ impl Component {
                 Self::CharacterController(object.character_controller?)
             }
             ComponentKind::AudioSource => Self::AudioSource(object.audio_source.clone()?),
+            ComponentKind::Animator => Self::Animator(object.animator.clone()?),
             ComponentKind::ParticleEmitter => {
                 Self::ParticleEmitter(object.particle_emitter.clone()?)
             }
@@ -173,6 +178,14 @@ impl Component {
             ComponentKind::AudioSource => Self::AudioSource(AudioSourceComponent::with_clip(
                 object.audio_source.as_ref()?.clip.clone(),
             )),
+            // Клипы сохраняются, как у источника звука: без них аниматор пустой.
+            ComponentKind::Animator => {
+                let clips = object.animator.as_ref()?.clips.clone();
+                Self::Animator(AnimatorComponent {
+                    clips,
+                    ..AnimatorComponent::new()
+                })
+            }
             // Текстура сохраняется по той же причине, что и клип звука.
             ComponentKind::ParticleEmitter => Self::ParticleEmitter(ParticleEmitterComponent {
                 texture: object.particle_emitter.as_ref()?.texture.clone(),
@@ -199,6 +212,7 @@ impl Component {
             Self::RigidBody(value) => object.rigid_body = Some(value),
             Self::CharacterController(value) => object.character_controller = Some(value),
             Self::AudioSource(value) => object.audio_source = Some(value),
+            Self::Animator(value) => object.animator = Some(value),
             Self::ParticleEmitter(value) => object.particle_emitter = Some(value),
         }
     }
@@ -1304,6 +1318,13 @@ impl EditorScene {
         })
     }
 
+    /// Удаляет аниматор объекта; клипы в `[[assets]]` остаются объявленными.
+    pub fn remove_animator(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.animator = None;
+            Ok(())
+        })
+    }
     /// Удаляет эмиттер частиц объекта.
     pub fn remove_particle_emitter(&mut self, id: &str) -> Result<(), String> {
         self.edit_object(id, None, |object| {
@@ -1530,6 +1551,11 @@ fn register_object_assets(
     }
     if let Some(audio) = &object.audio_source {
         ensure_asset(document, &audio.clip);
+    }
+    if let Some(animator) = &object.animator {
+        for clip in &animator.clips {
+            ensure_asset(document, clip);
+        }
     }
     if let Some(texture) = object
         .particle_emitter
@@ -2560,6 +2586,109 @@ mod tests {
         scene.remove_audio_source(&id).unwrap();
         assert!(scene.object(&id).unwrap().audio_source.is_none());
         assert!(Component::reset(scene.object(&id).unwrap(), ComponentKind::AudioSource).is_none());
+    }
+
+    #[test]
+    fn animator_registers_its_clips_resets_keeping_them_and_rolls_back_invalid_values() {
+        let mut scene = scene();
+        let model = VirtualPath::parse("models/hero.fbx").unwrap();
+        let id = scene
+            .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+            .unwrap();
+        let clip = VirtualPath::parse("anims/walk.fbx").unwrap();
+        let animator = AnimatorComponent {
+            clips: vec![clip.clone()],
+            speed: 2.0,
+            ..AnimatorComponent::new()
+        };
+        scene
+            .set_component(&id, Component::Animator(animator))
+            .unwrap();
+        assert!(scene.view().assets.iter().any(|asset| asset.path == clip));
+
+        let copied = Component::read(scene.object(&id).unwrap(), ComponentKind::Animator).unwrap();
+        assert!(matches!(
+            copied,
+            Component::Animator(ref value) if value.speed == 2.0
+        ));
+
+        // Reset сохраняет клипы: без них аниматор пуст, как и источник звука без клипа.
+        let reset = Component::reset(scene.object(&id).unwrap(), ComponentKind::Animator).unwrap();
+        scene.set_component(&id, reset).unwrap();
+        assert_eq!(
+            scene.object(&id).unwrap().animator.clone().unwrap(),
+            AnimatorComponent {
+                clips: vec![clip],
+                ..AnimatorComponent::new()
+            }
+        );
+
+        let invalid = AnimatorComponent {
+            speed: -1.0,
+            ..AnimatorComponent::new()
+        };
+        let error = scene
+            .set_component(&id, Component::Animator(invalid))
+            .unwrap_err();
+        assert!(error.contains("speed"), "{error}");
+        assert_eq!(
+            scene.object(&id).unwrap().animator.as_ref().unwrap().speed,
+            1.0
+        );
+
+        scene.remove_animator(&id).unwrap();
+        assert!(scene.object(&id).unwrap().animator.is_none());
+        assert!(Component::reset(scene.object(&id).unwrap(), ComponentKind::Animator).is_none());
+    }
+
+    #[test]
+    fn animator_edits_and_removal_are_undoable_as_whole_components() {
+        let mut scene = scene();
+        let model = VirtualPath::parse("models/hero.fbx").unwrap();
+        let id = scene
+            .create_object(&NewObject::Mesh(model, [0.0; 3]), None)
+            .unwrap();
+        let speed = |scene: &EditorScene| {
+            scene
+                .object(&id)
+                .unwrap()
+                .animator
+                .as_ref()
+                .map(|a| a.speed)
+        };
+        scene
+            .set_component(
+                &id,
+                Component::Animator(AnimatorComponent {
+                    speed: 2.0,
+                    ..AnimatorComponent::new()
+                }),
+            )
+            .unwrap();
+        scene
+            .set_component(
+                &id,
+                Component::Animator(AnimatorComponent {
+                    speed: 3.0,
+                    ..AnimatorComponent::new()
+                }),
+            )
+            .unwrap();
+        assert_eq!(speed(&scene), Some(3.0));
+
+        assert!(scene.undo());
+        assert_eq!(speed(&scene), Some(2.0));
+        assert!(scene.redo());
+        assert_eq!(speed(&scene), Some(3.0));
+
+        scene.remove_animator(&id).unwrap();
+        assert_eq!(speed(&scene), None);
+        assert!(scene.undo());
+        assert_eq!(
+            speed(&scene),
+            Some(3.0),
+            "удаление откатывается целым компонентом"
+        );
     }
 
     #[test]

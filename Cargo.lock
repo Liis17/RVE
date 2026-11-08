@@ -716,8 +716,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "engine-assets"
+name = "engine-animation"
 version = "0.1.0"
+dependencies = [
+ "engine-assets",
+ "engine-files",
+ "engine-scene",
+ "glam",
+ "ufbx",
+]
+
+[[package]]
+name = "engine-assets"
+version = "0.2.0"
 dependencies = [
  "engine-files",
  "engine-pak",
@@ -826,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -848,10 +859,11 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "egui",
  "egui-winit",
+ "engine-animation",
  "engine-assets",
  "engine-audio",
  "engine-console",
@@ -878,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "engine-files",
  "glam",
@@ -888,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "engine-console",
  "engine-files",
@@ -2729,11 +2741,12 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "egui",
  "egui-winit",
  "egui_dock",
+ "engine-animation",
  "engine-assets",
  "engine-audio",
  "engine-console",
@@ -2770,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "rve-sdk"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "rvepak"

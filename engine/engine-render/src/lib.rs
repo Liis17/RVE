@@ -4,7 +4,13 @@
 use ash::vk::Handle as _;
 use ash::{Entry, vk};
 
+/// Версия крейта (SemVer).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod environment;
+mod skin;
+
+pub use skin::{SkinBinding, SkinId, SkinVertex};
 
 use clusters::{ClusterBounds, DepthRange, GpuLocalLight, camera_cluster_bounds};
 use culling::{Frustum, LocalBounds, back_to_front_order};
@@ -57,8 +63,6 @@ const LINEAR_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 /// egui хранит значения в гамма-пространстве, поэтому они читаются без перевода; шейдер сам
 /// переводит результат для sRGB-swapchain, и смешивание в этом случае идёт в линейном пространстве.
 const UI_TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-/// Версия крейта, заданная в `Cargo.toml`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Resolution of each layer in the shared directional shadow map.
 pub const SHADOW_MAP_RESOLUTION: u32 = 2048;
@@ -71,6 +75,7 @@ const NO_GRAPHICS_COMPUTE_QUEUE_FAMILY_REASON: &str =
 const NO_GRAPHICS_PRESENT_QUEUE_FAMILY_REASON: &str = "нет общей graphics + present queue family";
 const MESH_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const CLUSTER_COMPUTE_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cluster.comp.spv"));
+const SKIN_COMPUTE_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skin.comp.spv"));
 const MESH_OPAQUE_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.opaque.spv"));
 const MESH_MASK_FRAGMENT_SHADER: &[u8] =
@@ -247,6 +252,8 @@ pub struct DrawCommand {
     pub lod_level: u8,
     /// Попадает ли меш в shadow map; на получение тени не влияет.
     pub casts_shadow: bool,
+    /// Экземпляр skinning меша и палитра кадра; `None` для статического меша.
+    pub skin: Option<SkinBinding>,
 }
 
 /// Направленный свет и фоновое освещение сцены в линейном RGB.
@@ -366,6 +373,8 @@ pub struct Frame<'a> {
     /// index in `lights`; omitted entries render that light without a shadow.
     pub local_light_shadows: &'a [LocalLightShadow],
     pub draws: &'a [DrawCommand],
+    /// Палитры skinning кадра: матрицы костей по столбцам, одна палитра на `SkinBinding::palette`.
+    pub joint_palettes: &'a [&'a [[[f32; 4]; 4]]],
     pub overlay: &'a [OverlayVertex],
     pub debug_view: DebugView,
     pub view: ViewSettings,
@@ -733,6 +742,8 @@ struct AcquiredFrameSubmission<'a> {
     temporal_submissions: &'a [TemporalSubmission],
     shadow_layout: vk::ImageLayout,
     local_shadow_layout: vk::ImageLayout,
+    /// План skinning вызова; состояние кольца фиксируется после отправки.
+    skin: Option<&'a skin::SkinPlan>,
 }
 
 /// Результат попытки показать кадр.
@@ -1004,6 +1015,13 @@ pub struct Renderer {
     local_shadow_pipeline: Option<vk::Pipeline>,
     cluster_pipeline: Option<vk::Pipeline>,
     cluster_pipeline_layout: Option<vk::PipelineLayout>,
+    skin_set_layout: Option<vk::DescriptorSetLayout>,
+    skin_pipeline_layout: Option<vk::PipelineLayout>,
+    skin_pipeline: Option<vk::Pipeline>,
+    /// Экземпляры skinning по `SkinId`; освобождённые места переиспользуются.
+    skin_instances: Vec<Option<skin::SkinInstance>>,
+    /// Номер последнего отправленного вызова с skinning; нужен для предыдущей позы.
+    skin_call_serial: u64,
     post_pipeline_layout: Option<vk::PipelineLayout>,
     taa_set_layout: Option<vk::DescriptorSetLayout>,
     taa_pipeline_layout: Option<vk::PipelineLayout>,
@@ -1130,6 +1148,11 @@ impl Renderer {
             local_shadow_pipeline: None,
             cluster_pipeline: None,
             cluster_pipeline_layout: None,
+            skin_set_layout: None,
+            skin_pipeline_layout: None,
+            skin_pipeline: None,
+            skin_instances: Vec::new(),
+            skin_call_serial: 0,
             post_pipeline_layout: None,
             taa_set_layout: None,
             taa_pipeline_layout: None,
@@ -1327,6 +1350,24 @@ impl Renderer {
         vertices: &[Vertex],
         indices: &[u32],
     ) -> Result<MeshId, RenderError> {
+        self.create_mesh_inner(vertices, indices, false)
+    }
+
+    /// Меш для skinning: вершины читает compute, поэтому буфер доступен как storage.
+    fn create_mesh_with_skin(
+        &mut self,
+        vertices: &[Vertex],
+        indices: &[u32],
+    ) -> Result<MeshId, RenderError> {
+        self.create_mesh_inner(vertices, indices, true)
+    }
+
+    fn create_mesh_inner(
+        &mut self,
+        vertices: &[Vertex],
+        indices: &[u32],
+        skinned: bool,
+    ) -> Result<MeshId, RenderError> {
         validate_mesh(vertices.len(), indices)?;
         let instance = self.instance()?.clone();
         let device = self.device()?.clone();
@@ -1388,11 +1429,18 @@ impl Renderer {
         .ok_or(RenderError::InvalidMesh(
             "размер меша переполняет диапазон буфера",
         ))?;
+        let vertex_usage = if skinned {
+            vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+        } else {
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST
+        };
         let vertex_buffer = DeviceBuffer::new(
             &instance,
             &device,
             self.physical_device,
-            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vertex_usage,
             vertex_data.len(),
         )?;
         let index_buffer = DeviceBuffer::new(
@@ -1410,6 +1458,7 @@ impl Renderer {
             layout,
             vertex_data.len(),
             index_data.len(),
+            skinned,
         );
         batch.cursor = layout.end;
         let upload_serial = batch.serial;
@@ -1419,12 +1468,23 @@ impl Renderer {
             index_count: indices.len() as u32,
             bounds,
             upload_serial,
+            skin: None,
         }));
         Ok(MeshId(self.meshes.len() - 1))
     }
 
     /// Отправляет его ожидающую загрузку при необходимости; буферы освобождаются после upload и кадров.
     pub fn destroy_mesh(&mut self, mesh: MeshId) -> Result<(), RenderError> {
+        if self
+            .skin_instances
+            .iter()
+            .flatten()
+            .any(|instance| instance.mesh == mesh)
+        {
+            return Err(RenderError::InvalidState(
+                "меш используется экземпляром skinning; сначала освободите его",
+            ));
+        }
         let upload_serial = self
             .meshes
             .get(mesh.0)
@@ -1438,7 +1498,7 @@ impl Renderer {
             .and_then(Option::take)
             .ok_or(RenderError::InvalidMesh("MeshId не принадлежит renderer"))?;
         self.retired
-            .retire(RetiredResource::Mesh(buffers), upload_serial);
+            .retire(RetiredResource::Mesh(Box::new(buffers)), upload_serial);
         Ok(())
     }
 
@@ -1752,6 +1812,7 @@ impl Renderer {
         }
         validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
+        self.validate_skin_draws(frame)?;
         validate_overlay(frame.overlay)?;
         let view = effective_view_settings(frame.view, frame.debug_view);
         self.miss_unlisted_viewports(&[]);
@@ -1815,6 +1876,8 @@ impl Renderer {
         self.retired.slot_completed(frame_slot);
         self.retired_swapchains
             .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
+        let skin_plan = self.plan_skin(&[frame], frame_slot)?;
+        let skin_record = self.skin_record(skin_plan.as_ref());
         if view.anti_aliasing.is_temporal() {
             ensure_temporal_history(
                 &instance,
@@ -2156,6 +2219,7 @@ impl Renderer {
                 meshes: &self.meshes,
                 materials: &self.materials,
                 draws: frame.draws,
+                skin_draws: skin::skin_draws_for(skin_plan.as_ref(), 0),
                 shadow_cascades: frame.shadow_cascades,
                 local_shadow_matrices: &prepared.local_shadow_matrices,
             };
@@ -2175,6 +2239,7 @@ impl Renderer {
                 meshes: &self.meshes,
                 materials: &self.materials,
                 draws: frame.draws,
+                skin_draws: skin::skin_draws_for(skin_plan.as_ref(), 0),
                 view_projection: multiply_4x4(frame.camera.projection, frame.camera.view),
                 #[cfg(windows)]
                 fsr_camera: fsr_camera_parameters(frame.camera.projection),
@@ -2277,6 +2342,7 @@ impl Renderer {
                 &scene,
                 overlay.as_ref(),
                 temporal_record,
+                skin_record,
                 output_marks,
             )?;
             Ok((temporal_outcome, shadow_layout, local_shadow_layout))
@@ -2357,6 +2423,7 @@ impl Renderer {
             temporal_submissions: &temporal_submissions,
             shadow_layout,
             local_shadow_layout,
+            skin: skin_plan.as_ref(),
         });
         let particles_submitted = match &submitted {
             Ok(outcome) => outcome.submitted,
@@ -2414,6 +2481,7 @@ impl Renderer {
         for (viewport, frame) in scenes {
             validate_debug_view(frame.debug_view, self.capabilities.wireframe)?;
             validate_draws(frame.draws, &self.meshes, &self.materials)?;
+            self.validate_skin_draws(frame)?;
             self.viewports
                 .get(viewport.0)
                 .and_then(Option::as_ref)
@@ -2492,6 +2560,9 @@ impl Renderer {
         self.retired.slot_completed(frame_slot);
         self.retired_swapchains
             .slot_completed(frame_slot, self.frames[frame_slot].submission_generation);
+        let scene_frames: Vec<&Frame<'_>> = scenes.iter().map(|(_, frame)| *frame).collect();
+        let skin_plan = self.plan_skin(&scene_frames, frame_slot)?;
+        let skin_record = self.skin_record(skin_plan.as_ref());
         let submitted_at = Instant::now();
         for ((viewport, frame), (_, _, _fallback_reason, _frame_delta_ms)) in
             scenes.iter().zip(&mut prepared_scenes)
@@ -2951,6 +3022,7 @@ impl Renderer {
                             meshes: &self.meshes,
                             materials: &self.materials,
                             draws: frame.draws,
+                            skin_draws: skin::skin_draws_for(skin_plan.as_ref(), index),
                             shadow_cascades: frame.shadow_cascades,
                             local_shadow_matrices,
                         },
@@ -2970,6 +3042,7 @@ impl Renderer {
                             meshes: &self.meshes,
                             materials: &self.materials,
                             draws: frame.draws,
+                            skin_draws: skin::skin_draws_for(skin_plan.as_ref(), index),
                             view_projection: multiply_4x4(
                                 frame.camera.projection,
                                 frame.camera.view,
@@ -3025,6 +3098,9 @@ impl Renderer {
         let record_started = Instant::now();
         let recorded = (|| {
             begin_command_buffer(&device, command_buffer, slot_timestamps)?;
+            if let Some(record) = skin_record {
+                skin::record_skin(&device, command_buffer, record);
+            }
             let mut shadow_layout = self.shadow_layout;
             let mut local_shadow_layout = self.local_shadow_layout;
             let post_sampler = target_resources.post_sampler;
@@ -3264,6 +3340,7 @@ impl Renderer {
             temporal_submissions: &temporal_submissions,
             shadow_layout,
             local_shadow_layout,
+            skin: skin_plan.as_ref(),
         });
         let particles_submitted = match &submitted {
             Ok(outcome) => outcome.submitted,
@@ -3408,6 +3485,7 @@ impl Renderer {
             temporal_submissions,
             shadow_layout,
             local_shadow_layout,
+            skin,
         } = acquired;
         let submit_started = Instant::now();
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
@@ -3441,6 +3519,7 @@ impl Renderer {
         }
         timings.submit = submit_started.elapsed();
         self.record_frame_submission(frame_slot);
+        self.commit_skin(skin);
         self.shadow_layout = shadow_layout;
         self.local_shadow_layout = local_shadow_layout;
         self.commit_temporal_submissions(temporal_submissions);
@@ -3848,6 +3927,7 @@ impl Renderer {
         self.create_shadow_resources()?;
         self.create_descriptor_resources()?;
         self.create_cluster_pipeline()?;
+        self.create_skin_pipeline()?;
         self.create_particle_pipelines()?;
         self.create_environment_resources()?;
         self.create_default_environment()?;
@@ -4237,6 +4317,41 @@ impl Renderer {
             cache,
             layout,
             CLUSTER_COMPUTE_SHADER,
+        )?);
+        Ok(())
+    }
+
+    /// Compute-пайплайн skinning: четыре storage-буфера в наборе 0 и `vertex_count` в push constant.
+    fn create_skin_pipeline(&mut self) -> Result<(), RenderError> {
+        let device = self.device()?.clone();
+        let cache = self.pipeline_cache()?;
+        let bindings: [vk::DescriptorSetLayoutBinding<'_>; 4] = std::array::from_fn(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding as u32)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        });
+        let set_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        // SAFETY: the layout describes four storage buffers used only by the skin compute shader.
+        let set_layout = unsafe { device.create_descriptor_set_layout(&set_info, None) }?;
+        self.skin_set_layout = Some(set_layout);
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(size_of::<u32>() as u32)];
+        let set_layouts = [set_layout];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_ranges);
+        // SAFETY: the set layout and push constant range are valid for this pipeline layout.
+        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
+        self.skin_pipeline_layout = Some(layout);
+        self.skin_pipeline = Some(create_compute_pipeline(
+            &device,
+            cache,
+            layout,
+            SKIN_COMPUTE_SHADER,
         )?);
         Ok(())
     }
@@ -5371,10 +5486,17 @@ impl Renderer {
                 .module(wireframe_module.handle)
                 .name(c"main"),
         ];
-        let vertex_bindings = [vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(size_of::<Vertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)];
+        // Binding 1 — позиции прошлого кадра для motion vectors; статический меш подаёт тот же буфер.
+        let vertex_bindings = [
+            vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(size_of::<Vertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX),
+            vk::VertexInputBindingDescription::default()
+                .binding(1)
+                .stride(size_of::<Vertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX),
+        ];
         let vertex_attributes = [
             vk::VertexInputAttributeDescription::default()
                 .location(0)
@@ -5396,6 +5518,11 @@ impl Renderer {
                 .binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(std::mem::offset_of!(Vertex, color) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(4)
+                .binding(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::offset_of!(Vertex, position) as u32),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
@@ -6094,11 +6221,16 @@ impl Drop for Renderer {
         #[cfg(all(windows, feature = "dlss"))]
         self.dlss_api.take();
         self.ui_textures.clear();
+        // Экземпляры skinning владеют пулами наборов и буферами; освобождаем их до layout и device.
+        self.skin_instances.clear();
+        // Эмиттеры частиц держат буферы, наборы и текстуры; освобождаем их до мешей и device.
+        if let Some(device) = self.device.as_ref() {
+            self.particles.destroy(device);
+        }
         self.meshes.clear();
         self.materials.clear();
         self.textures.clear();
         if let Some(device) = self.device.as_ref() {
-            self.particles.destroy(device);
             if let Some(pool) = self.frame_descriptor_pool.take() {
                 // SAFETY: the device is idle; destroying the pool frees its frame sets.
                 unsafe { device.destroy_descriptor_pool(pool, None) };
@@ -6210,6 +6342,18 @@ impl Drop for Renderer {
             if let Some(layout) = self.cluster_pipeline_layout.take() {
                 // SAFETY: the clustered compute pipeline was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+            if let Some(pipeline) = self.skin_pipeline.take() {
+                // SAFETY: device is idle and no submission uses the skinning pipeline.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
+            if let Some(layout) = self.skin_pipeline_layout.take() {
+                // SAFETY: the skinning pipeline using this layout was destroyed above.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+            }
+            if let Some(layout) = self.skin_set_layout.take() {
+                // SAFETY: descriptor sets using this layout are freed with their pools above.
+                unsafe { device.destroy_descriptor_set_layout(layout, None) };
             }
             if let Some(pipeline) = self.overlay_pipeline.take() {
                 // SAFETY: the device is idle, so no command buffer uses this pipeline.
@@ -6916,6 +7060,8 @@ struct FrameResources {
     gpu_layout: GpuProfileLayout,
     /// Последняя успешная отправка этого слота; начальный signaled fence не имеет поколения.
     submission_generation: u64,
+    /// Палитры skinning этого слота; растут до следующей степени двойки.
+    skin_palettes: GrowingBuffer,
 }
 
 impl FrameResources {
@@ -6939,6 +7085,7 @@ impl FrameResources {
             timestamps_pending: false,
             gpu_layout: GpuProfileLayout::default(),
             submission_generation: 0,
+            skin_palettes: GrowingBuffer::default(),
         };
         // SAFETY: creating an unsignaled binary semaphore uses a valid default create info.
         frame.image_available =
@@ -8063,7 +8210,7 @@ impl Drop for UiTexture {
 
 /// Ресурс, ожидающий кадры и связанный upload serial; освобождается своим `Drop`.
 enum RetiredResource {
-    Mesh(#[allow(dead_code)] MeshBuffers),
+    Mesh(#[allow(dead_code)] Box<MeshBuffers>),
     Texture(#[allow(dead_code)] Arc<Texture>),
     Image(#[allow(dead_code)] DeviceImage),
     Material(#[allow(dead_code)] GpuMaterial),
@@ -8075,6 +8222,7 @@ enum RetiredResource {
     #[cfg(all(windows, feature = "dlss"))]
     DlssView(#[allow(dead_code)] Box<DlssView>),
     Environment(#[allow(dead_code)] Box<GpuEnvironment>),
+    SkinInstance(#[allow(dead_code)] Box<skin::SkinInstance>),
     ParticleEmitter(#[allow(dead_code)] Box<ParticleEmitter>),
 }
 
@@ -9137,9 +9285,13 @@ fn record_frame(
     scene: &ScenePass<'_>,
     overlay: Option<&OverlayPass>,
     temporal: Option<TemporalResolveRecord<'_>>,
+    skin: Option<skin::SkinRecord<'_>>,
     output_marks: Option<GpuMarks>,
 ) -> Result<Option<TemporalResolveOutcome>, RenderError> {
     begin_command_buffer(device, command_buffer, output_marks.map(|marks| marks.pool))?;
+    if let Some(record) = skin {
+        skin::record_skin(device, command_buffer, record);
+    }
     record_scene(
         device,
         command_buffer,
@@ -9955,6 +10107,8 @@ struct ScenePass<'a> {
     meshes: &'a [Option<MeshBuffers>],
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
+    /// Буферы вершин skinned draw'ов по индексу draw; `None` у статических.
+    skin_draws: &'a [Option<skin::SkinDrawBuffers>],
     view_projection: [[f32; 4]; 4],
     #[cfg(windows)]
     fsr_camera: [f32; 3],
@@ -9977,6 +10131,7 @@ struct ShadowPass<'a> {
     meshes: &'a [Option<MeshBuffers>],
     materials: &'a [Option<GpuMaterial>],
     draws: &'a [DrawCommand],
+    skin_draws: &'a [Option<skin::SkinDrawBuffers>],
     shadow_cascades: &'a [[[f32; 4]; 4]],
     local_shadow_matrices: &'a [[[f32; 4]; 4]],
 }
@@ -10087,12 +10242,18 @@ fn record_draws(
         let Some(mesh) = scene.meshes[draw.mesh.0].as_ref() else {
             continue;
         };
-        if mesh
-            .bounds
-            .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
+        // Skinned draw'ы не отсекаются по bind-pose AABB: поза меняется каждый кадр.
+        if draw.skin.is_none()
+            && mesh
+                .bounds
+                .is_some_and(|bounds| !frustum.intersects(draw.model, bounds))
         {
             continue;
         }
+        let (current, previous) = scene.skin_draws.get(index).copied().flatten().map_or(
+            (mesh.vertex_buffer.buffer, mesh.vertex_buffer.buffer),
+            |buffers| (buffers.current, buffers.previous),
+        );
         let next_rasterization_state = draw_rasterization_state(material.double_sided, &draw.model);
         if rasterization_state != Some(next_rasterization_state) {
             // SAFETY: the graphics pipeline declares both values as dynamic Vulkan 1.3 states.
@@ -10117,7 +10278,7 @@ fn record_draws(
                 &[material.set],
                 &[],
             );
-            device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer.buffer], &[0]);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[current, previous], &[0, 0]);
             device.cmd_bind_index_buffer(
                 command_buffer,
                 mesh.index_buffer.buffer,
@@ -10167,10 +10328,11 @@ fn has_transparent_draws(scene: &ScenePass<'_>) -> bool {
 fn shadow_casters(
     draws: &[DrawCommand],
     mut alpha_mode: impl FnMut(&DrawCommand) -> AlphaMode,
-) -> impl Iterator<Item = &DrawCommand> {
+) -> impl Iterator<Item = (usize, &DrawCommand)> {
     draws
         .iter()
-        .filter(move |draw| draw.casts_shadow && !matches!(alpha_mode(draw), AlphaMode::Blend))
+        .enumerate()
+        .filter(move |(_, draw)| draw.casts_shadow && !matches!(alpha_mode(draw), AlphaMode::Blend))
 }
 
 fn shadow_caster_is_outside(
@@ -10219,7 +10381,7 @@ fn record_shadow_draws(
     }
     let frustum = Some(Frustum::from_view_projection(light_view_projection));
     let mut rasterization_state = None;
-    for draw in shadow_casters(shadow.draws, |draw| {
+    for (index, draw) in shadow_casters(shadow.draws, |draw| {
         material_for_draw(shadow.materials, draw)
             .map_or(AlphaMode::Opaque, |material| material.alpha_mode)
     }) {
@@ -10229,9 +10391,16 @@ fn record_shadow_draws(
         let Some(mesh) = &shadow.meshes[draw.mesh.0] else {
             continue;
         };
-        if shadow_caster_is_outside(draw, mesh.bounds, frustum) {
+        // Skinned draw'ы не отсекаются по bind-pose AABB: поза меняется каждый кадр.
+        if draw.skin.is_none() && shadow_caster_is_outside(draw, mesh.bounds, frustum) {
             continue;
         }
+        let vertex_buffer = shadow
+            .skin_draws
+            .get(index)
+            .copied()
+            .flatten()
+            .map_or(mesh.vertex_buffer.buffer, |buffers| buffers.current);
         let next_rasterization_state = draw_rasterization_state(material.double_sided, &draw.model);
         if rasterization_state != Some(next_rasterization_state) {
             // SAFETY: the shadow graphics pipeline declares both values as dynamic Vulkan 1.3 states.
@@ -10256,7 +10425,7 @@ fn record_shadow_draws(
                 &[material.set],
                 &[],
             );
-            device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer.buffer], &[0]);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex_buffer], &[0]);
             device.cmd_bind_index_buffer(
                 command_buffer,
                 mesh.index_buffer.buffer,
@@ -11554,6 +11723,8 @@ struct MeshBuffers {
     index_count: u32,
     bounds: Option<LocalBounds>,
     upload_serial: u64,
+    /// Веса костей; `Some` только у мешей, созданных через `create_skinned_mesh`.
+    skin: Option<skin::SkinnedMesh>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11701,6 +11872,7 @@ impl UploadBatch {
         layout: MeshUploadLayout,
         vertex_size: usize,
         index_size: usize,
+        skinned: bool,
     ) {
         let vertex_regions = [vk::BufferCopy2::default()
             .src_offset(layout.vertex_offset as vk::DeviceSize)
@@ -11756,6 +11928,25 @@ impl UploadBatch {
             self.device
                 .cmd_pipeline_barrier2(self.command_buffer, &dependency)
         };
+        if skinned {
+            // Исходные вершины skinning читает compute, а не вершинный вход.
+            let skin_barriers = [vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(vertex_buffer.buffer)
+                .offset(0)
+                .size(vertex_size as vk::DeviceSize)];
+            let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&skin_barriers);
+            // SAFETY: the barrier orders the vertex copy before the skinning compute reads it.
+            unsafe {
+                self.device
+                    .cmd_pipeline_barrier2(self.command_buffer, &dependency)
+            };
+        }
     }
 
     fn record_image_upload(
@@ -14761,6 +14952,8 @@ mod tests {
                 debug_view: DebugView::Lit,
                 view: ViewSettings::default(),
                 reset_history: false,
+
+                joint_palettes: &[],
             };
             assert!(frame_uniform_bytes(&frame).is_ok());
         }
@@ -15238,6 +15431,8 @@ mod tests {
             previous_model: None,
             lod_level: 0,
             casts_shadow,
+
+            skin: None,
         };
         let draws = [draw(0, true), draw(1, false), draw(2, true), draw(3, true)];
         let modes = [
@@ -15247,9 +15442,9 @@ mod tests {
             AlphaMode::Blend,
         ];
         let casters: Vec<_> = shadow_casters(&draws, |draw| modes[draw.mesh.0])
-            .map(|draw| draw.mesh.0)
+            .map(|(index, draw)| (index, draw.mesh.0))
             .collect();
-        assert_eq!(casters, [0, 2]);
+        assert_eq!(casters, [(0, 0), (2, 2)], "индексы draw сохраняются");
     }
 
     #[test]
@@ -15261,6 +15456,8 @@ mod tests {
             previous_model: None,
             lod_level: 0,
             casts_shadow: true,
+
+            skin: None,
         };
         let bounds = LocalBounds {
             min: [-0.1, -0.1, 0.4],
@@ -15304,6 +15501,8 @@ mod tests {
             previous_model: None,
             lod_level: 0,
             casts_shadow: true,
+
+            skin: None,
         };
         let slots = |count: usize| vec![Some(()); count];
         assert!(validate_draws(&[], &slots(0), &slots(1)).is_ok());
@@ -15596,6 +15795,8 @@ mod tests {
             previous_model: None,
             lod_level: 0,
             casts_shadow: true,
+
+            skin: None,
         };
         let alive_meshes = vec![Some(()), Some(())];
         let alive_materials = vec![Some(()), Some(())];
@@ -15758,6 +15959,8 @@ mod tests {
             debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
+
+            joint_palettes: &[],
         };
         let values = floats(&frame_uniform_bytes(&frame).unwrap());
         assert_eq!(FRAME_UNIFORMS_SIZE, 720);
@@ -15845,6 +16048,8 @@ mod tests {
                 ..ViewSettings::default()
             },
             reset_history: false,
+
+            joint_palettes: &[],
         };
         let uniforms = super::prepare_frame_with_temporal(
             &frame,
@@ -15893,6 +16098,8 @@ mod tests {
                         debug_view: DebugView::Lit,
                         view: ViewSettings::default(),
                         reset_history: false,
+
+                        joint_palettes: &[],
                     }),
                     Err(RenderError::InvalidConfig(_))
                 ),
@@ -15922,6 +16129,8 @@ mod tests {
             debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
+
+            joint_palettes: &[],
         };
         assert!(matches!(
             frame_uniform_bytes(&frame),
@@ -15951,6 +16160,8 @@ mod tests {
             debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
+
+            joint_palettes: &[],
         };
         assert!(matches!(
             frame_uniform_bytes(&frame),

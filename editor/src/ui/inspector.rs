@@ -143,6 +143,9 @@ fn show_object(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject)
     if let Some(audio) = &object.audio_source {
         show_audio_source(ui, state, id, audio);
     }
+    if let Some(animator) = &object.animator {
+        show_animator(ui, state, id, animator);
+    }
     if let Some(emitter) = &object.particle_emitter {
         show_particle_emitter(ui, state, id, emitter);
     }
@@ -1234,6 +1237,252 @@ fn show_point_light(
         });
     }
     run_menu_action(state, id, ComponentKind::PointLight, action);
+}
+
+/// Секция аниматора: поля компонента, клипы из FBX и одномерные blend tree.
+///
+/// Каждое изменение идёт через `commit`, поэтому правки попадают в историю и откатываются
+/// при ошибке валидации, как у остальных компонентов.
+fn show_animator(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    animator: &engine_scene::AnimatorComponent,
+) {
+    let field = OverrideField::Animator;
+    // Клип из поля Add clip объявляется в [[assets]] сцены через set_component, а не правкой.
+    let mut added_clip = None;
+    let action = component_header(
+        ui,
+        HeaderTitle {
+            text: "Animator",
+            icon: component_icon(state, ComponentKind::Animator),
+        },
+        id,
+        mark(state, id, field.clone()),
+        Some(component_menu(state, id, ComponentKind::Animator)),
+        true,
+        |ui| {
+            let mut value = animator.clone();
+            let mut response = ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+            egui::Grid::new("animator").num_columns(2).show(ui, |ui| {
+                ui.label("Default motion");
+                let mut motion = value.default_motion.clone().unwrap_or_default();
+                let edit = ui.text_edit_singleline(&mut motion);
+                if edit.changed() {
+                    value.default_motion = (!motion.is_empty()).then_some(motion);
+                }
+                response |= edit;
+                ui.end_row();
+
+                ui.label("Play on start");
+                response |= ui.checkbox(&mut value.play_on_start, "");
+                ui.end_row();
+
+                ui.label("Loop");
+                response |= ui.checkbox(&mut value.looping, "");
+                ui.end_row();
+
+                ui.label("Speed");
+                response |= ui.add(
+                    egui::DragValue::new(&mut value.speed)
+                        .speed(0.01)
+                        .range(0.0..=f32::MAX),
+                );
+                ui.end_row();
+            });
+
+            ui.separator();
+            ui.label("Clips");
+            let mut remove_clip = None;
+            for (index, clip) in value.clips.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.monospace(format!("/{}", clip.as_str()));
+                    if ui.small_button("×").clicked() {
+                        remove_clip = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove_clip {
+                value.clips.remove(index);
+                response.mark_changed();
+            }
+            let input_id = ui.make_persistent_id(("animator_clip_input", id));
+            let mut input =
+                ui.data_mut(|data| data.get_temp::<String>(input_id).unwrap_or_default());
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut input);
+                if ui.button("Add clip").clicked() && !input.is_empty() {
+                    if let Ok(clip) = VirtualPath::parse(input.trim_start_matches('/')) {
+                        added_clip = Some(clip);
+                        input.clear();
+                    } else {
+                        state
+                            .log
+                            .error(format!("{input}: некорректный путь ресурса"));
+                    }
+                }
+            });
+            ui.data_mut(|data| data.insert_temp(input_id, input));
+
+            ui.separator();
+            ui.label("Blend trees");
+            let mut remove_tree = None;
+            for (tree_index, tree) in value.blend_trees.iter_mut().enumerate() {
+                ui.push_id(("blend_tree", tree_index), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        response |= ui.text_edit_singleline(&mut tree.name);
+                        ui.label("Parameter");
+                        response |= ui.text_edit_singleline(&mut tree.parameter);
+                        if ui.small_button("Remove tree").clicked() {
+                            remove_tree = Some(tree_index);
+                        }
+                    });
+                    let mut remove_point = None;
+                    for (point_index, point) in tree.points.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label("Clip");
+                            response |= ui.text_edit_singleline(&mut point.clip);
+                            response |=
+                                ui.add(egui::DragValue::new(&mut point.threshold).speed(0.01));
+                            if ui.small_button("×").clicked() {
+                                remove_point = Some(point_index);
+                            }
+                        });
+                    }
+                    if let Some(index) = remove_point {
+                        tree.points.remove(index);
+                        response.mark_changed();
+                    }
+                    if ui.small_button("Add point").clicked() {
+                        tree.points.push(engine_scene::BlendTreePoint {
+                            clip: String::new(),
+                            threshold: 0.0,
+                        });
+                        response.mark_changed();
+                    }
+                });
+            }
+            if let Some(index) = remove_tree {
+                value.blend_trees.remove(index);
+                response.mark_changed();
+            }
+            if ui.button("Add blend tree").clicked() {
+                value.blend_trees.push(engine_scene::BlendTree {
+                    name: format!("tree{}", value.blend_trees.len() + 1),
+                    parameter: "speed".to_owned(),
+                    points: Vec::new(),
+                });
+                response.mark_changed();
+            }
+
+            if !state.is_playing() {
+                ui.separator();
+                show_animation_preview(ui, state, id, &value.blend_trees);
+            }
+
+            commit(state, id, "animator", &response, |object| {
+                object.animator = Some(value.clone());
+            });
+        },
+    );
+    if let Some(clip) = added_clip {
+        let mut next = animator.clone();
+        next.clips.push(clip);
+        state.edit_scene(|scene| scene.set_component(id, Component::Animator(next)));
+    }
+    if action == HeaderAction::Revert {
+        revert(state, id, field);
+        return;
+    }
+    if action == HeaderAction::Remove {
+        state.edit_scene(|scene| scene.remove_animator(id));
+    }
+    run_menu_action(state, id, ComponentKind::Animator, action);
+}
+
+/// Превью аниматора выбранного объекта: проигрывание, выбор движения, перемотка и параметры
+/// blend tree. Меняет только настройки превью и не попадает в документ и историю.
+fn show_animation_preview(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    id: &str,
+    blend_trees: &[engine_scene::BlendTree],
+) {
+    ui.label("Preview");
+    if state.animation_status.object.as_deref() != Some(id) {
+        // Кадр ещё не пересчитал превью для выбранного объекта.
+        return;
+    }
+    let motions = state.animation_status.motions.clone();
+    let (duration, time) = (state.animation_status.duration, state.animation_status.time);
+    ui.horizontal(|ui| {
+        let label = if state.animation_preview.playing {
+            "Pause"
+        } else {
+            "Play"
+        };
+        if ui.button(label).clicked() {
+            state.animation_preview.playing = !state.animation_preview.playing;
+        }
+        let selected_text = state
+            .animation_preview
+            .motion
+            .clone()
+            .unwrap_or_else(|| "Bind pose".to_owned());
+        egui::ComboBox::from_id_salt(("animation_preview_motion", id))
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(state.animation_preview.motion.is_none(), "Bind pose")
+                    .clicked()
+                {
+                    state.animation_preview.motion = None;
+                }
+                for motion in &motions {
+                    let current = state.animation_preview.motion.as_deref() == Some(motion);
+                    if ui.selectable_label(current, motion).clicked() {
+                        state.animation_preview.motion = Some(motion.clone());
+                    }
+                }
+            });
+    });
+    if state.animation_preview.motion.is_some() && duration > 0.0 {
+        let mut scrub = time;
+        let response = ui.add(
+            egui::Slider::new(&mut scrub, 0.0..=duration)
+                .text("Time")
+                .suffix(" s"),
+        );
+        if response.changed() {
+            state.animation_preview.seek = Some(scrub);
+        }
+    }
+    let parameters: std::collections::BTreeSet<&str> = blend_trees
+        .iter()
+        .map(|tree| tree.parameter.as_str())
+        .collect();
+    for name in parameters {
+        let mut value = state
+            .animation_preview
+            .parameters
+            .get(name)
+            .copied()
+            .unwrap_or(0.0);
+        ui.horizontal(|ui| {
+            ui.label(name);
+            if ui
+                .add(egui::DragValue::new(&mut value).speed(0.01))
+                .changed()
+            {
+                state
+                    .animation_preview
+                    .parameters
+                    .insert(name.to_owned(), value);
+            }
+        });
+    }
 }
 
 fn show_audio_source(
@@ -2728,6 +2977,17 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                         });
                     }
                 }
+            });
+        }
+        if object.mesh_renderer.is_some()
+            && object.animator.is_none()
+            && ui.button("Animator").clicked()
+        {
+            state.edit_scene(|scene| {
+                scene.set_component(
+                    id,
+                    Component::Animator(engine_scene::AnimatorComponent::new()),
+                )
             });
         }
         if object.point_light.is_none() && ui.button("Point Light").clicked() {

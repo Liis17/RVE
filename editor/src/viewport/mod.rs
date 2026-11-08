@@ -1,5 +1,6 @@
 //! 3D-вьюпорт редактора.
 
+pub mod animation;
 pub mod camera;
 pub mod colliders;
 pub mod gizmo;

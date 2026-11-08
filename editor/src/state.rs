@@ -12,10 +12,12 @@ use crate::profile::EditorProfile;
 use crate::project::OpenProject;
 use crate::project_prefabs::ProjectPrefabs;
 use crate::scene_edit::{Component, EditorScene, NewObject};
+use crate::viewport::animation::{AnimationPreview, PreviewStatus};
 use crate::viewport::camera::{EditorCamera, View};
 use crate::viewport::colliders::ColliderCache;
 use crate::viewport::gizmo::{GizmoDrag, GizmoSpace, GizmoTool, SnapSettings};
 use crate::viewport::model_loader::ModelLoader;
+use engine_animation::AnimationBridge;
 use engine_assets::Model;
 use engine_files::VirtualPath;
 use engine_render::DebugView;
@@ -135,6 +137,13 @@ pub struct FrameParts<'a> {
     pub models: &'a mut HashMap<String, Arc<Model>>,
     pub loader: &'a mut ModelLoader,
     pub log: &'a mut ConsoleLog,
+    /// Мост аниматоров Play; `None` в режиме редактирования.
+    pub animation: Option<&'a AnimationBridge>,
+    pub animation_preview: &'a mut AnimationPreview,
+    /// Сведения превью для инспектора, которые пересчитывает кадр.
+    pub animation_status: &'a mut PreviewStatus,
+    /// Id выбранного объекта: превью работает только с ним.
+    pub selected: Option<&'a str>,
 }
 
 pub struct EditorState {
@@ -213,6 +222,10 @@ pub struct EditorState {
     pub model_loader: ModelLoader,
     /// Выпуклые оболочки и trimesh для рёбер коллайдеров и ошибок инспектора.
     pub collider_cache: ColliderCache,
+    /// Настройки превью аниматора выбранного объекта; меняет инспектор.
+    pub animation_preview: AnimationPreview,
+    /// Сведения превью, которые кадр передаёт инспектору: движения и время.
+    pub animation_status: PreviewStatus,
     edit_world: Option<(u64, World)>,
     dirty_lite_schemas: HashSet<String>,
     camera_settings_error_revision: Option<u64>,
@@ -272,6 +285,8 @@ impl EditorState {
             lite_schemas: HashMap::new(),
             model_loader: ModelLoader::default(),
             collider_cache: ColliderCache::default(),
+            animation_preview: AnimationPreview::default(),
+            animation_status: PreviewStatus::default(),
             edit_world: None,
             dirty_lite_schemas: HashSet::new(),
             camera_settings_error_revision: None,
@@ -362,16 +377,28 @@ impl EditorState {
     /// Заимствует всё, что нужно для подготовки кадра сцены.
     pub fn frame_parts(&mut self) -> Option<FrameParts<'_>> {
         self.world_mut()?;
-        let world = match &mut self.play {
-            Some(play) => play.world_mut(),
-            None => &mut self.edit_world.as_mut()?.1,
+        let (world, animation) = match &mut self.play {
+            Some(play) => {
+                let (world, animation) = play.world_and_animation();
+                (world, Some(animation))
+            }
+            None => (&mut self.edit_world.as_mut()?.1, None),
         };
+        let selected = self
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.selected_object())
+            .map(|object| object.id.as_str());
         Some(FrameParts {
             world,
             project: self.project.as_ref()?,
             models: &mut self.models,
             loader: &mut self.model_loader,
             log: &mut self.log,
+            animation,
+            animation_preview: &mut self.animation_preview,
+            animation_status: &mut self.animation_status,
+            selected,
         })
     }
 

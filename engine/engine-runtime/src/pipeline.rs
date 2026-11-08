@@ -15,7 +15,8 @@ use crate::profiling::{
     script_phase, scripts_groups,
 };
 use crate::scene::{ParticleSource, PreparedPrefabs, particle_emitter_desc};
-use engine_assets::TextureData;
+use engine_animation::{AnimationBridge, AnimationEvent};
+use engine_assets::{Model, ModelAnimation, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
 use engine_core::profile::ProfileBoard;
@@ -31,6 +32,7 @@ use engine_render::{
     Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
     ViewSettings,
 };
+use engine_render::{SkinBinding, SkinId};
 #[cfg(feature = "dev-console")]
 use engine_render::{UiImage, UiPrimitive, UiVertex, ViewportId};
 use engine_resources::ResourceHandle;
@@ -83,6 +85,8 @@ pub(crate) struct FrameSnapshot {
     pub local_light_shadows: Vec<LocalLightShadow>,
     pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
+    /// Палитры skinning кадра; draw ссылается на них по индексу в `SkinBinding::palette`.
+    pub joint_palettes: Vec<Vec<[[f32; 4]; 4]>>,
     pub particles: Vec<ParticleSnapshot>,
     /// Игровое время скриптового потока на момент снимка; основа шага симуляции частиц.
     pub sim_time: f64,
@@ -139,6 +143,21 @@ pub(crate) struct GpuSceneTable {
     /// Описания эмиттеров быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub particle_templates: HashMap<String, Vec<Option<ParticleEmitterDesc>>>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
+    /// Скелеты и анимации моделей для моста анимации; вершины сюда не входят.
+    pub animation_models: HashMap<String, Arc<Model>>,
+    /// Клипы `animator.clips` по виртуальному пути файла.
+    pub animation_clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
+    /// Экземпляры skinning по объекту: по одному на часть меша уровня 0.
+    pub skin_instances: HashMap<ObjectHandle, Vec<SkinId>>,
+    /// Число костей модели объекта с экземплярами skinning; палитра моста должна иметь ту же длину.
+    pub joint_counts: HashMap<ObjectHandle, u32>,
+}
+
+impl GpuSceneTable {
+    /// Все экземпляры skinning сцены; рендер освобождает их при завершении.
+    pub(crate) fn skin_instance_ids(&self) -> Vec<SkinId> {
+        self.skin_instances.values().flatten().copied().collect()
+    }
 }
 
 type FrameLighting = (
@@ -286,6 +305,8 @@ pub(crate) trait RenderBackend: Send {
         Ok(())
     }
     fn wait_idle(&mut self) {}
+    /// Освобождает GPU-ресурсы сцены до уничтожения backend.
+    fn release_scene(&mut self) {}
     /// Ставит загруженные на CPU ресурсы тяжёлого префаба в очередь GPU-загрузки.
     fn submit_prefab(&mut self, prefab: LoadedPrefab) -> Option<PrefabReply>;
     /// Выполняет до `budget` шагов GPU-загрузки и возвращает завершённые префабы.
@@ -392,6 +413,8 @@ pub(crate) struct VulkanBackend {
     ui_bridge: UiBridge,
     #[cfg(feature = "dev-console")]
     console_viewport: Option<(ViewportId, u32, u32)>,
+    /// Экземпляры skinning сцены, которые освобождаются в `release_scene`.
+    scene_skin_instances: Vec<SkinId>,
 }
 
 #[cfg(feature = "dev-console")]
@@ -420,6 +443,7 @@ impl VulkanBackend {
             ui_bridge: UiBridge::default(),
             #[cfg(feature = "dev-console")]
             console_viewport: None,
+            scene_skin_instances: Vec::new(),
         }
     }
 
@@ -435,6 +459,11 @@ impl VulkanBackend {
     #[cfg(feature = "dev-console")]
     pub fn with_console(mut self, console_ui: Arc<ConsoleUiSlot>) -> Self {
         self.console_ui = Some(console_ui);
+        self
+    }
+
+    pub fn with_scene_skin_instances(mut self, instances: Vec<SkinId>) -> Self {
+        self.scene_skin_instances = instances;
         self
     }
 
@@ -607,7 +636,9 @@ impl RenderBackend for VulkanBackend {
                 })
             })
             .collect();
+        let joint_palettes = palette_refs(snapshot);
         let frame = Frame {
+            joint_palettes: &joint_palettes,
             clear_color: [
                 snapshot.view.render.clear_color[0],
                 snapshot.view.render.clear_color[1],
@@ -656,6 +687,14 @@ impl RenderBackend for VulkanBackend {
             self.last_submitted_sim_time = Some(snapshot.sim_time);
         }
         Ok(outcome)
+    }
+
+    fn release_scene(&mut self) {
+        for instance in self.scene_skin_instances.drain(..) {
+            if let Err(error) = self.renderer.destroy_skin_instance(instance) {
+                eprintln!("failed to release skin instance: {error}");
+            }
+        }
     }
 
     fn wait_idle(&mut self) {
@@ -720,7 +759,9 @@ impl RenderBackend for VulkanBackend {
         };
 
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
+        let joint_palettes = palette_refs(snapshot);
         let scene = Frame {
+            joint_palettes: &joint_palettes,
             clear_color: [
                 snapshot.view.render.clear_color[0],
                 snapshot.view.render.clear_color[1],
@@ -1029,6 +1070,9 @@ fn scripts_thread(
         audio.start(&world);
         audio.apply(scripts.drain_audio_requests(), &world);
     }
+    let mut animation = build_animation(&world, &gpu_scene);
+    drop_mismatched_skins(&world, &mut gpu_scene, &animation);
+    animation.apply(scripts.drain_animation_requests());
     apply_world_changes(
         &mut world,
         &mut scripts,
@@ -1223,6 +1267,15 @@ fn scripts_thread(
         if let Some(audio) = audio.as_mut() {
             audio.apply(scripts.drain_audio_requests(), &world);
         }
+        animation.apply(scripts.drain_animation_requests());
+        let finished = animation.advance(dt);
+        scripts.queue_animation_events(
+            &world,
+            finished.into_iter().map(|event| match event {
+                AnimationEvent::Finished { object, motion } => (object, motion),
+            }),
+        );
+        log_animation_warnings(&mut animation);
         let world_changes_started = Instant::now();
         apply_world_changes(
             &mut world,
@@ -1296,10 +1349,11 @@ fn scripts_thread(
             audio.sync_positions(&world);
         }
         let snapshot_started = Instant::now();
-        let made = make_snapshot(scene_frame, &world, &gpu_scene).map(|mut snapshot| {
-            snapshot.sim_time = sim_time;
-            snapshot
-        });
+        let made =
+            make_snapshot(scene_frame, &world, &gpu_scene, &animation).map(|mut snapshot| {
+                snapshot.sim_time = sim_time;
+                snapshot
+            });
         timings.record(
             script_phase::LOOP,
             script_phase::MAKE_SNAPSHOT,
@@ -1793,8 +1847,10 @@ fn make_snapshot(
     scene: engine_scene::SceneFrame,
     world: &World,
     gpu_scene: &GpuSceneTable,
+    animation: &AnimationBridge,
 ) -> Result<FrameSnapshot, String> {
     let mut draws = Vec::new();
+    let mut joint_palettes = Vec::new();
     let camera_position = scene.camera.position;
     let mut object_motion = HashMap::new();
     for instance in scene.meshes {
@@ -1808,7 +1864,22 @@ fn make_snapshot(
         };
         let model = instance.model.to_cols_array_2d();
         let draw_start = draws.len();
-        for (mesh, material) in meshes {
+        // Анимируемый объект рисуется экземплярами skinning, пока у моста есть палитра;
+        // иначе — bind-pose мешем без скиннинга.
+        let palette = gpu_scene
+            .skin_instances
+            .get(&instance.object)
+            .zip(animation.palette(instance.object))
+            .map(|(instances, palette)| {
+                joint_palettes.push(palette.to_vec());
+                (instances, (joint_palettes.len() - 1) as u32)
+            });
+        for (index, (mesh, material)) in meshes.iter().enumerate() {
+            let skin = palette.and_then(|(instances, palette)| {
+                instances
+                    .get(index)
+                    .map(|&instance| SkinBinding { instance, palette })
+            });
             draws.push(DrawCommand {
                 mesh: *mesh,
                 material: Some(*material),
@@ -1816,6 +1887,7 @@ fn make_snapshot(
                 previous_model: None,
                 lod_level,
                 casts_shadow: true,
+                skin,
             });
         }
         if draw_start != draws.len() {
@@ -1851,8 +1923,74 @@ fn make_snapshot(
         draws,
         particles,
         sim_time: 0.0,
+        joint_palettes,
         object_motion,
     })
+}
+
+/// Палитры кадра как срезы для `Frame::joint_palettes`.
+fn palette_refs(snapshot: &FrameSnapshot) -> Vec<&[[[f32; 4]; 4]]> {
+    snapshot.joint_palettes.iter().map(Vec::as_slice).collect()
+}
+
+/// Мост анимации для потока скриптов: модели и клипы берутся из GPU-таблицы.
+fn build_animation(world: &World, gpu_scene: &GpuSceneTable) -> AnimationBridge {
+    let mut animation = AnimationBridge::build(
+        world,
+        |path| {
+            gpu_scene
+                .animation_models
+                .get(path.as_str())
+                .cloned()
+                .ok_or_else(|| format!("модель {} не подготовлена для анимации", path.as_str()))
+        },
+        |path| {
+            gpu_scene
+                .animation_clips
+                .get(path.as_str())
+                .cloned()
+                .ok_or_else(|| format!("клип {} не загружен", path.as_str()))
+        },
+    );
+    log_animation_warnings(&mut animation);
+    animation
+}
+
+/// Убирает skinning у объектов, чья палитра моста не совпала с числом костей меша: такой объект
+/// рисуется статично и не валит кадр. Экземпляры остаются у renderer до его завершения.
+fn drop_mismatched_skins(
+    world: &World,
+    gpu_scene: &mut GpuSceneTable,
+    animation: &AnimationBridge,
+) -> Vec<ObjectHandle> {
+    let mut mismatched: Vec<ObjectHandle> = gpu_scene
+        .joint_counts
+        .iter()
+        .filter(|(object, joints)| {
+            animation
+                .palette(**object)
+                .is_some_and(|palette| palette.len() != **joints as usize)
+        })
+        .map(|(object, _)| *object)
+        .collect();
+    mismatched.sort_by_key(|object| object.index());
+    for object in &mismatched {
+        gpu_scene.skin_instances.remove(object);
+        let id = world.object(*object).map_or_else(
+            || format!("объект #{}", object.index()),
+            |item| item.id.clone(),
+        );
+        log::warn!(
+            "[animation] {id}: число костей палитры не совпадает с мешем; объект рисуется без скиннинга"
+        );
+    }
+    mismatched
+}
+
+fn log_animation_warnings(animation: &mut AnimationBridge) {
+    for warning in animation.take_warnings() {
+        log::warn!("[animation] {warning}");
+    }
 }
 
 /// Создаёт текстуры эмиттеров тяжёлого префаба и их описания. Объекты с одним путём текстуры
@@ -2374,6 +2512,14 @@ fn render_thread(config: RenderThreadConfig) {
     if let Err(error) = backend.close_console() {
         status.record_failure(format!("ошибка освобождения UI консоли: {error}"));
     }
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| backend.release_scene())) {
+        status.record_failure(format!(
+            "ошибка освобождения ресурсов сцены: {}",
+            panic_message(payload)
+        ));
+        interrupt.interrupt();
+        let _ = script_tx.send(ScriptControl::Shutdown);
+    }
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| backend.wait_idle())) {
         status.record_failure(format!(
             "ошибка ожидания renderer при завершении: {}",
@@ -2739,10 +2885,10 @@ mod tests {
         Clock, EnvironmentCacheKey, EnvironmentSnapshotSource, ExitRequester, FrameSnapshot,
         GpuSceneTable, MotionHistory, PhysicsWait, RenderBackend, RenderControl,
         RenderThreadConfig, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
-        ScriptThreadConfig, apply_physics_step, log_script_events_with, make_snapshot,
-        procedural_environment_key, receive_physics_interruptibly, render_local_lights,
-        render_loop, render_snapshot, render_thread, selected_level, send_snapshot,
-        sync_input_background, wait_background_tick,
+        ScriptThreadConfig, apply_physics_step, drop_mismatched_skins, log_script_events_with,
+        make_snapshot, procedural_environment_key, receive_physics_interruptibly,
+        render_local_lights, render_loop, render_snapshot, render_thread, selected_level,
+        send_snapshot, sync_input_background, wait_background_tick,
     };
     #[cfg(feature = "dev-console")]
     use super::{PROFILE_COMMAND, PROFILE_COMMAND_DESCRIPTION, publish_command_catalog};
@@ -2759,6 +2905,7 @@ mod tests {
     };
     use crate::profiling::{PhaseWindow, SOURCE_RENDER, render_groups, render_phase};
     use crate::scene::PreparedPrefabs;
+    use engine_animation::AnimationBridge;
     #[cfg(feature = "dev-console")]
     use engine_console::CommandLine;
     use engine_console::{ConsoleBuffer, ConsoleLevel, ConsoleLogger};
@@ -3344,6 +3491,7 @@ distance=2.0
             local_light_shadows: Vec::new(),
             environment: None,
             draws: Vec::<DrawCommand>::new(),
+            joint_palettes: Vec::new(),
             object_motion: HashMap::new(),
         }
     }
@@ -3386,6 +3534,7 @@ distance=2.0
             local_lights: Vec::new(),
             local_light_shadows: Vec::new(),
             environment: None,
+            joint_palettes: Vec::new(),
             draws: Vec::new(),
             object_motion: objects
                 .iter()
@@ -3534,7 +3683,13 @@ range = 10
             .set_camera_settings(world.active_camera(), settings)
             .unwrap();
         let (frame, _) = world.build_frame();
-        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default()).unwrap();
+        let snapshot = make_snapshot(
+            frame,
+            &world,
+            &GpuSceneTable::default(),
+            &AnimationBridge::default(),
+        )
+        .unwrap();
         assert_eq!(snapshot.view, settings);
     }
 
@@ -3548,7 +3703,15 @@ range = 10
         let mut world = World::from_document(&document).unwrap();
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty());
-        assert!(make_snapshot(frame.clone(), &world, &GpuSceneTable::default(),).is_err());
+        assert!(
+            make_snapshot(
+                frame.clone(),
+                &world,
+                &GpuSceneTable::default(),
+                &AnimationBridge::default()
+            )
+            .is_err()
+        );
 
         let source = Arc::new(EnvironmentSource::Equirect {
             width: 2,
@@ -3559,7 +3722,7 @@ range = 10
             environments: HashMap::from([("environment/sky.hdr".to_owned(), source)]),
             ..GpuSceneTable::default()
         };
-        let snapshot = make_snapshot(frame, &world, &scene).unwrap();
+        let snapshot = make_snapshot(frame, &world, &scene, &AnimationBridge::default()).unwrap();
         let environment = snapshot.environment.unwrap();
         assert_eq!(
             environment.key,
@@ -3632,7 +3795,13 @@ return Script
 
         let (frame, warnings) = world.build_frame();
         assert!(warnings.is_empty());
-        let snapshot = make_snapshot(frame, &world, &GpuSceneTable::default()).unwrap();
+        let snapshot = make_snapshot(
+            frame,
+            &world,
+            &GpuSceneTable::default(),
+            &AnimationBridge::default(),
+        )
+        .unwrap();
         assert_eq!(snapshot.view.color.exposure_ev, 2.5);
         assert!(host.drain_events().is_empty());
     }
@@ -4838,6 +5007,94 @@ return Move
         assert!(status.render_stopped());
         assert!(!interrupt.is_interrupted());
         assert!(matches!(script_rx.recv().unwrap(), ScriptControl::Shutdown));
+        drop((frame_tx, control_tx));
+    }
+
+    /// Backend для проверки порядка завершения: записывает `release_scene`, `wait_idle` и drop.
+    struct TeardownBackend {
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl RenderBackend for TeardownBackend {
+        fn resize(&mut self, _width: u32, _height: u32) {}
+
+        fn submit_prefab(&mut self, _prefab: LoadedPrefab) -> Option<PrefabReply> {
+            None
+        }
+
+        fn advance_prefab_uploads(&mut self, _budget: usize) -> Vec<PrefabReply> {
+            Vec::new()
+        }
+
+        fn has_pending_prefab_uploads(&self) -> bool {
+            false
+        }
+
+        fn release_prefab(&mut self, _token: &PrefabToken) {}
+
+        fn render(
+            &mut self,
+            _snapshot: &FrameSnapshot,
+            _width: u32,
+            _height: u32,
+        ) -> Result<FrameOutcome, String> {
+            Ok(FrameOutcome {
+                status: FrameStatus::Presented,
+                submitted: true,
+            })
+        }
+
+        fn release_scene(&mut self) {
+            self.log.lock().unwrap().push("release_scene");
+        }
+
+        fn wait_idle(&mut self) {
+            self.log.lock().unwrap().push("wait_idle");
+        }
+    }
+
+    impl Drop for TeardownBackend {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push("drop");
+        }
+    }
+
+    #[test]
+    fn render_thread_releases_scene_once_before_waiting_and_dropping_backend() {
+        // Регрессия: ресурсы сцены освобождаются один раз, до wait_idle и уничтожения backend.
+        let teardown = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (frame_tx, frame_rx) = flume::unbounded();
+        let (control_tx, control_rx) = flume::unbounded();
+        let (script_tx, _script_rx) = flume::unbounded();
+        let (stopped_tx, stopped_rx) = flume::bounded(1);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let status = Arc::new(RuntimeStatus::default());
+        frame_tx.send(Arc::new(empty_snapshot())).unwrap();
+        render_thread(RenderThreadConfig {
+            backend: Box::new(TeardownBackend {
+                log: Arc::clone(&teardown),
+            }),
+            width: 640,
+            height: 480,
+            frame_limit: Some(1),
+            frame_rx,
+            control_tx: control_tx.clone(),
+            control_rx,
+            script_tx,
+            interrupt: ScriptInterruptHandle::new(),
+            status: Arc::clone(&status),
+            resources: flume::unbounded().1,
+            resource_stats: None,
+            stopped_tx,
+            exit: Arc::new(FakeExit(exit_tx)),
+        });
+        stopped_rx.recv().unwrap();
+        exit_rx.recv().unwrap();
+        assert_eq!(status.exit_code(), 0);
+        assert_eq!(
+            *teardown.lock().unwrap(),
+            ["release_scene", "wait_idle", "drop"]
+        );
         drop((frame_tx, control_tx));
     }
 
@@ -6106,6 +6363,64 @@ return Gun
         );
         publish_script_cursor(&scripts, &control, &mut published);
         assert_eq!(sink.0.lock().unwrap().len(), states.len());
+    }
+
+    #[test]
+    fn skinned_object_whose_palette_has_another_joint_count_is_dropped_from_skinning() {
+        // Регрессия: палитра другой длины не должна доходить до renderer и валить кадр.
+        let text = "[[assets]]\npath = \"/models/hero.fbx\"\n[[objects]]\nid = \"camera\"\n[objects.camera]\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"/models/hero.fbx\"\n[objects.animator]\n";
+        let world = World::from_document(
+            &engine_scene::SceneDocument::parse("scene.rvescene", text).unwrap(),
+        )
+        .unwrap();
+        let hero = world.handle("hero").unwrap();
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let model = std::sync::Arc::new(engine_assets::Model {
+            meshes: Vec::new(),
+            textures: Vec::new(),
+            skeleton: Some(engine_assets::ModelSkeleton {
+                nodes: vec![engine_assets::ModelNode {
+                    name: "bone".to_owned(),
+                    parent: None,
+                    inherit_mode: engine_assets::ModelInheritMode::Normal,
+                    inherit_scale_node: None,
+                    rest: engine_assets::ModelTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                        scale: [1.0; 3],
+                    },
+                }],
+                joints: vec![engine_assets::ModelJoint {
+                    node: 0,
+                    inverse_bind: identity,
+                }],
+            }),
+            animations: Vec::new(),
+        });
+        // Палитра моста одна (одна кость), а меш объявлен с двумя костями.
+        let animation = AnimationBridge::build(
+            &world,
+            |_| Ok(model.clone()),
+            |_| Ok(std::sync::Arc::new(Vec::new())),
+        );
+        let mut scene = GpuSceneTable::default();
+        scene.skin_instances.insert(hero, Vec::new());
+        scene.joint_counts.insert(hero, 2);
+        assert_eq!(
+            drop_mismatched_skins(&world, &mut scene, &animation),
+            vec![hero]
+        );
+        assert!(!scene.skin_instances.contains_key(&hero));
+
+        scene.skin_instances.insert(hero, Vec::new());
+        scene.joint_counts.insert(hero, 1);
+        assert!(drop_mismatched_skins(&world, &mut scene, &animation).is_empty());
+        assert!(scene.skin_instances.contains_key(&hero));
     }
 }
 

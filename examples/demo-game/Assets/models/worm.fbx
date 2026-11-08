@@ -1,0 +1,194 @@
+; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",1
+	}
+}
+Objects:  {
+	Model: 100, "Model::Root", "Null" {
+		Version: 232
+		Properties70:  {
+		}
+	}
+	Model: 101, "Model::Bone1", "LimbNode" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,0,0
+		}
+	}
+	Model: 102, "Model::Bone2", "LimbNode" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,50,0
+		}
+	}
+	Model: 103, "Model::Bone3", "LimbNode" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,50,0
+		}
+	}
+	Geometry: 300, "Geometry::Worm", "Mesh" {
+		Vertices: *72 {
+			a: -12,0,-12,12,0,-12,12,0,12,-12,0,12,-12,25,-12,12,25,-12,12,25,12,-12,25,12,-12,50,-12,12,50,-12,12,50,12,-12,50,12,-12,75,-12,12,75,-12,12,75,12,-12,75,12,-12,100,-12,12,100,-12,12,100,12,-12,100,12,-12,125,-12,12,125,-12,12,125,12,-12,125,12
+		}
+		PolygonVertexIndex: *88 {
+			a: 4,5,1,-1,5,6,2,-2,6,7,3,-3,7,4,0,-4,8,9,5,-5,9,10,6,-6,10,11,7,-7,11,8,4,-8,12,13,9,-9,13,14,10,-10,14,15,11,-11,15,12,8,-12,16,17,13,-13,17,18,14,-14,18,19,15,-15,19,16,12,-16,20,21,17,-17,21,22,18,-18,22,23,19,-19,23,20,16,-20,1,2,3,-1,23,22,21,-21
+		}
+		GeometryVersion: 124
+	}
+	Model: 200, "Model::Worm", "Mesh" {
+		Version: 232
+		Properties70:  {
+		}
+	}
+	Deformer: 400, "Deformer::Skin", "Skin" {
+		Version: 101
+		Link_DeformAcrossNurbs: 0
+		Link_DeformAcrossSkinned: 0
+		Type: "Skin"
+	}
+	Deformer: 401, "SubDeformer::Cluster Bone1", "Cluster" {
+		Version: 100
+		UserData: "", ""
+		Indexes: *8 {
+			a: 0,1,2,3,4,5,6,7
+		}
+		Weights: *8 {
+			a: 1.0,1.0,1.0,1.0,0.5,0.5,0.5,0.5
+		}
+		Transform: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1
+		}
+		TransformLink: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1
+		}
+	}
+	Deformer: 402, "SubDeformer::Cluster Bone2", "Cluster" {
+		Version: 100
+		UserData: "", ""
+		Indexes: *12 {
+			a: 4,5,6,7,8,9,10,11,12,13,14,15
+		}
+		Weights: *12 {
+			a: 0.5,0.5,0.5,0.5,1.0,1.0,1.0,1.0,0.5,0.5,0.5,0.5
+		}
+		Transform: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,-50,0,1
+		}
+		TransformLink: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,50,0,1
+		}
+	}
+	Deformer: 403, "SubDeformer::Cluster Bone3", "Cluster" {
+		Version: 100
+		UserData: "", ""
+		Indexes: *12 {
+			a: 12,13,14,15,16,17,18,19,20,21,22,23
+		}
+		Weights: *12 {
+			a: 0.5,0.5,0.5,0.5,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0
+		}
+		Transform: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,-100,0,1
+		}
+		TransformLink: *16 {
+			a: 1,0,0,0,0,1,0,0,0,0,1,0,0,100,0,1
+		}
+	}
+	AnimationStack: 500, "AnimStack::Wiggle", "" {
+		Properties70:  {
+			P: "LocalStart", "KTime", "Time", "",0
+			P: "LocalStop", "KTime", "Time", "",46186158000
+			P: "ReferenceStart", "KTime", "Time", "",0
+			P: "ReferenceStop", "KTime", "Time", "",46186158000
+		}
+	}
+	AnimationLayer: 501, "AnimLayer::BaseLayer", "" {
+	}
+	AnimationCurveNode: 502, "AnimCurveNode::R", "" {
+		Properties70:  {
+			P: "d|X", "Number", "", "A",0
+			P: "d|Y", "Number", "", "A",0
+			P: "d|Z", "Number", "", "A",0
+		}
+	}
+	AnimationCurve: 503, "AnimCurve::", "" {
+		Default: 0
+		KeyVer: 4008
+		KeyTime: *3 {
+			a: 0,23093079000,46186158000
+		}
+		KeyValueFloat: *3 {
+			a: 0.0,25.0,0.0
+		}
+		KeyAttrFlags: *1 {
+			a: 24836
+		}
+		KeyAttrDataFloat: *4 {
+			a: 0,0,0,0
+		}
+		KeyAttrRefCount: *1 {
+			a: 3
+		}
+	}
+	AnimationCurveNode: 504, "AnimCurveNode::R", "" {
+		Properties70:  {
+			P: "d|X", "Number", "", "A",0
+			P: "d|Y", "Number", "", "A",0
+			P: "d|Z", "Number", "", "A",0
+		}
+	}
+	AnimationCurve: 505, "AnimCurve::", "" {
+		Default: 0
+		KeyVer: 4008
+		KeyTime: *3 {
+			a: 0,23093079000,46186158000
+		}
+		KeyValueFloat: *3 {
+			a: 0.0,-25.0,0.0
+		}
+		KeyAttrFlags: *1 {
+			a: 24836
+		}
+		KeyAttrDataFloat: *4 {
+			a: 0,0,0,0
+		}
+		KeyAttrRefCount: *1 {
+			a: 3
+		}
+	}
+}
+Connections:  {
+	C: "OO",100,0
+	C: "OO",101,100
+	C: "OO",102,101
+	C: "OO",103,102
+	C: "OO",200,100
+	C: "OO",300,200
+	C: "OO",400,300
+	C: "OO",401,400
+	C: "OO",101,401
+	C: "OO",402,400
+	C: "OO",102,402
+	C: "OO",403,400
+	C: "OO",103,403
+	C: "OO",501,500
+	C: "OO",502,501
+	C: "OP",503,502, "d|Z"
+	C: "OP",502,102, "Lcl Rotation"
+	C: "OO",504,501
+	C: "OP",505,504, "d|Z"
+	C: "OP",504,103, "Lcl Rotation"
+}

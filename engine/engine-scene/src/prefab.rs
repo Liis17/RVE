@@ -4,6 +4,7 @@
 //! `[[instances]]` вставляет раскрытое дерево префаба: корень получает id экземпляра,
 //! остальные объекты — `<экземпляр>.<id в префабе>`, у вложенных — `a.b.c`.
 
+use crate::animation::{AnimatorComponent, validate_animator_fields};
 use crate::audio::{AudioSourceComponent, validate_audio_source};
 use crate::document::{
     CameraComponent, CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
@@ -78,6 +79,7 @@ pub struct PrefabOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_source: Option<AudioSourceComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animator: Option<AnimatorComponent>,
     pub particle_emitter: Option<ParticleEmitterComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
@@ -293,6 +295,13 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .as_mut()
             .ok_or("override audio_source: у объекта нет audio_source")?;
         *target = audio.clone();
+    }
+    if let Some(animator) = &change.animator {
+        let target = object
+            .animator
+            .as_mut()
+            .ok_or("override animator: у объекта нет animator")?;
+        *target = animator.clone();
     }
     if let Some(emitter) = &change.particle_emitter {
         let target = object
@@ -643,6 +652,9 @@ pub(crate) fn validate_instances(
             }
             if let Some(audio) = &change.audio_source {
                 validate_audio_source(source, id, assets, audio)?;
+            }
+            if let Some(animator) = &change.animator {
+                validate_animator_fields(source, id, assets, animator)?;
             }
             if let Some(emitter) = &change.particle_emitter {
                 validate_particle_emitter(source, id, assets, emitter)?;

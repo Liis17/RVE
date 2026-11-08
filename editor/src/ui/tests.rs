@@ -160,8 +160,11 @@ fn cube() -> Arc<Model> {
                 7, 4, 1, 2, 6, 1, 6, 5,
             ],
             material: Default::default(),
+            skin: None,
         }],
         textures: Vec::new(),
+        skeleton: None,
+        animations: Vec::new(),
     })
 }
 

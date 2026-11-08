@@ -2,8 +2,8 @@ use crate::abi::{
     RVE_INPUT_DOWN, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR, RVE_LOG_INFO,
     RVE_LOG_WARN, RVE_SCRIPT_ABI_VERSION, RVE_VALUE_ARRAY, RVE_VALUE_STR, RveArray, RveAudioParams,
     RveCameraSettings, RveCharacterMoveResult, RveCursorState, RveHeader, RveHost, RveModule,
-    RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime,
-    RveTransform, RveValue, RveValueData,
+    RveParamEntry, RveParams, RvePlayAnimationParams, RveRaycastHit, RveScriptDesc, RveStatus,
+    RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use crate::{
     AntiAliasing, CameraSettings, ConsoleLevel, Context, Key, MouseButton, Params, Script,
@@ -205,6 +205,7 @@ struct HostState {
     cursor_visible: bool,
     cursor_locked: bool,
     audio_calls: Vec<String>,
+    animation_calls: Vec<String>,
     /// Status returned by every audio callback; zero is `RveStatus::Ok`.
     audio_status: u32,
     next_voice: u64,
@@ -516,6 +517,11 @@ fn host(state: &mut HostState) -> RveHost {
         prefab_load: None,
         prefab_unload: None,
         prefab_state: None,
+        animation_play: None,
+        animation_set_weight: None,
+        animation_set_parameter: None,
+        animation_set_speed: None,
+        animation_stop: None,
     }
 }
 
@@ -1898,7 +1904,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 9);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 10);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -1984,4 +1990,189 @@ fn sdk_cursor_api_reports_unavailable_callbacks_before_abi_v8() {
     assert_eq!(context.input().cursor_locked(), None);
     assert!(!context.set_cursor_visible(false));
     assert!(!context.set_cursor_locked(true));
+}
+
+unsafe fn animation_text(value: RveStr) -> String {
+    // SAFETY: the guest passes a valid string for the synchronous callback.
+    let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len) };
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+unsafe extern "C" fn animation_play(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    params: *const RvePlayAnimationParams,
+) -> u32 {
+    // SAFETY: the context and params are live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let params = unsafe { *params };
+    let then = unsafe { animation_text(params.then) };
+    let motion = unsafe { animation_text(motion) };
+    state.animation_calls.push(format!(
+        "play {object} {motion} fade={} loop={} then={then}",
+        params.fade, params.looping
+    ));
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn animation_set_weight(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    weight: f32,
+    fade: f32,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let motion = unsafe { animation_text(motion) };
+    state
+        .animation_calls
+        .push(format!("weight {object} {motion} {weight} {fade}"));
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn animation_set_parameter(
+    ctx: *mut c_void,
+    object: u64,
+    name: RveStr,
+    value: f32,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    let name = unsafe { animation_text(name) };
+    state
+        .animation_calls
+        .push(format!("parameter {object} {name} {value}"));
+    RveStatus::Error as u32
+}
+
+unsafe extern "C" fn animation_set_speed(ctx: *mut c_void, object: u64, speed: f32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state
+        .animation_calls
+        .push(format!("speed {object} {speed}"));
+    RveStatus::Ok as u32
+}
+
+unsafe extern "C" fn animation_stop(ctx: *mut c_void, object: u64) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.animation_calls.push(format!("stop {object}"));
+    RveStatus::Ok as u32
+}
+
+fn animation_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.animation_play = Some(animation_play);
+    host.animation_set_weight = Some(animation_set_weight);
+    host.animation_set_parameter = Some(animation_set_parameter);
+    host.animation_set_speed = Some(animation_set_speed);
+    host.animation_stop = Some(animation_stop);
+    host
+}
+
+#[test]
+fn sdk_animation_api_forwards_options_and_reports_host_refusals() {
+    let mut state = HostState::default();
+    let host = animation_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    object
+        .play_animation(
+            &mut context,
+            "walk",
+            crate::PlayAnimationOptions {
+                fade: 0.25,
+                looping: Some(false),
+                then: Some("idle"),
+            },
+        )
+        .unwrap();
+    object
+        .play_animation(&mut context, "idle", crate::PlayAnimationOptions::default())
+        .unwrap();
+    object
+        .set_animation_weight(&mut context, "walk", 0.5, 0.0)
+        .unwrap();
+    object.set_animation_speed(&mut context, 2.0).unwrap();
+    object.stop_animation(&mut context).unwrap();
+    assert_eq!(
+        state.animation_calls,
+        [
+            "play 1 walk fade=0.25 loop=0 then=idle",
+            "play 1 idle fade=0 loop=-1 then=",
+            "weight 1 walk 0.5 0",
+            "speed 1 2",
+            "stop 1",
+        ]
+    );
+}
+
+#[test]
+fn sdk_animation_api_checks_inputs_before_calling_the_host() {
+    let mut state = HostState::default();
+    let host = animation_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        object.play_animation(
+            &mut context,
+            "walk",
+            crate::PlayAnimationOptions {
+                fade: -1.0,
+                ..Default::default()
+            },
+        ),
+        Err(crate::AnimationError::InvalidInput)
+    );
+    assert_eq!(
+        object.set_animation_weight(&mut context, "walk", f32::NAN, 0.0),
+        Err(crate::AnimationError::InvalidInput)
+    );
+    assert_eq!(
+        object.set_animation_speed(&mut context, -0.5),
+        Err(crate::AnimationError::InvalidInput)
+    );
+    assert!(state.animation_calls.is_empty());
+    // Хост отклонил параметр: SDK возвращает Rejected, а не молчит.
+    assert_eq!(
+        object.set_animation_parameter(&mut context, "speed", 1.0),
+        Err(crate::AnimationError::Rejected)
+    );
+}
+
+#[test]
+fn sdk_animation_api_is_unavailable_for_hosts_without_v9_callbacks() {
+    let mut state = HostState::default();
+    let host = host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = context.find("camera").unwrap();
+    assert_eq!(
+        object.stop_animation(&mut context),
+        Err(crate::AnimationError::Unavailable)
+    );
+    assert_eq!(
+        object.play_animation(&mut context, "walk", crate::PlayAnimationOptions::default()),
+        Err(crate::AnimationError::Unavailable)
+    );
+}
+
+#[test]
+fn animation_callbacks_and_params_keep_the_v9_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<RvePlayAnimationParams>(), 24);
+    assert_eq!(offset_of!(RvePlayAnimationParams, looping), 4);
+    assert_eq!(offset_of!(RvePlayAnimationParams, then), 8);
+    assert_eq!(
+        offset_of!(RveHost, animation_play),
+        offset_of!(RveHost, prefab_state) + size_of::<Option<crate::abi::RvePrefabStateFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, animation_stop),
+        offset_of!(RveHost, animation_set_speed)
+            + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 10);
 }

@@ -1,5 +1,7 @@
 use crate::pipeline::GpuSceneTable;
-use engine_assets::{Assets, Model, ModelAlphaMode, ModelMaterial, TextureData};
+use engine_assets::{
+    Assets, Model, ModelAlphaMode, ModelAnimation, ModelMaterial, ModelSkin, TextureData,
+};
 use engine_files::VirtualPath;
 use engine_physics::{
     ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsSceneBinding, PhysicsSceneDesc, StepDriver,
@@ -8,19 +10,19 @@ use engine_project::PhysicsSettings;
 use engine_render::{
     AlphaMode, EnvironmentSource, Material, MaterialId, MeshId, ParticleBlend, ParticleBurst,
     ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleFlipbook, ParticleShape,
-    ParticleSizeKey, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
+    ParticleSizeKey, RenderError, Renderer, SkinVertex, TextureColorSpace, TextureId, Vertex,
 };
 use engine_resources::ResourceHandle;
 use engine_scene::CameraSettings;
 use engine_scene::prefab::PREFAB_EXTENSION;
 use engine_scene::{
-    EnvironmentComponent, LiteScript, LodGroup, MaterialAlphaMode, MaterialOverride, MeshRenderer,
-    ObjectHandle, ParticleBlendMode, ParticleEmitterComponent, ParticleShapeComponent,
-    PrefabTemplate, SceneDocument, SceneError, World, expand,
+    AnimatorComponent, EnvironmentComponent, LiteScript, LodGroup, MaterialAlphaMode,
+    MaterialOverride, MeshRenderer, ObjectHandle, ParticleBlendMode, ParticleEmitterComponent,
+    ParticleShapeComponent, PrefabTemplate, SceneDocument, SceneError, World, expand,
 };
 use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec};
 use glam::Vec3;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
 use std::sync::Arc;
@@ -29,12 +31,16 @@ use std::sync::Arc;
 pub(crate) struct ObjectModel {
     pub levels: Vec<(String, Option<String>)>,
     pub material: Option<MaterialOverride>,
+    /// Объект имеет `animator`: его модель получает скиннинг, если у модели есть скелет.
+    pub animated: bool,
 }
 
 pub(crate) struct PreparedRenderAssets {
     pub models: HashMap<String, Model>,
     pub textures: HashMap<String, TextureData>,
     pub environments: HashMap<String, Arc<EnvironmentSource>>,
+    /// Клипы из `animator.clips`, по виртуальному пути файла.
+    pub clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
     /// Объекты сцены с мешами и их хендлы.
     pub objects: Vec<(ObjectHandle, ObjectModel)>,
     /// Быстрые префабы по пути. Элемент `i` относится к объекту шаблона `i`; `None` — у объекта
@@ -203,6 +209,7 @@ struct RenderAssetSet {
     models: HashMap<String, Model>,
     textures: HashMap<String, TextureData>,
     environments: HashMap<String, Arc<EnvironmentSource>>,
+    clips: HashMap<String, Arc<Vec<ModelAnimation>>>,
     lite_paths: BTreeSet<String>,
 }
 
@@ -212,6 +219,7 @@ struct ObjectParts<'a> {
     environment: Option<&'a EnvironmentComponent>,
     mesh_renderer: Option<&'a MeshRenderer>,
     lod_group: Option<&'a LodGroup>,
+    animator: Option<&'a AnimatorComponent>,
     lite_scripts: &'a [LiteScript],
 }
 
@@ -262,6 +270,7 @@ fn prepare_scene_with_model_loader(
             environment: object.environment.as_ref(),
             mesh_renderer: object.mesh_renderer.as_ref(),
             lod_group: object.lod_group.as_ref(),
+            animator: object.animator.as_ref(),
             lite_scripts: &object.lite_scripts,
         };
         if let Some(model) = set.add_object(assets, scene_path, parts, &mut load_model)? {
@@ -276,6 +285,7 @@ fn prepare_scene_with_model_loader(
     let mut prefab_objects = BTreeMap::new();
     let mut prefab_particles = BTreeMap::new();
     for (path, template) in &prefabs.templates {
+        warn_unsupported_prefab_animators(path, template);
         let mut levels = Vec::with_capacity(template.objects().len());
         let mut emitters = Vec::with_capacity(template.objects().len());
         for object in template.objects() {
@@ -283,6 +293,7 @@ fn prepare_scene_with_model_loader(
                 environment: object.environment.as_ref(),
                 mesh_renderer: object.mesh_renderer.as_ref(),
                 lod_group: object.lod_group.as_ref(),
+                animator: None,
                 lite_scripts: &object.lite_scripts,
             };
             levels.push(set.add_object(assets, scene_path, parts, &mut load_model)?);
@@ -300,6 +311,7 @@ fn prepare_scene_with_model_loader(
         models,
         textures,
         environments,
+        clips,
         lite_paths,
     } = set;
     let mut sources = BTreeMap::new();
@@ -315,6 +327,7 @@ fn prepare_scene_with_model_loader(
             models,
             textures,
             environments,
+            clips,
             objects,
             prefabs: prefab_objects,
             particles,
@@ -348,6 +361,17 @@ impl RenderAssetSet {
                     height: image.height,
                     rgb: image.rgb,
                 }));
+            }
+        }
+        if let Some(animator) = parts.animator {
+            for path in &animator.clips {
+                if !self.clips.contains_key(path.as_str()) {
+                    let animations = assets
+                        .load_animations(&format!("/{}", path.as_str()))
+                        .map_err(|error| format!("{scene_path}: {error}"))?;
+                    self.clips
+                        .insert(path.as_str().to_owned(), Arc::new(animations));
+                }
             }
         }
         let mut model_object = None;
@@ -408,7 +432,11 @@ impl RenderAssetSet {
                     entry.insert(texture);
                 }
             }
-            model_object = Some(ObjectModel { levels, material });
+            model_object = Some(ObjectModel {
+                levels,
+                material,
+                animated: parts.animator.is_some(),
+            });
         }
         for script in parts.lite_scripts {
             self.lite_paths.insert(script.path.as_str().to_owned());
@@ -623,6 +651,20 @@ pub(crate) struct PreparedTemplate {
     pub sources: BTreeMap<String, String>,
 }
 
+/// Заспавненные объекты пока не получают анимацию: аниматор шаблона не готовится, и предупреждение
+/// выводится один раз на шаблон при его подготовке.
+fn warn_unsupported_prefab_animators(path: &str, template: &PrefabTemplate) {
+    if template
+        .objects()
+        .iter()
+        .any(|object| object.animator.is_some())
+    {
+        log::warn!(
+            "[animation] {path}: аниматор объектов префаба не поддерживается при спавне; объекты рисуются без анимации"
+        );
+    }
+}
+
 /// Готовит модели, текстуры и Lua-исходники шаблона. `stop` проверяется перед каждым объектом,
 /// моделью и исходником: прерванная подготовка возвращает ошибку, а не частичный результат.
 pub(crate) fn prepare_template(
@@ -633,6 +675,7 @@ pub(crate) fn prepare_template(
     stop: &dyn Fn() -> bool,
 ) -> Result<PreparedTemplate, String> {
     const STOPPED: &str = "подготовка префаба прервана";
+    warn_unsupported_prefab_animators(label, template);
     let mut set = RenderAssetSet::default();
     let mut levels = Vec::with_capacity(template.objects().len());
     let mut particles = Vec::with_capacity(template.objects().len());
@@ -644,6 +687,7 @@ pub(crate) fn prepare_template(
             environment: object.environment.as_ref(),
             mesh_renderer: object.mesh_renderer.as_ref(),
             lod_group: object.lod_group.as_ref(),
+            animator: None,
             lite_scripts: &object.lite_scripts,
         };
         let model = set.add_object(assets, label, parts, &mut |path: &str| {
@@ -659,6 +703,7 @@ pub(crate) fn prepare_template(
         models,
         textures,
         environments: _,
+        clips: _,
         lite_paths,
     } = set;
     let mut sources = BTreeMap::new();
@@ -683,8 +728,15 @@ pub(crate) fn upload_scene(
 ) -> Result<GpuSceneTable, RenderError> {
     let mut gpu_models: HashMap<String, Vec<(MeshId, MaterialId)>> = HashMap::new();
     let mut texture_cache = GpuTextureCache::<TextureId>::default();
+    // Модели, которые анимирует хотя бы один объект сцены, загружаются со скином.
+    let animated = animated_model_paths(assets);
 
     for (path, model) in &assets.models {
+        let skinned = animated.contains(path.as_str()) && model.skeleton.is_some();
+        let joint_count = model
+            .skeleton
+            .as_ref()
+            .map_or(0, |skeleton| skeleton.joints.len() as u32);
         let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
         for mesh in &model.meshes {
             let vertices = mesh
@@ -697,7 +749,15 @@ pub(crate) fn upload_scene(
                     color: [1.0; 3],
                 })
                 .collect::<Vec<_>>();
-            let mesh_id = renderer.create_mesh(&vertices, &mesh.indices)?;
+            let mesh_id = match &mesh.skin {
+                Some(skin) if skinned => renderer.create_skinned_mesh(
+                    &vertices,
+                    &skin_vertices(skin),
+                    &mesh.indices,
+                    joint_count,
+                )?,
+                _ => renderer.create_mesh(&vertices, &mesh.indices)?,
+            };
             let resolved = resolve_material(&mesh.material, None, None);
             let material_id = upload_resolved_material(
                 renderer,
@@ -714,11 +774,43 @@ pub(crate) fn upload_scene(
 
     let mut table = GpuSceneTable {
         environments: assets.environments.clone(),
+        animation_clips: assets.clips.clone(),
         ..GpuSceneTable::default()
     };
+    for path in &animated {
+        // Мосту нужны скелет и клипы; вершины остаются только в GPU-таблице.
+        if let Some(model) = assets.models.get(*path) {
+            table.animation_models.insert(
+                (*path).to_owned(),
+                Arc::new(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    skeleton: model.skeleton.clone(),
+                    animations: model.animations.clone(),
+                }),
+            );
+        }
+    }
     for (handle, object) in &assets.objects {
         let levels =
             upload_object_levels(renderer, assets, &gpu_models, &mut texture_cache, object)?;
+        if object.animated
+            && let Some((model_path, _)) = object.levels.first()
+            && let Some(skeleton) = assets
+                .models
+                .get(model_path)
+                .and_then(|model| model.skeleton.as_ref())
+        {
+            // Экземпляр skinning на каждую часть уровня 0: выходные вершины живут отдельно.
+            let mut instances = Vec::with_capacity(levels[0].len());
+            for (mesh_id, _) in &levels[0] {
+                instances.push(renderer.create_skin_instance(*mesh_id)?);
+            }
+            table.skin_instances.insert(*handle, instances);
+            table
+                .joint_counts
+                .insert(*handle, skeleton.joints.len() as u32);
+        }
         table.by_object.insert(*handle, levels);
     }
     for (path, objects) in &assets.prefabs {
@@ -750,6 +842,29 @@ pub(crate) fn upload_scene(
         table.particle_templates.insert(path.clone(), descs);
     }
     Ok(table)
+}
+
+/// Пути моделей уровня 0 у объектов сцены с `animator`.
+fn animated_model_paths(assets: &PreparedRenderAssets) -> HashSet<&str> {
+    assets
+        .objects
+        .iter()
+        .map(|(_, object)| object)
+        .filter(|object| object.animated)
+        .filter_map(|object| object.levels.first())
+        .map(|(path, _)| path.as_str())
+        .collect()
+}
+
+fn skin_vertices(skin: &ModelSkin) -> Vec<SkinVertex> {
+    skin.joints
+        .iter()
+        .zip(&skin.weights)
+        .map(|(joints, weights)| SkinVertex {
+            joints: *joints,
+            weights: *weights,
+        })
+        .collect()
 }
 
 /// Описание эмиттера с GPU-текстурой; текстура кэшируется вместе с текстурами сцены.
@@ -1574,6 +1689,8 @@ id = "camera"
                 Ok(Model {
                     meshes: Vec::new(),
                     textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
                 })
             },
         )
@@ -1609,6 +1726,8 @@ id = "camera"
                 Ok(Model {
                     meshes: Vec::new(),
                     textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
                 })
             },
         )
@@ -2030,6 +2149,8 @@ id = "camera"
                 Ok(Model {
                     meshes: Vec::new(),
                     textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
                 })
             },
         )
@@ -2043,6 +2164,51 @@ id = "camera"
             [("models/quad.fbx".to_owned(), None)]
         );
         assert!(levels[1].is_none());
+    }
+
+    #[test]
+    fn prefab_animators_are_not_prepared_because_spawned_animators_are_unsupported() {
+        // Регрессия: аниматор шаблона не загружает клипы и не получает скиннинг, поэтому
+        // отсутствующий клип не валит подготовку сцены.
+        let prefab_path = "prefabs/hero.rveprefab";
+        let template = PrefabTemplate::load(
+            &VirtualPath::parse(prefab_path).unwrap(),
+            &mut |_| {
+                Ok(
+                    "[[assets]]\npath = \"/models/hero.fbx\"\n[[assets]]\npath = \"/anims/missing.fbx\"\n[[objects]]\nid = \"hero\"\n[objects.mesh_renderer]\nmodel = \"models/hero.fbx\"\n[objects.animator]\nclips = [\"/anims/missing.fbx\"]\n"
+                        .to_owned(),
+                )
+            },
+        )
+        .unwrap();
+        let prefabs = PreparedPrefabs {
+            templates: BTreeMap::from([(prefab_path.to_owned(), Arc::new(template))]),
+            catalog: PrefabCatalog::default(),
+        };
+        let project = TempProject::new();
+        let resources = LooseResources::new(project.root());
+        let document = SceneDocument::parse("scene.rvescene", CAMERA_SCENE).unwrap();
+        let world = World::from_document(&document).unwrap();
+        let prepared = prepare_scene_with_model_loader(
+            &resources.system.handle(),
+            &resources.assets,
+            "scene.rvescene",
+            world,
+            prefabs,
+            |_| {
+                Ok(Model {
+                    meshes: Vec::new(),
+                    textures: Vec::new(),
+                    skeleton: None,
+                    animations: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(prepared.render_assets.clips.is_empty());
+        let levels = &prepared.render_assets.prefabs[prefab_path];
+        assert!(!levels[0].as_ref().unwrap().animated);
     }
 }
 

@@ -1069,6 +1069,7 @@ mod tests {
                         3
                     ],
                     indices: vec![0, 1, 2],
+                    skin: None,
                     material: ModelMaterial {
                         base_color: [1.0; 3],
                         metallic: 0.0,
@@ -1092,6 +1093,8 @@ mod tests {
                 height: 1,
                 rgba: vec![255; 4],
             }],
+            skeleton: None,
+            animations: Vec::new(),
         }
     }
 
@@ -1108,6 +1111,7 @@ mod tests {
                 .map(|(path, _)| ((*path).to_owned(), overridden.then(|| "tex.png".to_owned())))
                 .collect(),
             material: None,
+            animated: false,
         })];
         LoadedPrefab {
             token: load,

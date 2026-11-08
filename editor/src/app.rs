@@ -982,6 +982,7 @@ impl EditorApp {
             project.apply_camera_settings(&mut world)?;
             let model_geometry =
                 PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
+            let animation = crate::viewport::animation::project_bridge(&world, &project.assets);
             PlaySession::start_with_world_and_physics(
                 scene.view(),
                 world,
@@ -995,6 +996,7 @@ impl EditorApp {
                     resources: Some(project.resource_handle()),
                     output: true,
                 },
+                animation,
             )
         })();
         match result {
@@ -1264,7 +1266,11 @@ impl EditorApp {
         } else if let Some(play) = &mut self.state.play {
             let events = play.drain_events();
             self.state.log.push_script_events(events);
-            for warning in play.drain_audio_warnings() {
+            for warning in play
+                .drain_audio_warnings()
+                .into_iter()
+                .chain(play.drain_animation_warnings())
+            {
                 self.state.log.push(LogLevel::Warn, warning);
             }
         }
@@ -1288,7 +1294,9 @@ impl EditorApp {
             .is_some_and(|play| !play.is_paused());
         let size = window.inner_size();
         let skipped = status == FrameStatus::Skipped && size.width != 0 && size.height != 0;
-        if playing_now || skipped || framing || repaint_delay.is_zero() {
+        // Превью проигрывается без Play: кадры нужны, пока оно идёт.
+        let previewing = !self.state.is_playing() && self.state.animation_preview.is_animating();
+        if playing_now || previewing || skipped || framing || repaint_delay.is_zero() {
             window.request_redraw();
             self.repaint_at = None;
         } else {
@@ -1406,6 +1414,59 @@ fn editor_log_buffer() -> Arc<Mutex<ConsoleBuffer>> {
     buffer
 }
 
+/// Скиннинг и превью аниматоров кадра. Во время Play мост ведёт сессия, и кадр только
+/// синхронизирует экземпляры скиннинга. В режиме редактирования мост ведёт превью выбранного
+/// объекта: оно не меняет документ и не запускает скрипты.
+fn sync_animation_frame(
+    gpu: &mut GpuState,
+    parts: &mut crate::state::FrameParts<'_>,
+    playing: bool,
+) -> Result<(), RenderError> {
+    if playing {
+        gpu.scene.sync_skins(&mut gpu.renderer, parts.world)?;
+        let mut warnings = Vec::new();
+        gpu.scene
+            .report_palette_mismatches(parts.animation, &mut warnings);
+        for warning in warnings {
+            parts.log.push(LogLevel::Warn, warning);
+        }
+        return Ok(());
+    }
+    parts.animation_preview.retarget(parts.selected);
+    let object = parts
+        .selected
+        .and_then(|id| parts.world.handle(id))
+        .filter(|handle| {
+            parts
+                .world
+                .object(*handle)
+                .is_some_and(|object| object.animator.is_some())
+        });
+    let mut warnings = Vec::new();
+    let preview = object.map(|handle| (handle, &mut *parts.animation_preview));
+    gpu.scene.sync_animation(
+        &mut gpu.renderer,
+        &parts.project.assets,
+        &*parts.models,
+        &*parts.world,
+        preview,
+        &mut warnings,
+    )?;
+    for warning in warnings {
+        parts.log.push(LogLevel::Warn, warning);
+    }
+    *parts.animation_status = match object {
+        Some(handle) => {
+            let motion = parts.animation_preview.motion.as_deref();
+            let mut status = gpu.scene.preview_status(handle, motion);
+            status.object = parts.selected.map(str::to_owned);
+            status
+        }
+        None => Default::default(),
+    };
+    Ok(())
+}
+
 /// Кадр с видимыми панелями Scene и Game. Без мира сцены рисуется только интерфейс.
 fn render_scene_frame(
     gpu: &mut GpuState,
@@ -1432,7 +1493,7 @@ fn render_scene_frame(
     // Модель ещё разбирается в фоне: наведение камеры ждёт её готовности.
     let mut still_loading = None;
     let (scene_frame, game_camera, game_settings, game_camera_handle, has_light, frame_target) = {
-        let Some(parts) = state.frame_parts() else {
+        let Some(mut parts) = state.frame_parts() else {
             return render_ui_only(&mut gpu.renderer, ui, &[]);
         };
         gpu.scene.sync_assets(
@@ -1443,6 +1504,7 @@ fn render_scene_frame(
             parts.loader,
             parts.log,
         )?;
+        sync_animation_frame(gpu, &mut parts, playing)?;
         let (scene_frame, warnings) = parts.world.build_frame();
         for warning in warnings {
             parts.log.push(
@@ -1519,6 +1581,7 @@ fn render_scene_frame(
         scene_camera.position,
         game_camera.position,
         grid_camera_distance,
+        parts.animation,
     )?;
     gpu.scene.sync_environment(
         &mut gpu.renderer,
@@ -1539,6 +1602,7 @@ fn render_scene_frame(
         gpu.renderer
             .resize_viewport(gpu.scene.game_viewport, width, height)?;
     }
+    let joint_palettes = gpu.scene.joint_palette_refs(parts.animation);
     let scene_view = scene_size.map(|[width, height]| {
         gpu.scene.frame(
             scene_camera,
@@ -1551,6 +1615,7 @@ fn render_scene_frame(
             has_light,
             scene_frame.environment.as_ref(),
             &scene_shadow_cascades,
+            &joint_palettes,
             true,
             scene_debug_view,
         )
@@ -1567,6 +1632,7 @@ fn render_scene_frame(
             has_light,
             scene_frame.environment.as_ref(),
             &game_shadow_cascades,
+            &joint_palettes,
             false,
             game_debug_view,
         )
@@ -1835,6 +1901,15 @@ impl WindowHandler for EditorApp {
             job.kill();
         }
         self.save_settings();
+        // Экземпляры скиннинга освобождаются явно до уничтожения renderer.
+        if let Some(gpu) = &mut self.gpu
+            && let Err(error) = gpu.scene.release_skins(&mut gpu.renderer)
+        {
+            self.state.log.push(
+                LogLevel::Warn,
+                format!("освобождение скиннинга при закрытии: {error}"),
+            );
+        }
         // Renderer удерживает окно и освобождается до него.
         self.gpu = None;
         self.egui_state = None;

@@ -1,6 +1,7 @@
 //! TOML-документы сцен и их проверенная схема, независимая от renderer.
 
 use crate::CameraSettings;
+use crate::animation::{AnimatorComponent, validate_animator};
 use crate::audio::{AudioSourceComponent, validate_audio_source};
 use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
 use crate::prefab::{PREFAB_EXTENSION, PrefabInstance};
@@ -281,6 +282,9 @@ impl SceneDocument {
             if let Some(audio) = &object.audio_source {
                 validate_audio_source(source, &object.id, &asset_paths, audio)?;
             }
+            if let Some(animator) = &object.animator {
+                validate_animator(source, object, &asset_paths, animator)?;
+            }
             if let Some(emitter) = &object.particle_emitter {
                 validate_particle_emitter(source, &object.id, &asset_paths, emitter)?;
             }
@@ -510,6 +514,7 @@ pub struct SceneObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_source: Option<AudioSourceComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animator: Option<AnimatorComponent>,
     pub particle_emitter: Option<ParticleEmitterComponent>,
     #[serde(default)]
     pub lite_scripts: Vec<LiteScript>,

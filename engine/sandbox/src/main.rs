@@ -690,6 +690,7 @@ impl WindowHandler for Sandbox {
                 }),
                 lod_level: 0,
                 casts_shadow: true,
+                skin: None,
             })
             .collect::<Vec<_>>();
         let gpu_time = renderer.take_gpu_frame_time();
@@ -739,6 +740,7 @@ impl WindowHandler for Sandbox {
             .previous_elapsed
             .map_or(0.0, |previous| (elapsed - previous).max(0.0));
         let frame = Frame {
+            joint_palettes: &[],
             clear_color: [
                 self.camera_settings.render.clear_color[0],
                 self.camera_settings.render.clear_color[1],

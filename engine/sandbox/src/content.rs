@@ -364,14 +364,18 @@ mod tests {
                         double_sided: true,
                         ..ModelMaterial::default()
                     },
+                    skin: None,
                 },
                 ModelMesh {
                     vertices: vec![vertex([12.0, 1.0, 0.5]); 3],
                     indices: vec![0, 1, 2],
                     material: ModelMaterial::default(),
+                    skin: None,
                 },
             ],
             textures: vec![texture(7)],
+            skeleton: None,
+            animations: Vec::new(),
         }
     }
 

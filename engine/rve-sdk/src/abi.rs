@@ -8,9 +8,10 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 ///
 /// Version 8 appends cursor callbacks after the v7 audio tail.
 /// Version 9 appends spawn, destroy, object-state and prefab callbacks after the v8 cursor tail.
+/// Version 10 appends animation callbacks after the v9 prefab tail.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 9;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 10;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -844,6 +845,41 @@ pub type RveObjectStateFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) 
 pub type RvePrefabRequestFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> bool;
 /// Returns one of the `RVE_PREFAB_*` state codes for a prefab path. Appended in ABI v9.
 pub type RvePrefabStateFn = unsafe extern "C" fn(ctx: *mut c_void, path: RveStr) -> u32;
+/// Playback options for `animation_play`. Appended in ABI v10.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RvePlayAnimationParams {
+    /// Crossfade duration in seconds; zero switches at once.
+    pub fade: f32,
+    /// `-1` keeps the component's default, `0` plays once, `1` loops.
+    pub looping: i32,
+    /// Motion that starts when this one finishes; an empty string means none.
+    pub then: RveStr,
+}
+
+/// Starts a motion on one animated object; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationPlayFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    params: *const RvePlayAnimationParams,
+) -> u32;
+/// Sets a motion's manual weight with a fade; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationSetWeightFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    object: u64,
+    motion: RveStr,
+    weight: f32,
+    fade: f32,
+) -> u32;
+/// Sets one blend tree parameter; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationSetParameterFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, name: RveStr, value: f32) -> u32;
+/// Sets the animator speed; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationSetSpeedFn =
+    unsafe extern "C" fn(ctx: *mut c_void, object: u64, speed: f32) -> u32;
+/// Stops every motion of one animated object; returns `RveStatus` as a `u32`. Appended in ABI v10.
+pub type RveAnimationStopFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
 
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
@@ -942,6 +978,12 @@ pub struct RveHost {
     pub prefab_load: Option<RvePrefabRequestFn>,
     pub prefab_unload: Option<RvePrefabRequestFn>,
     pub prefab_state: Option<RvePrefabStateFn>,
+    /// Animation callbacks appended in ABI v10; `None` marks an unavailable callback.
+    pub animation_play: Option<RveAnimationPlayFn>,
+    pub animation_set_weight: Option<RveAnimationSetWeightFn>,
+    pub animation_set_parameter: Option<RveAnimationSetParameterFn>,
+    pub animation_set_speed: Option<RveAnimationSetSpeedFn>,
+    pub animation_stop: Option<RveAnimationStopFn>,
 }
 
 /// Guest factory callback.

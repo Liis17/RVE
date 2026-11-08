@@ -11,7 +11,8 @@ use crate::lite::{
 };
 use crate::physics::PhysicsScriptState;
 use crate::transaction::{
-    MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage, ScriptTransaction, ScriptTransactionInit,
+    MAX_MESSAGE_BYTES_PER_FRAME, MAX_MESSAGES_PER_FRAME, MessageTarget, PendingMessage,
+    ScriptTransaction, ScriptTransactionInit,
 };
 use crate::types::{
     ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
@@ -21,7 +22,8 @@ use engine_console::{CommandCatalog, CommandLine, CommandSpec};
 use engine_physics::{PhysicsCommand, PhysicsEvent, PhysicsSceneBinding, QuerySnapshot};
 use engine_project::InputSettings;
 use engine_scene::{
-    AudioRequest, LocalTransform, ObjectHandle, ParamSchema, PrefabTemplate, RigidBodyKind, World,
+    AnimationRequest, AudioRequest, LocalTransform, ObjectHandle, ParamSchema, ParamValue,
+    PrefabTemplate, RigidBodyKind, World,
 };
 use mlua::{Error as LuaError, Function, Lua, Table, Value};
 use rve_sdk::abi::RveScriptDesc;
@@ -187,6 +189,7 @@ pub struct ScriptHost {
     queued_messages: Vec<PendingMessage>,
     queued_bytes: usize,
     audio_requests: Vec<AudioRequest>,
+    animation_requests: Vec<AnimationRequest>,
     delivery_messages: Vec<PendingMessage>,
     lua_time: Table,
     call_deadline: lite::CallDeadline,
@@ -395,6 +398,7 @@ impl ScriptHost {
             queued_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             queued_bytes: 0,
             audio_requests: Vec::new(),
+            animation_requests: Vec::new(),
             delivery_messages: Vec::with_capacity(MAX_MESSAGES_PER_FRAME),
             lua_time: lua_state.time,
             call_deadline: lua_state.call_deadline,
@@ -433,6 +437,7 @@ impl ScriptHost {
                         actions: host.actions.frame(),
                         queued_messages: (host.queued_messages.len(), host.queued_bytes),
                         queued_audio: host.audio_requests.len(),
+                        queued_animation: host.animation_requests.len(),
                         physics: host.physics.clone(),
                         physics_phase_dt: None,
                         lifecycle: host.lifecycle.clone(),
@@ -525,6 +530,7 @@ impl ScriptHost {
                         actions: host.actions.frame(),
                         queued_messages: (host.queued_messages.len(), host.queued_bytes),
                         queued_audio: host.audio_requests.len(),
+                        queued_animation: host.animation_requests.len(),
                         physics: host.physics.clone(),
                         physics_phase_dt: None,
                         lifecycle: host.lifecycle.clone(),
@@ -862,6 +868,38 @@ impl ScriptHost {
         std::mem::take(&mut self.audio_requests)
     }
 
+    /// Takes animator requests committed by scripts since the previous drain, in commit order.
+    pub fn drain_animation_requests(&mut self) -> Vec<AnimationRequest> {
+        std::mem::take(&mut self.animation_requests)
+    }
+
+    /// Queues `animation_finished` messages for the next update, before script messages of
+    /// that frame. The sender is the animated object; the value is the motion name.
+    pub fn queue_animation_events(
+        &mut self,
+        world: &World,
+        events: impl IntoIterator<Item = (ObjectHandle, String)>,
+    ) {
+        for (object, motion) in events {
+            let Some(sender) = world.object(object) else {
+                continue;
+            };
+            let message = PendingMessage::engine_message(
+                sender.id.clone(),
+                MessageTarget::Object(object),
+                "animation_finished",
+                ParamValue::String(motion),
+            );
+            if self.queued_messages.len() >= MAX_MESSAGES_PER_FRAME
+                || self.queued_bytes.saturating_add(message.size()) > MAX_MESSAGE_BYTES_PER_FRAME
+            {
+                continue;
+            }
+            self.queued_bytes = self.queued_bytes.saturating_add(message.size());
+            self.queued_messages.push(message);
+        }
+    }
+
     pub fn command_catalog(&self) -> CommandCatalog {
         let mut catalog = CommandCatalog::default();
         for command in self.commands.borrow().values() {
@@ -949,6 +987,7 @@ impl ScriptHost {
             actions: self.actions.frame(),
             queued_messages: (self.queued_messages.len(), self.queued_bytes),
             queued_audio: self.audio_requests.len(),
+            queued_animation: self.animation_requests.len(),
             physics: self.physics.clone(),
             physics_phase_dt: None,
             lifecycle: self.lifecycle.clone(),
@@ -1033,6 +1072,7 @@ impl ScriptHost {
             &mut self.queued_bytes,
             &self.events,
             &mut self.audio_requests,
+            &mut self.animation_requests,
         ) {
             Ok(mutations) => {
                 self.cursor = self.transaction.cursor();
@@ -1348,6 +1388,7 @@ impl ScriptHost {
             queued_messages,
             queued_bytes,
             audio_requests,
+            animation_requests,
             lua,
             interrupt,
             commands,
@@ -1373,6 +1414,7 @@ impl ScriptHost {
             actions: actions.frame(),
             queued_messages: (queued_messages.len(), *queued_bytes),
             queued_audio: audio_requests.len(),
+            queued_animation: animation_requests.len(),
             physics: physics.clone(),
             physics_phase_dt: match phase {
                 Phase::Update(dt) => Some(dt),
@@ -1536,7 +1578,14 @@ impl ScriptHost {
 
         // SAFETY: the callback and all call-scoped transaction borrows have returned.
         match unsafe {
-            (*transaction_ptr).commit(world, queued_messages, queued_bytes, events, audio_requests)
+            (*transaction_ptr).commit(
+                world,
+                queued_messages,
+                queued_bytes,
+                events,
+                audio_requests,
+                animation_requests,
+            )
         } {
             Ok(mutations) => {
                 // SAFETY: commit returned, so no call-scoped borrow of the transaction remains.
@@ -1831,6 +1880,7 @@ impl ScriptHost {
                     actions: self.actions.frame(),
                     queued_messages: (self.queued_messages.len(), self.queued_bytes),
                     queued_audio: self.audio_requests.len(),
+                    queued_animation: self.animation_requests.len(),
                     physics: self.physics.clone(),
                     physics_phase_dt: None,
                     lifecycle: self.lifecycle.clone(),
@@ -2137,6 +2187,7 @@ impl ScriptHost {
             actions: self.actions.frame(),
             queued_messages: (self.queued_messages.len(), self.queued_bytes),
             queued_audio: self.audio_requests.len(),
+            queued_animation: self.animation_requests.len(),
             physics: self.physics.clone(),
             physics_phase_dt: None,
             lifecycle: self.lifecycle.clone(),
@@ -2331,6 +2382,8 @@ fn event_source(scene_name: &str, object_id: &str, script_name: &str) -> String 
     format!("{scene_name}/{object_id}/{script_name}")
 }
 
+#[cfg(test)]
+mod animation_tests;
 #[cfg(test)]
 mod audio_tests;
 #[cfg(test)]
