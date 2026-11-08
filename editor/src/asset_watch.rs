@@ -42,6 +42,11 @@ impl AssetChanges {
         })
     }
 
+    /// Изменённые `.glsl`: экранные шейдеры камер перекомпилируются при сохранении.
+    pub fn screen_shader_paths(&self) -> impl Iterator<Item = &VirtualPath> {
+        self.paths_with_extension("glsl")
+    }
+
     pub fn fbx_paths(&self) -> impl Iterator<Item = &VirtualPath> {
         self.paths_with_extension("fbx")
     }
