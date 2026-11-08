@@ -47,8 +47,8 @@ use bloom::{
     BloomChain, BloomPipelines, BloomRecord, bloom_record, record_bloom, write_composite_bloom,
 };
 use exposure::{
-    ExposureHistory, ExposurePipelines, ExposureRecord, ExposureResources, ExposureSync,
-    ExposureTarget, ViewExposure, exposure_record, prepare_view_exposure, record_exposure,
+    ExposureHistory, ExposurePipelines, ExposureRecord, ExposureResources, ExposureTarget,
+    ViewExposure, exposure_record, prepare_view_exposure, record_exposure,
     write_composite_exposure,
 };
 use filters::{FilterPipelines, FilterRecord, FilterScratch, record_filters};
@@ -2613,7 +2613,7 @@ impl Renderer {
         let temporal_submissions = [TemporalSubmission {
             view: TemporalViewId::Screen,
             plan: temporal_plan,
-            exposure: view_exposure.adaptation.map(|adaptation| adaptation.sync),
+            exposure: view_exposure.adaptation.is_some(),
             layouts: view
                 .anti_aliasing
                 .is_temporal()
@@ -3643,7 +3643,7 @@ impl Renderer {
                 temporal_submissions.push(TemporalSubmission {
                     view: TemporalViewId::Viewport(*viewport),
                     plan: pass.temporal_plan,
-                    exposure: view_exposure.adaptation.map(|adaptation| adaptation.sync),
+                    exposure: view_exposure.adaptation.is_some(),
                     layouts: temporal_outcome
                         .as_ref()
                         .is_some_and(|outcome| outcome.used_taa)
@@ -3814,7 +3814,7 @@ impl Renderer {
             };
             temporal.state.submitted(submission.plan);
             temporal.last_submitted_at = Some(submission.submitted_at);
-            temporal.exposure.submitted(submission.exposure.is_some());
+            temporal.exposure.submitted(submission.exposure);
             if let (Some(history), Some(layouts)) = (&mut temporal.history, submission.layouts) {
                 history.layouts = layouts;
             }
@@ -3890,44 +3890,17 @@ impl Renderer {
             )));
         }
 
-        // Адаптация экспозиции каждого вида ждёт предыдущую адаптацию того же вида и сигналит свою
-        // (см. exposure.rs). Списки собираются из отправляемых видов этого кадра.
-        let mut wait_infos = Vec::with_capacity(temporal_submissions.len() + 1);
-        wait_infos.push(
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(image_available)
-                .stage_mask(wait_stage)
-                .device_index(0),
-        );
-        let mut signal_infos = Vec::with_capacity(temporal_submissions.len() + 1);
-        signal_infos.push(
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(render_finished)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .device_index(0),
-        );
-        for sync in temporal_submissions
-            .iter()
-            .filter_map(|submission| submission.exposure)
-        {
-            if sync.wait {
-                wait_infos.push(
-                    vk::SemaphoreSubmitInfo::default()
-                        .semaphore(sync.semaphore)
-                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                        .device_index(0),
-                );
-            }
-            signal_infos.push(
-                vk::SemaphoreSubmitInfo::default()
-                    .semaphore(sync.semaphore)
-                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                    .device_index(0),
-            );
-        }
+        let wait_infos = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(image_available)
+            .stage_mask(wait_stage)
+            .device_index(0)];
         let command_infos = [vk::CommandBufferSubmitInfo::default()
             .command_buffer(command_buffer)
             .device_mask(0)];
+        let signal_infos = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(render_finished)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .device_index(0)];
         let mut latency_submission =
             vk::LatencySubmissionPresentIdNV::default().present_id(present_id);
         let mut submit_info = vk::SubmitInfo2::default()
@@ -8436,7 +8409,7 @@ struct TemporalView {
     last_submitted_at: Option<Instant>,
     /// Адаптация экспозиции вида; общая для всех кадровых слотов вида.
     exposure: ExposureHistory,
-    /// Буфер экспозиции и семафор адаптации вида; создаются при первом кадре вида.
+    /// Буфер экспозиции вида; создаётся при первом кадре вида.
     exposure_resources: Option<ExposureResources>,
     #[cfg(windows)]
     fsr: Option<Box<FsrView>>,
@@ -8632,8 +8605,8 @@ enum TemporalViewId {
 struct TemporalSubmission {
     view: TemporalViewId,
     plan: TemporalPlan,
-    /// Семафор адаптации экспозиции, если кадр вида адаптирует экспозицию.
-    exposure: Option<ExposureSync>,
+    /// Кадр вида адаптирует экспозицию; состояние адаптации фиксируется после успешного submit.
+    exposure: bool,
     layouts: Option<[vk::ImageLayout; 2]>,
     #[cfg(windows)]
     fsr_used: bool,

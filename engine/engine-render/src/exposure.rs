@@ -1,10 +1,11 @@
 //! Auto exposure: гистограмма log2-яркости HDR-источника и адаптация EV вида.
 //!
-//! Буфер экспозиции (гистограмма и адаптированный EV) и семафор принадлежат виду, а не
-//! кадровому слоту: адаптация идёт по кадрам вида подряд, даже когда кадры двух слотов
-//! перекрываются на GPU. Внутри кадра порядок задают барьеры. Между submit барьер не задаёт
-//! порядок, поэтому кадр вида, адаптирующий экспозицию, ждёт семафор предыдущей адаптации этого
-//! вида и сигналит свой (`Renderer::submit_and_present`). Состояние адаптации (`ExposureHistory`)
+//! Буфер экспозиции (гистограмма и адаптированный EV) принадлежит виду, а не кадровому слоту:
+//! адаптация идёт по кадрам вида подряд, даже когда кадры двух слотов перекрываются на GPU.
+//! Порядок между кадрами одного вида задаёт барьер в начале записи экспозиции: его первая область
+//! синхронизации охватывает команды, отправленные раньше на ту же очередь (все submit renderer
+//! идут через одну graphics queue). Поэтому запись предыдущего кадра вида (compute-адаптация и
+//! чтение composite/bloom) завершается до заполнения гистограммы. Состояние адаптации (`ExposureHistory`)
 //! меняется только после успешного submit, поэтому неотправленный кадр не помечает вид адаптированным.
 //! Композит читает адаптированное значение через binding 3 набора постобработки только в auto-режиме.
 
@@ -121,8 +122,6 @@ impl ExposurePipelines {
 pub(crate) struct ExposureHistory {
     /// Последний отправленный кадр вида адаптировал экспозицию; иначе следующий auto-кадр делает snap.
     adapted: bool,
-    /// Семафор вида уже сигналился: следующий адаптирующий кадр обязан его дождаться.
-    signaled: bool,
 }
 
 /// Решение адаптации для auto-кадра вида.
@@ -130,8 +129,6 @@ pub(crate) struct ExposureHistory {
 pub(crate) struct ExposureFrame {
     /// Адаптация стартует с текущей экспозиции, а не с прошлого значения буфера.
     pub(crate) snap: bool,
-    /// Кадр ждёт семафор предыдущей адаптации этого вида.
-    pub(crate) wait: bool,
 }
 
 impl ExposureHistory {
@@ -142,22 +139,18 @@ impl ExposureHistory {
     pub(crate) fn plan_frame(self, auto: bool, explicit_reset: bool) -> Option<ExposureFrame> {
         auto.then_some(ExposureFrame {
             snap: explicit_reset || !self.adapted,
-            wait: self.signaled,
         })
     }
 
     /// Фиксирует отправленный кадр вида; вызывается только после успешного `queue_submit2`.
     pub(crate) fn submitted(&mut self, auto: bool) {
         self.adapted = auto;
-        self.signaled |= auto;
     }
 }
 
-/// Буфер экспозиции вида и семафор, которым упорядочивается адаптация его кадров.
+/// Буфер экспозиции вида; создаётся при первом кадре вида.
 pub(crate) struct ExposureResources {
-    device: ash::Device,
     buffer: DeviceBuffer,
-    semaphore: vk::Semaphore,
 }
 
 impl ExposureResources {
@@ -173,37 +166,8 @@ impl ExposureResources {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             EXPOSURE_BUFFER_SIZE,
         )?;
-        // SAFETY: a default create info is valid for a new binary semaphore.
-        let semaphore =
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
-        Ok(Self {
-            device: device.clone(),
-            buffer,
-            semaphore,
-        })
+        Ok(Self { buffer })
     }
-}
-
-impl Drop for ExposureResources {
-    fn drop(&mut self) {
-        // SAFETY: the owner destroys these resources after device idle or after the view's
-        // submissions completed, so no pending submission waits on or signals the semaphore.
-        unsafe { self.device.destroy_semaphore(self.semaphore, None) };
-    }
-}
-
-/// Семафор адаптации вида для одного submit: кадр ждёт предыдущий и сигналит свой.
-#[derive(Clone, Copy)]
-pub(crate) struct ExposureSync {
-    pub(crate) semaphore: vk::Semaphore,
-    pub(crate) wait: bool,
-}
-
-/// Адаптация кадра вида: решение по `ExposureHistory` и синхронизация submit.
-#[derive(Clone, Copy)]
-pub(crate) struct ExposureAdaptation {
-    pub(crate) snap: bool,
-    pub(crate) sync: ExposureSync,
 }
 
 /// Экспозиция вида для одного кадра: буфер для composite и адаптация, если кадр auto.
@@ -211,7 +175,7 @@ pub(crate) struct ExposureAdaptation {
 pub(crate) struct ViewExposure {
     pub(crate) buffer: vk::Buffer,
     /// `None` — вид в ручном режиме; буфер в этом кадре не записывается и не читается.
-    pub(crate) adaptation: Option<ExposureAdaptation>,
+    pub(crate) adaptation: Option<ExposureFrame>,
 }
 
 /// Готовит экспозицию вида: создаёт его ресурсы при первом кадре и решает адаптацию.
@@ -232,18 +196,9 @@ pub(crate) fn prepare_view_exposure(
             "ресурсы экспозиции вида отсутствуют",
         ));
     };
-    let adaptation = history
-        .plan_frame(auto, explicit_reset)
-        .map(|frame| ExposureAdaptation {
-            snap: frame.snap,
-            sync: ExposureSync {
-                semaphore: resources.semaphore,
-                wait: frame.wait,
-            },
-        });
     Ok(ViewExposure {
         buffer: resources.buffer.buffer,
-        adaptation,
+        adaptation: history.plan_frame(auto, explicit_reset),
     })
 }
 
@@ -327,6 +282,17 @@ pub(crate) fn record_exposure(
     } = record;
     write_exposure_bindings(device, set, source.view, buffer);
     let set = [set];
+    // Предыдущий кадр вида мог писать буфер в compute и читать его в fragment-стадиях; барьер
+    // упорядочивает заполнение гистограммы после них (см. описание модуля).
+    buffer_barrier(
+        device,
+        command_buffer,
+        buffer,
+        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        vk::PipelineStageFlags2::ALL_TRANSFER,
+        vk::AccessFlags2::TRANSFER_WRITE,
+    );
     // SAFETY: the buffer is alive, the set and pipelines belong to this device and the
     // command buffer is in the recording state.
     unsafe {
@@ -486,20 +452,19 @@ mod tests {
         assert_eq!(HISTOGRAM_BYTES, EXPOSURE_BUFFER_SIZE - 16);
     }
 
-    /// Адаптирующий кадр, отправленный успешно: вид адаптирован и семафор сигналится.
+    /// Адаптирующий кадр, отправленный успешно: вид адаптирован.
     fn submitted_auto(history: &mut ExposureHistory) {
         assert!(history.plan_frame(true, false).is_some());
         history.submitted(true);
     }
 
     #[test]
-    fn first_auto_frame_of_view_snaps_without_waiting() {
+    fn first_auto_frame_of_view_snaps() {
         let history = ExposureHistory::default();
         let frame = history
             .plan_frame(true, false)
             .expect("auto frame plans adaptation");
         assert!(frame.snap);
-        assert!(!frame.wait);
     }
 
     #[test]
@@ -511,14 +476,13 @@ mod tests {
     }
 
     #[test]
-    fn next_auto_frame_adapts_from_previous_value_and_waits_for_it() {
+    fn next_auto_frame_adapts_from_previous_value_without_snap() {
         let mut history = ExposureHistory::default();
         submitted_auto(&mut history);
         let frame = history
             .plan_frame(true, false)
             .expect("auto frame plans adaptation");
         assert!(!frame.snap);
-        assert!(frame.wait);
     }
 
     #[test]
@@ -529,11 +493,10 @@ mod tests {
             .plan_frame(true, true)
             .expect("auto frame plans adaptation");
         assert!(frame.snap);
-        assert!(frame.wait);
     }
 
     #[test]
-    fn switching_from_manual_to_auto_snaps_but_still_waits_for_pending_signal() {
+    fn switching_from_manual_to_auto_snaps() {
         let mut history = ExposureHistory::default();
         submitted_auto(&mut history);
         history.submitted(false);
@@ -541,7 +504,6 @@ mod tests {
             .plan_frame(true, false)
             .expect("auto frame plans adaptation");
         assert!(frame.snap);
-        assert!(frame.wait);
     }
 
     #[test]
@@ -556,7 +518,6 @@ mod tests {
             .plan_frame(true, false)
             .expect("auto frame plans adaptation");
         assert!(retried.snap);
-        assert!(!retried.wait);
     }
 
     #[test]
