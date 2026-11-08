@@ -20,7 +20,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 | zstd 0.14.2 | Независимые Zstandard frames в RVEPAK | `engine/engine-pak/src` |
 | lz4_flex 0.14.0 | Независимые LZ4 blocks в RVEPAK | `engine/engine-pak/src` |
 | flume 0.11.1 | Bounded очереди ресурсов и снимков кадров, каналы управления потоками runtime | `engine/engine-resources/Cargo.toml`, `engine/engine-runtime/Cargo.toml` |
-| gilrs 0.11.2 | Геймпады: WGI на Windows, IOKit на macOS, неблокирующий опрос и force feedback | `engine/engine-input/src/backend.rs` |
+| gilrs 0.11.2 | Геймпады: WGI на Windows, IOKit на macOS, неблокирующий опрос и force feedback (на macOS вибрации нет) | `engine/engine-input/src/backend.rs` |
 | cpal 0.18.2 | Вывод звука на устройство Windows/macOS | `engine/engine-audio/src/output.rs` |
 | lewton 0.10.2 | Декодирование Ogg Vorbis клипов | `engine/engine-audio/src/decode.rs` |
 | rtrb 0.4.0 | SPSC-кольца между потоком `rve-audio` и callback вывода | `engine/engine-audio/src/lib.rs`, `engine/engine-audio/src/mixer.rs` |
@@ -58,7 +58,7 @@ RVE — workspace игрового движка на Rust. `engine-runtime` со
 - [[Engine/EngineScene]] — форматы `.rvescene` и `.camerasettings`, их проверка и runtime-граф `World` с множеством камер, трансформациями, светом, ресурсами и script-конфигурацией; независимо от renderer и script runtime.
 - [[Engine/EngineAnimation]] — скелетная анимация без GPU и без файлов: позы, клипы по именам костей, crossfade, blend tree, разовые клипы с переходом, палитры skinning и мост `AnimationBridge` между `World` и аниматорами объектов.
 - [[Engine/EngineScript]] — Lua host и загрузчик ABI-библиотеки Rust-скриптов; получает параметры, время и локальную трансформацию из `engine-scene`, не зависит от runtime, renderer или окна.
-- [[Engine/EngineInput]] — геймпады: `gilrs`-бэкенд, перевод событий, слоты 1–4, фокусный гейт и вибрация; не зависит от `engine-script` и окна.
+- [[Engine/EngineInput]] — геймпады: `gilrs`-бэкенд, перевод событий, слоты 1–4, фокусный гейт и вибрация; не зависит от `engine-script` и окна. Runtime держит один бэкенд на scene-потоке, редактор — один на процесс, переживающий сессии Play.
 - [[Engine/EngineConsole]] — общий лог, буфер, парсер/каталог команд и egui developer-console overlay; `engine-console` не зависит от окна/GPU, `engine-ui` адаптирует egui к UI pass.
 - [[Engine/RveSdk]] — независимый SDK с C ABI и guest API для игровых `cdylib`.
 - [[Engine/EngineRuntime]] — потоки игры, порядок запуска, ограниченный конвейер кадров и завершение; библиотека запуска используется бинарником `rve-player`.
