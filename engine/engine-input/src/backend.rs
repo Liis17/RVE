@@ -38,6 +38,16 @@ impl GilrsBackend {
         }
     }
 
+    /// Creates a backend without `gilrs`, for tests and hosts that must not touch devices. Its
+    /// snapshots stay empty and rumble does nothing.
+    pub fn without_devices(tuning: GamepadTuning) -> Self {
+        Self {
+            gilrs: None,
+            mapper: GamepadMapper::new(tuning),
+            effects: Vec::new(),
+        }
+    }
+
     /// Drains pending backend events without blocking.
     pub fn poll(&mut self) {
         let Some(gilrs) = self.gilrs.as_mut() else {

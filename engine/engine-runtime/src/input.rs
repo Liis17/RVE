@@ -1,3 +1,4 @@
+use engine_input::{GamepadSnapshot, SLOT_COUNT};
 use engine_script::{Key, MouseButton, ScriptInput};
 use engine_window::{Key as WindowKey, MouseButton as WindowMouseButton};
 use std::sync::{Mutex, MutexGuard};
@@ -8,6 +9,9 @@ pub(crate) struct InputAccumulator {
     input: ScriptInput,
     focused: bool,
     background: bool,
+    /// Buttons held on each pad when input was last regained. They stay masked until released.
+    pad_masks: [u32; SLOT_COUNT],
+    pads_accepting: bool,
 }
 
 impl InputAccumulator {
@@ -67,6 +71,30 @@ impl InputAccumulator {
 
     pub(crate) fn take_frame(&mut self) -> ScriptInput {
         self.input.take_frame()
+    }
+
+    /// Applies the backend's pad snapshot to the script snapshot. Outside accepted input, pads
+    /// report no buttons and zero axes; connection state is still reported. Buttons held when
+    /// input is regained stay masked until released. Returns whether input is accepted, so the
+    /// caller can stop rumble while it is not.
+    pub(crate) fn set_pads(&mut self, pads: &GamepadSnapshot) -> bool {
+        let accepting = self.accepting_input();
+        if accepting && !self.pads_accepting {
+            for (mask, pad) in self.pad_masks.iter_mut().zip(pads) {
+                *mask = pad.buttons;
+            }
+        }
+        self.pads_accepting = accepting;
+        for (index, (mask, pad)) in self.pad_masks.iter_mut().zip(pads).enumerate() {
+            if accepting {
+                *mask &= pad.buttons;
+                self.input
+                    .set_pad(index, pad.connected, pad.buttons & !*mask, pad.axes);
+            } else {
+                self.input.set_pad(index, pad.connected, 0, [0.0; 6]);
+            }
+        }
+        accepting
     }
 
     fn accepting_input(&self) -> bool {
@@ -417,5 +445,124 @@ mod tests {
         input.console_open(false, true);
         input.key(WindowKey::W, true);
         assert!(input.take_frame().key_down(Key::W));
+    }
+
+    mod gamepad {
+        use super::super::InputAccumulator;
+        use engine_input::{GamepadSnapshot, PadSnapshot, SLOT_COUNT};
+        use engine_script::ScriptInput;
+        use rve_sdk::{GamepadAxis, GamepadButton};
+
+        const SOUTH: u32 = 1 << GamepadButton::South as u32;
+
+        fn pads(buttons: u32, connected: bool) -> GamepadSnapshot {
+            let mut pads = [PadSnapshot::default(); SLOT_COUNT];
+            pads[0] = PadSnapshot {
+                connected,
+                buttons,
+                axes: [0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            };
+            pads
+        }
+
+        fn south_down(frame: &ScriptInput) -> bool {
+            frame.gamepad_state(1).unwrap().down & SOUTH != 0
+        }
+
+        fn south_pressed(frame: &ScriptInput) -> bool {
+            frame.gamepad_state(1).unwrap().pressed & SOUTH != 0
+        }
+
+        #[test]
+        fn losing_focus_or_background_releases_pads_and_zeroes_axes() {
+            let mut input = InputAccumulator::default();
+            input.focused(true);
+            input.set_pads(&pads(0, true));
+            assert!(input.set_pads(&pads(SOUTH, true)));
+            let frame = input.take_frame();
+            assert!(south_down(&frame) && south_pressed(&frame));
+
+            input.focused(false);
+            assert!(!input.set_pads(&pads(SOUTH, true)));
+            let frame = input.take_frame();
+            assert!(!south_down(&frame));
+            assert_eq!(
+                frame.gamepad_state(1).unwrap().axes[GamepadAxis::LeftX as usize],
+                0.0
+            );
+            assert!(frame.gamepad_state(1).unwrap().connected != 0);
+
+            input.focused(true);
+            input.set_pads(&pads(0, true));
+            assert!(input.set_pads(&pads(SOUTH, true)));
+            input.set_background(true);
+            assert!(!input.set_pads(&pads(SOUTH, true)));
+            assert!(!south_down(&input.take_frame()));
+        }
+
+        #[cfg(feature = "dev-console")]
+        #[test]
+        fn opening_the_console_releases_pads_until_it_closes() {
+            let mut input = InputAccumulator::default();
+            input.console_open(false, true);
+            input.set_pads(&pads(0, true));
+            input.set_pads(&pads(SOUTH, true));
+            input.console_open(true, true);
+            assert!(!input.set_pads(&pads(SOUTH, true)));
+            assert!(!south_down(&input.take_frame()));
+        }
+
+        #[test]
+        fn button_released_outside_focus_does_not_stick_after_refocus() {
+            let mut input = InputAccumulator::default();
+            input.focused(true);
+            input.set_pads(&pads(0, true));
+            input.set_pads(&pads(SOUTH, true));
+            input.take_frame();
+
+            input.focused(false);
+            input.set_pads(&pads(0, true));
+            input.focused(true);
+            input.set_pads(&pads(0, true));
+            let frame = input.take_frame();
+            assert!(!south_down(&frame) && !south_pressed(&frame));
+        }
+
+        #[test]
+        fn button_held_at_refocus_is_ignored_until_released() {
+            let mut input = InputAccumulator::default();
+            input.focused(true);
+            input.set_pads(&pads(0, true));
+            input.take_frame();
+
+            input.focused(false);
+            input.set_pads(&pads(SOUTH, true));
+            input.focused(true);
+            input.set_pads(&pads(SOUTH, true));
+            let frame = input.take_frame();
+            assert!(!south_down(&frame) && !south_pressed(&frame));
+
+            input.set_pads(&pads(0, true));
+            input.take_frame();
+            input.set_pads(&pads(SOUTH, true));
+            let frame = input.take_frame();
+            assert!(south_down(&frame) && south_pressed(&frame));
+        }
+
+        #[test]
+        fn disconnect_while_unfocused_is_visible_after_refocus() {
+            let mut input = InputAccumulator::default();
+            input.focused(true);
+            input.set_pads(&pads(SOUTH, true));
+            input.take_frame();
+
+            input.focused(false);
+            input.set_pads(&pads(0, false));
+            input.focused(true);
+            input.set_pads(&pads(0, false));
+            let frame = input.take_frame();
+            assert_eq!(frame.gamepad_state(1).unwrap().connected, 0);
+            assert!(!south_down(&frame));
+        }
     }
 }

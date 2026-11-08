@@ -6,7 +6,7 @@ mod prefab_catalog;
 mod project_settings;
 
 pub use bootstrap::{BootstrapConfig, BootstrapPresentMode};
-pub use input_settings::{InputAction, InputActionKind, InputSettings};
+pub use input_settings::{GamepadSettings, InputAction, InputActionKind, InputSettings};
 pub use prefab_catalog::{
     PREFAB_CATALOG_FILE_NAME, PREFAB_CATALOG_RELEASE_PATH, PrefabCatalogEntry, PrefabCatalogFile,
 };

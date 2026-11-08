@@ -868,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -878,6 +878,7 @@ dependencies = [
  "engine-console",
  "engine-core",
  "engine-files",
+ "engine-input",
  "engine-network",
  "engine-neural",
  "engine-physics",
