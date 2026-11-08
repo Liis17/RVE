@@ -26,11 +26,11 @@ use engine_physics::{
 };
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
+    EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
     FrameStatus, LocalLight, LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId,
-    ParticleEmitterDesc, ParticleEmitterFrame, ParticleEmitterId, ProceduralSky, RenderError,
-    Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
-    ViewSettings,
+    ParticleEmitterDesc, ParticleEmitterFrame, ParticleEmitterId, PostProcess, ProceduralSky,
+    RenderError, Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_render::{SkinBinding, SkinId};
 #[cfg(feature = "dev-console")]
@@ -660,11 +660,17 @@ impl RenderBackend for VulkanBackend {
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
-                exposure_ev: snapshot.view.color.unwrap_or_default().exposure_ev,
-                tonemapper: match snapshot.view.color.unwrap_or_default().tonemapper {
-                    Tonemapper::Aces => RenderTonemapper::Aces,
-                    Tonemapper::Neutral => RenderTonemapper::Neutral,
-                    Tonemapper::None => RenderTonemapper::None,
+                post: PostProcess {
+                    exposure: Exposure {
+                        ev: snapshot.view.color.unwrap_or_default().exposure_ev,
+                        ..Exposure::default()
+                    },
+                    tonemapper: match snapshot.view.color.unwrap_or_default().tonemapper {
+                        Tonemapper::Aces => RenderTonemapper::Aces,
+                        Tonemapper::Neutral => RenderTonemapper::Neutral,
+                        Tonemapper::None => RenderTonemapper::None,
+                    },
+                    ..PostProcess::default()
                 },
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
@@ -783,11 +789,17 @@ impl RenderBackend for VulkanBackend {
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
-                exposure_ev: snapshot.view.color.unwrap_or_default().exposure_ev,
-                tonemapper: match snapshot.view.color.unwrap_or_default().tonemapper {
-                    Tonemapper::Aces => RenderTonemapper::Aces,
-                    Tonemapper::Neutral => RenderTonemapper::Neutral,
-                    Tonemapper::None => RenderTonemapper::None,
+                post: PostProcess {
+                    exposure: Exposure {
+                        ev: snapshot.view.color.unwrap_or_default().exposure_ev,
+                        ..Exposure::default()
+                    },
+                    tonemapper: match snapshot.view.color.unwrap_or_default().tonemapper {
+                        Tonemapper::Aces => RenderTonemapper::Aces,
+                        Tonemapper::Neutral => RenderTonemapper::Neutral,
+                        Tonemapper::None => RenderTonemapper::None,
+                    },
+                    ..PostProcess::default()
                 },
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,

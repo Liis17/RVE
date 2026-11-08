@@ -13,11 +13,11 @@ use engine_files::VirtualPath;
 use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, LocalLight, LocalLightShadow,
-    LocalLightShadowMatrices, Material, MaterialId, MeshId, ParticleBlend, ParticleBurst,
-    ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleEmitterFrame,
-    ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey, ProceduralSky,
-    RenderError, Renderer, SHADOW_MAP_RESOLUTION, SkinBinding, SkinId, SkinVertex,
+    EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, LocalLight,
+    LocalLightShadow, LocalLightShadowMatrices, Material, MaterialId, MeshId, ParticleBlend,
+    ParticleBurst, ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleEmitterFrame,
+    ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey, PostProcess,
+    ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION, SkinBinding, SkinId, SkinVertex,
     TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_scene::camera::Camera;
@@ -1001,11 +1001,17 @@ impl SceneRenderer {
             },
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
-                exposure_ev: settings.color.unwrap_or_default().exposure_ev,
-                tonemapper: match settings.color.unwrap_or_default().tonemapper {
-                    Tonemapper::Aces => RenderTonemapper::Aces,
-                    Tonemapper::Neutral => RenderTonemapper::Neutral,
-                    Tonemapper::None => RenderTonemapper::None,
+                post: PostProcess {
+                    exposure: Exposure {
+                        ev: settings.color.unwrap_or_default().exposure_ev,
+                        ..Exposure::default()
+                    },
+                    tonemapper: match settings.color.unwrap_or_default().tonemapper {
+                        Tonemapper::Aces => RenderTonemapper::Aces,
+                        Tonemapper::Neutral => RenderTonemapper::Neutral,
+                        Tonemapper::None => RenderTonemapper::None,
+                    },
+                    ..PostProcess::default()
                 },
                 anti_aliasing: match settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,

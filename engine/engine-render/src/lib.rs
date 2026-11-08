@@ -32,6 +32,7 @@ mod clusters;
 mod culling;
 mod particle_gpu;
 mod particles;
+mod post;
 
 use particle_gpu::{
     ParticleEmitter, ParticlePass, ParticleSystem, particle_depth_source_masks, record_particles,
@@ -41,6 +42,11 @@ pub use particles::{
     MAX_PARTICLE_STEP, ParticleBlend, ParticleBurst, ParticleCollision, ParticleColorKey,
     ParticleEmitterDesc, ParticleFlipbook, ParticleShape, ParticleSizeKey,
 };
+pub use post::{
+    AmbientOcclusion, AmbientOcclusionQuality, Bloom, ChromaticAberration, ColorGrading,
+    DepthOfField, Exposure, ExposureMode, FilmGrain, MotionBlur, PostProcess, Vignette,
+};
+use post::{COMPOSITE_PUSH_CONSTANTS_SIZE, OUTPUT_PUSH_CONSTANTS_SIZE, PostFrame};
 #[cfg(any(test, all(windows, feature = "dlss")))]
 mod dlss;
 #[allow(dead_code)]
@@ -110,7 +116,6 @@ const SKYBOX_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sk
 const SKYBOX_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.frag.spv"));
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
-const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const TAA_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const PIPELINE_CACHE_HEADER_SIZE: usize = size_of::<vk::PipelineCacheHeaderVersionOne>();
 /// Максимум видов с GPU-границами за кадр: основной экран или viewport редактора.
@@ -390,8 +395,8 @@ pub struct Frame<'a> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewSettings {
     pub render_scale: f32,
-    pub exposure_ev: f32,
-    pub tonemapper: Tonemapper,
+    /// Экспозиция, tonemapper и эффекты постобработки вида.
+    pub post: PostProcess,
     pub anti_aliasing: AntiAliasing,
 }
 
@@ -399,8 +404,7 @@ impl Default for ViewSettings {
     fn default() -> Self {
         Self {
             render_scale: 1.0,
-            exposure_ev: 0.0,
-            tonemapper: Tonemapper::Aces,
+            post: PostProcess::default(),
             anti_aliasing: AntiAliasing::Fxaa,
         }
     }
@@ -1097,6 +1101,8 @@ pub struct Renderer {
     swapchain: Option<SwapchainBundle>,
     surface_format: vk::SurfaceFormatKHR,
     present_mode: PresentMode,
+    /// Номер кадра renderer; задаёт сид зерна постобработки.
+    frame_serial: u32,
     last_warned_present_mode: Option<PresentMode>,
     output_extent: vk::Extent2D,
     swapchain_dirty: bool,
@@ -1222,6 +1228,7 @@ impl Renderer {
             surface_format: vk::SurfaceFormatKHR::default(),
             present_mode: config.present_mode,
             last_warned_present_mode: None,
+            frame_serial: 0,
             output_extent: vk::Extent2D { width, height },
             swapchain_dirty: true,
             frame_slots_lost: false,
@@ -1805,6 +1812,8 @@ impl Renderer {
     ) -> Result<FrameOutcome, RenderError> {
         let prepare_started = Instant::now();
         self.begin_particle_frame();
+        self.frame_serial = self.frame_serial.wrapping_add(1);
+        let frame_serial = self.frame_serial;
         if self.frame_slots_lost {
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
@@ -2223,6 +2232,13 @@ impl Renderer {
                 shadow_cascades: frame.shadow_cascades,
                 local_shadow_matrices: &prepared.local_shadow_matrices,
             };
+            let post_frame = PostFrame::new(
+                &view.post,
+                frame.debug_view,
+                (render_extent.width, render_extent.height),
+                (output_extent.width, output_extent.height),
+                frame_serial,
+            );
             let scene = ScenePass {
                 pipeline: scene_pipeline,
                 mask_pipeline,
@@ -2253,6 +2269,7 @@ impl Renderer {
                 debug_view: frame.debug_view,
                 timestamps: screen_marks,
                 view,
+                post: post_frame,
                 particles: particle_pass,
             };
             let frame_resources = &mut self.frames[frame_slot];
@@ -2306,7 +2323,7 @@ impl Renderer {
                     #[cfg(windows)]
                     fsr,
                     #[cfg(windows)]
-                    exposure_ev: view.exposure_ev,
+                    exposure_ev: view.post.exposure.ev,
                     #[cfg(windows)]
                     frame_time_delta_ms,
                     #[cfg(windows)]
@@ -2468,6 +2485,8 @@ impl Renderer {
     ) -> Result<FrameOutcome, RenderError> {
         let prepare_started = Instant::now();
         self.begin_particle_frame();
+        self.frame_serial = self.frame_serial.wrapping_add(1);
+        let frame_serial = self.frame_serial;
         if self.frame_slots_lost {
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
@@ -2900,6 +2919,13 @@ impl Renderer {
                 &local_shadow_matrix_bytes(&prepared.local_shadow_matrices)?,
                 &prepared.cluster_bounds,
             )?;
+            let post_frame = PostFrame::new(
+                &effective_view_settings(frame.view, frame.debug_view).post,
+                frame.debug_view,
+                (target.render_extent.width, target.render_extent.height),
+                (target.extent.width, target.extent.height),
+                frame_serial,
+            );
             rendered.push((
                 *viewport,
                 *frame,
@@ -2913,6 +2939,7 @@ impl Renderer {
                 prepared.local_shadow_matrices.as_slice(),
                 *frame_delta_ms,
                 fallback_reason.clone(),
+                post_frame,
             ));
         }
 
@@ -2923,7 +2950,7 @@ impl Renderer {
                 UiImage::Viewport(viewport) => {
                     if !rendered
                         .iter()
-                        .any(|(drawn, _, _, _, _, _, _, _, _, _, _, _)| *drawn == viewport)
+                        .any(|(drawn, _, _, _, _, _, _, _, _, _, _, _, _)| *drawn == viewport)
                     {
                         continue;
                     }
@@ -3010,6 +3037,7 @@ impl Renderer {
                         local_shadow_matrices,
                         frame_delta_ms,
                         upscaler_fallback_reason,
+                        post_frame,
                     ),
                 )| {
                     (
@@ -3060,6 +3088,7 @@ impl Renderer {
                                     .map(|first| GpuMarks { pool, first })
                             }),
                             view: effective_view_settings(frame.view, frame.debug_view),
+                            post: *post_frame,
                             particles: particle_pipelines.map(|pipelines| ParticlePass {
                                 works: &particle_works[index],
                                 pipelines,
@@ -3170,8 +3199,7 @@ impl Renderer {
                         post_sampler,
                         pass.frame_set,
                         target.extent,
-                        pass.view,
-                        pass.debug_view,
+                        pass.post.composite,
                         pass.timestamps,
                         tonemap_pipeline,
                         post_pipeline_layout,
@@ -3186,7 +3214,7 @@ impl Renderer {
                             #[cfg(windows)]
                             fsr,
                             #[cfg(windows)]
-                            exposure_ev: pass.view.exposure_ev,
+                            exposure_ev: pass.view.post.exposure.ev,
                             #[cfg(windows)]
                             frame_time_delta_ms: *_frame_delta_ms,
                             #[cfg(windows)]
@@ -3210,8 +3238,7 @@ impl Renderer {
                         *tonemap_set,
                         tonemap_pipeline,
                         post_pipeline_layout,
-                        pass.view,
-                        pass.debug_view,
+                        pass.post.composite,
                         pass.timestamps,
                     );
                     target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -3233,6 +3260,7 @@ impl Renderer {
                     post_pipeline_layout,
                     pass.view.anti_aliasing,
                     true,
+                    pass.post.grain,
                     None,
                     true,
                 );
@@ -5791,11 +5819,11 @@ impl Renderer {
         let push_constant_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(POST_PUSH_CONSTANTS_SIZE as u32)];
+            .size(COMPOSITE_PUSH_CONSTANTS_SIZE as u32)];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&push_constant_ranges);
-        // SAFETY: the image/sampler set layout and 16-byte fragment range are valid.
+        // SAFETY: the image/sampler set layout and the composite fragment range are valid.
         let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
         self.post_pipeline_layout = Some(layout);
         self.tonemap_pipeline = Some(create_post_pipeline(
@@ -8174,8 +8202,8 @@ fn effective_view_settings(mut view: ViewSettings, debug_view: DebugView) -> Vie
         view.anti_aliasing = AntiAliasing::None;
     }
     if debug_view.has_linear_output() {
-        view.exposure_ev = 0.0;
-        view.tonemapper = Tonemapper::None;
+        view.post.exposure.ev = 0.0;
+        view.post.tonemapper = Tonemapper::None;
     }
     view
 }
@@ -8783,8 +8811,7 @@ fn record_temporal_resolve_and_tonemap(
     post_sampler: vk::Sampler,
     frame_set: vk::DescriptorSet,
     output_extent: vk::Extent2D,
-    view: ViewSettings,
-    debug_view: DebugView,
+    composite: post::CompositeParams,
     timestamps: Option<GpuMarks>,
     tonemap_pipeline: vk::Pipeline,
     post_pipeline_layout: vk::PipelineLayout,
@@ -8908,8 +8935,7 @@ fn record_temporal_resolve_and_tonemap(
         tonemap_set,
         tonemap_pipeline,
         post_pipeline_layout,
-        view,
-        debug_view,
+        composite,
         timestamps,
     );
     Ok(TemporalResolveOutcome {
@@ -9315,8 +9341,7 @@ fn record_frame(
             post_sampler,
             scene.frame_set,
             target.output_extent,
-            view,
-            scene.debug_view,
+            scene.post.composite,
             scene.timestamps,
             tonemap_pipeline,
             post_pipeline_layout,
@@ -9336,8 +9361,7 @@ fn record_frame(
             tonemap_set,
             tonemap_pipeline,
             post_pipeline_layout,
-            view,
-            scene.debug_view,
+            scene.post.composite,
             scene.timestamps,
         );
         target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -9362,6 +9386,7 @@ fn record_frame(
         post_pipeline_layout,
         view.anti_aliasing,
         output_is_srgb,
+        scene.post.grain,
         overlay,
         false,
     );
@@ -10119,6 +10144,7 @@ struct ScenePass<'a> {
     timestamps: Option<GpuMarks>,
     debug_view: DebugView,
     view: ViewSettings,
+    post: PostFrame,
     particles: Option<ParticlePass<'a>>,
 }
 
@@ -10490,8 +10516,7 @@ fn record_tonemap_pass(
     set: vk::DescriptorSet,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    view: ViewSettings,
-    debug_view: DebugView,
+    composite: post::CompositeParams,
     timestamps: Option<GpuMarks>,
 ) {
     if source_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
@@ -10548,12 +10573,7 @@ fn record_tonemap_pass(
         min_depth: 0.0,
         max_depth: 1.0,
     }];
-    let push_constants = float_bytes::<POST_PUSH_CONSTANTS_SIZE>(&[
-        view.exposure_ev,
-        view.tonemapper.code() as f32,
-        debug_view.code() as f32,
-        0.0,
-    ]);
+    let push_constants = composite.to_bytes();
     // SAFETY: source and destination views match the descriptor and attachment layouts.
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering_info);
@@ -10742,6 +10762,7 @@ fn record_output_pass(
     pipeline_layout: vk::PipelineLayout,
     anti_aliasing: AntiAliasing,
     output_is_srgb: bool,
+    grain: [f32; 4],
     overlay: Option<&OverlayPass>,
     sample_output: bool,
 ) {
@@ -10784,11 +10805,15 @@ fn record_output_pass(
         max_depth: 1.0,
     }];
     let [texel_width, texel_height] = inverse_extent(source_extent);
-    let push_constants = float_bytes::<POST_PUSH_CONSTANTS_SIZE>(&[
+    let push_constants = float_bytes::<OUTPUT_PUSH_CONSTANTS_SIZE>(&[
         texel_width,
         texel_height,
         anti_aliasing.code() as f32,
         f32::from(u8::from(output_is_srgb)),
+        grain[0],
+        grain[1],
+        grain[2],
+        grain[3],
     ]);
     // SAFETY: the output view uses the pipeline's color format and descriptor set samples LDR.
     unsafe {
@@ -13542,13 +13567,7 @@ fn validate_render_scale(scale: f32) -> Result<(), RenderError> {
 
 fn validate_view_settings(view: ViewSettings) -> Result<(), RenderError> {
     validate_render_scale(view.render_scale)?;
-    if view.exposure_ev.is_finite() && (-16.0..=16.0).contains(&view.exposure_ev) {
-        Ok(())
-    } else {
-        Err(RenderError::InvalidConfig(
-            "exposure_ev должен быть конечным и находиться в [-16, 16]",
-        ))
-    }
+    view.post.validate().map_err(RenderError::InvalidConfig)
 }
 
 fn scaled_extent(output: vk::Extent2D, scale: f32) -> vk::Extent2D {
@@ -13651,6 +13670,7 @@ mod tests {
         validate_mesh, validate_overlay, validate_pipeline_cache, validate_render_scale,
         validate_texture, validate_view_settings, vertex_bytes,
     };
+    use super::{Exposure, PostProcess};
     use super::{
         GpuPass, GpuProfileLayout, GpuViewTimings, LocalShadowKind, MAX_PROFILED_VIEWS,
         OUTPUT_QUERY_FIRST, ProfiledView, SelectedLocalLight, TIMESTAMP_QUERY_COUNT,
@@ -13764,15 +13784,20 @@ mod tests {
     fn non_lit_debug_views_disable_aa_and_raw_views_bypass_tonemapping() {
         let settings = ViewSettings {
             render_scale: 0.5,
-            exposure_ev: 2.0,
-            tonemapper: Tonemapper::Aces,
+            post: PostProcess {
+                exposure: Exposure {
+                    ev: 2.0,
+                    ..Exposure::default()
+                },
+                ..PostProcess::default()
+            },
             anti_aliasing: AntiAliasing::Taa,
         };
         assert_eq!(effective_view_settings(settings, DebugView::Lit), settings);
         let wireframe = effective_view_settings(settings, DebugView::Wireframe);
         assert_eq!(wireframe.anti_aliasing, AntiAliasing::None);
-        assert_eq!(wireframe.exposure_ev, 2.0);
-        assert_eq!(wireframe.tonemapper, Tonemapper::Aces);
+        assert_eq!(wireframe.post.exposure.ev, 2.0);
+        assert_eq!(wireframe.post.tonemapper, Tonemapper::Aces);
         for debug_view in [
             DebugView::Normals,
             DebugView::Overdraw,
@@ -13781,8 +13806,8 @@ mod tests {
         ] {
             let view = effective_view_settings(settings, debug_view);
             assert_eq!(view.anti_aliasing, AntiAliasing::None);
-            assert_eq!(view.exposure_ev, 0.0);
-            assert_eq!(view.tonemapper, Tonemapper::None);
+            assert_eq!(view.post.exposure.ev, 0.0);
+            assert_eq!(view.post.tonemapper, Tonemapper::None);
         }
     }
 
@@ -16199,8 +16224,7 @@ mod tests {
         assert!(config.extra_device_extensions.is_empty());
         let view = ViewSettings::default();
         assert_eq!(view.render_scale, 1.0);
-        assert_eq!(view.exposure_ev, 0.0);
-        assert_eq!(view.tonemapper, Tonemapper::Aces);
+        assert_eq!(view.post, PostProcess::default());
         assert_eq!(view.anti_aliasing, AntiAliasing::Fxaa);
         assert!(validate_view_settings(view).is_ok());
     }
@@ -16219,6 +16243,11 @@ mod tests {
 
     #[test]
     fn view_settings_validate_scale_and_exposure_ranges() {
+        let post_with_ev = |ev: f32| {
+            let mut post = PostProcess::default();
+            post.exposure.ev = ev;
+            post
+        };
         for render_scale in [1.0, 0.5, f32::MIN_POSITIVE] {
             assert!(
                 validate_view_settings(ViewSettings {
@@ -16231,7 +16260,7 @@ mod tests {
         for exposure_ev in [-16.0, 0.0, 16.0] {
             assert!(
                 validate_view_settings(ViewSettings {
-                    exposure_ev,
+                    post: post_with_ev(exposure_ev),
                     ..ViewSettings::default()
                 })
                 .is_ok()
@@ -16249,7 +16278,7 @@ mod tests {
         for exposure_ev in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -16.01, 16.01] {
             assert!(matches!(
                 validate_view_settings(ViewSettings {
-                    exposure_ev,
+                    post: post_with_ev(exposure_ev),
                     ..ViewSettings::default()
                 }),
                 Err(RenderError::InvalidConfig(_))

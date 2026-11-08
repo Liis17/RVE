@@ -10,10 +10,10 @@ use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, BootstrapPresentMode};
 use engine_render::{
     AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, Material, MaterialId,
-    MeshId, ParticleBlend, ParticleCollision, ParticleEmitterDesc, ParticleEmitterFrame,
-    ParticleShape, ProceduralSky, Renderer, RendererConfig, TextureColorSpace, TextureId,
-    Tonemapper as RenderTonemapper, ViewSettings,
+    EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameStatus, Material,
+    MaterialId, MeshId, ParticleBlend, ParticleCollision, ParticleEmitterDesc,
+    ParticleEmitterFrame, ParticleShape, PostProcess, ProceduralSky, Renderer, RendererConfig,
+    TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
@@ -767,11 +767,17 @@ impl WindowHandler for Sandbox {
             debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: self.camera_settings.render.render_scale,
-                exposure_ev: self.camera_settings.color.unwrap_or_default().exposure_ev,
-                tonemapper: match self.camera_settings.color.unwrap_or_default().tonemapper {
-                    Tonemapper::Aces => RenderTonemapper::Aces,
-                    Tonemapper::Neutral => RenderTonemapper::Neutral,
-                    Tonemapper::None => RenderTonemapper::None,
+                post: PostProcess {
+                    exposure: Exposure {
+                        ev: self.camera_settings.color.unwrap_or_default().exposure_ev,
+                        ..Exposure::default()
+                    },
+                    tonemapper: match self.camera_settings.color.unwrap_or_default().tonemapper {
+                        Tonemapper::Aces => RenderTonemapper::Aces,
+                        Tonemapper::Neutral => RenderTonemapper::Neutral,
+                        Tonemapper::None => RenderTonemapper::None,
+                    },
+                    ..PostProcess::default()
                 },
                 anti_aliasing: match self.camera_settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
