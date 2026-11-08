@@ -121,6 +121,15 @@ Scripts thread регистрирует каждый быстрый шаблон
 Тесты без GPU: учёт ресурсов проверяется подменой `GpuResources`, а поток скриптов и цикл рендера — ручными ответами загрузчика и `FakeBackend`. Draw-команды тяжёлого объекта в тестах не проверяются: `MeshId` нельзя создать вне engine-render.
 
 
+## NVIDIA Reflex
+
+`player.rs` передаёт `Reflex` из bootstrap в `RendererConfig::low_latency` и после создания renderer берёт `latency_handle()`. Handle отправляется скриптовому потоку как `ScriptControl::Latency(Arc<dyn FrameLatency>)` строго перед единственным `ScriptControl::Go`; `Go` не меняется. `FrameLatency` в `pipeline.rs` — узкий интерфейс для тестов, реализованный на `LatencyHandle`.
+
+- Скриптовый цикл: `sleep()` вызывается до `clock.now()`, затем `SimulationStart`, `InputSample` перед `take_frame()`, `SimulationEnd` после `make_snapshot`. Идентификатор кадра — `frame_number` (он же `snapshot.sequence`).
+- В background-режиме ни sleep, ни маркеров нет: id кадра в этом режиме до present не доходит.
+- Render thread перед `render_frame*` вызывает `set_latency_frame(snapshot.sequence)` в `VulkanBackend::render`.
+- Без handle (Reflex выключен или не поддержан) цикл работает как прежде. Тесты: `reflex_sleep_and_markers_run_in_order_for_the_submitted_sequence`, `reflex_is_not_called_while_scripts_run_in_background`, `scripts_produce_frames_without_a_reflex_handle` (`pipeline.rs`).
+
 ## Завершение и ошибки
 
 `close_requested` посылает Shutdown scripts и render и задаёт дедлайн закрытия через 2 секунды. При выходе `cleanup` сначала останавливает загрузчик `rve-prefabs` через `ModuleHost::stop_named` и ждёт его не дольше 2 секунд; при timeout поток отсоединяется с предупреждением, и код выхода не меняется: штатное закрытие не считается ошибкой, код 1 даёт только паника потока при `join`. Только после этого останавливается render. `next_wakeup` учитывает этот дедлайн и вне dev-console, а при открытой консоли выбирает более ранний момент repaint или закрытия. Render дожидается Vulkan через уничтожение renderer на своём потоке, помечает `RenderStopped` и вызывает `WindowProxy::request_exit`. Если дедлайн истёк, пока render ещё работает, `update` записывает `поток рендера не завершился после закрытия окна` и завершает оконный цикл. В `exiting` render join-ится только после `RenderStopped`; иначе главный поток ждёт до дедлайна закрытия (ноль времени, если он уже истёк; до 2 секунд при другом выходе), затем при timeout отсоединяет render handle и выставляет код 1. Затем scripts ждут до 2 секунд; после interrupt выполняется ещё одно ограниченное ожидание до 2 секунд, а при timeout поток отсоединяется без `join` и код выхода становится 1. `ModuleHost` останавливает и join-ит оставшиеся модули в обратном порядке; паника потока или stop-handler становится ошибкой запуска/завершения. После этого останавливается `ResourceSystem` и освобождается `InstanceLock`.
