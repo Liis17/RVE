@@ -1022,9 +1022,11 @@ impl PlaySession {
                 continue;
             }
             if let Some(physics) = &mut self.physics {
+                // Объект, который активация этого кадра уже вставила, второе тело не получает.
+                let fresh = physics.sync.unbound_objects(&spawned.objects);
                 let inserted = physics.sync.insert_objects(
                     &self.world,
-                    &spawned.objects,
+                    &fresh,
                     &physics.geometry,
                     &mut physics.shapes,
                 );

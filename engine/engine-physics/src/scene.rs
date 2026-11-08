@@ -269,6 +269,18 @@ impl PhysicsSceneSync {
         &self.bindings
     }
 
+    /// Объекты из `objects`, которые ещё не привязаны к телу. Привязанные пропускаются: например,
+    /// объект, который активация уже вставила в этом кадре, не должен получить второе тело.
+    pub fn unbound_objects(&self, objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
+        let bound: HashSet<ObjectHandle> =
+            self.bindings.iter().map(|binding| binding.object).collect();
+        objects
+            .iter()
+            .copied()
+            .filter(|object| !bound.contains(object))
+            .collect()
+    }
+
     /// Объект, которому принадлежит тело. Учитывает тела, удалённые с последним результатом
     /// шага и предыдущим, чтобы доставить их `*_exit` выжившим объектам.
     pub fn object_for_body(&self, body: BodyHandle) -> Option<ObjectHandle> {
@@ -1262,6 +1274,22 @@ mod tests {
             BodyChange::Insert { handle, desc } => (*handle, desc),
             other => panic!("expected an insertion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unbound_objects_skips_objects_that_already_have_a_body() {
+        let scene = world(&format!(
+            "{CAMERA}\n[[objects]]\nid='ball'\n[objects.collider]\n"
+        ));
+        let ball = scene.handle("ball").unwrap();
+        let camera = scene.handle("camera").unwrap();
+        let mut sync = PhysicsSceneSync::new(&scene, Vec::new()).unwrap();
+        let mut cache = ShapeCache::default();
+        sync.insert_objects(&scene, &[ball], &[], &mut cache)
+            .unwrap();
+
+        assert_eq!(sync.unbound_objects(&[ball, camera]), [camera]);
+        assert!(sync.unbound_objects(&[ball]).is_empty());
     }
 
     #[test]

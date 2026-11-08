@@ -1743,9 +1743,11 @@ fn apply_changes(
             continue;
         }
         if let Some(sync) = physics.as_deref_mut() {
+            // Объект, который активация этого кадра уже вставила, второе тело не получает.
+            let fresh = sync.unbound_objects(&spawned.objects);
             let inserted = sync.insert_objects(
                 world,
-                &spawned.objects,
+                &fresh,
                 &spawn_physics.geometry,
                 &mut spawn_physics.shapes,
             );
