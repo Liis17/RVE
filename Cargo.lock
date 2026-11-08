@@ -3101,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -3132,6 +3132,7 @@ dependencies = [
  "rve-sdk",
  "serde",
  "serde_json",
+ "toml",
  "windows-sys 0.61.2",
  "winit",
 ]

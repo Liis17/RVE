@@ -1129,6 +1129,15 @@ fn position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {
         })
 }
 
+fn last_position_of(texts: &[(String, Pos2)], text: &str) -> Pos2 {
+    texts
+        .iter()
+        .rev()
+        .find(|(found, _)| found == text)
+        .map(|(_, at)| *at)
+        .unwrap_or_else(|| position_of(texts, text))
+}
+
 fn inspector_click(harness: &mut Harness, at: Pos2) {
     inspector_frame(harness, vec![Event::PointerMoved(at)]);
     inspector_frame(harness, vec![button(at, PointerButton::Primary, true)]);
@@ -1810,6 +1819,12 @@ impl ProjectFixture {
         std::fs::write(dir.join("prefabs.rveprefabs"), prefabs).unwrap();
         Self(dir)
     }
+
+    fn write_asset(&self, path: &str, source: &str) {
+        let file = self.0.join("Assets").join(path.trim_start_matches('/'));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, source).unwrap();
+    }
 }
 
 impl Drop for ProjectFixture {
@@ -1848,4 +1863,120 @@ fn project_prefabs_panel_loads_the_project_list_on_first_show() {
         ["/prefabs/crate.rveprefab", "/prefabs/gate.rveprefab"]
     );
     assert_eq!(entries[1].max_instances, Some(2));
+}
+
+fn project_panel_frame(harness: &mut Harness, events: Vec<Event>) -> Vec<(String, Pos2)> {
+    let input = harness.input(events);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| project_panel::show(ui, state));
+    });
+    output.textures_delta.clear();
+    texts(&output.shapes)
+}
+
+fn open_asset_fixture(harness: &mut Harness, fixture: &ProjectFixture) {
+    let project = OpenProject::open(&fixture.0).unwrap();
+    harness.state.asset_tree = project.assets_dir.list().unwrap();
+    harness
+        .state
+        .materials
+        .refresh_all(&project, &harness.state.asset_tree);
+    harness.state.project = Some(project);
+}
+
+#[test]
+fn clicking_material_opens_asset_inspector_and_shader_combo_lists_project_shaders() {
+    let fixture = ProjectFixture::new("");
+    fixture.write_asset(
+        "materials/test.rvemat",
+        &engine_scene::MaterialAsset::default().to_toml().unwrap(),
+    );
+    fixture.write_asset(
+        "shaders/surface.rveshader",
+        &engine_scene::ShaderAsset::template("Surface"),
+    );
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+    harness.state.current_folder = "materials".to_owned();
+
+    let assets = project_panel_frame(&mut harness, Vec::new());
+    let material = position_of(&assets, "test.rvemat");
+    harness.click(material, project_panel::show);
+    assert_eq!(
+        harness.state.inspected_asset.as_deref(),
+        Some("materials/test.rvemat")
+    );
+    let inspector = inspector_frame(&mut harness, Vec::new());
+    position_of(&inspector, "Material");
+    let shader_combo = position_of(&inspector, "Lit (built-in)");
+    inspector_click(&mut harness, shader_combo);
+    let choices = inspector_frame(&mut harness, Vec::new());
+    position_of(&choices, "shaders/surface.rveshader");
+}
+
+#[test]
+fn material_property_reset_writes_the_asset_file() {
+    let fixture = ProjectFixture::new("");
+    fixture.write_asset(
+        "materials/test.rvemat",
+        &engine_scene::MaterialAsset::default().to_toml().unwrap(),
+    );
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+    harness.state.inspected_asset = Some("materials/test.rvemat".to_owned());
+
+    let labels = inspector_frame(&mut harness, Vec::new());
+    let reset = position_of(&labels, "↺");
+    inspector_click(&mut harness, reset);
+    let saved = std::fs::read_to_string(fixture.0.join("Assets/materials/test.rvemat")).unwrap();
+    assert!(saved.contains("base_color"), "{saved}");
+}
+
+#[test]
+fn create_material_context_menu_uses_the_folder_where_it_was_opened() {
+    let fixture = ProjectFixture::new("");
+    std::fs::create_dir_all(fixture.0.join("Assets/Materials")).unwrap();
+    let mut harness = Harness::new();
+    open_asset_fixture(&mut harness, &fixture);
+
+    let labels = project_panel_frame(&mut harness, Vec::new());
+    let folder = position_of(&labels, "Materials");
+    project_panel_frame(&mut harness, vec![Event::PointerMoved(folder)]);
+    project_panel_frame(
+        &mut harness,
+        vec![button(folder, PointerButton::Secondary, true)],
+    );
+    project_panel_frame(
+        &mut harness,
+        vec![button(folder, PointerButton::Secondary, false)],
+    );
+    let menu = project_panel_frame(&mut harness, Vec::new());
+    let create = last_position_of(&menu, "Create");
+    harness.click(create, project_panel::show);
+    let submenu = project_panel_frame(&mut harness, Vec::new());
+    let material = position_of(&submenu, "Material");
+    harness.click(material, project_panel::show);
+    assert_eq!(
+        harness.state.project_dialog,
+        Some(project_panel::ProjectDialog::NewMaterial {
+            folder: "Materials".to_owned(),
+            name: "New Material".to_owned(),
+        })
+    );
+
+    let input = harness.input(vec![key(egui::Key::Enter)]);
+    let state = &mut harness.state;
+    let mut output = harness.ctx.run_ui(input, |ui| {
+        project_panel::show_dialog(ui.ctx(), state);
+    });
+    output.textures_delta.clear();
+    assert!(
+        fixture
+            .0
+            .join("Assets/Materials/New Material.rvemat")
+            .is_file()
+    );
 }

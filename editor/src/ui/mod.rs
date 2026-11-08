@@ -1,10 +1,12 @@
 //! Панели и диалоги редактора.
 
+pub mod asset_inspector;
 pub mod console;
 mod debug_view;
 pub mod game_view;
 pub mod hierarchy;
 pub mod inspector;
+pub mod material_preview;
 pub mod profiler;
 pub mod project_panel;
 pub mod project_prefabs;
@@ -32,6 +34,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut DockState<Tab
     state.game_view.visible = false;
     state.game_view.hovered = false;
     state.game_view.rect = None;
+    state.material_preview.visible = false;
+    if std::mem::take(&mut state.preview_requested) {
+        if let Some(path) = dock.find_tab(&Tab::MaterialPreview) {
+            let _ = dock.set_active_tab(path);
+        } else {
+            dock.push_to_first_leaf(Tab::MaterialPreview);
+        }
+    }
     toolbar::handle_shortcuts(ui.ctx(), state);
     toolbar::show(ui, state, dock);
     show_status_bar(ui, state);

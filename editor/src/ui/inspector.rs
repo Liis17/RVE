@@ -19,6 +19,10 @@ use engine_scene::{
 use std::collections::BTreeMap;
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
+    if let Some(path) = state.inspected_asset.clone() {
+        super::asset_inspector::show(ui, state, &path);
+        return;
+    }
     let Some(object) = state
         .scene
         .as_ref()
@@ -673,6 +677,14 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     textures.extend(state.assets_of_kind(AssetKind::Texture));
     let mut model_choice = None;
     let mut texture_choice = None;
+    let material_assets = state.assets_of_kind(AssetKind::Material);
+    let part_count = state
+        .models
+        .get(mesh.model.as_str())
+        .map_or(0, |model| model.meshes.len());
+    let slot_count = part_count.max(mesh.materials.len());
+    let mut material_slots = mesh.materials.clone();
+    material_slots.resize(slot_count, None);
     let field = OverrideField::Mesh;
     let menu = component_menu(state, id, ComponentKind::MeshRenderer);
     let action = component_header(
@@ -696,6 +708,39 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
                 ui.end_row();
             });
             ui.separator();
+            ui.label("Materials");
+            if slot_count == 0 {
+                ui.weak("FBX part slots appear after the model loads.");
+            }
+            for (index, material_slot) in material_slots.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Element {index}"));
+                    let current = material_slot
+                        .as_ref()
+                        .map_or_else(String::new, |path| path.as_str().to_owned());
+                    let mut next = current.clone();
+                    egui::ComboBox::from_id_salt(("mesh-material-slot", id, index))
+                        .selected_text(if current.is_empty() {
+                            "None (FBX)"
+                        } else {
+                            &current
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut next, String::new(), "None (FBX)");
+                            for path in &material_assets {
+                                ui.selectable_value(&mut next, path.clone(), path);
+                            }
+                        });
+                    if next != current {
+                        *material_slot = if next.is_empty() {
+                            None
+                        } else {
+                            VirtualPath::parse(&next).ok()
+                        };
+                    }
+                });
+            }
+            ui.separator();
             show_material(ui, state, id, mesh.material.as_ref(), &textures);
         },
     );
@@ -713,6 +758,9 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
                 state.pending_frame = Some(id.to_owned());
             }
         }
+    }
+    if material_slots != mesh.materials {
+        state.edit_scene(|scene| scene.set_mesh_materials(id, material_slots));
     }
     if action == HeaderAction::Revert {
         revert(state, id, field);
