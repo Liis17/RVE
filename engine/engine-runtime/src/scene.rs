@@ -618,6 +618,8 @@ pub(crate) struct PreparedTemplate {
     pub textures: HashMap<String, TextureData>,
     /// Элемент `i` относится к объекту шаблона `i`; `None` — у объекта нет меша.
     pub levels: Vec<Option<ObjectModel>>,
+    /// Эмиттеры объектов шаблона; элемент `i` относится к объекту `i`.
+    pub particles: Vec<Option<ParticleSource>>,
     pub sources: BTreeMap<String, String>,
 }
 
@@ -633,6 +635,7 @@ pub(crate) fn prepare_template(
     const STOPPED: &str = "подготовка префаба прервана";
     let mut set = RenderAssetSet::default();
     let mut levels = Vec::with_capacity(template.objects().len());
+    let mut particles = Vec::with_capacity(template.objects().len());
     for object in template.objects() {
         if stop() {
             return Err(STOPPED.to_owned());
@@ -650,6 +653,7 @@ pub(crate) fn prepare_template(
             assets.load_model(path).map_err(|error| error.to_string())
         })?;
         levels.push(model);
+        particles.push(set.add_particle(assets, label, object.particle_emitter.as_ref())?);
     }
     let RenderAssetSet {
         models,
@@ -668,6 +672,7 @@ pub(crate) fn prepare_template(
         models,
         textures,
         levels,
+        particles,
         sources,
     })
 }
@@ -778,7 +783,7 @@ fn particle_desc(
 }
 
 /// Переводит компонент сцены в описание эмиттера `engine-render`; проверка диапазонов — в engine-scene.
-fn particle_emitter_desc(
+pub(crate) fn particle_emitter_desc(
     component: &ParticleEmitterComponent,
     texture: Option<TextureId>,
 ) -> ParticleEmitterDesc {

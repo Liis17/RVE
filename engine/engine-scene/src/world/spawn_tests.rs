@@ -762,3 +762,35 @@ fn ids_of(world: &World, handles: &[ObjectHandle]) -> Vec<String> {
         .map(|&handle| world.object(handle).unwrap().id.clone())
         .collect()
 }
+
+const EMITTER_BULLET: &str = "[[objects]]\nid = \"root\"\n[objects.transform]\nposition = [1.0, 0.0, 0.0]\n\
+[objects.particle_emitter]\ncapacity = 64\nrate = 5.0\n\
+[[objects]]\nid = \"plain\"\nparent = \"root\"\n";
+
+#[test]
+fn spawned_emitters_join_the_frame_and_despawn_removes_them() {
+    let mut world = world(CAMERA_SCENE);
+    let bullet = template(EMITTER_BULLET);
+    let first = spawn(&mut world, &bullet, SpawnOptions::default()).unwrap();
+
+    let (frame, _) = world.build_frame();
+    assert_eq!(frame.particle_emitters.len(), 1);
+    assert_eq!(frame.particle_emitters[0].object, first[0]);
+    assert_eq!(world.particle_emitter(first[0]).unwrap().capacity, 64);
+    let translation = frame.particle_emitters[0].model.w_axis.truncate();
+    assert!((translation - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5);
+
+    world.despawn_many(&[first[0]]).unwrap();
+    let (frame, _) = world.build_frame();
+    assert!(frame.particle_emitters.is_empty());
+    assert!(world.particle_emitter(first[0]).is_none());
+
+    let second = spawn(&mut world, &bullet, SpawnOptions::default()).unwrap();
+    let (frame, _) = world.build_frame();
+    assert_eq!(frame.particle_emitters.len(), 1);
+    assert_eq!(frame.particle_emitters[0].object, second[0]);
+    assert_ne!(
+        second[0], first[0],
+        "переиспользованный слот получает новое поколение"
+    );
+}

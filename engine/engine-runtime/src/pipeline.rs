@@ -6,15 +6,16 @@ use crate::cursor::CursorControl;
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
 use crate::prefabs::{
-    LoadedPrefab, LoaderRequest, PREFAB_UPLOAD_BUDGET, PrefabCpu, PrefabGpu, PrefabLoads,
-    PrefabReady, PrefabReply, PrefabToken, RenderResourceRequest,
+    LoadedPrefab, LoaderRequest, PREFAB_UPLOAD_BUDGET, ParticleRequest, PrefabCpu, PrefabGpu,
+    PrefabLoads, PrefabReady, PrefabReply, PrefabToken, RenderResourceRequest,
 };
 use crate::profiling::{
     PhaseWindow, SOURCE_RENDER, SOURCE_RESOURCES, SOURCE_SCRIPTS, SOURCE_STARTUP,
     log_startup_profile, record_frame_profile, record_update_profile, render_groups, render_phase,
     script_phase, scripts_groups,
 };
-use crate::scene::PreparedPrefabs;
+use crate::scene::{ParticleSource, PreparedPrefabs, particle_emitter_desc};
+use engine_assets::TextureData;
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
 use engine_core::profile::ProfileBoard;
@@ -26,8 +27,9 @@ use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
     FrameStatus, LocalLight, LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId,
-    ParticleEmitterDesc, ParticleEmitterFrame, ParticleEmitterId, ProceduralSky, Renderer,
-    SHADOW_MAP_RESOLUTION, Tonemapper as RenderTonemapper, ViewSettings,
+    ParticleEmitterDesc, ParticleEmitterFrame, ParticleEmitterId, ProceduralSky, RenderError,
+    Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
+    ViewSettings,
 };
 #[cfg(feature = "dev-console")]
 use engine_render::{UiImage, UiPrimitive, UiVertex, ViewportId};
@@ -81,7 +83,7 @@ pub(crate) struct FrameSnapshot {
     pub local_light_shadows: Vec<LocalLightShadow>,
     pub environment: Option<SceneEnvironmentSnapshot>,
     pub draws: Vec<DrawCommand>,
-    pub particles: Vec<ParticleEmitterFrame>,
+    pub particles: Vec<ParticleSnapshot>,
     /// Игровое время скриптового потока на момент снимка; основа шага симуляции частиц.
     pub sim_time: f64,
     object_motion: HashMap<ObjectHandle, ObjectMotion>,
@@ -117,6 +119,13 @@ pub(crate) enum EnvironmentCacheKey {
     },
 }
 
+/// Эмиттер частиц в снимке: render thread берёт id по хендлу объекта, поэтому хендл, а не id.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ParticleSnapshot {
+    pub object: ObjectHandle,
+    pub transform: [[f32; 4]; 4],
+}
+
 /// Уровни LOD объекта: каждый уровень — список пар «меш и материал».
 type GpuLevels = Vec<Vec<(MeshId, MaterialId)>>;
 
@@ -125,7 +134,7 @@ pub(crate) struct GpuSceneTable {
     pub by_object: HashMap<ObjectHandle, GpuLevels>,
     /// Уровни шаблонов быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub prefabs: HashMap<String, Vec<GpuLevels>>,
-    /// Эмиттеры частиц по объектам сцены; создаются при загрузке сцены.
+    /// Эмиттеры частиц объектов сцены; создаются при загрузке и передаются render thread.
     pub particles: HashMap<ObjectHandle, ParticleEmitterId>,
     /// Описания эмиттеров быстрых префабов по пути. Элемент `i` относится к объекту шаблона `i`.
     pub particle_templates: HashMap<String, Vec<Option<ParticleEmitterDesc>>>,
@@ -284,6 +293,8 @@ pub(crate) trait RenderBackend: Send {
     fn has_pending_prefab_uploads(&self) -> bool;
     /// Немедленно уничтожает GPU-ресурсы токена; вызывается, когда снимки ими не пользуются.
     fn release_prefab(&mut self, token: &PrefabToken);
+    /// Применяет заявку эмиттера частиц; у тестовых backend эмиттеров нет.
+    fn apply_particle_request(&mut self, _request: ParticleRequest) {}
 }
 
 pub(crate) trait ExitRequester: Send + Sync {
@@ -354,6 +365,14 @@ pub(crate) enum ScriptStartupError {
     Panic(String),
 }
 
+/// Ресурсы эмиттеров тяжёлого префаба на render thread.
+#[derive(Default)]
+struct PrefabParticles {
+    textures: Vec<TextureId>,
+    /// Отдаются с `PrefabReady` и затем обнуляются.
+    descs: Option<Vec<Option<ParticleEmitterDesc>>>,
+}
+
 pub(crate) struct VulkanBackend {
     renderer: Renderer,
     /// GPU-ресурсы тяжёлых префабов; `Renderer` выполняет создание и освобождение.
@@ -363,6 +382,10 @@ pub(crate) struct VulkanBackend {
     pipeline_cache_path: Option<std::path::PathBuf>,
     /// Игровое время последнего отправленного кадра: шаг частиц считается от него.
     last_submitted_sim_time: Option<f64>,
+    /// Эмиттеры частиц по хендлам объектов: сцены при загрузке, spawn-объекты по заявкам.
+    particle_emitters: HashMap<ObjectHandle, ParticleEmitterId>,
+    /// Текстуры тяжёлых префабов: описания ждут готовности, текстуры живут до освобождения.
+    prefab_particles: HashMap<PrefabToken, PrefabParticles>,
     #[cfg(feature = "dev-console")]
     console_ui: Option<Arc<ConsoleUiSlot>>,
     #[cfg(feature = "dev-console")]
@@ -389,6 +412,8 @@ impl VulkanBackend {
             current_environment: None,
             pipeline_cache_path,
             last_submitted_sim_time: None,
+            particle_emitters: HashMap::new(),
+            prefab_particles: HashMap::new(),
             #[cfg(feature = "dev-console")]
             console_ui: None,
             #[cfg(feature = "dev-console")]
@@ -396,6 +421,15 @@ impl VulkanBackend {
             #[cfg(feature = "dev-console")]
             console_viewport: None,
         }
+    }
+
+    /// Принимает эмиттеры объектов сцены, созданные при загрузке.
+    pub fn with_particle_emitters(
+        mut self,
+        emitters: HashMap<ObjectHandle, ParticleEmitterId>,
+    ) -> Self {
+        self.particle_emitters = emitters;
+        self
     }
 
     #[cfg(feature = "dev-console")]
@@ -479,12 +513,45 @@ impl RenderBackend for VulkanBackend {
         self.renderer.resize(width, height);
     }
 
-    fn submit_prefab(&mut self, prefab: LoadedPrefab) -> Option<PrefabReply> {
-        self.prefabs.submit(prefab)
+    fn submit_prefab(&mut self, mut prefab: LoadedPrefab) -> Option<PrefabReply> {
+        let token = prefab.token.clone();
+        let particles = std::mem::take(&mut prefab.particles);
+        let created =
+            match create_prefab_particles(&mut self.renderer, &prefab.textures, &particles) {
+                Ok(created) => created,
+                Err(error) => {
+                    return Some(PrefabReply::Failed {
+                        token,
+                        error: error.to_string(),
+                    });
+                }
+            };
+        let reply = self.prefabs.submit(prefab);
+        if reply.is_some() {
+            release_prefab_particles(&mut self.renderer, created.textures);
+        } else {
+            self.prefab_particles.insert(token, created);
+        }
+        reply
     }
 
     fn advance_prefab_uploads(&mut self, budget: usize) -> Vec<PrefabReply> {
-        self.prefabs.advance(&mut self.renderer, budget)
+        let mut replies = self.prefabs.advance(&mut self.renderer, budget);
+        for reply in &mut replies {
+            match reply {
+                PrefabReply::Ready(ready) => {
+                    if let Some(entry) = self.prefab_particles.get_mut(&ready.token) {
+                        ready.particles = entry.descs.take().unwrap_or_default();
+                    }
+                }
+                PrefabReply::Failed { token, .. } => {
+                    if let Some(entry) = self.prefab_particles.remove(token) {
+                        release_prefab_particles(&mut self.renderer, entry.textures);
+                    }
+                }
+            }
+        }
+        replies
     }
 
     fn has_pending_prefab_uploads(&self) -> bool {
@@ -493,6 +560,27 @@ impl RenderBackend for VulkanBackend {
 
     fn release_prefab(&mut self, token: &PrefabToken) {
         self.prefabs.release(&mut self.renderer, token);
+        if let Some(entry) = self.prefab_particles.remove(token) {
+            release_prefab_particles(&mut self.renderer, entry.textures);
+        }
+    }
+
+    fn apply_particle_request(&mut self, request: ParticleRequest) {
+        apply_emitter_request(
+            &mut self.particle_emitters,
+            &mut self.renderer,
+            request,
+            |renderer, desc| {
+                renderer
+                    .create_particle_emitter(desc)
+                    .map_err(|error| error.to_string())
+            },
+            |renderer, id| {
+                if let Err(error) = renderer.destroy_particle_emitter(id) {
+                    log::error!("эмиттер частиц не уничтожен: {error}");
+                }
+            },
+        );
     }
 
     #[cfg(feature = "dev-console")]
@@ -508,6 +596,17 @@ impl RenderBackend for VulkanBackend {
     ) -> Result<FrameOutcome, String> {
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let particle_step = particle_step(snapshot.sim_time, self.last_submitted_sim_time);
+        let particles: Vec<ParticleEmitterFrame> = snapshot
+            .particles
+            .iter()
+            .filter_map(|instance| {
+                Some(ParticleEmitterFrame {
+                    emitter: *self.particle_emitters.get(&instance.object)?,
+                    transform: instance.transform,
+                    emitting: true,
+                })
+            })
+            .collect();
         let frame = Frame {
             clear_color: [
                 snapshot.view.render.clear_color[0],
@@ -545,7 +644,7 @@ impl RenderBackend for VulkanBackend {
                 },
             },
             reset_history: snapshot.reset_history,
-            particles: &snapshot.particles,
+            particles: &particles,
             particle_step,
         };
         let outcome = self
@@ -1414,6 +1513,9 @@ fn apply_changes(
         }
     }
     detach_objects(&mut gpu_scene.by_object, &changes.despawned);
+    if !changes.despawned.is_empty() {
+        prefabs.send_particles(ParticleRequest::Destroy(changes.despawned.clone()));
+    }
     requests.extend(
         changes
             .despawned
@@ -1459,6 +1561,11 @@ fn apply_changes(
                     detach_objects(&mut gpu_scene.by_object, &spawned.objects);
                     continue;
                 }
+            }
+        }
+        if let Some(descs) = gpu_scene.particle_templates.get(&spawned.prefab) {
+            for request in spawn_particle_requests(&spawned.objects, descs) {
+                prefabs.send_particles(request);
             }
         }
         requests.extend(
@@ -1508,6 +1615,7 @@ fn apply_prefab_requests(
             }
             PrefabRequest::Unload(path) => {
                 gpu_scene.prefabs.remove(path);
+                gpu_scene.particle_templates.remove(path);
                 if let Some(slot) = prefabs.forget(path) {
                     if let Some(geometry) = slot.geometry {
                         spawn_physics.remove_heavy_geometry(&geometry);
@@ -1533,7 +1641,12 @@ fn drain_prefab_replies(
     while let Some(reply) = pending.pop_front() {
         match reply {
             PrefabReply::Ready(ready) => {
-                let PrefabReady { token, gpu, cpu } = *ready;
+                let PrefabReady {
+                    token,
+                    gpu,
+                    particles,
+                    cpu,
+                } = *ready;
                 if !prefabs.is_current(&token) {
                     prefabs.release(token);
                     continue;
@@ -1553,6 +1666,9 @@ fn drain_prefab_replies(
                 let geometry_paths = geometry.iter().map(|model| model.path.clone()).collect();
                 spawn_physics.add_heavy_geometry(geometry);
                 gpu_scene.prefabs.insert(token.path.clone(), gpu);
+                gpu_scene
+                    .particle_templates
+                    .insert(token.path.clone(), particles);
                 prefabs.mark_ready(&token, geometry_paths);
             }
             PrefabReply::Failed { token, error } => {
@@ -1717,13 +1833,9 @@ fn make_snapshot(
     let particles = scene
         .particle_emitters
         .iter()
-        .filter_map(|instance| {
-            let emitter = gpu_scene.particles.get(&instance.object)?;
-            Some(ParticleEmitterFrame {
-                emitter: *emitter,
-                transform: instance.model.to_cols_array_2d(),
-                emitting: true,
-            })
+        .map(|instance| ParticleSnapshot {
+            object: instance.object,
+            transform: instance.model.to_cols_array_2d(),
         })
         .collect();
     Ok(FrameSnapshot {
@@ -1741,6 +1853,116 @@ fn make_snapshot(
         sim_time: 0.0,
         object_motion,
     })
+}
+
+/// Создаёт текстуры эмиттеров тяжёлого префаба и их описания. Объекты с одним путём текстуры
+/// делят её. При ошибке созданные текстуры уничтожаются.
+fn create_prefab_particles(
+    renderer: &mut Renderer,
+    textures: &HashMap<String, TextureData>,
+    particles: &[Option<ParticleSource>],
+) -> Result<PrefabParticles, RenderError> {
+    let mut out = PrefabParticles::default();
+    let mut by_path = HashMap::<String, TextureId>::new();
+    let mut descs = Vec::with_capacity(particles.len());
+    let built = (|| -> Result<(), RenderError> {
+        for source in particles {
+            let Some(source) = source else {
+                descs.push(None);
+                continue;
+            };
+            let texture = match &source.texture {
+                Some(path) => match by_path.get(path) {
+                    Some(id) => Some(*id),
+                    None => {
+                        let data = textures.get(path).ok_or(RenderError::InvalidState(
+                            "CPU-текстура частиц отсутствует в таблице подготовленных ресурсов",
+                        ))?;
+                        let id = renderer.create_texture_with_color_space(
+                            data.width,
+                            data.height,
+                            &data.rgba,
+                            TextureColorSpace::Srgb,
+                        )?;
+                        out.textures.push(id);
+                        by_path.insert(path.clone(), id);
+                        Some(id)
+                    }
+                },
+                None => None,
+            };
+            descs.push(Some(particle_emitter_desc(&source.emitter, texture)));
+        }
+        Ok(())
+    })();
+    match built {
+        Ok(()) => {
+            out.descs = Some(descs);
+            Ok(out)
+        }
+        Err(error) => {
+            release_prefab_particles(renderer, out.textures);
+            Err(error)
+        }
+    }
+}
+
+fn release_prefab_particles(renderer: &mut Renderer, textures: Vec<TextureId>) {
+    for texture in textures {
+        if let Err(error) = renderer.destroy_texture(texture) {
+            log::error!("текстура эмиттера частиц не освобождена: {error}");
+        }
+    }
+}
+
+/// Применяет заявку эмиттеров к таблице по хендлам объектов. Create заменяет прежний эмиттер
+/// объекта; ошибка создания оставляет объект без эмиттера. Destroy неизвестного хендла ничего
+/// не делает, поэтому повтор и поздняя заявка безопасны.
+fn apply_emitter_request<E: Copy, R>(
+    table: &mut HashMap<ObjectHandle, E>,
+    renderer: &mut R,
+    request: ParticleRequest,
+    mut create: impl FnMut(&mut R, ParticleEmitterDesc) -> Result<E, String>,
+    mut destroy: impl FnMut(&mut R, E),
+) {
+    match request {
+        ParticleRequest::Create { object, desc } => {
+            if let Some(previous) = table.remove(&object) {
+                destroy(renderer, previous);
+            }
+            match create(renderer, *desc) {
+                Ok(id) => {
+                    table.insert(object, id);
+                }
+                Err(error) => log::error!("эмиттер частиц объекта {object:?} не создан: {error}"),
+            }
+        }
+        ParticleRequest::Destroy(objects) => {
+            for object in objects {
+                if let Some(id) = table.remove(&object) {
+                    destroy(renderer, id);
+                }
+            }
+        }
+    }
+}
+
+/// Заявки создания для объектов поддерева: объект `i` получает описание шаблона `i`; объекты
+/// без эмиттера пропускаются.
+fn spawn_particle_requests(
+    objects: &[ObjectHandle],
+    descs: &[Option<ParticleEmitterDesc>],
+) -> Vec<ParticleRequest> {
+    objects
+        .iter()
+        .zip(descs)
+        .filter_map(|(&object, desc)| {
+            Some(ParticleRequest::Create {
+                object,
+                desc: Box::new(desc.clone()?),
+            })
+        })
+        .collect()
 }
 
 /// Шаг симуляции частиц: сколько игрового времени прошло с последнего отправленного кадра.
@@ -2430,6 +2652,7 @@ fn handle_resource_request(
                 send_prefab_reply(script_tx, reply);
             }
         }
+        RenderResourceRequest::Particle(request) => backend.apply_particle_request(request),
         RenderResourceRequest::Release { token, last_seq } => {
             releases.push(PendingRelease { token, last_seq });
         }
@@ -2651,9 +2874,7 @@ return Input
         )
         .unwrap();
         thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         let snapshot = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(snapshot.camera.position.x, 9.0);
 
@@ -2901,6 +3122,7 @@ distance=2.0
                     PrefabReply::Ready(Box::new(PrefabReady {
                         token: prefab.token,
                         gpu: Vec::new(),
+                        particles: Vec::new(),
                         cpu: prefab.cpu,
                     }))
                 })
@@ -3567,9 +3789,7 @@ return Script
                 args: Vec::new(),
             }))
             .unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
 
         let _frame = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let catalog = catalog.lock().unwrap();
@@ -3929,9 +4149,7 @@ return Script
             .unwrap()
             .unwrap();
         interrupt.interrupt();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
 
         script_thread
             .stopped
@@ -4038,9 +4256,7 @@ return Script
             .unwrap();
         script_tx.send(ScriptControl::Background(false)).unwrap();
         script_tx.send(ScriptControl::Background(true)).unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
 
         waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(frame_rx.try_recv().is_err());
@@ -4140,9 +4356,7 @@ return Script
         )
         .unwrap();
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         let frame = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!((frame.camera.position.x - 3.0).abs() < 1.0e-5);
 
@@ -4258,9 +4472,7 @@ return Move
         )
         .unwrap();
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
 
         let (dt, has_teleport) = step_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(dt, 0.0);
@@ -4430,9 +4642,7 @@ return Move
         )
         .unwrap();
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         script_thread
             .stopped
@@ -4514,9 +4724,7 @@ return Move
             .unwrap();
 
         script_tx.send(ScriptControl::Background(true)).unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         clock.advance(Duration::from_secs(1));
         script_tx.send(ScriptControl::Background(true)).unwrap();
@@ -4849,9 +5057,7 @@ return Move
         .unwrap();
 
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         script_tx.send(ScriptControl::Shutdown).unwrap();
         script_thread
@@ -4920,9 +5126,7 @@ return Move
         .unwrap();
 
         script_thread.ready.recv().unwrap().unwrap();
-        script_tx
-            .send(ScriptControl::Go(Box::default()))
-            .unwrap();
+        script_tx.send(ScriptControl::Go(Box::default())).unwrap();
         assert_eq!(
             render_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             RenderControl::Shutdown
@@ -5418,6 +5622,7 @@ return Gun
         PrefabReply::Ready(Box::new(PrefabReady {
             token,
             gpu: Vec::new(),
+            particles: Vec::new(),
             cpu: PrefabCpu {
                 template: prefab_template(BALL_PATH, BALL_PREFAB),
                 sources: BTreeMap::new(),
@@ -5581,8 +5786,11 @@ return Gun
         harness.update();
         assert!(!harness.ball_alive());
         harness.update();
-        match harness.render_rx.try_recv() {
-            Ok(RenderResourceRequest::Release { token, last_seq }) => {
+        // Заявки эмиттеров удалённых объектов идут в том же канале раньше освобождения.
+        let released = std::iter::from_fn(|| harness.render_rx.try_recv().ok())
+            .find(|request| matches!(request, RenderResourceRequest::Release { .. }));
+        match released {
+            Some(RenderResourceRequest::Release { token, last_seq }) => {
                 assert_eq!(token, first);
                 assert_eq!(last_seq, 7);
             }
@@ -5825,6 +6033,7 @@ return Gun
             models: HashMap::new(),
             textures: HashMap::new(),
             levels: Vec::new(),
+            particles: Vec::new(),
         };
         render
             .resources
@@ -5918,5 +6127,117 @@ mod particle_step_tests {
     fn non_advancing_or_backwards_time_gives_no_step() {
         assert_eq!(particle_step(2.0, Some(2.0)), 0.0);
         assert_eq!(particle_step(1.0, Some(2.0)), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod particle_emitter_tests {
+    use super::{ParticleRequest, apply_emitter_request, spawn_particle_requests};
+    use crate::scene::particle_emitter_desc;
+    use engine_render::ParticleEmitterDesc;
+    use engine_scene::{ObjectHandle, ParticleEmitterComponent, SceneDocument, World};
+    use std::collections::HashMap;
+
+    fn handles() -> [ObjectHandle; 3] {
+        let document = SceneDocument::parse(
+            "particles.rvescene",
+            "[[objects]]\nid=\"camera\"\n[objects.camera]\n[[objects]]\nid=\"a\"\n[[objects]]\nid=\"b\"\n[[objects]]\nid=\"c\"\n",
+        )
+        .unwrap();
+        let world = World::from_document(&document).unwrap();
+        ["a", "b", "c"].map(|id| world.handle(id).unwrap())
+    }
+
+    fn desc(capacity: u32) -> ParticleEmitterDesc {
+        particle_emitter_desc(
+            &ParticleEmitterComponent {
+                capacity,
+                ..ParticleEmitterComponent::default()
+            },
+            None,
+        )
+    }
+
+    /// Эмиттер в тесте — его ёмкость; уничтожение пишет id в журнал.
+    fn create(_: &mut Vec<u32>, desc: ParticleEmitterDesc) -> Result<u32, String> {
+        if desc.capacity == 0 {
+            return Err("ёмкость 0".to_owned());
+        }
+        Ok(desc.capacity)
+    }
+
+    fn destroy(log: &mut Vec<u32>, id: u32) {
+        log.push(id);
+    }
+
+    fn apply(table: &mut HashMap<ObjectHandle, u32>, log: &mut Vec<u32>, request: ParticleRequest) {
+        apply_emitter_request(table, log, request, create, destroy);
+    }
+
+    fn create_request(object: ObjectHandle, capacity: u32) -> ParticleRequest {
+        ParticleRequest::Create {
+            object,
+            desc: Box::new(desc(capacity)),
+        }
+    }
+
+    #[test]
+    fn spawn_requests_follow_template_order_and_skip_objects_without_emitter() {
+        let [a, b, c] = handles();
+        let requests = spawn_particle_requests(&[a, b, c], &[Some(desc(8)), None, Some(desc(16))]);
+        let created: Vec<(ObjectHandle, u32)> = requests
+            .into_iter()
+            .map(|request| match request {
+                ParticleRequest::Create { object, desc } => (object, desc.capacity),
+                ParticleRequest::Destroy(_) => panic!("spawn creates only"),
+            })
+            .collect();
+        assert_eq!(created, vec![(a, 8), (c, 16)]);
+    }
+
+    #[test]
+    fn create_inserts_the_emitter_of_the_object() {
+        let [a, ..] = handles();
+        let mut table = HashMap::new();
+        let mut log = Vec::new();
+        apply(&mut table, &mut log, create_request(a, 8));
+        assert_eq!(table.get(&a), Some(&8));
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn create_for_an_object_with_an_emitter_destroys_the_previous_one() {
+        let [a, ..] = handles();
+        let mut table = HashMap::new();
+        let mut log = Vec::new();
+        apply(&mut table, &mut log, create_request(a, 8));
+        apply(&mut table, &mut log, create_request(a, 16));
+        assert_eq!(table.get(&a), Some(&16));
+        assert_eq!(log, vec![8]);
+    }
+
+    #[test]
+    fn failed_create_leaves_the_object_without_an_emitter() {
+        let [a, ..] = handles();
+        let mut table = HashMap::new();
+        let mut log = Vec::new();
+        apply(&mut table, &mut log, create_request(a, 0));
+        assert!(!table.contains_key(&a));
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn destroy_removes_known_objects_and_ignores_unknown_ones() {
+        let [a, b, c] = handles();
+        let mut table = HashMap::new();
+        let mut log = Vec::new();
+        apply(&mut table, &mut log, create_request(a, 8));
+        apply(&mut table, &mut log, create_request(b, 16));
+        apply(&mut table, &mut log, ParticleRequest::Destroy(vec![a, c]));
+        assert!(!table.contains_key(&a));
+        assert_eq!(table.get(&b), Some(&16));
+        assert_eq!(log, vec![8]);
+        apply(&mut table, &mut log, ParticleRequest::Destroy(vec![a]));
+        assert_eq!(log, vec![8], "повторное уничтожение не трогает эмиттер");
     }
 }
