@@ -424,7 +424,7 @@ fn to_sampled(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_fullscreen(
+pub(crate) fn draw_fullscreen(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     view: vk::ImageView,

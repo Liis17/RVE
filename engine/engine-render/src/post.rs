@@ -3,6 +3,7 @@
 //! Модуль не зависит от Vulkan: план, упаковка параметров и проверки проверяются unit-тестами
 //! без GPU. Выполнение проходов остаётся в `lib.rs` и использует результаты этого модуля.
 
+use crate::filters::FilterParams;
 use crate::{DebugView, Tonemapper};
 
 /// Число `vec4` в push constants composite-прохода (tonemap.frag).
@@ -685,6 +686,44 @@ fn adapt_exposure(
     current + (target - current) * alpha
 }
 
+/// Высота полнокадрового сенсора в метрах: CoC переводится в пиксели по этой высоте.
+const SENSOR_HEIGHT_M: f32 = 0.024;
+
+/// Параметры DoF для шейдера: (расстояние фокуса, масштаб CoC, максимум в пикселях, резерв).
+///
+/// CoC в пикселях для линейной глубины `z`: `scale * |z - focus| / z`, ограниченный максимумом.
+/// Масштаб выведен из формулы тонкой линзы: `c = (f^2 / N) * |z - S| / (z * (S - f))`.
+pub fn dof_parameters(dof: &DepthOfField, image_height_px: f32) -> [f32; 4] {
+    let focal = dof.focal_length_mm * 1e-3;
+    let focus = dof.focus_distance;
+    let aperture = focal * focal / dof.aperture;
+    let scale = aperture / (focus - focal).max(1e-4) / SENSOR_HEIGHT_M * image_height_px;
+    [focus, scale, dof.max_blur_px, 0.0]
+}
+
+/// Параметры motion blur: (доля кадра экспозиции shutter, максимум в пикселях, выборки, резерв).
+pub fn motion_parameters(motion: &MotionBlur) -> [f32; 4] {
+    [
+        motion.shutter_angle_deg / 360.0,
+        motion.max_blur_px,
+        motion.samples as f32,
+        0.0,
+    ]
+}
+
+/// CPU-зеркало `dof.frag`: радиус размытия в пикселях для линейной глубины `z`.
+#[cfg(test)]
+fn coc_radius_px(z: f32, parameters: [f32; 4]) -> f32 {
+    let [focus, scale, max_px, _] = parameters;
+    (scale * (z - focus).abs() / z.max(1e-4)).min(max_px)
+}
+
+/// CPU-зеркало линеаризации глубины из `dof.frag` для стандартной проекции Vulkan `[0, 1]`.
+#[cfg(test)]
+fn linear_depth(depth: f32, near: f32, far: f32) -> f32 {
+    near * far / (far - depth * (far - near))
+}
+
 /// Зерно считается по сиду кадра; ограничение по модулю сохраняет точность `f32`.
 const GRAIN_SEED_PERIOD: u32 = 4096;
 
@@ -694,22 +733,35 @@ pub struct PostFrame {
     pub plan: PostPlan,
     pub composite: CompositeParams,
     pub grain: [f32; 4],
+    /// Параметры motion blur и DoF; DoF задан на единицу высоты источника (см. `filters.rs`).
+    pub filters: FilterParams,
 }
 
 impl PostFrame {
     /// Строит план и параметры вида; сид зерна берётся из счётчика кадров renderer.
+    /// `near_far` — плоскости отсечения камеры для линеаризации глубины в DoF.
     pub fn new(
         post: &PostProcess,
         debug_view: DebugView,
         render_extent: (u32, u32),
         output_extent: (u32, u32),
         frame_serial: u32,
+        near_far: [f32; 2],
     ) -> Self {
         let plan = plan(post, debug_view, render_extent, output_extent);
         Self {
             plan,
             composite: composite_params(post, &plan, debug_view),
             grain: grain_params(&plan, post, frame_serial),
+            filters: FilterParams {
+                motion: plan
+                    .motion_blur
+                    .then(|| motion_parameters(&post.motion_blur)),
+                dof: plan
+                    .depth_of_field
+                    .then(|| dof_parameters(&post.depth_of_field, 1.0)),
+                near_far,
+            },
         }
     }
 }
@@ -1018,6 +1070,93 @@ mod tests {
             composite_params(&post, &auto_only, DebugView::Wireframe).vectors[2][3],
             0.0
         );
+    }
+
+    #[test]
+    fn circle_of_confusion_is_zero_at_focus_and_grows_with_distance_up_to_the_cap() {
+        let dof = DepthOfField {
+            enabled: true,
+            focus_distance: 10.0,
+            max_blur_px: 20.0,
+            ..DepthOfField::default()
+        };
+        let parameters = dof_parameters(&dof, 1080.0);
+        assert!(coc_radius_px(10.0, parameters).abs() < 1e-4);
+        let near = coc_radius_px(5.0, parameters);
+        let far = coc_radius_px(20.0, parameters);
+        assert!(near > 0.0 && far > 0.0, "{near} {far}");
+        assert!(coc_radius_px(10_000.0, parameters) <= 20.0 + 1e-4);
+        // Вдвое выше разрешение — вдвое больше пиксельный радиус.
+        let doubled = dof_parameters(&dof, 2160.0);
+        assert!((coc_radius_px(5.0, doubled) - 2.0 * near).abs() < 1e-3);
+    }
+
+    #[test]
+    fn wider_aperture_and_longer_focal_length_increase_blur() {
+        let base_dof = DepthOfField {
+            focus_distance: 10.0,
+            max_blur_px: 1e6,
+            ..DepthOfField::default()
+        };
+        let base = coc_radius_px(4.0, dof_parameters(&base_dof, 1080.0));
+        let wider = DepthOfField {
+            aperture: base_dof.aperture / 2.0,
+            ..base_dof
+        };
+        assert!(coc_radius_px(4.0, dof_parameters(&wider, 1080.0)) > base);
+        let longer = DepthOfField {
+            focal_length_mm: base_dof.focal_length_mm * 2.0,
+            ..base_dof
+        };
+        assert!(coc_radius_px(4.0, dof_parameters(&longer, 1080.0)) > base);
+    }
+
+    #[test]
+    fn linear_depth_inverts_the_standard_vulkan_projection() {
+        let (near, far) = (0.1_f32, 1000.0_f32);
+        for z in [0.5_f32, 4.0, 250.0] {
+            // Стандартная проекция [0, 1]: depth = far * (z - near) / (z * (far - near)).
+            let depth = far * (z - near) / (z * (far - near));
+            assert!((linear_depth(depth, near, far) - z).abs() / z < 1e-4, "{z}");
+        }
+    }
+
+    #[test]
+    fn motion_parameters_convert_shutter_angle_to_a_frame_fraction() {
+        let motion = MotionBlur {
+            shutter_angle_deg: 90.0,
+            samples: 16,
+            max_blur_px: 24.0,
+            ..MotionBlur::default()
+        };
+        assert_eq!(motion_parameters(&motion), [0.25, 24.0, 16.0, 0.0]);
+    }
+
+    #[test]
+    fn filter_parameters_follow_the_plan_and_depth_planes() {
+        let mut post = PostProcess::default();
+        post.motion_blur.enabled = true;
+        post.depth_of_field.enabled = true;
+        let lit = PostFrame::new(
+            &post,
+            DebugView::Lit,
+            (640, 360),
+            (1280, 720),
+            0,
+            [0.1, 1000.0],
+        );
+        assert!(lit.filters.motion.is_some() && lit.filters.dof.is_some());
+        assert_eq!(lit.filters.near_far, [0.1, 1000.0]);
+        let wireframe = PostFrame::new(
+            &post,
+            DebugView::Wireframe,
+            (640, 360),
+            (1280, 720),
+            0,
+            [0.1, 1000.0],
+        );
+        assert_eq!(wireframe.filters.motion, None);
+        assert_eq!(wireframe.filters.dof, None);
     }
 
     #[test]

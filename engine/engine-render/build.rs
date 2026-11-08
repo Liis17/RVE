@@ -194,6 +194,13 @@ const SHADERS: &[ShaderBuild] = &[
         "bloom_upsample.frag.spv",
     ),
     (
+        "motion_blur.frag",
+        naga::ShaderStage::Fragment,
+        &[],
+        "motion_blur.frag.spv",
+    ),
+    ("dof.frag", naga::ShaderStage::Fragment, &[], "dof.frag.spv"),
+    (
         "exposure_histogram.wgsl",
         naga::ShaderStage::Compute,
         &[],

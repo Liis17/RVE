@@ -32,6 +32,7 @@ mod bloom;
 mod clusters;
 mod culling;
 mod exposure;
+mod filters;
 mod particle_gpu;
 mod particles;
 mod post;
@@ -43,6 +44,7 @@ use exposure::{
     ExposurePipelines, ExposureRecord, ExposureTarget, exposure_record, record_exposure,
     write_composite_exposure,
 };
+use filters::{FilterPipelines, FilterRecord, FilterScratch, record_filters};
 use particle_gpu::{
     ParticleEmitter, ParticlePass, ParticleSystem, particle_depth_source_masks, record_particles,
 };
@@ -797,6 +799,8 @@ pub enum GpuPass {
     Particles,
     /// TAA, FSR или DLSS; отсутствует, если временное сглаживание выключено.
     TemporalResolve,
+    /// Motion blur и depth of field; отсутствуют, если эффекты выключены.
+    Filters,
     /// Адаптация экспозиции по гистограмме; отсутствует при ручной экспозиции.
     Exposure,
     /// Bloom: prefilter, downsample и upsample; отсутствует, если эффект выключен.
@@ -807,7 +811,7 @@ pub enum GpuPass {
 
 impl GpuPass {
     /// Число проходов, для которых записываются границы.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
     /// Все проходы в порядке выполнения.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Clusters,
@@ -819,6 +823,7 @@ impl GpuPass {
         Self::Wireframe,
         Self::Particles,
         Self::TemporalResolve,
+        Self::Filters,
         Self::Exposure,
         Self::Bloom,
         Self::Tonemap,
@@ -836,6 +841,7 @@ impl GpuPass {
             Self::Wireframe => "Wireframe",
             Self::Particles => "Particles",
             Self::TemporalResolve => "Temporal resolve",
+            Self::Filters => "Motion blur and DoF",
             Self::Exposure => "Exposure",
             Self::Bloom => "Bloom",
             Self::Tonemap => "Tonemap",
@@ -1051,6 +1057,7 @@ pub struct Renderer {
     /// Семафор упорядочивает адаптацию экспозиции между кадрами, которые могут перекрываться.
     exposure_semaphore: vk::Semaphore,
     exposure_semaphore_signaled: bool,
+    filter_pipelines: Option<FilterPipelines>,
     taa_set_layout: Option<vk::DescriptorSetLayout>,
     taa_pipeline_layout: Option<vk::PipelineLayout>,
     taa_pipeline: Option<vk::Pipeline>,
@@ -1190,6 +1197,7 @@ impl Renderer {
             exposure_pipelines: None,
             exposure_semaphore: vk::Semaphore::null(),
             exposure_semaphore_signaled: false,
+            filter_pipelines: None,
             taa_set_layout: None,
             taa_pipeline_layout: None,
             taa_pipeline: None,
@@ -1867,6 +1875,7 @@ impl Renderer {
             (render_extent.width, render_extent.height),
             (output_extent.width, output_extent.height),
             frame_serial,
+            camera_near_far(frame.camera.projection),
         );
         let temporal_plan = self.screen_temporal.state.plan(
             temporal_key(
@@ -2024,6 +2033,11 @@ impl Renderer {
             .ok_or(RenderError::InvalidState("exposure pipelines отсутствуют"))?
             .set_layout();
         let exposure_pipelines = self.exposure_pipelines;
+        let filter_layout = self
+            .filter_pipelines
+            .ok_or(RenderError::InvalidState("filter pipelines отсутствуют"))?
+            .set_layout();
+        let filter_pipelines = self.filter_pipelines;
         let exposure_dt_ms =
             temporal_frame_delta_ms(self.screen_temporal.last_submitted_at, submitted_at);
         let frame_resources = self
@@ -2204,6 +2218,27 @@ impl Renderer {
                 post_sampler,
             )?);
         }
+        if post_frame.plan.motion_blur || post_frame.plan.depth_of_field {
+            let filter_extent = if view.anti_aliasing.is_temporal() {
+                output_extent
+            } else {
+                render_extent
+            };
+            if let Some(target) = frame_resources.target.as_mut()
+                && target
+                    .filter_scratch
+                    .as_ref()
+                    .is_none_or(|scratch| scratch.extent != filter_extent)
+            {
+                target.filter_scratch = Some(FilterScratch::new(
+                    &instance,
+                    &device,
+                    self.physical_device,
+                    filter_extent,
+                    filter_layout,
+                )?);
+            }
+        }
         let target = frame_resources
             .target
             .as_ref()
@@ -2329,6 +2364,7 @@ impl Renderer {
                 exposure_pipelines,
                 exposure_dt_ms,
                 reset_history: frame.reset_history,
+                filter_pipelines,
                 particles: particle_pass,
             };
             let frame_resources = &mut self.frames[frame_slot];
@@ -2765,6 +2801,10 @@ impl Renderer {
             .exposure_pipelines
             .ok_or(RenderError::InvalidState("exposure pipelines отсутствуют"))?
             .set_layout();
+        let filter_set_layout = self
+            .filter_pipelines
+            .ok_or(RenderError::InvalidState("filter pipelines отсутствуют"))?
+            .set_layout();
         let taa_set_layout = self.taa_set_layout()?;
         let frame_set_layout = self.frame_set_layout()?;
         let frame_resources = self
@@ -2803,6 +2843,7 @@ impl Renderer {
             image_set_layout,
             post_set_layout,
             exposure_set_layout,
+            filter_set_layout,
             taa_set_layout,
             particle_depth_layout: self.particles.depth_layout()?,
             image_sampler: self
@@ -2993,6 +3034,7 @@ impl Renderer {
                 (target.render_extent.width, target.render_extent.height),
                 (target.extent.width, target.extent.height),
                 frame_serial,
+                camera_near_far(frame.camera.projection),
             );
             if post_frame.plan.bloom_mips > 0 && target.bloom.is_none() {
                 target.bloom = Some(BloomChain::new(
@@ -3004,6 +3046,29 @@ impl Renderer {
                     target_resources.image_set_layout,
                     target_resources.post_sampler,
                 )?);
+            }
+            if post_frame.plan.motion_blur || post_frame.plan.depth_of_field {
+                let filter_extent = if effective_view_settings(frame.view, frame.debug_view)
+                    .anti_aliasing
+                    .is_temporal()
+                {
+                    target.extent
+                } else {
+                    target.render_extent
+                };
+                if target
+                    .filter_scratch
+                    .as_ref()
+                    .is_none_or(|scratch| scratch.extent != filter_extent)
+                {
+                    target.filter_scratch = Some(FilterScratch::new(
+                        &instance,
+                        &device,
+                        physical_device,
+                        filter_extent,
+                        target_resources.filter_set_layout,
+                    )?);
+                }
             }
             exposure_work |= post_frame.plan.auto_exposure;
             rendered.push((
@@ -3100,6 +3165,7 @@ impl Renderer {
         let mut gpu_layout = GpuProfileLayout::default();
         let bloom_pipelines = self.bloom_pipelines;
         let exposure_pipelines = self.exposure_pipelines;
+        let filter_pipelines = self.filter_pipelines;
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -3175,6 +3241,7 @@ impl Renderer {
                             exposure_pipelines,
                             exposure_dt_ms: *frame_delta_ms,
                             reset_history: frame.reset_history,
+                            filter_pipelines,
                             particles: particle_pipelines.map(|pipelines| ParticlePass {
                                 works: &particle_works[index],
                                 pipelines,
@@ -3252,7 +3319,27 @@ impl Renderer {
                     pass,
                 );
                 let exposure_buffer = target.exposure.buffer();
+                let velocity_view = target.scene.velocity.view;
+                let depth_view = target.scene.depth.view;
+                let filters = match (target.filter_scratch.as_mut(), pass.filter_pipelines) {
+                    (Some(scratch), Some(pipelines))
+                        if pass.post.filters.motion.is_some()
+                            || pass.post.filters.dof.is_some() =>
+                    {
+                        Some(FilterRecord {
+                            scratch,
+                            pipelines,
+                            sampler: target_resources.post_sampler,
+                            velocity: velocity_view,
+                            depth: depth_view,
+                            params: pass.post.filters,
+                        })
+                    }
+                    _ => None,
+                };
                 let passes = PostPasses {
+                    filters,
+                    sampler: target_resources.post_sampler,
                     exposure: exposure_record(
                         &mut target.exposure,
                         pass.exposure_pipelines,
@@ -6039,6 +6126,7 @@ impl Renderer {
             self.texture_set_layout()?,
         )?);
         self.exposure_pipelines = Some(ExposurePipelines::new(&device, cache)?);
+        self.filter_pipelines = Some(FilterPipelines::new(&device, cache)?);
         // SAFETY: a default semaphore creation has no borrowed inputs.
         self.exposure_semaphore =
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
@@ -6546,6 +6634,9 @@ impl Drop for Renderer {
                 pipelines.destroy(device);
             }
             if let Some(pipelines) = self.exposure_pipelines.take() {
+                pipelines.destroy(device);
+            }
+            if let Some(pipelines) = self.filter_pipelines.take() {
                 pipelines.destroy(device);
             }
             let exposure_semaphore =
@@ -7556,6 +7647,8 @@ struct FrameTarget {
     /// Цепочка bloom создаётся лениво, когда эффект запланирован для этого разрешения.
     bloom: Option<BloomChain>,
     exposure: ExposureTarget,
+    /// Промежуточные буферы motion blur и DoF; создаются, когда фильтр запланирован.
+    filter_scratch: Option<FilterScratch>,
 }
 
 impl FrameTarget {
@@ -7593,6 +7686,7 @@ impl FrameTarget {
             taa_set,
             bloom: None,
             exposure,
+            filter_scratch: None,
             scene,
             ldr,
             ldr_layout: vk::ImageLayout::UNDEFINED,
@@ -7713,6 +7807,7 @@ struct ViewportTargetResources {
     image_set_layout: vk::DescriptorSetLayout,
     post_set_layout: vk::DescriptorSetLayout,
     exposure_set_layout: vk::DescriptorSetLayout,
+    filter_set_layout: vk::DescriptorSetLayout,
     particle_depth_layout: vk::DescriptorSetLayout,
     taa_set_layout: vk::DescriptorSetLayout,
     image_sampler: vk::Sampler,
@@ -7905,6 +8000,8 @@ struct ViewportTarget {
     /// Цепочка bloom создаётся лениво, как у цели экрана.
     bloom: Option<BloomChain>,
     exposure: ExposureTarget,
+    /// Промежуточные буферы motion blur и DoF; создаются, когда фильтр запланирован.
+    filter_scratch: Option<FilterScratch>,
 }
 
 impl ViewportTarget {
@@ -7972,6 +8069,7 @@ impl ViewportTarget {
             device: device.clone(),
             bloom: None,
             exposure,
+            filter_scratch: None,
             ui_pool,
             set,
             _taa_pool: taa_pool,
@@ -8369,6 +8467,20 @@ fn warn_temporal_fallback(backend: &str, warning_emitted: &mut bool, reason: &st
     if !*warning_emitted {
         eprintln!("{backend} unavailable; falling back to TAA: {reason}");
         *warning_emitted = true;
+    }
+}
+
+/// Плоскости отсечения камеры из матрицы проекции для линеаризации глубины в DoF.
+/// Формулы совпадают с `fsr_camera_parameters`; при неверной матрице берутся значения по умолчанию.
+fn camera_near_far(projection: [[f32; 4]; 4]) -> [f32; 2] {
+    let depth_scale = projection[2][2];
+    let depth_offset = projection[3][2];
+    let near = depth_offset / depth_scale;
+    let far = depth_offset / (depth_scale + 1.0);
+    if near.is_finite() && far.is_finite() && near > 0.0 && far > near {
+        [near, far]
+    } else {
+        [0.1, 1000.0]
     }
 }
 
@@ -9553,7 +9665,26 @@ fn record_frame(
         scene,
     );
     let exposure_buffer = target.exposure.buffer();
+    let velocity_view = target.scene.velocity.view;
+    let depth_view = target.scene.depth.view;
+    let filters = match (target.filter_scratch.as_mut(), scene.filter_pipelines) {
+        (Some(scratch), Some(pipelines))
+            if scene.post.filters.motion.is_some() || scene.post.filters.dof.is_some() =>
+        {
+            Some(FilterRecord {
+                scratch,
+                pipelines,
+                sampler: post_sampler,
+                velocity: velocity_view,
+                depth: depth_view,
+                params: scene.post.filters,
+            })
+        }
+        _ => None,
+    };
     let passes = PostPasses {
+        filters,
+        sampler: post_sampler,
         exposure: exposure_record(
             &mut target.exposure,
             scene.exposure_pipelines,
@@ -10393,6 +10524,7 @@ struct ScenePass<'a> {
     /// Время кадра вида для адаптации экспозиции.
     exposure_dt_ms: f32,
     reset_history: bool,
+    filter_pipelines: Option<FilterPipelines>,
     particles: Option<ParticlePass<'a>>,
 }
 
@@ -10754,9 +10886,11 @@ fn scene_viewport(extent: vk::Extent2D) -> vk::Viewport {
 
 /// Проходы постобработки вида, которые записываются перед composite.
 struct PostPasses<'a> {
+    filters: Option<FilterRecord<'a>>,
     exposure: Option<ExposureRecord<'a>>,
     bloom: Option<BloomRecord<'a>>,
     exposure_buffer: vk::Buffer,
+    sampler: vk::Sampler,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10776,17 +10910,39 @@ fn record_tonemap_pass(
     timestamps: Option<GpuMarks>,
 ) {
     let PostPasses {
+        mut filters,
         exposure,
         bloom,
         exposure_buffer,
+        sampler,
     } = passes;
     let mut source_layout = source_layout;
-    if let Some(record) = exposure {
-        record_exposure(
+    // Motion blur и DoF идут до экспозиции и bloom: им нужен цвет после resolve.
+    let filtered = match filters.as_mut() {
+        Some(record) => record_filters(
             device,
             command_buffer,
             source,
             &mut source_layout,
+            record,
+            timestamps,
+        ),
+        None => None,
+    };
+    let (final_image, mut final_layout) = match (filtered, filters.as_ref()) {
+        (Some(index), Some(record)) => (
+            record.scratch.image(index),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ),
+        _ => (source, source_layout),
+    };
+    write_image_set(device, set, final_image.view, sampler);
+    if let Some(record) = exposure {
+        record_exposure(
+            device,
+            command_buffer,
+            final_image,
+            &mut final_layout,
             extent,
             record,
             timestamps,
@@ -10796,16 +10952,16 @@ fn record_tonemap_pass(
         record_bloom(
             device,
             command_buffer,
-            source,
-            &mut source_layout,
+            final_image,
+            &mut final_layout,
             record,
             timestamps,
         )
     });
-    write_composite_bloom(device, set, bloom_view.unwrap_or(source.view));
+    write_composite_bloom(device, set, bloom_view.unwrap_or(final_image.view));
     write_composite_exposure(device, set, exposure_buffer);
-    if source_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-        let (source_stage, source_access) = match source_layout {
+    if final_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        let (source_stage, source_access) = match final_layout {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
@@ -10813,8 +10969,8 @@ fn record_tonemap_pass(
             _ => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
         };
         let source_barrier = image_layout_barrier(
-            source.image,
-            source_layout,
+            final_image.image,
+            final_layout,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             source_stage,
             source_access,
@@ -16944,7 +17100,7 @@ mod tests {
 
     #[test]
     fn view_timings_split_ticks_between_recorded_boundaries() {
-        // Начало, затем граница после каждого из двенадцати проходов в порядке выполнения.
+        // Начало, затем граница после каждого из тринадцати проходов в порядке выполнения.
         let marks = [
             Some(100),
             Some(110),
@@ -16952,7 +17108,8 @@ mod tests {
             Some(140),
             Some(150),
             Some(160),
-            Some(175),
+            Some(170),
+            Some(185),
             Some(190),
             Some(195),
             Some(200),
@@ -16971,8 +17128,9 @@ mod tests {
                 Some(ns(15)),
                 Some(ns(10)),
                 Some(ns(10)),
+                Some(ns(10)),
                 Some(ns(15)),
-                Some(ns(15)),
+                Some(ns(5)),
                 Some(ns(5)),
                 Some(ns(5)),
                 Some(ns(5)),
@@ -17143,7 +17301,7 @@ mod tests {
 
     #[test]
     fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
-        assert_eq!(TIMESTAMP_QUERY_COUNT, 54);
+        assert_eq!(TIMESTAMP_QUERY_COUNT, 58);
         let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
         let mut layout = GpuProfileLayout::default();
         for index in 0..MAX_PROFILED_VIEWS {
