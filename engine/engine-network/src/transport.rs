@@ -10,7 +10,7 @@ use crate::NetError;
 use crate::packet::MAX_DATAGRAM;
 
 /// Ожидание датаграммы в UDP-сокете: поток возвращается к командам примерно раз в 2 мс.
-const RECV_TIMEOUT: Duration = Duration::from_millis(2);
+pub(crate) const RECV_TIMEOUT: Duration = Duration::from_millis(2);
 
 /// Датаграммный сокет. `recv_from` ждёт не дольше своего таймаута и возвращает `None`,
 /// если датаграммы нет или её размер недопустим.

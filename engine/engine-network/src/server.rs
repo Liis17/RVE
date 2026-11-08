@@ -3,10 +3,11 @@
 //! Слот `max_clients` занимается только после первого аутентифицированного пакета клиента
 //! с верным доказательством пароля. Полуоткрытые сессии ограничены общим числом и числом на IP-адрес
 //! и сбрасываются по таймауту, поэтому повтор записанного Confirm слот не занимает. Новые Confirm
-//! с одного IP-адреса ограничены по частоте, а адрес с серией неудачных входов временно отклоняется.
+//! с одного адреса ограничены по частоте, а адрес с серией неудачных входов временно отклоняется
+//! явным отказом. Любой неудачный Auth получает один и тот же ответ и учитывается.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use engine_scene::network::{PeerId, SERVER_PEER_ID};
@@ -24,15 +25,15 @@ use crate::link::{
     AUTH_BODY, Link, OP_AUTH, OP_DISCONNECT, OP_FRAMES, disconnect_body, parse_disconnect,
     welcome_body,
 };
-use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM, SEQ_LEN, TAG_LEN};
+use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM};
 use crate::{Channel, NetError, NetworkEvent, Output};
 
 /// Наибольшее число клиентов на сервере.
 pub const MAX_CLIENTS: usize = 64;
 const MAX_HALF_OPEN: usize = 256;
-/// Полуоткрытые сессии с одного IP-адреса. Считаются по адресу, а не по порту.
+/// Полуоткрытые сессии с одного адреса: IPv4 — с IP-адреса, IPv6 — с префикса `/64`.
 pub(crate) const MAX_HALF_OPEN_PER_IP: usize = 4;
-/// Запас новых Confirm с одного IP-адреса и скорость пополнения в секунду.
+/// Запас новых Confirm с одного адреса и скорость пополнения в секунду.
 const CONFIRM_BURST: u32 = 8;
 const CONFIRM_PER_SEC: f64 = 1.0;
 /// Наибольшее число адресов, которые сервер помнит одновременно (частота Confirm и отказы входа).
@@ -40,9 +41,13 @@ const MAX_TRACKED_IPS: usize = 1024;
 /// Число неудачных входов подряд, после которого адрес временно отклоняется.
 pub(crate) const AUTH_FAILURE_LIMIT: u32 = 5;
 const AUTH_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Счётчик неудач обнуляется, если адрес не ошибался столько времени.
+const AUTH_FAILURE_DECAY: Duration = Duration::from_secs(600);
+/// Единственная причина отказа при неверной догадке о пароле. Ответ не зависит от длины и от того,
+/// верен ли ключ: иначе по ответу можно проверять пароль.
 const PASSWORD_REJECT: &str = "не удалось проверить пароль";
-/// Размер датаграммы с попыткой входа: по нему опознаётся неудачный Auth.
-const AUTH_DATAGRAM: usize = HEADER_LEN + SEQ_LEN + AUTH_BODY + TAG_LEN;
+/// Причина отказа адресу, который временно заблокирован после серии неудачных входов.
+const BLOCKED_REJECT: &str = "слишком много попыток, повторите позже";
 /// Доказательство пароля в теле Auth идёт сразу за операцией.
 const PROOF_RANGE: std::ops::Range<usize> = 1..33;
 
@@ -90,8 +95,21 @@ struct ConfirmLimiter {
     buckets: HashMap<IpAddr, Bucket>,
 }
 
+/// Адрес, по которому считаются лимиты. У IPv6 это префикс `/64`: хост получает целый блок адресов,
+/// и без агрегации один хост обходит лимиты, меняя адрес внутри блока.
+pub(crate) fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(address) => {
+            let s = address.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    }
+}
+
 impl ConfirmLimiter {
     fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let ip = limit_key(ip);
         let full = f64::from(CONFIRM_BURST);
         if !self.buckets.contains_key(&ip) && self.buckets.len() >= MAX_TRACKED_IPS {
             self.buckets
@@ -115,10 +133,11 @@ impl ConfirmLimiter {
     }
 }
 
-/// Неудачные входы одного адреса и время временного отказа.
-#[derive(Default, Clone, Copy)]
+/// Неудачные входы одного адреса, время последней неудачи и время временного отказа.
+#[derive(Clone, Copy)]
 struct AuthRecord {
     failures: u32,
+    last_failure: Instant,
     blocked_until: Option<Instant>,
 }
 
@@ -279,6 +298,18 @@ impl Server {
             .map(|(conn_id, _)| *conn_id)
     }
 
+    /// Участник, чей адрес совпадает с `from`. Рукопожатие и чужие адреса участника не имеют.
+    pub(crate) fn peer_of(&self, from: SocketAddr) -> Option<PeerId> {
+        self.links
+            .values()
+            .find(|link| link.addr == from)
+            .map(|link| link.peer)
+    }
+
+    pub(crate) fn peer_count(&self) -> usize {
+        self.links.len()
+    }
+
     fn now_ms(&self, now: Instant) -> u64 {
         u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
     }
@@ -321,6 +352,11 @@ impl Server {
         if !cookie_valid(&self.cookie_key, from, self.now_ms(now), &cookie, &hello) {
             return;
         }
+        // Адрес заблокирован: отказ явный. Cookie уже проверен, поэтому ответ не усиливает чужой трафик.
+        if self.auth_blocked(from.ip(), now) {
+            out.datagrams.push((from, reject_datagram(BLOCKED_REJECT)));
+            return;
+        }
         if let Some(reason) = self.mismatch(&hello) {
             out.datagrams.push((from, reject_datagram(reason)));
             return;
@@ -333,11 +369,11 @@ impl Server {
             out.datagrams.push((from, half.accept.clone()));
             return;
         }
-        // Лимиты считаются по IP-адресу: иначе один хост открывает их по одному разу на каждый порт.
+        // Лимиты считаются по адресу, а не по порту: иначе один хост открывает их по разу на каждый порт.
         let per_ip = self
             .halves
             .values()
-            .filter(|half| half.addr.ip() == from.ip())
+            .filter(|half| limit_key(half.addr.ip()) == limit_key(from.ip()))
             .count();
         if self.halves.len() >= MAX_HALF_OPEN || per_ip >= MAX_HALF_OPEN_PER_IP {
             return;
@@ -438,74 +474,83 @@ impl Server {
         now: Instant,
         out: &mut Output,
     ) {
-        if self.auth_blocked(from.ip(), now) {
-            return;
-        }
-        let Some(half) = self.halves.get_mut(&conn_id) else {
+        // Полуоткрытая сессия потребляется любым Auth, который не прошёл проверку. Все такие ветки дают один
+        // и тот же ответ и один и тот же учёт: иначе по ответу можно отличить верную догадку о пароле.
+        let blocked = self.auth_blocked(from.ip(), now);
+        let Some(half) = self.halves.get(&conn_id) else {
+            if blocked {
+                let reject = reject_datagram(BLOCKED_REJECT);
+                if bytes.len() >= reject.len() {
+                    out.datagrams.push((from, reject));
+                }
+            }
             return;
         };
         if half.addr != from {
             return;
         }
-        let Some((_, body)) = half.session.open(bytes) else {
-            // Ключи производные от пароля: неверный пароль проявляется как ошибка расшифровки.
-            // Отказ шифруется ключом рукопожатия, его не подделать. Он отправляется, только если запрос
-            // не короче отказа, и рукопожатие после него закрывается: сервер не усиливает чужой трафик
-            // и не отвечает на один и тот же запрос дважды.
-            let reply = half.reject.seal(conn_id, &disconnect_body(PASSWORD_REJECT));
-            if let Some((_, datagram)) = reply
-                && bytes.len() >= datagram.len()
-            {
-                self.halves.remove(&conn_id);
-                out.datagrams.push((from, datagram));
-                if bytes.len() == AUTH_DATAGRAM {
-                    self.record_auth_failure(from.ip(), now);
-                }
-            }
-            return;
-        };
         let Some(mut half) = self.halves.remove(&conn_id) else {
             return;
         };
-        if body.first() != Some(&OP_AUTH) || body.len() != AUTH_BODY {
-            reject_half(from, conn_id, &mut half, "нарушение протокола", out);
+        if blocked {
+            // Адрес временно заблокирован: попытку даже не расшифровываем, ответ не зависит от пароля.
+            reject_half(from, bytes, conn_id, &mut half, BLOCKED_REJECT, out);
             return;
         }
+        // Ключи производные от пароля, поэтому Auth открывается только верным паролем. Длина, операция и
+        // доказательство проверяются вместе: верный ключ с неверной длиной не отличается от неверного ключа.
         let expected = password_proof(self.password.as_ref(), &half.transcript);
-        if !ct_eq(&body[PROOF_RANGE], &expected) {
+        let authenticated = half.session.open(bytes).is_some_and(|(_, body)| {
+            body.first() == Some(&OP_AUTH)
+                && body.len() == AUTH_BODY
+                && ct_eq(&body[PROOF_RANGE], &expected)
+        });
+        if !authenticated {
             self.record_auth_failure(from.ip(), now);
-            reject_half(from, conn_id, &mut half, "неверный пароль", out);
+            reject_half(from, bytes, conn_id, &mut half, PASSWORD_REJECT, out);
             return;
         }
         // Номера участников не переиспользуются: исчерпание u32 равносильно заполненному серверу.
         if self.links.len() >= self.max_clients || self.next_peer == PeerId::MAX {
-            reject_half(from, conn_id, &mut half, "сервер заполнен", out);
+            reject_half(from, bytes, conn_id, &mut half, "сервер заполнен", out);
             return;
         }
-        self.auth_failures.remove(&from.ip());
+        self.auth_failures.remove(&limit_key(from.ip()));
         self.promote(conn_id, half, now, out);
     }
 
     /// Адрес временно отклонён после серии неудачных входов.
     fn auth_blocked(&self, ip: IpAddr, now: Instant) -> bool {
         self.auth_failures
-            .get(&ip)
+            .get(&limit_key(ip))
             .and_then(|record| record.blocked_until)
             .is_some_and(|until| now < until)
     }
 
-    /// Учитывает неудачный вход. С `AUTH_FAILURE_LIMIT` попытки подряд адрес отклоняется на срок,
-    /// который растёт вдвое с каждой следующей неудачей и ограничен `AUTH_BACKOFF_MAX`.
+    /// Учитывает неудачный вход. С `AUTH_FAILURE_LIMIT` неудачи подряд адрес отклоняется на срок,
+    /// который растёт вдвое с каждой следующей неудачей и ограничен `AUTH_BACKOFF_MAX`. Счётчик
+    /// сбрасывается, если адрес не ошибался `AUTH_FAILURE_DECAY`.
     fn record_auth_failure(&mut self, ip: IpAddr, now: Instant) {
-        if !self.auth_failures.contains_key(&ip) && self.auth_failures.len() >= MAX_TRACKED_IPS {
-            self.auth_failures
-                .retain(|_, record| record.blocked_until.is_some_and(|until| until > now));
+        let key = limit_key(ip);
+        if !self.auth_failures.contains_key(&key) && self.auth_failures.len() >= MAX_TRACKED_IPS {
+            self.auth_failures.retain(|_, record| {
+                now.saturating_duration_since(record.last_failure) < AUTH_FAILURE_DECAY
+            });
             if self.auth_failures.len() >= MAX_TRACKED_IPS {
                 return;
             }
         }
-        let record = self.auth_failures.entry(ip).or_default();
+        let record = self.auth_failures.entry(key).or_insert(AuthRecord {
+            failures: 0,
+            last_failure: now,
+            blocked_until: None,
+        });
+        if now.saturating_duration_since(record.last_failure) >= AUTH_FAILURE_DECAY {
+            record.failures = 0;
+            record.blocked_until = None;
+        }
         record.failures = record.failures.saturating_add(1);
+        record.last_failure = now;
         if record.failures >= AUTH_FAILURE_LIMIT {
             let steps = (record.failures - AUTH_FAILURE_LIMIT).min(16);
             let backoff = Duration::from_secs(1u64 << steps).min(AUTH_BACKOFF_MAX);
@@ -573,15 +618,19 @@ impl Server {
     }
 }
 
-/// Отказ на рукопожатии, которое прошло расшифровку: шифруется ключом отказа, не паролем.
+/// Отказ на рукопожатии. Шифруется ключом отказа, который не зависит от пароля, поэтому клиент прочтёт его
+/// и без верного пароля. Отказ отправляется, только если запрос не короче него: сервер не усиливает чужой трафик.
 fn reject_half(
     from: SocketAddr,
+    request: &[u8],
     conn_id: u32,
     half: &mut HalfOpen,
     reason: &str,
     out: &mut Output,
 ) {
-    if let Some((_, datagram)) = half.reject.seal(conn_id, &disconnect_body(reason)) {
+    if let Some((_, datagram)) = half.reject.seal(conn_id, &disconnect_body(reason))
+        && request.len() >= datagram.len()
+    {
         out.datagrams.push((from, datagram));
     }
 }
@@ -621,6 +670,30 @@ mod tests {
         assert!(
             limiter.allow([10, 1, 0, 0].into(), later),
             "полные записи освобождают место"
+        );
+    }
+
+    /// Регрессия: хост с IPv6 обходил лимит Confirm, меняя адрес внутри своего `/64`.
+    #[test]
+    fn confirm_limiter_counts_ipv6_hosts_by_their_slash_64() {
+        let mut limiter = ConfirmLimiter::default();
+        let now = Instant::now();
+        let first: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let same_prefix: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        let burst = (0..CONFIRM_BURST)
+            .filter(|_| limiter.allow(first, now))
+            .count();
+        assert_eq!(burst, CONFIRM_BURST as usize);
+        assert!(
+            !limiter.allow(same_prefix, now),
+            "тот же /64 — тот же запас"
+        );
+        assert!(limiter.allow(other_prefix, now), "другой /64 — свой запас");
+        assert_eq!(
+            limit_key(same_prefix),
+            limit_key(first),
+            "ключ лимита одинаков внутри /64"
         );
     }
 

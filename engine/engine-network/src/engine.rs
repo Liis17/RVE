@@ -2,7 +2,7 @@
 //! потоков и отдаёт события. Поток не ждёт команд без таймаута: сокет читается с короткой задержкой,
 //! а между чтениями выполняются команды, таймеры и отправка.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -11,17 +11,23 @@ use flume::{Receiver, Sender, TryRecvError, TrySendError};
 
 use crate::client::{Client, ClientConfig};
 use crate::server::{Server, ServerConfig};
-use crate::transport::{DatagramSocket, UdpTransport};
+use crate::transport::{DatagramSocket, RECV_TIMEOUT, UdpTransport};
 use crate::{
     Channel, NetError, NetworkEvent, Output, Password, ServerIdentity, check_message_size,
 };
 
 const COMMAND_QUEUE: usize = 256;
 const EVENT_QUEUE: usize = 1024;
-/// Сколько событий может ждать приложения, прежде чем сеть перестаёт обрабатывать датаграммы.
+/// Сколько событий может ждать приложения, прежде чем очередь считается переполненной. Тогда датаграммы пира,
+/// который занял свою долю очереди, не принимаются.
 const PENDING_LIMIT: usize = EVENT_QUEUE;
-/// Ошибки приёма подряд, после которых сокет считается неисправным.
-const MAX_RECV_ERRORS: u32 = 64;
+/// Непрерывное переполнение очереди, во время которого таймауты пиров не идут. Дольше таймауты идут обычно,
+/// иначе молчащий пир висел бы, пока приложение не читает события.
+const HOLD_LIMIT: Duration = Duration::from_secs(10);
+/// Ошибки приёма подряд дольше этого срока считаются неисправным сокетом.
+const RECV_ERROR_LIMIT: Duration = Duration::from_secs(5);
+/// Причина отключения пира, который занял свою долю очереди событий, пока очередь переполнена.
+const OVERLOAD_REASON: &str = "слишком много сообщений, очередь переполнена";
 
 /// Локальный адрес клиента того же семейства, что и адрес сервера.
 fn client_bind_addr(server: SocketAddr) -> SocketAddr {
@@ -125,8 +131,15 @@ pub struct NetworkEngine {
     commands: Receiver<Command>,
     events: Sender<NetworkEvent>,
     pending: VecDeque<NetworkEvent>,
-    /// Ошибки приёма подряд; успешный приём сбрасывает счётчик.
+    /// Число событий в `pending` по пирам: по нему видно, чья доля очереди заполнена.
+    pending_by_peer: HashMap<PeerId, usize>,
+    /// С какого момента очередь событий непрерывно переполнена.
+    backlog_since: Option<Instant>,
+    /// Когда началась серия ошибок приёма, и число ошибок в ней.
+    recv_error_since: Option<Instant>,
     recv_errors: u32,
+    /// Последний шаг закончился ошибкой приёма: перед следующим чтением поток делает короткую паузу.
+    recv_failed: bool,
 }
 
 impl NetworkEngine {
@@ -198,7 +211,11 @@ impl NetworkEngine {
             commands: command_rx,
             events: event_tx,
             pending: VecDeque::new(),
+            pending_by_peer: HashMap::new(),
+            backlog_since: None,
+            recv_error_since: None,
             recv_errors: 0,
+            recv_failed: false,
         };
         let handle = NetworkHandle {
             commands: command_tx,
@@ -217,6 +234,10 @@ impl NetworkEngine {
             if !self.step(Instant::now()) {
                 break;
             }
+            if std::mem::take(&mut self.recv_failed) {
+                // Неисправный сокет возвращает ошибку сразу: пауза не даёт крутить цикл впустую.
+                std::thread::sleep(RECV_TIMEOUT);
+            }
         }
         let out = self.machine.shutdown();
         for (addr, datagram) in out.datagrams {
@@ -229,24 +250,27 @@ impl NetworkEngine {
     /// Возвращает `false`, если сокет неисправен и поток нужно остановить.
     fn step(&mut self, now: Instant) -> bool {
         self.deliver_events();
-        // Пока приложение не забрало накопленные события, датаграммы не обрабатываются: отправитель
-        // повторит их без подтверждения, а таймаут соединения не идёт (см. `hold_timeouts`).
         let backlogged = self.pending.len() >= PENDING_LIMIT;
+        self.backlog_since = if backlogged {
+            self.backlog_since.or(Some(now))
+        } else {
+            None
+        };
         match self.socket.recv_from() {
             Ok(Some((from, bytes))) => {
-                self.recv_errors = 0;
-                if !backlogged {
-                    let out = self.machine.handle_datagram(from, &bytes, now);
-                    self.dispatch(out);
-                }
+                self.reset_recv_errors();
+                self.receive(from, &bytes, now, backlogged);
             }
-            Ok(None) => self.recv_errors = 0,
+            Ok(None) => self.reset_recv_errors(),
             Err(err) => {
+                let since = *self.recv_error_since.get_or_insert(now);
                 self.recv_errors += 1;
-                if self.recv_errors > MAX_RECV_ERRORS {
+                self.recv_failed = true;
+                if now.saturating_duration_since(since) > RECV_ERROR_LIMIT {
                     log::error!(
-                        "сетевой сокет остановлен после {} ошибок подряд: {err}",
-                        self.recv_errors
+                        "сетевой сокет остановлен: ошибки приёма ({} подряд) длятся дольше {:?}: {err}",
+                        self.recv_errors,
+                        RECV_ERROR_LIMIT
                     );
                     return false;
                 }
@@ -255,13 +279,44 @@ impl NetworkEngine {
                 }
             }
         }
-        if backlogged {
+        // Таймауты сдвигаются только на время непрерывного переполнения не дольше `HOLD_LIMIT`.
+        if let Some(since) = self.backlog_since
+            && now.saturating_duration_since(since) <= HOLD_LIMIT
+        {
             self.machine.hold_timeouts(now);
         }
         let out = self.machine.update(now);
         self.dispatch(out);
         self.deliver_events();
         true
+    }
+
+    fn reset_recv_errors(&mut self) {
+        self.recv_errors = 0;
+        self.recv_error_since = None;
+    }
+
+    /// Передаёт датаграмму машине состояний. Пока очередь переполнена, датаграмма пира, который уже занял
+    /// свою долю очереди, не принимается: если в сети есть другие пиры, такой пир отключается с причиной,
+    /// иначе его отправитель получает противодавление (повтор без подтверждения). Датаграммы остальных
+    /// пиров обрабатываются и подтверждаются. Датаграммы без известного пира при переполнении откладываются.
+    fn receive(&mut self, from: SocketAddr, bytes: &[u8], now: Instant, backlogged: bool) {
+        if backlogged {
+            let Some(peer) = self.machine.peer_of(from) else {
+                return;
+            };
+            let peers = self.machine.peer_count();
+            let share = PENDING_LIMIT / peers.max(1);
+            if self.pending_by_peer.get(&peer).copied().unwrap_or(0) >= share {
+                if peers >= 2 {
+                    let out = self.machine.disconnect(peer, OVERLOAD_REASON);
+                    self.dispatch(out);
+                }
+                return;
+            }
+        }
+        let out = self.machine.handle_datagram(from, bytes, now);
+        self.dispatch(out);
     }
 
     /// Возвращает `false`, если поток нужно остановить.
@@ -294,23 +349,47 @@ impl NetworkEngine {
                 log::debug!("датаграмма на {addr} не отправлена: {err}");
             }
         }
-        self.pending.extend(out.events);
+        for event in out.events {
+            *self.pending_by_peer.entry(event_peer(&event)).or_insert(0) += 1;
+            self.pending.push_back(event);
+        }
     }
 
     fn deliver_events(&mut self) {
         while let Some(event) = self.pending.pop_front() {
+            let peer = event_peer(&event);
             match self.events.try_send(event) {
-                Ok(()) => {}
+                Ok(()) => self.release(peer),
                 Err(TrySendError::Full(event)) => {
                     self.pending.push_front(event);
                     return;
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     self.pending.clear();
+                    self.pending_by_peer.clear();
                     return;
                 }
             }
         }
+    }
+
+    /// Событие покинуло очередь ожидания: доля пира освободилась.
+    fn release(&mut self, peer: PeerId) {
+        if let Some(count) = self.pending_by_peer.get_mut(&peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pending_by_peer.remove(&peer);
+            }
+        }
+    }
+}
+
+/// Пир, к которому относится событие.
+fn event_peer(event: &NetworkEvent) -> PeerId {
+    match event {
+        NetworkEvent::Connected { peer }
+        | NetworkEvent::Disconnected { peer, .. }
+        | NetworkEvent::Message { peer, .. } => *peer,
     }
 }
 
@@ -332,6 +411,21 @@ impl Machine {
         match self {
             Self::Server(server) => server.hold_timeouts(now),
             Self::Client(client) => client.hold_timeouts(now),
+        }
+    }
+
+    /// Пир, которому принадлежит датаграмма от `from`. Клиент знает только сервер.
+    fn peer_of(&self, from: SocketAddr) -> Option<PeerId> {
+        match self {
+            Self::Server(server) => server.peer_of(from),
+            Self::Client(client) => client.local_peer(),
+        }
+    }
+
+    fn peer_count(&self) -> usize {
+        match self {
+            Self::Server(server) => server.peer_count(),
+            Self::Client(client) => usize::from(client.is_connected()),
         }
     }
 
@@ -529,27 +623,40 @@ mod tests {
         }
     }
 
+    /// Регрессия: сотни ошибок приёма за долю секунды не останавливают поток. Остановка зависит от срока
+    /// серии ошибок, а не от их числа: иначе быстрый сбой сокета гасил сеть за микросекунды.
     #[test]
     fn unexpected_socket_errors_stop_the_engine_only_after_a_long_run() {
         let (mut engine, _handle) = NetworkEngine::from_parts(
             Machine::Server(Box::new(idle_server())),
             Box::new(BrokenSocket),
         );
-        let now = Instant::now();
-        for _ in 0..MAX_RECV_ERRORS {
-            assert!(engine.step(now));
+        let start = Instant::now();
+        for step in 0..10_000u32 {
+            let now = start + Duration::from_micros(u64::from(step) * 10);
+            assert!(
+                engine.step(now),
+                "серия ошибок короче срока не останавливает поток"
+            );
         }
-        assert!(!engine.step(now), "серия ошибок подряд останавливает поток");
+        assert!(engine.recv_failed, "после ошибки поток делает паузу");
+        let later = start + RECV_ERROR_LIMIT + Duration::from_millis(1);
+        assert!(
+            !engine.step(later),
+            "серия ошибок дольше срока останавливает поток"
+        );
     }
 
     #[test]
-    fn a_successful_receive_resets_the_error_count() {
+    fn a_successful_receive_resets_the_error_window() {
         let (mut engine, _handle) = NetworkEngine::from_parts(
             Machine::Server(Box::new(idle_server())),
             Box::new(FlakySocket { calls: 0 }),
         );
-        let now = Instant::now();
-        for _ in 0..MAX_RECV_ERRORS * 4 {
+        let start = Instant::now();
+        // Ошибки перемежаются успешными чтениями: серия не длится дольше срока, поток работает.
+        for step in 0..400u64 {
+            let now = start + Duration::from_millis(step * 100);
             assert!(engine.step(now), "ошибки не идут подряд");
         }
     }
@@ -566,14 +673,22 @@ mod tests {
             .collect()
     }
 
-    /// Сервер в движке и клиент в сети в памяти. Время и шаги задаёт тест, без задержек.
+    fn send_all(socket: &mut MemoryEndpoint, out: Output) {
+        for (to, datagram) in out.datagrams {
+            socket.send_to(to, &datagram).unwrap();
+        }
+    }
+
+    /// Сервер в движке и клиенты в сети в памяти. Время и шаги задаёт тест, без задержек.
     struct Rig {
         engine: NetworkEngine,
         handle: NetworkHandle,
-        client: Client,
-        client_socket: MemoryEndpoint,
+        network: MemoryNetwork,
+        fingerprint: [u8; 32],
+        timeout: Duration,
         now: Instant,
-        client_events: Vec<NetworkEvent>,
+        /// Клиенты: машина состояний и её сокет в сети.
+        clients: Vec<(Client, MemoryEndpoint)>,
     }
 
     impl Rig {
@@ -598,54 +713,60 @@ mod tests {
                 Machine::Server(Box::new(server)),
                 Box::new(network.endpoint(addr(7100))),
             );
+            Self {
+                engine,
+                handle,
+                network,
+                fingerprint,
+                timeout,
+                now,
+                clients: Vec::new(),
+            }
+        }
+
+        /// Добавляет клиента с отпечатком сервера. Адрес клиента — следующий по порядку.
+        fn add_client(&mut self) -> usize {
+            let index = self.clients.len();
             let client = Client::new(
                 ClientConfig {
                     protocol_id: [1; 32],
                     scene_hash: [2; 32],
                     server: addr(7100),
-                    fingerprint: Some(fingerprint),
+                    fingerprint: Some(self.fingerprint),
                     insecure_no_pin: false,
                     password: None,
-                    timeout,
+                    timeout: self.timeout,
                 },
-                now,
+                self.now,
             )
             .unwrap();
-            Self {
-                engine,
-                handle,
-                client,
-                client_socket: network.endpoint(addr(7101)),
-                now,
-                client_events: Vec::new(),
-            }
+            let socket = self.network.endpoint(addr(7101 + index as u16));
+            self.clients.push((client, socket));
+            index
         }
 
-        fn route_client(&mut self, out: Output) {
-            for (to, datagram) in out.datagrams {
-                self.client_socket.send_to(to, &datagram).unwrap();
-            }
-            self.client_events.extend(out.events);
-        }
-
-        /// Один шаг времени: клиент шлёт, движок обрабатывает датаграммы, клиент принимает ответы.
+        /// Один шаг времени: клиенты шлют, движок обрабатывает датаграммы, клиенты принимают ответы.
         fn tick(&mut self) {
             self.now += Duration::from_millis(10);
-            let out = self.client.update(self.now);
-            self.route_client(out);
+            for (client, socket) in &mut self.clients {
+                let out = client.update(self.now);
+                send_all(socket, out);
+            }
             for _ in 0..16 {
                 assert!(self.engine.step(self.now));
             }
-            while let Some((from, bytes)) = self.client_socket.recv_from().unwrap() {
-                let out = self.client.handle_datagram(from, &bytes, self.now);
-                self.route_client(out);
+            for (client, socket) in &mut self.clients {
+                while let Some((from, bytes)) = socket.recv_from().unwrap() {
+                    let out = client.handle_datagram(from, &bytes, self.now);
+                    send_all(socket, out);
+                }
             }
         }
 
         fn connect(&mut self) -> bool {
             for _ in 0..500 {
                 self.tick();
-                if self.client.is_connected() {
+                if self.clients.iter().all(|(client, _)| client.is_connected()) {
                     return true;
                 }
             }
@@ -659,11 +780,13 @@ mod tests {
     fn full_event_queue_does_not_drop_a_healthy_connection() {
         let timeout = Duration::from_secs(1);
         let mut rig = Rig::new(timeout);
+        rig.add_client();
         assert!(rig.connect(), "рукопожатие проходит");
 
         let total = EVENT_QUEUE * 2 + 100;
         for number in 0..total {
-            rig.client
+            rig.clients[0]
+                .0
                 .send(Channel::Reliable, &(number as u32).to_be_bytes())
                 .unwrap();
         }
@@ -709,6 +832,135 @@ mod tests {
             message_numbers(&received),
             (0..total as u32).collect::<Vec<_>>()
         );
-        assert!(rig.client.is_connected());
+        assert!(rig.clients[0].0.is_connected());
+    }
+
+    fn disconnect_reason<'a>(events: impl IntoIterator<Item = &'a NetworkEvent>) -> Option<String> {
+        events.into_iter().find_map(|event| match event {
+            NetworkEvent::Disconnected { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+    }
+
+    /// Регрессия: переполненная очередь не продлевает таймауты бесконечно. Молчащий пир отключается по
+    /// обычному таймауту, как только истёк `HOLD_LIMIT` непрерывного переполнения.
+    #[test]
+    fn timeouts_are_held_only_for_a_bounded_backlog() {
+        let mut rig = Rig::new(Duration::from_secs(1));
+        rig.add_client();
+        assert!(rig.connect());
+        for number in 0..EVENT_QUEUE * 3 {
+            rig.clients[0]
+                .0
+                .send(Channel::Reliable, &(number as u32).to_be_bytes())
+                .unwrap();
+        }
+        let mut ticks = 0;
+        while rig.engine.backlog_since.is_none() && ticks < 2_000 {
+            rig.tick();
+            ticks += 1;
+        }
+        let since = rig.engine.backlog_since.expect("очередь переполнена");
+        while rig.now < since + HOLD_LIMIT - Duration::from_millis(100) {
+            rig.tick();
+        }
+        assert_eq!(
+            disconnect_reason(rig.engine.pending.iter()),
+            None,
+            "внутри срока таймаут не идёт"
+        );
+        while disconnect_reason(rig.engine.pending.iter()).is_none()
+            && rig.now < since + HOLD_LIMIT + Duration::from_secs(5)
+        {
+            rig.tick();
+        }
+        assert_eq!(
+            disconnect_reason(rig.engine.pending.iter()).as_deref(),
+            Some("таймаут"),
+            "после срока молчащий пир отключается по обычному таймауту"
+        );
+    }
+
+    /// Регрессия: флудер, который заливает сообщения при переполненной очереди, отключается с причиной, а честный
+    /// пир не отключается: его датаграммы обрабатываются и подтверждаются, пока очередь переполнена.
+    #[test]
+    fn flooder_is_disconnected_and_honest_peer_survives_a_full_queue() {
+        const HONEST_BASE: u32 = 1_000_000;
+        let mut rig = Rig::new(Duration::from_secs(1));
+        let flooder = rig.add_client();
+        let honest = rig.add_client();
+        assert!(rig.connect());
+        for number in 0..EVENT_QUEUE as u32 * 3 {
+            rig.clients[flooder]
+                .0
+                .send(Channel::Reliable, &number.to_be_bytes())
+                .unwrap();
+        }
+        let mut ticks = 0;
+        while rig.engine.backlog_since.is_none() && ticks < 2_000 {
+            rig.tick();
+            ticks += 1;
+        }
+        assert!(rig.engine.backlog_since.is_some(), "очередь переполнена");
+        for number in 0..20u32 {
+            rig.clients[honest]
+                .0
+                .send(Channel::Reliable, &(HONEST_BASE + number).to_be_bytes())
+                .unwrap();
+        }
+        // Очередь остаётся переполненной дольше таймаута, но приложение событий не читает.
+        for _ in 0..600 {
+            rig.tick();
+        }
+        let mut received = Vec::new();
+        for _ in 0..5_000 {
+            rig.tick();
+            received.extend(rig.handle.poll_events());
+            let honest_done = message_numbers(&received)
+                .iter()
+                .filter(|number| **number >= HONEST_BASE)
+                .count()
+                == 20;
+            let flooder_out = received.iter().any(|event| {
+                matches!(event, NetworkEvent::Disconnected { reason, .. } if reason == OVERLOAD_REASON)
+            });
+            if honest_done && flooder_out {
+                break;
+            }
+        }
+        let honest_peer = received
+            .iter()
+            .find_map(|event| match event {
+                NetworkEvent::Message { peer, bytes, .. }
+                    if u32::from_be_bytes(bytes[..4].try_into().unwrap()) >= HONEST_BASE =>
+                {
+                    Some(*peer)
+                }
+                _ => None,
+            })
+            .expect("сообщения честного пира доставлены");
+        assert!(
+            !received.iter().any(|event| matches!(
+                event,
+                NetworkEvent::Disconnected { peer, .. } if *peer == honest_peer
+            )),
+            "честный пир не отключён"
+        );
+        assert!(
+            received.iter().any(|event| matches!(
+                event,
+                NetworkEvent::Disconnected { peer, reason }
+                    if *peer != honest_peer && reason == OVERLOAD_REASON
+            )),
+            "флудер отключён с причиной"
+        );
+        let honest_numbers: Vec<u32> = message_numbers(&received)
+            .into_iter()
+            .filter(|number| *number >= HONEST_BASE)
+            .collect();
+        assert_eq!(
+            honest_numbers,
+            (HONEST_BASE..HONEST_BASE + 20).collect::<Vec<_>>()
+        );
     }
 }

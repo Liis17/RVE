@@ -5,6 +5,7 @@
 use std::fmt::{self, Write as _};
 use std::io::Write as _;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -55,6 +56,7 @@ impl ServerIdentity {
 
     /// Читает ключ из файла (ровно 32 байта) или создаёт новый файл. На Unix файл создаётся с правами 0600.
     pub fn load_or_create(path: &Path) -> Result<Self, NetError> {
+        remove_stale_temps(path, SystemTime::now());
         match std::fs::read(path) {
             Ok(mut bytes) => {
                 warn_if_shared(path);
@@ -121,21 +123,43 @@ fn file_error(path: &Path, err: &std::io::Error) -> NetError {
     NetError::Config(format!("ключ сервера {}: {err}", path.display()))
 }
 
+/// Срок, после которого временный файл публикации считается оставшимся после аварийного завершения.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(3600);
+
 /// Пишет ключ во временный файл рядом с `path` и публикует его под именем `path` без перезаписи
-/// (hard link). Временный файл удаляется в любом случае, поэтому частичная запись не остаётся на диске.
+/// (hard link). Временный файл удаляется в любом случае. Если hard link недоступен (например, на FAT
+/// или части сетевых ресурсов), ключ пишется напрямую под именем `path` через `create_new`.
 fn publish_new_file(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
-    let mut suffix = [0u8; 8];
-    getrandom::fill(&mut suffix).map_err(|err| std::io::Error::other(format!("{err}")))?;
-    let name = path.file_name().map_or_else(
-        || "server.key".into(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let temp = path.with_file_name(format!(".{name}.{}.tmp", to_hex(&suffix)));
-    let result = write_new_file(&temp, seed).and_then(|()| std::fs::hard_link(&temp, path));
-    let _ = std::fs::remove_file(&temp);
-    result
+    publish_with(path, seed, |temp, target| std::fs::hard_link(temp, target))
 }
 
+/// Публикация с внедряемой операцией связывания, чтобы тесты проверяли запасной путь без зависимости от ФС.
+/// Существующий ключ не перезаписывается ни одним путём: `AlreadyExists` возвращается сразу.
+fn publish_with(
+    path: &Path,
+    seed: &[u8; 32],
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(|err| std::io::Error::other(format!("{err}")))?;
+    let temp = path.with_file_name(format!(".{}.{}.tmp", file_name(path), to_hex(&suffix)));
+    let result = write_new_file(&temp, seed).and_then(|()| link(&temp, path));
+    let _ = std::fs::remove_file(&temp);
+    match result {
+        Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => write_new_file(path, seed),
+        other => other,
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || "server.key".into(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// Создаёт файл, только если его нет, и пишет в него ключ. При ошибке записи частичный файл удаляется,
+/// чтобы недописанный ключ не остался под именем ключа.
 fn write_new_file(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -145,8 +169,50 @@ fn write_new_file(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(seed)?;
-    file.sync_all()
+    let written = file.write_all(seed).and_then(|()| file.sync_all());
+    // Файл закрывается до удаления: на Windows открытый файл удалить нельзя.
+    drop(file);
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+/// Удаляет временные файлы публикации ключа, оставшиеся рядом с `path` после аварии. Свежие файлы не трогаем:
+/// их может публиковать другой процесс прямо сейчас.
+fn remove_stale_temps(path: &Path, now: SystemTime) {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let prefix = format!(".{}.", file_name(path));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_temp_name(name, &prefix) {
+            continue;
+        }
+        let modified = entry.metadata().and_then(|meta| meta.modified());
+        let stale = modified.is_ok_and(|modified| {
+            now.duration_since(modified)
+                .is_ok_and(|age| age >= STALE_TEMP_AGE)
+        });
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Имя временного файла публикации: префикс, 16 шестнадцатеричных символов и `.tmp`.
+fn is_temp_name(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 /// Предупреждает, если к файлу ключа имеют доступ другие пользователи (только Unix).
@@ -657,6 +723,82 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&path).unwrap(), b"existing");
         assert_eq!(entries(&dir), vec!["server.key".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Регрессия: файловая система без hard link (например, FAT) не должна мешать созданию ключа.
+    #[test]
+    fn key_is_written_directly_when_hard_links_are_unsupported() {
+        let dir = scratch_dir("fallback");
+        let path = dir.join("server.key");
+        let unsupported =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        publish_with(&path, &[9u8; 32], unsupported).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [9u8; 32]);
+        assert_eq!(entries(&dir), vec!["server.key".to_owned()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Запасной путь не перезаписывает существующий ключ и не оставляет временных файлов.
+    #[test]
+    fn fallback_never_overwrites_an_existing_key() {
+        let dir = scratch_dir("fallback-existing");
+        let path = dir.join("server.key");
+        std::fs::write(&path, b"existing").unwrap();
+        let denied =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let err = publish_with(&path, &[9u8; 32], denied).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        assert_eq!(entries(&dir), vec!["server.key".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Уже существующий ключ при публикации не переходит на запасной путь: файл не создаётся.
+    #[test]
+    fn existing_key_is_reported_without_fallback() {
+        let dir = scratch_dir("exists");
+        let path = dir.join("server.key");
+        let exists =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+        let err = publish_with(&path, &[9u8; 32], exists).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!path.exists(), "запасной путь не должен был писать ключ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Устаревшие временные файлы ключа удаляются при старте; свежие и чужие файлы остаются.
+    #[test]
+    fn stale_key_temp_files_are_removed_and_fresh_ones_kept() {
+        let dir = scratch_dir("stale");
+        let path = dir.join("server.key");
+        let now = SystemTime::now();
+        let old_age = now - Duration::from_secs(7200);
+        let stale = dir.join(".server.key.0123456789abcdef.tmp");
+        let fresh = dir.join(".server.key.fedcba9876543210.tmp");
+        let other = dir.join(".other.key.0123456789abcdef.tmp");
+        for file in [&stale, &fresh, &other] {
+            std::fs::write(file, b"partial").unwrap();
+        }
+        for file in [&stale, &other] {
+            std::fs::File::open(file)
+                .unwrap()
+                .set_modified(old_age)
+                .unwrap();
+        }
+        remove_stale_temps(&path, now);
+        let mut expected = vec![
+            ".other.key.0123456789abcdef.tmp".to_owned(),
+            ".server.key.fedcba9876543210.tmp".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(entries(&dir), expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

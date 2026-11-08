@@ -15,18 +15,19 @@ use crate::{Channel, NetError, check_message_size};
 const CHANNELS: usize = 4;
 /// Размер кадра без полезной нагрузки: канал, номер, фрагмент, число фрагментов, длина.
 pub(crate) const FRAME_HEADER: usize = 1 + 4 + 2 + 2 + 2;
-/// Наибольшее число неподтверждённых пакетов с надёжными кадрами.
+/// Наибольшее число неподтверждённых пакетов с надёжными кадрами. Пакет несёт не больше одной датаграммы,
+/// поэтому объём надёжных кадров в полёте ограничен этим числом.
 const MAX_INFLIGHT: usize = 64;
-/// Объём надёжных кадров в полёте. Остаётся внутри буфера приёма пира (2 MiB).
-const MAX_INFLIGHT_BYTES: usize = 256 * 1024;
 /// Суммарный объём надёжных кадров в очередях одного пира.
 const MAX_QUEUED_BYTES: usize = 512 * 1024;
 /// Объём ненадёжных кадров в очередях. При переполнении вытесняются самые старые кадры.
 const MAX_SOFT_QUEUED_BYTES: usize = 256 * 1024;
 /// Насколько новый надёжный кадр канала может опережать старейший неподтверждённый кадр того же канала.
-/// 1024 кадра по ~1 KB укладываются в буфер приёма пира, поэтому честный пир не переполняет его
-/// даже при долгой потере одного кадра.
-const MAX_SEQ_GAP: i32 = 1024;
+/// Приёмник держит не больше `MAX_SEQ_GAP - 1` ожидающих кадров на канал. Два надёжных канала с кадрами
+/// по `FRAGMENT_PAYLOAD` байт и оценкой записи `BUFFER_ENTRY_COST` занимают
+/// 2 × (512 − 1) × (1000 + 64) = 1 087 408 байт, что укладывается в `MAX_BUFFERED_BYTES` (2 097 152).
+/// Поэтому при одновременной потере головных кадров обоих каналов честный пир не переполняет буфер приёма.
+const MAX_SEQ_GAP: i32 = 512;
 /// Насколько далеко вперёд приёмник принимает кадры канала. Окно широкое: при потере одного пакета
 /// отправитель продолжает слать мелкие сообщения, и их число за время повтора велико. Память ограничивает
 /// `MAX_BUFFERED_BYTES`, а не число кадров.
@@ -35,6 +36,11 @@ const REORDER_WINDOW: u32 = 65_536;
 const MAX_BUFFERED_BYTES: usize = 2 * 1024 * 1024;
 /// Оценка памяти на одну запись буфера приёма помимо полезной нагрузки.
 const BUFFER_ENTRY_COST: usize = 64;
+// Бюджет приёма проверяется на этапе компиляции: худший случай двух каналов укладывается в буфер.
+const _: () = assert!(
+    2 * (MAX_SEQ_GAP as usize - 1) * (FRAGMENT_PAYLOAD + BUFFER_ENTRY_COST) <= MAX_BUFFERED_BYTES
+);
+// Бюджет приёма проверяется на этапе компиляции: худший случай двух каналов укладывается в буфер.
 /// Лимит отправки на пира: байт в секунду и размер всплеска.
 const BYTES_PER_SEC: f64 = 256.0 * 1024.0;
 const BURST_BYTES: f64 = 64.0 * 1024.0;
@@ -100,8 +106,6 @@ impl Frame {
 struct InFlight {
     sent_at: Instant,
     frames: Vec<Frame>,
-    /// Занятый объём кадров с учётом заголовков: учитывается в `inflight_bytes`.
-    bytes: usize,
 }
 
 /// Входящий поток одного канала.
@@ -126,7 +130,6 @@ pub(crate) struct Reliability {
     queued_soft: usize,
     next_seq: [u32; CHANNELS],
     inflight: BTreeMap<u64, InFlight>,
-    inflight_bytes: usize,
     largest_received: Option<u64>,
     received_bits: u64,
     ack_needed: bool,
@@ -148,7 +151,6 @@ impl Reliability {
             queued_soft: 0,
             next_seq: [0; CHANNELS],
             inflight: BTreeMap::new(),
-            inflight_bytes: 0,
             largest_received: None,
             received_bits: 0,
             ack_needed: false,
@@ -219,9 +221,9 @@ impl Reliability {
         }
     }
 
-    /// Можно ли отправить ещё один пакет с надёжными кадрами: ограничены число пакетов и объём в полёте.
+    /// Можно ли отправить ещё один пакет с надёжными кадрами: ограничено число пакетов в полёте.
     pub(crate) fn can_send(&self) -> bool {
-        self.inflight.len() < MAX_INFLIGHT && self.inflight_bytes < MAX_INFLIGHT_BYTES
+        self.inflight.len() < MAX_INFLIGHT
     }
 
     /// Забирает кадры в порядке приоритета каналов, не больше `room` байт.
@@ -245,9 +247,11 @@ impl Reliability {
                 };
                 used += size;
                 dequeued[usize::from(!frame.channel.is_reliable())] += frame.payload.len();
-                // Кадры этой партии станут неподтверждёнными: самый старый из них задаёт базу отставания.
+                // Отправленный надёжный кадр станет неподтверждённым. База отставания — самый старый неподтверждённый
+                // кадр канала, в том числе переотправленный головной кадр, поэтому берётся минимум.
                 if frame.channel.is_reliable() {
-                    oldest[slot].get_or_insert(frame.seq);
+                    oldest[slot] =
+                        Some(oldest[slot].map_or(frame.seq, |current| older(current, frame.seq)));
                 }
                 taken.push(frame);
             }
@@ -280,26 +284,18 @@ impl Reliability {
         if reliable.is_empty() {
             return;
         }
-        let bytes = reliable
-            .iter()
-            .map(|frame| FRAME_HEADER + frame.payload.len())
-            .sum();
-        self.inflight_bytes += bytes;
         self.inflight.insert(
             seq,
             InFlight {
                 sent_at: now,
                 frames: reliable,
-                bytes,
             },
         );
     }
 
     /// Снимает пакет с учёта полёта и возвращает его кадры.
     fn take_flight(&mut self, seq: u64) -> Option<InFlight> {
-        let flight = self.inflight.remove(&seq)?;
-        self.inflight_bytes -= flight.bytes;
-        Some(flight)
+        self.inflight.remove(&seq)
     }
 
     /// Переотправляет кадры пакетов, у которых истёк RTO.
@@ -510,6 +506,11 @@ impl Reliability {
 /// Кадры старее `oldest` (requeue потерянных) разрешены: их и нужно переотправить.
 fn beyond_gap(seq: u32, oldest: Option<u32>) -> bool {
     oldest.is_some_and(|oldest| (seq.wrapping_sub(oldest) as i32) >= MAX_SEQ_GAP)
+}
+
+/// Более старый из двух номеров кадров канала с учётом переполнения u32.
+fn older(a: u32, b: u32) -> u32 {
+    if (a.wrapping_sub(b) as i32) < 0 { a } else { b }
 }
 
 fn acked_by(largest: u64, bits: u64, seq: u64) -> bool {
@@ -842,19 +843,71 @@ mod tests {
         );
     }
 
-    /// Надёжные кадры в полёте ограничены по байтам, а не только по числу пакетов.
+    /// Место под кадры одной датаграммы: не больше 1200 байт за вычетом служебных полей пакета
+    /// (см. `link::FRAMES_OVERHEAD`).
+    const DATAGRAM_ROOM: usize = 1_100;
+
+    /// Надёжные кадры в полёте ограничены числом пакетов; каждый пакет укладывается в датаграмму,
+    /// поэтому объём в полёте не превышает `MAX_INFLIGHT * DATAGRAM_ROOM`.
     #[test]
-    fn frames_in_flight_are_bounded_by_bytes() {
+    fn inflight_packets_are_bounded_and_each_fits_one_datagram() {
         let start = Instant::now();
         let mut rel = Reliability::new(start);
-        // 300 кадров по ~1 KB: 303 KB в полёте, выше лимита 256 KB.
         for _ in 0..300 {
             rel.enqueue(Channel::Reliable, &[0u8; FRAGMENT_PAYLOAD])
                 .unwrap();
         }
+        let mut packets = 0u64;
+        let mut inflight_bytes = 0;
+        while rel.can_send() {
+            let frames = rel.take_frames(DATAGRAM_ROOM);
+            let size: usize = frames
+                .iter()
+                .map(|frame| FRAME_HEADER + frame.payload.len())
+                .sum();
+            assert!(size <= DATAGRAM_ROOM, "пакет помещается в датаграмму");
+            inflight_bytes += size;
+            rel.record_sent(packets, start, frames);
+            packets += 1;
+        }
+        assert_eq!(
+            packets, MAX_INFLIGHT as u64,
+            "число пакетов в полёте ограничено"
+        );
+        assert!(inflight_bytes <= MAX_INFLIGHT * DATAGRAM_ROOM);
+    }
+
+    /// Регрессия: переотправка головного кадра понижает базу отставания. Раньше база оставалась на старом
+    /// значении, и отправитель уходил на `MAX_SEQ_GAP` дальше потерянного кадра.
+    #[test]
+    fn requeued_head_frame_lowers_the_gap_base() {
+        let start = Instant::now();
+        let mut rel = Reliability::new(start);
+        for _ in 0..2_000 {
+            rel.enqueue(Channel::Reliable, &[0u8; 8]).unwrap();
+        }
+        // Кадр `n` уходит в пакете `n`, пакеты 1..=4 подтверждены, пакет 0 потерян и переотправляется.
+        for packet in 0..=10u64 {
+            let frames = rel.take_frames(FRAME_HEADER + 8);
+            assert_eq!(frames.len(), 1);
+            rel.record_sent(packet, start, frames);
+        }
+        rel.on_ack(start, 4, 0b111);
         let frames = rel.take_frames(usize::MAX);
-        rel.record_sent(0, start, frames);
-        assert!(!rel.can_send(), "объём в полёте превышен");
+        let max_seq = frames
+            .iter()
+            .filter(|frame| frame.channel == Channel::Reliable)
+            .map(|frame| frame.seq)
+            .max()
+            .unwrap();
+        assert!(
+            frames.iter().any(|frame| frame.seq == 0),
+            "головной кадр переотправлен"
+        );
+        assert!(
+            max_seq < MAX_SEQ_GAP as u32,
+            "отправитель не уходит дальше {MAX_SEQ_GAP} от потерянного кадра"
+        );
     }
 
     /// RTO растёт при подряд идущих таймаутах и возвращается к базовому значению после подтверждения.
@@ -881,31 +934,50 @@ mod tests {
         assert_eq!(rel.rto_backoff, 0);
     }
 
-    /// Регрессия: долгая потеря одного кадра при большом потоке не переполняет буфер честного пира.
-    #[test]
-    fn long_loss_of_one_frame_does_not_overflow_the_receiver() {
+    /// Отправитель и приёмник соединены в памяти. Головные кадры каналов `lost` теряются вместе с пакетами,
+    /// в которых идут, до истечения 20 с. Возвращает номера доставленных сообщений по каждому каналу.
+    /// Приёмник не должен закрываться ни с какой ошибкой: честный пир обязан выдержать такую потерю.
+    fn long_loss_of_heads(
+        channels: &[Channel],
+        lost: &[Channel],
+        per_channel: u32,
+    ) -> Vec<Vec<u32>> {
         let start = Instant::now();
+        let lost_until = start + Duration::from_secs(20);
         let mut sender = Reliability::new(start);
         let mut receiver = Reliability::new(start);
-        let total: u32 = 4_000;
-        let lost_until = start + Duration::from_secs(20);
-        let mut queued = 0u32;
+        let mut queued = vec![0u32; channels.len()];
+        let mut delivered: Vec<Vec<u32>> = vec![Vec::new(); channels.len()];
         let mut packet = 0u64;
-        let mut delivered: Vec<u32> = Vec::new();
         let mut now = start;
-        while delivered.len() < total as usize && now < start + Duration::from_secs(600) {
-            while queued < total {
-                let mut message = vec![0u8; FRAGMENT_PAYLOAD];
-                message[..4].copy_from_slice(&queued.to_be_bytes());
-                if sender.enqueue(Channel::Reliable, &message).is_err() {
+        let done = |delivered: &[Vec<u32>]| {
+            delivered
+                .iter()
+                .all(|numbers| numbers.len() >= per_channel as usize)
+        };
+        while !done(&delivered) && now < start + Duration::from_secs(600) {
+            // Сообщения ставятся по очереди в каждый канал, пока его очередь принимает их.
+            loop {
+                let mut progressed = false;
+                for (index, channel) in channels.iter().enumerate() {
+                    if queued[index] >= per_channel {
+                        continue;
+                    }
+                    let mut message = vec![0u8; FRAGMENT_PAYLOAD];
+                    message[..4].copy_from_slice(&queued[index].to_be_bytes());
+                    if sender.enqueue(*channel, &message).is_ok() {
+                        queued[index] += 1;
+                        progressed = true;
+                    }
+                }
+                if !progressed {
                     break;
                 }
-                queued += 1;
             }
             sender.on_timers(now);
             sender.refill(now);
             while sender.can_send() {
-                let frames = sender.take_frames(sender.tokens().min(1_100));
+                let frames = sender.take_frames(sender.tokens().min(DATAGRAM_ROOM));
                 if frames.is_empty() {
                     break;
                 }
@@ -914,23 +986,23 @@ mod tests {
                     .map(|frame| FRAME_HEADER + frame.payload.len())
                     .sum();
                 sender.spend(size);
-                let lost = now < lost_until
+                let lost_now = now < lost_until
                     && frames
                         .iter()
-                        .any(|frame| frame.channel == Channel::Reliable && frame.seq == 0);
+                        .any(|frame| lost.contains(&frame.channel) && frame.seq == 0);
                 sender.record_sent(packet, now, frames.clone());
-                if !lost {
+                if !lost_now {
                     receiver.note_received(packet, true);
                     for frame in frames {
                         let mut out = Vec::new();
                         receiver
                             .receive(frame, &mut out)
                             .expect("честный пир не закрыт");
-                        delivered.extend(
-                            out.into_iter().map(|(_, bytes)| {
-                                u32::from_be_bytes(bytes[..4].try_into().unwrap())
-                            }),
-                        );
+                        for (channel, bytes) in out {
+                            let index = channels.iter().position(|c| *c == channel).unwrap();
+                            delivered[index]
+                                .push(u32::from_be_bytes(bytes[..4].try_into().unwrap()));
+                        }
                     }
                 }
                 packet += 1;
@@ -940,7 +1012,25 @@ mod tests {
             }
             now += Duration::from_millis(10);
         }
-        assert_eq!(delivered, (0..total).collect::<Vec<_>>());
+        delivered
+    }
+
+    /// Регрессия: долгая потеря одного кадра при большом потоке не переполняет буфер честного пира.
+    #[test]
+    fn long_loss_of_one_frame_does_not_overflow_the_receiver() {
+        let delivered = long_loss_of_heads(&[Channel::Reliable], &[Channel::Reliable], 4_000);
+        assert_eq!(delivered[0], (0..4_000).collect::<Vec<_>>());
+    }
+
+    /// Регрессия: головные кадры обоих надёжных каналов теряются одновременно. Два канала с окном в 1024 кадра
+    /// занимали больше `MAX_BUFFERED_BYTES`, и приёмник закрывал честного пира с ошибкой переполнения буфера.
+    #[test]
+    fn long_loss_of_both_reliable_heads_does_not_overflow_the_receiver() {
+        let channels = [Channel::Reliable, Channel::Rpc];
+        let delivered = long_loss_of_heads(&channels, &channels, 2_000);
+        for numbers in &delivered {
+            assert_eq!(numbers, &(0..2_000).collect::<Vec<_>>());
+        }
     }
 
     #[test]

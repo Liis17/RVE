@@ -6,9 +6,15 @@ use std::time::{Duration, Instant};
 
 use engine_scene::network::PeerId;
 
-use crate::crypto::EphemeralKey;
-use crate::handshake::{COOKIE_BODY, Hello, confirm_datagram, hello_datagram};
-use crate::link::AUTH_BODY;
+use crate::crypto::{
+    EphemeralKey, Session, Transcript, derive_keys, password_hash, password_proof, reject_session,
+    transcript_hash,
+};
+use crate::handshake::{
+    COOKIE_BODY, HANDSHAKE_TIMEOUT, Hello, confirm_datagram, hello_datagram, parse_accept,
+    parse_reject,
+};
+use crate::link::{AUTH_BODY, OP_AUTH, OP_DISCONNECT, parse_disconnect};
 use crate::packet::{HEADER_LEN, Header, Kind, MAX_DATAGRAM, SEQ_LEN, TAG_LEN};
 use crate::server::{AUTH_FAILURE_LIMIT, MAX_HALF_OPEN_PER_IP};
 
@@ -699,12 +705,16 @@ fn forged_packets_get_at_most_one_reject_and_only_when_not_shorter() {
     let mut server = server_only(4);
     let now = Instant::now();
     let addr = client_addr(0);
-    let hello = fresh_hello();
-    let cookie = cookie_from(&server.handle_datagram(addr, &hello_datagram(&hello), now));
-    let out = server.handle_datagram(addr, &confirm_datagram(&cookie, &hello), now);
-    let (_, accept) = out.datagrams.first().expect("Accept");
-    let conn_id = Header::decode(accept).unwrap().conn_id;
+    let open = |server: &mut Server| -> u32 {
+        let hello = fresh_hello();
+        let cookie = cookie_from(&server.handle_datagram(addr, &hello_datagram(&hello), now));
+        let out = server.handle_datagram(addr, &confirm_datagram(&cookie, &hello), now);
+        let (_, accept) = out.datagrams.first().expect("Accept");
+        Header::decode(accept).unwrap().conn_id
+    };
 
+    // Короткий мусор без ответа, но он потребляет полуоткрытую сессию: повтор на ней ответа не даёт.
+    let conn_id = open(&mut server);
     let short = data_datagram(conn_id, 40);
     assert!(
         server
@@ -713,7 +723,15 @@ fn forged_packets_get_at_most_one_reject_and_only_when_not_shorter() {
             .is_empty(),
         "короткий запрос без ответа"
     );
+    assert!(
+        server
+            .handle_datagram(addr, &data_datagram(conn_id, AUTH_DATAGRAM), now)
+            .datagrams
+            .is_empty(),
+        "потреблённая сессия не отвечает"
+    );
 
+    let conn_id = open(&mut server);
     let long = data_datagram(conn_id, AUTH_DATAGRAM);
     let reply = server.handle_datagram(addr, &long, now).datagrams;
     assert_eq!(reply.len(), 1, "отказ на длинный запрос");
@@ -760,20 +778,187 @@ fn repeated_wrong_passwords_from_one_address_are_refused_for_a_while() {
             at,
         )
         .unwrap();
-        attempt(&mut server, &mut client, from, at)
+        let mut reasons = attempt(&mut server, &mut client, from, at);
+        // Обычный отказ на этапе рукопожатия не обрывает соединение сразу: клиент показывает его по таймауту.
+        reasons.extend(disconnect_reasons(
+            &client.update(at + HANDSHAKE_TIMEOUT).events,
+        ));
+        reasons
     };
     for _ in 0..AUTH_FAILURE_LIMIT {
         assert_eq!(try_wrong(now), vec!["не удалось проверить пароль"]);
     }
-    assert!(
-        try_wrong(now).is_empty(),
-        "после серии неудач адрес временно отклонён"
+    assert_eq!(
+        try_wrong(now),
+        vec!["слишком много попыток, повторите позже"],
+        "после серии неудач адрес временно отклонён явным отказом"
     );
     assert_eq!(
         try_wrong(now + Duration::from_secs(2)),
         vec!["не удалось проверить пароль"],
         "срок отказа истёк"
     );
+}
+
+/// Полуоткрытая сессия, открытая клиентом с известным ключом: по ней подделывается Auth с догадкой о пароле.
+struct HalfSession {
+    ephemeral: EphemeralKey,
+    server_public: [u8; 32],
+    transcript: [u8; 32],
+    conn_id: u32,
+}
+
+impl HalfSession {
+    fn open(server: &mut Server, from: SocketAddr, now: Instant) -> Self {
+        let ephemeral = EphemeralKey::random().unwrap();
+        let hello = Hello {
+            client_public: ephemeral.public(),
+            nonce: [7; 16],
+            protocol_id: PROTOCOL,
+            scene_hash: SCENE,
+        };
+        let cookie = cookie_from(&server.handle_datagram(from, &hello_datagram(&hello), now));
+        let out = server.handle_datagram(from, &confirm_datagram(&cookie, &hello), now);
+        let (_, accept) = out.datagrams.first().expect("Accept");
+        let conn_id = Header::decode(accept).unwrap().conn_id;
+        let (server_public, identity_public, _) = parse_accept(&accept[HEADER_LEN..]).unwrap();
+        let transcript = transcript_hash(&Transcript {
+            protocol_id: &PROTOCOL,
+            scene_hash: &SCENE,
+            client_public: &hello.client_public,
+            nonce: &hello.nonce,
+            server_public: &server_public,
+            identity_public: &identity_public,
+            conn_id,
+        });
+        Self {
+            ephemeral,
+            server_public,
+            transcript,
+            conn_id,
+        }
+    }
+
+    /// Auth нужной длины, запечатанный ключом догадки. Длина `AUTH_BODY` — честный формат.
+    fn guess(&self, guess: Option<&Password>, body_len: usize) -> Vec<u8> {
+        let shared = self.ephemeral.agree(&self.server_public).unwrap();
+        let keys = derive_keys(&shared, &self.transcript, &password_hash(guess));
+        let mut session = Session::new(&keys.client_to_server, &keys.server_to_client);
+        let mut body = vec![OP_AUTH];
+        body.extend_from_slice(&password_proof(guess, &self.transcript));
+        body.resize(body_len, 0);
+        session.seal(self.conn_id, &body).unwrap().1
+    }
+
+    /// Ответ сервера на датаграмму, расшифрованный ключом отказа. `None` — ответа нет.
+    fn answer(
+        &self,
+        server: &mut Server,
+        from: SocketAddr,
+        datagram: &[u8],
+        now: Instant,
+    ) -> Option<String> {
+        let out = server.handle_datagram(from, datagram, now);
+        assert!(
+            out.datagrams.len() <= 1,
+            "не больше одного ответа на запрос"
+        );
+        let (_, reply) = out.datagrams.first()?;
+        let shared = self.ephemeral.agree(&self.server_public).unwrap();
+        let (_, body) = reject_session(&shared, &self.transcript).open(reply)?;
+        assert_eq!(body.first(), Some(&OP_DISCONNECT));
+        Some(parse_disconnect(&body[1..]))
+    }
+}
+
+fn password_server(password: &str) -> Server {
+    Server::new(
+        ServerConfig {
+            protocol_id: PROTOCOL,
+            scene_hash: SCENE,
+            max_clients: 2,
+            password: Some(Password::new(password)),
+            timeout: TIMEOUT,
+        },
+        ServerIdentity::ephemeral().unwrap(),
+        Instant::now(),
+    )
+    .unwrap()
+}
+
+/// Регрессия: короткий Auth с верным ключом и Auth неверной длины обходили счётчик неудач и давали
+/// отличимый ответ. Теперь любая догадка учитывается, а ответ зависит только от того, прошла ли она
+/// (короткий запрос не получает отказа), но не от верности ключа.
+#[test]
+fn guessed_passwords_get_one_answer_whatever_their_length_and_always_count() {
+    const SHORT: usize = 33;
+    const LONG: usize = AUTH_BODY + 1;
+    let mut server = password_server("верный");
+    let now = Instant::now();
+    let from = client_addr(0);
+    let wrong = Password::new("неверный");
+    let right = Password::new("верный");
+    let cases = [
+        (&wrong, SHORT),
+        (&right, SHORT),
+        (&wrong, LONG),
+        (&right, LONG),
+        (&wrong, SHORT),
+    ];
+    let mut answers = Vec::new();
+    for (guess, body_len) in cases {
+        let half = HalfSession::open(&mut server, from, now);
+        let datagram = half.guess(Some(guess), body_len);
+        answers.push(half.answer(&mut server, from, &datagram, now));
+    }
+    assert_eq!(
+        answers,
+        vec![
+            None,
+            None,
+            Some("не удалось проверить пароль".to_owned()),
+            Some("не удалось проверить пароль".to_owned()),
+            None,
+        ],
+        "верная и неверная догадка одной длины получают одинаковый ответ"
+    );
+
+    let hello = fresh_hello();
+    let cookie = cookie_from(&server.handle_datagram(from, &hello_datagram(&hello), now));
+    let out = server.handle_datagram(from, &confirm_datagram(&cookie, &hello), now);
+    let (_, reject) = out.datagrams.first().expect("явный отказ, а не молчание");
+    assert_eq!(kind_of(reject), Some(Kind::Reject));
+    assert_eq!(
+        parse_reject(&reject[HEADER_LEN..]),
+        "слишком много попыток, повторите позже"
+    );
+}
+
+/// Счётчик неудач сбрасывается после десяти минут без неудач: редкие ошибки не приводят к блокировке.
+#[test]
+fn failure_counter_decays_after_ten_minutes_without_failures() {
+    let mut server = password_server("верный");
+    let now = Instant::now();
+    let from = client_addr(0);
+    let wrong = Password::new("неверный");
+    for _ in 0..AUTH_FAILURE_LIMIT - 1 {
+        let half = HalfSession::open(&mut server, from, now);
+        let datagram = half.guess(Some(&wrong), AUTH_BODY + 1);
+        assert_eq!(
+            half.answer(&mut server, from, &datagram, now),
+            Some("не удалось проверить пароль".to_owned())
+        );
+    }
+    let later = now + Duration::from_secs(600);
+    for _ in 0..AUTH_FAILURE_LIMIT - 1 {
+        let half = HalfSession::open(&mut server, from, later);
+        let datagram = half.guess(Some(&wrong), AUTH_BODY + 1);
+        assert_eq!(
+            half.answer(&mut server, from, &datagram, later),
+            Some("не удалось проверить пароль".to_owned()),
+            "после паузы счётчик начинается заново"
+        );
+    }
 }
 
 /// Переполнение надёжной очереди отключает медленного пира с причиной, а не теряет сообщения молча.
