@@ -621,12 +621,15 @@ impl PhysicsWorld {
         Ok(events)
     }
 
-    /// Статик, который появился или сдвинулся, может оказаться под спящими телами. Broadphase
-    /// спящие тела с неактивными не сравнивает, поэтому будим такие тела по AABB.
+    /// Статик или неподвижный kinematic, который появился или сдвинулся, может оказаться под
+    /// спящими телами. Broadphase спящие тела с неактивными не сравнивает, поэтому будим такие
+    /// тела по AABB. Движущийся kinematic будит спящих контактом (`wake_contact_pair`).
     fn wake_sleepers_under_changed_statics(&mut self) -> Result<(), PhysicsWorldError> {
         let mut changed = Vec::new();
         for body in self.bodies.values() {
-            if body.kind == BodyKind::Static
+            let stationary_blocker = body.kind == BodyKind::Static
+                || (body.kind == BodyKind::Kinematic && !is_moving_kinematic(body));
+            if stationary_blocker
                 && !body.collider.trigger
                 && body.collider.enabled
                 && body.pending_refresh
@@ -804,6 +807,17 @@ impl PhysicsWorld {
     /// Будит тело вместе с его островом: спящие динамические тела, связанные контактами, тоже
     /// поднимаются в этом же вызове.
     fn wake_body(&mut self, handle: BodyHandle) {
+        let Some(body) = self.bodies.get_mut(&handle) else {
+            return;
+        };
+        if body.kind != BodyKind::Dynamic {
+            return;
+        }
+        // Бодрствующий остров не содержит спящих соседей, поэтому достаточно сбросить таймер тела.
+        if !body.sleeping {
+            body.wake();
+            return;
+        }
         let graph = self.dynamic_contact_graph();
         let mut pending = vec![handle];
         let mut visited = HashSet::new();
@@ -2672,6 +2686,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(driver.world().body_is_sleeping(top), Some(false));
+    }
+
+    #[test]
+    fn stationary_kinematic_inserted_against_a_sleeping_box_wakes_it() {
+        let (mut driver, boxes) = sleeping_stack_driver();
+        let top = *boxes.last().unwrap();
+        driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: BodyHandle(100),
+                    desc: BodyDesc::new(
+                        BodyKind::Kinematic,
+                        Pose::new(Vec3::new(0.0, 2.5, 0.0), Quat::IDENTITY).unwrap(),
+                        ColliderDesc::new(box_shape(0.5)),
+                    ),
+                }],
+                [],
+            )
+            .unwrap();
+        assert_eq!(driver.world().body_is_sleeping(top), Some(false));
+    }
+
+    #[test]
+    fn stationary_kinematic_teleported_against_a_sleeping_box_wakes_it() {
+        let (mut driver, boxes) = sleeping_stack_driver();
+        let top = *boxes.last().unwrap();
+        driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: BodyHandle(100),
+                    desc: BodyDesc::new(
+                        BodyKind::Kinematic,
+                        Pose::new(Vec3::new(10.0, 0.5, 0.0), Quat::IDENTITY).unwrap(),
+                        ColliderDesc::new(box_shape(0.5)),
+                    ),
+                }],
+                [],
+            )
+            .unwrap();
+        assert_eq!(driver.world().body_is_sleeping(top), Some(true));
+        driver
+            .advance_step(
+                1.0 / 60.0,
+                [PhysicsCommand::Teleport {
+                    body: BodyHandle(100),
+                    pose: Pose::new(Vec3::new(0.0, 2.5, 0.0), Quat::IDENTITY).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(driver.world().body_is_sleeping(top), Some(false));
+    }
+
+    #[test]
+    fn commands_on_an_awake_body_leave_an_unrelated_sleeping_stack_alone() {
+        let (mut driver, boxes) = sleeping_stack_driver();
+        let far = BodyHandle(100);
+        driver
+            .advance_step_with_changes(
+                1.0 / 60.0,
+                [BodyChange::Insert {
+                    handle: far,
+                    desc: BodyDesc::dynamic(
+                        box_shape(0.5),
+                        Pose::new(Vec3::new(10.0, 5.0, 0.0), Quat::IDENTITY).unwrap(),
+                        1.0,
+                    ),
+                }],
+                [],
+            )
+            .unwrap();
+        run_steps(&mut driver, 10);
+        assert_eq!(driver.world().body_is_sleeping(far), Some(false));
+
+        driver
+            .advance_step(
+                1.0 / 60.0,
+                [
+                    PhysicsCommand::SetVelocity {
+                        body: far,
+                        velocity: Vec3::Y,
+                    },
+                    PhysicsCommand::AddImpulse {
+                        body: far,
+                        impulse: Vec3::X,
+                        point: None,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(driver.world().body_is_sleeping(far), Some(false));
+        for handle in &boxes {
+            assert_eq!(driver.world().body_is_sleeping(*handle), Some(true));
+            assert_eq!(driver.world().body_velocity(*handle), Some(Vec3::ZERO));
+        }
     }
 
     #[test]
