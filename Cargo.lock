@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -2721,7 +2721,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rve-build"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "engine-assets",
  "engine-files",

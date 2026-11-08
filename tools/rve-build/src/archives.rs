@@ -375,6 +375,42 @@ Material: 3000, "Material::Paint", "" { Version: 102 ShadingModel: "lambert" }
         assert!(error.to_string().contains("/cameras/shared.camerasettings"));
         assert!(error.to_string().contains("0 и 180"));
     }
+
+    #[test]
+    fn rejects_invalid_postprocess_during_project_preparation() {
+        let project_root = TempDir::create(&std::env::temp_dir(), "rve-build-postprocess").unwrap();
+        create_demo_like_project(project_root.path());
+        let assets = project_root.path().join("Assets");
+        fs::write(
+            assets.join("cameras/post.postprocess"),
+            "[bloom]\nenabled = true\nintensity = -1.0\n",
+        )
+        .unwrap();
+        let scene = assets.join("scenes/main.rvescene");
+        let source = fs::read_to_string(&scene).unwrap();
+        let patched = source
+            .replacen(
+                "[[assets]]\npath = \"/cameras/shared.camerasettings\"",
+                "[[assets]]\npath = \"/cameras/shared.camerasettings\"\n[[assets]]\npath = \"/cameras/post.postprocess\"",
+                1,
+            )
+            .replacen(
+                "settings = \"/cameras/shared.camerasettings\"",
+                "settings = \"/cameras/shared.camerasettings\"\npost_process = \"/cameras/post.postprocess\"",
+                1,
+            );
+        assert_ne!(
+            patched, source,
+            "fixture scene must reference the post process file"
+        );
+        fs::write(&scene, patched).unwrap();
+        let error = prepare_project(project_root.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("/cameras/post.postprocess"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("intensity"), "{error}");
+    }
 }
 
 #[cfg(test)]
