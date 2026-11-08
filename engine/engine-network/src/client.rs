@@ -315,6 +315,7 @@ impl Client {
                 now,
                 self.settings.timeout,
             );
+            out.events.push(NetworkEvent::LocalPeer { peer });
             out.events.push(NetworkEvent::Connected {
                 peer: SERVER_PEER_ID,
             });

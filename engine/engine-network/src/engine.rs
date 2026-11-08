@@ -387,7 +387,8 @@ impl NetworkEngine {
 /// Пир, к которому относится событие.
 fn event_peer(event: &NetworkEvent) -> PeerId {
     match event {
-        NetworkEvent::Connected { peer }
+        NetworkEvent::LocalPeer { peer }
+        | NetworkEvent::Connected { peer }
         | NetworkEvent::Disconnected { peer, .. }
         | NetworkEvent::Message { peer, .. } => *peer,
     }

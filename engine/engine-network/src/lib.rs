@@ -4,18 +4,23 @@
 //! время, они возвращают исходящие датаграммы и события ([`Output`]). [`NetworkEngine`] владеет
 //! сокетом и потоком `rve-network`, [`NetworkHandle`] даёт доступ к нему из других потоков.
 
+mod bridge;
 mod client;
 pub mod codec;
 mod crypto;
 mod engine;
 mod error;
 mod handshake;
+mod interpolation;
 mod link;
 mod packet;
 mod reliable;
+pub mod replication;
 mod server;
 mod transport;
 
+#[cfg(test)]
+mod bridge_tests;
 #[cfg(test)]
 mod tests;
 
@@ -25,6 +30,9 @@ use engine_scene::network::PeerId;
 
 use crate::packet::{FRAGMENT_PAYLOAD, MAX_MESSAGE_BYTES};
 
+pub use bridge::{
+    BridgeConfig, FAULT_LIMIT, FAULT_WINDOW, NetLink, NetworkBridge, SpawnedRoot, WorldSink,
+};
 pub use client::{Client, ClientConfig};
 pub use crypto::{Password, ServerIdentity};
 pub use engine::{NetRole, NetworkConfig, NetworkEngine, NetworkHandle};
@@ -81,6 +89,8 @@ pub(crate) fn check_message_size(channel: Channel, size: usize) -> Result<(), Ne
 /// Событие сети для приложения.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkEvent {
+    /// Номер, который сервер выдал этому клиенту. Приходит перед `Connected`.
+    LocalPeer { peer: PeerId },
     /// Участник подключён. На клиенте `peer` — сервер.
     Connected { peer: PeerId },
     /// Участник отключён; `reason` — причина на русском языке.

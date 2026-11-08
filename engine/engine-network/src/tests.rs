@@ -130,12 +130,22 @@ impl World {
         fingerprint: Option<[u8; 32]>,
         protocol: [u8; 32],
     ) -> usize {
+        self.add_client_with_scene(password, fingerprint, protocol, SCENE)
+    }
+
+    fn add_client_with_scene(
+        &mut self,
+        password: Option<&str>,
+        fingerprint: Option<[u8; 32]>,
+        protocol: [u8; 32],
+        scene: [u8; 32],
+    ) -> usize {
         let index = self.clients.len();
         let addr = client_addr(index);
         let client = Client::new(
             ClientConfig {
                 protocol_id: protocol,
-                scene_hash: SCENE,
+                scene_hash: scene,
                 server: server_addr(),
                 insecure_no_pin: fingerprint.is_none(),
                 fingerprint,
@@ -352,6 +362,18 @@ fn protocol_mismatch_is_refused_with_reason() {
     assert_eq!(
         disconnect_reasons(&world.clients[index].events),
         vec!["протокол не совпадает"]
+    );
+}
+
+#[test]
+fn scene_mismatch_is_refused_with_reason() {
+    let mut world = World::new(2, None, Faults::default(), 5);
+    let fingerprint = world.fingerprint;
+    let index = world.add_client_with_scene(None, Some(fingerprint), PROTOCOL, [7; 32]);
+    assert!(!world.connect(index));
+    assert_eq!(
+        disconnect_reasons(&world.clients[index].events),
+        vec!["версия сцены не совпадает"]
     );
 }
 

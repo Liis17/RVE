@@ -13,7 +13,11 @@ chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
 engine-scene = { path = "../engine-scene" }
 flume.workspace = true
+glam.workspace = true
 getrandom.workspace = true
 log.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+engine-files = { path = "../engine-files" }
