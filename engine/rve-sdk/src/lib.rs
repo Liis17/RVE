@@ -375,6 +375,11 @@ pub trait Script: 'static {
     fn on_trigger_enter(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
     /// Called when this object stops overlapping a trigger.
     fn on_trigger_exit(&mut self, _ctx: &mut Context<'_>, _other: Object) {}
+    /// Called when this instance starts running: it was enabled and its object is active.
+    /// Runs right before `on_start` on the first run.
+    fn on_enable(&mut self, _ctx: &mut Context<'_>) {}
+    /// Called when a running instance stops: it was disabled or its object became inactive.
+    fn on_disable(&mut self, _ctx: &mut Context<'_>) {}
     /// Called when the script host is destroyed after this instance has started.
     fn on_destroy(&mut self, _ctx: &mut Context<'_>) {}
     /// Called when a registered developer-console command is submitted.
@@ -2184,6 +2189,252 @@ impl Object {
     }
 }
 
+/// Reads a host handle list in two calls: the first learns the total count, the second fills a
+/// buffer of that size. Returns an empty list if the host refuses either call.
+fn host_handles(mut call: impl FnMut(*mut u64, usize, *mut usize) -> bool) -> Vec<Object> {
+    let mut count = 0usize;
+    if !call(std::ptr::null_mut(), 0, &mut count) {
+        return Vec::new();
+    }
+    let mut handles = vec![0u64; count];
+    let mut written = 0usize;
+    if !call(handles.as_mut_ptr(), count, &mut written) {
+        return Vec::new();
+    }
+    handles.truncate(written.min(count));
+    handles
+        .into_iter()
+        .filter(|&handle| handle != 0)
+        .map(|handle| Object { handle })
+        .collect()
+}
+
+impl Object {
+    /// Returns the parent object, or `None` for a root object or an unavailable one.
+    pub fn parent(&self, ctx: &mut Context<'_>) -> Option<Object> {
+        let callback = ctx.host.object_parent?;
+        let mut parent = 0u64;
+        // SAFETY: the host context and the output slot are valid for this callback.
+        let ok = unsafe { callback(ctx.host.ctx, self.handle, &mut parent) };
+        (ok && parent != 0).then_some(Object { handle: parent })
+    }
+
+    /// Returns direct children in document and spawn order; empty for an unavailable object.
+    pub fn children(&self, ctx: &mut Context<'_>) -> Vec<Object> {
+        let Some(callback) = ctx.host.object_children else {
+            return Vec::new();
+        };
+        let (host, handle) = (ctx.host.ctx, self.handle);
+        // SAFETY: the host context and output buffers are valid for each call.
+        host_handles(|out, capacity, count| unsafe { callback(host, handle, out, capacity, count) })
+    }
+
+    /// Sets the parent (`None` makes a root). `keep_world` keeps the world pose.
+    pub fn set_parent(
+        &self,
+        ctx: &mut Context<'_>,
+        parent: Option<Object>,
+        keep_world: bool,
+    ) -> bool {
+        let Some(callback) = ctx.host.object_set_parent else {
+            return false;
+        };
+        let parent = parent.map_or(0, |parent| parent.handle);
+        // SAFETY: the host context is valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, parent, keep_world) }
+    }
+
+    /// Returns this object's own active flag; `None` if the object is unavailable.
+    pub fn is_active(&self, ctx: &mut Context<'_>) -> Option<bool> {
+        bool_query(ctx.host.object_is_active, ctx, self.handle)
+    }
+
+    /// Returns whether this object and all its ancestors are active.
+    pub fn active_in_hierarchy(&self, ctx: &mut Context<'_>) -> Option<bool> {
+        bool_query(ctx.host.object_active_in_hierarchy, ctx, self.handle)
+    }
+
+    /// Sets this object's own active flag. Returns false if the write is refused.
+    pub fn set_active(&self, ctx: &mut Context<'_>, active: bool) -> bool {
+        let Some(callback) = ctx.host.object_set_active else {
+            return false;
+        };
+        // SAFETY: the host context is valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, active) }
+    }
+
+    /// Returns the world position.
+    pub fn world_position(&self, ctx: &mut Context<'_>) -> Option<[f32; 3]> {
+        vec3_query(ctx.host.object_world_position, ctx, self.handle)
+    }
+
+    /// Sets the world position, keeping the parent space in mind.
+    pub fn set_world_position(&self, ctx: &mut Context<'_>, position: [f32; 3]) -> bool {
+        let Some(callback) = ctx.host.object_set_world_position else {
+            return false;
+        };
+        // SAFETY: the host context and the vector are valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, &position) }
+    }
+
+    /// Returns the world rotation as Euler angles in degrees.
+    pub fn world_rotation(&self, ctx: &mut Context<'_>) -> Option<[f32; 3]> {
+        vec3_query(ctx.host.object_world_rotation, ctx, self.handle)
+    }
+
+    /// Sets the world rotation from Euler angles in degrees.
+    pub fn set_world_rotation(&self, ctx: &mut Context<'_>, rotation_deg: [f32; 3]) -> bool {
+        let Some(callback) = ctx.host.object_set_world_rotation else {
+            return false;
+        };
+        // SAFETY: the host context and the vector are valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, &rotation_deg) }
+    }
+
+    /// Returns the tag; an empty string means no tag.
+    pub fn tag(&self, ctx: &mut Context<'_>) -> Option<String> {
+        let callback = ctx.host.object_tag?;
+        let mut value = RveStr::from_static("");
+        // SAFETY: the host context and the output slot are valid for this callback.
+        if !unsafe { callback(ctx.host.ctx, self.handle, &mut value) } {
+            return None;
+        }
+        // SAFETY: the host keeps the string valid for the duration of this callback.
+        unsafe { value.to_str() }.ok().map(str::to_owned)
+    }
+
+    /// Sets the tag `[A-Za-z0-9_-]{1,64}`, or an empty string to clear it.
+    pub fn set_tag(&self, ctx: &mut Context<'_>, tag: &str) -> bool {
+        let Some(callback) = ctx.host.object_set_tag else {
+            return false;
+        };
+        // SAFETY: the borrowed string is valid for this call.
+        unsafe { callback(ctx.host.ctx, self.handle, RveStr::from_str_ref(tag)) }
+    }
+
+    /// Returns the layer index `0..32`.
+    pub fn layer(&self, ctx: &mut Context<'_>) -> Option<u32> {
+        let callback = ctx.host.object_layer?;
+        let mut layer = 0u32;
+        // SAFETY: the host context and the output slot are valid for this callback.
+        (unsafe { callback(ctx.host.ctx, self.handle, &mut layer) }).then_some(layer)
+    }
+
+    /// Sets the layer index `0..32`.
+    pub fn set_layer(&self, ctx: &mut Context<'_>, layer: u32) -> bool {
+        let Some(callback) = ctx.host.object_set_layer else {
+            return false;
+        };
+        // SAFETY: the host context is valid for this callback.
+        unsafe { callback(ctx.host.ctx, self.handle, layer) }
+    }
+
+    /// Returns whether the object has the named component (see [`crate::abi::RVE_COMPONENT_NAMES`]),
+    /// or `script:<path>` for an attached Lua script.
+    pub fn has_component(&self, ctx: &mut Context<'_>, name: &str) -> bool {
+        let Some(callback) = ctx.host.object_has_component else {
+            return false;
+        };
+        let mut present = false;
+        // SAFETY: the borrowed name and the output slot are valid for this callback.
+        let ok = unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                RveStr::from_str_ref(name),
+                &mut present,
+            )
+        };
+        ok && present
+    }
+
+    /// Returns the names of the built-in components this object has.
+    pub fn components(&self, ctx: &mut Context<'_>) -> Vec<&'static str> {
+        crate::abi::RVE_COMPONENT_NAMES
+            .into_iter()
+            .filter(|name| self.has_component(ctx, name))
+            .collect()
+    }
+}
+
+fn bool_query(
+    callback: Option<abi::RveObjectBoolQueryFn>,
+    ctx: &mut Context<'_>,
+    handle: u64,
+) -> Option<bool> {
+    let callback = callback?;
+    let mut value = false;
+    // SAFETY: the host context and the output slot are valid for this callback.
+    (unsafe { callback(ctx.host.ctx, handle, &mut value) }).then_some(value)
+}
+
+fn vec3_query(
+    callback: Option<abi::RveObjectVec3QueryFn>,
+    ctx: &mut Context<'_>,
+    handle: u64,
+) -> Option<[f32; 3]> {
+    let callback = callback?;
+    let mut value = [0.0; 3];
+    // SAFETY: the host context and the output slot are valid for this callback.
+    (unsafe { callback(ctx.host.ctx, handle, &mut value) }).then_some(value)
+}
+
+impl Context<'_> {
+    /// Finds the first live object with this display name, including inactive ones.
+    pub fn find_by_name(&self, name: &str) -> Option<Object> {
+        self.find_list(self.host.find_objects_by_name, name)
+            .into_iter()
+            .next()
+    }
+
+    /// Finds every live object with this display name.
+    pub fn find_all_by_name(&self, name: &str) -> Vec<Object> {
+        self.find_list(self.host.find_objects_by_name, name)
+    }
+
+    /// Finds the first live object with this tag.
+    pub fn find_with_tag(&self, tag: &str) -> Option<Object> {
+        self.find_list(self.host.find_objects_by_tag, tag)
+            .into_iter()
+            .next()
+    }
+
+    /// Finds every live object with this tag.
+    pub fn find_all_with_tag(&self, tag: &str) -> Vec<Object> {
+        self.find_list(self.host.find_objects_by_tag, tag)
+    }
+
+    /// Sets this script instance's enabled flag. Applied after this callback commits.
+    pub fn set_enabled(&self, enabled: bool) -> bool {
+        let Some(callback) = self.host.script_set_enabled else {
+            return false;
+        };
+        // SAFETY: the host context is valid for this callback.
+        unsafe { callback(self.host.ctx, enabled) }
+    }
+
+    /// Returns this script instance's enabled flag; `false` if the host lacks the callback.
+    pub fn enabled(&self) -> bool {
+        let Some(callback) = self.host.script_enabled else {
+            return false;
+        };
+        let mut enabled = false;
+        // SAFETY: the host context and the output slot are valid for this callback.
+        unsafe { callback(self.host.ctx, &mut enabled) && enabled }
+    }
+
+    fn find_list(&self, callback: Option<abi::RveFindObjectsFn>, value: &str) -> Vec<Object> {
+        let Some(callback) = callback else {
+            return Vec::new();
+        };
+        let host = self.host.ctx;
+        // SAFETY: the host context and the borrowed string are valid for each call.
+        host_handles(|out, capacity, count| unsafe {
+            callback(host, RveStr::from_str_ref(value), out, capacity, count)
+        })
+    }
+}
+
 #[doc(hidden)]
 pub mod __private {
     use super::{CollisionContact, Context, Object, Params, Script, ValueError};
@@ -2213,6 +2464,8 @@ pub mod __private {
         command: RveCommandFn,
         collision: RveCollisionFn,
         net_event: RveNetEventFn,
+        enable: RveStartFn,
+        disable: RveStartFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -2228,6 +2481,8 @@ pub mod __private {
             command: Some(command),
             collision: Some(collision),
             net_event: Some(net_event),
+            on_enable: Some(enable),
+            on_disable: Some(disable),
         }
     }
 
@@ -2467,6 +2722,14 @@ pub mod __private {
 
     pub unsafe fn destroy(instance: *mut c_void, host: *const RveHost) -> RveStatus {
         unsafe { with_context(instance, host, |script, ctx| script.on_destroy(ctx)) }
+    }
+
+    pub unsafe fn enable(instance: *mut c_void, host: *const RveHost) -> RveStatus {
+        unsafe { with_context(instance, host, |script, ctx| script.on_enable(ctx)) }
+    }
+
+    pub unsafe fn disable(instance: *mut c_void, host: *const RveHost) -> RveStatus {
+        unsafe { with_context(instance, host, |script, ctx| script.on_disable(ctx)) }
     }
 
     pub unsafe fn drop_instance(instance: *mut c_void) -> RveStatus {
@@ -2843,6 +3106,20 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: host ABI owns the instance and call-scoped host pointer.
             unsafe { $crate::__private::destroy(instance, host) }
         }
+        unsafe extern "C" fn __rve_enable(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped host pointer.
+            unsafe { $crate::__private::enable(instance, host) }
+        }
+        unsafe extern "C" fn __rve_disable(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: host ABI owns the instance and call-scoped host pointer.
+            unsafe { $crate::__private::disable(instance, host) }
+        }
         unsafe extern "C" fn __rve_drop_instance(
             instance: *mut ::std::ffi::c_void,
         ) -> $crate::abi::RveStatus {
@@ -2860,6 +3137,8 @@ macro_rules! __rve_script_descriptor {
             __rve_command,
             __rve_collision,
             __rve_net_event,
+            __rve_enable,
+            __rve_disable,
             $crate::__rve_params!(@munch [] $($params)*),
         )
     }};

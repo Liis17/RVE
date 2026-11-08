@@ -1238,6 +1238,9 @@ pub struct LiteScript {
     pub path: VirtualPath,
     #[serde(default)]
     pub params: BTreeMap<String, ParamValue>,
+    /// Начальный флаг `script:set_enabled`; `false` создаёт экземпляр выключенным.
+    #[serde(default = "default_active", skip_serializing_if = "is_active")]
+    pub enabled: bool,
 }
 
 /// Фабрика скрипта, зарегистрированная игровым крейтом.
@@ -1247,6 +1250,9 @@ pub struct HeavyScript {
     pub name: String,
     #[serde(default)]
     pub params: BTreeMap<String, ParamValue>,
+    /// Начальный флаг `script:set_enabled`; `false` создаёт экземпляр выключенным.
+    #[serde(default = "default_active", skip_serializing_if = "is_active")]
+    pub enabled: bool,
 }
 
 fn validate_transform(source: &str, object: &SceneObject) -> Result<(), SceneError> {

@@ -12,11 +12,19 @@ use std::collections::HashSet;
 
 /// Изменение мира, которое скрипт ставит в очередь транзакции. Применяется через
 /// [`World::apply_edit`] строго в порядке записи.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ObjectEdit {
     SetActive {
         object: ObjectHandle,
         active: bool,
+    },
+    SetTag {
+        object: ObjectHandle,
+        tag: String,
+    },
+    SetLayer {
+        object: ObjectHandle,
+        layer: u8,
     },
     SetParent {
         object: ObjectHandle,
@@ -251,20 +259,22 @@ impl World {
 
     /// Применяет одно изменение; при ошибке мир не меняется.
     pub fn apply_edit(&mut self, edit: &ObjectEdit) -> Result<(), SceneError> {
-        match *edit {
-            ObjectEdit::SetActive { object, active } => self.set_active(object, active),
+        match edit {
+            ObjectEdit::SetActive { object, active } => self.set_active(*object, *active),
+            ObjectEdit::SetTag { object, tag } => self.set_tag(*object, tag.clone()),
+            ObjectEdit::SetLayer { object, layer } => self.set_layer(*object, *layer),
             ObjectEdit::SetParent {
                 object,
                 parent,
                 keep_world,
-            } => self.set_parent(object, parent, keep_world),
+            } => self.set_parent(*object, *parent, *keep_world),
             ObjectEdit::SetWorldPosition { object, position } => {
-                self.set_world_position(object, position)
+                self.set_world_position(*object, *position)
             }
             ObjectEdit::SetWorldRotation {
                 object,
                 rotation_deg,
-            } => self.set_world_rotation(object, rotation_deg),
+            } => self.set_world_rotation(*object, *rotation_deg),
         }
     }
 

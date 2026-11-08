@@ -493,6 +493,9 @@ pub struct PlaySession {
     rumble: Vec<RumbleRequest>,
     heavy: HeavyLoads,
     last_step: PlayStep,
+    /// Ошибки, которые не относятся к скриптам и ждут `drain_events`: например, отказ физики
+    /// при создании тела активированного объекта.
+    pending_events: Vec<ScriptEvent>,
 }
 
 /// The project's `[input.gamepad]` as the gamepad backend takes it.
@@ -725,6 +728,7 @@ impl PlaySession {
             frame: 0,
             last_tick: Instant::now(),
             last_step: PlayStep::default(),
+            pending_events: Vec::new(),
             input: ScriptInput::default(),
             pad_gate: PadGate::default(),
             rumble: Vec::new(),
@@ -926,6 +930,7 @@ impl PlaySession {
     /// синхронизации поз, поэтому новые тела не телепортируются. Выгрузка может сразу запросить
     /// новую загрузку (отложенный spawn), поэтому заявки вычитываются, пока очередь не опустеет.
     fn apply_world_changes(&mut self) {
+        self.apply_activity_changes();
         loop {
             let WorldChanges {
                 spawned,
@@ -944,6 +949,52 @@ impl PlaySession {
             }
             self.apply_spawns(spawned, &despawned);
             self.apply_prefab_requests(prefab_requests);
+        }
+    }
+
+    /// Переключает тела и звук объектов с изменившейся действующей активностью, как в `rve-runtime`:
+    /// тела неактивных объектов удаляются, тела активированных создаются заново, звук останавливается.
+    fn apply_activity_changes(&mut self) {
+        let changed = self.world.take_activity_changes();
+        if changed.is_empty() {
+            return;
+        }
+        let (hidden, shown): (Vec<ObjectHandle>, Vec<ObjectHandle>) = changed
+            .into_iter()
+            .partition(|&object| self.world.active_in_hierarchy(object) != Some(true));
+        if let Some(physics) = &mut self.physics {
+            physics.changes.extend(physics.sync.remove_objects(&hidden));
+            let bound: std::collections::HashSet<ObjectHandle> = physics
+                .sync
+                .bindings()
+                .iter()
+                .map(|binding| binding.object)
+                .collect();
+            let unbound: Vec<ObjectHandle> = shown
+                .into_iter()
+                .filter(|object| self.world.is_alive(*object) && !bound.contains(object))
+                .collect();
+            if !unbound.is_empty() {
+                match physics.sync.insert_objects(
+                    &self.world,
+                    &unbound,
+                    &physics.geometry,
+                    &mut physics.shapes,
+                ) {
+                    Ok(inserted) => physics.changes.extend(inserted),
+                    Err(error) => self.pending_events.push(physics_error_event(format!(
+                        "физика не создала тела активированных объектов: {error}"
+                    ))),
+                }
+            }
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.bridge.apply(
+                hidden
+                    .iter()
+                    .map(|&object| AudioRequest::StopSource { object }),
+                &self.world,
+            );
         }
     }
 
@@ -1003,6 +1054,7 @@ impl PlaySession {
                         self.world
                             .audio_source(object)
                             .is_some_and(|audio| audio.play_on_start)
+                            && self.world.active_in_hierarchy(object) == Some(true)
                     })
                     .map(|&object| AudioRequest::PlaySource {
                         object,
@@ -1094,7 +1146,9 @@ impl PlaySession {
     }
 
     pub fn drain_events(&mut self) -> Vec<ScriptEvent> {
-        self.host.drain_events()
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.extend(self.host.drain_events());
+        events
     }
 
     /// Предупреждения звука, которые ещё не показаны: клип не загрузился, устройство недоступно.
@@ -1116,7 +1170,8 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.destroy(&mut self.world, time);
         self.watchdog.set_deadline(None);
-        let mut events = self.host.drain_events();
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.extend(self.host.drain_events());
         if let Some(mut physics) = self.physics.take()
             && let Err(error) = physics.shutdown()
         {

@@ -232,6 +232,9 @@ pub(crate) struct Lifecycle {
     /// Заявки, ждущие загрузки префаба.
     pub(crate) waiting: Vec<SpawnRequest>,
     pub(crate) destroys: Vec<DestroyRequest>,
+    /// Закоммиченные `set_enabled`: серийный номер экземпляра и новый флаг. Хост применяет их
+    /// в конце фазы, а переходы `on_enable` и `on_disable` выполняет на следующей фазе.
+    pub(crate) enabled_writes: Vec<(u64, bool)>,
     /// Отложенные удаления: ранний срок побеждает.
     pub(crate) scheduled: HashMap<ObjectHandle, f64>,
     pub(crate) changes: WorldChanges,

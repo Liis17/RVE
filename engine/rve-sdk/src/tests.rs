@@ -550,6 +550,25 @@ fn host(state: &mut HostState) -> RveHost {
         net_object_has_authority: None,
         net_object_set_owner: None,
         net_object_send: None,
+        object_set_active: None,
+        object_is_active: None,
+        object_active_in_hierarchy: None,
+        object_parent: None,
+        object_set_parent: None,
+        object_children: None,
+        object_world_position: None,
+        object_set_world_position: None,
+        object_world_rotation: None,
+        object_set_world_rotation: None,
+        object_tag: None,
+        object_set_tag: None,
+        object_layer: None,
+        object_set_layer: None,
+        object_has_component: None,
+        find_objects_by_name: None,
+        find_objects_by_tag: None,
+        script_set_enabled: None,
+        script_enabled: None,
     }
 }
 
@@ -2003,7 +2022,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2273,7 +2292,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
 }
 
 #[test]
@@ -2293,11 +2312,33 @@ fn network_callbacks_and_v13_descriptor_layout_remain_compatible() {
         size_of::<crate::abi::RveScriptDescV13>(),
         size_of::<crate::abi::RveScriptDescV6>() + size_of::<Option<crate::abi::RveNetEventFn>>()
     );
+    // v14 changed the parameter descriptor contents but not the script descriptor's shape.
     assert_eq!(
-        size_of::<crate::abi::RveScriptDesc>(),
+        size_of::<crate::abi::RveScriptDescV14>(),
         size_of::<crate::abi::RveScriptDescV13>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 14);
+    assert_eq!(
+        offset_of!(RveScriptDesc, on_enable),
+        size_of::<crate::abi::RveScriptDescV14>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDesc>(),
+        size_of::<crate::abi::RveScriptDescV14>() + 2 * size_of::<Option<crate::abi::RveStartFn>>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 15);
+}
+
+#[test]
+fn object_hierarchy_callbacks_are_appended_after_the_v14_network_tail() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, object_set_active),
+        offset_of!(RveHost, net_object_send) + size_of::<Option<crate::abi::RveNetObjectSendFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, script_enabled) + size_of::<Option<crate::abi::RveScriptEnabledFn>>(),
+        size_of::<RveHost>()
+    );
 }
 
 unsafe extern "C" fn net_mode(ctx: *mut c_void) -> u32 {

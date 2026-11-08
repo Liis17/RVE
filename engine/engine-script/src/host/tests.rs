@@ -22,6 +22,9 @@ use std::time::Duration;
 #[path = "tests/parity.rs"]
 mod parity;
 
+#[path = "tests/activity.rs"]
+mod activity;
+
 fn world(source: &str) -> World {
     let source = if source.contains("[objects.camera]") {
         source.to_owned()

@@ -1551,6 +1551,7 @@ impl EditorScene {
                 .push(engine_scene::LiteScript {
                     path,
                     params: Default::default(),
+                    enabled: true,
                 });
             Ok(())
         })

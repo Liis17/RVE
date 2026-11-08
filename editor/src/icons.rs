@@ -278,6 +278,7 @@ mod tests {
             lite_scripts: vec![engine_scene::LiteScript {
                 path: VirtualPath::parse("/scripts/spin.lua").unwrap(),
                 params: Default::default(),
+                enabled: true,
             }],
             ..empty
         };

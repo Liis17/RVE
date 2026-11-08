@@ -3653,6 +3653,7 @@ fn show_add_component(ui: &mut egui::Ui, state: &mut EditorState, object: &Scene
                         object.heavy_scripts.push(HeavyScript {
                             name: script,
                             params: BTreeMap::new(),
+                            enabled: true,
                         });
                         Ok(())
                     })

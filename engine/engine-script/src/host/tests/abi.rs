@@ -14,7 +14,8 @@ use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
     RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParamDescV13, RveParams,
     RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6,
-    RveScriptDescV13, RveSpawnOptions, RveStatus, RveStr, RveTransform, RveUpdateFn, RveValue,
+    RveScriptDescV13, RveScriptDescV14, RveSpawnOptions, RveStatus, RveStr, RveTransform,
+    RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
@@ -1512,6 +1513,64 @@ fn v13_module() -> &'static RveModule {
     }))
 }
 
+/// Модуль ABI v14: descriptor без `on_enable` и `on_disable`, но с параметрами v14.
+fn v14_module() -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV14] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV14 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+                net_event: descriptor.net_event,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 14,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
+#[test]
+fn abi_v14_modules_load_on_the_v15_host_without_enable_callbacks() {
+    let _lock = test_lock();
+    let module = v14_module();
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v14" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v14"),
+        "guest ABI v14 runs on the v15 host"
+    );
+}
+
 #[test]
 fn abi_v11_rumble_requests_are_capped_per_frame_and_keep_guest_order() {
     let _lock = test_lock();
@@ -2215,6 +2274,8 @@ fn null_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2237,6 +2298,8 @@ fn null_name_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2260,6 +2323,8 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2663,6 +2728,8 @@ fn error_message_module() -> &'static RveModule {
             command: None,
             collision: None,
             net_event: None,
+            on_enable: None,
+            on_disable: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -2677,6 +2744,8 @@ fn error_message_module() -> &'static RveModule {
             command: None,
             collision: None,
             net_event: None,
+            on_enable: None,
+            on_disable: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -2707,6 +2776,8 @@ fn set_local_during_create_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2726,6 +2797,8 @@ fn poisoned_create_module() -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        on_enable: None,
+        on_disable: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3374,6 +3447,8 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         command: None,
         collision: None,
         net_event: None,
+        on_enable: None,
+        on_disable: None,
     }]));
     RveModule::new(scripts)
 }
@@ -3453,6 +3528,8 @@ fn malformed_parameter_tables_are_rejected() {
             command: None,
             collision: None,
             net_event: None,
+            on_enable: None,
+            on_disable: None,
         }]));
         module.scripts = scripts.as_ptr();
         module
@@ -3689,6 +3766,8 @@ fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
         command: None,
         collision: None,
         net_event: None,
+        on_enable: None,
+        on_disable: None,
     }]));
     Box::leak(Box::new(RveModule::new(scripts)))
 }

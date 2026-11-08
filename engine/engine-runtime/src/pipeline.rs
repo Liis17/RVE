@@ -1613,6 +1613,58 @@ impl SpawnPhysics {
     }
 }
 
+/// Переключает тела и звук объектов, у которых изменилась действующая активность: тела неактивных
+/// объектов удаляются, тела активированных создаются заново, источники звука неактивных
+/// объектов останавливаются. Тела вставляются и удаляются до `sync_world_commands`, как и spawn.
+fn apply_activity_changes(
+    world: &mut World,
+    physics: Option<&mut PhysicsSceneSync>,
+    spawn_physics: &mut SpawnPhysics,
+    audio: Option<&mut engine_audio::AudioBridge>,
+) {
+    let changed = world.take_activity_changes();
+    if changed.is_empty() {
+        return;
+    }
+    let (hidden, shown): (Vec<ObjectHandle>, Vec<ObjectHandle>) = changed
+        .into_iter()
+        .partition(|&object| world.active_in_hierarchy(object) != Some(true));
+    if let Some(sync) = physics {
+        spawn_physics.changes.extend(sync.remove_objects(&hidden));
+        let bound: std::collections::HashSet<ObjectHandle> = sync
+            .bindings()
+            .iter()
+            .map(|binding| binding.object)
+            .collect();
+        let unbound: Vec<ObjectHandle> = shown
+            .iter()
+            .copied()
+            .filter(|object| world.is_alive(*object) && !bound.contains(object))
+            .collect();
+        if !unbound.is_empty() {
+            match sync.insert_objects(
+                world,
+                &unbound,
+                &spawn_physics.geometry,
+                &mut spawn_physics.shapes,
+            ) {
+                Ok(inserted) => spawn_physics.changes.extend(inserted),
+                Err(error) => {
+                    log::warn!("физика не создала тела активированных объектов: {error}");
+                }
+            }
+        }
+    }
+    if let Some(audio) = audio {
+        audio.apply(
+            hidden
+                .iter()
+                .map(|&object| AudioRequest::StopSource { object }),
+            world,
+        );
+    }
+}
+
 /// Применяет spawn и destroy, закоммиченные скриптами в фазе: обновляет GPU-таблицу, физику и
 /// звук. Тела удаляются и вставляются до `sync_world_commands`, поэтому позы новых тел не дают
 /// ложных телепортаций. Возвращает корни созданных объектов для сетевого моста.
@@ -1625,6 +1677,12 @@ fn apply_world_changes(
     prefabs: &mut PrefabLoads,
     mut audio: Option<&mut engine_audio::AudioBridge>,
 ) -> Vec<SpawnedRoot> {
+    apply_activity_changes(
+        world,
+        physics.as_deref_mut(),
+        spawn_physics,
+        audio.as_deref_mut(),
+    );
     let mut roots = Vec::new();
     // Выгрузка может сразу запросить новую загрузку (отложенный spawn), поэтому заявки
     // вычитываются, пока очередь не опустеет.

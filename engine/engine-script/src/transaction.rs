@@ -14,9 +14,10 @@ use engine_physics::{
     QueryHit, Ray,
 };
 use engine_scene::{
-    AnimationRequest, AudioRequest, CameraSettings, LocalTransform, MAX_MESSAGE_DEPTH,
-    MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetMode, NetRequest, NetTarget, ObjectHandle,
-    ParamValue, PeerId, PostProcessSettings, SERVER_PEER_ID, World,
+    AnimationRequest, AudioRequest, CameraSettings, ComponentKind, LAYER_COUNT, LocalTransform,
+    MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetMode, NetRequest,
+    NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId, PostProcessSettings, SERVER_PEER_ID,
+    World,
 };
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
@@ -153,6 +154,8 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) lifecycle_writes: bool,
     /// Серийный номер экземпляра, который выполняет вызов; нужен для предупреждений.
     pub(crate) instance_serial: u64,
+    /// Пользовательский флаг `set_enabled` экземпляра до этого вызова.
+    pub(crate) instance_enabled: bool,
     /// Состояние курсора, применённое хостом до этого вызова.
     pub(crate) cursor: ScriptCursor,
     /// Режим сети, участники и сетевые атрибуты объектов.
@@ -231,6 +234,11 @@ pub(crate) struct ScriptTransaction {
     pending_ids: HashMap<String, ObjectHandle>,
     /// Предупреждения о мёртвых объектах; в журнал попадают только при коммите.
     pending_dead_warnings: Vec<(ObjectHandle, String)>,
+    /// Изменения мира в порядке записи; применяются через `World::apply_edit` при коммите.
+    pending_edits: Vec<ObjectEdit>,
+    /// Новое значение `set_enabled` экземпляра; применяется в `commit_lifecycle`.
+    pending_script_enabled: Option<bool>,
+    instance_enabled: bool,
     #[cfg(test)]
     peak_pending_bytes: usize,
 }
@@ -287,6 +295,9 @@ impl Default for ScriptTransaction {
             pending_prefab_requests: Vec::new(),
             pending_ids: HashMap::new(),
             pending_dead_warnings: Vec::new(),
+            pending_edits: Vec::new(),
+            pending_script_enabled: None,
+            instance_enabled: true,
             #[cfg(test)]
             peak_pending_bytes: 0,
         }
@@ -340,6 +351,9 @@ impl ScriptTransaction {
         self.lifecycle = init.lifecycle;
         self.lifecycle_writes = init.lifecycle_writes;
         self.instance_serial = init.instance_serial;
+        self.instance_enabled = init.instance_enabled;
+        self.pending_edits.clear();
+        self.pending_script_enabled = None;
         self.pending_spawns.clear();
         self.pending_destroys.clear();
         self.pending_prefab_requests.clear();
@@ -1041,6 +1055,180 @@ impl ScriptTransaction {
             .map(|slot| slot.status)
     }
 
+    /// Ставит изменение мира в очередь. Цель должна быть живым объектом; состав правок
+    /// проверяет коммит на копии мира, поэтому отказ отбрасывает весь вызов.
+    pub(crate) fn stage_edit(&mut self, edit: ObjectEdit) -> bool {
+        let target = match &edit {
+            ObjectEdit::SetActive { object, .. }
+            | ObjectEdit::SetTag { object, .. }
+            | ObjectEdit::SetLayer { object, .. }
+            | ObjectEdit::SetParent { object, .. }
+            | ObjectEdit::SetWorldPosition { object, .. }
+            | ObjectEdit::SetWorldRotation { object, .. } => *object,
+        };
+        let value_valid = match &edit {
+            ObjectEdit::SetTag { tag, .. } => {
+                tag.is_empty()
+                    || (tag.len() <= 64
+                        && tag.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                        }))
+            }
+            ObjectEdit::SetLayer { layer, .. } => *layer < LAYER_COUNT,
+            _ => true,
+        };
+        if !self.writable
+            || !value_valid
+            || self
+                .world()
+                .and_then(|world| world.object(target))
+                .is_none()
+        {
+            return false;
+        }
+        self.pending_edits.push(edit);
+        true
+    }
+
+    /// Проверяет заявки на копии мира: любая отказавшая заявка отбрасывает весь вызов.
+    fn probe_edits(&self, world: &World) -> Result<(), String> {
+        if self.pending_edits.is_empty() {
+            return Ok(());
+        }
+        let mut probe = world.clone();
+        for (handle, transform) in &self.pending_transforms {
+            probe
+                .set_local_transform(*handle, *transform)
+                .map_err(|error| error.to_string())?;
+        }
+        for edit in &self.pending_edits {
+            probe.apply_edit(edit).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Последняя заявка активности самого объекта в этом вызове.
+    fn pending_self_active(&self, handle: ObjectHandle) -> Option<bool> {
+        self.pending_edits.iter().rev().find_map(|edit| match edit {
+            ObjectEdit::SetActive { object, active } if *object == handle => Some(*active),
+            _ => None,
+        })
+    }
+
+    /// Собственная активность с учётом заявок этого вызова.
+    pub(crate) fn is_active(&self, handle: ObjectHandle) -> Option<bool> {
+        self.pending_self_active(handle)
+            .or_else(|| self.world()?.is_active(handle))
+    }
+
+    /// Действующая активность: заявки этого вызова учитываются для всех предков; родитель
+    /// берётся из мира, поэтому заявки `set_parent` видны только после коммита.
+    pub(crate) fn active_in_hierarchy(&self, handle: ObjectHandle) -> Option<bool> {
+        let world = self.world()?;
+        let mut current = Some(handle);
+        while let Some(object) = current {
+            let object_ref = world.object(object)?;
+            if !self
+                .pending_self_active(object)
+                .unwrap_or(object_ref.active)
+            {
+                return Some(false);
+            }
+            current = object_ref.parent;
+        }
+        Some(true)
+    }
+
+    /// Родитель с учётом заявок этого вызова; внешний `None` — объект мёртв.
+    pub(crate) fn parent(&self, handle: ObjectHandle) -> Option<Option<ObjectHandle>> {
+        let committed = self.world()?.object(handle)?.parent;
+        Some(
+            self.pending_edits
+                .iter()
+                .rev()
+                .find_map(|edit| match edit {
+                    ObjectEdit::SetParent { object, parent, .. } if *object == handle => {
+                        Some(*parent)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(committed),
+        )
+    }
+
+    /// Прямые потомки по последнему коммиту мира.
+    pub(crate) fn children(&self, handle: ObjectHandle) -> Option<Vec<ObjectHandle>> {
+        self.world()?.children(handle)
+    }
+
+    /// Мировая позиция по последнему коммиту мира.
+    pub(crate) fn world_position(&self, handle: ObjectHandle) -> Option<Vec3> {
+        self.world()?.world_position(handle)
+    }
+
+    /// Мировой поворот в градусах по последнему коммиту мира.
+    pub(crate) fn world_rotation_deg(&self, handle: ObjectHandle) -> Option<Vec3> {
+        self.world()?.world_rotation_deg(handle)
+    }
+
+    /// Тег с учётом заявок этого вызова; пустая строка означает отсутствие тега.
+    pub(crate) fn tag(&self, handle: ObjectHandle) -> Option<&str> {
+        let pending = self.pending_edits.iter().rev().find_map(|edit| match edit {
+            ObjectEdit::SetTag { object, tag } if *object == handle => Some(tag.as_str()),
+            _ => None,
+        });
+        pending.or_else(|| self.world()?.tag(handle))
+    }
+
+    /// Слой с учётом заявок этого вызова.
+    pub(crate) fn layer(&self, handle: ObjectHandle) -> Option<u8> {
+        let pending = self.pending_edits.iter().rev().find_map(|edit| match edit {
+            ObjectEdit::SetLayer { object, layer } if *object == handle => Some(*layer),
+            _ => None,
+        });
+        pending.or_else(|| self.world()?.layer(handle))
+    }
+
+    pub(crate) fn has_component(&self, handle: ObjectHandle, kind: &ComponentKind) -> Option<bool> {
+        self.world()?.has_component(handle, kind)
+    }
+
+    /// Живые объекты с этим отображаемым именем по последнему коммиту мира.
+    pub(crate) fn find_all_by_name(&self, name: &str) -> Vec<ObjectHandle> {
+        self.world()
+            .map(|world| world.find_all_by_name(name))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn find_by_name(&self, name: &str) -> Option<ObjectHandle> {
+        self.world()?.find_by_name(name)
+    }
+
+    /// Живые объекты с этим тегом по последнему коммиту мира.
+    pub(crate) fn find_all_with_tag(&self, tag: &str) -> Vec<ObjectHandle> {
+        self.world()
+            .map(|world| world.find_all_with_tag(tag))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn find_with_tag(&self, tag: &str) -> Option<ObjectHandle> {
+        self.world()?.find_with_tag(tag)
+    }
+
+    /// Пользовательский флаг экземпляра с учётом заявки этого вызова.
+    pub(crate) fn script_enabled(&self) -> bool {
+        self.pending_script_enabled.unwrap_or(self.instance_enabled)
+    }
+
+    /// Ставит новый флаг `set_enabled` текущего экземпляра. Применяется после успешного коммита.
+    pub(crate) fn set_script_enabled(&mut self, enabled: bool) -> bool {
+        if !self.writable {
+            return false;
+        }
+        self.pending_script_enabled = Some(enabled);
+        true
+    }
+
     pub(crate) fn object_id(&self, handle: ObjectHandle) -> Option<&str> {
         self.world()?
             .object(handle)
@@ -1386,6 +1574,10 @@ impl ScriptTransaction {
             self.discard();
             return Err("script selected an object without a camera as active".to_owned());
         }
+        if let Err(message) = self.probe_edits(world) {
+            self.discard();
+            return Err(message);
+        }
 
         let mut physics_commands = std::mem::take(&mut self.pending_physics_commands);
         if let Some(dt) = self
@@ -1439,6 +1631,11 @@ impl ScriptTransaction {
             world
                 .set_active_camera(handle)
                 .expect("validated active camera target remains present during commit");
+        }
+        for edit in self.pending_edits.drain(..) {
+            world
+                .apply_edit(&edit)
+                .expect("validated world edit remains applicable during commit");
         }
 
         self.physics.borrow_mut().commit(
@@ -1503,6 +1700,11 @@ impl ScriptTransaction {
             for request in self.pending_prefab_requests.drain(..) {
                 lifecycle.apply_prefab_request(request);
             }
+            if let Some(enabled) = self.pending_script_enabled.take() {
+                lifecycle
+                    .enabled_writes
+                    .push((self.instance_serial, enabled));
+            }
         }
         for (handle, message) in self.pending_dead_warnings.drain(..) {
             if self
@@ -1533,6 +1735,8 @@ impl ScriptTransaction {
         self.pending_prefab_requests.clear();
         self.pending_ids.clear();
         self.pending_dead_warnings.clear();
+        self.pending_edits.clear();
+        self.pending_script_enabled = None;
         self.pending_transforms.clear();
         self.pending_camera_settings.clear();
         self.pending_post_process.clear();

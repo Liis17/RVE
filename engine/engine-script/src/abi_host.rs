@@ -18,9 +18,9 @@ use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
     AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AudioGroup, AudioRequest,
-    CameraColorSettings, CameraRenderSettings, CameraSettings, ClipParams, ExposureMode, NetEvent,
-    NetMode, NetTarget, ObjectHandle, ParamValue, PeerId, PostProcessSettings, ProjectionSettings,
-    Tonemapper, VoiceId,
+    CameraColorSettings, CameraRenderSettings, CameraSettings, ClipParams, ComponentKind,
+    ExposureMode, NetEvent, NetMode, NetTarget, ObjectEdit, ObjectHandle, ParamValue, PeerId,
+    PostProcessSettings, ProjectionSettings, Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use rve_sdk::PhysicalInput;
@@ -236,6 +236,25 @@ impl<'a> AbiCallContext<'a> {
             net_object_has_authority: Some(host_net_object_has_authority),
             net_object_set_owner: Some(host_net_object_set_owner),
             net_object_send: Some(host_net_object_send),
+            object_set_active: Some(host_object_set_active),
+            object_is_active: Some(host_object_is_active),
+            object_active_in_hierarchy: Some(host_object_active_in_hierarchy),
+            object_parent: Some(host_object_parent),
+            object_set_parent: Some(host_object_set_parent),
+            object_children: Some(host_object_children),
+            object_world_position: Some(host_object_world_position),
+            object_set_world_position: Some(host_object_set_world_position),
+            object_world_rotation: Some(host_object_world_rotation),
+            object_set_world_rotation: Some(host_object_set_world_rotation),
+            object_tag: Some(host_object_tag),
+            object_set_tag: Some(host_object_set_tag),
+            object_layer: Some(host_object_layer),
+            object_set_layer: Some(host_object_set_layer),
+            object_has_component: Some(host_object_has_component),
+            find_objects_by_name: Some(host_find_objects_by_name),
+            find_objects_by_tag: Some(host_find_objects_by_tag),
+            script_set_enabled: Some(host_script_set_enabled),
+            script_enabled: Some(host_script_enabled),
         }
     }
 
@@ -354,6 +373,15 @@ impl AbiScriptInstance {
             unsafe {
                 match phase {
                     AbiPhase::Start => (self.descriptor.start)(self.instance, &host),
+                    // Descriptors without these callbacks have nothing to run on the transition.
+                    AbiPhase::Enable => match self.descriptor.on_enable {
+                        Some(callback) => callback(self.instance, &host),
+                        None => RveStatus::Ok,
+                    },
+                    AbiPhase::Disable => match self.descriptor.on_disable {
+                        Some(callback) => callback(self.instance, &host),
+                        None => RveStatus::Ok,
+                    },
                     AbiPhase::Update(dt) => (self.descriptor.update)(self.instance, &host, dt),
                     AbiPhase::Destroy => (self.descriptor.destroy)(self.instance, &host),
                 }
@@ -575,6 +603,8 @@ impl Drop for AbiScriptInstance {
 #[derive(Clone, Copy)]
 pub(crate) enum AbiPhase {
     Start,
+    Enable,
+    Disable,
     Update(f32),
     Destroy,
 }
@@ -1624,6 +1654,387 @@ unsafe extern "C" fn host_object_state(ctx: *mut c_void, object: u64) -> u32 {
             ObjectState::Pending => RVE_OBJECT_PENDING,
             ObjectState::Dead => RVE_OBJECT_DEAD,
         }
+    })
+}
+
+unsafe extern "C" fn host_object_set_active(ctx: *mut c_void, object: u64, active: bool) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        context.transaction.stage_edit(ObjectEdit::SetActive {
+            object: handle,
+            active,
+        })
+    })
+}
+
+/// Записывает флаг в `out`, если объект жив; общий путь для `is_active` и иерархической активности.
+fn object_bool(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut bool,
+    query: fn(&ScriptTransaction, ObjectHandle) -> Option<bool>,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(value) = query(context.transaction, handle) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the caller's stack slot.
+        unsafe { *out = value };
+        true
+    })
+}
+
+unsafe extern "C" fn host_object_is_active(ctx: *mut c_void, object: u64, out: *mut bool) -> bool {
+    object_bool(ctx, object, out, ScriptTransaction::is_active)
+}
+
+unsafe extern "C" fn host_object_active_in_hierarchy(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut bool,
+) -> bool {
+    object_bool(ctx, object, out, ScriptTransaction::active_in_hierarchy)
+}
+
+unsafe extern "C" fn host_object_parent(ctx: *mut c_void, object: u64, out: *mut u64) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(parent) = context.transaction.parent(handle) else {
+            return false;
+        };
+        let value = match parent {
+            Some(parent) => match context.transaction.abi_handle(parent) {
+                Some(value) => value,
+                None => return false,
+            },
+            None => 0,
+        };
+        // SAFETY: output was checked and points to the caller's stack slot.
+        unsafe { *out = value };
+        true
+    })
+}
+
+unsafe extern "C" fn host_object_set_parent(
+    ctx: *mut c_void,
+    object: u64,
+    parent: u64,
+    keep_world: bool,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let parent = if parent == 0 {
+            None
+        } else {
+            match context.transaction.object_from_abi_handle(parent) {
+                Some(parent) => Some(parent),
+                None => return false,
+            }
+        };
+        context.transaction.stage_edit(ObjectEdit::SetParent {
+            object: handle,
+            parent,
+            keep_world,
+        })
+    })
+}
+
+/// Копирует список хендлов в буфер гостя: пишет общее число и не больше `capacity` значений.
+fn write_handles(out: *mut u64, capacity: usize, count: *mut usize, handles: &[u64]) -> bool {
+    if count.is_null() || (capacity > 0 && out.is_null()) {
+        return false;
+    }
+    // SAFETY: the guest passes a writable count slot, checked above.
+    unsafe { *count = handles.len() };
+    for (index, handle) in handles.iter().take(capacity).enumerate() {
+        // SAFETY: `index` is below `capacity`, and the guest allocated `capacity` entries.
+        unsafe { *out.add(index) = *handle };
+    }
+    true
+}
+
+unsafe extern "C" fn host_object_children(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(children) = context.transaction.children(handle) else {
+            return false;
+        };
+        let values = children
+            .into_iter()
+            .filter_map(|child| context.transaction.abi_handle(child))
+            .collect::<Vec<_>>();
+        write_handles(out, capacity, count, &values)
+    })
+}
+
+/// Записывает вектор в `out`, если объект жив; общий путь для мировых позиции и поворота.
+fn object_vec3(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut [f32; 3],
+    query: fn(&ScriptTransaction, ObjectHandle) -> Option<Vec3>,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(value) = query(context.transaction, handle) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the caller's stack slot.
+        unsafe { *out = value.to_array() };
+        true
+    })
+}
+
+unsafe extern "C" fn host_object_world_position(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut [f32; 3],
+) -> bool {
+    object_vec3(ctx, object, out, ScriptTransaction::world_position)
+}
+
+unsafe extern "C" fn host_object_world_rotation(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut [f32; 3],
+) -> bool {
+    object_vec3(ctx, object, out, ScriptTransaction::world_rotation_deg)
+}
+
+/// Reads the vector passed by the guest; `None` for a null pointer.
+fn read_vec3(value: *const [f32; 3]) -> Option<Vec3> {
+    // SAFETY: the guest passes a readable vector for the duration of this callback.
+    (!value.is_null()).then(|| Vec3::from_array(unsafe { *value }))
+}
+
+unsafe extern "C" fn host_object_set_world_position(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    guarded(ctx, false, |context| {
+        let (Some(position), Some(handle)) = (
+            read_vec3(value),
+            context.transaction.object_from_abi_handle(object),
+        ) else {
+            return false;
+        };
+        context
+            .transaction
+            .stage_edit(ObjectEdit::SetWorldPosition {
+                object: handle,
+                position,
+            })
+    })
+}
+
+unsafe extern "C" fn host_object_set_world_rotation(
+    ctx: *mut c_void,
+    object: u64,
+    value: *const [f32; 3],
+) -> bool {
+    guarded(ctx, false, |context| {
+        let (Some(rotation_deg), Some(handle)) = (
+            read_vec3(value),
+            context.transaction.object_from_abi_handle(object),
+        ) else {
+            return false;
+        };
+        context
+            .transaction
+            .stage_edit(ObjectEdit::SetWorldRotation {
+                object: handle,
+                rotation_deg,
+            })
+    })
+}
+
+unsafe extern "C" fn host_object_tag(ctx: *mut c_void, object: u64, out: *mut RveStr) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(tag) = context.transaction.tag(handle) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the caller's stack slot.
+        unsafe { *out = RveStr::from_str_ref(tag) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_object_set_tag(ctx: *mut c_void, object: u64, value: RveStr) -> bool {
+    guarded(ctx, false, |context| {
+        // SAFETY: the guest passes a string valid for the duration of this callback.
+        let Ok(tag) = (unsafe { read_abi_str(value) }) else {
+            return false;
+        };
+        let tag = tag.to_owned();
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        context.transaction.stage_edit(ObjectEdit::SetTag {
+            object: handle,
+            tag,
+        })
+    })
+}
+
+unsafe extern "C" fn host_object_layer(ctx: *mut c_void, object: u64, out: *mut u32) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(layer) = context.transaction.layer(handle) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the caller's stack slot.
+        unsafe { *out = u32::from(layer) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_object_set_layer(ctx: *mut c_void, object: u64, layer: u32) -> bool {
+    guarded(ctx, false, |context| {
+        let Ok(layer) = u8::try_from(layer) else {
+            return false;
+        };
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        context.transaction.stage_edit(ObjectEdit::SetLayer {
+            object: handle,
+            layer,
+        })
+    })
+}
+
+unsafe extern "C" fn host_object_has_component(
+    ctx: *mut c_void,
+    object: u64,
+    name: RveStr,
+    out: *mut bool,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: the guest passes a string valid for the duration of this callback.
+        let Ok(name) = (unsafe { read_abi_str(name) }) else {
+            return false;
+        };
+        let Some(kind) = ComponentKind::parse(name) else {
+            return false;
+        };
+        let Some(handle) = context.transaction.object_from_abi_handle(object) else {
+            return false;
+        };
+        let Some(present) = context.transaction.has_component(handle, &kind) else {
+            return false;
+        };
+        // SAFETY: output was checked and points to the caller's stack slot.
+        unsafe { *out = present };
+        true
+    })
+}
+
+/// Ищет живые объекты по имени или тегу; общий путь для `find_objects_by_name` и `..._by_tag`.
+fn find_objects(
+    ctx: *mut c_void,
+    value: RveStr,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+    find: fn(&ScriptTransaction, &str) -> Vec<ObjectHandle>,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if count.is_null() || (capacity > 0 && out.is_null()) {
+            return false;
+        }
+        // SAFETY: the guest passes a string valid for the duration of this callback.
+        let Ok(text) = (unsafe { read_abi_str(value) }) else {
+            return false;
+        };
+        let handles = find(context.transaction, text)
+            .into_iter()
+            .filter_map(|handle| context.transaction.abi_handle(handle))
+            .collect::<Vec<_>>();
+        write_handles(out, capacity, count, &handles)
+    })
+}
+
+unsafe extern "C" fn host_find_objects_by_name(
+    ctx: *mut c_void,
+    name: RveStr,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    find_objects(ctx, name, out, capacity, count, |transaction, name| {
+        transaction.find_all_by_name(name)
+    })
+}
+
+unsafe extern "C" fn host_find_objects_by_tag(
+    ctx: *mut c_void,
+    tag: RveStr,
+    out: *mut u64,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    find_objects(ctx, tag, out, capacity, count, |transaction, tag| {
+        transaction.find_all_with_tag(tag)
+    })
+}
+
+unsafe extern "C" fn host_script_set_enabled(ctx: *mut c_void, enabled: bool) -> bool {
+    guarded(ctx, false, |context| {
+        context.transaction.set_script_enabled(enabled)
+    })
+}
+
+unsafe extern "C" fn host_script_enabled(ctx: *mut c_void, out: *mut bool) -> bool {
+    guarded(ctx, false, |context| {
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: output was checked and points to the caller's stack slot.
+        unsafe { *out = context.transaction.script_enabled() };
+        true
     })
 }
 
@@ -3079,6 +3490,7 @@ mod tests {
             )),
             lifecycle_writes: true,
             instance_serial: 0,
+            instance_enabled: true,
             cursor: ScriptCursor::default(),
         });
         let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
@@ -3179,6 +3591,7 @@ mod tests {
             )),
             lifecycle_writes: true,
             instance_serial: 0,
+            instance_enabled: true,
             cursor: ScriptCursor::default(),
         });
         let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene/camera/Probe");
@@ -3258,6 +3671,7 @@ mod tests {
             )),
             lifecycle_writes: true,
             instance_serial: 0,
+            instance_enabled: true,
             cursor: ScriptCursor::default(),
         });
         {
@@ -3351,6 +3765,7 @@ mod tests {
             )),
             lifecycle_writes: true,
             instance_serial: 0,
+            instance_enabled: true,
             cursor: ScriptCursor::default(),
         });
         let mut context = AbiCallContext::new(1, &mut transaction, &events, "scene");
@@ -3396,6 +3811,7 @@ mod tests {
             )),
             lifecycle_writes: true,
             instance_serial: 0,
+            instance_enabled: true,
             cursor: ScriptCursor::default(),
         });
         {

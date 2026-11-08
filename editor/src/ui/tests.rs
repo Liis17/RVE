@@ -1445,6 +1445,7 @@ fn rust_script_parameters_use_the_library_schema() {
             object.heavy_scripts.push(engine_scene::HeavyScript {
                 name: "Bobber".to_owned(),
                 params: BTreeMap::new(),
+                enabled: true,
             });
             Ok(())
         })

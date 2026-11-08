@@ -149,6 +149,10 @@ impl PhysicsSceneDesc {
         let mut cache = ShapeCache::default();
         let mut bodies = Vec::new();
         for object in world.objects() {
+            // Тело неактивного объекта создаётся при активации, а не при загрузке сцены.
+            if world.active_in_hierarchy(object.handle) != Some(true) {
+                continue;
+            }
             if let Some(body) = scene_body(world, object, &models, &mut cache)? {
                 bodies.push(body);
             }
