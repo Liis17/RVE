@@ -1069,7 +1069,7 @@ fn validate_positive_dt(dt: f32) -> Result<(), PhysicsWorldError> {
 mod tests {
     use super::{
         BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent,
-        PhysicsWorld, PhysicsWorldError, StepDriver,
+        PhysicsWorld, PhysicsWorldError, SLEEP_ANGULAR_SPEED, SLEEP_LINEAR_SPEED, StepDriver,
     };
     use crate::{Hull, Pose, Shape, TriMesh};
     use glam::{Quat, Vec3};
@@ -2213,5 +2213,60 @@ mod tests {
                 if (*first == ball && *second == trigger_body)
                     || (*first == trigger_body && *second == ball)
         )));
+    }
+
+    /// Квад 4×4 в плоскости y = 0 из двух треугольников; диагональ проходит через x = z.
+    fn diagonal_mesh_floor_desc() -> BodyDesc {
+        let vertices = vec![
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+        ];
+        BodyDesc::static_collider(
+            Shape::TriMesh(Arc::new(
+                TriMesh::new(vertices, vec![[0, 1, 2], [0, 2, 3]]).unwrap(),
+            )),
+            Pose::IDENTITY,
+        )
+    }
+
+    /// Ящик половины 0.5, центр которого лежит на диагонали квада пола.
+    fn box_over_diagonal(hz: u32) -> (StepDriver, BodyHandle) {
+        let mut world = PhysicsWorld::default();
+        world.insert_body(diagonal_mesh_floor_desc()).unwrap();
+        let body = world
+            .insert_body(BodyDesc::dynamic(
+                box_shape(0.5),
+                Pose::new(Vec3::new(0.0, 0.7, 0.0), Quat::IDENTITY).unwrap(),
+                1.0,
+            ))
+            .unwrap();
+        (StepDriver::new(world, hz, 8).unwrap(), body)
+    }
+
+    #[test]
+    fn box_on_diagonal_mesh_floor_rests_without_jitter_or_drift() {
+        let (mut driver, body) = box_over_diagonal(60);
+        let mut peak_speed = 0.0_f32;
+        let mut peak_spin = 0.0_f32;
+        let mut peak_drift = 0.0_f32;
+        for frame in 0..=60 {
+            driver.advance_step(1.0 / 60.0, []).unwrap();
+            if frame < 30 {
+                continue;
+            }
+            // Спящее тело не имеет скорости по определению; проверяем покой только пока оно не спит.
+            if driver.world().body_is_sleeping(body) == Some(false) {
+                peak_speed = peak_speed.max(driver.world().body_velocity(body).unwrap().length());
+                peak_spin =
+                    peak_spin.max(driver.world().body_angular_velocity(body).unwrap().length());
+            }
+            let pose = driver.world().body_pose(body).unwrap();
+            peak_drift = peak_drift.max(pose.position.x.abs().max(pose.position.z.abs()));
+        }
+        assert!(peak_speed < SLEEP_LINEAR_SPEED, "peak speed {peak_speed}");
+        assert!(peak_spin < SLEEP_ANGULAR_SPEED, "peak spin {peak_spin}");
+        assert!(peak_drift < 1.0e-3, "horizontal drift {peak_drift}");
     }
 }

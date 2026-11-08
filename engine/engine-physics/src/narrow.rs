@@ -14,6 +14,18 @@ pub const MAX_MESH_CANDIDATES: usize = 16_384;
 
 const BOX_AXIS_EPSILON: f32 = 1.0e-6;
 const CONTACT_NORMAL_THRESHOLD: f32 = 0.8;
+/// Минимальное косинус-выравнивание нормали грани и направления контакта для многоточечного manifold.
+const FACE_ALIGNMENT: f32 = 0.98;
+/// Допуск плоскости грани и границ треугольника; точки внутри допуска остаются в manifold.
+const FACE_PLANE_TOLERANCE: f32 = 1.0e-4;
+
+struct ConvexFace {
+    /// Внешняя нормаль грани в мировых координатах.
+    normal: Vec3,
+    alignment: f32,
+    /// Вершины грани по кругу.
+    vertices: Vec<Vec3>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NarrowphaseError {
@@ -304,9 +316,8 @@ pub fn collide(
             let a = WorldShape::new(shape_a, pose_a)?;
             let b = WorldShape::new(shape_b, pose_b)?;
             generic_contact(&a, &b, 0).map(|contact| {
-                contact.map(|(normal, point)| ContactManifold {
-                    normal,
-                    contacts: vec![point],
+                contact.map(|(normal, point)| {
+                    convex_pair_manifold(shape_a, pose_a, shape_b, pose_b, normal, point)
                 })
             })
         }
@@ -783,30 +794,40 @@ fn collide_convex_mesh(
 
     let mut contacts = Vec::new();
     let mut normal = None;
+    let mut group_depth = -1.0;
     for triangle_index in candidates {
         let indices = mesh.triangles()[triangle_index as usize];
         let vertices =
             indices.map(|index| transform_point(mesh_pose, mesh.vertices()[index as usize]));
         let triangle = TriangleProxy { vertices };
-        if let Some((triangle_normal, mut contact)) =
+        if let Some((epa_normal, contact)) =
             generic_contact(&convex_proxy, &triangle, triangle_index as u64 + 1)?
         {
+            let feature_id = (triangle_index as u64 + 1) << 32;
+            let (triangle_normal, triangle_contacts) = triangle_face_contacts(
+                convex,
+                convex_pose,
+                vertices,
+                epa_normal,
+                contact.penetration,
+                feature_id,
+            )
+            .unwrap_or_else(|| {
+                let mut single = contact;
+                single.feature_id = feature_id;
+                (epa_normal, vec![single])
+            });
             if normal.is_none_or(|best: Vec3| best.dot(triangle_normal) < CONTACT_NORMAL_THRESHOLD)
             {
-                if normal.is_none_or(|_| {
-                    contact.penetration
-                        > contacts
-                            .first()
-                            .map_or(-1.0, |old: &ContactPoint| old.penetration)
-                }) {
+                if normal.is_none_or(|_| contact.penetration > group_depth) {
                     normal = Some(triangle_normal);
+                    group_depth = contact.penetration;
                     contacts.clear();
                 } else {
                     continue;
                 }
             }
-            contact.feature_id = (triangle_index as u64 + 1) << 32;
-            contacts.push(contact);
+            contacts.extend(triangle_contacts);
         }
     }
     let Some(normal) = normal else {
@@ -821,6 +842,195 @@ fn collide_convex_mesh(
         normal,
         contacts: reduce_contacts(contacts, epsilon),
     }))
+}
+
+/// Точки грани выпуклой формы, попадающие в треугольник. `normal` идёт от выпуклой формы к
+/// треугольнику; возвращается нормаль треугольника в том же направлении. Без грани — `None`.
+fn triangle_face_contacts(
+    convex: &Shape,
+    convex_pose: Pose,
+    triangle: [Vec3; 3],
+    normal: Vec3,
+    depth: f32,
+    feature_id: u64,
+) -> Option<(Vec3, Vec<ContactPoint>)> {
+    let face = convex_face(convex, convex_pose, normal)?;
+    let geometric = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
+    let area_normal = geometric.try_normalize()?;
+    let normal = if area_normal.dot(normal) < 0.0 {
+        -area_normal
+    } else {
+        area_normal
+    };
+    let mut contacts = Vec::new();
+    for (index, &vertex) in face.vertices.iter().enumerate() {
+        let penetration = (vertex - triangle[0]).dot(normal);
+        if penetration < -FACE_PLANE_TOLERANCE || penetration > depth + FACE_PLANE_TOLERANCE {
+            continue;
+        }
+        let projected = vertex - normal * penetration;
+        if !point_in_triangle(projected, triangle, area_normal) {
+            continue;
+        }
+        contacts.push(contact_point(
+            vertex,
+            projected,
+            penetration,
+            feature_id | (index as u64 + 1),
+        ));
+    }
+    (!contacts.is_empty()).then_some((normal, contacts))
+}
+
+fn point_in_triangle(point: Vec3, triangle: [Vec3; 3], unit_normal: Vec3) -> bool {
+    (0..3).all(|index| {
+        let start = triangle[index];
+        let edge = triangle[(index + 1) % 3] - start;
+        let edge_length = edge.length();
+        edge_length <= f32::MIN_POSITIVE
+            || edge.cross(point - start).dot(unit_normal) / edge_length >= -FACE_PLANE_TOLERANCE
+    })
+}
+
+/// Грань выпуклой формы, внешняя нормаль которой выровнена с `direction` не хуже `FACE_ALIGNMENT`.
+fn convex_face(shape: &Shape, pose: Pose, direction: Vec3) -> Option<ConvexFace> {
+    let direction = direction.try_normalize()?;
+    let (normal, alignment, vertices) = match shape {
+        Shape::Box { half_extents } => {
+            let axes = box_axes(pose);
+            let axis = (0..3).max_by(|&left, &right| {
+                axes[left]
+                    .dot(direction)
+                    .abs()
+                    .total_cmp(&axes[right].dot(direction).abs())
+            })?;
+            let normal = axes[axis] * axes[axis].dot(direction).signum();
+            let vertices = box_face_vertices(pose, *half_extents, axes, axis, normal);
+            (normal, axes[axis].dot(direction).abs(), vertices)
+        }
+        Shape::ConvexHull(hull) => {
+            let (normal, point, alignment) =
+                hull.planes()
+                    .iter()
+                    .fold(None, |best: Option<(Vec3, Vec3, f32)>, plane| {
+                        let normal = (pose.rotation * plane.normal).normalize_or_zero();
+                        let alignment = normal.dot(direction);
+                        match best {
+                            Some((_, _, best_alignment)) if best_alignment >= alignment => best,
+                            _ => Some((
+                                normal,
+                                pose.position + pose.rotation * plane.point,
+                                alignment,
+                            )),
+                        }
+                    })?;
+            let vertices: Vec<Vec3> = hull
+                .vertices()
+                .iter()
+                .map(|&vertex| pose.position + pose.rotation * vertex)
+                .filter(|vertex| (*vertex - point).dot(normal).abs() <= FACE_PLANE_TOLERANCE)
+                .collect();
+            if vertices.len() < 3 {
+                return None;
+            }
+            (normal, alignment, sort_face_vertices(vertices, normal))
+        }
+        _ => return None,
+    };
+    (alignment >= FACE_ALIGNMENT).then_some(ConvexFace {
+        normal,
+        alignment,
+        vertices,
+    })
+}
+
+/// Упорядочивает вершины плоской грани по углу вокруг центра, чтобы их можно было обрезать.
+fn sort_face_vertices(mut vertices: Vec<Vec3>, normal: Vec3) -> Vec<Vec3> {
+    let center = vertices.iter().copied().sum::<Vec3>() / vertices.len() as f32;
+    let u = (vertices[0] - center).normalize_or_zero();
+    let w = normal.cross(u);
+    vertices.sort_by(|left, right| {
+        let angle = |point: Vec3| {
+            let offset = point - center;
+            offset.dot(w).atan2(offset.dot(u))
+        };
+        angle(*left).total_cmp(&angle(*right))
+    });
+    vertices
+}
+
+/// Manifold двух выпуклых форм по граням: грань с большим выравниванием служит опорной, вершины
+/// второй грани обрезаются её боковыми рёбрами. Без двух граней или при пустом результате
+/// возвращается одна точка `fallback`.
+fn convex_pair_manifold(
+    shape_a: &Shape,
+    pose_a: Pose,
+    shape_b: &Shape,
+    pose_b: Pose,
+    normal: Vec3,
+    fallback: ContactPoint,
+) -> ContactManifold {
+    let single = ContactManifold {
+        normal,
+        contacts: vec![fallback],
+    };
+    let (Some(face_a), Some(face_b)) = (
+        convex_face(shape_a, pose_a, normal),
+        convex_face(shape_b, pose_b, -normal),
+    ) else {
+        return single;
+    };
+    let reference_is_a = face_a.alignment >= face_b.alignment;
+    let (reference, incident) = if reference_is_a {
+        (&face_a, &face_b)
+    } else {
+        (&face_b, &face_a)
+    };
+    let reference_normal = reference.normal;
+    let count = reference.vertices.len();
+    let center = reference.vertices.iter().copied().sum::<Vec3>() / count as f32;
+    let mut polygon = incident.vertices.clone();
+    for index in 0..count {
+        let start = reference.vertices[index];
+        let edge = reference.vertices[(index + 1) % count] - start;
+        let Some(mut inward) = reference_normal.cross(edge).try_normalize() else {
+            return single;
+        };
+        if (center - start).dot(inward) < 0.0 {
+            inward = -inward;
+        }
+        polygon = clip_polygon_to_face(polygon, start, -inward, 0.0, FACE_PLANE_TOLERANCE);
+        if polygon.is_empty() {
+            return single;
+        }
+    }
+
+    let mut contacts = Vec::new();
+    for point in polygon {
+        let signed = (point - reference.vertices[0]).dot(reference_normal);
+        if signed > FACE_PLANE_TOLERANCE {
+            continue;
+        }
+        let projected = point - reference_normal * signed;
+        let (point_a, point_b) = if reference_is_a {
+            (projected, point)
+        } else {
+            (point, projected)
+        };
+        contacts.push(contact_point(point_a, point_b, -signed, 0));
+    }
+    if contacts.is_empty() {
+        return single;
+    }
+    let normal = if reference_is_a {
+        reference_normal
+    } else {
+        -reference_normal
+    };
+    ContactManifold {
+        normal,
+        contacts: reduce_contacts(contacts, FACE_PLANE_TOLERANCE),
+    }
 }
 
 fn invert_manifold(mut manifold: ContactManifold) -> ContactManifold {
@@ -2129,6 +2339,77 @@ mod tests {
                 assert_eq!(updated.contacts[0].normal_impulse, 0.0);
                 assert_eq!(updated.contacts[0].tangent_impulse, Vec3::ZERO);
             }
+        }
+    }
+
+    /// Квад 4×4 в плоскости y = 0, разбитый диагональю a–c на линию x = z.
+    fn diagonal_quad_mesh() -> Shape {
+        let vertices = vec![
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+        ];
+        Shape::TriMesh(Arc::new(
+            TriMesh::new(vertices, vec![[0, 1, 2], [0, 2, 3]]).unwrap(),
+        ))
+    }
+
+    /// Пол из хулла: куб половины 2 с верхней гранью в y = 0.
+    fn top_face_hull_floor() -> (Shape, Pose) {
+        let points: Vec<Vec3> = (0..8)
+            .map(|index| {
+                Vec3::new(
+                    if index & 1 == 0 { -2.0 } else { 2.0 },
+                    if index & 2 == 0 { -2.0 } else { 2.0 },
+                    if index & 4 == 0 { -2.0 } else { 2.0 },
+                )
+            })
+            .collect();
+        (
+            Shape::ConvexHull(Arc::new(Hull::from_points(&points).unwrap())),
+            Pose::new(Vec3::new(0.0, -2.0, 0.0), Quat::IDENTITY).unwrap(),
+        )
+    }
+
+    #[test]
+    fn box_resting_on_mesh_diagonal_gets_a_multi_point_manifold() {
+        let manifold = collide(
+            &Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+            Pose::new(Vec3::new(0.0, 0.495, 0.0), Quat::IDENTITY).unwrap(),
+            &diagonal_quad_mesh(),
+            Pose::IDENTITY,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(manifold.contacts.len() >= 3, "{manifold:?}");
+        assert!(manifold.normal.dot(-Vec3::Y) > 0.999, "{manifold:?}");
+        for contact in &manifold.contacts {
+            assert!(
+                (0.0045..=0.0055).contains(&contact.penetration),
+                "{contact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn box_resting_on_hull_face_gets_a_multi_point_manifold() {
+        let (floor, floor_pose) = top_face_hull_floor();
+        let manifold = collide(
+            &Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+            Pose::new(Vec3::new(0.0, 0.495, 0.0), Quat::IDENTITY).unwrap(),
+            &floor,
+            floor_pose,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(manifold.contacts.len() >= 3, "{manifold:?}");
+        assert!(manifold.normal.dot(-Vec3::Y) > 0.999, "{manifold:?}");
+        for contact in &manifold.contacts {
+            assert!(
+                (0.0045..=0.0055).contains(&contact.penetration),
+                "{contact:?}"
+            );
         }
     }
 }
