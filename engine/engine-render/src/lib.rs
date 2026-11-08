@@ -750,6 +750,192 @@ enum SubmitAndPresentError {
     AfterSubmit(RenderError),
 }
 
+struct CaptureRecord {
+    ticket: CaptureTicket,
+    viewport: ViewportId,
+    state: CaptureState,
+}
+
+enum CaptureState {
+    Queued,
+    Submitted(Box<CaptureSubmission>),
+    Ready(Result<CapturedImage, RenderError>),
+    Cancelled,
+}
+
+struct CaptureSubmission {
+    ticket: CaptureTicket,
+    frame_slot: usize,
+    buffer: HostBuffer,
+    layout: CaptureBufferLayout,
+    width: u32,
+    height: u32,
+    completion: CaptureCompletion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureCompletion {
+    Image,
+    Failed(&'static str),
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureLifecycle {
+    Queued,
+    Submitted,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapturePixelOrder {
+    Rgba,
+    Bgra,
+}
+
+fn capture_pixel_order(format: vk::Format) -> CapturePixelOrder {
+    if format == vk::Format::B8G8R8A8_SRGB {
+        CapturePixelOrder::Bgra
+    } else {
+        CapturePixelOrder::Rgba
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaptureBufferLayout {
+    row_pitch: usize,
+    row_length: u32,
+    size: usize,
+}
+
+fn capture_lifecycle(state: &CaptureState) -> CaptureLifecycle {
+    match state {
+        CaptureState::Queued => CaptureLifecycle::Queued,
+        CaptureState::Submitted(_) => CaptureLifecycle::Submitted,
+        CaptureState::Ready(Ok(_)) => CaptureLifecycle::Completed,
+        CaptureState::Ready(Err(_)) => CaptureLifecycle::Failed,
+        CaptureState::Cancelled => CaptureLifecycle::Cancelled,
+    }
+}
+
+fn cancel_capture_lifecycle(state: CaptureLifecycle) -> CaptureLifecycle {
+    match state {
+        CaptureLifecycle::Submitted => CaptureLifecycle::Submitted,
+        CaptureLifecycle::Cancelled => CaptureLifecycle::Cancelled,
+        CaptureLifecycle::Queued | CaptureLifecycle::Completed | CaptureLifecycle::Failed => {
+            CaptureLifecycle::Cancelled
+        }
+    }
+}
+
+fn capture_buffer_layout(
+    width: u32,
+    height: u32,
+    row_pitch_alignment: u64,
+) -> Result<CaptureBufferLayout, RenderError> {
+    if width == 0 || height == 0 {
+        return Err(RenderError::InvalidConfig("viewport capture size is zero"));
+    }
+    let texel_bytes = 4_u64;
+    let alignment = row_pitch_alignment.max(1);
+    let divisor = greatest_common_divisor(alignment, texel_bytes);
+    let pitch_alignment = alignment
+        .checked_div(divisor)
+        .and_then(|value| value.checked_mul(texel_bytes))
+        .ok_or(RenderError::InvalidConfig(
+            "viewport capture alignment overflow",
+        ))?;
+    let row_bytes = u64::from(width)
+        .checked_mul(texel_bytes)
+        .ok_or(RenderError::InvalidConfig("viewport capture row overflow"))?;
+    let row_pitch = align_up(row_bytes, pitch_alignment)
+        .ok_or(RenderError::InvalidConfig("viewport capture row overflow"))?;
+    let size = row_pitch
+        .checked_mul(u64::from(height))
+        .ok_or(RenderError::InvalidConfig(
+            "viewport capture buffer overflow",
+        ))?;
+    let row_length = row_pitch
+        .checked_div(texel_bytes)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or(RenderError::InvalidConfig(
+            "viewport capture row is too wide",
+        ))?;
+    Ok(CaptureBufferLayout {
+        row_pitch: usize::try_from(row_pitch)
+            .map_err(|_| RenderError::InvalidConfig("viewport capture row is too wide"))?,
+        row_length,
+        size: usize::try_from(size)
+            .map_err(|_| RenderError::InvalidConfig("viewport capture buffer is too large"))?,
+    })
+}
+
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Some(value)
+    } else {
+        value.checked_add(alignment - remainder)
+    }
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
+fn next_capture_ticket(next: &mut u64) -> CaptureTicket {
+    let ticket = CaptureTicket(*next);
+    *next = next.wrapping_add(1);
+    ticket
+}
+
+fn capture_rgba8(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    row_pitch: usize,
+    order: CapturePixelOrder,
+) -> Result<Vec<u8>, RenderError> {
+    let tight_row = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or(RenderError::InvalidConfig("viewport capture row overflow"))?;
+    let source_size = row_pitch
+        .checked_mul(height as usize)
+        .ok_or(RenderError::InvalidConfig(
+            "viewport capture buffer overflow",
+        ))?;
+    if width == 0 || height == 0 || row_pitch < tight_row || source.len() < source_size {
+        return Err(RenderError::InvalidConfig(
+            "invalid viewport capture buffer layout",
+        ));
+    }
+    let mut rgba = Vec::with_capacity(tight_row * height as usize);
+    for row in source.chunks_exact(row_pitch).take(height as usize) {
+        let row = &row[..tight_row];
+        match order {
+            CapturePixelOrder::Rgba => rgba.extend_from_slice(row),
+            CapturePixelOrder::Bgra => {
+                for pixel_index in 0..width as usize {
+                    let pixel_start = pixel_index * 4;
+                    rgba.extend_from_slice(&[
+                        row[pixel_start + 2],
+                        row[pixel_start + 1],
+                        row[pixel_start],
+                        row[pixel_start + 3],
+                    ]);
+                }
+            }
+        }
+    }
+    Ok(rgba)
+}
+
 struct AcquiredFrameSubmission<'a> {
     device: &'a ash::Device,
     swapchain_loader: &'a ash::khr::swapchain::Device,
@@ -766,6 +952,7 @@ struct AcquiredFrameSubmission<'a> {
     timestamps_written: bool,
     timings: &'a mut RenderCpuTimings,
     temporal_submissions: &'a [TemporalSubmission],
+    capture_submissions: Vec<CaptureSubmission>,
     shadow_layout: vk::ImageLayout,
     local_shadow_layout: vk::ImageLayout,
     /// План skinning вызова; состояние кольца фиксируется после отправки.
@@ -779,6 +966,18 @@ struct AcquiredFrameSubmission<'a> {
 pub enum FrameStatus {
     Presented,
     Skipped,
+}
+
+/// Identifier for an asynchronous viewport capture request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CaptureTicket(u64);
+
+/// CPU readback of a viewport's post-composite sRGB image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba8: Vec<u8>,
 }
 
 /// Presentation status and whether this render attempt reached a successful queue submission.
@@ -1046,6 +1245,7 @@ pub struct Renderer {
     queue: vk::Queue,
     queue_family_index: u32,
     upload_alignment: usize,
+    capture_row_alignment: u64,
     next_upload_serial: u64,
     completed_upload_serial: u64,
     pending_upload: Option<UploadBatch>,
@@ -1139,6 +1339,8 @@ pub struct Renderer {
     retired_swapchains: RetiredSwapchains<SwapchainBundle>,
     pending_swapchain_drop: Option<SwapchainBundle>,
     frames: Vec<FrameResources>,
+    captures: Vec<CaptureRecord>,
+    next_capture_ticket: u64,
     particles: ParticleSystem,
     frame_slot: usize,
     submission_generation: u64,
@@ -1195,6 +1397,7 @@ impl Renderer {
             queue: vk::Queue::null(),
             queue_family_index: 0,
             upload_alignment: 16,
+            capture_row_alignment: 4,
             next_upload_serial: 1,
             completed_upload_serial: 0,
             pending_upload: None,
@@ -1281,6 +1484,8 @@ impl Renderer {
             present_ids: PresentIdTracker::default(),
             pending_swapchain_drop: None,
             frames: Vec::new(),
+            captures: Vec::new(),
+            next_capture_ticket: 0,
             frame_slot: 0,
             submission_generation: 0,
             swapchain_generation: 0,
@@ -1894,9 +2099,77 @@ impl Renderer {
             .get_mut(viewport.0)
             .and_then(Option::take)
             .ok_or_else(unknown_viewport)?;
+        for capture in &mut self.captures {
+            if capture.viewport != viewport {
+                continue;
+            }
+            match &mut capture.state {
+                CaptureState::Queued => {
+                    capture.state = CaptureState::Ready(Err(unknown_viewport()));
+                }
+                CaptureState::Submitted(submission) => {
+                    submission.completion = CaptureCompletion::Failed("viewport was freed");
+                }
+                CaptureState::Ready(_) | CaptureState::Cancelled => {}
+            }
+        }
         self.retired
             .retire(RetiredResource::Viewport(Box::new(resource)), 0);
         Ok(())
+    }
+
+    /// Queues a readback of the viewport after its next rendered composite pass.
+    pub fn request_viewport_capture(&mut self, viewport: ViewportId) -> CaptureTicket {
+        let ticket = next_capture_ticket(&mut self.next_capture_ticket);
+        let state = if self.viewports.get(viewport.0).is_some_and(Option::is_some) {
+            CaptureState::Queued
+        } else {
+            CaptureState::Ready(Err(unknown_viewport()))
+        };
+        self.captures.push(CaptureRecord {
+            ticket,
+            viewport,
+            state,
+        });
+        ticket
+    }
+
+    /// Cancels a queued or submitted capture without releasing an in-flight staging buffer early.
+    pub fn cancel_capture(&mut self, ticket: CaptureTicket) {
+        let Some(capture) = self
+            .captures
+            .iter_mut()
+            .find(|capture| capture.ticket == ticket)
+        else {
+            return;
+        };
+        match cancel_capture_lifecycle(capture_lifecycle(&capture.state)) {
+            CaptureLifecycle::Cancelled => capture.state = CaptureState::Cancelled,
+            CaptureLifecycle::Submitted => {
+                if let CaptureState::Submitted(submission) = &mut capture.state {
+                    submission.completion = CaptureCompletion::Cancelled;
+                }
+            }
+            CaptureLifecycle::Queued | CaptureLifecycle::Completed | CaptureLifecycle::Failed => {
+                unreachable!("cancel transition is terminal or retains submitted buffers")
+            }
+        }
+    }
+
+    /// Returns captures whose submission fences have signaled, without waiting for the GPU.
+    pub fn take_captures(&mut self) -> Vec<(CaptureTicket, Result<CapturedImage, RenderError>)> {
+        self.poll_captures(None);
+        let mut pending = Vec::with_capacity(self.captures.len());
+        let mut completed = Vec::new();
+        for capture in self.captures.drain(..) {
+            match capture.state {
+                CaptureState::Ready(result) => completed.push((capture.ticket, result)),
+                CaptureState::Cancelled => {}
+                state => pending.push(CaptureRecord { state, ..capture }),
+            }
+        }
+        self.captures = pending;
+        completed
     }
 
     /// Очищает offscreen-таргет, рисует меши и масштабирует результат в swapchain.
@@ -1915,6 +2188,7 @@ impl Renderer {
         self.frame_serial = self.frame_serial.wrapping_add(1);
         let frame_serial = self.frame_serial;
         if self.frame_slots_lost {
+            self.fail_all_queued_captures("frame slot synchronization was lost");
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
             ));
@@ -1979,7 +2253,11 @@ impl Renderer {
         // SAFETY: this fence belongs to the frame slot and its prior submission is finished before reuse.
         let prepare = prepare_started.elapsed();
         let fence_started = Instant::now();
-        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        if let Err(error) = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) } {
+            self.fail_all_queued_captures("frame slot fence wait failed");
+            return Err(error.into());
+        }
+        self.poll_captures(Some(frame_slot));
         let fence_wait = fence_started.elapsed();
         let uploads_started = Instant::now();
         self.poll_uploads()?;
@@ -2650,6 +2928,7 @@ impl Renderer {
             timestamps_written: timestamps.is_some(),
             timings: &mut cpu,
             temporal_submissions: &temporal_submissions,
+            capture_submissions: Vec::new(),
             shadow_layout,
             local_shadow_layout,
             skin: skin_plan.as_ref(),
@@ -2700,6 +2979,7 @@ impl Renderer {
         self.frame_serial = self.frame_serial.wrapping_add(1);
         let frame_serial = self.frame_serial;
         if self.frame_slots_lost {
+            self.fail_all_queued_captures("frame slot synchronization was lost");
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
             ));
@@ -2777,7 +3057,11 @@ impl Renderer {
         // SAFETY: this fence belongs to the frame slot and its prior submission is finished before reuse.
         let prepare = prepare_started.elapsed();
         let fence_started = Instant::now();
-        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }?;
+        if let Err(error) = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) } {
+            self.fail_all_queued_captures("frame slot fence wait failed");
+            return Err(error.into());
+        }
+        self.poll_captures(Some(frame_slot));
         let fence_wait = fence_started.elapsed();
         let uploads_started = Instant::now();
         self.poll_uploads()?;
@@ -3316,6 +3600,10 @@ impl Renderer {
         let ao_pipelines = self.ao_pipelines;
         let opaque_equal_pipeline = self.opaque_equal_pipeline;
         let prepass_pipeline = self.prepass_pipeline;
+        let capture_tickets_by_viewport = rendered
+            .iter()
+            .map(|entry| (entry.0, self.queued_capture_tickets(entry.0)))
+            .collect::<Vec<_>>();
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -3436,6 +3724,8 @@ impl Renderer {
             clear,
         };
 
+        let mut capture_submissions = Vec::new();
+        let mut capture_attempted_viewports = Vec::new();
         let record_started = Instant::now();
         let recorded = (|| {
             begin_command_buffer(&device, command_buffer, slot_timestamps)?;
@@ -3459,12 +3749,17 @@ impl Renderer {
                 _upscaler_fallback_reason,
             ) in &scene_passes
             {
+                let capture_tickets = capture_tickets_by_viewport
+                    .iter()
+                    .find(|(listed, _)| listed == viewport)
+                    .map_or(&[][..], |(_, tickets)| tickets.as_slice());
                 let Some(entry) = self.viewports[viewport.0].as_mut() else {
                     continue;
                 };
                 let Some(target) = entry.targets[frame_slot].as_mut() else {
                     continue;
                 };
+                capture_attempted_viewports.push(*viewport);
                 let view_exposure = prepare_view_exposure(
                     &instance,
                     &device,
@@ -3626,6 +3921,37 @@ impl Renderer {
                     None,
                     true,
                 );
+                for ticket in capture_tickets.iter().copied() {
+                    let layout = capture_buffer_layout(
+                        target.extent.width,
+                        target.extent.height,
+                        self.capture_row_alignment,
+                    )?;
+                    let buffer = HostBuffer::new_empty(
+                        &instance,
+                        &device,
+                        physical_device,
+                        vk::BufferUsageFlags::TRANSFER_DST,
+                        layout.size,
+                    )?;
+                    record_viewport_capture(
+                        &device,
+                        command_buffer,
+                        target.output.image,
+                        buffer.buffer,
+                        target.extent,
+                        layout.row_length,
+                    );
+                    capture_submissions.push(CaptureSubmission {
+                        ticket,
+                        frame_slot,
+                        buffer,
+                        layout,
+                        width: target.extent.width,
+                        height: target.extent.height,
+                        completion: CaptureCompletion::Image,
+                    });
+                }
                 target.output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
                 if let Some(error) = temporal_outcome
                     .as_ref()
@@ -3707,6 +4033,14 @@ impl Renderer {
         let (temporal_submissions, shadow_layout, local_shadow_layout) = match recorded {
             Ok(recorded) => recorded,
             Err(error) => {
+                self.fail_capture_submissions(
+                    &capture_submissions,
+                    "frame recording failed before viewport capture",
+                );
+                self.fail_queued_captures(
+                    &capture_attempted_viewports,
+                    "frame recording failed before viewport capture",
+                );
                 self.miss_all_temporal_views();
                 self.abandon_acquired_frame(frame_slot, &device, queue, image_available);
                 return Err(error);
@@ -3730,6 +4064,7 @@ impl Renderer {
             timestamps_written: timestamps,
             timings: &mut cpu,
             temporal_submissions: &temporal_submissions,
+            capture_submissions,
             shadow_layout,
             local_shadow_layout,
             skin: skin_plan.as_ref(),
@@ -3798,6 +4133,133 @@ impl Renderer {
             {
                 viewport.temporal.state.missed();
             }
+        }
+    }
+
+    fn queued_capture_tickets(&self, viewport: ViewportId) -> Vec<CaptureTicket> {
+        self.captures
+            .iter()
+            .filter(|capture| {
+                capture.viewport == viewport
+                    && capture_lifecycle(&capture.state) == CaptureLifecycle::Queued
+            })
+            .map(|capture| capture.ticket)
+            .collect()
+    }
+
+    fn commit_capture_submissions(&mut self, submissions: Vec<CaptureSubmission>) {
+        for submission in submissions {
+            if let Some(capture) = self
+                .captures
+                .iter_mut()
+                .find(|capture| capture.ticket == submission.ticket)
+                && matches!(capture.state, CaptureState::Queued)
+            {
+                capture.state = CaptureState::Submitted(Box::new(submission));
+            }
+        }
+    }
+
+    fn fail_capture_submissions(
+        &mut self,
+        submissions: &[CaptureSubmission],
+        message: &'static str,
+    ) {
+        for submission in submissions {
+            if let Some(capture) = self
+                .captures
+                .iter_mut()
+                .find(|capture| capture.ticket == submission.ticket)
+                && matches!(capture.state, CaptureState::Queued)
+            {
+                capture.state = CaptureState::Ready(Err(RenderError::InvalidState(message)));
+            }
+        }
+    }
+
+    fn fail_queued_captures(&mut self, viewports: &[ViewportId], message: &'static str) {
+        for capture in &mut self.captures {
+            if viewports.contains(&capture.viewport)
+                && capture_lifecycle(&capture.state) == CaptureLifecycle::Queued
+            {
+                capture.state = CaptureState::Ready(Err(RenderError::InvalidState(message)));
+            }
+        }
+    }
+
+    fn fail_all_queued_captures(&mut self, message: &'static str) {
+        for capture in &mut self.captures {
+            if capture_lifecycle(&capture.state) == CaptureLifecycle::Queued {
+                capture.state = CaptureState::Ready(Err(RenderError::InvalidState(message)));
+            }
+        }
+    }
+
+    fn poll_captures(&mut self, only_slot: Option<usize>) {
+        let Some(device) = self.device.as_ref().cloned() else {
+            return;
+        };
+        let fences: Vec<_> = self.frames.iter().map(|frame| frame.fence).collect();
+        for index in 0..self.captures.len() {
+            let frame_slot = match &self.captures[index].state {
+                CaptureState::Submitted(submission) => submission.frame_slot,
+                CaptureState::Queued | CaptureState::Ready(_) | CaptureState::Cancelled => continue,
+            };
+            if only_slot.is_some_and(|only_slot| only_slot != frame_slot) {
+                continue;
+            }
+            let Some(fence) = fences.get(frame_slot).copied() else {
+                if let CaptureState::Submitted(submission) = &mut self.captures[index].state {
+                    submission.completion =
+                        CaptureCompletion::Failed("capture frame slot is missing");
+                }
+                continue;
+            };
+            // SAFETY: this is the fence of the frame slot that submitted the copy command.
+            match unsafe { device.get_fence_status(fence) } {
+                Ok(false) => continue,
+                Err(_) => {
+                    if let CaptureState::Submitted(submission) = &mut self.captures[index].state {
+                        submission.completion =
+                            CaptureCompletion::Failed("capture fence status failed");
+                    }
+                    continue;
+                }
+                Ok(true) => {}
+            }
+
+            let CaptureState::Submitted(submission) =
+                std::mem::replace(&mut self.captures[index].state, CaptureState::Cancelled)
+            else {
+                unreachable!("capture state was checked immediately before the fence poll")
+            };
+            let submission = *submission;
+            self.captures[index].state = match submission.completion {
+                CaptureCompletion::Image => {
+                    let result = submission
+                        .buffer
+                        .read_bytes(submission.layout.size)
+                        .and_then(|bytes| {
+                            capture_rgba8(
+                                &bytes,
+                                submission.width,
+                                submission.height,
+                                submission.layout.row_pitch,
+                                capture_pixel_order(LDR_FORMAT),
+                            )
+                            .map(|rgba8| CapturedImage {
+                                width: submission.width,
+                                height: submission.height,
+                                rgba8,
+                            })
+                        });
+                    CaptureState::Ready(result)
+                }
+                CaptureCompletion::Failed(message) => {
+                    CaptureState::Ready(Err(RenderError::InvalidState(message)))
+                }
+                CaptureCompletion::Cancelled => CaptureState::Cancelled,
+            };
         }
     }
 
@@ -3876,6 +4338,7 @@ impl Renderer {
             timestamps_written,
             timings,
             temporal_submissions,
+            capture_submissions,
             shadow_layout,
             local_shadow_layout,
             skin,
@@ -3885,6 +4348,10 @@ impl Renderer {
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
         // SAFETY: эта точка — непосредственно перед submit, которому принадлежит fence.
         if let Err(error) = unsafe { device.reset_fences(&[fence]) } {
+            self.fail_capture_submissions(
+                &capture_submissions,
+                "frame submission failed before viewport capture",
+            );
             return Err(SubmitAndPresentError::BeforeSubmit(RenderError::Vulkan(
                 error,
             )));
@@ -3913,10 +4380,15 @@ impl Renderer {
         let submit_info = [submit_info];
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
         if let Err(error) = unsafe { device.queue_submit2(queue, &submit_info, fence) } {
+            self.fail_capture_submissions(
+                &capture_submissions,
+                "frame submission failed before viewport capture",
+            );
             return Err(SubmitAndPresentError::BeforeSubmit(RenderError::Vulkan(
                 error,
             )));
         }
+        self.commit_capture_submissions(capture_submissions);
         timings.submit = submit_started.elapsed();
         if present_id != 0 {
             self.present_ids.submitted(present_id);
@@ -4357,6 +4829,7 @@ impl Renderer {
         self.config.pipeline_cache = Vec::new();
         let limits = properties.limits;
         self.max_texture_size = limits.max_image_dimension2_d;
+        self.capture_row_alignment = limits.optimal_buffer_copy_row_pitch_alignment.max(1);
         self.upload_alignment = usize::try_from(limits.optimal_buffer_copy_offset_alignment)
             .map_err(|_| {
                 RenderError::Unsupported("слишком большое выравнивание buffer copy".to_owned())
@@ -6774,6 +7247,8 @@ impl Drop for Renderer {
         }
         self.pending_upload.take();
         self.in_flight_uploads.clear();
+        // SAFETY: device_wait_idle above completed every command that can use capture staging buffers.
+        self.captures.clear();
         self.swapchain.take();
         self.pending_swapchain_drop.take();
         self.retired_swapchains.clear();
@@ -8336,7 +8811,9 @@ impl ViewportTarget {
             physical_device,
             extent,
             LDR_FORMAT,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             color_subresource_range(),
         )?;
         let exposure = ExposureTarget::new(device, resources.exposure_set_layout)?;
@@ -11756,6 +12233,84 @@ fn output_attachment_barrier(output_image: vk::Image) -> vk::ImageMemoryBarrier2
         .subresource_range(color_subresource_range())
 }
 
+fn record_viewport_capture(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    buffer: vk::Buffer,
+    extent: vk::Extent2D,
+    row_length: u32,
+) {
+    let to_transfer = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, to_transfer);
+
+    let regions = [vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(row_length)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D::default())
+        .image_extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })];
+    // SAFETY: the output image is in TRANSFER_SRC_OPTIMAL and the staging buffer fits the aligned extent.
+    unsafe {
+        device.cmd_copy_image_to_buffer(
+            command_buffer,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer,
+            &regions,
+        );
+    }
+
+    let host_read = vk::BufferMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+        .dst_access_mask(vk::AccessFlags2::HOST_READ)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(buffer)
+        .offset(0)
+        .size(vk::WHOLE_SIZE);
+    let host_barriers = [host_read];
+    let host_dependency = vk::DependencyInfo::default().buffer_memory_barriers(&host_barriers);
+    // SAFETY: the copy writes this host-visible buffer before the frame fence signals.
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &host_dependency) };
+
+    let to_shader = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(color_subresource_range());
+    pipeline_barrier(device, command_buffer, to_shader);
+}
+
 /// Рисует оверлей внутри output pass, поверх уже отфильтрованного изображения.
 fn record_overlay(
     device: &ash::Device,
@@ -12126,6 +12681,7 @@ fn missing_post_format_features(supported: vk::FormatFeatureFlags) -> Vec<&'stat
     [
         (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
         (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+        (vk::FormatFeatureFlags::TRANSFER_SRC, "TRANSFER_SRC"),
         (
             vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
             "SAMPLED_IMAGE_FILTER_LINEAR",
@@ -13047,6 +13603,30 @@ impl HostBuffer {
         }
         Ok(())
     }
+
+    fn read_bytes(&self, length: usize) -> Result<Vec<u8>, RenderError> {
+        if length > self.size {
+            return Err(RenderError::InvalidState(
+                "чтение выходит за размер host buffer",
+            ));
+        }
+        let mut bytes = vec![0; length];
+        if length == 0 {
+            return Ok(bytes);
+        }
+        // SAFETY: callers read only after the submission fence and the buffer is host-coherent.
+        unsafe {
+            let mapped = self.device.map_memory(
+                self.memory,
+                0,
+                length as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(mapped.cast::<u8>(), bytes.as_mut_ptr(), length);
+            self.device.unmap_memory(self.memory);
+        }
+        Ok(bytes)
+    }
 }
 
 /// Буфер в DEVICE_LOCAL памяти для vertex и index input.
@@ -13112,7 +13692,7 @@ impl Drop for DeviceBuffer {
 
 impl Drop for HostBuffer {
     fn drop(&mut self) {
-        // SAFETY: the renderer waits for device idle before dropping meshes.
+        // SAFETY: owners drop this buffer only after uploads, frame submissions, or device idle complete.
         unsafe { self.device.destroy_buffer(self.buffer, None) };
         if self.memory != vk::DeviceMemory::null() {
             // SAFETY: the buffer bound to this memory was destroyed first.
@@ -15031,15 +15611,17 @@ mod tests {
     }
 
     #[test]
-    fn post_format_requires_attachment_sampling_and_linear_filtering() {
+    fn post_format_requires_attachment_sampling_linear_filtering_and_readback() {
         let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
             | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::TRANSFER_SRC
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
         assert_eq!(LDR_FORMAT, vk::Format::R8G8B8A8_SRGB);
         assert!(missing_post_format_features(required).is_empty());
         for (feature, name) in [
             (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
             (vk::FormatFeatureFlags::SAMPLED_IMAGE, "SAMPLED_IMAGE"),
+            (vk::FormatFeatureFlags::TRANSFER_SRC, "TRANSFER_SRC"),
             (
                 vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
                 "SAMPLED_IMAGE_FILTER_LINEAR",
@@ -17813,6 +18395,64 @@ mod tests {
             timestamp_duration(u64::MAX, 4, 64, 1.0),
             Duration::from_nanos(5)
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::{
+        CaptureLifecycle, CapturePixelOrder, CaptureTicket, cancel_capture_lifecycle,
+        capture_buffer_layout, capture_pixel_order, capture_rgba8, next_capture_ticket,
+    };
+    use ash::vk;
+
+    #[test]
+    fn bgra_readback_is_swizzled_and_row_padding_is_removed() {
+        let source = [
+            10, 20, 30, 40, 0, 0, 0, 0, // row 0 + padding
+            50, 60, 70, 80, 0, 0, 0, 0, // row 1 + padding
+        ];
+        let rgba = capture_rgba8(&source, 1, 2, 8, CapturePixelOrder::Bgra).unwrap();
+        assert_eq!(rgba, [30, 20, 10, 40, 70, 60, 50, 80]);
+        assert_eq!(
+            capture_pixel_order(vk::Format::B8G8R8A8_SRGB),
+            CapturePixelOrder::Bgra
+        );
+    }
+
+    #[test]
+    fn capture_tickets_are_issued_in_sequence() {
+        let mut next = 0;
+        assert_eq!(next_capture_ticket(&mut next), CaptureTicket(0));
+        assert_eq!(next_capture_ticket(&mut next), CaptureTicket(1));
+    }
+
+    #[test]
+    fn cancellation_is_safe_in_every_lifecycle_state() {
+        let cases = [
+            (CaptureLifecycle::Queued, CaptureLifecycle::Cancelled),
+            (CaptureLifecycle::Submitted, CaptureLifecycle::Submitted),
+            (CaptureLifecycle::Completed, CaptureLifecycle::Cancelled),
+            (CaptureLifecycle::Failed, CaptureLifecycle::Cancelled),
+            (CaptureLifecycle::Cancelled, CaptureLifecycle::Cancelled),
+        ];
+        for (before, after) in cases {
+            assert_eq!(cancel_capture_lifecycle(before), after);
+        }
+    }
+
+    #[test]
+    fn capture_buffer_size_and_row_alignment_are_checked() {
+        let tight = capture_buffer_layout(3, 2, 1).unwrap();
+        assert_eq!(tight.row_pitch, 12);
+        assert_eq!(tight.row_length, 3);
+        assert_eq!(tight.size, 24);
+
+        let aligned = capture_buffer_layout(3, 2, 16).unwrap();
+        assert_eq!(aligned.row_pitch, 16);
+        assert_eq!(aligned.row_length, 4);
+        assert_eq!(aligned.size, 32);
+        assert!(capture_buffer_layout(0, 2, 16).is_err());
     }
 }
 
