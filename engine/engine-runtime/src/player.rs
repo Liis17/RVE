@@ -820,7 +820,7 @@ impl WindowHandler for PlayerWindow<'_> {
             self.wireframe_supported = renderer.capabilities().wireframe;
         }
         let phase_started = Instant::now();
-        let gpu_scene = match upload_scene(&mut renderer, &self.render_assets) {
+        let mut gpu_scene = match upload_scene(&mut renderer, &self.render_assets) {
             Ok(scene) => scene,
             Err(error) => return self.fail_init(format!("ошибка загрузки GPU-ресурсов: {error}")),
         };
@@ -838,7 +838,8 @@ impl WindowHandler for PlayerWindow<'_> {
         let (render_stopped_tx, render_stopped_rx) = flume::bounded(1);
         self.render_stopped_rx = Some(render_stopped_rx);
         let backend =
-            VulkanBackend::new(renderer, self.pipeline_cache_path.clone(), self.debug_view);
+            VulkanBackend::new(renderer, self.pipeline_cache_path.clone(), self.debug_view)
+                .with_particle_emitters(std::mem::take(&mut gpu_scene.particles));
         #[cfg(feature = "dev-console")]
         let backend = backend.with_console(Arc::clone(&self.console_ui));
         if let Err(error) = start_render(
@@ -863,7 +864,11 @@ impl WindowHandler for PlayerWindow<'_> {
             return self.fail_init(format!("не удалось запустить поток рендера: {error}"));
         }
         self.render_started = true;
-        if self.script_tx.send(ScriptControl::Go(gpu_scene)).is_err() {
+        if self
+            .script_tx
+            .send(ScriptControl::Go(Box::new(gpu_scene)))
+            .is_err()
+        {
             self.status
                 .record_failure("поток скриптов завершился до запуска сцены");
             let _ = self.render_tx.send(RenderControl::Shutdown);

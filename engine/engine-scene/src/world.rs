@@ -10,6 +10,7 @@ use crate::document::{
     SpotLightComponent, camera_from_matrix, light_direction_from_matrix, valid_ascii_name,
 };
 use crate::light::ShadowSettings;
+use crate::particles::ParticleEmitterComponent;
 use crate::prefab::{MAX_EXPANDED_ID_BYTES, PrefabTemplate};
 use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
@@ -221,6 +222,7 @@ pub struct WorldObject {
     pub rigid_body: Option<RigidBodyComponent>,
     pub character_controller: Option<CharacterControllerComponent>,
     pub audio_source: Option<AudioSourceComponent>,
+    pub particle_emitter: Option<ParticleEmitterComponent>,
     pub lite_scripts: Vec<LiteScript>,
     pub heavy_scripts: Vec<HeavyScript>,
 }
@@ -280,6 +282,13 @@ pub struct MeshInstance {
     pub model: Mat4,
 }
 
+/// Эмиттер частиц объекта с мировой матрицей на текущий кадр.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParticleEmitterInstance {
+    pub object: ObjectHandle,
+    pub model: Mat4,
+}
+
 /// Данные мирового пространства для отрисовки одного кадра сцены.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneFrame {
@@ -289,6 +298,8 @@ pub struct SceneFrame {
     pub local_lights: Vec<LocalLightState>,
     pub environment: Option<EnvironmentState>,
     pub meshes: Vec<MeshInstance>,
+    /// Эмиттеры частиц в порядке объектов сцены.
+    pub particle_emitters: Vec<ParticleEmitterInstance>,
 }
 
 /// Текущий источник окружения, мировая ориентация владельца и направление солнечного света.
@@ -577,6 +588,11 @@ impl World {
         self.object(handle)?.audio_source.as_ref()
     }
 
+    /// Эмиттер частиц объекта, если у него есть `particle_emitter`.
+    pub fn particle_emitter(&self, handle: ObjectHandle) -> Option<&ParticleEmitterComponent> {
+        self.object(handle)?.particle_emitter.as_ref()
+    }
+
     /// Пути `[[assets]]` сцены в порядке документа.
     pub fn asset_paths(&self) -> &[VirtualPath] {
         &self.asset_paths
@@ -759,6 +775,16 @@ impl World {
                 model: self.world_matrices[index],
             })
             .collect();
+        let particle_emitters = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| object.particle_emitter.is_some())
+            .map(|(index, object)| ParticleEmitterInstance {
+                object: object.handle,
+                model: self.world_matrices[index],
+            })
+            .collect();
         let has_light = self
             .objects
             .iter()
@@ -792,6 +818,7 @@ impl World {
                 local_lights,
                 environment,
                 meshes,
+                particle_emitters,
             },
             warnings,
         )
@@ -1162,6 +1189,7 @@ fn world_object(
         rigid_body: object.rigid_body,
         character_controller: object.character_controller,
         audio_source: object.audio_source.clone(),
+        particle_emitter: object.particle_emitter.clone(),
         lite_scripts: object.lite_scripts.clone(),
         heavy_scripts: object.heavy_scripts.clone(),
     }
@@ -1876,5 +1904,58 @@ lock_on_start = true
         let cursor = world.active_camera_cursor();
         assert!(!cursor.hide_on_start);
         assert!(cursor.lock_on_start);
+    }
+}
+
+#[cfg(test)]
+mod particle_tests {
+    use super::{ObjectHandle, World};
+    use crate::SceneDocument;
+    use crate::particles::ParticleEmitterComponent;
+
+    const SCENE: &str = r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+
+[[objects]]
+id = "plain"
+[objects.transform]
+position = [1.0, 0.0, 0.0]
+
+[[objects]]
+id = "fx"
+[objects.transform]
+position = [0.0, 2.0, 0.0]
+[objects.particle_emitter]
+capacity = 64
+rate = 5.0
+"#;
+
+    fn handle_of(world: &World, id: &str) -> ObjectHandle {
+        world
+            .objects()
+            .iter()
+            .find(|object| object.id == id)
+            .map(|object| object.handle)
+            .expect("object exists")
+    }
+
+    #[test]
+    fn world_exposes_emitters_and_frame_lists_only_their_objects() {
+        let document = SceneDocument::parse("particles.rvescene", SCENE).unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let fx = handle_of(&world, "fx");
+        let plain = handle_of(&world, "plain");
+        let emitter: &ParticleEmitterComponent = world.particle_emitter(fx).expect("emitter");
+        assert_eq!(emitter.capacity, 64);
+        assert!(world.particle_emitter(plain).is_none());
+
+        let (frame, _) = world.build_frame();
+        assert_eq!(frame.particle_emitters.len(), 1);
+        let instance = frame.particle_emitters[0];
+        assert_eq!(instance.object, fx);
+        let translation = instance.model.w_axis.truncate();
+        assert!((translation - glam::Vec3::new(0.0, 2.0, 0.0)).length() < 1e-5);
     }
 }

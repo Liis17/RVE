@@ -5,9 +5,9 @@ use engine_scene::document::MaterialOverride;
 use engine_scene::{
     AudioSourceComponent, CameraComponent, CameraCursor, CharacterControllerComponent,
     ColliderComponent, DirectionalLightComponent, EnvironmentComponent, Expansion, LodGroup,
-    MeshRenderer, ObjectOrigin, PointLightComponent, PrefabInstance, PrefabOverride,
-    ProceduralSkyComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
-    SceneTransform, SpotLightComponent,
+    MeshRenderer, ObjectOrigin, ParticleEmitterComponent, PointLightComponent, PrefabInstance,
+    PrefabOverride, ProceduralSkyComponent, RigidBodyComponent, SceneAsset, SceneDocument,
+    SceneError, SceneObject, SceneTransform, SpotLightComponent,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -85,6 +85,7 @@ pub enum ComponentKind {
     RigidBody,
     CharacterController,
     AudioSource,
+    ParticleEmitter,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -102,6 +103,7 @@ pub enum Component {
     RigidBody(RigidBodyComponent),
     CharacterController(CharacterControllerComponent),
     AudioSource(AudioSourceComponent),
+    ParticleEmitter(ParticleEmitterComponent),
 }
 
 impl Component {
@@ -119,6 +121,7 @@ impl Component {
             Self::RigidBody(_) => ComponentKind::RigidBody,
             Self::CharacterController(_) => ComponentKind::CharacterController,
             Self::AudioSource(_) => ComponentKind::AudioSource,
+            Self::ParticleEmitter(_) => ComponentKind::ParticleEmitter,
         }
     }
 
@@ -139,6 +142,9 @@ impl Component {
                 Self::CharacterController(object.character_controller?)
             }
             ComponentKind::AudioSource => Self::AudioSource(object.audio_source.clone()?),
+            ComponentKind::ParticleEmitter => {
+                Self::ParticleEmitter(object.particle_emitter.clone()?)
+            }
         })
     }
 
@@ -167,6 +173,11 @@ impl Component {
             ComponentKind::AudioSource => Self::AudioSource(AudioSourceComponent::with_clip(
                 object.audio_source.as_ref()?.clip.clone(),
             )),
+            // Текстура сохраняется по той же причине, что и клип звука.
+            ComponentKind::ParticleEmitter => Self::ParticleEmitter(ParticleEmitterComponent {
+                texture: object.particle_emitter.as_ref()?.texture.clone(),
+                ..ParticleEmitterComponent::default()
+            }),
         })
     }
 
@@ -188,6 +199,7 @@ impl Component {
             Self::RigidBody(value) => object.rigid_body = Some(value),
             Self::CharacterController(value) => object.character_controller = Some(value),
             Self::AudioSource(value) => object.audio_source = Some(value),
+            Self::ParticleEmitter(value) => object.particle_emitter = Some(value),
         }
     }
 }
@@ -1292,6 +1304,14 @@ impl EditorScene {
         })
     }
 
+    /// Удаляет эмиттер частиц объекта.
+    pub fn remove_particle_emitter(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.particle_emitter = None;
+            Ok(())
+        })
+    }
+
     /// Удаляет mesh renderer и его обязательную LOD Group в одной правке.
     pub fn remove_mesh_renderer(&mut self, id: &str) -> Result<(), String> {
         self.edit_object(id, None, |object| {
@@ -1510,6 +1530,13 @@ fn register_object_assets(
     }
     if let Some(audio) = &object.audio_source {
         ensure_asset(document, &audio.clip);
+    }
+    if let Some(texture) = object
+        .particle_emitter
+        .as_ref()
+        .and_then(|emitter| emitter.texture.as_ref())
+    {
+        ensure_asset(document, texture);
     }
     for script in &object.lite_scripts {
         ensure_asset(document, &script.path);
@@ -2533,6 +2560,59 @@ mod tests {
         scene.remove_audio_source(&id).unwrap();
         assert!(scene.object(&id).unwrap().audio_source.is_none());
         assert!(Component::reset(scene.object(&id).unwrap(), ComponentKind::AudioSource).is_none());
+    }
+
+    #[test]
+    fn particle_emitter_adds_registers_texture_and_undoes_removal() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let texture = VirtualPath::parse("fx/smoke.png").unwrap();
+        let emitter = engine_scene::ParticleEmitterComponent {
+            texture: Some(texture.clone()),
+            ..engine_scene::ParticleEmitterComponent::default()
+        };
+        scene
+            .set_component(&id, Component::ParticleEmitter(emitter.clone()))
+            .unwrap();
+        assert_eq!(
+            scene.object(&id).unwrap().particle_emitter.as_ref(),
+            Some(&emitter)
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == texture),
+            "texture must be declared in [[assets]]"
+        );
+
+        let reset =
+            Component::reset(scene.object(&id).unwrap(), ComponentKind::ParticleEmitter).unwrap();
+        scene.set_component(&id, reset).unwrap();
+        let kept = scene.object(&id).unwrap().particle_emitter.clone().unwrap();
+        assert_eq!(
+            kept.texture,
+            Some(texture.clone()),
+            "reset keeps the texture"
+        );
+        assert_eq!(
+            kept.capacity,
+            engine_scene::ParticleEmitterComponent::default().capacity
+        );
+
+        scene.remove_particle_emitter(&id).unwrap();
+        assert!(scene.object(&id).unwrap().particle_emitter.is_none());
+        assert!(scene.undo());
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .particle_emitter
+                .as_ref()
+                .map(|value| value.capacity),
+            Some(kept.capacity)
+        );
     }
 
     #[test]

@@ -10,9 +10,11 @@ use engine_render::AlphaMode;
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, LocalLight, LocalLightShadow,
-    LocalLightShadowMatrices, Material, MaterialId, MeshId, ProceduralSky, RenderError, Renderer,
-    SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, Vertex,
-    ViewSettings, ViewportId,
+    LocalLightShadowMatrices, Material, MaterialId, MeshId, ParticleBlend, ParticleBurst,
+    ParticleCollision, ParticleColorKey, ParticleEmitterDesc, ParticleEmitterFrame,
+    ParticleEmitterId, ParticleFlipbook, ParticleShape, ParticleSizeKey, ProceduralSky,
+    RenderError, Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId,
+    Tonemapper as RenderTonemapper, Vertex, ViewSettings, ViewportId,
 };
 use engine_scene::camera::Camera;
 use engine_scene::document::{LodGroup, MaterialOverride, MeshRenderer};
@@ -21,12 +23,14 @@ use engine_scene::light::{
 };
 use engine_scene::world::ObjectHandle;
 use engine_scene::{
-    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, SceneFrame,
-    Tonemapper, World,
+    AntiAliasing, CameraSettings, EnvironmentState, LightState, LocalLightState, ParticleBlendMode,
+    ParticleEmitterComponent, ParticleShapeComponent, SceneFrame, Tonemapper, World,
 };
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Instant;
 
 const GRID_HALF_CELLS: i32 = 20;
 const GRID_LINE_WIDTH: f32 = 0.02;
@@ -54,6 +58,12 @@ pub struct SceneRenderer {
     scene_draws: Vec<DrawCommand>,
     game_draws: Vec<DrawCommand>,
     motion_history: MotionHistory,
+    particle_emitters: HashMap<ObjectHandle, EditorParticleEmitter>,
+    particle_frames: Vec<ParticleEmitterFrame>,
+    particle_step: f32,
+    particle_clock: Option<Instant>,
+    particles_playing: Option<bool>,
+    playing: bool,
 }
 
 #[derive(Default)]
@@ -135,6 +145,92 @@ fn environment_transition(
     }
 }
 
+/// GPU-эмиттер редактора: id в renderer и компонент, по которому он создан.
+struct EditorParticleEmitter {
+    id: ParticleEmitterId,
+    component: ParticleEmitterComponent,
+    texture: Option<String>,
+    texture_id: Option<TextureId>,
+}
+
+/// Создаёт значение через `create` и вставляет его в `entries` вместо прежнего. Возвращает прежнее значение,
+/// которое вызывающий уничтожает уже после успешного создания; при ошибке `entries` не меняется.
+fn replace_entry<K: Eq + Hash, V, E>(
+    entries: &mut HashMap<K, V>,
+    key: K,
+    create: impl FnOnce() -> Result<V, E>,
+) -> Result<Option<V>, E> {
+    let value = create()?;
+    Ok(entries.insert(key, value))
+}
+
+/// Переводит компонент сцены в описание эмиттера `engine-render`. Совпадает с сопоставлением в engine-runtime.
+fn editor_particle_desc(
+    component: &ParticleEmitterComponent,
+    texture: Option<TextureId>,
+) -> ParticleEmitterDesc {
+    ParticleEmitterDesc {
+        capacity: component.capacity,
+        blend: match component.blend {
+            ParticleBlendMode::Additive => ParticleBlend::Additive,
+            ParticleBlendMode::Alpha => ParticleBlend::Alpha,
+        },
+        shape: match component.shape {
+            ParticleShapeComponent::Point {} => ParticleShape::Point,
+            ParticleShapeComponent::Sphere { radius } => ParticleShape::Sphere { radius },
+            ParticleShapeComponent::Cone { angle, radius } => ParticleShape::Cone { angle, radius },
+            ParticleShapeComponent::Box { half_extents } => ParticleShape::Box { half_extents },
+        },
+        rate: component.rate,
+        bursts: component
+            .bursts
+            .iter()
+            .map(|burst| ParticleBurst {
+                time: burst.time,
+                count: burst.count,
+            })
+            .collect(),
+        duration: component.duration,
+        looping: component.looping,
+        lifetime: component.lifetime,
+        speed: component.speed,
+        size: component.size,
+        rotation: component.rotation,
+        angular_velocity: component.angular_velocity,
+        gravity: component.gravity,
+        drag: component.drag,
+        color_over_life: component
+            .color_over_life
+            .iter()
+            .map(|key| ParticleColorKey {
+                time: key.time,
+                color: key.color,
+            })
+            .collect(),
+        size_over_life: component
+            .size_over_life
+            .iter()
+            .map(|key| ParticleSizeKey {
+                time: key.time,
+                size: key.size,
+            })
+            .collect(),
+        texture,
+        flipbook: ParticleFlipbook {
+            columns: component.flipbook.columns,
+            rows: component.flipbook.rows,
+            frames_per_second: component.flipbook.frames_per_second,
+        },
+        soft_distance: component.soft_distance,
+        collision: component.collision.map(|collision| ParticleCollision {
+            restitution: collision.restitution,
+            friction: collision.friction,
+            thickness: collision.thickness,
+        }),
+        seed: component.seed,
+    }
+}
+
 impl SceneRenderer {
     pub fn new(renderer: &mut Renderer) -> Result<Self, RenderError> {
         Ok(Self {
@@ -144,6 +240,12 @@ impl SceneRenderer {
             model_dependencies: HashMap::new(),
             failed_reloads: HashSet::new(),
             textures: HashMap::new(),
+            particle_emitters: HashMap::new(),
+            particle_frames: Vec::new(),
+            particle_step: 0.0,
+            particle_clock: None,
+            particles_playing: None,
+            playing: false,
             environment_sources: HashMap::new(),
             current_environment: None,
             failed_environment: None,
@@ -246,6 +348,21 @@ impl SceneRenderer {
                         }
                     }
                 }
+            }
+        }
+        for object in world.objects() {
+            if let Some(path) = object
+                .particle_emitter
+                .as_ref()
+                .and_then(|emitter| emitter.texture.as_ref())
+            {
+                self.sync_texture(
+                    renderer,
+                    project,
+                    log,
+                    path.as_str(),
+                    TextureColorSpace::Srgb,
+                )?;
             }
         }
         for object in world.objects() {
@@ -569,6 +686,7 @@ impl SceneRenderer {
     ) -> Result<(), RenderError> {
         self.scene_draws.clear();
         self.game_draws.clear();
+        self.sync_particles(renderer, world, frame)?;
         let used_object_materials = {
             let mut resources = DrawResources {
                 models: &self.models,
@@ -641,6 +759,7 @@ impl SceneRenderer {
     }
 
     pub fn begin_motion_frame(&mut self, game_camera: ObjectHandle, playing: bool) {
+        self.playing = playing;
         self.motion_history.begin_frame(game_camera, playing);
     }
 
@@ -692,6 +811,13 @@ impl SceneRenderer {
             overlay: &[],
             debug_view,
             reset_history: self.motion_history.reset_pending,
+            // Симулирует вид, который показывает игру: Scene в редактировании, Game во время Play.
+            particles: &self.particle_frames,
+            particle_step: if with_grid != self.playing {
+                self.particle_step
+            } else {
+                0.0
+            },
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
                 exposure_ev: settings.color.exposure_ev,
@@ -709,6 +835,97 @@ impl SceneRenderer {
                 },
             },
         }
+    }
+
+    /// Создаёт, обновляет и удаляет GPU-эмиттеры по компонентам сцены.
+    ///
+    /// Шаг симуляции — wall-clock время между кадрами. Симулирует вид, который показывает
+    /// игру: Scene в режиме редактирования и Game во время Play. Переключение Play перезапускает эмиттеры.
+    fn sync_particles(
+        &mut self,
+        renderer: &mut Renderer,
+        world: &World,
+        frame: &SceneFrame,
+    ) -> Result<(), RenderError> {
+        // Старые ссылки на эмиттеры могут уйти на замену; при ошибке кадр не должен их использовать.
+        self.particle_frames.clear();
+        let now = Instant::now();
+        self.particle_step = self
+            .particle_clock
+            .map_or(0.0, |previous| (now - previous).as_secs_f32());
+        self.particle_clock = Some(now);
+        if self.particles_playing != Some(self.playing) {
+            for entry in self.particle_emitters.values() {
+                renderer.restart_particle_emitter(entry.id)?;
+            }
+            self.particles_playing = Some(self.playing);
+        }
+        let mut frames = Vec::with_capacity(frame.particle_emitters.len());
+        let mut live = HashSet::new();
+        for instance in &frame.particle_emitters {
+            let Some(component) = world.particle_emitter(instance.object) else {
+                continue;
+            };
+            live.insert(instance.object);
+            let texture_path = component
+                .texture
+                .as_ref()
+                .map(|path| path.as_str().to_owned());
+            let texture = texture_path.as_ref().and_then(|path| {
+                self.textures
+                    .get(&(path.clone(), TextureColorSpace::Srgb))
+                    .copied()
+                    .flatten()
+            });
+            let stale = self
+                .particle_emitters
+                .get(&instance.object)
+                .is_none_or(|entry| {
+                    entry.component != *component
+                        || entry.texture != texture_path
+                        || entry.texture_id != texture
+                });
+            if stale {
+                // Новый эмиттер создаётся до уничтожения старого: при ошибке старый остаётся рабочим.
+                let previous = replace_entry(
+                    &mut self.particle_emitters,
+                    instance.object,
+                    || -> Result<EditorParticleEmitter, RenderError> {
+                        let id = renderer
+                            .create_particle_emitter(editor_particle_desc(component, texture))?;
+                        Ok(EditorParticleEmitter {
+                            id,
+                            component: component.clone(),
+                            texture: texture_path,
+                            texture_id: texture,
+                        })
+                    },
+                )?;
+                if let Some(old) = previous {
+                    renderer.destroy_particle_emitter(old.id)?;
+                }
+            }
+            if let Some(entry) = self.particle_emitters.get(&instance.object) {
+                frames.push(ParticleEmitterFrame {
+                    emitter: entry.id,
+                    transform: instance.model.to_cols_array_2d(),
+                    emitting: true,
+                });
+            }
+        }
+        let removed: Vec<ObjectHandle> = self
+            .particle_emitters
+            .keys()
+            .filter(|handle| !live.contains(handle))
+            .copied()
+            .collect();
+        for handle in removed {
+            if let Some(old) = self.particle_emitters.remove(&handle) {
+                renderer.destroy_particle_emitter(old.id)?;
+            }
+        }
+        self.particle_frames = frames;
+        Ok(())
     }
 
     pub fn sync_environment(
@@ -2059,5 +2276,30 @@ range = 10
         history.begin_frame(main_camera, true);
         assert!(history.reset_pending);
         assert_eq!(history.previous_model(mesh), None);
+    }
+
+    #[test]
+    fn failed_particle_replacement_keeps_previous_entry() {
+        let mut entries = HashMap::from([(1u32, "old")]);
+        let result: Result<Option<&str>, &str> =
+            replace_entry(&mut entries, 1, || Err("create failed"));
+        assert_eq!(result, Err("create failed"));
+        assert_eq!(entries.get(&1), Some(&"old"));
+    }
+
+    #[test]
+    fn successful_particle_replacement_returns_previous_for_destruction() {
+        let mut entries = HashMap::from([(1u32, "old")]);
+        let previous = replace_entry::<_, _, ()>(&mut entries, 1, || Ok("new")).unwrap();
+        assert_eq!(previous, Some("old"));
+        assert_eq!(entries.get(&1), Some(&"new"));
+    }
+
+    #[test]
+    fn first_particle_creation_has_no_previous_entry() {
+        let mut entries = HashMap::new();
+        let previous = replace_entry::<u32, &str, ()>(&mut entries, 7, || Ok("new")).unwrap();
+        assert_eq!(previous, None);
+        assert_eq!(entries.get(&7), Some(&"new"));
     }
 }

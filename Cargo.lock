@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "engine-render"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ash",
  "engine-platform",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "engine-scene"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "engine-files",
  "glam",
@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "rve-editor"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "egui",
  "egui-winit",

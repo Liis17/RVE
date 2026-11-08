@@ -9,17 +9,18 @@
 use crate::module_host::ModuleHost;
 use crate::pipeline::ScriptControl;
 use crate::scene::{
-    MaterialTextureSource, ObjectModel, ResolvedMaterial, load_prefab_template, model_geometry,
-    prepare_template, resolve_material,
+    MaterialTextureSource, ObjectModel, ParticleSource, ResolvedMaterial, load_prefab_template,
+    model_geometry, prepare_template, resolve_material,
 };
 use engine_assets::{Assets, Model, TextureData};
 use engine_files::VirtualPath;
 use engine_physics::ModelGeometry;
 use engine_render::{
-    MaterialId, MeshId, RenderError, Renderer, TextureColorSpace, TextureId, Vertex,
+    MaterialId, MeshId, ParticleEmitterDesc, RenderError, Renderer, TextureColorSpace, TextureId,
+    Vertex,
 };
 use engine_resources::ResourceHandle;
-use engine_scene::PrefabTemplate;
+use engine_scene::{ObjectHandle, PrefabTemplate};
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
@@ -62,6 +63,8 @@ pub(crate) struct LoadedPrefab {
     pub models: HashMap<String, Model>,
     pub textures: HashMap<String, TextureData>,
     pub levels: Vec<Option<ObjectModel>>,
+    /// Эмиттеры объектов шаблона; элемент `i` относится к объекту `i`.
+    pub particles: Vec<Option<ParticleSource>>,
 }
 
 /// Запросы к render thread, кроме управления окном.
@@ -71,6 +74,17 @@ pub(crate) enum RenderResourceRequest {
     /// Scripts thread освободил префаб; GPU-ресурсы уничтожаются, когда снимки с `seq ≥ last_seq`
     /// обработаны.
     Release { token: PrefabToken, last_seq: u64 },
+    /// Эмиттеры частиц: создание для объекта или уничтожение по объектам (поддеревья удалены).
+    Particle(ParticleRequest),
+}
+
+/// Заявка на эмиттер частиц объекта. Эмиттер живёт в render thread под хендлом объекта.
+pub(crate) enum ParticleRequest {
+    Create {
+        object: ObjectHandle,
+        desc: Box<ParticleEmitterDesc>,
+    },
+    Destroy(Vec<ObjectHandle>),
 }
 
 /// Готовый префаб: GPU-уровни шаблона по объектам и CPU-часть.
@@ -79,6 +93,8 @@ pub(crate) struct PrefabReadyOf<M, Mt> {
     pub token: PrefabToken,
     /// Элемент `i` относится к объекту шаблона `i`; уровни объекта — список мешей с материалами.
     pub gpu: Vec<Vec<Vec<(M, Mt)>>>,
+    /// Описания эмиттеров по объектам шаблона; их текстуры живут, пока токен не освобождён.
+    pub particles: Vec<Option<ParticleEmitterDesc>>,
     pub cpu: PrefabCpu,
 }
 
@@ -664,6 +680,7 @@ impl<G: GpuResources> PrefabGpu<G> {
         PrefabReplyOf::Ready(Box::new(PrefabReadyOf {
             token: token_key,
             gpu: gpu_objects,
+            particles: Vec::new(),
             cpu: prefab.cpu,
         }))
     }
@@ -807,6 +824,7 @@ pub(crate) fn load_prefab(
         models: prepared.models,
         textures: prepared.textures,
         levels: prepared.levels,
+        particles: prepared.particles,
     })
 }
 
@@ -900,6 +918,11 @@ impl PrefabLoads {
     /// Номер последнего снимка, реально отправленного render thread.
     pub fn set_last_sent_seq(&mut self, seq: u64) {
         self.last_sent_seq = seq;
+    }
+
+    /// Отправляет заявку эмиттера render thread; закрытый канал означает остановку рендера.
+    pub fn send_particles(&self, request: ParticleRequest) {
+        let _ = self.render.send(RenderResourceRequest::Particle(request));
     }
 
     /// Запускает загрузку и возвращает ошибку, если загрузчик уже остановлен.
@@ -1106,6 +1129,7 @@ mod tests {
                 },
             )]),
             levels,
+            particles: Vec::new(),
         }
     }
 
