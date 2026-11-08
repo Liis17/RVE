@@ -280,3 +280,27 @@ path = "/cycle.lua"
         None
     );
 }
+
+#[test]
+fn a_script_declared_disabled_gets_no_callbacks_at_all() {
+    let mut world = world(
+        r#"
+[[assets]]
+path = "/life.lua"
+[[objects]]
+id = "camera"
+[objects.camera]
+[[objects]]
+id = "prop"
+[[objects.lite_scripts]]
+path = "/life.lua"
+enabled = false
+"#,
+    );
+    let mut host =
+        ScriptHost::load(&world, "scene", &sources(&[("life.lua", LIFE)]), None).unwrap();
+    host.start(&mut world, frame());
+    host.update(&mut world, 1.0 / 60.0, frame());
+    host.destroy(&mut world, frame());
+    assert!(event_messages(&mut host).is_empty());
+}
