@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use temporal::{Extent as TemporalExtent, TemporalKey, TemporalPlan, TemporalState};
 use ui::{
-    PackedUi, RetireQueue, RetiredSwapchains, UiDraw, is_srgb_format, pack_ui,
+    PackedUi, RetireQueue, RetiredSwapchains, UiDraw, is_srgb_format, validate_frame_ui,
     validate_texture_region, validate_viewport_size,
 };
 
@@ -383,7 +383,10 @@ pub struct FrameEnvironment {
 /// Y-up и глубиной `[0, 1]`; пустой срез отключает тени. Матрицы должны быть конечными.
 /// `overlay` — треугольники (по три вершины), которые рисуются с альфа-смешиванием
 /// поверх итогового изображения без масштабирования `render_scale`; пустой срез
-/// отключает оверлей. `view` задаёт render scale, экспозицию, tonemapper и сглаживание.
+/// отключает оверлей. `ui` — игровой UI вида, который рисуется сразу после `overlay`
+/// внутри того же output pass, без своего render pass; пустой срез не создаёт работы.
+/// `UiImage::Viewport` в `ui` запрещён: результат другого вида в этот момент не готов.
+/// `view` задаёт render scale, экспозицию, tonemapper и сглаживание.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
     pub clear_color: [f32; 4],
@@ -399,6 +402,8 @@ pub struct Frame<'a> {
     /// Палитры skinning кадра: матрицы костей по столбцам, одна палитра на `SkinBinding::palette`.
     pub joint_palettes: &'a [&'a [[[f32; 4]; 4]]],
     pub overlay: &'a [OverlayVertex],
+    /// Игровой UI вида: только `UiImage::Texture`, рисуется поверх `overlay`.
+    pub ui: &'a [UiPrimitive<'a>],
     pub debug_view: DebugView,
     pub view: ViewSettings,
     /// Discards temporal history for this view before rendering it.
@@ -1089,6 +1094,8 @@ pub struct Renderer {
     overlay_pipeline: Option<vk::Pipeline>,
     ui_pipeline_layout: Option<vk::PipelineLayout>,
     ui_pipeline: Option<vk::Pipeline>,
+    /// UI игрового вида: тот же layout, формат цвета viewport target.
+    viewport_ui_pipeline: Option<vk::Pipeline>,
     /// Линейный sampler с `CLAMP_TO_EDGE`: `REPEAT` дал бы артефакты на краях атласа шрифтов.
     ui_sampler: Option<vk::Sampler>,
     /// Значащие биты timestamp очереди; ноль — измерение времени GPU недоступно.
@@ -1234,6 +1241,7 @@ impl Renderer {
             overlay_pipeline: None,
             ui_pipeline_layout: None,
             ui_pipeline: None,
+            viewport_ui_pipeline: None,
             ui_sampler: None,
             timestamp_valid_bits: 0,
             timestamp_period: 0.0,
@@ -1923,6 +1931,7 @@ impl Renderer {
         validate_draws(frame.draws, &self.meshes, &self.materials)?;
         self.validate_skin_draws(frame)?;
         validate_overlay(frame.overlay)?;
+        validate_frame_ui(frame.ui)?;
         let view = effective_view_settings(frame.view, frame.debug_view);
         self.miss_unlisted_viewports(&[]);
         let output_extent = self
@@ -1965,6 +1974,10 @@ impl Renderer {
                 submitted: false,
             });
         }
+        // Размер swapchain стабилен после проверки выше: UI упаковывается под его extent.
+        let mut frame_ui = PackedUi::default();
+        frame_ui.append(frame.ui, output_extent)?;
+        let frame_ui_draws = self.ui_texture_draws(&frame_ui.draws)?;
         let present_id = self.begin_latency_frame();
 
         let instance = self.instance()?.clone();
@@ -2145,6 +2158,9 @@ impl Renderer {
         }
         // Fence слота дождались, поэтому GPU больше не читает вершины оверлея этого слота.
         frame_resources.write_overlay(&instance, &device, self.physical_device, frame.overlay)?;
+        if !frame_ui_draws.is_empty() {
+            frame_resources.write_ui(&instance, &device, self.physical_device, &frame_ui)?;
+        }
         let timestamps = frame_resources.timestamps;
         let mut gpu_layout = GpuProfileLayout::default();
         let screen_marks = timestamps.and_then(|pool| {
@@ -2237,6 +2253,12 @@ impl Renderer {
         let output_pipeline = self
             .output_pipeline
             .ok_or(RenderError::InvalidState("output pipeline отсутствует"))?;
+        let ui_pipeline = self
+            .ui_pipeline
+            .ok_or(RenderError::InvalidState("UI pipeline отсутствует"))?;
+        let ui_pipeline_layout = self
+            .ui_pipeline_layout
+            .ok_or(RenderError::InvalidState("UI pipeline layout отсутствует"))?;
         let post_pipeline_layout = self.post_pipeline_layout.ok_or(RenderError::InvalidState(
             "post pipeline layout отсутствует",
         ))?;
@@ -2492,6 +2514,14 @@ impl Renderer {
                 }),
                 _ => None,
             };
+            let ui = UiDrawPass::new(
+                ui_pipeline,
+                ui_pipeline_layout,
+                &frame_resources.ui_vertices,
+                &frame_resources.ui_indices,
+                output_is_srgb,
+                &frame_ui_draws,
+            );
             let target = frame_resources
                 .target
                 .as_mut()
@@ -2568,6 +2598,7 @@ impl Renderer {
                 &scene,
                 view_exposure,
                 overlay.as_ref(),
+                ui.as_ref(),
                 temporal_record,
                 skin_record,
                 output_marks,
@@ -2746,7 +2777,20 @@ impl Renderer {
             ));
             scene_environment_sets.push(self.environment_set_for(frame.environment)?);
         }
-        let packed = pack_ui(ui, self.output_extent)?;
+        // UI видов и swapchain лежит в одних буферах слота; смещения накапливаются.
+        let mut packed = PackedUi::default();
+        let mut view_ui = Vec::with_capacity(scenes.len());
+        for (viewport, frame) in scenes {
+            validate_frame_ui(frame.ui)?;
+            let extent = self
+                .viewports
+                .get(viewport.0)
+                .and_then(Option::as_ref)
+                .ok_or_else(unknown_viewport)?
+                .extent;
+            view_ui.push((*viewport, packed.append(frame.ui, extent)?));
+        }
+        let swapchain_ui = packed.append(ui, self.output_extent)?;
         self.validate_ui_images(&packed, scenes)?;
         if self.output_extent.width == 0 || self.output_extent.height == 0 {
             self.miss_all_temporal_views();
@@ -3027,6 +3071,9 @@ impl Renderer {
         let ui_pipeline_layout = self
             .ui_pipeline_layout
             .ok_or(RenderError::InvalidState("UI pipeline layout отсутствует"))?;
+        let viewport_ui_pipeline = self.viewport_ui_pipeline.ok_or(RenderError::InvalidState(
+            "viewport UI pipeline отсутствует",
+        ))?;
         let tonemap_pipeline = self
             .tonemap_pipeline
             .ok_or(RenderError::InvalidState("tonemap pipeline отсутствует"))?;
@@ -3236,7 +3283,14 @@ impl Renderer {
         }
 
         let mut draws = Vec::with_capacity(packed.draws.len());
-        for draw in &packed.draws {
+        let mut view_draws = Vec::with_capacity(view_ui.len());
+        for (viewport, range) in view_ui {
+            let start = draws.len();
+            draws.extend(self.ui_texture_draws(&packed.draws[range])?);
+            view_draws.push((viewport, start..draws.len()));
+        }
+        let swapchain_start = draws.len();
+        for draw in &packed.draws[swapchain_ui] {
             let (set, image_is_linear) = match draw.image {
                 UiImage::Texture(texture) => (self.ui_texture(texture)?.set, false),
                 UiImage::Viewport(viewport) => {
@@ -3255,6 +3309,7 @@ impl Renderer {
             };
             draws.push((*draw, set, image_is_linear));
         }
+        let swapchain_draws = swapchain_start..draws.len();
 
         let acquire_started = Instant::now();
         let acquired = match acquire_image(
@@ -3417,24 +3472,34 @@ impl Renderer {
             .collect::<Vec<_>>();
         self.frames[frame_slot].gpu_layout = gpu_layout;
         let timestamps = slot_timestamps.is_some();
+        let frame_resources = &self.frames[frame_slot];
         let ui_pass = UiPass {
-            pipeline: ui_pipeline,
-            pipeline_layout: ui_pipeline_layout,
-            vertex_buffer: self.frames[frame_slot]
-                .ui_vertices
-                .buffer
-                .as_ref()
-                .map(|buffer| buffer.buffer),
-            index_buffer: self.frames[frame_slot]
-                .ui_indices
-                .buffer
-                .as_ref()
-                .map(|buffer| buffer.buffer),
-            framebuffer_is_srgb,
-            draws: &draws,
+            draws: UiDrawPass::new(
+                ui_pipeline,
+                ui_pipeline_layout,
+                &frame_resources.ui_vertices,
+                &frame_resources.ui_indices,
+                framebuffer_is_srgb,
+                &draws[swapchain_draws],
+            ),
             view: swapchain_view,
             clear,
         };
+        // Каждый вид рисует свой UI в собственном output pass; буферы у видов общие с swapchain.
+        let view_passes: Vec<(ViewportId, Option<UiDrawPass<'_>>)> = view_draws
+            .iter()
+            .map(|(viewport, range)| {
+                let pass = UiDrawPass::new(
+                    viewport_ui_pipeline,
+                    ui_pipeline_layout,
+                    &frame_resources.ui_vertices,
+                    &frame_resources.ui_indices,
+                    is_srgb_format(LDR_FORMAT),
+                    &draws[range.clone()],
+                );
+                (*viewport, pass)
+            })
+            .collect();
 
         let record_started = Instant::now();
         let recorded = (|| {
@@ -3609,6 +3674,10 @@ impl Renderer {
                 let output_source_extent = temporal_outcome
                     .as_ref()
                     .map_or(target.render_extent, |outcome| outcome.output_extent);
+                let view_ui = view_passes
+                    .iter()
+                    .find(|(drawn, _)| drawn == viewport)
+                    .and_then(|(_, pass)| pass.as_ref());
                 record_output_pass(
                     &device,
                     command_buffer,
@@ -3624,6 +3693,7 @@ impl Renderer {
                     true,
                     pass.post.grain,
                     None,
+                    view_ui,
                     true,
                 );
                 target.output_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -3750,6 +3820,22 @@ impl Renderer {
             }
             Err(SubmitAndPresentError::AfterSubmit(error)) => Err(error),
         }
+    }
+
+    /// Сопоставляет вызовы вида с наборами текстур; вид не может ссылаться на viewport.
+    fn ui_texture_draws(
+        &self,
+        draws: &[UiDraw],
+    ) -> Result<Vec<(UiDraw, vk::DescriptorSet, bool)>, RenderError> {
+        draws
+            .iter()
+            .map(|draw| {
+                let UiImage::Texture(texture) = draw.image else {
+                    return Err(RenderError::InvalidState("UI вида ссылается на viewport"));
+                };
+                Ok((*draw, self.ui_texture(texture)?.set, false))
+            })
+            .collect()
     }
 
     fn ui_texture(&self, texture: UiTextureId) -> Result<&UiTexture, RenderError> {
@@ -6486,7 +6572,18 @@ impl Renderer {
         // SAFETY: the set layout is alive and the push-constant range fits in the guaranteed 128 bytes.
         let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
         self.ui_pipeline_layout = Some(layout);
+        self.ui_pipeline = self.create_ui_graphics_pipeline(layout, self.surface_format.format)?;
+        self.viewport_ui_pipeline = self.create_ui_graphics_pipeline(layout, LDR_FORMAT)?;
+        Ok(())
+    }
 
+    /// Создаёт графический пайплайн UI для формата цвета; layout общий для swapchain и viewport.
+    fn create_ui_graphics_pipeline(
+        &self,
+        layout: vk::PipelineLayout,
+        color_format: vk::Format,
+    ) -> Result<Option<vk::Pipeline>, RenderError> {
+        let device = self.device()?.clone();
         let vertex_module = ShaderModule::new(&device, UI_VERTEX_SHADER)?;
         let fragment_module = ShaderModule::new(&device, UI_FRAGMENT_SHADER)?;
         let stages = [
@@ -6549,7 +6646,7 @@ impl Renderer {
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let color_formats = [self.surface_format.format];
+        let color_formats = [color_format];
         let mut rendering_info =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
         let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
@@ -6563,13 +6660,12 @@ impl Renderer {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .push_next(&mut rendering_info)];
-        // SAFETY: shader modules, layout and the surface color format are valid for this device.
+        // SAFETY: shader modules, layout and the color format are valid for this device.
         let pipelines = unsafe {
             device.create_graphics_pipelines(self.pipeline_cache()?, &pipeline_info, None)
         }
         .map_err(|(_, error)| RenderError::Vulkan(error))?;
-        self.ui_pipeline = pipelines.into_iter().next();
-        Ok(())
+        Ok(pipelines.into_iter().next())
     }
 
     /// Создаёт timeline semaphore Reflex и общее состояние после создания device.
@@ -6954,8 +7050,11 @@ impl Drop for Renderer {
                 // SAFETY: the only pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
-            if let Some(pipeline) = self.ui_pipeline.take() {
-                // SAFETY: the device is idle, so no command buffer uses this pipeline.
+            for pipeline in [self.ui_pipeline.take(), self.viewport_ui_pipeline.take()]
+                .into_iter()
+                .flatten()
+            {
+                // SAFETY: the device is idle, so no command buffer uses these pipelines.
                 unsafe { device.destroy_pipeline(pipeline, None) };
             }
             if let Some(layout) = self.ui_pipeline_layout.take() {
@@ -7749,6 +7848,31 @@ impl FrameResources {
             physical_device,
             vk::BufferUsageFlags::VERTEX_BUFFER,
             overlay_vertex_bytes(vertices),
+        )
+    }
+
+    /// Копирует UI кадра (всех видов и swapchain, если упакован вместе) в буферы слота.
+    /// Вызывается после ожидания fence слота.
+    fn write_ui(
+        &mut self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        packed: &PackedUi,
+    ) -> Result<(), RenderError> {
+        self.ui_vertices.write(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &packed.vertices,
+        )?;
+        self.ui_indices.write(
+            instance,
+            device,
+            physical_device,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &packed.indices,
         )
     }
 }
@@ -9947,6 +10071,7 @@ fn record_frame(
     scene: &ScenePass<'_>,
     exposure: ViewExposure,
     overlay: Option<&OverlayPass>,
+    ui: Option<&UiDrawPass<'_>>,
     temporal: Option<TemporalResolveRecord<'_>>,
     skin: Option<skin::SkinRecord<'_>>,
     output_marks: Option<GpuMarks>,
@@ -10065,6 +10190,7 @@ fn record_frame(
         output_is_srgb,
         scene.post.grain,
         overlay,
+        ui,
         false,
     );
     if let Some(marks) = output_marks {
@@ -10960,14 +11086,45 @@ struct ShadowPass<'a> {
     local_shadow_matrices: &'a [[[f32; 4]; 4]],
 }
 
-/// Рисование UI в swapchain image; `draws` хранит вызов, его набор и признак линейного изображения.
-struct UiPass<'a> {
+/// Вызовы UI внутри rendering pass: пайплайн, общие буферы слота и вызовы.
+///
+/// `draws` хранит вызов, его набор дескрипторов и признак линейного изображения.
+struct UiDrawPass<'a> {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    vertex_buffer: Option<vk::Buffer>,
-    index_buffer: Option<vk::Buffer>,
+    vertex_buffer: vk::Buffer,
+    index_buffer: vk::Buffer,
     framebuffer_is_srgb: bool,
     draws: &'a [(UiDraw, vk::DescriptorSet, bool)],
+}
+
+impl<'a> UiDrawPass<'a> {
+    /// Собирает проход; `None`, если вызовов нет или буферы слота не выделены.
+    fn new(
+        pipeline: vk::Pipeline,
+        pipeline_layout: vk::PipelineLayout,
+        vertices: &GrowingBuffer,
+        indices: &GrowingBuffer,
+        framebuffer_is_srgb: bool,
+        draws: &'a [(UiDraw, vk::DescriptorSet, bool)],
+    ) -> Option<Self> {
+        if draws.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pipeline,
+            pipeline_layout,
+            vertex_buffer: vertices.buffer.as_ref()?.buffer,
+            index_buffer: indices.buffer.as_ref()?.buffer,
+            framebuffer_is_srgb,
+            draws,
+        })
+    }
+}
+
+/// Рисование UI в swapchain image после очистки; `draws` может быть пустым.
+struct UiPass<'a> {
+    draws: Option<UiDrawPass<'a>>,
     view: vk::ImageView,
     clear: [f32; 4],
 }
@@ -11635,6 +11792,7 @@ fn record_output_pass(
     output_is_srgb: bool,
     grain: [f32; 4],
     overlay: Option<&OverlayPass>,
+    ui: Option<&UiDrawPass<'_>>,
     sample_output: bool,
 ) {
     let to_attachment = if sample_output {
@@ -11711,6 +11869,9 @@ fn record_output_pass(
     }
     if let Some(overlay) = overlay {
         record_overlay(device, command_buffer, output_extent, overlay);
+    }
+    if let Some(ui) = ui {
+        record_ui_draws(device, command_buffer, ui, output_extent);
     }
     // SAFETY: this matches the output pass's dynamic rendering begin.
     unsafe { device.cmd_end_rendering(command_buffer) };
@@ -11837,62 +11998,10 @@ fn record_ui(
         })
         .layer_count(1)
         .color_attachments(&color_attachment);
-    let viewport = [vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: output_extent.width as f32,
-        height: output_extent.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    }];
     // SAFETY: the view belongs to the output image and the pipeline matches the swapchain format.
     unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
-    if let (Some(vertex_buffer), Some(index_buffer)) = (ui.vertex_buffer, ui.index_buffer)
-        && !ui.draws.is_empty()
-    {
-        // SAFETY: inside dynamic rendering; the buffers were written after the slot fence.
-        unsafe {
-            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, ui.pipeline);
-            device.cmd_set_viewport(command_buffer, 0, &viewport);
-            device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex_buffer], &[0]);
-            device.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk::IndexType::UINT32);
-        }
-        for (draw, set, image_is_linear) in ui.draws {
-            let push_constants = float_bytes::<UI_PUSH_CONSTANTS_SIZE>(&[
-                viewport[0].width,
-                viewport[0].height,
-                f32::from(u8::from(ui.framebuffer_is_srgb)),
-                f32::from(u8::from(*image_is_linear)),
-            ]);
-            // SAFETY: the set, scissor and index range were validated before recording; the
-            // descriptor's image stays alive until the fences of this submission are waited.
-            unsafe {
-                device.cmd_set_scissor(command_buffer, 0, &[draw.scissor]);
-                device.cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    ui.pipeline_layout,
-                    0,
-                    &[*set],
-                    &[],
-                );
-                device.cmd_push_constants(
-                    command_buffer,
-                    ui.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    &push_constants,
-                );
-                device.cmd_draw_indexed(
-                    command_buffer,
-                    draw.index_count,
-                    1,
-                    draw.first_index,
-                    draw.vertex_offset,
-                    0,
-                );
-            }
-        }
+    if let Some(pass) = &ui.draws {
+        record_ui_draws(device, command_buffer, pass, output_extent);
     }
     // SAFETY: this matches the preceding cmd_begin_rendering call.
     unsafe { device.cmd_end_rendering(command_buffer) };
@@ -11909,6 +12018,70 @@ fn record_ui(
         .image(output_image)
         .subresource_range(color_subresource_range());
     pipeline_barrier(device, command_buffer, present_barrier);
+}
+
+/// Рисует вызовы UI внутри уже начатого rendering pass; viewport покрывает весь `extent`.
+fn record_ui_draws(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    pass: &UiDrawPass<'_>,
+    extent: vk::Extent2D,
+) {
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: extent.width as f32,
+        height: extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    // SAFETY: inside dynamic rendering; the buffers were written after the slot fence.
+    unsafe {
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pass.pipeline,
+        );
+        device.cmd_set_viewport(command_buffer, 0, &viewport);
+        device.cmd_bind_vertex_buffers(command_buffer, 0, &[pass.vertex_buffer], &[0]);
+        device.cmd_bind_index_buffer(command_buffer, pass.index_buffer, 0, vk::IndexType::UINT32);
+    }
+    for (draw, set, image_is_linear) in pass.draws {
+        let push_constants = float_bytes::<UI_PUSH_CONSTANTS_SIZE>(&[
+            viewport[0].width,
+            viewport[0].height,
+            f32::from(u8::from(pass.framebuffer_is_srgb)),
+            f32::from(u8::from(*image_is_linear)),
+        ]);
+        // SAFETY: the set, scissor and index range were validated before recording; the
+        // descriptor's image stays alive until the fences of this submission are waited.
+        unsafe {
+            device.cmd_set_scissor(command_buffer, 0, &[draw.scissor]);
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pass.pipeline_layout,
+                0,
+                &[*set],
+                &[],
+            );
+            device.cmd_push_constants(
+                command_buffer,
+                pass.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                &push_constants,
+            );
+            device.cmd_draw_indexed(
+                command_buffer,
+                draw.index_count,
+                1,
+                draw.first_index,
+                draw.vertex_offset,
+                0,
+            );
+        }
+    }
 }
 
 fn pipeline_barrier(
@@ -15892,6 +16065,7 @@ mod tests {
                 local_light_shadows: &[],
                 draws: &[],
                 overlay: &[],
+                ui: &[],
                 debug_view: DebugView::Lit,
                 view: ViewSettings::default(),
                 reset_history: false,
@@ -16899,6 +17073,7 @@ mod tests {
             local_light_shadows: &[],
             draws: &[],
             overlay: &[],
+            ui: &[],
             debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
@@ -16985,6 +17160,7 @@ mod tests {
             local_light_shadows: &[],
             draws: &[],
             overlay: &[],
+            ui: &[],
             debug_view: DebugView::Lit,
             view: ViewSettings {
                 anti_aliasing: AntiAliasing::Taa,
@@ -17038,6 +17214,7 @@ mod tests {
                         local_light_shadows: &[],
                         draws: &[],
                         overlay: &[],
+                        ui: &[],
                         debug_view: DebugView::Lit,
                         view: ViewSettings::default(),
                         reset_history: false,
@@ -17069,6 +17246,7 @@ mod tests {
             local_light_shadows: &[],
             draws: &[],
             overlay: &[],
+            ui: &[],
             debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
@@ -17100,6 +17278,7 @@ mod tests {
             local_light_shadows: &[],
             draws: &[],
             overlay: &[],
+            ui: &[],
             debug_view: DebugView::Lit,
             view: ViewSettings::default(),
             reset_history: false,
