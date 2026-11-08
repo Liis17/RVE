@@ -8,7 +8,7 @@ default_context = "game"
 
 [input.contexts.game.Jump]
 kind = "button"
-inputs = ["Space"]
+inputs = ["Space", "Gamepad.South"]
 
 [input.contexts.game.Move]
 kind = "vector2"
@@ -16,22 +16,23 @@ up = ["W"]
 down = ["S"]
 left = ["A"]
 right = ["D"]
+analog = "Gamepad.LeftStick"
 
 [input.contexts.game.Escape]
 kind = "button"
-inputs = ["Escape"]
+inputs = ["Escape", "Gamepad.Start"]
 
 [input.contexts.game.fire]
 kind = "button"
-inputs = ["Mouse.Left"]
+inputs = ["Mouse.Left", "Gamepad.RightTrigger"]
 
 [input.contexts.game.spawn_heavy]
 kind = "button"
-inputs = ["T"]
+inputs = ["T", "Gamepad.North"]
 
 [input.contexts.menu.Escape]
 kind = "button"
-inputs = ["Escape"]
+inputs = ["Escape", "Gamepad.Start"]
 
 # Первая включённая сцена — стартовая; физическая демо-сцена запускается первой.
 [[scenes]]
