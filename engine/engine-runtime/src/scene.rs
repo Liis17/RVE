@@ -71,6 +71,8 @@ pub(crate) struct PreparedScene {
     pub sources: BTreeMap<String, String>,
     pub render_assets: PreparedRenderAssets,
     pub prefabs: PreparedPrefabs,
+    /// Хэш раскрытого документа сцены для проверки совместимости клиента и сервера.
+    pub scene_hash: [u8; 32],
 }
 
 impl PreparedScene {
@@ -113,9 +115,10 @@ pub(crate) fn load_scene(
         .map_err(|error| error.to_string())?;
     let instanced = expansion.prefabs;
     let mut expanded = expansion.document;
+    let scene_hash = engine_network::replication::scene_hash(&expanded);
     let prefabs = load_fast_prefabs(resources, &mut expanded, &instanced)?;
     let world = World::from_document(&expanded).map_err(|error| error.to_string())?;
-    prepare_scene(resources, assets, scene_path, world, prefabs)
+    prepare_scene(resources, assets, scene_path, world, prefabs, scene_hash)
 }
 
 /// Раскрывает каждый `.rveprefab` из `[[assets]]` сцены в шаблон для spawn. Ассеты шаблонов
@@ -196,10 +199,17 @@ fn prepare_scene(
     scene_path: &str,
     world: World,
     prefabs: PreparedPrefabs,
+    scene_hash: [u8; 32],
 ) -> Result<PreparedScene, String> {
-    prepare_scene_with_model_loader(resources, assets, scene_path, world, prefabs, |path| {
-        assets.load_model(path).map_err(|error| error.to_string())
-    })
+    prepare_scene_with_model_loader(
+        resources,
+        assets,
+        scene_path,
+        world,
+        prefabs,
+        scene_hash,
+        |path| assets.load_model(path).map_err(|error| error.to_string()),
+    )
 }
 
 /// Ресурсы объектов сцены и шаблонов префабов, собранные за один проход. Модели и текстуры
@@ -229,6 +239,7 @@ fn prepare_scene_with_model_loader(
     scene_path: &str,
     mut world: World,
     prefabs: PreparedPrefabs,
+    scene_hash: [u8; 32],
     mut load_model: impl FnMut(&str) -> Result<Model, String>,
 ) -> Result<PreparedScene, String> {
     let camera_settings = world
@@ -323,6 +334,7 @@ fn prepare_scene_with_model_loader(
         world,
         name: scene_path.to_owned(),
         sources,
+        scene_hash,
         render_assets: PreparedRenderAssets {
             models,
             textures,
@@ -1683,6 +1695,7 @@ id = "camera"
             "scene.rvescene",
             world,
             PreparedPrefabs::default(),
+            [0; 32],
             |path| {
                 assert_eq!(path, "models/quad.fbx");
                 load_count.set(load_count.get() + 1);
@@ -1721,6 +1734,7 @@ id = "camera"
             "scene.rvescene",
             world,
             PreparedPrefabs::default(),
+            [0; 32],
             |path| {
                 loaded_paths.push(path.to_owned());
                 Ok(Model {
@@ -2144,6 +2158,7 @@ id = "camera"
             "scene.rvescene",
             world,
             prefabs,
+            [0; 32],
             |path| {
                 loaded_paths.borrow_mut().push(path.to_owned());
                 Ok(Model {
@@ -2195,6 +2210,7 @@ id = "camera"
             "scene.rvescene",
             world,
             prefabs,
+            [0; 32],
             |_| {
                 Ok(Model {
                     meshes: Vec::new(),

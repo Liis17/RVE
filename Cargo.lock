@@ -1064,8 +1064,9 @@ dependencies = [
 
 [[package]]
 name = "engine-runtime"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
+ "blake3",
  "egui",
  "egui-winit",
  "engine-animation",
@@ -3071,6 +3072,13 @@ dependencies = [
 [[package]]
 name = "rve-sdk"
 version = "0.5.0"
+
+[[package]]
+name = "rve-server"
+version = "0.1.0"
+dependencies = [
+ "engine-runtime",
+]
 
 [[package]]
 name = "rvepak"

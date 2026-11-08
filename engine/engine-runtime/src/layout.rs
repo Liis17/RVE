@@ -46,6 +46,30 @@ pub(crate) fn release_root(exe_dir: &Path) -> PathBuf {
     exe_dir.to_owned()
 }
 
+/// Корень release-раскладки для `rve-server`. На macOS сервер лежит рядом с `.app`, а не внутри него,
+/// поэтому без `Engine` рядом берётся ресурсы единственного `*.app` в том же каталоге. Иначе — каталог
+/// исполняемого файла, как у игры.
+pub(crate) fn server_release_root(exe_dir: &Path) -> PathBuf {
+    if !cfg!(target_os = "macos") || exe_dir.join("Engine").is_dir() {
+        return exe_dir.to_owned();
+    }
+    let Ok(entries) = std::fs::read_dir(exe_dir) else {
+        return exe_dir.to_owned();
+    };
+    let mut bundles = entries.filter_map(Result::ok).filter_map(|entry| {
+        let path = entry.path();
+        let resources = path.join("Contents").join("Resources");
+        let is_bundle = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
+        (is_bundle && resources.join("Engine").is_dir()).then_some(resources)
+    });
+    match (bundles.next(), bundles.next()) {
+        (Some(resources), None) => resources,
+        _ => exe_dir.to_owned(),
+    }
+}
+
 fn app_bundle_resources(exe_dir: &Path) -> Option<PathBuf> {
     let contents = exe_dir.parent()?;
     let bundle = contents.parent()?;
@@ -157,9 +181,38 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
-    use super::{Layout, PrefabCatalogLocation, ProjectSettingsLocation, app_bundle_resources};
+    use super::{
+        Layout, PrefabCatalogLocation, ProjectSettingsLocation, app_bundle_resources,
+        server_release_root,
+    };
     use engine_resources::SourceMode;
     use std::path::Path;
+
+    #[test]
+    fn server_root_uses_engine_next_to_it_or_the_only_app_bundle() {
+        let dir = std::env::temp_dir().join(format!("rve-server-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = dir.join("Game.app/Contents/Resources");
+        std::fs::create_dir_all(bundle.join("Engine")).unwrap();
+        let expected = if cfg!(target_os = "macos") {
+            bundle.clone()
+        } else {
+            dir.clone()
+        };
+        assert_eq!(server_release_root(&dir), expected);
+
+        std::fs::create_dir_all(dir.join("Engine")).unwrap();
+        assert_eq!(server_release_root(&dir), dir);
+
+        std::fs::remove_dir_all(dir.join("Engine")).unwrap();
+        std::fs::create_dir_all(dir.join("Other.app/Contents/Resources/Engine")).unwrap();
+        assert_eq!(
+            server_release_root(&dir),
+            dir,
+            "неоднозначные bundle не выбираются"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn release_layout_is_anchored_to_executable_directory() {
