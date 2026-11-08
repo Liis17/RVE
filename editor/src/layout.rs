@@ -18,10 +18,11 @@ pub enum Tab {
     /// Подокно списка тяжёлых префабов `prefabs.rveprefabs` проекта.
     ProjectPrefabs,
     Profiler,
+    MaterialPreview,
 }
 
 impl Tab {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Scene,
         Self::Game,
         Self::Hierarchy,
@@ -31,6 +32,7 @@ impl Tab {
         Self::SceneAssets,
         Self::ProjectPrefabs,
         Self::Profiler,
+        Self::MaterialPreview,
     ];
 
     pub fn title(self) -> &'static str {
@@ -44,6 +46,7 @@ impl Tab {
             Self::SceneAssets => "Scene Assets",
             Self::ProjectPrefabs => "Project Prefabs",
             Self::Profiler => "Profiler",
+            Self::MaterialPreview => "Material Preview",
         }
     }
 }
@@ -52,7 +55,8 @@ impl Tab {
 pub fn default_layout() -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Scene, Tab::Game]);
     let surface = dock.main_surface_mut();
-    let [center, _inspector] = surface.split_right(NodeIndex::root(), 0.78, vec![Tab::Inspector]);
+    let [center, inspector] = surface.split_right(NodeIndex::root(), 0.78, vec![Tab::Inspector]);
+    surface.split_below(inspector, 0.62, vec![Tab::MaterialPreview]);
     let [center, _hierarchy] = surface.split_left(center, 0.22, vec![Tab::Hierarchy]);
     surface.split_below(center, 0.68, vec![Tab::Project, Tab::Console]);
     dock
@@ -89,6 +93,7 @@ impl TabViewer for EditorTabs<'_> {
             Tab::SceneAssets => ui::scene_assets::show(ui, self.state),
             Tab::ProjectPrefabs => ui::project_prefabs::show(ui, self.state),
             Tab::Profiler => ui::profiler::show(ui, self.state),
+            Tab::MaterialPreview => ui::material_preview::show(ui, self.state),
         }
     }
 

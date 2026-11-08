@@ -20,6 +20,10 @@ use engine_scene::{
 use std::collections::BTreeMap;
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState) {
+    if let Some(path) = state.inspected_asset.clone() {
+        super::asset_inspector::show(ui, state, &path);
+        return;
+    }
     let Some(object) = state
         .scene
         .as_ref()
@@ -696,6 +700,13 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
     textures.extend(state.assets_of_kind(AssetKind::Texture));
     let mut model_choice = None;
     let mut texture_choice = None;
+    let material_assets = state.assets_of_kind(AssetKind::Material);
+    let part_count = state
+        .models
+        .get(mesh.model.as_str())
+        .map_or(0, |model| model.meshes.len());
+    let slot_count = part_count.max(mesh.materials.len());
+    let mut slot_choice = None;
     let field = OverrideField::Mesh;
     let menu = component_menu(state, id, ComponentKind::MeshRenderer);
     let action = component_header(
@@ -719,6 +730,38 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
                 ui.end_row();
             });
             ui.separator();
+            ui.label("Materials");
+            if slot_count == 0 {
+                ui.weak("FBX part slots appear after the model loads.");
+            }
+            for index in 0..slot_count {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Element {index}"));
+                    let current = mesh
+                        .materials
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .map_or_else(String::new, |path| path.as_str().to_owned());
+                    let mut next = current.clone();
+                    egui::ComboBox::from_id_salt(("mesh-material-slot", id, index))
+                        .selected_text(if current.is_empty() {
+                            "None (FBX)"
+                        } else {
+                            &current
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut next, String::new(), "None (FBX)");
+                            for path in &material_assets {
+                                ui.selectable_value(&mut next, path.clone(), path);
+                            }
+                        });
+                    // Запись только по выбору пользователя: отображение не меняет документ.
+                    if next != current {
+                        slot_choice = Some((index, next));
+                    }
+                });
+            }
+            ui.separator();
             show_material(ui, state, id, mesh.material.as_ref(), &textures);
         },
     );
@@ -737,6 +780,17 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
             }
         }
     }
+    if let Some((index, path)) = slot_choice {
+        let slot = if path.is_empty() {
+            Some(None)
+        } else {
+            parse_path(state, &path).map(Some)
+        };
+        if let Some(slot) = slot {
+            let materials = materials_with_choice(&mesh.materials, slot_count, index, slot);
+            state.edit_scene(|scene| scene.set_mesh_materials(id, materials));
+        }
+    }
     if action == HeaderAction::Revert {
         revert(state, id, field);
         return;
@@ -745,6 +799,20 @@ fn show_mesh(ui: &mut egui::Ui, state: &mut EditorState, object: &SceneObject) {
         state.edit_scene(|scene| scene.remove_mesh_renderer(id));
     }
     run_menu_action(state, id, ComponentKind::MeshRenderer, action);
+}
+
+/// Список слотов после выбора в части `index`. Дополнение до числа частей происходит только здесь,
+/// поэтому отображение без выбора не записывает пустые слоты в сцену.
+fn materials_with_choice(
+    current: &[Option<VirtualPath>],
+    slot_count: usize,
+    index: usize,
+    slot: Option<VirtualPath>,
+) -> Vec<Option<VirtualPath>> {
+    let mut materials = current.to_vec();
+    materials.resize(slot_count, None);
+    materials[index] = slot;
+    materials
 }
 
 /// Поле override: флажок включает замену значения FBX, без него поле не показывается.
@@ -3753,6 +3821,33 @@ mod tests {
             ]
         );
         assert_eq!(anti_aliasing_label(AntiAliasing::Dlss), "DLSS");
+    }
+
+    fn material_path(value: &str) -> Option<VirtualPath> {
+        Some(VirtualPath::parse(value).unwrap())
+    }
+
+    #[test]
+    fn picking_a_slot_pads_the_list_to_the_part_count_and_keeps_other_slots() {
+        let current = [None, material_path("/materials/a.rvemat")];
+        let picked = materials_with_choice(&current, 3, 0, material_path("/materials/b.rvemat"));
+        assert_eq!(
+            picked,
+            [
+                material_path("/materials/b.rvemat"),
+                material_path("/materials/a.rvemat"),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn choosing_none_restores_the_fbx_material_of_that_part() {
+        let current = [material_path("/materials/a.rvemat")];
+        assert_eq!(
+            materials_with_choice(&current, 1, 0, None),
+            [None::<VirtualPath>]
+        );
     }
 }
 

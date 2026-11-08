@@ -172,6 +172,7 @@ impl Component {
                 model: object.mesh_renderer.as_ref()?.model.clone(),
                 texture: None,
                 material: None,
+                materials: Vec::new(),
             }),
             ComponentKind::LodGroup => return None,
             ComponentKind::DirectionalLight => Self::DirectionalLight(default_light()),
@@ -680,6 +681,7 @@ impl EditorScene {
                         model: path.clone(),
                         texture: None,
                         material: None,
+                        materials: Vec::new(),
                     });
                 }
             }
@@ -1205,15 +1207,49 @@ impl EditorScene {
                 ensure_asset(document, texture);
             }
             let object = find_object_mut(document, id)?;
-            let material = object
-                .mesh_renderer
-                .as_ref()
-                .and_then(|mesh| mesh.material.clone());
+            let previous = object.mesh_renderer.as_ref();
+            let material = previous.and_then(|mesh| mesh.material.clone());
+            let materials = previous.map_or_else(Vec::new, |mesh| mesh.materials.clone());
             object.mesh_renderer = Some(MeshRenderer {
                 model,
                 texture,
                 material,
+                materials,
             });
+            Ok(())
+        })
+    }
+
+    /// Assigns FBX-part material slots. Empty entries keep the imported FBX material.
+    pub fn set_mesh_materials(
+        &mut self,
+        id: &str,
+        materials: Vec<Option<VirtualPath>>,
+    ) -> Result<(), String> {
+        for path in materials.iter().flatten() {
+            if !path.as_str().to_ascii_lowercase().ends_with(".rvemat") {
+                return Err(format!("{path}: ожидается ресурс .rvemat"));
+            }
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                let mesh = object
+                    .mesh_renderer
+                    .as_mut()
+                    .ok_or("Mesh Renderer объекта префаба добавляется только в самом префабе")?;
+                mesh.materials = materials;
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            for path in materials.iter().flatten() {
+                ensure_asset(document, path);
+            }
+            find_object_mut(document, id)?
+                .mesh_renderer
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?}: нет Mesh Renderer"))?
+                .materials = materials;
             Ok(())
         })
     }
@@ -1777,6 +1813,9 @@ fn register_object_assets(
 ) -> Result<(), String> {
     if let Some(mesh) = &object.mesh_renderer {
         ensure_asset(document, &mesh.model);
+        for path in mesh.materials.iter().flatten() {
+            ensure_asset(document, path);
+        }
         let material = mesh.material.as_ref();
         for path in [
             mesh.texture.as_ref(),
@@ -2314,6 +2353,55 @@ mod tests {
         assert_eq!(scene.document().assets.len(), 3);
         assert!(scene.set_mesh(&id, path("/t.png"), None).is_err());
         assert!(scene.add_lite_script(&id, path("/m.fbx")).is_err());
+    }
+
+    #[test]
+    fn material_slots_register_assets_and_undo_as_one_edit() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene.set_mesh(&id, path("/mesh.fbx"), None).unwrap();
+        let slots = vec![Some(path("/materials/metal.rvemat")), None];
+        scene.set_mesh_materials(&id, slots.clone()).unwrap();
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .materials,
+            slots
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/materials/metal.rvemat"))
+        );
+        assert!(
+            scene
+                .set_mesh_materials(&id, vec![Some(path("/bad.png"))])
+                .is_err()
+        );
+        assert!(scene.undo());
+        assert!(
+            scene
+                .object(&id)
+                .unwrap()
+                .mesh_renderer
+                .as_ref()
+                .unwrap()
+                .materials
+                .is_empty()
+        );
+        assert!(
+            !scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == path("/materials/metal.rvemat"))
+        );
     }
 
     #[test]
