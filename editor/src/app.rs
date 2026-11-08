@@ -41,6 +41,8 @@ const WINDOW_CLEAR: [f32; 4] = [0.02, 0.02, 0.025, 1.0];
 const PREVIEW_POLL: Duration = Duration::from_millis(30);
 /// Как часто забирать вывод идущей сборки.
 const BUILD_POLL: Duration = Duration::from_millis(50);
+/// Как часто дренировать очередь геймпадов вне Play: без этого события копятся до следующего Play.
+const IDLE_GAMEPAD_POLL: Duration = Duration::from_secs(1);
 
 pub struct EditorApp {
     state: EditorState,
@@ -1845,6 +1847,12 @@ impl WindowHandler for EditorApp {
             self.apply_asset_changes(changes);
             window.request_redraw();
         }
+        // Вне Play очередь геймпадов дренируется без доставки в скрипты; в Play опрос идёт в кадре.
+        if self.state.play.is_none()
+            && let Some(gamepads) = self.state.gamepads.as_mut()
+        {
+            gamepads.discard_events();
+        }
         if self.exit {
             return false;
         }
@@ -1878,11 +1886,14 @@ impl WindowHandler for EditorApp {
             .scripts_job
             .is_some()
             .then(|| Instant::now() + BUILD_POLL);
+        let idle_pads = (self.state.play.is_none() && self.state.gamepads.is_some())
+            .then(|| Instant::now() + IDLE_GAMEPAD_POLL);
         [
             self.repaint_at,
             preview,
             build,
             scripts,
+            idle_pads,
             self.autosave_deadline(),
             self.asset_changes.deadline(),
         ]

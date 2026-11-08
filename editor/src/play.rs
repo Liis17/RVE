@@ -1346,6 +1346,29 @@ return Rotate
     }
 
     #[test]
+    fn gamepad_rumble_is_delivered_once_and_dropped_when_pads_are_not_accepted() {
+        const RUMBLE: &str = r#"
+local Rumble = {}
+function Rumble:on_update(dt)
+  rve.input.gamepad_rumble(1.0, 0.5, 1.0, 1)
+end
+return Rumble
+"#;
+        let mut gamepads = GilrsBackend::without_devices(GamepadTuning::default());
+        let mut session = start(RUMBLE).unwrap();
+
+        session.step(0.1).unwrap();
+        assert_eq!(session.rumble.len(), 1);
+        session.poll_gamepads(&mut gamepads, false);
+        assert!(session.rumble.is_empty());
+
+        session.step(0.1).unwrap();
+        assert_eq!(session.rumble.len(), 1);
+        session.poll_gamepads(&mut gamepads, true);
+        assert!(session.rumble.is_empty());
+    }
+
+    #[test]
     fn play_starts_with_the_active_camera_cursor_flags() {
         let scene = SCENE.replace(
             "[objects.camera]\n",

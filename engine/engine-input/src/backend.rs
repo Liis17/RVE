@@ -44,11 +44,18 @@ impl GilrsBackend {
     /// `tuning`, and registers the pads that are already connected.
     pub fn begin_session(&mut self, tuning: GamepadTuning) {
         self.effects.clear();
+        self.discard_events();
+        self.mapper = GamepadMapper::new(tuning);
+        self.register_connected();
+    }
+
+    /// Drops queued backend events without applying them. The editor calls it outside Play so
+    /// the `gilrs` queue does not grow; pad state is untouched and the next session starts from
+    /// [`GilrsBackend::begin_session`] anyway.
+    pub fn discard_events(&mut self) {
         if let Some(gilrs) = self.gilrs.as_mut() {
             while gilrs.next_event().is_some() {}
         }
-        self.mapper = GamepadMapper::new(tuning);
-        self.register_connected();
     }
 
     /// Ends a Play session: stops rumble and releases every pad. The `gilrs` context stays open.
@@ -233,6 +240,14 @@ mod tests {
     #[test]
     fn pads_outside_the_slot_range_are_ignored() {
         assert_eq!(latest_per_slot([(5, 1.0, 1.0, 1.0)]), [None; SLOT_COUNT]);
+    }
+
+    #[test]
+    fn discarding_idle_events_without_devices_leaves_the_next_session_clean() {
+        let mut backend = GilrsBackend::without_devices(GamepadTuning::default());
+        backend.discard_events();
+        backend.begin_session(GamepadTuning::default());
+        assert_eq!(backend.snapshot(), [PadSnapshot::default(); SLOT_COUNT]);
     }
 
     #[test]
