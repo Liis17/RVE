@@ -41,6 +41,9 @@ layout(push_constant) uniform PushConstants {
     uvec4 params;
 } push_constants;
 
+// Одинаковая позиция в prepass и в основном проходе: глубина совпадает бит-в-бит для LESS_OR_EQUAL.
+invariant gl_Position;
+
 void main() {
     vec4 world_position = push_constants.model * vec4(in_position, 1.0);
     vec4 current_clip = frame.view_projection * world_position;

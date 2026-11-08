@@ -26,10 +26,10 @@ use engine_physics::{
 };
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
+    EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
     FrameStatus, LatencyHandle, LatencyMarker, LocalLight, LocalLightShadow,
     LocalLightShadowMatrices, MaterialId, MeshId, ParticleEmitterDesc, ParticleEmitterFrame,
-    ParticleEmitterId, ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION,
+    ParticleEmitterId, PostProcess, ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION,
     TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_render::{SkinBinding, SkinId};
@@ -42,7 +42,7 @@ use engine_scene::light::{
 };
 use engine_scene::{
     AntiAliasing, AudioRequest, CameraSettings, EnvironmentState, LightState, LocalLightState,
-    ObjectHandle, PrefabTemplate, Tonemapper, VoiceId, World,
+    ObjectHandle, PostProcessSettings, PrefabTemplate, Tonemapper, VoiceId, World,
 };
 #[cfg(feature = "dev-console")]
 use engine_script::CommandError;
@@ -79,6 +79,8 @@ pub(crate) struct FrameSnapshot {
     pub camera: Camera,
     pub active_camera: ObjectHandle,
     pub view: CameraSettings,
+    /// Постобработка активной камеры, уже разрешённая из `.postprocess` или `[color]`.
+    pub post_process: PostProcessSettings,
     pub reset_history: bool,
     pub light: LightState,
     pub local_lights: Vec<LocalLight>,
@@ -686,12 +688,7 @@ impl RenderBackend for VulkanBackend {
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
-                exposure_ev: snapshot.view.color.exposure_ev,
-                tonemapper: match snapshot.view.color.tonemapper {
-                    Tonemapper::Aces => RenderTonemapper::Aces,
-                    Tonemapper::Neutral => RenderTonemapper::Neutral,
-                    Tonemapper::None => RenderTonemapper::None,
-                },
+                post: render_post_process(&snapshot.post_process),
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -809,12 +806,7 @@ impl RenderBackend for VulkanBackend {
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
-                exposure_ev: snapshot.view.color.exposure_ev,
-                tonemapper: match snapshot.view.color.tonemapper {
-                    Tonemapper::Aces => RenderTonemapper::Aces,
-                    Tonemapper::Neutral => RenderTonemapper::Neutral,
-                    Tonemapper::None => RenderTonemapper::None,
-                },
+                post: render_post_process(&snapshot.post_process),
                 anti_aliasing: match snapshot.view.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -1989,6 +1981,7 @@ fn make_snapshot(
         camera: scene.camera,
         active_camera: world.active_camera(),
         view: scene.view,
+        post_process: scene.post_process,
         reset_history: false,
         light: scene.light,
         local_lights,
@@ -2947,6 +2940,113 @@ fn render_snapshot(
     Ok(Some(outcome))
 }
 
+/// Переводит постобработку камеры в настройки renderer.
+///
+/// Выключенная экспозиция становится ручной с EV 0, выключенный tonemapping — `None`. Выключенные
+/// эффекты сохраняют параметры, но renderer их не выполняет, поэтому `enabled = false` совпадает
+/// с тождественным преобразованием.
+pub fn render_post_process(post: &PostProcessSettings) -> PostProcess {
+    let exposure = if post.exposure.enabled {
+        Exposure {
+            mode: match post.exposure.mode {
+                engine_scene::ExposureMode::Manual => engine_render::ExposureMode::Manual,
+                engine_scene::ExposureMode::Auto => engine_render::ExposureMode::Auto,
+            },
+            ev: post.exposure.ev,
+            min_ev: post.exposure.min_ev,
+            max_ev: post.exposure.max_ev,
+            speed_up: post.exposure.speed_up,
+            speed_down: post.exposure.speed_down,
+            low_percent: post.exposure.low_percent,
+            high_percent: post.exposure.high_percent,
+        }
+    } else {
+        Exposure::default()
+    };
+    let tonemapper = if post.tonemapping.enabled {
+        match post.tonemapping.tonemapper {
+            Tonemapper::Aces => RenderTonemapper::Aces,
+            Tonemapper::Neutral => RenderTonemapper::Neutral,
+            Tonemapper::None => RenderTonemapper::None,
+        }
+    } else {
+        RenderTonemapper::None
+    };
+    let quality = match post.ambient_occlusion.quality {
+        engine_scene::AmbientOcclusionQuality::Low => engine_render::AmbientOcclusionQuality::Low,
+        engine_scene::AmbientOcclusionQuality::Medium => {
+            engine_render::AmbientOcclusionQuality::Medium
+        }
+        engine_scene::AmbientOcclusionQuality::High => engine_render::AmbientOcclusionQuality::High,
+    };
+    let bloom = post.bloom;
+    let ao = post.ambient_occlusion;
+    let grading = post.color_grading;
+    let vignette = post.vignette;
+    let aberration = post.chromatic_aberration;
+    let grain = post.film_grain;
+    let dof = post.depth_of_field;
+    let motion = post.motion_blur;
+    PostProcess {
+        exposure,
+        tonemapper,
+        bloom: engine_render::Bloom {
+            enabled: bloom.enabled,
+            intensity: bloom.intensity,
+            threshold: bloom.threshold,
+            knee: bloom.knee,
+            scatter: bloom.scatter,
+            tint: bloom.tint,
+        },
+        ambient_occlusion: engine_render::AmbientOcclusion {
+            enabled: ao.enabled,
+            radius: ao.radius,
+            intensity: ao.intensity,
+            falloff: ao.falloff,
+            quality,
+        },
+        color_grading: engine_render::ColorGrading {
+            enabled: grading.enabled,
+            temperature: grading.temperature,
+            tint: grading.tint,
+            contrast: grading.contrast,
+            saturation: grading.saturation,
+            lift: grading.lift,
+            gamma: grading.gamma,
+            gain: grading.gain,
+        },
+        vignette: engine_render::Vignette {
+            enabled: vignette.enabled,
+            intensity: vignette.intensity,
+            smoothness: vignette.smoothness,
+            roundness: vignette.roundness,
+            color: vignette.color,
+        },
+        chromatic_aberration: engine_render::ChromaticAberration {
+            enabled: aberration.enabled,
+            intensity: aberration.intensity,
+        },
+        film_grain: engine_render::FilmGrain {
+            enabled: grain.enabled,
+            intensity: grain.intensity,
+            response: grain.response,
+        },
+        depth_of_field: engine_render::DepthOfField {
+            enabled: dof.enabled,
+            focus_distance: dof.focus_distance,
+            aperture: dof.aperture,
+            focal_length_mm: dof.focal_length_mm,
+            max_blur_px: dof.max_blur_px,
+        },
+        motion_blur: engine_render::MotionBlur {
+            enabled: motion.enabled,
+            shutter_angle_deg: motion.shutter_angle_deg,
+            samples: motion.samples,
+            max_blur_px: motion.max_blur_px,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "dev-console")]
@@ -3562,6 +3662,7 @@ distance=2.0
             },
             active_camera,
             view: CameraSettings::default(),
+            post_process: engine_scene::PostProcessSettings::default(),
             reset_history: false,
             light: LightState::default(),
             local_lights: Vec::new(),
@@ -3606,6 +3707,7 @@ distance=2.0
             },
             active_camera,
             view: CameraSettings::default(),
+            post_process: engine_scene::PostProcessSettings::default(),
             reset_history: false,
             light: LightState::default(),
             local_lights: Vec::new(),
@@ -3754,8 +3856,14 @@ range = 10
         settings.render.render_scale = 0.5;
         settings.render.clear_color = [0.2, 0.3, 0.4];
         settings.render.anti_aliasing = engine_scene::AntiAliasing::None;
-        settings.color.exposure_ev = 1.0;
-        settings.color.tonemapper = engine_scene::Tonemapper::Neutral;
+        settings
+            .color
+            .get_or_insert_with(Default::default)
+            .exposure_ev = 1.0;
+        settings
+            .color
+            .get_or_insert_with(Default::default)
+            .tonemapper = engine_scene::Tonemapper::Neutral;
         world
             .set_camera_settings(world.active_camera(), settings)
             .unwrap();
@@ -3879,7 +3987,7 @@ return Script
             &AnimationBridge::default(),
         )
         .unwrap();
-        assert_eq!(snapshot.view.color.exposure_ev, 2.5);
+        assert_eq!(snapshot.view.color.unwrap_or_default().exposure_ev, 2.5);
         assert!(host.drain_events().is_empty());
     }
 
@@ -6802,5 +6910,50 @@ mod particle_emitter_tests {
         assert_eq!(log, vec![8]);
         apply(&mut table, &mut log, ParticleRequest::Destroy(vec![a]));
         assert_eq!(log, vec![8], "повторное уничтожение не трогает эмиттер");
+    }
+}
+
+#[cfg(test)]
+mod post_process_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn scene_defaults_map_to_renderer_defaults() {
+        assert_eq!(
+            render_post_process(&PostProcessSettings::default()),
+            PostProcess::default()
+        );
+    }
+
+    #[test]
+    fn disabled_exposure_and_tonemapping_become_identity_values() {
+        let mut post = PostProcessSettings::default();
+        post.exposure.enabled = false;
+        post.exposure.ev = 2.0;
+        post.tonemapping.enabled = false;
+        let mapped = render_post_process(&post);
+        assert_eq!(mapped.exposure, Exposure::default());
+        assert_eq!(mapped.tonemapper, RenderTonemapper::None);
+    }
+
+    #[test]
+    fn enabled_effects_keep_their_parameters_and_quality() {
+        let mut post = PostProcessSettings::default();
+        post.bloom.enabled = true;
+        post.bloom.intensity = 1.5;
+        post.ambient_occlusion.enabled = true;
+        post.ambient_occlusion.quality = engine_scene::AmbientOcclusionQuality::High;
+        post.exposure.mode = engine_scene::ExposureMode::Auto;
+        post.exposure.ev = -0.5;
+        let mapped = render_post_process(&post);
+        assert!(mapped.bloom.enabled);
+        assert_eq!(mapped.bloom.intensity, 1.5);
+        assert!(mapped.ambient_occlusion.enabled);
+        assert_eq!(
+            mapped.ambient_occlusion.quality,
+            engine_render::AmbientOcclusionQuality::High
+        );
+        assert_eq!(mapped.exposure.mode, engine_render::ExposureMode::Auto);
+        assert_eq!(mapped.exposure.ev, -0.5);
     }
 }

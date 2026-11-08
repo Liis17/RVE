@@ -59,6 +59,10 @@ layout(set = 0, binding = 6, std430) readonly buffer LocalShadowMatrixBuffer {
     mat4 matrices[MAX_LOCAL_SHADOW_LAYERS];
 } local_shadow_matrix_buffer;
 layout(set = 0, binding = 7) uniform texture2DArray local_shadow_map;
+#ifndef NO_SCREEN_AO
+// Экранный AO цели; при выключенном эффекте привязана 1×1 белая текстура.
+layout(set = 0, binding = 8) uniform texture2D ao_image;
+#endif
 
 layout(set = 1, binding = 0) uniform MaterialUniforms {
     vec4 base_color;
@@ -469,6 +473,14 @@ void main() {
     ).rg;
     vec3 indirect_diffuse = irradiance * diffuse_color / PI;
     vec3 indirect_specular = prefiltered * (f0 * brdf.x + brdf.y);
+#ifndef NO_SCREEN_AO
+    // AO ослабляет только непрямое освещение; маска и прозрачность его не получают.
+    ivec2 ao_size = textureSize(ao_image, 0);
+    ivec2 ao_pixel = clamp(ivec2(gl_FragCoord.xy), ivec2(0), ao_size - 1);
+    float screen_ao = texelFetch(ao_image, ao_pixel, 0).r;
+    indirect_diffuse *= screen_ao;
+    indirect_specular *= screen_ao;
+#endif
     float environment_weight = frame.environment_params.z;
     vec3 ambient = mix(
         frame.ambient_color.rgb * (indirect_diffuse + indirect_specular),

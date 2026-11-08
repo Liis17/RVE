@@ -530,6 +530,8 @@ fn host(state: &mut HostState) -> RveHost {
         animation_stop: None,
         gamepad_state: None,
         gamepad_rumble: None,
+        get_post_process: None,
+        set_post_process: None,
     }
 }
 
@@ -1912,7 +1914,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 11);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 12);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2182,6 +2184,7 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 12);
 }
 
 #[test]

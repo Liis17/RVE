@@ -7,7 +7,7 @@ use engine_project::{
 use engine_resources::{
     ResourceConfig, ResourceError, ResourceErrorKind, ResourceHandle, ResourceSystem, SourceMode,
 };
-use engine_scene::{CameraSettings, PhysicsMaterialSettings};
+use engine_scene::{CameraSettings, PhysicsMaterialSettings, PostProcessSettings};
 use engine_scene::{
     ParamSchema, ParamValue, PrefabTemplate, SceneAsset, SceneDocument, SceneError, SceneObject,
     expand,
@@ -404,6 +404,19 @@ fn record_asset(
             ))
         })?;
         CameraSettings::parse(format!("/{path}"), &source)
+            .map_err(|error| BuildError::input(error.to_string()))?;
+    }
+
+    if extension_is(path.as_str(), "postprocess") {
+        let bytes = sources
+            .handle
+            .read_all(format!("/{path}"))
+            .and_then(|request| request.wait())
+            .map_err(|error| resource_error(&format!("постобработка /{path}"), error))?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            BuildError::input(format!("постобработка /{path} должна быть UTF-8: {error}"))
+        })?;
+        PostProcessSettings::parse(format!("/{path}"), &source)
             .map_err(|error| BuildError::input(error.to_string()))?;
     }
 

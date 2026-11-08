@@ -417,6 +417,49 @@ impl EditorState {
         })
     }
 
+    /// Сохраняет правку `.postprocess` и обновляет все камеры, которые используют этот файл.
+    pub fn save_post_process(
+        &mut self,
+        path: &engine_files::VirtualPath,
+        settings: engine_scene::PostProcessSettings,
+    ) -> bool {
+        if self.is_playing() {
+            return false;
+        }
+        let Some(project) = self.project.as_ref() else {
+            self.log.error("проект не открыт");
+            return false;
+        };
+        if let Err(error) = project.save_post_process(path, &settings) {
+            self.log.error(error);
+            return false;
+        }
+        let handles = self
+            .world_mut()
+            .map(|world| {
+                world
+                    .objects()
+                    .iter()
+                    .filter(|object| {
+                        object
+                            .camera
+                            .as_ref()
+                            .and_then(|camera| camera.post_process.as_ref())
+                            == Some(path)
+                    })
+                    .map(|object| object.handle)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(world) = self.world_mut() {
+            for handle in handles {
+                let _ = world.set_post_process(handle, settings);
+            }
+        }
+        self.log.info(format!("Сохранена постобработка {path}"));
+        true
+    }
+
     pub fn camera_settings_for(&mut self, id: &str) -> Option<CameraSettings> {
         let world = self.world_mut()?;
         let handle = world.handle(id)?;

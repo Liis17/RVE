@@ -5,6 +5,9 @@ path = "/models/shared-cube.fbx"
 path = "/cameras/default.camerasettings"
 
 [[assets]]
+path = "/cameras/default.postprocess"
+
+[[assets]]
 path = "/scripts/rotate.lua"
 
 [[assets]]
@@ -17,6 +20,7 @@ name = "Camera"
 position = [0.0, 1.15, 6.0]
 [objects.camera]
 settings = "/cameras/default.camerasettings"
+post_process = "/cameras/default.postprocess"
 
 [[objects]]
 id = "sun"

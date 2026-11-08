@@ -10,13 +10,15 @@ use engine_files::VirtualPath;
 use engine_project::{BootstrapConfig, BootstrapPresentMode, BootstrapReflexMode};
 use engine_render::{
     AlphaMode, AntiAliasing as RenderAntiAliasing, DebugView, DrawCommand, EnvironmentId,
-    EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameStatus, LatencyHandle,
+    EnvironmentSource, Exposure, Frame, FrameCamera, FrameEnvironment, FrameStatus, LatencyHandle,
     LatencyMarker, LowLatencyMode, Material, MaterialId, MeshId, ParticleBlend, ParticleCollision,
-    ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape, ProceduralSky, Renderer,
+    ParticleEmitterDesc, ParticleEmitterFrame, ParticleShape, PostProcess, ProceduralSky, Renderer,
     RendererConfig, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
-use engine_scene::{AntiAliasing, CameraSettings, Tonemapper};
+use engine_scene::{
+    AntiAliasing, CameraSettings, PostProcessSettings, Tonemapper, resolve_post_process,
+};
 use engine_window::{PhysicalSize, Window, WindowConfig, WindowHandler, run};
 use glam::{Mat4, Vec3};
 use scene::Scene;
@@ -27,7 +29,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--resize-test] [--scene triangle|cube|shadows|materials|clustered|particles] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
+const USAGE: &str = "Использование: sandbox [--frames N] [--render-scale S] [--camera-settings /путь.camerasettings] [--post-process /путь.postprocess] [--resize-test] [--scene triangle|cube|shadows|materials|clustered|particles] [--model /путь.fbx] [--texture /путь.png] [--environment procedural|/путь.hdr] [--debug-overlay]";
 const RESIZE_SIZE: PhysicalSize<u32> = PhysicalSize::new(960, 540);
 const RESTORE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 720);
 
@@ -35,6 +37,7 @@ struct Options {
     frames: Option<u64>,
     render_scale: Option<f32>,
     camera_settings: Option<String>,
+    post_process: Option<String>,
     resize_test: bool,
     scene: Scene,
     /// Путь модели внутри `assets`, например `/model/cube.fbx`.
@@ -61,6 +64,7 @@ where
     let mut frames = None;
     let mut render_scale = None;
     let mut camera_settings = None;
+    let mut post_process = None;
     let mut resize_test = false;
     let mut scene = None;
     let mut model = None;
@@ -118,6 +122,26 @@ where
                     return Err("--camera-settings должен указывать на .camerasettings".to_owned());
                 }
                 camera_settings = Some(path.as_str().to_owned());
+            }
+            "--post-process" => {
+                if post_process.is_some() {
+                    return Err("флаг --post-process указан повторно".to_owned());
+                }
+                let value = args.next().ok_or_else(|| {
+                    "после --post-process требуется путь к .postprocess".to_owned()
+                })?;
+                let path = VirtualPath::parse(&value)
+                    .map_err(|error| format!("некорректный путь --post-process: {error}"))?;
+                let is_post_process = path
+                    .as_str()
+                    .rsplit('/')
+                    .next()
+                    .and_then(|name| name.rsplit_once('.'))
+                    .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("postprocess"));
+                if !is_post_process {
+                    return Err("--post-process должен указывать на .postprocess".to_owned());
+                }
+                post_process = Some(path.as_str().to_owned());
             }
             "--resize-test" => {
                 if resize_test {
@@ -202,6 +226,7 @@ where
         frames,
         render_scale,
         camera_settings,
+        post_process,
         resize_test,
         scene: scene.unwrap_or_default(),
         model,
@@ -209,6 +234,128 @@ where
         environment,
         debug_overlay,
     })
+}
+
+/// Загружает `.postprocess` из `--post-process`; без флага постобработка берётся из камеры.
+fn load_post_process(
+    options: &Options,
+    resources: &ResourceHandle,
+) -> Result<Option<PostProcessSettings>, String> {
+    let Some(path) = &options.post_process else {
+        return Ok(None);
+    };
+    let bytes = resources
+        .read_all(path)
+        .map_err(|error| format!("{path}: {error}"))?
+        .wait()
+        .map_err(|error| format!("{path}: {error}"))?;
+    let source = String::from_utf8(bytes)
+        .map_err(|error| format!("{path}: файл должен быть UTF-8: {error}"))?;
+    PostProcessSettings::parse(path, &source)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Переводит постобработку в настройки renderer; выключенные exposure и tonemapping дают
+/// тождественные значения. Совпадает с маппингом runtime (`render_post_process`).
+fn render_post_process(post: &PostProcessSettings) -> PostProcess {
+    let exposure = if post.exposure.enabled {
+        Exposure {
+            mode: match post.exposure.mode {
+                engine_scene::ExposureMode::Manual => engine_render::ExposureMode::Manual,
+                engine_scene::ExposureMode::Auto => engine_render::ExposureMode::Auto,
+            },
+            ev: post.exposure.ev,
+            min_ev: post.exposure.min_ev,
+            max_ev: post.exposure.max_ev,
+            speed_up: post.exposure.speed_up,
+            speed_down: post.exposure.speed_down,
+            low_percent: post.exposure.low_percent,
+            high_percent: post.exposure.high_percent,
+        }
+    } else {
+        Exposure::default()
+    };
+    let tonemapper = if post.tonemapping.enabled {
+        match post.tonemapping.tonemapper {
+            Tonemapper::Aces => RenderTonemapper::Aces,
+            Tonemapper::Neutral => RenderTonemapper::Neutral,
+            Tonemapper::None => RenderTonemapper::None,
+        }
+    } else {
+        RenderTonemapper::None
+    };
+    let (bloom, ao, grading) = (post.bloom, post.ambient_occlusion, post.color_grading);
+    let (vignette, aberration, grain) = (post.vignette, post.chromatic_aberration, post.film_grain);
+    let (dof, motion) = (post.depth_of_field, post.motion_blur);
+    PostProcess {
+        exposure,
+        tonemapper,
+        bloom: engine_render::Bloom {
+            enabled: bloom.enabled,
+            intensity: bloom.intensity,
+            threshold: bloom.threshold,
+            knee: bloom.knee,
+            scatter: bloom.scatter,
+            tint: bloom.tint,
+        },
+        ambient_occlusion: engine_render::AmbientOcclusion {
+            enabled: ao.enabled,
+            radius: ao.radius,
+            intensity: ao.intensity,
+            falloff: ao.falloff,
+            quality: match ao.quality {
+                engine_scene::AmbientOcclusionQuality::Low => {
+                    engine_render::AmbientOcclusionQuality::Low
+                }
+                engine_scene::AmbientOcclusionQuality::Medium => {
+                    engine_render::AmbientOcclusionQuality::Medium
+                }
+                engine_scene::AmbientOcclusionQuality::High => {
+                    engine_render::AmbientOcclusionQuality::High
+                }
+            },
+        },
+        color_grading: engine_render::ColorGrading {
+            enabled: grading.enabled,
+            temperature: grading.temperature,
+            tint: grading.tint,
+            contrast: grading.contrast,
+            saturation: grading.saturation,
+            lift: grading.lift,
+            gamma: grading.gamma,
+            gain: grading.gain,
+        },
+        vignette: engine_render::Vignette {
+            enabled: vignette.enabled,
+            intensity: vignette.intensity,
+            smoothness: vignette.smoothness,
+            roundness: vignette.roundness,
+            color: vignette.color,
+        },
+        chromatic_aberration: engine_render::ChromaticAberration {
+            enabled: aberration.enabled,
+            intensity: aberration.intensity,
+        },
+        film_grain: engine_render::FilmGrain {
+            enabled: grain.enabled,
+            intensity: grain.intensity,
+            response: grain.response,
+        },
+        depth_of_field: engine_render::DepthOfField {
+            enabled: dof.enabled,
+            focus_distance: dof.focus_distance,
+            aperture: dof.aperture,
+            focal_length_mm: dof.focal_length_mm,
+            max_blur_px: dof.max_blur_px,
+        },
+        motion_blur: engine_render::MotionBlur {
+            enabled: motion.enabled,
+            shutter_angle_deg: motion.shutter_angle_deg,
+            samples: motion.samples,
+            max_blur_px: motion.max_blur_px,
+        },
+    }
 }
 
 fn load_camera_settings(
@@ -349,6 +496,8 @@ struct Sandbox {
     environment_source: Option<EnvironmentSource>,
     environment: Option<EnvironmentId>,
     camera_settings: CameraSettings,
+    /// Постобработка камеры, разрешённая из `--post-process` или устаревшего `[color]`.
+    post_process: PostProcessSettings,
     present_mode: Option<BootstrapPresentMode>,
     reflex: Option<BootstrapReflexMode>,
     /// Reflex-handle renderer; `None`, если Reflex выключен или не поддержан.
@@ -390,6 +539,7 @@ impl Sandbox {
             environment_source,
             environment: None,
             camera_settings,
+            post_process: PostProcessSettings::default(),
             present_mode,
             reflex: None,
             latency: None,
@@ -795,12 +945,7 @@ impl WindowHandler for Sandbox {
             debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: self.camera_settings.render.render_scale,
-                exposure_ev: self.camera_settings.color.exposure_ev,
-                tonemapper: match self.camera_settings.color.tonemapper {
-                    Tonemapper::Aces => RenderTonemapper::Aces,
-                    Tonemapper::Neutral => RenderTonemapper::Neutral,
-                    Tonemapper::None => RenderTonemapper::None,
-                },
+                post: render_post_process(&self.post_process),
                 anti_aliasing: match self.camera_settings.render.anti_aliasing {
                     AntiAliasing::Fxaa => RenderAntiAliasing::Fxaa,
                     AntiAliasing::None => RenderAntiAliasing::None,
@@ -969,6 +1114,14 @@ fn main_after_vulkan_environment() -> ExitCode {
     };
     let pipeline_cache_path = engine_platform::pipeline_cache_path("sandbox");
     let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
+    let post_file = match load_post_process(&options, &resources.handle()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("Ошибка постобработки: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let post_process = resolve_post_process(&camera_settings, post_file.as_ref());
     let mut app = Sandbox::new(
         options,
         content,
@@ -978,6 +1131,7 @@ fn main_after_vulkan_environment() -> ExitCode {
         pipeline_cache_path,
         pipeline_cache,
     );
+    app.post_process = post_process;
     app.reflex = reflex;
     let run_result = run(config, &mut app);
     let failure = app.take_failure();
@@ -1126,6 +1280,7 @@ mod tests {
             frames: None,
             render_scale: Some(1.0),
             camera_settings: None,
+            post_process: None,
             resize_test: true,
             scene: Scene::Cube,
             model: None,
@@ -1184,6 +1339,8 @@ mod tests {
             "0.5",
             "--camera-settings",
             "/camera/default.camerasettings",
+            "--post-process",
+            "/post/bloom.postprocess",
             "--resize-test",
             "--scene",
             "triangle",
@@ -1192,6 +1349,10 @@ mod tests {
             "--debug-overlay",
         ])
         .expect("valid arguments should parse");
+        assert_eq!(
+            options.post_process.as_deref(),
+            Some("post/bloom.postprocess")
+        );
         assert_eq!(options.frames, Some(120));
         assert_eq!(options.render_scale, Some(0.5));
         assert_eq!(
@@ -1243,6 +1404,14 @@ mod tests {
             vec!["--render-scale", "2"],
             vec!["--render-scale", "0.5", "--render-scale", "0.25"],
             vec!["--camera-settings"],
+            vec!["--post-process"],
+            vec!["--post-process", "/camera/default.camerasettings"],
+            vec![
+                "--post-process",
+                "/a.postprocess",
+                "--post-process",
+                "/b.postprocess",
+            ],
             vec!["--camera-settings", "../camera.camerasettings"],
             vec!["--camera-settings", "/camera/default.toml"],
             vec![

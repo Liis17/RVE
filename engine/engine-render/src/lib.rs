@@ -32,11 +32,26 @@ use ui::{
     validate_texture_region, validate_viewport_size,
 };
 
+mod ambient_occlusion;
+mod bloom;
 mod clusters;
 mod culling;
+mod exposure;
+mod filters;
 mod particle_gpu;
 mod particles;
+mod post;
 
+use ambient_occlusion::{AoPipelines, AoRecord, AoTarget, record_ambient_occlusion};
+use bloom::{
+    BloomChain, BloomPipelines, BloomRecord, bloom_record, record_bloom, write_composite_bloom,
+};
+use exposure::{
+    ExposureHistory, ExposurePipelines, ExposureRecord, ExposureResources, ExposureTarget,
+    ViewExposure, exposure_record, prepare_view_exposure, record_exposure,
+    write_composite_exposure,
+};
+use filters::{FilterPipelines, FilterRecord, FilterScratch, record_filters};
 use particle_gpu::{
     ParticleEmitter, ParticlePass, ParticleSystem, particle_depth_source_masks, record_particles,
 };
@@ -45,6 +60,11 @@ pub use particles::{
     MAX_PARTICLE_STEP, ParticleBlend, ParticleBurst, ParticleCollision, ParticleColorKey,
     ParticleEmitterDesc, ParticleFlipbook, ParticleShape, ParticleSizeKey,
 };
+pub use post::{
+    AmbientOcclusion, AmbientOcclusionQuality, Bloom, ChromaticAberration, ColorGrading,
+    DepthOfField, Exposure, ExposureMode, FilmGrain, MotionBlur, PostProcess, Vignette,
+};
+use post::{COMPOSITE_PUSH_CONSTANTS_SIZE, OUTPUT_PUSH_CONSTANTS_SIZE, PostFrame};
 #[cfg(any(test, all(windows, feature = "dlss")))]
 mod dlss;
 #[allow(dead_code)]
@@ -114,7 +134,6 @@ const SKYBOX_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sk
 const SKYBOX_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.frag.spv"));
 const OVERLAY_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 2]>();
 const UI_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
-const POST_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const TAA_PUSH_CONSTANTS_SIZE: usize = size_of::<[f32; 4]>();
 const PIPELINE_CACHE_HEADER_SIZE: usize = size_of::<vk::PipelineCacheHeaderVersionOne>();
 /// Максимум видов с GPU-границами за кадр: основной экран или viewport редактора.
@@ -394,8 +413,8 @@ pub struct Frame<'a> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewSettings {
     pub render_scale: f32,
-    pub exposure_ev: f32,
-    pub tonemapper: Tonemapper,
+    /// Экспозиция, tonemapper и эффекты постобработки вида.
+    pub post: PostProcess,
     pub anti_aliasing: AntiAliasing,
 }
 
@@ -403,8 +422,7 @@ impl Default for ViewSettings {
     fn default() -> Self {
         Self {
             render_scale: 1.0,
-            exposure_ev: 0.0,
-            tonemapper: Tonemapper::Aces,
+            post: PostProcess::default(),
             anti_aliasing: AntiAliasing::Fxaa,
         }
     }
@@ -780,6 +798,10 @@ pub enum GpuPass {
     ShadowDirectional,
     /// Локальные теневые слои.
     ShadowLocal,
+    /// Depth prepass непрозрачных мешей; отсутствует, если AO выключен.
+    DepthPrepass,
+    /// GTAO и denoise; отсутствует, если AO выключен.
+    AmbientOcclusion,
     /// Непрозрачные и маскированные меши.
     Opaque,
     /// Skybox.
@@ -792,24 +814,35 @@ pub enum GpuPass {
     Particles,
     /// TAA, FSR или DLSS; отсутствует, если временное сглаживание выключено.
     TemporalResolve,
-    /// Tonemap до вывода на swapchain.
+    /// Motion blur и depth of field; отсутствуют, если эффекты выключены.
+    Filters,
+    /// Адаптация экспозиции по гистограмме; отсутствует при ручной экспозиции.
+    Exposure,
+    /// Bloom: prefilter, downsample и upsample; отсутствует, если эффект выключен.
+    Bloom,
+    /// Composite: tonemap до вывода на swapchain.
     Tonemap,
 }
 
 impl GpuPass {
     /// Число проходов, для которых записываются границы.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 15;
     /// Все проходы в порядке выполнения.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Clusters,
         Self::ShadowDirectional,
         Self::ShadowLocal,
+        Self::DepthPrepass,
+        Self::AmbientOcclusion,
         Self::Opaque,
         Self::Skybox,
         Self::Transparent,
         Self::Wireframe,
         Self::Particles,
         Self::TemporalResolve,
+        Self::Filters,
+        Self::Exposure,
+        Self::Bloom,
         Self::Tonemap,
     ];
 
@@ -819,12 +852,17 @@ impl GpuPass {
             Self::Clusters => "Clusters",
             Self::ShadowDirectional => "Shadow directional",
             Self::ShadowLocal => "Shadow local",
+            Self::DepthPrepass => "Depth prepass",
+            Self::AmbientOcclusion => "Ambient occlusion",
             Self::Opaque => "Opaque",
             Self::Skybox => "Skybox",
             Self::Transparent => "Transparent",
             Self::Wireframe => "Wireframe",
             Self::Particles => "Particles",
             Self::TemporalResolve => "Temporal resolve",
+            Self::Filters => "Motion blur and DoF",
+            Self::Exposure => "Exposure",
+            Self::Bloom => "Bloom",
             Self::Tonemap => "Tonemap",
         }
     }
@@ -1033,6 +1071,14 @@ pub struct Renderer {
     /// Номер последнего отправленного вызова с skinning; нужен для предыдущей позы.
     skin_call_serial: u64,
     post_pipeline_layout: Option<vk::PipelineLayout>,
+    bloom_pipelines: Option<BloomPipelines>,
+    exposure_pipelines: Option<ExposurePipelines>,
+    filter_pipelines: Option<FilterPipelines>,
+    ao_pipelines: Option<AoPipelines>,
+    /// Вариант непрозрачного пайплайна с LESS_OR_EQUAL для прохода после prepass.
+    opaque_equal_pipeline: Option<vk::Pipeline>,
+    /// Depth-only пайплайн непрозрачных мешей для prepass.
+    prepass_pipeline: Option<vk::Pipeline>,
     taa_set_layout: Option<vk::DescriptorSetLayout>,
     taa_pipeline_layout: Option<vk::PipelineLayout>,
     taa_pipeline: Option<vk::Pipeline>,
@@ -1058,6 +1104,8 @@ pub struct Renderer {
     environment_set_layout: Option<vk::DescriptorSetLayout>,
     compute_set_layout: Option<vk::DescriptorSetLayout>,
     texture_set_layout: Option<vk::DescriptorSetLayout>,
+    /// Набор постобработки: HDR-источник, sampler и bloom для composite.
+    post_set_layout: Option<vk::DescriptorSetLayout>,
     frame_descriptor_pool: Option<vk::DescriptorPool>,
     post_descriptor_pool: Option<vk::DescriptorPool>,
     frame_uniforms: Vec<FrameUniforms>,
@@ -1111,6 +1159,8 @@ pub struct Renderer {
     present_ids: PresentIdTracker,
     surface_format: vk::SurfaceFormatKHR,
     present_mode: PresentMode,
+    /// Номер кадра renderer; задаёт сид зерна постобработки.
+    frame_serial: u32,
     last_warned_present_mode: Option<PresentMode>,
     output_extent: vk::Extent2D,
     swapchain_dirty: bool,
@@ -1168,6 +1218,12 @@ impl Renderer {
             skin_instances: Vec::new(),
             skin_call_serial: 0,
             post_pipeline_layout: None,
+            bloom_pipelines: None,
+            exposure_pipelines: None,
+            filter_pipelines: None,
+            ao_pipelines: None,
+            opaque_equal_pipeline: None,
+            prepass_pipeline: None,
             taa_set_layout: None,
             taa_pipeline_layout: None,
             taa_pipeline: None,
@@ -1189,6 +1245,7 @@ impl Renderer {
             environment_set_layout: None,
             compute_set_layout: None,
             texture_set_layout: None,
+            post_set_layout: None,
             frame_descriptor_pool: None,
             post_descriptor_pool: None,
             frame_uniforms: Vec::new(),
@@ -1240,6 +1297,7 @@ impl Renderer {
             surface_format: vk::SurfaceFormatKHR::default(),
             present_mode: config.present_mode,
             last_warned_present_mode: None,
+            frame_serial: 0,
             output_extent: vk::Extent2D { width, height },
             swapchain_dirty: true,
             frame_slots_lost: false,
@@ -1854,6 +1912,8 @@ impl Renderer {
     ) -> Result<FrameOutcome, RenderError> {
         let prepare_started = Instant::now();
         self.begin_particle_frame();
+        self.frame_serial = self.frame_serial.wrapping_add(1);
+        let frame_serial = self.frame_serial;
         if self.frame_slots_lost {
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
@@ -1870,6 +1930,14 @@ impl Renderer {
             .as_ref()
             .map_or(self.output_extent, |swapchain| swapchain.extent);
         let render_extent = scaled_extent(output_extent, frame.view.render_scale);
+        let post_frame = PostFrame::new(
+            &view.post,
+            frame.debug_view,
+            (render_extent.width, render_extent.height),
+            (output_extent.width, output_extent.height),
+            frame_serial,
+            camera_near_far(frame.camera.projection),
+        );
         let temporal_plan = self.screen_temporal.state.plan(
             temporal_key(
                 render_extent,
@@ -2020,6 +2088,46 @@ impl Renderer {
         let swapchain_image_count = swapchain.images.len();
         let queue = self.queue;
         let taa_set_layout = self.taa_set_layout()?;
+        let bloom_layout = self.texture_set_layout()?;
+        let bloom_prefilter_layout = self
+            .bloom_pipelines
+            .ok_or(RenderError::InvalidState("bloom pipelines отсутствуют"))?
+            .prefilter_set_layout();
+        let ao_layout = self
+            .ao_pipelines
+            .ok_or(RenderError::InvalidState("ao pipelines отсутствуют"))?
+            .set_layout();
+        let white_ao_view = self
+            .textures
+            .get(WHITE_LINEAR_TEXTURE)
+            .and_then(Option::as_ref)
+            .map(|texture| texture.image.view)
+            .ok_or(RenderError::InvalidState("белая текстура отсутствует"))?;
+        let bloom_pipelines = self.bloom_pipelines;
+        let exposure_layout = self
+            .exposure_pipelines
+            .ok_or(RenderError::InvalidState("exposure pipelines отсутствуют"))?
+            .set_layout();
+        let exposure_pipelines = self.exposure_pipelines;
+        let filter_layout = self
+            .filter_pipelines
+            .ok_or(RenderError::InvalidState("filter pipelines отсутствуют"))?
+            .set_layout();
+        let filter_pipelines = self.filter_pipelines;
+        let ao_pipelines = self.ao_pipelines;
+        let opaque_equal_pipeline = self.opaque_equal_pipeline;
+        let prepass_pipeline = self.prepass_pipeline;
+        let exposure_dt_ms =
+            temporal_frame_delta_ms(self.screen_temporal.last_submitted_at, submitted_at);
+        let view_exposure = prepare_view_exposure(
+            &instance,
+            &device,
+            self.physical_device,
+            self.screen_temporal.exposure,
+            &mut self.screen_temporal.exposure_resources,
+            post_frame.plan.auto_exposure,
+            frame.reset_history,
+        )?;
         let frame_resources = self
             .frames
             .get_mut(frame_slot)
@@ -2174,6 +2282,7 @@ impl Renderer {
                 output_extent,
                 taa_set_layout,
                 self.particles.depth_layout()?,
+                exposure_layout,
             )?;
             write_image_set(
                 &device,
@@ -2182,6 +2291,62 @@ impl Renderer {
                 post_sampler,
             );
             frame_resources.target = Some(target);
+        }
+        if post_frame.plan.bloom_mips > 0
+            && let Some(target) = frame_resources.target.as_mut()
+            && target.bloom.is_none()
+        {
+            target.bloom = Some(BloomChain::new(
+                &instance,
+                &device,
+                self.physical_device,
+                target.render_extent,
+                post_frame.plan.bloom_mips,
+                bloom_layout,
+                bloom_prefilter_layout,
+                post_sampler,
+            )?);
+        }
+        if post_frame.plan.ambient_occlusion
+            && let Some(target) = frame_resources.target.as_mut()
+            && target.scene.ao.is_none()
+        {
+            target.scene.ao = Some(AoTarget::new(
+                &instance,
+                &device,
+                self.physical_device,
+                target.render_extent,
+                target.scene.depth.view,
+                ao_layout,
+            )?);
+        }
+        let frame_ao_view = frame_resources
+            .target
+            .as_ref()
+            .and_then(|target| target.scene.ao.as_ref())
+            .filter(|_| post_frame.plan.ambient_occlusion)
+            .map_or(white_ao_view, |ao| ao.filtered.view);
+        write_frame_ao(&device, frame_set, frame_ao_view);
+        if post_frame.plan.motion_blur || post_frame.plan.depth_of_field {
+            let filter_extent = if view.anti_aliasing.is_temporal() {
+                output_extent
+            } else {
+                render_extent
+            };
+            if let Some(target) = frame_resources.target.as_mut()
+                && target
+                    .filter_scratch
+                    .as_ref()
+                    .is_none_or(|scratch| scratch.extent != filter_extent)
+            {
+                target.filter_scratch = Some(FilterScratch::new(
+                    &instance,
+                    &device,
+                    self.physical_device,
+                    filter_extent,
+                    filter_layout,
+                )?);
+            }
         }
         let target = frame_resources
             .target
@@ -2303,6 +2468,17 @@ impl Renderer {
                 debug_view: frame.debug_view,
                 timestamps: screen_marks,
                 view,
+                post: post_frame,
+                bloom_pipelines,
+                exposure_pipelines,
+                exposure_dt_ms,
+                reset_history: frame.reset_history,
+                filter_pipelines,
+                ao_pipelines,
+                opaque_equal_pipeline,
+                prepass_pipeline,
+                depth_prepass: post_frame.plan.depth_prepass && prepass_pipeline.is_some(),
+                projection_scale: [frame.camera.projection[0][0], frame.camera.projection[1][1]],
                 particles: particle_pass,
             };
             let frame_resources = &mut self.frames[frame_slot];
@@ -2356,7 +2532,7 @@ impl Renderer {
                     #[cfg(windows)]
                     fsr,
                     #[cfg(windows)]
-                    exposure_ev: view.exposure_ev,
+                    exposure_ev: view.post.exposure.ev,
                     #[cfg(windows)]
                     frame_time_delta_ms,
                     #[cfg(windows)]
@@ -2390,6 +2566,7 @@ impl Renderer {
                 output_is_srgb,
                 &shadow,
                 &scene,
+                view_exposure,
                 overlay.as_ref(),
                 temporal_record,
                 skin_record,
@@ -2436,6 +2613,7 @@ impl Renderer {
         let temporal_submissions = [TemporalSubmission {
             view: TemporalViewId::Screen,
             plan: temporal_plan,
+            exposure: view_exposure.adaptation.is_some(),
             layouts: view
                 .anti_aliasing
                 .is_temporal()
@@ -2519,6 +2697,8 @@ impl Renderer {
     ) -> Result<FrameOutcome, RenderError> {
         let prepare_started = Instant::now();
         self.begin_particle_frame();
+        self.frame_serial = self.frame_serial.wrapping_add(1);
+        let frame_serial = self.frame_serial;
         if self.frame_slots_lost {
             return Err(RenderError::InvalidState(
                 "ресурсы синхронизации кадровых слотов потеряны",
@@ -2733,6 +2913,19 @@ impl Renderer {
         let swapchain_image_count = swapchain.images.len();
         let queue = self.queue;
         let image_set_layout = self.texture_set_layout()?;
+        let post_set_layout = self.post_set_layout()?;
+        let bloom_prefilter_layout = self
+            .bloom_pipelines
+            .ok_or(RenderError::InvalidState("bloom pipelines отсутствуют"))?
+            .prefilter_set_layout();
+        let exposure_set_layout = self
+            .exposure_pipelines
+            .ok_or(RenderError::InvalidState("exposure pipelines отсутствуют"))?
+            .set_layout();
+        let filter_set_layout = self
+            .filter_pipelines
+            .ok_or(RenderError::InvalidState("filter pipelines отсутствуют"))?
+            .set_layout();
         let taa_set_layout = self.taa_set_layout()?;
         let frame_set_layout = self.frame_set_layout()?;
         let frame_resources = self
@@ -2769,6 +2962,9 @@ impl Renderer {
         // сигнальный semaphore.
         let target_resources = ViewportTargetResources {
             image_set_layout,
+            post_set_layout,
+            exposure_set_layout,
+            filter_set_layout,
             taa_set_layout,
             particle_depth_layout: self.particles.depth_layout()?,
             image_sampler: self
@@ -2882,6 +3078,16 @@ impl Renderer {
         let framebuffer_is_srgb = is_srgb_format(self.surface_format.format);
         let physical_device = self.physical_device;
         let mut rendered = Vec::with_capacity(scenes.len());
+        let ao_set_layout = self
+            .ao_pipelines
+            .ok_or(RenderError::InvalidState("ao pipelines отсутствуют"))?
+            .set_layout();
+        let white_ao_view = self
+            .textures
+            .get(WHITE_LINEAR_TEXTURE)
+            .and_then(Option::as_ref)
+            .map(|texture| texture.image.view)
+            .ok_or(RenderError::InvalidState("белая текстура отсутствует"))?;
         for ((scene, prepared_scene), environment) in scenes
             .iter()
             .zip(&prepared_scenes)
@@ -2952,6 +3158,66 @@ impl Renderer {
                 &local_shadow_matrix_bytes(&prepared.local_shadow_matrices)?,
                 &prepared.cluster_bounds,
             )?;
+            let post_frame = PostFrame::new(
+                &effective_view_settings(frame.view, frame.debug_view).post,
+                frame.debug_view,
+                (target.render_extent.width, target.render_extent.height),
+                (target.extent.width, target.extent.height),
+                frame_serial,
+                camera_near_far(frame.camera.projection),
+            );
+            if post_frame.plan.ambient_occlusion && target.scene.ao.is_none() {
+                target.scene.ao = Some(AoTarget::new(
+                    &instance,
+                    &device,
+                    physical_device,
+                    target.render_extent,
+                    target.scene.depth.view,
+                    ao_set_layout,
+                )?);
+            }
+            let frame_ao_view = target
+                .scene
+                .ao
+                .as_ref()
+                .filter(|_| post_frame.plan.ambient_occlusion)
+                .map_or(white_ao_view, |ao| ao.filtered.view);
+            write_frame_ao(&device, frame_set, frame_ao_view);
+            if post_frame.plan.bloom_mips > 0 && target.bloom.is_none() {
+                target.bloom = Some(BloomChain::new(
+                    &instance,
+                    &device,
+                    physical_device,
+                    target.render_extent,
+                    post_frame.plan.bloom_mips,
+                    target_resources.image_set_layout,
+                    bloom_prefilter_layout,
+                    target_resources.post_sampler,
+                )?);
+            }
+            if post_frame.plan.motion_blur || post_frame.plan.depth_of_field {
+                let filter_extent = if effective_view_settings(frame.view, frame.debug_view)
+                    .anti_aliasing
+                    .is_temporal()
+                {
+                    target.extent
+                } else {
+                    target.render_extent
+                };
+                if target
+                    .filter_scratch
+                    .as_ref()
+                    .is_none_or(|scratch| scratch.extent != filter_extent)
+                {
+                    target.filter_scratch = Some(FilterScratch::new(
+                        &instance,
+                        &device,
+                        physical_device,
+                        filter_extent,
+                        target_resources.filter_set_layout,
+                    )?);
+                }
+            }
             rendered.push((
                 *viewport,
                 *frame,
@@ -2965,6 +3231,7 @@ impl Renderer {
                 prepared.local_shadow_matrices.as_slice(),
                 *frame_delta_ms,
                 fallback_reason.clone(),
+                post_frame,
             ));
         }
 
@@ -2975,7 +3242,7 @@ impl Renderer {
                 UiImage::Viewport(viewport) => {
                     if !rendered
                         .iter()
-                        .any(|(drawn, _, _, _, _, _, _, _, _, _, _, _)| *drawn == viewport)
+                        .any(|(drawn, _, _, _, _, _, _, _, _, _, _, _, _)| *drawn == viewport)
                     {
                         continue;
                     }
@@ -3043,6 +3310,12 @@ impl Renderer {
             )?);
         }
         let mut gpu_layout = GpuProfileLayout::default();
+        let bloom_pipelines = self.bloom_pipelines;
+        let exposure_pipelines = self.exposure_pipelines;
+        let filter_pipelines = self.filter_pipelines;
+        let ao_pipelines = self.ao_pipelines;
+        let opaque_equal_pipeline = self.opaque_equal_pipeline;
+        let prepass_pipeline = self.prepass_pipeline;
         let scene_passes = rendered
             .iter()
             .enumerate()
@@ -3062,6 +3335,7 @@ impl Renderer {
                         local_shadow_matrices,
                         frame_delta_ms,
                         upscaler_fallback_reason,
+                        post_frame,
                     ),
                 )| {
                     (
@@ -3112,6 +3386,21 @@ impl Renderer {
                                     .map(|first| GpuMarks { pool, first })
                             }),
                             view: effective_view_settings(frame.view, frame.debug_view),
+                            post: *post_frame,
+                            bloom_pipelines,
+                            exposure_pipelines,
+                            exposure_dt_ms: *frame_delta_ms,
+                            reset_history: frame.reset_history,
+                            filter_pipelines,
+                            ao_pipelines,
+                            opaque_equal_pipeline,
+                            prepass_pipeline,
+                            depth_prepass: post_frame.plan.depth_prepass
+                                && prepass_pipeline.is_some(),
+                            projection_scale: [
+                                frame.camera.projection[0][0],
+                                frame.camera.projection[1][1],
+                            ],
                             particles: particle_pipelines.map(|pipelines| ParticlePass {
                                 works: &particle_works[index],
                                 pipelines,
@@ -3176,6 +3465,15 @@ impl Renderer {
                 let Some(target) = entry.targets[frame_slot].as_mut() else {
                     continue;
                 };
+                let view_exposure = prepare_view_exposure(
+                    &instance,
+                    &device,
+                    physical_device,
+                    entry.temporal.exposure,
+                    &mut entry.temporal.exposure_resources,
+                    pass.post.plan.auto_exposure,
+                    pass.reset_history,
+                )?;
                 record_scene(
                     &device,
                     command_buffer,
@@ -3188,6 +3486,45 @@ impl Renderer {
                     shadow,
                     pass,
                 );
+                let exposure_buffer = view_exposure.buffer;
+                let velocity_view = target.scene.velocity.view;
+                let depth_view = target.scene.depth.view;
+                let filters = match (target.filter_scratch.as_mut(), pass.filter_pipelines) {
+                    (Some(scratch), Some(pipelines))
+                        if pass.post.filters.motion.is_some()
+                            || pass.post.filters.dof.is_some() =>
+                    {
+                        Some(FilterRecord {
+                            scratch,
+                            pipelines,
+                            sampler: target_resources.post_sampler,
+                            velocity: velocity_view,
+                            depth: depth_view,
+                            params: pass.post.filters,
+                        })
+                    }
+                    _ => None,
+                };
+                let passes = PostPasses {
+                    filters,
+                    sampler: target_resources.post_sampler,
+                    exposure: exposure_record(
+                        &target.exposure,
+                        pass.exposure_pipelines,
+                        view_exposure,
+                        &pass.view.post,
+                        pass.exposure_dt_ms,
+                    ),
+                    bloom: bloom_record(
+                        target.bloom.as_mut(),
+                        pass.bloom_pipelines,
+                        pass.post.plan.bloom_mips,
+                        target_resources.post_sampler,
+                        &pass.view.post,
+                        view_exposure,
+                    ),
+                    exposure_buffer,
+                };
                 let temporal_outcome = if pass.view.anti_aliasing.is_temporal() {
                     let temporal = &mut entry.temporal;
                     let history = temporal
@@ -3222,8 +3559,8 @@ impl Renderer {
                         post_sampler,
                         pass.frame_set,
                         target.extent,
-                        pass.view,
-                        pass.debug_view,
+                        pass.post.composite,
+                        passes,
                         pass.timestamps,
                         tonemap_pipeline,
                         post_pipeline_layout,
@@ -3238,7 +3575,7 @@ impl Renderer {
                             #[cfg(windows)]
                             fsr,
                             #[cfg(windows)]
-                            exposure_ev: pass.view.exposure_ev,
+                            exposure_ev: pass.view.post.exposure.ev,
                             #[cfg(windows)]
                             frame_time_delta_ms: *_frame_delta_ms,
                             #[cfg(windows)]
@@ -3262,8 +3599,8 @@ impl Renderer {
                         *tonemap_set,
                         tonemap_pipeline,
                         post_pipeline_layout,
-                        pass.view,
-                        pass.debug_view,
+                        pass.post.composite,
+                        passes,
                         pass.timestamps,
                     );
                     target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -3285,6 +3622,7 @@ impl Renderer {
                     post_pipeline_layout,
                     pass.view.anti_aliasing,
                     true,
+                    pass.post.grain,
                     None,
                     true,
                 );
@@ -3305,6 +3643,7 @@ impl Renderer {
                 temporal_submissions.push(TemporalSubmission {
                     view: TemporalViewId::Viewport(*viewport),
                     plan: pass.temporal_plan,
+                    exposure: view_exposure.adaptation.is_some(),
                     layouts: temporal_outcome
                         .as_ref()
                         .is_some_and(|outcome| outcome.used_taa)
@@ -3475,6 +3814,7 @@ impl Renderer {
             };
             temporal.state.submitted(submission.plan);
             temporal.last_submitted_at = Some(submission.submitted_at);
+            temporal.exposure.submitted(submission.exposure);
             if let (Some(history), Some(layouts)) = (&mut temporal.history, submission.layouts) {
                 history.layouts = layouts;
             }
@@ -4123,6 +4463,11 @@ impl Renderer {
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let frame_layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&frame_bindings);
@@ -4228,6 +4573,34 @@ impl Renderer {
         self.texture_set_layout =
             Some(unsafe { device.create_descriptor_set_layout(&texture_layout_info, None) }?);
 
+        let post_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let post_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&post_bindings);
+        // SAFETY: composite, output and fullscreen post shaders read bindings 0, 1 and (composite) 2.
+        self.post_set_layout =
+            Some(unsafe { device.create_descriptor_set_layout(&post_layout_info, None) }?);
+
         let taa_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -4293,7 +4666,7 @@ impl Renderer {
                 .descriptor_count(self.frames.len() as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count((self.frames.len() * 2) as u32),
+                .descriptor_count((self.frames.len() * 3) as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(self.frames.len() as u32),
@@ -4379,9 +4752,12 @@ impl Renderer {
         let post_pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(post_set_count),
+                .descriptor_count(post_set_count * 2),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(post_set_count),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(post_set_count),
         ];
         let post_pool_info = vk::DescriptorPoolCreateInfo::default()
@@ -4390,7 +4766,7 @@ impl Renderer {
         // SAFETY: each frame slot owns a tonemap and output image set.
         let post_pool = unsafe { device.create_descriptor_pool(&post_pool_info, None) }?;
         self.post_descriptor_pool = Some(post_pool);
-        let post_layouts = vec![self.texture_set_layout()?; post_set_count as usize];
+        let post_layouts = vec![self.post_set_layout()?; post_set_count as usize];
         let post_allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(post_pool)
             .set_layouts(&post_layouts);
@@ -5693,6 +6069,16 @@ impl Renderer {
         let overdraw_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(false)
             .depth_write_enable(false);
+        let opaque_equal_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let prepass_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let prepass_stages = [vertex_stage];
+        let no_color_blend = vk::PipelineColorBlendStateCreateInfo::default();
         let wireframe_rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_bias_enable(true)
             .depth_bias_constant_factor(-1.0)
@@ -5729,6 +6115,11 @@ impl Renderer {
         let mut wireframe_rendering_info = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(DEPTH_FORMAT);
+        let mut opaque_equal_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let mut prepass_rendering_info =
+            vk::PipelineRenderingCreateInfo::default().depth_attachment_format(DEPTH_FORMAT);
         let pipeline_layout = self
             .pipeline_layout
             .ok_or(RenderError::InvalidState("pipeline layout отсутствует"))?;
@@ -5781,6 +6172,30 @@ impl Renderer {
                 .dynamic_state(&dynamic_state)
                 .layout(pipeline_layout)
                 .push_next(&mut overdraw_rendering_info),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&opaque_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&opaque_equal_depth_stencil)
+                .color_blend_state(&color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut opaque_equal_rendering_info),
+            vk::GraphicsPipelineCreateInfo::default()
+                .stages(&prepass_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&prepass_depth_stencil)
+                .color_blend_state(&no_color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut prepass_rendering_info),
         ];
         // SAFETY: shader modules, layout and dynamic-rendering formats are valid for this device.
         let mut pipelines = match unsafe {
@@ -5795,7 +6210,7 @@ impl Renderer {
                 return Err(RenderError::Vulkan(error));
             }
         };
-        if pipelines.len() != 4 {
+        if pipelines.len() != 6 {
             for pipeline in pipelines {
                 // SAFETY: these pipeline handles were returned by this device.
                 unsafe { device.destroy_pipeline(pipeline, None) };
@@ -5808,6 +6223,8 @@ impl Renderer {
         self.mask_pipeline = Some(pipelines.remove(0));
         self.blend_pipeline = Some(pipelines.remove(0));
         self.overdraw_pipeline = Some(pipelines.remove(0));
+        self.opaque_equal_pipeline = Some(pipelines.remove(0));
+        self.prepass_pipeline = Some(pipelines.remove(0));
         if self.capabilities.wireframe {
             let wireframe_info = [vk::GraphicsPipelineCreateInfo::default()
                 .stages(&wireframe_stages)
@@ -5886,15 +6303,15 @@ impl Renderer {
     fn create_post_pipelines(&mut self) -> Result<(), RenderError> {
         let device = self.device()?.clone();
         let cache = self.pipeline_cache()?;
-        let set_layouts = [self.texture_set_layout()?];
+        let set_layouts = [self.post_set_layout()?];
         let push_constant_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(POST_PUSH_CONSTANTS_SIZE as u32)];
+            .size(COMPOSITE_PUSH_CONSTANTS_SIZE as u32)];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&push_constant_ranges);
-        // SAFETY: the image/sampler set layout and 16-byte fragment range are valid.
+        // SAFETY: the image/sampler set layout and the composite fragment range are valid.
         let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
         self.post_pipeline_layout = Some(layout);
         self.tonemap_pipeline = Some(create_post_pipeline(
@@ -5903,6 +6320,7 @@ impl Renderer {
             layout,
             LDR_FORMAT,
             TONEMAP_FRAGMENT_SHADER,
+            false,
         )?);
         self.output_pipeline = Some(create_post_pipeline(
             &device,
@@ -5910,6 +6328,7 @@ impl Renderer {
             layout,
             self.surface_format.format,
             OUTPUT_FRAGMENT_SHADER,
+            false,
         )?);
         self.viewport_output_pipeline = Some(create_post_pipeline(
             &device,
@@ -5917,6 +6336,7 @@ impl Renderer {
             layout,
             LDR_FORMAT,
             OUTPUT_FRAGMENT_SHADER,
+            false,
         )?);
         let taa_set_layouts = [self.taa_set_layout()?, self.frame_set_layout()?];
         let taa_push_constants = [vk::PushConstantRange::default()
@@ -5935,7 +6355,16 @@ impl Renderer {
             taa_layout,
             OFFSCREEN_FORMAT,
             TAA_FRAGMENT_SHADER,
+            false,
         )?);
+        self.bloom_pipelines = Some(BloomPipelines::new(
+            &device,
+            cache,
+            self.texture_set_layout()?,
+        )?);
+        self.exposure_pipelines = Some(ExposurePipelines::new(&device, cache)?);
+        self.filter_pipelines = Some(FilterPipelines::new(&device, cache)?);
+        self.ao_pipelines = Some(AoPipelines::new(&device, cache)?);
         Ok(())
     }
 
@@ -6315,6 +6744,12 @@ impl Renderer {
         ))
     }
 
+    fn post_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
+        self.post_set_layout.ok_or(RenderError::InvalidState(
+            "layout дескрипторов постобработки отсутствует",
+        ))
+    }
+
     fn taa_set_layout(&self) -> Result<vk::DescriptorSetLayout, RenderError> {
         self.taa_set_layout.ok_or(RenderError::InvalidState(
             "layout дескрипторов TAA отсутствует",
@@ -6347,6 +6782,7 @@ impl Drop for Renderer {
         self.environments.clear();
         self.viewports.clear();
         self.screen_temporal.history.take();
+        self.screen_temporal.exposure_resources.take();
         #[cfg(windows)]
         self.screen_temporal.fsr.take();
         #[cfg(all(windows, feature = "dlss"))]
@@ -6464,6 +6900,28 @@ impl Drop for Renderer {
                 // SAFETY: all pipelines created with this layout were destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
             }
+            if let Some(pipelines) = self.bloom_pipelines.take() {
+                pipelines.destroy(device);
+            }
+            if let Some(pipelines) = self.exposure_pipelines.take() {
+                pipelines.destroy(device);
+            }
+            if let Some(pipelines) = self.filter_pipelines.take() {
+                pipelines.destroy(device);
+            }
+            if let Some(pipelines) = self.ao_pipelines.take() {
+                pipelines.destroy(device);
+            }
+            for pipeline in [
+                self.opaque_equal_pipeline.take(),
+                self.prepass_pipeline.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                // SAFETY: the device is idle, so no command buffer uses the mesh variant.
+                unsafe { device.destroy_pipeline(pipeline, None) };
+            }
             if let Some(layout) = self.taa_pipeline_layout.take() {
                 // SAFETY: the TAA pipeline created with this layout was destroyed above.
                 unsafe { device.destroy_pipeline_layout(layout, None) };
@@ -6510,6 +6968,7 @@ impl Drop for Renderer {
                 self.environment_set_layout.take(),
                 self.compute_set_layout.take(),
                 self.texture_set_layout.take(),
+                self.post_set_layout.take(),
                 self.taa_set_layout.take(),
             ]
             .into_iter()
@@ -7373,6 +7832,8 @@ struct OffscreenTarget {
     /// Набор с depth для проходов частиц; пул освобождается вместе с целью.
     _depth_pool: OwnedDescriptorPool,
     depth_set: vk::DescriptorSet,
+    /// Экранный AO цели; создаётся, когда эффект запланирован, и живёт вместе с целью.
+    ao: Option<AoTarget>,
 }
 
 impl OffscreenTarget {
@@ -7418,6 +7879,7 @@ impl OffscreenTarget {
             depth_layout: vk::ImageLayout::UNDEFINED,
             _depth_pool: depth_pool,
             depth_set,
+            ao: None,
         })
     }
 }
@@ -7468,9 +7930,15 @@ struct FrameTarget {
     ldr_layout: vk::ImageLayout,
     render_extent: vk::Extent2D,
     output_extent: vk::Extent2D,
+    /// Цепочка bloom создаётся лениво, когда эффект запланирован для этого разрешения.
+    bloom: Option<BloomChain>,
+    exposure: ExposureTarget,
+    /// Промежуточные буферы motion blur и DoF; создаются, когда фильтр запланирован.
+    filter_scratch: Option<FilterScratch>,
 }
 
 impl FrameTarget {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         instance: &ash::Instance,
         device: &ash::Device,
@@ -7479,6 +7947,7 @@ impl FrameTarget {
         output_extent: vk::Extent2D,
         taa_set_layout: vk::DescriptorSetLayout,
         particle_depth_layout: vk::DescriptorSetLayout,
+        exposure_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
         let scene = OffscreenTarget::new(
             instance,
@@ -7497,9 +7966,13 @@ impl FrameTarget {
             color_subresource_range(),
         )?;
         let (taa_pool, taa_set) = allocate_taa_image_set(device, taa_set_layout)?;
+        let exposure = ExposureTarget::new(device, exposure_layout)?;
         Ok(Self {
             _taa_pool: taa_pool,
             taa_set,
+            bloom: None,
+            exposure,
+            filter_scratch: None,
             scene,
             ldr,
             ldr_layout: vk::ImageLayout::UNDEFINED,
@@ -7510,6 +7983,21 @@ impl FrameTarget {
 }
 
 /// Заполняет набор дескрипторов кадра: uniform, shadow map и локальные источники.
+#[allow(clippy::too_many_arguments)]
+/// Привязывает экранный AO цели к binding 8 набора кадра; вызывается каждый кадр до записи.
+fn write_frame_ao(device: &ash::Device, set: vk::DescriptorSet, view: vk::ImageView) {
+    let image_info = [vk::DescriptorImageInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(8)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+        .image_info(&image_info)];
+    // SAFETY: the set and view are alive and the set is not used by in-flight work.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_frame_set(
     device: &ash::Device,
@@ -7618,6 +8106,9 @@ fn write_local_light_descriptor(
 /// Общие объекты renderer, нужные каждой цели viewport.
 struct ViewportTargetResources {
     image_set_layout: vk::DescriptorSetLayout,
+    post_set_layout: vk::DescriptorSetLayout,
+    exposure_set_layout: vk::DescriptorSetLayout,
+    filter_set_layout: vk::DescriptorSetLayout,
     particle_depth_layout: vk::DescriptorSetLayout,
     taa_set_layout: vk::DescriptorSetLayout,
     image_sampler: vk::Sampler,
@@ -7689,7 +8180,7 @@ impl ViewportFrameSet {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(2),
+                .descriptor_count(3),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
@@ -7807,6 +8298,11 @@ struct ViewportTarget {
     output: DeviceImage,
     output_layout: vk::ImageLayout,
     frame_set: ViewportFrameSet,
+    /// Цепочка bloom создаётся лениво, как у цели экрана.
+    bloom: Option<BloomChain>,
+    exposure: ExposureTarget,
+    /// Промежуточные буферы motion blur и DoF; создаются, когда фильтр запланирован.
+    filter_scratch: Option<FilterScratch>,
 }
 
 impl ViewportTarget {
@@ -7843,11 +8339,12 @@ impl ViewportTarget {
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             color_subresource_range(),
         )?;
+        let exposure = ExposureTarget::new(device, resources.exposure_set_layout)?;
         let frame_set = ViewportFrameSet::new(instance, device, physical_device, resources)?;
         let (taa_pool, taa_set) = allocate_taa_image_set(device, resources.taa_set_layout)?;
         let (post_pool, post_sets) = allocate_post_image_sets(
             device,
-            resources.image_set_layout,
+            resources.post_set_layout,
             resources.post_sampler,
             [scene.color.view, ldr.view],
         )?;
@@ -7866,6 +8363,9 @@ impl ViewportTarget {
         };
         Ok(Self {
             device: device.clone(),
+            bloom: None,
+            exposure,
+            filter_scratch: None,
             ui_pool,
             set,
             _taa_pool: taa_pool,
@@ -7907,6 +8407,10 @@ struct TemporalView {
     state: TemporalState,
     history: Option<TemporalHistory>,
     last_submitted_at: Option<Instant>,
+    /// Адаптация экспозиции вида; общая для всех кадровых слотов вида.
+    exposure: ExposureHistory,
+    /// Буфер экспозиции вида; создаётся при первом кадре вида.
+    exposure_resources: Option<ExposureResources>,
     #[cfg(windows)]
     fsr: Option<Box<FsrView>>,
     #[cfg(windows)]
@@ -8101,6 +8605,8 @@ enum TemporalViewId {
 struct TemporalSubmission {
     view: TemporalViewId,
     plan: TemporalPlan,
+    /// Кадр вида адаптирует экспозицию; состояние адаптации фиксируется после успешного submit.
+    exposure: bool,
     layouts: Option<[vk::ImageLayout; 2]>,
     #[cfg(windows)]
     fsr_used: bool,
@@ -8266,6 +8772,20 @@ fn warn_temporal_fallback(backend: &str, warning_emitted: &mut bool, reason: &st
     }
 }
 
+/// Плоскости отсечения камеры из матрицы проекции для линеаризации глубины в DoF.
+/// Формулы совпадают с `fsr_camera_parameters`; при неверной матрице берутся значения по умолчанию.
+fn camera_near_far(projection: [[f32; 4]; 4]) -> [f32; 2] {
+    let depth_scale = projection[2][2];
+    let depth_offset = projection[3][2];
+    let near = depth_offset / depth_scale;
+    let far = depth_offset / (depth_scale + 1.0);
+    if near.is_finite() && far.is_finite() && near > 0.0 && far > near {
+        [near, far]
+    } else {
+        [0.1, 1000.0]
+    }
+}
+
 #[cfg(windows)]
 fn fsr_camera_parameters(projection: [[f32; 4]; 4]) -> [f32; 3] {
     let depth_scale = projection[2][2];
@@ -8313,8 +8833,8 @@ fn effective_view_settings(mut view: ViewSettings, debug_view: DebugView) -> Vie
         view.anti_aliasing = AntiAliasing::None;
     }
     if debug_view.has_linear_output() {
-        view.exposure_ev = 0.0;
-        view.tonemapper = Tonemapper::None;
+        view.post.exposure.ev = 0.0;
+        view.post.tonemapper = Tonemapper::None;
     }
     view
 }
@@ -8461,15 +8981,18 @@ fn allocate_post_image_sets(
     let pool_sizes = [
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLED_IMAGE)
-            .descriptor_count(2),
+            .descriptor_count(4),
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLER)
+            .descriptor_count(2),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(2),
     ];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(2)
         .pool_sizes(&pool_sizes);
-    // SAFETY: the pool holds one tonemap and one output descriptor set.
+    // SAFETY: the pool holds one tonemap and one output descriptor set (two sampled images each).
     let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
     let layouts = [layout; 2];
     let allocate_info = vk::DescriptorSetAllocateInfo::default()
@@ -8922,8 +9445,8 @@ fn record_temporal_resolve_and_tonemap(
     post_sampler: vk::Sampler,
     frame_set: vk::DescriptorSet,
     output_extent: vk::Extent2D,
-    view: ViewSettings,
-    debug_view: DebugView,
+    composite: post::CompositeParams,
+    passes: PostPasses<'_>,
     timestamps: Option<GpuMarks>,
     tonemap_pipeline: vk::Pipeline,
     post_pipeline_layout: vk::PipelineLayout,
@@ -9047,8 +9570,8 @@ fn record_temporal_resolve_and_tonemap(
         tonemap_set,
         tonemap_pipeline,
         post_pipeline_layout,
-        view,
-        debug_view,
+        composite,
+        passes,
         timestamps,
     );
     Ok(TemporalResolveOutcome {
@@ -9422,6 +9945,7 @@ fn record_frame(
     output_is_srgb: bool,
     shadow: &ShadowPass<'_>,
     scene: &ScenePass<'_>,
+    exposure: ViewExposure,
     overlay: Option<&OverlayPass>,
     temporal: Option<TemporalResolveRecord<'_>>,
     skin: Option<skin::SkinRecord<'_>>,
@@ -9443,6 +9967,44 @@ fn record_frame(
         shadow,
         scene,
     );
+    let exposure_buffer = exposure.buffer;
+    let velocity_view = target.scene.velocity.view;
+    let depth_view = target.scene.depth.view;
+    let filters = match (target.filter_scratch.as_mut(), scene.filter_pipelines) {
+        (Some(scratch), Some(pipelines))
+            if scene.post.filters.motion.is_some() || scene.post.filters.dof.is_some() =>
+        {
+            Some(FilterRecord {
+                scratch,
+                pipelines,
+                sampler: post_sampler,
+                velocity: velocity_view,
+                depth: depth_view,
+                params: scene.post.filters,
+            })
+        }
+        _ => None,
+    };
+    let passes = PostPasses {
+        filters,
+        sampler: post_sampler,
+        exposure: exposure_record(
+            &target.exposure,
+            scene.exposure_pipelines,
+            exposure,
+            &view.post,
+            scene.exposure_dt_ms,
+        ),
+        bloom: bloom_record(
+            target.bloom.as_mut(),
+            scene.bloom_pipelines,
+            scene.post.plan.bloom_mips,
+            post_sampler,
+            &view.post,
+            exposure,
+        ),
+        exposure_buffer,
+    };
     let temporal_outcome = if let Some(resolve) = temporal {
         Some(record_temporal_resolve_and_tonemap(
             device,
@@ -9454,8 +10016,8 @@ fn record_frame(
             post_sampler,
             scene.frame_set,
             target.output_extent,
-            view,
-            scene.debug_view,
+            scene.post.composite,
+            passes,
             scene.timestamps,
             tonemap_pipeline,
             post_pipeline_layout,
@@ -9475,8 +10037,8 @@ fn record_frame(
             tonemap_set,
             tonemap_pipeline,
             post_pipeline_layout,
-            view,
-            scene.debug_view,
+            scene.post.composite,
+            passes,
             scene.timestamps,
         );
         target.scene.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -9501,6 +10063,7 @@ fn record_frame(
         post_pipeline_layout,
         view.anti_aliasing,
         output_is_srgb,
+        scene.post.grain,
         overlay,
         false,
     );
@@ -9532,6 +10095,52 @@ fn begin_command_buffer(
 }
 
 /// Записывает cluster, shadow и scene pass; цвет цели остаётся в `COLOR_ATTACHMENT_OPTIMAL`.
+#[allow(clippy::too_many_arguments)]
+/// Записывает depth prepass непрозрачных мешей. Глубина очищается здесь, основной проход её загружает.
+fn record_depth_prepass(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    target: &OffscreenTarget,
+    render_extent: vk::Extent2D,
+    scene: &ScenePass<'_>,
+) {
+    let depth_attachment = vk::RenderingAttachmentInfo::default()
+        .image_view(target.depth.view)
+        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .clear_value(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        });
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: render_extent,
+        })
+        .layer_count(1)
+        .depth_attachment(&depth_attachment);
+    // SAFETY: the depth view covers the render extent and matches the prepass pipeline.
+    unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
+    record_draws(
+        device,
+        command_buffer,
+        render_extent,
+        scene,
+        DrawPass::Prepass,
+    );
+    // SAFETY: this matches the preceding cmd_begin_rendering call.
+    unsafe { device.cmd_end_rendering(command_buffer) };
+    mark_pass(
+        device,
+        command_buffer,
+        scene.timestamps,
+        GpuPass::DepthPrepass,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_scene(
     device: &ash::Device,
@@ -9769,10 +10378,70 @@ fn record_scene(
                 color: vk::ClearColorValue { float32: [0.0; 4] },
             }),
     ];
+    if scene.depth_prepass {
+        record_depth_prepass(device, command_buffer, target, render_extent, scene);
+    }
+    if scene.depth_prepass
+        && scene.post.plan.ambient_occlusion
+        && let (Some(pipelines), Some(ao)) = (scene.ao_pipelines, target.ao.as_mut())
+    {
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                target.depth.image,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+                depth_subresource_range(),
+            ),
+        );
+        let gtao = post::ao_parameters(
+            &scene.post.ao,
+            scene.projection_scale,
+            scene.post.filters.near_far,
+            (render_extent.width, render_extent.height),
+        );
+        record_ambient_occlusion(
+            device,
+            command_buffer,
+            render_extent,
+            AoRecord {
+                target: ao,
+                pipelines,
+                gtao,
+                near_far: scene.post.filters.near_far,
+            },
+            scene.timestamps,
+        );
+        pipeline_barrier(
+            device,
+            command_buffer,
+            image_layout_barrier(
+                target.depth.image,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                depth_subresource_range(),
+            ),
+        );
+    }
     let depth_attachment = vk::RenderingAttachmentInfo::default()
         .image_view(target.depth.view)
         .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(if scene.depth_prepass {
+            vk::AttachmentLoadOp::LOAD
+        } else {
+            vk::AttachmentLoadOp::CLEAR
+        })
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
@@ -10224,6 +10893,8 @@ fn record_skybox(
 
 #[derive(Clone, Copy)]
 enum DrawPass {
+    /// Непрозрачные меши без маски: только глубина, перед основным проходом.
+    Prepass,
     OpaqueAndMask,
     Blend,
     Overdraw,
@@ -10258,6 +10929,20 @@ struct ScenePass<'a> {
     timestamps: Option<GpuMarks>,
     debug_view: DebugView,
     view: ViewSettings,
+    post: PostFrame,
+    bloom_pipelines: Option<BloomPipelines>,
+    exposure_pipelines: Option<ExposurePipelines>,
+    /// Время кадра вида для адаптации экспозиции.
+    exposure_dt_ms: f32,
+    reset_history: bool,
+    filter_pipelines: Option<FilterPipelines>,
+    ao_pipelines: Option<AoPipelines>,
+    opaque_equal_pipeline: Option<vk::Pipeline>,
+    prepass_pipeline: Option<vk::Pipeline>,
+    /// Prepass записан: основной непрозрачный проход использует LESS_OR_EQUAL и загружает глубину.
+    depth_prepass: bool,
+    /// (proj[0][0], proj[1][1]) камеры для восстановления позиции по глубине в AO.
+    projection_scale: [f32; 2],
     particles: Option<ParticlePass<'a>>,
 }
 
@@ -10350,6 +11035,10 @@ fn record_draws(
             continue;
         };
         let pipeline_kind = match pass {
+            DrawPass::Prepass => match material.alpha_mode {
+                AlphaMode::Opaque => DrawPipeline::Prepass,
+                AlphaMode::Mask { .. } | AlphaMode::Blend => continue,
+            },
             DrawPass::Overdraw => DrawPipeline::Overdraw,
             DrawPass::Wireframe => DrawPipeline::Wireframe,
             DrawPass::OpaqueAndMask => match material.alpha_mode {
@@ -10364,6 +11053,13 @@ fn record_draws(
         };
         if bound_pipeline != Some(pipeline_kind) {
             let pipeline = match pipeline_kind {
+                DrawPipeline::Prepass => match scene.prepass_pipeline {
+                    Some(pipeline) => pipeline,
+                    None => continue,
+                },
+                DrawPipeline::Opaque if scene.depth_prepass => {
+                    scene.opaque_equal_pipeline.unwrap_or(scene.pipeline)
+                }
                 DrawPipeline::Opaque => scene.pipeline,
                 DrawPipeline::Mask => scene.mask_pipeline,
                 DrawPipeline::Blend => scene.blend_pipeline,
@@ -10438,6 +11134,7 @@ fn record_draws(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DrawPipeline {
+    Prepass,
     Opaque,
     Mask,
     Blend,
@@ -10617,6 +11314,15 @@ fn scene_viewport(extent: vk::Extent2D) -> vk::Viewport {
     }
 }
 
+/// Проходы постобработки вида, которые записываются перед composite.
+struct PostPasses<'a> {
+    filters: Option<FilterRecord<'a>>,
+    exposure: Option<ExposureRecord>,
+    bloom: Option<BloomRecord<'a>>,
+    exposure_buffer: vk::Buffer,
+    sampler: vk::Sampler,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_tonemap_pass(
     device: &ash::Device,
@@ -10629,12 +11335,63 @@ fn record_tonemap_pass(
     set: vk::DescriptorSet,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    view: ViewSettings,
-    debug_view: DebugView,
+    composite: post::CompositeParams,
+    passes: PostPasses<'_>,
     timestamps: Option<GpuMarks>,
 ) {
-    if source_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-        let (source_stage, source_access) = match source_layout {
+    let PostPasses {
+        mut filters,
+        exposure,
+        bloom,
+        exposure_buffer,
+        sampler,
+    } = passes;
+    let mut source_layout = source_layout;
+    // Motion blur и DoF идут до экспозиции и bloom: им нужен цвет после resolve.
+    let filtered = match filters.as_mut() {
+        Some(record) => record_filters(
+            device,
+            command_buffer,
+            source,
+            &mut source_layout,
+            record,
+            timestamps,
+        ),
+        None => None,
+    };
+    let (final_image, mut final_layout) = match (filtered, filters.as_ref()) {
+        (Some(index), Some(record)) => (
+            record.scratch.image(index),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ),
+        _ => (source, source_layout),
+    };
+    write_image_set(device, set, final_image.view, sampler);
+    if let Some(record) = exposure {
+        record_exposure(
+            device,
+            command_buffer,
+            final_image,
+            &mut final_layout,
+            extent,
+            record,
+            timestamps,
+        );
+    }
+    let bloom_view = bloom.map(|record| {
+        record_bloom(
+            device,
+            command_buffer,
+            final_image,
+            &mut final_layout,
+            record,
+            timestamps,
+        )
+    });
+    write_composite_bloom(device, set, bloom_view.unwrap_or(final_image.view));
+    write_composite_exposure(device, set, exposure_buffer);
+    if final_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        let (source_stage, source_access) = match final_layout {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
@@ -10642,8 +11399,8 @@ fn record_tonemap_pass(
             _ => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
         };
         let source_barrier = image_layout_barrier(
-            source.image,
-            source_layout,
+            final_image.image,
+            final_layout,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             source_stage,
             source_access,
@@ -10687,12 +11444,7 @@ fn record_tonemap_pass(
         min_depth: 0.0,
         max_depth: 1.0,
     }];
-    let push_constants = float_bytes::<POST_PUSH_CONSTANTS_SIZE>(&[
-        view.exposure_ev,
-        view.tonemapper.code() as f32,
-        debug_view.code() as f32,
-        0.0,
-    ]);
+    let push_constants = composite.to_bytes();
     // SAFETY: source and destination views match the descriptor and attachment layouts.
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering_info);
@@ -10881,6 +11633,7 @@ fn record_output_pass(
     pipeline_layout: vk::PipelineLayout,
     anti_aliasing: AntiAliasing,
     output_is_srgb: bool,
+    grain: [f32; 4],
     overlay: Option<&OverlayPass>,
     sample_output: bool,
 ) {
@@ -10923,11 +11676,15 @@ fn record_output_pass(
         max_depth: 1.0,
     }];
     let [texel_width, texel_height] = inverse_extent(source_extent);
-    let push_constants = float_bytes::<POST_PUSH_CONSTANTS_SIZE>(&[
+    let push_constants = float_bytes::<OUTPUT_PUSH_CONSTANTS_SIZE>(&[
         texel_width,
         texel_height,
         anti_aliasing.code() as f32,
         f32::from(u8::from(output_is_srgb)),
+        grain[0],
+        grain[1],
+        grain[2],
+        grain[3],
     ]);
     // SAFETY: the output view uses the pipeline's color format and descriptor set samples LDR.
     unsafe {
@@ -11755,6 +12512,7 @@ fn create_post_pipeline(
     layout: vk::PipelineLayout,
     color_format: vk::Format,
     fragment_shader: &[u8],
+    additive: bool,
 ) -> Result<vk::Pipeline, RenderError> {
     let vertex_module = ShaderModule::new(device, FULLSCREEN_VERTEX_SHADER)?;
     let fragment_module = ShaderModule::new(device, fragment_shader)?;
@@ -11781,8 +12539,22 @@ fn create_post_pipeline(
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    // Аддитивное смешивание нужно только upsample bloom: цель уже содержит уровень.
+    let blend_attachment = if additive {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+            .alpha_blend_op(vk::BlendOp::ADD)
+    } else {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+    };
+    let blend_attachments = [blend_attachment];
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -13713,13 +14485,7 @@ fn validate_render_scale(scale: f32) -> Result<(), RenderError> {
 
 fn validate_view_settings(view: ViewSettings) -> Result<(), RenderError> {
     validate_render_scale(view.render_scale)?;
-    if view.exposure_ev.is_finite() && (-16.0..=16.0).contains(&view.exposure_ev) {
-        Ok(())
-    } else {
-        Err(RenderError::InvalidConfig(
-            "exposure_ev должен быть конечным и находиться в [-16, 16]",
-        ))
-    }
+    view.post.validate().map_err(RenderError::InvalidConfig)
 }
 
 fn scaled_extent(output: vk::Extent2D, scale: f32) -> vk::Extent2D {
@@ -13822,6 +14588,7 @@ mod tests {
         validate_mesh, validate_overlay, validate_pipeline_cache, validate_render_scale,
         validate_texture, validate_view_settings, vertex_bytes,
     };
+    use super::{Exposure, PostProcess};
     use super::{
         GpuPass, GpuProfileLayout, GpuViewTimings, LocalShadowKind, MAX_PROFILED_VIEWS,
         OUTPUT_QUERY_FIRST, ProfiledView, SelectedLocalLight, TIMESTAMP_QUERY_COUNT,
@@ -13935,15 +14702,20 @@ mod tests {
     fn non_lit_debug_views_disable_aa_and_raw_views_bypass_tonemapping() {
         let settings = ViewSettings {
             render_scale: 0.5,
-            exposure_ev: 2.0,
-            tonemapper: Tonemapper::Aces,
+            post: PostProcess {
+                exposure: Exposure {
+                    ev: 2.0,
+                    ..Exposure::default()
+                },
+                ..PostProcess::default()
+            },
             anti_aliasing: AntiAliasing::Taa,
         };
         assert_eq!(effective_view_settings(settings, DebugView::Lit), settings);
         let wireframe = effective_view_settings(settings, DebugView::Wireframe);
         assert_eq!(wireframe.anti_aliasing, AntiAliasing::None);
-        assert_eq!(wireframe.exposure_ev, 2.0);
-        assert_eq!(wireframe.tonemapper, Tonemapper::Aces);
+        assert_eq!(wireframe.post.exposure.ev, 2.0);
+        assert_eq!(wireframe.post.tonemapper, Tonemapper::Aces);
         for debug_view in [
             DebugView::Normals,
             DebugView::Overdraw,
@@ -13952,8 +14724,8 @@ mod tests {
         ] {
             let view = effective_view_settings(settings, debug_view);
             assert_eq!(view.anti_aliasing, AntiAliasing::None);
-            assert_eq!(view.exposure_ev, 0.0);
-            assert_eq!(view.tonemapper, Tonemapper::None);
+            assert_eq!(view.post.exposure.ev, 0.0);
+            assert_eq!(view.post.tonemapper, Tonemapper::None);
         }
     }
 
@@ -16370,8 +17142,7 @@ mod tests {
         assert!(config.extra_device_extensions.is_empty());
         let view = ViewSettings::default();
         assert_eq!(view.render_scale, 1.0);
-        assert_eq!(view.exposure_ev, 0.0);
-        assert_eq!(view.tonemapper, Tonemapper::Aces);
+        assert_eq!(view.post, PostProcess::default());
         assert_eq!(view.anti_aliasing, AntiAliasing::Fxaa);
         assert!(validate_view_settings(view).is_ok());
     }
@@ -16390,6 +17161,11 @@ mod tests {
 
     #[test]
     fn view_settings_validate_scale_and_exposure_ranges() {
+        let post_with_ev = |ev: f32| {
+            let mut post = PostProcess::default();
+            post.exposure.ev = ev;
+            post
+        };
         for render_scale in [1.0, 0.5, f32::MIN_POSITIVE] {
             assert!(
                 validate_view_settings(ViewSettings {
@@ -16402,7 +17178,7 @@ mod tests {
         for exposure_ev in [-16.0, 0.0, 16.0] {
             assert!(
                 validate_view_settings(ViewSettings {
-                    exposure_ev,
+                    post: post_with_ev(exposure_ev),
                     ..ViewSettings::default()
                 })
                 .is_ok()
@@ -16420,7 +17196,7 @@ mod tests {
         for exposure_ev in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -16.01, 16.01] {
             assert!(matches!(
                 validate_view_settings(ViewSettings {
-                    exposure_ev,
+                    post: post_with_ev(exposure_ev),
                     ..ViewSettings::default()
                 }),
                 Err(RenderError::InvalidConfig(_))
@@ -16786,18 +17562,23 @@ mod tests {
 
     #[test]
     fn view_timings_split_ticks_between_recorded_boundaries() {
-        // Начало, затем граница после каждого из десяти проходов в порядке выполнения.
+        // Начало, затем граница после каждого из пятнадцати проходов в порядке выполнения.
         let marks = [
             Some(100),
             Some(110),
             Some(125),
             Some(140),
+            Some(145),
             Some(150),
             Some(160),
+            Some(165),
             Some(175),
+            Some(180),
+            Some(185),
             Some(190),
             Some(195),
             Some(200),
+            Some(205),
             Some(215),
         ];
         let view = decode_view(ProfiledView::Screen, &marks, 64, 1.0).unwrap();
@@ -16809,13 +17590,18 @@ mod tests {
                 Some(ns(10)),
                 Some(ns(15)),
                 Some(ns(15)),
-                Some(ns(10)),
-                Some(ns(10)),
-                Some(ns(15)),
-                Some(ns(15)),
                 Some(ns(5)),
                 Some(ns(5)),
-                Some(ns(15)),
+                Some(ns(10)),
+                Some(ns(5)),
+                Some(ns(10)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(5)),
+                Some(ns(10)),
             ]
         );
         assert_eq!(view.total, ns(115));
@@ -16981,7 +17767,7 @@ mod tests {
 
     #[test]
     fn query_ranges_of_views_and_output_cover_pool_without_overlap() {
-        assert_eq!(TIMESTAMP_QUERY_COUNT, 46);
+        assert_eq!(TIMESTAMP_QUERY_COUNT, 66);
         let mut owner = [None::<usize>; TIMESTAMP_QUERY_COUNT as usize];
         let mut layout = GpuProfileLayout::default();
         for index in 0..MAX_PROFILED_VIEWS {

@@ -8,6 +8,8 @@ const PROJECT_TEMPLATE: &str = include_str!("../templates/new_project/project.rv
 const BOOTSTRAP_TEMPLATE: &str = include_str!("../templates/new_project/bootstrap.rves");
 const CAMERA_TEMPLATE: &str =
     include_str!("../templates/new_project/Assets/cameras/default.camerasettings");
+const POST_PROCESS_TEMPLATE: &str =
+    include_str!("../templates/new_project/Assets/cameras/default.postprocess");
 const SCENE_TEMPLATE: &str = include_str!("../templates/new_project/Assets/scenes/main.rvescene");
 const JUMP_TEMPLATE: &str = include_str!("../templates/new_project/Assets/scripts/jump.lua");
 const GUEST_CARGO_TEMPLATE: &str = include_str!("../templates/new_project/Scripts/Cargo.toml");
@@ -168,6 +170,10 @@ fn write_project_template(root: &Path, id: &str, name: &str) -> Result<(), Strin
         (
             "Assets/cameras/default.camerasettings",
             CAMERA_TEMPLATE.as_bytes(),
+        ),
+        (
+            "Assets/cameras/default.postprocess",
+            POST_PROCESS_TEMPLATE.as_bytes(),
         ),
         ("Assets/scenes/main.rvescene", SCENE_TEMPLATE.as_bytes()),
         ("Assets/scripts/jump.lua", JUMP_TEMPLATE.as_bytes()),

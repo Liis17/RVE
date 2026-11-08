@@ -516,6 +516,27 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
                     }
                 }
                 ui.end_row();
+                ui.label("Post Process");
+                let mut post_options = vec!["Default".to_owned()];
+                post_options.extend(state.assets_of_kind(AssetKind::PostProcess));
+                let current_post = camera
+                    .post_process
+                    .as_ref()
+                    .map(|path| path.as_str())
+                    .unwrap_or("Default");
+                if let Some(chosen) =
+                    asset_picker(ui, "camera_post_process", current_post, &post_options)
+                {
+                    let post = if chosen == "Default" {
+                        Some(None)
+                    } else {
+                        parse_path(state, &chosen).map(Some)
+                    };
+                    if let Some(post) = post {
+                        state.edit_scene(|scene| scene.set_camera_post_process(id, post));
+                    }
+                }
+                ui.end_row();
                 ui.label("Anti-Aliasing").on_hover_text(
                     "Immediately saves to the assigned .camerasettings asset; TOML comments and formatting are not preserved.",
                 );
@@ -548,6 +569,9 @@ fn show_camera(ui: &mut egui::Ui, state: &mut EditorState, id: &str, camera: &Ca
                 }
                 finish_edit(state, &response);
             });
+            if let Some(path) = camera.post_process.clone() {
+                show_post_process_editor(ui, state, &path);
+            }
             egui::CollapsingHeader::new("Cursor")
                 .id_salt("camera_cursor")
                 .default_open(false)
@@ -3199,4 +3223,297 @@ mod schema_tests {
         reset_schema_param(&mut params, "speed", Some(ParamValue::Int(30)), false);
         assert!(!params.contains_key("speed"));
     }
+}
+
+/// Редактор `.postprocess` под камерой: секции по эффектам, черновик хранится до кнопки Save.
+fn show_post_process_editor(ui: &mut egui::Ui, state: &mut EditorState, path: &VirtualPath) {
+    let Some(cached) = state
+        .project
+        .as_ref()
+        .and_then(|project| project.cached_post_process(path.as_str()))
+    else {
+        ui.label("Файл постобработки не загружен");
+        return;
+    };
+    let draft_id = egui::Id::new(("post_process_draft", path.as_str()));
+    let mut draft = ui
+        .data(|data| data.get_temp::<engine_scene::PostProcessSettings>(draft_id))
+        .unwrap_or(cached);
+    let mut save = false;
+    let mut revert = false;
+    egui::CollapsingHeader::new("Post Process")
+        .id_salt(draft_id)
+        .default_open(false)
+        .show(ui, |ui| {
+            post_process_sections(ui, &mut draft);
+            ui.horizontal(|ui| {
+                save = ui
+                    .add_enabled(draft != cached, egui::Button::new("Save"))
+                    .clicked();
+                revert = ui
+                    .add_enabled(draft != cached, egui::Button::new("Revert"))
+                    .clicked();
+            });
+        });
+    if save {
+        if state.save_post_process(path, draft) {
+            ui.data_mut(|data| data.remove::<engine_scene::PostProcessSettings>(draft_id));
+        }
+    } else if revert {
+        ui.data_mut(|data| data.remove::<engine_scene::PostProcessSettings>(draft_id));
+    } else {
+        ui.data_mut(|data| data.insert_temp(draft_id, draft));
+    }
+}
+
+/// Все секции эффектов; поля связаны с полями `PostProcessSettings`.
+fn post_process_sections(ui: &mut egui::Ui, post: &mut engine_scene::PostProcessSettings) {
+    use engine_scene::{AmbientOcclusionQuality, ExposureMode, Tonemapper};
+    egui::CollapsingHeader::new("Exposure")
+        .id_salt("pp_exposure")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.exposure.enabled, "Enabled");
+            ui.horizontal(|ui| {
+                ui.label("Mode");
+                egui::ComboBox::from_id_salt("pp_exposure_mode")
+                    .selected_text(match post.exposure.mode {
+                        ExposureMode::Manual => "Manual",
+                        ExposureMode::Auto => "Auto",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut post.exposure.mode,
+                            ExposureMode::Manual,
+                            "Manual",
+                        );
+                        ui.selectable_value(&mut post.exposure.mode, ExposureMode::Auto, "Auto");
+                    });
+            });
+            drag_f32(ui, "EV", &mut post.exposure.ev, -16.0..=16.0);
+            drag_f32(ui, "Min EV", &mut post.exposure.min_ev, -16.0..=16.0);
+            drag_f32(ui, "Max EV", &mut post.exposure.max_ev, -16.0..=16.0);
+            drag_f32(ui, "Speed up", &mut post.exposure.speed_up, 0.01..=20.0);
+            drag_f32(ui, "Speed down", &mut post.exposure.speed_down, 0.01..=20.0);
+            drag_f32(
+                ui,
+                "Low percent",
+                &mut post.exposure.low_percent,
+                0.0..=100.0,
+            );
+            drag_f32(
+                ui,
+                "High percent",
+                &mut post.exposure.high_percent,
+                0.0..=100.0,
+            );
+        });
+    egui::CollapsingHeader::new("Tonemapping")
+        .id_salt("pp_tonemapping")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.tonemapping.enabled, "Enabled");
+            ui.horizontal(|ui| {
+                ui.label("Tonemapper");
+                egui::ComboBox::from_id_salt("pp_tonemapper")
+                    .selected_text(match post.tonemapping.tonemapper {
+                        Tonemapper::Aces => "ACES",
+                        Tonemapper::Neutral => "Neutral",
+                        Tonemapper::None => "None",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut post.tonemapping.tonemapper,
+                            Tonemapper::Aces,
+                            "ACES",
+                        );
+                        ui.selectable_value(
+                            &mut post.tonemapping.tonemapper,
+                            Tonemapper::Neutral,
+                            "Neutral",
+                        );
+                        ui.selectable_value(
+                            &mut post.tonemapping.tonemapper,
+                            Tonemapper::None,
+                            "None",
+                        );
+                    });
+            });
+        });
+    egui::CollapsingHeader::new("Bloom")
+        .id_salt("pp_bloom")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.bloom.enabled, "Enabled");
+            drag_f32(ui, "Intensity", &mut post.bloom.intensity, 0.0..=16.0);
+            drag_f32(ui, "Threshold", &mut post.bloom.threshold, 0.0..=16.0);
+            drag_f32(ui, "Knee", &mut post.bloom.knee, 0.0..=1.0);
+            drag_f32(ui, "Scatter", &mut post.bloom.scatter, 0.0..=1.0);
+            ui.horizontal(|ui| {
+                ui.label("Tint");
+                ui.color_edit_button_rgb(&mut post.bloom.tint);
+            });
+        });
+    egui::CollapsingHeader::new("Ambient occlusion")
+        .id_salt("pp_ao")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.ambient_occlusion.enabled, "Enabled");
+            drag_f32(
+                ui,
+                "Radius",
+                &mut post.ambient_occlusion.radius,
+                0.001..=100.0,
+            );
+            drag_f32(
+                ui,
+                "Intensity",
+                &mut post.ambient_occlusion.intensity,
+                0.0..=4.0,
+            );
+            drag_f32(
+                ui,
+                "Falloff",
+                &mut post.ambient_occlusion.falloff,
+                0.0..=1.0,
+            );
+            ui.horizontal(|ui| {
+                ui.label("Quality");
+                egui::ComboBox::from_id_salt("pp_ao_quality")
+                    .selected_text(match post.ambient_occlusion.quality {
+                        AmbientOcclusionQuality::Low => "Low",
+                        AmbientOcclusionQuality::Medium => "Medium",
+                        AmbientOcclusionQuality::High => "High",
+                    })
+                    .show_ui(ui, |ui| {
+                        let quality = &mut post.ambient_occlusion.quality;
+                        ui.selectable_value(quality, AmbientOcclusionQuality::Low, "Low");
+                        ui.selectable_value(quality, AmbientOcclusionQuality::Medium, "Medium");
+                        ui.selectable_value(quality, AmbientOcclusionQuality::High, "High");
+                    });
+            });
+        });
+    egui::CollapsingHeader::new("Color grading")
+        .id_salt("pp_grading")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.color_grading.enabled, "Enabled");
+            drag_f32(
+                ui,
+                "Temperature",
+                &mut post.color_grading.temperature,
+                -1.0..=1.0,
+            );
+            drag_f32(ui, "Tint", &mut post.color_grading.tint, -1.0..=1.0);
+            drag_f32(ui, "Contrast", &mut post.color_grading.contrast, 0.0..=2.0);
+            drag_f32(
+                ui,
+                "Saturation",
+                &mut post.color_grading.saturation,
+                0.0..=2.0,
+            );
+            drag_rgb(ui, "Lift", &mut post.color_grading.lift, -1.0..=1.0);
+            drag_rgb(ui, "Gamma", &mut post.color_grading.gamma, 0.001..=4.0);
+            drag_rgb(ui, "Gain", &mut post.color_grading.gain, 0.0..=4.0);
+        });
+    egui::CollapsingHeader::new("Vignette")
+        .id_salt("pp_vignette")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.vignette.enabled, "Enabled");
+            drag_f32(ui, "Intensity", &mut post.vignette.intensity, 0.0..=1.0);
+            drag_f32(ui, "Smoothness", &mut post.vignette.smoothness, 0.0..=1.0);
+            drag_f32(ui, "Roundness", &mut post.vignette.roundness, 0.0..=1.0);
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                ui.color_edit_button_rgb(&mut post.vignette.color);
+            });
+        });
+    egui::CollapsingHeader::new("Chromatic aberration")
+        .id_salt("pp_aberration")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.chromatic_aberration.enabled, "Enabled");
+            drag_f32(
+                ui,
+                "Intensity",
+                &mut post.chromatic_aberration.intensity,
+                0.0..=1.0,
+            );
+        });
+    egui::CollapsingHeader::new("Film grain")
+        .id_salt("pp_grain")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.film_grain.enabled, "Enabled");
+            drag_f32(ui, "Intensity", &mut post.film_grain.intensity, 0.0..=1.0);
+            drag_f32(ui, "Response", &mut post.film_grain.response, 0.0..=1.0);
+        });
+    egui::CollapsingHeader::new("Depth of field")
+        .id_salt("pp_dof")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.depth_of_field.enabled, "Enabled");
+            drag_f32(
+                ui,
+                "Focus distance",
+                &mut post.depth_of_field.focus_distance,
+                0.001..=10_000.0,
+            );
+            drag_f32(
+                ui,
+                "Aperture",
+                &mut post.depth_of_field.aperture,
+                0.1..=64.0,
+            );
+            drag_f32(
+                ui,
+                "Focal length (mm)",
+                &mut post.depth_of_field.focal_length_mm,
+                1.0..=1000.0,
+            );
+            drag_f32(
+                ui,
+                "Max blur (px)",
+                &mut post.depth_of_field.max_blur_px,
+                0.0..=256.0,
+            );
+        });
+    egui::CollapsingHeader::new("Motion blur")
+        .id_salt("pp_motion")
+        .show(ui, |ui| {
+            ui.checkbox(&mut post.motion_blur.enabled, "Enabled");
+            drag_f32(
+                ui,
+                "Shutter angle",
+                &mut post.motion_blur.shutter_angle_deg,
+                0.1..=360.0,
+            );
+            ui.horizontal(|ui| {
+                ui.label("Samples");
+                ui.add(egui::DragValue::new(&mut post.motion_blur.samples).range(4..=32));
+            });
+            drag_f32(
+                ui,
+                "Max blur (px)",
+                &mut post.motion_blur.max_blur_px,
+                0.0..=256.0,
+            );
+        });
+}
+
+fn drag_f32(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::DragValue::new(value).range(range).speed(0.01));
+    });
+}
+
+fn drag_rgb(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut [f32; 3],
+    range: std::ops::RangeInclusive<f32>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        for channel in value.iter_mut() {
+            ui.add(
+                egui::DragValue::new(channel)
+                    .range(range.clone())
+                    .speed(0.01),
+            );
+        }
+    });
 }

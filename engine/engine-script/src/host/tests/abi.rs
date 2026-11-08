@@ -1434,7 +1434,7 @@ fn abi_v6_to_v8_modules_load_on_the_v9_host() {
 }
 
 #[test]
-fn abi_v10_modules_load_on_the_v11_host() {
+fn abi_v10_modules_load_on_the_v12_host() {
     let _lock = test_lock();
     let current = sdk_module();
     let module = Box::leak(Box::new(RveModule {
@@ -1460,7 +1460,38 @@ fn abi_v10_modules_load_on_the_v11_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v10"),
-        "guest ABI v10 runs on the v11 host"
+        "guest ABI v10 runs on the v12 host"
+    );
+}
+
+#[test]
+fn abi_v11_modules_load_on_the_v12_host() {
+    let _lock = test_lock();
+    let current = sdk_module();
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 11,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: current.scripts,
+        script_count: current.script_count,
+    }));
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v11" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v11"),
+        "guest ABI v11 runs on the v12 host"
     );
 }
 
@@ -1729,10 +1760,10 @@ id = "second"
                 clear_color: [0.2, 0.3, 0.4],
                 anti_aliasing: engine_scene::AntiAliasing::None,
             },
-            color: engine_scene::CameraColorSettings {
+            color: Some(engine_scene::CameraColorSettings {
                 exposure_ev: 2.0,
                 tonemapper: engine_scene::Tonemapper::Neutral,
-            },
+            }),
         }
     );
     assert!(host.drain_events().is_empty());

@@ -13,6 +13,7 @@ use crate::document::{
 use crate::light::ShadowSettings;
 use crate::particles::ParticleEmitterComponent;
 use crate::physics_material::resolve_collider_material;
+use crate::post_process::PostProcessSettings;
 use crate::prefab::{MAX_EXPANDED_ID_BYTES, PrefabTemplate};
 use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
@@ -216,6 +217,8 @@ pub struct WorldObject {
     pub lod_group: Option<LodGroup>,
     pub camera: Option<CameraComponent>,
     pub camera_settings: Option<CameraSettings>,
+    /// Разрешённая постобработка камеры; есть только у объектов с Camera component.
+    pub post_process: Option<PostProcessSettings>,
     pub directional_light: Option<DirectionalLightComponent>,
     pub point_light: Option<PointLightComponent>,
     pub spot_light: Option<SpotLightComponent>,
@@ -297,6 +300,8 @@ pub struct ParticleEmitterInstance {
 pub struct SceneFrame {
     pub camera: Camera,
     pub view: CameraSettings,
+    /// Постобработка активной камеры.
+    pub post_process: PostProcessSettings,
     pub light: LightState,
     pub local_lights: Vec<LocalLightState>,
     pub environment: Option<EnvironmentState>,
@@ -634,6 +639,36 @@ impl World {
         Ok(())
     }
 
+    /// Постобработка камеры; `None`, если объект не содержит Camera component.
+    pub fn post_process(&self, handle: ObjectHandle) -> Option<&PostProcessSettings> {
+        self.object(handle)?.camera.as_ref()?;
+        self.object(handle)?.post_process.as_ref()
+    }
+
+    /// Проверяет и заменяет постобработку существующей камеры. Общий файл `.postprocess`
+    /// не меняется: правится только копия этой камеры.
+    pub fn set_post_process(
+        &mut self,
+        handle: ObjectHandle,
+        settings: PostProcessSettings,
+    ) -> Result<(), SceneError> {
+        settings.validate().map_err(|error| {
+            let object_id = self.object(handle).map(|object| object.id.as_str());
+            SceneError::new(&self.source_label, object_id, error.message)
+        })?;
+        let index = self.live_index_or_error(handle)?;
+        let object = &mut self.objects[index];
+        if object.camera.is_none() {
+            return Err(SceneError::new(
+                &self.source_label,
+                Some(&object.id),
+                "у объекта нет Camera component",
+            ));
+        }
+        object.post_process = Some(settings);
+        Ok(())
+    }
+
     /// Читает `.rvephysmat` всех коллайдеров мира и заполняет их разрешённые материалы.
     pub fn resolve_physics_materials(
         &mut self,
@@ -837,10 +872,16 @@ impl World {
             Some(state)
         });
 
+        let post_process = self
+            .object(self.active_camera)
+            .and_then(|object| object.post_process)
+            .unwrap_or_default();
+
         (
             SceneFrame {
                 camera,
                 view,
+                post_process,
                 light,
                 local_lights,
                 environment,
@@ -1208,6 +1249,10 @@ fn world_object(
         lod_group: object.lod_group.clone(),
         camera: object.camera.clone(),
         camera_settings: object.camera.as_ref().map(|_| CameraSettings::default()),
+        post_process: object
+            .camera
+            .as_ref()
+            .map(|_| PostProcessSettings::default()),
         directional_light: object.directional_light,
         point_light: object.point_light,
         spot_light: object.spot_light,
@@ -1666,9 +1711,11 @@ position=[2.0,0.0,0.0]
         let main_settings =
             crate::CameraSettings::parse("main.camerasettings", "[color]\nexposure_ev = 2.0\n")
                 .unwrap();
+        let main_post = crate::post_process::resolve_post_process(&main_settings, None);
+        world.set_post_process(main, main_post).unwrap();
         world.set_camera_settings(main, main_settings).unwrap();
         assert_eq!(world.build_frame().0.camera.position.x, 1.0);
-        assert_eq!(world.build_frame().0.view.color.exposure_ev, 2.0);
+        assert_eq!(world.build_frame().0.post_process.exposure.ev, 2.0);
         let second = world.handle("second").unwrap();
         assert_eq!(world.camera_of(second).unwrap().position.x, 2.0);
         assert!(world.camera_settings(second).is_some());
@@ -1706,6 +1753,58 @@ position=[2.0,0.0,0.0]
         let (second, warnings) = world.build_frame();
         assert_eq!(second.camera, previous);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn post_process_copies_are_per_camera_and_only_cameras_accept_them() {
+        let document = SceneDocument::parse(
+            "post.rvescene",
+            r#"
+[[objects]]
+id="main"
+[objects.camera]
+active=true
+[[objects]]
+id="second"
+[objects.camera]
+[[objects]]
+id="mesh"
+"#,
+        )
+        .unwrap();
+        let mut world = World::from_document(&document).unwrap();
+        let main = world.handle("main").unwrap();
+        let second = world.handle("second").unwrap();
+        let mesh = world.handle("mesh").unwrap();
+        assert_eq!(
+            world.post_process(main),
+            Some(&crate::PostProcessSettings::default())
+        );
+        assert_eq!(world.post_process(mesh), None);
+
+        let mut graded = crate::PostProcessSettings::default();
+        graded.bloom.enabled = true;
+        graded.bloom.intensity = 2.0;
+        world.set_post_process(main, graded).unwrap();
+        assert_eq!(world.post_process(main), Some(&graded));
+        assert_eq!(
+            world.post_process(second),
+            Some(&crate::PostProcessSettings::default()),
+            "правка одной камеры не меняет копию другой"
+        );
+        assert!(world.build_frame().0.post_process.bloom.enabled);
+
+        world.set_active_camera(second).unwrap();
+        assert!(!world.build_frame().0.post_process.bloom.enabled);
+
+        let mut invalid = crate::PostProcessSettings::default();
+        invalid.bloom.intensity = -1.0;
+        assert!(world.set_post_process(second, invalid).is_err());
+        assert_eq!(
+            world.post_process(second),
+            Some(&crate::PostProcessSettings::default())
+        );
+        assert!(world.set_post_process(mesh, graded).is_err());
     }
 
     #[test]
