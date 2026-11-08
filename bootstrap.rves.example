@@ -3,3 +3,4 @@ WindowSizeY=720
 WindowTitle=RVE Sandbox
 AllowMultipleInstances=true
 PresentMode=Fifo
+Reflex=Off

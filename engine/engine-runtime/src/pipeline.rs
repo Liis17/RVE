@@ -27,10 +27,10 @@ use engine_physics::{
 use engine_render::{
     AntiAliasing as RenderAntiAliasing, DebugView, DirectionalLight, DrawCommand, EnvironmentId,
     EnvironmentSource, Frame, FrameCamera, FrameEnvironment, FrameOutcome, FrameProfile,
-    FrameStatus, LocalLight, LocalLightShadow, LocalLightShadowMatrices, MaterialId, MeshId,
-    ParticleEmitterDesc, ParticleEmitterFrame, ParticleEmitterId, ProceduralSky, RenderError,
-    Renderer, SHADOW_MAP_RESOLUTION, TextureColorSpace, TextureId, Tonemapper as RenderTonemapper,
-    ViewSettings,
+    FrameStatus, LatencyHandle, LatencyMarker, LocalLight, LocalLightShadow,
+    LocalLightShadowMatrices, MaterialId, MeshId, ParticleEmitterDesc, ParticleEmitterFrame,
+    ParticleEmitterId, ProceduralSky, RenderError, Renderer, SHADOW_MAP_RESOLUTION,
+    TextureColorSpace, TextureId, Tonemapper as RenderTonemapper, ViewSettings,
 };
 use engine_render::{SkinBinding, SkinId};
 #[cfg(feature = "dev-console")]
@@ -166,8 +166,33 @@ type FrameLighting = (
     Option<FrameEnvironment>,
 );
 
+/// Вызовы NVIDIA Reflex из скриптового потока; реализация — `engine_render::LatencyHandle`.
+pub(crate) trait FrameLatency: Send + Sync {
+    /// Ждёт разрешения Reflex на начало симуляции кадра.
+    fn sleep(&self);
+    fn marker(&self, frame_id: u64, marker: LatencyMarker);
+}
+
+impl FrameLatency for LatencyHandle {
+    fn sleep(&self) {
+        LatencyHandle::sleep(self);
+    }
+
+    fn marker(&self, frame_id: u64, marker: LatencyMarker) {
+        LatencyHandle::marker(self, frame_id, marker);
+    }
+}
+
+impl std::fmt::Debug for dyn FrameLatency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrameLatency")
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ScriptControl {
+    /// Reflex-handle renderer; приходит один раз перед первым `Go`.
+    Latency(Arc<dyn FrameLatency>),
     Go(Box<GpuSceneTable>),
     Background(bool),
     #[cfg(feature = "dev-console")]
@@ -623,6 +648,7 @@ impl RenderBackend for VulkanBackend {
         width: u32,
         height: u32,
     ) -> Result<FrameOutcome, String> {
+        self.renderer.set_latency_frame(snapshot.sequence);
         let (light, shadow_cascades, environment) = self.frame_lighting(snapshot, width, height)?;
         let particle_step = particle_step(snapshot.sim_time, self.last_submitted_sim_time);
         let particles: Vec<ParticleEmitterFrame> = snapshot
@@ -1022,8 +1048,10 @@ fn scripts_thread(
     let mut pending_console_commands = PendingConsoleCommands::default();
     let mut prefab_loads = PrefabLoads::new(prefab_loader, render_resources);
     let mut pending_prefab = VecDeque::new();
+    let mut frame_latency: Option<Arc<dyn FrameLatency>> = None;
     let gpu_scene = loop {
         match control_rx.recv() {
+            Ok(ScriptControl::Latency(latency)) => frame_latency = Some(latency),
             Ok(ScriptControl::Go(scene)) => break Some(*scene),
             Ok(ScriptControl::Shutdown) | Err(_) => break None,
             Ok(ScriptControl::Background(value)) => {
@@ -1109,6 +1137,10 @@ fn scripts_thread(
                         }
                         false
                     }
+                    ScriptControl::Latency(latency) => {
+                        frame_latency = Some(latency);
+                        false
+                    }
                     ScriptControl::Go(_) => false,
                     ScriptControl::Prefab(reply) => {
                         pending_prefab.push_back(reply);
@@ -1181,6 +1213,7 @@ fn scripts_thread(
                         entered_background = true;
                         break;
                     }
+                    Ok(ScriptControl::Latency(latency)) => frame_latency = Some(latency),
                     Ok(ScriptControl::Background(false)) | Ok(ScriptControl::Go(_)) => {}
                     Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(reply),
                     #[cfg(feature = "dev-console")]
@@ -1198,6 +1231,13 @@ fn scripts_thread(
             }
         }
 
+        // Reflex: сон и маркеры только в интерактивном режиме; в background кадры без Reflex.
+        let reflex = frame_latency.as_deref().filter(|_| !background);
+        let next_frame = frame_number.saturating_add(1);
+        if let Some(latency) = reflex {
+            latency.sleep();
+            latency.marker(next_frame, LatencyMarker::SimulationStart);
+        }
         let now = clock.now();
         let dt = now.saturating_sub(last_tick).as_secs_f32();
         last_tick = now;
@@ -1252,6 +1292,9 @@ fn scripts_thread(
             script_phase::PREFAB_REPLIES,
             prefab_started.elapsed(),
         );
+        if let Some(latency) = reflex {
+            latency.marker(frame_number, LatencyMarker::InputSample);
+        }
         let input_frame = lock_input(&input).take_frame();
         scripts.set_input(input_frame);
         let update_started = Instant::now();
@@ -1362,6 +1405,9 @@ fn scripts_thread(
         let snapshot = match made {
             Ok(mut snapshot) => {
                 snapshot.sequence = frame_number;
+                if let Some(latency) = reflex {
+                    latency.marker(frame_number, LatencyMarker::SimulationEnd);
+                }
                 Arc::new(snapshot)
             }
             Err(error) => {
@@ -2402,7 +2448,8 @@ fn send_snapshot(
             ScriptSelection::Control(Ok(ScriptControl::Console(command))) => {
                 pending_console_commands.push_back(command);
             }
-            ScriptSelection::Control(Ok(ScriptControl::Go(_))) => {}
+            // Latency и Go приходят только до первого кадра, поэтому здесь они не нужны.
+            ScriptSelection::Control(Ok(ScriptControl::Go(_) | ScriptControl::Latency(_))) => {}
             ScriptSelection::Control(Ok(ScriptControl::Prefab(reply))) => {
                 pending_prefab.push_back(reply);
             }
@@ -2435,7 +2482,8 @@ fn wait_background_tick(
             #[cfg(feature = "dev-console")]
             Ok(ScriptControl::Console(command)) => pending_console_commands.push_back(command),
             Ok(ScriptControl::Prefab(reply)) => pending_prefab.push_back(reply),
-            Ok(ScriptControl::Go(_)) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(ScriptControl::Go(_) | ScriptControl::Latency(_))
+            | Err(RecvTimeoutError::Timeout) => {}
         }
     }
     true
@@ -2890,11 +2938,11 @@ mod tests {
         render_local_lights, render_loop, render_snapshot, render_thread, selected_level,
         send_snapshot, sync_input_background, wait_background_tick,
     };
+    use super::{FrameLatency, publish_script_cursor, set_initial_cursor};
     #[cfg(feature = "dev-console")]
     use super::{PROFILE_COMMAND, PROFILE_COMMAND_DESCRIPTION, publish_command_catalog};
     use super::{SpawnPhysics, apply_world_changes, drain_prefab_replies};
     use super::{attach_prefab_levels, detach_objects};
-    use super::{publish_script_cursor, set_initial_cursor};
     use crate::cursor::{CursorControl, RecordingCursorSink};
     use crate::input::{InputAccumulator, lock_input};
     use crate::module_host::ModuleHost;
@@ -2917,7 +2965,7 @@ mod tests {
         PhysicsWorld, Pose,
     };
     use engine_project::{InputAction, InputSettings};
-    use engine_render::{DrawCommand, FrameOutcome, FrameStatus, LocalLight};
+    use engine_render::{DrawCommand, FrameOutcome, FrameStatus, LatencyMarker, LocalLight};
     use engine_render::{EnvironmentSource, ProceduralSky};
     use engine_scene::CameraSettings;
     use engine_scene::camera::Camera;
@@ -4246,6 +4294,161 @@ return Script
         assert!(frame.key_pressed(Key::A));
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum LatencyEvent {
+        Sleep,
+        Marker(u64, LatencyMarker),
+    }
+
+    #[derive(Default)]
+    struct RecordingLatency {
+        events: Mutex<Vec<LatencyEvent>>,
+    }
+
+    impl FrameLatency for RecordingLatency {
+        fn sleep(&self) {
+            self.events.lock().unwrap().push(LatencyEvent::Sleep);
+        }
+
+        fn marker(&self, frame_id: u64, marker: LatencyMarker) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(LatencyEvent::Marker(frame_id, marker));
+        }
+    }
+
+    fn latency_test_world() -> World {
+        let document = SceneDocument::parse(
+            "startup.rvescene",
+            "[[objects]]\nid = \"camera\"\n[objects.camera]\n",
+        )
+        .unwrap();
+        World::from_document(&document).unwrap()
+    }
+
+    fn shutdown_test_scripts(mut scripts: TestScripts) {
+        scripts.control.send(ScriptControl::Shutdown).unwrap();
+        scripts
+            .thread
+            .stopped
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        scripts.modules.join_named(SCRIPTS_THREAD).unwrap();
+        assert!(scripts.modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn reflex_sleep_and_markers_run_in_order_for_the_submitted_sequence() {
+        let latency = Arc::new(RecordingLatency::default());
+        let scripts =
+            start_test_scripts(latency_test_world(), &[], PreparedPrefabs::default(), None);
+        scripts
+            .control
+            .send(ScriptControl::Latency(latency.clone()))
+            .unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(Box::default()))
+            .unwrap();
+        let frame = scripts
+            .frames
+            .recv_timeout(Duration::from_secs(2))
+            .expect("кадр");
+        assert_eq!(frame.sequence, 1);
+        // Цикл может уже готовить следующий кадр, поэтому сравниваем только первые события.
+        let events = latency.events.lock().unwrap();
+        assert_eq!(
+            events[..4],
+            [
+                LatencyEvent::Sleep,
+                LatencyEvent::Marker(frame.sequence, LatencyMarker::SimulationStart),
+                LatencyEvent::Marker(frame.sequence, LatencyMarker::InputSample),
+                LatencyEvent::Marker(frame.sequence, LatencyMarker::SimulationEnd),
+            ]
+        );
+        drop(events);
+        shutdown_test_scripts(scripts);
+    }
+
+    #[test]
+    fn reflex_is_not_called_while_scripts_run_in_background() {
+        let clock = Arc::new(FakeClock::default());
+        let waiting = clock.observe_waits();
+        let latency = Arc::new(RecordingLatency::default());
+        let scripts = start_test_scripts_with_clock(
+            latency_test_world(),
+            &[],
+            PreparedPrefabs::default(),
+            None,
+            Arc::clone(&clock),
+        );
+        scripts
+            .control
+            .send(ScriptControl::Latency(latency.clone()))
+            .unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Background(true))
+            .unwrap();
+        scripts
+            .control
+            .send(ScriptControl::Go(Box::default()))
+            .unwrap();
+        waiting
+            .recv_timeout(Duration::from_secs(2))
+            .expect("фоновое ожидание тика");
+        // Время проходит до дедлайна; Go здесь игнорируется и лишь пробуждает ожидание.
+        clock.advance(Duration::from_secs(1));
+        scripts
+            .control
+            .send(ScriptControl::Go(Box::default()))
+            .unwrap();
+        waiting
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ожидание после фонового шага симуляции");
+        // Второе ожидание начинается уже после фонового шага: Reflex за него не вызывался.
+        assert!(latency.events.lock().unwrap().is_empty());
+        scripts
+            .control
+            .send(ScriptControl::Background(false))
+            .unwrap();
+        let frame = scripts
+            .frames
+            .recv_timeout(Duration::from_secs(2))
+            .expect("кадр после выхода из фона");
+        // Позитивный контроль: фоновый шаг увеличил номер кадра, а Reflex появился только для кадра.
+        assert_eq!(frame.sequence, 2);
+        let events = latency.events.lock().unwrap();
+        assert_eq!(
+            events[..4],
+            [
+                LatencyEvent::Sleep,
+                LatencyEvent::Marker(frame.sequence, LatencyMarker::SimulationStart),
+                LatencyEvent::Marker(frame.sequence, LatencyMarker::InputSample),
+                LatencyEvent::Marker(frame.sequence, LatencyMarker::SimulationEnd),
+            ]
+        );
+        drop(events);
+        shutdown_test_scripts(scripts);
+    }
+
+    #[test]
+    fn scripts_produce_frames_without_a_reflex_handle() {
+        let scripts =
+            start_test_scripts(latency_test_world(), &[], PreparedPrefabs::default(), None);
+        scripts
+            .control
+            .send(ScriptControl::Go(Box::default()))
+            .unwrap();
+        let frame = scripts
+            .frames
+            .recv_timeout(Duration::from_secs(2))
+            .expect("кадр без Reflex");
+        assert_eq!(frame.sequence, 1);
+        shutdown_test_scripts(scripts);
+    }
+
     #[test]
     fn physics_step_sent_after_host_stopped_physics_is_not_a_failure() {
         let document = SceneDocument::parse(
@@ -5495,6 +5698,22 @@ return Move
         prefabs: PreparedPrefabs,
         physics: Option<(PhysicsClient, PhysicsInitialization)>,
     ) -> TestScripts {
+        start_test_scripts_with_clock(
+            world,
+            sources,
+            prefabs,
+            physics,
+            Arc::new(FakeClock::default()),
+        )
+    }
+
+    fn start_test_scripts_with_clock(
+        world: World,
+        sources: &[(&str, &str)],
+        prefabs: PreparedPrefabs,
+        physics: Option<(PhysicsClient, PhysicsInitialization)>,
+        clock: Arc<FakeClock>,
+    ) -> TestScripts {
         let mut modules = ModuleHost::new();
         let (script_tx, script_rx) = flume::unbounded();
         let (frame_tx, frame_rx) = flume::bounded(1);
@@ -5517,7 +5736,7 @@ return Move
                 scripts_library: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
-                clock: Arc::new(FakeClock::default()),
+                clock,
                 background_tick_hz: 30,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,

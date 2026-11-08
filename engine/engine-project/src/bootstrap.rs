@@ -11,6 +11,15 @@ pub enum BootstrapPresentMode {
     Immediate,
 }
 
+/// NVIDIA Reflex (low latency) mode requested by a player, editor or sandbox at startup.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BootstrapReflexMode {
+    #[default]
+    Off,
+    On,
+    Boost,
+}
+
 /// Startup settings read from a `bootstrap.rves` file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapConfig {
@@ -20,6 +29,7 @@ pub struct BootstrapConfig {
     pub allow_multiple_instances: bool,
     pub app_icon: Option<String>,
     pub present_mode: Option<BootstrapPresentMode>,
+    pub reflex: Option<BootstrapReflexMode>,
 }
 
 impl Default for BootstrapConfig {
@@ -31,6 +41,7 @@ impl Default for BootstrapConfig {
             allow_multiple_instances: true,
             app_icon: None,
             present_mode: None,
+            reflex: None,
         }
     }
 }
@@ -57,7 +68,7 @@ impl BootstrapConfig {
 
     fn parse_with_path(contents: &str, path: &str) -> Result<Self, String> {
         let mut config = Self::default();
-        let mut seen = [false; 6];
+        let mut seen = [false; 7];
 
         for (line_index, raw_line) in contents.lines().enumerate() {
             let line_number = line_index + 1;
@@ -78,6 +89,7 @@ impl BootstrapConfig {
                 "AllowMultipleInstances" => 3,
                 "AppIcon" => 4,
                 "PresentMode" => 5,
+                "Reflex" => 6,
                 _ => return Err(error(&format!("неизвестный параметр {name}"))),
             };
             if seen[seen_index] {
@@ -140,6 +152,14 @@ impl BootstrapConfig {
                         }
                     });
                 }
+                "Reflex" => {
+                    config.reflex = Some(match raw_value.trim() {
+                        "Off" => BootstrapReflexMode::Off,
+                        "On" => BootstrapReflexMode::On,
+                        "Boost" => BootstrapReflexMode::Boost,
+                        _ => return Err(error("Reflex должен быть Off, On или Boost")),
+                    });
+                }
                 _ => unreachable!("known bootstrap field"),
             }
 
@@ -152,7 +172,7 @@ impl BootstrapConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{BootstrapConfig, BootstrapPresentMode};
+    use super::{BootstrapConfig, BootstrapPresentMode, BootstrapReflexMode};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -177,6 +197,40 @@ mod tests {
         assert!(!config.allow_multiple_instances);
         assert_eq!(config.app_icon.as_deref(), Some("/ui/game.png"));
         assert_eq!(config.present_mode, Some(BootstrapPresentMode::Mailbox));
+        assert_eq!(config.reflex, None);
+    }
+
+    #[test]
+    fn parses_reflex_modes_and_defaults_to_absent() {
+        assert_eq!(
+            BootstrapConfig::parse("Reflex=Off").unwrap().reflex,
+            Some(BootstrapReflexMode::Off)
+        );
+        assert_eq!(
+            BootstrapConfig::parse(" Reflex = On ").unwrap().reflex,
+            Some(BootstrapReflexMode::On)
+        );
+        assert_eq!(
+            BootstrapConfig::parse("Reflex=Boost").unwrap().reflex,
+            Some(BootstrapReflexMode::Boost)
+        );
+        assert_eq!(
+            BootstrapConfig::parse("WindowSizeX=800").unwrap().reflex,
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_or_invalid_reflex_with_source_location() {
+        let error = BootstrapConfig::parse("Reflex=On\nReflex=Boost").unwrap_err();
+        assert!(error.contains("bootstrap.rves: строка 2:"), "{error}");
+        assert!(error.contains("указан повторно"), "{error}");
+
+        for value in ["on", "Vsync", ""] {
+            let error = BootstrapConfig::parse(&format!("\nReflex={value}")).unwrap_err();
+            assert!(error.contains("bootstrap.rves: строка 2:"), "{error}");
+            assert!(error.contains("Reflex"), "{error}");
+        }
     }
 
     #[test]

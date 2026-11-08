@@ -26,7 +26,7 @@ mod state;
 mod ui;
 mod viewport;
 
-use engine_project::ProjectSettings;
+use engine_project::{BootstrapReflexMode, ProjectSettings};
 use engine_window::{RedrawMode, WindowConfig};
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
@@ -37,8 +37,8 @@ const DEFAULT_WINDOW_SIZE: (u32, u32) = (1600, 900);
 /// Версия редактора из `Cargo.toml`; пишется в журнал при запуске.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Проверяет аргументы до создания окна и собирает его настройки.
-fn prepare(args: &cli::EditorArgs) -> Result<WindowConfig, String> {
+/// Проверяет аргументы до создания окна и собирает его настройки и режим Reflex.
+fn prepare(args: &cli::EditorArgs) -> Result<(WindowConfig, Option<BootstrapReflexMode>), String> {
     let mut config = WindowConfig {
         title: "RVE Editor".to_owned(),
         width: DEFAULT_WINDOW_SIZE.0,
@@ -54,13 +54,15 @@ fn prepare(args: &cli::EditorArgs) -> Result<WindowConfig, String> {
             scripts.display()
         ));
     }
+    let mut reflex = None;
     if let Some(dir) = &args.project {
         ProjectSettings::load(dir.join("project.rveproject"))?;
         let bootstrap = project::OpenProject::bootstrap(dir)?;
         config.width = bootstrap.window_size_x.unwrap_or(config.width);
         config.height = bootstrap.window_size_y.unwrap_or(config.height);
+        reflex = bootstrap.reflex;
     }
-    Ok(config)
+    Ok((config, reflex))
 }
 
 fn main() -> ExitCode {
@@ -71,15 +73,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config = match prepare(&args) {
-        Ok(config) => config,
+    let (config, reflex) = match prepare(&args) {
+        Ok(prepared) => prepared,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::from(2);
         }
     };
     prepare_vulkan_environment();
-    let mut editor = app::EditorApp::new(args.project, args.scripts);
+    let mut editor = app::EditorApp::new(args.project, args.scripts, reflex);
     let run_result = engine_window::run(config, &mut editor);
     editor.save_pipeline_cache();
     if let Err(error) = run_result {
@@ -152,7 +154,7 @@ mod tests {
             "/../examples/demo-game"
         ));
         let bootstrap = project::OpenProject::bootstrap(&dir).unwrap();
-        let config = prepare(&cli::EditorArgs {
+        let (config, reflex) = prepare(&cli::EditorArgs {
             project: Some(dir),
             scripts: None,
         })
@@ -162,6 +164,7 @@ mod tests {
             config.width,
             bootstrap.window_size_x.unwrap_or(DEFAULT_WINDOW_SIZE.0)
         );
+        assert_eq!(reflex, bootstrap.reflex);
     }
 
     #[test]
@@ -188,7 +191,8 @@ mod tests {
 
     #[test]
     fn without_a_project_the_default_window_is_used() {
-        let config = prepare(&cli::EditorArgs::default()).unwrap();
+        let (config, reflex) = prepare(&cli::EditorArgs::default()).unwrap();
         assert_eq!((config.width, config.height), DEFAULT_WINDOW_SIZE);
+        assert_eq!(reflex, None);
     }
 }
