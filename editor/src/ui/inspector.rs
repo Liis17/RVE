@@ -2140,11 +2140,35 @@ fn show_collider(
                 let trigger = ui.checkbox(&mut value.trigger, "");
                 ui.end_row();
                 merge_response(&mut combined, trigger);
-                let friction = drag_row(ui, "Friction", &mut value.friction, 0.01, 0.0..=f32::MAX);
-                merge_response(&mut combined, friction);
-                let restitution =
-                    drag_row(ui, "Restitution", &mut value.restitution, 0.01, 0.0..=1.0);
-                merge_response(&mut combined, restitution);
+                ui.label("Material").on_hover_text(
+                    "Physics material asset (.rvephysmat). When assigned, it replaces Friction and Restitution.",
+                );
+                let mut options = vec!["Inline".to_owned()];
+                options.extend(state.assets_of_kind(AssetKind::PhysicsMaterial));
+                let current = collider
+                    .material
+                    .as_ref()
+                    .map(|path| path.as_str())
+                    .unwrap_or("Inline");
+                if let Some(chosen) = asset_picker(ui, "collider_material", current, &options) {
+                    let material = if chosen == "Inline" {
+                        Some(None)
+                    } else {
+                        parse_path(state, &chosen).map(Some)
+                    };
+                    if let Some(material) = material {
+                        state.edit_scene(|scene| scene.set_collider_material(id, material));
+                    }
+                }
+                ui.end_row();
+                if value.material.is_none() {
+                    let friction =
+                        drag_row(ui, "Friction", &mut value.friction, 0.01, 0.0..=f32::MAX);
+                    merge_response(&mut combined, friction);
+                    let restitution =
+                        drag_row(ui, "Restitution", &mut value.restitution, 0.01, 0.0..=1.0);
+                    merge_response(&mut combined, restitution);
+                }
                 if let Some(response) = combined {
                     commit(state, id, "collider", &response, |object| {
                         object.collider = Some(value);

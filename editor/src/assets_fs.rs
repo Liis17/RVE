@@ -22,6 +22,7 @@ pub enum AssetKind {
     Scene,
     Prefab,
     CameraSettings,
+    PhysicsMaterial,
     Model,
     Texture,
     Hdr,
@@ -41,6 +42,7 @@ impl AssetKind {
             Some("rvescene") => Self::Scene,
             Some("rveprefab") => Self::Prefab,
             Some("camerasettings") => Self::CameraSettings,
+            Some("rvephysmat") => Self::PhysicsMaterial,
             Some("fbx") => Self::Model,
             Some("png") => Self::Texture,
             Some("hdr") => Self::Hdr,
@@ -122,6 +124,18 @@ impl AssetsDir {
         }
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
         Ok(entries)
+    }
+
+    /// Создаёт новый файл с содержимым `contents`; существующий файл не перезаписывается.
+    pub fn create_file(&self, parent: &str, name: &str, contents: &str) -> io::Result<String> {
+        validate_name(name)?;
+        let path = join(parent, name);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.resolve(&path)?)?;
+        io::Write::write_all(&mut file, contents.as_bytes())?;
+        Ok(path)
     }
 
     pub fn create_folder(&self, parent: &str, name: &str) -> io::Result<String> {
@@ -306,6 +320,26 @@ mod tests {
             AssetKind::CameraSettings
         );
         assert_eq!(AssetKind::of("s.lua"), AssetKind::Script);
+    }
+
+    #[test]
+    fn physics_material_files_are_classified_and_created_without_overwrite() {
+        assert_eq!(
+            AssetKind::of("materials/ICE.RVEPHYSMAT"),
+            AssetKind::PhysicsMaterial
+        );
+        let temp = TempAssets::new();
+        assert_eq!(
+            temp.assets
+                .create_file("", "ice.rvephysmat", "static_friction = 0.1\n")
+                .unwrap(),
+            "ice.rvephysmat"
+        );
+        assert!(temp.assets.create_file("", "ice.rvephysmat", "").is_err());
+        assert_eq!(
+            fs::read_to_string(temp.assets.root().join("ice.rvephysmat")).unwrap(),
+            "static_friction = 0.1\n"
+        );
     }
 
     #[test]
