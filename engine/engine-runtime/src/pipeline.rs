@@ -1271,9 +1271,11 @@ fn scripts_thread(
         scripts.update(&mut world, dt, time);
         let rumble = scripts.take_rumble_requests();
         if accepting_input {
-            for request in rumble {
-                gamepads.rumble(request.pad, request.strong, request.weak, request.seconds);
-            }
+            gamepads.rumble_frame(
+                rumble
+                    .iter()
+                    .map(|request| (request.pad, request.strong, request.weak, request.seconds)),
+            );
         }
         publish_script_cursor(&scripts, &cursor, &mut published_cursor);
         timings.record(

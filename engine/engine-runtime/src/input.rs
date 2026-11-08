@@ -363,6 +363,31 @@ mod tests {
     }
 
     #[test]
+    fn pad_tap_latched_into_one_poll_is_pressed_then_released_in_script_frames() {
+        use engine_input::GamepadSnapshot;
+
+        const SOUTH: u32 = 1;
+        let mut input = InputAccumulator {
+            focused: true,
+            ..Default::default()
+        };
+        let mut pads = GamepadSnapshot::default();
+        pads[0].connected = true;
+        // Regaining input with nothing held: a button already held would stay masked.
+        assert!(input.set_pads(&pads));
+        pads[0].buttons = SOUTH;
+        assert!(input.set_pads(&pads));
+
+        let tapped = input.take_frame().gamepad_state(1).unwrap();
+        assert_eq!((tapped.down, tapped.pressed, tapped.released), (SOUTH, SOUTH, 0));
+
+        pads[0].buttons = 0;
+        assert!(input.set_pads(&pads));
+        let released = input.take_frame().gamepad_state(1).unwrap();
+        assert_eq!((released.down, released.pressed, released.released), (0, 0, SOUTH));
+    }
+
+    #[test]
     fn focus_loss_and_background_release_all_held_input() {
         let mut input = InputAccumulator {
             focused: true,
