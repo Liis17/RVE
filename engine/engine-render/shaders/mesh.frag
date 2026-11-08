@@ -76,6 +76,27 @@ layout(set = 1, binding = 3) uniform texture2D normal_texture;
 layout(set = 1, binding = 4) uniform texture2D emissive_texture;
 layout(set = 1, binding = 5) uniform texture2D occlusion_texture;
 layout(set = 1, binding = 6) uniform sampler material_sampler;
+layout(set = 1, binding = 7) uniform UserMaterialUniforms { vec4 values[16]; } rve_user;
+layout(set = 1, binding = 8) uniform texture2D rve_user_texture0;
+layout(set = 1, binding = 9) uniform texture2D rve_user_texture1;
+layout(set = 1, binding = 10) uniform texture2D rve_user_texture2;
+layout(set = 1, binding = 11) uniform texture2D rve_user_texture3;
+layout(set = 1, binding = 12) uniform texture2D rve_user_texture4;
+layout(set = 1, binding = 13) uniform texture2D rve_user_texture5;
+layout(set = 1, binding = 14) uniform texture2D rve_user_texture6;
+layout(set = 1, binding = 15) uniform texture2D rve_user_texture7;
+
+struct Surface {
+    vec2 uv;
+    vec3 albedo;
+    float alpha;
+    vec3 geometric_normal;
+    vec3 normal;
+    float metallic;
+    float roughness;
+    float occlusion;
+    vec3 emissive;
+};
 
 layout(set = 2, binding = 0) uniform textureCube environment_map;
 layout(set = 2, binding = 1) uniform sampler environment_sampler;
@@ -242,45 +263,11 @@ vec3 cascade_color(int index) {
     return vec3(1.0, 0.82, 0.18);
 }
 
-void main() {
-    int debug_view = int(frame.render_params.w + 0.5);
-    if (debug_view == 3) {
-        out_color = vec4(1.0, 0.0, 0.0, 1.0);
-        out_velocity = vec2(0.0);
-        return;
-    }
-    vec4 base_sample = texture(
-        sampler2D(base_color_texture, material_sampler), in_uv, frame.render_params.z
-    );
-    float surface_alpha = base_sample.a * material.alpha_parameters.x;
-#ifdef ALPHA_MASK
-    if (surface_alpha < material.alpha_parameters.y) {
-        discard;
-    }
-    float output_alpha = 1.0;
-#elif defined(ALPHA_BLEND)
-    float output_alpha = surface_alpha;
-#else
-    float output_alpha = 1.0;
-#endif
-    vec4 metallic_roughness_sample = texture(
-        sampler2D(metallic_roughness_texture, material_sampler), in_uv, frame.render_params.z
-    );
-    vec3 normal_sample = texture(
-        sampler2D(normal_texture, material_sampler), in_uv, frame.render_params.z
-    ).rgb;
-    vec3 emissive_sample = texture(
-        sampler2D(emissive_texture, material_sampler), in_uv, frame.render_params.z
-    ).rgb;
-    float occlusion = texture(
-        sampler2D(occlusion_texture, material_sampler), in_uv, frame.render_params.z
-    ).r;
-
+vec3 rve_perturb_normal(vec3 tangent_normal) {
     vec3 dp1 = dFdx(in_world_position);
     vec3 dp2 = dFdy(in_world_position);
     vec2 duv1 = dFdx(in_uv);
     vec2 duv2 = dFdy(in_uv);
-
     vec3 geometric_normal = safe_normalize(in_normal, vec3(0.0, 0.0, 1.0));
     vec3 tangent = vec3(0.0);
     vec3 bitangent = vec3(0.0);
@@ -304,23 +291,90 @@ void main() {
             bitangent = safe_normalize(raw_bitangent, geometric_normal);
         }
     }
-
-    vec3 tangent_normal = normal_sample * 2.0 - 1.0;
-    tangent_normal.xy *= material.parameters.z;
-    tangent_normal = safe_normalize(tangent_normal, vec3(0.0, 0.0, 1.0));
     vec3 normal = geometric_normal;
-    if (material.parameters.w > 0.5 && valid_basis) {
+    if (valid_basis) {
+        tangent_normal = safe_normalize(tangent_normal, vec3(0.0, 0.0, 1.0));
         normal = safe_normalize(
             tangent * tangent_normal.x + bitangent * tangent_normal.y
                 + geometric_normal * tangent_normal.z,
             geometric_normal
         );
     }
-
     if (!gl_FrontFacing) {
-        geometric_normal = -geometric_normal;
         normal = -normal;
     }
+    return normal;
+}
+
+Surface rve_default_surface() {
+    vec4 base_sample = texture(
+        sampler2D(base_color_texture, material_sampler), in_uv, frame.render_params.z
+    );
+    vec4 metallic_roughness_sample = texture(
+        sampler2D(metallic_roughness_texture, material_sampler), in_uv, frame.render_params.z
+    );
+    vec3 normal_sample = texture(
+        sampler2D(normal_texture, material_sampler), in_uv, frame.render_params.z
+    ).rgb;
+    vec3 emissive_sample = texture(
+        sampler2D(emissive_texture, material_sampler), in_uv, frame.render_params.z
+    ).rgb;
+    float occlusion = texture(
+        sampler2D(occlusion_texture, material_sampler), in_uv, frame.render_params.z
+    ).r;
+    vec3 geometric_normal = safe_normalize(in_normal, vec3(0.0, 0.0, 1.0));
+    vec3 normal = geometric_normal;
+    if (material.parameters.w > 0.5) {
+        vec3 tangent_normal = normal_sample * 2.0 - 1.0;
+        tangent_normal.xy *= material.parameters.z;
+        normal = rve_perturb_normal(tangent_normal);
+    } else if (!gl_FrontFacing) {
+        normal = -normal;
+    }
+    if (!gl_FrontFacing) {
+        geometric_normal = -geometric_normal;
+    }
+    Surface result;
+    result.uv = in_uv;
+    result.albedo = base_sample.rgb * material.base_color.rgb * in_color;
+    result.alpha = base_sample.a * material.alpha_parameters.x;
+    result.geometric_normal = geometric_normal;
+    result.normal = normal;
+    result.metallic = clamp(material.parameters.x * metallic_roughness_sample.b, 0.0, 1.0);
+    result.roughness = clamp(material.parameters.y * metallic_roughness_sample.g, 0.0, 1.0);
+    result.occlusion = mix(1.0, occlusion, material.alpha_parameters.w);
+    result.emissive = material.emissive.rgb * emissive_sample;
+    return result;
+}
+
+#ifndef CUSTOM_SURFACE
+void surface(inout Surface s) { }
+#endif
+
+// CUSTOM_SURFACE_INSERTION_POINT
+
+void main() {
+    int debug_view = int(frame.render_params.w + 0.5);
+    if (debug_view == 3) {
+        out_color = vec4(1.0, 0.0, 0.0, 1.0);
+        out_velocity = vec2(0.0);
+        return;
+    }
+    Surface surface_data = rve_default_surface();
+    surface(surface_data);
+    float surface_alpha = surface_data.alpha;
+#ifdef ALPHA_MASK
+    if (surface_alpha < material.alpha_parameters.y) {
+        discard;
+    }
+    float output_alpha = 1.0;
+#elif defined(ALPHA_BLEND)
+    float output_alpha = surface_alpha;
+#else
+    float output_alpha = 1.0;
+#endif
+    vec3 geometric_normal = surface_data.geometric_normal;
+    vec3 normal = surface_data.normal;
 
     if (debug_view == 2) {
         out_color = vec4(normal * 0.5 + 0.5, output_alpha);
@@ -328,11 +382,12 @@ void main() {
         return;
     }
 
-    vec3 base_color = base_sample.rgb * material.base_color.rgb * in_color;
-    float metallic = clamp(material.parameters.x * metallic_roughness_sample.b, 0.0, 1.0);
-    float roughness = clamp(material.parameters.y * metallic_roughness_sample.g, 0.0, 1.0);
+    vec3 base_color = surface_data.albedo;
+    float metallic = surface_data.metallic;
+    float roughness = surface_data.roughness;
     float effective_roughness = max(roughness, 0.045);
     float alpha = effective_roughness * effective_roughness;
+#ifndef UNLIT
     vec3 f0 = mix(vec3(0.04), base_color, metallic);
 
     vec3 view = safe_normalize(frame.camera_position.xyz - in_world_position, geometric_normal);
@@ -486,14 +541,17 @@ void main() {
         frame.ambient_color.rgb * (indirect_diffuse + indirect_specular),
         frame.environment_params.x * (indirect_diffuse + indirect_specular),
         environment_weight
-    ) * mix(1.0, occlusion, material.alpha_parameters.w);
-    vec3 emissive = material.emissive.rgb * emissive_sample;
+    ) * surface_data.occlusion;
+    vec3 emissive = surface_data.emissive;
     vec3 lit_color = ambient + direct + emissive;
     if (debug_view == 5) {
         lit_color = selected_cascade < 0
             ? vec3(1.0, 0.0, 1.0)
             : lit_color * cascade_color(selected_cascade);
     }
+#else
+    vec3 lit_color = surface_data.albedo + surface_data.emissive;
+#endif
     out_color = vec4(lit_color, output_alpha);
     vec2 current_ndc = in_current_clip.xy / in_current_clip.w;
     vec2 previous_ndc = in_previous_clip.xy / in_previous_clip.w;
