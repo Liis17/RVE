@@ -7,20 +7,21 @@ use engine_assets::Assets;
 use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
 use engine_files::VirtualPath;
+use engine_input::{GamepadSnapshot, GamepadTuning, GilrsBackend, PadGate};
 use engine_physics::{
     BodyChange, BodyHandle, ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsClient,
     PhysicsCommand, PhysicsInitialization, PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync,
     PhysicsServer, PhysicsServerError, ShapeCache,
 };
-use engine_project::{InputSettings, PhysicsSettings, PrefabCatalogFile};
+use engine_project::{GamepadSettings, InputSettings, PhysicsSettings, PrefabCatalogFile};
 use engine_resources::ResourceHandle;
 use engine_scene::document::mesh_collider_model;
 use engine_scene::prefab::PREFAB_EXTENSION;
 use engine_scene::{AudioRequest, ObjectHandle, PrefabTemplate, SceneDocument, VoiceId, World};
 use engine_script::{
-    CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, ScriptCursor, ScriptEvent,
-    ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary, ScriptLoadOptions, ScriptTime,
-    SpawnedObject, WorldChanges,
+    CommandError, PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, RumbleRequest,
+    ScriptCursor, ScriptEvent, ScriptHost, ScriptInput, ScriptInterruptHandle, ScriptLibrary,
+    ScriptLoadOptions, ScriptTime, SpawnedObject, WorldChanges,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -153,9 +154,16 @@ impl PlayPrefabs {
             .filter(|asset| is_prefab_path(asset.path.as_str()))
         {
             let path = asset.path.as_str();
-            let template = match PrefabTemplate::load(&asset.path, &mut |child: &VirtualPath| {
+            let loaded = PrefabTemplate::load(&asset.path, &mut |child: &VirtualPath| {
                 read_text(&format!("/{}", child.as_str()))
-            }) {
+            })
+            .and_then(|mut template| {
+                template.resolve_physics_materials(&mut |child: &VirtualPath| {
+                    read_text(&format!("/{}", child.as_str()))
+                })?;
+                Ok(template)
+            });
+            let template = match loaded {
                 Ok(template) => template,
                 Err(error) => {
                     warnings.push(format!("префаб /{path} пропущен: {error}"));
@@ -423,10 +431,15 @@ fn load_heavy_prefab(
     let interrupted = || stop.load(Ordering::Acquire);
     let prefab_path =
         VirtualPath::parse(path).map_err(|_| format!("некорректный путь префаба {path:?}"))?;
-    let template = PrefabTemplate::load(&prefab_path, &mut |child: &VirtualPath| {
+    let mut template = PrefabTemplate::load(&prefab_path, &mut |child: &VirtualPath| {
         read_resource_text(resources, &format!("/{}", child.as_str()))
     })
     .map_err(|error| error.to_string())?;
+    template
+        .resolve_physics_materials(&mut |child: &VirtualPath| {
+            read_resource_text(resources, &format!("/{}", child.as_str()))
+        })
+        .map_err(|error| error.to_string())?;
     template
         .check_spawnable()
         .map_err(|error| error.to_string())?;
@@ -468,8 +481,35 @@ pub struct PlaySession {
     frame: u64,
     last_tick: Instant,
     input: ScriptInput,
+    pad_gate: PadGate,
+    /// Rumble requests of the last update. They play at the next `poll_gamepads` while pads are
+    /// accepted, so the editor delivers them the same way the runtime does.
+    rumble: Vec<RumbleRequest>,
     heavy: HeavyLoads,
     last_step: PlayStep,
+}
+
+/// The project's `[input.gamepad]` as the gamepad backend takes it.
+pub fn gamepad_tuning(settings: &GamepadSettings) -> GamepadTuning {
+    GamepadTuning {
+        stick_deadzone: settings.stick_deadzone,
+        trigger_threshold: settings.trigger_threshold,
+    }
+}
+
+/// Returns the editor's single gamepad backend, creating it on first use and keeping it for later
+/// Play sessions. Tests run without devices so they never open `gilrs`.
+pub fn editor_gamepads(
+    slot: &mut Option<GilrsBackend>,
+    tuning: GamepadTuning,
+) -> &mut GilrsBackend {
+    slot.get_or_insert_with(|| {
+        if cfg!(test) {
+            GilrsBackend::without_devices(tuning)
+        } else {
+            GilrsBackend::new(tuning)
+        }
+    })
 }
 
 impl PlaySession {
@@ -557,7 +597,7 @@ impl PlaySession {
             .objects()
             .iter()
             .filter_map(|object| {
-                mesh_collider_model(object.collider, object.mesh_renderer.as_ref())
+                mesh_collider_model(object.collider.clone(), object.mesh_renderer.as_ref())
             })
             .chain(
                 prefabs
@@ -678,6 +718,8 @@ impl PlaySession {
             last_tick: Instant::now(),
             last_step: PlayStep::default(),
             input: ScriptInput::default(),
+            pad_gate: PadGate::default(),
+            rumble: Vec::new(),
             heavy: HeavyLoads::new(resources),
         })
     }
@@ -719,6 +761,33 @@ impl PlaySession {
     /// Вводит состояние кнопок и клавиш для следующего обновления.
     pub fn input_mut(&mut self) -> &mut ScriptInput {
         &mut self.input
+    }
+
+    /// Reads the gamepads for the next update and delivers the rumble of the last update. Pads
+    /// count only while `accepting` is true: the editor window has focus and the console is
+    /// closed. Otherwise they read as released, and rumble stops and is dropped.
+    pub fn poll_gamepads(&mut self, gamepads: &mut GilrsBackend, accepting: bool) {
+        gamepads.poll();
+        let pads = gamepads.snapshot();
+        self.apply_gamepads(&pads, accepting);
+        if accepting {
+            let requests = std::mem::take(&mut self.rumble);
+            gamepads.rumble_frame(
+                requests
+                    .iter()
+                    .map(|request| (request.pad, request.strong, request.weak, request.seconds)),
+            );
+        } else {
+            self.rumble.clear();
+            gamepads.stop_rumble();
+        }
+    }
+
+    fn apply_gamepads(&mut self, pads: &GamepadSnapshot, accepting: bool) {
+        for (index, pad) in self.pad_gate.apply(accepting, pads).iter().enumerate() {
+            self.input
+                .set_pad(index, pad.connected, pad.buttons, pad.axes);
+        }
     }
 
     pub(crate) fn clear_input(&mut self) {
@@ -773,6 +842,7 @@ impl PlaySession {
             .set_deadline(Some(Instant::now() + self.time_limit));
         self.host.update(&mut self.world, dt, time);
         self.watchdog.set_deadline(None);
+        self.rumble = self.host.take_rumble_requests();
         // Порядок как в runtime: запросы скриптов, затем время; события уйдут в следующий update.
         self.animation.apply(self.host.drain_animation_requests());
         let finished = self.animation.advance(dt);
@@ -1288,6 +1358,29 @@ return Rotate
     }
 
     #[test]
+    fn gamepad_rumble_is_delivered_once_and_dropped_when_pads_are_not_accepted() {
+        const RUMBLE: &str = r#"
+local Rumble = {}
+function Rumble:on_update(dt)
+  rve.input.gamepad_rumble(1.0, 0.5, 1.0, 1)
+end
+return Rumble
+"#;
+        let mut gamepads = GilrsBackend::without_devices(GamepadTuning::default());
+        let mut session = start(RUMBLE).unwrap();
+
+        session.step(0.1).unwrap();
+        assert_eq!(session.rumble.len(), 1);
+        session.poll_gamepads(&mut gamepads, false);
+        assert!(session.rumble.is_empty());
+
+        session.step(0.1).unwrap();
+        assert_eq!(session.rumble.len(), 1);
+        session.poll_gamepads(&mut gamepads, true);
+        assert!(session.rumble.is_empty());
+    }
+
+    #[test]
     fn play_starts_with_the_active_camera_cursor_flags() {
         let scene = SCENE.replace(
             "[objects.camera]\n",
@@ -1621,6 +1714,57 @@ return Hero
     }
 
     #[test]
+    fn editor_gamepads_are_created_once_and_kept_for_later_sessions() {
+        let tuning = gamepad_tuning(&GamepadSettings::default());
+        let mut slot = None;
+        let first = std::ptr::from_mut(editor_gamepads(&mut slot, tuning));
+        let second = std::ptr::from_mut(editor_gamepads(&mut slot, tuning));
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn gamepad_input_reaches_the_script_only_while_accepted() {
+        use engine_input::{PadSnapshot, SLOT_COUNT};
+        use rve_sdk::GamepadButton;
+
+        let script = r#"
+local S = {}
+function S:on_update(dt)
+  if rve.input.gamepad_pressed("South", 1) then rve.log_info("pad") end
+end
+return S
+"#;
+        let mut pads = [PadSnapshot::default(); SLOT_COUNT];
+        pads[0] = PadSnapshot {
+            connected: true,
+            buttons: 1 << GamepadButton::South as u32,
+            axes: [0.0; 6],
+        };
+
+        let mut session = start(script).unwrap();
+        // Input is regained with nothing held; a button already held then would stay masked.
+        session.apply_gamepads(&[PadSnapshot::default(); SLOT_COUNT], true);
+        session.apply_gamepads(&pads, true);
+        session.step(0.1).unwrap();
+        assert!(
+            session
+                .drain_events()
+                .iter()
+                .any(|event| event.message == "pad")
+        );
+
+        let mut session = start(script).unwrap();
+        session.apply_gamepads(&pads, false);
+        session.step(0.1).unwrap();
+        assert!(
+            !session
+                .drain_events()
+                .iter()
+                .any(|event| event.message == "pad")
+        );
+    }
+
+    #[test]
     fn input_snapshot_reaches_the_script() {
         let script = r#"
 local S = {}
@@ -1650,6 +1794,7 @@ end
 return S
 "#;
         let input_settings = InputSettings {
+            gamepad: Default::default(),
             default_context: Some("game".to_owned()),
             contexts: std::collections::BTreeMap::from([(
                 "game".to_owned(),

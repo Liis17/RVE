@@ -12,12 +12,13 @@ use crate::document::{
 };
 use crate::light::ShadowSettings;
 use crate::particles::ParticleEmitterComponent;
+use crate::physics_material::resolve_collider_material;
 use crate::post_process::PostProcessSettings;
 use crate::prefab::{MAX_EXPANDED_ID_BYTES, PrefabTemplate};
 use engine_files::VirtualPath;
 use glam::{EulerRot, Mat3, Mat4, Quat, Vec3};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Наибольшее поколение слота. Слот, поколение которого исчерпано, больше не переиспользуется.
 pub const MAX_GENERATION: u32 = i32::MAX as u32;
@@ -668,6 +669,26 @@ impl World {
         Ok(())
     }
 
+    /// Читает `.rvephysmat` всех коллайдеров мира и заполняет их разрешённые материалы.
+    pub fn resolve_physics_materials(
+        &mut self,
+        read: &mut dyn FnMut(&VirtualPath) -> Result<String, String>,
+    ) -> Result<(), SceneError> {
+        let mut cache = BTreeMap::new();
+        for object in &mut self.objects {
+            if let Some(collider) = object.collider.as_mut() {
+                resolve_collider_material(
+                    collider,
+                    &self.source_label,
+                    &object.id,
+                    read,
+                    &mut cache,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Возвращает handle камеры, активной при построении кадра.
     pub fn active_camera(&self) -> ObjectHandle {
         self.active_camera
@@ -1236,7 +1257,7 @@ fn world_object(
         point_light: object.point_light,
         spot_light: object.spot_light,
         environment: object.environment.clone(),
-        collider: object.collider,
+        collider: object.collider.clone(),
         rigid_body: object.rigid_body,
         character_controller: object.character_controller,
         audio_source: object.audio_source.clone(),

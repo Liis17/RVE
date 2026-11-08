@@ -2,11 +2,17 @@ use std::collections::BTreeMap;
 
 use glam::Vec3;
 
+use crate::material::combine_materials;
 use crate::narrow::{ContactPoint, ManifoldCache, PairKey};
 use crate::world::{
     ActivePair, Body, BodyHandle, BodyKind, POSITIONAL_CORRECTION, POSITIONAL_SLOP, PairKind,
     RESTITUTION_THRESHOLD, SOLVER_ITERATIONS,
 };
+
+/// Скорость скольжения в точке контакта, выше которой упёртое в конус трение считается скольжением.
+const SLIDING_SPEED: f32 = 0.05;
+/// Относительный допуск, по которому касательный импульс считается упёршимся в конус трения.
+const FRICTION_CLAMP_TOLERANCE: f32 = 1.0e-3;
 
 struct ContactConstraint {
     key: PairKey,
@@ -23,7 +29,6 @@ pub(crate) fn solve(
     bodies: &mut BTreeMap<BodyHandle, Body>,
     pairs: &mut BTreeMap<PairKey, ActivePair>,
     manifolds: &mut ManifoldCache,
-    _dt: f32,
 ) {
     let constraints = build_constraints(bodies, pairs);
     warm_start(bodies, pairs, &constraints);
@@ -33,7 +38,12 @@ pub(crate) fn solve(
             solve_friction(bodies, pairs, constraint);
         }
     }
-    positional_correction(bodies, pairs);
+    for constraint in &constraints {
+        let sliding = slides_after_solve(bodies, pairs, constraint);
+        if let Some(contact) = contact_mut(pairs, constraint.key, constraint.index) {
+            contact.sliding = sliding;
+        }
+    }
     for (key, pair) in pairs.iter() {
         if pair.kind == PairKind::Collision
             && let Some(manifold) = &pair.manifold
@@ -64,17 +74,22 @@ fn build_constraints(
         if !is_awake_dynamic(body_a) && !is_awake_dynamic(body_b) {
             continue;
         }
-        let friction = body_a.collider.friction.sqrt() * body_b.collider.friction.sqrt();
-        let restitution = body_a.collider.restitution.max(body_b.collider.restitution);
+        let material = combine_materials(&body_a.collider.material, &body_b.collider.material);
         let (tangent_1, tangent_2) = tangent_basis(manifold.normal);
         for (index, contact) in manifold.contacts.iter().enumerate() {
             let relative_velocity =
                 body_b.velocity_at(contact.position) - body_a.velocity_at(contact.position);
             let normal_speed = relative_velocity.dot(manifold.normal);
             let restitution_bias = if normal_speed < -RESTITUTION_THRESHOLD {
-                restitution * normal_speed
+                material.bounciness * normal_speed
             } else {
                 0.0
+            };
+            // Режим трения фиксируется на весь solve по флагу скольжения прошлого шага.
+            let friction = if contact.sliding {
+                material.dynamic_friction
+            } else {
+                material.static_friction
             };
             constraints.push(ContactConstraint {
                 key: *key,
@@ -100,6 +115,12 @@ fn warm_start(
         let Some(contact) = contact_mut(pairs, constraint.key, constraint.index) else {
             continue;
         };
+        // Касательный импульс прошлого шага переносится только в пределах конуса текущего трения:
+        // при смене статического трения на динамическое старый импульс не должен остаться в покое.
+        contact.tangent_impulse = clamp_to_friction_cone(
+            contact.tangent_impulse,
+            constraint.friction * contact.normal_impulse,
+        );
         let impulse = constraint.normal * contact.normal_impulse + contact.tangent_impulse;
         apply_pair_impulse(bodies, constraint.key, constraint.point, impulse);
     }
@@ -160,19 +181,28 @@ fn solve_friction(
             return;
         };
         let old_impulse = contact.tangent_impulse;
-        let mut candidate = old_impulse + tangent * delta;
-        let maximum = constraint.friction * contact.normal_impulse;
-        let length = candidate.length();
-        if maximum.is_finite() && length > maximum && length > f32::MIN_POSITIVE {
-            candidate *= maximum / length;
-        }
+        let candidate = clamp_to_friction_cone(
+            old_impulse + tangent * delta,
+            constraint.friction * contact.normal_impulse,
+        );
         contact.tangent_impulse = candidate;
         let applied = candidate - old_impulse;
         apply_pair_impulse(bodies, constraint.key, constraint.point, applied);
     }
 }
 
-fn positional_correction(
+/// Ограничивает касательный импульс конусом трения радиуса `maximum` (`μ·λn`).
+fn clamp_to_friction_cone(impulse: Vec3, maximum: f32) -> Vec3 {
+    let length = impulse.length();
+    if maximum.is_finite() && length > maximum && length > f32::MIN_POSITIVE {
+        impulse * (maximum / length)
+    } else {
+        impulse
+    }
+}
+
+/// Смещает позы на проникновение сверх `POSITIONAL_SLOP`; скорости не меняет.
+pub(crate) fn correct_positions(
     bodies: &mut BTreeMap<BodyHandle, Body>,
     pairs: &BTreeMap<PairKey, ActivePair>,
 ) {
@@ -206,11 +236,17 @@ fn positional_correction(
             ((penetration - POSITIONAL_SLOP).max(0.0) * POSITIONAL_CORRECTION) / inverse_mass_sum;
         let translation_a = -manifold.normal * (correction * body_a.inverse_mass);
         let translation_b = manifold.normal * (correction * body_b.inverse_mass);
-        if let Some(body) = bodies.get_mut(&BodyHandle(key.first)) {
+        if let Some(body) = bodies.get_mut(&BodyHandle(key.first))
+            && translation_a != Vec3::ZERO
+        {
             body.pose.position += translation_a;
+            body.mark_pose_changed();
         }
-        if let Some(body) = bodies.get_mut(&BodyHandle(key.second)) {
+        if let Some(body) = bodies.get_mut(&BodyHandle(key.second))
+            && translation_b != Vec3::ZERO
+        {
             body.pose.position += translation_b;
+            body.mark_pose_changed();
         }
     }
 }
@@ -267,4 +303,36 @@ fn contact_mut(
 
 fn is_awake_dynamic(body: &Body) -> bool {
     body.kind == BodyKind::Dynamic && !body.sleeping
+}
+
+/// Скользит ли точка после solve: касательный импульс упёрся в конус трения и относительная
+/// касательная скорость выше `SLIDING_SPEED`. Флаг читается на следующем шаге.
+fn slides_after_solve(
+    bodies: &BTreeMap<BodyHandle, Body>,
+    pairs: &BTreeMap<PairKey, ActivePair>,
+    constraint: &ContactConstraint,
+) -> bool {
+    let (Some(body_a), Some(body_b)) = (
+        bodies.get(&BodyHandle(constraint.key.first)),
+        bodies.get(&BodyHandle(constraint.key.second)),
+    ) else {
+        return false;
+    };
+    let Some(contact) = pairs
+        .get(&constraint.key)
+        .and_then(|pair| pair.manifold.as_ref())
+        .and_then(|manifold| manifold.contacts.get(constraint.index))
+    else {
+        return false;
+    };
+    let relative_velocity =
+        body_b.velocity_at(constraint.point) - body_a.velocity_at(constraint.point);
+    let tangent_speed =
+        (relative_velocity - constraint.normal * relative_velocity.dot(constraint.normal)).length();
+    let limit = constraint.friction * contact.normal_impulse;
+    // Нулевое трение не удерживает точку: любое касательное движение остаётся скольжением.
+    let clamped = constraint.friction <= 0.0
+        || (limit > 0.0
+            && contact.tangent_impulse.length() >= limit * (1.0 - FRICTION_CLAMP_TOLERANCE));
+    clamped && tangent_speed > SLIDING_SPEED
 }

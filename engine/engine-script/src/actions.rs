@@ -1,7 +1,9 @@
 use crate::types::ScriptInput;
 use engine_project::{InputAction, InputActionKind, InputSettings};
-use rve_sdk::{Key, MouseButton, PhysicalInput};
+use rve_sdk::abi::{RVE_GAMEPAD_SLOTS, split_gamepad_name};
+use rve_sdk::{GamepadAxis, GamepadButton, GamepadStick, Key, MouseButton, PhysicalInput};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 const MAX_INPUTS_PER_SLOT: usize = rve_sdk::abi::RVE_INPUT_MAX_BINDINGS;
 
@@ -26,6 +28,16 @@ enum AnalogSource {
     MouseY,
     WheelX,
     WheelY,
+    /// `Gamepad[N].<Axis>`; without `N` the slot with the largest magnitude is used.
+    GamepadAxis {
+        pad: Option<u8>,
+        axis: GamepadAxis,
+    },
+    /// `Gamepad[N].LeftStick|RightStick`; without `N` the slot with the longest vector is used.
+    GamepadStick {
+        pad: Option<u8>,
+        stick: GamepadStick,
+    },
 }
 
 impl AnalogSource {
@@ -37,8 +49,29 @@ impl AnalogSource {
             "MouseY" => Some(Self::MouseY),
             "WheelX" => Some(Self::WheelX),
             "WheelY" => Some(Self::WheelY),
-            _ => None,
+            _ => {
+                let (pad, name) = split_gamepad_name(value)?;
+                if let Some(axis) = GamepadAxis::from_name(name) {
+                    return Some(Self::GamepadAxis { pad, axis });
+                }
+                match name {
+                    "LeftStick" => Some(Self::GamepadStick {
+                        pad,
+                        stick: GamepadStick::Left,
+                    }),
+                    "RightStick" => Some(Self::GamepadStick {
+                        pad,
+                        stick: GamepadStick::Right,
+                    }),
+                    _ => None,
+                }
+            }
         }
+    }
+
+    /// Gamepad analog sources are clamped after scaling; mouse and wheel sources are not.
+    fn is_gamepad(self) -> bool {
+        matches!(self, Self::GamepadAxis { .. } | Self::GamepadStick { .. })
     }
 }
 
@@ -101,6 +134,45 @@ pub(crate) struct InputActions {
 struct InputMask {
     keys: u128,
     mouse: u8,
+    /// Suppressed gamepad button bits, per slot.
+    pads: [u32; RVE_GAMEPAD_SLOTS],
+}
+
+impl InputMask {
+    fn union(self, other: Self) -> Self {
+        let mut mask = self;
+        mask.absorb(other);
+        mask
+    }
+
+    fn intersection(self, other: Self) -> Self {
+        let mut pads = [0; RVE_GAMEPAD_SLOTS];
+        for (slot, (own, theirs)) in pads.iter_mut().zip(self.pads.iter().zip(other.pads)) {
+            *slot = own & theirs;
+        }
+        Self {
+            keys: self.keys & other.keys,
+            mouse: self.mouse & other.mouse,
+            pads,
+        }
+    }
+
+    fn absorb(&mut self, other: Self) {
+        self.keys |= other.keys;
+        self.mouse |= other.mouse;
+        for (slot, theirs) in self.pads.iter_mut().zip(other.pads) {
+            *slot |= theirs;
+        }
+    }
+
+    /// Keeps only the suppressions whose inputs are still held.
+    fn retain_held(&mut self, held: Self) {
+        self.keys &= held.keys;
+        self.mouse &= held.mouse;
+        for (slot, held) in self.pads.iter_mut().zip(held.pads) {
+            *slot &= held;
+        }
+    }
 }
 
 impl InputActions {
@@ -143,11 +215,9 @@ impl InputActions {
 
     pub(crate) fn set_input(&mut self, input: ScriptInput) {
         let held = unreleased_down_inputs(input);
-        self.context_suppression.keys &= held.keys;
-        self.context_suppression.mouse &= held.mouse;
+        self.context_suppression.retain_held(held);
         for suppression in &mut self.binding_suppression {
-            suppression.keys &= held.keys;
-            suppression.mouse &= held.mouse;
+            suppression.retain_held(held);
         }
 
         self.changed_bindings.fill(false);
@@ -207,8 +277,7 @@ impl InputActions {
                     self.tombstones.push(index);
                 }
             }
-            self.context_suppression.keys |= held.keys;
-            self.context_suppression.mouse |= held.mouse;
+            self.context_suppression.absorb(held);
         } else if let Some(changed_actions) = &changed_actions {
             for (changed_context, action) in changed_actions {
                 if context.as_deref() == Some(changed_context.as_str()) {
@@ -221,8 +290,7 @@ impl InputActions {
                     let binding_index = self.catalog.binding_indices[changed_context][action];
                     let definition = &definitions.contexts[changed_context][action];
                     let bound = bound_inputs(definition);
-                    self.binding_suppression[binding_index].keys |= held.keys & bound.keys;
-                    self.binding_suppression[binding_index].mouse |= held.mouse & bound.mouse;
+                    self.binding_suppression[binding_index].absorb(held.intersection(bound));
                 }
             }
         }
@@ -246,8 +314,7 @@ impl InputActions {
                     input,
                     definition,
                     previous_down,
-                    self.context_suppression.keys | suppression.keys,
-                    self.context_suppression.mouse | suppression.mouse,
+                    self.context_suppression.union(suppression),
                 );
             }
         }
@@ -292,8 +359,7 @@ impl InputActions {
                     input,
                     definition,
                     previous_down,
-                    context_suppression.keys | suppression.keys,
-                    context_suppression.mouse | suppression.mouse,
+                    context_suppression.union(suppression),
                 );
             }
         }
@@ -526,18 +592,14 @@ fn evaluate_action(
     input: ScriptInput,
     definition: &ActionDefinition,
     previous_down: bool,
-    suppressed_keys: u128,
-    suppressed_mouse: u8,
+    suppressed: InputMask,
 ) -> ActionValue {
     match definition.kind {
         InputActionKind::Button => {
             let mut down = false;
             let mut any_pressed = false;
             for binding in &definition.slots["inputs"] {
-                if is_suppressed(*binding, suppressed_keys, suppressed_mouse) {
-                    continue;
-                }
-                let state = physical_state(input, *binding);
+                let state = binding_state(input, *binding, suppressed);
                 down |= state & RVE_INPUT_DOWN != 0;
                 any_pressed |= state & RVE_INPUT_PRESSED != 0;
             }
@@ -549,59 +611,37 @@ fn evaluate_action(
             }
         }
         InputActionKind::Axis => {
-            let negative = slot_down(
-                input,
-                &definition.slots["negative"],
-                suppressed_keys,
-                suppressed_mouse,
-            );
-            let positive = slot_down(
-                input,
-                &definition.slots["positive"],
-                suppressed_keys,
-                suppressed_mouse,
-            );
+            let negative = slot_down(input, &definition.slots["negative"], suppressed);
+            let positive = slot_down(input, &definition.slots["positive"], suppressed);
             let analog = match definition.analog {
                 Some(AnalogSource::MouseX) => input.mouse_delta()[0],
                 Some(AnalogSource::MouseY) => input.mouse_delta()[1],
                 Some(AnalogSource::WheelX) => input.wheel()[0],
                 Some(AnalogSource::WheelY) => input.wheel()[1],
+                Some(AnalogSource::GamepadAxis { pad, axis }) => {
+                    gamepad_axis_value(input, pad, axis)
+                }
                 _ => 0.0,
             };
+            let value = (if positive { 1.0 } else { 0.0 }) - (if negative { 1.0 } else { 0.0 })
+                + analog * definition.scale;
             ActionValue {
                 value: [
-                    (if positive { 1.0 } else { 0.0 }) - (if negative { 1.0 } else { 0.0 })
-                        + analog * definition.scale,
+                    if definition.analog.is_some_and(AnalogSource::is_gamepad) {
+                        value.clamp(-1.0, 1.0)
+                    } else {
+                        value
+                    },
                     0.0,
                 ],
                 ..ActionValue::default()
             }
         }
         InputActionKind::Vector2 => {
-            let right = slot_down(
-                input,
-                &definition.slots["right"],
-                suppressed_keys,
-                suppressed_mouse,
-            );
-            let left = slot_down(
-                input,
-                &definition.slots["left"],
-                suppressed_keys,
-                suppressed_mouse,
-            );
-            let up = slot_down(
-                input,
-                &definition.slots["up"],
-                suppressed_keys,
-                suppressed_mouse,
-            );
-            let down = slot_down(
-                input,
-                &definition.slots["down"],
-                suppressed_keys,
-                suppressed_mouse,
-            );
+            let right = slot_down(input, &definition.slots["right"], suppressed);
+            let left = slot_down(input, &definition.slots["left"], suppressed);
+            let up = slot_down(input, &definition.slots["up"], suppressed);
+            let down = slot_down(input, &definition.slots["down"], suppressed);
             let mut x = (if right { 1.0 } else { 0.0 }) - (if left { 1.0 } else { 0.0 });
             let mut y = (if up { 1.0 } else { 0.0 }) - (if down { 1.0 } else { 0.0 });
             let length_squared: f32 = x * x + y * y;
@@ -613,43 +653,100 @@ fn evaluate_action(
             let analog = match definition.analog {
                 Some(AnalogSource::MouseDelta) => input.mouse_delta(),
                 Some(AnalogSource::Wheel) => input.wheel(),
+                Some(AnalogSource::GamepadStick { pad, stick }) => {
+                    gamepad_stick_value(input, pad, stick)
+                }
                 _ => [0.0; 2],
             };
+            let mut value = [
+                x + analog[0] * definition.scale,
+                y + analog[1] * definition.scale,
+            ];
+            if definition.analog.is_some_and(AnalogSource::is_gamepad) {
+                let length = value[0].hypot(value[1]);
+                if length > 1.0 {
+                    value = [value[0] / length, value[1] / length];
+                }
+            }
             ActionValue {
-                value: [
-                    x + analog[0] * definition.scale,
-                    y + analog[1] * definition.scale,
-                ],
+                value,
                 ..ActionValue::default()
             }
         }
     }
 }
 
-fn slot_down(
-    input: ScriptInput,
-    bindings: &[PhysicalInput],
-    suppressed_keys: u128,
-    suppressed_mouse: u8,
-) -> bool {
-    bindings.iter().any(|binding| {
-        !is_suppressed(*binding, suppressed_keys, suppressed_mouse)
-            && physical_state(input, *binding) & RVE_INPUT_DOWN != 0
-    })
+fn slot_down(input: ScriptInput, bindings: &[PhysicalInput], suppressed: InputMask) -> bool {
+    bindings
+        .iter()
+        .any(|binding| binding_state(input, *binding, suppressed) & RVE_INPUT_DOWN != 0)
 }
 
-fn physical_state(input: ScriptInput, binding: PhysicalInput) -> u32 {
+/// Returns the down/pressed/released flags of one binding. Suppressed inputs read as idle. A
+/// gamepad binding without a slot is the OR of every slot that is not suppressed.
+fn binding_state(input: ScriptInput, binding: PhysicalInput, suppressed: InputMask) -> u32 {
     match binding {
-        PhysicalInput::Key(key) => input.key_state(key as u32),
-        PhysicalInput::MouseButton(button) => input.mouse_button_state(button as u32),
+        PhysicalInput::Key(key) => {
+            if suppressed.keys & (1_u128 << key as u32) != 0 {
+                0
+            } else {
+                input.key_state(key as u32)
+            }
+        }
+        PhysicalInput::MouseButton(button) => {
+            if suppressed.mouse & (1_u8 << button as u32) != 0 {
+                0
+            } else {
+                input.mouse_button_state(button as u32)
+            }
+        }
+        PhysicalInput::GamepadButton { pad, button } => {
+            let bit = 1_u32 << button as u32;
+            pad_slots(pad)
+                .filter(|slot| suppressed.pads[*slot] & bit == 0)
+                .fold(0, |state, slot| {
+                    state | input.pad(slot).button_state(button)
+                })
+        }
     }
 }
 
-fn is_suppressed(binding: PhysicalInput, keys: u128, mouse: u8) -> bool {
-    match binding {
-        PhysicalInput::Key(key) => keys & (1_u128 << key as u32) != 0,
-        PhysicalInput::MouseButton(button) => mouse & (1_u8 << button as u32) != 0,
+/// Returns the slot indices (0..=3 for pads 1..=4) that a gamepad binding covers.
+fn pad_slots(pad: Option<u8>) -> Range<usize> {
+    match pad {
+        Some(pad) => usize::from(pad) - 1..usize::from(pad),
+        None => 0..RVE_GAMEPAD_SLOTS,
     }
+}
+
+/// Returns the stick component of the covered slot with the longest stick. Triggers take the value
+/// with the largest magnitude among the covered slots.
+fn gamepad_axis_value(input: ScriptInput, pad: Option<u8>, axis: GamepadAxis) -> f32 {
+    let stick = match axis {
+        GamepadAxis::LeftX | GamepadAxis::LeftY => Some(GamepadStick::Left),
+        GamepadAxis::RightX | GamepadAxis::RightY => Some(GamepadStick::Right),
+        GamepadAxis::LeftTrigger | GamepadAxis::RightTrigger => None,
+    };
+    if let Some(stick) = stick {
+        let [x, y] = gamepad_stick_value(input, pad, stick);
+        return if matches!(axis, GamepadAxis::LeftX | GamepadAxis::RightX) {
+            x
+        } else {
+            y
+        };
+    }
+    pad_slots(pad)
+        .map(|slot| input.pad(slot).axis(axis))
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .unwrap_or(0.0)
+}
+
+/// Returns the whole stick vector of the covered slot with the longest vector.
+fn gamepad_stick_value(input: ScriptInput, pad: Option<u8>, stick: GamepadStick) -> [f32; 2] {
+    pad_slots(pad)
+        .map(|slot| input.pad(slot).stick(stick))
+        .max_by(|a, b| (a[0] * a[0] + a[1] * a[1]).total_cmp(&(b[0] * b[0] + b[1] * b[1])))
+        .unwrap_or([0.0; 2])
 }
 
 fn unreleased_down_inputs(input: ScriptInput) -> InputMask {
@@ -666,6 +763,15 @@ fn unreleased_down_inputs(input: ScriptInput) -> InputMask {
             held.mouse |= 1_u8 << code;
         }
     }
+    for (slot, mask) in held.pads.iter_mut().enumerate() {
+        let pad = input.pad(slot);
+        for button in GamepadButton::ALL {
+            let state = pad.button_state(button);
+            if state & RVE_INPUT_DOWN != 0 && state & RVE_INPUT_RELEASED == 0 {
+                *mask |= 1_u32 << button as u32;
+            }
+        }
+    }
     held
 }
 
@@ -676,6 +782,12 @@ fn bound_inputs(definition: &ActionDefinition) -> InputMask {
             match input {
                 PhysicalInput::Key(key) => bound.keys |= 1_u128 << *key as u32,
                 PhysicalInput::MouseButton(button) => bound.mouse |= 1_u8 << *button as u32,
+                PhysicalInput::GamepadButton { pad, button } => {
+                    let bit = 1_u32 << *button as u32;
+                    for slot in pad_slots(*pad) {
+                        bound.pads[slot] |= bit;
+                    }
+                }
             }
         }
     }
@@ -708,6 +820,7 @@ mod tests {
 
     fn settings() -> InputSettings {
         InputSettings {
+            gamepad: Default::default(),
             default_context: Some("game".to_owned()),
             contexts: BTreeMap::from([
                 (
@@ -1280,5 +1393,254 @@ mod tests {
         assert!(frame.input().key_down(Key::W));
         assert!(!frame.input().key_pressed(Key::W));
         assert_eq!(frame.input().mouse_delta(), [0.0, 0.0]);
+    }
+
+    fn gamepad_actions() -> InputActions {
+        let mut settings = settings();
+        let game = settings.contexts.get_mut("game").unwrap();
+        game.insert(
+            "Fire".to_owned(),
+            InputAction::Button {
+                inputs: vec!["Gamepad.South".to_owned()],
+            },
+        );
+        game.insert(
+            "Turn".to_owned(),
+            InputAction::Axis {
+                negative: Vec::new(),
+                positive: Vec::new(),
+                analog: Some("Gamepad2.RightX".to_owned()),
+                scale: 1.0,
+            },
+        );
+        game.insert(
+            "Strafe".to_owned(),
+            InputAction::Axis {
+                negative: Vec::new(),
+                positive: vec!["D".to_owned()],
+                analog: Some("Gamepad.LeftX".to_owned()),
+                scale: 2.0,
+            },
+        );
+        game.insert(
+            "Drive".to_owned(),
+            InputAction::Vector2 {
+                up: Vec::new(),
+                down: Vec::new(),
+                left: Vec::new(),
+                right: Vec::new(),
+                analog: Some("Gamepad.LeftStick".to_owned()),
+                scale: 1.0,
+            },
+        );
+        InputActions::new(settings).unwrap()
+    }
+
+    /// Builds a snapshot from `(index, buttons, axes)` entries, where index 0..=3 is pad 1..=4.
+    fn pad_snapshot(pads: &[(usize, u32, [f32; 6])]) -> ScriptInput {
+        let mut input = ScriptInput::default();
+        for index in 0..4 {
+            let (buttons, axes) = pads
+                .iter()
+                .find(|(slot, _, _)| *slot == index)
+                .map_or((0, [0.0; 6]), |(_, buttons, axes)| (*buttons, *axes));
+            input.set_pad(index, true, buttons, axes);
+        }
+        input
+    }
+
+    const SOUTH_BIT: u32 = 1;
+    const EAST_BIT: u32 = 2;
+
+    #[test]
+    fn gamepad_slots_feed_button_and_analog_actions() {
+        let mut actions = gamepad_actions();
+        let input = pad_snapshot(&[(1, SOUTH_BIT, [0.0, 0.0, 0.5, 0.0, 0.0, 0.0])]);
+        actions.set_input(input);
+        let frame = actions.frame();
+
+        let fire = frame.state("Fire", InputActionKind::Button).unwrap();
+        assert!(fire.down && fire.pressed);
+        assert_eq!(
+            frame.state("Turn", InputActionKind::Axis).unwrap().value[0],
+            0.5
+        );
+        assert_eq!(
+            frame.bindings("game", "Fire", "inputs").unwrap(),
+            vec!["Gamepad.South".to_owned()]
+        );
+    }
+
+    #[test]
+    fn analog_axes_clamp_after_scale_and_vectors_keep_y_up() {
+        let mut actions = gamepad_actions();
+        actions.set_input(pad_snapshot(&[(0, 0, [0.3, 0.0, 0.0, 0.0, 0.0, 0.0])]));
+        let strafe = actions
+            .frame()
+            .state("Strafe", InputActionKind::Axis)
+            .unwrap()
+            .value[0];
+        assert!((strafe - 0.6).abs() < 1e-6, "{strafe}");
+
+        let mut input = pad_snapshot(&[(0, 0, [0.9, 0.0, 0.0, 0.0, 0.0, 0.0])]);
+        input.set_key(Key::D, true);
+        actions.set_input(input);
+        assert_eq!(
+            actions
+                .frame()
+                .state("Strafe", InputActionKind::Axis)
+                .unwrap()
+                .value[0],
+            1.0
+        );
+
+        let mut actions = gamepad_actions();
+        actions.set_input(pad_snapshot(&[(0, 0, [0.6, -0.9, 0.0, 0.0, 0.0, 0.0])]));
+        let drive = actions
+            .frame()
+            .state("Drive", InputActionKind::Vector2)
+            .unwrap()
+            .value;
+        assert!((drive[0].hypot(drive[1]) - 1.0).abs() < 1e-6, "{drive:?}");
+        assert!(drive[0] > 0.0 && drive[1] < 0.0, "{drive:?}");
+    }
+
+    #[test]
+    fn unslotted_gamepad_axis_uses_the_largest_magnitude_and_stick_the_longest_vector() {
+        let mut actions = gamepad_actions();
+        actions.set_input(pad_snapshot(&[
+            (0, 0, [0.2, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (1, 0, [-0.4, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ]));
+        let strafe = actions
+            .frame()
+            .state("Strafe", InputActionKind::Axis)
+            .unwrap()
+            .value[0];
+        assert!((strafe + 0.8).abs() < 1e-6, "{strafe}");
+
+        actions.set_input(pad_snapshot(&[
+            (0, 0, [0.3, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (2, 0, [0.0, 0.5, 0.0, 0.0, 0.0, 0.0]),
+        ]));
+        let drive = actions
+            .frame()
+            .state("Drive", InputActionKind::Vector2)
+            .unwrap()
+            .value;
+        assert_eq!(drive, [0.0, 0.5]);
+    }
+
+    #[test]
+    fn unslotted_stick_axis_takes_the_component_of_the_longest_stick_like_the_aggregate() {
+        let mut actions = gamepad_actions();
+        let input = pad_snapshot(&[
+            (0, 0, [0.3, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (1, 0, [0.0, 0.5, 0.0, 0.0, 0.0, 0.0]),
+        ]);
+        let aggregate = input.gamepad_state(0).unwrap();
+        assert_eq!(aggregate.axes[rve_sdk::GamepadAxis::LeftX as usize], 0.0);
+        assert_eq!(aggregate.axes[rve_sdk::GamepadAxis::LeftY as usize], 0.5);
+        actions.set_input(input);
+
+        let strafe = actions
+            .frame()
+            .state("Strafe", InputActionKind::Axis)
+            .unwrap()
+            .value[0];
+        assert_eq!(strafe, 0.0);
+    }
+
+    #[test]
+    fn held_gamepad_slot_stays_suppressed_after_rebind_while_other_slots_still_act() {
+        let mut actions = gamepad_actions();
+        actions.set_input(pad_snapshot(&[(1, EAST_BIT, [0.0; 6])]));
+
+        actions.queue_mutations(vec![ActionMutation::Rebind {
+            context: "game".to_owned(),
+            action: "Fire".to_owned(),
+            slot: "inputs".to_owned(),
+            inputs: vec![physical("Gamepad.East")],
+        }]);
+        actions.set_input(pad_snapshot(&[(1, EAST_BIT, [0.0; 6])]));
+        assert!(
+            !actions
+                .frame()
+                .state("Fire", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
+
+        actions.set_input(pad_snapshot(&[
+            (0, EAST_BIT, [0.0; 6]),
+            (1, EAST_BIT, [0.0; 6]),
+        ]));
+        let fire = actions
+            .frame()
+            .state("Fire", InputActionKind::Button)
+            .unwrap();
+        assert!(fire.down && fire.pressed);
+    }
+
+    #[test]
+    fn held_gamepad_slot_stays_suppressed_across_a_context_change() {
+        let mut settings = settings();
+        settings.contexts.get_mut("menu").unwrap().insert(
+            "Confirm".to_owned(),
+            InputAction::Button {
+                inputs: vec!["Gamepad.East".to_owned()],
+            },
+        );
+        let mut actions = InputActions::new(settings).unwrap();
+        actions.set_input(pad_snapshot(&[(1, EAST_BIT, [0.0; 6])]));
+
+        actions.queue_mutations(vec![ActionMutation::SetContext("menu".to_owned())]);
+        actions.set_input(pad_snapshot(&[(1, EAST_BIT, [0.0; 6])]));
+        assert!(
+            !actions
+                .frame()
+                .state("Confirm", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
+
+        actions.set_input(pad_snapshot(&[
+            (0, EAST_BIT, [0.0; 6]),
+            (1, EAST_BIT, [0.0; 6]),
+        ]));
+        let confirm = actions
+            .frame()
+            .state("Confirm", InputActionKind::Button)
+            .unwrap();
+        assert!(confirm.down && confirm.pressed);
+    }
+
+    #[test]
+    fn physical_gamepad_inputs_bind_only_the_named_slot() {
+        let mut actions = gamepad_actions();
+        actions.set_input(pad_snapshot(&[(2, SOUTH_BIT, [0.0; 6])]));
+        assert!(
+            actions
+                .frame()
+                .state("Fire", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
+
+        let other = pad_snapshot(&[(0, SOUTH_BIT, [0.0; 6])]);
+        actions.queue_mutations(vec![ActionMutation::Rebind {
+            context: "game".to_owned(),
+            action: "Fire".to_owned(),
+            slot: "inputs".to_owned(),
+            inputs: vec![physical("Gamepad3.South")],
+        }]);
+        actions.set_input(other);
+        assert!(
+            !actions
+                .frame()
+                .state("Fire", InputActionKind::Button)
+                .unwrap()
+                .down
+        );
     }
 }

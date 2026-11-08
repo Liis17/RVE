@@ -25,6 +25,6 @@ pub use lifecycle::{
 };
 pub use rve_sdk::{Key, MouseButton};
 pub use types::{
-    ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
-    ScriptTransform,
+    MAX_RUMBLE_SECONDS, RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput,
+    ScriptParams, ScriptTime, ScriptTransform,
 };

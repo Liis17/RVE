@@ -19,7 +19,7 @@ Parent: [[Index]]
 | `engine/engine-render/src/lib.rs` | `ViewSettings::post`, `GpuPass`, `record_tonemap_pass` | Вызов проходов в кадре вида |
 | `engine/engine-render/shaders/` | `tonemap.frag`, `output.frag`, `bloom_*.frag`, `motion_blur.frag`, `dof.frag`, `gtao.comp`, `gtao_denoise.comp`, `exposure_histogram.wgsl`, `exposure_average.comp` | Шейдеры; `build.rs` компилирует GLSL и WGSL через naga |
 | `engine/engine-runtime/src/scene.rs`, `engine/engine-runtime/src/pipeline.rs` | `resolve_post_process`, `render_post_process` | Загрузка `.postprocess` на камеру с кэшем и маппинг в `PostProcess` |
-| `engine/rve-sdk/src/abi.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/transaction.rs` | `RvePostProcessSettings`, `host_get_post_process`, `host_set_post_process` | Script ABI 11 и Lua API |
+| `engine/rve-sdk/src/abi.rs`, `engine/engine-script/src/abi_host.rs`, `engine/engine-script/src/lite.rs`, `engine/engine-script/src/transaction.rs` | `RvePostProcessSettings`, `host_get_post_process`, `host_set_post_process` | Script ABI 12 и Lua API |
 | `tools/rve-build/src/project.rs` | ветка `postprocess` | Проверка файла при сборке релиза |
 | `editor/src/viewport/render.rs`, `editor/src/ui/inspector.rs`, `editor/src/project.rs` | `render_post_process`, `show_post_process_editor` | Маппинг в редакторе, панель камеры и предпросмотр файла |
 
@@ -53,9 +53,9 @@ TOML с таблицами `exposure`, `tonemapping`, `bloom`, `ambient_occlusio
 - Новые эффекты (всё, кроме ручной экспозиции и tonemapper) работают только при `Frame::debug_view == DebugView::Lit`. В отладочных режимах они отключаются.
 - Нулевой extent у render или output даёт пустой план (`PostPlan::NONE`).
 
-### Script ABI 11
+### Script ABI 12
 
-`RVE_SCRIPT_ABI_VERSION` = 11, `RvePostProcessSettings` (`repr(C)`, плоские поля, коды enum `RVE_EXPOSURE_MODE_*` и `RVE_AO_QUALITY_*`). Host callbacks `get_post_process` и `set_post_process` работают только с камерами. Layout `RveCameraSettings` не менялся: его поля exposure и tonemapper стали проксирующими к постобработке камеры и помечены как устаревшие.
+`RVE_SCRIPT_ABI_VERSION` = 12, `RvePostProcessSettings` (`repr(C)`, плоские поля, коды enum `RVE_EXPOSURE_MODE_*` и `RVE_AO_QUALITY_*`). Host callbacks `get_post_process` и `set_post_process` работают только с камерами. Layout `RveCameraSettings` не менялся: его поля exposure и tonemapper стали проксирующими к постобработке камеры и помечены как устаревшие.
 
 В Lua доступен API `post_process` на камере. Вызовы `set_camera_settings` и `set_post_process` в одном кадре применяются по порядку: обе операции меняют одну очередь постобработки камеры. Legacy-прокси читает exposure и tonemapper из эффективной постобработки (с учётом уже поставленных в очередь изменений), а не из `[color]`. Legacy-запись меняет копию постобработки только если значение отличается от эффективного.
 

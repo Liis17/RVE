@@ -140,7 +140,7 @@ impl Component {
             ComponentKind::PointLight => Self::PointLight(object.point_light?),
             ComponentKind::SpotLight => Self::SpotLight(object.spot_light?),
             ComponentKind::Environment => Self::Environment(object.environment.clone()?),
-            ComponentKind::Collider => Self::Collider(object.collider?),
+            ComponentKind::Collider => Self::Collider(object.collider.clone()?),
             ComponentKind::RigidBody => Self::RigidBody(object.rigid_body?),
             ComponentKind::CharacterController => {
                 Self::CharacterController(object.character_controller?)
@@ -1123,6 +1123,41 @@ impl EditorScene {
                 texture,
                 material,
             });
+            Ok(())
+        })
+    }
+
+    /// Назначает коллайдеру `.rvephysmat` и добавляет его в ресурсы сцены; `None` возвращает
+    /// инлайн-поля трения и отскока.
+    pub fn set_collider_material(
+        &mut self,
+        id: &str,
+        material: Option<VirtualPath>,
+    ) -> Result<(), String> {
+        if let Some(path) = &material
+            && !path.as_str().to_ascii_lowercase().ends_with(".rvephysmat")
+        {
+            return Err(format!("{}: ожидается ресурс .rvephysmat", path));
+        }
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                let collider = object
+                    .collider
+                    .as_mut()
+                    .ok_or_else(|| format!("объект {id:?} не имеет коллайдера"))?;
+                collider.material = material;
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            if let Some(path) = &material {
+                ensure_asset(document, path);
+            }
+            let collider = find_object_mut(document, id)?
+                .collider
+                .as_mut()
+                .ok_or_else(|| format!("объект {id:?} не имеет коллайдера"))?;
+            collider.material = material;
             Ok(())
         })
     }
@@ -2191,6 +2226,52 @@ mod tests {
     }
 
     #[test]
+    fn assigning_collider_material_registers_asset_and_inline_clears_it() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene
+            .set_component(&id, Component::Collider(ColliderComponent::default()))
+            .unwrap();
+        let material = path("/materials/ice.rvephysmat");
+        scene
+            .set_collider_material(&id, Some(material.clone()))
+            .unwrap();
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .material,
+            Some(material.clone())
+        );
+        assert!(
+            scene
+                .document()
+                .assets
+                .iter()
+                .any(|asset| asset.path == material)
+        );
+        assert!(
+            scene
+                .set_collider_material(&id, Some(path("/materials/ice.toml")))
+                .is_err()
+        );
+        scene.set_collider_material(&id, None).unwrap();
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .material,
+            None
+        );
+    }
+
+    #[test]
     fn lod_group_registers_assets_and_supports_undo_redo() {
         let mut scene = scene();
         let id = scene
@@ -2568,9 +2649,27 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(scene.object(&id).unwrap().collider.unwrap().friction, 0.9);
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .friction,
+            0.9
+        );
         assert!(scene.undo());
-        assert_eq!(scene.object(&id).unwrap().collider.unwrap().friction, 0.5);
+        assert_eq!(
+            scene
+                .object(&id)
+                .unwrap()
+                .collider
+                .as_ref()
+                .unwrap()
+                .friction,
+            0.5
+        );
 
         // Коллайдер нельзя убрать, оставив тело: удаление идёт одной правкой, один undo вернёт оба.
         scene

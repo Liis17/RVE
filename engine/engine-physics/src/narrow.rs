@@ -14,6 +14,20 @@ pub const MAX_MESH_CANDIDATES: usize = 16_384;
 
 const BOX_AXIS_EPSILON: f32 = 1.0e-6;
 const CONTACT_NORMAL_THRESHOLD: f32 = 0.8;
+/// Минимальное косинус-выравнивание нормали грани и направления контакта для многоточечного manifold.
+const FACE_ALIGNMENT: f32 = 0.98;
+/// Минимальный допуск плоскости грани и границ треугольника; точки внутри допуска остаются в manifold.
+const FACE_PLANE_TOLERANCE: f32 = 1.0e-4;
+/// Доля размера формы; допуск грани берёт максимум из неё и `FACE_PLANE_TOLERANCE`.
+const FACE_RELATIVE_TOLERANCE: f32 = 1.0e-4;
+
+struct ConvexFace {
+    /// Внешняя нормаль грани в мировых координатах.
+    normal: Vec3,
+    alignment: f32,
+    /// Вершины грани по кругу.
+    vertices: Vec<Vec3>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NarrowphaseError {
@@ -96,6 +110,8 @@ pub struct ContactPoint {
     pub normal_impulse: f32,
     /// Accumulated world-space tangential impulse for the next solver pass.
     pub tangent_impulse: Vec3,
+    /// Точка скользила на последнем solve: трение берётся динамическое. Хранится в кэше.
+    pub(crate) sliding: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,12 +138,15 @@ struct CachedPoint {
     feature_id: u64,
     normal_impulse: f32,
     tangent_impulse: Vec3,
+    sliding: bool,
 }
 
 #[derive(Clone, Debug)]
 struct CachedManifold {
     normal: Vec3,
     points: Vec<CachedPoint>,
+    /// Скользила ли хоть одна точка manifold на последнем solve.
+    sliding: bool,
 }
 
 #[derive(Default)]
@@ -147,6 +166,7 @@ impl ManifoldCache {
         let pose_b = Pose::new(pose_b.position, pose_b.rotation)?;
         let old = self.entries.get(&key);
         let preserve = old.is_some_and(|entry| entry.normal.dot(generated.normal) >= 0.9);
+        let inherited_sliding = old.is_some_and(|entry| entry.sliding);
         let mut used = HashSet::new();
         let mut points = Vec::with_capacity(generated.contacts.len());
 
@@ -185,6 +205,11 @@ impl ManifoldCache {
                 contact.normal_impulse = cached.normal_impulse;
                 contact.tangent_impulse = cached.tangent_impulse
                     - generated.normal * cached.tangent_impulse.dot(generated.normal);
+                contact.sliding = cached.sliding;
+            } else {
+                // Точка без пары на этом шаге (скольжение сдвигает её дальше допуска) наследует
+                // режим трения пары: иначе статическое трение возвращается через шаг.
+                contact.sliding = inherited_sliding;
             }
             points.push(CachedPoint {
                 local_a,
@@ -192,6 +217,7 @@ impl ManifoldCache {
                 feature_id: contact.feature_id,
                 normal_impulse: contact.normal_impulse,
                 tangent_impulse: contact.tangent_impulse,
+                sliding: contact.sliding,
             });
         }
         self.entries.insert(
@@ -199,6 +225,7 @@ impl ManifoldCache {
             CachedManifold {
                 normal: generated.normal,
                 points,
+                sliding: generated.contacts.iter().any(|contact| contact.sliding),
             },
         );
         Ok(generated)
@@ -211,7 +238,9 @@ impl ManifoldCache {
         for (point, contact) in cached.points.iter_mut().zip(&manifold.contacts) {
             point.normal_impulse = contact.normal_impulse;
             point.tangent_impulse = contact.tangent_impulse;
+            point.sliding = contact.sliding;
         }
+        cached.sliding = manifold.contacts.iter().any(|contact| contact.sliding);
     }
 
     pub fn remove(&mut self, key: PairKey) -> bool {
@@ -304,9 +333,8 @@ pub fn collide(
             let a = WorldShape::new(shape_a, pose_a)?;
             let b = WorldShape::new(shape_b, pose_b)?;
             generic_contact(&a, &b, 0).map(|contact| {
-                contact.map(|(normal, point)| ContactManifold {
-                    normal,
-                    contacts: vec![point],
+                contact.map(|(normal, point)| {
+                    convex_pair_manifold(shape_a, pose_a, shape_b, pose_b, normal, point)
                 })
             })
         }
@@ -782,35 +810,58 @@ fn collide_convex_mesh(
     }
 
     let mut contacts = Vec::new();
+    // Точки EPA треугольников группы без вершин грани; нужны, только если вершин в группе нет.
+    let mut fallbacks = Vec::new();
     let mut normal = None;
+    let mut group_depth = -1.0;
     for triangle_index in candidates {
         let indices = mesh.triangles()[triangle_index as usize];
         let vertices =
             indices.map(|index| transform_point(mesh_pose, mesh.vertices()[index as usize]));
         let triangle = TriangleProxy { vertices };
-        if let Some((triangle_normal, mut contact)) =
+        if let Some((epa_normal, contact)) =
             generic_contact(&convex_proxy, &triangle, triangle_index as u64 + 1)?
         {
+            let feature_id = (triangle_index as u64 + 1) << 32;
+            let (triangle_normal, triangle_contacts, fallback) = match triangle_face_contacts(
+                convex,
+                convex_pose,
+                vertices,
+                epa_normal,
+                contact.penetration,
+                feature_id,
+            ) {
+                Some((triangle_normal, triangle_contacts)) => {
+                    (triangle_normal, triangle_contacts, None)
+                }
+                None => {
+                    let mut single = contact;
+                    single.feature_id = feature_id;
+                    (epa_normal, Vec::new(), Some(single))
+                }
+            };
             if normal.is_none_or(|best: Vec3| best.dot(triangle_normal) < CONTACT_NORMAL_THRESHOLD)
             {
-                if normal.is_none_or(|_| {
-                    contact.penetration
-                        > contacts
-                            .first()
-                            .map_or(-1.0, |old: &ContactPoint| old.penetration)
-                }) {
+                if normal.is_none_or(|_| contact.penetration > group_depth) {
                     normal = Some(triangle_normal);
+                    group_depth = contact.penetration;
                     contacts.clear();
+                    fallbacks.clear();
                 } else {
                     continue;
                 }
             }
-            contact.feature_id = (triangle_index as u64 + 1) << 32;
-            contacts.push(contact);
+            contacts.extend(triangle_contacts);
+            fallbacks.extend(fallback);
         }
     }
     let Some(normal) = normal else {
         return Ok(None);
+    };
+    let contacts = if contacts.is_empty() {
+        fallbacks
+    } else {
+        contacts
     };
     let epsilon = linear_epsilon(
         convex_proxy.scale(),
@@ -821,6 +872,222 @@ fn collide_convex_mesh(
         normal,
         contacts: reduce_contacts(contacts, epsilon),
     }))
+}
+
+/// Точки грани выпуклой формы, попадающие в треугольник. `normal` идёт от выпуклой формы к
+/// треугольнику; возвращается нормаль треугольника в том же направлении. Без грани — `None`.
+fn triangle_face_contacts(
+    convex: &Shape,
+    convex_pose: Pose,
+    triangle: [Vec3; 3],
+    normal: Vec3,
+    depth: f32,
+    feature_id: u64,
+) -> Option<(Vec3, Vec<ContactPoint>)> {
+    let face = convex_face(convex, convex_pose, normal)?;
+    let geometric = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
+    let area_normal = geometric.try_normalize()?;
+    let normal = if area_normal.dot(normal) < 0.0 {
+        -area_normal
+    } else {
+        area_normal
+    };
+    let tolerance = face_tolerance(convex);
+    let mut contacts = Vec::new();
+    for (index, &vertex) in face.vertices.iter().enumerate() {
+        let penetration = (vertex - triangle[0]).dot(normal);
+        if penetration < -tolerance || penetration > depth + tolerance {
+            continue;
+        }
+        let projected = vertex - normal * penetration;
+        if !point_in_triangle(projected, triangle, area_normal, tolerance) {
+            continue;
+        }
+        contacts.push(contact_point(
+            vertex,
+            projected,
+            penetration,
+            feature_id | (index as u64 + 1),
+        ));
+    }
+    (!contacts.is_empty()).then_some((normal, contacts))
+}
+
+fn point_in_triangle(point: Vec3, triangle: [Vec3; 3], unit_normal: Vec3, tolerance: f32) -> bool {
+    (0..3).all(|index| {
+        let start = triangle[index];
+        let edge = triangle[(index + 1) % 3] - start;
+        let edge_length = edge.length();
+        edge_length <= f32::MIN_POSITIVE
+            || edge.cross(point - start).dot(unit_normal) / edge_length >= -tolerance
+    })
+}
+
+/// Допуск граней формы: не меньше `FACE_PLANE_TOLERANCE` и пропорционален её размеру, чтобы
+/// крупные хуллы не теряли вершины грани из-за округления поз.
+fn face_tolerance(shape: &Shape) -> f32 {
+    let extent = shape
+        .local_aabb()
+        .map_or(0.0, |aabb| (aabb.max - aabb.min).max_element());
+    FACE_PLANE_TOLERANCE.max(FACE_RELATIVE_TOLERANCE * extent)
+}
+
+/// Грань выпуклой формы, внешняя нормаль которой выровнена с `direction` не хуже `FACE_ALIGNMENT`.
+/// Капсула даёт грань-отрезок (два конца), если отрезок лежит в плоскости грани в пределах допуска.
+fn convex_face(shape: &Shape, pose: Pose, direction: Vec3) -> Option<ConvexFace> {
+    let direction = direction.try_normalize()?;
+    let tolerance = face_tolerance(shape);
+    let (normal, alignment, vertices) = match shape {
+        Shape::Box { half_extents } => {
+            let axes = box_axes(pose);
+            let axis = (0..3).max_by(|&left, &right| {
+                axes[left]
+                    .dot(direction)
+                    .abs()
+                    .total_cmp(&axes[right].dot(direction).abs())
+            })?;
+            let normal = axes[axis] * axes[axis].dot(direction).signum();
+            let vertices = box_face_vertices(pose, *half_extents, axes, axis, normal);
+            (normal, axes[axis].dot(direction).abs(), vertices)
+        }
+        Shape::ConvexHull(hull) => {
+            let (normal, point, alignment) =
+                hull.planes()
+                    .iter()
+                    .fold(None, |best: Option<(Vec3, Vec3, f32)>, plane| {
+                        let normal = (pose.rotation * plane.normal).normalize_or_zero();
+                        let alignment = normal.dot(direction);
+                        match best {
+                            Some((_, _, best_alignment)) if best_alignment >= alignment => best,
+                            _ => Some((
+                                normal,
+                                pose.position + pose.rotation * plane.point,
+                                alignment,
+                            )),
+                        }
+                    })?;
+            let vertices: Vec<Vec3> = hull
+                .vertices()
+                .iter()
+                .map(|&vertex| pose.position + pose.rotation * vertex)
+                .filter(|vertex| (*vertex - point).dot(normal).abs() <= tolerance)
+                .collect();
+            if vertices.len() < 3 {
+                return None;
+            }
+            (normal, alignment, sort_face_vertices(vertices, normal))
+        }
+        Shape::Capsule { radius, height } => {
+            let half_axis = (pose.rotation * Vec3::Y) * (*height * 0.5);
+            let ends = [pose.position - half_axis, pose.position + half_axis];
+            if (ends[0].dot(direction) - ends[1].dot(direction)).abs() > tolerance {
+                return None;
+            }
+            let vertices = ends.iter().map(|&end| end + direction * *radius).collect();
+            (direction, 1.0, vertices)
+        }
+        _ => return None,
+    };
+    (alignment >= FACE_ALIGNMENT).then_some(ConvexFace {
+        normal,
+        alignment,
+        vertices,
+    })
+}
+
+/// Упорядочивает вершины плоской грани по углу вокруг центра, чтобы их можно было обрезать.
+fn sort_face_vertices(mut vertices: Vec<Vec3>, normal: Vec3) -> Vec<Vec3> {
+    let center = vertices.iter().copied().sum::<Vec3>() / vertices.len() as f32;
+    let u = (vertices[0] - center).normalize_or_zero();
+    let w = normal.cross(u);
+    vertices.sort_by(|left, right| {
+        let angle = |point: Vec3| {
+            let offset = point - center;
+            offset.dot(w).atan2(offset.dot(u))
+        };
+        angle(*left).total_cmp(&angle(*right))
+    });
+    vertices
+}
+
+/// Manifold двух выпуклых форм по граням: грань с большим выравниванием служит опорной, вершины
+/// второй грани обрезаются её боковыми рёбрами. Без двух граней или при пустом результате
+/// возвращается одна точка `fallback`.
+fn convex_pair_manifold(
+    shape_a: &Shape,
+    pose_a: Pose,
+    shape_b: &Shape,
+    pose_b: Pose,
+    normal: Vec3,
+    fallback: ContactPoint,
+) -> ContactManifold {
+    let single = ContactManifold {
+        normal,
+        contacts: vec![fallback],
+    };
+    let (Some(face_a), Some(face_b)) = (
+        convex_face(shape_a, pose_a, normal),
+        convex_face(shape_b, pose_b, -normal),
+    ) else {
+        return single;
+    };
+    let tolerance = face_tolerance(shape_a).max(face_tolerance(shape_b));
+    // Опорная грань — многоугольник: отрезок капсулы может быть только инцидентным.
+    let reference_is_a = match (face_a.vertices.len() >= 3, face_b.vertices.len() >= 3) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => face_a.alignment >= face_b.alignment,
+    };
+    let (reference, incident) = if reference_is_a {
+        (&face_a, &face_b)
+    } else {
+        (&face_b, &face_a)
+    };
+    let reference_normal = reference.normal;
+    let count = reference.vertices.len();
+    let center = reference.vertices.iter().copied().sum::<Vec3>() / count as f32;
+    let mut polygon = incident.vertices.clone();
+    for index in 0..count {
+        let start = reference.vertices[index];
+        let edge = reference.vertices[(index + 1) % count] - start;
+        let Some(mut inward) = reference_normal.cross(edge).try_normalize() else {
+            return single;
+        };
+        if (center - start).dot(inward) < 0.0 {
+            inward = -inward;
+        }
+        polygon = clip_polygon_to_face(polygon, start, -inward, 0.0, tolerance);
+        if polygon.is_empty() {
+            return single;
+        }
+    }
+
+    let mut contacts = Vec::new();
+    for point in polygon {
+        let signed = (point - reference.vertices[0]).dot(reference_normal);
+        if signed > tolerance {
+            continue;
+        }
+        let projected = point - reference_normal * signed;
+        let (point_a, point_b) = if reference_is_a {
+            (projected, point)
+        } else {
+            (point, projected)
+        };
+        contacts.push(contact_point(point_a, point_b, -signed, 0));
+    }
+    if contacts.is_empty() {
+        return single;
+    }
+    let normal = if reference_is_a {
+        reference_normal
+    } else {
+        -reference_normal
+    };
+    ContactManifold {
+        normal,
+        contacts: reduce_contacts(contacts, tolerance),
+    }
 }
 
 fn invert_manifold(mut manifold: ContactManifold) -> ContactManifold {
@@ -854,6 +1121,7 @@ fn contact_point(point_a: Vec3, point_b: Vec3, penetration: f32, feature_id: u64
         feature_id,
         normal_impulse: 0.0,
         tangent_impulse: Vec3::ZERO,
+        sliding: false,
     }
 }
 
@@ -2129,6 +2397,199 @@ mod tests {
                 assert_eq!(updated.contacts[0].normal_impulse, 0.0);
                 assert_eq!(updated.contacts[0].tangent_impulse, Vec3::ZERO);
             }
+        }
+    }
+
+    /// Квад 4×4 в плоскости y = 0, разбитый диагональю a–c на линию x = z.
+    fn diagonal_quad_mesh() -> Shape {
+        let vertices = vec![
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+        ];
+        Shape::TriMesh(Arc::new(
+            TriMesh::new(vertices, vec![[0, 1, 2], [0, 2, 3]]).unwrap(),
+        ))
+    }
+
+    /// Пол из хулла: куб половины 2 с верхней гранью в y = 0.
+    fn top_face_hull_floor() -> (Shape, Pose) {
+        let points: Vec<Vec3> = (0..8)
+            .map(|index| {
+                Vec3::new(
+                    if index & 1 == 0 { -2.0 } else { 2.0 },
+                    if index & 2 == 0 { -2.0 } else { 2.0 },
+                    if index & 4 == 0 { -2.0 } else { 2.0 },
+                )
+            })
+            .collect();
+        (
+            Shape::ConvexHull(Arc::new(Hull::from_points(&points).unwrap())),
+            Pose::new(Vec3::new(0.0, -2.0, 0.0), Quat::IDENTITY).unwrap(),
+        )
+    }
+
+    #[test]
+    fn box_resting_on_mesh_diagonal_gets_a_multi_point_manifold() {
+        let manifold = collide(
+            &Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+            Pose::new(Vec3::new(0.0, 0.495, 0.0), Quat::IDENTITY).unwrap(),
+            &diagonal_quad_mesh(),
+            Pose::IDENTITY,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(manifold.contacts.len() >= 3, "{manifold:?}");
+        assert!(manifold.normal.dot(-Vec3::Y) > 0.999, "{manifold:?}");
+        for contact in &manifold.contacts {
+            assert!(
+                (0.0045..=0.0055).contains(&contact.penetration),
+                "{contact:?}"
+            );
+        }
+    }
+
+    /// Нижние углы ящика половины `half` в мировых координатах.
+    fn bottom_corners(pose: Pose, half: f32) -> Vec<Vec3> {
+        [-1.0, 1.0]
+            .into_iter()
+            .flat_map(|x| [-1.0, 1.0].into_iter().map(move |z| (x, z)))
+            .map(|(x, z)| pose.position + pose.rotation * Vec3::new(x * half, -half, z * half))
+            .collect()
+    }
+
+    /// Сетка квадов 0.3 с диагоналями (края ±2.1) для проверки швов между треугольниками.
+    fn seam_grid_floor() -> Shape {
+        let count = 15;
+        let coordinate = |index: usize| -2.1 + 0.3 * index as f32;
+        let vertex = |x: usize, z: usize| (z * count + x) as u32;
+        let mut vertices = Vec::new();
+        for z in 0..count {
+            for x in 0..count {
+                vertices.push(Vec3::new(coordinate(x), 0.0, coordinate(z)));
+            }
+        }
+        let mut triangles = Vec::new();
+        for z in 0..count - 1 {
+            for x in 0..count - 1 {
+                triangles.push([vertex(x, z), vertex(x + 1, z), vertex(x + 1, z + 1)]);
+                triangles.push([vertex(x, z), vertex(x + 1, z + 1), vertex(x, z + 1)]);
+            }
+        }
+        Shape::TriMesh(Arc::new(TriMesh::new(vertices, triangles).unwrap()))
+    }
+
+    #[test]
+    fn box_over_mesh_seams_keeps_only_face_vertex_contacts() {
+        let half = 0.5;
+        let box_shape = Shape::cuboid(Vec3::splat(half)).unwrap();
+        let floor = seam_grid_floor();
+        // Ящик лежит на сетке на краю пола (часть углов за пределами сетки) и сдвигается по x:
+        // треугольники внутри основания без углов ящика дают EPA-точку, которой быть не должно.
+        for x_step in 0..=22 {
+            for z_step in 0..=8 {
+                let x = -2.35 + 0.013 + x_step as f32 * 0.13;
+                let z = -0.5 + 0.013 + z_step as f32 * 0.13;
+                // Второй прогон сдвинут на малый шаг: соседний кадр даёт те же точки контакта.
+                for drift in [0.0, 0.001] {
+                    let pose = Pose::new(Vec3::new(x + drift, 0.495, z), Quat::IDENTITY).unwrap();
+                    // Численный сбой пары (вырожденный симплекс) мир пропускает на шаге; здесь
+                    // проверяется только геометрия контактов, которые narrowphase вернул.
+                    let manifold = match collide(&box_shape, pose, &floor, Pose::IDENTITY) {
+                        Ok(manifold) => manifold.unwrap(),
+                        Err(error) if error.is_numeric_limit() => continue,
+                        Err(error) => panic!("x {x} z {z} drift {drift}: {error}"),
+                    };
+                    let corners = bottom_corners(pose, half);
+                    for contact in &manifold.contacts {
+                        assert!(
+                            corners
+                                .iter()
+                                .any(|corner| corner.distance(contact.point_a) < 1.0e-3),
+                            "x {x} z {z} drift {drift}: {contact:?} is not a box corner"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn box_resting_on_hull_face_gets_a_multi_point_manifold() {
+        let (floor, floor_pose) = top_face_hull_floor();
+        let manifold = collide(
+            &Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+            Pose::new(Vec3::new(0.0, 0.495, 0.0), Quat::IDENTITY).unwrap(),
+            &floor,
+            floor_pose,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(manifold.contacts.len() >= 3, "{manifold:?}");
+        assert!(manifold.normal.dot(-Vec3::Y) > 0.999, "{manifold:?}");
+        for contact in &manifold.contacts {
+            assert!(
+                (0.0045..=0.0055).contains(&contact.penetration),
+                "{contact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn box_resting_on_large_hull_face_away_from_origin_keeps_its_face() {
+        // Хулл 100 м с верхней гранью в y = 0, повёрнутый и сдвинутый: округление поз не должно
+        // терять вершины грани.
+        let points: Vec<Vec3> = (0..8)
+            .map(|index| {
+                Vec3::new(
+                    if index & 1 == 0 { -50.0 } else { 50.0 },
+                    if index & 2 == 0 { -50.0 } else { 50.0 },
+                    if index & 4 == 0 { -50.0 } else { 50.0 },
+                )
+            })
+            .collect();
+        let floor = Shape::ConvexHull(Arc::new(Hull::from_points(&points).unwrap()));
+        let floor_pose = Pose::new(
+            Vec3::new(1234.5, -50.0, -777.7),
+            Quat::from_rotation_y(0.37),
+        )
+        .unwrap();
+        let manifold = collide(
+            &Shape::cuboid(Vec3::splat(0.5)).unwrap(),
+            Pose::new(Vec3::new(1234.5, 0.495, -777.7), Quat::IDENTITY).unwrap(),
+            &floor,
+            floor_pose,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(manifold.contacts.len() >= 3, "{manifold:?}");
+        assert!(manifold.normal.dot(-Vec3::Y) > 0.999, "{manifold:?}");
+    }
+
+    #[test]
+    fn capsule_lying_on_box_top_gets_contacts_at_both_ends() {
+        let manifold = collide(
+            &Shape::cuboid(Vec3::splat(1.0)).unwrap(),
+            Pose::IDENTITY,
+            &Shape::capsule(0.25, 1.0).unwrap(),
+            Pose::new(
+                Vec3::new(0.0, 1.0 + 0.25 - 0.002, 0.0),
+                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(manifold.contacts.len(), 2, "{manifold:?}");
+        for end_x in [-0.5, 0.5] {
+            assert!(
+                manifold
+                    .contacts
+                    .iter()
+                    .any(|contact| (contact.point_b.x - end_x).abs() < 1.0e-3),
+                "no contact at the capsule end x = {end_x}: {manifold:?}"
+            );
         }
     }
 }
