@@ -12,7 +12,7 @@ use crate::document::{
     PointLightComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
     SceneTransform, SpotLightComponent, mesh_collider_model, option_virtual_path_serde,
     require_asset_path, require_extension, valid_ascii_name, validate_environment,
-    validate_material_override, virtual_path_serde,
+    validate_material_override, validate_screen_shaders, virtual_path_serde,
 };
 use crate::network::{
     NetworkIdentityComponent, NetworkTransformComponent, validate_network_transform,
@@ -702,6 +702,9 @@ pub(crate) fn validate_instances(
                     "postprocess",
                     "постобработка камеры override",
                 )?;
+            }
+            if let Some(camera) = change.camera.as_ref() {
+                validate_screen_shaders(source, id, assets, &camera.screen_shaders)?;
             }
             if let Some(material) = change
                 .collider
