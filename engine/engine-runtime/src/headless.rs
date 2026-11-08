@@ -109,6 +109,8 @@ mod tests {
             },
             models: Default::default(),
             textures: Default::default(),
+            material_assets: Default::default(),
+            shader_assets: Default::default(),
             levels: Vec::new(),
             particles: Vec::new(),
         }
