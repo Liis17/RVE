@@ -51,6 +51,8 @@ pub enum Action {
     },
     Save,
     SaveAs,
+    /// Сохранить в явно заданный путь без системного диалога.
+    SaveAsAt(String),
     Exit,
     Play,
     Stop,
@@ -60,6 +62,8 @@ pub enum Action {
     RefreshTree,
     /// Выбрать каталог и собрать релиз проекта через `rve-build`; сцена сохраняется заранее.
     BuildPlayer,
+    /// Собрать релиз в явно заданный каталог без системного диалога.
+    BuildPlayerAt(PathBuf),
     /// Сохранить поддерево объекта в новый префаб и заменить его экземпляром.
     CreatePrefab(String),
     /// Перенести overrides объекта экземпляра в файл префаба.
@@ -225,6 +229,10 @@ pub struct EditorState {
     pub apply_prompt: Option<String>,
     /// Идущая сборка релиза; одновременно — не больше одной.
     pub build: Option<BuildJob>,
+    /// Хвост вывода последней/текущей сборки для MCP build_status.
+    pub build_output_tail: Vec<String>,
+    /// Итог последней сборки: None до завершения, Some(true) при успехе.
+    pub build_succeeded: Option<bool>,
     /// Схемы `properties` lite-скриптов по пути; ошибка пишется в Console один раз.
     /// Кэшированные схемы читаются повторно после изменения исходного файла.
     pub lite_schemas: HashMap<String, Result<Option<ParamSchema>, String>>,
@@ -295,6 +303,8 @@ impl EditorState {
             pending_frame: None,
             models: HashMap::new(),
             build: None,
+            build_output_tail: Vec::new(),
+            build_succeeded: None,
             apply_prompt: None,
             lite_schemas: HashMap::new(),
             model_loader: ModelLoader::default(),

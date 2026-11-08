@@ -34,7 +34,7 @@ pub(super) fn call(
         "list_project_files" => list_project_files(arguments, state),
         "read_text_file" => read_text_file(arguments, state),
         "get_project_settings" => get_project_settings(state),
-        "get_scene_hierarchy" => get_scene_hierarchy(state),
+        "get_scene_hierarchy" => get_scene_hierarchy(arguments, state),
         "get_object" => get_object(arguments, state),
         "get_component" => get_component(arguments, state),
         "describe_components" => Ok(describe_components()),
@@ -229,7 +229,34 @@ fn bootstrap_value(config: &BootstrapConfig) -> Value {
     })
 }
 
-fn get_scene_hierarchy(state: &EditorState) -> Result<Value, String> {
+fn get_scene_hierarchy(arguments: &Value, state: &mut EditorState) -> Result<Value, String> {
+    if source(arguments)? == "play" {
+        let play = state
+            .play
+            .as_mut()
+            .ok_or_else(|| "Play source requested without an active Play session".to_owned())?;
+        let world = play.world_mut();
+        let objects = world.objects();
+        let hierarchy = objects
+            .iter()
+            .map(|object| {
+                let children = objects
+                    .iter()
+                    .filter(|child| child.parent == Some(object.handle))
+                    .map(|child| child.id.as_str())
+                    .collect::<Vec<_>>();
+                json!({
+                    "id": object.id,
+                    "name": object.name,
+                    "parent": object.parent.and_then(|handle| world.object(handle)).map(|parent| parent.id.as_str()),
+                    "children": children,
+                    "components": runtime_component_kinds(object),
+                    "prefab": null,
+                })
+            })
+            .collect::<Vec<_>>();
+        return Ok(json!({"objects": hierarchy, "source": "play"}));
+    }
     open_project(state)?;
     let scene = open_scene(state)?;
     let objects = &scene.view().objects;
@@ -254,10 +281,24 @@ fn get_scene_hierarchy(state: &EditorState) -> Result<Value, String> {
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({ "objects": hierarchy }))
+    Ok(json!({ "objects": hierarchy, "source": "edit" }))
 }
 
-fn get_object(arguments: &Value, state: &EditorState) -> Result<Value, String> {
+fn get_object(arguments: &Value, state: &mut EditorState) -> Result<Value, String> {
+    if source(arguments)? == "play" {
+        let id = required_string(arguments, "id")?;
+        let play = state
+            .play
+            .as_mut()
+            .ok_or_else(|| "Play source requested without an active Play session".to_owned())?;
+        let world = play.world_mut();
+        let object = world
+            .object_by_id(id)
+            .ok_or_else(|| format!("object {id:?} was not found in Play"))?;
+        return Ok(
+            json!({"object": runtime_object_value(world, object), "origin": null, "source": "play"}),
+        );
+    }
     open_project(state)?;
     let scene = open_scene(state)?;
     let id = required_string(arguments, "id")?;
@@ -271,7 +312,86 @@ fn get_object(arguments: &Value, state: &EditorState) -> Result<Value, String> {
             "instance": origin.instance,
             "target": origin.target,
         })),
+        "source": "edit",
     }))
+}
+
+fn source(arguments: &Value) -> Result<&str, String> {
+    let source = arguments
+        .get("source")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| "source must be a string".to_owned())
+        })
+        .transpose()?
+        .unwrap_or("edit");
+    match source {
+        "edit" => Ok("edit"),
+        "play" => Ok("play"),
+        other => Err(format!("unknown scene source {other:?}")),
+    }
+}
+
+fn runtime_component_kinds(object: &engine_scene::WorldObject) -> Vec<&'static str> {
+    let mut components = vec!["transform"];
+    components.extend(
+        [
+            (object.camera.is_some(), "camera"),
+            (object.mesh_renderer.is_some(), "mesh_renderer"),
+            (object.lod_group.is_some(), "lod_group"),
+            (object.directional_light.is_some(), "directional_light"),
+            (object.point_light.is_some(), "point_light"),
+            (object.spot_light.is_some(), "spot_light"),
+            (object.environment.is_some(), "environment"),
+            (object.collider.is_some(), "collider"),
+            (object.rigid_body.is_some(), "rigid_body"),
+            (
+                object.character_controller.is_some(),
+                "character_controller",
+            ),
+            (object.audio_source.is_some(), "audio_source"),
+            (object.animator.is_some(), "animator"),
+            (object.particle_emitter.is_some(), "particle_emitter"),
+            (object.network_identity.is_some(), "network_identity"),
+            (object.network_transform.is_some(), "network_transform"),
+        ]
+        .into_iter()
+        .filter_map(|(present, name)| present.then_some(name)),
+    );
+    components
+}
+
+fn runtime_object_value(world: &engine_scene::World, object: &engine_scene::WorldObject) -> Value {
+    json!({
+        "id": object.id,
+        "name": object.name,
+        "parent": object.parent.and_then(|handle| world.object(handle)).map(|parent| parent.id.as_str()),
+        "transform": {
+            "position": object.transform.position.to_array(),
+            "rotation": object.transform.rotation_deg.to_array(),
+            "scale": object.transform.scale.to_array(),
+        },
+        "camera": object.camera,
+        "camera_settings": object.camera_settings,
+        "post_process": object.post_process,
+        "mesh_renderer": object.mesh_renderer,
+        "lod_group": object.lod_group,
+        "directional_light": object.directional_light,
+        "point_light": object.point_light,
+        "spot_light": object.spot_light,
+        "environment": object.environment,
+        "collider": object.collider,
+        "rigid_body": object.rigid_body,
+        "character_controller": object.character_controller,
+        "audio_source": object.audio_source,
+        "animator": object.animator,
+        "particle_emitter": object.particle_emitter,
+        "network_identity": object.network_identity,
+        "network_transform": object.network_transform,
+        "lite_scripts": object.lite_scripts,
+        "heavy_scripts": object.heavy_scripts,
+    })
 }
 
 fn get_component(arguments: &Value, state: &EditorState) -> Result<Value, String> {
@@ -367,7 +487,7 @@ fn component_kind_list() -> [(ComponentKind, &'static str); 16] {
     ]
 }
 
-fn component_value(component: Component) -> Result<Value, String> {
+pub(super) fn component_value(component: Component) -> Result<Value, String> {
     match component {
         Component::Transform(value) => serde_json::to_value(value),
         Component::Camera(value) => serde_json::to_value(value),
@@ -513,7 +633,7 @@ fn open_scene(state: &EditorState) -> Result<&EditorScene, String> {
         .ok_or_else(|| "scene is not open".to_owned())
 }
 
-fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
+pub(super) fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
     arguments
         .get(name)
         .and_then(Value::as_str)
@@ -579,7 +699,7 @@ fn asset_kind_name(kind: AssetKind) -> &'static str {
     }
 }
 
-fn parse_component_kind(input: &str) -> Result<ComponentKind, String> {
+pub(super) fn parse_component_kind(input: &str) -> Result<ComponentKind, String> {
     component_kind_list()
         .into_iter()
         .find_map(|(kind, name)| (name == input).then_some(kind))

@@ -1,9 +1,12 @@
+mod assets;
+mod build;
+mod edit;
 pub mod paths;
+mod play;
 mod read;
 
 use crate::console::LogLevel;
 use crate::settings::McpSettings;
-use crate::state::EditorState;
 use engine_mcp::{McpConfig, McpServer, Permission, Permissions, ToolResult, ToolSpec};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -156,11 +159,13 @@ impl McpHost {
         }
     }
 
-    pub fn drain(&mut self, state: &mut EditorState) -> bool {
+    pub fn drain(&mut self, app: &mut crate::app::EditorApp) -> bool {
         let Some(server) = &self.server else {
             return false;
         };
-        server.set_generation(state.mcp_generation);
+        let generation = app.mcp_state_mut().mcp_generation;
+        server.set_generation(generation);
+        let permissions = server.permissions();
         let mut handled = false;
         while let Some(call) = server.try_recv() {
             if call.is_abandoned() {
@@ -170,11 +175,12 @@ impl McpHost {
                 &call.name,
                 &call.arguments,
                 call.required_permission,
-                server.permissions(),
+                permissions,
                 call.generation(),
                 call.deadline,
-                state,
+                app,
             );
+            server.set_generation(app.mcp_state_mut().mcp_generation);
             if let Some(result) = result {
                 handled |= call.respond(result);
             }
@@ -263,7 +269,7 @@ fn execute_pending(
     permissions: Permissions,
     generation: u64,
     deadline: Instant,
-    state: &mut EditorState,
+    app: &mut crate::app::EditorApp,
 ) -> Option<ToolResult> {
     if Instant::now() >= deadline {
         return None;
@@ -275,35 +281,90 @@ fn execute_pending(
         generation,
         deadline,
     };
-    Some(execute_call(call, permissions, state))
+    Some(execute_call(call, permissions, app))
 }
 
 fn execute_call(
     call: PendingCall<'_>,
     permissions: Permissions,
-    state: &mut EditorState,
+    app: &mut crate::app::EditorApp,
 ) -> ToolResult {
-    if !permissions.allows(call.permission) {
-        return ToolResult::error(format!(
-            "permission '{}' is disabled",
-            call.permission.flag()
-        ));
+    let error = {
+        let state = app.mcp_state_mut();
+        if !permissions.allows(call.permission) {
+            Some(ToolResult::error(format!(
+                "permission '{}' is disabled",
+                call.permission.flag()
+            )))
+        } else if state.mcp_generation != call.generation {
+            Some(ToolResult::error(
+                "project or scene changed while request was queued",
+            ))
+        } else if Instant::now() >= call.deadline {
+            Some(ToolResult::error("tool call deadline expired"))
+        } else {
+            None
+        }
+    };
+    if let Some(error) = error {
+        return error;
     }
-    if state.mcp_generation != call.generation {
-        return ToolResult::error("project or scene changed while request was queued");
+    if call.permission != Permission::Read && call.name != "build_status" {
+        app.mcp_state_mut().log.info(format!("[MCP] {}", call.name));
     }
-    if Instant::now() >= call.deadline {
-        return ToolResult::error("tool call deadline expired");
-    }
-    match read::call(call.name, call.arguments, state, permissions) {
+    match app.mcp_execute_tool(call.name, call.arguments, permissions) {
         Ok(value) => ToolResult::json(value),
         Err(error) => ToolResult::error(error),
     }
 }
 
+pub(crate) fn dispatch(
+    app: &mut crate::app::EditorApp,
+    tool: &str,
+    arguments: &Value,
+    permissions: Permissions,
+) -> Result<Value, String> {
+    match tool {
+        "editor_status"
+        | "list_assets"
+        | "list_project_files"
+        | "read_text_file"
+        | "get_project_settings"
+        | "get_scene_hierarchy"
+        | "get_object"
+        | "get_component"
+        | "describe_components"
+        | "get_asset_settings"
+        | "get_script_params_schema"
+        | "get_console_log" => read::call(tool, arguments, app.mcp_state_mut(), permissions),
+        "select_objects" | "create_object" | "delete_objects" | "duplicate_objects"
+        | "set_parent" | "rename_object" | "change_id" | "set_transform" | "set_component"
+        | "remove_component" | "set_script_param" | "set_camera_active" | "undo" | "redo" => {
+            edit::call(tool, arguments, app.mcp_state_mut())
+        }
+        "save_scene"
+        | "open_scene"
+        | "new_scene"
+        | "open_project"
+        | "write_asset_settings"
+        | "create_folder"
+        | "write_text_file"
+        | "rename_asset"
+        | "delete_asset"
+        | "import_files"
+        | "create_prefab"
+        | "apply_to_prefab" => assets::call(app, tool, arguments),
+        "play_start" | "play_stop" | "play_pause" | "play_resume" | "console_command" => {
+            play::call(app, tool, arguments)
+        }
+        "build_scripts" | "build_player" | "build_status" => build::call(app, tool, arguments),
+        _ => Err(format!("unknown or unimplemented tool: {tool}")),
+    }
+}
+
 fn tool_specs() -> Vec<ToolSpec> {
     let empty = json!({"type": "object", "properties": {}, "additionalProperties": false});
-    vec![
+    let mut tools = vec![
         ToolSpec::new(
             "editor_status",
             "Current editor, project, scene, selection, and permissions.",
@@ -349,14 +410,14 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec::new(
             "get_scene_hierarchy",
             "Get the expanded scene hierarchy and component kinds.",
-            empty.clone(),
+            json!({"type":"object","properties":{"source":{"type":"string","enum":["edit","play"]}},"additionalProperties":false}),
             Permission::Read,
         ),
         ToolSpec::new(
             "get_object",
             "Get an expanded scene object and prefab origin.",
             json!({
-                "type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"], "additionalProperties": false
+                "type": "object", "properties": {"id": {"type": "string"}, "source":{"type":"string","enum":["edit","play"]}}, "required": ["id"], "additionalProperties": false
             }),
             Permission::Read,
         ),
@@ -409,44 +470,108 @@ fn tool_specs() -> Vec<ToolSpec> {
             }),
             Permission::Read,
         ),
-    ]
+    ];
+    tools.extend(edit::tool_specs());
+    tools.extend(assets::tool_specs());
+    tools.extend(play::tool_specs());
+    tools.extend(build::tool_specs());
+    tools
 }
 
 #[cfg(test)]
 mod tests {
     use super::{execute_pending, tool_specs};
+    use crate::app::EditorApp;
+    use crate::new_project::create_project;
+    use crate::project::OpenProject;
+    use crate::scene_edit::EditorScene;
     use crate::state::EditorState;
+    use engine_files::VirtualPath;
     use engine_mcp::{Permission, Permissions};
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    fn fixture_app() -> (PathBuf, EditorApp) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "rve-mcp-drain-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = create_project("Fixture", &parent).unwrap();
+        let project = OpenProject::open(&root).unwrap();
+        let path = project.settings.starting_scene().unwrap();
+        let source = project.read_text(path).unwrap();
+        let scene = EditorScene::parse(
+            VirtualPath::parse(path).unwrap(),
+            &source,
+            project.prefab_loader(),
+        )
+        .unwrap();
+        let mut state = EditorState::new(None);
+        state.project = Some(project);
+        state.scene = Some(scene);
+        (parent, EditorApp::new_for_mcp_tests_with_state(state))
+    }
+
+    fn clean(parent: PathBuf, app: EditorApp) {
+        drop(app);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
     #[test]
-    fn tools_list_contains_every_read_tool_except_capture_view() {
+    fn tools_list_registers_every_stage_four_tool_with_its_permission_and_schema() {
         let tools = tool_specs();
         let names = tools
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 46);
         assert!(names.contains(&"editor_status"));
         assert!(names.contains(&"get_console_log"));
         assert!(!names.contains(&"capture_view"));
-        assert!(tools.iter().all(|tool| {
-            tool.permission == Permission::Read && tool.input_schema["type"] == "object"
-        }));
+        for (name, permission) in [
+            ("set_component", Permission::EditScene),
+            ("undo", Permission::EditScene),
+            ("write_text_file", Permission::Assets),
+            ("open_project", Permission::Assets),
+            ("play_start", Permission::Play),
+            ("console_command", Permission::Play),
+            ("build_player", Permission::Build),
+            ("build_status", Permission::Build),
+        ] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            assert_eq!(tool.permission, permission);
+            assert_eq!(tool.input_schema["type"], "object");
+        }
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.input_schema["type"] == "object")
+        );
     }
 
     #[test]
     fn permission_revoked_after_enqueue_is_checked_before_dispatch() {
-        let mut state = EditorState::new(None);
+        let (parent, mut app) = fixture_app();
+        let target = app
+            .mcp_state_mut()
+            .project
+            .as_ref()
+            .unwrap()
+            .root
+            .join("Assets/revoked.txt");
         let result = execute_pending(
             "write_text_file",
-            &json!({"path": "new.txt", "content": "no"}),
+            &json!({"path": "revoked.txt", "content": "no"}),
             Permission::Assets,
             Permissions::default(),
-            state.mcp_generation,
+            app.mcp_state_mut().mcp_generation,
             Instant::now() + Duration::from_secs(1),
-            &mut state,
+            &mut app,
         )
         .unwrap();
 
@@ -457,38 +582,164 @@ mod tests {
                 .unwrap()
                 .contains("assets")
         );
-        assert!(state.project.is_none());
+        assert!(!target.exists());
+        assert!(
+            !app.mcp_state_mut()
+                .log
+                .entries()
+                .any(|entry| entry.message.starts_with("[MCP]"))
+        );
+        clean(parent, app);
+    }
+
+    #[test]
+    fn modifying_tool_is_logged_in_the_editor_console() {
+        let (parent, mut app) = fixture_app();
+        let result = execute_pending(
+            "write_text_file",
+            &json!({"path": "logged.txt", "content": "saved"}),
+            Permission::Assets,
+            Permissions {
+                assets: true,
+                ..Permissions::default()
+            },
+            app.mcp_state_mut().mcp_generation,
+            Instant::now() + Duration::from_secs(1),
+            &mut app,
+        )
+        .unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            app.mcp_state_mut()
+                .log
+                .entries()
+                .any(|entry| entry.message == "[MCP] write_text_file")
+        );
+        clean(parent, app);
+    }
+
+    #[test]
+    fn play_source_without_an_active_session_returns_tool_errors() {
+        let (parent, mut app) = fixture_app();
+        let generation = app.mcp_state_mut().mcp_generation;
+        for (tool, arguments) in [
+            ("get_scene_hierarchy", json!({"source": "play"})),
+            ("get_object", json!({"id": "camera", "source": "play"})),
+        ] {
+            let result = execute_pending(
+                tool,
+                &arguments,
+                Permission::Read,
+                Permissions::default(),
+                generation,
+                Instant::now() + Duration::from_secs(1),
+                &mut app,
+            )
+            .unwrap();
+            assert!(result.is_error);
+            assert!(
+                result.content[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("without an active Play session")
+            );
+        }
+
+        app.mcp_state_mut().scene = Some(EditorScene::new_untitled().unwrap());
+        let play = crate::play::PlaySession::start(
+            app.mcp_state_mut().scene.as_ref().unwrap().view(),
+            None,
+            |_| Ok(String::new()),
+        )
+        .unwrap();
+        app.mcp_state_mut().play = Some(play);
+        for (tool, arguments, expected) in [
+            ("get_scene_hierarchy", json!({"source": "play"}), "objects"),
+            (
+                "get_object",
+                json!({"id": "camera", "source": "play"}),
+                "object",
+            ),
+        ] {
+            let result = execute_pending(
+                tool,
+                &arguments,
+                Permission::Read,
+                Permissions::default(),
+                app.mcp_state_mut().mcp_generation,
+                Instant::now() + Duration::from_secs(1),
+                &mut app,
+            )
+            .unwrap();
+            assert!(!result.is_error);
+            let value = result.structured_content.unwrap();
+            assert_eq!(value["source"], "play");
+            assert!(value[expected].is_array() || value[expected].is_object());
+        }
+        clean(parent, app);
     }
 
     #[test]
     fn expired_call_is_dropped_before_tool_execution() {
-        let mut state = EditorState::new(None);
+        let (parent, mut app) = fixture_app();
+        let target = app
+            .mcp_state_mut()
+            .project
+            .as_ref()
+            .unwrap()
+            .root
+            .join("Assets/expired.txt");
         let result = execute_pending(
-            "editor_status",
-            &json!({}),
-            Permission::Read,
-            Permissions::default(),
-            state.mcp_generation,
+            "write_text_file",
+            &json!({"path": "expired.txt", "content": "no"}),
+            Permission::Assets,
+            Permissions {
+                assets: true,
+                ..Permissions::default()
+            },
+            app.mcp_state_mut().mcp_generation,
             Instant::now(),
-            &mut state,
+            &mut app,
         );
 
         assert!(result.is_none());
-        assert!(state.project.is_none());
+        assert!(!target.exists());
+        assert!(
+            !app.mcp_state_mut()
+                .log
+                .entries()
+                .any(|entry| entry.message.starts_with("[MCP]"))
+        );
+        clean(parent, app);
     }
 
     #[test]
-    fn calls_from_an_earlier_project_generation_fail_without_execution() {
-        let mut state = EditorState::new(None);
-        state.advance_mcp_generation();
+    fn scene_replacement_invalidates_queued_edit_without_touching_new_scene() {
+        let (parent, mut app) = fixture_app();
+        let generation = app.mcp_state_mut().mcp_generation;
+        let scene = EditorScene::new_untitled().unwrap();
+        app.mcp_state_mut().scene = Some(scene);
+        app.mcp_state_mut().advance_mcp_generation();
+        let before = app
+            .mcp_state_mut()
+            .scene
+            .as_ref()
+            .unwrap()
+            .document()
+            .to_toml()
+            .unwrap();
         let result = execute_pending(
-            "editor_status",
-            &json!({}),
-            Permission::Read,
-            Permissions::default(),
-            state.mcp_generation - 1,
+            "set_component",
+            &json!({"id":"camera","kind":"transform","value":{"position":[9,9,9]}}),
+            Permission::EditScene,
+            Permissions {
+                edit_scene: true,
+                ..Permissions::default()
+            },
+            generation,
             Instant::now() + Duration::from_secs(1),
-            &mut state,
+            &mut app,
         )
         .unwrap();
 
@@ -499,5 +750,16 @@ mod tests {
                 .unwrap()
                 .contains("changed")
         );
+        assert_eq!(
+            app.mcp_state_mut()
+                .scene
+                .as_ref()
+                .unwrap()
+                .document()
+                .to_toml()
+                .unwrap(),
+            before
+        );
+        clean(parent, app);
     }
 }

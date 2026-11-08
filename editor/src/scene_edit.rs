@@ -1380,7 +1380,41 @@ impl EditorScene {
         })
     }
 
-    /// Задаёт значение компонента целиком; его ресурсы добавляются в список сцены.
+    /// Задаёт mesh renderer и добавляет его ресурсы в список сцены.
+    pub fn set_mesh_renderer(&mut self, id: &str, mesh: MeshRenderer) -> Result<(), String> {
+        if self.origin(id).is_some() {
+            return self.edit_object(id, None, |object| {
+                object.mesh_renderer = Some(mesh);
+                Ok(())
+            });
+        }
+        self.edit(None, |document| {
+            let object = find_object_mut(document, id)?;
+            object.mesh_renderer = Some(mesh);
+            let object = object.clone();
+            register_object_assets(document, &object)
+        })
+    }
+
+    /// Sets camera settings while leaving active-state changes to `set_camera_active`.
+    pub fn set_camera_component(
+        &mut self,
+        id: &str,
+        mut camera: CameraComponent,
+    ) -> Result<(), String> {
+        if let Some(active) = self
+            .view()
+            .objects
+            .iter()
+            .find(|object| object.id == id)
+            .and_then(|object| object.camera.as_ref())
+            .map(|current| current.active)
+        {
+            camera.active = active;
+        }
+        self.set_component(id, Component::Camera(camera))
+    }
+
     pub fn set_component(&mut self, id: &str, component: Component) -> Result<(), String> {
         if self.origin(id).is_some() {
             return self.edit_object(id, None, |object| {

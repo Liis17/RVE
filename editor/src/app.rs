@@ -98,6 +98,47 @@ struct GpuState {
 }
 
 impl EditorApp {
+    #[cfg(test)]
+    pub(crate) fn new_for_mcp_tests_with_state(state: EditorState) -> Self {
+        let user_settings = UserSettings::default();
+        Self {
+            state,
+            control_click: false,
+            window_focused: false,
+            modifiers: ModifiersState::empty(),
+            dock: user_settings.layout_or_default(),
+            settings: None,
+            user_settings,
+            preferences: Preferences::default(),
+            mcp_host: McpHost::default(),
+            mcp_cli_enabled: false,
+            stored_mcp_enabled: false,
+            initial_project: None,
+            gpu: None,
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+            console_overlay: ConsoleOverlay::default(),
+            bridge: UiBridge::default(),
+            engine_log: Arc::new(Mutex::new(ConsoleBuffer::default())),
+            repaint_at: None,
+            reflex: None,
+            latency: None,
+            latency_frame: 0,
+            continuous_redraw: false,
+            autosaved_revision: None,
+            last_autosave: Instant::now(),
+            exit: false,
+            exit_code: 0,
+            window_title: String::new(),
+            window: None,
+            proxy: None,
+            asset_watcher: None,
+            asset_changes: ChangeBatch::default(),
+            pipeline_cache_path: None,
+            pipeline_cache: Vec::new(),
+        }
+    }
+
     pub fn new(
         project: Option<PathBuf>,
         scripts: Option<PathBuf>,
@@ -192,65 +233,230 @@ impl EditorApp {
         true
     }
 
-    fn open_project(&mut self, dir: &Path) {
-        match OpenProject::open(dir) {
-            Ok(project) => {
-                self.cancel_project_jobs();
-                self.stop_play();
-                let previous_generation = self.state.script_generation.take();
-                self.state.library = None;
-                if let Some(generation) = previous_generation
-                    && let Err(error) = std::fs::remove_file(&generation.path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    self.state.log.push(
-                        LogLevel::Warn,
-                        format!("{}: {error}", generation.path.display()),
-                    );
-                }
-                if self.state.scripts_path.is_none()
-                    && let Err(error) = crate::build::cleanup_script_generations(&project.root)
-                {
-                    self.state.log.push(
-                        LogLevel::Warn,
-                        format!(
-                            "{}: {error}",
-                            project.root.join(".rve/editor/scripts").display()
-                        ),
-                    );
-                }
-                self.state
-                    .log
-                    .info(format!("Открыт проект {}", project.settings.name));
-                let start = project.settings.starting_scene().map(str::to_owned);
-                UserSettings::remember_project(
-                    &mut self.state.recent_projects,
-                    project.root.clone(),
-                );
-                self.state.advance_mcp_generation();
-                self.state.project = Some(project);
-                self.state.project_replaced();
-                self.save_settings();
-                self.state.current_folder.clear();
-                self.reset_project_assets();
-                self.watch_project_assets();
-                self.refresh_tree_only();
-                if self.state.scripts_path.is_some() {
-                    self.load_manual_library();
-                } else if self
+    fn open_project(&mut self, dir: &Path) -> Result<(), String> {
+        let project = OpenProject::open(dir)?;
+        self.cancel_project_jobs();
+        self.stop_play();
+        let previous_generation = self.state.script_generation.take();
+        self.state.library = None;
+        if let Some(generation) = previous_generation
+            && let Err(error) = std::fs::remove_file(&generation.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.state.log.push(
+                LogLevel::Warn,
+                format!("{}: {error}", generation.path.display()),
+            );
+        }
+        if self.state.scripts_path.is_none()
+            && let Err(error) = crate::build::cleanup_script_generations(&project.root)
+        {
+            self.state.log.push(
+                LogLevel::Warn,
+                format!(
+                    "{}: {error}",
+                    project.root.join(".rve/editor/scripts").display()
+                ),
+            );
+        }
+        self.state
+            .log
+            .info(format!("Открыт проект {}", project.settings.name));
+        let start = project.settings.starting_scene().map(str::to_owned);
+        UserSettings::remember_project(&mut self.state.recent_projects, project.root.clone());
+        self.state.advance_mcp_generation();
+        self.state.project = Some(project);
+        self.state.project_replaced();
+        self.save_settings();
+        self.state.current_folder.clear();
+        self.reset_project_assets();
+        self.watch_project_assets();
+        self.refresh_tree_only();
+        if self.state.scripts_path.is_some() {
+            self.load_manual_library();
+        } else if self
+            .state
+            .project
+            .as_ref()
+            .is_some_and(|project| project.settings.heavy_scripts.is_some())
+        {
+            self.start_scripts_build();
+        }
+        match start {
+            Some(path) => self.open_scene(&path),
+            None => self.new_scene(),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mcp_state_mut(&mut self) -> &mut EditorState {
+        &mut self.state
+    }
+
+    pub(crate) fn mcp_execute_tool(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        permissions: engine_mcp::Permissions,
+    ) -> Result<serde_json::Value, String> {
+        crate::mcp::dispatch(self, name, arguments, permissions)
+    }
+
+    pub(crate) fn mcp_open_project(&mut self, dir: &Path) -> Result<(), String> {
+        if self.state.is_playing() {
+            return Err("stop Play before opening a project".to_owned());
+        }
+        self.open_project(dir)?;
+        self.state.recovery_prompt = None;
+        Ok(())
+    }
+
+    pub(crate) fn mcp_open_scene(&mut self, path: &str) -> Result<(), String> {
+        if self.state.is_playing() {
+            return Err("stop Play before opening a scene".to_owned());
+        }
+        self.open_scene_with_recovery(path, false)
+    }
+
+    pub(crate) fn mcp_new_scene(&mut self) -> Result<(), String> {
+        if self.state.project.is_none() {
+            return Err("project is not open".to_owned());
+        }
+        if self.state.is_playing() {
+            return Err("stop Play before creating a scene".to_owned());
+        }
+        let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
+        let mut scene = EditorScene::new_untitled()?;
+        if let Some(loader) = loader {
+            scene.set_prefab_loader(loader)?;
+        }
+        self.set_scene(scene);
+        Ok(())
+    }
+
+    pub(crate) fn mcp_save_scene(&mut self, path: Option<&str>) -> Result<String, String> {
+        if self.state.is_playing() {
+            return Err("scene cannot be saved during Play".to_owned());
+        }
+        let target = match path {
+            Some(path) => {
+                VirtualPath::parse(path).map_err(|_| format!("{path}: invalid scene path"))?
+            }
+            None => self
+                .state
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.path().cloned())
+                .ok_or_else(|| "path is required for an untitled scene".to_owned())?,
+        };
+        let project = self
+            .state
+            .project
+            .as_ref()
+            .ok_or_else(|| "project is not open".to_owned())?;
+        crate::mcp::paths::resolve_write_path(&project.root, target.as_str())?;
+        self.run_explicit_path_action(Action::SaveAsAt(target.as_str().to_owned()))?;
+        Ok(target.as_str().to_owned())
+    }
+
+    pub(crate) fn mcp_start_play(&mut self, network: Option<bool>) -> Result<String, String> {
+        if self.state.is_playing() || self.state.pending_play {
+            return Err("Play is already running or starting".to_owned());
+        }
+        if let Some(network) = network {
+            if network {
+                let project = self
                     .state
                     .project
                     .as_ref()
-                    .is_some_and(|project| project.settings.heavy_scripts.is_some())
-                {
-                    self.start_scripts_build();
+                    .ok_or_else(|| "project is not open".to_owned())?;
+                if !project.settings.network.enabled {
+                    return Err("network play is disabled in project.rveproject".to_owned());
                 }
-                match start {
-                    Some(path) => self.open_scene(&path),
-                    None => self.new_scene(),
-                }
+                self.state.play_network.mode = crate::play_network::PlayNetworkMode::Host;
+            } else {
+                self.state.play_network.mode = crate::play_network::PlayNetworkMode::Offline;
             }
-            Err(error) => self.state.log.error(error),
+        }
+        self.start_play();
+        if self.state.is_playing() {
+            Ok("running".to_owned())
+        } else if self.state.pending_play {
+            Ok("building_scripts".to_owned())
+        } else {
+            Err("Play could not start; see Console for details".to_owned())
+        }
+    }
+
+    pub(crate) fn mcp_stop_play(&mut self) {
+        self.stop_play();
+    }
+
+    pub(crate) fn mcp_console_command(&mut self, command: &str) {
+        submit_console_command(&mut self.state, command);
+    }
+
+    pub(crate) fn mcp_start_scripts_build(&mut self) -> Result<String, String> {
+        if self.state.scripts_job.is_some() {
+            return Ok("running".to_owned());
+        }
+        let project = self
+            .state
+            .project
+            .as_ref()
+            .ok_or_else(|| "project is not open".to_owned())?;
+        if self.state.scripts_path.is_some() {
+            return Err(
+                "a manual scripts library is configured; no scripts build is needed".to_owned(),
+            );
+        }
+        if project.settings.heavy_scripts.is_none() {
+            return Err("project has no heavy_scripts configuration".to_owned());
+        }
+        if self.start_scripts_build() {
+            Ok("running".to_owned())
+        } else {
+            Err("scripts build could not start; see Console for details".to_owned())
+        }
+    }
+
+    pub(crate) fn mcp_start_build(&mut self, output: &Path) -> Result<(), String> {
+        if self.state.is_playing() {
+            return Err("stop Play before building".to_owned());
+        }
+        if self.state.has_unsaved_changes() {
+            return Err("save or discard unsaved changes before building".to_owned());
+        }
+        self.run_explicit_path_action(Action::BuildPlayerAt(output.to_owned()))
+    }
+
+    pub(crate) fn mcp_refresh_tree(&mut self) {
+        self.refresh_tree_only();
+    }
+
+    pub(crate) fn mcp_create_prefab(&mut self, id: &str) -> Result<String, String> {
+        if self.state.is_playing() {
+            return Err("stop Play before editing the scene".to_owned());
+        }
+        self.create_prefab(id)
+    }
+
+    pub(crate) fn mcp_apply_to_prefab(&mut self, id: &str) -> Result<String, String> {
+        if self.state.is_playing() {
+            return Err("stop Play before editing the scene".to_owned());
+        }
+        self.apply_to_prefab(id)
+    }
+
+    fn run_explicit_path_action(&mut self, action: Action) -> Result<(), String> {
+        match action {
+            Action::SaveAsAt(path) => {
+                let target =
+                    VirtualPath::parse(&path).map_err(|_| format!("{path}: invalid scene path"))?;
+                self.save_target(target)
+            }
+            Action::BuildPlayerAt(output) => self.start_build_at(&output),
+            _ => Err("action does not carry an explicit path".to_owned()),
         }
     }
 
@@ -328,6 +534,8 @@ impl EditorApp {
         let command = tool.scripts_command(&project_dir);
         match crate::build::ScriptsJob::spawn(command, project_dir.clone()) {
             Ok(job) => {
+                self.state.build_output_tail.clear();
+                self.state.build_succeeded = None;
                 self.state
                     .log
                     .info(format!("Build scripts: {}", project_dir.display()));
@@ -570,8 +778,14 @@ impl EditorApp {
     }
 
     fn open_scene(&mut self, path: &str) {
+        if let Err(error) = self.open_scene_with_recovery(path, true) {
+            self.state.log.error(error);
+        }
+    }
+
+    fn open_scene_with_recovery(&mut self, path: &str, offer_recovery: bool) -> Result<(), String> {
         let Some(project) = &self.state.project else {
-            return;
+            return Err("project is not open".to_owned());
         };
         let result = VirtualPath::parse(path)
             .map_err(|_| format!("{path}: некорректный путь сцены"))
@@ -582,9 +796,12 @@ impl EditorApp {
         match result {
             Ok(scene) => {
                 self.set_scene(scene);
-                self.offer_recovery();
+                if offer_recovery {
+                    self.offer_recovery();
+                }
+                Ok(())
             }
-            Err(error) => self.state.log.error(error),
+            Err(error) => Err(error),
         }
     }
 
@@ -618,15 +835,35 @@ impl EditorApp {
                 }
             }
             Action::OpenProject => {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.open_project(&dir);
+                if let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    && let Err(error) = self.open_project(&dir)
+                {
+                    self.state.log.error(error);
                 }
             }
-            Action::OpenProjectAt(dir) => self.open_project(&dir),
+            Action::OpenProjectAt(dir) => {
+                if let Err(error) = self.open_project(&dir) {
+                    self.state.log.error(error);
+                }
+            }
+            Action::SaveAsAt(path) => {
+                if let Err(error) = self.run_explicit_path_action(Action::SaveAsAt(path)) {
+                    self.state.log.error(error);
+                }
+            }
+            Action::BuildPlayerAt(output) => {
+                if let Err(error) = self.run_explicit_path_action(Action::BuildPlayerAt(output)) {
+                    self.state.log.error(error);
+                }
+            }
             Action::NewProject | Action::CreateProject { .. } => {}
             Action::Exit => self.exit = true,
             Action::BuildPlayer => self.start_build(),
-            Action::CreatePrefab(id) => self.create_prefab(&id),
+            Action::CreatePrefab(id) => {
+                if let Err(error) = self.create_prefab(&id) {
+                    self.state.log.error(error);
+                }
+            }
             _ => {}
         }
     }
@@ -641,57 +878,59 @@ impl EditorApp {
         let Some(project) = &self.state.project else {
             return;
         };
-        let (project_dir, id) = (project.root.clone(), project.settings.id.clone());
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_owned));
-        let tool = match crate::build::locate_build_tool(
-            exe_dir.as_deref(),
-            &crate::build::checkout_workspace(),
-            std::env::var_os("CARGO"),
-        ) {
-            Ok(tool) => tool,
-            Err(error) => {
-                self.state.log.error(error);
-                return;
-            }
-        };
+        let id = project.settings.id.clone();
         let Some(folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let output = match std::path::absolute(folder.join(id)) {
-            Ok(output) => output,
-            Err(error) => {
-                self.state
-                    .log
-                    .error(format!("{}: {error}", folder.display()));
-                return;
-            }
-        };
+        let output = folder.join(id);
+        if let Err(error) = self.start_build_at(&output) {
+            self.state.log.error(error);
+        }
+    }
+
+    fn start_build_at(&mut self, output: &Path) -> Result<(), String> {
+        if self.state.build.is_some() {
+            return Err("a build is already running".to_owned());
+        }
+        let project_dir = self
+            .state
+            .project
+            .as_ref()
+            .map(|project| project.root.clone())
+            .ok_or_else(|| "project is not open".to_owned())?;
+        let output = std::path::absolute(output)
+            .map_err(|error| format!("{}: {error}", output.display()))?;
         if output.exists() {
-            self.state.log.error(format!(
-                "{}: каталог уже существует, выберите другую папку",
+            return Err(format!(
+                "{}: output directory already exists",
                 output.display()
             ));
-            return;
         }
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_owned));
+        let tool = crate::build::locate_build_tool(
+            exe_dir.as_deref(),
+            &crate::build::checkout_workspace(),
+            std::env::var_os("CARGO"),
+        )?;
         let command = tool.command(&project_dir, &output);
-        match crate::build::BuildJob::spawn(command, output.clone()) {
-            Ok(job) => {
-                self.state
-                    .log
-                    .info(format!("Build Player: {}", output.display()));
-                self.state.build = Some(job);
-            }
-            Err(error) => self.state.log.error(format!("rve-build: {error}")),
-        }
+        let job = crate::build::BuildJob::spawn(command, output.clone())
+            .map_err(|error| format!("rve-build: {error}"))?;
+        self.state.build_output_tail.clear();
+        self.state.build_succeeded = None;
+        self.state
+            .log
+            .info(format!("Build Player: {}", output.display()));
+        self.state.build = Some(job);
+        Ok(())
     }
 
     /// Сохраняет поддерево объекта в `Assets/prefabs/<id>.rveprefab` и заменяет его
     /// экземпляром. Запись файла не входит в undo: undo вернёт поддерево, файл останется.
-    fn create_prefab(&mut self, id: &str) {
+    fn create_prefab(&mut self, id: &str) -> Result<String, String> {
         let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
-            return;
+            return Err("project and scene must be open".to_owned());
         };
         let result = VirtualPath::parse(&format!("prefabs/{id}.rveprefab"))
             .map_err(|_| format!("{id}: некорректное имя префаба"))
@@ -720,16 +959,17 @@ impl EditorApp {
                     .log
                     .info(format!("Создан префаб /{}", path.as_str()));
                 self.refresh_tree_only();
+                Ok(path.as_str().to_owned())
             }
-            Err(error) => self.state.log.error(error),
+            Err(error) => Err(error),
         }
     }
 
     /// Переносит overrides объекта экземпляра в файл префаба и убирает их из сцены.
     /// Запись файла атомарна и не входит в undo сцены.
-    fn apply_to_prefab(&mut self, id: &str) {
+    fn apply_to_prefab(&mut self, id: &str) -> Result<String, String> {
         let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
-            return;
+            return Err("project and scene must be open".to_owned());
         };
         let result = scene.prefab_with_override(id).and_then(|(path, prefab)| {
             let file = project
@@ -743,11 +983,14 @@ impl EditorApp {
             Ok(path)
         });
         match result {
-            Ok(path) => self
-                .state
-                .log
-                .info(format!("Overrides перенесены в /{}", path.as_str())),
-            Err(error) => self.state.log.error(error),
+            Ok(path) => {
+                self.state
+                    .log
+                    .info(format!("Overrides перенесены в /{}", path.as_str()));
+                self.refresh_tree_only();
+                Ok(path.as_str().to_owned())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -757,11 +1000,18 @@ impl EditorApp {
             return false;
         };
         let lines = job.poll();
-        if job.is_finished() {
+        let finished = job.is_finished();
+        let succeeded = job.completion().map(|completion| completion.success);
+        if finished {
+            self.state.build_succeeded = succeeded;
             self.state.build = None;
         }
         let any = !lines.is_empty();
         for (level, line) in lines {
+            self.state.build_output_tail.push(line.clone());
+            if self.state.build_output_tail.len() > 100 {
+                self.state.build_output_tail.remove(0);
+            }
             self.state.log.push(level, line);
         }
         any
@@ -776,6 +1026,10 @@ impl EditorApp {
         let completion = job.completion().cloned();
         let any = !lines.is_empty();
         for (level, line) in lines {
+            self.state.build_output_tail.push(line.clone());
+            if self.state.build_output_tail.len() > 100 {
+                self.state.build_output_tail.remove(0);
+            }
             self.state.log.push(level, line);
         }
         if !finished {
@@ -807,6 +1061,7 @@ impl EditorApp {
                 false
             }
         };
+        self.state.build_succeeded = Some(succeeded);
         if self.state.finish_pending_play(succeeded) {
             self.start_play_now();
         }
@@ -928,34 +1183,39 @@ impl EditorApp {
                 path
             }
         };
-        let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
-            return false;
-        };
-        let result = project
-            .assets_dir
-            .resolve(target.as_str())
-            .map_err(|error| error.to_string())
-            .and_then(|file| scene.save(&file, target.clone()));
-        match result {
-            Ok(()) => {
-                self.state
-                    .log
-                    .info(format!("Сохранено {}", target.as_str()));
-                // Сохранённый префаб видят следующие раскрытия.
-                if let Some(project) = &self.state.project {
-                    project.clear_prefabs();
-                }
-                self.refresh_tree_only();
-                // Копии прежнего и нового пути устарели: на диске теперь актуальная сцена.
-                self.remove_autosave(existing.as_ref());
-                self.remove_autosave(Some(&target));
-                true
-            }
+        match self.save_target(target) {
+            Ok(()) => true,
             Err(error) => {
                 self.state.log.error(error);
                 false
             }
         }
+    }
+
+    fn save_target(&mut self, target: VirtualPath) -> Result<(), String> {
+        let existing = self
+            .state
+            .scene
+            .as_ref()
+            .and_then(|scene| scene.path().cloned());
+        let (Some(project), Some(scene)) = (&self.state.project, &mut self.state.scene) else {
+            return Err("project and scene must be open".to_owned());
+        };
+        let file = project
+            .assets_dir
+            .resolve(target.as_str())
+            .map_err(|error| error.to_string())?;
+        scene.save(&file, target.clone())?;
+        self.state
+            .log
+            .info(format!("Сохранено {}", target.as_str()));
+        if let Some(project) = &self.state.project {
+            project.clear_prefabs();
+        }
+        self.refresh_tree_only();
+        self.remove_autosave(existing.as_ref());
+        self.remove_autosave(Some(&target));
+        Ok(())
     }
 
     fn refresh_tree_only(&mut self) {
@@ -1150,6 +1410,14 @@ impl EditorApp {
                         self.save(true);
                     }
                 }
+                Action::SaveAsAt(path) => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else if let Err(error) = self.run_explicit_path_action(Action::SaveAsAt(path))
+                    {
+                        self.state.log.error(error);
+                    }
+                }
                 Action::Play => self.start_play(),
                 Action::Stop => self.stop_play(),
                 Action::NewProject => {
@@ -1183,6 +1451,13 @@ impl EditorApp {
                         self.run_guarded(Action::BuildPlayer);
                     }
                 }
+                Action::BuildPlayerAt(output) => {
+                    if self.state.is_playing() {
+                        self.state.log.error("Сначала остановите Play-режим");
+                    } else {
+                        self.run_guarded(Action::BuildPlayerAt(output));
+                    }
+                }
                 Action::Discard(then) => {
                     // Отказ от изменений делает копию ненужной.
                     let scene = self
@@ -1210,8 +1485,8 @@ impl EditorApp {
                 Action::ApplyToPrefab(id) => {
                     if self.state.is_playing() {
                         self.state.log.error("Сначала остановите Play-режим");
-                    } else {
-                        self.apply_to_prefab(&id);
+                    } else if let Err(error) = self.apply_to_prefab(&id) {
+                        self.state.log.error(error);
                     }
                 }
                 Action::CreatePrefab(id) => {
@@ -1879,8 +2154,10 @@ impl WindowHandler for EditorApp {
         self.state
             .log
             .info(format!("RVE Editor {}", crate::VERSION));
-        if let Some(project) = self.initial_project.take() {
-            self.open_project(&project);
+        if let Some(project) = self.initial_project.take()
+            && let Err(error) = self.open_project(&project)
+        {
+            self.state.log.error(error);
         }
         if self.user_settings.mcp.enabled && self.user_settings.mcp.token.is_empty() {
             if let Err(error) = self.user_settings.mcp.regenerate_token() {
@@ -1988,7 +2265,9 @@ impl WindowHandler for EditorApp {
             self.state.mcp_generation,
             &mut self.state.log,
         );
-        let handled_mcp_calls = self.mcp_host.drain(&mut self.state);
+        let mut mcp_host = std::mem::take(&mut self.mcp_host);
+        let handled_mcp_calls = mcp_host.drain(self);
+        self.mcp_host = mcp_host;
         if handled_mcp_calls || *self.mcp_host.status() != previous_mcp_status {
             window.request_redraw();
         }
