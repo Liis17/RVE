@@ -43,7 +43,8 @@ use bloom::{
     BloomChain, BloomPipelines, BloomRecord, bloom_record, record_bloom, write_composite_bloom,
 };
 use exposure::{
-    ExposurePipelines, ExposureRecord, ExposureTarget, exposure_record, record_exposure,
+    ExposureHistory, ExposurePipelines, ExposureRecord, ExposureResources, ExposureSync,
+    ExposureTarget, ViewExposure, exposure_record, prepare_view_exposure, record_exposure,
     write_composite_exposure,
 };
 use filters::{FilterPipelines, FilterRecord, FilterScratch, record_filters};
@@ -761,8 +762,6 @@ struct AcquiredFrameSubmission<'a> {
     local_shadow_layout: vk::ImageLayout,
     /// План skinning вызова; состояние кольца фиксируется после отправки.
     skin: Option<&'a skin::SkinPlan>,
-    /// Кадр записал адаптацию экспозиции и участвует в цепочке семафора экспозиции.
-    exposure_work: bool,
 }
 
 /// Результат попытки показать кадр.
@@ -1064,9 +1063,6 @@ pub struct Renderer {
     post_pipeline_layout: Option<vk::PipelineLayout>,
     bloom_pipelines: Option<BloomPipelines>,
     exposure_pipelines: Option<ExposurePipelines>,
-    /// Семафор упорядочивает адаптацию экспозиции между кадрами, которые могут перекрываться.
-    exposure_semaphore: vk::Semaphore,
-    exposure_semaphore_signaled: bool,
     filter_pipelines: Option<FilterPipelines>,
     ao_pipelines: Option<AoPipelines>,
     /// Вариант непрозрачного пайплайна с LESS_OR_EQUAL для прохода после prepass.
@@ -1210,8 +1206,6 @@ impl Renderer {
             post_pipeline_layout: None,
             bloom_pipelines: None,
             exposure_pipelines: None,
-            exposure_semaphore: vk::Semaphore::null(),
-            exposure_semaphore_signaled: false,
             filter_pipelines: None,
             ao_pipelines: None,
             opaque_equal_pipeline: None,
@@ -2071,6 +2065,15 @@ impl Renderer {
         let prepass_pipeline = self.prepass_pipeline;
         let exposure_dt_ms =
             temporal_frame_delta_ms(self.screen_temporal.last_submitted_at, submitted_at);
+        let view_exposure = prepare_view_exposure(
+            &instance,
+            &device,
+            self.physical_device,
+            self.screen_temporal.exposure,
+            &mut self.screen_temporal.exposure_resources,
+            post_frame.plan.auto_exposure,
+            frame.reset_history,
+        )?;
         let frame_resources = self
             .frames
             .get_mut(frame_slot)
@@ -2508,6 +2511,7 @@ impl Renderer {
                 output_is_srgb,
                 &shadow,
                 &scene,
+                view_exposure,
                 overlay.as_ref(),
                 temporal_record,
                 skin_record,
@@ -2554,6 +2558,7 @@ impl Renderer {
         let temporal_submissions = [TemporalSubmission {
             view: TemporalViewId::Screen,
             plan: temporal_plan,
+            exposure: view_exposure.adaptation.map(|adaptation| adaptation.sync),
             layouts: view
                 .anti_aliasing
                 .is_temporal()
@@ -2592,7 +2597,6 @@ impl Renderer {
             shadow_layout,
             local_shadow_layout,
             skin: skin_plan.as_ref(),
-            exposure_work: post_frame.plan.auto_exposure,
         });
         let particles_submitted = match &submitted {
             Ok(outcome) => outcome.submitted,
@@ -3023,7 +3027,6 @@ impl Renderer {
             .and_then(Option::as_ref)
             .map(|texture| texture.image.view)
             .ok_or(RenderError::InvalidState("белая текстура отсутствует"))?;
-        let mut exposure_work = false;
         for ((scene, prepared_scene), environment) in scenes
             .iter()
             .zip(&prepared_scenes)
@@ -3153,7 +3156,6 @@ impl Renderer {
                     )?);
                 }
             }
-            exposure_work |= post_frame.plan.auto_exposure;
             rendered.push((
                 *viewport,
                 *frame,
@@ -3401,6 +3403,15 @@ impl Renderer {
                 let Some(target) = entry.targets[frame_slot].as_mut() else {
                     continue;
                 };
+                let view_exposure = prepare_view_exposure(
+                    &instance,
+                    &device,
+                    physical_device,
+                    entry.temporal.exposure,
+                    &mut entry.temporal.exposure_resources,
+                    pass.post.plan.auto_exposure,
+                    pass.reset_history,
+                )?;
                 record_scene(
                     &device,
                     command_buffer,
@@ -3413,7 +3424,7 @@ impl Renderer {
                     shadow,
                     pass,
                 );
-                let exposure_buffer = target.exposure.buffer();
+                let exposure_buffer = view_exposure.buffer;
                 let velocity_view = target.scene.velocity.view;
                 let depth_view = target.scene.depth.view;
                 let filters = match (target.filter_scratch.as_mut(), pass.filter_pipelines) {
@@ -3436,12 +3447,11 @@ impl Renderer {
                     filters,
                     sampler: target_resources.post_sampler,
                     exposure: exposure_record(
-                        &mut target.exposure,
+                        &target.exposure,
                         pass.exposure_pipelines,
-                        pass.post.plan.auto_exposure,
+                        view_exposure,
                         &pass.view.post,
                         pass.exposure_dt_ms,
-                        pass.reset_history,
                     ),
                     bloom: bloom_record(
                         target.bloom.as_mut(),
@@ -3570,6 +3580,7 @@ impl Renderer {
                 temporal_submissions.push(TemporalSubmission {
                     view: TemporalViewId::Viewport(*viewport),
                     plan: pass.temporal_plan,
+                    exposure: view_exposure.adaptation.map(|adaptation| adaptation.sync),
                     layouts: temporal_outcome
                         .as_ref()
                         .is_some_and(|outcome| outcome.used_taa)
@@ -3658,7 +3669,6 @@ impl Renderer {
             shadow_layout,
             local_shadow_layout,
             skin: skin_plan.as_ref(),
-            exposure_work,
         });
         let particles_submitted = match &submitted {
             Ok(outcome) => outcome.submitted,
@@ -3740,6 +3750,7 @@ impl Renderer {
             };
             temporal.state.submitted(submission.plan);
             temporal.last_submitted_at = Some(submission.submitted_at);
+            temporal.exposure.submitted(submission.exposure.is_some());
             if let (Some(history), Some(layouts)) = (&mut temporal.history, submission.layouts) {
                 history.layouts = layouts;
             }
@@ -3804,7 +3815,6 @@ impl Renderer {
             shadow_layout,
             local_shadow_layout,
             skin,
-            exposure_work,
         } = acquired;
         let submit_started = Instant::now();
         // Fence сбрасывается только после успешного acquire и полной записи command buffer.
@@ -3815,50 +3825,53 @@ impl Renderer {
             )));
         }
 
-        // Адаптация экспозиции кадра читает буфер, который записал предыдущий кадр с ней;
-        // семафор задаёт этот порядок без ожидания CPU (см. exposure.rs).
-        let exposure_semaphore = self.exposure_semaphore;
-        let wait_infos = [
+        // Адаптация экспозиции каждого вида ждёт предыдущую адаптацию того же вида и сигналит свою
+        // (см. exposure.rs). Списки собираются из отправляемых видов этого кадра.
+        let mut wait_infos = Vec::with_capacity(temporal_submissions.len() + 1);
+        wait_infos.push(
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(image_available)
                 .stage_mask(wait_stage)
                 .device_index(0),
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(exposure_semaphore)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .device_index(0),
-        ];
-        let wait_count = if exposure_work && self.exposure_semaphore_signaled {
-            2
-        } else {
-            1
-        };
-        let command_infos = [vk::CommandBufferSubmitInfo::default()
-            .command_buffer(command_buffer)
-            .device_mask(0)];
-        let signal_infos = [
+        );
+        let mut signal_infos = Vec::with_capacity(temporal_submissions.len() + 1);
+        signal_infos.push(
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(render_finished)
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                 .device_index(0),
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(exposure_semaphore)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .device_index(0),
-        ];
-        let signal_count = if exposure_work { 2 } else { 1 };
+        );
+        for sync in temporal_submissions
+            .iter()
+            .filter_map(|submission| submission.exposure)
+        {
+            if sync.wait {
+                wait_infos.push(
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(sync.semaphore)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                        .device_index(0),
+                );
+            }
+            signal_infos.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(sync.semaphore)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .device_index(0),
+            );
+        }
+        let command_infos = [vk::CommandBufferSubmitInfo::default()
+            .command_buffer(command_buffer)
+            .device_mask(0)];
         let submit_info = [vk::SubmitInfo2::default()
-            .wait_semaphore_infos(&wait_infos[..wait_count])
+            .wait_semaphore_infos(&wait_infos)
             .command_buffer_infos(&command_infos)
-            .signal_semaphore_infos(&signal_infos[..signal_count])];
+            .signal_semaphore_infos(&signal_infos)];
         // SAFETY: command buffer, semaphores and fence are owned by this renderer and are synchronized per frame/image.
         if let Err(error) = unsafe { device.queue_submit2(queue, &submit_info, fence) } {
             return Err(SubmitAndPresentError::BeforeSubmit(RenderError::Vulkan(
                 error,
             )));
-        }
-        if exposure_work {
-            self.exposure_semaphore_signaled = true;
         }
         timings.submit = submit_started.elapsed();
         self.record_frame_submission(frame_slot);
@@ -6269,9 +6282,6 @@ impl Renderer {
         self.exposure_pipelines = Some(ExposurePipelines::new(&device, cache)?);
         self.filter_pipelines = Some(FilterPipelines::new(&device, cache)?);
         self.ao_pipelines = Some(AoPipelines::new(&device, cache)?);
-        // SAFETY: a default semaphore creation has no borrowed inputs.
-        self.exposure_semaphore =
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
         Ok(())
     }
 
@@ -6655,6 +6665,7 @@ impl Drop for Renderer {
         self.environments.clear();
         self.viewports.clear();
         self.screen_temporal.history.take();
+        self.screen_temporal.exposure_resources.take();
         #[cfg(windows)]
         self.screen_temporal.fsr.take();
         #[cfg(all(windows, feature = "dlss"))]
@@ -6793,12 +6804,6 @@ impl Drop for Renderer {
             {
                 // SAFETY: the device is idle, so no command buffer uses the mesh variant.
                 unsafe { device.destroy_pipeline(pipeline, None) };
-            }
-            let exposure_semaphore =
-                std::mem::replace(&mut self.exposure_semaphore, vk::Semaphore::null());
-            if exposure_semaphore != vk::Semaphore::null() {
-                // SAFETY: the device is idle, so no submission waits on or signals the semaphore.
-                unsafe { device.destroy_semaphore(exposure_semaphore, None) };
             }
             if let Some(layout) = self.taa_pipeline_layout.take() {
                 // SAFETY: the TAA pipeline created with this layout was destroyed above.
@@ -7838,7 +7843,7 @@ impl FrameTarget {
             color_subresource_range(),
         )?;
         let (taa_pool, taa_set) = allocate_taa_image_set(device, taa_set_layout)?;
-        let exposure = ExposureTarget::new(instance, device, physical_device, exposure_layout)?;
+        let exposure = ExposureTarget::new(device, exposure_layout)?;
         Ok(Self {
             _taa_pool: taa_pool,
             taa_set,
@@ -8211,12 +8216,7 @@ impl ViewportTarget {
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             color_subresource_range(),
         )?;
-        let exposure = ExposureTarget::new(
-            instance,
-            device,
-            physical_device,
-            resources.exposure_set_layout,
-        )?;
+        let exposure = ExposureTarget::new(device, resources.exposure_set_layout)?;
         let frame_set = ViewportFrameSet::new(instance, device, physical_device, resources)?;
         let (taa_pool, taa_set) = allocate_taa_image_set(device, resources.taa_set_layout)?;
         let (post_pool, post_sets) = allocate_post_image_sets(
@@ -8284,6 +8284,10 @@ struct TemporalView {
     state: TemporalState,
     history: Option<TemporalHistory>,
     last_submitted_at: Option<Instant>,
+    /// Адаптация экспозиции вида; общая для всех кадровых слотов вида.
+    exposure: ExposureHistory,
+    /// Буфер экспозиции и семафор адаптации вида; создаются при первом кадре вида.
+    exposure_resources: Option<ExposureResources>,
     #[cfg(windows)]
     fsr: Option<Box<FsrView>>,
     #[cfg(windows)]
@@ -8478,6 +8482,8 @@ enum TemporalViewId {
 struct TemporalSubmission {
     view: TemporalViewId,
     plan: TemporalPlan,
+    /// Семафор адаптации экспозиции, если кадр вида адаптирует экспозицию.
+    exposure: Option<ExposureSync>,
     layouts: Option<[vk::ImageLayout; 2]>,
     #[cfg(windows)]
     fsr_used: bool,
@@ -9816,6 +9822,7 @@ fn record_frame(
     output_is_srgb: bool,
     shadow: &ShadowPass<'_>,
     scene: &ScenePass<'_>,
+    exposure: ViewExposure,
     overlay: Option<&OverlayPass>,
     temporal: Option<TemporalResolveRecord<'_>>,
     skin: Option<skin::SkinRecord<'_>>,
@@ -9837,7 +9844,7 @@ fn record_frame(
         shadow,
         scene,
     );
-    let exposure_buffer = target.exposure.buffer();
+    let exposure_buffer = exposure.buffer;
     let velocity_view = target.scene.velocity.view;
     let depth_view = target.scene.depth.view;
     let filters = match (target.filter_scratch.as_mut(), scene.filter_pipelines) {
@@ -9859,12 +9866,11 @@ fn record_frame(
         filters,
         sampler: post_sampler,
         exposure: exposure_record(
-            &mut target.exposure,
+            &target.exposure,
             scene.exposure_pipelines,
-            scene.post.plan.auto_exposure,
+            exposure,
             &view.post,
             scene.exposure_dt_ms,
-            scene.reset_history,
         ),
         bloom: bloom_record(
             target.bloom.as_mut(),
@@ -11187,7 +11193,7 @@ fn scene_viewport(extent: vk::Extent2D) -> vk::Viewport {
 /// Проходы постобработки вида, которые записываются перед composite.
 struct PostPasses<'a> {
     filters: Option<FilterRecord<'a>>,
-    exposure: Option<ExposureRecord<'a>>,
+    exposure: Option<ExposureRecord>,
     bloom: Option<BloomRecord<'a>>,
     exposure_buffer: vk::Buffer,
     sampler: vk::Sampler,

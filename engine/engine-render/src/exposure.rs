@@ -1,10 +1,12 @@
 //! Auto exposure: гистограмма log2-яркости HDR-источника и адаптация EV вида.
 //!
-//! Буфер экспозиции (гистограмма и адаптированный EV) принадлежит цели вида и создаётся
-//! вместе с ней. Композит читает адаптированное значение через binding 3 набора постобработки.
-//! Гистограмма очищается в начале каждого кадра, а кадры двух слотов упорядочиваются семафором
-//! экспозиции в submit (см. `Renderer::submit_and_present`), поэтому адаптация не гоняется
-//! между кадрами, которые выполняются одновременно.
+//! Буфер экспозиции (гистограмма и адаптированный EV) и семафор принадлежат виду, а не
+//! кадровому слоту: адаптация идёт по кадрам вида подряд, даже когда кадры двух слотов
+//! перекрываются на GPU. Внутри кадра порядок задают барьеры. Между submit барьер не задаёт
+//! порядок, поэтому кадр вида, адаптирующий экспозицию, ждёт семафор предыдущей адаптации этого
+//! вида и сигналит свой (`Renderer::submit_and_present`). Состояние адаптации (`ExposureHistory`)
+//! меняется только после успешного submit, поэтому неотправленный кадр не помечает вид адаптированным.
+//! Композит читает адаптированное значение через binding 3 набора постобработки только в auto-режиме.
 
 use super::bloom::ensure_sampled;
 use super::post::{EXPOSURE_BINS, ExposureAverageParams, exposure_average_params};
@@ -114,21 +116,55 @@ impl ExposurePipelines {
     }
 }
 
-/// Буфер экспозиции и набор дескрипторов одной цели вида.
-pub(crate) struct ExposureTarget {
-    buffer: DeviceBuffer,
-    _pool: OwnedDescriptorPool,
-    set: vk::DescriptorSet,
-    /// Адаптация уже выполнялась: следующий кадр адаптируется, а не делает snap.
-    initialized: bool,
+/// Состояние адаптации вида между кадрами. Меняется только после успешного submit кадра.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExposureHistory {
+    /// Последний отправленный кадр вида адаптировал экспозицию; иначе следующий auto-кадр делает snap.
+    adapted: bool,
+    /// Семафор вида уже сигналился: следующий адаптирующий кадр обязан его дождаться.
+    signaled: bool,
 }
 
-impl ExposureTarget {
+/// Решение адаптации для auto-кадра вида.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExposureFrame {
+    /// Адаптация стартует с текущей экспозиции, а не с прошлого значения буфера.
+    pub(crate) snap: bool,
+    /// Кадр ждёт семафор предыдущей адаптации этого вида.
+    pub(crate) wait: bool,
+}
+
+impl ExposureHistory {
+    /// Решение для кадра: `None`, если вид в ручном режиме и буфер не адаптируется.
+    ///
+    /// Snap происходит при явном `Frame::reset_history`, при первом адаптирующем кадре вида и
+    /// после ручного кадра. Изменение размера цели сюда не входит, поэтому адаптация его не сбрасывает.
+    pub(crate) fn plan_frame(self, auto: bool, explicit_reset: bool) -> Option<ExposureFrame> {
+        auto.then_some(ExposureFrame {
+            snap: explicit_reset || !self.adapted,
+            wait: self.signaled,
+        })
+    }
+
+    /// Фиксирует отправленный кадр вида; вызывается только после успешного `queue_submit2`.
+    pub(crate) fn submitted(&mut self, auto: bool) {
+        self.adapted = auto;
+        self.signaled |= auto;
+    }
+}
+
+/// Буфер экспозиции вида и семафор, которым упорядочивается адаптация его кадров.
+pub(crate) struct ExposureResources {
+    device: ash::Device,
+    buffer: DeviceBuffer,
+    semaphore: vk::Semaphore,
+}
+
+impl ExposureResources {
     pub(crate) fn new(
         instance: &ash::Instance,
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
-        set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
         let buffer = DeviceBuffer::new(
             instance,
@@ -137,6 +173,91 @@ impl ExposureTarget {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             EXPOSURE_BUFFER_SIZE,
         )?;
+        // SAFETY: a default create info is valid for a new binary semaphore.
+        let semaphore =
+            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+        Ok(Self {
+            device: device.clone(),
+            buffer,
+            semaphore,
+        })
+    }
+}
+
+impl Drop for ExposureResources {
+    fn drop(&mut self) {
+        // SAFETY: the owner destroys these resources after device idle or after the view's
+        // submissions completed, so no pending submission waits on or signals the semaphore.
+        unsafe { self.device.destroy_semaphore(self.semaphore, None) };
+    }
+}
+
+/// Семафор адаптации вида для одного submit: кадр ждёт предыдущий и сигналит свой.
+#[derive(Clone, Copy)]
+pub(crate) struct ExposureSync {
+    pub(crate) semaphore: vk::Semaphore,
+    pub(crate) wait: bool,
+}
+
+/// Адаптация кадра вида: решение по `ExposureHistory` и синхронизация submit.
+#[derive(Clone, Copy)]
+pub(crate) struct ExposureAdaptation {
+    pub(crate) snap: bool,
+    pub(crate) sync: ExposureSync,
+}
+
+/// Экспозиция вида для одного кадра: буфер для composite и адаптация, если кадр auto.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewExposure {
+    pub(crate) buffer: vk::Buffer,
+    /// `None` — вид в ручном режиме; буфер в этом кадре не записывается и не читается.
+    pub(crate) adaptation: Option<ExposureAdaptation>,
+}
+
+/// Готовит экспозицию вида: создаёт его ресурсы при первом кадре и решает адаптацию.
+pub(crate) fn prepare_view_exposure(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    history: ExposureHistory,
+    resources: &mut Option<ExposureResources>,
+    auto: bool,
+    explicit_reset: bool,
+) -> Result<ViewExposure, RenderError> {
+    if resources.is_none() {
+        *resources = Some(ExposureResources::new(instance, device, physical_device)?);
+    }
+    let Some(resources) = resources.as_ref() else {
+        return Err(RenderError::InvalidState(
+            "ресурсы экспозиции вида отсутствуют",
+        ));
+    };
+    let adaptation = history
+        .plan_frame(auto, explicit_reset)
+        .map(|frame| ExposureAdaptation {
+            snap: frame.snap,
+            sync: ExposureSync {
+                semaphore: resources.semaphore,
+                wait: frame.wait,
+            },
+        });
+    Ok(ViewExposure {
+        buffer: resources.buffer.buffer,
+        adaptation,
+    })
+}
+
+/// Набор дескрипторов одного кадрового слота цели вида; буфер подставляется при записи кадра.
+pub(crate) struct ExposureTarget {
+    _pool: OwnedDescriptorPool,
+    set: vk::DescriptorSet,
+}
+
+impl ExposureTarget {
+    pub(crate) fn new(
+        device: &ash::Device,
+        set_layout: vk::DescriptorSetLayout,
+    ) -> Result<Self, RenderError> {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
@@ -155,77 +276,57 @@ impl ExposureTarget {
             .set_layouts(&layouts);
         // SAFETY: the pool is sized for exactly one set of this layout.
         let set = unsafe { device.allocate_descriptor_sets(&allocate_info) }?[0];
-        let buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(buffer.buffer)
-            .offset(0)
-            .range(EXPOSURE_BUFFER_SIZE as u64)];
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&buffer_info)];
-        // SAFETY: the buffer and set are alive and the set is not used by in-flight work.
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
-        Ok(Self {
-            buffer,
-            _pool: pool,
-            set,
-            initialized: false,
-        })
-    }
-
-    pub(crate) fn buffer(&self) -> vk::Buffer {
-        self.buffer.buffer
+        Ok(Self { _pool: pool, set })
     }
 }
 
-/// Запись экспозиции для вида: существует, только если кадр адаптирует экспозицию.
-pub(crate) struct ExposureRecord<'a> {
-    pub(crate) target: &'a mut ExposureTarget,
-    pub(crate) pipelines: ExposurePipelines,
-    pub(crate) params: ExposureAverageParams,
+/// Запись адаптации для кадра: пайплайны, набор слота, буфер вида и параметры.
+pub(crate) struct ExposureRecord {
+    set: vk::DescriptorSet,
+    buffer: vk::Buffer,
+    pipelines: ExposurePipelines,
+    params: ExposureAverageParams,
 }
 
-/// Строит запись адаптации для вида; `None` — вид использует ручную экспозицию.
-pub(crate) fn exposure_record<'a>(
-    target: &'a mut ExposureTarget,
+/// Строит запись адаптации; `None` — кадр ручной или пайплайны отсутствуют.
+pub(crate) fn exposure_record(
+    target: &ExposureTarget,
     pipelines: Option<ExposurePipelines>,
-    auto: bool,
+    view: ViewExposure,
     post: &PostProcess,
     frame_delta_ms: f32,
-    explicit_reset: bool,
-) -> Option<ExposureRecord<'a>> {
+) -> Option<ExposureRecord> {
     let pipelines = pipelines?;
-    if !auto {
-        return None;
-    }
-    let snap = explicit_reset || !target.initialized;
+    let adaptation = view.adaptation?;
     Some(ExposureRecord {
-        params: exposure_average_params(&post.exposure, frame_delta_ms, snap),
-        target,
+        set: target.set,
+        buffer: view.buffer,
         pipelines,
+        params: exposure_average_params(&post.exposure, frame_delta_ms, adaptation.snap),
     })
 }
 
 /// Записывает гистограмму и адаптацию; после записи буфер готов для composite.
+///
+/// Вызывается только при успешной записи кадра; `ExposureHistory` обновляется после submit.
 pub(crate) fn record_exposure(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     source: &DeviceImage,
     source_layout: &mut vk::ImageLayout,
     source_extent: vk::Extent2D,
-    record: ExposureRecord<'_>,
+    record: ExposureRecord,
     timestamps: Option<GpuMarks>,
 ) {
     ensure_sampled(device, command_buffer, source.image, source_layout);
     let ExposureRecord {
-        target,
+        set,
+        buffer,
         pipelines,
         params,
     } = record;
-    write_source_binding(device, target.set, source.view);
-    let buffer = target.buffer.buffer;
-    let set = [target.set];
+    write_exposure_bindings(device, set, source.view, buffer);
+    let set = [set];
     // SAFETY: the buffer is alive, the set and pipelines belong to this device and the
     // command buffer is in the recording state.
     unsafe {
@@ -298,24 +399,39 @@ pub(crate) fn record_exposure(
         vk::AccessFlags2::SHADER_STORAGE_READ,
     );
     mark_pass(device, command_buffer, timestamps, GpuPass::Exposure);
-    target.initialized = true;
 }
 
-/// Привязывает HDR-источник к binding 0 набора экспозиции; меняется каждый кадр.
-fn write_source_binding(device: &ash::Device, set: vk::DescriptorSet, view: vk::ImageView) {
+/// Привязывает HDR-источник (binding 0) и буфер вида (binding 1) к набору слота; меняется каждый кадр.
+fn write_exposure_bindings(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    view: vk::ImageView,
+    buffer: vk::Buffer,
+) {
     let image_info = [vk::DescriptorImageInfo::default()
         .image_view(view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-    let writes = [vk::WriteDescriptorSet::default()
-        .dst_set(set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-        .image_info(&image_info)];
-    // SAFETY: the set and view are alive and the set is not used by in-flight work.
+    let buffer_info = [vk::DescriptorBufferInfo::default()
+        .buffer(buffer)
+        .offset(0)
+        .range(EXPOSURE_BUFFER_SIZE as u64)];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&image_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buffer_info),
+    ];
+    // SAFETY: the set, view and buffer are alive and the set is not used by in-flight work.
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
 
-/// Привязывает буфер экспозиции к binding 3 набора постобработки (читает composite).
+/// Привязывает буфер экспозиции вида к binding 3 набора постобработки (читает composite).
 pub(crate) fn write_composite_exposure(
     device: &ash::Device,
     set: vk::DescriptorSet,
@@ -368,5 +484,90 @@ mod tests {
         assert_eq!(EXPOSURE_BUFFER_SIZE, 1040);
         // adapted_ev лежит сразу после гистограммы: композит читает его по этому смещению.
         assert_eq!(HISTOGRAM_BYTES, EXPOSURE_BUFFER_SIZE - 16);
+    }
+
+    /// Адаптирующий кадр, отправленный успешно: вид адаптирован и семафор сигналится.
+    fn submitted_auto(history: &mut ExposureHistory) {
+        assert!(history.plan_frame(true, false).is_some());
+        history.submitted(true);
+    }
+
+    #[test]
+    fn first_auto_frame_of_view_snaps_without_waiting() {
+        let history = ExposureHistory::default();
+        let frame = history
+            .plan_frame(true, false)
+            .expect("auto frame plans adaptation");
+        assert!(frame.snap);
+        assert!(!frame.wait);
+    }
+
+    #[test]
+    fn manual_frame_does_not_plan_adaptation() {
+        let mut history = ExposureHistory::default();
+        assert_eq!(history.plan_frame(false, false), None);
+        history.submitted(false);
+        assert_eq!(history.plan_frame(false, true), None);
+    }
+
+    #[test]
+    fn next_auto_frame_adapts_from_previous_value_and_waits_for_it() {
+        let mut history = ExposureHistory::default();
+        submitted_auto(&mut history);
+        let frame = history
+            .plan_frame(true, false)
+            .expect("auto frame plans adaptation");
+        assert!(!frame.snap);
+        assert!(frame.wait);
+    }
+
+    #[test]
+    fn explicit_reset_snaps_even_after_adaptation() {
+        let mut history = ExposureHistory::default();
+        submitted_auto(&mut history);
+        let frame = history
+            .plan_frame(true, true)
+            .expect("auto frame plans adaptation");
+        assert!(frame.snap);
+        assert!(frame.wait);
+    }
+
+    #[test]
+    fn switching_from_manual_to_auto_snaps_but_still_waits_for_pending_signal() {
+        let mut history = ExposureHistory::default();
+        submitted_auto(&mut history);
+        history.submitted(false);
+        let frame = history
+            .plan_frame(true, false)
+            .expect("auto frame plans adaptation");
+        assert!(frame.snap);
+        assert!(frame.wait);
+    }
+
+    #[test]
+    fn failed_submit_keeps_view_unadapted_so_next_frame_snaps() {
+        let history = ExposureHistory::default();
+        // Кадр спланирован, но submit не выполнен: commit не вызывается.
+        let planned = history
+            .plan_frame(true, false)
+            .expect("auto frame plans adaptation");
+        assert!(planned.snap);
+        let retried = history
+            .plan_frame(true, false)
+            .expect("auto frame plans adaptation");
+        assert!(retried.snap);
+        assert!(!retried.wait);
+    }
+
+    #[test]
+    fn resize_does_not_reset_adaptation_because_it_is_not_an_input() {
+        // Пересоздание цели не передаёт сюда ничего: без явного reset адаптация продолжается.
+        let mut history = ExposureHistory::default();
+        submitted_auto(&mut history);
+        submitted_auto(&mut history);
+        let frame = history
+            .plan_frame(true, false)
+            .expect("auto frame plans adaptation");
+        assert!(!frame.snap);
     }
 }
