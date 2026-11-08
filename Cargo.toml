@@ -12,12 +12,15 @@ license = "MIT"
 ash = "=0.38.0"
 ash-window = "=0.13.0"
 blake3 = "=1.8.7"
+chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
 cpal = "=0.18.2"
+ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }
 egui = "=0.36.2"
 egui-winit = { version = "=0.36.2", default-features = false, features = ["clipboard", "links"] }
 egui_dock = "=0.21.1"
 font8x8 = { version = "=0.3.1", default-features = false }
 flume = { version = "=0.11.1", default-features = false, features = ["async", "select"] }
+getrandom = "=0.4.3"
 gilrs = "=0.11.2"
 glam = "=0.34.1"
 lz4_flex = "=0.14.0"
@@ -43,6 +46,8 @@ toml = "=0.8.23"
 ufbx = "=0.11.5"
 windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 winit = "=0.30.13"
+x25519-dalek = { version = "=2.0.1", features = ["static_secrets", "zeroize"] }
+zeroize = "=1.9.1"
 zstd = "=0.14.2"
 
 # Без оптимизаций кадр редактора в dev-сборке в десятки раз медленнее release.

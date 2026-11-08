@@ -50,6 +50,8 @@ pub fn component_icon(kind: ComponentKind) -> Option<&'static str> {
         ComponentKind::SpotLight => Some("spot-light"),
         ComponentKind::Collider => Some("collider"),
         ComponentKind::AudioSource => Some("audio-component"),
+        ComponentKind::NetworkIdentity => Some("network-identity"),
+        ComponentKind::NetworkTransform => Some("network-transform"),
         _ => None,
     }
 }
@@ -79,6 +81,8 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         animator,
 
         particle_emitter,
+        network_identity,
+        network_transform,
         lite_scripts,
         heavy_scripts,
     } = object;
@@ -100,6 +104,8 @@ pub fn object_icon(object: &SceneObject) -> Option<&'static str> {
         && audio_source.is_none()
         && animator.is_none()
         && particle_emitter.is_none()
+        && network_identity.is_none()
+        && network_transform.is_none()
         && lite_scripts.is_empty()
         && heavy_scripts.is_empty()
     {
@@ -200,6 +206,14 @@ mod tests {
             component_icon(ComponentKind::AudioSource),
             Some("audio-component")
         );
+        assert_eq!(
+            component_icon(ComponentKind::NetworkIdentity),
+            Some("network-identity")
+        );
+        assert_eq!(
+            component_icon(ComponentKind::NetworkTransform),
+            Some("network-transform")
+        );
         assert_eq!(component_icon(ComponentKind::RigidBody), None);
         assert_eq!(
             file_icon(AssetKind::CameraSettings),
@@ -219,6 +233,8 @@ mod tests {
             ComponentKind::RigidBody,
             ComponentKind::CharacterController,
             ComponentKind::AudioSource,
+            ComponentKind::NetworkIdentity,
+            ComponentKind::NetworkTransform,
         ];
         let icons = components
             .into_iter()

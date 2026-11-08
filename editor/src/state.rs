@@ -7,6 +7,7 @@ use crate::console::ConsoleLog;
 use crate::icons::IconCache;
 use crate::play::PlaySession;
 use crate::play_cursor::PlayCursor;
+use crate::play_network::PlayNetworkForm;
 use crate::previews::PreviewCache;
 use crate::profile::EditorProfile;
 use crate::project::OpenProject;
@@ -177,6 +178,8 @@ pub struct EditorState {
     pub scripts_job: Option<ScriptsJob>,
     /// Play, ожидающий успешного завершения автоматической сборки скриптов.
     pub pending_play: bool,
+    /// Сетевой режим следующего Play и его параметры; пароль живёт только здесь, в памяти.
+    pub play_network: PlayNetworkForm,
     pub actions: Vec<Action>,
     pub unsaved_prompt: Option<UnsavedPrompt>,
     pub recovery_prompt: Option<RecoveryPrompt>,
@@ -261,6 +264,7 @@ impl EditorState {
             script_generation: None,
             scripts_job: None,
             pending_play: false,
+            play_network: PlayNetworkForm::default(),
             actions: Vec::new(),
             unsaved_prompt: None,
             recovery_prompt: None,

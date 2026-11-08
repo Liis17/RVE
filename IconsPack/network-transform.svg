@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" role="img" aria-label="RVE Network Transform">
+  <defs>
+    <linearGradient id="pose" x1="22" y1="22" x2="42" y2="42" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A6EEFA"/>
+      <stop offset="1" stop-color="#46BFDB"/>
+    </linearGradient>
+  </defs>
+  <!-- The synchronised pose in the centre. -->
+  <rect x="22" y="22" width="20" height="20" rx="3" fill="url(#pose)" fill-opacity=".25" stroke="#64D5EB" stroke-width="2.2"/>
+  <!-- Replicated movement in four directions. -->
+  <path d="M8 32H18M13 27L8 32L13 37M46 32H56M51 27L56 32L51 37M32 8V18M27 13L32 8L37 13M32 46V56M27 51L32 56L37 51" stroke="#55CEE5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

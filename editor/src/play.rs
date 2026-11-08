@@ -1,5 +1,6 @@
 //! Play-режим: копия мира сцены и скрипты на главном потоке редактора.
 
+use crate::play_network::{PlayNetwork, PlayNetworkPlan};
 use crate::profile::PlayStep;
 use crate::project::read_resource_text;
 use engine_animation::{AnimationBridge, AnimationEvent};
@@ -8,6 +9,7 @@ use engine_audio::{AudioBridge, AudioConfig, AudioEngine, AudioHandle};
 use engine_console::{CommandCatalog, CommandLine};
 use engine_files::VirtualPath;
 use engine_input::{GamepadSnapshot, GamepadTuning, GilrsBackend, PadGate};
+use engine_network::SpawnedRoot;
 use engine_physics::{
     BodyChange, BodyHandle, ModelGeometry, ModelMesh as PhysicsModelMesh, PhysicsClient,
     PhysicsCommand, PhysicsInitialization, PhysicsReceive, PhysicsSceneDesc, PhysicsSceneSync,
@@ -472,6 +474,10 @@ pub struct PlaySession {
     host: ScriptHost,
     physics: Option<PlayPhysics>,
     audio: Option<PlayAudio>,
+    /// Сетевой Play: поток `rve-network` и мост. `None` — сеть не используется.
+    network: Option<PlayNetwork>,
+    /// Корни, созданные с прошлого шага сети. Копятся только при подключённой сети.
+    spawned_roots: Vec<SpawnedRoot>,
     /// Аниматоры мира Play: запросы скриптов, время и события `animation_finished`.
     animation: AnimationBridge,
     watchdog: Watchdog,
@@ -709,6 +715,8 @@ impl PlaySession {
             host,
             physics: Some(physics),
             audio: Some(audio),
+            network: None,
+            spawned_roots: Vec::new(),
             animation,
             watchdog,
             time_limit,
@@ -722,6 +730,13 @@ impl PlaySession {
             rumble: Vec::new(),
             heavy: HeavyLoads::new(resources),
         })
+    }
+
+    /// Подключает сеть к запущенной сцене. Вызывается сразу после старта и до первого шага: `on_start`
+    /// выполняется на нём и должен видеть режим сети, как в runtime. Ошибка сокета не запускает Play.
+    pub fn attach_network(&mut self, plan: PlayNetworkPlan) -> Result<(), String> {
+        self.network = Some(PlayNetwork::start(plan, &mut self.world, &mut self.host)?);
+        Ok(())
     }
 
     pub fn world_mut(&mut self) -> &mut World {
@@ -834,6 +849,9 @@ impl PlaySession {
             physics.receive(&mut self.world, &mut self.host)?;
             physics_wait = started.elapsed();
         }
+        if let Some(network) = &mut self.network {
+            network.receive(&mut self.world, &mut self.host);
+        }
         self.elapsed += f64::from(dt);
         self.frame += 1;
         self.host.set_input(self.input.take_frame());
@@ -852,8 +870,12 @@ impl PlaySession {
                 AnimationEvent::Finished { object, motion } => (object, motion),
             }),
         );
+        if let Some(network) = &mut self.network {
+            network.apply(&mut self.world, &mut self.host);
+        }
         let world_started = Instant::now();
         self.apply_world_changes();
+        self.tick_network();
         let world_changes = world_started.elapsed();
         let physics_started = Instant::now();
         let mut physics_step = Duration::ZERO;
@@ -891,6 +913,14 @@ impl PlaySession {
         Ok(())
     }
 
+    /// Шаг сети после spawn и despawn. Корни передаются мосту один раз, даже без сети.
+    fn tick_network(&mut self) {
+        if let Some(network) = &mut self.network {
+            network.tick(&mut self.world, &mut self.host, &mut self.spawned_roots);
+        }
+        self.spawned_roots.clear();
+    }
+
     /// Применяет закоммиченные скриптами изменения мира: spawn, destroy и заявки тяжёлых
     /// префабов. Порядок тот же, что в `rve-runtime`: тела удаляются и вставляются до
     /// синхронизации поз, поэтому новые тела не телепортируются. Выгрузка может сразу запросить
@@ -904,6 +934,13 @@ impl PlaySession {
             } = self.host.drain_world_changes();
             if spawned.is_empty() && despawned.is_empty() && prefab_requests.is_empty() {
                 return;
+            }
+            if self.network.is_some() {
+                self.spawned_roots
+                    .extend(spawned.iter().map(|object| SpawnedRoot {
+                        handle: object.handle,
+                        prefab: object.prefab.clone(),
+                    }));
             }
             self.apply_spawns(spawned, &despawned);
             self.apply_prefab_requests(prefab_requests);
@@ -1088,6 +1125,9 @@ impl PlaySession {
         if let Some(mut audio) = self.audio.take() {
             audio.shutdown();
         }
+        if let Some(mut network) = self.network.take() {
+            network.shutdown();
+        }
         events
     }
 }
@@ -1096,6 +1136,9 @@ impl Drop for PlaySession {
     fn drop(&mut self) {
         if let Some(mut physics) = self.physics.take() {
             let _ = physics.shutdown();
+        }
+        if let Some(mut network) = self.network.take() {
+            network.shutdown();
         }
         if let Some(mut audio) = self.audio.take() {
             audio.shutdown();

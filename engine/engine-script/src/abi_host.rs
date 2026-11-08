@@ -18,8 +18,9 @@ use engine_physics::Ray;
 use engine_project::InputActionKind;
 use engine_scene::{
     AmbientOcclusionQuality, AnimationRequest, AntiAliasing, AudioGroup, AudioRequest,
-    CameraColorSettings, CameraRenderSettings, CameraSettings, ClipParams, ExposureMode,
-    ObjectHandle, ParamValue, PostProcessSettings, ProjectionSettings, Tonemapper, VoiceId,
+    CameraColorSettings, CameraRenderSettings, CameraSettings, ClipParams, ExposureMode, NetEvent,
+    NetMode, NetTarget, ObjectHandle, ParamValue, PeerId, PostProcessSettings, ProjectionSettings,
+    Tonemapper, VoiceId,
 };
 use glam::Vec3;
 use rve_sdk::PhysicalInput;
@@ -27,11 +28,14 @@ use rve_sdk::abi::{
     RVE_ACTION_AXIS, RVE_ACTION_BUTTON, RVE_ACTION_VECTOR2, RVE_ANTI_ALIASING_DLSS,
     RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE, RVE_ANTI_ALIASING_TAA,
     RVE_INPUT_DOWN, RVE_INPUT_MAX_BINDINGS, RVE_INPUT_PRESSED, RVE_INPUT_RELEASED, RVE_LOG_ERROR,
-    RVE_LOG_INFO, RVE_LOG_WARN, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
-    RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
-    RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent, RveCursorState, RveGamepadState,
-    RveHost, RveParamEntry, RveParams, RveRaycastHit, RveScriptDesc, RveStatus, RveStr, RveTime,
-    RveTransform, RveValue, RveValueData,
+    RVE_LOG_INFO, RVE_LOG_WARN, RVE_NET_EVENT_MESSAGE, RVE_NET_EVENT_PEER_CONNECTED,
+    RVE_NET_EVENT_PEER_DISCONNECTED, RVE_NET_INVALID_INPUT, RVE_NET_MODE_CLIENT, RVE_NET_MODE_HOST,
+    RVE_NET_MODE_OFFLINE, RVE_NET_MODE_SERVER, RVE_NET_OK, RVE_NET_REJECTED, RVE_NET_TARGET_ALL,
+    RVE_NET_TARGET_PEER, RVE_NET_TARGET_SERVER, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL,
+    RVE_TONEMAPPER_NONE, RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT,
+    RVE_VALUE_STR, RveArray, RveCameraSettings, RveCharacterMoveResult, RveCollisionEvent,
+    RveCursorState, RveGamepadState, RveHost, RveNetEvent, RveParamEntry, RveParams, RveRaycastHit,
+    RveScriptDesc, RveStatus, RveStr, RveTime, RveTransform, RveValue, RveValueData,
 };
 use rve_sdk::abi::{
     RVE_AO_QUALITY_HIGH, RVE_AO_QUALITY_LOW, RVE_AO_QUALITY_MEDIUM, RVE_AUDIO_GROUP_AMBIENT,
@@ -221,6 +225,16 @@ impl<'a> AbiCallContext<'a> {
             gamepad_rumble: Some(host_gamepad_rumble),
             get_post_process: Some(host_get_post_process),
             set_post_process: Some(host_set_post_process),
+            net_mode: Some(host_net_mode),
+            net_local_peer: Some(host_net_local_peer),
+            net_peers: Some(host_net_peers),
+            net_send: Some(host_net_send),
+            net_object_id: Some(host_net_object_id),
+            net_object_owner: Some(host_net_object_owner),
+            net_object_is_owner: Some(host_net_object_is_owner),
+            net_object_has_authority: Some(host_net_object_has_authority),
+            net_object_set_owner: Some(host_net_object_set_owner),
+            net_object_send: Some(host_net_object_send),
         }
     }
 
@@ -374,6 +388,78 @@ impl AbiScriptInstance {
             let host = context.host(time);
             // SAFETY: message data, instance, and host remain live throughout the callback.
             unsafe { (self.descriptor.message)(self.instance, &host, sender, name, &value.value) }
+        };
+        context.callback_result(status)
+    }
+
+    /// Есть ли у дескриптора callback сетевых событий (ABI v13).
+    pub(crate) fn has_net_event(&self) -> bool {
+        self.descriptor.net_event.is_some()
+    }
+
+    /// Вызывает сетевой callback гостя. Без него (дескриптор до v13) событие пропускается без ошибки.
+    pub(crate) fn invoke_net_event(
+        &mut self,
+        time: ScriptTime,
+        event: &NetEvent,
+        call: AbiScriptCall<'_>,
+    ) -> Result<(), String> {
+        let Some(callback) = self.descriptor.net_event else {
+            return Ok(());
+        };
+        let (kind, peer, name, reason, value) = match event {
+            NetEvent::Message {
+                peer, name, value, ..
+            } => (
+                RVE_NET_EVENT_MESSAGE,
+                *peer,
+                RveStr::from_str_ref(name),
+                RveStr::empty(),
+                Some(OwnedAbiValue::new(value)),
+            ),
+            NetEvent::PeerConnected { peer } => (
+                RVE_NET_EVENT_PEER_CONNECTED,
+                *peer,
+                RveStr::empty(),
+                RveStr::empty(),
+                None,
+            ),
+            NetEvent::PeerDisconnected { peer, reason } => (
+                RVE_NET_EVENT_PEER_DISCONNECTED,
+                *peer,
+                RveStr::empty(),
+                RveStr::from_str_ref(reason),
+                None,
+            ),
+        };
+        let command_access = AbiCommandAccess {
+            commands: call.commands,
+            generation: call.commands_generation,
+            owner: call.command_owner,
+            allowed: call.commands_allowed && self.descriptor.command.is_some(),
+        };
+        let mut context = AbiCallContext::with_commands(
+            call.self_object,
+            call.transaction,
+            call.events,
+            call.source,
+            command_access,
+        );
+        let status = {
+            let host = context.host(time);
+            let value = value
+                .as_ref()
+                .map_or(std::ptr::null(), |value| &value.value as *const RveValue);
+            let event = RveNetEvent {
+                kind,
+                peer,
+                name,
+                value,
+                reason,
+            };
+            // SAFETY: the event, its borrowed strings and value, the instance, and the host remain
+            // live throughout the callback.
+            unsafe { callback(self.instance, &host, event) }
         };
         context.callback_result(status)
     }
@@ -1999,6 +2085,252 @@ unsafe extern "C" fn host_broadcast(
     })
 }
 
+fn net_mode_code(mode: NetMode) -> u32 {
+    match mode {
+        NetMode::Offline => RVE_NET_MODE_OFFLINE,
+        NetMode::Host => RVE_NET_MODE_HOST,
+        NetMode::Server => RVE_NET_MODE_SERVER,
+        NetMode::Client => RVE_NET_MODE_CLIENT,
+    }
+}
+
+/// Адресат из кода `RVE_NET_TARGET_*` и номера участника.
+fn net_target(kind: u32, peer: u32) -> Result<NetTarget, String> {
+    match kind {
+        RVE_NET_TARGET_SERVER => Ok(NetTarget::Server),
+        RVE_NET_TARGET_ALL => Ok(NetTarget::All),
+        RVE_NET_TARGET_PEER => Ok(NetTarget::Peer(peer as PeerId)),
+        other => Err(format!("unknown network target code {other}")),
+    }
+}
+
+/// Переводит результат сетевой операции в код ABI. Ошибка пишется в журнал скрипта и в ответ гостю.
+fn net_result(context: &mut AbiCallContext<'_>, result: Result<(), String>, invalid: bool) -> u32 {
+    match result {
+        Ok(()) => RVE_NET_OK,
+        Err(message) => {
+            context.events.borrow_mut().push(ScriptEvent {
+                level: ScriptEventLevel::Error,
+                source: context.source.to_owned(),
+                message: message.clone(),
+            });
+            context.error = Some(message);
+            if invalid {
+                RVE_NET_INVALID_INPUT
+            } else {
+                RVE_NET_REJECTED
+            }
+        }
+    }
+}
+
+/// Живой объект сетевого вызова. Мёртвый или pending объект даёт `None` без ошибки.
+fn net_object(context: &mut AbiCallContext<'_>, object: u64) -> Option<ObjectHandle> {
+    match context.transaction.abi_object(object) {
+        AbiObject::Alive(handle) => Some(handle),
+        AbiObject::Unavailable => None,
+        AbiObject::Malformed => {
+            context.error = Some("network call received an unknown object handle".to_owned());
+            None
+        }
+    }
+}
+
+unsafe extern "C" fn host_net_mode(ctx: *mut c_void) -> u32 {
+    guarded(ctx, RVE_NET_MODE_OFFLINE, |context| {
+        net_mode_code(context.transaction.net_mode())
+    })
+}
+
+unsafe extern "C" fn host_net_local_peer(ctx: *mut c_void) -> u32 {
+    guarded(ctx, 0, |context| context.transaction.net_local_peer())
+}
+
+unsafe extern "C" fn host_net_peers(
+    ctx: *mut c_void,
+    out: *mut u32,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    guarded(ctx, false, |context| {
+        if count.is_null() || (capacity > 0 && out.is_null()) {
+            return false;
+        }
+        let peers = context.transaction.net_peers();
+        // SAFETY: the guest passes a writable count slot, checked above.
+        unsafe { *count = peers.len() };
+        for (index, peer) in peers.iter().take(capacity).enumerate() {
+            // SAFETY: `index` is below `capacity`, and the guest allocated `capacity` entries.
+            unsafe { out.add(index).write(*peer) };
+        }
+        true
+    })
+}
+
+/// Общая часть `send` и `net_send`: имя и значение проверяются по тем же лимитам, что у `rve.send`.
+fn net_send_request(
+    context: &mut AbiCallContext<'_>,
+    object: Option<ObjectHandle>,
+    target: (u32, u32),
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32 {
+    if name.len > MAX_MESSAGE_NAME_BYTES {
+        return net_result(
+            context,
+            Err(format!(
+                "message name exceeds {MAX_MESSAGE_NAME_BYTES} bytes"
+            )),
+            true,
+        );
+    }
+    let name = match unsafe { read_abi_str(name) } {
+        Ok(name) => name,
+        Err(error) => {
+            return net_result(
+                context,
+                Err(format!("invalid message name: {error:?}")),
+                true,
+            );
+        }
+    };
+    // SAFETY: `value` is provided by the guest for the duration of this ABI callback.
+    let (value, _) = match unsafe { read_message_value(value) } {
+        Ok(value) => value,
+        Err(error) => return net_result(context, Err(error), true),
+    };
+    let target = match net_target(target.0, target.1) {
+        Ok(target) => target,
+        Err(error) => return net_result(context, Err(error), true),
+    };
+    let result = context
+        .transaction
+        .send_net(object, name, value, target, reliable);
+    net_result(context, result, false)
+}
+
+unsafe extern "C" fn host_net_send(
+    ctx: *mut c_void,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32 {
+    guarded(ctx, RVE_NET_REJECTED, |context| {
+        net_send_request(context, None, (target_kind, peer), name, value, reliable)
+    })
+}
+
+unsafe extern "C" fn host_net_object_id(ctx: *mut c_void, object: u64, out: *mut u32) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = net_object(context, object) else {
+            return false;
+        };
+        let Some(state) = context.transaction.net_object(handle) else {
+            return false;
+        };
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: the guest owns the output slot for this call; null was rejected above.
+        unsafe { *out = state.net_id.get() };
+        true
+    })
+}
+
+unsafe extern "C" fn host_net_object_owner(ctx: *mut c_void, object: u64, out: *mut u32) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = net_object(context, object) else {
+            return false;
+        };
+        let Some(owner) = context
+            .transaction
+            .net_object(handle)
+            .and_then(|state| state.owner)
+        else {
+            return false;
+        };
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: the guest owns the output slot for this call; null was rejected above.
+        unsafe { *out = owner };
+        true
+    })
+}
+
+unsafe extern "C" fn host_net_object_is_owner(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut bool,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = net_object(context, object) else {
+            return false;
+        };
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: the guest owns the output slot for this call; null was rejected above.
+        unsafe { *out = context.transaction.net_is_owner(handle) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_net_object_has_authority(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut bool,
+) -> bool {
+    guarded(ctx, false, |context| {
+        let Some(handle) = net_object(context, object) else {
+            return false;
+        };
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: the guest owns the output slot for this call; null was rejected above.
+        unsafe { *out = context.transaction.net_has_authority(handle) };
+        true
+    })
+}
+
+unsafe extern "C" fn host_net_object_set_owner(ctx: *mut c_void, object: u64, peer: u32) -> u32 {
+    guarded(ctx, RVE_NET_REJECTED, |context| {
+        let Some(handle) = net_object(context, object) else {
+            return RVE_NET_OK;
+        };
+        let result = context.transaction.set_net_owner(handle, peer as PeerId);
+        net_result(context, result, false)
+    })
+}
+
+unsafe extern "C" fn host_net_object_send(
+    ctx: *mut c_void,
+    object: u64,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32 {
+    guarded(ctx, RVE_NET_REJECTED, |context| {
+        let Some(handle) = net_object(context, object) else {
+            return RVE_NET_OK;
+        };
+        net_send_request(
+            context,
+            Some(handle),
+            (target_kind, peer),
+            name,
+            value,
+            reliable,
+        )
+    })
+}
+
 unsafe extern "C" fn host_key_state(ctx: *mut c_void, key: u32) -> u32 {
     guarded(ctx, 0, |context| context.transaction.input().key_state(key))
 }
@@ -2615,6 +2947,8 @@ mod tests {
             queued_audio: 0,
             queued_animation: 0,
             queued_rumble: 0,
+            net: Default::default(),
+            queued_net: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -2713,6 +3047,8 @@ mod tests {
             queued_audio: 0,
             queued_animation: 0,
             queued_rumble: 0,
+            net: Default::default(),
+            queued_net: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -2790,6 +3126,8 @@ mod tests {
             queued_audio: 0,
             queued_rumble: 0,
             queued_animation: 0,
+            net: Default::default(),
+            queued_net: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -2881,6 +3219,8 @@ mod tests {
             queued_audio: 0,
             queued_rumble: 0,
             queued_animation: 0,
+            net: Default::default(),
+            queued_net: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -2924,6 +3264,8 @@ mod tests {
             queued_audio: 0,
             queued_rumble: 0,
             queued_animation: 0,
+            net: Default::default(),
+            queued_net: 0,
             physics: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::physics::PhysicsScriptState::default(),
             )),
@@ -2963,6 +3305,7 @@ mod tests {
                 &mut queued_bytes,
                 &events,
                 &mut audio,
+                &mut Vec::new(),
                 &mut Vec::new(),
                 &mut Vec::new(),
             )

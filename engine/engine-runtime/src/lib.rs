@@ -11,9 +11,11 @@ mod cursor;
 #[cfg(any(feature = "dev-console", test))]
 mod dev_overlays;
 mod hardware;
+mod headless;
 mod input;
 mod layout;
 mod module_host;
+mod net;
 mod pipeline;
 mod player;
 mod prefabs;
@@ -21,7 +23,7 @@ mod profiling;
 mod scene;
 
 use activation::{ActivationFailure, InstanceOutcome, PendingActivation, acquire_or_activate};
-use cli::{PlayerArgs, USAGE};
+use cli::{PlayerArgs, SERVER_USAGE, USAGE};
 #[cfg(feature = "dev-console")]
 use console::{CommandCatalogSnapshot, ConsoleUiSlot};
 use cursor::CursorControl;
@@ -30,6 +32,7 @@ use engine_assets::{Assets, TextureData};
 use engine_console::ConsoleBuffer;
 use engine_console::install_logger;
 use engine_files::VirtualPath;
+use engine_network::{NetworkEngine, NetworkHandle};
 use engine_physics::{
     PhysicsClient, PhysicsInitialization, PhysicsRequest, PhysicsServer, StepDriver,
 };
@@ -39,21 +42,24 @@ use engine_render::{DebugView, probe_devices};
 use engine_resources::{ResourceConfig, ResourceHandle, ResourceSystem};
 use engine_script::{PrefabCatalog, PrefabKind, PrefabSpec, ScriptInterruptHandle};
 use engine_window::{RedrawMode, WindowConfig, WindowIcon};
-use hardware::hardware_issues;
+use hardware::{hardware_issues, memory_and_cpu_issues};
+use headless::{run_resource_responder, spawn_quit_listener};
 use layout::{
     Layout, PrefabCatalogLocation, ProjectSettingsLocation, normalize_layout_path,
-    normalize_scripts_path, release_root,
+    normalize_scripts_path, release_root, server_release_root,
 };
 use module_host::ModuleHost;
+use net::{NetworkSession, prepare};
 use pipeline::{
-    Clock, MonotonicClock, RuntimeStatus, SCRIPTS_THREAD, ScriptStartupError, ScriptThreadConfig,
-    start_scripts,
+    Clock, MonotonicClock, RuntimeStatus, SCRIPTS_THREAD, ScriptControl, ScriptStartupError,
+    ScriptThreadConfig, start_scripts,
 };
 use prefabs::{RenderResourceRequest, start_prefab_loader};
 use profiling::StartupProfile;
 use scene::{PreparedScene, load_scene};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{CpuRefreshKind, System};
@@ -94,9 +100,45 @@ pub fn run_player() -> ExitCode {
     unsafe { engine_platform::prepare_vulkan_environment(&release_root) };
     let activation = PendingActivation::default();
     #[cfg(feature = "dev-console")]
-    return run_from_args(release_root, args, activation, console_buffer);
+    return run_from_args(release_root, args, false, activation, console_buffer);
     #[cfg(not(feature = "dev-console"))]
-    run_from_args(release_root, args, activation)
+    run_from_args(release_root, args, false, activation)
+}
+
+/// Runs a dedicated headless server (`rve-server`): no window, renderer, GPU probe or audio output.
+/// Scripts run in background ticks at `[network].tick_hz`. Stops on `--frames`, `quit` on stdin,
+/// or a fatal error.
+pub fn run_server() -> ExitCode {
+    let args = match PlayerArgs::parse_server(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("Ошибка аргументов: {error}");
+            eprintln!("{SERVER_USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let _ = install_logger(None);
+    let release_root = match executable_dir() {
+        Ok(exe_dir) => server_release_root(&exe_dir),
+        Err(error) => {
+            return fail(
+                2,
+                format!("не удалось определить каталог исполняемого файла: {error}"),
+            );
+        }
+    };
+    #[cfg(feature = "dev-console")]
+    let console_buffer = Arc::new(Mutex::new(ConsoleBuffer::default()));
+    #[cfg(feature = "dev-console")]
+    return run_from_args(
+        release_root,
+        args,
+        true,
+        PendingActivation::default(),
+        console_buffer,
+    );
+    #[cfg(not(feature = "dev-console"))]
+    run_from_args(release_root, args, true, PendingActivation::default())
 }
 
 fn executable_dir() -> Result<PathBuf, String> {
@@ -108,9 +150,12 @@ fn executable_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "путь исполняемого файла не содержит родительский каталог".to_owned())
 }
 
+/// Общий путь запуска игры (`rve-player`) и выделенного сервера (`headless`). Окно, renderer, проверка
+/// Vulkan, иконка, экземпляр и звуковой вывод есть только у игры.
 fn run_from_args(
     release_root: PathBuf,
     args: PlayerArgs,
+    headless: bool,
     activation: PendingActivation,
     #[cfg(feature = "dev-console")] console_buffer: Arc<Mutex<ConsoleBuffer>>,
 ) -> ExitCode {
@@ -179,7 +224,7 @@ fn run_from_args(
     let fsr_library = layout.fsr_library_path(project.runtime.fsr_library.as_deref());
     let dlss_library = layout.dlss_library_path(project.runtime.dlss_library.as_deref());
 
-    if !bootstrap.allow_multiple_instances {
+    if !headless && !bootstrap.allow_multiple_instances {
         let outcome = acquire_or_activate(
             || {
                 let activation = activation.clone();
@@ -222,17 +267,24 @@ fn run_from_args(
     system.refresh_cpu_list(CpuRefreshKind::nothing());
     let total_ram_mb = system.total_memory() / (1024 * 1024);
     let logical_cpus = system.cpus().len();
-    let reports = probe_devices().map_err(|error| error.to_string());
-    let issues = hardware_issues(
-        reports.as_deref().map_err(String::as_str),
-        total_ram_mb,
-        logical_cpus,
-        &project.requirements,
-    );
+    let issues = if headless {
+        // Серверу нужны RAM и CPU; Vulkan-устройство для него не требуется.
+        memory_and_cpu_issues(total_ram_mb, logical_cpus, &project.requirements)
+    } else {
+        let reports = probe_devices().map_err(|error| error.to_string());
+        hardware_issues(
+            reports.as_deref().map_err(String::as_str),
+            total_ram_mb,
+            logical_cpus,
+            &project.requirements,
+        )
+    };
     if !issues.is_empty() {
         let message = issues.join("\n");
         log::error!("{message}");
-        engine_platform::show_error_dialog("RVE: системные требования", &message);
+        if !headless {
+            engine_platform::show_error_dialog("RVE: системные требования", &message);
+        }
         if let Err(error) = resources.shutdown() {
             log::error!("Ошибка завершения ресурсного сервиса: {error}");
         }
@@ -243,9 +295,13 @@ fn run_from_args(
     startup.record("hardware probe", phase_started.elapsed());
     phase_started = Instant::now();
     let assets = Assets::with_resources(resource_handle.clone());
-    let icon = match load_window_icon(&bootstrap, &assets) {
-        Ok(icon) => icon,
-        Err(error) => return fail(2, format!("ошибка иконки приложения: {error}")),
+    let icon = if headless {
+        None
+    } else {
+        match load_window_icon(&bootstrap, &assets) {
+            Ok(icon) => icon,
+            Err(error) => return fail(2, format!("ошибка иконки приложения: {error}")),
+        }
     };
     startup.record("window icon", phase_started.elapsed());
     phase_started = Instant::now();
@@ -278,6 +334,43 @@ fn run_from_args(
 
     startup.record("physics build", phase_started.elapsed());
     phase_started = Instant::now();
+    let network = if args.network.is_requested() {
+        let plan = match prepare(&args.network, &project, prepared.scene_hash, headless) {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Err(error) = resources.shutdown() {
+                    log::error!("Ошибка завершения ресурсного сервиса: {error}");
+                }
+                drop(instance_lock.take());
+                return fail(2, format!("ошибка сетевых настроек: {error}"));
+            }
+        };
+        match NetworkEngine::new(plan.config) {
+            Ok((engine, handle)) => Some((
+                engine,
+                NetworkSession {
+                    handle,
+                    bridge: plan.bridge,
+                },
+            )),
+            Err(error) => {
+                if let Err(error) = resources.shutdown() {
+                    log::error!("Ошибка завершения ресурсного сервиса: {error}");
+                }
+                drop(instance_lock.take());
+                return fail(1, format!("не удалось запустить сеть: {error}"));
+            }
+        }
+    } else {
+        None
+    };
+    let (network_engine, network_session) = match network {
+        Some((engine, session)) => (
+            Some((engine, NetworkHandle::clone(&session.handle))),
+            Some(session),
+        ),
+        None => (None, None),
+    };
     let mut modules = ModuleHost::new();
     let status = Arc::new(RuntimeStatus::default());
     let (physics_client, audio_handle) = match start_modules(
@@ -285,6 +378,8 @@ fn run_from_args(
         physics_driver,
         Arc::clone(&status),
         resource_handle.clone(),
+        !headless,
+        network_engine,
     ) {
         Ok(started) => started,
         Err(error) => {
@@ -303,6 +398,7 @@ fn run_from_args(
         sources,
         render_assets,
         prefabs,
+        ..
     } = prepared;
     let (script_tx, script_rx) = flume::unbounded();
     let (frame_tx, frame_rx) = flume::bounded(1);
@@ -329,6 +425,11 @@ fn run_from_args(
     let input = Arc::new(Mutex::new(input::InputAccumulator::default()));
     let cursor = CursorControl::default();
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
+    if headless {
+        // Сервер без render thread работает фоновыми тиками с пустой GPU-таблицей.
+        let _ = script_tx.send(ScriptControl::Background(true));
+        let _ = script_tx.send(ScriptControl::Go(Box::default()));
+    }
     let script_thread = match start_scripts(
         &mut modules,
         world,
@@ -341,7 +442,12 @@ fn run_from_args(
             script_module: None,
             interrupt: interrupt.clone(),
             clock,
-            background_tick_hz: project.runtime.background_tick_hz,
+            background_tick_hz: if headless {
+                project.network.tick_hz
+            } else {
+                project.runtime.background_tick_hz
+            },
+            gamepad_devices: !headless,
             control_tx: script_tx.clone(),
             control_rx: script_rx,
             frame_tx,
@@ -356,6 +462,8 @@ fn run_from_args(
             physics_geometry,
             prefab_loader: prefab_loader_tx,
             render_resources: resource_tx.clone(),
+            network: network_session,
+            frame_limit: if headless { args.frames } else { None },
             #[cfg(feature = "dev-console")]
             command_catalog: Arc::clone(&command_catalog),
         },
@@ -392,56 +500,66 @@ fn run_from_args(
         return fail(code, message);
     }
 
-    let pipeline_cache_path = engine_platform::pipeline_cache_path(&project.name);
-    let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
-    let title = bootstrap.window_title.unwrap_or(project.name);
-    let default_window = WindowConfig::default();
-    let config = WindowConfig {
-        title,
-        width: bootstrap.window_size_x.unwrap_or(default_window.width),
-        height: bootstrap.window_size_y.unwrap_or(default_window.height),
-        icon,
-        redraw: RedrawMode::OnDemand,
-    };
     startup.record("scripts ready", phase_started.elapsed());
-    let code = player::run_window(
-        player::PlayerConfig {
-            window: config,
-            present_mode: bootstrap.present_mode,
-            reflex: bootstrap.reflex,
-            pipeline_cache_path,
-            fsr_library,
-            dlss_library,
-            dlss_project_id: project.runtime.dlss_project_id,
-            dlss_application_id: project.runtime.dlss_application_id,
-            dlss_engine_version: project.runtime.dlss_engine_version,
-            pipeline_cache,
-            frame_limit: args.frames,
-            debug_view,
-            render_assets,
-            activation,
-            cursor,
+    let code = if headless {
+        run_headless(
+            &mut modules,
+            &status,
+            resource_rx,
             script_tx,
-            render_tx,
-            render_rx,
-            frame_rx,
-            resources: resource_rx,
-            prefab_loader_stopped_rx,
-            script_stopped_rx: script_thread.stopped,
-            interrupt,
-            status: Arc::clone(&status),
-            resource_stats: resource_handle.clone(),
-            startup,
-            input,
-            #[cfg(feature = "dev-console")]
-            console_buffer,
-            #[cfg(feature = "dev-console")]
-            command_catalog,
-            #[cfg(feature = "dev-console")]
-            console_ui,
-        },
-        &mut modules,
-    );
+            script_thread.stopped,
+        )
+    } else {
+        let pipeline_cache_path = engine_platform::pipeline_cache_path(&project.name);
+        let pipeline_cache = engine_platform::load_pipeline_cache(pipeline_cache_path.as_deref());
+        let title = bootstrap.window_title.unwrap_or(project.name);
+        let default_window = WindowConfig::default();
+        let config = WindowConfig {
+            title,
+            width: bootstrap.window_size_x.unwrap_or(default_window.width),
+            height: bootstrap.window_size_y.unwrap_or(default_window.height),
+            icon,
+            redraw: RedrawMode::OnDemand,
+        };
+        player::run_window(
+            player::PlayerConfig {
+                window: config,
+                present_mode: bootstrap.present_mode,
+                reflex: bootstrap.reflex,
+                pipeline_cache_path,
+                fsr_library,
+                dlss_library,
+                dlss_project_id: project.runtime.dlss_project_id,
+                dlss_application_id: project.runtime.dlss_application_id,
+                dlss_engine_version: project.runtime.dlss_engine_version,
+                pipeline_cache,
+                frame_limit: args.frames,
+                debug_view,
+                render_assets,
+                activation,
+                cursor,
+                script_tx,
+                render_tx,
+                render_rx,
+                frame_rx,
+                resources: resource_rx,
+                prefab_loader_stopped_rx,
+                script_stopped_rx: script_thread.stopped,
+                interrupt,
+                status: Arc::clone(&status),
+                resource_stats: resource_handle.clone(),
+                startup,
+                input,
+                #[cfg(feature = "dev-console")]
+                console_buffer,
+                #[cfg(feature = "dev-console")]
+                command_catalog,
+                #[cfg(feature = "dev-console")]
+                console_ui,
+            },
+            &mut modules,
+        )
+    };
     let mut code = code;
     for error in modules.shutdown() {
         log::error!("Ошибка завершения модуля: {error}");
@@ -528,6 +646,9 @@ fn scripts_ready_result(
         Ok(Err(ScriptStartupError::Physics(error))) => {
             Err((1, format!("ошибка запуска физики: {error}")))
         }
+        Ok(Err(ScriptStartupError::Network(error))) => {
+            Err((1, format!("ошибка запуска сетевого моста: {error}")))
+        }
         Ok(Err(ScriptStartupError::Panic(error))) => Err((1, error)),
         Err(error) => Err((1, format!("поток скриптов не подтвердил запуск: {error}"))),
     }
@@ -606,10 +727,12 @@ fn start_modules(
     physics_driver: StepDriver,
     status: Arc<RuntimeStatus>,
     resources: ResourceHandle,
+    audio_output: bool,
+    network: Option<(NetworkEngine, NetworkHandle)>,
 ) -> std::io::Result<(PhysicsClient, engine_audio::AudioHandle)> {
     let (audio, audio_handle) = engine_audio::AudioEngine::new(engine_audio::AudioConfig {
         resources: Some(resources),
-        output: true,
+        output: audio_output,
     });
     let audio_stop = audio_handle.clone();
     modules.spawn(
@@ -639,17 +762,6 @@ fn start_modules(
         },
     )?;
 
-    let (network_tx, network_rx) = std::sync::mpsc::channel();
-    modules.spawn(
-        "rve-network",
-        move || {
-            let _ = network_tx.send(());
-        },
-        move || {
-            engine_network::NetworkEngine::new().run(network_rx);
-        },
-    )?;
-
     let (neural_tx, neural_rx) = std::sync::mpsc::channel();
     modules.spawn(
         "rve-neural",
@@ -660,10 +772,49 @@ fn start_modules(
             engine_neural::NeuralEngine::new().run(neural_rx);
         },
     )?;
+    if let Some((engine, handle)) = network {
+        modules.spawn(
+            "rve-network",
+            move || handle.shutdown(),
+            move || engine.run(),
+        )?;
+    }
     Ok((
         PhysicsClient::new_preinitialized(physics_request_tx, physics_reply_rx),
         audio_handle,
     ))
+}
+
+/// Ждёт завершения scripts thread. Оно наступает по `--frames`, строке `quit`, фатальной ошибке
+/// любого потока или Ctrl+C (процесс завершается без `on_destroy`). Код выхода берётся из
+/// `RuntimeStatus`; ответчик ресурсов и чтение stdin работают, пока не остановит `ModuleHost`.
+fn run_headless(
+    modules: &mut ModuleHost,
+    status: &RuntimeStatus,
+    requests: flume::Receiver<RenderResourceRequest>,
+    script_tx: flume::Sender<ScriptControl>,
+    stopped: std::sync::mpsc::Receiver<()>,
+) -> u8 {
+    let responder_stop = Arc::new(AtomicBool::new(false));
+    let responder_flag = Arc::clone(&responder_stop);
+    let responder_tx = script_tx.clone();
+    if let Err(error) = modules.spawn(
+        "rve-headless-resources",
+        move || responder_flag.store(true, Ordering::Release),
+        move || run_resource_responder(requests, responder_tx, responder_stop),
+    ) {
+        log::error!("не удалось запустить ответчик ресурсов: {error}");
+        return 1;
+    }
+    if let Err(error) = spawn_quit_listener(script_tx) {
+        log::error!("не удалось читать команды из stdin: {error}");
+        return 1;
+    }
+    let _ = stopped.recv();
+    if let Some(message) = status.failure_message() {
+        log::error!("{message}");
+    }
+    status.exit_code()
 }
 
 fn fail(code: u8, message: impl AsRef<str>) -> ExitCode {

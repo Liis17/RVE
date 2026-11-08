@@ -6,7 +6,7 @@
 
 use engine_files::VirtualPath;
 use engine_physics::BodyHandle;
-use engine_scene::{ObjectHandle, PrefabTemplate, SpawnOptions};
+use engine_scene::{ObjectHandle, PrefabTemplate, SpawnOptions, World};
 use glam::Vec3;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -153,6 +153,8 @@ pub(crate) struct SpawnRequest {
     pub(crate) prefab: String,
     pub(crate) args: SpawnArgs,
     pub(crate) source: String,
+    /// Заявка от скрипта, а не от сетевого моста: клиенту скрипт не создаёт сетевые префабы.
+    pub(crate) from_script: bool,
 }
 
 /// Заявка на удаление поддерева. `due = None` — в конце текущей фазы.
@@ -411,6 +413,78 @@ impl Lifecycle {
 }
 
 /// Допустимый авторский id spawn-объекта: `[A-Za-z0-9_-]{1,64}`.
+/// Проверяет заявку spawn до резервирования корня: префаб и его статус, лимит кадра, параметры
+/// и явный id. `pending_spawns` и `pending_ids` описывают заявки, уже принятые в этом вызове.
+pub(crate) fn check_spawn_request(
+    world: &World,
+    lifecycle: &Lifecycle,
+    pending_spawns: usize,
+    pending_ids: &HashMap<String, ObjectHandle>,
+    prefab: &str,
+    args: &SpawnArgs,
+) -> Result<(), String> {
+    let slot = lifecycle.prefabs.get(prefab).ok_or_else(|| {
+        format!(
+            "prefab {:?} is not in the project prefab list",
+            prefab_display(prefab)
+        )
+    })?;
+    if slot.status == PrefabStatus::Failed {
+        return Err(format!(
+            "prefab {:?} failed to load",
+            prefab_display(prefab)
+        ));
+    }
+    if slot.kind == PrefabKind::Fast && slot.template.is_none() {
+        return Err(format!(
+            "prefab {:?} is not registered",
+            prefab_display(prefab)
+        ));
+    }
+    if lifecycle.queued.len() + lifecycle.waiting.len() + pending_spawns
+        >= MAX_SPAWNED_OBJECTS_PER_FRAME
+    {
+        return Err(format!(
+            "spawn requests limit ({MAX_SPAWNED_OBJECTS_PER_FRAME} per frame) reached"
+        ));
+    }
+    let options = &args.options;
+    if [options.position, options.rotation_deg, options.scale]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+        || args.velocity.is_some_and(|value| !value.is_finite())
+    {
+        return Err("spawn transform and velocity must be finite".to_owned());
+    }
+    if let Some(parent) = options.parent
+        && !world.is_alive(parent)
+    {
+        return Err("spawn parent must be an existing object".to_owned());
+    }
+    if options
+        .name
+        .as_ref()
+        .is_some_and(|name| name.len() > MAX_SPAWN_NAME_BYTES)
+    {
+        return Err(format!(
+            "spawn name must be at most {MAX_SPAWN_NAME_BYTES} bytes"
+        ));
+    }
+    if let Some(id) = &options.id {
+        if !valid_spawn_id(id) {
+            return Err(format!("spawn id {id:?} must match [A-Za-z0-9_-]{{1,64}}"));
+        }
+        if world.handle(id).is_some()
+            || pending_ids.contains_key(id)
+            || lifecycle.pending_ids.contains_key(id)
+        {
+            return Err(format!("object id {id:?} is already used"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn valid_spawn_id(id: &str) -> bool {
     (1..=64).contains(&id.len())
         && id

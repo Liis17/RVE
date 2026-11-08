@@ -20,7 +20,8 @@ Parent: [[Index]]
 | `engine/engine-scene/src/prefab.rs` | `PrefabInstance`, `PrefabOverride`, `expand`, `Expansion`, `PrefabTemplate` | Экземпляры префабов, component overrides, раскрытие в плоский документ и шаблон spawn-префаба |
 | `engine/engine-scene/src/params.rs` | `ParamSchema`, `ParamSpec`, `ParamKind` | Схема параметров скрипта и разрешение значений экземпляра |
 | `engine/engine-scene/src/world.rs` | `ObjectHandle`, `World`, `WorldObject`, `SpawnOptions`, `SceneFrame`, `EnvironmentState`, `SceneWarning` | Хендлы с поколениями, runtime-объекты, spawn/despawn, топологический порядок, мировые матрицы и кэш мировых вращений, источник/ориентация окружения и данные кадра |
-| `engine/engine-scene/Cargo.toml` | зависимости крейта | glam, engine-files, serde и toml; нет renderer/script/оконных API |
+| `engine/engine-scene/src/network.rs` | `NetworkIdentityComponent`, `NetworkTransformComponent`, `NetId`, `scene_net_id`, `NetRequest`, `NetEvent`, лимиты значений сообщения | Сетевые компоненты объектов и общие типы сетевого модуля; протокол — в [[Engine/EngineNetwork]] |
+| `engine/engine-scene/Cargo.toml` | зависимости крейта | glam, engine-files, blake3, serde и toml; нет renderer/script/оконных и сетевых API |
 
 ## Документ сцены `.rvescene`
 
@@ -124,6 +125,17 @@ Parent: [[Index]]
 - `World::animator(handle)` возвращает компонент. Prefab override заменяет компонент целиком, включая клипы.
 - `AnimationRequest` (`Play`, `SetWeight`, `SetParameter`, `SetSpeed`, `Stop`) — очередь запросов, которую скрипты ставят в транзакцию; состояние проигрывания живёт в [[Engine/EngineAnimation]].
 
+## Сетевые компоненты
+
+`network_identity` и `network_transform` — необязательные компоненты объекта (`engine-scene/src/network.rs`). Протокол, репликация и лимиты сети описаны в [[Engine/EngineNetwork]].
+
+- `network_identity` задаёт `authority`: `server` (по умолчанию) или `owner`. Значение по умолчанию не сериализуется, поэтому компонент без явного поля пишется как пустая таблица `[objects.network_identity]`.
+- `network_transform` требует `network_identity`. Поля: `sync_position` и `sync_rotation` (включены по умолчанию), `sync_scale` (выключен), `send_rate_hz` (1..=60, по умолчанию 20), `interpolate` (включено), `interpolation_delay_ms` (0..=1000, по умолчанию 100) и `snap_distance` (конечное число больше нуля, по умолчанию 5). Синхронизируется локальная трансформация. Значения по умолчанию в TOML не пишутся, поэтому сцены без сетевых компонентов сохраняются побайтово.
+- Prefab override заменяет компонент целиком; компоненты допустимы и в spawn-префабе.
+- `World::network_identity(handle)` и `World::network_transform(handle)` возвращают компоненты. Проверка документа (`SceneDocument::validate`) отвергает неверные диапазоны и `network_transform` без `network_identity`.
+- Сетевой id объекта сцены — `scene_net_id(id)`: BLAKE3 от строкового id с учётом класса. Два объекта с одинаковым сетевым id — ошибка сцены (`validate_scene_net_ids`).
+- Общие типы сети (`NetId`, `NetMode`, `NetTarget`, `NetRequest`, `NetEvent`, `NetAuthority`, `PeerId`) и лимиты значений сообщения (глубина, число элементов и суммарный размер строк) находятся в том же модуле. `engine-network` и `engine-script` используют их отсюда, поэтому между ними нет прямой зависимости.
+
 ## Runtime-контракты
 
 - `SceneDocument::validate` публичен: [[Engine/RveEditor]] проверяет им документ после каждой правки. Метод применяет те же правила, что `parse`, кроме проверки исходной записи virtual path в TOML.
@@ -146,7 +158,7 @@ Parent: [[Index]]
 
 ## Зависимости и размещение
 
-`engine-scene` зависит от glam, engine-files, serde и toml. `engine-render` не зависит от него и не принимает типы glam; runtime и скрипты также не являются зависимостями сцены. `engine-runtime` загружает `.rvescene` в `World` для `rve-player`; sandbox сохраняет собственную процедурную демонстрационную сцену. Поток загрузки игры описан в [[Engine/EngineRuntime]].
+`engine-scene` зависит от glam, engine-files, blake3, serde и toml. `engine-render` не зависит от него и не принимает типы glam; runtime и скрипты также не являются зависимостями сцены. `engine-runtime` загружает `.rvescene` в `World` для `rve-player`; sandbox сохраняет собственную процедурную демонстрационную сцену. Поток загрузки игры описан в [[Engine/EngineRuntime]].
 
 ## Эмиттер частиц
 

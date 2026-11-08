@@ -26,14 +26,15 @@ RVE — игровой движок на Rust с рабочим оконным �
 | [[Engine/EngineAudio]] | Звук: декодирование WAV/Ogg, микшер на `cpal`, мост сцены и Play |
 | [[Engine/EngineInput]] | Геймпады: `gilrs`-бэкенд, перевод событий, слоты 1–4, фокусный гейт снимка и вибрация |
 | [[Engine/EngineAnimation]] | Скелетная анимация: позы, клипы, blend tree, one-shot с переходом, палитры skinning и мост аниматоров |
+| [[Engine/EngineNetwork]] | Сеть: UDP-протокол с шифрованием и рукопожатием, sans-IO Server/Client, репликация объектов, снимки и мост к миру |
 | [[Engine/EngineConsole]] | Ограниченный буфер лога, команды и общий egui developer console |
 | [[Engine/RveSdk]] | C ABI и гостевой API для игровых Rust-скриптов в `cdylib` |
-| [[Engine/EngineRuntime]] | Runtime игры: layout проекта, потоки сцены, скриптов и рендера, быстрые и тяжёлые префабы, завершение и коды выхода |
+| [[Engine/EngineRuntime]] | Runtime игры: layout проекта, потоки сцены, скриптов и рендера, быстрые и тяжёлые префабы, сетевой режим и выделенный сервер `rve-server`, завершение и коды выхода |
 | [[Engine/RveBuild]] | Сборка релиза проекта в player и набор RVEPAK |
 | [[Engine/Sandbox]] | Пример приложения и CLI для проверки движка |
 | [[Engine/RveEditor]] | Графический редактор сцен на egui: панели, правки с undo, вьюпорт и Play |
 
-Пустые модули `engine-network` и `engine-neural` описаны в [[Architecture]]; отдельных заметок для них нет.
+Пустой модуль `engine-neural` описан в [[Architecture]]; отдельной заметки для него нет.
 
 ## Обновление памяти
 

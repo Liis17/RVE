@@ -11,7 +11,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use abi::{GamepadAxis, GamepadButton, Key, MouseButton, PhysicalInput};
 use abi::{
     RVE_ANTI_ALIASING_DLSS, RVE_ANTI_ALIASING_FSR, RVE_ANTI_ALIASING_FXAA, RVE_ANTI_ALIASING_NONE,
-    RVE_ANTI_ALIASING_TAA, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
+    RVE_ANTI_ALIASING_TAA, RVE_NET_INVALID_INPUT, RVE_NET_MODE_CLIENT, RVE_NET_MODE_HOST,
+    RVE_NET_MODE_SERVER, RVE_NET_OK, RVE_NET_TARGET_ALL, RVE_NET_TARGET_PEER,
+    RVE_NET_TARGET_SERVER, RVE_TONEMAPPER_ACES, RVE_TONEMAPPER_NEUTRAL, RVE_TONEMAPPER_NONE,
     RVE_VALUE_ARRAY, RVE_VALUE_BOOL, RVE_VALUE_FLOAT, RVE_VALUE_INT, RVE_VALUE_STR, RveArray,
     RveCameraSettings, RveCharacterMoveResult, RveHost, RveParams, RvePostProcessSettings,
     RveRaycastHit, RveStr, RveTime, RveTransform, RveValue, RveValueData,
@@ -360,6 +362,12 @@ pub trait Script: 'static {
     fn on_destroy(&mut self, _ctx: &mut Context<'_>) {}
     /// Called when a registered developer-console command is submitted.
     fn on_command(&mut self, _ctx: &mut Context<'_>, _name: &str, _args: &[&str]) {}
+    /// Called when a network message for this object or broadcast reaches the script.
+    fn on_net_message(&mut self, _ctx: &mut Context<'_>, _peer: u32, _name: &str, _value: &Value) {}
+    /// Called when a peer connects; delivered to every instance with this callback.
+    fn on_peer_connected(&mut self, _ctx: &mut Context<'_>, _peer: u32) {}
+    /// Called when a peer disconnects; delivered to every instance with this callback.
+    fn on_peer_disconnected(&mut self, _ctx: &mut Context<'_>, _peer: u32, _reason: &str) {}
 }
 
 /// Call-scoped access to the host and this script's object.
@@ -1108,6 +1116,11 @@ impl<'a> Context<'a> {
     /// Returns the input snapshot available during this callback.
     pub fn input(&self) -> Input<'_> {
         Input { host: self.host }
+    }
+
+    /// Network state and messaging. Methods return [`NetError::Unavailable`] without host callbacks.
+    pub fn net(&self) -> Net<'_> {
+        Net { host: self.host }
     }
 
     /// Returns physics queries available during this callback.
@@ -1924,14 +1937,231 @@ impl<'a> BorrowedAbiValue<'a> {
     }
 }
 
+/// Network mode seen by a guest script.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetMode {
+    /// No network: the local process is the only authority.
+    Offline,
+    /// Listen server: the local process is the server and also has a local player.
+    Host,
+    /// Dedicated server.
+    Server,
+    /// Client connected to a server.
+    Client,
+}
+
+/// Destination of a network message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetTarget {
+    /// The server.
+    Server,
+    /// Every connected peer.
+    All,
+    /// One peer by number.
+    Peer(u32),
+}
+
+/// Failure of a network call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetError {
+    /// The host does not provide network callbacks.
+    Unavailable,
+    /// The host refused the call in the current phase or state.
+    Rejected,
+    /// The name or value violates the message limits, or the target is not valid here.
+    InvalidInput,
+}
+
+impl std::fmt::Display for NetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "network callback is unavailable in this host",
+            Self::Rejected => "network operation was rejected by the host",
+            Self::InvalidInput => "network input violates the message limits or target rules",
+        })
+    }
+}
+
+impl std::error::Error for NetError {}
+
+fn net_status(status: u32) -> Result<(), NetError> {
+    match status {
+        RVE_NET_OK => Ok(()),
+        RVE_NET_INVALID_INPUT => Err(NetError::InvalidInput),
+        _ => Err(NetError::Rejected),
+    }
+}
+
+fn net_target(target: NetTarget) -> (u32, u32) {
+    match target {
+        NetTarget::Server => (RVE_NET_TARGET_SERVER, 0),
+        NetTarget::All => (RVE_NET_TARGET_ALL, 0),
+        NetTarget::Peer(peer) => (RVE_NET_TARGET_PEER, peer),
+    }
+}
+
+/// Call-scoped network access from [`Context::net`].
+pub struct Net<'a> {
+    host: &'a RveHost,
+}
+
+impl Net<'_> {
+    /// Returns the network mode; without host callbacks it is [`NetMode::Offline`].
+    pub fn mode(&self) -> Result<NetMode, NetError> {
+        let callback = self.host.net_mode.ok_or(NetError::Unavailable)?;
+        // SAFETY: the host context is valid for this callback.
+        Ok(match unsafe { callback(self.host.ctx) } {
+            RVE_NET_MODE_HOST => NetMode::Host,
+            RVE_NET_MODE_SERVER => NetMode::Server,
+            RVE_NET_MODE_CLIENT => NetMode::Client,
+            _ => NetMode::Offline,
+        })
+    }
+
+    /// True for offline, listen-server and dedicated-server modes.
+    pub fn is_server(&self) -> Result<bool, NetError> {
+        Ok(matches!(
+            self.mode()?,
+            NetMode::Offline | NetMode::Host | NetMode::Server
+        ))
+    }
+
+    /// True for listen-server and client modes.
+    pub fn is_client(&self) -> Result<bool, NetError> {
+        Ok(matches!(self.mode()?, NetMode::Host | NetMode::Client))
+    }
+
+    /// Returns the number of this process's peer.
+    pub fn local_peer(&self) -> Result<u32, NetError> {
+        let callback = self.host.net_local_peer.ok_or(NetError::Unavailable)?;
+        // SAFETY: the host context is valid for this callback.
+        Ok(unsafe { callback(self.host.ctx) })
+    }
+
+    /// Returns the remote peers, without the local one.
+    pub fn peers(&self) -> Result<Vec<u32>, NetError> {
+        let callback = self.host.net_peers.ok_or(NetError::Unavailable)?;
+        let mut count = 0_usize;
+        // SAFETY: a zero-capacity call writes only the total count.
+        if !unsafe { callback(self.host.ctx, std::ptr::null_mut(), 0, &mut count) } {
+            return Err(NetError::Rejected);
+        }
+        let mut peers = vec![0_u32; count];
+        let mut total = 0_usize;
+        // SAFETY: the buffer holds `count` entries; the host writes at most that many.
+        if !unsafe { callback(self.host.ctx, peers.as_mut_ptr(), peers.len(), &mut total) } {
+            return Err(NetError::Rejected);
+        }
+        peers.truncate(total.min(count));
+        Ok(peers)
+    }
+
+    /// Stages a message for `target`. `reliable` selects ordered delivery.
+    pub fn send(
+        &self,
+        target: NetTarget,
+        name: &str,
+        value: &Value,
+        reliable: bool,
+    ) -> Result<(), NetError> {
+        let callback = self.host.net_send.ok_or(NetError::Unavailable)?;
+        let (kind, peer) = net_target(target);
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: strings and the recursive ABI value remain alive for the duration of this call.
+        let status = unsafe {
+            callback(
+                self.host.ctx,
+                kind,
+                peer,
+                RveStr::from_str_ref(name),
+                &value.value,
+                reliable,
+            )
+        };
+        net_status(status)
+    }
+}
+
+impl Object {
+    /// Network number of this object, or `None` without a network identity.
+    pub fn net_id(&self, ctx: &Context<'_>) -> Result<Option<u32>, NetError> {
+        let callback = ctx.host.net_object_id.ok_or(NetError::Unavailable)?;
+        let mut id = 0_u32;
+        // SAFETY: the host owns the output slot for this call.
+        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut id) }.then_some(id))
+    }
+
+    /// Owner peer of this object, or `None` when no owner is assigned.
+    pub fn net_owner(&self, ctx: &Context<'_>) -> Result<Option<u32>, NetError> {
+        let callback = ctx.host.net_object_owner.ok_or(NetError::Unavailable)?;
+        let mut owner = 0_u32;
+        // SAFETY: the host owns the output slot for this call.
+        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut owner) }.then_some(owner))
+    }
+
+    /// True when the local peer owns this object.
+    pub fn is_owner(&self, ctx: &Context<'_>) -> Result<bool, NetError> {
+        let callback = ctx.host.net_object_is_owner.ok_or(NetError::Unavailable)?;
+        let mut owner = false;
+        // SAFETY: the host owns the output slot for this call.
+        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut owner) } && owner)
+    }
+
+    /// True when this process may change the state of this object.
+    pub fn has_authority(&self, ctx: &Context<'_>) -> Result<bool, NetError> {
+        let callback = ctx
+            .host
+            .net_object_has_authority
+            .ok_or(NetError::Unavailable)?;
+        let mut authority = false;
+        // SAFETY: the host owns the output slot for this call.
+        Ok(unsafe { callback(ctx.host.ctx, self.handle, &mut authority) } && authority)
+    }
+
+    /// Assigns the owner peer; only the server, a listen server or offline mode may do it.
+    pub fn set_net_owner(&self, ctx: &mut Context<'_>, peer: u32) -> Result<(), NetError> {
+        let callback = ctx.host.net_object_set_owner.ok_or(NetError::Unavailable)?;
+        // SAFETY: the host context is valid for this callback.
+        net_status(unsafe { callback(ctx.host.ctx, self.handle, peer) })
+    }
+
+    /// Stages a message for the same object on `target`'s side.
+    pub fn net_send(
+        &self,
+        ctx: &mut Context<'_>,
+        name: &str,
+        value: &Value,
+        target: NetTarget,
+        reliable: bool,
+    ) -> Result<(), NetError> {
+        let callback = ctx.host.net_object_send.ok_or(NetError::Unavailable)?;
+        let (kind, peer) = net_target(target);
+        let value = BorrowedAbiValue::new(value);
+        // SAFETY: strings and the recursive ABI value remain alive for the duration of this call.
+        let status = unsafe {
+            callback(
+                ctx.host.ctx,
+                self.handle,
+                kind,
+                peer,
+                RveStr::from_str_ref(name),
+                &value.value,
+                reliable,
+            )
+        };
+        net_status(status)
+    }
+}
+
 #[doc(hidden)]
 pub mod __private {
     use super::{CollisionContact, Context, Object, Params, Script, ValueError};
     use crate::abi::{
-        RVE_COLLISION_ENTER, RVE_COLLISION_EXIT, RVE_PARAM_HAS_MAX, RVE_PARAM_HAS_MIN,
-        RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCollisionFn, RveCommandFn,
-        RveCreateFn, RveDropFn, RveHost, RveMessageFn, RveParamDesc, RveParams, RveStartFn,
-        RveStatus, RveStr, RveUpdateFn, RveValue,
+        RVE_COLLISION_ENTER, RVE_COLLISION_EXIT, RVE_NET_EVENT_MESSAGE,
+        RVE_NET_EVENT_PEER_CONNECTED, RVE_NET_EVENT_PEER_DISCONNECTED, RVE_PARAM_HAS_MAX,
+        RVE_PARAM_HAS_MIN, RVE_TRIGGER_ENTER, RVE_TRIGGER_EXIT, RveCollisionEvent, RveCollisionFn,
+        RveCommandFn, RveCreateFn, RveDropFn, RveHost, RveMessageFn, RveNetEvent, RveNetEventFn,
+        RveParamDesc, RveParams, RveStartFn, RveStatus, RveStr, RveUpdateFn, RveValue,
     };
     use std::any::Any;
     use std::ffi::c_void;
@@ -1951,6 +2181,7 @@ pub mod __private {
         drop: RveDropFn,
         command: RveCommandFn,
         collision: RveCollisionFn,
+        net_event: RveNetEventFn,
         params: &'static [RveParamDesc],
     ) -> crate::abi::RveScriptDesc {
         crate::abi::RveScriptDesc {
@@ -1965,6 +2196,7 @@ pub mod __private {
             param_count: params.len(),
             command: Some(command),
             collision: Some(collision),
+            net_event: Some(net_event),
         }
     }
 
@@ -2140,6 +2372,50 @@ pub mod __private {
             let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
             let mut context = Context::new(unsafe { &*host })?;
             instance.0.on_command(&mut context, name, &args);
+            context.commit()
+        }));
+        status_from_result(host, result)
+    }
+
+    pub unsafe fn net_event(
+        instance: *mut c_void,
+        host: *const RveHost,
+        event: RveNetEvent,
+    ) -> RveStatus {
+        if instance.is_null() || host.is_null() {
+            return report(host, "null net event callback argument", RveStatus::Error);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: instance and host are valid for this synchronous ABI callback.
+            let instance = unsafe { &mut *instance.cast::<GuestInstance>() };
+            let mut context = Context::new(unsafe { &*host })?;
+            match event.kind {
+                RVE_NET_EVENT_MESSAGE => {
+                    if event.value.is_null() {
+                        return Err("null net message value".to_owned());
+                    }
+                    // SAFETY: the host keeps the name and value readable for this callback.
+                    let name = unsafe { event.name.to_str() }.map_err(|error| error.to_string())?;
+                    // SAFETY: the host keeps the value readable for this callback.
+                    let value = unsafe { (*event.value).into_owned() }
+                        .map_err(|error: ValueError| error.to_string())?;
+                    instance
+                        .0
+                        .on_net_message(&mut context, event.peer, name, &value);
+                }
+                RVE_NET_EVENT_PEER_CONNECTED => {
+                    instance.0.on_peer_connected(&mut context, event.peer);
+                }
+                RVE_NET_EVENT_PEER_DISCONNECTED => {
+                    // SAFETY: the host keeps the reason readable for this callback.
+                    let reason =
+                        unsafe { event.reason.to_str() }.map_err(|error| error.to_string())?;
+                    instance
+                        .0
+                        .on_peer_disconnected(&mut context, event.peer, reason);
+                }
+                _ => return Err("unknown net event kind".to_owned()),
+            }
             context.commit()
         }));
         status_from_result(host, result)
@@ -2410,6 +2686,14 @@ macro_rules! __rve_script_descriptor {
             // SAFETY: the host owns the instance and event for this callback.
             unsafe { $crate::__private::collision(instance, host, event) }
         }
+        unsafe extern "C" fn __rve_net_event(
+            instance: *mut ::std::ffi::c_void,
+            host: *const $crate::abi::RveHost,
+            event: $crate::abi::RveNetEvent,
+        ) -> $crate::abi::RveStatus {
+            // SAFETY: the host owns the instance and event for this callback.
+            unsafe { $crate::__private::net_event(instance, host, event) }
+        }
         unsafe extern "C" fn __rve_destroy(
             instance: *mut ::std::ffi::c_void,
             host: *const $crate::abi::RveHost,
@@ -2433,6 +2717,7 @@ macro_rules! __rve_script_descriptor {
             __rve_drop_instance,
             __rve_command,
             __rve_collision,
+            __rve_net_event,
             $crate::__rve_params!(@munch [] $($params)*),
         )
     }};

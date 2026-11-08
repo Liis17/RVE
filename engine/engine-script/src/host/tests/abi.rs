@@ -2,23 +2,23 @@ use super::world;
 use crate::ScriptTime;
 use crate::host::{ScriptHost, ScriptLoadError};
 use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec};
-use crate::transaction::{
-    MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_STRING_BYTES,
-    MAX_MESSAGES_PER_FRAME,
-};
+use crate::transaction::{MAX_MESSAGE_NAME_BYTES, MAX_MESSAGES_PER_FRAME};
 use crate::types::ScriptEventLevel;
 use engine_files::VirtualPath;
 use engine_project::{InputAction, InputSettings};
-use engine_scene::{AudioRequest, PrefabTemplate, World};
+use engine_scene::{
+    AudioRequest, MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES,
+    PrefabTemplate, World,
+};
 use rve_sdk::abi::{
     RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
     RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParams, RveScriptDesc,
-    RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveSpawnOptions, RveStatus, RveStr,
-    RveTransform, RveUpdateFn, RveValue,
+    RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveScriptDescV6, RveSpawnOptions, RveStatus,
+    RveStr, RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
-    AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Key, MouseButton, Params,
-    PhysicalInput, Script, Tonemapper, Value,
+    AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Context, Key, MouseButton,
+    NetTarget, Params, PhysicalInput, Script, Tonemapper, Value,
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -1344,6 +1344,40 @@ name = "AudioRejected"
     assert_eq!(host.drain_audio_requests().len(), 1);
 }
 
+/// Таблица версий 6–12 в layout `RveScriptDescV6`, построенная из дескрипторов `sdk_module`.
+fn v6_module(abi_version: u32) -> &'static RveModule {
+    let current = sdk_module();
+    // SAFETY: `sdk_module` returns an immutable process-lifetime descriptor table.
+    let descriptors = unsafe { std::slice::from_raw_parts(current.scripts, current.script_count) };
+    let legacy: &'static [RveScriptDescV6] = Box::leak(
+        descriptors
+            .iter()
+            .map(|descriptor| RveScriptDescV6 {
+                name: descriptor.name,
+                create: descriptor.create,
+                start: descriptor.start,
+                update: descriptor.update,
+                message: descriptor.message,
+                destroy: descriptor.destroy,
+                drop: descriptor.drop,
+                params: descriptor.params,
+                param_count: descriptor.param_count,
+                command: descriptor.command,
+                collision: descriptor.collision,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: legacy.as_ptr().cast(),
+        script_count: legacy.len(),
+    }))
+}
+
 #[test]
 fn abi_v11_rumble_requests_are_capped_per_frame_and_keep_guest_order() {
     let _lock = test_lock();
@@ -1402,16 +1436,8 @@ params = { panic_after = true }
 #[test]
 fn abi_v6_to_v8_modules_load_on_the_v9_host() {
     let _lock = test_lock();
-    let current = sdk_module();
     for abi_version in [6, 7, 8] {
-        let module = Box::leak(Box::new(RveModule {
-            header: RveHeader {
-                abi_version,
-                header_size: std::mem::size_of::<RveHeader>() as u32,
-            },
-            scripts: current.scripts,
-            script_count: current.script_count,
-        }));
+        let module = v6_module(abi_version);
         // SAFETY: the module and its descriptor table live for the whole test process.
         let library =
             unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
@@ -1434,17 +1460,52 @@ fn abi_v6_to_v8_modules_load_on_the_v9_host() {
 }
 
 #[test]
-fn abi_v10_modules_load_on_the_v12_host() {
+fn abi_v6_to_v12_modules_load_without_net_callbacks_and_skip_net_events() {
     let _lock = test_lock();
-    let current = sdk_module();
-    let module = Box::leak(Box::new(RveModule {
-        header: RveHeader {
-            abi_version: 10,
-            header_size: std::mem::size_of::<RveHeader>() as u32,
-        },
-        scripts: current.scripts,
-        script_count: current.script_count,
-    }));
+    for abi_version in 6..=12 {
+        let module = v6_module(abi_version);
+        // SAFETY: the module and its descriptor table live for the whole test process.
+        let library =
+            unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+        let mut world = scripted_world("Probe", r#"{ label = "v6" }"#);
+        let mut host = load_host(&world, &library);
+        host.start(
+            &mut world,
+            ScriptTime {
+                elapsed: 3.5,
+                frame: 17,
+            },
+        );
+        assert!(
+            message_list(&mut host)
+                .iter()
+                .any(|message| message == "start:v6"),
+            "guest ABI v{abi_version} runs on the current host"
+        );
+        // Модуль без сетевого callback пропускает сетевые события без ошибки и без счётчика.
+        host.queue_network_events(&world, [engine_scene::NetEvent::PeerConnected { peer: 2 }]);
+        host.update(
+            &mut world,
+            1.0 / 60.0,
+            ScriptTime {
+                elapsed: 4.0,
+                frame: 18,
+            },
+        );
+        assert!(host.drain_peer_faults().is_empty());
+        assert!(
+            host.drain_events()
+                .iter()
+                .all(|event| event.level != ScriptEventLevel::Error),
+            "guest ABI v{abi_version} skips net events silently"
+        );
+    }
+}
+
+#[test]
+fn abi_v10_modules_load_on_the_v13_host() {
+    let _lock = test_lock();
+    let module = v6_module(10);
     // SAFETY: the module and its descriptor table live for the whole test process.
     let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
     let mut world = scripted_world("Probe", r#"{ label = "v10" }"#);
@@ -1460,22 +1521,14 @@ fn abi_v10_modules_load_on_the_v12_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v10"),
-        "guest ABI v10 runs on the v12 host"
+        "guest ABI v10 runs on the v13 host"
     );
 }
 
 #[test]
-fn abi_v11_modules_load_on_the_v12_host() {
+fn abi_v11_modules_load_on_the_v13_host() {
     let _lock = test_lock();
-    let current = sdk_module();
-    let module = Box::leak(Box::new(RveModule {
-        header: RveHeader {
-            abi_version: 11,
-            header_size: std::mem::size_of::<RveHeader>() as u32,
-        },
-        scripts: current.scripts,
-        script_count: current.script_count,
-    }));
+    let module = v6_module(11);
     // SAFETY: the module and its descriptor table live for the whole test process.
     let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
     let mut world = scripted_world("Probe", r#"{ label = "v11" }"#);
@@ -1491,7 +1544,7 @@ fn abi_v11_modules_load_on_the_v12_host() {
         message_list(&mut host)
             .iter()
             .any(|message| message == "start:v11"),
-        "guest ABI v11 runs on the v12 host"
+        "guest ABI v11 runs on the v13 host"
     );
 }
 
@@ -2004,6 +2057,7 @@ fn null_module() -> &'static RveModule {
         param_count: 0,
         command: None,
         collision: None,
+        net_event: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2025,6 +2079,7 @@ fn null_name_module() -> &'static RveModule {
         param_count: 0,
         command: None,
         collision: None,
+        net_event: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2047,6 +2102,7 @@ fn invalid_utf8_name_module() -> &'static RveModule {
         param_count: 0,
         command: None,
         collision: None,
+        net_event: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2449,6 +2505,7 @@ fn error_message_module() -> &'static RveModule {
             param_count: 0,
             command: None,
             collision: None,
+            net_event: None,
         },
         RveScriptDesc {
             name: RveStr::from_static("ErrorObserver"),
@@ -2462,6 +2519,7 @@ fn error_message_module() -> &'static RveModule {
             param_count: 0,
             command: None,
             collision: None,
+            net_event: None,
         },
     ];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
@@ -2491,6 +2549,7 @@ fn set_local_during_create_module() -> &'static RveModule {
         param_count: 0,
         command: None,
         collision: None,
+        net_event: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -2509,6 +2568,7 @@ fn poisoned_create_module() -> &'static RveModule {
         param_count: 0,
         command: None,
         collision: None,
+        net_event: None,
     }];
     static MODULE: RveModule = RveModule::new(&SCRIPTS);
     &MODULE
@@ -3036,6 +3096,7 @@ fn module_with_params(params: &'static [rve_sdk::abi::RveParamDesc]) -> RveModul
         param_count: params.len(),
         command: None,
         collision: None,
+        net_event: None,
     }]));
     RveModule::new(scripts)
 }
@@ -3113,6 +3174,7 @@ fn malformed_parameter_tables_are_rejected() {
             param_count: 1,
             command: None,
             collision: None,
+            net_event: None,
         }]));
         module.scripts = scripts.as_ptr();
         module
@@ -3348,6 +3410,7 @@ fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
         param_count: 0,
         command: None,
         collision: None,
+        net_event: None,
     }]));
     Box::leak(Box::new(RveModule::new(scripts)))
 }
@@ -3471,4 +3534,236 @@ fn abi_spawn_refuses_unknown_option_flags_and_bad_parents() {
         "{errors:?}"
     );
     assert!(host.drain_world_changes().spawned.is_empty());
+}
+
+/// Гость ABI v13: читает сеть на старте, пишет запросы и откликается на сетевые события.
+struct NetGuest;
+
+impl Script for NetGuest {
+    fn on_start(&mut self, ctx: &mut Context<'_>) {
+        let net = ctx.net();
+        ctx.log_info(format!(
+            "mode {:?} local {:?} peers {:?}",
+            net.mode(),
+            net.local_peer(),
+            net.peers()
+        ));
+        ctx.log_info(format!(
+            "send {:?}",
+            ctx.net()
+                .send(NetTarget::Server, "hello", &Value::Int(1), true)
+        ));
+        if let Some(player) = ctx.find("player") {
+            ctx.log_info(format!(
+                "id {:?} owner {:?} is_owner {:?} authority {:?}",
+                player.net_id(ctx),
+                player.net_owner(ctx),
+                player.is_owner(ctx),
+                player.has_authority(ctx)
+            ));
+            let owner = player.set_net_owner(ctx, 4);
+            ctx.log_info(format!("set_owner {owner:?}"));
+            let sent = player.net_send(ctx, "ping", &Value::Bool(true), NetTarget::Peer(2), false);
+            ctx.log_info(format!("object_send {sent:?}"));
+        }
+    }
+
+    fn on_net_message(&mut self, ctx: &mut Context<'_>, peer: u32, name: &str, value: &Value) {
+        if name == "fail" {
+            panic!("net callback exploded");
+        }
+        ctx.log_info(format!("message {peer} {name} {value:?}"));
+    }
+
+    fn on_peer_connected(&mut self, ctx: &mut Context<'_>, peer: u32) {
+        ctx.log_info(format!("connected {peer}"));
+    }
+
+    fn on_peer_disconnected(&mut self, ctx: &mut Context<'_>, peer: u32, reason: &str) {
+        ctx.log_info(format!("disconnected {peer} {reason}"));
+    }
+}
+
+fn net_guest_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(NetGuest))
+}
+
+fn net_module() -> &'static RveModule {
+    rve_sdk::script_module! { "NetGuest" => net_guest_factory }
+}
+
+fn net_world() -> World {
+    world(
+        r#"
+[[objects]]
+id = "camera"
+[objects.camera]
+
+[[objects]]
+id = "player"
+[objects.network_identity]
+authority = "owner"
+[[objects.heavy_scripts]]
+name = "NetGuest"
+params = {}
+"#,
+    )
+}
+
+#[test]
+fn abi_v13_net_guest_reads_state_and_stages_requests_through_the_sdk() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    let player = world.handle("player").unwrap();
+    host.set_network_state(engine_scene::NetMode::Client, Some(5), vec![0]);
+    host.set_object_net(player, engine_scene::NetId::scene(42).unwrap(), Some(5));
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 1,
+        },
+    );
+    let logs: Vec<String> = message_list(&mut host);
+    assert!(
+        logs.contains(&"mode Ok(Client) local Ok(5) peers Ok([0])".to_owned()),
+        "{logs:?}"
+    );
+    assert!(logs.contains(&"send Ok(())".to_owned()), "{logs:?}");
+    assert!(
+        logs.contains(
+            &"id Ok(Some(42)) owner Ok(Some(5)) is_owner Ok(true) authority Ok(true)".to_owned()
+        ),
+        "{logs:?}"
+    );
+    assert!(
+        logs.contains(&"set_owner Err(Rejected)".to_owned()),
+        "{logs:?}"
+    );
+    assert!(
+        logs.contains(&"object_send Err(Rejected)".to_owned()),
+        "{logs:?}"
+    );
+    // Клиент отправляет только серверу: запрос к серверу ставится, остальные отказы — нет.
+    assert_eq!(
+        host.drain_network_requests(),
+        vec![engine_scene::NetRequest::Send {
+            target: engine_scene::NetTarget::Server,
+            name: "hello".to_owned(),
+            value: engine_scene::ParamValue::Int(1),
+            reliable: true,
+        }]
+    );
+
+    host.set_network_state(engine_scene::NetMode::Server, Some(0), vec![5]);
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    let player = world.handle("player").unwrap();
+    host.set_object_net(player, engine_scene::NetId::scene(42).unwrap(), Some(5));
+    host.set_network_state(engine_scene::NetMode::Server, Some(0), vec![5]);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 1,
+        },
+    );
+    let logs: Vec<String> = message_list(&mut host);
+    assert!(logs.contains(&"send Ok(())".to_owned()), "{logs:?}");
+    assert!(logs.contains(&"set_owner Ok(())".to_owned()), "{logs:?}");
+    let requests = host.drain_network_requests();
+    assert_eq!(
+        requests,
+        vec![
+            engine_scene::NetRequest::Send {
+                target: engine_scene::NetTarget::Server,
+                name: "hello".to_owned(),
+                value: engine_scene::ParamValue::Int(1),
+                reliable: true,
+            },
+            engine_scene::NetRequest::SetOwner {
+                object: player,
+                peer: 4,
+            },
+            engine_scene::NetRequest::ObjectSend {
+                object: player,
+                name: "ping".to_owned(),
+                value: engine_scene::ParamValue::Bool(true),
+                target: engine_scene::NetTarget::Peer(2),
+                reliable: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn abi_v13_net_events_reach_the_guest_and_a_panic_keeps_the_instance() {
+    let _lock = test_lock();
+    let library =
+        unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(net_module())) }.unwrap();
+    let mut world = net_world();
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 0.0,
+            frame: 1,
+        },
+    );
+    message_list(&mut host);
+    host.queue_network_events(
+        &world,
+        [
+            engine_scene::NetEvent::Message {
+                peer: 3,
+                object: None,
+                name: "fail".to_owned(),
+                value: engine_scene::ParamValue::Int(0),
+            },
+            engine_scene::NetEvent::Message {
+                peer: 3,
+                object: None,
+                name: "ok".to_owned(),
+                value: engine_scene::ParamValue::String("x".to_owned()),
+            },
+            engine_scene::NetEvent::PeerConnected { peer: 8 },
+            engine_scene::NetEvent::PeerDisconnected {
+                peer: 8,
+                reason: "timeout".to_owned(),
+            },
+        ],
+    );
+    host.update(
+        &mut world,
+        1.0 / 60.0,
+        ScriptTime {
+            elapsed: 1.0,
+            frame: 2,
+        },
+    );
+    let events = host.drain_events();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message.clone())
+        .collect();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.clone())
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("net callback exploded"), "{errors:?}");
+    assert_eq!(
+        infos,
+        [
+            "message 3 ok String(\"x\")",
+            "connected 8",
+            "disconnected 8 timeout",
+        ]
+    );
+    assert_eq!(host.drain_peer_faults(), [(3, 1)]);
 }

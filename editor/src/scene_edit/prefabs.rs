@@ -527,6 +527,12 @@ fn merge_override(base: &mut PrefabOverride, outer: &PrefabOverride) {
     if outer.particle_emitter.is_some() {
         base.particle_emitter = outer.particle_emitter.clone();
     }
+    if outer.network_identity.is_some() {
+        base.network_identity = outer.network_identity;
+    }
+    if outer.network_transform.is_some() {
+        base.network_transform = outer.network_transform;
+    }
     for params in &outer.lite_params {
         match base
             .lite_params
@@ -564,6 +570,8 @@ fn is_empty(change: &PrefabOverride) -> bool {
         && change.audio_source.is_none()
         && change.animator.is_none()
         && change.particle_emitter.is_none()
+        && change.network_identity.is_none()
+        && change.network_transform.is_none()
         && change.lite_params.is_empty()
         && change.heavy_params.is_empty()
 }
@@ -679,6 +687,16 @@ pub(crate) fn object_override(
         (Some(from), Some(to)) => {
             change.particle_emitter = (to != from).then(|| to.clone());
         }
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.network_identity, edited.network_identity) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.network_identity = (to != from).then_some(to),
+        _ => return Err(COMPONENTS.to_owned()),
+    }
+    match (base.network_transform, edited.network_transform) {
+        (None, None) => {}
+        (Some(from), Some(to)) => change.network_transform = (to != from).then_some(to),
         _ => return Err(COMPONENTS.to_owned()),
     }
     if base.lite_scripts.len() != edited.lite_scripts.len()
@@ -828,6 +846,8 @@ pub enum OverrideField {
     AudioSource,
     Animator,
     ParticleEmitter,
+    NetworkIdentity,
+    NetworkTransform,
     LiteParams(VirtualPath),
     HeavyParams(String),
 }
@@ -861,6 +881,8 @@ impl EditorScene {
             OverrideField::AudioSource => change.audio_source.is_some(),
             OverrideField::Animator => change.animator.is_some(),
             OverrideField::ParticleEmitter => change.particle_emitter.is_some(),
+            OverrideField::NetworkIdentity => change.network_identity.is_some(),
+            OverrideField::NetworkTransform => change.network_transform.is_some(),
             OverrideField::LiteParams(path) => {
                 change.lite_params.iter().any(|params| &params.path == path)
             }
@@ -906,6 +928,8 @@ impl EditorScene {
                     OverrideField::AudioSource => change.audio_source = None,
                     OverrideField::Animator => change.animator = None,
                     OverrideField::ParticleEmitter => change.particle_emitter = None,
+                    OverrideField::NetworkIdentity => change.network_identity = None,
+                    OverrideField::NetworkTransform => change.network_transform = None,
                     OverrideField::LiteParams(path) => {
                         change.lite_params.retain(|params| &params.path != path)
                     }
@@ -2195,5 +2219,95 @@ mod tests {
             .unwrap();
         assert_eq!(emitter.rate, 20.0);
         assert_eq!(emitter.capacity, 128);
+    }
+
+    #[test]
+    fn network_components_override_replaces_the_component_and_reverts() {
+        let prefab = "[[objects]]\nid = \"crate\"\n[objects.network_identity]\nauthority = \"owner\"\n[objects.network_transform]\nsend_rate_hz = 10\n";
+        let files = Files::with(&[("prefabs/crate.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/crate.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        scene
+            .edit_object("crate", None, |object| {
+                object.network_transform.as_mut().unwrap().send_rate_hz = 30;
+                Ok(())
+            })
+            .unwrap();
+        assert!(scene.is_overridden("crate", &OverrideField::NetworkTransform));
+        assert!(!scene.is_overridden("crate", &OverrideField::NetworkIdentity));
+        let change = scene.object_override("crate").unwrap();
+        assert_eq!(
+            change.network_transform,
+            scene.object("crate").unwrap().network_transform
+        );
+
+        scene
+            .edit_object("crate", None, |object| {
+                object.network_identity.as_mut().unwrap().authority =
+                    engine_scene::NetAuthority::Server;
+                Ok(())
+            })
+            .unwrap();
+        assert!(scene.is_overridden("crate", &OverrideField::NetworkIdentity));
+
+        scene
+            .revert_field("crate", &OverrideField::NetworkTransform)
+            .unwrap();
+        assert!(!scene.is_overridden("crate", &OverrideField::NetworkTransform));
+        assert_eq!(
+            scene
+                .object("crate")
+                .unwrap()
+                .network_transform
+                .unwrap()
+                .send_rate_hz,
+            10
+        );
+        scene
+            .revert_field("crate", &OverrideField::NetworkIdentity)
+            .unwrap();
+        assert_eq!(
+            scene
+                .object("crate")
+                .unwrap()
+                .network_identity
+                .unwrap()
+                .authority,
+            engine_scene::NetAuthority::Owner
+        );
+    }
+
+    #[test]
+    fn network_identity_cannot_be_added_to_a_prefab_part() {
+        let prefab = "[[objects]]\nid = \"crate\"\n[[objects]]\nid = \"lid\"\nparent = \"crate\"\n";
+        let files = Files::with(&[("prefabs/crate.rveprefab", prefab)]);
+        let mut scene = scene_with(&files);
+        scene
+            .create_object(
+                &NewObject::Prefab(path("/prefabs/crate.rveprefab"), [0.0; 3]),
+                None,
+            )
+            .unwrap();
+        let part = scene
+            .view()
+            .objects
+            .iter()
+            .find(|object| object.parent.is_some())
+            .unwrap()
+            .id
+            .clone();
+        let error = scene
+            .set_component(
+                &part,
+                Component::NetworkIdentity(engine_scene::NetworkIdentityComponent::default()),
+            )
+            .unwrap_err();
+        assert!(error.contains("компоненты"), "{error}");
+        assert!(scene.object(&part).unwrap().network_identity.is_none());
     }
 }

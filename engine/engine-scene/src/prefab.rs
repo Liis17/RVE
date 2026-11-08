@@ -14,6 +14,9 @@ use crate::document::{
     require_asset_path, require_extension, valid_ascii_name, validate_environment,
     validate_material_override, virtual_path_serde,
 };
+use crate::network::{
+    NetworkIdentityComponent, NetworkTransformComponent, validate_network_transform,
+};
 use crate::particles::{ParticleEmitterComponent, validate_particle_emitter};
 use crate::physics_material::resolve_collider_material;
 use crate::world::topological_order;
@@ -82,6 +85,10 @@ pub struct PrefabOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub animator: Option<AnimatorComponent>,
     pub particle_emitter: Option<ParticleEmitterComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_identity: Option<NetworkIdentityComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_transform: Option<NetworkTransformComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentComponent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -310,6 +317,20 @@ pub fn apply_override(object: &mut SceneObject, change: &PrefabOverride) -> Resu
             .as_mut()
             .ok_or("override particle_emitter: у объекта нет particle_emitter")?;
         *target = emitter.clone();
+    }
+    if let Some(identity) = change.network_identity {
+        let target = object
+            .network_identity
+            .as_mut()
+            .ok_or("override network_identity: у объекта нет network_identity")?;
+        *target = identity;
+    }
+    if let Some(transform) = change.network_transform {
+        let target = object
+            .network_transform
+            .as_mut()
+            .ok_or("override network_transform: у объекта нет network_transform")?;
+        *target = transform;
     }
     if let Some(environment) = &change.environment {
         let target = object
@@ -707,6 +728,9 @@ pub(crate) fn validate_instances(
             }
             if let Some(emitter) = &change.particle_emitter {
                 validate_particle_emitter(source, id, assets, emitter)?;
+            }
+            if let Some(transform) = &change.network_transform {
+                validate_network_transform(source, id, transform)?;
             }
         }
     }

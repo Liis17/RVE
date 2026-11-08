@@ -13,7 +13,7 @@ Parent: [[Index]]
 | Файл | Значимые символы | Роль |
 |---|---|---|
 | `engine/engine-project/src/bootstrap.rs` | `BootstrapConfig::{parse, load}` | Формат начальных настроек, значения по умолчанию и проверки |
-| `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings`, `PhysicsSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
+| `engine/engine-project/src/project_settings.rs` | `ProjectSettings`, `ProjectScene`, `ProjectRequirements`, `RuntimeSettings`, `PhysicsSettings`, `NetworkSettings` | TOML-схема проекта, валидация, стартовая сцена и сериализация |
 | `engine/engine-project/src/input_settings.rs` | `InputSettings`, `InputAction` | Схема игровых действий, проверка физических имён вводов и ограничений |
 | `engine/engine-project/src/prefab_catalog.rs` | `PrefabCatalogFile`, `PrefabCatalogEntry`, `PREFAB_CATALOG_FILE_NAME`, `PREFAB_CATALOG_RELEASE_PATH` | Список тяжёлых префабов проекта: разбор, проверка, сериализация |
 | `engine/engine-project/src/lib.rs` | публичные реэкспорты | API крейта |
@@ -78,6 +78,12 @@ gravity = [0.0, -9.81, 0.0]
 fixed_hz = 60
 max_substeps = 8
 ```
+
+### Сеть `[network]`
+
+Необязательная секция `NetworkSettings`. `enabled` (по умолчанию `false`) разрешает сетевые флаги player и сервера; без него флаги дают код 2. `port` — порт сервера по умолчанию, `1..=65535`, по умолчанию `7777`. `max_clients` — `1..=64`, по умолчанию `8`. `tick_hz` — частота сетевого тика и серверных меток, `1..=240`, по умолчанию `30`. `timeout_ms` — молчание пира до разрыва соединения, `1000..=120000`, по умолчанию `10000`.
+
+Секреты в секцию не входят: неизвестные поля отклоняются (`deny_unknown_fields`), а пароль и ключ сервера задаются флагами и переменной окружения ([[Engine/EngineNetwork]]). При значениях по умолчанию секция не сериализуется, поэтому проекты без сети не меняются. Round-trip через `to_toml` сохраняет секцию, потому что `rve-build` переписывает `project.toml` в релиз.
 
 ### Игровой ввод `[input]`
 

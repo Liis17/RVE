@@ -5,10 +5,10 @@ use engine_scene::document::MaterialOverride;
 use engine_scene::{
     AnimatorComponent, AudioSourceComponent, CameraComponent, CameraCursor,
     CharacterControllerComponent, ColliderComponent, DirectionalLightComponent,
-    EnvironmentComponent, Expansion, LodGroup, MeshRenderer, ObjectOrigin,
-    ParticleEmitterComponent, PointLightComponent, PrefabInstance, PrefabOverride,
-    ProceduralSkyComponent, RigidBodyComponent, SceneAsset, SceneDocument, SceneError, SceneObject,
-    SceneTransform, SpotLightComponent,
+    EnvironmentComponent, Expansion, LodGroup, MeshRenderer, NetworkIdentityComponent,
+    NetworkTransformComponent, ObjectOrigin, ParticleEmitterComponent, PointLightComponent,
+    PrefabInstance, PrefabOverride, ProceduralSkyComponent, RigidBodyComponent, SceneAsset,
+    SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -88,6 +88,8 @@ pub enum ComponentKind {
     AudioSource,
     Animator,
     ParticleEmitter,
+    NetworkIdentity,
+    NetworkTransform,
 }
 
 /// Значение компонента объекта: копируется в буфер Inspector и вставляется в объект.
@@ -107,6 +109,8 @@ pub enum Component {
     AudioSource(AudioSourceComponent),
     Animator(AnimatorComponent),
     ParticleEmitter(ParticleEmitterComponent),
+    NetworkIdentity(NetworkIdentityComponent),
+    NetworkTransform(NetworkTransformComponent),
 }
 
 impl Component {
@@ -126,6 +130,8 @@ impl Component {
             Self::AudioSource(_) => ComponentKind::AudioSource,
             Self::Animator(_) => ComponentKind::Animator,
             Self::ParticleEmitter(_) => ComponentKind::ParticleEmitter,
+            Self::NetworkIdentity(_) => ComponentKind::NetworkIdentity,
+            Self::NetworkTransform(_) => ComponentKind::NetworkTransform,
         }
     }
 
@@ -150,6 +156,8 @@ impl Component {
             ComponentKind::ParticleEmitter => {
                 Self::ParticleEmitter(object.particle_emitter.clone()?)
             }
+            ComponentKind::NetworkIdentity => Self::NetworkIdentity(object.network_identity?),
+            ComponentKind::NetworkTransform => Self::NetworkTransform(object.network_transform?),
         })
     }
 
@@ -191,6 +199,12 @@ impl Component {
                 texture: object.particle_emitter.as_ref()?.texture.clone(),
                 ..ParticleEmitterComponent::default()
             }),
+            ComponentKind::NetworkIdentity => {
+                Self::NetworkIdentity(NetworkIdentityComponent::default())
+            }
+            ComponentKind::NetworkTransform => {
+                Self::NetworkTransform(NetworkTransformComponent::default())
+            }
         })
     }
 
@@ -214,6 +228,8 @@ impl Component {
             Self::AudioSource(value) => object.audio_source = Some(value),
             Self::Animator(value) => object.animator = Some(value),
             Self::ParticleEmitter(value) => object.particle_emitter = Some(value),
+            Self::NetworkIdentity(value) => object.network_identity = Some(value),
+            Self::NetworkTransform(value) => object.network_transform = Some(value),
         }
     }
 }
@@ -1399,6 +1415,24 @@ impl EditorScene {
     pub fn remove_particle_emitter(&mut self, id: &str) -> Result<(), String> {
         self.edit_object(id, None, |object| {
             object.particle_emitter = None;
+            Ok(())
+        })
+    }
+
+    /// Удаляет сетевой идентификатор вместе с `network_transform`: без идентификатора трансформация
+    /// невалидна, поэтому оба компонента уходят в одной правке (как Mesh Renderer с LOD Group).
+    pub fn remove_network_identity(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.network_identity = None;
+            object.network_transform = None;
+            Ok(())
+        })
+    }
+
+    /// Удаляет сетевую трансформацию; идентификатор остаётся.
+    pub fn remove_network_transform(&mut self, id: &str) -> Result<(), String> {
+        self.edit_object(id, None, |object| {
+            object.network_transform = None;
             Ok(())
         })
     }
@@ -3413,5 +3447,94 @@ mod tests {
         assert_eq!(cube.lite_scripts.len(), 1);
         assert_eq!(cube.heavy_scripts[0].name, "Bobber");
         assert_eq!(cube.heavy_scripts[0].params.len(), 2);
+    }
+
+    #[test]
+    fn network_transform_needs_identity_and_removing_identity_takes_both() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        let transform = engine_scene::NetworkTransformComponent {
+            send_rate_hz: 10,
+            ..Default::default()
+        };
+        assert!(
+            scene
+                .set_component(&id, Component::NetworkTransform(transform))
+                .is_err(),
+            "network_transform без network_identity невалиден"
+        );
+        assert!(scene.object(&id).unwrap().network_transform.is_none());
+
+        let identity = engine_scene::NetworkIdentityComponent {
+            authority: engine_scene::NetAuthority::Owner,
+        };
+        scene
+            .set_component(&id, Component::NetworkIdentity(identity))
+            .unwrap();
+        scene
+            .set_component(&id, Component::NetworkTransform(transform))
+            .unwrap();
+        assert_eq!(scene.object(&id).unwrap().network_identity, Some(identity));
+        assert_eq!(
+            scene.object(&id).unwrap().network_transform,
+            Some(transform)
+        );
+
+        scene.remove_network_identity(&id).unwrap();
+        let object = scene.object(&id).unwrap();
+        assert!(object.network_identity.is_none());
+        assert!(object.network_transform.is_none());
+        assert!(scene.undo());
+        let object = scene.object(&id).unwrap();
+        assert_eq!(object.network_identity, Some(identity));
+        assert_eq!(
+            object.network_transform,
+            Some(transform),
+            "откат возвращает пару целиком"
+        );
+
+        scene.remove_network_transform(&id).unwrap();
+        let object = scene.object(&id).unwrap();
+        assert!(object.network_transform.is_none());
+        assert_eq!(
+            object.network_identity,
+            Some(identity),
+            "удаление трансформации оставляет идентификатор"
+        );
+    }
+
+    #[test]
+    fn network_transform_out_of_range_values_are_rolled_back() {
+        let mut scene = scene();
+        let id = scene.create_object(&NewObject::Empty, None).unwrap();
+        scene
+            .set_component(
+                &id,
+                Component::NetworkIdentity(engine_scene::NetworkIdentityComponent::default()),
+            )
+            .unwrap();
+        let limit = engine_scene::MAX_SEND_RATE_HZ;
+        for invalid in [
+            engine_scene::NetworkTransformComponent {
+                send_rate_hz: 0,
+                ..Default::default()
+            },
+            engine_scene::NetworkTransformComponent {
+                send_rate_hz: limit + 1,
+                ..Default::default()
+            },
+            engine_scene::NetworkTransformComponent {
+                snap_distance: f32::NAN,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                scene
+                    .set_component(&id, Component::NetworkTransform(invalid))
+                    .is_err(),
+                "{invalid:?}"
+            );
+            assert!(scene.object(&id).unwrap().network_transform.is_none());
+        }
     }
 }

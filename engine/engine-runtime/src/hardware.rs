@@ -24,6 +24,21 @@ pub(crate) fn hardware_issues(
         }
         Ok(_) => {}
     }
+    issues.extend(memory_and_cpu_issues(
+        total_ram_mb,
+        logical_cpus,
+        requirements,
+    ));
+    issues
+}
+
+/// Проверка RAM и логических CPU без GPU: её использует headless-сервер, которому Vulkan не нужен.
+pub(crate) fn memory_and_cpu_issues(
+    total_ram_mb: u64,
+    logical_cpus: usize,
+    requirements: &ProjectRequirements,
+) -> Vec<String> {
+    let mut issues = Vec::new();
     if total_ram_mb < requirements.min_ram_mb {
         issues.push(format!(
             "недостаточно RAM: доступно {total_ram_mb} МиБ, требуется {} МиБ",
@@ -41,9 +56,21 @@ pub(crate) fn hardware_issues(
 
 #[cfg(test)]
 mod tests {
-    use super::hardware_issues;
+    use super::{hardware_issues, memory_and_cpu_issues};
     use engine_project::ProjectRequirements;
     use engine_render::DeviceReport;
+
+    #[test]
+    fn headless_check_reports_only_memory_and_cpu_shortfalls() {
+        let requirements = ProjectRequirements {
+            min_ram_mb: 4096,
+            min_cpu_threads: 4,
+        };
+        assert!(memory_and_cpu_issues(4096, 4, &requirements).is_empty());
+        let issues = memory_and_cpu_issues(1024, 2, &requirements);
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues.iter().all(|issue| !issue.contains("Vulkan")));
+    }
 
     fn suitable() -> DeviceReport {
         DeviceReport {

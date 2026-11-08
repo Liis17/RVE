@@ -219,6 +219,14 @@ struct HostState {
     object_state_code: u32,
     /// Code returned by the prefab-state callback.
     prefab_state_code: u32,
+    /// Mode code returned by the network mode callback.
+    net_mode: u32,
+    net_local_peer: u32,
+    net_peers: Vec<u32>,
+    /// Status returned by the network send and owner callbacks.
+    net_status: u32,
+    /// Network calls in guest order, formatted for comparison.
+    net_calls: Vec<String>,
     /// Gamepad snapshots indexed by pad: 0 is the aggregate, 1..=4 are slots.
     gamepads: [RveGamepadState; 5],
     /// Rumble requests in guest order: pad, strong, weak, seconds.
@@ -532,6 +540,16 @@ fn host(state: &mut HostState) -> RveHost {
         gamepad_rumble: None,
         get_post_process: None,
         set_post_process: None,
+        net_mode: None,
+        net_local_peer: None,
+        net_peers: None,
+        net_send: None,
+        net_object_id: None,
+        net_object_owner: None,
+        net_object_is_owner: None,
+        net_object_has_authority: None,
+        net_object_set_owner: None,
+        net_object_send: None,
     }
 }
 
@@ -1914,7 +1932,7 @@ fn param_descriptor_layout_is_c_compatible() {
         offset_of!(RveScriptDesc, collision),
         size_of::<RveScriptDescV4>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 12);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 13);
     assert_eq!(RVE_SCRIPT_ABI_MIN_VERSION, 3);
     assert_eq!(crate::abi::RVE_INPUT_MAX_BINDINGS, 16);
     assert_eq!(
@@ -2184,7 +2202,159 @@ fn animation_callbacks_and_params_keep_the_v9_layout() {
         offset_of!(RveHost, animation_set_speed)
             + size_of::<Option<crate::abi::RveAnimationSetSpeedFn>>()
     );
-    assert_eq!(RVE_SCRIPT_ABI_VERSION, 12);
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 13);
+}
+
+#[test]
+fn network_callbacks_and_descriptor_keep_the_v13_layout() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(
+        offset_of!(RveHost, net_mode),
+        offset_of!(RveHost, set_post_process)
+            + size_of::<Option<crate::abi::RveSetPostProcessFn>>()
+    );
+    assert_eq!(
+        offset_of!(RveHost, net_object_send),
+        offset_of!(RveHost, net_object_set_owner)
+            + size_of::<Option<crate::abi::RveNetObjectSetOwnerFn>>()
+    );
+    assert_eq!(
+        size_of::<crate::abi::RveScriptDesc>(),
+        size_of::<crate::abi::RveScriptDescV6>() + size_of::<Option<crate::abi::RveNetEventFn>>()
+    );
+    assert_eq!(RVE_SCRIPT_ABI_VERSION, 13);
+}
+
+unsafe extern "C" fn net_mode(ctx: *mut c_void) -> u32 {
+    // SAFETY: the context is live for this callback.
+    unsafe { (*ctx.cast::<HostState>()).net_mode }
+}
+
+unsafe extern "C" fn net_local_peer(ctx: *mut c_void) -> u32 {
+    // SAFETY: the context is live for this callback.
+    unsafe { (*ctx.cast::<HostState>()).net_local_peer }
+}
+
+unsafe extern "C" fn net_peers(
+    ctx: *mut c_void,
+    out: *mut u32,
+    capacity: usize,
+    count: *mut usize,
+) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest passes a writable count slot.
+    unsafe { *count = state.net_peers.len() };
+    for (index, peer) in state.net_peers.iter().take(capacity).enumerate() {
+        // SAFETY: the guest allocated `capacity` entries, and `index` is below it.
+        unsafe { out.add(index).write(*peer) };
+    }
+    true
+}
+
+unsafe extern "C" fn net_send(
+    ctx: *mut c_void,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest keeps the name and value readable for this call.
+    let name = unsafe { name.to_str() }.unwrap().to_owned();
+    let value = unsafe { (*value).into_owned() }.unwrap();
+    state.net_calls.push(format!(
+        "send {target_kind} {peer} {name} {reliable} {value:?}"
+    ));
+    state.net_status
+}
+
+unsafe extern "C" fn net_object_id(ctx: *mut c_void, object: u64, out: *mut u32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("id {object}"));
+    if object == 7 {
+        // SAFETY: the guest owns the output slot.
+        unsafe { *out = 77 };
+        true
+    } else {
+        false
+    }
+}
+
+unsafe extern "C" fn net_object_owner(ctx: *mut c_void, object: u64, out: *mut u32) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("owner {object}"));
+    // SAFETY: the guest owns the output slot.
+    unsafe { *out = 3 };
+    true
+}
+
+unsafe extern "C" fn net_object_is_owner(ctx: *mut c_void, object: u64, out: *mut bool) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("is_owner {object}"));
+    // SAFETY: the guest owns the output slot.
+    unsafe { *out = false };
+    true
+}
+
+unsafe extern "C" fn net_object_has_authority(
+    ctx: *mut c_void,
+    object: u64,
+    out: *mut bool,
+) -> bool {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("authority {object}"));
+    // SAFETY: the guest owns the output slot.
+    unsafe { *out = true };
+    true
+}
+
+unsafe extern "C" fn net_object_set_owner(ctx: *mut c_void, object: u64, peer: u32) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    state.net_calls.push(format!("set_owner {object} {peer}"));
+    state.net_status
+}
+
+unsafe extern "C" fn net_object_send(
+    ctx: *mut c_void,
+    object: u64,
+    target_kind: u32,
+    peer: u32,
+    name: RveStr,
+    value: *const RveValue,
+    reliable: bool,
+) -> u32 {
+    // SAFETY: the context is live for this callback.
+    let state = unsafe { &mut *ctx.cast::<HostState>() };
+    // SAFETY: the guest keeps the name and value readable for this call.
+    let name = unsafe { name.to_str() }.unwrap().to_owned();
+    let value = unsafe { (*value).into_owned() }.unwrap();
+    state.net_calls.push(format!(
+        "object_send {object} {target_kind} {peer} {name} {reliable} {value:?}"
+    ));
+    state.net_status
+}
+
+fn net_host(state: &mut HostState) -> RveHost {
+    let mut host = host(state);
+    host.net_mode = Some(net_mode);
+    host.net_local_peer = Some(net_local_peer);
+    host.net_peers = Some(net_peers);
+    host.net_send = Some(net_send);
+    host.net_object_id = Some(net_object_id);
+    host.net_object_owner = Some(net_object_owner);
+    host.net_object_is_owner = Some(net_object_is_owner);
+    host.net_object_has_authority = Some(net_object_has_authority);
+    host.net_object_set_owner = Some(net_object_set_owner);
+    host.net_object_send = Some(net_object_send);
+    host
 }
 
 #[test]
@@ -2285,6 +2455,240 @@ fn gamepad_host(state: &mut HostState) -> RveHost {
     host.gamepad_state = Some(gamepad_state);
     host.gamepad_rumble = Some(gamepad_rumble);
     host
+}
+
+#[test]
+fn sdk_net_api_reports_mode_peers_and_copies_the_full_peer_list() {
+    let mut state = HostState {
+        net_mode: crate::abi::RVE_NET_MODE_CLIENT,
+        net_local_peer: 5,
+        net_peers: vec![1, 2, 9],
+        ..HostState::default()
+    };
+    let host = net_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let net = context.net();
+    assert_eq!(net.mode(), Ok(crate::NetMode::Client));
+    assert_eq!(net.is_server(), Ok(false));
+    assert_eq!(net.is_client(), Ok(true));
+    assert_eq!(net.local_peer(), Ok(5));
+    assert_eq!(net.peers(), Ok(vec![1, 2, 9]));
+
+    state.net_mode = crate::abi::RVE_NET_MODE_HOST;
+    state.net_peers = vec![4; 70];
+    let host = net_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let net = context.net();
+    assert_eq!(net.mode(), Ok(crate::NetMode::Host));
+    assert_eq!(net.is_server(), Ok(true));
+    assert_eq!(net.is_client(), Ok(true));
+    assert_eq!(net.peers().unwrap().len(), 70);
+}
+
+#[test]
+fn sdk_net_send_encodes_targets_and_maps_host_statuses() {
+    let mut state = HostState {
+        net_status: crate::abi::RVE_NET_OK,
+        ..HostState::default()
+    };
+    let host = net_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    let net = context.net();
+    assert_eq!(
+        net.send(crate::NetTarget::Server, "a", &Value::Int(1), true),
+        Ok(())
+    );
+    assert_eq!(
+        net.send(crate::NetTarget::All, "b", &Value::Bool(true), false),
+        Ok(())
+    );
+    assert_eq!(
+        net.send(crate::NetTarget::Peer(4), "c", &Value::Float(0.5), true),
+        Ok(())
+    );
+    assert_eq!(
+        state.net_calls,
+        vec![
+            "send 0 0 a true Int(1)".to_owned(),
+            "send 1 0 b false Bool(true)".to_owned(),
+            "send 2 4 c true Float(0.5)".to_owned(),
+        ]
+    );
+
+    state.net_status = crate::abi::RVE_NET_INVALID_INPUT;
+    let host = net_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    assert_eq!(
+        context
+            .net()
+            .send(crate::NetTarget::All, "d", &Value::Int(0), true),
+        Err(crate::NetError::InvalidInput)
+    );
+    state.net_status = crate::abi::RVE_NET_REJECTED;
+    let host = net_host(&mut state);
+    let context = Context::new(&host).unwrap();
+    assert_eq!(
+        context
+            .net()
+            .send(crate::NetTarget::All, "d", &Value::Int(0), true),
+        Err(crate::NetError::Rejected)
+    );
+}
+
+#[test]
+fn sdk_net_object_api_forwards_handles_and_reports_unavailable_hosts() {
+    let mut state = HostState {
+        net_status: crate::abi::RVE_NET_OK,
+        ..HostState::default()
+    };
+    let host = net_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    let object = crate::Object { handle: 7 };
+    assert_eq!(object.net_id(&context), Ok(Some(77)));
+    assert_eq!(object.net_owner(&context), Ok(Some(3)));
+    assert_eq!(object.is_owner(&context), Ok(false));
+    assert_eq!(object.has_authority(&context), Ok(true));
+    assert_eq!(object.set_net_owner(&mut context, 4), Ok(()));
+    assert_eq!(
+        object.net_send(
+            &mut context,
+            "hit",
+            &Value::String("x".to_owned()),
+            crate::NetTarget::Peer(6),
+            false,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        state.net_calls,
+        vec![
+            "id 7".to_owned(),
+            "owner 7".to_owned(),
+            "is_owner 7".to_owned(),
+            "authority 7".to_owned(),
+            "set_owner 7 4".to_owned(),
+            "object_send 7 2 6 hit false String(\"x\")".to_owned(),
+        ]
+    );
+
+    state.net_status = crate::abi::RVE_NET_REJECTED;
+    let host = net_host(&mut state);
+    let mut context = Context::new(&host).unwrap();
+    assert_eq!(
+        object.set_net_owner(&mut context, 4),
+        Err(crate::NetError::Rejected)
+    );
+
+    let mut bare = HostState::default();
+    let bare_host = self::host(&mut bare);
+    let mut context = Context::new(&bare_host).unwrap();
+    let net = context.net();
+    assert_eq!(net.mode(), Err(crate::NetError::Unavailable));
+    assert_eq!(net.peers(), Err(crate::NetError::Unavailable));
+    assert_eq!(
+        net.send(crate::NetTarget::Server, "a", &Value::Int(1), true),
+        Err(crate::NetError::Unavailable)
+    );
+    assert_eq!(object.net_id(&context), Err(crate::NetError::Unavailable));
+    assert_eq!(
+        object.set_net_owner(&mut context, 1),
+        Err(crate::NetError::Unavailable)
+    );
+}
+
+struct NetProbe;
+
+impl Script for NetProbe {
+    fn on_net_message(&mut self, ctx: &mut Context<'_>, peer: u32, name: &str, value: &Value) {
+        ctx.log_info(format!("message {peer} {name} {value:?}"));
+    }
+
+    fn on_peer_connected(&mut self, ctx: &mut Context<'_>, peer: u32) {
+        ctx.log_info(format!("connected {peer}"));
+    }
+
+    fn on_peer_disconnected(&mut self, ctx: &mut Context<'_>, peer: u32, reason: &str) {
+        ctx.log_info(format!("disconnected {peer} {reason}"));
+    }
+}
+
+fn net_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(NetProbe))
+}
+
+#[test]
+fn net_events_reach_the_guest_callbacks_and_failures_stay_in_the_guest() {
+    use crate::abi::{RVE_NET_EVENT_MESSAGE, RVE_NET_EVENT_PEER_CONNECTED, RveNetEvent};
+    let mut state = HostState::default();
+    let host = net_host(&mut state);
+    let params = RveParams {
+        entries: std::ptr::null(),
+        len: 0,
+    };
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: the host and parameters remain valid for this synchronous creation call.
+    let status =
+        unsafe { crate::__private::create(&host, &params, &mut instance, net_probe_factory) };
+    assert_eq!(status, RveStatus::Ok);
+
+    let value = RveValue::integer(9);
+    // SAFETY: the instance was created by this module and the value outlives the call.
+    let status = unsafe {
+        crate::__private::net_event(
+            instance,
+            &host,
+            RveNetEvent {
+                kind: RVE_NET_EVENT_MESSAGE,
+                peer: 3,
+                name: RveStr::from_static("hit"),
+                value: &value,
+                reason: RveStr::empty(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Ok);
+    // SAFETY: as above.
+    let status = unsafe {
+        crate::__private::net_event(
+            instance,
+            &host,
+            RveNetEvent {
+                kind: RVE_NET_EVENT_PEER_CONNECTED,
+                peer: 8,
+                name: RveStr::empty(),
+                value: std::ptr::null(),
+                reason: RveStr::empty(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Ok);
+    // SAFETY: as above; an unknown kind is rejected by the guest without a panic.
+    let status = unsafe {
+        crate::__private::net_event(
+            instance,
+            &host,
+            RveNetEvent {
+                kind: 99,
+                peer: 0,
+                name: RveStr::empty(),
+                value: std::ptr::null(),
+                reason: RveStr::empty(),
+            },
+        )
+    };
+    assert_eq!(status, RveStatus::Error);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("unknown net event kind")
+    );
+    // SAFETY: the instance is dropped exactly once.
+    assert_eq!(
+        unsafe { crate::__private::drop_instance(instance) },
+        RveStatus::Ok
+    );
 }
 
 #[test]

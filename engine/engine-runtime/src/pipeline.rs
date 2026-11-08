@@ -5,6 +5,7 @@ use crate::console::{CommandCatalogSnapshot, ConsoleUiFrame};
 use crate::cursor::CursorControl;
 use crate::input::{InputAccumulator, lock_input};
 use crate::module_host::{ModuleHost, panic_message};
+use crate::net::{self, NetworkSession, ScriptNetwork};
 use crate::prefabs::{
     LoadedPrefab, LoaderRequest, PREFAB_UPLOAD_BUDGET, ParticleRequest, PrefabCpu, PrefabGpu,
     PrefabLoads, PrefabReady, PrefabReply, PrefabToken, RenderResourceRequest,
@@ -20,6 +21,7 @@ use engine_assets::{Model, ModelAnimation, TextureData};
 #[cfg(feature = "dev-console")]
 use engine_console::CommandLine;
 use engine_core::profile::ProfileBoard;
+use engine_network::SpawnedRoot;
 use engine_physics::{
     BodyChange, BodyHandle, ModelGeometry, PhysicsClient, PhysicsCommand, PhysicsInitialization,
     PhysicsReceive, PhysicsSceneSync, PhysicsStepResult, ShapeCache,
@@ -359,6 +361,8 @@ pub(crate) struct ScriptThreadConfig {
     pub interrupt: ScriptInterruptHandle,
     pub clock: Arc<dyn Clock>,
     pub background_tick_hz: u32,
+    /// Открывать ли геймпады (`gilrs`). `false` для выделенного сервера без окна: он не читает устройства ввода.
+    pub gamepad_devices: bool,
     pub control_tx: Sender<ScriptControl>,
     pub control_rx: Receiver<ScriptControl>,
     pub frame_tx: Sender<Arc<FrameSnapshot>>,
@@ -378,6 +382,10 @@ pub(crate) struct ScriptThreadConfig {
     pub prefab_loader: Sender<LoaderRequest>,
     /// Заявки render thread: выгрузка тяжёлых префабов.
     pub render_resources: Sender<RenderResourceRequest>,
+    /// Сетевой поток и режим моста; `None` — offline, мост не подключается.
+    pub network: Option<NetworkSession>,
+    /// Число тиков, после которого цикл останавливается сам (`rve-server --frames`); `None` — без предела.
+    pub frame_limit: Option<u64>,
     #[cfg(feature = "dev-console")]
     pub command_catalog: Arc<Mutex<CommandCatalogSnapshot>>,
 }
@@ -410,6 +418,7 @@ pub(crate) struct RenderThreadConfig {
 pub(crate) enum ScriptStartupError {
     Load(String),
     Physics(String),
+    Network(String),
     Panic(String),
 }
 
@@ -940,6 +949,7 @@ fn scripts_thread(
         interrupt,
         clock,
         background_tick_hz,
+        gamepad_devices,
         control_rx,
         frame_tx,
         render_tx,
@@ -955,6 +965,8 @@ fn scripts_thread(
         physics_geometry,
         prefab_loader,
         render_resources,
+        network,
+        frame_limit,
         ..
     } = config;
     let library = match load_script_library(
@@ -1029,6 +1041,19 @@ fn scripts_thread(
             return;
         }
     }
+    // Мост подключается до `start`: `on_start` уже видит режим сети и сетевые id объектов сцены.
+    let mut network: Option<ScriptNetwork> = match network {
+        Some(session) => match net::attach(session, &mut world, &mut scripts) {
+            Ok(bridge) => Some(bridge),
+            Err(error) => {
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Err(ScriptStartupError::Network(error.to_string())));
+                }
+                return;
+            }
+        },
+        None => None,
+    };
     if let Some(ready_tx) = ready_tx.take()
         && ready_tx.send(Ok(())).is_err()
     {
@@ -1094,7 +1119,7 @@ fn scripts_thread(
     let mut animation = build_animation(&world, &gpu_scene);
     drop_mismatched_skins(&world, &mut gpu_scene, &animation);
     animation.apply(scripts.drain_animation_requests());
-    apply_world_changes(
+    let mut spawned_roots = apply_world_changes(
         &mut world,
         &mut scripts,
         physics_sync.as_mut(),
@@ -1103,6 +1128,7 @@ fn scripts_thread(
         &mut prefab_loads,
         audio.as_mut(),
     );
+    net::tick(&mut network, &mut world, &mut scripts, &mut spawned_roots);
     #[cfg(feature = "dev-console")]
     let mut published_catalog_generation = u64::MAX;
     #[cfg(feature = "dev-console")]
@@ -1111,16 +1137,20 @@ fn scripts_thread(
         &command_catalog,
         &mut published_catalog_generation,
     );
-    #[cfg(test)]
-    let mut gamepads = engine_input::GilrsBackend::without_devices(pad_tuning);
-    #[cfg(not(test))]
-    let mut gamepads = engine_input::GilrsBackend::new(pad_tuning);
+    let mut gamepads = if gamepad_devices {
+        engine_input::GilrsBackend::new(pad_tuning)
+    } else {
+        engine_input::GilrsBackend::without_devices(pad_tuning)
+    };
     let interval = Duration::from_secs_f64(1.0 / background_tick_hz.max(1) as f64);
     let now = clock.now();
     let mut next_background_tick =
         now.saturating_add(if background { interval } else { Duration::ZERO });
     loop {
         timings.publish_if_due(Instant::now());
+        if frame_limit.is_some_and(|limit| frame_number >= limit) {
+            break;
+        }
         let mut stop_after_physics = false;
         if let (Some(client), Some(sync)) = (&mut physics_client, &mut physics_sync) {
             let physics_started = Instant::now();
@@ -1252,7 +1282,7 @@ fn scripts_thread(
             {
                 log::error!(target: "console", "command {name} failed: {error}");
             }
-            apply_world_changes(
+            spawned_roots.extend(apply_world_changes(
                 &mut world,
                 &mut scripts,
                 physics_sync.as_mut(),
@@ -1260,7 +1290,7 @@ fn scripts_thread(
                 &mut gpu_scene,
                 &mut prefab_loads,
                 audio.as_mut(),
-            );
+            ));
             publish_script_cursor(&scripts, &cursor, &mut published_cursor);
             publish_command_catalog(
                 &scripts,
@@ -1292,6 +1322,7 @@ fn scripts_thread(
         if let Some(latency) = reflex {
             latency.marker(frame_number, LatencyMarker::InputSample);
         }
+        net::receive(&mut network, &mut world, &mut scripts);
         gamepads.poll();
         let (input_frame, accepting_input) = {
             let mut accumulator = lock_input(&input);
@@ -1333,7 +1364,8 @@ fn scripts_thread(
         );
         log_animation_warnings(&mut animation);
         let world_changes_started = Instant::now();
-        apply_world_changes(
+        net::apply(&mut network, &mut world, &mut scripts);
+        spawned_roots.extend(apply_world_changes(
             &mut world,
             &mut scripts,
             physics_sync.as_mut(),
@@ -1341,7 +1373,8 @@ fn scripts_thread(
             &mut gpu_scene,
             &mut prefab_loads,
             audio.as_mut(),
-        );
+        ));
+        net::tick(&mut network, &mut world, &mut scripts, &mut spawned_roots);
         timings.record(
             script_phase::LOOP,
             script_phase::WORLD_CHANGES,
@@ -1582,7 +1615,7 @@ impl SpawnPhysics {
 
 /// Применяет spawn и destroy, закоммиченные скриптами в фазе: обновляет GPU-таблицу, физику и
 /// звук. Тела удаляются и вставляются до `sync_world_commands`, поэтому позы новых тел не дают
-/// ложных телепортаций.
+/// ложных телепортаций. Возвращает корни созданных объектов для сетевого моста.
 fn apply_world_changes(
     world: &mut World,
     scripts: &mut ScriptHost,
@@ -1591,7 +1624,8 @@ fn apply_world_changes(
     gpu_scene: &mut GpuSceneTable,
     prefabs: &mut PrefabLoads,
     mut audio: Option<&mut engine_audio::AudioBridge>,
-) {
+) -> Vec<SpawnedRoot> {
+    let mut roots = Vec::new();
     // Выгрузка может сразу запросить новую загрузку (отложенный spawn), поэтому заявки
     // вычитываются, пока очередь не опустеет.
     loop {
@@ -1600,8 +1634,12 @@ fn apply_world_changes(
             && changes.despawned.is_empty()
             && changes.prefab_requests.is_empty()
         {
-            return;
+            return roots;
         }
+        roots.extend(changes.spawned.iter().map(|spawned| SpawnedRoot {
+            handle: spawned.handle,
+            prefab: spawned.prefab.clone(),
+        }));
         apply_changes(
             world,
             scripts,
@@ -3179,6 +3217,8 @@ return Input
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 physics_client: None,
                 physics_initialization: None,
                 audio: None,
@@ -3186,6 +3226,7 @@ return Input
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -4119,10 +4160,13 @@ return Script
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -4405,6 +4449,76 @@ return Script
     }
 
     #[test]
+    fn headless_loop_stops_by_itself_after_frame_limit_ticks() {
+        let clock = Arc::new(FakeClock::default());
+        let waits = clock.observe_waits();
+        let world =
+            World::from_document(&SceneDocument::parse("spawn.rvescene", SPAWN_SCENE).unwrap())
+                .unwrap();
+        let mut scripts = start_test_scripts_configured(
+            world,
+            &[("gun.lua", "local Gun = {}\nreturn Gun\n")],
+            PreparedPrefabs::default(),
+            None,
+            Arc::clone(&clock),
+            Some(2),
+            true,
+        );
+        // Каждый тик ждёт сообщение, а часы должны пройти дедлайн: так тики детерминированы.
+        waits
+            .recv_timeout(Duration::from_secs(2))
+            .expect("первое ожидание тика");
+        clock.advance(Duration::from_millis(100));
+        scripts
+            .control
+            .send(ScriptControl::Background(true))
+            .unwrap();
+        waits
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ожидание второго тика");
+        assert!(
+            scripts.thread.stopped.try_recv().is_err(),
+            "после одного тика цикл продолжается"
+        );
+        clock.advance(Duration::from_millis(100));
+        scripts
+            .control
+            .send(ScriptControl::Background(true))
+            .unwrap();
+        scripts
+            .thread
+            .stopped
+            .recv_timeout(Duration::from_secs(2))
+            .expect("цикл остановился по --frames без Shutdown");
+        assert!(scripts.modules.shutdown().is_empty());
+    }
+
+    #[test]
+    fn headless_reply_to_a_heavy_upload_materializes_the_spawn() {
+        let mut harness = HeavyHarness::new(SPAWN_ON_START);
+        harness.start();
+        let token = harness.next_load();
+        let loaded = LoadedPrefab {
+            token,
+            cpu: PrefabCpu {
+                template: prefab_template(BALL_PATH, BALL_PREFAB),
+                sources: BTreeMap::new(),
+                geometry: Vec::new(),
+            },
+            models: HashMap::new(),
+            textures: HashMap::new(),
+            levels: Vec::new(),
+            particles: Vec::new(),
+        };
+        harness.reply(crate::headless::resource_reply(loaded));
+        harness.update();
+        assert!(
+            harness.ball_alive(),
+            "ответ headless без GPU открывает отложенный spawn"
+        );
+    }
+
+    #[test]
     fn background_sync_releases_held_input_once() {
         let input = test_input();
         {
@@ -4631,10 +4745,13 @@ return Script
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: None,
                 interrupt: interrupt.clone(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 1,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -4737,10 +4854,13 @@ return Script
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: Some(script_module()),
                 interrupt: ScriptInterruptHandle::new(),
                 clock: clock.clone(),
                 background_tick_hz: 1,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -4843,10 +4963,13 @@ return Script
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -4959,10 +5082,13 @@ return Move
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -5129,10 +5255,13 @@ return Move
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -5208,10 +5337,13 @@ return Move
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: Some(input_probe_module()),
                 interrupt: ScriptInterruptHandle::new(),
                 clock: clock.clone(),
                 background_tick_hz: 1,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -5525,10 +5657,13 @@ return Move
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: None,
                 interrupt,
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx,
                 control_rx: script_rx,
                 frame_tx,
@@ -5580,10 +5715,13 @@ return Move
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx,
                 control_rx: script_rx,
                 frame_tx,
@@ -5634,10 +5772,13 @@ return Move
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: Some(script_module()),
                 interrupt: interrupt.clone(),
                 clock: Arc::new(FakeClock::default()),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -5703,10 +5844,13 @@ return Move
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit: None,
                 script_module: None,
                 interrupt: ScriptInterruptHandle::new(),
                 clock: Arc::new(PanicClock),
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -5851,6 +5995,19 @@ return Move
         physics: Option<(PhysicsClient, PhysicsInitialization)>,
         clock: Arc<FakeClock>,
     ) -> TestScripts {
+        start_test_scripts_configured(world, sources, prefabs, physics, clock, None, false)
+    }
+
+    /// `background` и `frame_limit` — headless-режим: фон и предел тиков, как у `rve-server`.
+    fn start_test_scripts_configured(
+        world: World,
+        sources: &[(&str, &str)],
+        prefabs: PreparedPrefabs,
+        physics: Option<(PhysicsClient, PhysicsInitialization)>,
+        clock: Arc<FakeClock>,
+        frame_limit: Option<u64>,
+        background: bool,
+    ) -> TestScripts {
         let mut modules = ModuleHost::new();
         let (script_tx, script_rx) = flume::unbounded();
         let (frame_tx, frame_rx) = flume::bounded(1);
@@ -5859,6 +6016,10 @@ return Move
             Some((client, initialization)) => (Some(client), Some(initialization)),
             None => (None, None),
         };
+        if background {
+            let _ = script_tx.send(ScriptControl::Background(true));
+            let _ = script_tx.send(ScriptControl::Go(Box::default()));
+        }
         let thread = start_scripts(
             &mut modules,
             world,
@@ -5875,6 +6036,7 @@ return Move
                 interrupt: ScriptInterruptHandle::new(),
                 clock,
                 background_tick_hz: 30,
+                gamepad_devices: false,
                 control_tx: script_tx.clone(),
                 control_rx: script_rx,
                 frame_tx,
@@ -5888,6 +6050,8 @@ return Move
                 physics_geometry: Vec::new(),
                 prefab_loader: flume::unbounded().0,
                 render_resources: flume::unbounded().0,
+                network: None,
+                frame_limit,
                 #[cfg(feature = "dev-console")]
                 command_catalog: test_command_catalog(),
             },

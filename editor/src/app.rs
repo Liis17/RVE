@@ -993,9 +993,22 @@ impl EditorApp {
         let (Some(project), Some(scene)) = (&self.state.project, &self.state.scene) else {
             return;
         };
+        let protocol = engine_network::protocol_id(&project.settings.id, &project.settings.version);
+        let network = match self.state.play_network.plan(
+            &project.settings.network,
+            protocol,
+            engine_network::replication::scene_hash(scene.view()),
+        ) {
+            Ok(network) => network,
+            Err(error) => {
+                self.state.log.error(error);
+                return;
+            }
+        };
+        let network_summary = network.as_ref().map(|plan| plan.summary.clone());
         let tuning = gamepad_tuning(&project.settings.input.gamepad);
         editor_gamepads(&mut self.state.gamepads, tuning).begin_session(tuning);
-        let result = (|| {
+        let result: Result<PlaySession, String> = (|| {
             let mut world =
                 World::from_document(scene.view()).map_err(|error| error.to_string())?;
             project.apply_camera_settings(&mut world)?;
@@ -1003,7 +1016,7 @@ impl EditorApp {
             let model_geometry =
                 PlaySession::load_model_geometry(&world, &prefabs, &project.assets)?;
             let animation = crate::viewport::animation::project_bridge(&world, &project.assets);
-            PlaySession::start_with_world_and_physics(
+            let mut session = PlaySession::start_with_world_and_physics(
                 scene.view(),
                 world,
                 self.state.library.as_ref(),
@@ -1017,7 +1030,11 @@ impl EditorApp {
                     output: true,
                 },
                 animation,
-            )
+            )?;
+            if let Some(plan) = network {
+                session.attach_network(plan)?;
+            }
+            Ok(session)
         })();
         match result {
             Ok(session) => {
@@ -1025,6 +1042,9 @@ impl EditorApp {
                 self.state.play_cursor.reset();
                 play_cursor::focus_game_tab(&mut self.dock);
                 self.state.log.info("Play");
+                if let Some(summary) = network_summary {
+                    self.state.log.info(summary);
+                }
             }
             Err(error) => self.state.log.error(error),
         }

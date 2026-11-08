@@ -1,10 +1,10 @@
 use crate::actions::{ActionFrame, ActionMutation, ActionValue};
 use crate::lifecycle::{
-    DestroyRequest, Lifecycle, MAX_SPAWN_NAME_BYTES, MAX_SPAWNED_OBJECTS_PER_FRAME, ObjectState,
-    PrefabKind, PrefabRequest, PrefabStatus, SpawnArgs, SpawnRequest, prefab_display, prefab_key,
-    valid_spawn_id,
+    DestroyRequest, Lifecycle, ObjectState, PrefabKind, PrefabRequest, PrefabStatus, SpawnArgs,
+    SpawnRequest, check_spawn_request, prefab_display, prefab_key,
 };
 use crate::lite::EventQueue;
+use crate::net::{MAX_NET_REQUESTS_PER_FRAME, NetObjectState, NetScriptState, networked_template};
 use crate::physics::PhysicsScriptState;
 use crate::types::{
     RumbleRequest, ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptTransform,
@@ -14,8 +14,9 @@ use engine_physics::{
     QueryHit, Ray,
 };
 use engine_scene::{
-    AnimationRequest, AudioRequest, CameraSettings, LocalTransform, ObjectHandle, ParamValue,
-    PostProcessSettings, World,
+    AnimationRequest, AudioRequest, CameraSettings, LocalTransform, MAX_MESSAGE_DEPTH,
+    MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_STRING_BYTES, NetMode, NetRequest, NetTarget, ObjectHandle,
+    ParamValue, PeerId, PostProcessSettings, SERVER_PEER_ID, World,
 };
 use glam::{EulerRot, Quat, Vec3};
 use std::cell::RefCell;
@@ -31,9 +32,6 @@ pub(crate) const MAX_ANIMATION_REQUESTS_PER_FRAME: usize = 256;
 /// Запросов вибрации за кадр, включая уже зафиксированные скриптами; сверх лимита скрипт получает ошибку.
 pub(crate) const MAX_RUMBLE_REQUESTS_PER_FRAME: usize = 256;
 pub(crate) const MAX_MESSAGE_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
-pub(crate) const MAX_MESSAGE_DEPTH: usize = 16;
-pub(crate) const MAX_MESSAGE_ELEMENTS: usize = 1024;
-pub(crate) const MAX_MESSAGE_STRING_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_MESSAGE_NAME_BYTES: usize = 256;
 pub(crate) const MAX_MESSAGE_TARGET_ID_BYTES: usize = 256;
 
@@ -151,6 +149,10 @@ pub(crate) struct ScriptTransactionInit<'a> {
     pub(crate) instance_serial: u64,
     /// Состояние курсора, применённое хостом до этого вызова.
     pub(crate) cursor: ScriptCursor,
+    /// Режим сети, участники и сетевые атрибуты объектов.
+    pub(crate) net: Rc<RefCell<NetScriptState>>,
+    /// Сетевые запросы, уже зафиксированные в этом кадре.
+    pub(crate) queued_net: usize,
 }
 
 /// Результат разбора хендла объекта в вызове ABI.
@@ -209,6 +211,9 @@ pub(crate) struct ScriptTransaction {
     pending_audio: Vec<AudioRequest>,
     pending_rumble: Vec<RumbleRequest>,
     pending_animation: Vec<AnimationRequest>,
+    net: Rc<RefCell<NetScriptState>>,
+    queued_net: usize,
+    pending_net: Vec<NetRequest>,
     lifecycle: Rc<RefCell<Lifecycle>>,
     lifecycle_writes: bool,
     instance_serial: u64,
@@ -265,6 +270,9 @@ impl Default for ScriptTransaction {
             pending_audio: Vec::new(),
             pending_rumble: Vec::new(),
             pending_animation: Vec::new(),
+            net: Rc::new(RefCell::new(NetScriptState::default())),
+            queued_net: 0,
+            pending_net: Vec::new(),
             lifecycle: Rc::new(RefCell::new(Lifecycle::default())),
             lifecycle_writes: false,
             instance_serial: 0,
@@ -320,6 +328,9 @@ impl ScriptTransaction {
         self.pending_audio.clear();
         self.pending_rumble.clear();
         self.pending_animation.clear();
+        self.net = init.net;
+        self.queued_net = init.queued_net;
+        self.pending_net.clear();
         self.lifecycle = init.lifecycle;
         self.lifecycle_writes = init.lifecycle_writes;
         self.instance_serial = init.instance_serial;
@@ -431,6 +442,132 @@ impl ScriptTransaction {
     pub(crate) fn has_audio_source(&self, handle: ObjectHandle) -> bool {
         self.world()
             .is_some_and(|world| world.audio_source(handle).is_some())
+    }
+
+    /// Режим сети, который видит скрипт.
+    pub(crate) fn net_mode(&self) -> NetMode {
+        self.net.borrow().mode()
+    }
+
+    /// Номер локального участника; до подключения клиента скрипты видят 0, как и раньше.
+    pub(crate) fn net_local_peer(&self) -> PeerId {
+        self.net.borrow().local_peer().unwrap_or(SERVER_PEER_ID)
+    }
+
+    pub(crate) fn net_peers(&self) -> Vec<PeerId> {
+        self.net.borrow().peers().to_vec()
+    }
+
+    pub(crate) fn net_object(&self, handle: ObjectHandle) -> Option<NetObjectState> {
+        self.net.borrow().object(handle)
+    }
+
+    /// Авторитет над состоянием объекта. Объект без `network_identity` не реплицируется и остаётся
+    /// локальным. Сервер и offline ведут все объекты; клиент — только `authority = owner`, если он владелец.
+    pub(crate) fn net_has_authority(&self, handle: ObjectHandle) -> bool {
+        let Some(world) = self.world() else {
+            return false;
+        };
+        if !world.is_alive(handle) {
+            return false;
+        }
+        let Some(identity) = world.network_identity(handle) else {
+            return true;
+        };
+        let net = self.net.borrow();
+        match net.mode() {
+            NetMode::Offline | NetMode::Host | NetMode::Server => true,
+            NetMode::Client => {
+                let owner = net.object(handle).and_then(|state| state.owner);
+                identity.authority == engine_scene::NetAuthority::Owner
+                    && owner.is_some()
+                    && owner == net.local_peer()
+            }
+        }
+    }
+
+    /// Владелец объекта совпадает с локальным участником. Пока номер неизвестен, никто не владелец.
+    pub(crate) fn net_is_owner(&self, handle: ObjectHandle) -> bool {
+        let net = self.net.borrow();
+        let owner = net.object(handle).and_then(|state| state.owner);
+        owner.is_some() && owner == net.local_peer()
+    }
+
+    /// Ставит сообщение сети до коммита. Без `object` это `rve.net.send`, с ним — `obj:net_send`.
+    /// В offline-режиме запрос не ставится и ошибки нет; на клиенте адресат только сервер.
+    pub(crate) fn send_net(
+        &mut self,
+        object: Option<ObjectHandle>,
+        name: &str,
+        value: ParamValue,
+        target: NetTarget,
+        reliable: bool,
+    ) -> Result<(), String> {
+        self.ensure_net_writable()?;
+        let mode = self.net_mode();
+        if mode == NetMode::Offline {
+            return Ok(());
+        }
+        if mode == NetMode::Client && target != NetTarget::Server {
+            return Err("на клиенте сетевые сообщения можно отправлять только серверу".to_owned());
+        }
+        let name = name.to_owned();
+        let request = match object {
+            Some(object) => NetRequest::ObjectSend {
+                object,
+                name,
+                value,
+                target,
+                reliable,
+            },
+            None => NetRequest::Send {
+                target,
+                name,
+                value,
+                reliable,
+            },
+        };
+        self.stage_net(request)
+    }
+
+    /// Назначает владельца объекта. Работает только на сервере, в listen-server и offline (где запрос не ставится).
+    pub(crate) fn set_net_owner(
+        &mut self,
+        object: ObjectHandle,
+        peer: PeerId,
+    ) -> Result<(), String> {
+        self.ensure_net_writable()?;
+        if self.net_mode() == NetMode::Client {
+            return Err("set_net_owner доступен только серверу, а не клиенту".to_owned());
+        }
+        let has_identity = self
+            .world()
+            .is_some_and(|world| world.network_identity(object).is_some());
+        if !has_identity {
+            return Err("set_net_owner требует объект с network_identity".to_owned());
+        }
+        if self.net_mode() == NetMode::Offline {
+            return Ok(());
+        }
+        self.stage_net(NetRequest::SetOwner { object, peer })
+    }
+
+    fn ensure_net_writable(&self) -> Result<(), String> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err("network is unavailable during script creation".to_owned())
+        }
+    }
+
+    fn stage_net(&mut self, request: NetRequest) -> Result<(), String> {
+        if self.queued_net.saturating_add(self.pending_net.len()) >= MAX_NET_REQUESTS_PER_FRAME {
+            return Err(format!(
+                "network requests limit ({MAX_NET_REQUESTS_PER_FRAME} per frame) reached"
+            ));
+        }
+        self.pending_net.push(request);
+        Ok(())
     }
 
     pub(crate) fn stage_animation(&mut self, request: AnimationRequest) -> Result<(), String> {
@@ -804,64 +941,26 @@ impl ScriptTransaction {
             .ok_or_else(|| "spawn is only available during script calls".to_owned())?;
         {
             let lifecycle = self.lifecycle.borrow();
-            let slot = lifecycle.prefabs.get(&prefab).ok_or_else(|| {
-                format!(
-                    "prefab {:?} is not in the project prefab list",
-                    prefab_display(&prefab)
-                )
-            })?;
-            if slot.status == PrefabStatus::Failed {
+            check_spawn_request(
+                world,
+                &lifecycle,
+                self.pending_spawns.len(),
+                &self.pending_ids,
+                &prefab,
+                &args,
+            )?;
+            // Клиент получает сетевые объекты только от сервера: локальный spawn такого префаба запрещён.
+            // Незагруженный тяжёлый префаб проверяется при создании (см. `ScriptHost::materialize`).
+            let networked = lifecycle
+                .prefabs
+                .get(&prefab)
+                .and_then(|slot| slot.template.as_deref())
+                .is_some_and(networked_template);
+            if networked && self.net.borrow().mode() == NetMode::Client {
                 return Err(format!(
-                    "prefab {:?} failed to load",
+                    "prefab {:?} has network objects; a client can spawn them only through the network",
                     prefab_display(&prefab)
                 ));
-            }
-            if slot.kind == PrefabKind::Fast && slot.template.is_none() {
-                return Err(format!(
-                    "prefab {:?} is not registered",
-                    prefab_display(&prefab)
-                ));
-            }
-            if lifecycle.queued.len() + lifecycle.waiting.len() + self.pending_spawns.len()
-                >= MAX_SPAWNED_OBJECTS_PER_FRAME
-            {
-                return Err(format!(
-                    "spawn requests limit ({MAX_SPAWNED_OBJECTS_PER_FRAME} per frame) reached"
-                ));
-            }
-        }
-        let options = &args.options;
-        if [options.position, options.rotation_deg, options.scale]
-            .into_iter()
-            .flatten()
-            .any(|value| !value.is_finite())
-            || args.velocity.is_some_and(|value| !value.is_finite())
-        {
-            return Err("spawn transform and velocity must be finite".to_owned());
-        }
-        if let Some(parent) = options.parent
-            && !world.is_alive(parent)
-        {
-            return Err("spawn parent must be an existing object".to_owned());
-        }
-        if options
-            .name
-            .as_ref()
-            .is_some_and(|name| name.len() > MAX_SPAWN_NAME_BYTES)
-        {
-            return Err(format!(
-                "spawn name must be at most {MAX_SPAWN_NAME_BYTES} bytes"
-            ));
-        }
-        if let Some(id) = &options.id {
-            if !valid_spawn_id(id) {
-                return Err(format!("spawn id {id:?} must match [A-Za-z0-9_-]{{1,64}}"));
-            }
-            if world.handle(id).is_some()
-                || self.pending_ids.contains_key(id)
-                || self.lifecycle.borrow().pending_ids.contains_key(id)
-            {
-                return Err(format!("object id {id:?} is already used"));
             }
         }
         let root = world.reserve_object();
@@ -874,6 +973,7 @@ impl ScriptTransaction {
             prefab,
             args,
             source: self.source.clone(),
+            from_script: true,
         });
         Ok(root)
     }
@@ -1201,6 +1301,7 @@ impl ScriptTransaction {
         events: &EventQueue,
         audio: &mut Vec<AudioRequest>,
         animation: &mut Vec<AnimationRequest>,
+        net: &mut Vec<NetRequest>,
         rumble: &mut Vec<RumbleRequest>,
     ) -> Result<Vec<ActionMutation>, String> {
         let transforms_are_finite = self.pending_transforms.values().all(|transform| {
@@ -1374,6 +1475,7 @@ impl ScriptTransaction {
         self.overflowed_messages = 0;
         audio.append(&mut self.pending_audio);
         animation.append(&mut self.pending_animation);
+        net.append(&mut self.pending_net);
         rumble.append(&mut self.pending_rumble);
         self.world = std::ptr::null();
         self.action_frame = None;
@@ -1445,6 +1547,7 @@ impl ScriptTransaction {
         self.pending_audio.clear();
         self.pending_rumble.clear();
         self.pending_animation.clear();
+        self.pending_net.clear();
         self.world = std::ptr::null();
         self.action_frame = None;
     }
