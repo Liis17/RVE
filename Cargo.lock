@@ -3039,6 +3039,7 @@ dependencies = [
  "engine-console",
  "engine-core",
  "engine-files",
+ "engine-network",
  "engine-physics",
  "engine-platform",
  "engine-project",

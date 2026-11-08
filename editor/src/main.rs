@@ -16,6 +16,7 @@ mod layout;
 mod new_project;
 mod play;
 mod play_cursor;
+mod play_network;
 mod previews;
 mod profile;
 mod project;

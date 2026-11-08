@@ -1,6 +1,7 @@
 //! Верхнее меню, строка инструментов и горячие клавиши.
 
 use crate::layout::{Tab, default_layout, is_open};
+use crate::play_network::{NETWORK_DISABLED_HINT, PlayNetworkMode};
 use crate::scene_edit::{NewObject, objects_from_clipboard, objects_to_clipboard};
 use crate::state::{Action, EditorState};
 use crate::ui::scene_view;
@@ -343,6 +344,76 @@ fn snap_step<'a>(value: &'a mut f32, prefix: &str, suffix: &str) -> egui::DragVa
         .suffix(suffix)
 }
 
+/// Сетевой режим следующего Play и его параметры. Во время Play меню закрыто для изменений.
+fn show_play_network(ui: &mut egui::Ui, state: &mut EditorState, playing: bool) {
+    let network = state
+        .project
+        .as_ref()
+        .map(|project| &project.settings.network);
+    let enabled = network.is_some_and(|network| network.enabled);
+    let default_port = network.map_or(7777, |network| network.port);
+    let form = &mut state.play_network;
+    ui.add_enabled_ui(!playing, |ui| {
+        ui.menu_button(format!("Network: {}", form.mode.label()), |ui| {
+            for mode in PlayNetworkMode::ALL {
+                let allowed = mode == PlayNetworkMode::Offline || enabled;
+                let option = ui
+                    .add_enabled(
+                        allowed,
+                        egui::Button::selectable(form.mode == mode, mode.label()),
+                    )
+                    .on_disabled_hover_text(NETWORK_DISABLED_HINT);
+                if option.clicked() {
+                    form.mode = mode;
+                }
+            }
+            match form.mode {
+                PlayNetworkMode::Offline => {}
+                PlayNetworkMode::Host => {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Port");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.port)
+                                .hint_text(default_port.to_string())
+                                .desired_width(72.0),
+                        );
+                    });
+                }
+                PlayNetworkMode::Client => {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Address");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.address)
+                                .hint_text("127.0.0.1:7777")
+                                .desired_width(180.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Fingerprint");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.fingerprint)
+                                .hint_text("64 hex-символа из Console хоста")
+                                .desired_width(300.0),
+                        );
+                    });
+                    ui.checkbox(&mut form.insecure_no_pin, "Insecure: no pin");
+                    ui.horizontal(|ui| {
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.password)
+                                .password(true)
+                                .hint_text("необязательно")
+                                .desired_width(180.0),
+                        );
+                    });
+                }
+            }
+        });
+    });
+}
+
 fn show_tools(ui: &mut egui::Ui, state: &mut EditorState) {
     for (tool, label, tip) in [
         (GizmoTool::Move, "Move", "Перемещение (W)"),
@@ -369,6 +440,7 @@ fn show_tools(ui: &mut egui::Ui, state: &mut EditorState) {
     if ui.selectable_label(can_stop, "Play").clicked() {
         state.action(if can_stop { Action::Stop } else { Action::Play });
     }
+    show_play_network(ui, state, can_stop);
     let paused = state.play.as_ref().is_some_and(|play| play.is_paused());
     if ui
         .add_enabled(playing, egui::Button::selectable(paused, "Pause"))
