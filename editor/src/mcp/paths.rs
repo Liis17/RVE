@@ -1,9 +1,6 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
-
 /// Resolves an existing project file or directory and rejects paths outside the project.
 pub fn resolve_read_path(project_root: &Path, input: &str) -> Result<PathBuf, String> {
     let root = canonical_project_root(project_root)?;
@@ -157,15 +154,10 @@ fn canonical_project_root(path: &Path) -> Result<PathBuf, String> {
 }
 
 pub(super) fn is_link_or_junction(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        // Junctions are reparse points but are not reported as symbolic links by `FileType`.
-        metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
+    // На Windows std считает симлинком и junction (проверено `rejects_junctions_for_read_and_write`).
+    // Прочие reparse-точки (облачные заглушки, dedup) этим предикатом больше не отклоняются;
+    // на реальных тегах это не проверено.
+    metadata.file_type().is_symlink()
 }
 
 fn canonical_assets_root(project_root: &Path) -> Result<PathBuf, String> {
@@ -317,6 +309,33 @@ mod tests {
         std::fs::write(root.join("Assets/a.txt"), "ok").unwrap();
         assert!(resolve_read_path(&root, "Assets/a.txt").is_ok());
         let _ = std::fs::remove_dir_all(dot_parent);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_junctions_for_read_and_write() {
+        let project = TempProject::new();
+        let target = project.0.with_extension("junction-target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("source.txt"), "secret").unwrap();
+        // cmd's mklink misreads forward slashes in the link name, so the path is built from components.
+        let link = project.0.join("Assets").join("junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert!(resolve_write_path(&project.0, "junction/new.txt").is_err());
+        assert!(resolve_read_path(&project.0, "Assets/junction/source.txt").is_err());
+        // rmdir removes only the junction itself, so the target survives the cleanup below.
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "rmdir"])
+            .arg(&link)
+            .status();
+        let _ = std::fs::remove_dir_all(target);
     }
 
     #[test]

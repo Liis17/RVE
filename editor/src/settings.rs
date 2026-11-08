@@ -4,7 +4,6 @@
 //! устаревшее поле заменяется значением по умолчанию и не мешает читать остальные.
 
 use crate::layout::{Tab, default_layout};
-use crate::scene_edit::write_atomic;
 use egui_dock::DockState;
 use engine_mcp::Permissions;
 use serde::{Deserialize, Serialize};
@@ -185,8 +184,44 @@ impl SettingsStore {
             "mcp": settings.mcp,
         });
         let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-        write_atomic(&self.file, text.as_bytes())
+        write_private(&self.file, text.as_bytes())
     }
+}
+
+/// Атомарная запись `settings.json`; на unix временный файл создаётся сразу с правами 0600,
+/// потому что в нём лежит токен MCP.
+#[cfg(unix)]
+fn write_private(file: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let describe = |error: std::io::Error| format!("{}: {error}", file.display());
+    let name = file
+        .file_name()
+        .ok_or_else(|| format!("{}: нет имени файла", file.display()))?;
+    let mut temporary_name = name.to_owned();
+    temporary_name.push(".tmp");
+    let temporary = file.with_file_name(temporary_name);
+    let _ = std::fs::remove_file(&temporary);
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(describe)?;
+    if let Err(error) = output.write_all(contents) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(describe(error));
+    }
+    drop(output);
+    std::fs::rename(&temporary, file).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        describe(error)
+    })
+}
+
+#[cfg(not(unix))]
+fn write_private(file: &Path, contents: &[u8]) -> Result<(), String> {
+    crate::scene_edit::write_atomic(file, contents)
 }
 
 /// Поле настроек; неразборчивое значение пропускается с записью в `problems`.
@@ -354,6 +389,27 @@ mod tests {
         assert_eq!(loaded.mcp.token, "token");
         assert!(loaded.mcp.permissions.edit_scene);
         assert_eq!(message, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_file_holding_the_mcp_token_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        // A temporary file left with wider permissions must not be reused for the token.
+        let leftover = dir.0.join(format!("{FILE_NAME}.tmp"));
+        std::fs::write(&leftover, "old").unwrap();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = SettingsStore::in_dir(&dir.0);
+        let mut settings = UserSettings::default();
+        settings.mcp.token = "token".to_owned();
+        store.save(&settings).unwrap();
+        let mode = std::fs::metadata(dir.0.join(FILE_NAME))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
