@@ -5,6 +5,7 @@ use std::sync::Arc;
 use glam::{Mat3, Quat, Vec3};
 
 use crate::broad::sweep_and_prune_pairable;
+use crate::material::PhysicsMaterial;
 use crate::narrow::{ManifoldCache, PairKey, collide};
 use crate::query::{QueryCollider, QueryColliderDesc, QueryError, QuerySnapshot};
 use crate::{Aabb, BroadPhaseError, ContactManifold, GeometryError, NarrowphaseError, Pose, Shape};
@@ -33,8 +34,7 @@ pub struct ColliderDesc {
     pub shape: Shape,
     pub offset: Vec3,
     pub trigger: bool,
-    pub friction: f32,
-    pub restitution: f32,
+    pub material: PhysicsMaterial,
     pub enabled: bool,
 }
 
@@ -44,8 +44,7 @@ impl ColliderDesc {
             shape,
             offset: Vec3::ZERO,
             trigger: false,
-            friction: 0.5,
-            restitution: 0.0,
+            material: PhysicsMaterial::from_friction_restitution(0.5, 0.0),
             enabled: true,
         }
     }
@@ -114,13 +113,7 @@ impl BodyDesc {
         {
             return Err(PhysicsWorldError::InvalidBody);
         }
-        if !self.collider.friction.is_finite()
-            || self.collider.friction < 0.0
-            || !self.collider.restitution.is_finite()
-            || !(0.0..=1.0).contains(&self.collider.restitution)
-        {
-            return Err(PhysicsWorldError::InvalidMaterial);
-        }
+        self.collider.material.validate()?;
         Pose::new(self.pose.position, self.pose.rotation)?;
         self.mass_terms()?;
         Ok(())
@@ -1240,7 +1233,7 @@ mod tests {
         BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent,
         PhysicsWorld, PhysicsWorldError, SLEEP_ANGULAR_SPEED, SLEEP_LINEAR_SPEED, StepDriver,
     };
-    use crate::{Hull, Pose, Shape, TriMesh};
+    use crate::{Hull, PhysicsMaterial, Pose, Shape, TriMesh};
     use glam::{Quat, Vec3};
     use std::sync::Arc;
 
@@ -1266,6 +1259,12 @@ mod tests {
             );
         }
         events
+    }
+
+    fn run_steps_at(driver: &mut StepDriver, hz: u32, seconds: f32) {
+        for _ in 0..(seconds * hz as f32).round() as usize {
+            driver.advance_step(1.0 / hz as f32, []).unwrap();
+        }
     }
 
     fn count_events(events: &[PhysicsEvent], predicate: impl Fn(&PhysicsEvent) -> bool) -> usize {
@@ -1369,14 +1368,14 @@ mod tests {
     fn restitution_produces_a_bounded_bounce() {
         let mut world = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0)).unwrap();
         let mut floor = floor_desc();
-        floor.collider.restitution = 0.8;
+        floor.collider.material.bounciness = 0.8;
         world.insert_body(floor).unwrap();
         let mut ball = BodyDesc::dynamic(
             Shape::sphere(0.5).unwrap(),
             Pose::new(Vec3::new(0.0, 1.5, 0.0), Quat::IDENTITY).unwrap(),
             1.0,
         );
-        ball.collider.restitution = 0.8;
+        ball.collider.material.bounciness = 0.8;
         let ball = world.insert_body(ball).unwrap();
         world
             .apply_command(
@@ -1418,19 +1417,140 @@ mod tests {
             Pose::IDENTITY,
         );
         ramp.pose.rotation = rotation;
-        ramp.collider.friction = friction;
+        ramp.collider.material = PhysicsMaterial::from_friction_restitution(friction, 0.0);
         world.insert_body(ramp).unwrap();
         let mut block = BodyDesc::dynamic(
             box_shape(0.4),
             Pose::new(normal * 0.6, rotation).unwrap(),
             1.0,
         );
-        block.collider.friction = friction;
+        block.collider.material = PhysicsMaterial::from_friction_restitution(friction, 0.0);
         block.lock_rotation = true;
         let block = world.insert_body(block).unwrap();
         let mut driver = StepDriver::new(world, 60, 8).unwrap();
         run_steps(&mut driver, 120);
         driver.world().body_velocity(block).unwrap()
+    }
+
+    /// Рампа под 20° и блок 0.8 на ней; материалы задаются снаружи.
+    fn ramp_block_world(
+        hz: u32,
+        ramp_material: PhysicsMaterial,
+        block_material: PhysicsMaterial,
+    ) -> (StepDriver, BodyHandle) {
+        let rotation = Quat::from_rotation_z(-20.0_f32.to_radians());
+        let mut world = PhysicsWorld::default();
+        let mut ramp = BodyDesc::static_collider(
+            Shape::cuboid(Vec3::new(5.0, 0.2, 3.0)).unwrap(),
+            Pose::new(Vec3::ZERO, rotation).unwrap(),
+        );
+        ramp.collider.material = ramp_material;
+        world.insert_body(ramp).unwrap();
+        let mut block = BodyDesc::dynamic(
+            box_shape(0.4),
+            Pose::new(rotation * Vec3::Y * 0.6, rotation).unwrap(),
+            1.0,
+        );
+        block.collider.material = block_material;
+        block.lock_rotation = true;
+        let block = world.insert_body(block).unwrap();
+        (StepDriver::new(world, hz, 8).unwrap(), block)
+    }
+
+    fn friction_material(static_friction: f32, dynamic_friction: f32) -> PhysicsMaterial {
+        PhysicsMaterial {
+            static_friction,
+            dynamic_friction,
+            ..PhysicsMaterial::from_friction_restitution(0.0, 0.0)
+        }
+    }
+
+    #[test]
+    fn static_friction_holds_a_block_and_dynamic_friction_applies_once_it_slides() {
+        let downslope = Quat::from_rotation_z(-20.0_f32.to_radians()) * Vec3::X;
+        for hz in [60_u32, 30] {
+            let mut slid = [0.0_f32; 2];
+            for (index, dynamic) in [0.1_f32, 0.6].into_iter().enumerate() {
+                let (mut driver, block) = ramp_block_world(
+                    hz,
+                    friction_material(0.6, dynamic),
+                    friction_material(0.6, dynamic),
+                );
+                let start = driver.world().body_pose(block).unwrap().position;
+                for _ in 0..hz {
+                    driver.advance_step(1.0 / hz as f32, []).unwrap();
+                }
+                let rest = driver.world().body_pose(block).unwrap().position;
+                assert!(
+                    (rest - start).length() < 0.01,
+                    "hz {hz}: drifted to {rest:?}"
+                );
+
+                driver
+                    .advance_step(
+                        1.0 / hz as f32,
+                        [PhysicsCommand::AddImpulse {
+                            body: block,
+                            impulse: downslope,
+                            point: None,
+                        }],
+                    )
+                    .unwrap();
+                let before = driver.world().body_pose(block).unwrap().position;
+                run_steps_at(&mut driver, hz, 1.0);
+                let after = driver.world().body_pose(block).unwrap().position;
+                slid[index] = (after - before).dot(downslope);
+            }
+            assert!(
+                slid[0] > slid[1] + 1.0,
+                "hz {hz}: slide with dynamic 0.1 {} vs dynamic 0.6 {}",
+                slid[0],
+                slid[1]
+            );
+        }
+    }
+
+    #[test]
+    fn combined_friction_between_identical_runs_is_bit_for_bit_repeatable() {
+        let downslope = Quat::from_rotation_z(-20.0_f32.to_radians()) * Vec3::X;
+        let mut finals = Vec::new();
+        for _ in 0..2 {
+            let (mut driver, block) =
+                ramp_block_world(60, friction_material(0.7, 0.3), friction_material(0.5, 0.2));
+            run_steps_at(&mut driver, 60, 0.5);
+            driver
+                .advance_step(
+                    1.0 / 60.0,
+                    [PhysicsCommand::AddImpulse {
+                        body: block,
+                        impulse: downslope * 0.8,
+                        point: None,
+                    }],
+                )
+                .unwrap();
+            run_steps_at(&mut driver, 60, 1.0);
+            finals.push(driver.world().body_pose(block).unwrap());
+        }
+        assert_eq!(finals[0], finals[1]);
+    }
+
+    #[test]
+    fn collider_desc_new_keeps_half_friction_and_no_bounce() {
+        let desc = ColliderDesc::new(box_shape(0.5));
+        assert_eq!(desc.material.static_friction, 0.5);
+        assert_eq!(desc.material.dynamic_friction, 0.5);
+        assert_eq!(desc.material.bounciness, 0.0);
+    }
+
+    #[test]
+    fn body_with_invalid_material_is_rejected_on_insert() {
+        let mut world = PhysicsWorld::default();
+        let mut desc = BodyDesc::dynamic(box_shape(0.5), Pose::IDENTITY, 1.0);
+        desc.collider.material.bounciness = 1.5;
+        assert_eq!(
+            world.insert_body(desc),
+            Err(PhysicsWorldError::InvalidMaterial)
+        );
     }
 
     #[test]
@@ -1992,14 +2112,14 @@ mod tests {
             );
             let mut world = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0)).unwrap();
             let mut floor = BodyDesc::static_collider(Shape::TriMesh(triangle), Pose::IDENTITY);
-            floor.collider.friction = 1.0;
+            floor.collider.material = PhysicsMaterial::from_friction_restitution(1.0, 0.0);
             world.insert_body(floor).unwrap();
             let mut ball = BodyDesc::dynamic(
                 Shape::sphere(0.5).unwrap(),
                 Pose::new(Vec3::new(start_x, 0.49, 0.0), Quat::IDENTITY).unwrap(),
                 1.0,
             );
-            ball.collider.friction = 1.0;
+            ball.collider.material = PhysicsMaterial::from_friction_restitution(1.0, 0.0);
             ball.linear_damping = 0.0;
             ball.angular_damping = 0.0;
             let ball = world.insert_body(ball).unwrap();

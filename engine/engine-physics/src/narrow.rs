@@ -108,6 +108,8 @@ pub struct ContactPoint {
     pub normal_impulse: f32,
     /// Accumulated world-space tangential impulse for the next solver pass.
     pub tangent_impulse: Vec3,
+    /// Точка скользила на последнем solve: трение берётся динамическое. Хранится в кэше.
+    pub(crate) sliding: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,12 +136,15 @@ struct CachedPoint {
     feature_id: u64,
     normal_impulse: f32,
     tangent_impulse: Vec3,
+    sliding: bool,
 }
 
 #[derive(Clone, Debug)]
 struct CachedManifold {
     normal: Vec3,
     points: Vec<CachedPoint>,
+    /// Скользила ли хоть одна точка manifold на последнем solve.
+    sliding: bool,
 }
 
 #[derive(Default)]
@@ -159,6 +164,7 @@ impl ManifoldCache {
         let pose_b = Pose::new(pose_b.position, pose_b.rotation)?;
         let old = self.entries.get(&key);
         let preserve = old.is_some_and(|entry| entry.normal.dot(generated.normal) >= 0.9);
+        let inherited_sliding = old.is_some_and(|entry| entry.sliding);
         let mut used = HashSet::new();
         let mut points = Vec::with_capacity(generated.contacts.len());
 
@@ -197,6 +203,11 @@ impl ManifoldCache {
                 contact.normal_impulse = cached.normal_impulse;
                 contact.tangent_impulse = cached.tangent_impulse
                     - generated.normal * cached.tangent_impulse.dot(generated.normal);
+                contact.sliding = cached.sliding;
+            } else {
+                // Точка без пары на этом шаге (скольжение сдвигает её дальше допуска) наследует
+                // режим трения пары: иначе статическое трение возвращается через шаг.
+                contact.sliding = inherited_sliding;
             }
             points.push(CachedPoint {
                 local_a,
@@ -204,6 +215,7 @@ impl ManifoldCache {
                 feature_id: contact.feature_id,
                 normal_impulse: contact.normal_impulse,
                 tangent_impulse: contact.tangent_impulse,
+                sliding: contact.sliding,
             });
         }
         self.entries.insert(
@@ -211,6 +223,7 @@ impl ManifoldCache {
             CachedManifold {
                 normal: generated.normal,
                 points,
+                sliding: generated.contacts.iter().any(|contact| contact.sliding),
             },
         );
         Ok(generated)
@@ -223,7 +236,9 @@ impl ManifoldCache {
         for (point, contact) in cached.points.iter_mut().zip(&manifold.contacts) {
             point.normal_impulse = contact.normal_impulse;
             point.tangent_impulse = contact.tangent_impulse;
+            point.sliding = contact.sliding;
         }
+        cached.sliding = manifold.contacts.iter().any(|contact| contact.sliding);
     }
 
     pub fn remove(&mut self, key: PairKey) -> bool {
@@ -1064,6 +1079,7 @@ fn contact_point(point_a: Vec3, point_b: Vec3, penetration: f32, feature_id: u64
         feature_id,
         normal_impulse: 0.0,
         tangent_impulse: Vec3::ZERO,
+        sliding: false,
     }
 }
 

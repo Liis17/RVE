@@ -13,7 +13,7 @@ use crate::world::{
     BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsWorld,
     PhysicsWorldError, StepDriver,
 };
-use crate::{GeometryError, Pose, Shape, TriMesh};
+use crate::{GeometryError, PhysicsMaterial, Pose, Shape, TriMesh};
 
 const POSE_POSITION_EPSILON_SQUARED: f32 = 1.0e-8;
 const POSE_ROTATION_DOT_EPSILON: f32 = 1.0e-5;
@@ -635,8 +635,8 @@ fn scene_body(
     let mut collider_desc = ColliderDesc::new(shape);
     collider_desc.offset = Vec3::from_array(collider.offset) * transform.scale;
     collider_desc.trigger = collider.trigger;
-    collider_desc.friction = collider.friction;
-    collider_desc.restitution = collider.restitution;
+    collider_desc.material =
+        PhysicsMaterial::from_friction_restitution(collider.friction, collider.restitution);
     let mut desc = BodyDesc::new(kind, transform.pose, collider_desc);
     apply_rigid_body(&mut desc, rigid_body);
     Ok(Some(PhysicsSceneBody {
