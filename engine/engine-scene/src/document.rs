@@ -805,6 +805,13 @@ pub struct CharacterControllerComponent {
     pub snap_distance: f32,
     pub skin: f32,
     pub push_strength: f32,
+    /// Гравитация для `simple_move`; по умолчанию выключена, как у старых контроллеров.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_gravity: bool,
+    #[serde(default = "one_f32", skip_serializing_if = "is_one")]
+    pub gravity_scale: f32,
+    #[serde(default = "default_jump_height", skip_serializing_if = "is_default_jump_height")]
+    pub jump_height: f32,
 }
 
 impl Default for CharacterControllerComponent {
@@ -817,8 +824,31 @@ impl Default for CharacterControllerComponent {
             snap_distance: 0.2,
             skin: 0.02,
             push_strength: 1.0,
+            use_gravity: false,
+            gravity_scale: 1.0,
+            jump_height: default_jump_height(),
         }
     }
+}
+
+fn one_f32() -> f32 {
+    1.0
+}
+
+fn default_jump_height() -> f32 {
+    1.0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_one(value: &f32) -> bool {
+    *value == 1.0
+}
+
+fn is_default_jump_height(value: &f32) -> bool {
+    *value == default_jump_height()
 }
 
 /// Локальная трансформация документа; углы вращения хранятся в градусах.
@@ -1392,6 +1422,8 @@ fn validate_physics_components(source: &str, object: &SceneObject) -> Result<(),
             controller.snap_distance,
             controller.skin,
             controller.push_strength,
+            controller.gravity_scale,
+            controller.jump_height,
         ]
         .into_iter()
         .all(f32::is_finite)
@@ -1409,6 +1441,8 @@ fn validate_physics_components(source: &str, object: &SceneObject) -> Result<(),
             || controller.snap_distance < 0.0
             || controller.skin < 0.0
             || controller.push_strength < 0.0
+            || controller.gravity_scale < 0.0
+            || controller.jump_height < 0.0
         {
             return Err(SceneError::new(
                 source,
@@ -3092,6 +3126,43 @@ push_strength = 2.0
                 parse(&input).is_err(),
                 "accepted character_controller.{field}"
             );
+        }
+    }
+
+    #[test]
+    fn character_controller_gravity_fields_default_for_old_scenes_and_round_trip() {
+        let old = parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\n[objects.character_controller]\nradius=0.5\n"
+        ))
+        .unwrap();
+        let controller = old.objects[1].character_controller.unwrap();
+        assert!(!controller.use_gravity);
+        assert_eq!(controller.gravity_scale, 1.0);
+        assert_eq!(controller.jump_height, 1.0);
+        let saved = old.to_toml().unwrap();
+        assert!(!saved.contains("use_gravity"), "{saved}");
+        assert!(!saved.contains("jump_height"), "{saved}");
+
+        let authored = parse(&format!(
+            "{VALID}\n[[objects]]\nid=\"player\"\n[objects.character_controller]\n\
+             use_gravity=true\ngravity_scale=2.5\njump_height=0.0\n"
+        ))
+        .unwrap();
+        let round_trip = parse(&authored.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            round_trip.objects[1].character_controller,
+            authored.objects[1].character_controller
+        );
+        let controller = round_trip.objects[1].character_controller.unwrap();
+        assert!(controller.use_gravity);
+        assert_eq!(controller.gravity_scale, 2.5);
+        assert_eq!(controller.jump_height, 0.0);
+
+        for field in ["gravity_scale=-1.0", "jump_height=-0.5", "jump_height=nan"] {
+            let input = format!(
+                "{VALID}\n[[objects]]\nid=\"player\"\n[objects.character_controller]\n{field}\n"
+            );
+            assert!(parse(&input).is_err(), "accepted {field}");
         }
     }
 
