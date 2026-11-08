@@ -960,7 +960,7 @@ version = "0.1.0"
 
 [[package]]
 name = "engine-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine-files",
  "epaint",
@@ -1127,10 +1127,11 @@ dependencies = [
 
 [[package]]
 name = "engine-script"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "engine-console",
  "engine-files",
+ "engine-gui",
  "engine-physics",
  "engine-project",
  "engine-scene",

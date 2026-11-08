@@ -25,6 +25,22 @@ pub struct UiCanvasHandle {
     pub(crate) generation: u32,
 }
 
+impl UiCanvasHandle {
+    /// Хендл из пары «индекс слота, поколение» для внешнего кодирования (ABI скриптов).
+    /// Чужой или устаревший хендл отклоняется при первом использовании, а не здесь.
+    pub fn from_raw(index: u32, generation: u32) -> Self {
+        Self { index, generation }
+    }
+
+    pub fn index(self) -> u32 {
+        self.index
+    }
+
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
 /// Хендл элемента: канвас (с поколением) и индекс элемента в документе.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UiElementHandle {
@@ -48,6 +64,8 @@ pub enum UiSystemError {
     /// Хендл закрытого канваса; слот мог быть занят новым канвасом.
     StaleHandle,
     UnknownElement(String),
+    /// Индекс элемента вне документа канваса.
+    UnknownIndex(usize),
     /// У элемента нет такого свойства или действия.
     Unsupported {
         element: String,
@@ -61,6 +79,9 @@ impl fmt::Display for UiSystemError {
         match self {
             Self::StaleHandle => f.write_str("хендл UI устарел: канвас закрыт"),
             Self::UnknownElement(id) => write!(f, "элемент {id:?} не объявлен в документе"),
+            Self::UnknownIndex(index) => {
+                write!(f, "элемент с индексом {index} не объявлен в документе")
+            }
             Self::Unsupported { element, property } => {
                 write!(f, "элемент {element:?} не поддерживает свойство {property}")
             }
@@ -218,6 +239,42 @@ impl UiSystem {
             canvas,
             index: index as u32,
         })
+    }
+
+    /// Хендл элемента по индексу в порядке объявления документа; индекс вне документа — ошибка.
+    pub fn element(
+        &self,
+        canvas: UiCanvasHandle,
+        index: usize,
+    ) -> Result<UiElementHandle, UiSystemError> {
+        if index >= self.canvas_ref(canvas)?.elements.len() {
+            return Err(UiSystemError::UnknownIndex(index));
+        }
+        Ok(UiElementHandle {
+            canvas,
+            index: index as u32,
+        })
+    }
+
+    /// Идентификатор элемента из документа.
+    pub fn element_id(&self, handle: UiElementHandle) -> Result<&str, UiSystemError> {
+        let (canvas, index) = self.element_ref(handle)?;
+        Ok(canvas.elements[index].id.as_str())
+    }
+
+    /// Слой канваса с учётом переопределения скриптом.
+    pub fn layer(&self, canvas: UiCanvasHandle) -> Result<i32, UiSystemError> {
+        Ok(self.canvas_ref(canvas)?.layer)
+    }
+
+    /// Ключ владельца, переданный в [`UiSystem::open`].
+    pub fn owner(&self, canvas: UiCanvasHandle) -> Result<u64, UiSystemError> {
+        Ok(self.canvas_ref(canvas)?.owner)
+    }
+
+    /// Видим ли канвас; скрытый канвас остаётся открытым и сохраняет состояние элементов.
+    pub fn canvas_visible(&self, canvas: UiCanvasHandle) -> Result<bool, UiSystemError> {
+        Ok(self.canvas_ref(canvas)?.visible)
     }
 
     /// Элемент в фокусе; фокус всегда на живом элементе после следующего update.
@@ -753,6 +810,31 @@ image = { path = "/ui/icon.png" }
         assert_eq!(system.text(label), Err(UiSystemError::StaleHandle));
         let fresh = system.find(second, "label").unwrap();
         assert_eq!(system.text(fresh).unwrap(), "Hi");
+    }
+
+    #[test]
+    fn element_handles_check_index_and_getters_reflect_the_canvas() {
+        let mut system = UiSystem::default();
+        let canvas = system.open(document(BASIC), 1);
+        let label = system.element(canvas, 0).unwrap();
+        assert_eq!(system.element_id(label), Ok("label"));
+        assert_eq!(
+            system.element(canvas, 99),
+            Err(UiSystemError::UnknownIndex(99))
+        );
+
+        assert_eq!(system.owner(canvas), Ok(1));
+        assert_eq!(system.layer(canvas), Ok(0));
+        assert_eq!(system.canvas_visible(canvas), Ok(true));
+        system.set_layer(canvas, 4).unwrap();
+        system.set_canvas_visible(canvas, false).unwrap();
+        assert_eq!(system.layer(canvas), Ok(4));
+        assert_eq!(system.canvas_visible(canvas), Ok(false));
+
+        let raw = UiCanvasHandle::from_raw(canvas.index(), canvas.generation());
+        assert_eq!(raw, canvas);
+        system.close(canvas).unwrap();
+        assert_eq!(system.layer(raw), Err(UiSystemError::StaleHandle));
     }
 
     #[test]

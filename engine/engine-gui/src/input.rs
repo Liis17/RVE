@@ -220,6 +220,13 @@ impl UiSystem {
         Ok(events)
     }
 
+    /// Снимает фокус; возвращает `blur` для элемента, который его терял.
+    pub fn clear_focus(&mut self) -> Vec<UiEvent> {
+        let mut events = Vec::new();
+        self.set_focus(None, &mut events);
+        events
+    }
+
     /// Закрывает открытые списки, кроме списка элемента `keep`.
     pub(crate) fn close_popups_except(&mut self, keep: Option<UiElementHandle>) {
         for (slot_index, slot) in self.slots.iter_mut().enumerate() {
@@ -1146,6 +1153,19 @@ RECT_C
         let released = step(&mut system, release(160.0, 110.0), 0.0);
         assert!(!has(&released, Kind::Click, slider));
         assert_eq!(system.value(slider).unwrap(), Some(UiValue::Number(75.0)));
+    }
+
+    #[test]
+    fn clear_focus_reports_blur_once_and_leaves_no_focus() {
+        let (mut system, canvas) = open(&row(), 1);
+        let a = system.find(canvas, "a").unwrap();
+        system.focus(a).unwrap();
+
+        let events = system.clear_focus();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, Kind::Blur);
+        assert_eq!(system.focused(), None);
+        assert!(system.clear_focus().is_empty());
     }
 
     #[test]

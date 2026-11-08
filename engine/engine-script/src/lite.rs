@@ -8,6 +8,8 @@ use crate::types::{
     RumbleRequest, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,
     ScriptTransform,
 };
+use crate::ui::UiDelivery;
+use crate::ui_lua;
 use engine_console::CommandSpec;
 use engine_files::VirtualPath;
 use engine_physics::Ray;
@@ -273,6 +275,7 @@ pub(crate) fn create_lua(
     call_deadline.install_sparse_hook(&lua)?;
 
     create_object_handles(&lua)?;
+    ui_lua::create_registry(&lua)?;
     let globals = lua.globals();
     globals.set("dofile", Value::Nil)?;
     globals.set("loadfile", Value::Nil)?;
@@ -397,6 +400,7 @@ pub(crate) fn create_lua(
     rve.set("broadcast", broadcast_function(&lua, active_call.clone())?)?;
     rve.set("audio", audio_table(&lua, active_call.clone())?)?;
     rve.set("net", net_table(&lua, active_call.clone())?)?;
+    rve.set("ui", ui_lua::ui_table(&lua, active_call.clone())?)?;
     rve.set("input", input_table(&lua, active_call)?)?;
     globals.set("rve", rve)?;
     Ok(LuaState {
@@ -620,6 +624,7 @@ impl LuaInstance {
     pub(crate) fn new(
         lua: &Lua,
         class: Table,
+        handle: ObjectHandle,
         object_id: &str,
         object_name: &str,
         params: &ScriptParams,
@@ -629,6 +634,8 @@ impl LuaInstance {
         let object = lua.create_table()?;
         object.set("id", object_id)?;
         object.set("name", object_name)?;
+        // `self.object` — тот же хендл, что у `rve.find`, поэтому API объекта (например, `rve.ui.canvas`) его принимает.
+        register_object_handle(lua, &object, handle)?;
         let transform = lua.create_userdata(TransformUserData { value: transform })?;
 
         let instance = lua.create_table()?;
@@ -719,6 +726,16 @@ impl LuaInstance {
                 (self.instance.clone(), *peer, reason.as_str()),
             ),
         }
+    }
+
+    pub(crate) fn invoke_ui_event(
+        &self,
+        lua: &Lua,
+        active_call: &ActiveCall,
+        event: &UiDelivery,
+    ) -> mlua::Result<()> {
+        let table = ui_lua::event_table(lua, event, active_call.clone())?;
+        self.invoke("on_ui_event", (self.instance.clone(), table))
     }
 
     pub(crate) fn invoke_physics_event(
@@ -895,7 +912,7 @@ fn unregister_command_function(
     })
 }
 
-fn with_active_call<T>(
+pub(crate) fn with_active_call<T>(
     active_call: &ActiveCall,
     callback: impl FnOnce(&mut ScriptTransaction) -> mlua::Result<T>,
 ) -> mlua::Result<T> {
@@ -931,7 +948,7 @@ fn register_object_handle(lua: &Lua, object: &Table, handle: ObjectHandle) -> ml
 }
 
 /// Хендл объекта, который вернул `rve.find`, `rve.spawn` или методы объекта.
-fn object_handle_of(lua: &Lua, object: &Table) -> mlua::Result<Option<ObjectHandle>> {
+pub(crate) fn object_handle_of(lua: &Lua, object: &Table) -> mlua::Result<Option<ObjectHandle>> {
     let handles: Table = lua.named_registry_value(OBJECT_HANDLES_KEY)?;
     Ok(match handles.raw_get::<Value>(object.clone())? {
         Value::Integer(value) => u64::try_from(value).ok().and_then(ObjectHandle::from_abi),
@@ -1431,7 +1448,7 @@ fn lua_name_value(value: Value, function: &str) -> mlua::Result<String> {
     }
 }
 
-fn lua_integer(value: Value, what: &str) -> mlua::Result<i64> {
+pub(crate) fn lua_integer(value: Value, what: &str) -> mlua::Result<i64> {
     match value {
         Value::Integer(value) => Ok(value),
         Value::Number(value) if value.is_finite() && value.fract() == 0.0 => Ok(value as i64),
@@ -3258,7 +3275,7 @@ fn cursor_locked_function(lua: &Lua, active_call: ActiveCall) -> mlua::Result<Fu
 }
 
 /// mlua приводит любое значение к bool, поэтому API принимает только настоящий boolean.
-fn lua_boolean(value: Value, function: &str) -> mlua::Result<bool> {
+pub(crate) fn lua_boolean(value: Value, function: &str) -> mlua::Result<bool> {
     match value {
         Value::Boolean(value) => Ok(value),
         other => Err(LuaError::runtime(format!(

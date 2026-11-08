@@ -14,7 +14,10 @@ mod net;
 mod physics;
 mod transaction;
 mod types;
+mod ui;
+mod ui_lua;
 
+pub use engine_gui::{document::UiDocument, events::UiEvent, system::UiSystem};
 pub use engine_scene::{ParamKind, ParamSchema, ParamSpec, ParamValue};
 pub use host::{
     CommandError, ScriptHost, ScriptInterruptHandle, ScriptLoadError, ScriptLoadOptions,
