@@ -349,10 +349,10 @@ pub(crate) fn dispatch(
         | "remove_component" | "set_script_param" | "set_camera_active" | "undo" | "redo" => {
             edit::call(tool, arguments, app.mcp_state_mut())
         }
+        "open_project" => assets::open_project(app, arguments, permissions),
         "save_scene"
         | "open_scene"
         | "new_scene"
-        | "open_project"
         | "write_asset_settings"
         | "create_folder"
         | "write_text_file"

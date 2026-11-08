@@ -235,7 +235,7 @@ impl EditorApp {
         true
     }
 
-    fn open_project(&mut self, dir: &Path) -> Result<(), String> {
+    fn open_project(&mut self, dir: &Path, build_scripts: bool) -> Result<(), String> {
         let project = OpenProject::open(dir)?;
         self.cancel_project_jobs();
         self.stop_play();
@@ -276,11 +276,12 @@ impl EditorApp {
         self.refresh_tree_only();
         if self.state.scripts_path.is_some() {
             self.load_manual_library();
-        } else if self
-            .state
-            .project
-            .as_ref()
-            .is_some_and(|project| project.settings.heavy_scripts.is_some())
+        } else if build_scripts
+            && self
+                .state
+                .project
+                .as_ref()
+                .is_some_and(|project| project.settings.heavy_scripts.is_some())
         {
             self.start_scripts_build();
         }
@@ -311,29 +312,48 @@ impl EditorApp {
         crate::mcp::dispatch(self, name, arguments, permissions)
     }
 
-    pub(crate) fn mcp_open_project(&mut self, dir: &Path) -> Result<(), String> {
+    /// `build_scripts` — право Build: без него `heavy_scripts` не собирается (cargo не запускается).
+    pub(crate) fn mcp_open_project(
+        &mut self,
+        dir: &Path,
+        build_scripts: bool,
+        discard: bool,
+    ) -> Result<(), String> {
         if self.state.is_playing() {
             return Err("stop Play before opening a project".to_owned());
         }
-        self.open_project(dir)?;
+        self.discard_dirty_scene_autosave(discard);
+        self.open_project(dir, build_scripts)?;
         self.state.recovery_prompt = None;
         Ok(())
     }
 
-    pub(crate) fn mcp_open_scene(&mut self, path: &str) -> Result<(), String> {
+    /// Авто-сборка скриптов после открытия проекта, которую пропускает MCP без права Build.
+    pub(crate) fn mcp_scripts_build_needed(&self) -> bool {
+        self.state.scripts_path.is_none()
+            && self
+                .state
+                .project
+                .as_ref()
+                .is_some_and(|project| project.settings.heavy_scripts.is_some())
+    }
+
+    pub(crate) fn mcp_open_scene(&mut self, path: &str, discard: bool) -> Result<(), String> {
         if self.state.is_playing() {
             return Err("stop Play before opening a scene".to_owned());
         }
+        self.discard_dirty_scene_autosave(discard);
         self.open_scene_with_recovery(path, false)
     }
 
-    pub(crate) fn mcp_new_scene(&mut self) -> Result<(), String> {
+    pub(crate) fn mcp_new_scene(&mut self, discard: bool) -> Result<(), String> {
         if self.state.project.is_none() {
             return Err("project is not open".to_owned());
         }
         if self.state.is_playing() {
             return Err("stop Play before creating a scene".to_owned());
         }
+        self.discard_dirty_scene_autosave(discard);
         let loader = self.state.project.as_ref().map(OpenProject::prefab_loader);
         let mut scene = EditorScene::new_untitled()?;
         if let Some(loader) = loader {
@@ -716,6 +736,18 @@ impl EditorApp {
         }
     }
 
+    /// Как `Action::Discard` в UI: копия отброшенной изменённой сцены удаляется до смены сцены или проекта.
+    fn discard_dirty_scene_autosave(&mut self, discard: bool) {
+        if discard && self.state.scene.as_ref().is_some_and(EditorScene::is_dirty) {
+            let scene = self
+                .state
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.path().cloned());
+            self.remove_autosave(scene.as_ref());
+        }
+    }
+
     /// Записывает копию изменённой сцены не чаще `AUTOSAVE_INTERVAL`.
     fn autosave_tick(&mut self) {
         let Some(scene) = &self.state.scene else {
@@ -845,13 +877,13 @@ impl EditorApp {
             }
             Action::OpenProject => {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder()
-                    && let Err(error) = self.open_project(&dir)
+                    && let Err(error) = self.open_project(&dir, true)
                 {
                     self.state.log.error(error);
                 }
             }
             Action::OpenProjectAt(dir) => {
-                if let Err(error) = self.open_project(&dir) {
+                if let Err(error) = self.open_project(&dir, true) {
                     self.state.log.error(error);
                 }
             }
@@ -2258,7 +2290,7 @@ impl WindowHandler for EditorApp {
             .log
             .info(format!("RVE Editor {}", crate::VERSION));
         if let Some(project) = self.initial_project.take()
-            && let Err(error) = self.open_project(&project)
+            && let Err(error) = self.open_project(&project, true)
         {
             self.state.log.error(error);
         }

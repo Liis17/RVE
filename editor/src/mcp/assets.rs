@@ -1,7 +1,8 @@
 use super::paths;
 use crate::app::EditorApp;
+use crate::assets_fs::AssetKind;
 use engine_files::VirtualPath;
-use engine_mcp::{Permission, ToolSpec};
+use engine_mcp::{Permission, Permissions, ToolSpec};
 use engine_scene::{CameraSettings, PhysicsMaterialSettings, PostProcessSettings};
 use serde_json::{Value, json};
 use std::fs;
@@ -91,6 +92,9 @@ pub(super) fn call(app: &mut EditorApp, tool: &str, arguments: &Value) -> Result
             let path = optional_string(arguments, "path")?;
             let normalized;
             let path = if let Some(path) = path {
+                if extension(path) != "rvescene" {
+                    return Err(format!("{path}: scene path must end with .rvescene"));
+                }
                 let root = project_root(app)?;
                 let destination = paths::resolve_write_path(&root, path)?;
                 normalized = normalized_path(&root, &destination)?;
@@ -112,7 +116,7 @@ pub(super) fn call(app: &mut EditorApp, tool: &str, arguments: &Value) -> Result
                     "scene has unsaved changes; pass discard_changes=true to continue".to_owned(),
                 );
             }
-            app.mcp_open_scene(&virtual_path)?;
+            app.mcp_open_scene(&virtual_path, discard)?;
             Ok(json!({"path": virtual_path}))
         }
         "new_scene" => {
@@ -122,27 +126,8 @@ pub(super) fn call(app: &mut EditorApp, tool: &str, arguments: &Value) -> Result
                     "scene has unsaved changes; pass discard_changes=true to continue".to_owned(),
                 );
             }
-            app.mcp_new_scene()?;
+            app.mcp_new_scene(discard)?;
             Ok(json!({"created": true}))
-        }
-        "open_project" => {
-            let dir = PathBuf::from(required_string(arguments, "dir")?);
-            let discard = optional_bool(arguments, "discard_changes")?.unwrap_or(false);
-            let project_file = dir.join("project.rveproject");
-            if !project_file.is_file() {
-                return Err(format!(
-                    "{} does not contain project.rveproject",
-                    dir.display()
-                ));
-            }
-            if app.mcp_state_mut().has_unsaved_changes() && !discard {
-                return Err(
-                    "project state has unsaved changes; pass discard_changes=true to continue"
-                        .to_owned(),
-                );
-            }
-            app.mcp_open_project(&dir)?;
-            Ok(json!({"project": std::fs::canonicalize(&dir).unwrap_or(dir).display().to_string()}))
         }
         "write_asset_settings"
         | "create_folder"
@@ -154,6 +139,39 @@ pub(super) fn call(app: &mut EditorApp, tool: &str, arguments: &Value) -> Result
         "apply_to_prefab" => apply_to_prefab(app, arguments),
         _ => Err(format!("unknown or unimplemented tool: {tool}")),
     }
+}
+
+/// Открывает проект. Авто-сборка скриптов (`heavy_scripts`) запускает cargo, поэтому выполняется
+/// только при праве Build; без него проект открывается и ответ сообщает, что сборка пропущена.
+pub(super) fn open_project(
+    app: &mut EditorApp,
+    arguments: &Value,
+    permissions: Permissions,
+) -> Result<Value, String> {
+    let dir = PathBuf::from(required_string(arguments, "dir")?);
+    let discard = optional_bool(arguments, "discard_changes")?.unwrap_or(false);
+    let project_file = dir.join("project.rveproject");
+    if !project_file.is_file() {
+        return Err(format!(
+            "{} does not contain project.rveproject",
+            dir.display()
+        ));
+    }
+    if app.mcp_state_mut().has_unsaved_changes() && !discard {
+        return Err(
+            "project state has unsaved changes; pass discard_changes=true to continue".to_owned(),
+        );
+    }
+    let build_scripts = permissions.build;
+    app.mcp_open_project(&dir, build_scripts, discard)?;
+    let mut result =
+        json!({"project": std::fs::canonicalize(&dir).unwrap_or(dir).display().to_string()});
+    if !build_scripts && app.mcp_scripts_build_needed() {
+        result["scripts_build"] = json!(
+            "skipped: scripts build runs cargo and requires the build_scripts permission (Build)"
+        );
+    }
+    Ok(result)
 }
 
 fn call_file_tool(app: &mut EditorApp, tool: &str, arguments: &Value) -> Result<Value, String> {
@@ -181,6 +199,11 @@ fn call_file_tool(app: &mut EditorApp, tool: &str, arguments: &Value) -> Result<
             let destination = required_string(arguments, "new_path")?;
             let (source_path, destination_path) =
                 paths::resolve_rename_paths(&root, source, destination)?;
+            if destination_path.exists() {
+                return Err(format!(
+                    "{destination} already exists; rename does not overwrite"
+                ));
+            }
             fs::rename(&source_path, &destination_path)
                 .map_err(|error| format!("{source} -> {destination}: {error}"))?;
             json!({"path": normalized_path(&root, &destination_path)?})
@@ -254,33 +277,53 @@ fn import_files(root: &Path, arguments: &Value) -> Result<Value, String> {
     let folder = optional_string(arguments, "folder")?.unwrap_or("");
     let folder_path = paths::resolve_assets_directory(root, folder)?;
     let folder_name = normalized_path(root, &folder_path)?;
-    let mut imported = Vec::new();
+    // Все источники проверяются до первого копирования: при любом отказе импорт не начинается.
+    let mut sources = Vec::with_capacity(files.len());
     let mut errors = Vec::new();
     for source in files {
         let Some(source) = source.as_str() else {
             errors.push("each files item must be a path string".to_owned());
             continue;
         };
-        match import_one(root, Path::new(source), &folder_name) {
-            Ok(path) => imported.push(path),
+        match check_import_source(Path::new(source)) {
+            Ok(name) => sources.push((PathBuf::from(source), name)),
             Err(error) => errors.push(error),
         }
     }
-    Ok(json!({"imported": imported, "errors": errors}))
+    if !errors.is_empty() {
+        return Err(format!("import rejected: {}", errors.join("; ")));
+    }
+    let mut imported = Vec::with_capacity(sources.len());
+    for (source, name) in &sources {
+        imported.push(import_one(root, source, name, &folder_name)?);
+    }
+    Ok(json!({"imported": imported}))
 }
 
-fn import_one(root: &Path, source: &Path, folder: &str) -> Result<String, String> {
-    if !fs::metadata(source)
-        .map_err(|error| format!("{}: {error}", source.display()))?
-        .is_file()
-    {
-        return Err(format!("{} is not a file", source.display()));
-    }
+/// Разрешён только обычный файл известного типа ассета, не ссылка и не junction.
+fn check_import_source(source: &Path) -> Result<String, String> {
+    let display = source.display();
     let name = source
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("{}: filename is not UTF-8", source.display()))?;
+        .ok_or_else(|| format!("{display}: filename is not UTF-8"))?;
     validate_name(name)?;
+    let metadata = fs::symlink_metadata(source).map_err(|error| format!("{display}: {error}"))?;
+    if paths::is_link_or_junction(&metadata) {
+        return Err(format!(
+            "{display}: symbolic links and junctions cannot be imported"
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{display} is not a file"));
+    }
+    if AssetKind::of(name) == AssetKind::Other {
+        return Err(format!("{display}: file type is not an importable asset"));
+    }
+    Ok(name.to_owned())
+}
+
+fn import_one(root: &Path, source: &Path, name: &str, folder: &str) -> Result<String, String> {
     let (stem, extension) = match name.rsplit_once('.') {
         Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
         _ => (name, None),
@@ -615,5 +658,133 @@ mod tests {
         let error = call(&mut app, "new_scene", &json!({})).unwrap_err();
         assert_eq!(error, "project is not open");
         assert!(app.mcp_state_mut().scene.is_none());
+    }
+
+    #[test]
+    fn open_project_without_build_permission_does_not_start_scripts_build() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "rve-mcp-open-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&parent).unwrap();
+        let root = create_project("Heavy", &parent).unwrap();
+        let file = root.join("project.rveproject");
+        let mut settings = engine_project::ProjectSettings::load(&file).unwrap();
+        settings.heavy_scripts = Some("HeavyScripts".to_owned());
+        fs::write(&file, settings.to_toml().unwrap()).unwrap();
+
+        let mut app = EditorApp::new_for_mcp_tests_with_state(EditorState::new(None));
+        let result = open_project(
+            &mut app,
+            &json!({"dir": root.display().to_string()}),
+            Permissions {
+                assets: true,
+                ..Permissions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(app.mcp_state_mut().scripts_job.is_none());
+        assert!(app.mcp_state_mut().project.is_some());
+        assert!(
+            result["scripts_build"]
+                .as_str()
+                .unwrap()
+                .contains("build_scripts")
+        );
+        drop(app);
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn import_rejects_unknown_types_and_links_without_a_partial_copy() {
+        let mut fixture = TempProject::new();
+        let outside = fixture.parent.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        fs::write(outside.join("texture.png"), b"png").unwrap();
+        let state = std::mem::replace(&mut fixture.state, EditorState::new(None));
+        let mut app = EditorApp::new_for_mcp_tests_with_state(state);
+        let root = app.mcp_state_mut().project.as_ref().unwrap().root.clone();
+        let texture = outside.join("texture.png").display().to_string();
+        let secret = outside.join("secret.txt").display().to_string();
+
+        let error = call_file_tool(
+            &mut app,
+            "import_files",
+            &json!({"files": [texture, secret]}),
+        )
+        .unwrap_err();
+        assert!(error.contains("secret.txt"));
+        assert!(!root.join("Assets/texture.png").exists());
+
+        let directory = outside.display().to_string();
+        let error =
+            call_file_tool(&mut app, "import_files", &json!({"files": [directory]})).unwrap_err();
+        assert!(error.contains("not a file"));
+
+        assert!(!root.join("Assets/texture.png").exists());
+        assert!(!root.join("Assets/secret.txt").exists());
+
+        #[cfg(unix)]
+        {
+            let link = outside.join("link.png");
+            std::os::unix::fs::symlink(outside.join("texture.png"), &link).unwrap();
+            let error = call_file_tool(
+                &mut app,
+                "import_files",
+                &json!({"files": [link.display().to_string()]}),
+            )
+            .unwrap_err();
+            assert!(error.contains("symbolic links"));
+        }
+
+        let imported = call_file_tool(
+            &mut app,
+            "import_files",
+            &json!({"files": [outside.join("texture.png").display().to_string()]}),
+        )
+        .unwrap();
+        assert_eq!(imported["imported"][0], "texture.png");
+        assert!(root.join("Assets/texture.png").is_file());
+    }
+
+    #[test]
+    fn rename_never_overwrites_an_existing_target() {
+        let mut fixture = TempProject::new();
+        let state = std::mem::replace(&mut fixture.state, EditorState::new(None));
+        let mut app = EditorApp::new_for_mcp_tests_with_state(state);
+        let root = app.mcp_state_mut().project.as_ref().unwrap().root.clone();
+        fs::write(root.join("Assets/a.txt"), "first").unwrap();
+        fs::write(root.join("Assets/b.txt"), "second").unwrap();
+
+        let error = call_file_tool(
+            &mut app,
+            "rename_asset",
+            &json!({"path": "a.txt", "new_path": "b.txt"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(root.join("Assets/a.txt")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Assets/b.txt")).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn save_scene_accepts_only_the_rvescene_extension() {
+        let mut fixture = TempProject::new();
+        let state = std::mem::replace(&mut fixture.state, EditorState::new(None));
+        let mut app = EditorApp::new_for_mcp_tests_with_state(state);
+        let error = call(&mut app, "save_scene", &json!({"path": "scenes/x.txt"})).unwrap_err();
+        assert!(error.contains(".rvescene"));
+        let root = app.mcp_state_mut().project.as_ref().unwrap().root.clone();
+        assert!(!root.join("Assets/scenes/x.txt").exists());
     }
 }

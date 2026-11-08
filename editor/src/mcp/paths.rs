@@ -30,7 +30,22 @@ pub fn resolve_read_path(project_root: &Path, input: &str) -> Result<PathBuf, St
             path.display()
         ));
     }
+    // Скрытость проверяется только относительно корня: родительские каталоги проекта могут начинаться с точки.
+    if canonical
+        .strip_prefix(&root)
+        .is_ok_and(is_hidden_root_entry)
+    {
+        return Err(format!("{} is a hidden project entry", path.display()));
+    }
     Ok(canonical)
+}
+
+/// Элемент корня проекта, чьё имя начинается с точки (`.rve`, `.git`, `.env`, ...).
+pub(super) fn is_hidden_root_entry(relative: &Path) -> bool {
+    relative
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str().to_string_lossy().starts_with('.'))
 }
 
 /// Resolves a directory below `Assets/`; an empty path denotes the assets root.
@@ -281,6 +296,27 @@ mod tests {
         assert!(resolve_delete_path(&project.0, "link/source.txt").is_err());
         assert!(resolve_delete_path(&project.0, "link").is_err());
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn read_rejects_every_hidden_root_entry_but_not_dot_parents_of_the_project() {
+        let project = TempProject::new();
+        std::fs::create_dir_all(project.0.join(".git")).unwrap();
+        std::fs::write(project.0.join(".git/config"), "[core]").unwrap();
+        std::fs::write(project.0.join(".env"), "KEY=1").unwrap();
+        assert!(resolve_read_path(&project.0, ".git/config").is_err());
+        assert!(resolve_read_path(&project.0, ".git").is_err());
+        assert!(resolve_read_path(&project.0, ".env").is_err());
+        assert!(resolve_read_path(&project.0, ".rve/private.txt").is_err());
+
+        // Корень проекта внутри каталога с точкой (например `~/.t3/...`) должен оставаться читаемым.
+        let dot_parent =
+            std::env::temp_dir().join(format!(".rve-mcp-dot-parent-{}", std::process::id()));
+        let root = dot_parent.join("project");
+        std::fs::create_dir_all(root.join("Assets")).unwrap();
+        std::fs::write(root.join("Assets/a.txt"), "ok").unwrap();
+        assert!(resolve_read_path(&root, "Assets/a.txt").is_ok());
+        let _ = std::fs::remove_dir_all(dot_parent);
     }
 
     #[test]

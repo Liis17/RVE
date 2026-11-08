@@ -146,7 +146,9 @@ fn list_project_files(arguments: &Value, state: &EditorState) -> Result<Value, S
     {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name();
-        if name.eq_ignore_ascii_case(".rve") {
+        let hidden_root_entry =
+            directory == project_root && name.to_string_lossy().starts_with('.');
+        if hidden_root_entry || name.eq_ignore_ascii_case(".rve") {
             continue;
         }
         let metadata = std::fs::symlink_metadata(entry.path())
@@ -191,21 +193,29 @@ fn read_text_file(arguments: &Value, state: &EditorState) -> Result<Value, Strin
 fn get_project_settings(state: &EditorState) -> Result<Value, String> {
     let project = open_project(state)?;
     let project_file = paths::resolve_read_path(&project.root, "project.rveproject")?;
-    let bootstrap_file = paths::resolve_read_path(&project.root, "bootstrap.rves")?;
     let project_settings = engine_project::ProjectSettings::load(&project_file)?;
     let project_settings =
         serde_json::to_value(project_settings).map_err(|error| error.to_string())?;
-    let bootstrap_text = read_limited_text(&bootstrap_file, "bootstrap.rves")?;
-    let bootstrap = BootstrapConfig::parse(&bootstrap_text)?;
+    // Отсутствующий bootstrap.rves — штатный случай (значения по умолчанию), поэтому это `null`, а не ошибка.
+    let bootstrap_path = project.root.join("bootstrap.rves");
+    let bootstrap = match std::fs::symlink_metadata(&bootstrap_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        _ => {
+            let bootstrap_file = paths::resolve_read_path(&project.root, "bootstrap.rves")?;
+            let bootstrap_text = read_limited_text(&bootstrap_file, "bootstrap.rves")?;
+            let config = BootstrapConfig::parse(&bootstrap_text)?;
+            json!({
+                "path": bootstrap_file.display().to_string(),
+                "settings": bootstrap_value(&config),
+            })
+        }
+    };
     Ok(json!({
         "project": {
             "path": project_file.display().to_string(),
             "settings": project_settings,
         },
-        "bootstrap": {
-            "path": bootstrap_file.display().to_string(),
-            "settings": bootstrap_value(&bootstrap),
-        },
+        "bootstrap": bootstrap,
     }))
 }
 
@@ -789,6 +799,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn missing_bootstrap_is_null_and_hidden_root_entries_are_not_listed_or_read() {
+        let (_fixture, mut state) = ProjectFixture::new();
+        let root = state.project.as_ref().unwrap().root.clone();
+        let permissions = Permissions::default();
+        std::fs::remove_file(root.join("bootstrap.rves")).unwrap();
+        let settings = call("get_project_settings", &json!({}), &mut state, permissions).unwrap();
+        assert!(settings["bootstrap"].is_null());
+        assert_eq!(settings["project"]["settings"]["name"], "Fixture");
+
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".env"), "TOKEN=1").unwrap();
+        let files = call("list_project_files", &json!({}), &mut state, permissions).unwrap();
+        let names = files["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"Assets".to_owned()));
+        assert!(!names.iter().any(|name| name.starts_with('.')));
+        assert!(
+            call(
+                "read_text_file",
+                &json!({"path": ".env"}),
+                &mut state,
+                permissions
+            )
+            .is_err()
+        );
+        assert!(
+            call(
+                "read_text_file",
+                &json!({"path": ".git"}),
+                &mut state,
+                permissions
+            )
+            .is_err()
+        );
     }
 
     #[test]
