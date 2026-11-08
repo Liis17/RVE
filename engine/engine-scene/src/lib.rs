@@ -8,6 +8,7 @@ pub mod document;
 pub mod light;
 pub mod params;
 pub mod particles;
+pub mod post_process;
 pub mod prefab;
 pub mod transform;
 pub mod world;
@@ -41,6 +42,12 @@ pub use document::{
     SceneDocument, SceneError, SceneObject, SceneTransform, SpotLightComponent,
 };
 pub use params::{ParamKind, ParamSchema, ParamSpec};
+pub use post_process::{
+    AmbientOcclusionQuality, AmbientOcclusionSettings, BloomSettings, ChromaticAberrationSettings,
+    ColorGradingSettings, DepthOfFieldSettings, ExposureMode, ExposureSettings, FilmGrainSettings,
+    MotionBlurSettings, PostProcessError, PostProcessSettings, TonemappingSettings,
+    VignetteSettings, resolve_post_process,
+};
 pub use prefab::{
     Expansion, HeavyParamsOverride, LiteParamsOverride, MeshRendererOverride, ObjectOrigin,
     PrefabInstance, PrefabOverride, PrefabTemplate, TransformOverride, apply_override, expand,

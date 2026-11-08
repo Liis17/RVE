@@ -1891,6 +1891,7 @@ mod tests {
         let added = scene.edit_object("door.handle", None, |object| {
             object.camera = Some(engine_scene::CameraComponent {
                 settings: None,
+                post_process: None,
                 active: false,
                 cursor: Default::default(),
             });

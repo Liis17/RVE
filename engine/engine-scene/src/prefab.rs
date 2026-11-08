@@ -647,6 +647,26 @@ pub(crate) fn validate_instances(
                     "настройки камеры override",
                 )?;
             }
+            if let Some(post_process) = change
+                .camera
+                .as_ref()
+                .and_then(|camera| camera.post_process.as_ref())
+            {
+                require_asset_path(
+                    source,
+                    id,
+                    assets,
+                    post_process,
+                    "постобработка камеры override",
+                )?;
+                require_extension(
+                    source,
+                    id,
+                    post_process,
+                    "postprocess",
+                    "постобработка камеры override",
+                )?;
+            }
             if let Some(environment) = &change.environment {
                 validate_environment(source, id, assets, environment)?;
             }

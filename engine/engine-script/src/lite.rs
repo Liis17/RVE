@@ -2005,11 +2005,12 @@ fn camera_settings_table(lua: &Lua, settings: CameraSettings) -> mlua::Result<Ta
     )?;
     result.set("render", render)?;
 
+    let color_settings = settings.color.unwrap_or_default();
     let color = lua.create_table()?;
-    color.set("exposure_ev", settings.color.exposure_ev as f64)?;
+    color.set("exposure_ev", color_settings.exposure_ev as f64)?;
     color.set(
         "tonemapper",
-        match settings.color.tonemapper {
+        match color_settings.tonemapper {
             Tonemapper::Aces => "aces",
             Tonemapper::Neutral => "neutral",
             Tonemapper::None => "none",
@@ -2066,9 +2067,10 @@ fn apply_camera_settings_table(table: &Table, settings: &mut CameraSettings) -> 
     }
     if let Value::Table(color) = table.get::<Value>("color")? {
         ensure_known_fields(&color, &["exposure_ev", "tonemapper"], "color")?;
-        set_optional_number(&color, "exposure_ev", &mut settings.color.exposure_ev)?;
+        let mut color_settings = settings.color.unwrap_or_default();
+        set_optional_number(&color, "exposure_ev", &mut color_settings.exposure_ev)?;
         if let Value::String(value) = color.get::<Value>("tonemapper")? {
-            settings.color.tonemapper = match value.to_str()?.as_ref() {
+            color_settings.tonemapper = match value.to_str()?.as_ref() {
                 "aces" => Tonemapper::Aces,
                 "neutral" => Tonemapper::Neutral,
                 "none" => Tonemapper::None,
@@ -2081,6 +2083,7 @@ fn apply_camera_settings_table(table: &Table, settings: &mut CameraSettings) -> 
         } else if !matches!(color.get::<Value>("tonemapper")?, Value::Nil) {
             return Err(LuaError::runtime("color.tonemapper must be a string"));
         }
+        settings.color = Some(color_settings);
     } else if !matches!(table.get::<Value>("color")?, Value::Nil) {
         return Err(LuaError::runtime("camera settings.color must be a table"));
     }

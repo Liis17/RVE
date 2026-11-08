@@ -264,6 +264,22 @@ impl SceneDocument {
                         "настройки камеры",
                     )?;
                 }
+                if let Some(post_process) = &camera.post_process {
+                    require_asset_path(
+                        source,
+                        &object.id,
+                        &asset_paths,
+                        post_process,
+                        "постобработка камеры",
+                    )?;
+                    require_extension(
+                        source,
+                        &object.id,
+                        post_process,
+                        "postprocess",
+                        "постобработка камеры",
+                    )?;
+                }
             }
             if let Some(light) = &object.directional_light {
                 light_count += 1;
@@ -659,6 +675,9 @@ impl Default for SceneTransform {
 pub struct CameraComponent {
     #[serde(default, with = "option_virtual_path_serde")]
     pub settings: Option<VirtualPath>,
+    /// Файл `.postprocess`; без него используется постобработка по умолчанию.
+    #[serde(default, with = "option_virtual_path_serde")]
+    pub post_process: Option<VirtualPath>,
     pub active: bool,
     /// Состояние курсора при старте сцены; действует, только если камера активна.
     #[serde(default, skip_serializing_if = "CameraCursor::is_default")]
@@ -1463,6 +1482,12 @@ fn validate_raw_virtual_paths(value: &toml::Value, source: &str) -> Result<(), S
                     .and_then(toml::Value::as_str)
                     .map(|path| (object_id, "camera.settings", path)),
             );
+            paths.extend(
+                camera
+                    .get("post_process")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| (object_id, "camera.post_process", path)),
+            );
         }
         if let Some(environment) = object.get("environment").and_then(toml::Value::as_table) {
             paths.extend(
@@ -2214,6 +2239,40 @@ scale=[1.0,1.0,0.0]
             )
         );
         assert!(parse(&good).is_ok());
+    }
+
+    #[test]
+    fn camera_post_process_must_be_a_declared_postprocess_asset() {
+        let rejects = |input: &str, expected: &str| {
+            let message = parse(input).unwrap_err().to_string();
+            assert!(message.contains(expected), "{message}");
+        };
+        let with_post_process = |path: &str| {
+            VALID.replace(
+                "[objects.camera]",
+                &format!("[objects.camera]\npost_process=\"{path}\""),
+            )
+        };
+        rejects(
+            &with_post_process("/post/default.postprocess"),
+            "отсутствует в [[assets]]",
+        );
+        let wrong_extension = format!(
+            "[[assets]]\npath=\"/post/default.toml\"\n{}",
+            with_post_process("/post/default.toml")
+        );
+        rejects(&wrong_extension, "расширение .postprocess");
+        let good = format!(
+            "[[assets]]\npath=\"/post/Default.POSTprocess\"\n{}",
+            with_post_process("/post/Default.POSTprocess")
+        );
+        let document = parse(&good).unwrap();
+        assert!(
+            document.objects[0]
+                .camera
+                .as_ref()
+                .is_some_and(|camera| camera.post_process.is_some())
+        );
     }
 
     #[test]

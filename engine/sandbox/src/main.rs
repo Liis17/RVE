@@ -767,8 +767,8 @@ impl WindowHandler for Sandbox {
             debug_view: DebugView::Lit,
             view: ViewSettings {
                 render_scale: self.camera_settings.render.render_scale,
-                exposure_ev: self.camera_settings.color.exposure_ev,
-                tonemapper: match self.camera_settings.color.tonemapper {
+                exposure_ev: self.camera_settings.color.unwrap_or_default().exposure_ev,
+                tonemapper: match self.camera_settings.color.unwrap_or_default().tonemapper {
                     Tonemapper::Aces => RenderTonemapper::Aces,
                     Tonemapper::Neutral => RenderTonemapper::Neutral,
                     Tonemapper::None => RenderTonemapper::None,

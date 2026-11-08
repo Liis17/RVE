@@ -5,12 +5,17 @@ use std::error::Error;
 use std::fmt;
 
 /// Полный набор настроек камеры и её вывода.
+///
+/// Блок `[color]` устарел: exposure и tonemapper перенесены в `.postprocess`. Старый блок
+/// читается как fallback (см. `post_process::resolve_post_process`), а при сохранении
+/// без него не появляется в файле.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraSettings {
     pub projection: ProjectionSettings,
     pub render: CameraRenderSettings,
-    pub color: CameraColorSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<CameraColorSettings>,
 }
 
 impl CameraSettings {
@@ -75,7 +80,8 @@ impl CameraSettings {
                 "render.clear_color должен содержать конечные компоненты >= 0",
             ));
         }
-        if !self.color.exposure_ev.is_finite() || !(-16.0..=16.0).contains(&self.color.exposure_ev)
+        if let Some(color) = self.color
+            && (!color.exposure_ev.is_finite() || !(-16.0..=16.0).contains(&color.exposure_ev))
         {
             return Err(CameraSettingsError::new(
                 label,
@@ -200,7 +206,32 @@ mod tests {
         assert_eq!(settings, CameraSettings::default());
         assert_eq!(settings.projection, ProjectionSettings::default());
         assert_eq!(settings.render, CameraRenderSettings::default());
-        assert_eq!(settings.color, CameraColorSettings::default());
+        assert_eq!(settings.color, None);
+    }
+
+    #[test]
+    fn legacy_color_table_is_read_and_kept_on_save_only_when_present() {
+        let legacy = CameraSettings::parse(
+            "legacy.camerasettings",
+            "[color]\nexposure_ev = 1.5\ntonemapper = \"neutral\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.color,
+            Some(CameraColorSettings {
+                exposure_ev: 1.5,
+                tonemapper: Tonemapper::Neutral,
+            })
+        );
+        let saved = legacy.to_toml().unwrap();
+        assert!(saved.contains("[color]"), "{saved}");
+        assert_eq!(
+            CameraSettings::parse("saved.camerasettings", &saved).unwrap(),
+            legacy
+        );
+
+        let plain = CameraSettings::default().to_toml().unwrap();
+        assert!(!plain.contains("[color]"), "{plain}");
     }
 
     #[test]
@@ -229,7 +260,10 @@ tonemapper = "neutral"
             "{serialized}"
         );
         assert_eq!(settings.render.anti_aliasing, AntiAliasing::None);
-        assert_eq!(settings.color.tonemapper, Tonemapper::Neutral);
+        assert_eq!(
+            settings.color.map(|color| color.tonemapper),
+            Some(Tonemapper::Neutral)
+        );
     }
 
     #[test]

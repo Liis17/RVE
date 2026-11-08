@@ -1620,10 +1620,10 @@ id = "second"
                 clear_color: [0.2, 0.3, 0.4],
                 anti_aliasing: engine_scene::AntiAliasing::None,
             },
-            color: engine_scene::CameraColorSettings {
+            color: Some(engine_scene::CameraColorSettings {
                 exposure_ev: 2.0,
                 tonemapper: engine_scene::Tonemapper::Neutral,
-            },
+            }),
         }
     );
     assert!(host.drain_events().is_empty());

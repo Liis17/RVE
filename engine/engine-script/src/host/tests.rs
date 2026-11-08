@@ -4010,9 +4010,12 @@ return Script
     let primary_settings = world.camera_settings(primary).unwrap();
     assert_eq!(primary_settings.projection.fov_deg, 72.0);
     assert_eq!(primary_settings.render.clear_color, [0.2, 0.3, 0.4]);
-    assert_eq!(primary_settings.color.exposure_ev, 1.5);
+    assert_eq!(primary_settings.color.unwrap_or_default().exposure_ev, 1.5);
     let secondary_settings = world.camera_settings(secondary).unwrap();
-    assert_eq!(secondary_settings.color.exposure_ev, -2.0);
+    assert_eq!(
+        secondary_settings.color.unwrap_or_default().exposure_ev,
+        -2.0
+    );
 }
 
 #[test]
@@ -4096,7 +4099,12 @@ return Script
     assert_eq!(world.local_transform(primary).unwrap().position.x, 0.0);
     assert_eq!(world.active_camera(), primary);
     assert_eq!(
-        world.camera_settings(primary).unwrap().color.exposure_ev,
+        world
+            .camera_settings(primary)
+            .unwrap()
+            .color
+            .unwrap_or_default()
+            .exposure_ev,
         0.0
     );
     assert!(host.drain_events().iter().any(|event| {
@@ -4118,7 +4126,12 @@ fn lua_camera_writes_are_rejected_during_creation() {
         );
         assert_eq!(world.active_camera(), handle);
         assert_eq!(
-            world.camera_settings(handle).unwrap().color.exposure_ev,
+            world
+                .camera_settings(handle)
+                .unwrap()
+                .color
+                .unwrap_or_default()
+                .exposure_ev,
             0.0
         );
     }

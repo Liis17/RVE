@@ -1627,13 +1627,14 @@ unsafe extern "C" fn host_unregister_command(ctx: *mut c_void, name: RveStr) -> 
 }
 
 fn camera_settings_to_abi(settings: CameraSettings) -> RveCameraSettings {
+    let color = settings.color.unwrap_or_default();
     RveCameraSettings {
         fov_deg: settings.projection.fov_deg,
         near: settings.projection.near,
         far: settings.projection.far,
         render_scale: settings.render.render_scale,
         clear_color: settings.render.clear_color,
-        exposure_ev: settings.color.exposure_ev,
+        exposure_ev: color.exposure_ev,
         anti_aliasing: match settings.render.anti_aliasing {
             AntiAliasing::Fxaa => RVE_ANTI_ALIASING_FXAA,
             AntiAliasing::None => RVE_ANTI_ALIASING_NONE,
@@ -1641,7 +1642,7 @@ fn camera_settings_to_abi(settings: CameraSettings) -> RveCameraSettings {
             AntiAliasing::Fsr => RVE_ANTI_ALIASING_FSR,
             AntiAliasing::Dlss => RVE_ANTI_ALIASING_DLSS,
         },
-        tonemapper: match settings.color.tonemapper {
+        tonemapper: match color.tonemapper {
             Tonemapper::Aces => RVE_TONEMAPPER_ACES,
             Tonemapper::Neutral => RVE_TONEMAPPER_NEUTRAL,
             Tonemapper::None => RVE_TONEMAPPER_NONE,
@@ -1675,10 +1676,10 @@ fn camera_settings_from_abi(value: RveCameraSettings) -> Option<CameraSettings> 
             clear_color: value.clear_color,
             anti_aliasing,
         },
-        color: CameraColorSettings {
+        color: Some(CameraColorSettings {
             exposure_ev: value.exposure_ev,
             tonemapper,
-        },
+        }),
     };
     settings.validate().ok()?;
     Some(settings)

@@ -660,8 +660,8 @@ impl RenderBackend for VulkanBackend {
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
-                exposure_ev: snapshot.view.color.exposure_ev,
-                tonemapper: match snapshot.view.color.tonemapper {
+                exposure_ev: snapshot.view.color.unwrap_or_default().exposure_ev,
+                tonemapper: match snapshot.view.color.unwrap_or_default().tonemapper {
                     Tonemapper::Aces => RenderTonemapper::Aces,
                     Tonemapper::Neutral => RenderTonemapper::Neutral,
                     Tonemapper::None => RenderTonemapper::None,
@@ -783,8 +783,8 @@ impl RenderBackend for VulkanBackend {
             debug_view: self.debug_view,
             view: ViewSettings {
                 render_scale: snapshot.view.render.render_scale,
-                exposure_ev: snapshot.view.color.exposure_ev,
-                tonemapper: match snapshot.view.color.tonemapper {
+                exposure_ev: snapshot.view.color.unwrap_or_default().exposure_ev,
+                tonemapper: match snapshot.view.color.unwrap_or_default().tonemapper {
                     Tonemapper::Aces => RenderTonemapper::Aces,
                     Tonemapper::Neutral => RenderTonemapper::Neutral,
                     Tonemapper::None => RenderTonemapper::None,
@@ -3677,8 +3677,14 @@ range = 10
         settings.render.render_scale = 0.5;
         settings.render.clear_color = [0.2, 0.3, 0.4];
         settings.render.anti_aliasing = engine_scene::AntiAliasing::None;
-        settings.color.exposure_ev = 1.0;
-        settings.color.tonemapper = engine_scene::Tonemapper::Neutral;
+        settings
+            .color
+            .get_or_insert_with(Default::default)
+            .exposure_ev = 1.0;
+        settings
+            .color
+            .get_or_insert_with(Default::default)
+            .tonemapper = engine_scene::Tonemapper::Neutral;
         world
             .set_camera_settings(world.active_camera(), settings)
             .unwrap();
@@ -3802,7 +3808,7 @@ return Script
             &AnimationBridge::default(),
         )
         .unwrap();
-        assert_eq!(snapshot.view.color.exposure_ev, 2.5);
+        assert_eq!(snapshot.view.color.unwrap_or_default().exposure_ev, 2.5);
         assert!(host.drain_events().is_empty());
     }
 

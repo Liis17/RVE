@@ -1001,8 +1001,8 @@ impl SceneRenderer {
             },
             view: ViewSettings {
                 render_scale: settings.render.render_scale,
-                exposure_ev: settings.color.exposure_ev,
-                tonemapper: match settings.color.tonemapper {
+                exposure_ev: settings.color.unwrap_or_default().exposure_ev,
+                tonemapper: match settings.color.unwrap_or_default().tonemapper {
                     Tonemapper::Aces => RenderTonemapper::Aces,
                     Tonemapper::Neutral => RenderTonemapper::Neutral,
                     Tonemapper::None => RenderTonemapper::None,
