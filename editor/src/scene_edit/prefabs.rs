@@ -963,6 +963,7 @@ impl EditorScene {
                 prefab.assets.push(engine_scene::SceneAsset {
                     path: asset,
                     archive,
+                    max_instances: None,
                 });
             }
         }

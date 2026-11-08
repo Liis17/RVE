@@ -1,0 +1,26 @@
+[[assets]]
+path = "/models/shared-cube.fbx"
+
+[[assets]]
+path = "/scripts/bullet.lua"
+
+# Пуля: сфера радиуса 1 в локальных единицах. Радиус умножается на наибольший масштаб корня,
+# поэтому физический радиус равен 0.05 м. Масса мала, поэтому пуля легко двигает ящики.
+[[objects]]
+id = "bullet"
+name = "Bullet"
+[objects.transform]
+scale = [0.05, 0.05, 0.05]
+[objects.mesh_renderer]
+model = "/models/shared-cube.fbx"
+[objects.mesh_renderer.material]
+metallic = 0.9
+roughness = 0.3
+[objects.collider]
+shape = "sphere"
+radius = 1.0
+[objects.rigid_body]
+kind = "dynamic"
+mass = 0.05
+[[objects.lite_scripts]]
+path = "/scripts/bullet.lua"

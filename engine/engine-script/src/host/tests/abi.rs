@@ -1,17 +1,20 @@
 use super::world;
 use crate::ScriptTime;
 use crate::host::{ScriptHost, ScriptLoadError};
+use crate::lifecycle::{PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec};
 use crate::transaction::{
     MAX_MESSAGE_DEPTH, MAX_MESSAGE_ELEMENTS, MAX_MESSAGE_NAME_BYTES, MAX_MESSAGE_STRING_BYTES,
     MAX_MESSAGES_PER_FRAME,
 };
 use crate::types::ScriptEventLevel;
+use engine_files::VirtualPath;
 use engine_project::{InputAction, InputSettings};
-use engine_scene::{AudioRequest, World};
+use engine_scene::{AudioRequest, PrefabTemplate, World};
 use rve_sdk::abi::{
-    RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RveHeader, RveHost,
-    RveModule, RveParams, RveScriptDesc, RveScriptDescV1, RveScriptDescV3, RveScriptDescV4,
-    RveStatus, RveStr, RveTransform, RveValue,
+    RVE_LOG_INFO, RVE_SCRIPT_ABI_MIN_VERSION, RVE_SCRIPT_ABI_VERSION, RVE_SPAWN_HAS_ID,
+    RVE_SPAWN_HAS_PARENT, RveCreateFn, RveHeader, RveHost, RveModule, RveParams, RveScriptDesc,
+    RveScriptDescV1, RveScriptDescV3, RveScriptDescV4, RveSpawnOptions, RveStatus, RveStr,
+    RveTransform, RveUpdateFn, RveValue,
 };
 use rve_sdk::{
     AntiAliasing, CameraSettings, CollisionContact, ConsoleLevel, Key, MouseButton, Params,
@@ -19,8 +22,8 @@ use rve_sdk::{
 };
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static PROBE_DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -551,6 +554,184 @@ impl Script for LimitMessage {
     }
 }
 
+/// Spawns one bolt from `on_update` and then drives its handle one step per update.
+#[derive(Default)]
+struct SpawnDriver {
+    step: u32,
+    bolt: Option<rve_sdk::Object>,
+}
+
+fn spawn_driver_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(SpawnDriver::default()))
+}
+
+impl Script for SpawnDriver {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let step = self.step;
+        self.step += 1;
+        match step {
+            0 => {
+                let options = rve_sdk::SpawnOptions::new()
+                    .position([1.0, 0.0, 0.0])
+                    .id("bolt")
+                    .name("Bolt");
+                let bolt = ctx.spawn("prefabs/bolt.rveprefab", &options);
+                self.bolt = bolt;
+                ctx.log_info(format!("spawned={}", bolt.is_some()));
+                if let Some(bolt) = bolt {
+                    let pending = bolt.is_pending(ctx);
+                    let alive = bolt.is_alive(ctx);
+                    ctx.log_info(format!("pending={pending} alive={alive}"));
+                }
+                // The target is still pending, so only the transaction's pending ids can resolve it.
+                let sent = ctx.send("bolt", "ping", &rve_sdk::Value::Bool(true));
+                ctx.log_info(format!("sent={sent}"));
+            }
+            1 => {
+                self.log_state(ctx);
+                let destroyed = self.bolt_handle().destroy(ctx, 1.0);
+                ctx.log_info(format!("destroy={destroyed}"));
+            }
+            2 | 3 => self.log_state(ctx),
+            4 => {
+                self.log_state(ctx);
+                let first = self.bolt_handle().destroy(ctx, 0.0);
+                let second = self.bolt_handle().destroy(ctx, 0.0);
+                ctx.log_info(format!("dead_destroy={first}"));
+                ctx.log_info(format!("dead_destroy={second}"));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl SpawnDriver {
+    fn bolt_handle(&self) -> rve_sdk::Object {
+        self.bolt.expect("bolt was spawned in the first update")
+    }
+
+    fn log_state(&self, ctx: &mut rve_sdk::Context<'_>) {
+        let bolt = self.bolt_handle();
+        let alive = bolt.is_alive(ctx);
+        let pending = bolt.is_pending(ctx);
+        ctx.log_info(format!("alive={alive} pending={pending}"));
+    }
+}
+
+/// Destroys `victim` on its first update, then calls every handle-taking object API on the dead
+/// object. The guest must see no-op results and no error, and keep running.
+#[derive(Default)]
+struct DeadHandleProbe {
+    step: u32,
+    victim: Option<rve_sdk::Object>,
+}
+
+fn dead_handle_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(DeadHandleProbe::default()))
+}
+
+impl Script for DeadHandleProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        self.step += 1;
+        if self.step == 1 {
+            let victim = ctx.find("victim").expect("victim exists");
+            self.victim = Some(victim);
+            let destroyed = victim.destroy(ctx, 0.0);
+            ctx.log_info(format!("destroy={destroyed}"));
+            return;
+        }
+        let victim = self.victim.expect("victim was found in the first update");
+        let alive = victim.is_alive(ctx);
+        let velocity = victim.get_velocity(ctx).err();
+        let set_velocity = victim.set_velocity(ctx, [1.0, 0.0, 0.0]).err();
+        let movement = victim.move_character(ctx, [0.0; 3]).err();
+        let matrix_none = victim.world_matrix(ctx).is_none();
+        let transform = rve_sdk::Transform {
+            position: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: [1.0; 3],
+        };
+        let set_transform = victim.set_transform(ctx, transform);
+        ctx.log_info(format!("alive={alive}"));
+        ctx.log_info(format!("velocity_err={velocity:?}"));
+        ctx.log_info(format!("set_velocity_err={set_velocity:?}"));
+        ctx.log_info(format!("move_err={movement:?}"));
+        ctx.log_info(format!("matrix_none={matrix_none}"));
+        ctx.log_info(format!("set_transform={set_transform}"));
+        ctx.log_info("still running");
+    }
+}
+
+/// Destroys `victim` on its first update, then reports each collision exit it receives and keeps
+/// logging its update number.
+#[derive(Default)]
+struct ExitWatcher {
+    step: u32,
+}
+
+fn exit_watcher_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(ExitWatcher::default()))
+}
+
+impl Script for ExitWatcher {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        self.step += 1;
+        if self.step == 1 {
+            let victim = ctx.find("victim").expect("victim exists");
+            let destroyed = victim.destroy(ctx, 0.0);
+            ctx.log_info(format!("destroy={destroyed}"));
+        }
+        ctx.log_info(format!("update {}", self.step));
+    }
+
+    fn on_collision_exit(&mut self, ctx: &mut rve_sdk::Context<'_>, other: rve_sdk::Object) {
+        ctx.log_info(format!("exit alive={}", other.is_alive(ctx)));
+    }
+}
+
+/// Heavy script of the spawned bolt: reports its start, the message sent to its id, and its end.
+struct BoltProbe;
+
+fn bolt_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(BoltProbe))
+}
+
+impl Script for BoltProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        let id = ctx.object_id().unwrap_or_default();
+        ctx.log_info(format!("start:{id}"));
+    }
+
+    fn on_message(&mut self, ctx: &mut rve_sdk::Context<'_>, _: &str, name: &str, _: &Value) {
+        ctx.log_info(format!("hit:{name}"));
+    }
+
+    fn on_destroy(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        ctx.log_info("bolt destroyed");
+    }
+}
+
+/// Reads prefab states and requests from `on_start`.
+struct PrefabProbe;
+
+fn prefab_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(PrefabProbe))
+}
+
+impl Script for PrefabProbe {
+    fn on_start(&mut self, ctx: &mut rve_sdk::Context<'_>) {
+        let prefabs = ctx.prefabs();
+        let resident = prefabs.state("prefabs/bolt.rveprefab");
+        let unknown = prefabs.state("prefabs/missing.rveprefab");
+        let heavy = prefabs.state("prefabs/heavy.rveprefab");
+        let loaded = prefabs.load("prefabs/heavy.rveprefab");
+        let rejected = prefabs.load("prefabs/missing.rveprefab");
+        ctx.log_info(format!(
+            "resident={resident:?} unknown={unknown:?} heavy={heavy:?} load={loaded} rejected={rejected}"
+        ));
+    }
+}
+
 fn sdk_module() -> &'static RveModule {
     rve_sdk::script_module! {
         "Probe" => probe_factory,
@@ -564,6 +745,11 @@ fn sdk_module() -> &'static RveModule {
         "AudioProbe" => audio_probe_factory,
         "AudioRejected" => audio_rejected_factory,
         "InputActionsProbe" => input_actions_probe_factory,
+        "SpawnDriver" => spawn_driver_factory,
+        "BoltProbe" => bolt_probe_factory,
+        "PrefabProbe" => prefab_probe_factory,
+        "DeadHandleProbe" => dead_handle_probe_factory,
+        "ExitWatcher" => exit_watcher_factory,
         "CameraControl" => camera_control_factory,
         "AbiConsoleCommand" => abi_console_command_factory,
         "AbiConsoleForeign" => abi_console_foreign_factory,
@@ -921,6 +1107,136 @@ id = "crate"
 }
 
 #[test]
+fn abi_dead_object_handles_are_noops_with_one_warning() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "probe"
+[[objects.heavy_scripts]]
+name = "DeadHandleProbe"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    // Physics callbacks are offered only while physics is attached, so attach an empty world.
+    let physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    host.set_physics_snapshot(physics.query_snapshot().unwrap(), &[]);
+    host.update(&mut world, 1.0 / 60.0, at(0.1, 1));
+    assert!(world.handle("victim").is_none());
+    assert_eq!(info_messages(&mut host), ["destroy=true"]);
+
+    host.update(&mut world, 1.0 / 60.0, at(0.2, 2));
+    let events = host.drain_events();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(
+        infos,
+        [
+            "alive=false",
+            "velocity_err=Some(Rejected)",
+            "set_velocity_err=Some(Rejected)",
+            "move_err=Some(Rejected)",
+            "matrix_none=true",
+            "set_transform=false",
+            "still running",
+        ],
+        "every handle-taking call on the dead object is a no-op"
+    );
+    let mut warnings = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+
+    host.update(&mut world, 1.0 / 60.0, at(0.3, 3));
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != ScriptEventLevel::Error),
+        "no callback error"
+    );
+    warnings += events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+    assert_eq!(warnings, 1, "one warning per script and dead object");
+}
+
+#[test]
+fn abi_exit_with_a_destroyed_other_is_delivered_only_inside_the_retired_window() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "sensor"
+[[objects.heavy_scripts]]
+name = "ExitWatcher"
+[[objects]]
+id = "victim"
+"#,
+    );
+    let sensor = world.handle("sensor").unwrap();
+    let victim = world.handle("victim").unwrap();
+    let mut physics = engine_physics::PhysicsWorld::new(glam::Vec3::ZERO).unwrap();
+    let sensor_body = physics
+        .insert_body(engine_physics::BodyDesc::static_collider(
+            engine_physics::Shape::sphere(0.5).unwrap(),
+            engine_physics::Pose::IDENTITY,
+        ))
+        .unwrap();
+    let victim_body = physics
+        .insert_body(engine_physics::BodyDesc::static_collider(
+            engine_physics::Shape::sphere(0.5).unwrap(),
+            engine_physics::Pose::new(glam::Vec3::X * 2.0, glam::Quat::IDENTITY).unwrap(),
+        ))
+        .unwrap();
+    let binding = |object, body| engine_physics::PhysicsSceneBinding {
+        object,
+        body,
+        kind: engine_physics::BodyKind::Static,
+        character_controller: None,
+    };
+    let both = [binding(sensor, sensor_body), binding(victim, victim_body)];
+    let sensor_only = [binding(sensor, sensor_body)];
+    let snapshot = physics.query_snapshot().unwrap();
+    let exit = engine_physics::PhysicsEvent::CollisionExit {
+        first: sensor_body,
+        second: victim_body,
+    };
+    let mut host = load_host(&world, &library());
+
+    host.set_physics_snapshot(snapshot.clone(), &both);
+    host.update(&mut world, 1.0 / 60.0, at(0.1, 1));
+    assert!(world.handle("victim").is_none());
+    host.drain_events();
+
+    host.set_physics_snapshot(snapshot.clone(), &sensor_only);
+    host.queue_physics_events([exit.clone()]);
+    host.update(&mut world, 1.0 / 60.0, at(0.2, 2));
+    assert!(
+        info_messages(&mut host).contains(&"exit alive=false".to_owned()),
+        "the survivor receives the exit inside the window"
+    );
+
+    // The window closes with the second result; the stale binding must not reach the guest.
+    host.set_physics_snapshot(snapshot, &both);
+    host.queue_physics_events([exit]);
+    host.update(&mut world, 1.0 / 60.0, at(0.3, 3));
+    let after = info_messages(&mut host);
+    assert!(
+        !after.iter().any(|message| message.starts_with("exit ")),
+        "{after:?}"
+    );
+    assert!(after.contains(&"update 3".to_owned()), "{after:?}");
+    assert!(error_messages(&mut host).is_empty());
+}
+
+#[test]
 fn abi_v7_audio_callbacks_stage_requests_in_guest_order() {
     let _lock = test_lock();
     let mut world = world(
@@ -1006,33 +1322,37 @@ name = "AudioRejected"
 }
 
 #[test]
-fn abi_v6_module_loads_on_the_v7_host() {
+fn abi_v6_to_v8_modules_load_on_the_v9_host() {
     let _lock = test_lock();
     let current = sdk_module();
-    let module = Box::leak(Box::new(RveModule {
-        header: RveHeader {
-            abi_version: 6,
-            header_size: std::mem::size_of::<RveHeader>() as u32,
-        },
-        scripts: current.scripts,
-        script_count: current.script_count,
-    }));
-    // SAFETY: the module and its descriptor table live for the whole test process.
-    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
-    let mut world = scripted_world("Probe", r#"{ label = "v6" }"#);
-    let mut host = load_host(&world, &library);
-    host.start(
-        &mut world,
-        ScriptTime {
-            elapsed: 3.5,
-            frame: 17,
-        },
-    );
-    assert!(
-        message_list(&mut host)
-            .iter()
-            .any(|message| message == "start:v6")
-    );
+    for abi_version in [6, 7, 8] {
+        let module = Box::leak(Box::new(RveModule {
+            header: RveHeader {
+                abi_version,
+                header_size: std::mem::size_of::<RveHeader>() as u32,
+            },
+            scripts: current.scripts,
+            script_count: current.script_count,
+        }));
+        // SAFETY: the module and its descriptor table live for the whole test process.
+        let library =
+            unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+        let mut world = scripted_world("Probe", r#"{ label = "v6" }"#);
+        let mut host = load_host(&world, &library);
+        host.start(
+            &mut world,
+            ScriptTime {
+                elapsed: 3.5,
+                frame: 17,
+            },
+        );
+        assert!(
+            message_list(&mut host)
+                .iter()
+                .any(|message| message == "start:v6"),
+            "guest ABI v{abi_version} runs on the v9 host"
+        );
+    }
 }
 
 fn v3_probe_module() -> &'static RveModule {
@@ -2663,4 +2983,352 @@ fn malformed_parameter_tables_are_rejected() {
         result,
         Err(crate::ScriptLibraryError::InvalidParams { .. })
     ));
+}
+
+fn at(elapsed: f64, frame: u64) -> ScriptTime {
+    ScriptTime { elapsed, frame }
+}
+
+fn info_messages(host: &mut ScriptHost) -> Vec<String> {
+    host.drain_events()
+        .into_iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message)
+        .collect()
+}
+
+fn error_messages(host: &mut ScriptHost) -> Vec<String> {
+    host.drain_events()
+        .into_iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message)
+        .collect()
+}
+
+const BOLT_PREFAB: &str =
+    "[[objects]]\nid = \"root\"\n[[objects.heavy_scripts]]\nname = \"BoltProbe\"\n";
+/// A prefab with no heavy script, for tests whose guest module does not define the bolt script.
+const RAW_PREFAB: &str = "[[objects]]\nid = \"root\"\n";
+const SPAWNER_SCENE: &str =
+    "[[objects]]\nid = \"spawner\"\n[[objects.heavy_scripts]]\nname = \"SpawnDriver\"\n";
+
+/// Loads a scene with the bolt prefab registered as a fast prefab from `template_text` and
+/// `prefabs/heavy.rveprefab` in the project list.
+fn spawn_host(world: &World, library: &crate::ScriptLibrary, template_text: &str) -> ScriptHost {
+    let mut prefabs = PrefabCatalog::default();
+    prefabs.insert(
+        "prefabs/bolt.rveprefab",
+        PrefabSpec {
+            kind: PrefabKind::Fast,
+            max_instances: None,
+        },
+    );
+    prefabs.insert(
+        "prefabs/heavy.rveprefab",
+        PrefabSpec {
+            kind: PrefabKind::Heavy,
+            max_instances: None,
+        },
+    );
+    let mut host = ScriptHost::load_with_options(
+        world,
+        "scene",
+        &empty_sources(),
+        Some(library),
+        crate::ScriptLoadOptions {
+            prefabs,
+            ..crate::ScriptLoadOptions::default()
+        },
+    )
+    .unwrap();
+    let path = VirtualPath::parse("prefabs/bolt.rveprefab").unwrap();
+    let mut read = |_: &VirtualPath| -> Result<String, String> { Ok(template_text.to_owned()) };
+    let template = Arc::new(PrefabTemplate::load(&path, &mut read).unwrap());
+    host.register_prefab(world, "prefabs/bolt.rveprefab", template, &empty_sources())
+        .unwrap();
+    host
+}
+
+#[test]
+fn abi_spawn_is_pending_then_applied_and_starts_before_messages() {
+    let _lock = test_lock();
+    let mut world = world(SPAWNER_SCENE);
+    let mut host = spawn_host(&world, &library(), BOLT_PREFAB);
+
+    host.update(&mut world, 0.1, at(0.1, 1));
+    assert!(
+        world.handle("bolt").is_some(),
+        "applied at the end of the phase"
+    );
+    assert_eq!(
+        info_messages(&mut host),
+        ["spawned=true", "pending=true alive=false", "sent=true"],
+        "the pending handle reads as pending and the pending id accepts the message"
+    );
+
+    host.update(&mut world, 0.1, at(0.2, 2));
+    assert_eq!(
+        info_messages(&mut host),
+        [
+            "start:bolt",
+            "hit:ping",
+            "alive=true pending=false",
+            "destroy=true"
+        ],
+        "on_start runs before the queued message; the spawned object is alive"
+    );
+}
+
+#[test]
+fn abi_destroy_with_delay_keeps_the_object_until_due_and_dead_handles_warn_once() {
+    let _lock = test_lock();
+    let mut world = world(SPAWNER_SCENE);
+    let mut host = spawn_host(&world, &library(), BOLT_PREFAB);
+    host.update(&mut world, 0.1, at(0.1, 1));
+    host.update(&mut world, 0.1, at(0.2, 2));
+    assert!(info_messages(&mut host).contains(&"destroy=true".to_owned()));
+    let _ = host.drain_world_changes();
+
+    // The delay is 1.0 seconds from elapsed 0.2, so the object is still in the world at 0.5.
+    host.update(&mut world, 0.1, at(0.5, 3));
+    assert!(world.handle("bolt").is_some());
+    assert_eq!(info_messages(&mut host), ["alive=true pending=false"]);
+
+    // Removal happens at the end of the phase, so the driver still sees it alive in this update.
+    host.update(&mut world, 0.1, at(1.3, 4));
+    assert_eq!(
+        info_messages(&mut host),
+        ["alive=true pending=false", "bolt destroyed"]
+    );
+    assert!(world.handle("bolt").is_none());
+    let changes = host.drain_world_changes();
+    assert_eq!(changes.despawned.len(), 1);
+
+    host.update(&mut world, 0.1, at(1.4, 5));
+    let events = host.drain_events();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(
+        infos,
+        [
+            "alive=false pending=false",
+            "dead_destroy=false",
+            "dead_destroy=false"
+        ],
+        "a dead handle reads as dead and destroy refuses it"
+    );
+    let warnings = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Warn)
+        .count();
+    assert_eq!(warnings, 1, "one warning per script and dead object");
+}
+
+#[test]
+fn abi_prefab_api_reports_states_and_queues_heavy_loads() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "probe"
+[[objects.heavy_scripts]]
+name = "PrefabProbe"
+"#,
+    );
+    let mut host = spawn_host(&world, &library(), BOLT_PREFAB);
+    host.update(&mut world, 0.1, at(0.1, 1));
+
+    let events = host.drain_events();
+    let infos: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Info)
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(
+        infos,
+        ["resident=Resident unknown=Unknown heavy=Unloaded load=true rejected=false"]
+    );
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| event.level == ScriptEventLevel::Error)
+        .map(|event| event.message.clone())
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("prefabs/missing.rveprefab")),
+        "{errors:?}"
+    );
+    assert_eq!(
+        host.drain_world_changes().prefab_requests,
+        [PrefabRequest::Load("prefabs/heavy.rveprefab".to_owned())]
+    );
+}
+
+unsafe fn spawn_options_from_host(host: *const RveHost, flags: u32, id: RveStr) -> u64 {
+    // SAFETY: callers pass the live host of a running guest callback.
+    let host = unsafe { &*host };
+    let Some(spawn) = host.spawn else {
+        return 0;
+    };
+    let options = RveSpawnOptions {
+        flags,
+        position: [0.0; 3],
+        rotation_deg: [0.0; 3],
+        scale: [1.0; 3],
+        velocity: [0.0; 3],
+        parent: 0,
+        name: RveStr::empty(),
+        id,
+    };
+    // SAFETY: the prefab path and options stay valid for this host call.
+    unsafe {
+        spawn(
+            host.ctx,
+            RveStr::from_static("prefabs/bolt.rveprefab"),
+            &options,
+        )
+    }
+}
+
+/// Builds a one-script module whose callbacks are supplied by the test.
+fn raw_module(create: RveCreateFn, update: RveUpdateFn) -> &'static RveModule {
+    let scripts = Box::leak(Box::new([RveScriptDesc {
+        name: RveStr::from_static("RawProbe"),
+        create,
+        start: no_op,
+        update,
+        message: no_op_message,
+        destroy: no_op,
+        drop: free_byte,
+        params: std::ptr::null(),
+        param_count: 0,
+        command: None,
+        collision: None,
+    }]));
+    Box::leak(Box::new(RveModule::new(scripts)))
+}
+
+unsafe extern "C" fn spawn_during_create(
+    host: *const RveHost,
+    _: *const RveParams,
+    out: *mut *mut c_void,
+) -> RveStatus {
+    if host.is_null() || out.is_null() {
+        return RveStatus::Error;
+    }
+    // SAFETY: the host is valid for this create callback.
+    if unsafe { spawn_options_from_host(host, 0, RveStr::empty()) } != 0 {
+        return RveStatus::Error;
+    }
+    // The refusal is reported as a script event; the instance itself is created normally.
+    // SAFETY: the caller supplies a live output slot; `free_byte` releases the allocation.
+    unsafe { *out = Box::into_raw(Box::new(0_u8)).cast() };
+    RveStatus::Ok
+}
+
+#[test]
+fn abi_spawn_during_create_is_refused_without_queueing() {
+    let _lock = test_lock();
+    let module = raw_module(spawn_during_create, no_op_update);
+    // SAFETY: the test module and its callbacks have process lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world =
+        world("[[objects]]\nid = \"raw\"\n[[objects.heavy_scripts]]\nname = \"RawProbe\"\n");
+    let mut host = spawn_host(&world, &library, RAW_PREFAB);
+    assert!(
+        error_messages(&mut host)
+            .iter()
+            .any(|message| message == "spawn is unavailable during script creation"),
+    );
+    host.update(&mut world, 0.1, at(0.1, 1));
+    assert!(host.drain_world_changes().spawned.is_empty());
+    assert!(world.handle("bolt").is_none());
+}
+
+unsafe extern "C" fn spawn_then_error(_: *mut c_void, host: *const RveHost, _: f32) -> RveStatus {
+    if host.is_null() {
+        return RveStatus::Error;
+    }
+    // SAFETY: the host is valid for this callback.
+    let host_ref = unsafe { &*host };
+    // SAFETY: the host is valid for this callback.
+    let handle =
+        unsafe { spawn_options_from_host(host, RVE_SPAWN_HAS_ID, RveStr::from_static("rolled")) };
+    if handle == 0 {
+        return RveStatus::Error;
+    }
+    // SAFETY: the host callback copies the static message during this call.
+    unsafe { (host_ref.set_error)(host_ref.ctx, RveStr::from_static("injected spawn error")) };
+    RveStatus::Error
+}
+
+#[test]
+fn abi_spawn_is_rolled_back_when_the_callback_returns_error() {
+    let _lock = test_lock();
+    let module = raw_module(create_byte_instance, spawn_then_error);
+    // SAFETY: the test module and its callbacks have process lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world =
+        world("[[objects]]\nid = \"raw\"\n[[objects.heavy_scripts]]\nname = \"RawProbe\"\n");
+    let mut host = spawn_host(&world, &library, RAW_PREFAB);
+    host.update(&mut world, 0.1, at(0.1, 1));
+
+    let errors = error_messages(&mut host);
+    assert!(
+        errors
+            .iter()
+            .any(|message| message == "injected spawn error"),
+        "{errors:?}"
+    );
+    assert!(world.handle("rolled").is_none());
+    assert!(host.drain_world_changes().spawned.is_empty());
+}
+
+unsafe extern "C" fn spawn_invalid_options(
+    _: *mut c_void,
+    host: *const RveHost,
+    _: f32,
+) -> RveStatus {
+    if host.is_null() {
+        return RveStatus::Error;
+    }
+    // Unknown presence bit 7 and a parent handle that names no slot are both refused.
+    // SAFETY: the host is valid for this callback.
+    let unknown = unsafe { spawn_options_from_host(host, 1 << 7, RveStr::empty()) };
+    // SAFETY: the host is valid for this callback.
+    let no_parent = unsafe { spawn_options_from_host(host, RVE_SPAWN_HAS_PARENT, RveStr::empty()) };
+    if unknown != 0 || no_parent != 0 {
+        return RveStatus::Error;
+    }
+    RveStatus::Ok
+}
+
+#[test]
+fn abi_spawn_refuses_unknown_option_flags_and_bad_parents() {
+    let _lock = test_lock();
+    let module = raw_module(create_byte_instance, spawn_invalid_options);
+    // SAFETY: the test module and its callbacks have process lifetime.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world =
+        world("[[objects]]\nid = \"raw\"\n[[objects.heavy_scripts]]\nname = \"RawProbe\"\n");
+    let mut host = spawn_host(&world, &library, RAW_PREFAB);
+    host.update(&mut world, 0.1, at(0.1, 1));
+    let errors = error_messages(&mut host);
+    assert!(
+        errors
+            .iter()
+            .any(|message| message == "spawn received unknown option flags 0x80"),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message == "spawn parent is not an object handle"),
+        "{errors:?}"
+    );
+    assert!(host.drain_world_changes().spawned.is_empty());
 }

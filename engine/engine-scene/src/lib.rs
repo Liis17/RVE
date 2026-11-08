@@ -11,7 +11,7 @@ pub mod prefab;
 pub mod transform;
 pub mod world;
 
-/// Версия крейта из `Cargo.toml`.
+/// Версия крейта, заданная в `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use audio::{
@@ -39,10 +39,11 @@ pub use document::{
 pub use params::{ParamKind, ParamSchema, ParamSpec};
 pub use prefab::{
     Expansion, HeavyParamsOverride, LiteParamsOverride, MeshRendererOverride, ObjectOrigin,
-    PrefabInstance, PrefabOverride, TransformOverride, apply_override, expand,
+    PrefabInstance, PrefabOverride, PrefabTemplate, TransformOverride, apply_override, expand,
     expand_without_overrides,
 };
 pub use world::{
-    EnvironmentState, LightState, LocalLightState, LocalTransform, MeshInstance, ObjectHandle,
-    ParticleEmitterInstance, SceneFrame, SceneWarning, World, WorldObject,
+    EnvironmentState, LightState, LocalLightState, LocalTransform, MAX_GENERATION,
+    MAX_LIVE_OBJECTS, MeshInstance, ObjectHandle, ParticleEmitterInstance, SceneFrame,
+    SceneWarning, SpawnOptions, World, WorldObject,
 };

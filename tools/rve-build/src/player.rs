@@ -368,15 +368,15 @@ fn validate_heavy_scripts(
     for script in heavy_scripts {
         if !library.contains_script(&script.name) {
             return Err(BuildError::input(format!(
-                "сцена /{} ссылается на heavy-скрипт {:?}, которого нет в библиотеке",
-                script.scene, script.name
+                "{} ссылается на heavy-скрипт {:?}, которого нет в библиотеке",
+                script.owner, script.name
             )));
         }
         if let Some(schema) = library.schema(&script.name) {
             schema.resolve(&script.params).map_err(|error| {
                 BuildError::input(format!(
-                    "сцена /{}, объект {:?}, heavy-скрипт {:?}: {error}",
-                    script.scene, script.object, script.name
+                    "{}, объект {:?}, heavy-скрипт {:?}: {error}",
+                    script.owner, script.object, script.name
                 ))
             })?;
         }
@@ -1284,6 +1284,7 @@ mod tests {
             project_dir: project_dir.to_path_buf(),
             bootstrap_path: project_dir.join("bootstrap.rves"),
             settings,
+            prefabs: engine_project::PrefabCatalogFile::default(),
             files: BTreeMap::new(),
             assignments: BTreeMap::new(),
             archives: vec!["base".to_owned()],
@@ -1516,7 +1517,7 @@ mod tests {
         }
         let wrapper: Wrapper = toml::from_str(&format!("params = {params}")).unwrap();
         HeavyScriptUse {
-            scene: scene.to_owned(),
+            owner: format!("сцена /{scene}"),
             object: "mesh".to_owned(),
             name: name.to_owned(),
             params: wrapper.params,

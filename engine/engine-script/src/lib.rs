@@ -8,6 +8,7 @@ mod abi_string;
 mod actions;
 mod host;
 mod library;
+mod lifecycle;
 mod lite;
 mod physics;
 mod transaction;
@@ -19,6 +20,9 @@ pub use host::{
     ScriptUpdateProfile, lite_properties,
 };
 pub use library::{ScriptLibrary, ScriptLibraryError};
+pub use lifecycle::{
+    PrefabCatalog, PrefabKind, PrefabRequest, PrefabSpec, PrefabStatus, SpawnedObject, WorldChanges,
+};
 pub use rve_sdk::{Key, MouseButton};
 pub use types::{
     ScriptCursor, ScriptEvent, ScriptEventLevel, ScriptInput, ScriptParams, ScriptTime,

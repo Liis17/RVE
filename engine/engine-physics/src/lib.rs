@@ -1,5 +1,8 @@
 //! Столкновения и физическая симуляция игрового мира.
 
+/// Версия крейта, заданная в `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod broad;
 pub mod bvh;
 pub mod character;
@@ -37,7 +40,7 @@ pub use query::{
 pub use ray::{Ray, RayHit, raycast};
 pub use scene::{
     ModelGeometry, ModelMesh, ObjectWorldTransform, PhysicsSceneBinding, PhysicsSceneBody,
-    PhysicsSceneDesc, PhysicsSceneError, PhysicsSceneSync, PhysicsSceneSyncError,
+    PhysicsSceneDesc, PhysicsSceneError, PhysicsSceneSync, PhysicsSceneSyncError, ShapeCache,
     character_capsule_shape, object_world_transform, primitive_collider_shape,
 };
 pub use shape::{Aabb, MassProperties, Pose, Shape};
@@ -46,6 +49,6 @@ pub use thread::{
     PhysicsRequest, PhysicsServer, PhysicsServerError, PhysicsStepResult,
 };
 pub use world::{
-    BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent, PhysicsWorld,
-    PhysicsWorldError, StepDriver, StepResult,
+    BodyChange, BodyDesc, BodyHandle, BodyKind, ColliderDesc, PhysicsCommand, PhysicsEvent,
+    PhysicsWorld, PhysicsWorldError, StepDriver, StepResult,
 };

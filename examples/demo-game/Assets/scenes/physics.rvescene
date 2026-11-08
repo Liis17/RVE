@@ -16,6 +16,17 @@ path = "/audio/hum.wav"
 [[assets]]
 path = "/scripts/coin.lua"
 
+# Быстрые префабы для стрельбы: пули и следы spawn-ятся из скриптов. Следам ограничен лимит живых.
+[[assets]]
+path = "/prefabs/bullet.rveprefab"
+
+[[assets]]
+path = "/prefabs/bullet_hole.rveprefab"
+max_instances = 100
+
+[[assets]]
+path = "/scripts/shooter.lua"
+
 # Модель shared-cube.fbx занимает диапазон [-1, 1] по каждой оси, поэтому коллайдеры
 # box задают half_extents = [1, 1, 1], а полуразмер коробки задаёт scale.
 
@@ -312,6 +323,9 @@ position = [0.0, 0.6, 3.5]
 rotation = [-8.0, 0.0, 0.0]
 [objects.camera]
 settings = "/cameras/default.camerasettings"
+# Стрельба: fire — пуля вылетает вперёд по взгляду, spawn_heavy — переключает тяжёлую башню.
+[[objects.lite_scripts]]
+path = "/scripts/shooter.lua"
 
 [[objects]]
 id = "ambient-hum"
