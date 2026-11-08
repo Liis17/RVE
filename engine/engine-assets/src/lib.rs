@@ -780,7 +780,7 @@ fn load_fbx(
     let scene = load_fbx_scene(bytes, virtual_path, path)?;
     // Скелет нужен при skin или анимациях с ключами: тогда все части получают связи с костями.
     let needs_skeleton = !scene.skin_deformers.is_empty()
-        || animation::has_animated_stack(&scene).map_err(&decode_error)?;
+        || animation::has_animated_stack(&scene).map_err(decode_error)?;
     let mut builder = needs_skeleton.then(skin::SkeletonBuilder::default);
 
     let mut model = Model {
