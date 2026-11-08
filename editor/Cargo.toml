@@ -20,6 +20,7 @@ engine-assets = { path = "../engine/engine-assets" }
 engine-audio = { path = "../engine/engine-audio" }
 engine-physics = { path = "../engine/engine-physics" }
 engine-files = { path = "../engine/engine-files" }
+engine-input = { path = "../engine/engine-input" }
 engine-platform = { path = "../engine/engine-platform" }
 engine-ui = { path = "../engine/engine-ui" }
 engine-project = { path = "../engine/engine-project" }

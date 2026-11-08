@@ -237,6 +237,27 @@ impl Script for AudioRejected {
     }
 }
 
+struct RumbleProbe {
+    panic_after: bool,
+}
+
+fn rumble_probe_factory(params: &Params) -> Result<Box<dyn Script>, String> {
+    Ok(Box::new(RumbleProbe {
+        panic_after: matches!(params.get("panic_after"), Some(Value::Bool(true))),
+    }))
+}
+
+impl Script for RumbleProbe {
+    fn on_update(&mut self, ctx: &mut rve_sdk::Context<'_>, _: f32) {
+        let input = ctx.input();
+        let accepted = (0..300).filter(|_| input.rumble(1, 0.5, 0.25, 0.1)).count();
+        ctx.log_info(format!("rumble accepted {accepted}"));
+        if self.panic_after {
+            panic!("rumble panic");
+        }
+    }
+}
+
 fn input_actions_probe_factory(_: &Params) -> Result<Box<dyn Script>, String> {
     Ok(Box::new(InputActionsProbe(0)))
 }
@@ -744,6 +765,7 @@ fn sdk_module() -> &'static RveModule {
         "PhysicsProbe" => physics_probe_factory,
         "AudioProbe" => audio_probe_factory,
         "AudioRejected" => audio_rejected_factory,
+        "RumbleProbe" => rumble_probe_factory,
         "InputActionsProbe" => input_actions_probe_factory,
         "SpawnDriver" => spawn_driver_factory,
         "BoltProbe" => bolt_probe_factory,
@@ -766,6 +788,7 @@ fn library() -> crate::ScriptLibrary {
 
 fn input_action_settings() -> InputSettings {
     InputSettings {
+        gamepad: Default::default(),
         default_context: Some("game".to_owned()),
         contexts: BTreeMap::from([
             (
@@ -1322,6 +1345,61 @@ name = "AudioRejected"
 }
 
 #[test]
+fn abi_v11_rumble_requests_are_capped_per_frame_and_keep_guest_order() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "RumbleProbe"
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    let events = host.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.level == ScriptEventLevel::Error
+                && event.message.starts_with("rumble requests limit")),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message == "rumble accepted 256")
+    );
+    let rumble = host.take_rumble_requests();
+    assert_eq!(rumble.len(), 256);
+    assert!(rumble.iter().all(|request| request.pad == 1));
+}
+
+#[test]
+fn abi_v11_rumble_is_rolled_back_when_the_guest_panics() {
+    let _lock = test_lock();
+    let mut world = world(
+        r#"
+[[objects]]
+id = "actor"
+[[objects.heavy_scripts]]
+name = "RumbleProbe"
+params = { panic_after = true }
+"#,
+    );
+    let mut host = load_host(&world, &library());
+    host.update(&mut world, 1.0 / 60.0, ScriptTime::default());
+
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message.contains("rumble panic"))
+    );
+    assert!(host.take_rumble_requests().is_empty());
+}
+
+#[test]
 fn abi_v6_to_v8_modules_load_on_the_v9_host() {
     let _lock = test_lock();
     let current = sdk_module();
@@ -1353,6 +1431,37 @@ fn abi_v6_to_v8_modules_load_on_the_v9_host() {
             "guest ABI v{abi_version} runs on the v9 host"
         );
     }
+}
+
+#[test]
+fn abi_v10_modules_load_on_the_v11_host() {
+    let _lock = test_lock();
+    let current = sdk_module();
+    let module = Box::leak(Box::new(RveModule {
+        header: RveHeader {
+            abi_version: 10,
+            header_size: std::mem::size_of::<RveHeader>() as u32,
+        },
+        scripts: current.scripts,
+        script_count: current.script_count,
+    }));
+    // SAFETY: the module and its descriptor table live for the whole test process.
+    let library = unsafe { crate::ScriptLibrary::from_module(std::ptr::from_ref(module)) }.unwrap();
+    let mut world = scripted_world("Probe", r#"{ label = "v10" }"#);
+    let mut host = load_host(&world, &library);
+    host.start(
+        &mut world,
+        ScriptTime {
+            elapsed: 3.5,
+            frame: 17,
+        },
+    );
+    assert!(
+        message_list(&mut host)
+            .iter()
+            .any(|message| message == "start:v10"),
+        "guest ABI v10 runs on the v11 host"
+    );
 }
 
 fn v3_probe_module() -> &'static RveModule {

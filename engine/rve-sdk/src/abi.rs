@@ -9,9 +9,10 @@ pub const RVE_SCRIPT_ABI_MIN_VERSION: u32 = 3;
 /// Version 8 appends cursor callbacks after the v7 audio tail.
 /// Version 9 appends spawn, destroy, object-state and prefab callbacks after the v8 cursor tail.
 /// Version 10 appends animation callbacks after the v9 prefab tail.
+/// Version 11 appends gamepad state and rumble callbacks after the v10 animation tail.
 /// Each version is a new number because hosts of the previous version already accept modules
 /// that end at its tail.
-pub const RVE_SCRIPT_ABI_VERSION: u32 = 10;
+pub const RVE_SCRIPT_ABI_VERSION: u32 = 11;
 
 /// Camera anti-aliasing code for [`RveCameraSettings::anti_aliasing`].
 pub const RVE_ANTI_ALIASING_FXAA: u32 = 0;
@@ -44,6 +45,8 @@ pub const RVE_ACTION_AXIS: u32 = 1;
 pub const RVE_ACTION_VECTOR2: u32 = 2;
 /// Maximum number of physical inputs in one binding slot.
 pub const RVE_INPUT_MAX_BINDINGS: usize = 16;
+/// Number of gamepad slots, numbered 1..=4 in script names and 0 for the aggregate.
+pub const RVE_GAMEPAD_SLOTS: usize = 4;
 
 /// Stable key codes shared by the host ABI and the Rust guest API.
 #[repr(u32)]
@@ -269,18 +272,184 @@ impl MouseButton {
     }
 }
 
-/// A physical keyboard key or mouse button used by project input bindings.
+/// Stable gamepad button codes shared by the host ABI and the Rust guest API.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GamepadButton {
+    South = 0,
+    East = 1,
+    West = 2,
+    North = 3,
+    LeftBumper = 4,
+    RightBumper = 5,
+    LeftTrigger = 6,
+    RightTrigger = 7,
+    Select = 8,
+    Start = 9,
+    Mode = 10,
+    LeftStick = 11,
+    RightStick = 12,
+    DPadUp = 13,
+    DPadDown = 14,
+    DPadLeft = 15,
+    DPadRight = 16,
+}
+
+impl GamepadButton {
+    /// Every button in ABI code order.
+    pub const ALL: [Self; 17] = [
+        Self::South,
+        Self::East,
+        Self::West,
+        Self::North,
+        Self::LeftBumper,
+        Self::RightBumper,
+        Self::LeftTrigger,
+        Self::RightTrigger,
+        Self::Select,
+        Self::Start,
+        Self::Mode,
+        Self::LeftStick,
+        Self::RightStick,
+        Self::DPadUp,
+        Self::DPadDown,
+        Self::DPadLeft,
+        Self::DPadRight,
+    ];
+
+    /// Converts an API name to a gamepad button.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|button| button.name() == name)
+    }
+
+    /// Converts a stable ABI gamepad-button code to a button when it is supported.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::South),
+            1 => Some(Self::East),
+            2 => Some(Self::West),
+            3 => Some(Self::North),
+            4 => Some(Self::LeftBumper),
+            5 => Some(Self::RightBumper),
+            6 => Some(Self::LeftTrigger),
+            7 => Some(Self::RightTrigger),
+            8 => Some(Self::Select),
+            9 => Some(Self::Start),
+            10 => Some(Self::Mode),
+            11 => Some(Self::LeftStick),
+            12 => Some(Self::RightStick),
+            13 => Some(Self::DPadUp),
+            14 => Some(Self::DPadDown),
+            15 => Some(Self::DPadLeft),
+            16 => Some(Self::DPadRight),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable button name without the `Gamepad` prefix.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::South => "South",
+            Self::East => "East",
+            Self::West => "West",
+            Self::North => "North",
+            Self::LeftBumper => "LeftBumper",
+            Self::RightBumper => "RightBumper",
+            Self::LeftTrigger => "LeftTrigger",
+            Self::RightTrigger => "RightTrigger",
+            Self::Select => "Select",
+            Self::Start => "Start",
+            Self::Mode => "Mode",
+            Self::LeftStick => "LeftStick",
+            Self::RightStick => "RightStick",
+            Self::DPadUp => "DPadUp",
+            Self::DPadDown => "DPadDown",
+            Self::DPadLeft => "DPadLeft",
+            Self::DPadRight => "DPadRight",
+        }
+    }
+}
+
+/// Stable gamepad analog-axis codes shared by the host ABI and the Rust guest API.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GamepadAxis {
+    LeftX = 0,
+    LeftY = 1,
+    RightX = 2,
+    RightY = 3,
+    LeftTrigger = 4,
+    RightTrigger = 5,
+}
+
+impl GamepadAxis {
+    /// Converts an API name to a gamepad axis.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "LeftX" => Some(Self::LeftX),
+            "LeftY" => Some(Self::LeftY),
+            "RightX" => Some(Self::RightX),
+            "RightY" => Some(Self::RightY),
+            "LeftTrigger" => Some(Self::LeftTrigger),
+            "RightTrigger" => Some(Self::RightTrigger),
+            _ => None,
+        }
+    }
+
+    /// Converts a stable ABI gamepad-axis code to an axis when it is supported.
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::LeftX),
+            1 => Some(Self::LeftY),
+            2 => Some(Self::RightX),
+            3 => Some(Self::RightY),
+            4 => Some(Self::LeftTrigger),
+            5 => Some(Self::RightTrigger),
+            _ => None,
+        }
+    }
+}
+
+/// Splits `Gamepad[N].<Name>` into its optional slot (1..=4, `None` for any gamepad) and the
+/// trailing name. Returns `None` for other strings and for slots outside 1..=4.
+pub fn split_gamepad_name(name: &str) -> Option<(Option<u8>, &str)> {
+    let rest = name.strip_prefix("Gamepad")?;
+    let (pad, tail) = rest.split_once('.')?;
+    let pad = match pad {
+        "" => None,
+        digits if digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+            let pad = digits.parse::<u8>().ok()?;
+            if !(1..=RVE_GAMEPAD_SLOTS as u8).contains(&pad) {
+                return None;
+            }
+            Some(pad)
+        }
+        _ => return None,
+    };
+    Some((pad, tail))
+}
+
+/// A physical keyboard key, mouse button, or gamepad button used by project input bindings.
+///
+/// `GamepadButton.pad` is `None` for any gamepad (`Gamepad.South`) or `Some(1..=4)` for one
+/// slot (`Gamepad2.South`).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PhysicalInput {
     Key(Key),
     MouseButton(MouseButton),
+    GamepadButton {
+        pad: Option<u8>,
+        button: GamepadButton,
+    },
 }
 
 impl PhysicalInput {
-    /// Parses a stable key name or a `Mouse.<Button>` name.
+    /// Parses a stable key name, a `Mouse.<Button>` name, or a `Gamepad[N].<Button>` name.
     pub fn from_name(name: &str) -> Option<Self> {
         if let Some(button) = name.strip_prefix("Mouse.") {
             MouseButton::from_name(button).map(Self::MouseButton)
+        } else if let Some((pad, button)) = split_gamepad_name(name) {
+            GamepadButton::from_name(button).map(|button| Self::GamepadButton { pad, button })
         } else {
             Key::from_name(name).map(Self::Key)
         }
@@ -291,6 +460,11 @@ impl PhysicalInput {
         match self {
             Self::Key(key) => format!("{key:?}"),
             Self::MouseButton(button) => format!("Mouse.{button:?}"),
+            Self::GamepadButton { pad: None, button } => format!("Gamepad.{}", button.name()),
+            Self::GamepadButton {
+                pad: Some(pad),
+                button,
+            } => format!("Gamepad{pad}.{}", button.name()),
         }
     }
 }
@@ -881,6 +1055,33 @@ pub type RveAnimationSetSpeedFn =
 /// Stops every motion of one animated object; returns `RveStatus` as a `u32`. Appended in ABI v10.
 pub type RveAnimationStopFn = unsafe extern "C" fn(ctx: *mut c_void, object: u64) -> u32;
 
+/// Gamepad snapshot copied by [`RveGamepadStateFn`]. Button bits use [`GamepadButton`] codes and
+/// axes use [`GamepadAxis`] codes. Appended in ABI v11.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RveGamepadState {
+    /// Non-zero when the slot (or any slot, for the aggregate) has a connected gamepad.
+    pub connected: u32,
+    /// Button bits held now.
+    pub down: u32,
+    /// Button bits that became held since the previous script update.
+    pub pressed: u32,
+    /// Button bits that became released since the previous script update.
+    pub released: u32,
+    /// Analog axis values in [`GamepadAxis`] code order.
+    pub axes: [f32; 6],
+}
+
+/// Copies one gamepad snapshot. `pad` is 0 for the aggregate of all slots or 1..=4 for one slot.
+/// Returns `false` and zeroes `out` for any other slot. Appended in ABI v11.
+pub type RveGamepadStateFn =
+    unsafe extern "C" fn(ctx: *mut c_void, pad: u32, out: *mut RveGamepadState) -> bool;
+
+/// Queues one rumble request for `pad` (0 for every connected gamepad, 1..=4 for one slot).
+/// Appended in ABI v11.
+pub type RveGamepadRumbleFn =
+    unsafe extern "C" fn(ctx: *mut c_void, pad: u32, strong: f32, weak: f32, seconds: f32) -> bool;
+
 /// Host functions available during one guest call. The value is call-scoped and thread-local.
 #[repr(C)]
 pub struct RveHost {
@@ -984,6 +1185,9 @@ pub struct RveHost {
     pub animation_set_parameter: Option<RveAnimationSetParameterFn>,
     pub animation_set_speed: Option<RveAnimationSetSpeedFn>,
     pub animation_stop: Option<RveAnimationStopFn>,
+    /// Gamepad state and rumble callbacks appended in ABI v11; `None` marks an unavailable callback.
+    pub gamepad_state: Option<RveGamepadStateFn>,
+    pub gamepad_rumble: Option<RveGamepadRumbleFn>,
 }
 
 /// Guest factory callback.
