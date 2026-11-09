@@ -3005,6 +3005,33 @@ impl ScriptTransaction {
         Ok(())
     }
 
+    /// Интенсивность и небо одним вызовом: все значения проверяются до первой записи, поэтому
+    /// отказ не оставляет частично применённого окружения.
+    pub(crate) fn stage_environment(
+        &mut self,
+        handle: ObjectHandle,
+        intensity: Option<f32>,
+        sky: Option<ProceduralSkyComponent>,
+    ) -> Result<(), String> {
+        if let Some(problem) = intensity.and_then(engine_scene::world::environment_intensity_problem)
+        {
+            return Err(problem.to_owned());
+        }
+        if let Some(problem) = sky
+            .as_ref()
+            .and_then(engine_scene::world::procedural_sky_problem)
+        {
+            return Err(problem.to_owned());
+        }
+        if let Some(intensity) = intensity {
+            self.stage_environment_intensity(handle, intensity)?;
+        }
+        if let Some(sky) = sky {
+            self.stage_procedural_sky(handle, sky)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn stage_lod_distances(
         &mut self,
         handle: ObjectHandle,

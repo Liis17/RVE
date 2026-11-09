@@ -281,14 +281,10 @@ pub(super) unsafe extern "C" fn host_environment_set(
         let Some(handle) = live_object(context, object, "environment_set") else {
             return false;
         };
-        let mut staged = context
+        let sky = value.has_sky.then(|| sky_from_abi(value.sky));
+        let staged = context
             .transaction
-            .stage_environment_intensity(handle, value.intensity);
-        if value.has_sky && staged.is_ok() {
-            staged = context
-                .transaction
-                .stage_procedural_sky(handle, sky_from_abi(value.sky));
-        }
+            .stage_environment(handle, Some(value.intensity), sky);
         component_result(context, staged)
     })
 }

@@ -248,3 +248,56 @@ return Script
     );
     assert!(host.drain_audio_requests().is_empty());
 }
+
+#[test]
+fn a_caught_environment_error_leaves_the_intensity_unchanged() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  local ok = pcall(function()
+    rve.find("sky"):set_environment({ intensity = 2.0, sky = { sun_size_deg = 0.0 } })
+  end)
+  if not ok then
+    rve.find("crate"):set_visible(false)
+  end
+end
+return Script
+"#,
+    );
+    let sky = world.handle("sky").unwrap();
+    let before = world.object(sky).unwrap().environment.clone();
+    run_once(&mut world, &mut host);
+    assert!(
+        !world.object(world.handle("crate").unwrap()).unwrap().mesh_visible,
+        "вызов должен отказать, а скрипт продолжить"
+    );
+    let after = world.object(sky).unwrap().environment.clone();
+    assert_eq!(format!("{after:?}"), format!("{before:?}"));
+}
+
+#[test]
+fn a_caught_light_error_leaves_the_light_unchanged() {
+    let (mut world, mut host) = load(
+        r#"
+local Script = {}
+function Script:on_update()
+  local ok = pcall(function()
+    rve.find("lamp"):set_light({ intensity = 3.0, enabled = "no" })
+  end)
+  if not ok then
+    rve.find("crate"):set_visible(false)
+  end
+end
+return Script
+"#,
+    );
+    run_once(&mut world, &mut host);
+    assert!(
+        !world.object(world.handle("crate").unwrap()).unwrap().mesh_visible,
+        "вызов должен отказать, а скрипт продолжить"
+    );
+    let lamp = world.object(world.handle("lamp").unwrap()).unwrap();
+    assert_eq!(lamp.point_light.unwrap().intensity, 1.0);
+    assert!(lamp.light_enabled);
+}

@@ -76,7 +76,10 @@ fn add_light_methods(
             with_active_call(&set_active, |transaction| {
                 let (current, _) = current_light(transaction, handle)
                     .ok_or_else(|| LuaError::runtime("object.set_light requires a light"))?;
+                // Все поля разбираются до первой записи: ошибка в `enabled` не оставляет свет
+                // частично изменённым.
                 let updated = light_from_table(&table, current)?;
+                let enabled = bool_field(&table, "enabled")?;
                 match updated {
                     LightValue::Directional(light) => {
                         transaction.stage_directional_light(handle, light)
@@ -85,7 +88,7 @@ fn add_light_methods(
                     LightValue::Spot(light) => transaction.stage_spot_light(handle, light),
                 }
                 .map_err(LuaError::runtime)?;
-                if let Some(enabled) = bool_field(&table, "enabled")? {
+                if let Some(enabled) = enabled {
                     transaction
                         .stage_light_enabled(handle, enabled)
                         .map_err(LuaError::runtime)?;
@@ -302,21 +305,21 @@ fn add_environment_methods(
                 return Ok(false);
             }
             with_active_call(&set_active, |transaction| {
-                if let Some(intensity) = intensity {
-                    transaction
-                        .stage_environment_intensity(handle, intensity)
-                        .map_err(LuaError::runtime)?;
-                }
-                if let Some(sky_table) = sky {
-                    let current = transaction
-                        .environment_state(handle)
-                        .and_then(|(_, sky)| sky)
-                        .ok_or_else(|| LuaError::runtime("environment is not a procedural sky"))?;
-                    let sky = sky_from_table(&sky_table, current)?;
-                    transaction
-                        .stage_procedural_sky(handle, sky)
-                        .map_err(LuaError::runtime)?;
-                }
+                let sky = match sky {
+                    Some(sky_table) => {
+                        let current = transaction
+                            .environment_state(handle)
+                            .and_then(|(_, sky)| sky)
+                            .ok_or_else(|| {
+                                LuaError::runtime("environment is not a procedural sky")
+                            })?;
+                        Some(sky_from_table(&sky_table, current)?)
+                    }
+                    None => None,
+                };
+                transaction
+                    .stage_environment(handle, intensity, sky)
+                    .map_err(LuaError::runtime)?;
                 Ok(true)
             })
         })?,

@@ -4038,6 +4038,9 @@ impl OwnedAbiParams {
 }
 
 #[cfg(test)]
+mod component_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{ScriptCursor, ScriptEventLevel, ScriptInput};
