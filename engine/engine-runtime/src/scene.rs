@@ -1485,6 +1485,10 @@ id = "camera"
             },
         )
         .unwrap();
+        // Канвас HUD сцены открывается скриптами: документы регистрируются, как при старте runtime.
+        crate::game_ui::UiRegistry::default()
+            .register(&mut host, &prepared.ui)
+            .unwrap();
         for (path, template) in &prepared.prefabs.templates {
             host.register_prefab(
                 &prepared.world,
