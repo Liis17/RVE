@@ -335,6 +335,11 @@ impl SceneSwitch {
             .extend(rekey(&mut table.skin_instances, &handles));
         gpu.joint_counts
             .extend(rekey(&mut table.joint_counts, &handles));
+        // Удалённые объекты: их скиннинг больше не живой и уходит в освобождение ниже.
+        for object in &replacement.removed {
+            gpu.skin_instances.remove(object);
+            gpu.joint_counts.remove(object);
+        }
         for (scene_object, desc) in table.particle_descs.drain() {
             if let Some(&object) = handles.get(&scene_object) {
                 ctx.prefabs.send_particles(ParticleRequest::Create {
